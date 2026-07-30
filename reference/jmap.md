@@ -55,8 +55,21 @@ returns `Error::Method` for JMAP method-level errors.
 - `HttpTransport` - api_request, upload, download, get_session (returns `Bytes`).
 - `SseTransport` - open_sse (EventSource, with `last_event_id` support).
 - `ReqwestTransport` - default implementation with a pooled reqwest::Client.
-- `Client::with_transport(transport, session)` - crate-internal custom transport injection.
+- `Client::with_transport(transport, session, session_url)` - crate-internal custom transport injection. The session URL is required and rejected when empty: a client built without one could never re-fetch its session, so `refresh_session` was a silent no-op against the wrong (empty) URL.
 - WebSocket remains reqwest-specific (documented).
+
+The session and everything derived from it (`apiUrl`, the upload / download /
+EventSource templates parsed into `URLPart`s, and the default account id) live
+together in one `Arc<SessionState>` behind a single lock. RFC 8620 §2 lets any
+Session property change, so `refresh_session` republishes the whole derived set
+atomically; readers take one `session_state()` snapshot and build a whole URL
+from it, so a concurrent refresh cannot splice two sessions into one request.
+
+Values substituted into the session's URI templates are percent-encoded per RFC
+6570 §3.2.2 simple string expansion - everything outside ALPHA / DIGIT / `-` /
+`.` / `_` / `~` (`core::session::encode_template_value`). A deny list is not
+sufficient here: `+` in a query-position `{type}` would otherwise decode
+server-side as a space, turning `application/ld+json` into `application/ld json`.
 
 All convenience helpers are `impl<Tr: HttpTransport> Client<Tr>` so custom transports get the full API.
 `Client::build()` uses the lexicographically first primary capability as its

@@ -53,7 +53,9 @@ impl IdentityPatch {
         T: Iterator<Item = U>,
         U: Into<EmailAddress>,
     {
-        self.bcc = bcc.map(|s| s.map(std::convert::Into::into).collect());
+        self.bcc = bcc
+            .map(|s| s.map(std::convert::Into::into).collect::<Vec<_>>())
+            .and_then(|values| (!values.is_empty()).then_some(values));
         self
     }
 
@@ -62,7 +64,9 @@ impl IdentityPatch {
         T: Iterator<Item = U>,
         U: Into<EmailAddress>,
     {
-        self.reply_to = reply_to.map(|s| s.map(std::convert::Into::into).collect());
+        self.reply_to = reply_to
+            .map(|s| s.map(std::convert::Into::into).collect::<Vec<_>>())
+            .and_then(|values| (!values.is_empty()).then_some(values));
         self
     }
 

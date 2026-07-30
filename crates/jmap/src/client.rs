@@ -80,20 +80,76 @@ impl Authorization {
     }
 }
 
+/// Everything a client derives from a [`Session`], held together so a
+/// refresh swaps all of it at once.
+///
+/// RFC 8620 §2 lets any Session property change between fetches -
+/// `apiUrl`, the upload / download / EventSource templates and
+/// `primaryAccounts` included. Caching those next to, rather than with,
+/// the `Session` let a refreshed session be observable through
+/// `session()` while requests kept going to the endpoints and account of
+/// the session it replaced. One `Arc<SessionState>` behind one lock makes
+/// the swap atomic: a reader either sees the whole old session or the
+/// whole new one.
+pub(crate) struct SessionState {
+    session: Arc<Session>,
+    api_url: String,
+    upload_url: Vec<URLPart<blob::URLParameter>>,
+    download_url: Vec<URLPart<blob::URLParameter>>,
+    event_source_url: Vec<URLPart<crate::event_source::URLParameter>>,
+    default_account_id: crate::core::id::AccountId,
+}
+
+impl SessionState {
+    fn derive(session: Session) -> crate::Result<Self> {
+        let default_account_id = session
+            .default_account_id()
+            .map(crate::core::id::AccountId::new)
+            .unwrap_or_else(|| crate::core::id::AccountId::new(""));
+
+        Ok(Self {
+            api_url: session.api_url().to_string(),
+            upload_url: URLPart::parse(session.upload_url())?,
+            download_url: URLPart::parse(session.download_url())?,
+            event_source_url: URLPart::parse(session.event_source_url())?,
+            default_account_id,
+            session: Arc::new(session),
+        })
+    }
+
+    pub(crate) fn session(&self) -> &Arc<Session> {
+        &self.session
+    }
+
+    pub(crate) fn api_url(&self) -> &str {
+        &self.api_url
+    }
+
+    pub(crate) fn upload_url(&self) -> &[URLPart<blob::URLParameter>] {
+        &self.upload_url
+    }
+
+    pub(crate) fn download_url(&self) -> &[URLPart<blob::URLParameter>] {
+        &self.download_url
+    }
+
+    pub(crate) fn event_source_url(&self) -> &[URLPart<crate::event_source::URLParameter>] {
+        &self.event_source_url
+    }
+
+    pub(crate) fn default_account_id(&self) -> &crate::core::id::AccountId {
+        &self.default_account_id
+    }
+}
+
 /// Internal shared state of a [`Client`]. Stored behind an `Arc` so the
 /// client itself is cheap to clone and pass around.
 pub(crate) struct ClientInner<T: HttpTransport = ReqwestTransport> {
     transport: T,
-    session: std::sync::Mutex<Arc<Session>>,
+    state: std::sync::Mutex<Arc<SessionState>>,
     session_url: String,
-    api_url: String,
     session_updated: AtomicBool,
 
-    upload_url: Vec<URLPart<blob::URLParameter>>,
-    download_url: Vec<URLPart<blob::URLParameter>>,
-    event_source_url: Vec<URLPart<crate::event_source::URLParameter>>,
-
-    default_account_id: crate::core::id::AccountId,
     timeout: Duration,
     #[cfg(feature = "websockets")]
     pub(crate) accept_invalid_certs: bool,
@@ -225,30 +281,20 @@ impl ClientBuilder {
         )
         .map_err(crate::Error::from)?;
 
-        let session_url = format!("{url}/.well-known/jmap");
+        let session_url = well_known_session_url(url);
         let session_bytes = transport
             .get_session(&session_url)
             .await
             .map_err(crate::Error::from)?;
         let session: Session = serde_json::from_slice(&session_bytes)?;
 
-        let default_account_id = session
-            .default_account_id()
-            .map(crate::core::id::AccountId::new)
-            .unwrap_or_else(|| crate::core::id::AccountId::new(""));
-
         Ok(Client {
             inner: Arc::new(ClientInner {
-                download_url: URLPart::parse(session.download_url())?,
-                upload_url: URLPart::parse(session.upload_url())?,
-                event_source_url: URLPart::parse(session.event_source_url())?,
-                api_url: session.api_url().to_string(),
-                session: std::sync::Mutex::new(Arc::new(session)),
+                state: std::sync::Mutex::new(Arc::new(SessionState::derive(session)?)),
                 session_url,
                 session_updated: true.into(),
                 timeout: self.timeout,
                 transport,
-                default_account_id,
                 #[cfg(feature = "websockets")]
                 accept_invalid_certs: self.accept_invalid_certs,
                 #[cfg(feature = "websockets")]
@@ -257,6 +303,140 @@ impl ClientBuilder {
                 ws: None.into(),
             }),
         })
+    }
+}
+
+fn well_known_session_url(url: &str) -> String {
+    format!("{}/.well-known/jmap", url.trim_end_matches('/'))
+}
+
+#[cfg(test)]
+mod session_state_tests {
+    use std::sync::{Arc, Mutex};
+
+    use bytes::Bytes;
+    use serde_json::json;
+
+    use super::{Client, Session, well_known_session_url};
+    use crate::core::transport::{HttpTransport, TransportError};
+
+    fn session_json(tag: &str, account: &str, state: &str) -> String {
+        json!({
+            "capabilities": {},
+            "accounts": {},
+            "primaryAccounts": {"urn:ietf:params:jmap:mail": account},
+            "username": "user@example.test",
+            "apiUrl": format!("https://{tag}.example.test/api"),
+            "downloadUrl": format!("https://{tag}.example.test/dl/{{accountId}}/{{blobId}}/{{name}}/{{type}}"),
+            "uploadUrl": format!("https://{tag}.example.test/upload/{{accountId}}"),
+            "eventSourceUrl": format!("https://{tag}.example.test/es"),
+            "state": state
+        })
+        .to_string()
+    }
+
+    fn leading_value<P: crate::core::session::URLParser>(parts: &[super::URLPart<P>]) -> &str {
+        match parts.first() {
+            Some(super::URLPart::Value(value)) => value,
+            _ => panic!("a parsed template starts with a literal"),
+        }
+    }
+
+    /// Serves a second, entirely different session on refresh, and
+    /// records which `apiUrl` requests actually went to.
+    struct RefreshingTransport {
+        api_urls: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl HttpTransport for RefreshingTransport {
+        async fn api_request(&self, url: &str, _body: Vec<u8>) -> Result<Bytes, TransportError> {
+            self.api_urls
+                .lock()
+                .expect("api url lock")
+                .push(url.to_string());
+            Err(TransportError::new("stub transport returns no response"))
+        }
+
+        async fn upload(
+            &self,
+            _url: &str,
+            _body: Vec<u8>,
+            _content_type: Option<&str>,
+        ) -> Result<Bytes, TransportError> {
+            Err(TransportError::new("stub transport does not upload"))
+        }
+
+        async fn download(&self, _url: &str) -> Result<Bytes, TransportError> {
+            Err(TransportError::new("stub transport does not download"))
+        }
+
+        async fn get_session(&self, _url: &str) -> Result<Bytes, TransportError> {
+            Ok(Bytes::from(session_json("new", "B2", "session-2")))
+        }
+    }
+
+    /// RFC 8620 §2 lets any Session property change. A refresh that only
+    /// replaced the `Session` left `apiUrl`, the blob / EventSource
+    /// templates and the default account frozen at the values of the
+    /// session it replaced, so `session()` reported the new server while
+    /// every request still went to the old one.
+    #[tokio::test]
+    async fn refresh_replaces_the_session_and_everything_derived_from_it() {
+        let api_urls = Arc::new(Mutex::new(Vec::new()));
+        let old: Session = serde_json::from_str(&session_json("old", "A1", "session-1"))
+            .expect("session fixture parses");
+        let client = Client::with_transport(
+            RefreshingTransport {
+                api_urls: Arc::clone(&api_urls),
+            },
+            old,
+            "https://example.test/.well-known/jmap",
+        )
+        .expect("client builds");
+
+        assert_eq!(client.default_account_id().as_str(), "A1");
+        let _ = client.send_request(&client.build()).await;
+
+        client.refresh_session().await.expect("refresh succeeds");
+
+        assert_eq!(client.session().state(), "session-2");
+        assert_eq!(client.default_account_id().as_str(), "B2");
+        let state = client.session_state();
+        assert_eq!(state.api_url(), "https://new.example.test/api");
+        assert_eq!(
+            leading_value(state.download_url()),
+            "https://new.example.test/dl/"
+        );
+        assert_eq!(
+            leading_value(state.upload_url()),
+            "https://new.example.test/upload/"
+        );
+        assert_eq!(
+            leading_value(state.event_source_url()),
+            "https://new.example.test/es"
+        );
+
+        let _ = client.send_request(&client.build()).await;
+        let urls = api_urls.lock().expect("api url lock").clone();
+        assert_eq!(
+            urls,
+            vec![
+                "https://old.example.test/api".to_string(),
+                "https://new.example.test/api".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn well_known_session_url_has_one_separator() {
+        assert_eq!(
+            well_known_session_url("https://example.test/jmap"),
+            "https://example.test/jmap/.well-known/jmap"
+        );
+        assert_eq!(
+            well_known_session_url("https://example.test/jmap/"),
+            "https://example.test/jmap/.well-known/jmap"
+        );
     }
 }
 
@@ -273,24 +453,24 @@ impl Client {
 
 impl<T: HttpTransport> Client<T> {
     /// Create a client with a custom transport and pre-fetched session.
-    pub(crate) fn with_transport(transport: T, session: Session) -> crate::Result<Self> {
-        let default_account_id = session
-            .default_account_id()
-            .map(crate::core::id::AccountId::new)
-            .unwrap_or_else(|| crate::core::id::AccountId::new(""));
-
+    pub(crate) fn with_transport(
+        transport: T,
+        session: Session,
+        session_url: impl Into<String>,
+    ) -> crate::Result<Self> {
+        let session_url = session_url.into();
+        if session_url.is_empty() {
+            return Err(crate::Error::InvalidUrl(
+                "a custom transport client needs a session URL".to_string(),
+            ));
+        }
         Ok(Client {
             inner: Arc::new(ClientInner {
-                upload_url: URLPart::parse(session.upload_url())?,
-                download_url: URLPart::parse(session.download_url())?,
-                event_source_url: URLPart::parse(session.event_source_url())?,
-                api_url: session.api_url().to_string(),
-                session_url: String::new(),
-                session: std::sync::Mutex::new(Arc::new(session)),
+                state: std::sync::Mutex::new(Arc::new(SessionState::derive(session)?)),
+                session_url,
                 session_updated: true.into(),
                 timeout: Duration::from_millis(DEFAULT_TIMEOUT_MS),
                 transport,
-                default_account_id,
                 #[cfg(feature = "websockets")]
                 accept_invalid_certs: false,
                 #[cfg(feature = "websockets")]
@@ -309,32 +489,28 @@ impl<T: HttpTransport> Client<T> {
         self.inner.timeout
     }
 
-    pub(crate) fn session(&self) -> Arc<Session> {
+    /// The session and everything derived from it, as one consistent
+    /// snapshot. Hold the returned `Arc` for the duration of a URL build
+    /// so a concurrent [`Client::refresh_session`] cannot splice two
+    /// sessions into one request.
+    pub(crate) fn session_state(&self) -> Arc<SessionState> {
         self.inner
-            .session
+            .state
             .lock()
             .expect("session mutex poisoned")
             .clone()
+    }
+
+    pub(crate) fn session(&self) -> Arc<Session> {
+        Arc::clone(self.session_state().session())
     }
 
     pub(crate) fn session_url(&self) -> &str {
         &self.inner.session_url
     }
 
-    pub(crate) fn default_account_id(&self) -> &crate::core::id::AccountId {
-        &self.inner.default_account_id
-    }
-
-    pub(crate) fn download_url(&self) -> &[URLPart<blob::URLParameter>] {
-        &self.inner.download_url
-    }
-
-    pub(crate) fn upload_url(&self) -> &[URLPart<blob::URLParameter>] {
-        &self.inner.upload_url
-    }
-
-    pub(crate) fn event_source_url(&self) -> &[URLPart<crate::event_source::URLParameter>] {
-        &self.inner.event_source_url
+    pub(crate) fn default_account_id(&self) -> crate::core::id::AccountId {
+        self.session_state().default_account_id().clone()
     }
 
     /// Send a JMAP request and get a typed Response.
@@ -343,22 +519,25 @@ impl<T: HttpTransport> Client<T> {
         request: &request::Request<'_, T>,
     ) -> crate::Result<response::Response> {
         let body = serde_json::to_vec(request).map_err(crate::Error::RequestEncode)?;
+        let state = self.session_state();
         let bytes = self
             .inner
             .transport
-            .api_request(&self.inner.api_url, body)
+            .api_request(state.api_url(), body)
             .await
             .map_err(crate::Error::from)?;
         let response: response::Response = serde_json::from_slice(&bytes)?;
-        {
-            let session = self.inner.session.lock().expect("session mutex poisoned");
-            if response.session_state() != session.state() {
-                self.inner.session_updated.store(false, Ordering::Release);
-            }
+        if response.session_state() != state.session().state() {
+            self.inner.session_updated.store(false, Ordering::Release);
         }
         Ok(response)
     }
 
+    /// Re-fetch the session and republish everything derived from it.
+    ///
+    /// The derived endpoints and default account are replaced together
+    /// with the `Session` itself; a partial swap would leave requests
+    /// routed by a session no caller can observe.
     pub(crate) async fn refresh_session(&self) -> crate::Result<()> {
         let bytes = self
             .inner
@@ -367,10 +546,9 @@ impl<T: HttpTransport> Client<T> {
             .await
             .map_err(crate::Error::from)?;
         let session: Session = serde_json::from_slice(&bytes)?;
-        {
-            *self.inner.session.lock().expect("session mutex poisoned") = Arc::new(session);
-            self.inner.session_updated.store(true, Ordering::Release);
-        }
+        let state = Arc::new(SessionState::derive(session)?);
+        *self.inner.state.lock().expect("session mutex poisoned") = state;
+        self.inner.session_updated.store(true, Ordering::Release);
         Ok(())
     }
 

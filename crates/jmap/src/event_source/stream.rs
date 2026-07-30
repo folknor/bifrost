@@ -22,9 +22,10 @@ impl<T: HttpTransport + SseTransport> Client<T> {
         ping: Option<u32>,
         last_event_id: Option<&str>,
     ) -> crate::Result<impl Stream<Item = crate::Result<PushNotification>> + Unpin> {
-        let mut event_source_url = String::with_capacity(self.session().event_source_url().len());
+        let state = self.session_state();
+        let mut event_source_url = String::with_capacity(state.session().event_source_url().len());
 
-        for part in self.event_source_url() {
+        for part in state.event_source_url() {
             match part {
                 URLPart::Value(value) => {
                     event_source_url.push_str(value);
@@ -231,8 +232,12 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_event_terminates_the_stream_without_reading_on() {
-        let client = Client::with_transport(MalformedEventTransport, session())
-            .expect("client accepts the test session");
+        let client = Client::with_transport(
+            MalformedEventTransport,
+            session(),
+            "https://example.org/.well-known/jmap",
+        )
+        .expect("client accepts the test session");
         let mut events = client
             .event_source(None::<Vec<DataType>>, false, None, None)
             .await
@@ -248,8 +253,12 @@ mod tests {
     // events that follow it.
     #[tokio::test]
     async fn comment_heartbeats_do_not_disturb_the_stream() {
-        let client = Client::with_transport(HeartbeatTransport, session())
-            .expect("client accepts the test session");
+        let client = Client::with_transport(
+            HeartbeatTransport,
+            session(),
+            "https://example.org/.well-known/jmap",
+        )
+        .expect("client accepts the test session");
         let mut events = client
             .event_source(None::<Vec<DataType>>, false, None, None)
             .await

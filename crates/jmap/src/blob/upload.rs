@@ -1,4 +1,3 @@
-use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use serde::Deserialize;
 
 use crate::{
@@ -7,7 +6,7 @@ use crate::{
     client::Client,
     core::{
         id::{AccountId, BlobId},
-        session::URLPart,
+        session::{URLPart, encode_template_value},
         transport::HttpTransport,
     },
 };
@@ -34,19 +33,6 @@ pub(crate) struct UploadResponse {
     size: usize,
 }
 
-const PATH_SEGMENT: &AsciiSet = &CONTROLS
-    .add(b' ')
-    .add(b'"')
-    .add(b'<')
-    .add(b'>')
-    .add(b'`')
-    .add(b'#')
-    .add(b'?')
-    .add(b'{')
-    .add(b'}')
-    .add(b'/')
-    .add(b'%');
-
 impl<Tr: HttpTransport> Client<Tr> {
     /// Upload `data` to the named account's blob store. Lower-level
     /// counterpart to [`Account::upload`] for callers that need the
@@ -57,15 +43,16 @@ impl<Tr: HttpTransport> Client<Tr> {
         data: impl Into<Vec<u8>>,
         content_type: Option<&str>,
     ) -> crate::Result<UploadResponse> {
+        let state = self.session_state();
         let mut upload_url =
-            String::with_capacity(self.session().upload_url().len() + account_id.as_str().len());
+            String::with_capacity(state.session().upload_url().len() + account_id.as_str().len());
 
-        for part in self.upload_url() {
+        for part in state.upload_url() {
             match part {
                 URLPart::Value(value) => upload_url.push_str(value),
                 URLPart::Parameter(param) => {
                     if let super::URLParameter::AccountId = param {
-                        upload_url.extend(utf8_percent_encode(account_id.as_str(), PATH_SEGMENT));
+                        upload_url.extend(encode_template_value(account_id.as_str()));
                     }
                 }
             }
@@ -132,5 +119,90 @@ impl UploadResponse {
 
     pub(crate) fn into_blob_id(self) -> BlobId {
         self.blob_id
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use bytes::Bytes;
+    use serde_json::json;
+
+    use crate::{
+        client::Client,
+        core::{
+            id::AccountId,
+            session::Session,
+            transport::{HttpTransport, TransportError},
+        },
+    };
+
+    struct UrlCapture(Arc<Mutex<Option<String>>>);
+
+    impl HttpTransport for UrlCapture {
+        async fn api_request(&self, _url: &str, _body: Vec<u8>) -> Result<Bytes, TransportError> {
+            Err(TransportError::new("stub transport does not call the API"))
+        }
+
+        async fn upload(
+            &self,
+            url: &str,
+            _body: Vec<u8>,
+            _content_type: Option<&str>,
+        ) -> Result<Bytes, TransportError> {
+            *self.0.lock().expect("capture lock") = Some(url.to_string());
+            Ok(Bytes::from_static(
+                br#"{"accountId":"a","blobId":"b","type":"text/plain","size":4}"#,
+            ))
+        }
+
+        async fn download(&self, _url: &str) -> Result<Bytes, TransportError> {
+            Err(TransportError::new("stub transport does not download"))
+        }
+
+        async fn get_session(&self, _url: &str) -> Result<Bytes, TransportError> {
+            Err(TransportError::new("stub transport has no session route"))
+        }
+    }
+
+    fn session() -> Session {
+        serde_json::from_value(json!({
+            "capabilities": {},
+            "accounts": {},
+            "primaryAccounts": {},
+            "username": "user@example.test",
+            "apiUrl": "https://example.test/jmap/api",
+            "downloadUrl": "https://example.test/dl/{accountId}/{blobId}/{name}/{type}",
+            "uploadUrl": "https://example.test/upload?account={accountId}",
+            "eventSourceUrl": "https://example.test/eventsource",
+            "state": "session-1"
+        }))
+        .expect("session fixture parses")
+    }
+
+    /// Same RFC 6570 §3.2.2 rule as the download template: the account
+    /// id is expanded with everything outside the unreserved set
+    /// percent-encoded, not just the two query delimiters.
+    #[tokio::test]
+    async fn account_id_is_rfc6570_level_one_encoded() {
+        let captured = Arc::new(Mutex::new(None));
+        let client = Client::with_transport(
+            UrlCapture(Arc::clone(&captured)),
+            session(),
+            "https://example.test/.well-known/jmap",
+        )
+        .expect("client builds");
+
+        client
+            .upload_to(&AccountId::new("a&b=c+d;e@f"), b"data".to_vec(), None)
+            .await
+            .expect("upload runs");
+
+        let url = captured.lock().expect("capture lock").clone().expect("url");
+        assert_eq!(
+            url,
+            "https://example.test/upload?account=a%26b%3Dc%2Bd%3Be%40f"
+        );
     }
 }

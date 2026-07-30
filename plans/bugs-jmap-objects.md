@@ -16,157 +16,6 @@ Tests landed in this pass are listed at the end.
 
 ---
 
-## B9 (BUG, severity: medium, latent) - `ParticipantIdentity` models `sendTo`, which the calendars draft this crate targets may no longer define
-
-**Where:** `crates/jmap/src/participant_identity/mod.rs:49-94`
-(`ParticipantIdentity`, `ParticipantIdentityCreate`,
-`ParticipantIdentityPatch`, `Property::SendTo`).
-
-The original B9 was the default-patch leak on `PushSubscriptionPatch` and
-`ParticipantIdentityPatch` (plus the two Create shapes missing their
-sentinels). That half is closed: those Patch shapes are `Field<T>` now
-and the creates install sentinels. What remains is the shape itself.
-
-The crate targets draft-ietf-jmap-calendars-26. A review pass reports
-that -26 section 3 defines `ParticipantIdentity` with a **required
-`calendarAddress`** and no `sendTo` at all. I could not check the draft
-text (this environment has no network), and per N4's precedent a guess is
-not worth pinning, so nothing here has been renamed and no test asserts
-either spelling.
-
-If the report is right, three things follow: a compliant identity's
-address is silently dropped on decode (serde ignores the unknown key, so
-`ParticipantIdentity/get` still succeeds but `send_to()` is always
-`None`); `ParticipantIdentityCreate` cannot express a valid create and a
-server should answer `invalidProperties`; and `Property::SendTo` names a
-property that will not round-trip through `properties`.
-
-**Reachability:** the module is `#![allow(dead_code)]` with no `sync/`
-call site, so this is latent until the calendar conveniences are wired.
-
-**Next step.** Read draft-ietf-jmap-calendars-26 section 3 and, if it
-says `calendarAddress`, rename the field on all three shapes (a required
-`String` on Create, `Field<String>` or plain `Option<String>` on Patch),
-rename the `Property` variant, and pin the wire name in
-`tests.rs::patch_defaults` / a new participant-identity module.
-
----
-
-## S7 (SMELL) - `IdentityPatch::reply_to(Some(<empty>))` / `bcc(Some(<empty>))` silently send nothing
-
-**Where:** `crates/jmap/src/identity/mod.rs:93-99` (`skip_if_empty_list`),
-`crates/jmap/src/identity/set.rs:51-67`.
-**Live call site:** `crates/jmap/src/sync/pim.rs::identity_update` (~line 996).
-
-Noticed while confirming that B2 does not reproduce - it does not:
-`IdentityPatch` has a hand-written `Default` installing the
-`Some(Vec::new())` sentinels the predicate wants, and `reply_to(None)`
-does emit `null` and does clear. But the sentinel is also the encoding of
-"an empty list", so the *value* `Some([])` is indistinguishable from the
-default and is skipped. `identity_update` forwards
-`bifrost_types::IdentityPatch::reply_to` straight through as
-`item.reply_to(Some(values))`; if a caller expresses "no reply-to" as an
-empty vector rather than `None`, the edit is a silent no-op.
-
-Whether an empty vector is a legal way to say "clear" is a
-`bifrost_types` contract question, which is why this is a smell and not a
-bug. `Field<Vec<EmailAddress>>` would remove the ambiguity here the same
-way it did on `VacationResponsePatch`.
-
----
-
-## G1 (GAP) - the request envelope has no test double
-
-**Correction.** The original G1 claimed this crate could not host an async
-test because `crates/jmap/Cargo.toml` had no `[dev-dependencies]`. That
-was **false when it was written**: line 64 of the manifest already
-carries `tokio = { workspace = true, features = ["macros", "rt",
-"test-util"] }`. Nothing about the manifest changed in either fix round;
-the blocker was believed, not real. `#[tokio::test]` works today - see
-`event_source/stream.rs::tests`, which drives the whole EventSource
-stream through a stub `SseTransport`.
-
-What actually remains is a **coverage** gap, not a tooling one. Nothing
-exercises the request envelope: `Client::with_transport(stub, session)`
-plus a `HttpTransport` stub that captures the outgoing body would pin
-`using` array construction and de-duplication, the `methodCalls` tuple
-encoding, `accountId` injection via `JmapMethod::set_account_id`,
-`CallHandle` -> `Response::get` call-id matching, method-error routing,
-and `send_methods` tuple extraction. None of that has a single test.
-
-The stub is cheap - `event_source/stream.rs::tests` already writes the
-`HttpTransport` half of one (every method `unreachable!()`) purely to
-satisfy the trait bound. Turning that into a capture-and-assert double is
-the highest-value follow-up in this file.
-
-A byte-level transcript over `tokio::io::duplex` is likewise reachable,
-but it buys less here: the crate's transport seam is `HttpTransport` /
-`SseTransport`, not a socket, so a duplex would only re-test reqwest.
-
----
-
-## S1 (SMELL) - `CalendarEventPatch` / `ContactCardPatch` reuse the Create setters verbatim
-
-**Where:** `crates/jmap/src/calendar_event/set.rs` (`ce_setters!` applied
-to both `CalendarEventCreate` and `CalendarEventPatch`),
-`crates/jmap/src/contact_card/set.rs` (`cc_setters!`, same).
-
-`calendar_id(id, false)` writes a **nested** object
-`{"calendarIds": {"cal-1": null}}`. On a create that is at worst odd. On
-a `/set update` it is a wholesale replacement of `calendarIds` with a map
-containing a null, not the `"calendarIds/cal-1": null` dotted path
-RFC 8620 §5.3 asks for - so it also drops every calendar membership the
-caller did not name, which is exactly the class of bug the
-`EmailPatch::submitted_to_sent` doc comment was written to prevent.
-
-The existing test `tests.rs::patch_object_null_semantics` pins the Create
-side, and per the standing bug-hunt rule an existing passing test wins,
-so I have **not** touched it - I have only added the Patch-side
-observation as
-`tests.rs::calendar_event_patch_nesting::patch_calendar_id_nests_instead_of_using_a_dotted_path`.
-The type-state split exists precisely so the two shapes can differ;
-applying one macro to both throws it away. Whoever wires
-`calendar_ops.rs` membership edits should split the macro first.
-
----
-
-## S2 (SMELL) - `Client::with_transport` produces a client that cannot refresh its session
-
-**Where:** `crates/jmap/src/client.rs:277-304`.
-
-`with_transport` sets `session_url: String::new()`. `refresh_session()`
-on such a client issues `GET ""`. Harmless today (only the reqwest path
-constructs a session URL, and nothing calls `refresh_session`), but the
-constructor is the documented custom-transport entry point and it hands
-back a half-functional object. Either take the session URL as a
-parameter or make `refresh_session` return `Error::InvalidUrl` when it is
-empty.
-
-Adjacent: `ClientBuilder::connect` builds `format!("{url}/.well-known/jmap")`
-with no trailing-slash normalisation, so a configured base URL ending in
-`/` yields `//.well-known/jmap`.
-
----
-
-## S3 (SMELL) - `send_ws` / `enable_push_ws` / `disable_push_ws` send an empty frame on encode failure
-
-**Where:** `crates/jmap/src/client_ws.rs:250-257, 277-283, 295-300`.
-
-```rust
-Message::text(serde_json::to_string(&frame).unwrap_or_default())
-```
-
-`unwrap_or_default()` turns an encode failure into an **empty text
-frame** rather than an error. The payloads involved cannot currently fail
-to serialise (`method_calls` is already a `Value`, `using` is
-`&'static str`s, the push frames are two fields), so this is not a live
-bug - but the crate's own `Error::RequestEncode` variant exists for
-exactly this and the doc comment on it says outbound encode sites must
-use it explicitly rather than relying on `?`. These three sites do
-neither.
-
----
-
 ## S8 (SMELL) - two residual SSE-parser deviations from the WHATWG rules
 
 **Where:** `crates/jmap/src/event_source/parser.rs`.
@@ -187,19 +36,23 @@ JMAP server behaving even approximately correctly.
 
 ---
 
-## S6 (SMELL) - blob download URL percent-encoding leaves `&` and `=` alone
+## S9 (SMELL, wire-or-remove decision) - the EventSource path has no caller
 
-**Where:** `crates/jmap/src/blob/download.rs:12-23` (`PATH_SEGMENT`),
-`upload.rs:37-48` (same set).
+**Where:** `crates/jmap/src/event_source/` and its `Client::event_source()`
+entry point.
 
-The set encodes `/ ? # % { } < > " ` ` and space, but not `&` or `=`.
-RFC 8620's download URL template routinely puts `{name}` and `{type}` in
-a **query** position (the session fixtures in this repo use
-`.../{name}?accept={type}`), and `name` comes from an attachment
-filename, i.e. it is attacker-controlled. A filename containing `&`
-appends parameters to the download request. `?` is encoded so a new query
-string cannot be started, which caps the impact at "inject extra params
-into an existing query" - but the set should just include `&` and `=`.
+Surfaced by the round-2 fix-and-commit agent: `event_source()` has no
+caller anywhere in the workspace. `sync/` push is WebSocket-only
+(`reference/jmap.md` documents this), so the whole EventSource stack -
+now spec-correct after the round-2 SSE fixes - is dead code from the
+`Account` impl's point of view. The round-2 fixes are latent-correctness
+for a path nothing reaches, and the Last-Event-ID resume semantics have
+no live reconnect path to serve.
+
+Decision needed: either wire EventSource in as the push fallback for
+servers without RFC 8887 WebSocket support (its plausible purpose), or
+remove the module. S8's residual parser deviations only matter under the
+"wire it" branch.
 
 ---
 
@@ -289,8 +142,8 @@ comment directly above them ("BUG, documented rather than endorsed" /
 - `quota_field_three_state`, `address_book_wire`, `calendar_wire` - the
   `Field<T>` three-state contract where it IS implemented correctly, plus
   RFC-shape decodes (`mayRSVP` casing, rights defaulting).
-- `calendar_event_patch_nesting` - S1, `set_property` dotted paths,
-  Get/Set argument flattening.
+- `calendar_event_patch_nesting` - calendar membership dotted paths and
+  no-overlap, `set_property` dotted paths, Get/Set argument flattening.
 - `misc_mail_object_decode` - N2, `SearchSnippet/get` request shape,
   `Email/import` `iN` create-id keying.
 - `push_subscription_wire` - the non-account-scoped `accountId` omission.
@@ -310,30 +163,45 @@ event after an `id` carries that id forward).
 `#[tokio::test]`): malformed event payloads emit one error and terminate
 the EventSource stream; comment heartbeats neither surface as events nor
 tear the stream down, and the resume token survives them. Both drive a
-stub `HttpTransport` + `SseTransport` - the first async tests in this
-crate, and the pattern G1 asks to be extended to the request envelope.
+stub `HttpTransport` + `SseTransport`, the same capture-and-assert
+pattern `core/tests.rs::envelope` uses for the request envelope.
+
+---
+
+Round 3 additions (the fix pass's own pins, plus the three the cold
+review turned up):
+
+- `crates/jmap/src/blob/download.rs::tests` and
+  `crates/jmap/src/blob/upload.rs::tests` - a capturing `HttpTransport`
+  behind `Client::with_transport` renders a whole download / upload URL
+  and asserts RFC 6570 §3.2.2 simple-string expansion: every character
+  outside ALPHA / DIGIT / `-` / `.` / `_` / `~` percent-encoded. The
+  first fix-pass attempt at S6 added `&` and `=` to a deny list, which
+  left `+`, `;`, `@`, `!`, `,` and `$` through - a query-position
+  `{type}` of `application/ld+json` reached the server as
+  `application/ld json`. The deny list is gone; both call sites now
+  share `core::session::encode_template_value`.
+- `crates/jmap/src/client.rs::session_state_tests` -
+  `refresh_replaces_the_session_and_everything_derived_from_it`. S2 gave
+  custom-transport clients a session URL, but `refresh_session` replaced
+  only the `Session`; `apiUrl`, the three URL templates and
+  `default_account_id` stayed derived from the session it replaced, so a
+  refreshed client reported the new server through `session()` while
+  every request still went to the old one. All of it now lives in one
+  `Arc<SessionState>` swapped under one lock. The test drives two
+  distinct sessions through a stub transport and asserts the second
+  request's `apiUrl` moved.
+- `crates/jmap/src/tests.rs::participant_identity_wire::patch_omits_calendar_address_rather_than_nulling_it`
+  - B9's patch modelled `calendarAddress` as `Field<String>`, so
+  `calendar_address(None)` emitted `"calendarAddress": null`. draft-26 §3
+  makes the property required and non-nullable, so that PatchObject is a
+  guaranteed `invalidProperties` rejection. The patch field is now
+  omitted-or-String and the setter takes a `String`.
 
 ---
 
 ## Not done, and why
 
-- **A transport-level test double** (G1). Still the highest-value thing
-  in scope, but nothing blocks it: the manifest has always had the tokio
-  dev-dependency, and `event_source/stream.rs::tests` now proves an async
-  test with a stub transport compiles and runs here. A capturing
-  `HttpTransport` stub behind `Client::with_transport` would pin the
-  request envelope (`using` construction and de-duplication, `methodCalls`
-  tuple encoding, `accountId` injection via `JmapMethod::set_account_id`,
-  `CallHandle` -> `Response::get` matching, method-error routing,
-  `send_methods` tuple extraction) and none of that has a single test
-  today. It was left because this round was scoped to the decode and
-  parser cluster.
-- **`blob/download.rs` URL construction.** The templating + percent-encoding
-  logic (S6) is inside an `async fn` that immediately calls the transport,
-  so pinning it wants either the G1 stub or a pure
-  `build_download_url(&[URLPart], &BlobRef) -> String` extraction. That
-  extraction is a refactor, and the brief splits tests from fixes, so I
-  left it. It is a five-line change and would make S6 verifiable.
 - **`client_ws.rs` frame handling beyond the subprotocol check.** The
   `WebSocketMessage_` decode is partly covered by the existing
   `deserializes_single_type_state_change_frame`; the close/error/binary

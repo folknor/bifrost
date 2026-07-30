@@ -2263,6 +2263,17 @@ mod settings_object_wire {
     }
 
     #[test]
+    fn identity_patch_empty_list_clears_instead_of_omitting() {
+        let mut patch = IdentityPatch::default();
+        patch.reply_to(Some(std::iter::empty::<crate::email::EmailAddress>()));
+        patch.bcc(Some(std::iter::empty::<crate::email::EmailAddress>()));
+        assert_eq!(
+            serde_json::to_value(&patch).unwrap(),
+            json!({"replyTo": null, "bcc": null})
+        );
+    }
+
+    #[test]
     fn identity_patch_sets_a_reply_to_list() {
         let mut patch = IdentityPatch::default();
         patch.reply_to(Some(
@@ -2409,7 +2420,7 @@ mod patch_defaults {
                 Some(0)
             ))
             .unwrap(),
-            json!({})
+            json!({"calendarAddress": ""})
         );
         #[cfg(feature = "mail")]
         {
@@ -3072,7 +3083,64 @@ mod calendar_wire {
 }
 
 // ---------------------------------------------------------------------------
-// CalendarEvent / ContactCard patch-vs-create nesting
+// ParticipantIdentity wire shape (JMAP Calendars draft-26 s3)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "calendars")]
+mod participant_identity_wire {
+    use super::*;
+    use crate::core::SetCreate;
+    use crate::participant_identity::{
+        ParticipantIdentity, ParticipantIdentityCreate, ParticipantIdentityPatch, Property,
+    };
+
+    #[test]
+    fn calendar_address_decodes_and_round_trips_through_create_and_patch() {
+        let identity: ParticipantIdentity = serde_json::from_value(json!({
+            "id": "pi-1",
+            "name": "Ada",
+            "calendarAddress": "mailto:ada@example.test",
+            "isDefault": true
+        }))
+        .expect("a draft-26 identity decodes");
+        assert_eq!(identity.calendar_address(), Some("mailto:ada@example.test"));
+        assert_eq!(
+            serde_json::to_value(Property::CalendarAddress).unwrap(),
+            json!("calendarAddress")
+        );
+
+        let mut create = ParticipantIdentityCreate::new(Some(0));
+        create.calendar_address("mailto:ada@example.test");
+        assert_eq!(
+            serde_json::to_value(create).unwrap(),
+            json!({"calendarAddress": "mailto:ada@example.test"})
+        );
+
+        let mut patch = ParticipantIdentityPatch::default();
+        patch.calendar_address("mailto:grace@example.test");
+        assert_eq!(
+            serde_json::to_value(patch).unwrap(),
+            json!({"calendarAddress": "mailto:grace@example.test"})
+        );
+    }
+
+    /// draft-26 §3 makes `calendarAddress` required and non-nullable, so
+    /// the patch is two-state: omitted, or a String. A name-only patch
+    /// must not emit `"calendarAddress": null` - that is a property
+    /// removal the server has to answer with `invalidProperties`.
+    #[test]
+    fn patch_omits_calendar_address_rather_than_nulling_it() {
+        let mut patch = ParticipantIdentityPatch::default();
+        patch.name("Grace");
+        assert_eq!(
+            serde_json::to_value(patch).unwrap(),
+            json!({"name": "Grace"})
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CalendarEvent / ContactCard patch-vs-create membership updates
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "calendars")]
@@ -3080,25 +3148,32 @@ mod calendar_event_patch_nesting {
     use super::*;
     use crate::calendar_event::{CalendarEventPatch, CalendarEventSet};
 
-    // Documented, not endorsed. `calendar_id(id, false)` writes a NESTED
-    // object (`{"calendarIds": {"cal-1": null}}`). On a create that is
-    // fine-ish; inside a `/set update` it is a wholesale REPLACEMENT of
-    // `calendarIds` with a map containing a null value, not the
-    // `"calendarIds/cal-1": null` dotted path RFC 8620 s5.3 calls for.
-    // `EmailPatch::mailbox_id` gets this right; the JSON-map objects do
-    // not have the same distinction between their Create and Patch
-    // setters (`ce_setters!` is applied to both types verbatim).
     #[test]
-    fn patch_calendar_id_nests_instead_of_using_a_dotted_path() {
+    fn patch_calendar_id_uses_dotted_paths() {
         let mut patch = CalendarEventPatch::default();
         patch.calendar_id("cal-1", false);
         patch.calendar_id("cal-2", true);
-        let value = serde_json::to_value(&patch).unwrap();
         assert_eq!(
-            value,
-            json!({"calendarIds": {"cal-1": null, "cal-2": true}})
+            serde_json::to_value(&patch).unwrap(),
+            json!({"calendarIds/cal-1": null, "calendarIds/cal-2": true})
         );
-        assert!(value.get("calendarIds/cal-1").is_none());
+    }
+
+    #[test]
+    fn calendar_membership_setters_never_overlap_wholesale_and_dotted_forms() {
+        let mut patch = CalendarEventPatch::default();
+        patch.calendar_id("cal-1", true);
+        patch.calendar_ids(["cal-2"]);
+        assert_eq!(
+            serde_json::to_value(&patch).unwrap(),
+            json!({"calendarIds": {"cal-2": true}})
+        );
+
+        patch.calendar_id("cal-3", false);
+        assert_eq!(
+            serde_json::to_value(&patch).unwrap(),
+            json!({"calendarIds/cal-3": null})
+        );
     }
 
     #[test]
@@ -3137,6 +3212,24 @@ mod calendar_event_patch_nesting {
         assert_eq!(value.get("reduceParticipants"), Some(&json!(true)));
         assert_eq!(value.get("timeZone"), Some(&json!("Europe/Oslo")));
         assert!(value.get("recurrenceOverridesBefore").is_none());
+    }
+}
+
+#[cfg(feature = "contacts")]
+mod contact_card_patch_membership {
+    use super::*;
+    use crate::contact_card::ContactCardPatch;
+
+    #[test]
+    fn patch_address_book_id_uses_dotted_paths_without_overlap() {
+        let mut patch = ContactCardPatch::default();
+        patch.address_book_ids(["ab-1"]);
+        patch.address_book_id("ab-2", false);
+        patch.address_book_id("ab-3", true);
+        assert_eq!(
+            serde_json::to_value(&patch).unwrap(),
+            json!({"addressBookIds/ab-2": null, "addressBookIds/ab-3": true})
+        );
     }
 }
 

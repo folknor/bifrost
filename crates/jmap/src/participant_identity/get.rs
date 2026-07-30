@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use super::{ParticipantIdentity, ParticipantIdentityId};
 
 impl ParticipantIdentity {
@@ -17,8 +15,8 @@ impl ParticipantIdentity {
         self.name.as_deref()
     }
 
-    pub(crate) fn send_to(&self) -> Option<&HashMap<String, String>> {
-        self.send_to.as_ref()
+    pub(crate) fn calendar_address(&self) -> Option<&str> {
+        self.calendar_address.as_deref()
     }
 
     pub(crate) fn is_default(&self) -> Option<bool> {

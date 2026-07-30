@@ -8,10 +8,6 @@ pub(crate) mod set;
 use std::fmt::Display;
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-
-use crate::core::field::Field;
-use crate::core::set::skip_if_empty_map;
 
 mod marker {
     pub(crate) enum ParticipantIdentity {}
@@ -46,9 +42,9 @@ pub(crate) struct ParticipantIdentity {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) name: Option<String>,
 
-    #[serde(rename = "sendTo")]
+    #[serde(rename = "calendarAddress")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) send_to: Option<HashMap<String, String>>,
+    pub(super) calendar_address: Option<String>,
 
     #[serde(rename = "isDefault")]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -64,9 +60,8 @@ pub(crate) struct ParticipantIdentityCreate {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) name: Option<String>,
 
-    #[serde(rename = "sendTo")]
-    #[serde(skip_serializing_if = "skip_if_empty_map")]
-    pub(super) send_to: Option<HashMap<String, String>>,
+    #[serde(rename = "calendarAddress")]
+    pub(super) calendar_address: String,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -75,9 +70,13 @@ pub(crate) struct ParticipantIdentityPatch {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) name: Option<String>,
 
-    #[serde(rename = "sendTo")]
-    #[serde(skip_serializing_if = "Field::is_omitted")]
-    pub(super) send_to: Field<HashMap<String, String>>,
+    // Omitted-or-String, deliberately not `Field<String>`: draft-26 §3
+    // makes `calendarAddress` required and non-nullable, so the null
+    // (removal) state a `Field` would offer is always an
+    // `invalidProperties` error on the wire.
+    #[serde(rename = "calendarAddress")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) calendar_address: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Copy)]
@@ -87,8 +86,8 @@ pub(crate) enum Property {
     Id,
     #[serde(rename = "name")]
     Name,
-    #[serde(rename = "sendTo")]
-    SendTo,
+    #[serde(rename = "calendarAddress")]
+    CalendarAddress,
     #[serde(rename = "isDefault")]
     IsDefault,
 }
@@ -98,7 +97,7 @@ impl Display for Property {
         match self {
             Property::Id => write!(f, "id"),
             Property::Name => write!(f, "name"),
-            Property::SendTo => write!(f, "sendTo"),
+            Property::CalendarAddress => write!(f, "calendarAddress"),
             Property::IsDefault => write!(f, "isDefault"),
         }
     }
@@ -135,7 +134,7 @@ impl crate::core::SetCreate for ParticipantIdentityCreate {
         ParticipantIdentityCreate {
             _create_id: create_id,
             name: None,
-            send_to: Some(HashMap::new()),
+            calendar_address: String::new(),
         }
     }
 }

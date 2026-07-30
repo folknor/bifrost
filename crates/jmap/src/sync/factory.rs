@@ -970,8 +970,12 @@ mod tests {
         session: Session,
         replies: impl IntoIterator<Item = ScriptedReply>,
     ) -> Client<ScriptedTransport> {
-        Client::with_transport(ScriptedTransport::new(replies), session)
-            .expect("scripted client builds")
+        Client::with_transport(
+            ScriptedTransport::new(replies),
+            session,
+            "https://example.test/.well-known/jmap",
+        )
+        .expect("scripted client builds")
     }
 
     fn assert_open_batch(request: &Value, account_id: &str) {

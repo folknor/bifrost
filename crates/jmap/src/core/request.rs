@@ -89,7 +89,7 @@ impl<'x, T: HttpTransport> Request<'x, T> {
             using: vec!["urn:ietf:params:jmap:core"],
             method_calls: Vec::new(),
             created_ids: None,
-            account_id: client.default_account_id().clone(),
+            account_id: client.default_account_id(),
             client,
         }
     }

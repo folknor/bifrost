@@ -1046,14 +1046,18 @@ mod tests {
             },
             Some(&SharedAddressBookId("old".to_string())),
         );
-        let books = patch
-            .properties
-            .get("addressBookIds")
-            .and_then(Value::as_object)
-            .expect("addressBookIds");
-
-        assert_eq!(books.get("old"), Some(&Value::Null));
-        assert_eq!(books.get("new").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            patch.properties.get("addressBookIds/old"),
+            Some(&Value::Null)
+        );
+        assert_eq!(
+            patch
+                .properties
+                .get("addressBookIds/new")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(patch.properties.get("addressBookIds").is_none());
     }
 
     #[test]
@@ -1065,14 +1069,14 @@ mod tests {
             },
             Some(&SharedAddressBookId("book".to_string())),
         );
-        let books = patch
-            .properties
-            .get("addressBookIds")
-            .and_then(Value::as_object)
-            .expect("addressBookIds");
-
-        assert_eq!(books.len(), 1);
-        assert_eq!(books.get("book").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            patch
+                .properties
+                .get("addressBookIds/book")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(patch.properties.get("addressBookIds").is_none());
     }
 
     #[test]

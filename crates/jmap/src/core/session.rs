@@ -579,6 +579,29 @@ pub(crate) trait URLParser: Sized {
     fn parse(value: &str) -> Option<Self>;
 }
 
+/// The set to percent-encode when substituting a value into a URI
+/// template variable.
+///
+/// RFC 6570 §3.2.2 (simple string expansion, the only form JMAP session
+/// templates use) says a value is expanded by percent-encoding every
+/// character that is not *unreserved* - ALPHA / DIGIT / `-` / `.` / `_`
+/// / `~`. An ad-hoc deny list is the wrong shape here: it silently lets
+/// through whatever reserved character nobody thought of, and each one
+/// is a different injection. `+` in a query-position `{type}` is the
+/// cheapest example - `application/ld+json` arrives at the server as
+/// `application/ld json` - but `;`, `@`, `!`, `,` and `$` all carry
+/// delimiter meaning somewhere in RFC 3986.
+pub(crate) const TEMPLATE_VALUE: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~');
+
+/// Percent-encode `value` for substitution into a URI template variable.
+pub(crate) fn encode_template_value(value: &str) -> percent_encoding::PercentEncode<'_> {
+    percent_encoding::utf8_percent_encode(value, TEMPLATE_VALUE)
+}
+
 #[non_exhaustive]
 pub(crate) enum URLPart<T: URLParser> {
     Value(String),

@@ -244,18 +244,17 @@ impl Client {
         ws.req_id += 1;
 
         let method_calls =
-            serde_json::to_value(&request.method_calls).unwrap_or(serde_json::Value::Array(vec![]));
+            serde_json::to_value(&request.method_calls).map_err(crate::Error::RequestEncode)?;
+        let frame = serde_json::to_string(&WebSocketRequest {
+            _type: WebSocketRequestType::Request,
+            id: request_id.clone().into(),
+            using: request.using,
+            method_calls,
+            created_ids: request.created_ids,
+        })
+        .map_err(crate::Error::RequestEncode)?;
         ws.tx
-            .send(Message::text(
-                serde_json::to_string(&WebSocketRequest {
-                    _type: WebSocketRequestType::Request,
-                    id: request_id.clone().into(),
-                    using: request.using,
-                    method_calls,
-                    created_ids: request.created_ids,
-                })
-                .unwrap_or_default(),
-            ))
+            .send(Message::text(frame))
             .await
             .map_err(crate::Error::WebSocketRuntime)?;
 
@@ -267,37 +266,35 @@ impl Client {
         data_types: Option<impl IntoIterator<Item = DataType>>,
         push_state: Option<impl Into<String>>,
     ) -> crate::Result<()> {
+        let frame = serde_json::to_string(&WebSocketPushEnable {
+            _type: WebSocketPushEnableType::WebSocketPushEnable,
+            data_types: data_types.map(|it| it.into_iter().collect()),
+            push_state: push_state.map(std::convert::Into::into),
+        })
+        .map_err(crate::Error::RequestEncode)?;
         self.ws
             .lock()
             .await
             .as_mut()
             .ok_or_else(|| crate::Error::WebSocketNotConnected)?
             .tx
-            .send(Message::text(
-                serde_json::to_string(&WebSocketPushEnable {
-                    _type: WebSocketPushEnableType::WebSocketPushEnable,
-                    data_types: data_types.map(|it| it.into_iter().collect()),
-                    push_state: push_state.map(std::convert::Into::into),
-                })
-                .unwrap_or_default(),
-            ))
+            .send(Message::text(frame))
             .await
             .map_err(crate::Error::WebSocketRuntime)
     }
 
     pub(crate) async fn disable_push_ws(&self) -> crate::Result<()> {
+        let frame = serde_json::to_string(&WebSocketPushDisable {
+            _type: WebSocketPushDisableType::WebSocketPushDisable,
+        })
+        .map_err(crate::Error::RequestEncode)?;
         self.ws
             .lock()
             .await
             .as_mut()
             .ok_or_else(|| crate::Error::WebSocketNotConnected)?
             .tx
-            .send(Message::text(
-                serde_json::to_string(&WebSocketPushDisable {
-                    _type: WebSocketPushDisableType::WebSocketPushDisable,
-                })
-                .unwrap_or_default(),
-            ))
+            .send(Message::text(frame))
             .await
             .map_err(crate::Error::WebSocketRuntime)
     }

@@ -504,8 +504,12 @@ mod envelope {
             sent: Arc::clone(&sent),
             replies: Arc::new(Mutex::new(replies.into_iter().collect())),
         };
-        let client = Client::with_transport(transport, session(primary_accounts))
-            .expect("stub client builds");
+        let client = Client::with_transport(
+            transport,
+            session(primary_accounts),
+            "https://example.test/.well-known/jmap",
+        )
+        .expect("stub client builds");
         Stub { client, sent }
     }
 
