@@ -18,19 +18,21 @@ use crate::{DataType, PushObject};
 pub(crate) type DataTypeSet = HashSet<DataType>;
 
 /// Routing snapshot for push notifications: which JMAP `accountId` is the
-/// primary, and which seeded `Folder` cursor scopes each foreign
-/// (shared/delegate) account's state changes drive.
+/// primary, and which seeded account-level `Folder` cursor scope each
+/// foreign (shared/delegate) account's state changes drive.
 ///
 /// RFC 8620 s7.1 keys `StateChange.changed` by `accountId`, so a
-/// notification names the account whose state moved. The engine's cursor
-/// topology is derived from the same seed snapshot at attach, so the two
-/// views cannot drift within a session; a share granted after open is
-/// invisible to both until reopen (the documented foreign-lifecycle
-/// limit).
+/// notification names the account whose state moved. Each foreign account
+/// seeds exactly ONE cursor scope (JMAP state is per `(accountId, type)`),
+/// so one foreign push is one hint - the map value is a single scope by
+/// construction, never a fanout list. The engine's cursor topology is
+/// derived from the same seed snapshot at attach, so the two views cannot
+/// drift within a session; a share granted after open is invisible to
+/// both until reopen (the documented foreign-lifecycle limit).
 pub(crate) struct PushRouting {
     primary_account_id: String,
-    /// Foreign JMAP `accountId` -> every seeded `Folder` scope in it.
-    foreign_scopes: HashMap<String, Vec<CursorScope>>,
+    /// Foreign JMAP `accountId` -> its one seeded `Folder` scope.
+    foreign_scopes: HashMap<String, CursorScope>,
 }
 
 impl PushRouting {
@@ -38,15 +40,12 @@ impl PushRouting {
         primary_account_id: String,
         seed_scopes: impl Iterator<Item = &'a CursorScope>,
     ) -> Self {
-        let mut foreign_scopes: HashMap<String, Vec<CursorScope>> = HashMap::new();
+        let mut foreign_scopes: HashMap<String, CursorScope> = HashMap::new();
         for scope in seed_scopes {
             if let CursorScope::Folder(folder) = scope
                 && let Some(parsed) = super::foreign::parse_foreign(folder)
             {
-                foreign_scopes
-                    .entry(parsed.account_id)
-                    .or_default()
-                    .push(scope.clone());
+                foreign_scopes.insert(parsed.account_id, scope.clone());
             }
         }
         Self {
@@ -530,7 +529,7 @@ fn emit_state_change(
         let _ = tx.send(invalidated(payload));
         return;
     }
-    let Some(scopes) = routing.foreign_scopes.get(account_id) else {
+    let Some(scope) = routing.foreign_scopes.get(account_id) else {
         // An accountId this session never seeded: a probe-skipped share
         // or one granted after open. JMAP state is per-(accountId, type),
         // so no registered cursor's state can have moved - there is
@@ -546,14 +545,11 @@ fn emit_state_change(
         // foreign delivery and defeat the narrow routing.
         return;
     }
-    // A foreign account's Email state is account-wide, and each of its
-    // mailboxes syncs as its own `Folder` cursor scope, so every seeded
-    // scope of the account is invalidated. The engine's reconciler skips
-    // any scope without a registered cursor, so a hint for a quarantined
-    // scope is a no-op.
-    for scope in scopes {
-        let _ = tx.send(invalidated(HintPayload::SpecificCursorScope(scope.clone())));
-    }
+    // A foreign account's Email state is account-wide and the account
+    // syncs as exactly one account-level `Folder` cursor scope, so one
+    // push is one hint. The engine's reconciler skips a scope without a
+    // registered cursor, so a hint for a quarantined scope is a no-op.
+    let _ = tx.send(invalidated(HintPayload::SpecificCursorScope(scope.clone())));
 }
 
 fn invalidated(payload: HintPayload) -> WatchEvent {
@@ -586,20 +582,16 @@ mod tests {
         PushObject::StateChange { changed }
     }
 
-    fn foreign_scope(account_id: &str, mailbox_id: &str) -> CursorScope {
-        CursorScope::Folder(super::super::foreign::encode_foreign(
-            account_id, mailbox_id,
-        ))
+    fn foreign_scope(account_id: &str) -> CursorScope {
+        CursorScope::Folder(super::super::foreign::encode_foreign_account(account_id))
     }
 
-    /// A primary account plus one seeded foreign account with two
-    /// mailboxes - the same snapshot `factory.rs::open` builds from
-    /// `seed_states`.
+    /// A primary account plus one seeded foreign account - the same
+    /// snapshot `factory.rs::open` builds from `seed_states`: exactly one
+    /// account-level `Folder` scope per share, however many mailboxes it
+    /// holds.
     fn routing() -> PushRouting {
-        let seeds = [
-            foreign_scope("acct-foreign", "mbx-inbox"),
-            foreign_scope("acct-foreign", "mbx-archive"),
-        ];
+        let seeds = [foreign_scope("acct-foreign")];
         PushRouting::new("acct-primary".to_string(), seeds.iter())
     }
 
@@ -672,13 +664,12 @@ mod tests {
     }
 
     // RFC 8620 s7.1 keys `StateChange.changed` by `accountId`. A foreign
-    // account's Email state is account-wide, and each of its mailboxes
-    // syncs as its own `Folder` cursor scope, so a foreign Email change
-    // must invalidate every seeded `Folder(accountId, *)` scope - and
-    // must NOT touch the primary `Type(Email)` scope, which did not
-    // change.
+    // account's Email state is account-wide and the account seeds exactly
+    // one account-level `Folder` cursor scope, so a foreign Email change
+    // is exactly ONE hint - not a per-mailbox fanout - and must NOT touch
+    // the primary `Type(Email)` scope, which did not change.
     #[test]
-    fn a_foreign_account_email_change_invalidates_each_seeded_folder_scope() {
+    fn a_foreign_account_email_change_is_one_hint_for_its_account_scope() {
         let (tx, mut rx) = broadcast::channel(8);
         emit_push(
             state_change("acct-foreign", DataType::Email, "s2"),
@@ -688,9 +679,7 @@ mod tests {
 
         let events = drain(&mut rx);
         let scopes = events.iter().filter_map(hinted_scope).collect::<Vec<_>>();
-        assert_eq!(scopes.len(), 2);
-        assert!(scopes.contains(&foreign_scope("acct-foreign", "mbx-inbox")));
-        assert!(scopes.contains(&foreign_scope("acct-foreign", "mbx-archive")));
+        assert_eq!(scopes, vec![foreign_scope("acct-foreign")]);
         assert!(
             !scopes.contains(&CursorScope::Type(ObjectType::Email)),
             "the primary scope did not change and must not be repolled"
@@ -748,10 +737,9 @@ mod tests {
             .iter()
             .filter_map(hinted_scope)
             .collect::<Vec<_>>();
-        assert_eq!(scopes.len(), 3);
+        assert_eq!(scopes.len(), 2);
         assert!(scopes.contains(&CursorScope::Type(ObjectType::Email)));
-        assert!(scopes.contains(&foreign_scope("acct-foreign", "mbx-inbox")));
-        assert!(scopes.contains(&foreign_scope("acct-foreign", "mbx-archive")));
+        assert!(scopes.contains(&foreign_scope("acct-foreign")));
     }
 
     // `PushRouting::new` buckets only foreign-encoded `Folder` scopes;
@@ -762,19 +750,18 @@ mod tests {
         let seeds = [
             CursorScope::Type(ObjectType::Email),
             CursorScope::Folder(bifrost_types::FolderId("no-separator".to_string())),
-            foreign_scope("acct-a", "m1"),
-            foreign_scope("acct-a", "m2"),
-            foreign_scope("acct-b", "m1"),
+            foreign_scope("acct-a"),
+            foreign_scope("acct-b"),
         ];
         let routing = PushRouting::new("acct-primary".to_string(), seeds.iter());
         assert_eq!(routing.foreign_scopes.len(), 2);
-        assert_eq!(routing.foreign_scopes["acct-a"].len(), 2);
-        assert_eq!(routing.foreign_scopes["acct-b"].len(), 1);
+        assert_eq!(routing.foreign_scopes["acct-a"], foreign_scope("acct-a"));
+        assert_eq!(routing.foreign_scopes["acct-b"], foreign_scope("acct-b"));
     }
 
     #[test]
     fn a_foreign_folder_scope_maps_to_email_push_data_type() {
-        let folder = CursorScope::Folder(super::super::foreign::encode_foreign("acct-9", "mbx-1"));
+        let folder = foreign_scope("acct-9");
         assert_eq!(data_type_for_scope(&folder), Some(DataType::Email));
 
         // Primary type scopes do map.

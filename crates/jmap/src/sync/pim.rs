@@ -1925,12 +1925,15 @@ async fn fetch_mailboxes<T: HttpTransport>(
 /// `owner_account` is `Some(accountId)` for a foreign (shared/delegate)
 /// account's mailbox. In that case the container's `native_id` is
 /// `encode_foreign(accountId, mailboxId)` - byte-identical to the
-/// `CursorScope::Folder` string the factory seeds for that mailbox, which is
-/// what lets the consumer join a container to its sync scope - while
-/// `owner_local_id` keeps the bare mailbox id for calls made against the
-/// owner's own account. The parent is re-encoded in the same namespace so a
-/// foreign child never points at a primary mailbox that happens to share
-/// the parent's id.
+/// `MembershipScope::Folder` qualification the foreign inventory and
+/// hydration stamp on that account's messages, which is what lets the
+/// consumer join a message's membership to its container. (The account's
+/// SYNC scope is coarser: one account-level `Folder` scope per share,
+/// since `Email/changes` cannot be filtered by mailbox.) `owner_local_id`
+/// keeps the bare mailbox id for calls made against the owner's own
+/// account. The parent is re-encoded in the same namespace so a foreign
+/// child never points at a primary mailbox that happens to share the
+/// parent's id.
 fn container_from_mailbox(
     mut mailbox: Mailbox,
     owner_account: Option<&str>,
@@ -2907,8 +2910,8 @@ mod tests {
             super::super::foreign::encode_object("acct-9", "B1")
         );
         // A container id is a mailbox id, so it rides the FOLDER namespace
-        // `containers_list` and the cursor scopes key on - byte-identical, or
-        // the join fails.
+        // `containers_list` and the qualified memberships key on -
+        // byte-identical, or the join fails.
         assert_eq!(
             containers[0].0,
             super::super::foreign::encode_foreign("acct-9", "inbox").0
@@ -2977,25 +2980,32 @@ mod tests {
     }
 
     /// The container's `native_id` must be byte-identical to the
-    /// `CursorScope::Folder` string the factory seeds for the same foreign
-    /// mailbox - that identity is the join key between a container and its
-    /// sync scope.
+    /// `MembershipScope::Folder` qualification the foreign inventory and
+    /// hydration stamp on the same mailbox - that identity is the join
+    /// key between a message's membership and its container. (The
+    /// share's SYNC scope is coarser: one account-level `Folder` scope
+    /// per account, pinned in `factory.rs`.)
     #[test]
-    fn foreign_container_native_id_matches_seeded_cursor_scope() {
+    fn foreign_container_native_id_matches_qualified_membership() {
         let container = container_from_mailbox(
             mailbox_json("mbx-12", None, full_rights()),
             Some("acct-9"),
             None,
         )
         .expect("container");
-        let scope = bifrost_types::CursorScope::Folder(super::super::foreign::encode_foreign(
-            "acct-9", "mbx-12",
-        ));
-        assert_eq!(
-            scope,
-            bifrost_types::CursorScope::Folder(bifrost_types::FolderId(
-                container.native_id.clone()
+        let mut memberships = vec![bifrost_types::MembershipScope::Mailbox(
+            bifrost_types::MailboxId("mbx-12".to_string()),
+        )];
+        super::super::inventory::qualify_foreign_memberships(
+            &mut memberships,
+            &bifrost_types::MailboxId("acct-9".to_string()),
+        );
+        assert!(
+            memberships.contains(&bifrost_types::MembershipScope::Folder(
+                bifrost_types::FolderId(container.native_id.clone())
             )),
+            "container {:?} does not join the qualified memberships {memberships:?}",
+            container.native_id
         );
     }
 

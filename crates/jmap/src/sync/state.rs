@@ -31,10 +31,12 @@ pub(crate) enum JmapScopeRepr {
     Mailbox,
     Thread,
     Query(String),
-    /// A foreign (shared/delegate) account mailbox. The owning JMAP
-    /// `accountId` and the native mailbox id are recovered from the
-    /// `CursorScope::Folder(FolderId(encode_foreign(account_id,
-    /// mailbox_id)))` codec so a cold resume routes to the same account.
+    /// A foreign (shared/delegate) account scope. The owning JMAP
+    /// `accountId` (and mailbox part) are recovered from the
+    /// `CursorScope::Folder` codec so a cold resume routes to the same
+    /// account. The seeded shape is account-level (`mailbox_id` empty,
+    /// via `encode_foreign_account`); a legacy per-mailbox cursor
+    /// (non-empty `mailbox_id`) still decodes under the same tag.
     Folder {
         account_id: String,
         mailbox_id: String,
@@ -325,6 +327,25 @@ mod tests {
         );
         // The decoded repr reconstructs the original scope (the
         // decode_cursor scope-equality guard holds).
+        assert_eq!(repr.to_cursor_scope(), scope);
+    }
+
+    #[test]
+    fn account_level_foreign_scope_round_trips_through_cursor() {
+        // The seeded foreign shape: account-level, empty mailbox part.
+        // It rides the same SCOPE_TAG_FOLDER envelope (an empty string
+        // is a legal length-prefixed field), so no version bump.
+        let scope = CursorScope::Folder(super::super::foreign::encode_foreign_account("acct-9"));
+        let cursor = cursor_for_scope(scope.clone(), "astate").expect("account scope encodes");
+        let (repr, state_string) = decode_cursor(&cursor).expect("account cursor decodes");
+        assert_eq!(state_string, "astate");
+        assert_eq!(
+            repr,
+            JmapScopeRepr::Folder {
+                account_id: "acct-9".to_string(),
+                mailbox_id: String::new(),
+            }
+        );
         assert_eq!(repr.to_cursor_scope(), scope);
     }
 

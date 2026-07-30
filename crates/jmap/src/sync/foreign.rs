@@ -1,13 +1,19 @@
-//! Foreign (shared/delegate) JMAP account mailbox codec.
+//! Foreign (shared/delegate) JMAP account codec.
 //!
-//! A non-personal JMAP account's mailboxes surface as
-//! `CursorScope::Folder(FolderId(encode_foreign(account_id, mailbox_id)))`.
-//! The owning JMAP `accountId` rides inside the `FolderId` string so the
-//! scope is distinct per (account, mailbox) and self-routing on a cold
-//! cursor resume. `Type(_)` scopes cannot carry a foreign account
-//! (`Type(Email)` is the same value for every account, so identical
-//! scopes for different accounts would collide in the engine's cursor /
-//! membership index); the `Folder` shape is the variant-free resolution.
+//! A non-personal JMAP account surfaces as ONE account-level cursor scope,
+//! `CursorScope::Folder(encode_foreign_account(account_id))` - the same
+//! `accountId\u{1f}` namespace with an empty mailbox part, because JMAP
+//! `Email/changes` state is per `(accountId, type)` and cannot be
+//! filtered by mailbox. Its individual mailboxes keep the two-part
+//! `encode_foreign(account_id, mailbox_id)` form, which is the CONTAINER
+//! and MEMBERSHIP namespace (`containers_list` native ids, qualified
+//! `mailboxIds` on inventory and hydration), not a cursor scope. The
+//! owning JMAP `accountId` rides inside the `FolderId` string so the
+//! scope is self-routing on a cold cursor resume. `Type(_)` scopes
+//! cannot carry a foreign account (`Type(Email)` is the same value for
+//! every account, so identical scopes for different accounts would
+//! collide in the engine's cursor / membership index); the `Folder`
+//! shape is the variant-free resolution.
 //!
 //! Identical in shape to the Graph codec but per-crate: here the
 //! `mailbox` field is a JMAP `accountId` and `folder` is a native JMAP
@@ -29,14 +35,36 @@ const FOREIGN_SEP: char = '\u{1f}';
 pub(crate) struct ForeignMailbox {
     /// The foreign JMAP `accountId`.
     pub(crate) account_id: String,
-    /// The native JMAP mailbox id.
+    /// The native JMAP mailbox id. Empty for the account-level cursor
+    /// scope (`encode_foreign_account`).
     pub(crate) mailbox_id: String,
 }
 
+impl ForeignMailbox {
+    /// True for the account-level cursor scope shape (empty mailbox
+    /// part), which names the whole foreign account rather than one of
+    /// its mailboxes.
+    pub(crate) fn is_account_scope(&self) -> bool {
+        self.mailbox_id.is_empty()
+    }
+}
+
 /// Encode a `(accountId, mailboxId)` pair into the namespaced `FolderId`
-/// carried in a foreign `Folder` scope.
+/// used for foreign containers and memberships.
 pub(crate) fn encode_foreign(account_id: &str, mailbox_id: &str) -> FolderId {
     FolderId(format!("{account_id}{FOREIGN_SEP}{mailbox_id}"))
+}
+
+/// Encode a foreign account's single ACCOUNT-LEVEL cursor scope id: the
+/// two-part namespace with an empty mailbox part (`"acct\u{1f}"`).
+///
+/// The empty part is unambiguous because an RFC 8620 `Id` is 1-255
+/// characters, so no real mailbox can ever produce it. Routing helpers
+/// (`parse_foreign`, `mail_for_scope`, `owner_of_scope`) see the same
+/// `account_id` either way; `is_account_scope` distinguishes the two
+/// shapes where the mailbox part matters (the inventory filter).
+pub(crate) fn encode_foreign_account(account_id: &str) -> FolderId {
+    encode_foreign(account_id, "")
 }
 
 /// Parse a foreign `FolderId` back into its `(accountId, mailboxId)`
@@ -130,6 +158,19 @@ mod tests {
     #[test]
     fn plain_id_is_not_foreign() {
         assert!(parse_foreign(&FolderId("mbx-12".to_string())).is_none());
+    }
+
+    #[test]
+    fn account_scope_round_trips_and_is_distinguishable() {
+        let id = encode_foreign_account("acct-99");
+        let parsed = parse_foreign(&id).expect("account scope parses as foreign");
+        assert_eq!(parsed.account_id, "acct-99");
+        assert!(parsed.is_account_scope());
+
+        // A real mailbox scope is never mistaken for the account scope:
+        // RFC 8620 ids are 1-255 chars, so the mailbox part is non-empty.
+        let mailbox = parse_foreign(&encode_foreign("acct-99", "mbx-1")).expect("foreign");
+        assert!(!mailbox.is_account_scope());
     }
 
     #[test]

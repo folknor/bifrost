@@ -240,7 +240,24 @@ fn reconcile_hydration(
                     .map(str::to_string)
                     .collect::<HashSet<_>>(),
             ),
-            Projection::Metadata => HydratedObjectKind::Metadata(email_to_inventory(email, state)),
+            Projection::Metadata => {
+                let mut entry = email_to_inventory(email, state);
+                // A foreign-qualified id must yield a foreign-qualified
+                // entry, exactly as the foreign inventory walk mints one.
+                // This is the attribution channel for foreign changes:
+                // the account-level change stream emits only qualified
+                // ids, and the consumer learns WHICH shared folder the
+                // message sits in from these memberships. Left bare, the
+                // native `mailboxIds` collide with same-id primary
+                // mailboxes, and the bare entry/blob ids would route
+                // later reads through the primary account.
+                if let Some((owner, _)) = super::foreign::parse_object(&id.0) {
+                    let owner = bifrost_types::MailboxId(owner.to_string());
+                    super::inventory::qualify_foreign_memberships(&mut entry.memberships, &owner);
+                    super::inventory::qualify_foreign_ids(&mut entry, &owner);
+                }
+                HydratedObjectKind::Metadata(entry)
+            }
             _ => HydratedObjectKind::FlagsOnly(HashSet::new()),
         };
         let item_id = BatchItemId(id.0.clone());
@@ -477,6 +494,98 @@ mod tests {
             panic!("the foreign id hydrated");
         };
         assert_eq!(success.output.id, qualified);
+    }
+
+    /// Metadata hydration is the attribution channel for foreign changes:
+    /// the account-level change stream emits only qualified ids, and the
+    /// consumer learns WHICH shared folder a message sits in from the
+    /// hydrated memberships. So the metadata entry must come back in the
+    /// owner's namespace, exactly as the foreign inventory walk mints it:
+    /// bare native `mailboxIds` collide with same-id primary mailboxes,
+    /// and bare entry/blob ids would route later reads through the
+    /// primary account.
+    #[test]
+    fn a_foreign_metadata_hydration_is_qualified_like_the_foreign_inventory() {
+        let qualified = ObjectId(super::super::foreign::encode_object("acct-9", "M1"));
+        let requested = vec![qualified.clone()];
+        let answered: crate::email::Email = serde_json::from_value(serde_json::json!({
+            "id": "M1",
+            "blobId": "B1",
+            "threadId": "T1",
+            "size": 10,
+            "mailboxIds": {"inbox": true},
+            "keywords": {}
+        }))
+        .expect("email fixture decodes");
+
+        let outcomes =
+            reconcile_hydration(&requested, vec![answered], &[], Projection::Metadata, "s1");
+
+        assert_eq!(outcomes.len(), 1);
+        let ItemOutcome::Succeeded(success) = &outcomes[0] else {
+            panic!("the foreign id hydrated: {:?}", outcomes[0]);
+        };
+        let HydratedObjectKind::Metadata(entry) = &success.output.kind else {
+            panic!("expected a metadata entry");
+        };
+        assert_eq!(
+            entry.id, qualified,
+            "the entry id must match the submitted id"
+        );
+        assert_eq!(
+            entry.blob_id.as_ref().map(|blob| blob.0.as_str()),
+            Some(super::super::foreign::encode_object("acct-9", "B1").as_str()),
+            "a bare blob id would download through the primary account"
+        );
+        assert!(
+            entry
+                .memberships
+                .contains(&bifrost_types::MembershipScope::Folder(
+                    super::super::foreign::encode_foreign("acct-9", "inbox")
+                )),
+            "membership must land in the owner's container namespace: {:?}",
+            entry.memberships
+        );
+        assert!(
+            !entry
+                .memberships
+                .contains(&bifrost_types::MembershipScope::Mailbox(
+                    bifrost_types::MailboxId("inbox".to_string())
+                )),
+            "a bare native membership conflates the share with the primary"
+        );
+        assert!(
+            entry
+                .memberships
+                .contains(&bifrost_types::MembershipScope::Mailbox(
+                    bifrost_types::MailboxId("acct-9".to_string())
+                )),
+            "the owner tag identifies the share"
+        );
+
+        // A primary id's metadata stays bare: qualification keys off the
+        // submitted id's namespace, never off which route fetched it.
+        let bare = vec![ObjectId("M1".to_string())];
+        let answered: crate::email::Email = serde_json::from_value(serde_json::json!({
+            "id": "M1",
+            "mailboxIds": {"inbox": true},
+            "keywords": {}
+        }))
+        .expect("email fixture decodes");
+        let outcomes = reconcile_hydration(&bare, vec![answered], &[], Projection::Metadata, "s1");
+        let ItemOutcome::Succeeded(success) = &outcomes[0] else {
+            panic!("the primary id hydrated");
+        };
+        let HydratedObjectKind::Metadata(entry) = &success.output.kind else {
+            panic!("expected a metadata entry");
+        };
+        assert!(
+            entry
+                .memberships
+                .contains(&bifrost_types::MembershipScope::Mailbox(
+                    bifrost_types::MailboxId("inbox".to_string())
+                ))
+        );
     }
 
     /// A response object that does not correlate with a submitted id is

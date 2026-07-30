@@ -199,15 +199,22 @@ impl AccountFactory for JmapAccountFactory {
 
             // Foreign (shared/delegate) accounts: the session lists every
             // non-personal mail account. For each, probe its two states
-            // and seed one `Folder` cursor scope per mailbox. A probe
-            // failure - revoked grant and exhausted transient retry
-            // alike - skips that foreign account and records the
-            // omission on `OpenedAccount::skipped_scopes` with its
-            // classified error. Open itself must not fail here: initial
-            // attach does not retry `factory.open`, so failing would
-            // block the user's own primary mail on someone else's
-            // shared mailbox being down. And skipping silently would
-            // erase the share for the session with no signal anywhere.
+            // and seed ONE account-level `Folder` cursor scope. JMAP
+            // `Email/changes` state is per (accountId, type) and cannot
+            // be filtered by mailbox, so a per-mailbox topology would
+            // stream the same account-wide change set once per mailbox
+            // (the original B9 defect); the account-level scope streams
+            // it exactly once, and per-mailbox membership is derived at
+            // hydration from the qualified `mailboxIds` - the same model
+            // the primary `Type(Email)` scope uses. A probe failure -
+            // revoked grant and exhausted transient retry alike - skips
+            // that foreign account and records the omission on
+            // `OpenedAccount::skipped_scopes` with its classified error.
+            // Open itself must not fail here: initial attach does not
+            // retry `factory.open`, so failing would block the user's
+            // own primary mail on someone else's shared mailbox being
+            // down. And skipping silently would erase the share for the
+            // session with no signal anywhere.
             let foreign_ids = foreign_mail_account_ids(&session, &primary_id);
             let mut foreign_mail: HashMap<String, MailAccount> = HashMap::new();
             let mut foreign_submission = HashSet::new();
@@ -217,22 +224,13 @@ impl AccountFactory for JmapAccountFactory {
                     MailAccount::new(client.clone(), JmapAccountId::new(&foreign_id));
                 match seed_foreign_account_or_skip(&foreign_id, &foreign_account).await {
                     Ok(seed) => {
-                        email_states.insert(foreign_id.clone(), Some(seed.email_state));
-                        mailbox_states.insert(foreign_id.clone(), Some(seed.mailbox_state));
-                        for mailbox_id in seed.mailbox_ids {
-                            let scope = CursorScope::Folder(foreign::encode_foreign(
-                                &foreign_id,
-                                &mailbox_id,
-                            ));
-                            // Foreign email changes track the account's
-                            // Email state; seed each mailbox's Folder
-                            // cursor from it.
-                            if let Ok(encoded) =
-                                state::encode_for_scope(&scope, seed.email_state_for_seed.clone())
-                            {
-                                seed_states.insert(scope, encoded);
-                            }
-                        }
+                        apply_foreign_seed(
+                            &foreign_id,
+                            seed,
+                            &mut seed_states,
+                            &mut email_states,
+                            &mut mailbox_states,
+                        );
                         if account_advertises_submission(&session, &foreign_id) {
                             foreign_submission.insert(foreign_id.clone());
                         }
@@ -266,8 +264,9 @@ impl AccountFactory for JmapAccountFactory {
             let shutdown = CancellationToken::new();
             // Snapshot of who this session syncs: push notifications are
             // keyed by accountId (RFC 8620 s7.1) and the reader routes a
-            // foreign account's Email changes onto its seeded `Folder`
-            // scopes instead of the primary type scope.
+            // foreign account's Email changes onto its one seeded
+            // account-level `Folder` scope instead of the primary type
+            // scope.
             let push_routing = Arc::new(PushRouting::new(primary_id.clone(), seed_states.keys()));
             let ws = WsState::spawn(
                 client.clone(),
@@ -410,28 +409,46 @@ fn foreign_mail_account_ids(
 }
 
 struct ForeignSeed {
+    /// The foreign account's `Email/changes` state: the seed for its one
+    /// account-level `Folder` cursor scope.
     email_state: String,
     mailbox_state: String,
-    /// The foreign account's mailbox ids, one `Folder` cursor scope per.
-    mailbox_ids: Vec<String>,
-    /// The Email state seeded into each foreign `Folder` cursor (the
-    /// foreign account's `Email/changes` state).
-    email_state_for_seed: String,
 }
 
-/// Probe one foreign account's `Email` / `Mailbox` states and enumerate its
-/// mailboxes. Mirrors the primary probes.
+/// Probe one foreign account's `Email` / `Mailbox` states. Mirrors the
+/// primary probes (the `Mailbox/get` also proves the grant reaches the
+/// account's mailboxes, not just its Email state).
 async fn seed_foreign_account<T: HttpTransport>(
     mail: &JmapMailAccount<T>,
 ) -> crate::Result<ForeignSeed> {
-    let (email_state, mailbox_state, mailbox_names) = seed_account_state(mail).await?;
-    let mailbox_ids: Vec<String> = mailbox_names.into_keys().collect();
+    let (email_state, mailbox_state, _mailbox_names) = seed_account_state(mail).await?;
     Ok(ForeignSeed {
-        email_state_for_seed: email_state.clone(),
         email_state,
         mailbox_state,
-        mailbox_ids,
     })
+}
+
+/// Register one successfully probed foreign account: its per-accountId
+/// state-cache entries plus exactly ONE seeded cursor scope - the
+/// account-level `Folder` scope, seeded from the account's Email state.
+///
+/// One scope per account, never one per mailbox: `Email/changes` is
+/// account-wide, so per-mailbox cursors would each replay the identical
+/// change set and a foreign push would fan out to every one of them.
+/// Pure over its maps so the seeded topology is unit-pinnable.
+fn apply_foreign_seed(
+    foreign_id: &str,
+    seed: ForeignSeed,
+    seed_states: &mut HashMap<CursorScope, bifrost_types::OpaqueChangeState>,
+    email_states: &mut HashMap<String, Option<String>>,
+    mailbox_states: &mut HashMap<String, Option<String>>,
+) {
+    let scope = CursorScope::Folder(foreign::encode_foreign_account(foreign_id));
+    let encoded = state::encode_for_scope(&scope, seed.email_state.clone())
+        .expect("the account-level foreign scope always carries the codec separator");
+    seed_states.insert(scope, encoded);
+    email_states.insert(foreign_id.to_string(), Some(seed.email_state));
+    mailbox_states.insert(foreign_id.to_string(), Some(seed.mailbox_state));
 }
 
 /// Seed one foreign account, or turn its probe failure into the
@@ -1029,6 +1046,145 @@ mod tests {
         assert_eq!(requests.len(), 2);
         assert_open_batch(&requests[0], "primary");
         assert_open_batch(&requests[1], "shared");
+    }
+
+    /// B9's regression guard: `Email/changes` is account-wide, so a share
+    /// with M mailboxes must seed exactly ONE cursor scope - the
+    /// account-level `Folder` scope, carrying the account's Email state -
+    /// never one scope per mailbox each replaying the identical change
+    /// set. This drives the real probe + seed application; only the
+    /// `open()` shell around them is out of hermetic reach.
+    #[tokio::test]
+    async fn a_multi_mailbox_share_seeds_exactly_one_account_level_cursor_scope() {
+        let client = scripted_client([method_reply(vec![
+            email_result("shared", "s", "s0"),
+            json!(["Mailbox/get", {"accountId": "shared", "state": "mailbox-s", "list": [
+                {"id": "inbox", "name": "Inbox"},
+                {"id": "archive", "name": "Archive"},
+                {"id": "spam", "name": "Spam"}
+            ], "notFound": []}, "s1"]),
+        ])]);
+        let shared = JmapMailAccount::new(client.clone(), JmapAccountId::new("shared"));
+        let seed = seed_foreign_account(&shared).await.expect("shared seed");
+
+        let mut seed_states = HashMap::new();
+        let mut email_states = HashMap::new();
+        let mut mailbox_states = HashMap::new();
+        apply_foreign_seed(
+            "shared",
+            seed,
+            &mut seed_states,
+            &mut email_states,
+            &mut mailbox_states,
+        );
+
+        assert_eq!(
+            seed_states.len(),
+            1,
+            "three mailboxes must not become three account-wide change streams"
+        );
+        let scope = CursorScope::Folder(foreign::encode_foreign_account("shared"));
+        let encoded = seed_states
+            .get(&scope)
+            .expect("the one scope is the account-level Folder scope")
+            .clone();
+        let cursor = bifrost_types::ChangeCursor {
+            scope: scope.clone(),
+            server_state: encoded,
+            advanced_through: None,
+            envelope_version: state::CHANGE_CURSOR_ENVELOPE_VERSION,
+        };
+        let (_, seeded_state) = state::decode_cursor(&cursor).expect("seed decodes");
+        assert_eq!(
+            seeded_state, "email-s",
+            "the account scope is seeded from the account's Email state"
+        );
+        assert_eq!(
+            email_states.get("shared"),
+            Some(&Some("email-s".to_string()))
+        );
+        assert_eq!(
+            mailbox_states.get("shared"),
+            Some(&Some("mailbox-s".to_string()))
+        );
+    }
+
+    /// The account-level foreign scope inventories the WHOLE account: one
+    /// unfiltered `Email/query` walk against the foreign handle (the
+    /// per-mailbox topology issued one `inMailbox`-filtered walk per
+    /// mailbox), with every entry qualified into the owner's namespace so
+    /// hydration, blob reads, and folder attribution stay self-routing.
+    #[tokio::test]
+    async fn foreign_account_inventory_walks_the_whole_account_without_a_mailbox_filter() {
+        let client = scripted_client([
+            method_reply(vec![json!([
+                "Email/query",
+                {"accountId": "shared", "queryState": "q1", "position": 0, "ids": ["M1"]},
+                "s0"
+            ])]),
+            method_reply(vec![json!([
+                "Email/get",
+                {"accountId": "shared", "state": "email-s", "list": [
+                    {"id": "M1", "blobId": "B1", "threadId": "T1", "size": 10,
+                     "mailboxIds": {"inbox": true}, "keywords": {}}
+                ], "notFound": []},
+                "s0"
+            ])]),
+            // The empty follow-up page ends the walk.
+            method_reply(vec![json!([
+                "Email/query",
+                {"accountId": "shared", "queryState": "q1", "position": 1, "ids": []},
+                "s0"
+            ])]),
+        ]);
+        let shared = JmapMailAccount::new(client.clone(), JmapAccountId::new("shared"));
+        let scope = CursorScope::Folder(foreign::encode_foreign_account("shared"));
+        let owner = Some(bifrost_types::MailboxId("shared".to_string()));
+        let mut stream = crate::sync::inventory::stream(
+            shared,
+            super::capabilities::CoreLimits {
+                max_objects_in_get: 4,
+                max_objects_in_set: 4,
+            },
+            scope,
+            owner,
+        );
+
+        match stream.next().await {
+            Some(bifrost_types::SyncEvent::Batch(batch)) => match &batch.items[..] {
+                [entry] => {
+                    assert_eq!(entry.id.0, foreign::encode_object("shared", "M1"));
+                    assert_eq!(
+                        entry.blob_id.as_ref().map(|blob| blob.0.as_str()),
+                        Some(foreign::encode_object("shared", "B1").as_str())
+                    );
+                    assert!(entry.memberships.contains(&MembershipScope::Folder(
+                        foreign::encode_foreign("shared", "inbox")
+                    )));
+                    assert!(entry.memberships.contains(&MembershipScope::Mailbox(
+                        bifrost_types::MailboxId("shared".to_string())
+                    )));
+                }
+                other => panic!("expected one qualified inventory entry, got {other:?}"),
+            },
+            other => panic!("expected the inventory batch, got {other:?}"),
+        }
+        assert!(matches!(
+            stream.next().await,
+            Some(bifrost_types::SyncEvent::Done(None))
+        ));
+
+        let requests = client.transport().requests();
+        assert_eq!(requests.len(), 3);
+        for request in [&requests[0], &requests[2]] {
+            let query = &request["methodCalls"][0];
+            assert_eq!(query[0], "Email/query");
+            assert_eq!(query[1]["accountId"], "shared");
+            assert!(
+                query[1].get("filter").is_none(),
+                "the account-level scope walks the whole account, unfiltered: {query}"
+            );
+        }
     }
 
     /// The production factory still calls `connect()` and therefore

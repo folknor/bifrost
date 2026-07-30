@@ -24,9 +24,13 @@ pub(crate) fn stream<T: HttpTransport>(
     match scope {
         CursorScope::Type(ObjectType::Email) => email_inventory(mail, limits),
         CursorScope::Type(ObjectType::Mailbox) => mailbox_inventory(mail),
-        // A foreign (shared/delegate) account mailbox: page its emails
-        // via `Email/query` filtered on the native mailbox id, hydrating
-        // inventory entries against the foreign account.
+        // A foreign (shared/delegate) account scope: page its emails via
+        // `Email/query` against the foreign account, hydrating inventory
+        // entries there. The seeded shape is the ACCOUNT-LEVEL scope
+        // (empty mailbox part), which walks the whole account unfiltered
+        // - one walk per share, mirroring the primary `Type(Email)`
+        // inventory. A legacy per-mailbox scope still decodes and takes
+        // the `inMailbox`-filtered walk.
         CursorScope::Folder(ref folder) => match super::foreign::parse_foreign(folder) {
             Some(parsed) => {
                 foreign_email_inventory(mail, limits, scope.clone(), parsed.mailbox_id, owner)
@@ -100,15 +104,17 @@ fn foreign_email_inventory<T: HttpTransport>(
 
         loop {
             let started = Instant::now();
-            let query_response = mail
-                .call(
-                    EmailQuery::new()
-                        .filter(crate::email::query::Filter::in_mailbox(mailbox_id.clone()))
-                        .sort([query::Comparator::new(crate::email::query::Comparator::ReceivedAt).descending()])
-                        .position(position)
-                        .limit(limit),
-                )
-                .await;
+            // The account-level scope (empty mailbox part) queries the
+            // whole account; only a legacy per-mailbox scope filters.
+            let mut query = EmailQuery::new();
+            if !mailbox_id.is_empty() {
+                query = query.filter(crate::email::query::Filter::in_mailbox(mailbox_id.clone()));
+            }
+            let query = query
+                .sort([query::Comparator::new(crate::email::query::Comparator::ReceivedAt).descending()])
+                .position(position)
+                .limit(limit);
+            let query_response = mail.call(query).await;
 
             let query_response = match query_response {
                 Ok(response) => response,
@@ -209,16 +215,22 @@ fn foreign_email_inventory<T: HttpTransport>(
     })
 }
 
-/// Qualify a foreign (shared/delegate) inventory item's memberships with
-/// its owning account. The `owner` tag IS the foreign JMAP accountId.
+/// Qualify a foreign (shared/delegate) item's memberships with its
+/// owning account. The `owner` tag IS the foreign JMAP accountId.
 /// Each native `Mailbox(native)` membership is re-encoded as
-/// `Folder(encode_foreign(accountId, native))` - the same per-account
-/// namespace discovery uses for the foreign cursor scope - and the owner
+/// `Folder(encode_foreign(accountId, native))` - byte-identical to the
+/// container ids `containers_list` mints for the share - and the owner
 /// `Mailbox(accountId)` tag is appended. Without the re-encoding, a
 /// foreign native mailbox id (e.g. `inbox`) collides with the primary's
 /// identical id in the engine's membership index and the two accounts'
-/// messages conflate.
-fn qualify_foreign_memberships(memberships: &mut Vec<MembershipScope>, owner: &TypesMailboxId) {
+/// messages conflate. Shared by the foreign inventory walk and by
+/// `hydrate`'s Metadata projection: hydration is where the consumer
+/// learns which folder a foreign change landed in (the account-level
+/// change stream cannot know), so the two must speak one namespace.
+pub(crate) fn qualify_foreign_memberships(
+    memberships: &mut Vec<MembershipScope>,
+    owner: &TypesMailboxId,
+) {
     for membership in memberships.iter_mut() {
         if let MembershipScope::Mailbox(native) = membership {
             *membership =
@@ -237,7 +249,7 @@ fn qualify_foreign_memberships(memberships: &mut Vec<MembershipScope>, owner: &T
 /// accountId into both the object id and the whole-message `blobId` is what
 /// makes those reads self-routing, exactly as the folder codec makes the
 /// cursor scope self-routing on a cold resume.
-fn qualify_foreign_ids(entry: &mut InventoryEntry, owner: &TypesMailboxId) {
+pub(crate) fn qualify_foreign_ids(entry: &mut InventoryEntry, owner: &TypesMailboxId) {
     entry.id = ObjectId(super::foreign::encode_object(&owner.0, &entry.id.0));
     if let Some(blob) = entry.blob_id.take() {
         entry.blob_id = Some(BlobId(super::foreign::encode_object(&owner.0, &blob.0)));

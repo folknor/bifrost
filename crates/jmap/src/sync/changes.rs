@@ -86,17 +86,17 @@ pub(crate) fn stream<T: HttpTransport>(
         // query id cannot be turned into a valid filter/sort request. Do
         // not send an unfiltered Email/queryChanges and mislabel its ids.
         JmapScopeRepr::Query(_) => unsupported_scope(cursor.scope.clone(), "Query"),
-        // A foreign (shared/delegate) account mailbox: its emails sync
-        // against that foreign account's `Email/changes` state. The owner
-        // tag drives revocation isolation. `Email/changes` is
-        // account-wide and cannot be filtered by mailbox, so this leg
-        // emits every changed id of the account under this one scope and
-        // nothing attributes an id to its actual mailbox (no
-        // `ScopeChange` is emitted here); consumers learn membership at
-        // hydration via `mailboxIds`. With M seeded mailboxes the same
-        // account-wide change set therefore streams M times - a known
-        // cost, accepted until the per-mailbox scope topology for
-        // foreign accounts is revisited.
+        // A foreign (shared/delegate) account: its emails sync against
+        // that account's `Email/changes` state. The owner tag drives
+        // revocation isolation. `Email/changes` is account-wide and
+        // cannot be filtered by mailbox, which is exactly why the seeded
+        // topology is ONE account-level `Folder` scope per share: the
+        // change set streams once, and per-mailbox membership is learned
+        // at hydration via the foreign-qualified `mailboxIds` - the same
+        // model the primary `Type(Email)` scope uses (no `ScopeChange`
+        // needed). A legacy per-mailbox `Folder` cursor still lands here
+        // and still advances correctly; it just is not seeded or
+        // discovered anymore.
         JmapScopeRepr::Folder { .. } => email_changes(
             mail,
             account_id,
@@ -358,6 +358,9 @@ mod tests {
         for scope in [
             CursorScope::Type(bifrost_types::ObjectType::Email),
             CursorScope::Type(bifrost_types::ObjectType::Mailbox),
+            // The seeded foreign shape (account-level) and the legacy
+            // per-mailbox shape both reach this loop; both must encode.
+            CursorScope::Folder(super::super::foreign::encode_foreign_account("acct-9")),
             CursorScope::Folder(super::super::foreign::encode_foreign("acct-9", "mbx-1")),
         ] {
             let cursor = checkpoint_for(scope.clone(), "state-1".to_string());

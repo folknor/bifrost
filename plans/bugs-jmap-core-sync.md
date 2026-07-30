@@ -8,8 +8,6 @@ Read first: `reference/jmap.md`, `reference/error-model.md`,
 `plans/bug-hunt-2026-06-17.md`, `plans/jmap/*`. Nothing below re-reports a
 finding already closed there.
 
-Ordering inside each section is by blast radius, not by discovery order.
-
 This file is NOT the whole open-gap picture for bifrost-jmap: it holds only
 what this sweep found and has not yet closed. Standing jmap gaps that predate
 or outlive it live in `TODO.md` as `nc-*` (currently nc-6 hydration flush
@@ -21,50 +19,12 @@ mutation paths this sweep just wired.
 
 ## 1. Bugs
 
-### B9 - Every foreign mailbox scope replays the whole account-wide `Email/changes`
-
-**Where:** `sync/changes.rs::stream` (100-108) -> `email_changes` (113-181).
-
-**Mechanism.** `JmapScopeRepr::Folder { .. }` routes to `email_changes` with
-no `inMailbox` restriction, because `Email/changes` is account-wide and cannot
-be filtered. The account seeds **one `Folder` scope per mailbox** of each
-foreign account (`factory.rs:238-252`). So a shared account with M mailboxes
-produces M cursor scopes, each of which streams the *same* account-wide change
-set, each qualifying ids with the *same* accountId.
-
-**Path to failure.** A delegate account with 12 folders. One message arrives in
-its Inbox. The engine drives all 12 `Folder` cursors. Each emits an
-`ObjectChange { id: "acct-9\u{1f}M123", kind: Created }`. The engine sees 12
-identical change events for one message, attributed to 12 different scopes,
-11 of which do not contain it. Hydration then runs up to 12 times for the same
-id (the per-scope streams are independent), so the wire cost is O(mailboxes)
-per change.
-
-Related, and worse for correctness: `email_changes` emits only
-`Change::ObjectChange`, never `Change::ScopeChange`, so nothing tells the
-engine which of the 12 folders the message actually landed in - membership is
-only learned at hydration via `mailboxIds`. (The dispatch comment in
-`changes.rs` used to claim a compensating scope-change mechanism that does
-not exist; it now states this reality instead.)
-
-**Interaction with push routing (added after the routing fix landed).**
-`push.rs::emit_state_change` now routes a foreign `StateChange` onto one exact
-`SpecificCursorScope` hint per seeded `Folder(accountId, *)` scope, because
-that is the only correct answer while the cursor topology is per-mailbox: JMAP
-state is per-(accountId, type), so all M of that account's cursors really did
-move, and hinting fewer would leave cursors stale. The consequence is that a
-single foreign push now drives M change-stream passes for an M-mailbox share -
-the fanout is *correct*, but it pays B9's pre-existing O(mailboxes) wire cost
-once per notification rather than once per poll interval, so B9's cost is now
-push-rate-driven. Whoever takes B9 should weigh the two together: option (a)
-below collapses the topology to one `Folder` scope per foreign account, which
-collapses the push fanout to a single hint at the same time. Option (b) keeps
-the fanout as-is. This is an argument for (a), not a new bug.
-
-**Proposed fix.** Two options, both larger than a patch:
-(a) seed one `Folder` scope per foreign *account* rather than per mailbox, and
-    derive per-mailbox membership from the hydrated `mailboxIds`; or
-(b) keep per-mailbox scopes but have the foreign changes leg hydrate
-    `mailboxIds` for each changed id and emit `ScopeChange`s, so the engine
-    can attribute the change.
-This is a design call, not a mechanical fix.
+No open findings. B9 (every foreign mailbox scope replayed the whole
+account-wide `Email/changes`) closed by collapsing the foreign cursor
+topology to one account-level `Folder` scope per shared account - option (a)
+of the two it proposed - which also collapsed the push-routing fanout to one
+hint per foreign notification and surfaced a hydration defect on the way:
+`get_stream`'s `Metadata` projection returned foreign entries with bare
+native `mailboxIds` / entry / blob ids, which would have broken the folder
+attribution the new topology relies on (and already misrouted foreign blob
+reads). Both fixed in the same commit.

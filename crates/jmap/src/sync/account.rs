@@ -195,9 +195,10 @@ impl JmapAccount {
             .filter(|scope| self.seed_states.contains_key(scope))
             .collect();
 
-        // Foreign (shared/delegate) account mailboxes surface as seeded
-        // `Folder` scopes (the foreign accountId rides in the FolderId).
-        // Preserve a deterministic order so discovery is stable.
+        // Each foreign (shared/delegate) account surfaces as ONE seeded
+        // account-level `Folder` scope (the foreign accountId rides in
+        // the FolderId; the mailbox part is empty). Preserve a
+        // deterministic order so discovery is stable.
         let mut foreign: Vec<CursorScope> = self
             .seed_states
             .keys()
@@ -1398,13 +1399,14 @@ mod tests {
 
     #[test]
     fn discover_emits_foreign_account_owner_membership() {
-        // Two foreign mailboxes in one account plus one in another: the
-        // owner tag is per-account (deduped), not per-mailbox.
+        // The seeded shape is one account-level scope per share; a legacy
+        // per-mailbox scope for the same account still contributes the
+        // same (deduped) owner tag.
         let scopes = [
             CursorScope::Type(ObjectType::Email),
-            CursorScope::Folder(foreign::encode_foreign("acct-9", "mbx-1")),
+            CursorScope::Folder(foreign::encode_foreign_account("acct-9")),
             CursorScope::Folder(foreign::encode_foreign("acct-9", "mbx-2")),
-            CursorScope::Folder(foreign::encode_foreign("acct-7", "mbx-3")),
+            CursorScope::Folder(foreign::encode_foreign_account("acct-7")),
         ];
         let owners = foreign_owner_memberships_from_scopes(scopes.iter());
         assert!(owners.contains(&MembershipScope::Mailbox(MailboxId("acct-9".to_string()))));
@@ -1418,7 +1420,14 @@ mod tests {
         let registered: HashSet<String> = ["acct-9".to_string()].into_iter().collect();
         let is_registered = |id: &str| registered.contains(id);
 
-        // A foreign Folder scope for a registered account routes foreign.
+        // The seeded account-level Folder scope routes foreign.
+        let account_scope = CursorScope::Folder(foreign::encode_foreign_account("acct-9"));
+        assert_eq!(
+            resolve_foreign_account_id(&account_scope, is_registered),
+            Some("acct-9".to_string())
+        );
+
+        // So does a legacy per-mailbox Folder scope.
         let foreign_scope = CursorScope::Folder(foreign::encode_foreign("acct-9", "mbx-3"));
         assert_eq!(
             resolve_foreign_account_id(&foreign_scope, is_registered),
