@@ -132,7 +132,13 @@ impl ReqwestTransport {
         if status.is_success() {
             Ok(body)
         } else {
-            // Return the full body so the caller can parse ProblemDetails
+            // Only a passed-through 3xx reaches here: bifrost-net turns
+            // every 4xx/5xx into a typed `Error` before `send` returns,
+            // so `Ok(response)` with a non-2xx status means a 304 / 305 /
+            // 306 or a `Location`-less redirect. Keep the body attached
+            // anyway - it costs nothing and a server that answers a
+            // conditional request with a problem document still gets
+            // interpreted.
             Err(TransportError::with_body(format!("HTTP {status}"), body))
         }
     }
@@ -251,8 +257,11 @@ impl Unpin for ReqwestByteStream {}
 fn transport_error_from_net(error: bifrost_net::Error) -> TransportError {
     // Preserve the original net error so the JMAP conversion boundary
     // can delegate to bifrost_net::into_account_error for pure
-    // transport-level signals. `TransportError::from_net` retains the
-    // 4xx/5xx body for ProblemDetails parsing as a side benefit.
+    // transport-level signals. `TransportError::from_net` also lifts the
+    // response body out of whichever variant carries it (`Status`
+    // directly, `RateLimited` / `RetryBudgetExhausted` from the
+    // preserved final response) so ProblemDetails parsing still works
+    // for the statuses the retry loop consumed.
     TransportError::from_net(error)
 }
 

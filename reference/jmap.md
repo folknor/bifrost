@@ -63,6 +63,20 @@ All convenience helpers are `impl<Tr: HttpTransport> Client<Tr>` so custom trans
 stable generic fallback; account-scoped callers use `Account::build()` and
 therefore select their required capability explicitly.
 
+The sync request helpers likewise take `Account<Tr>` / `Client<Tr>` with
+`Tr: HttpTransport`; the engine-facing `JmapAccount` remains the reqwest
+production specialization because WebSocket push is reqwest-specific. Factory
+tests use an armed scripted transport that records exact API JSON and derives
+each reply's error shape from the same decision table `crates/net/src/request.rs`
+walks, so a fixture cannot pin behavior against a response shape production
+cannot produce: 2xx bodies reach the protocol decoder, a passed-through 3xx is
+body-preserving at the JMAP boundary, a second 401 is `AuthLost`, statuses
+retryable under `RetryPolicy::default()` (429 plus the 5xx family, read off the
+policy rather than restated) come back as `RateLimited` / `RetryBudgetExhausted`
+with their final response preserved, and only a genuinely non-retryable 4xx is
+`Error::Status`. An exhausted script reports the request ordinal rather than
+falling through to a network.
+
 ## Module pattern
 
 Every JMAP object type under `crates/jmap/src/<type>/`:
@@ -170,7 +184,9 @@ crates/jmap/src/sync/
 
 ### `JmapAccount` / `JmapAccountFactory` shape and lifecycle
 
-`JmapAccountFactory` carries a `JmapAccountFactoryBuilder` config (URL, `JmapCredentials::Basic`/`Bearer`, optional timeout, `accept_invalid_certs`, `ReconnectPolicy`). `AccountFactory::open(account_id)` connects a `Client`, passing the engine account id into the `bifrost-net` attachment so metering / priority / caps / trace use the real key on reopen. Open resolves the primary `Mail` account plus optional `Submission`/`VacationResponse`/`Quota`/`Sieve`, reads the session, builds `AccountCapabilities` + `CoreLimits`, probes initial `Email`/`Mailbox`/`Thread` state to seed cursors (and the same per foreign account), spawns the WebSocket reader with a `CancellationToken`, and returns `Arc<dyn Account>`.
+`JmapAccountFactory` carries a `JmapAccountFactoryBuilder` config (URL, `JmapCredentials::Basic`/`Bearer`, optional timeout, `accept_invalid_certs`, `ReconnectPolicy`). `AccountFactory::open(account_id)` connects a `Client`, passing the engine account id into the `bifrost-net` attachment so metering / priority / caps / trace use the real key on reopen. Open resolves the primary `Mail` account plus optional `Submission`/`VacationResponse`/`Quota`/`Sieve`, reads the session, builds `AccountCapabilities` + `CoreLimits`, then batches the initial `Email/get`, `Mailbox/get` (including names), and `Thread/get` probes into one request for the primary and one request per foreign account. It spawns the WebSocket reader with a `CancellationToken`, and returns `Arc<dyn Account>`.
+
+The batch is conditional on the session's own numbers. `maxCallsInRequest` and `maxSizeRequest` are hard limits (RFC 8620 §2) the server enforces by rejecting the whole request with a request-level `limit` error, and the commonly quoted 16 calls is the minimum a server is *recommended* to support, never a floor a client may assume. So `batched_open_probes` sends the three-call batch only when the advertised call count allows it and `Request::send_methods_within` finds the encoded request inside `maxSizeRequest`; otherwise nothing is sent and the probes go out one request each. `send_methods_within` takes the size limit as a required argument (and returns `Ok(None)` without sending when the batch does not fit) precisely so a future batching call site cannot forget the question.
 
 `JmapAccount` (`pub(crate)`) owns the `Client`, the primary `Mail` `Account` handle, a `foreign_mail: Arc<HashMap<String, MailAccount>>` of shared/delegate-account handles keyed by JMAP `accountId`, optional `Submission`/`VacationResponse`/`Quota`/`Sieve` handles, the built capabilities, per-scope cursor seed states, the `WsState`, a subscription registry, and per-`accountId` state caches (`email_states`/`mailbox_states`/`thread_states`, each `Arc<Mutex<HashMap<String, Option<String>>>>` via `state_cache.rs`). The maps are keyed by accountId because JMAP state is per-`(accountId, type)`; the primary account's id is one ordinary key. `set_priority`/`set_bandwidth_cap` delegate to `bifrost-net::AccountNet`. See "Foreign (shared/delegate) accounts" below.
 
@@ -313,6 +329,16 @@ Mapping highlights for the JMAP signals the central table reads:
   `Engine(RestartAccount)`; `Problem(notJSON | notRequest)` ->
   `Protocol(ContractViolation)`. Bare-`Problem` HTTP fallbacks
   (401/403/429/5xx) map per the central rules.
+- Which net error shape carried the problem document decides where its
+  evidence lives, and the crate reads all of them. `Error::Status` is the
+  *only* variant bifrost-net produces for a terminal HTTP status, and a
+  429 or 5xx never takes that path (the retry loop consumes it and hands
+  back `RateLimited` / `RetryBudgetExhausted` with the final response
+  preserved), so `TransportError::from_net` lifts the body back out of
+  that evidence and `retry_after_from_net` reads the hint from the
+  parsed field, the recorded history, *and* the response's own
+  `Retry-After` header. `AuthLost` is the deliberate exception: its 401
+  classification and transmission evidence stay bifrost-net's.
 - `Transport(_)` -> `Transport(Network)` with `AttemptCause::transmission_state` from where the wire failed; central mapping picks `Retry::SameRequest` for idempotent ops, `Reconcile` for non-idempotent ops caught mid-flight.
 - WebSocket errors split by handshake position: `WebSocketHandshake`
   (pre-handshake) -> `Transport(Network)` + `Attempt(Unsent)`;

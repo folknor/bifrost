@@ -895,6 +895,10 @@ fn wire_for_problem(error: &ProblemType) -> WireCause {
     }
 }
 
+/// The HTTP status behind a problem-details response. All three shapes
+/// are reachable: `Status` for a terminal 4xx, and `RateLimited` /
+/// `RetryBudgetExhausted` for a 429 / 5xx whose problem body the
+/// transport lifted out of the preserved final response.
 fn status_from_net(net: Option<&bifrost_net::Error>) -> Option<u32> {
     match net? {
         bifrost_net::Error::Status { code, .. } => Some(u32::from(code.as_u16())),
@@ -909,11 +913,37 @@ fn status_from_net(net: Option<&bifrost_net::Error>) -> Option<u32> {
     }
 }
 
+/// The server's retry hint for a problem-details response.
+///
+/// Where the hint lives depends on which net error shape carried the
+/// body here, and the terminal-status shape is the common one: a 4xx
+/// bifrost-net does not retry arrives as `Error::Status`, which holds
+/// the response headers but no parsed hint, so the `Retry-After` has to
+/// be read off the header. A retried 429 / 5xx arrives as
+/// `RateLimited` / `RetryBudgetExhausted` with the final attempt's hint
+/// already parsed and capped by the retry policy; fall back to that
+/// response's own header when the loop recorded none.
 fn retry_after_from_net(net: Option<&bifrost_net::Error>) -> Option<Duration> {
     match net? {
-        bifrost_net::Error::RateLimited { retry_after, .. } => *retry_after,
+        bifrost_net::Error::Status { headers, .. } => retry_after_header(headers),
+        bifrost_net::Error::RateLimited {
+            retry_after,
+            final_response,
+        } => retry_after.or_else(|| retry_after_header(&final_response.headers)),
+        bifrost_net::Error::RetryBudgetExhausted {
+            final_response,
+            retry_after_history,
+        } => retry_after_history.last().copied().or_else(|| {
+            final_response
+                .as_ref()
+                .and_then(|response| retry_after_header(&response.headers))
+        }),
         _ => None,
     }
+}
+
+fn retry_after_header(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    bifrost_net::parse_retry_after(headers.get(reqwest::header::RETRY_AFTER))
 }
 
 fn convert_method(method: crate::core::error::MethodError, ctx: JmapErrorContext) -> AccountError {
@@ -1244,6 +1274,128 @@ mod tests {
             details: Box::new(ProblemDetails::new(error, status, None, None, None, None)),
             transport: None,
         }
+    }
+
+    fn retry_after_headers(seconds: &'static str) -> reqwest::header::HeaderMap {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            reqwest::header::HeaderValue::from_static(seconds),
+        );
+        headers
+    }
+
+    /// Route a wire response through the same `TransportError` ->
+    /// `crate::Error` conversion the transports use, so these tests see
+    /// exactly what a live response produces.
+    fn from_net(error: bifrost_net::Error) -> crate::Error {
+        crate::Error::from(crate::core::transport::TransportError::from_net(error))
+    }
+
+    /// A JMAP `limit` problem is not retried by bifrost-net when the
+    /// server states it as a terminal 4xx, so it arrives as
+    /// `Error::Status` and its only retry hint is the `Retry-After`
+    /// header. Reading the hint off `RateLimited` - a shape that cannot
+    /// reach this branch, because a 429 is retried and never surfaces as
+    /// a status - dropped the server's hint on every one of them.
+    #[test]
+    fn a_terminal_limit_problem_keeps_the_servers_retry_after_header() {
+        let err = into_account_error(
+            from_net(bifrost_net::Error::Status {
+                code: reqwest::StatusCode::BAD_REQUEST,
+                body: bytes::Bytes::from_static(
+                    br#"{"type":"urn:ietf:params:jmap:error:limit","limit":"maxObjectsInGet"}"#,
+                ),
+                headers: retry_after_headers("120"),
+            }),
+            JmapErrorContext::new(AccountOperation::SyncChanges),
+        );
+
+        assert_eq!(
+            err.kind(),
+            &AccountErrorKind::Server(ServerErrorKind::RateLimited)
+        );
+        let RecoveryClass::Retry(advice) = err.recovery() else {
+            panic!("expected Retry, got {:?}", err.recovery());
+        };
+        assert_eq!(
+            advice.retry_hint,
+            Some(bifrost_types::RetryHint::After(Duration::from_secs(120))),
+            "the server's Retry-After must survive the problem-details path"
+        );
+    }
+
+    /// A 429 is retried, so it reaches the JMAP boundary as
+    /// `RateLimited` with the response preserved on the error rather
+    /// than as a status. Its problem document must still be read.
+    #[test]
+    fn a_retried_429_still_reaches_the_problem_details_mapping() {
+        let err = into_account_error(
+            from_net(bifrost_net::Error::RateLimited {
+                retry_after: Some(Duration::from_secs(30)),
+                final_response: bifrost_net::FinalResponse {
+                    status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+                    headers: reqwest::header::HeaderMap::new(),
+                    body: bytes::Bytes::from_static(
+                        br#"{"type":"urn:ietf:params:jmap:error:limit"}"#,
+                    ),
+                },
+            }),
+            JmapErrorContext::new(AccountOperation::SyncChanges),
+        );
+
+        assert_eq!(
+            err.kind(),
+            &AccountErrorKind::Server(ServerErrorKind::RateLimited)
+        );
+        let RecoveryClass::Retry(advice) = err.recovery() else {
+            panic!("expected Retry, got {:?}", err.recovery());
+        };
+        assert_eq!(
+            advice.retry_hint,
+            Some(bifrost_types::RetryHint::After(Duration::from_secs(30)))
+        );
+        assert_eq!(advice.throttle_scope, Some(ThrottleScope::Account));
+    }
+
+    /// The 5xx counterpart: a retryable status arrives as
+    /// `RetryBudgetExhausted`, and the hint the loop recorded on the
+    /// final attempt is the one to surface.
+    #[test]
+    fn a_retry_exhausted_5xx_problem_keeps_its_final_retry_hint() {
+        let err = into_account_error(
+            from_net(bifrost_net::Error::RetryBudgetExhausted {
+                final_response: Some(bifrost_net::FinalResponse {
+                    status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                    headers: retry_after_headers("45"),
+                    body: bytes::Bytes::from_static(br#"{"type":"about:blank"}"#),
+                }),
+                retry_after_history: vec![Duration::from_secs(45)],
+            }),
+            JmapErrorContext::new(AccountOperation::SyncChanges),
+        );
+
+        assert_eq!(
+            err.kind(),
+            &AccountErrorKind::Server(ServerErrorKind::Unavailable)
+        );
+        let RecoveryClass::Retry(advice) = err.recovery() else {
+            panic!("expected Retry, got {:?}", err.recovery());
+        };
+        assert_eq!(
+            advice.retry_hint,
+            Some(bifrost_types::RetryHint::After(Duration::from_secs(45)))
+        );
+        // The generic net mapping reaches the same kind and hint, so pin
+        // the one thing only the problem-details path can produce: the
+        // document's own type code in the cause chain.
+        assert!(
+            err.chain().iter().any(|cause| matches!(
+                cause,
+                Cause::Wire(WireCause::Jmap(JmapMethod::Unknown { code })) if code == "about:blank"
+            )),
+            "the problem document itself must have been read"
+        );
     }
 
     #[test]

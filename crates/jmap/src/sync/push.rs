@@ -90,10 +90,9 @@ impl Default for ReconnectPolicy {
 
 /// The client operations the push reader awaits outside its read loop.
 ///
-/// The sync layer hardwires `ReqwestTransport` into `Client`, so the
-/// reader has no in-process seam of its own; this trait is the narrow one
-/// that makes the reader's shutdown and timeout behavior testable without
-/// a socket. It carries nothing the reader does not already call.
+/// WebSocket push remains the reqwest production specialization, so this
+/// narrow trait makes the reader's shutdown and timeout behavior testable
+/// without a socket. It carries nothing the reader does not already call.
 pub(crate) trait PushTransport: Send + Sync + 'static {
     type Stream: futures::Stream<Item = crate::Result<crate::client_ws::WebSocketMessage>>
         + Send

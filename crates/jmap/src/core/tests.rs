@@ -264,20 +264,72 @@ fn call_handle_result_reference() {
     assert_eq!(ref_.path, "/ids");
 }
 
+/// Every net error shape that can carry a JMAP problem document has to
+/// hand it to the problem-details conversion. A terminal 4xx arrives as
+/// `Status`; a 429 or 5xx is retried first and arrives as `RateLimited`
+/// / `RetryBudgetExhausted` with the final response preserved on the
+/// error, so the body has to be lifted back out of that evidence.
 #[test]
-fn problem_details_from_transport_error() {
+fn problem_details_from_every_body_bearing_transport_error() {
     use crate::core::transport::TransportError;
 
-    let problem_json = json!({
-        "type": "urn:ietf:params:jmap:error:limit",
-        "title": "Too many requests",
-        "status": 429
-    });
+    let problem = bytes::Bytes::from(
+        serde_json::to_vec(&json!({
+            "type": "urn:ietf:params:jmap:error:limit",
+            "title": "Too many requests"
+        }))
+        .unwrap(),
+    );
+    let final_response = |status| bifrost_net::FinalResponse {
+        status,
+        headers: reqwest::header::HeaderMap::new(),
+        body: problem.clone(),
+    };
 
-    let err = TransportError::with_body("HTTP 429", serde_json::to_vec(&problem_json).unwrap());
+    let shapes = [
+        bifrost_net::Error::Status {
+            code: reqwest::StatusCode::BAD_REQUEST,
+            body: problem.clone(),
+            headers: reqwest::header::HeaderMap::new(),
+        },
+        bifrost_net::Error::RateLimited {
+            retry_after: None,
+            final_response: final_response(reqwest::StatusCode::TOO_MANY_REQUESTS),
+        },
+        bifrost_net::Error::RetryBudgetExhausted {
+            final_response: Some(final_response(reqwest::StatusCode::SERVICE_UNAVAILABLE)),
+            retry_after_history: Vec::new(),
+        },
+    ];
 
-    let error: Error = err.into();
-    assert!(matches!(error, Error::Problem { .. }));
+    for shape in shapes {
+        let described = shape.to_string();
+        let error: Error = TransportError::from_net(shape).into();
+        assert!(
+            matches!(error, Error::Problem { .. }),
+            "{described} must reach the problem-details mapping"
+        );
+    }
+}
+
+/// `AuthLost` is the deliberate exception: its 401 classification and
+/// transmission evidence belong to bifrost-net, so its body is not
+/// lifted into a status-derived problem guess.
+#[test]
+fn auth_lost_stays_a_transport_error() {
+    use crate::core::transport::TransportError;
+
+    let error: Error = TransportError::from_net(bifrost_net::Error::AuthLost {
+        transmission_state: Some(bifrost_types::TransmissionState::Acknowledged),
+        final_response: Some(bifrost_net::FinalResponse {
+            status: reqwest::StatusCode::UNAUTHORIZED,
+            headers: reqwest::header::HeaderMap::new(),
+            body: bytes::Bytes::from_static(br#"{"type":"urn:ietf:params:jmap:error:limit"}"#),
+        }),
+    })
+    .into();
+
+    assert!(matches!(error, Error::Transport(_)));
 }
 
 #[test]
@@ -602,9 +654,10 @@ mod envelope {
         let (get, query) = stub
             .client
             .build()
-            .send_methods((TestGet::new(), TestQuery::new()))
+            .send_methods_within((TestGet::new(), TestQuery::new()), usize::MAX)
             .await
-            .expect("batch send");
+            .expect("batch send")
+            .expect("batch fits an unbounded size limit");
 
         assert_eq!(get.list().len(), 1);
         assert_eq!(query.ids().len(), 2);
@@ -634,12 +687,37 @@ mod envelope {
         let (get, query) = stub
             .client
             .build()
-            .send_methods((TestGet::new(), TestQuery::new()))
+            .send_methods_within((TestGet::new(), TestQuery::new()), usize::MAX)
             .await
-            .expect("batch send");
+            .expect("batch send")
+            .expect("batch fits an unbounded size limit");
 
         assert_eq!(get.state(), "s1");
         assert_eq!(query.ids().len(), 2);
+    }
+
+    /// `maxSizeRequest` is a hard limit: a batch that does not fit must
+    /// not reach the wire at all, or the server rejects every call in it
+    /// with a request-level `limit` error.
+    #[tokio::test]
+    async fn a_batch_over_the_size_limit_is_not_sent() {
+        let stub = stub(
+            mail_primary(),
+            [reply(
+                "session-1",
+                vec![get_result("s0"), query_result("s1")],
+            )],
+        );
+
+        let sent = stub
+            .client
+            .build()
+            .send_methods_within((TestGet::new(), TestQuery::new()), 8)
+            .await
+            .expect("size rejection is not an error");
+
+        assert!(sent.is_none(), "an oversized batch reports no responses");
+        assert_eq!(stub.request_count(), 0, "and sends nothing");
     }
 
     #[tokio::test]

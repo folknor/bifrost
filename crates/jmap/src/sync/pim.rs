@@ -42,6 +42,7 @@ use futures::StreamExt;
 use super::state_cache::{self, StateMap};
 use crate::core::SetCreate;
 use crate::core::query;
+use crate::core::transport::HttpTransport;
 use crate::email::{
     BodyProperty, DRAFT_KEYWORD, Email, EmailAddress as JmapEmailAddress, EmailBodyPart,
     EmailBodyValue, EmailGet, EmailId, EmailPatch, EmailSet, Property as EmailProperty,
@@ -53,10 +54,9 @@ use crate::mailbox::{
 };
 use crate::quota::{Property as QuotaProperty, QuotaGet};
 use crate::thread::{ThreadGet, ThreadId as JmapThreadId};
-use crate::transport_reqwest::ReqwestTransport;
 use crate::vacation_response::{VacationResponseGet, VacationResponseId, VacationResponseSet};
 
-type MailAccount = crate::account::Account<ReqwestTransport>;
+type MailAccount<T> = crate::account::Account<T>;
 
 const SEEN_KEYWORD: &str = "$seen";
 const IMPORTANT_KEYWORD: &str = "$important";
@@ -70,8 +70,8 @@ pub(crate) struct ForeignSubmission {
     pub(crate) self_address: Option<bifrost_types::Address>,
 }
 
-pub(crate) fn add_to_container(
-    mail: MailAccount,
+pub(crate) fn add_to_container<T: HttpTransport>(
+    mail: MailAccount<T>,
     email_states: StateMap,
     account_id: String,
     target: MutationTarget,
@@ -91,8 +91,8 @@ pub(crate) fn add_to_container(
     })
 }
 
-pub(crate) fn remove_from_container(
-    mail: MailAccount,
+pub(crate) fn remove_from_container<T: HttpTransport>(
+    mail: MailAccount<T>,
     email_states: StateMap,
     account_id: String,
     target: MutationTarget,
@@ -112,8 +112,8 @@ pub(crate) fn remove_from_container(
     })
 }
 
-pub(crate) fn set_keyword(
-    mail: MailAccount,
+pub(crate) fn set_keyword<T: HttpTransport>(
+    mail: MailAccount<T>,
     email_states: StateMap,
     account_id: String,
     target: MutationTarget,
@@ -147,8 +147,8 @@ pub(crate) fn set_keyword(
     })
 }
 
-pub(crate) fn set_is_read(
-    mail: MailAccount,
+pub(crate) fn set_is_read<T: HttpTransport>(
+    mail: MailAccount<T>,
     email_states: StateMap,
     account_id: String,
     target: MutationTarget,
@@ -167,8 +167,8 @@ pub(crate) fn set_is_read(
 /// Exclusive importance overwrite via the `$important` keyword. JMAP's
 /// model is two-valued: `High` sets `$important`, `Normal`/`Low` clear
 /// it. One `Email/set` keyword update, no expand-into-two.
-pub(crate) fn set_importance(
-    mail: MailAccount,
+pub(crate) fn set_importance<T: HttpTransport>(
+    mail: MailAccount<T>,
     email_states: StateMap,
     account_id: String,
     target: MutationTarget,
@@ -208,8 +208,8 @@ fn resolve_foreign_headers(
     }
 }
 
-pub(crate) fn send_message(
-    mail: MailAccount,
+pub(crate) fn send_message<T: HttpTransport>(
+    mail: MailAccount<T>,
     email_states: StateMap,
     account_id: String,
     max_delayed_send: usize,
@@ -373,8 +373,8 @@ pub(crate) fn send_message(
     })
 }
 
-pub(crate) fn send_raw_message(
-    mail: MailAccount,
+pub(crate) fn send_raw_message<T: HttpTransport>(
+    mail: MailAccount<T>,
     raw: Bytes,
     save_to_sent: Option<bool>,
 ) -> AccountFuture<Result<ObjectId, AccountError>> {
@@ -451,8 +451,8 @@ pub(crate) fn send_raw_message(
     })
 }
 
-pub(crate) fn attachment_upload(
-    mail: MailAccount,
+pub(crate) fn attachment_upload<T: HttpTransport>(
+    mail: MailAccount<T>,
     mut bytes: AccountStream<Result<Bytes, AccountError>>,
     mime: String,
 ) -> AccountFuture<Result<bifrost_types::AttachmentHandle, AccountError>> {
@@ -473,8 +473,8 @@ pub(crate) fn attachment_upload(
     })
 }
 
-pub(crate) fn draft_create(
-    mail: MailAccount,
+pub(crate) fn draft_create<T: HttpTransport>(
+    mail: MailAccount<T>,
     email_states: StateMap,
     account_id: String,
     patch: bifrost_types::DraftPatch,
@@ -515,8 +515,8 @@ pub(crate) fn draft_create(
     })
 }
 
-pub(crate) fn draft_update(
-    mail: MailAccount,
+pub(crate) fn draft_update<T: HttpTransport>(
+    mail: MailAccount<T>,
     email_states: StateMap,
     account_id: String,
     draft: bifrost_types::DraftHandle,
@@ -552,8 +552,8 @@ pub(crate) fn draft_update(
     })
 }
 
-pub(crate) fn draft_discard(
-    mail: MailAccount,
+pub(crate) fn draft_discard<T: HttpTransport>(
+    mail: MailAccount<T>,
     email_states: StateMap,
     account_id: String,
     draft: bifrost_types::DraftHandle,
@@ -570,8 +570,8 @@ pub(crate) fn draft_discard(
     })
 }
 
-pub(crate) fn draft_send(
-    mail: MailAccount,
+pub(crate) fn draft_send<T: HttpTransport>(
+    mail: MailAccount<T>,
     email_states: StateMap,
     account_id: String,
     draft: bifrost_types::DraftHandle,
@@ -614,8 +614,8 @@ pub(crate) fn draft_send(
     })
 }
 
-pub(crate) fn search(
-    mail: MailAccount,
+pub(crate) fn search<T: HttpTransport>(
+    mail: MailAccount<T>,
     request: SearchRequest,
 ) -> AccountFuture<Result<Page<ThreadId>, AccountError>> {
     Box::pin(async move {
@@ -653,8 +653,8 @@ pub(crate) fn search(
     })
 }
 
-pub(crate) fn search_messages(
-    mail: MailAccount,
+pub(crate) fn search_messages<T: HttpTransport>(
+    mail: MailAccount<T>,
     request: SearchRequest,
 ) -> AccountFuture<Result<Page<ObjectId>, AccountError>> {
     Box::pin(async move {
@@ -685,9 +685,9 @@ pub(crate) fn search_messages(
 /// wiring them into a warning-carrying containers surface is a call-site
 /// change rather than a rewrite. The load-bearing half of the degradation
 /// (the remaining containers still return) is live either way.
-pub(crate) fn containers_list(
-    mail: MailAccount,
-    foreign_mail: Arc<HashMap<String, MailAccount>>,
+pub(crate) fn containers_list<T: HttpTransport>(
+    mail: MailAccount<T>,
+    foreign_mail: Arc<HashMap<String, MailAccount<T>>>,
 ) -> AccountFuture<Result<Vec<Container>, AccountError>> {
     Box::pin(async move {
         let mut containers = fetch_containers(&mail, AccountOperation::ContainersList).await?;
@@ -709,8 +709,8 @@ pub(crate) fn containers_list(
     })
 }
 
-pub(crate) fn container_create(
-    mail: MailAccount,
+pub(crate) fn container_create<T: HttpTransport>(
+    mail: MailAccount<T>,
     mailbox_states: StateMap,
     account_id: String,
     kind: ContainerKind,
@@ -752,8 +752,8 @@ pub(crate) fn container_create(
     })
 }
 
-pub(crate) fn container_rename(
-    mail: MailAccount,
+pub(crate) fn container_rename<T: HttpTransport>(
+    mail: MailAccount<T>,
     mailbox_states: StateMap,
     account_id: String,
     container: ContainerId,
@@ -784,8 +784,8 @@ pub(crate) fn container_rename(
     })
 }
 
-pub(crate) fn container_move(
-    mail: MailAccount,
+pub(crate) fn container_move<T: HttpTransport>(
+    mail: MailAccount<T>,
     mailbox_states: StateMap,
     account_id: String,
     container: ContainerId,
@@ -815,8 +815,8 @@ pub(crate) fn container_move(
     })
 }
 
-pub(crate) fn container_delete(
-    mail: MailAccount,
+pub(crate) fn container_delete<T: HttpTransport>(
+    mail: MailAccount<T>,
     mailbox_states: StateMap,
     account_id: String,
     container: ContainerId,
@@ -846,8 +846,8 @@ pub(crate) fn container_delete(
     })
 }
 
-pub(crate) fn identities_list(
-    submission: Option<MailAccount>,
+pub(crate) fn identities_list<T: HttpTransport>(
+    submission: Option<MailAccount<T>>,
 ) -> AccountFuture<Result<Vec<bifrost_types::Identity>, AccountError>> {
     Box::pin(async move {
         let Some(account) = submission else {
@@ -900,8 +900,8 @@ struct ForeignIdentity {
 /// identity, so the first concrete address returned by the server is the
 /// documented best-effort convention. Wildcard identities cannot be used in
 /// an RFC 5322 From header.
-async fn foreign_sending_identity(
-    mail: &MailAccount,
+async fn foreign_sending_identity<T: HttpTransport>(
+    mail: &MailAccount<T>,
     requested: Option<&bifrost_types::IdentityId>,
 ) -> Result<ForeignIdentity, AccountError> {
     let get = IdentityGet::new().properties([
@@ -952,8 +952,8 @@ fn select_concrete_identity(
     ))
 }
 
-pub(crate) fn identity_update(
-    submission: Option<MailAccount>,
+pub(crate) fn identity_update<T: HttpTransport>(
+    submission: Option<MailAccount<T>>,
     identity: bifrost_types::IdentityId,
     patch: bifrost_types::IdentityPatch,
 ) -> AccountFuture<Result<(), AccountError>> {
@@ -1005,8 +1005,8 @@ pub(crate) fn identity_update(
     })
 }
 
-pub(crate) fn vacation_get(
-    vacation: Option<MailAccount>,
+pub(crate) fn vacation_get<T: HttpTransport>(
+    vacation: Option<MailAccount<T>>,
 ) -> AccountFuture<Result<Option<VacationConfig>, AccountError>> {
     Box::pin(async move {
         let Some(account) = vacation else {
@@ -1034,8 +1034,8 @@ pub(crate) fn vacation_get(
     })
 }
 
-pub(crate) fn vacation_set(
-    vacation: Option<MailAccount>,
+pub(crate) fn vacation_set<T: HttpTransport>(
+    vacation: Option<MailAccount<T>>,
     config: VacationConfig,
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
@@ -1084,8 +1084,8 @@ pub(crate) fn vacation_set(
     })
 }
 
-pub(crate) fn quota_get(
-    quota: Option<MailAccount>,
+pub(crate) fn quota_get<T: HttpTransport>(
+    quota: Option<MailAccount<T>>,
 ) -> AccountFuture<Result<Option<QuotaInfo>, AccountError>> {
     Box::pin(async move {
         let Some(account) = quota else {
@@ -1118,8 +1118,8 @@ pub(crate) fn quota_get(
     })
 }
 
-pub(crate) fn thread_hydrate(
-    mail: MailAccount,
+pub(crate) fn thread_hydrate<T: HttpTransport>(
+    mail: MailAccount<T>,
     thread: ThreadId,
 ) -> AccountFuture<Result<ThreadHydration, AccountError>> {
     Box::pin(async move {
@@ -1206,9 +1206,9 @@ fn qualify_foreign_message_ids(
     }
 }
 
-pub(crate) fn message_hydrate(
-    mail: MailAccount,
-    foreign_mail: Arc<HashMap<String, MailAccount>>,
+pub(crate) fn message_hydrate<T: HttpTransport>(
+    mail: MailAccount<T>,
+    foreign_mail: Arc<HashMap<String, MailAccount<T>>>,
     message: ObjectId,
     projection: HydrationProjection,
 ) -> AccountFuture<Result<Message, AccountError>> {
@@ -1280,8 +1280,8 @@ pub(crate) fn message_hydrate(
     })
 }
 
-pub(crate) fn move_thread(
-    mail: MailAccount,
+pub(crate) fn move_thread<T: HttpTransport>(
+    mail: MailAccount<T>,
     email_states: StateMap,
     account_id: String,
     thread: ThreadId,
@@ -1315,8 +1315,8 @@ pub(crate) fn move_thread(
     })
 }
 
-pub(crate) fn delete_thread(
-    mail: MailAccount,
+pub(crate) fn delete_thread<T: HttpTransport>(
+    mail: MailAccount<T>,
     email_states: StateMap,
     account_id: String,
     thread: ThreadId,
@@ -1377,8 +1377,8 @@ pub(crate) fn delete_thread(
     })
 }
 
-async fn patch_mailbox_membership(
-    mail: &MailAccount,
+async fn patch_mailbox_membership<T: HttpTransport>(
+    mail: &MailAccount<T>,
     email_states: &StateMap,
     account_id: &str,
     target: MutationTarget,
@@ -1404,8 +1404,8 @@ async fn patch_mailbox_membership(
     Ok(())
 }
 
-async fn resolve_target(
-    mail: &MailAccount,
+async fn resolve_target<T: HttpTransport>(
+    mail: &MailAccount<T>,
     target: MutationTarget,
     op: AccountOperation,
 ) -> Result<Vec<EmailId>, AccountError> {
@@ -1439,8 +1439,8 @@ async fn resolve_target(
     }
 }
 
-async fn destroy_emails(
-    mail: &MailAccount,
+async fn destroy_emails<T: HttpTransport>(
+    mail: &MailAccount<T>,
     email_states: &StateMap,
     account_id: &str,
     ids: impl IntoIterator<Item = EmailId> + Clone + Send + 'static,
@@ -1464,8 +1464,8 @@ async fn destroy_emails(
     Ok(())
 }
 
-async fn send_email_set_with_retry<F>(
-    mail: &MailAccount,
+async fn send_email_set_with_retry<T: HttpTransport, F>(
+    mail: &MailAccount<T>,
     email_states: &StateMap,
     account_id: &str,
     op: AccountOperation,
@@ -1502,8 +1502,8 @@ where
     Ok(response)
 }
 
-async fn current_or_probe_email_state(
-    mail: &MailAccount,
+async fn current_or_probe_email_state<T: HttpTransport>(
+    mail: &MailAccount<T>,
     email_states: &StateMap,
     account_id: &str,
     op: AccountOperation,
@@ -1521,8 +1521,8 @@ async fn current_or_probe_email_state(
     Ok(state)
 }
 
-async fn role_mailbox(
-    mail: &MailAccount,
+async fn role_mailbox<T: HttpTransport>(
+    mail: &MailAccount<T>,
     role: FolderRole,
     op: AccountOperation,
 ) -> Result<MailboxId, AccountError> {
@@ -1537,8 +1537,8 @@ async fn role_mailbox(
 /// caller decides which of them are required. Batching matters because
 /// the submission paths need Drafts and Sent together and
 /// `fetch_mailboxes` is an uncached round trip.
-async fn role_mailboxes(
-    mail: &MailAccount,
+async fn role_mailboxes<T: HttpTransport>(
+    mail: &MailAccount<T>,
     roles: &[FolderRole],
     op: AccountOperation,
 ) -> Result<HashMap<FolderRole, MailboxId>, AccountError> {
@@ -1563,8 +1563,8 @@ fn missing_role_mailbox(op: AccountOperation) -> AccountError {
     super::error::unsupported_error(op, None, "JMAP required mailbox role not found")
 }
 
-async fn fetch_containers(
-    mail: &MailAccount,
+async fn fetch_containers<T: HttpTransport>(
+    mail: &MailAccount<T>,
     op: AccountOperation,
 ) -> Result<Vec<Container>, AccountError> {
     Ok(fetch_mailboxes(mail, op)
@@ -1695,9 +1695,9 @@ fn owner_email_plans(
 /// Resolve owner emails for the foreign accounts, once per account.
 /// Returns only the resolved entries; every failure lands as an absent
 /// key (fail-soft, mandatory - see `containers_list`).
-async fn resolve_owner_emails(
-    mail: &MailAccount,
-    foreign_mail: &HashMap<String, MailAccount>,
+async fn resolve_owner_emails<T: HttpTransport>(
+    mail: &MailAccount<T>,
+    foreign_mail: &HashMap<String, MailAccount<T>>,
 ) -> HashMap<String, String> {
     let mut resolved = HashMap::new();
     if foreign_mail.is_empty() {
@@ -1781,8 +1781,8 @@ fn owner_email_from_lookup(
 ///
 /// Still fail-soft - no error escapes - but the failure is now
 /// classified rather than flattened.
-async fn fetch_principal_email(
-    mail: &MailAccount,
+async fn fetch_principal_email<T: HttpTransport>(
+    mail: &MailAccount<T>,
     principals_account_id: Option<&str>,
     principal_id: &str,
 ) -> PrincipalEmail {
@@ -1816,8 +1816,8 @@ async fn fetch_principal_email(
 /// failure degrades to a `Warning` plus the remaining containers - matching
 /// the shape the discovery path already uses for a revoked share. One
 /// unreachable share must not blank the whole sidebar.
-async fn fetch_foreign_containers(
-    foreign_mail: &HashMap<String, MailAccount>,
+async fn fetch_foreign_containers<T: HttpTransport>(
+    foreign_mail: &HashMap<String, MailAccount<T>>,
     owner_emails: &HashMap<String, String>,
     op: AccountOperation,
 ) -> (Vec<Container>, Vec<Warning>) {
@@ -1842,8 +1842,8 @@ async fn fetch_foreign_containers(
     (containers, warnings)
 }
 
-async fn fetch_mailboxes(
-    mail: &MailAccount,
+async fn fetch_mailboxes<T: HttpTransport>(
+    mail: &MailAccount<T>,
     op: AccountOperation,
 ) -> Result<Vec<Mailbox>, AccountError> {
     Ok(mail
@@ -1960,8 +1960,8 @@ fn map_role(role: Option<&Role>) -> Option<FolderRole> {
     }
 }
 
-async fn search_email_ids(
-    mail: &MailAccount,
+async fn search_email_ids<T: HttpTransport>(
+    mail: &MailAccount<T>,
     request: SearchRequest,
     collapse_threads: bool,
     op: AccountOperation,
@@ -2079,8 +2079,8 @@ fn search_filter_to_jmap(filter: SearchFilter) -> query::Filter<crate::email::qu
     }
 }
 
-async fn build_email_create_from_send(
-    mail: &MailAccount,
+async fn build_email_create_from_send<T: HttpTransport>(
+    mail: &MailAccount<T>,
     request: bifrost_types::SendRequest,
     mailbox: MailboxId,
 ) -> Result<crate::email::EmailCreate, AccountError> {
@@ -2121,8 +2121,8 @@ async fn build_email_create_from_send(
     Ok(create)
 }
 
-async fn build_email_create_from_draft(
-    mail: &MailAccount,
+async fn build_email_create_from_draft<T: HttpTransport>(
+    mail: &MailAccount<T>,
     patch: bifrost_types::DraftPatch,
     mailbox: MailboxId,
     op: AccountOperation,
@@ -2159,8 +2159,8 @@ async fn build_email_create_from_draft(
     Ok(create)
 }
 
-async fn apply_body_to_create(
-    mail: &MailAccount,
+async fn apply_body_to_create<T: HttpTransport>(
+    mail: &MailAccount<T>,
     create: &mut crate::email::EmailCreate,
     patch: bifrost_types::DraftPatch,
     op: AccountOperation,
@@ -2192,8 +2192,8 @@ async fn apply_body_to_create(
     Ok(())
 }
 
-async fn apply_draft_patch_to_email_patch(
-    mail: &MailAccount,
+async fn apply_draft_patch_to_email_patch<T: HttpTransport>(
+    mail: &MailAccount<T>,
     email_patch: &mut EmailPatch,
     patch: bifrost_types::DraftPatch,
     op: AccountOperation,
@@ -2313,8 +2313,8 @@ struct BuiltBody {
     attachments: Vec<EmailBodyPart>,
 }
 
-async fn build_body(
-    mail: &MailAccount,
+async fn build_body<T: HttpTransport>(
+    mail: &MailAccount<T>,
     text: Option<String>,
     html: Option<String>,
     inline: Vec<bifrost_types::AttachmentInline>,
@@ -2473,8 +2473,8 @@ fn scheduled_requires_envelope() -> AccountError {
 
 /// Cancel a scheduled JMAP submission by id: `EmailSubmission/set`
 /// update setting `undoStatus: canceled`.
-pub(crate) fn cancel_scheduled_send(
-    submission_account: MailAccount,
+pub(crate) fn cancel_scheduled_send<T: HttpTransport>(
+    submission_account: MailAccount<T>,
     handle: ObjectId,
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
@@ -2504,8 +2504,8 @@ pub(crate) fn cancel_scheduled_send(
 /// reschedule: cancel the existing submission and create a new one
 /// referencing the same `emailId` with the new `holduntil`. Returns the
 /// new submission id.
-pub(crate) fn reschedule_send(
-    submission_account: MailAccount,
+pub(crate) fn reschedule_send<T: HttpTransport>(
+    submission_account: MailAccount<T>,
     max_delayed_send: usize,
     handle: ObjectId,
     scheduled: SystemTime,

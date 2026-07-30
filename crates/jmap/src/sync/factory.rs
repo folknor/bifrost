@@ -14,15 +14,16 @@ use crate::client::{Client, Credentials};
 use crate::core::capability;
 use crate::core::capability::Capability;
 use crate::core::id::AccountId as JmapAccountId;
+use crate::core::transport::HttpTransport;
+use crate::email::{EmailGet, EmailId};
+use crate::mailbox::{MailboxGet, Property as MailboxProperty};
 use crate::principal::PrincipalGet;
 use crate::thread::ThreadId;
 use crate::transport_reqwest::ReqwestTransport;
 
 use super::account::JmapAccount;
 use super::capabilities;
-use super::discover;
 use super::foreign;
-use super::mutation;
 use super::push::{PushRouting, ReconnectPolicy, WsState};
 use super::state;
 
@@ -161,15 +162,8 @@ impl AccountFactory for JmapAccountFactory {
                 Some(caps) => caps.max_delayed_send(),
                 None => 0,
             };
-            let email_state = mutation::probe_email_state(&mail).await.map_err(|err| {
-                super::error::into_account_error(
-                    err,
-                    super::error::JmapErrorContext::new(bifrost_types::AccountOperation::Discover)
-                        .with_scope(bifrost_types::ErrorScope::Account),
-                )
-            })?;
-            let (mailbox_state, mailbox_names) =
-                discover::fetch_mailbox_names(&mail).await.map_err(|err| {
+            let (email_state, mailbox_state, mailbox_names, thread_state) =
+                seed_account_state(&mail).await.map_err(|err| {
                     super::error::into_account_error(
                         err,
                         super::error::JmapErrorContext::new(
@@ -178,13 +172,6 @@ impl AccountFactory for JmapAccountFactory {
                         .with_scope(bifrost_types::ErrorScope::Account),
                     )
                 })?;
-            let thread_state = probe_thread_state(&mail).await.map_err(|err| {
-                super::error::into_account_error(
-                    err,
-                    super::error::JmapErrorContext::new(bifrost_types::AccountOperation::Discover)
-                        .with_scope(bifrost_types::ErrorScope::Account),
-                )
-            })?;
 
             let mut seed_states = HashMap::new();
             seed_states.insert(
@@ -431,10 +418,11 @@ struct ForeignSeed {
 /// enumerate its mailboxes. Mirrors the three primary probes. A failure
 /// (permission-denied or transient) returns `Err` so the caller skips
 /// this account without aborting `open`.
-async fn seed_foreign_account(mail: &MailAccount) -> crate::Result<ForeignSeed> {
-    let email_state = mutation::probe_email_state(mail).await?;
-    let (mailbox_state, mailbox_names) = discover::fetch_mailbox_names(mail).await?;
-    let thread_state = probe_thread_state(mail).await?;
+async fn seed_foreign_account<T: HttpTransport>(
+    mail: &JmapMailAccount<T>,
+) -> crate::Result<ForeignSeed> {
+    let (email_state, mailbox_state, mailbox_names, thread_state) =
+        seed_account_state(mail).await?;
     let mailbox_ids: Vec<String> = mailbox_names.into_keys().collect();
     Ok(ForeignSeed {
         email_state_for_seed: email_state.clone(),
@@ -443,6 +431,97 @@ async fn seed_foreign_account(mail: &MailAccount) -> crate::Result<ForeignSeed> 
         thread_state,
         mailbox_ids,
     })
+}
+
+/// The open-time probe set: `Email/get`, `Mailbox/get`, `Thread/get`.
+const OPEN_PROBE_CALLS: usize = 3;
+
+type OpenProbeResponses = (
+    crate::core::get::GetResponse<crate::email::Email>,
+    crate::core::get::GetResponse<crate::mailbox::Mailbox>,
+    crate::core::get::GetResponse<crate::thread::Thread>,
+);
+
+/// Fresh copies of the three open-time probes, in wire order.
+fn open_probe_methods() -> (EmailGet, MailboxGet, crate::thread::ThreadGet) {
+    (
+        EmailGet::new().ids(Vec::<EmailId>::new()),
+        MailboxGet::new().properties([MailboxProperty::Id, MailboxProperty::Name]),
+        crate::thread::ThreadGet::new().ids(Vec::<ThreadId>::new()),
+    )
+}
+
+/// Issue the three open-time probes, batched into one request when the
+/// session says one request can hold them and serially when it does not.
+///
+/// `maxCallsInRequest` and `maxSizeRequest` are both hard limits
+/// (RFC 8620 §2): exceeding either makes the server reject the *entire*
+/// request with a request-level `limit` error, not just the surplus
+/// calls. The commonly quoted 16 is the minimum a server is recommended
+/// to support, never a floor a client may assume, so batching without
+/// checking would fail a primary account's open outright and silently
+/// drop every foreign account against a conservative server.
+async fn open_probes<T: HttpTransport>(
+    mail: &JmapMailAccount<T>,
+) -> crate::Result<OpenProbeResponses> {
+    if let Some(responses) = batched_open_probes(mail).await? {
+        return Ok(responses);
+    }
+    let (email, mailboxes, thread) = open_probe_methods();
+    Ok((
+        mail.call(email).await?,
+        mail.call(mailboxes).await?,
+        mail.call(thread).await?,
+    ))
+}
+
+/// The batched leg. Returns `Ok(None)` without sending anything when
+/// the advertised limits cannot hold all three calls in one request.
+async fn batched_open_probes<T: HttpTransport>(
+    mail: &JmapMailAccount<T>,
+) -> crate::Result<Option<OpenProbeResponses>> {
+    let session = mail.client().session();
+    // A session with no advertised core capability tells us nothing
+    // about its limits, and `capabilities::build` rejects it later in
+    // open anyway. Take the conservative shape rather than guessing.
+    let Some(core) = session.core_capabilities() else {
+        return Ok(None);
+    };
+    if core.max_calls_in_request() < OPEN_PROBE_CALLS {
+        return Ok(None);
+    }
+    // The size limit is checked against the actual encoding inside
+    // `send_methods_within`, because it can fall between the individual
+    // probes and their batch.
+    mail.build()
+        .send_methods_within(open_probe_methods(), core.max_size_request())
+        .await
+}
+
+/// Read the three states needed at open. Mailbox names ride the
+/// Mailbox/get already needed for its state, so both the primary and
+/// shared-account paths use exactly the same request shape.
+async fn seed_account_state<T: HttpTransport>(
+    mail: &JmapMailAccount<T>,
+) -> crate::Result<(String, String, HashMap<String, String>, String)> {
+    let (email, mailboxes, thread) = open_probes(mail).await?;
+
+    let email_state = email.into_state();
+    let mailbox_state = mailboxes.state().to_string();
+    let mut mailbox_names = HashMap::new();
+    for mut mailbox in mailboxes.into_list() {
+        let id = mailbox.take_id();
+        if !id.as_str().is_empty() {
+            mailbox_names.insert(id.into_string(), mailbox.name().unwrap_or("").to_string());
+        }
+    }
+
+    Ok((
+        email_state,
+        mailbox_state,
+        mailbox_names,
+        thread.into_state(),
+    ))
 }
 
 async fn connect(
@@ -493,18 +572,523 @@ impl JmapCredentials {
     }
 }
 
-async fn probe_thread_state(
-    mail: &crate::account::Account<crate::transport_reqwest::ReqwestTransport>,
-) -> crate::Result<String> {
-    Ok(mail
-        .call(crate::thread::ThreadGet::new().ids(Vec::<ThreadId>::new()))
-        .await?
-        .into_state())
-}
-
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
     use super::*;
+    use bytes::Bytes;
+    use serde_json::{Value, json};
+
+    use crate::core::session::Session;
+    use crate::core::transport::TransportError;
+
+    /// Scripted JMAP HTTP boundary with the same contract as
+    /// `ReqwestTransport`.
+    ///
+    /// Fidelity is the whole point: a fixture states a status and a body,
+    /// and the seam derives the error shape from the same decision table
+    /// `crates/net/src/request.rs` walks, so a test cannot pin behaviour
+    /// against a response shape the production stack is incapable of
+    /// producing. Once armed, the script is closed: an unplanned request
+    /// reports its ordinal instead of ever reaching a real HTTP transport.
+    struct ScriptedTransport {
+        requests: Mutex<Vec<Value>>,
+        replies: Mutex<VecDeque<ScriptedReply>>,
+    }
+
+    enum ScriptedReply {
+        /// A server response, classified on delivery.
+        Response {
+            status: reqwest::StatusCode,
+            body: Bytes,
+            headers: reqwest::header::HeaderMap,
+        },
+        /// A transport failure with no HTTP response behind it.
+        Error(TransportError),
+    }
+
+    impl ScriptedReply {
+        fn ok(body: impl Into<Bytes>) -> Self {
+            Self::status(reqwest::StatusCode::OK, body)
+        }
+
+        fn status(status: reqwest::StatusCode, body: impl Into<Bytes>) -> Self {
+            Self::Response {
+                status,
+                body: body.into(),
+                headers: reqwest::header::HeaderMap::new(),
+            }
+        }
+
+        fn header(mut self, name: &'static str, value: &str) -> Self {
+            if let Self::Response { headers, .. } = &mut self {
+                headers.insert(
+                    name,
+                    reqwest::header::HeaderValue::from_str(value).expect("test header value"),
+                );
+            }
+            self
+        }
+
+        /// Reproduce what the production stack hands the JMAP layer for
+        /// this response. Follows `crates/net/src/request.rs`:
+        ///
+        /// - 2xx: the body reaches the protocol decoder.
+        /// - 3xx: bifrost-net returns 304 / 305 / 306 and `Location`-less
+        ///   redirects as `Ok`, so `ReqwestTransport::handle_response`
+        ///   turns them into a bodied `TransportError` with no net
+        ///   evidence attached.
+        /// - 401: the forced refresh retries once, and the second 401 is
+        ///   `AuthLost` with acknowledged transmission evidence.
+        /// - Retryable per `RetryPolicy::default()` - 429 plus the whole
+        ///   5xx family, read off the policy rather than restated: the
+        ///   retry budget is spent and the loop surfaces `RateLimited`
+        ///   for 429 and `RetryBudgetExhausted` for the rest, each with
+        ///   the final response preserved.
+        /// - Any other 4xx: terminal `Error::Status`.
+        ///
+        /// So a `Status` fixture for a retryable code is not something a
+        /// test author can write by accident.
+        fn into_transport_result(self) -> Result<Bytes, TransportError> {
+            let (status, body, headers) = match self {
+                Self::Error(error) => return Err(error),
+                Self::Response {
+                    status,
+                    body,
+                    headers,
+                } => (status, body, headers),
+            };
+            if status.is_success() {
+                return Ok(body);
+            }
+            if status.is_redirection() {
+                return Err(TransportError::with_body(format!("HTTP {status}"), body));
+            }
+            let final_response = bifrost_net::FinalResponse {
+                status,
+                headers: headers.clone(),
+                body: body.clone(),
+            };
+            if status == reqwest::StatusCode::UNAUTHORIZED {
+                return Err(TransportError::from_net(bifrost_net::Error::AuthLost {
+                    transmission_state: Some(bifrost_types::TransmissionState::Acknowledged),
+                    final_response: Some(final_response),
+                }));
+            }
+            let policy = bifrost_net::RetryPolicy::default();
+            if policy.statuses.contains(&status) || status.is_server_error() {
+                let retry_after =
+                    bifrost_net::parse_retry_after(headers.get(reqwest::header::RETRY_AFTER))
+                        .map(|hint| hint.min(policy.honor_retry_after_cap));
+                if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                    return Err(TransportError::from_net(bifrost_net::Error::RateLimited {
+                        retry_after,
+                        final_response,
+                    }));
+                }
+                return Err(TransportError::from_net(
+                    bifrost_net::Error::RetryBudgetExhausted {
+                        final_response: Some(final_response),
+                        retry_after_history: retry_after.into_iter().collect(),
+                    },
+                ));
+            }
+            Err(TransportError::from_net(bifrost_net::Error::Status {
+                code: status,
+                body,
+                headers,
+            }))
+        }
+    }
+
+    impl ScriptedTransport {
+        fn new(replies: impl IntoIterator<Item = ScriptedReply>) -> Self {
+            Self {
+                requests: Mutex::new(Vec::new()),
+                replies: Mutex::new(replies.into_iter().collect()),
+            }
+        }
+
+        fn requests(&self) -> Vec<Value> {
+            self.requests.lock().expect("script requests lock").clone()
+        }
+
+        fn api_reply(&self, body: Vec<u8>) -> Result<Bytes, TransportError> {
+            let request = serde_json::from_slice(&body).map_err(|error| {
+                TransportError::with_source("JMAP client emitted a non-JSON API request", error)
+            })?;
+            let request_number = {
+                let mut requests = self
+                    .requests
+                    .lock()
+                    .map_err(|_| TransportError::new("script requests lock poisoned"))?;
+                requests.push(request);
+                requests.len()
+            };
+            let reply = self
+                .replies
+                .lock()
+                .map_err(|_| TransportError::new("script replies lock poisoned"))?
+                .pop_front()
+                .ok_or_else(|| {
+                    TransportError::new(format!(
+                        "scripted JMAP transport exhausted at API request #{request_number}"
+                    ))
+                })?;
+            reply.into_transport_result()
+        }
+    }
+
+    impl HttpTransport for ScriptedTransport {
+        async fn api_request(&self, _url: &str, body: Vec<u8>) -> Result<Bytes, TransportError> {
+            self.api_reply(body)
+        }
+
+        async fn upload(
+            &self,
+            _url: &str,
+            _body: Vec<u8>,
+            _content_type: Option<&str>,
+        ) -> Result<Bytes, TransportError> {
+            Err(TransportError::new(
+                "scripted JMAP transport has no upload reply",
+            ))
+        }
+
+        async fn download(&self, _url: &str) -> Result<Bytes, TransportError> {
+            Err(TransportError::new(
+                "scripted JMAP transport has no download reply",
+            ))
+        }
+
+        async fn get_session(&self, _url: &str) -> Result<Bytes, TransportError> {
+            Err(TransportError::new(
+                "scripted JMAP transport has no session reply",
+            ))
+        }
+    }
+
+    fn session() -> Session {
+        session_with_limits(8, 100_000)
+    }
+
+    fn session_with_limits(max_calls_in_request: usize, max_size_request: usize) -> Session {
+        serde_json::from_value(json!({
+            "capabilities": {
+                "urn:ietf:params:jmap:core": {
+                    "maxSizeUpload": 1000,
+                    "maxConcurrentUpload": 2,
+                    "maxSizeRequest": max_size_request,
+                    "maxConcurrentRequests": 4,
+                    "maxCallsInRequest": max_calls_in_request,
+                    "maxObjectsInGet": 256,
+                    "maxObjectsInSet": 256,
+                    "collationAlgorithms": []
+                },
+                "urn:ietf:params:jmap:mail": {}
+            },
+            "accounts": {
+                "primary": {"name": "Primary", "isPersonal": true, "isReadOnly": false, "accountCapabilities": {"urn:ietf:params:jmap:mail": {}}},
+                "shared": {"name": "Shared", "isPersonal": false, "isReadOnly": false, "accountCapabilities": {"urn:ietf:params:jmap:mail": {}}}
+            },
+            "primaryAccounts": {"urn:ietf:params:jmap:mail": "primary"},
+            "username": "user@example.test",
+            "apiUrl": "https://example.test/jmap/api",
+            "downloadUrl": "https://example.test/download/{accountId}/{blobId}/{name}/{type}",
+            "uploadUrl": "https://example.test/upload/{accountId}",
+            "eventSourceUrl": "https://example.test/eventsource",
+            "state": "session-1"
+        }))
+        .expect("test session parses")
+    }
+
+    fn email_result(account_id: &str, suffix: &str, call_id: &str) -> Value {
+        json!(["Email/get", {"accountId": account_id, "state": format!("email-{suffix}"), "list": [], "notFound": []}, call_id])
+    }
+
+    fn mailbox_result(account_id: &str, suffix: &str, call_id: &str) -> Value {
+        json!(["Mailbox/get", {"accountId": account_id, "state": format!("mailbox-{suffix}"), "list": [{"id": format!("inbox-{suffix}"), "name": "Inbox"}], "notFound": []}, call_id])
+    }
+
+    fn thread_result(account_id: &str, suffix: &str, call_id: &str) -> Value {
+        json!(["Thread/get", {"accountId": account_id, "state": format!("thread-{suffix}"), "list": [], "notFound": []}, call_id])
+    }
+
+    fn method_reply(results: Vec<Value>) -> ScriptedReply {
+        ScriptedReply::ok(
+            json!({"sessionState": "session-1", "methodResponses": results}).to_string(),
+        )
+    }
+
+    /// One reply answering all three batched open probes.
+    fn open_reply(account_id: &str, suffix: &str) -> ScriptedReply {
+        method_reply(vec![
+            email_result(account_id, suffix, "s0"),
+            mailbox_result(account_id, suffix, "s1"),
+            thread_result(account_id, suffix, "s2"),
+        ])
+    }
+
+    /// Three replies, one per probe, for the serial fallback. Each
+    /// single-call request numbers its one call `s0`.
+    fn serial_open_replies(account_id: &str, suffix: &str) -> [ScriptedReply; 3] {
+        [
+            method_reply(vec![email_result(account_id, suffix, "s0")]),
+            method_reply(vec![mailbox_result(account_id, suffix, "s0")]),
+            method_reply(vec![thread_result(account_id, suffix, "s0")]),
+        ]
+    }
+
+    fn scripted_client(
+        replies: impl IntoIterator<Item = ScriptedReply>,
+    ) -> Client<ScriptedTransport> {
+        scripted_client_with_session(session(), replies)
+    }
+
+    fn scripted_client_with_session(
+        session: Session,
+        replies: impl IntoIterator<Item = ScriptedReply>,
+    ) -> Client<ScriptedTransport> {
+        Client::with_transport(ScriptedTransport::new(replies), session)
+            .expect("scripted client builds")
+    }
+
+    fn assert_open_batch(request: &Value, account_id: &str) {
+        assert_eq!(request["methodCalls"].as_array().map(Vec::len), Some(3));
+        assert_eq!(request["methodCalls"][0][0], "Email/get");
+        assert_eq!(request["methodCalls"][1][0], "Mailbox/get");
+        assert_eq!(request["methodCalls"][2][0], "Thread/get");
+        for call in request["methodCalls"]
+            .as_array()
+            .expect("method calls array")
+        {
+            assert_eq!(call[1]["accountId"], account_id);
+        }
+    }
+
+    #[tokio::test]
+    async fn open_state_probes_are_one_recorded_request_per_account() {
+        let client = scripted_client([open_reply("primary", "p"), open_reply("shared", "s")]);
+        let primary = client
+            .primary_account::<capability::Mail>()
+            .expect("primary mail account");
+        let shared = JmapMailAccount::new(client.clone(), JmapAccountId::new("shared"));
+
+        let primary_seed = seed_account_state(&primary).await.expect("primary seed");
+        let shared_seed = seed_foreign_account(&shared).await.expect("shared seed");
+
+        assert_eq!(primary_seed.0, "email-p");
+        assert_eq!(shared_seed.email_state, "email-s");
+        let requests = client.transport().requests();
+        assert_eq!(requests.len(), 2);
+        assert_open_batch(&requests[0], "primary");
+        assert_open_batch(&requests[1], "shared");
+    }
+
+    #[tokio::test]
+    async fn armed_open_script_fails_at_the_unexpected_request() {
+        let client = scripted_client([open_reply("primary", "p")]);
+        let primary = client
+            .primary_account::<capability::Mail>()
+            .expect("primary mail account");
+
+        seed_account_state(&primary)
+            .await
+            .expect("first scripted request");
+        let error = seed_account_state(&primary)
+            .await
+            .expect_err("second unscripted request must fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("scripted JMAP transport exhausted at API request #2")
+        );
+        assert_eq!(client.transport().requests().len(), 2);
+    }
+
+    /// `maxCallsInRequest` is a hard limit. RFC 8620 §2 recommends
+    /// servers allow at least 16, but a client that treats the
+    /// recommendation as a floor hands a conservative server a batch it
+    /// rejects wholesale - which fails a primary open and silently drops
+    /// every foreign account.
+    #[tokio::test]
+    async fn a_session_that_forbids_three_calls_gets_one_request_per_probe() {
+        let client = scripted_client_with_session(
+            session_with_limits(2, 100_000),
+            serial_open_replies("primary", "p"),
+        );
+        let primary = client
+            .primary_account::<capability::Mail>()
+            .expect("primary mail account");
+
+        let seed = seed_account_state(&primary).await.expect("serial seed");
+
+        assert_eq!(seed.0, "email-p");
+        assert_eq!(seed.1, "mailbox-p");
+        assert_eq!(seed.3, "thread-p");
+        let requests = client.transport().requests();
+        assert_eq!(requests.len(), 3, "one request per probe");
+        for request in &requests {
+            assert_eq!(request["methodCalls"].as_array().map(Vec::len), Some(1));
+        }
+        assert_eq!(requests[0]["methodCalls"][0][0], "Email/get");
+        assert_eq!(requests[1]["methodCalls"][0][0], "Mailbox/get");
+        assert_eq!(requests[2]["methodCalls"][0][0], "Thread/get");
+    }
+
+    /// `maxSizeRequest` is the other hard limit, and it can fall between
+    /// the individual probes and their batch - so the call-count check
+    /// alone is not enough.
+    #[tokio::test]
+    async fn a_size_limit_between_one_probe_and_the_batch_gets_one_request_per_probe() {
+        // Big enough for any single probe, too small for all three.
+        let one_probe = {
+            let client = scripted_client([open_reply("primary", "p")]);
+            let primary = client
+                .primary_account::<capability::Mail>()
+                .expect("primary mail account");
+            let mut request = primary.build();
+            let (email, _, _) = open_probe_methods();
+            request.call(email).expect("probe encodes");
+            request.encoded_len().expect("probe encodes")
+        };
+        let client = scripted_client_with_session(
+            session_with_limits(16, one_probe),
+            serial_open_replies("primary", "p"),
+        );
+        let primary = client
+            .primary_account::<capability::Mail>()
+            .expect("primary mail account");
+
+        let seed = seed_account_state(&primary).await.expect("serial seed");
+
+        assert_eq!(seed.0, "email-p");
+        let requests = client.transport().requests();
+        assert_eq!(requests.len(), 3, "one request per probe");
+    }
+
+    /// A 429 never reaches a caller as `bifrost_net::Error::Status`:
+    /// bifrost-net retries it and surfaces `RateLimited` with the final
+    /// response preserved. The JMAP boundary has to lift the problem
+    /// document back out of that evidence, or the provider's own
+    /// explanation of the throttle is lost.
+    #[tokio::test]
+    async fn a_429_arrives_as_rate_limited_with_its_problem_document() {
+        let client = scripted_client([ScriptedReply::status(
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            Bytes::from_static(
+                br#"{"type":"urn:ietf:params:jmap:error:limit","limit":"concurrentRequests"}"#,
+            ),
+        )
+        .header("retry-after", "120")]);
+        let primary = client
+            .primary_account::<capability::Mail>()
+            .expect("primary mail account");
+
+        let error = seed_account_state(&primary)
+            .await
+            .expect_err("429 is a typed error, never a JMAP response");
+
+        let crate::Error::Problem {
+            transport: Some(transport),
+            ..
+        } = error
+        else {
+            panic!("a 429 carrying a problem document is a Problem error");
+        };
+        assert!(
+            matches!(
+                transport.net,
+                Some(bifrost_net::Error::RateLimited {
+                    retry_after: Some(_),
+                    ..
+                })
+            ),
+            "production never produces Error::Status for a 429"
+        );
+    }
+
+    /// A retryable 5xx is `RetryBudgetExhausted`, not `Status`, for the
+    /// same reason.
+    #[tokio::test]
+    async fn a_5xx_arrives_as_retry_budget_exhausted() {
+        let client = scripted_client([ScriptedReply::status(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            Bytes::from_static(br#"{"type":"about:blank","status":503}"#),
+        )]);
+        let primary = client
+            .primary_account::<capability::Mail>()
+            .expect("primary mail account");
+
+        let error = seed_account_state(&primary)
+            .await
+            .expect_err("503 is a typed error, never a JMAP response");
+
+        let crate::Error::Problem {
+            transport: Some(transport),
+            ..
+        } = error
+        else {
+            panic!("a 503 carrying a problem document is a Problem error");
+        };
+        assert!(
+            matches!(
+                transport.net,
+                Some(bifrost_net::Error::RetryBudgetExhausted { .. })
+            ),
+            "production never produces Error::Status for a 5xx"
+        );
+    }
+
+    /// A status the retry policy does not cover is the one shape that
+    /// really is `Error::Status`.
+    #[tokio::test]
+    async fn a_non_retryable_4xx_arrives_as_a_status_error() {
+        let client = scripted_client([ScriptedReply::status(
+            reqwest::StatusCode::BAD_REQUEST,
+            Bytes::from_static(br#"{"type":"urn:ietf:params:jmap:error:notRequest"}"#),
+        )]);
+        let primary = client
+            .primary_account::<capability::Mail>()
+            .expect("primary mail account");
+
+        let error = seed_account_state(&primary)
+            .await
+            .expect_err("400 is a typed error, never a JMAP response");
+
+        let crate::Error::Problem {
+            transport: Some(transport),
+            ..
+        } = error
+        else {
+            panic!("a 400 carrying a problem document is a Problem error");
+        };
+        assert!(matches!(
+            transport.net,
+            Some(bifrost_net::Error::Status {
+                code: reqwest::StatusCode::BAD_REQUEST,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn scripted_typed_error_reaches_the_sync_request_unchanged() {
+        let client = scripted_client([ScriptedReply::Error(TransportError::new(
+            "scripted connection reset",
+        ))]);
+        let primary = client
+            .primary_account::<capability::Mail>()
+            .expect("primary mail account");
+
+        let error = seed_account_state(&primary)
+            .await
+            .expect_err("scripted transport error");
+        assert!(matches!(error, crate::Error::Transport(_)));
+    }
 
     #[test]
     fn configured_email_uses_basic_email_username_only() {

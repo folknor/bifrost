@@ -14,14 +14,14 @@ use crate::contact_card::{
     ContactCardPatch, ContactCardQuery, ContactCardSet,
 };
 use crate::core::SetCreate;
-use crate::transport_reqwest::ReqwestTransport;
+use crate::core::transport::HttpTransport;
 
-type ContactAccount = JmapProtoAccount<ReqwestTransport>;
+type ContactAccount<T> = JmapProtoAccount<T>;
 
 const PAGE_LIMIT: usize = 100;
 
-pub(crate) fn address_books_list(
-    contacts: Option<ContactAccount>,
+pub(crate) fn address_books_list<T: HttpTransport>(
+    contacts: Option<ContactAccount<T>>,
 ) -> AccountFuture<Result<Vec<AddressBook>, AccountError>> {
     Box::pin(async move {
         let contacts = require_contacts(contacts, AccountOperation::AddressBooksList)?;
@@ -37,8 +37,8 @@ pub(crate) fn address_books_list(
     })
 }
 
-pub(crate) fn list(
-    contacts: Option<ContactAccount>,
+pub(crate) fn list<T: HttpTransport>(
+    contacts: Option<ContactAccount<T>>,
     address_book: Option<SharedAddressBookId>,
     page_cursor: Option<Vec<u8>>,
 ) -> AccountFuture<Result<Page<ContactCard>, AccountError>> {
@@ -83,8 +83,8 @@ pub(crate) fn list(
     })
 }
 
-pub(crate) fn get(
-    contacts: Option<ContactAccount>,
+pub(crate) fn get<T: HttpTransport>(
+    contacts: Option<ContactAccount<T>>,
     contact: ContactId,
 ) -> AccountFuture<Result<ContactCard, AccountError>> {
     Box::pin(async move {
@@ -103,8 +103,8 @@ pub(crate) fn get(
     })
 }
 
-pub(crate) fn create(
-    contacts: Option<ContactAccount>,
+pub(crate) fn create<T: HttpTransport>(
+    contacts: Option<ContactAccount<T>>,
     contact: ContactCreate,
 ) -> AccountFuture<Result<ContactId, AccountError>> {
     Box::pin(async move {
@@ -126,8 +126,8 @@ pub(crate) fn create(
     })
 }
 
-pub(crate) fn update(
-    contacts: Option<ContactAccount>,
+pub(crate) fn update<T: HttpTransport>(
+    contacts: Option<ContactAccount<T>>,
     contact: ContactId,
     patch: ContactPatch,
 ) -> AccountFuture<Result<(), AccountError>> {
@@ -166,8 +166,8 @@ pub(crate) fn update(
     })
 }
 
-pub(crate) fn delete(
-    contacts: Option<ContactAccount>,
+pub(crate) fn delete<T: HttpTransport>(
+    contacts: Option<ContactAccount<T>>,
     contact: ContactId,
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
@@ -184,8 +184,8 @@ pub(crate) fn delete(
     })
 }
 
-pub(crate) fn search(
-    contacts: Option<ContactAccount>,
+pub(crate) fn search<T: HttpTransport>(
+    contacts: Option<ContactAccount<T>>,
     request: ContactSearchRequest,
 ) -> AccountFuture<Result<Page<ContactCard>, AccountError>> {
     Box::pin(async move {
@@ -239,8 +239,8 @@ struct HydratedCards {
     failed_ids: Vec<String>,
 }
 
-async fn get_cards(
-    contacts: &ContactAccount,
+async fn get_cards<T: HttpTransport>(
+    contacts: &ContactAccount<T>,
     ids: Vec<ContactCardId>,
     operation: AccountOperation,
 ) -> Result<HydratedCards, AccountError> {
@@ -769,10 +769,10 @@ fn usize_to_u64(value: usize, operation: AccountOperation) -> Result<u64, Accoun
     })
 }
 
-fn require_contacts(
-    contacts: Option<ContactAccount>,
+fn require_contacts<T: HttpTransport>(
+    contacts: Option<ContactAccount<T>>,
     operation: AccountOperation,
-) -> Result<ContactAccount, AccountError> {
+) -> Result<ContactAccount<T>, AccountError> {
     contacts.ok_or_else(|| unsupported(operation, "JMAP contacts capability is unavailable"))
 }
 

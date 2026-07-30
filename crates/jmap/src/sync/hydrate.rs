@@ -8,13 +8,13 @@ use bifrost_types::{
 };
 use futures::StreamExt;
 
+use crate::core::transport::HttpTransport;
 use crate::email::{EmailGet, EmailId, Property};
-use crate::transport_reqwest::ReqwestTransport;
 
 use super::capabilities::CoreLimits;
 use super::inventory::{email_to_inventory, inventory_properties};
 
-type MailAccount = crate::account::Account<ReqwestTransport>;
+type MailAccount<T> = crate::account::Account<T>;
 
 /// Which JMAP account an incoming hydration id routes to.
 ///
@@ -48,9 +48,9 @@ where
     }
 }
 
-pub(crate) fn stream(
-    mail: MailAccount,
-    foreign_mail: Arc<HashMap<String, MailAccount>>,
+pub(crate) fn stream<T: HttpTransport>(
+    mail: MailAccount<T>,
+    foreign_mail: Arc<HashMap<String, MailAccount<T>>>,
     limits: CoreLimits,
     mut ids: AccountStream<ObjectId>,
     projection: Projection,
@@ -118,9 +118,9 @@ pub(crate) fn stream(
 /// foreign route whose handle vanished mid-stream falls back to the primary
 /// handle rather than dropping the ids silently (the primary `Email/get`
 /// then reports them as not found).
-async fn fetch_route(
-    mail: &MailAccount,
-    foreign_mail: &HashMap<String, MailAccount>,
+async fn fetch_route<T: HttpTransport>(
+    mail: &MailAccount<T>,
+    foreign_mail: &HashMap<String, MailAccount<T>>,
     route: &HydrationRoute,
     projection: Projection,
     batch: &mut Vec<ObjectId>,
@@ -137,8 +137,8 @@ async fn fetch_route(
 /// Outcome ids are the ids the CALLER submitted, verbatim - the foreign
 /// qualification already rides on them, so nothing is re-encoded from the
 /// native id the server echoed back.
-async fn fetch_batch(
-    mail: &MailAccount,
+async fn fetch_batch<T: HttpTransport>(
+    mail: &MailAccount<T>,
     projection: Projection,
     batch: &mut Vec<ObjectId>,
 ) -> crate::Result<Option<Batch<ItemOutcome<HydratedObject>>>> {
@@ -183,8 +183,7 @@ async fn fetch_batch(
 
 /// Reconcile one `Email/get` answer against the ids that were submitted.
 ///
-/// Pure, so the accounting is unit-pinnable without a live transport
-/// (the sync layer hardwires `ReqwestTransport`).
+/// Pure, so the accounting is unit-pinnable without a live transport.
 ///
 /// The closed per-item contract is "every submitted id leaves on exactly
 /// one lane", and neither half of the response can carry that alone:

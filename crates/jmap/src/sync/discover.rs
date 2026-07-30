@@ -10,13 +10,13 @@ use bifrost_types::{
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
+use crate::core::transport::HttpTransport;
 use crate::mailbox::{Mailbox, MailboxChanges, MailboxGet, MailboxId, Property};
-use crate::transport_reqwest::ReqwestTransport;
 
 use super::capabilities::CoreLimits;
 use super::state_cache::{self, StateMap};
 
-type MailAccount = crate::account::Account<ReqwestTransport>;
+type MailAccount<T> = crate::account::Account<T>;
 
 pub(crate) fn cursor_scopes(scopes: Vec<CursorScope>) -> AccountStream<SyncEvent<CursorScope>> {
     Box::pin(async_stream::stream! {
@@ -33,8 +33,8 @@ pub(crate) fn cursor_scopes(scopes: Vec<CursorScope>) -> AccountStream<SyncEvent
     })
 }
 
-pub(crate) fn memberships(
-    mail: MailAccount,
+pub(crate) fn memberships<T: HttpTransport>(
+    mail: MailAccount<T>,
     foreign_owners: Vec<MembershipScope>,
 ) -> AccountStream<SyncEvent<MembershipScope>> {
     Box::pin(async_stream::stream! {
@@ -86,8 +86,8 @@ pub(crate) fn memberships(
     })
 }
 
-pub(crate) async fn fetch_mailbox_names(
-    mail: &MailAccount,
+pub(crate) async fn fetch_mailbox_names<T: HttpTransport>(
+    mail: &MailAccount<T>,
 ) -> crate::Result<(String, HashMap<String, String>)> {
     let response = mail
         .call(MailboxGet::new().properties([Property::Id, Property::Name]))
@@ -122,8 +122,8 @@ async fn poll_pause(shutdown: &CancellationToken) {
 
 const POLL_INTERVAL: Duration = Duration::from_secs(300);
 
-pub(crate) fn scope_lifecycle(
-    mail: MailAccount,
+pub(crate) fn scope_lifecycle<T: HttpTransport>(
+    mail: MailAccount<T>,
     limits: CoreLimits,
     mailbox_states: StateMap,
     account_id: String,
@@ -266,8 +266,8 @@ pub(crate) fn scope_lifecycle(
     })
 }
 
-async fn fetch_mailboxes<'a>(
-    mail: &MailAccount,
+async fn fetch_mailboxes<'a, T: HttpTransport>(
+    mail: &MailAccount<T>,
     ids: impl Iterator<Item = &'a MailboxId>,
 ) -> crate::Result<Vec<Mailbox>> {
     let ids = ids.cloned().collect::<Vec<_>>();

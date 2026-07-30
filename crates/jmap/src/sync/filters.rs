@@ -8,13 +8,13 @@ use crate::blob::BlobRef;
 use crate::core::SetCreate;
 use crate::core::id::BlobId;
 use crate::core::set::SetError;
+use crate::core::transport::HttpTransport;
 use crate::sieve::validate::SieveScriptValidateRequest;
 use crate::sieve::{
     Property as SieveProperty, SieveScriptGet, SieveScriptId, SieveScriptQuery, SieveScriptSet,
 };
-use crate::transport_reqwest::ReqwestTransport;
 
-type SieveAccount = crate::account::Account<ReqwestTransport>;
+type SieveAccount<T> = crate::account::Account<T>;
 
 const SIEVE_MIME: &str = "application/sieve";
 const SIEVE_DOWNLOAD_NAME: &str = "filter.sieve";
@@ -28,15 +28,15 @@ fn unsupported(op: AccountOperation, detail: &'static str) -> AccountError {
     super::error::unsupported_error(op, None, detail)
 }
 
-fn require_sieve(
-    account: Option<SieveAccount>,
+fn require_sieve<T: HttpTransport>(
+    account: Option<SieveAccount<T>>,
     op: AccountOperation,
-) -> Result<SieveAccount, AccountError> {
+) -> Result<SieveAccount<T>, AccountError> {
     account.ok_or_else(|| unsupported(op, "JMAP Sieve capability not available"))
 }
 
-pub(crate) fn list(
-    sieve: Option<SieveAccount>,
+pub(crate) fn list<T: HttpTransport>(
+    sieve: Option<SieveAccount<T>>,
 ) -> AccountFuture<Result<Vec<ServerFilter>, AccountError>> {
     Box::pin(async move {
         let account = require_sieve(sieve, AccountOperation::FiltersList)?;
@@ -80,8 +80,8 @@ pub(crate) fn list(
     })
 }
 
-pub(crate) fn create(
-    sieve: Option<SieveAccount>,
+pub(crate) fn create<T: HttpTransport>(
+    sieve: Option<SieveAccount<T>>,
     filter: ServerFilterCreate,
 ) -> AccountFuture<Result<ServerFilterId, AccountError>> {
     Box::pin(async move {
@@ -125,8 +125,8 @@ pub(crate) fn create(
     })
 }
 
-pub(crate) fn update(
-    sieve: Option<SieveAccount>,
+pub(crate) fn update<T: HttpTransport>(
+    sieve: Option<SieveAccount<T>>,
     filter: ServerFilterId,
     patch: ServerFilterPatch,
 ) -> AccountFuture<Result<(), AccountError>> {
@@ -193,8 +193,8 @@ pub(crate) fn update(
     })
 }
 
-pub(crate) fn delete(
-    sieve: Option<SieveAccount>,
+pub(crate) fn delete<T: HttpTransport>(
+    sieve: Option<SieveAccount<T>>,
     filter: ServerFilterId,
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
@@ -210,8 +210,8 @@ pub(crate) fn delete(
     })
 }
 
-pub(crate) fn validate(
-    sieve: Option<SieveAccount>,
+pub(crate) fn validate<T: HttpTransport>(
+    sieve: Option<SieveAccount<T>>,
     filter: ServerFilterCreate,
 ) -> AccountFuture<Result<FilterValidation, AccountError>> {
     Box::pin(async move {
@@ -257,8 +257,8 @@ fn validation_from_error(error: Option<SetError<String>>) -> FilterValidation {
     }
 }
 
-async fn upload_script_body(
-    account: &SieveAccount,
+async fn upload_script_body<T: HttpTransport>(
+    account: &SieveAccount<T>,
     body: String,
     op: AccountOperation,
 ) -> Result<BlobId, AccountError> {
@@ -269,8 +269,8 @@ async fn upload_script_body(
     Ok(blob.blob_id)
 }
 
-async fn download_script_body(
-    account: &SieveAccount,
+async fn download_script_body<T: HttpTransport>(
+    account: &SieveAccount<T>,
     blob_id: &BlobId,
     op: AccountOperation,
 ) -> Result<String, AccountError> {

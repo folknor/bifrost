@@ -87,11 +87,37 @@ impl TransportError {
             },
             other => Self {
                 message,
-                body: None,
+                body: preserved_response_body(&other),
                 net: Some(other),
                 source: None,
             },
         }
+    }
+}
+
+/// The response body a non-`Status` net error still carries.
+///
+/// `Error::Status` is the only variant bifrost-net produces for a
+/// *terminal* HTTP status, and a 429 or 5xx never takes that path: the
+/// retry loop consumes those and surfaces `RateLimited` /
+/// `RetryBudgetExhausted` with the final attempt's response preserved
+/// on the error instead. Those are exactly the statuses a JMAP server
+/// answers with an RFC 7807 problem document (RFC 8620 s3.6.1), so the
+/// body has to be lifted back out of the evidence or the JMAP boundary
+/// never sees the provider's own explanation of the failure.
+///
+/// `AuthLost` is deliberately not lifted. Its 401 classification and
+/// its `transmission_state` evidence are bifrost-net's to interpret,
+/// and routing it through the problem-details branch would replace a
+/// typed auth failure with a status-derived guess.
+fn preserved_response_body(error: &bifrost_net::Error) -> Option<Bytes> {
+    match error {
+        bifrost_net::Error::RateLimited { final_response, .. } => Some(final_response.body.clone()),
+        bifrost_net::Error::RetryBudgetExhausted {
+            final_response: Some(final_response),
+            ..
+        } => Some(final_response.body.clone()),
+        _ => None,
     }
 }
 

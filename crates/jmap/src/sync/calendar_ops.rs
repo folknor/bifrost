@@ -19,14 +19,14 @@ use crate::calendar_event::{
 };
 use crate::core::SetCreate;
 use crate::core::query::Filter as QueryFilter;
-use crate::transport_reqwest::ReqwestTransport;
+use crate::core::transport::HttpTransport;
 
-type CalendarAccount = JmapProtoAccount<ReqwestTransport>;
+type CalendarAccount<T> = JmapProtoAccount<T>;
 
 const PAGE_LIMIT: usize = 250;
 
-pub(crate) fn calendars_list(
-    calendars: Option<CalendarAccount>,
+pub(crate) fn calendars_list<T: HttpTransport>(
+    calendars: Option<CalendarAccount<T>>,
 ) -> AccountFuture<Result<Vec<Calendar>, AccountError>> {
     Box::pin(async move {
         let calendars = require_calendars(calendars, AccountOperation::CalendarsList)?;
@@ -42,8 +42,8 @@ pub(crate) fn calendars_list(
     })
 }
 
-pub(crate) fn events_in_range(
-    calendars: Option<CalendarAccount>,
+pub(crate) fn events_in_range<T: HttpTransport>(
+    calendars: Option<CalendarAccount<T>>,
     range: EventRange,
 ) -> AccountFuture<Result<Page<CalendarEvent>, AccountError>> {
     Box::pin(async move {
@@ -91,8 +91,8 @@ fn range_filter(range: &EventRange) -> QueryFilter<EventFilter> {
     ])
 }
 
-pub(crate) fn get(
-    calendars: Option<CalendarAccount>,
+pub(crate) fn get<T: HttpTransport>(
+    calendars: Option<CalendarAccount<T>>,
     event: EventId,
 ) -> AccountFuture<Result<CalendarEvent, AccountError>> {
     Box::pin(async move {
@@ -112,8 +112,8 @@ pub(crate) fn get(
     })
 }
 
-pub(crate) fn create(
-    calendars: Option<CalendarAccount>,
+pub(crate) fn create<T: HttpTransport>(
+    calendars: Option<CalendarAccount<T>>,
     event: EventCreate,
 ) -> AccountFuture<Result<EventId, AccountError>> {
     Box::pin(async move {
@@ -136,8 +136,8 @@ pub(crate) fn create(
     })
 }
 
-pub(crate) fn update(
-    calendars: Option<CalendarAccount>,
+pub(crate) fn update<T: HttpTransport>(
+    calendars: Option<CalendarAccount<T>>,
     event: EventId,
     patch: EventPatch,
 ) -> AccountFuture<Result<(), AccountError>> {
@@ -161,8 +161,8 @@ pub(crate) fn update(
     })
 }
 
-pub(crate) fn delete(
-    calendars: Option<CalendarAccount>,
+pub(crate) fn delete<T: HttpTransport>(
+    calendars: Option<CalendarAccount<T>>,
     event: EventId,
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
@@ -179,8 +179,8 @@ pub(crate) fn delete(
     })
 }
 
-pub(crate) fn rsvp(
-    calendars: Option<CalendarAccount>,
+pub(crate) fn rsvp<T: HttpTransport>(
+    calendars: Option<CalendarAccount<T>>,
     self_emails: Vec<String>,
     event: EventId,
     status: RsvpStatus,
@@ -204,8 +204,8 @@ pub(crate) fn rsvp(
     })
 }
 
-pub(crate) fn search(
-    calendars: Option<CalendarAccount>,
+pub(crate) fn search<T: HttpTransport>(
+    calendars: Option<CalendarAccount<T>>,
     request: EventSearchRequest,
 ) -> AccountFuture<Result<Page<CalendarEvent>, AccountError>> {
     Box::pin(async move {
@@ -249,8 +249,8 @@ pub(crate) fn search(
     })
 }
 
-async fn get_events(
-    calendars: &CalendarAccount,
+async fn get_events<T: HttpTransport>(
+    calendars: &CalendarAccount<T>,
     ids: Vec<CalendarEventId>,
     operation: AccountOperation,
 ) -> Result<Vec<CalendarEvent>, AccountError> {
@@ -268,8 +268,8 @@ async fn get_events(
         .collect())
 }
 
-async fn get_raw_event(
-    calendars: &CalendarAccount,
+async fn get_raw_event<T: HttpTransport>(
+    calendars: &CalendarAccount<T>,
     id: CalendarEventId,
     operation: AccountOperation,
 ) -> Result<JmapCalendarEvent, AccountError> {
@@ -1230,10 +1230,10 @@ fn cursor_error(operation: AccountOperation, message: String) -> AccountError {
     .expect("valid account error classification")
 }
 
-fn require_calendars(
-    calendars: Option<CalendarAccount>,
+fn require_calendars<T: HttpTransport>(
+    calendars: Option<CalendarAccount<T>>,
     operation: AccountOperation,
-) -> Result<CalendarAccount, AccountError> {
+) -> Result<CalendarAccount<T>, AccountError> {
     calendars.ok_or_else(|| unsupported(operation, "JMAP Calendars capability is unavailable"))
 }
 

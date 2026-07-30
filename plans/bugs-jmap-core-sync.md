@@ -155,67 +155,29 @@ with no warning anywhere, because `open` returns `Ok`. Classifying through
 `into_account_error` and retrying (or at least surfacing) the retry classes
 would separate them.
 
+### G9 - The SSE leg classifies a status shape `bifrost-net` cannot hand it
+
+`transport_reqwest.rs::open_sse` calls `request.send_streaming()` and then
+branches on `response.status().is_success()`, building a bare
+`TransportError::new(format!("SSE: HTTP {status}"))` for anything else. But
+`send_streaming` only returns `Ok` for 2xx and for passed-through 3xx
+(304/305/306, `Location`-less redirects); every 4xx/5xx has already become a
+typed `bifrost_net::Error` by then. So that branch fires only for a 3xx, and
+when it does it discards the body and the net evidence both - the resulting
+`TransportError` has `net: None`, which `convert_transport` can only classify
+as a generic `Transport(Network)`.
+
+This is the same defect class the API leg had (fixed in this round for
+`api_request` / `handle_response`): a branch written against a response shape
+the production stack never delivers. It is currently unreachable in practice -
+the `Account` impl drives WebSocket push, not EventSource, and
+`ReqwestByteStream` is `#[allow(dead_code)]` - so it is filed rather than
+fixed. Whoever wires EventSource must route the non-2xx leg through
+`TransportError::from_net` the way `send`/`handle_response` does, or the first
+real SSE failure arrives with no status, no body, and no recovery signal.
+
 ---
 
-## 3. Optimization opportunities
-
-### O1 - Account open does `3 + 4F` serial round trips where `1 + F` (or fewer) would do
-
-`factory.rs::open` (164-260), sequentially and each on its own request:
-
-- primary: `Email/get` (state probe), `Mailbox/get` (state + names),
-  `Thread/get` (state probe) - 3 round trips.
-- plus `fetch_self_emails` - 1.
-- per foreign account `seed_foreign_account` (424-440): `Email/get`,
-  `Mailbox/get`, `Thread/get`, `Mailbox/get` (enumeration) - 4 round trips,
-  serially, and the outer `for foreign_id in foreign_ids` loop is serial too.
-
-With 5 shared mailboxes that is 24 sequential HTTP round trips before the
-account is usable. On a 150ms RTT link, ~3.6 seconds of pure latency.
-
-`Request::send_methods` exists for exactly this (`core/request.rs:243-255`,
-tuples up to 8 methods) and is used nowhere in `sync/`. The three primary
-probes are one `send_methods((EmailGet, MailboxGet, ThreadGet))`. Each foreign
-account's four calls are one batch. The foreign accounts themselves could go
-in the same request up to `maxCallsInRequest` (validated at 82-87 and then
-discarded), or at minimum `futures::future::join_all` over the per-account
-batches. Realistic result: 24 round trips -> 2, or 1 on a server with a
-generous `maxCallsInRequest`.
-
-Note the two `Mailbox/get` calls per foreign account are literally the same
-call with different property sets; even without batching, merging them halves
-that leg. Same for the primary: `discover::fetch_mailbox_names` already
-returns the state, so the separate mailbox state probe is redundant there -
-and that merge is already done for the primary but not mirrored into
-`seed_foreign_account`.
-
-Nothing here changes behavior; it is pure round-trip elimination on the
-open path, which is the path a user waits on.
-
-### O2 - The sync layer hardwires `ReqwestTransport`, so none of it is testable in-process
-
-Nine files under `sync/` each declare
-`type MailAccount = crate::account::Account<ReqwestTransport>;`
-(account, blob, changes, discover, hydrate, inventory, mutation, pim, and
-factory's variant). `Client<T>` and `Account<Tr>` are both generic over
-`HttpTransport`, and `Client::with_transport` is `pub(crate)` - the seam
-exists and the sync layer opts out of it.
-
-Consequence for the remaining stream bug, B9: its async
-behavior cannot be pinned with an in-process transport stub without a
-mechanical genericization across the sync tree.
-
-Making the alias a generic parameter (`fn stream<Tr: HttpTransport>(mail:
-Account<Tr>, ...)`) is mechanical but touches every file in the tree, so it
-is a decision rather than a drive-by. It is the single highest-leverage change
-available for this crate's testability, and the `core/tests.rs` stub I landed
-is the working proof that the transport seam holds.
-
-Partially worked around in `push.rs` only: the reader now drives the client
-through a two-method `PushTransport` trait, which is what lets its shutdown
-and timeout behavior be pinned hermetically. That is a local seam for one
-file, not a substitute for genericizing the tree.
-
-## 4. Doc contradictions found
+## 3. Doc contradictions found
 
 1. `sync/capabilities.rs:194-196` - the comment claims JMAP foreign accounts are not open-time discovery. They are. See G1.

@@ -7,17 +7,17 @@ use bifrost_types::{
 };
 use futures::StreamExt;
 
+use crate::core::transport::HttpTransport;
 use crate::email::{EmailGet, EmailId, EmailPatch, EmailSet};
 use crate::mailbox::MailboxId;
-use crate::transport_reqwest::ReqwestTransport;
 
 use super::capabilities::CoreLimits;
 use super::state_cache::{self, StateMap};
 
-type MailAccount = crate::account::Account<ReqwestTransport>;
+type MailAccount<T> = crate::account::Account<T>;
 
-pub(crate) fn set_flags(
-    mail: MailAccount,
+pub(crate) fn set_flags<T: HttpTransport>(
+    mail: MailAccount<T>,
     limits: CoreLimits,
     email_states: StateMap,
     account_id: String,
@@ -90,8 +90,8 @@ fn skipped_flag_stream(
     })
 }
 
-pub(crate) fn move_to(
-    mail: MailAccount,
+pub(crate) fn move_to<T: HttpTransport>(
+    mail: MailAccount<T>,
     limits: CoreLimits,
     email_states: StateMap,
     account_id: String,
@@ -114,8 +114,8 @@ pub(crate) fn move_to(
     mutation_stream(mail, limits, email_states, account_id, targets, kind)
 }
 
-pub(crate) fn destroy(
-    mail: MailAccount,
+pub(crate) fn destroy<T: HttpTransport>(
+    mail: MailAccount<T>,
     limits: CoreLimits,
     email_states: StateMap,
     account_id: String,
@@ -146,8 +146,8 @@ fn operation_for_kind(kind: &MutationKind) -> AccountOperation {
     }
 }
 
-fn mutation_stream(
-    mail: MailAccount,
+fn mutation_stream<T: HttpTransport>(
+    mail: MailAccount<T>,
     limits: CoreLimits,
     email_states: StateMap,
     account_id: String,
@@ -192,8 +192,8 @@ fn mutation_stream(
     })
 }
 
-async fn apply_batch(
-    mail: &MailAccount,
+async fn apply_batch<T: HttpTransport>(
+    mail: &MailAccount<T>,
     email_states: &StateMap,
     account_id: &str,
     kind: &MutationKind,
@@ -349,8 +349,8 @@ fn state_mismatch_method_error() -> crate::core::error::MethodError {
         .expect("stateMismatch is a valid MethodError shape")
 }
 
-async fn send_set(
-    mail: &MailAccount,
+async fn send_set<T: HttpTransport>(
+    mail: &MailAccount<T>,
     state: &str,
     ids: &[ObjectId],
     kind: &MutationKind,
@@ -404,8 +404,8 @@ fn apply_flags(patch: &mut EmailPatch, op: &FlagOp) {
     }
 }
 
-async fn current_or_probe_state(
-    mail: &MailAccount,
+async fn current_or_probe_state<T: HttpTransport>(
+    mail: &MailAccount<T>,
     email_states: &StateMap,
     account_id: &str,
 ) -> crate::Result<String> {
@@ -421,7 +421,9 @@ async fn current_or_probe_state(
     Ok(state)
 }
 
-pub(crate) async fn probe_email_state(mail: &MailAccount) -> crate::Result<String> {
+pub(crate) async fn probe_email_state<T: HttpTransport>(
+    mail: &MailAccount<T>,
+) -> crate::Result<String> {
     Ok(mail
         .call(EmailGet::new().ids(Vec::<EmailId>::new()))
         .await?

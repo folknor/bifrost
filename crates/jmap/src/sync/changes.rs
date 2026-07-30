@@ -9,20 +9,20 @@ use bifrost_types::{
 
 use crate::core::changes::ChangesObject;
 use crate::core::query_changes::QueryChangesResponse;
+use crate::core::transport::HttpTransport;
 use crate::email::{Email, EmailChanges, EmailQueryChanges};
 use crate::mailbox::{Mailbox, MailboxChanges};
 use crate::thread::{Thread, ThreadChanges};
-use crate::transport_reqwest::ReqwestTransport;
 
 use super::capabilities::CoreLimits;
 use super::state::{self, JmapScopeRepr};
 use super::state_cache::{self, StateMap};
 
-type MailAccount = crate::account::Account<ReqwestTransport>;
+type MailAccount<T> = crate::account::Account<T>;
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn stream(
-    mail: MailAccount,
+pub(crate) fn stream<T: HttpTransport>(
+    mail: MailAccount<T>,
     account_id: String,
     limits: CoreLimits,
     cursor: ChangeCursor,
@@ -115,8 +115,8 @@ pub(crate) fn stream(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn email_changes(
-    mail: MailAccount,
+fn email_changes<T: HttpTransport>(
+    mail: MailAccount<T>,
     account_id: String,
     limits: CoreLimits,
     scope: CursorScope,
@@ -185,8 +185,8 @@ fn email_changes(
     })
 }
 
-fn mailbox_changes(
-    mail: MailAccount,
+fn mailbox_changes<T: HttpTransport>(
+    mail: MailAccount<T>,
     account_id: String,
     limits: CoreLimits,
     scope: CursorScope,
@@ -249,8 +249,8 @@ fn mailbox_changes(
     })
 }
 
-fn thread_changes(
-    mail: MailAccount,
+fn thread_changes<T: HttpTransport>(
+    mail: MailAccount<T>,
     account_id: String,
     limits: CoreLimits,
     scope: CursorScope,
@@ -309,8 +309,8 @@ fn thread_changes(
     })
 }
 
-fn query_changes(
-    mail: MailAccount,
+fn query_changes<T: HttpTransport>(
+    mail: MailAccount<T>,
     limits: CoreLimits,
     query_id: String,
     since_state: String,

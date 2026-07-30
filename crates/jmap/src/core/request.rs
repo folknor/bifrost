@@ -154,6 +154,20 @@ impl<'x, T: HttpTransport> Request<'x, T> {
         }
     }
 
+    /// Byte length of this request exactly as [`Request::send`] will
+    /// encode it.
+    ///
+    /// `maxSizeRequest` (RFC 8620 §2) is a hard limit the server
+    /// rejects the whole request over, so a call site deciding how much
+    /// to batch measures the real encoding rather than estimating from
+    /// the call count. Shares `serde_json::to_vec` with the send path so
+    /// the measurement and the wire bytes cannot drift apart.
+    pub(crate) fn encoded_len(&self) -> crate::Result<usize> {
+        serde_json::to_vec(self)
+            .map(|body| body.len())
+            .map_err(crate::Error::RequestEncode)
+    }
+
     /// Send the request and get the full response.
     pub(crate) async fn send(self) -> crate::Result<Response> {
         self.client.send_request(&self).await
@@ -174,16 +188,29 @@ impl<'x, T: HttpTransport> Request<'x, T> {
 
 // -- Typed batch results --
 //
-// `Request::send_methods((m1, m2, ...))` adds the methods to the
-// batch in order, sends the request, and returns a tuple of the
+// `Request::send_methods_within((m1, m2, ...), max_size)` adds the
+// methods to the batch in order, sends the request if it fits the
+// server's advertised `maxSizeRequest`, and returns a tuple of the
 // typed responses. For batches that do not need a result reference
 // between calls, this collapses the
 // `let h = request.call(m)?; ... let r = response.get(&h)?` dance
 // into a single expression:
 //
 // ```ignore
-// let (q, g) = account.build().send_methods((email_query, email_get)).await?;
+// let Some((q, g)) = account
+//     .build()
+//     .send_methods_within((email_query, email_get), max_size)
+//     .await?
+// else {
+//     // too large for one request; fall back to smaller ones
+// };
 // ```
+//
+// The size limit is a required argument rather than an optional guard
+// because `maxSizeRequest` is a hard limit (RFC 8620 §2) that the
+// server enforces by rejecting the whole request: a batching call site
+// that has not decided what to do when its batch does not fit has a
+// bug, not a default.
 //
 // Result-reference flows (where method N needs a `CallHandle` from
 // method N-1 to construct an `ids_ref`/`mailbox_ids_ref`/etc.) keep
@@ -244,13 +271,22 @@ impl<T: HttpTransport> Request<'_, T> {
     /// Send a tuple of methods in one batch and return their typed
     /// responses as a tuple. See the module-level note on result
     /// references.
-    pub(crate) async fn send_methods<M: MethodTuple>(
+    ///
+    /// Returns `Ok(None)`, having sent nothing, when the encoded batch
+    /// exceeds `max_size` - the caller then falls back to smaller
+    /// requests rather than handing the server a batch it will reject
+    /// wholesale with a request-level `limit` error.
+    pub(crate) async fn send_methods_within<M: MethodTuple>(
         mut self,
         methods: M,
-    ) -> crate::Result<M::Responses> {
+        max_size: usize,
+    ) -> crate::Result<Option<M::Responses>> {
         let extract = methods.add_to_request(&mut self)?;
+        if self.encoded_len()? > max_size {
+            return Ok(None);
+        }
         let response = self.send().await?;
-        extract(response)
+        extract(response).map(Some)
     }
 }
 

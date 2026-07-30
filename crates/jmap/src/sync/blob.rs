@@ -10,9 +10,10 @@ use bifrost_types::{
 use crate::blob::BlobRef;
 use crate::client::Client;
 use crate::core::id::{AccountId, BlobId};
+use crate::core::transport::HttpTransport;
 use crate::email::{EmailGet, EmailId, Property};
 
-type MailAccount = crate::account::Account<crate::transport_reqwest::ReqwestTransport>;
+type MailAccount<T> = crate::account::Account<T>;
 
 /// Resolve the JMAP `accountId` a foreign-qualified id belongs to.
 ///
@@ -32,10 +33,10 @@ where
     super::foreign::parse_object(id).filter(|(account, _)| is_registered(account))
 }
 
-pub(crate) fn open(
-    client: Client,
+pub(crate) fn open<T: HttpTransport>(
+    client: Client<T>,
     account_id: AccountId,
-    foreign_accounts: Arc<HashMap<String, MailAccount>>,
+    foreign_accounts: Arc<HashMap<String, MailAccount<T>>>,
     handle: BlobHandle,
 ) -> AccountStream<SyncEvent<bytes::Bytes>> {
     Box::pin(async_stream::stream! {
@@ -80,11 +81,11 @@ pub(crate) fn open(
 /// of that blob. The `hydrate.rs` raw-projection fatal is intentionally
 /// untouched: hydration's raw projection is A1's concern; this is the
 /// dedicated raw read.
-pub(crate) fn open_raw_rfc822(
-    client: Client,
+pub(crate) fn open_raw_rfc822<T: HttpTransport>(
+    client: Client<T>,
     account_id: AccountId,
-    mail: MailAccount,
-    foreign_accounts: Arc<HashMap<String, MailAccount>>,
+    mail: MailAccount<T>,
+    foreign_accounts: Arc<HashMap<String, MailAccount<T>>>,
     message: ObjectId,
 ) -> AccountStream<SyncEvent<bytes::Bytes>> {
     Box::pin(async_stream::stream! {

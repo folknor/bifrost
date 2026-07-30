@@ -7,16 +7,16 @@ use bifrost_types::{
 };
 
 use crate::core::query;
+use crate::core::transport::HttpTransport;
 use crate::email::{Email, EmailGet, EmailQuery, Property as EmailProperty};
 use crate::mailbox::{Mailbox, MailboxGet, Property as MailboxProperty};
-use crate::transport_reqwest::ReqwestTransport;
 
 use super::capabilities::CoreLimits;
 
-type MailAccount = crate::account::Account<ReqwestTransport>;
+type MailAccount<T> = crate::account::Account<T>;
 
-pub(crate) fn stream(
-    mail: MailAccount,
+pub(crate) fn stream<T: HttpTransport>(
+    mail: MailAccount<T>,
     limits: CoreLimits,
     scope: CursorScope,
     owner: Option<TypesMailboxId>,
@@ -63,8 +63,8 @@ pub(crate) fn stream(
     }
 }
 
-pub(crate) fn stream_partition(
-    mail: MailAccount,
+pub(crate) fn stream_partition<T: HttpTransport>(
+    mail: MailAccount<T>,
     limits: CoreLimits,
     scope: CursorScope,
     partition: InventoryPartition,
@@ -87,8 +87,8 @@ pub(crate) fn stream_partition(
     }
 }
 
-fn foreign_email_inventory(
-    mail: MailAccount,
+fn foreign_email_inventory<T: HttpTransport>(
+    mail: MailAccount<T>,
     limits: CoreLimits,
     scope: CursorScope,
     mailbox_id: String,
@@ -244,8 +244,8 @@ fn qualify_foreign_ids(entry: &mut InventoryEntry, owner: &TypesMailboxId) {
     }
 }
 
-fn email_inventory(
-    mail: MailAccount,
+fn email_inventory<T: HttpTransport>(
+    mail: MailAccount<T>,
     limits: CoreLimits,
 ) -> AccountStream<SyncEvent<InventoryEntry>> {
     Box::pin(async_stream::stream! {
@@ -356,8 +356,8 @@ fn email_inventory(
     })
 }
 
-fn email_inventory_page(
-    mail: MailAccount,
+fn email_inventory_page<T: HttpTransport>(
+    mail: MailAccount<T>,
     _limits: CoreLimits,
     from: u32,
     to: u32,
@@ -526,7 +526,9 @@ pub(crate) fn inventory_properties() -> Vec<EmailProperty> {
     ]
 }
 
-fn mailbox_inventory(mail: MailAccount) -> AccountStream<SyncEvent<InventoryEntry>> {
+fn mailbox_inventory<T: HttpTransport>(
+    mail: MailAccount<T>,
+) -> AccountStream<SyncEvent<InventoryEntry>> {
     Box::pin(async_stream::stream! {
         let started = Instant::now();
         let response = mail
