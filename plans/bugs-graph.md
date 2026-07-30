@@ -5,43 +5,30 @@ else. Resolved findings live in git history - the commit that fixed one is
 its record - and so do the per-pass repair logs; retaining either here means
 maintaining a second, drifting copy of `git log`.
 
-Open work, in full: O-25. The shared-contract subscription-lifecycle question
-that used to sit here as O-7 is tracked as `xc-2` in `TODO.md` instead, since
-it is a contract question rather than a Graph defect. This file is not
-finished while the list below has entries.
+There are no open CORRECTNESS findings. One efficiency gap is recorded
+below. The shared-contract subscription-lifecycle question that used to sit
+here as O-7 is tracked as `xc-2` in `TODO.md` instead, since it is a
+contract question rather than a Graph defect.
 
 ## Open findings
 
-**O-25 - thread-keyed operations are silently primary-mailbox only.** Every
-per-message door decodes the foreign-encoded `ObjectId` and routes via
-`client_for_owner`, so a shared-mailbox message reads and writes under
-`/users/{owner}`. The thread-keyed doors cannot: a `ThreadId` is Graph's bare
-`conversationId`, minted with no owner tag by `inventory_entry_from_value`
-and by search, and `message_values_for_thread` builds its filter query off
-`account.client.api_path_prefix()` unconditionally. So `thread_hydrate`,
-`move_thread`, `delete_thread`, and every `MutationTarget::Thread` fan-out
-resolve their members against `/me`, where a shared mailbox's conversation
-does not exist.
+### O-26 (efficiency): `delete_thread` re-resolves well-known folders per call
 
-The failure is silent in both directions, which is what makes it worth
-filing rather than accepting: zero matches is not an error, so hydration
-returns `ThreadHydration { messages: [] }` and a thread-targeted flag / move
-/ destroy submits an empty batch and reports success having touched nothing.
-Foreign scopes are minted for `ObjectType::Email` only, so this is exactly
-the shared-mail case, and a consumer cannot see it coming - the `thread_id`
-on a shared mailbox's `InventoryEntry` is indistinguishable from a primary
-one.
+`trash_container_id` runs `well_known_folder_roles`, which is six serial
+`GET /{prefix}/mailFolders/{name}?$select=id` requests, on every
+`delete_thread` - and, since the Trash must now be resolved in the thread's
+own mailbox, once per shared mailbox as well as for the primary. Only the
+`deletedItems` row is ever read on this path, and the mapping is stable for
+the lifetime of an account. `containers_list` pays the same cost for its own
+reason (it needs all six).
 
-Two honest closes. Either give `ThreadId` the same owner tag `ObjectId`
-carries (mint it encoded at both projection sites, decode it in
-`message_values_for_thread`, and route the filter query through
-`client_for_owner`), which makes thread operations work per-mailbox and
-keeps one wire form per logical thread; or leave the surface primary-only
-and say so on the wire - reject a thread whose members cannot be located
-rather than returning an empty success - plus in `reference/types.md`, since
-no consumer can infer it. The first is the real fix; the second is only
-acceptable if owner-tagging the thread id is judged too invasive for the id
-codec.
+Not a correctness defect and not a regression: the shape predates the
+owner-aware routing, which only made it per-mailbox. A cached
+`FolderRole -> id` map on `GraphAccount` (invalidated at reopen, which is
+already when the folder tree is re-seeded) would collapse it, and a
+`deletedItems`-only lookup would collapse it further for this call site.
+Left open rather than fixed here because it changes account-level caching
+state, which is outside a thread-routing round.
 
 ## Test coverage: the standing seam
 
@@ -65,7 +52,9 @@ subscribable-scope predicate, the REST-to-EWS translation rules
 `convertIdResult` wire shape, and the translation context's idempotency
 override run through `bifrost_net::Error` directly), the EWS notification
 routing rules (`dedupe_by_ews_folder` for the Subscribe body,
-`unique_scopes_for_folder` for the invalidation fan-out), the single-answer
+`unique_scopes_for_folder` for the invalidation fan-out), the
+owner-namespaced Trash comparison (`container_is_trash`, including the two
+ways a bare `deletedItems` must NOT satisfy a shared thread), the single-answer
 request guard (`per_answer_request_ids` plus a per-builder sweep and the
 `build_soap_envelope` debug assert), and the bounded LRU change-key cache.
 
@@ -77,7 +66,11 @@ The wire coverage pins webhook-create rollback, subscription DELETE
 iteration, tolerating a subscription row the server already dropped, the
 inventory absolute-nextLink walk and neither-link failure, mixed reaction
 batches that send their surviving Graph request, translation's 1,000-id POST
-fan-out, inventory tombstone ETag eviction, a write batch that drains past a
+fan-out, foreign thread hydration and mutation member resolution through the
+owner client, the COMPLETE `delete_thread` operation for a shared thread
+(member query, the well-known-folder lookups that resolve Trash, the etag
+preflight, and the `/$batch` subrequest URL plus its native `destinationId`),
+inventory tombstone ETag eviction, a write batch that drains past a
 failed subresponse to evict a later confirmed destroy, and the raw-MIME
 import's base64 `text/plain` body. The script is shared with every client
 derived from the one a test holds (`for_shared_mailbox`, `with_outlook_base`),
@@ -101,7 +94,22 @@ distinction matters, the test roots the shared client in its own
 an EMPTY script, so a fallback hits the exhaustion panic instead of passing
 quietly. Both foreign delta walks (inventory and changes-resume) are pinned
 that way, over a `nextLink` continuation, and both fail against a reverted
-routing change.
+routing change. So are the thread-keyed doors: the shared thread's hydration
+and member resolution run against an empty primary script, and
+`delete_thread` - whose account-wide `/$batch` POST legitimately goes to the
+primary client - arms the primary with EXACTLY that one response, so a Trash
+lookup that fell back to `/me` consumes it and the next primary request
+panics. Each was verified by reverting the production change and watching the
+test fail: the routing reverts panic at
+`Graph REST script exhausted by request: GET .../me/...`, and the container
+requalification revert fails on the id comparison itself.
+
+The cursor-envelope v2 bump is pinned at the `changes_stream` door, not just
+at `decode_cursor`: a v1 cursor whose payload still deserializes must
+terminate `SyncState(SchemaIncompatible)` AND derive
+`Engine(SchemaIncompatible)`, which is the directive that reseeds through
+inventory. Asserting only the error kind would have left the recovery path -
+the entire point of choosing that rejection - unpinned.
 
 The seam is pinned as an EQUIVALENCE, not just a convenience, because every
 test built on it inherits its correctness: a scripted status takes the shape
@@ -115,8 +123,6 @@ and `subscription_is_gone` never matched the shape a REST 404 actually
 arrives in.
 
 Still not reached, and still pinned only as pure functions or not at all:
-the thread-keyed fan-out's mailbox routing (reachable through the seam, but
-pinning today's behavior would pin O-25's bug, so it waits on that decision),
 blob byte streams (`download_stream`), the OneDrive resumable chunk PUT
 (pre-authed, no bearer, its own builder), the Autodiscover POST, the renewal
 worker's timing loop as a loop (`due_renewals` and `install_replacement` are

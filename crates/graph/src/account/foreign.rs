@@ -11,7 +11,7 @@
 //! carries an `accountId` where Graph carries a `/users/{id}` routing
 //! key, so a shared `bifrost-types` type would be a false generalization.
 
-use bifrost_types::{CursorScope, FolderId, MailboxId, MembershipScope, ObjectId};
+use bifrost_types::{CursorScope, FolderId, MailboxId, MembershipScope, ObjectId, ThreadId};
 
 /// Reserved separator. A `FolderId` of the form `"<mailbox>\u{1f}<folder>"`
 /// is a foreign-mailbox folder; a plain id is the primary mailbox.
@@ -172,12 +172,78 @@ pub(crate) fn encode_public_item_id(folder: &FolderId, item: &str) -> ObjectId {
 pub(crate) fn encode_message_id(scope: &CursorScope, native: &str) -> ObjectId {
     match scope {
         CursorScope::FolderType { folder, .. } | CursorScope::Folder(folder) => {
-            match parse_folder(folder).foreign() {
-                Some(foreign) => ObjectId(format!("{}{FOREIGN_SEP}{native}", foreign.mailbox)),
-                None => ObjectId(native.to_string()),
-            }
+            ObjectId(qualify_with_owner(folder_owner(folder).as_deref(), native))
         }
         _ => ObjectId(native.to_string()),
+    }
+}
+
+/// A parsed Graph conversation id. Like message ids, a thread from a shared
+/// mailbox must retain its owner: Graph conversation ids are only unique
+/// within a mailbox, and thread operations resolve their member messages.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ParsedThreadId {
+    Primary(String),
+    Foreign { mailbox: String, thread: String },
+}
+
+impl ParsedThreadId {
+    pub(crate) fn native_id(&self) -> &str {
+        match self {
+            Self::Primary(id) => id,
+            Self::Foreign { thread, .. } => thread,
+        }
+    }
+
+    pub(crate) fn owner(&self) -> Option<&str> {
+        match self {
+            Self::Primary(_) => None,
+            Self::Foreign { mailbox, .. } => Some(mailbox),
+        }
+    }
+}
+
+/// Qualify a native Graph id with an optional shared-mailbox owner.
+///
+/// Every id an owner-aware projection re-mints - message, conversation,
+/// parent folder - goes through this one function so the four id
+/// namespaces cannot drift apart on the separator. `None` yields the bare
+/// native id, which is the primary mailbox's only wire form.
+pub(crate) fn qualify_with_owner(owner: Option<&str>, native: &str) -> String {
+    match owner {
+        Some(mailbox) => format!("{mailbox}{FOREIGN_SEP}{native}"),
+        None => native.to_string(),
+    }
+}
+
+/// The shared-mailbox owner of a `FolderId`, or `None` for the primary
+/// mailbox. The folder-shaped twin of `ParsedMessageId::owner`.
+pub(crate) fn folder_owner(folder: &FolderId) -> Option<String> {
+    parse_folder(folder)
+        .foreign()
+        .map(|foreign| foreign.mailbox.clone())
+}
+
+/// Encode a Graph conversation id with the same mailbox qualification as its
+/// messages. Primary-mailbox thread ids deliberately remain bare.
+pub(crate) fn encode_thread_id(scope: &CursorScope, native: &str) -> ThreadId {
+    match scope {
+        CursorScope::FolderType { folder, .. } | CursorScope::Folder(folder) => {
+            ThreadId(qualify_with_owner(folder_owner(folder).as_deref(), native))
+        }
+        _ => ThreadId(native.to_string()),
+    }
+}
+
+/// Decode a thread id into the native Graph conversation id plus its optional
+/// shared-mailbox owner.
+pub(crate) fn parse_thread_id(id: &ThreadId) -> ParsedThreadId {
+    match id.0.split_once(FOREIGN_SEP) {
+        Some((mailbox, thread)) => ParsedThreadId::Foreign {
+            mailbox: mailbox.to_string(),
+            thread: thread.to_string(),
+        },
+        None => ParsedThreadId::Primary(id.0.clone()),
     }
 }
 
@@ -274,6 +340,33 @@ mod tests {
         assert_eq!(parsed, ParsedMessageId::Primary("AAMkmessage".to_string()));
         assert_eq!(parsed.native_id(), "AAMkmessage");
         assert_eq!(parsed.owner(), None);
+    }
+
+    #[test]
+    fn thread_id_encodes_foreign_scope_and_round_trips() {
+        let scope = CursorScope::FolderType {
+            folder: encode_foreign("shared@contoso.com", "AAMkfolder"),
+            ty: bifrost_types::ObjectType::Email,
+        };
+        let id = encode_thread_id(&scope, "conversation-1");
+        assert_eq!(
+            id.0,
+            format!("shared@contoso.com{FOREIGN_SEP}conversation-1")
+        );
+        let parsed = parse_thread_id(&id);
+        assert_eq!(parsed.native_id(), "conversation-1");
+        assert_eq!(parsed.owner(), Some("shared@contoso.com"));
+    }
+
+    #[test]
+    fn primary_thread_id_stays_bare() {
+        let scope = CursorScope::FolderType {
+            folder: FolderId("inbox".to_string()),
+            ty: bifrost_types::ObjectType::Email,
+        };
+        let id = encode_thread_id(&scope, "conversation-1");
+        assert_eq!(id.0, "conversation-1");
+        assert_eq!(parse_thread_id(&id).owner(), None);
     }
 
     #[test]

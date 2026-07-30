@@ -645,7 +645,7 @@ pub(crate) async fn containers_list(account: GraphAccount) -> Result<Vec<Contain
             .iter()
             .map(|folder| (folder.id.clone(), folder.parent_folder_id.clone())),
     );
-    let roles = well_known_folder_roles(&account).await;
+    let roles = well_known_folder_roles(&account.client).await;
     let mut containers: Vec<Container> = folders
         .into_iter()
         .map(|folder| container_from_folder(folder, &roles, None))
@@ -979,9 +979,16 @@ pub(crate) async fn thread_hydrate(
     thread: ThreadId,
 ) -> Result<ThreadHydration, AccountError> {
     let values = message_values_for_thread(&account, &thread, hydrate_select(true)).await?;
+    let owner = super::foreign::parse_thread_id(&thread)
+        .owner()
+        .map(str::to_string);
     let mut messages = Vec::new();
     for value in values {
-        messages.push(message_from_value(&value, HydrationProjection::Full)?);
+        messages.push(message_from_value(
+            &value,
+            HydrationProjection::Full,
+            owner.as_deref(),
+        )?);
     }
     messages.sort_by_key(|message| message.date);
     Ok(ThreadHydration {
@@ -1006,7 +1013,10 @@ pub(crate) async fn message_hydrate(
     }
     let value =
         fetch_message_value(&account, &message, hydrate_select(expand_blobs(projection))).await?;
-    message_from_value(&value, projection)
+    let owner = super::foreign::parse_message_id(&message)
+        .owner()
+        .map(str::to_string);
+    message_from_value(&value, projection, owner.as_deref())
 }
 
 /// The public folder a read of `id` must route through EWS `GetItem`, or
@@ -1147,26 +1157,61 @@ pub(crate) async fn move_thread(
     add_to_container(account, MutationTarget::Thread(thread), target).await
 }
 
+/// Delete a thread: move its members to Trash, or destroy them outright
+/// when they are already there.
+///
+/// The WHOLE operation is owner-scoped, not just the member lookup.
+/// `resolve_target_ids` returns owner-qualified message ids, and
+/// `move_messages` refuses a destination whose owner differs from the
+/// message's, so resolving Trash against the primary mailbox would have
+/// failed the move outright for a shared thread - and before that guard
+/// existed it named a folder id from a mailbox the messages do not live
+/// in. The `already_in_trash` short-circuit is compared in the same
+/// namespace for the same reason.
 pub(crate) async fn delete_thread(
     account: GraphAccount,
     thread: ThreadId,
     current: Option<ContainerId>,
 ) -> Result<(), AccountError> {
+    let owner = super::foreign::parse_thread_id(&thread)
+        .owner()
+        .map(str::to_string);
+    let scope = ErrorScope::Thread {
+        id: thread.0.clone(),
+    };
     let ids = resolve_target_ids(
         &account,
         MutationTarget::Thread(thread),
         AccountOperation::BulkMove,
     )
     .await?;
-    let trash = trash_container_id(&account).await;
+    let trash = trash_container_id(&account, owner.as_deref(), scope).await?;
     let already_in_trash = current
         .as_ref()
-        .is_some_and(|id| id.0 == trash.0 || id.0.eq_ignore_ascii_case(DELETED_ITEMS));
+        .is_some_and(|id| container_is_trash(id, &trash, owner.as_deref()));
     if already_in_trash {
         destroy_messages(&account, &ids, AccountOperation::BulkDestroy).await
     } else {
         move_messages(&account, &ids, &trash.0, AccountOperation::BulkMove).await
     }
+}
+
+/// Does `current` already name the Trash of the mailbox `owner` names?
+///
+/// Both sides are owner-qualified ids. The `deletedItems` well-known-NAME
+/// fallback is matched on the NATIVE half so a shared mailbox's
+/// `"{owner}\u{1f}deletedItems"` is recognized, while the primary's bare
+/// `"deletedItems"` is not accepted as a shared thread's Trash (destroying
+/// on that mistake is unrecoverable, where a redundant move is not).
+fn container_is_trash(current: &ContainerId, trash: &ContainerId, owner: Option<&str>) -> bool {
+    if current.0 == trash.0 {
+        return true;
+    }
+    let folder = bifrost_types::FolderId(current.0.clone());
+    super::foreign::folder_owner(&folder).as_deref() == owner
+        && super::foreign::parse_folder(&folder)
+            .native_id()
+            .eq_ignore_ascii_case(DELETED_ITEMS)
 }
 
 struct MessagePatch {
@@ -1184,9 +1229,12 @@ async fn resolve_target_ids(
         MutationTarget::Message(id) => Ok(vec![id]),
         MutationTarget::Thread(thread) => {
             let values = message_values_for_thread(account, &thread, "id").await?;
+            let owner = super::foreign::parse_thread_id(&thread)
+                .owner()
+                .map(str::to_string);
             values
                 .iter()
-                .map(|value| object_id_from_value(value, operation))
+                .map(|value| object_id_from_value(value, operation, owner.as_deref()))
                 .collect()
         }
         _ => Err(unsupported_account_error(operation)),
@@ -1196,8 +1244,8 @@ async fn resolve_target_ids(
 /// A resolved message for a write: the routing id (the caller-supplied,
 /// possibly foreign-encoded `ObjectId` that the conditioned write must
 /// route by) paired with its fetched value (carrying the etag/body). For
-/// a `Thread` target the routing id is the native id the server listed -
-/// thread queries run against `/me`, so those items are primary-mailbox.
+/// a `Thread` target the routing id is qualified with the thread's owner, so
+/// its subsequent `$batch` subrequest stays in that shared mailbox.
 struct ResolvedMessage {
     routing_id: ObjectId,
     value: Value,
@@ -1219,10 +1267,13 @@ async fn resolve_target_values(
         }
         MutationTarget::Thread(thread) => {
             let values = message_values_for_thread(account, &thread, select).await?;
+            let owner = super::foreign::parse_thread_id(&thread)
+                .owner()
+                .map(str::to_string);
             values
                 .into_iter()
                 .map(|value| {
-                    let routing_id = object_id_from_value(&value, operation)?;
+                    let routing_id = object_id_from_value(&value, operation, owner.as_deref())?;
                     Ok(ResolvedMessage { routing_id, value })
                 })
                 .collect()
@@ -1271,18 +1322,27 @@ async fn message_values_for_thread(
     thread: &ThreadId,
     select: &str,
 ) -> Result<Vec<Value>, AccountError> {
-    let filter = format!("conversationId eq {}", odata_quoted(&thread.0));
+    let parsed = super::foreign::parse_thread_id(thread);
+    let client = account.client_for_owner(parsed.owner()).map_err(|error| {
+        into_account_error(
+            error,
+            GraphErrorContext::graph(AccountOperation::Hydrate).with_scope(ErrorScope::Thread {
+                id: thread.0.clone(),
+            }),
+        )
+    })?;
+    let filter = format!("conversationId eq {}", odata_quoted(parsed.native_id()));
     let path = format!(
         "{}/messages?{}&$filter={}&$top=50",
-        account.client.api_path_prefix(),
+        client.api_path_prefix(),
         select_query(select),
         bifrost_net::url::encode_query_value(&filter)
     );
-    fetch_paged_values(account, path).await
+    fetch_paged_values(client, path).await
 }
 
 async fn fetch_paged_values(
-    account: &GraphAccount,
+    client: &GraphClient,
     first_url: String,
 ) -> Result<Vec<Value>, AccountError> {
     let ctx = GraphErrorContext::graph(AccountOperation::Hydrate);
@@ -1290,9 +1350,9 @@ async fn fetch_paged_values(
     let mut next_url = Some(first_url);
     while let Some(url) = next_url {
         let page: ODataCollection<Value> = if url.starts_with("http") {
-            account.client.get_absolute(&url).await
+            client.get_absolute(&url).await
         } else {
-            account.client.get_json(&url).await
+            client.get_json(&url).await
         }
         .map_err(|e| into_account_error(e, ctx.clone()))?;
         values.extend(page.value);
@@ -1619,11 +1679,12 @@ async fn cache_etag_for(account: &GraphAccount, id: &ObjectId, value: &Value) {
 fn object_id_from_value(
     value: &Value,
     operation: AccountOperation,
+    owner: Option<&str>,
 ) -> Result<ObjectId, AccountError> {
     value
         .get("id")
         .and_then(Value::as_str)
-        .map(|id| ObjectId(id.to_string()))
+        .map(|id| ObjectId(super::foreign::qualify_with_owner(owner, id)))
         .ok_or_else(|| pim_protocol_error(operation, None, "Graph message did not include an id"))
 }
 
@@ -1889,7 +1950,14 @@ async fn search_message_rows(
     .map_err(|e| into_account_error(e, ctx))?;
     let mut rows = Vec::new();
     for value in page.value {
-        let id = object_id_from_value(&value, AccountOperation::Search)?;
+        // Owner is `None` on purpose, not by omission: the URL above is
+        // built off `account.client` unconditionally, so every hit came
+        // from the PRIMARY mailbox and its message / conversation ids are
+        // primary ids. Qualifying them with an owner would name a mailbox
+        // the search never queried. Searching a shared mailbox is not
+        // supported at all (see `reference/graph.md`); when it is, the
+        // owner has to be threaded from the searched prefix to here.
+        let id = object_id_from_value(&value, AccountOperation::Search, None)?;
         let thread_id = value
             .get("conversationId")
             .and_then(Value::as_str)
@@ -2161,8 +2229,9 @@ fn expand_blobs(projection: HydrationProjection) -> bool {
 fn message_from_value(
     value: &Value,
     projection: HydrationProjection,
+    owner: Option<&str>,
 ) -> Result<Message, AccountError> {
-    let id = object_id_from_value(value, AccountOperation::HydrateMessage)?;
+    let id = object_id_from_value(value, AccountOperation::HydrateMessage, owner)?;
     let body = value.get("body");
     let (mut body_text, mut body_html) = match body {
         Some(body) => body_parts_from_graph_body(body),
@@ -2209,7 +2278,7 @@ fn message_from_value(
         thread_id: value
             .get("conversationId")
             .and_then(Value::as_str)
-            .map(|id| ThreadId(id.to_string())),
+            .map(|id| ThreadId(super::foreign::qualify_with_owner(owner, id))),
         from: value
             .get("from")
             .and_then(address_from_recipient)
@@ -2224,10 +2293,16 @@ fn message_from_value(
             .and_then(Value::as_str)
             .map(str::to_string),
         date: graph_message_date(value),
+        // `parentFolderId` arrives bare from Graph even when the request
+        // went to `/users/{owner}`, so it must be re-qualified here.
+        // `containers_list` emits a shared mailbox's folders as
+        // `encode_foreign(mailbox, folderId)`; a bare id could neither join
+        // that list nor be told apart from a primary folder carrying the
+        // same bytes.
         containers: value
             .get("parentFolderId")
             .and_then(Value::as_str)
-            .map(|id| vec![ContainerId(id.to_string())])
+            .map(|id| vec![ContainerId(super::foreign::qualify_with_owner(owner, id))])
             .unwrap_or_default(),
         flags: flags_from_message(value),
         importance: importance_from_graph(value),
@@ -2335,15 +2410,18 @@ fn internet_header(value: &Value, name: &str) -> Option<String> {
         })
 }
 
-async fn well_known_folder_roles(account: &GraphAccount) -> HashMap<String, FolderRole> {
+/// Resolve the well-known folder ids of ONE mailbox. Takes the client
+/// rather than the account: a shared mailbox's well-known folders are its
+/// own, so the caller picks the client the lookup must run on.
+async fn well_known_folder_roles(client: &GraphClient) -> HashMap<String, FolderRole> {
     let mut roles = HashMap::new();
     for (name, role) in WELL_KNOWN_FOLDERS {
         let path = format!(
             "{}/mailFolders/{}?$select=id",
-            account.client.api_path_prefix(),
+            client.api_path_prefix(),
             bifrost_net::url::encode_path_component(name)
         );
-        if let Ok(value) = account.client.get_json::<Value>(&path).await
+        if let Ok(value) = client.get_json::<Value>(&path).await
             && let Some(id) = value.get("id").and_then(Value::as_str)
         {
             roles.insert(id.to_string(), *role);
@@ -2428,12 +2506,33 @@ fn role_from_well_known_name(name: &str) -> Option<FolderRole> {
         .find_map(|(known, role)| name.eq_ignore_ascii_case(known).then_some(*role))
 }
 
-async fn trash_container_id(account: &GraphAccount) -> ContainerId {
-    let roles = well_known_folder_roles(account).await;
-    roles
+/// Resolve the Trash container of the mailbox `owner` names (the primary
+/// mailbox for `None`), returned OWNER-QUALIFIED so it is byte-identical to
+/// the id `containers_list` emits for the same folder and so
+/// `move_messages`'s same-mailbox destination guard accepts it.
+///
+/// The well-known lookup itself must run on the owner's client: shared and
+/// primary mailboxes do not share well-known folder ids, so the primary's
+/// `deletedItems` id names nothing in a shared mailbox.
+async fn trash_container_id(
+    account: &GraphAccount,
+    owner: Option<&str>,
+    scope: ErrorScope,
+) -> Result<ContainerId, AccountError> {
+    let client = account.client_for_owner(owner).map_err(|error| {
+        into_account_error(
+            error,
+            GraphErrorContext::graph(AccountOperation::BulkMove).with_scope(scope),
+        )
+    })?;
+    let native = well_known_folder_roles(client)
+        .await
         .into_iter()
-        .find_map(|(id, role)| (role == FolderRole::Trash).then_some(ContainerId(id)))
-        .unwrap_or_else(|| ContainerId(DELETED_ITEMS.to_string()))
+        .find_map(|(id, role)| (role == FolderRole::Trash).then_some(id))
+        .unwrap_or_else(|| DELETED_ITEMS.to_string());
+    Ok(ContainerId(super::foreign::qualify_with_owner(
+        owner, &native,
+    )))
 }
 
 #[derive(Debug, Deserialize)]
@@ -2515,6 +2614,8 @@ fn system_time_naive_utc(value: SystemTime) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use bytes::Bytes;
     use serde_json::json;
 
@@ -2913,6 +3014,207 @@ mod tests {
             ty: ObjectType::Email,
         };
         encode_message_id(&scope, native)
+    }
+
+    #[tokio::test]
+    async fn foreign_thread_members_are_queried_and_requalified_on_the_owner_client() {
+        let primary = GraphClient::new("token");
+        primary.script_rest(std::iter::empty::<ScriptedRestResponse>());
+        let shared_root = GraphClient::new("token");
+        shared_root.script_rest([
+            ScriptedRestResponse::json(
+                reqwest::StatusCode::OK,
+                json!({ "value": [{
+                    "id": "AAMkmsg",
+                    "conversationId": "conversation-1",
+                    "parentFolderId": "AAMkfolder",
+                }] }),
+            ),
+            ScriptedRestResponse::json(
+                reqwest::StatusCode::OK,
+                json!({ "value": [{ "id": "AAMkmsg" }] }),
+            ),
+        ]);
+        let mailbox = "shared@contoso.com";
+        let shared = shared_root.for_shared_mailbox(mailbox);
+        let account = GraphAccount::new_for_tests_with_shared_clients(
+            primary.clone(),
+            PushMode::GraphSubscriptions,
+            HashMap::from([(mailbox.to_string(), shared)]),
+        );
+        let thread = ThreadId(format!("{mailbox}\u{1f}conversation-1"));
+
+        let hydrated = thread_hydrate(account.clone(), thread.clone())
+            .await
+            .expect("shared thread hydrates");
+        assert_eq!(hydrated.messages.len(), 1);
+        assert_eq!(hydrated.messages[0].id.0, format!("{mailbox}\u{1f}AAMkmsg"));
+        assert_eq!(hydrated.messages[0].thread_id, Some(thread.clone()));
+        // `parentFolderId` comes back bare from `/users/{owner}`; it has to
+        // be re-qualified or it neither joins the `Shared`-namespace
+        // containers `containers_list` emits nor stays distinguishable from
+        // a primary folder that happens to share the id.
+        assert_eq!(
+            hydrated.messages[0].containers,
+            vec![ContainerId(format!("{mailbox}\u{1f}AAMkfolder"))]
+        );
+
+        let ids = resolve_target_ids(
+            &account,
+            MutationTarget::Thread(thread),
+            AccountOperation::SetKeyword,
+        )
+        .await
+        .expect("shared thread members resolve");
+
+        assert_eq!(ids, vec![ObjectId(format!("{mailbox}\u{1f}AAMkmsg"))]);
+        assert!(primary.take_rest_requests().is_empty());
+        let requests = shared_root.take_rest_requests();
+        assert_eq!(requests.len(), 2);
+        for request in requests {
+            assert!(
+                request
+                    .url
+                    .contains("/users/shared%40contoso.com/messages?")
+            );
+            assert!(
+                request
+                    .url
+                    .contains("conversationId%20eq%20%27conversation-1%27")
+            );
+        }
+    }
+
+    /// The complete `delete_thread` operation for a shared thread, not just
+    /// its id resolution.
+    ///
+    /// Every read leg - the conversation query, the well-known-folder
+    /// lookups that resolve Trash, and the etag preflight - must run on the
+    /// owner's client, and the Trash id must come back owner-qualified. The
+    /// primary is armed with EXACTLY the one response the operation
+    /// legitimately needs (the `/$batch` POST, which is account-wide and
+    /// carries its routing in the subrequest URLs), so any leg that fell
+    /// back to `/me` consumes that response and the next primary request
+    /// hits the seam's exhaustion panic.
+    ///
+    /// Resolving Trash on the primary is not a silent wrong-mailbox write
+    /// either way: `move_messages` refuses a destination whose owner
+    /// differs from the message's, so the bug surfaced as a bare primary
+    /// folder id being rejected against foreign-owned messages.
+    #[tokio::test]
+    async fn deleting_a_shared_thread_resolves_trash_in_the_owner_mailbox() {
+        let mailbox = "shared@contoso.com";
+        let primary = GraphClient::new("token");
+        primary.script_rest([ScriptedRestResponse::json(
+            reqwest::StatusCode::OK,
+            json!({ "responses": [{ "id": "0", "status": 200 }] }),
+        )]);
+        let shared_root = GraphClient::new("token");
+        shared_root.script_rest([
+            // 1. the conversation members
+            ScriptedRestResponse::json(
+                reqwest::StatusCode::OK,
+                json!({ "value": [{ "id": "AAMkmsg" }] }),
+            ),
+            // 2-7. the shared mailbox's own well-known folder ids, in
+            // `WELL_KNOWN_FOLDERS` order. Deliberately different bytes from
+            // any primary folder id: a shared mailbox's `deletedItems`
+            // resolves to its own id, so the primary's would name nothing.
+            ScriptedRestResponse::json(reqwest::StatusCode::OK, json!({ "id": "SharedInbox" })),
+            ScriptedRestResponse::json(reqwest::StatusCode::OK, json!({ "id": "SharedSent" })),
+            ScriptedRestResponse::json(reqwest::StatusCode::OK, json!({ "id": "SharedDrafts" })),
+            ScriptedRestResponse::json(reqwest::StatusCode::OK, json!({ "id": "SharedTrash" })),
+            ScriptedRestResponse::json(reqwest::StatusCode::OK, json!({ "id": "SharedJunk" })),
+            ScriptedRestResponse::json(reqwest::StatusCode::OK, json!({ "id": "SharedArchive" })),
+            // 8. the move's etag preflight
+            ScriptedRestResponse::json(
+                reqwest::StatusCode::OK,
+                json!({ "id": "AAMkmsg", "changeKey": "CK1" }),
+            ),
+        ]);
+        let account = GraphAccount::new_for_tests_with_shared_clients(
+            primary.clone(),
+            PushMode::GraphSubscriptions,
+            HashMap::from([(mailbox.to_string(), shared_root.for_shared_mailbox(mailbox))]),
+        );
+
+        delete_thread(
+            account,
+            ThreadId(format!("{mailbox}\u{1f}conversation-1")),
+            None,
+        )
+        .await
+        .expect("shared thread deletes");
+
+        let shared_requests = shared_root.take_rest_requests();
+        assert_eq!(shared_requests.len(), 8);
+        for request in &shared_requests {
+            assert!(
+                request.url.contains("/users/shared%40contoso.com/"),
+                "every read leg routes through the owner: {}",
+                request.url
+            );
+        }
+        assert!(
+            shared_requests[4]
+                .url
+                .ends_with("/users/shared%40contoso.com/mailFolders/deletedItems?$select=id"),
+            "Trash is resolved against the owner's own well-known folders: {}",
+            shared_requests[4].url
+        );
+
+        // The primary carried the `/$batch` envelope and nothing else. The
+        // destination is the SHARED mailbox's Trash, sent native (the
+        // `destinationId` body may never carry a `\u{1f}` id).
+        let primary_requests = primary.take_rest_requests();
+        assert_eq!(primary_requests.len(), 1);
+        assert!(primary_requests[0].url.ends_with("/$batch"));
+        let body = primary_requests[0].body.as_ref().expect("batch body");
+        let sub = &body["requests"][0];
+        assert_eq!(
+            sub["url"],
+            json!("/users/shared%40contoso.com/messages/AAMkmsg/move")
+        );
+        assert_eq!(sub["body"]["destinationId"], json!("SharedTrash"));
+    }
+
+    #[test]
+    fn container_is_trash_compares_in_the_thread_owners_namespace() {
+        let mailbox = "shared@contoso.com";
+        let shared_trash = ContainerId(format!("{mailbox}\u{1f}SharedTrash"));
+
+        assert!(container_is_trash(
+            &shared_trash,
+            &shared_trash,
+            Some(mailbox)
+        ));
+        // The well-known-NAME fallback still applies, but only qualified.
+        assert!(container_is_trash(
+            &ContainerId(format!("{mailbox}\u{1f}deletedItems")),
+            &shared_trash,
+            Some(mailbox)
+        ));
+        // A BARE `deletedItems` names the PRIMARY mailbox's Trash. Accepting
+        // it for a shared thread would take the destroy branch and delete
+        // messages that were never in their own Trash - unrecoverable, where
+        // a redundant move is not.
+        assert!(!container_is_trash(
+            &ContainerId(DELETED_ITEMS.to_string()),
+            &shared_trash,
+            Some(mailbox)
+        ));
+        // Another mailbox's Trash is not this thread's Trash either.
+        assert!(!container_is_trash(
+            &ContainerId("other@contoso.com\u{1f}deletedItems".to_string()),
+            &shared_trash,
+            Some(mailbox)
+        ));
+        // The primary keeps its bare form on both sides.
+        assert!(container_is_trash(
+            &ContainerId(DELETED_ITEMS.to_string()),
+            &ContainerId("PrimaryTrash".to_string()),
+            None
+        ));
     }
 
     /// A shared-mailbox client is derived inside `GraphAccount::new`, so a

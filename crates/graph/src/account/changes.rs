@@ -280,6 +280,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_v1_cursor_terminates_on_a_recovery_path_that_reseeds_through_inventory() {
+        // v1 is the encoding that minted BARE thread ids for shared
+        // mailboxes. Its payload still deserializes - the shape never
+        // changed - so nothing but the version rejects it, and resuming it
+        // would keep emitting thread ids that parse as primary and route
+        // thread hydration and thread-targeted writes at `/me`.
+        //
+        // The rejection must not be terminal: `SchemaIncompatible` derives
+        // `Engine(SchemaIncompatible)`, which is the directive that makes
+        // the engine drop every durable cursor and re-establish each scope
+        // through a full inventory pass (the pass that re-mints the ids).
+        let scope = CursorScope::FolderType {
+            folder: super::super::foreign::encode_foreign("shared@contoso.com", "AAMkfolder"),
+            ty: ObjectType::Email,
+        };
+        let payload = GraphCursorPayload::new(
+            kind_for_scope(&scope).expect("scope maps"),
+            "https://graph.example/delta".to_string(),
+            None,
+        );
+        let cursor = ChangeCursor {
+            scope,
+            server_state: OpaqueChangeState {
+                protocol: ProtocolKind::Graph,
+                envelope_version: 1,
+                bytes: serde_json::to_vec(&payload).expect("serialize"),
+            },
+            advanced_through: None,
+            envelope_version: CHANGE_CURSOR_ENVELOPE_VERSION,
+        };
+        let error = terminal_kind(cursor).await;
+        assert!(matches!(
+            error.kind(),
+            AccountErrorKind::SyncState(SyncStateErrorKind::SchemaIncompatible)
+        ));
+        assert!(matches!(
+            error.recovery(),
+            bifrost_types::RecoveryClass::Engine(
+                bifrost_types::EngineDirective::SchemaIncompatible
+            )
+        ));
+    }
+
+    #[tokio::test]
     async fn a_garbage_payload_terminates_as_a_contract_violation() {
         let cursor = ChangeCursor {
             scope: email_scope("inbox"),

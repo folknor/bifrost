@@ -3,7 +3,7 @@ use std::time::Duration;
 use bifrost_types::{
     AccountOperation, AccountStream, Batch, ChangeCursor, Checkpoint, CursorScope, ErrorScope,
     Fingerprint, FolderId, InventoryEntry, MembershipScope, ObjectId, ObjectType, PageBoundary,
-    ServerVersion, SyncEvent, ThreadId,
+    ServerVersion, SyncEvent,
 };
 use serde_json::Value;
 
@@ -191,7 +191,7 @@ pub(crate) fn inventory_entry_from_value(
     let thread_id = value
         .get("conversationId")
         .and_then(Value::as_str)
-        .map(|thread| ThreadId(thread.to_string()));
+        .map(|thread| super::foreign::encode_thread_id(scope, thread));
 
     Some(InventoryEntry {
         // Foreign-encode the id at mint so later hydration / blob /
@@ -887,6 +887,23 @@ mod tests {
         };
         let entry = inventory_entry_from_value(&primary_scope, &value).expect("entry");
         assert_eq!(entry.id.0, "AAMkmsg");
+    }
+
+    #[test]
+    fn inventory_entry_thread_id_encodes_foreign_scope() {
+        let scope = CursorScope::FolderType {
+            folder: super::super::foreign::encode_foreign("shared@contoso.com", "AAMkfolder"),
+            ty: ObjectType::Email,
+        };
+        let entry = inventory_entry_from_value(
+            &scope,
+            &json!({ "id": "AAMkmsg", "conversationId": "conversation-1" }),
+        )
+        .expect("entry");
+        assert_eq!(
+            entry.thread_id.expect("thread").0,
+            "shared@contoso.com\u{1f}conversation-1"
+        );
     }
 
     #[test]

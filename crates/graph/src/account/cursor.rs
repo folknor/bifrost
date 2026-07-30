@@ -60,7 +60,22 @@ pub(crate) fn routing_error(error: crate::error::GraphError) -> CursorError {
     }
 }
 
-pub(crate) const GRAPH_CURSOR_ENVELOPE_VERSION: u32 = 1;
+/// Graph's inner (protocol-owned) cursor envelope version.
+///
+/// v2: `ThreadId`s minted from a shared mailbox carry the owner tag
+/// (`"{mailbox}\u{1f}{conversationId}"`) the same way message ids already
+/// did. That is an OBJECT-ID encoding change, not a payload-shape change,
+/// so it is not expressible as an additive `serde(default)` field: a v1
+/// account resumes its delta link, never re-runs inventory, and keeps
+/// emitting bare thread ids that still parse - as PRIMARY - and therefore
+/// route thread hydration and thread-targeted writes at the wrong mailbox.
+/// Bumping forces `decode_cursor` to refuse a v1 cursor as
+/// `SchemaIncompatible`, which derives `Engine(SchemaIncompatible)`: the
+/// engine drops every durable cursor and re-establishes each scope through
+/// a full `inventory_stream` pass, which re-mints the ids under the new
+/// encoding. Reseeding is the cheapest correct migration here - the ids are
+/// server-issued and not reconstructable from the stored bytes.
+pub(crate) const GRAPH_CURSOR_ENVELOPE_VERSION: u32 = 2;
 pub(crate) const CHANGE_CURSOR_ENVELOPE_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

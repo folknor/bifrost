@@ -18,6 +18,12 @@ deltas per `contactFolders/{id}`. Cursors are scoped to
 and `inventory_stream` / `changes_stream` walk the `@odata.nextLink` chain
 to the final page. Public folders (opt-in) instead poll a watermark cursor
 (no delta token). Mutations route through `POST /$batch` with `If-Match`.
+Message, conversation, and hydrated container ids from a shared mailbox carry
+its owner tag. A thread operation decodes that tag before querying its
+members, routes the query through `/users/{owner}`, keeps the returned
+message ids qualified for the later batch write, and resolves any folder it
+needs (`delete_thread`'s Trash) in that same mailbox. The tag on thread ids
+arrived with cursor envelope v2, which forces a reseed.
 
 ## Module layout
 
@@ -311,9 +317,19 @@ selecting against the same token.
 ## Cursor envelope
 
 `OpaqueChangeState` for Graph is tagged `ProtocolKind::Graph` with
-`envelope_version = GRAPH_CURSOR_ENVELOPE_VERSION` (currently `1`);
+`envelope_version = GRAPH_CURSOR_ENVELOPE_VERSION` (currently `2`);
 `CHANGE_CURSOR_ENVELOPE_VERSION` is the matching
-`ChangeCursor.envelope_version`. `GraphCursorPayload` carries a kind, final
+`ChangeCursor.envelope_version`. v2 is an OBJECT-ID encoding change, not a
+payload-shape change: v1 minted bare `ThreadId`s for shared mailboxes, and
+those still parse - as PRIMARY - so no additive `serde(default)` field can
+detect them. A v1 account would resume its delta link, never re-run
+inventory, and keep routing thread hydration and thread-targeted writes at
+`/me`. `decode_cursor` therefore refuses a v1 cursor as
+`SchemaIncompatible`, which derives `Engine(SchemaIncompatible)`: the engine
+drops every durable cursor and re-establishes each scope through a full
+`inventory_stream` pass, which re-mints the ids. The ids are server-issued
+and not reconstructable from the stored bytes, so reseeding is the migration.
+`GraphCursorPayload` carries a kind, final
 `@odata.deltaLink`, and optional mid-walk page marker
 (landing in `OpaqueChangeState::bytes`; page markers also in
 `ChangeCursor::advanced_through`).
@@ -329,8 +345,9 @@ cheap/`Poll`/fresh; invalid cursors reseed through inventory.
 
 ### Public-folder cursor (no delta token)
 
-`GraphCursorKind::PublicFolder(PublicFolderCursor)` is additive, no version
-bump (a v1 reader never wrote it). The payload IS the sync state:
+`GraphCursorKind::PublicFolder(PublicFolderCursor)` was additive and needed
+no version bump of its own (a reader of the previous version never wrote
+it). The payload IS the sync state:
 `folder_id`, `PublicFolderRouting` (the cold-resumable `X-AnchorMailbox` /
 `X-PublicFolderMailbox` pair), a `DateTimeReceived` `watermark`, the
 `last_full_scan_at` throttle clock, and a `live_ids` deletion baseline.
@@ -489,16 +506,37 @@ flag/move/destroy and the `pim.rs` writes), and the typed `message_hydrate`. A
 foreign id builds `/users/{owner}/messages/{native}`, a primary id
 `/me/messages/{id}`.
 
-The THREAD-keyed doors are the exception, and it is a gap rather than a
-design: a `ThreadId` is Graph's bare `conversationId`, minted with no owner
-tag, so `thread_hydrate` and every `MutationTarget::Thread` fan-out resolve
-their member ids through `/me/messages?$filter=conversationId eq ...` -
-`message_values_for_thread` reads `account.client.api_path_prefix()`
-unconditionally. A thread id a consumer took off a shared mailbox's
-`InventoryEntry` therefore resolves against the PRIMARY mailbox, where that
-conversation does not exist, and the empty result is not an error: hydration
-returns an empty thread and a thread-targeted write reports success having
-touched nothing. Tracked as O-25 in `plans/bugs-graph.md`. `bulk_move` also decodes the destination
+The THREAD-keyed doors carry the owner the same way. A `ThreadId` is
+`encode_thread_id(scope, conversationId)` - `{mailbox}\u{1f}{conversationId}`
+for a foreign scope, bare for the primary - minted at the same projection
+site as the message id, and `parse_thread_id` -> `ParsedThreadId::{Primary,
+Foreign}` decodes it. `message_values_for_thread` selects
+`client_for_owner(parsed.owner())` and filters on `parsed.native_id()`, so
+`thread_hydrate` and every `MutationTarget::Thread` fan-out
+(`resolve_target_ids` / `resolve_target_values`) query
+`/users/{owner}/messages?$filter=conversationId eq ...`, and the member ids
+they hand back are re-qualified with that owner so the following `$batch`
+subrequest stays in the same mailbox. `delete_thread` scopes the WHOLE
+operation, not just the lookup: Trash is resolved through the owner's own
+well-known folders (a shared mailbox's `deletedItems` id is not the
+primary's) and returned owner-qualified, and the already-in-Trash
+short-circuit compares in that namespace - a bare `deletedItems` is the
+PRIMARY mailbox's Trash and must not send a shared thread down the destroy
+branch. Conversation ids are unique per mailbox only, and Graph answers a
+filter for an absent conversation with an empty 200, so the untagged form
+was silent: hydration returned an empty thread and a thread-targeted write
+reported success having touched nothing.
+
+The owner also rides back out of the typed projection. `message_from_value`
+takes the owner decoded from the requested id and qualifies all three ids it
+mints - `Message.id`, `Message.thread_id`, and `Message.containers` (Graph
+returns `parentFolderId` bare even from `/users/{owner}`) - through the
+single `foreign::qualify_with_owner`. Without the container leg a shared
+hydrated message could not join the `Shared`-namespace containers
+`containers_list` emits (that path uses `encode_foreign`) and its parent id
+was indistinguishable from a primary folder's.
+
+`bulk_move` also decodes the destination
 `FolderId` (the `destinationId` body must be the native id) and rejects a
 cross-mailbox move - destination owner != source owner - as `Request(Malformed)`,
 since one endpoint can't express it. The etag cache stays keyed by the encoded
@@ -851,7 +889,10 @@ mailbox is `Request(Malformed)`.
 
 Search uses `/messages` (`$filter`/`$search`/`$top`, `@odata.nextLink` as
 the opaque page cursor); message search returns native ids, thread search
-dedups `conversationId` per page. Graph forbids `$search`+`$filter` together and
+dedups `conversationId` per page. It is PRIMARY-mailbox only - the URL is
+built off `account.client` unconditionally - which is why its message and
+thread ids are minted bare while every other projection qualifies them: a
+shared mailbox is never searched, so there is no owner to carry. Graph forbids `$search`+`$filter` together and
 rejects `$filter` `contains()` on sender/recipient (400), so any
 `SearchFilter::{From,To}` leaf (`filter_requires_search`) routes the whole
 filter onto `$search`/KQL (`kql_filter`), AND-combining any `provider_query`;
@@ -928,8 +969,11 @@ HTML body onto `body_text` / `body_html`, tags the containing folder as the
 only container, and carries `Importance::Normal` and no `thread_id` (EWS's
 message shape reports neither).
 
-`move_thread` calls Graph move directly. `delete_thread` resolves Trash via
-`deletedItems` (Trash source destroys, else moves to Trash).
+`move_thread` calls Graph move directly (the destination is the container id
+the consumer already holds, which is owner-qualified for a shared folder).
+`delete_thread` resolves Trash via `deletedItems` IN THE THREAD'S OWN MAILBOX
+(Trash source destroys, else moves to Trash); see the foreign-mailbox section
+for why both halves of that operation are owner-scoped.
 `apply_label`/`remove_label` inherit the trait default (Graph provenance ->
 `set_category`, `(Folder, non-Graph)` ->
 `add_to_container`/`remove_from_container`, else `Unsupported`).
@@ -1091,7 +1135,9 @@ terminal error, so the engine continues past a referenceAttachment in a batch.
 - `scope_lifecycle_stream` is empty; folder creates/renames/deletes are
   observed only at reopen. Shared-mailbox routing is otherwise complete:
   send-as (C-3), read paths and message mutations (flag/move/destroy,
-  drafts) all route to the owning mailbox via the encoded message id.
+  drafts) all route to the owning mailbox via the encoded message id, and
+  the thread-keyed doors (`thread_hydrate`, `move_thread`, `delete_thread`,
+  every `MutationTarget::Thread`) do the same via the encoded thread id.
 - Public folders are poll-only (no push) and side-table-free: the deletion
   baseline rides in the cursor, capped at 10_000 items/folder (above:
   additions-only). `CalendarItem` and `Contact` public folders sync at
