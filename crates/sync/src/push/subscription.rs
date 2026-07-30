@@ -11,6 +11,14 @@ use dashmap::DashMap;
 pub(crate) struct RegisteredSubscription {
     pub handle: SubscriptionHandle,
     pub scopes: Vec<CursorScope>,
+    /// A server-side teardown for this handle was attempted and failed, so
+    /// the subscription may still be live on the provider. The record is kept
+    /// purely so the teardown can be retried; it is never recreated against a
+    /// replacement connection, and a further failed retry is logged rather
+    /// than aborting the caller - the handle may belong to a connection that
+    /// is already gone, and one unreachable orphan must not wedge every
+    /// future reopen.
+    pub teardown_unconfirmed: bool,
 }
 
 /// Per-engine subscription handle registry.
@@ -30,16 +38,43 @@ impl SubscriptionRegistry {
         self.inner
             .entry(account)
             .or_default()
-            .push(RegisteredSubscription { handle, scopes });
+            .push(RegisteredSubscription {
+                handle,
+                scopes,
+                teardown_unconfirmed: false,
+            });
     }
 
-    /// Take all handles registered for an account. Returns an empty
-    /// vec if none.
+    /// Take all records registered for an account. Returns an empty
+    /// vec if none. Callers that cannot tear down a handle restore its
+    /// record so the same account-side handle remains retryable.
     #[must_use]
-    pub fn take(&self, account: &AccountId) -> Vec<SubscriptionHandle> {
+    pub(crate) fn take(&self, account: &AccountId) -> Vec<RegisteredSubscription> {
         match self.inner.remove(account) {
-            Some((_, v)) => v.into_iter().map(|record| record.handle).collect(),
+            Some((_, v)) => v,
             None => Vec::new(),
+        }
+    }
+
+    /// Restore records whose server-side teardown failed. Merge rather than
+    /// replace so a concurrent `subscribe_push` registration is preserved.
+    pub(crate) fn restore(&self, account: AccountId, records: Vec<RegisteredSubscription>) {
+        if records.is_empty() {
+            return;
+        }
+        self.inner.entry(account).or_default().extend(records);
+    }
+
+    /// Flag a still-registered handle whose server-side teardown failed.
+    /// Reopen keeps carrying the record and retrying it, but stops treating
+    /// its failure as a reason to abandon the swap.
+    pub(crate) fn mark_unconfirmed(&self, account: &AccountId, handle: &SubscriptionHandle) {
+        if let Some(mut records) = self.inner.get_mut(account) {
+            for record in records.iter_mut() {
+                if &record.handle == handle {
+                    record.teardown_unconfirmed = true;
+                }
+            }
         }
     }
 

@@ -31,7 +31,7 @@ use crate::backfill::{
     LiveSupersedes,
 };
 use crate::cancel::{Boundary, BoundaryRequest};
-use crate::control::SyncControl;
+use crate::control::{SyncActivityGuard, SyncControl};
 use crate::cursor::CursorRegistry;
 use crate::cursor::store::{DynCheckpointStore, InMemoryCheckpointStore};
 use crate::error::Error;
@@ -714,6 +714,7 @@ impl SyncEngine {
                                     account_generation_tx: &reopen_account_generation_tx,
                                     reopen_lock: &reopen_serial,
                                     open_skips: &reopen_open_skips,
+                                    shutdown: &reopen_shutdown,
                                 };
                                 handle_account_error(&ctx, scope, error).await;
                             }
@@ -890,21 +891,16 @@ impl SyncEngine {
     /// discovery, cursor topology, push subscriptions, capabilities,
     /// and the live protocol handle all refresh before the old handle
     /// is closed.
+    ///
+    /// A paused account is quiescent by contract, so this call waits for
+    /// `resume_account` (or `Control::resume`) before opening a replacement.
+    /// Shutdown while waiting returns `Error::ShuttingDown`.
     pub async fn reopen(&self, account_id: &AccountId) -> Result<(), Error> {
         let slot = self
             .accounts
             .get(account_id)
             .map(|r| Arc::clone(r.value()))
             .ok_or_else(|| Error::AccountNotAttached(account_id.clone()))?;
-        // `reopen` is the post-attach swap path. Per the engine error
-        // policy, failures in this path use `Account` (not `OpenFailed`)
-        // so callers know the account was running and the engine is
-        // reporting an in-flight failure.
-        let next = slot
-            .factory
-            .open(account_id.clone())
-            .await
-            .map_err(Error::Account)?;
         let ctx = RecoveryContext {
             factory: &slot.factory,
             current: &slot.current,
@@ -921,9 +917,26 @@ impl SyncEngine {
             account_generation_tx: &slot.account_generation_tx,
             reopen_lock: &slot.reopen_lock,
             open_skips: &slot.open_skips,
+            shutdown: &slot.shutdown,
         };
         let _reopen_guard = slot.reopen_lock.lock().await;
-        reattach_account(&ctx, next).await
+        loop {
+            if !slot.control.wait_until_running(&slot.shutdown).await {
+                return Err(Error::ShuttingDown);
+            }
+            match open_replacement(&ctx).await {
+                Ok((activity, next)) => return reattach_account(&ctx, activity, next).await,
+                // A pause won the race between the wait above and the activity
+                // registration, and nothing was opened. Keep this public
+                // request queued until the account runs again.
+                Err(ReplacementOpen::Paused) => continue,
+                // `reopen` is the post-attach swap path. Per the engine error
+                // policy, failures in this path use `Account` (not
+                // `OpenFailed`) so callers know the account was running and
+                // the engine is reporting an in-flight failure.
+                Err(ReplacementOpen::Failed(error)) => return Err(Error::Account(error)),
+            }
+        }
     }
 
     /// The `OpenedAccount::skipped_scopes` lane from the account's most
@@ -1017,14 +1030,30 @@ impl SyncEngine {
             .get(account_id)
             .map(|r| Arc::clone(r.value()))
             .ok_or_else(|| Error::AccountNotAttached(account_id.clone()))?;
-        let handles = self.subscriptions.take(account_id);
+        let records = self.subscriptions.take(account_id);
         let account = slot.current.load_full();
-        for handle in handles {
-            if let Err(e) = account.push_unsubscribe(handle).await {
-                tracing::warn!(target: "bifrost.sync.reconcile", error=?e, "push_unsubscribe failed");
+        let mut failed = Vec::new();
+        let mut first_error = None;
+        for record in records {
+            if let Err(error) = account.push_unsubscribe(record.handle.clone()).await {
+                tracing::warn!(target: "bifrost.sync.reconcile", error=?error, "push_unsubscribe failed; retaining handle for retry");
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+                // The server side may still be live. Keep the record, but flag
+                // it so a reopen carries it for retry instead of recreating it
+                // against the replacement connection.
+                failed.push(RegisteredSubscription {
+                    teardown_unconfirmed: true,
+                    ..record
+                });
             }
         }
-        Ok(())
+        self.subscriptions.restore(account_id.clone(), failed);
+        match first_error {
+            Some(error) => Err(Error::Account(error)),
+            None => Ok(()),
+        }
     }
 
     /// Engine-side push subscription request. The engine stashes the
@@ -1095,6 +1124,7 @@ impl SyncEngine {
         let mut attempt: u32 = 0;
         let mut retry_advice: Option<RetryAdvice> = None;
         let mut blocked_by_engine: bool = false;
+        let mut forwarded_directives: HashSet<DirectiveKey> = HashSet::new();
 
         loop {
             if let Some(advice) = retry_advice.take() {
@@ -1121,16 +1151,22 @@ impl SyncEngine {
                 match event {
                     bifrost_types::SyncEvent::Batch(batch) => {
                         for item in batch.items {
-                            if let Some((scope, error)) = classify_item_outcome(
+                            if let Some((directive, error)) = classify_item_outcome(
                                 item,
                                 &mut outcomes,
                                 &mut retry_ids,
                                 &mut dedupe_count,
                             ) {
-                                let _ = slot
-                                    .reopen_tx
-                                    .send(ReopenRequest::Recovery { scope, error })
-                                    .await;
+                                if should_forward_engine_recovery(
+                                    &mut forwarded_directives,
+                                    &directive,
+                                ) {
+                                    let scope = crate::recovery::directive_target_scope(&directive);
+                                    let _ = slot
+                                        .reopen_tx
+                                        .send(ReopenRequest::Recovery { scope, error })
+                                        .await;
+                                }
                                 blocked_by_engine = true;
                             }
                         }
@@ -1403,6 +1439,7 @@ impl SyncEngine {
         let mut attempt: u32 = 0;
         let mut retry_advice: Option<RetryAdvice> = None;
         let mut blocked_by_engine: bool = false;
+        let mut forwarded_directives: HashSet<DirectiveKey> = HashSet::new();
 
         loop {
             if let Some(advice) = retry_advice.take() {
@@ -1440,16 +1477,22 @@ impl SyncEngine {
                 match event {
                     bifrost_types::SyncEvent::Batch(batch) => {
                         for item in batch.items {
-                            if let Some((scope, error)) = classify_item_outcome(
+                            if let Some((directive, error)) = classify_item_outcome(
                                 item,
                                 &mut outcomes,
                                 &mut retry_ids,
                                 &mut dedupe_count,
                             ) {
-                                let _ = slot
-                                    .reopen_tx
-                                    .send(ReopenRequest::Recovery { scope, error })
-                                    .await;
+                                if should_forward_engine_recovery(
+                                    &mut forwarded_directives,
+                                    &directive,
+                                ) {
+                                    let scope = crate::recovery::directive_target_scope(&directive);
+                                    let _ = slot
+                                        .reopen_tx
+                                        .send(ReopenRequest::Recovery { scope, error })
+                                        .await;
+                                }
                                 blocked_by_engine = true;
                             }
                         }
@@ -3244,6 +3287,7 @@ async fn run_deferred_inventory_establishment(
                     account_generation_tx: &account_generation_tx,
                     reopen_lock: &reopen_lock,
                     open_skips: &open_skips,
+                    shutdown: &shutdown,
                 };
                 handle_account_error(&ctx, Some(scope.clone()), error).await;
             }
@@ -3407,6 +3451,8 @@ pub(crate) struct RecoveryContext<'a> {
     /// Slot-lifetime open-skip lane; a successful reattach replaces it
     /// with the replacement open's `OpenedAccount::skipped_scopes`.
     pub open_skips: &'a Arc<std::sync::Mutex<Vec<SkippedScope>>>,
+    /// Cancels a queued recovery during detach.
+    pub shutdown: &'a CancellationToken,
 }
 
 /// Dispatch an `AccountError` to the engine's recovery machinery.
@@ -3795,14 +3841,87 @@ async fn re_establish_scope_with_backoff(ctx: &RecoveryContext<'_>, scope: Curso
 /// is paused with `PauseReason::RetryBudgetExhausted` and the last
 /// `AccountError` is broadcast as `SyncEvent::Terminated`. (sync-D6,
 /// sync-D7)
-async fn reattach_account(ctx: &RecoveryContext<'_>, next: OpenedAccount) -> Result<(), Error> {
+/// Tear down the subscriptions already created on a replacement connection
+/// that is about to be discarded.
+///
+/// Any handle whose delete did not succeed is registered against the account
+/// with `teardown_unconfirmed`, because the replacement is closed immediately
+/// after and `Account::close()` does not delete server-side subscriptions.
+/// Without that record the engine would forget the handle entirely and
+/// recreate exactly the orphaned-webhook leak the retained-handle rule exists
+/// to prevent - a provider like Graph keeps delivering to the endpoint until
+/// the subscription expires on its own.
+async fn unwind_replacement_subscriptions(
+    ctx: &RecoveryContext<'_>,
+    next: &dyn Account,
+    replacements: &mut Vec<RegisteredSubscription>,
+) {
+    let mut orphaned = Vec::new();
+    for replacement in replacements.drain(..) {
+        if let Err(cleanup) = next.push_unsubscribe(replacement.handle.clone()).await {
+            tracing::warn!(
+                target: "bifrost.sync.reopen",
+                account = ?ctx.account_id,
+                error = %cleanup,
+                "replacement push cleanup failed while unwinding reopen; retaining handle for retry"
+            );
+            orphaned.push(RegisteredSubscription {
+                teardown_unconfirmed: true,
+                ..replacement
+            });
+        }
+    }
+    ctx.subscriptions.restore(ctx.account_id.clone(), orphaned);
+}
+
+/// Why no replacement connection was opened.
+enum ReplacementOpen {
+    /// The boundary left `Run` before activity could be registered. Nothing
+    /// was opened, so there is nothing to close.
+    Paused,
+    Failed(AccountError),
+}
+
+/// Open a replacement connection with the account's activity registration
+/// already held.
+///
+/// The guard must span the open itself, not just the reattach that follows
+/// it. `pause` reports quiescence as soon as the active count reaches zero,
+/// so registering after `factory.open()` returns would let a pause observe an
+/// idle account while a replacement connection is being established in the
+/// background - the opposite of what the quiescence contract promises. The
+/// guard is returned so the caller can hand it to `reattach_account` and keep
+/// the whole reopen inside one activity registration.
+async fn open_replacement(
+    ctx: &RecoveryContext<'_>,
+) -> Result<(SyncActivityGuard, OpenedAccount), ReplacementOpen> {
+    let activity = ctx
+        .control
+        .begin_activity()
+        .ok_or(ReplacementOpen::Paused)?;
+    match ctx.factory.open(ctx.account_id.clone()).await {
+        Ok(next) => Ok((activity, next)),
+        // Dropping `activity` here is the point: the failed open registered
+        // no lasting work, so quiescence must not stay blocked on it.
+        Err(error) => Err(ReplacementOpen::Failed(error)),
+    }
+}
+
+/// Swap in a replacement connection. `activity` is the registration taken by
+/// `open_replacement` before the connection was opened; holding it here keeps
+/// the open and the swap inside one uninterrupted non-quiescent window.
+async fn reattach_account(
+    ctx: &RecoveryContext<'_>,
+    activity: SyncActivityGuard,
+    next: OpenedAccount,
+) -> Result<(), Error> {
+    let _activity = activity;
     let OpenedAccount {
         account: next,
         skipped_scopes: next_skips,
     } = next;
     next.set_priority(ctx.control.priority_snapshot());
     next.set_bandwidth_cap(ctx.control.bandwidth_cap_snapshot());
-    let _activity = ctx.control.begin_activity().ok_or(Error::Paused)?;
 
     let result = async {
         let discovered = discover_scopes_from(next.as_ref()).await?;
@@ -3863,41 +3982,88 @@ async fn reattach_account(ctx: &RecoveryContext<'_>, next: OpenedAccount) -> Res
 
         let previous_subscriptions = ctx.subscriptions.snapshot(ctx.account_id);
         let mut replacement_subscriptions = Vec::with_capacity(previous_subscriptions.len());
-        for record in previous_subscriptions
-            .iter()
-            .filter(|_| next.capabilities().push != bifrost_types::PushCapability::None)
-        {
-            let mut scopes: Vec<CursorScope> = record
+        for record in previous_subscriptions.iter().filter(|record| {
+            // An unconfirmed record is an orphan being carried for retry, not
+            // a live subscription the consumer asked for; recreating it on the
+            // replacement would double-subscribe the account.
+            !record.teardown_unconfirmed
+                && next.capabilities().push != bifrost_types::PushCapability::None
+        }) {
+            let scopes: Vec<CursorScope> = record
                 .scopes
                 .iter()
                 .filter(|scope| discovered_set.contains(*scope))
                 .cloned()
                 .collect();
             if scopes.is_empty() {
-                scopes.clone_from(&discovered);
-            }
-            if scopes.is_empty() {
+                // The requested topology vanished. Do not silently widen a
+                // scoped subscription to every discovered scope; its old
+                // handle is explicitly torn down below, and the consumer can
+                // opt in again against the replacement topology.
                 continue;
             }
             match next.push_subscribe(&scopes).await {
                 Ok(handle) => {
-                    replacement_subscriptions.push(RegisteredSubscription { handle, scopes });
+                    replacement_subscriptions.push(RegisteredSubscription {
+                        handle,
+                        scopes,
+                        teardown_unconfirmed: false,
+                    });
                 }
                 Err(error) => {
-                    for replacement in replacement_subscriptions.drain(..) {
-                        if let Err(cleanup) = next.push_unsubscribe(replacement.handle).await {
-                            tracing::warn!(
-                                target: "bifrost.sync.reopen",
-                                account = ?ctx.account_id,
-                                error = %cleanup,
-                                "replacement push cleanup failed while unwinding reopen"
-                            );
-                        }
-                    }
+                    unwind_replacement_subscriptions(
+                        ctx,
+                        next.as_ref(),
+                        &mut replacement_subscriptions,
+                    )
+                    .await;
                     return Err(Error::Account(error));
                 }
             }
         }
+
+        // Accounts such as Graph retain server-side subscription ids after a
+        // failed delete so the same handle can retry. Tear old handles down
+        // before swapping and closing their account: otherwise a vanished
+        // record would lose the only retry path and leak a server subscription.
+        let previous = ctx.current.load_full();
+        let mut carried_unconfirmed = Vec::new();
+        for record in &previous_subscriptions {
+            let teardown = previous.push_unsubscribe(record.handle.clone()).await;
+            match teardown {
+                Ok(()) => {}
+                Err(error) if record.teardown_unconfirmed => {
+                    // Already an orphan. Its handle may belong to a connection
+                    // that is long gone, so a repeated failure must not block
+                    // the swap; keep carrying it so the next reopen or an
+                    // `unsubscribe_push` call can try again.
+                    tracing::warn!(
+                        target: "bifrost.sync.reopen",
+                        account = ?ctx.account_id,
+                        error = %error,
+                        "carrying push subscription whose teardown is still unconfirmed"
+                    );
+                    carried_unconfirmed.push(record.clone());
+                }
+                Err(error) => {
+                    // The replacement's own subscriptions must not be stranded
+                    // by this unwind: `Account::close()` deliberately does not
+                    // delete server-side subscriptions, so any handle whose
+                    // teardown did not succeed stays in the registry - on
+                    // whichever side it was created - and is retried later.
+                    unwind_replacement_subscriptions(
+                        ctx,
+                        next.as_ref(),
+                        &mut replacement_subscriptions,
+                    )
+                    .await;
+                    ctx.subscriptions
+                        .mark_unconfirmed(ctx.account_id, &record.handle);
+                    return Err(Error::Account(error));
+                }
+            }
+        }
+        replacement_subscriptions.extend(carried_unconfirmed);
 
         let previous = ctx.current.swap(Arc::new(Arc::clone(&next)));
         ctx.cursors.replace_from(&staged);
@@ -3924,16 +4090,6 @@ async fn reattach_account(ctx: &RecoveryContext<'_>, next: OpenedAccount) -> Res
         ctx.account_generation_tx
             .send_modify(|generation| *generation = generation.saturating_add(1));
 
-        for record in previous_subscriptions {
-            if let Err(error) = previous.push_unsubscribe(record.handle).await {
-                tracing::warn!(
-                    target: "bifrost.sync.reopen",
-                    account = ?ctx.account_id,
-                    error = %error,
-                    "old-handle push unsubscribe failed during reopen"
-                );
-            }
-        }
         if let Err(error) = previous.close().await {
             tracing::warn!(
                 target: "bifrost.sync.reopen",
@@ -3962,16 +4118,26 @@ async fn reattach_account(ctx: &RecoveryContext<'_>, next: OpenedAccount) -> Res
 async fn restart_account(ctx: &RecoveryContext<'_>) {
     let mut delay = REOPEN_BACKOFF_INITIAL;
     let mut last_error: Option<AccountError> = None;
-    for attempt in 0..REOPEN_RETRY_BUDGET {
+    let mut attempt = 0;
+    while attempt < REOPEN_RETRY_BUDGET {
+        // A consumer pause is a quiescence boundary. Keep this recovery
+        // request queued until resume instead of opening a replacement while
+        // the account has promised to be idle.
+        if !ctx.control.wait_until_running(ctx.shutdown).await {
+            return;
+        }
         if attempt > 0 {
             let sleep_for = jittered(delay);
             tokio::time::sleep(sleep_for).await;
             delay = (delay.saturating_mul(2)).min(REOPEN_BACKOFF_CAP);
         }
-        match ctx.factory.open(ctx.account_id.clone()).await {
-            Ok(next) => match reattach_account(ctx, next).await {
+        match open_replacement(ctx).await {
+            // A pause won the race between the wait above and the activity
+            // registration, and nothing was opened. Loop back through the
+            // boundary wait instead of spending an attempt on it.
+            Err(ReplacementOpen::Paused) => continue,
+            Ok((activity, next)) => match reattach_account(ctx, activity, next).await {
                 Ok(()) => return,
-                Err(Error::Paused) => return,
                 Err(Error::Account(error) | Error::EstablishCursorTerminated(error)) => {
                     tracing::warn!(
                         target: "bifrost.sync.changes",
@@ -3982,6 +4148,7 @@ async fn restart_account(ctx: &RecoveryContext<'_>) {
                         "RestartAccount: replacement attach failed"
                     );
                     last_error = Some(error);
+                    attempt = attempt.saturating_add(1);
                 }
                 Err(error) => {
                     tracing::warn!(
@@ -3995,9 +4162,10 @@ async fn restart_account(ctx: &RecoveryContext<'_>) {
                         CursorScope::Account,
                         bifrost_types::AccountOperation::EstablishCursor,
                     ));
+                    attempt = attempt.saturating_add(1);
                 }
             },
-            Err(err) => {
+            Err(ReplacementOpen::Failed(err)) => {
                 tracing::warn!(
                     target: "bifrost.sync.changes",
                     account = ?ctx.account_id,
@@ -4007,6 +4175,7 @@ async fn restart_account(ctx: &RecoveryContext<'_>) {
                     "RestartAccount: factory.open failed"
                 );
                 last_error = Some(err);
+                attempt = attempt.saturating_add(1);
             }
         }
     }
@@ -4298,7 +4467,7 @@ fn classify_item_outcome(
     outcomes: &mut HashMap<bifrost_types::ObjectId, MutationBucket>,
     retry_ids: &mut Vec<bifrost_types::ObjectId>,
     dedupe_count: &mut u64,
-) -> Option<(Option<CursorScope>, AccountError)> {
+) -> Option<(EngineDirective, AccountError)> {
     use crate::recovery::{RecoveryPlan, plan_recovery};
     match item {
         ItemOutcome::Succeeded(success) => {
@@ -4352,10 +4521,7 @@ fn classify_item_outcome(
                 }
                 RecoveryPlan::Engine(directive) => {
                     outcomes.insert(id, MutationBucket::BlockedByEngine);
-                    Some((
-                        crate::recovery::directive_target_scope(&directive),
-                        original,
-                    ))
+                    Some((directive, original))
                 }
                 RecoveryPlan::Terminal(_) => {
                     outcomes.insert(id, MutationBucket::FailedTerminal);
@@ -4369,6 +4535,57 @@ fn classify_item_outcome(
             None
         }
     }
+}
+
+/// Campaign-scoped dedupe identity for an engine directive: the directive's
+/// own variant plus the scope it targets.
+///
+/// Keying on the target scope alone is wrong in both directions. Every
+/// account-wide directive would collapse onto `None`, so the first
+/// `RestartAccount` in a mixed batch would suppress a later
+/// `OperatorOverrideRequired` or `SchemaIncompatible`; and `RestartScope`,
+/// `DowngradeCapabilityForScope` and `DisableScope` on one folder would
+/// collapse onto each other even though they ask the engine for three
+/// different things.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum DirectiveKey {
+    RestartScope(CursorScope),
+    RestartAccount,
+    DowngradeStrategy,
+    DowngradeCapabilityForScope(CursorScope),
+    SchemaIncompatible,
+    OperatorOverrideRequired,
+    DisableScope(CursorScope),
+    /// `EngineDirective` is `#[non_exhaustive]`; an unnamed future variant
+    /// dedupes by its resolved target only, which is never coarser than the
+    /// old behavior.
+    Other(Option<CursorScope>),
+}
+
+fn directive_key(directive: &EngineDirective) -> DirectiveKey {
+    match directive {
+        EngineDirective::RestartScope(scope) => DirectiveKey::RestartScope(scope.clone()),
+        EngineDirective::RestartAccount => DirectiveKey::RestartAccount,
+        EngineDirective::DowngradeStrategy(_) => DirectiveKey::DowngradeStrategy,
+        EngineDirective::DowngradeCapabilityForScope(scope) => {
+            DirectiveKey::DowngradeCapabilityForScope(scope.clone())
+        }
+        EngineDirective::SchemaIncompatible => DirectiveKey::SchemaIncompatible,
+        EngineDirective::OperatorOverrideRequired { .. } => DirectiveKey::OperatorOverrideRequired,
+        EngineDirective::DisableScope(scope) => DirectiveKey::DisableScope(scope.clone()),
+        other => DirectiveKey::Other(crate::recovery::directive_target_scope(other)),
+    }
+}
+
+/// Return whether this campaign has not yet forwarded this exact directive.
+/// A per-item engine failure can name the same directive hundreds of times;
+/// the reopen listener needs one request per distinct directive, not one per
+/// failed object - and not one per campaign either.
+fn should_forward_engine_recovery(
+    forwarded: &mut HashSet<DirectiveKey>,
+    directive: &EngineDirective,
+) -> bool {
+    forwarded.insert(directive_key(directive))
 }
 
 fn counters_from_outcomes(
@@ -4393,9 +4610,9 @@ fn counters_from_outcomes(
 mod tests {
     use super::{
         MutationBucket, classify_item_outcome, queue_unresolved_for_retry, scope_covers_membership,
-        unresolved_readback_ids,
+        should_forward_engine_recovery, unresolved_readback_ids,
     };
-    use bifrost_types::{CursorScope, FolderId, MembershipScope, ObjectType};
+    use bifrost_types::{CursorScope, EngineDirective, FolderId, MembershipScope, ObjectType};
 
     #[test]
     fn jittered_stays_within_plus_minus_20_percent() {
@@ -4473,16 +4690,76 @@ mod tests {
         let mut retry = Vec::new();
         let mut dedupe = 0;
 
-        let (target, forwarded) =
+        let (directive, forwarded) =
             classify_item_outcome(item, &mut outcomes, &mut retry, &mut dedupe)
                 .expect("engine recovery must be forwarded");
 
-        assert_eq!(target, Some(scope));
+        assert_eq!(
+            crate::recovery::directive_target_scope(&directive),
+            Some(scope)
+        );
         assert!(forwarded.recovery().requires_engine_action());
         assert_eq!(
             outcomes.get(&bifrost_types::ObjectId("message".into())),
             Some(&MutationBucket::BlockedByEngine)
         );
+    }
+
+    #[test]
+    fn per_item_engine_recovery_forwards_once_per_distinct_directive() {
+        let inbox = CursorScope::Folder(FolderId("INBOX".into()));
+        let archive = CursorScope::Folder(FolderId("Archive".into()));
+        let mut forwarded = std::collections::HashSet::new();
+
+        assert!(should_forward_engine_recovery(
+            &mut forwarded,
+            &EngineDirective::RestartScope(inbox.clone())
+        ));
+        assert!(
+            !should_forward_engine_recovery(
+                &mut forwarded,
+                &EngineDirective::RestartScope(inbox.clone())
+            ),
+            "every failed object naming one directive shares one reopen request"
+        );
+        assert!(should_forward_engine_recovery(
+            &mut forwarded,
+            &EngineDirective::RestartScope(archive)
+        ));
+    }
+
+    /// A mixed batch is the case keying on the target scope alone got wrong:
+    /// three distinct account-wide directives all resolve to `None`, and three
+    /// distinct directives on one folder all resolve to that folder. Under the
+    /// old key the first of each group suppressed the rest, so an
+    /// `OperatorOverrideRequired` or a scope disable could be silently
+    /// swallowed by an unrelated earlier failure in the same campaign.
+    #[test]
+    fn mixed_batch_directives_are_not_suppressed_by_a_shared_target() {
+        let inbox = CursorScope::Folder(FolderId("INBOX".into()));
+        let mut forwarded = std::collections::HashSet::new();
+
+        for directive in [
+            EngineDirective::RestartAccount,
+            EngineDirective::SchemaIncompatible,
+            EngineDirective::OperatorOverrideRequired {
+                reason: "mailbox quota frozen".into(),
+            },
+            EngineDirective::RestartScope(inbox.clone()),
+            EngineDirective::DowngradeCapabilityForScope(inbox.clone()),
+            EngineDirective::DisableScope(inbox.clone()),
+        ] {
+            assert!(
+                should_forward_engine_recovery(&mut forwarded, &directive),
+                "{directive:?} must reach the reopen listener on its own"
+            );
+            assert!(
+                crate::recovery::directive_target_scope(&directive).is_none()
+                    || crate::recovery::directive_target_scope(&directive) == Some(inbox.clone()),
+                "test fixture must exercise the two colliding target groups"
+            );
+        }
+        assert_eq!(forwarded.len(), 6);
     }
 
     /// Both pending lanes reach the guard, and nothing else does.

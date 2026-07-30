@@ -138,7 +138,11 @@ impl BudgetGate {
         Self {
             inner: Arc::new(BudgetInner {
                 budget,
-                global: Arc::new(Semaphore::new(budget.global)),
+                // `BudgetGate::new` is public and can be reached without the
+                // builder's `ConcurrencyBudget::validate` call. Preserve the
+                // constructor invariant here so a direct `global: 0` cannot
+                // create a gate that blocks every acquisition forever.
+                global: Arc::new(Semaphore::new(budget.global.max(1))),
                 account_sync: DashMap::new(),
                 account_mutation: DashMap::new(),
             }),
@@ -280,5 +284,20 @@ mod tests {
             .await
             .expect("waiter task completes")
             .expect("waiter acquires after release");
+    }
+
+    #[tokio::test]
+    async fn public_constructor_floors_a_zero_global_budget() {
+        let gate = BudgetGate::new(ConcurrencyBudget {
+            global: 0,
+            ..ConcurrencyBudget::default()
+        });
+        let account = AccountId("zero-global".into());
+
+        let permit = gate
+            .acquire(&account, WorkKind::Sync)
+            .await
+            .expect("public constructor must retain one global permit");
+        drop(permit);
     }
 }

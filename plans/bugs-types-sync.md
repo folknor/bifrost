@@ -10,102 +10,6 @@ Found reviewing the quiescence / reattach pass (2026-07-29). The two
 boundary-primitive defects from that review are fixed and pinned in
 `control.rs`'s unit tests; what follows is what remains.
 
-### R1. Per-item `Engine(_)` recovery is forwarded once per failing item
-
-`crates/sync/src/engine.rs`, both bulk pipelines (the `SyncEvent::Batch`
-arms feeding `classify_item_outcome`).
-
-B8's fix is correct but unthrottled: every item whose recovery is
-`Engine(_)` sends its own `ReopenRequest::Recovery`. A 500-target
-`bulk_set_flags` whose items all fail with `Engine(RestartScope(...))`
-pushes 500 requests through a 16-slot channel; the campaign blocks on
-`send().await` while the reopen listener performs 500 sequential
-scope/account restarts, each under `reopen_lock` with its own backoff
-budget. The stream-level `Terminated` arm immediately below forwards
-exactly once.
-
-Fix: dedupe by directive target within the campaign - a
-`HashSet<Option<CursorScope>>`, forward on first sight - so the
-per-item path costs the same as the stream-level one.
-
-### R2. Reopen widens push subscriptions when the recorded scopes vanish
-
-`crates/sync/src/engine.rs`, `reattach_account`
-(`scopes.clone_from(&discovered)`).
-
-When none of a registered subscription's scopes survive discovery, the
-replacement subscribes against EVERY discovered scope. A subscription
-the consumer registered for one shared folder silently becomes
-account-wide, and the consumer has no way to observe the widening.
-Dropping the record is the honest behavior; the consumer can
-re-subscribe against the new topology.
-
-### R3. Reopen is a silent no-op while the account is paused
-
-`crates/sync/src/engine.rs`, `reattach_account` +
-`restart_account` + `SyncEngine::reopen`.
-
-`reattach_account` opens with `begin_activity().ok_or(Error::Paused)?`,
-and `restart_account` maps `Err(Error::Paused) => return`. On a paused
-account a `RestartAccount` directive therefore does nothing: no retry
-budget consumed, no `SyncEvent::Terminated` broadcast, no
-`RetryBudgetExhausted` pause. It self-heals only because the poll loop
-re-raises the same error after resume, which is implicit and untested.
-
-The public `SyncEngine::reopen` inherits the same behavior and returns
-`Error::Paused` on a paused account. Neither its doc comment nor
-`reference/sync.md` records that. Decide whether reopen should queue
-until resume, run regardless of the boundary (it is engine-initiated
-recovery, not consumer work), or document the refusal; today it is
-none of the three.
-
-### R4. Terminal lifecycle errors now retry forever
-
-`crates/sync/src/multiplexer/mod.rs`, lifecycle task.
-
-`ScopeLifecycleEvent::Terminated` changed from `return` to `break` as
-part of the B4 fix, so the task reconnects and re-sends
-`ReopenRequest::Recovery` every <= 30s indefinitely against a
-permanently-dead lifecycle stream. Arguably right - a reopen can
-revive it - but it is an unrecorded behavior change with no attempt
-budget mirroring `restart_account`'s three-strike rule, and nothing
-distinguishes "auth is gone for good" from "transient".
-
-### R5. `BudgetGate::new` no longer floors `global` at one permit
-
-`crates/sync/src/scheduler/budget.rs`.
-
-The `.max(1)` unmasking is right for `per_account` / mutation
-(`mutation_permits()` keeps its own `.max(1)`, and the new
-`mutation_permits() >= per_account` rejection guarantees
-`sync_permits() >= 1`). `global` is the one that lost its floor
-without gaining a guard on the same path: `BudgetGate::new` is `pub`,
-and `ConcurrencyBudget { global: 0, .. }` there yields a
-`Semaphore::new(0)` that blocks every acquisition forever.
-`validate()` covers the `SyncEngineBuilder` path only. Latent while
-the gate is unwired.
-
-### R6. `unsubscribe_push` retires the handle before it knows teardown succeeded
-
-`crates/sync/src/engine.rs:982`.
-
-`SyncEngine::unsubscribe_push` does `self.subscriptions.take(account_id)`
-*before* the per-handle loop, then only logs a warning when
-`Account::push_unsubscribe` fails. The registry entry is gone either way,
-so a failed teardown leaves no engine-side record to retry through.
-
-This became load-bearing when `bifrost-graph` fixed its own half (G-15,
-commit 578c1ff): Graph now deliberately keeps a subscription's server ids
-registered after a failed DELETE precisely so the teardown can be retried,
-and orphaned Graph subscriptions otherwise keep delivering to the webhook
-endpoint until their 24h expiry. That retry lane currently has no retrier
-on the engine side - only a consumer holding its own handle can drive it.
-
-Either retain the registry entry until every `push_unsubscribe` reports
-success, or surface the failure to the caller instead of swallowing it into
-a log line. Found while reviewing the Graph teardown work, not by a review
-of `bifrost-sync` itself.
-
 ## Nits
 
 - **N1. Push forwarder polls capabilities once a second while
@@ -122,6 +26,25 @@ of `bifrost-sync` itself.
   like `push_overflow_total`.
 
 ## Fixed in this pass
+
+- **R1-R6 plus the four P1 regressions the cold review found in them.**
+  Per-item `Engine(_)` recovery now dedupes by directive identity
+  (variant + target scope), not by target alone, so a mixed batch can no
+  longer have an `OperatorOverrideRequired`, schema reset or scope
+  disable swallowed by an unrelated earlier failure. Reopen registers
+  the account's activity BEFORE `factory.open()`, closing the window
+  where `pause` reported quiescence while a replacement connection was
+  mid-open (and where the losing replacement was dropped without
+  `close()`). The lifecycle reader parks on the account generation only
+  for `RestartAccount` - the one directive that replaces its connection
+  - and that park is bounded; every other directive is handed over once
+  and the reader reconnects on backoff instead of waiting for a signal
+  that never fires. Any push handle whose server-side teardown did not
+  succeed, on either side of a reopen, stays in the registry flagged
+  `teardown_unconfirmed`: it is never recreated on a replacement, is
+  carried across swaps, and is retried by the next reopen or
+  `unsubscribe_push`, so the correlated old-teardown-plus-failed-unwind
+  case can no longer orphan a webhook.
 
 - **Unbounded, never-pruned pending-checkpoint set.** `SyncControl`'s
   outstanding-broadcast set only ever shrank on an exact-identity ack,

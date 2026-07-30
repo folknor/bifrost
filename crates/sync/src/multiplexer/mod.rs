@@ -83,6 +83,48 @@ pub enum ReopenRequest {
     },
 }
 
+/// Upper bound on the lifecycle reader's wait for a replacement connection.
+///
+/// Only a successful account reattach bumps the account generation. A reopen
+/// that exhausts its retry budget, or that is queued behind a pause, produces
+/// no generation change at all, so an unbounded wait would park the reader for
+/// the process lifetime and silently stop folder/label lifecycle observation.
+const LIFECYCLE_REOPEN_WAIT: Duration = Duration::from_secs(30);
+
+/// Lifecycle-stream termination policy.
+///
+/// A terminal account error cannot be repaired by reconnecting the same dead
+/// stream. An `Engine(RestartAccount)` directive replaces the connection this
+/// reader is holding, so it hands the error over once and waits (bounded) for
+/// the generation change rather than hammering a dead handle. Every other
+/// directive - `RestartScope`, `DisableScope`, `SchemaIncompatible`,
+/// `OperatorOverrideRequired`, the downgrades - is handled without swapping
+/// the account, so no generation change is ever coming and the reader must
+/// reconnect on its own backoff after handing the error over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LifecycleTermination {
+    /// Forward once, then wait (bounded) for a replacement connection.
+    AwaitReopen,
+    /// Forward once, then reconnect this reader on backoff.
+    ForwardAndReconnect,
+    /// Reconnect on backoff; the engine has nothing to decide.
+    Reconnect,
+    /// Report once and stop this reader.
+    Terminate,
+}
+
+fn lifecycle_termination(error: &AccountError) -> LifecycleTermination {
+    use crate::recovery::{RecoveryPlan, plan_recovery};
+    use bifrost_types::EngineDirective;
+
+    match plan_recovery(error.clone()) {
+        RecoveryPlan::Engine(EngineDirective::RestartAccount) => LifecycleTermination::AwaitReopen,
+        RecoveryPlan::Engine(_) => LifecycleTermination::ForwardAndReconnect,
+        RecoveryPlan::Terminal(_) => LifecycleTermination::Terminate,
+        RecoveryPlan::Retry(_) | RecoveryPlan::Reconcile(_) => LifecycleTermination::Reconnect,
+    }
+}
+
 /// Multiplexer task state. Constructed in `engine::attach` and run on
 /// a `tokio::spawn`.
 pub struct Multiplexer {
@@ -186,6 +228,7 @@ impl Multiplexer {
         let lifecycle_cursors = Arc::clone(&cursors);
         let lifecycle_tokens = Arc::clone(&scope_tokens);
         let lifecycle_reopen = reopen_tx.clone();
+        let lifecycle_changes = changes_tx.clone();
         let mut lifecycle_generation = account_generation;
         let lifecycle_handle = tokio::spawn(async move {
             let mut reconnect_delay = Duration::from_millis(50);
@@ -215,21 +258,62 @@ impl Multiplexer {
                             let lifecycle = match ev {
                                 bifrost_types::ScopeLifecycleEvent::Lifecycle(lc) => lc,
                                 bifrost_types::ScopeLifecycleEvent::Terminated(err) => {
-                                    // Protocol classified an unrecoverable
-                                    // failure observed by the lifecycle
-                                    // poller (auth lost, schema break, etc.).
-                                    // Route the structured error through the
-                                    // reopen channel so the engine's
-                                    // `RecoveryPlan` dispatch handles it the
-                                    // same way it handles errors from any
-                                    // other source.
-                                    let _ = lifecycle_reopen
-                                        .send(ReopenRequest::Recovery {
-                                            scope: None,
-                                            error: err,
-                                        })
-                                        .await;
-                                    break;
+                                    let policy = lifecycle_termination(&err);
+                                    match policy {
+                                        LifecycleTermination::AwaitReopen
+                                        | LifecycleTermination::ForwardAndReconnect => {
+                                            // Hand the classified error to the
+                                            // engine exactly once. The reopen
+                                            // path owns the three-strike
+                                            // budget, so one dead lifecycle
+                                            // stream cannot enqueue unbounded
+                                            // account reopens.
+                                            if lifecycle_reopen
+                                                .send(ReopenRequest::Recovery {
+                                                    scope: None,
+                                                    error: err,
+                                                })
+                                                .await
+                                                .is_err()
+                                            {
+                                                return;
+                                            }
+                                            if policy == LifecycleTermination::AwaitReopen {
+                                                // A replacement connection can
+                                                // revive this stream, so prefer
+                                                // waiting for it - but bound the
+                                                // wait, because a failed or
+                                                // pause-queued reopen never
+                                                // bumps the generation and this
+                                                // reader must not park forever.
+                                                tokio::select! {
+                                                    () = lifecycle_shutdown.cancelled() => return,
+                                                    changed = lifecycle_generation.changed() => {
+                                                        if changed.is_err() {
+                                                            return;
+                                                        }
+                                                        reopened = true;
+                                                    }
+                                                    () = tokio::time::sleep(LIFECYCLE_REOPEN_WAIT) => {}
+                                                }
+                                            }
+                                            break;
+                                        }
+                                        LifecycleTermination::Terminate => {
+                                            // Auth/policy/provider terminal
+                                            // errors cannot be revived by an
+                                            // account reopen. Surface the
+                                            // classified failure once and end
+                                            // this lifecycle reader.
+                                            let _ = lifecycle_changes.send(MultiplexerEvent {
+                                                scope: CursorScope::Account,
+                                                event: Arc::new(SyncEvent::Terminated(err)),
+                                                checkpoint: None,
+                                            });
+                                            return;
+                                        }
+                                        LifecycleTermination::Reconnect => break,
+                                    }
                                 }
                                 _ => continue,
                             };
@@ -804,6 +888,10 @@ fn folder_cursor_shapes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bifrost_types::{
+        AccountErrorBuilder, AccountErrorKind, AccountOperation, AuthCause, AuthErrorKind, Cause,
+        StateCause, SyncStateErrorKind,
+    };
 
     fn ms(n: u64) -> Duration {
         Duration::from_millis(n)
@@ -849,5 +937,67 @@ mod tests {
         };
         let next = Multiplexer::updated_cadence(c, false, ms(100), ms(30_000));
         assert_eq!(next.interval, ms(30_000));
+    }
+
+    #[test]
+    fn lifecycle_terminal_errors_do_not_reconnect_or_reopen() {
+        let error = AccountErrorBuilder::new(
+            AccountErrorKind::Authentication(AuthErrorKind::Expired),
+            Cause::Auth(AuthCause::Expired),
+        )
+        .operation(AccountOperation::SyncChanges)
+        .try_build()
+        .expect("valid terminal authentication error");
+
+        assert_eq!(
+            lifecycle_termination(&error),
+            LifecycleTermination::Terminate
+        );
+    }
+
+    /// A `RestartAccount` directive swaps the connection this reader holds,
+    /// so waiting for the generation change is the right park - bounded, so a
+    /// reopen that never succeeds cannot silence lifecycle observation.
+    #[test]
+    fn lifecycle_account_reopen_errors_wait_for_the_generation_change() {
+        let error = AccountErrorBuilder::new(
+            AccountErrorKind::SyncState(SyncStateErrorKind::CapabilityChanged),
+            Cause::State(StateCause::CapabilityChanged { delta: None }),
+        )
+        .operation(AccountOperation::SyncChanges)
+        .try_build()
+        .expect("valid account-reopen recovery error");
+
+        assert_eq!(
+            lifecycle_termination(&error),
+            LifecycleTermination::AwaitReopen
+        );
+    }
+
+    /// Scope-level and account-wide-but-not-reopen directives never bump the
+    /// account generation, so parking on it would strand this reader for the
+    /// process lifetime. Hand the error over once, then reconnect on backoff.
+    #[test]
+    fn lifecycle_non_reopen_directives_reconnect_instead_of_parking() {
+        let schema = AccountErrorBuilder::new(
+            AccountErrorKind::SyncState(SyncStateErrorKind::SchemaIncompatible),
+            Cause::State(StateCause::SchemaIncompatible),
+        )
+        .operation(AccountOperation::SyncChanges)
+        .try_build()
+        .expect("valid schema recovery error");
+        assert_eq!(
+            lifecycle_termination(&schema),
+            LifecycleTermination::ForwardAndReconnect
+        );
+
+        let revoked = crate::recovery::restart_scope_error(
+            CursorScope::Folder(bifrost_types::FolderId("Shared".into())),
+            AccountOperation::SyncChanges,
+        );
+        assert_eq!(
+            lifecycle_termination(&revoked),
+            LifecycleTermination::ForwardAndReconnect
+        );
     }
 }

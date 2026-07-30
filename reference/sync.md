@@ -132,7 +132,8 @@ as `SyncEngine::reopen`) is a staged reattach. It opens a replacement,
 reapplies priority and bandwidth, rediscovers cursor scopes and
 memberships into a temporary registry, establishes newly-appeared
 scopes, removes vanished cursors, recreates registered push
-subscriptions, refreshes the capability snapshot, and then swaps the
+subscriptions whose requested scopes still exist, refreshes the
+capability snapshot, and then swaps the
 handle and registry topology. On a successful swap the replacement
 open's `skipped_scopes` replace the slot's stored lane, so a healed
 namespace disappears from `open_skipped_scopes` and a still-degraded
@@ -143,9 +144,33 @@ this rediscovery, and the scheduling cadence (how often the reattach's
 wire cost is worth paying) is consumer policy - the engine does not
 schedule speculative reopens on its own. A generation watch wakes
 the push and lifecycle readers even when their old streams never end.
-The old subscriptions are removed through the old handle and
-`Account::close()` is called best-effort. Any failure before the swap
-closes the replacement and leaves the running handle installed.
+If every requested scope of a registered push subscription vanished,
+the record is dropped rather than widened to all discovered scopes; its
+old handle is explicitly unsubscribed before the swap. All old-handle
+push teardowns must succeed before the replacement is installed, so an
+account that retains failed server-side DELETE state (Graph) remains
+live and retryable instead of being closed with an orphaned subscription.
+`Account::close()` is called best-effort after the swap. Any failure
+before the swap closes the replacement and leaves the running handle
+installed - and any subscription already created on that replacement is
+torn down first, with every handle whose delete did not succeed kept in
+the registry as `teardown_unconfirmed`. `close()` does not delete
+server-side subscriptions, so a handle the engine forgets is an orphan
+that keeps delivering until the provider expires it; an unconfirmed
+record is therefore never recreated against a replacement, is carried
+across swaps, and is retried by the next reopen or `unsubscribe_push`.
+A repeat failure on an already-unconfirmed record is logged rather than
+aborting the swap, because a handle belonging to a long-dead connection
+must not wedge every future reopen.
+
+A public or engine-initiated reopen queues behind `Pause` and runs after
+resume: pause is a quiescence boundary, not permission to open a
+replacement connection in the background. The activity registration that
+makes the account non-quiescent is taken BEFORE `factory.open()`, not
+after it, so `pause` cannot report quiescence while a replacement
+connection is being established; a pause that wins the race against the
+registration means nothing was opened at all, and the caller loops back
+to the boundary wait without spending a retry attempt.
 
 ## Stream contract: broadcast + consumer ack
 
@@ -209,8 +234,19 @@ successful `Done`.
   NOTIFY-MAILBOXES / LIST-diff lifecycle detection for IMAP is a
   deferred feature, not a bug. The lifecycle reader reloads the
   replacement account whenever the reopen-generation watch changes;
-  a naturally-ended stream reconnects with bounded exponential
-  backoff.
+  a naturally-ended or retryable stream reconnects with bounded
+  exponential backoff. A terminal lifecycle error is broadcast once and
+  stops that reader. Every non-terminal classified error is handed to
+  the reopen channel exactly once - the reopen path owns the
+  three-strike budget, so one dead lifecycle stream cannot enqueue
+  unbounded account reopens - and only `RestartAccount`, the one
+  directive that actually replaces this reader's connection, then waits
+  for the generation change. That wait is bounded (30s): a reopen that
+  exhausts its budget or queues behind a pause never bumps the
+  generation. Every other directive (scope restarts, scope disable,
+  schema reset, capability downgrade, operator override) is handled
+  without swapping the account, so the reader reconnects on its own
+  backoff instead of parking for a signal that is never coming.
 - **Reopen requests** on a `mpsc::Sender<ReopenRequest>` channel:
   `RestartScope` deletes the in-memory and durable cursor before
   re-establishing; `RestartAccount` routes up to the engine's reopen
@@ -430,8 +466,12 @@ with its requested cursor scopes. That scope snapshot lets account
 reopen recreate subscriptions against the replacement topology.
 The consumer can later call
 `SyncEngine::unsubscribe_push(account)` to walk the handles back
-through `Account::push_unsubscribe`. `SyncEngine::subscribe_push`
-is the engine-side entry that records the handle on success.
+through `Account::push_unsubscribe`. A failed teardown is returned to
+the caller and its registry record is retained, while successful records
+are retired; a later call retries only the failed handles. This composes
+with Graph's retained server ids after a failed DELETE.
+`SyncEngine::subscribe_push` is the engine-side entry that records the
+handle on success.
 
 ## Mutation pipeline
 
@@ -481,7 +521,15 @@ is the engine-side entry that records the handle on success.
   recovery dispatch performs the restart / downgrade / schema
   clear. `blocked_by_engine` is distinct from `failed_terminal`:
   the campaign was halted by the engine, not by per-item
-  terminal classification.
+  terminal classification. Forwarding is deduped per campaign by
+  directive identity - the variant plus its target scope - not by the
+  target alone: a 500-item batch whose items all name one directive
+  costs one reopen request, while a mixed batch still delivers each
+  distinct directive. Keying on the target alone would collapse every
+  account-wide directive onto `None` (the first `RestartAccount`
+  swallowing a later `OperatorOverrideRequired` or schema reset) and
+  every same-folder directive onto that folder (a `RestartScope`
+  swallowing a later `DisableScope`).
 - terminal recovery -> `failed_terminal`.
 
 `ItemOutcome::Uncertain` always queues for read-back so a
@@ -610,7 +658,10 @@ consume global capacity needed by another account. Lazy-creation uses
 `DashMap::entry().or_insert_with(...)` to close the original
 data race. `ConcurrencyBudget::validate` requires `per_account >= 2`
 and a mutation share that leaves at least one real sync permit; the
-gate no longer masks a zero split by granting an extra permit.
+gate no longer masks a zero split by granting an extra permit. Its public
+constructor still floors the global semaphore at one permit, because direct
+construction bypasses builder validation and must not create a permanently
+blocked gate from `global: 0`.
 
 **Status (v1):** the scheduler and budget gate are intentionally
 NOT WIRED into the engine's production work paths. Multiplexer,

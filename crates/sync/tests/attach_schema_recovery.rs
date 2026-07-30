@@ -23,7 +23,7 @@ use bifrost_types::{
     AccountFactory, AccountFuture, AccountId, AccountStream, AttachmentHandle, BackfillCheckpoint,
     Batch, BatchingPolicy, BlobHandle, BlobRangeSupport, ByteRange, Cause, Change, ChangeCursor,
     CloudUploadMeta, ContactCard, ContactCreate, ContactId, ContactPatch, ContactSearchRequest,
-    ContainerId, ContainerKind, ConvenienceShape, CursorDescriptor, CursorEstablishment,
+    ContainerId, ContainerKind, Control, ConvenienceShape, CursorDescriptor, CursorEstablishment,
     CursorFreshness, CursorScope, DraftHandle, DraftPatch, EventCreate, EventId, EventPatch,
     EventRange, EventSearchRequest, FilterRuleShape, FilterValidation, FlagOp, HostedAttachment,
     HydratedObject, HydrationProjection, IdempotencyKey, Identity, IdentityId, IdentityPatch,
@@ -209,6 +209,7 @@ struct HealAccount {
     closed_generations: Arc<Mutex<Vec<usize>>>,
     subscribed: SubscriptionCalls,
     unsubscribed: Arc<Mutex<Vec<(usize, SubscriptionHandle)>>>,
+    unsubscribe_failures: Arc<AtomicUsize>,
     lifecycle_calls: Arc<Mutex<Vec<usize>>>,
 }
 
@@ -250,6 +251,7 @@ impl AccountFactory for HealFactory {
                 closed_generations: Arc::new(Mutex::new(Vec::new())),
                 subscribed: Arc::new(Mutex::new(Vec::new())),
                 unsubscribed: Arc::new(Mutex::new(Vec::new())),
+                unsubscribe_failures: Arc::new(AtomicUsize::new(0)),
                 lifecycle_calls: Arc::new(Mutex::new(Vec::new())),
             });
             Ok(bifrost_types::OpenedAccount::complete(account))
@@ -264,6 +266,7 @@ struct RotatingFactory {
     closed_generations: Arc<Mutex<Vec<usize>>>,
     subscribed: SubscriptionCalls,
     unsubscribed: Arc<Mutex<Vec<(usize, SubscriptionHandle)>>>,
+    unsubscribe_failures: Arc<AtomicUsize>,
     lifecycle_calls: Arc<Mutex<Vec<usize>>>,
     opens: AtomicUsize,
 }
@@ -285,6 +288,7 @@ impl AccountFactory for RotatingFactory {
         let closed_generations = Arc::clone(&self.closed_generations);
         let subscribed = Arc::clone(&self.subscribed);
         let unsubscribed = Arc::clone(&self.unsubscribed);
+        let unsubscribe_failures = Arc::clone(&self.unsubscribe_failures);
         let lifecycle_calls = Arc::clone(&self.lifecycle_calls);
         Box::pin(async move {
             let mut account_caps = caps();
@@ -302,6 +306,7 @@ impl AccountFactory for RotatingFactory {
                 closed_generations,
                 subscribed,
                 unsubscribed,
+                unsubscribe_failures,
                 lifecycle_calls,
             });
             Ok(bifrost_types::OpenedAccount::complete(account))
@@ -400,7 +405,30 @@ impl Account for HealAccount {
             .lock()
             .expect("unsubscribed lock")
             .push((self.generation, handle));
-        Box::pin(async { Ok(()) })
+        let mut remaining = self.unsubscribe_failures.load(Ordering::SeqCst);
+        let fail = loop {
+            if remaining == 0 {
+                break false;
+            }
+            match self.unsubscribe_failures.compare_exchange(
+                remaining,
+                remaining - 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => break true,
+                Err(actual) => remaining = actual,
+            }
+        };
+        Box::pin(async move {
+            if fail {
+                Err(unsupported(
+                    bifrost_types::AccountOperation::PushUnsubscribe,
+                ))
+            } else {
+                Ok(())
+            }
+        })
     }
 
     fn push_stream(&self) -> AccountStream<WatchEvent> {
@@ -994,6 +1022,7 @@ async fn reopen_refreshes_topology_subscriptions_and_lifecycle_handle() {
         closed_generations: Arc::clone(&closed_generations),
         subscribed: Arc::clone(&subscribed),
         unsubscribed: Arc::clone(&unsubscribed),
+        unsubscribe_failures: Arc::new(AtomicUsize::new(0)),
         lifecycle_calls: Arc::clone(&lifecycle_calls),
         opens: AtomicUsize::new(0),
     });
@@ -1041,8 +1070,8 @@ async fn reopen_refreshes_topology_subscriptions_and_lifecycle_handle() {
     );
     assert_eq!(
         *subscribed.lock().expect("subscribed lock"),
-        vec![(0, vec![old_scope.clone()]), (1, vec![new_scope.clone()]),],
-        "replacement handle must recreate every registered subscription"
+        vec![(0, vec![old_scope.clone()])],
+        "a vanished requested scope must not widen a replacement subscription"
     );
     assert_eq!(
         *unsubscribed.lock().expect("unsubscribed lock"),
@@ -1080,6 +1109,281 @@ async fn reopen_refreshes_topology_subscriptions_and_lifecycle_handle() {
     );
 }
 
+#[tokio::test]
+async fn reopen_waits_for_resume_without_opening_during_pause() {
+    let account_id = AccountId("paused-reopen".to_owned());
+    let established = Arc::new(Mutex::new(Vec::new()));
+    let closed = Arc::new(AtomicUsize::new(0));
+    let factory: Arc<dyn AccountFactory> = Arc::new(HealFactory::new(
+        vec![CursorScope::Account],
+        Arc::clone(&established),
+        Arc::clone(&closed),
+    ));
+    let engine = SyncEngine::builder()
+        .build()
+        .expect("default engine config is valid");
+    let control = engine
+        .attach(account_id.clone(), factory)
+        .await
+        .expect("attach");
+    control
+        .pause()
+        .await
+        .expect("idle account pauses immediately");
+
+    let mut reopen = Box::pin(engine.reopen(&account_id));
+    tokio::select! {
+        result = &mut reopen => panic!("paused reopen completed early: {result:?}"),
+        () = tokio::task::yield_now() => {}
+    }
+    assert_eq!(
+        established.lock().expect("established lock").len(),
+        1,
+        "reopen must not open or establish a replacement while paused"
+    );
+
+    control.resume();
+    reopen.await.expect("queued reopen completes after resume");
+    assert_eq!(
+        closed.load(Ordering::SeqCst),
+        1,
+        "resume releases the queued reattach and swaps the live handle"
+    );
+
+    engine.detach(&account_id).await.expect("detach");
+}
+
+#[tokio::test]
+async fn failed_push_unsubscribe_is_reported_and_the_handle_is_retryable() {
+    let account_id = AccountId("retry-push-unsubscribe".to_owned());
+    let unsubscribed = Arc::new(Mutex::new(Vec::new()));
+    let factory = Arc::new(RotatingFactory {
+        scopes: Mutex::new(VecDeque::from([vec![CursorScope::Account]])),
+        established: Arc::new(Mutex::new(Vec::new())),
+        closed: Arc::new(AtomicUsize::new(0)),
+        closed_generations: Arc::new(Mutex::new(Vec::new())),
+        subscribed: Arc::new(Mutex::new(Vec::new())),
+        unsubscribed: Arc::clone(&unsubscribed),
+        unsubscribe_failures: Arc::new(AtomicUsize::new(1)),
+        lifecycle_calls: Arc::new(Mutex::new(Vec::new())),
+        opens: AtomicUsize::new(0),
+    });
+    let engine = SyncEngine::builder()
+        .build()
+        .expect("default engine config is valid");
+    let factory_trait: Arc<dyn AccountFactory> = factory;
+
+    engine
+        .attach(account_id.clone(), factory_trait)
+        .await
+        .expect("attach");
+    engine
+        .subscribe_push(&account_id, &[CursorScope::Account])
+        .await
+        .expect("subscribe");
+
+    assert!(
+        matches!(
+            engine.unsubscribe_push(&account_id).await,
+            Err(Error::Account(_))
+        ),
+        "a failed account-side teardown must be surfaced to the caller"
+    );
+    engine
+        .unsubscribe_push(&account_id)
+        .await
+        .expect("retained handle retries successfully");
+    assert_eq!(
+        *unsubscribed.lock().expect("unsubscribed lock"),
+        vec![
+            (0, SubscriptionHandle("generation-0".into())),
+            (0, SubscriptionHandle("generation-0".into())),
+        ],
+        "the failed handle remains registered for the next teardown call"
+    );
+
+    engine.detach(&account_id).await.expect("detach");
+}
+
+/// Factory that parks inside `open` until the test releases it, so a test can
+/// observe the window between "the engine decided to reopen" and "a
+/// replacement connection exists". The first open (attach) is never gated.
+struct GatingFactory {
+    scopes: Vec<CursorScope>,
+    established: Arc<Mutex<Vec<CursorScope>>>,
+    closed: Arc<AtomicUsize>,
+    opens: AtomicUsize,
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+impl AccountFactory for GatingFactory {
+    fn open(
+        &self,
+        _account_id: AccountId,
+    ) -> AccountFuture<Result<bifrost_types::OpenedAccount, AccountError>> {
+        let generation = self.opens.fetch_add(1, Ordering::SeqCst);
+        let scopes = self.scopes.clone();
+        let established = Arc::clone(&self.established);
+        let closed = Arc::clone(&self.closed);
+        let entered = Arc::clone(&self.entered);
+        let release = Arc::clone(&self.release);
+        Box::pin(async move {
+            if generation > 0 {
+                entered.notify_one();
+                release.notified().await;
+            }
+            let account: Arc<dyn Account> = Arc::new(HealAccount {
+                caps: caps(),
+                scopes,
+                established,
+                closed,
+                generation,
+                closed_generations: Arc::new(Mutex::new(Vec::new())),
+                subscribed: Arc::new(Mutex::new(Vec::new())),
+                unsubscribed: Arc::new(Mutex::new(Vec::new())),
+                unsubscribe_failures: Arc::new(AtomicUsize::new(0)),
+                lifecycle_calls: Arc::new(Mutex::new(Vec::new())),
+            });
+            Ok(bifrost_types::OpenedAccount::complete(account))
+        })
+    }
+}
+
+/// `pause` promises the consumer a quiescent account: no engine-initiated
+/// protocol work in flight. Registering the reopen's activity only after
+/// `factory.open()` returned left a window where a pause could report
+/// quiescence while a replacement connection was being established in the
+/// background - and where the replacement, on losing that race, was dropped
+/// without `close()`.
+#[tokio::test]
+async fn pause_cannot_report_quiescence_while_a_replacement_is_mid_open() {
+    let account_id = AccountId("mid-open-pause".to_owned());
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let closed = Arc::new(AtomicUsize::new(0));
+    let factory: Arc<dyn AccountFactory> = Arc::new(GatingFactory {
+        scopes: vec![CursorScope::Account],
+        established: Arc::new(Mutex::new(Vec::new())),
+        closed: Arc::clone(&closed),
+        opens: AtomicUsize::new(0),
+        entered: Arc::clone(&entered),
+        release: Arc::clone(&release),
+    });
+    let engine = Arc::new(
+        SyncEngine::builder()
+            .build()
+            .expect("default engine config is valid"),
+    );
+    let control = engine
+        .attach(account_id.clone(), factory)
+        .await
+        .expect("attach");
+
+    let reopen_engine = Arc::clone(&engine);
+    let reopen_id = account_id.clone();
+    let reopen = tokio::spawn(async move { reopen_engine.reopen(&reopen_id).await });
+    entered.notified().await;
+
+    let mut pause = Box::pin(control.pause());
+    for _ in 0..16 {
+        tokio::select! {
+            biased;
+            result = &mut pause => {
+                panic!("pause reported quiescence mid-open: {result:?}");
+            }
+            () = tokio::task::yield_now() => {}
+        }
+    }
+
+    release.notify_one();
+    reopen
+        .await
+        .expect("reopen task joins")
+        .expect("reopen completes");
+    pause.await.expect("pause completes once the swap is done");
+    assert_eq!(
+        closed.load(Ordering::SeqCst),
+        1,
+        "the replacement swap must close exactly the old handle"
+    );
+
+    control.resume();
+    engine.detach(&account_id).await.expect("detach");
+}
+
+/// Correlated teardown failure: the old handle refuses to unsubscribe AND the
+/// unwind of the replacement's own subscriptions fails too. `Account::close()`
+/// deliberately does not delete server-side subscriptions, so a replacement
+/// handle that is merely logged and forgotten here is exactly the orphaned
+/// webhook the retained-handle rule exists to prevent.
+#[tokio::test]
+async fn correlated_teardown_failure_retains_both_sides_for_retry() {
+    let account_id = AccountId("correlated-teardown".to_owned());
+    let unsubscribed = Arc::new(Mutex::new(Vec::new()));
+    let factory = Arc::new(RotatingFactory {
+        scopes: Mutex::new(VecDeque::from([
+            vec![CursorScope::Account],
+            vec![CursorScope::Account],
+        ])),
+        established: Arc::new(Mutex::new(Vec::new())),
+        closed: Arc::new(AtomicUsize::new(0)),
+        closed_generations: Arc::new(Mutex::new(Vec::new())),
+        subscribed: Arc::new(Mutex::new(Vec::new())),
+        unsubscribed: Arc::clone(&unsubscribed),
+        // Both the old-handle teardown and the replacement unwind that
+        // follows it fail.
+        unsubscribe_failures: Arc::new(AtomicUsize::new(2)),
+        lifecycle_calls: Arc::new(Mutex::new(Vec::new())),
+        opens: AtomicUsize::new(0),
+    });
+    let engine = SyncEngine::builder()
+        .build()
+        .expect("default engine config is valid");
+    let factory_trait: Arc<dyn AccountFactory> = factory;
+
+    engine
+        .attach(account_id.clone(), factory_trait)
+        .await
+        .expect("attach");
+    engine
+        .subscribe_push(&account_id, &[CursorScope::Account])
+        .await
+        .expect("subscribe");
+
+    assert!(
+        matches!(engine.reopen(&account_id).await, Err(Error::Account(_))),
+        "an unconfirmed old-handle teardown must abort the swap"
+    );
+    assert_eq!(
+        *unsubscribed.lock().expect("unsubscribed lock"),
+        vec![
+            (0, SubscriptionHandle("generation-0".into())),
+            (1, SubscriptionHandle("generation-1".into())),
+        ],
+        "both sides are attempted, and both fail"
+    );
+
+    // The replacement was closed, but its handle must still be registered:
+    // a later teardown call is the only thing that can delete it server-side.
+    engine
+        .unsubscribe_push(&account_id)
+        .await
+        .expect("both retained handles tear down on retry");
+    assert_eq!(
+        *unsubscribed.lock().expect("unsubscribed lock"),
+        vec![
+            (0, SubscriptionHandle("generation-0".into())),
+            (1, SubscriptionHandle("generation-1".into())),
+            (0, SubscriptionHandle("generation-0".into())),
+            (0, SubscriptionHandle("generation-1".into())),
+        ],
+        "neither the old nor the replacement handle may be forgotten"
+    );
+
+    engine.detach(&account_id).await.expect("detach");
+}
+
 /// Factory whose successive opens answer a scripted
 /// `OpenedAccount::skipped_scopes` lane, so the engine-side plumbing of
 /// the lane (store on attach, replace on reopen, expose via
@@ -1113,6 +1417,7 @@ impl AccountFactory for SkippingFactory {
                 closed_generations: Arc::new(Mutex::new(Vec::new())),
                 subscribed: Arc::new(Mutex::new(Vec::new())),
                 unsubscribed: Arc::new(Mutex::new(Vec::new())),
+                unsubscribe_failures: Arc::new(AtomicUsize::new(0)),
                 lifecycle_calls: Arc::new(Mutex::new(Vec::new())),
             });
             Ok(bifrost_types::OpenedAccount {
