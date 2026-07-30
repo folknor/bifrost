@@ -5,37 +5,14 @@ else. Resolved findings live in git history - the commit that fixed one is
 its record - and so do the per-pass repair logs; retaining either here means
 maintaining a second, drifting copy of `git log`.
 
-One open finding is recorded below. The shared-contract
-subscription-lifecycle question that used to sit here as O-7 is tracked as
-`xc-2` in `TODO.md` instead, since it is a contract question rather than a
-Graph defect.
-
-## Open findings
-
-### O-28 (correctness): one inaccessible shared mailbox kills the whole search
-
-`search_message_rows` now walks the primary mailbox and then every
-configured shared mailbox. Any per-mailbox failure propagates as the
-whole call's `Err`, so a shared mailbox the account has lost delegate
-access to (403 -> `Authorization(PermissionDenied)` -> `NoPermission`,
-terminal) ends the search for every mailbox, including the primary pages
-the caller has not reached yet. Every other shared-mailbox door in this
-crate deliberately does the opposite: a revoked foreign scope is
-quarantined (`ScopeRevoked` -> scope-bearing `DisableScope`) rather than
-escalated account-wide. Search is now the one door where it escalates.
-
-Not fixed in the round that introduced the walk because the right
-behavior is a contract question, not a local repair: `Page` has no
-warning channel, and its `failed_ids` is documented as native identifiers
-of RESOURCES the provider could not materialize, not of mailboxes that
-were skipped. Silently dropping a mailbox's results is the one option
-that is clearly wrong. Deciding between "widen the page vocabulary",
-"skip and report through a new channel", and "keep failing the call but
-name the mailbox in the scope" needs a `bifrost-types` decision, so it is
-filed rather than guessed at.
-
-Bounded by configuration: an account with no shared mailboxes cannot hit
-it, and a walk that dies still delivered every earlier page.
+No findings are open. The shared-contract subscription-lifecycle question
+that used to sit here as O-7 is tracked as `xc-2` in `TODO.md` instead,
+since it is a contract question rather than a Graph defect. The last
+finding, O-28 (one revoked shared mailbox killed the whole search walk),
+was resolved by widening the `bifrost-types` page vocabulary
+(`Page::skipped_scopes`) and quarantining the revoked mailbox in the walk;
+its record, like every other resolved finding's, is the commit that fixed
+it.
 
 ## Test coverage: the standing seam
 
@@ -143,10 +120,31 @@ request count proves. That test fails against the pre-fix code at the very
 first assertion, returning `ContainerId("deletedItems")` where the caller
 expected an error.
 
-What these two seams do NOT reach: no test walks a shared mailbox's OWN
-`nextLink` continuation (only the primary's is exercised), no test walks
-three mailboxes, and the per-mailbox failure behavior of the search walk is
-unpinned entirely - which is O-28 above, not an accident of coverage.
+The search walk's per-mailbox FAILURE behavior (formerly O-28) is pinned on
+both sides of its quarantine line. A 403 on a foreign mailbox mid-walk must
+not end the search: the walk skips that mailbox, continues into the next one
+IN THE SAME CALL, and reports the skip as a `Page::skipped_scopes` entry
+(scope `Mailbox { id }`, error `Authorization(PermissionDenied)` ->
+`NoPermission`) - pinned over a three-mailbox account whose middle mailbox
+is dead, with each client independently scripted so the request counts prove
+the dead mailbox was asked exactly once and the live one answered from its
+own script. The dead-mailbox-LAST shape is pinned separately, because it
+must complete as a terminal empty page carrying the skip rather than error.
+Both were verified against the reverted production change: each fails with
+the pre-fix escalation, `Err(Authorization(PermissionDenied))` /
+`NoPermission` scoped to the dead mailbox, at the call that resumes into it.
+The quarantine's NARROWNESS is pinned by two behavior-preservation tests
+(which pass against the old code by construction, since they assert what
+must NOT change): a transient 503 on a foreign mailbox still fails the call
+retryable - the caller's retry of the same cursor can succeed, a skip could
+not - and a primary-mailbox 403 still fails terminal, since a permission
+loss on the account's own mailbox is not something a walk may step around.
+
+What these two seams still do NOT reach: no test walks a shared mailbox's
+OWN `nextLink` continuation (only the primary's pagination is exercised),
+and no test PAGES through three mailboxes - the quarantine test routes
+across three, but only the primary and one live shared mailbox return
+result pages.
 
 The cursor-envelope v2 bump is pinned at the `changes_stream` door, not just
 at `decode_cursor`: a v1 cursor whose payload still deserializes must

@@ -78,6 +78,7 @@ pub(crate) fn events_in_range(
             next_cursor,
             estimated_total: total,
             failed_ids: Vec::new(),
+            skipped_scopes: Vec::new(),
         })
     })
 }
@@ -243,6 +244,7 @@ pub(crate) fn search(
             next_cursor,
             estimated_total: total,
             failed_ids: Vec::new(),
+            skipped_scopes: Vec::new(),
         })
     })
 }

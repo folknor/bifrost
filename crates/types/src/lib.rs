@@ -148,7 +148,7 @@ pub use mutation::{
 };
 
 // Pagination.
-pub use page::Page;
+pub use page::{Page, SkippedScope};
 
 // Search request AST.
 pub use search::{SearchFilter, SearchRequest};

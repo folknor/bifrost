@@ -245,6 +245,7 @@ pub(crate) fn search(
                     next_cursor: Some(encode_cross_calendar_cursor(calendar_id, &[])),
                     estimated_total: None,
                     failed_ids: Vec::new(),
+                    skipped_scopes: Vec::new(),
                 });
             }
             let page = search_one_calendar(
@@ -273,6 +274,7 @@ pub(crate) fn search(
                     next_cursor: Some(encode_cross_calendar_cursor(calendar_id, &next_token)),
                     estimated_total: None,
                     failed_ids: Vec::new(),
+                    skipped_scopes: Vec::new(),
                 });
             }
             index += 1;
@@ -284,6 +286,7 @@ pub(crate) fn search(
                         .map(|calendar_id| encode_cross_calendar_cursor(calendar_id, &[])),
                     estimated_total: None,
                     failed_ids: Vec::new(),
+                    skipped_scopes: Vec::new(),
                 });
             }
         }
@@ -292,6 +295,7 @@ pub(crate) fn search(
             next_cursor: None,
             estimated_total: None,
             failed_ids: Vec::new(),
+            skipped_scopes: Vec::new(),
         })
     })
 }
@@ -340,6 +344,7 @@ fn page_from_events(
         next_cursor: response.next_page_token.map(String::into_bytes),
         estimated_total: None,
         failed_ids: Vec::new(),
+        skipped_scopes: Vec::new(),
     })
 }
 

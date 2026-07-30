@@ -3,12 +3,13 @@ use std::time::SystemTime;
 
 use base64::Engine;
 use bifrost_types::{
-    AccountError, AccountOperation, Address, AttachmentInline, Container, ContainerContentClass,
-    ContainerId, ContainerKind, ContainerNamespace, ContainerRights, DraftHandle, DraftPatch,
-    ErrorScope, FolderId, FolderRole, HydrationProjection, Identity, IdentityId, Importance,
-    LabelId, MailboxId, Message, MutationTarget, ObjectId, Page, ProtocolErrorKind, ProtocolKind,
-    Provenance, SearchFilter, SearchRequest, SendAs, ThreadHydration, ThreadId, VacationConfig,
-    Warning, WarningKind,
+    AccessErrorKind, AccountError, AccountErrorKind, AccountOperation, Address, AttachmentInline,
+    Container, ContainerContentClass, ContainerId, ContainerKind, ContainerNamespace,
+    ContainerRights, DraftHandle, DraftPatch, ErrorScope, FolderId, FolderRole,
+    HydrationProjection, Identity, IdentityId, Importance, LabelId, MailboxId, Message,
+    MutationTarget, ObjectId, Page, ProtocolErrorKind, ProtocolKind, Provenance, SearchFilter,
+    SearchRequest, SendAs, SkippedScope, ThreadHydration, ThreadId, VacationConfig, Warning,
+    WarningKind,
 };
 use chrono::TimeZone;
 use serde::{Deserialize, Serialize};
@@ -612,7 +613,8 @@ pub(crate) async fn search(
         items: threads,
         next_cursor: page.next_cursor,
         estimated_total: page.estimated_total,
-        failed_ids: Vec::new(),
+        failed_ids: page.failed_ids,
+        skipped_scopes: page.skipped_scopes,
     })
 }
 
@@ -625,7 +627,8 @@ pub(crate) async fn search_messages(
         items: page.items.into_iter().map(|row| row.id).collect(),
         next_cursor: page.next_cursor,
         estimated_total: page.estimated_total,
-        failed_ids: Vec::new(),
+        failed_ids: page.failed_ids,
+        skipped_scopes: page.skipped_scopes,
     })
 }
 
@@ -1968,29 +1971,84 @@ async fn search_message_rows(
     request: SearchRequest,
 ) -> Result<Page<SearchRow>, AccountError> {
     let cursor = decode_search_cursor(account, request.page_cursor.as_deref())?;
-    let owner = cursor
+    let mut owner = cursor
         .as_ref()
         .and_then(|cursor| cursor.owner.as_deref())
         .map(str::to_string);
-    let client = account
-        .client_for_owner(owner.as_deref())
-        .map_err(|error| {
-            into_account_error(error, GraphErrorContext::graph(AccountOperation::Search))
-        })?;
-    let url = match cursor.and_then(|cursor| cursor.next_link) {
-        Some(next_link) => next_link,
-        // No `next_link` means "start this mailbox at its first page":
-        // either the whole search, or the mailbox after one whose own
-        // pagination ran out.
-        None => search_url(&client.api_path_prefix(), &request)?,
+    let mut next_link = cursor.and_then(|cursor| cursor.next_link);
+    // Shared mailboxes the walk quarantined instead of searching, reported
+    // on the returned page. See the skip arm below for why they are not the
+    // call's `Err`.
+    let mut skipped_scopes: Vec<SkippedScope> = Vec::new();
+    let page = loop {
+        let client = account
+            .client_for_owner(owner.as_deref())
+            .map_err(|error| {
+                into_account_error(error, GraphErrorContext::graph(AccountOperation::Search))
+            })?;
+        let url = match next_link.take() {
+            Some(next_link) => next_link,
+            // No `next_link` means "start this mailbox at its first page":
+            // either the whole search, or the mailbox after one whose own
+            // pagination ran out.
+            None => search_url(&client.api_path_prefix(), &request)?,
+        };
+        let ctx = GraphErrorContext::graph(AccountOperation::Search);
+        let result: Result<ODataCollection<Value>, _> = if url.starts_with("http") {
+            client.get_absolute(&url).await
+        } else {
+            client.get_json(&url).await
+        };
+        match result {
+            Ok(page) => break page,
+            Err(error) => {
+                // A shared mailbox this account has lost delegate access to
+                // must not end the walk for the mailboxes behind it. The
+                // dead mailbox stays configured, so retrying this cursor -
+                // or restarting the search from page one - would 403 at the
+                // same position forever, leaving the whole search surface
+                // dead over one revoked share. Quarantine it the way every
+                // other shared-mailbox door does, but report the skip on the
+                // page (`Page::skipped_scopes`) instead of raising an engine
+                // directive: a search walk has no cursor scope to disable,
+                // and skipping SILENTLY would leave "no matches there"
+                // indistinguishable from "never searched there". A primary
+                // failure (`owner == None`) is a genuine account-level
+                // signal, and a non-permission failure is transient enough
+                // that retrying this same cursor can succeed; both still
+                // fail the call.
+                let Some(mailbox) = owner.as_deref() else {
+                    return Err(into_account_error(error, ctx));
+                };
+                let scope = ErrorScope::Mailbox {
+                    id: mailbox.to_string(),
+                };
+                let error = into_account_error(error, ctx.with_scope(scope.clone()));
+                if !matches!(
+                    error.kind(),
+                    AccountErrorKind::Authorization(AccessErrorKind::PermissionDenied)
+                ) {
+                    return Err(error);
+                }
+                let next_owner = next_search_owner(account, Some(mailbox));
+                skipped_scopes.push(SkippedScope { scope, error });
+                match next_owner {
+                    Some(next_owner) => owner = Some(next_owner),
+                    // The dead mailbox was the walk's last: the search is
+                    // complete, minus the quarantined scopes it reports.
+                    None => {
+                        return Ok(Page {
+                            items: Vec::new(),
+                            next_cursor: None,
+                            estimated_total: None,
+                            failed_ids: Vec::new(),
+                            skipped_scopes,
+                        });
+                    }
+                }
+            }
+        }
     };
-    let ctx = GraphErrorContext::graph(AccountOperation::Search);
-    let page: ODataCollection<Value> = if url.starts_with("http") {
-        client.get_absolute(&url).await
-    } else {
-        client.get_json(&url).await
-    }
-    .map_err(|e| into_account_error(e, ctx))?;
     let mut rows = Vec::new();
     for value in page.value {
         let id = object_id_from_value(&value, AccountOperation::Search, None)?;
@@ -2015,6 +2073,7 @@ async fn search_message_rows(
         next_cursor,
         estimated_total: None,
         failed_ids: Vec::new(),
+        skipped_scopes,
     })
 }
 
@@ -3318,6 +3377,186 @@ mod tests {
                 .url
                 .contains("/users/shared%40contoso.com/messages?")
         );
+    }
+
+    /// O-28: search was the one shared-mailbox door where a revoked share
+    /// escalated account-wide. The dead mailbox stays configured, so the
+    /// old `Err(NoPermission)` did not just fail one call - every retry
+    /// and every restarted search died at the same walk position, taking
+    /// the mailboxes behind it down too. The walk must quarantine the
+    /// revoked share like its sibling doors do, continue into the next
+    /// mailbox, and REPORT the skip on the page so "no matches in b@" is
+    /// distinguishable from "b@ was never searched".
+    #[tokio::test]
+    async fn a_revoked_shared_mailbox_is_skipped_and_the_walk_continues() {
+        let primary = GraphClient::new("token");
+        primary.script_rest([ScriptedRestResponse::json(
+            reqwest::StatusCode::OK,
+            json!({ "value": [{ "id": "primary-message", "conversationId": "primary-thread" }] }),
+        )]);
+        let dead = GraphClient::new("token");
+        dead.script_rest([ScriptedRestResponse::json(
+            reqwest::StatusCode::FORBIDDEN,
+            json!({ "error": { "code": "AccessDenied", "message": "delegate access revoked" } }),
+        )]);
+        let alive = GraphClient::new("token");
+        alive.script_rest([ScriptedRestResponse::json(
+            reqwest::StatusCode::OK,
+            json!({ "value": [{ "id": "alive-message", "conversationId": "alive-thread" }] }),
+        )]);
+        let account = GraphAccount::new_for_tests_with_shared_clients(
+            primary.clone(),
+            PushMode::GraphSubscriptions,
+            HashMap::from([
+                (
+                    "b@contoso.com".to_string(),
+                    dead.for_shared_mailbox("b@contoso.com"),
+                ),
+                (
+                    "c@contoso.com".to_string(),
+                    alive.for_shared_mailbox("c@contoso.com"),
+                ),
+            ]),
+        );
+
+        let first = search_message_rows(&account, SearchRequest::default())
+            .await
+            .expect("primary page succeeds");
+        assert!(first.skipped_scopes.is_empty());
+        let mut continuation = SearchRequest::default();
+        continuation.page_cursor = first.next_cursor;
+        let resumed = search_message_rows(&account, continuation)
+            .await
+            .expect("the walk continues past the revoked mailbox");
+
+        // The page holds the LIVE mailbox's results, owner-qualified.
+        assert_eq!(
+            resumed.items[0].id,
+            ObjectId("c@contoso.com\u{1f}alive-message".to_string())
+        );
+        assert!(resumed.next_cursor.is_none());
+        // The quarantined mailbox is reported, carrying the terminal
+        // classification the old code raised account-wide.
+        assert_eq!(resumed.skipped_scopes.len(), 1);
+        let skip = &resumed.skipped_scopes[0];
+        assert_eq!(
+            skip.scope,
+            ErrorScope::Mailbox {
+                id: "b@contoso.com".to_string()
+            }
+        );
+        assert!(matches!(
+            skip.error.kind(),
+            AccountErrorKind::Authorization(AccessErrorKind::PermissionDenied)
+        ));
+        assert!(matches!(
+            skip.error.recovery(),
+            RecoveryClass::NoPermission { .. }
+        ));
+        assert_eq!(skip.error.scope(), Some(&skip.scope));
+
+        // One request per mailbox: the revoked one was asked exactly once,
+        // and the walk resumed at the next mailbox in the same call.
+        assert_eq!(primary.take_rest_requests().len(), 1);
+        assert_eq!(dead.take_rest_requests().len(), 1);
+        let alive_requests = alive.take_rest_requests();
+        assert_eq!(alive_requests.len(), 1);
+        assert!(
+            alive_requests[0]
+                .url
+                .contains("/users/c%40contoso.com/messages?")
+        );
+    }
+
+    /// The revoked mailbox at the END of the walk must not turn "search
+    /// complete, minus one quarantined scope" into an error: the call
+    /// answers a terminal empty page that still reports the skip.
+    #[tokio::test]
+    async fn a_walk_ending_in_a_revoked_mailbox_completes_and_reports_the_skip() {
+        let primary = GraphClient::new("token");
+        primary.script_rest([ScriptedRestResponse::json(
+            reqwest::StatusCode::OK,
+            json!({ "value": [{ "id": "primary-message", "conversationId": "primary-thread" }] }),
+        )]);
+        let dead = GraphClient::new("token");
+        dead.script_rest([ScriptedRestResponse::json(
+            reqwest::StatusCode::FORBIDDEN,
+            json!({ "error": { "code": "AccessDenied", "message": "delegate access revoked" } }),
+        )]);
+        let mailbox = "shared@contoso.com";
+        let account = GraphAccount::new_for_tests_with_shared_clients(
+            primary,
+            PushMode::GraphSubscriptions,
+            HashMap::from([(mailbox.to_string(), dead.for_shared_mailbox(mailbox))]),
+        );
+
+        let mut continuation = SearchRequest::default();
+        continuation.page_cursor = search_message_rows(&account, SearchRequest::default())
+            .await
+            .expect("primary page succeeds")
+            .next_cursor;
+        let last = search_message_rows(&account, continuation)
+            .await
+            .expect("the walk completes despite the revoked tail mailbox");
+        assert!(last.items.is_empty());
+        assert!(last.next_cursor.is_none());
+        assert_eq!(last.skipped_scopes.len(), 1);
+        assert_eq!(
+            last.skipped_scopes[0].scope,
+            ErrorScope::Mailbox {
+                id: mailbox.to_string()
+            }
+        );
+    }
+
+    /// The quarantine is exactly as narrow as its sibling doors': only a
+    /// permission denial on a FOREIGN mailbox skips. A transient failure
+    /// there still fails the call - the caller retries the same cursor and
+    /// can succeed - and a primary-mailbox 403 is a genuine account-level
+    /// signal, not something a walk may step around.
+    #[tokio::test]
+    async fn only_a_foreign_permission_denial_is_skipped() {
+        // Transient failure on the shared mailbox: propagates retryable.
+        let primary = GraphClient::new("token");
+        primary.script_rest([ScriptedRestResponse::json(
+            reqwest::StatusCode::OK,
+            json!({ "value": [] }),
+        )]);
+        let flaky = GraphClient::new("token");
+        flaky.script_rest([ScriptedRestResponse::empty(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        )]);
+        let mailbox = "shared@contoso.com";
+        let account = GraphAccount::new_for_tests_with_shared_clients(
+            primary,
+            PushMode::GraphSubscriptions,
+            HashMap::from([(mailbox.to_string(), flaky.for_shared_mailbox(mailbox))]),
+        );
+        let mut continuation = SearchRequest::default();
+        continuation.page_cursor = search_message_rows(&account, SearchRequest::default())
+            .await
+            .expect("primary page succeeds")
+            .next_cursor;
+        let transient = search_message_rows(&account, continuation)
+            .await
+            .expect_err("a transient shared-mailbox failure fails the call");
+        assert!(transient.recovery().is_retryable());
+
+        // Permission denial on the PRIMARY mailbox: propagates terminal.
+        let primary = GraphClient::new("token");
+        primary.script_rest([ScriptedRestResponse::json(
+            reqwest::StatusCode::FORBIDDEN,
+            json!({ "error": { "code": "AccessDenied", "message": "nope" } }),
+        )]);
+        let account = GraphAccount::new_for_tests(primary, PushMode::GraphSubscriptions);
+        let denied = search_message_rows(&account, SearchRequest::default())
+            .await
+            .expect_err("a primary permission denial fails the call");
+        assert!(matches!(
+            denied.kind(),
+            AccountErrorKind::Authorization(AccessErrorKind::PermissionDenied)
+        ));
+        assert!(denied.recovery().is_terminal());
     }
 
     /// A search cursor names a position in a WALK over several mailboxes,

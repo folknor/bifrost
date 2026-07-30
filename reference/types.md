@@ -135,6 +135,24 @@ and must be read back rather than replayed blindly.
 the error model. Absolute-state writes are idempotent. Sends, creates,
 moves, destroys, uploads, and other side-effecting writers are not.
 
+## Paginated results
+
+`Page<T>` (`page.rs`) is the envelope `search`, `search_messages`, and the
+other paged list surfaces return: `items`, an opaque protocol-owned
+`next_cursor`, an optional `estimated_total`, and two degradation lanes
+with distinct namespaces. `failed_ids` names RESOURCES (item-namespace
+native ids) the provider fetched but could not materialize.
+`skipped_scopes` names SCOPES a multi-scope walk quarantined instead of
+visiting - each `SkippedScope` carries a mandatory `ErrorScope` (which
+scope went unsearched) plus the classified `AccountError` that caused the
+skip (for Graph, a shared mailbox whose delegate access was revoked:
+terminal `NoPermission`). A skip entry is advisory - the walk continued
+and `items` remain valid - but absence of results from a skipped scope is
+not evidence of absence. Both `Page` and `SkippedScope` are deliberately
+NOT `#[non_exhaustive]`: protocol impls construct them directly, and a new
+lane must break every constructor so each one answers the new question
+instead of silently defaulting it.
+
 ## Provenance and container vocabulary
 
 Identifiers are typed newtypes. `Container`, `Label`, and related
@@ -186,6 +204,6 @@ crates/types/src/
   cloud.rs            hosted attachment vocabulary
   mime.rs             MIME-facing shared values
   ids.rs              typed identifiers
-  page.rs             page helpers
+  page.rs             Page envelope + SkippedScope skip lane
   error/              structured error, recovery, batch, warning model
 ```

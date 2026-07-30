@@ -78,6 +78,7 @@ pub(crate) fn list(
             next_cursor,
             estimated_total: total,
             failed_ids: hydrated.failed_ids,
+            skipped_scopes: Vec::new(),
         })
     })
 }
@@ -223,6 +224,7 @@ pub(crate) fn search(
             next_cursor,
             estimated_total: total,
             failed_ids: hydrated.failed_ids,
+            skipped_scopes: Vec::new(),
         })
     })
 }

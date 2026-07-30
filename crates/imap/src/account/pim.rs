@@ -1655,6 +1655,7 @@ fn page_from_items<T: Clone>(
         next_cursor,
         estimated_total: Some(u64::try_from(items.len()).unwrap_or(u64::MAX)),
         failed_ids: Vec::new(),
+        skipped_scopes: Vec::new(),
     })
 }
 

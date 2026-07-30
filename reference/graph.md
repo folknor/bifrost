@@ -913,6 +913,22 @@ reject costs one round trip and nothing else. There is deliberately no
 compatibility arm for a bare Graph nextLink - unrecognized cursor bytes are
 never re-issued as a URL. Cursor bytes are request input, so none of these
 rejections is a `Protocol(...)` classification.
+A shared mailbox the account has lost delegate access to must not end the
+walk: the dead mailbox stays configured, so propagating its 403 as the
+call's `Err` (terminal `NoPermission`) killed every retry and every
+restarted search at the same position, account-wide, over one revoked
+share - the exact escalation every other shared-mailbox door quarantines.
+The walk instead skips that mailbox, continues into the next one in the
+same call, and reports the skip as a `Page::skipped_scopes` entry
+(`bifrost-types` vocabulary added for this: scope `Mailbox { id }` plus the
+classified `AccountError`), so "no matches there" stays distinguishable
+from "never searched there". The quarantine is exactly as narrow as
+`graph_shared_scope_error`'s: only `Authorization(PermissionDenied)` on a
+FOREIGN mailbox skips. A transient failure there still fails the call
+(retrying the same cursor can succeed; a skip could not), and a
+primary-mailbox 403 still fails terminal. The skip is a page report rather
+than a `ScopeRevoked` -> `DisableScope` directive because a search walk has
+no cursor scope for the engine to disable.
 Message and thread ids from shared mailboxes are owner-qualified, while
 primary ids remain bare; thread search dedups `conversationId` within each
 page. Graph forbids `$search`+`$filter` together and

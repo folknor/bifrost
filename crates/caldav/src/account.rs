@@ -751,6 +751,7 @@ impl Account for CalDavAccount {
                 next_cursor: None,
                 estimated_total: None,
                 failed_ids: failed,
+                skipped_scopes: Vec::new(),
             })
         })
     }
@@ -968,6 +969,7 @@ impl Account for CalDavAccount {
                 next_cursor: None,
                 estimated_total: None,
                 failed_ids: failed,
+                skipped_scopes: Vec::new(),
             })
         })
     }

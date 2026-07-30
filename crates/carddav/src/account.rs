@@ -199,6 +199,7 @@ impl CardDavAccount {
                 .then(|| (offset + page_size).to_string().into_bytes()),
             estimated_total: Some(estimated_total(total)),
             failed_ids,
+            skipped_scopes: Vec::new(),
         })
     }
 
@@ -1342,6 +1343,7 @@ fn page_from_offset<T>(items: Vec<T>, offset: usize, page_size: usize) -> Page<T
         next_cursor: (end < total).then(|| end.to_string().into_bytes()),
         estimated_total: Some(estimated_total(total)),
         failed_ids: Vec::new(),
+        skipped_scopes: Vec::new(),
     }
 }
 

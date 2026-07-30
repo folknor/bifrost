@@ -90,6 +90,7 @@ pub(crate) async fn events_in_range(
         next_cursor: page.next_link.map(String::into_bytes),
         estimated_total: None,
         failed_ids: Vec::new(),
+        skipped_scopes: Vec::new(),
     })
 }
 
@@ -324,6 +325,7 @@ async fn search_locally(
         next_cursor,
         estimated_total: None,
         failed_ids: Vec::new(),
+        skipped_scopes: Vec::new(),
     })
 }
 
@@ -373,6 +375,7 @@ async fn search_with_graph_api(
         next_cursor,
         estimated_total: None,
         failed_ids: Vec::new(),
+        skipped_scopes: Vec::new(),
     })
 }
 
