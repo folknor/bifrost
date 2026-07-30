@@ -84,10 +84,13 @@ impl InvalidationSink for InvalidationSinkInner {
             Err(mpsc::error::TrySendError::Full(rejected)) => {
                 let sender = tx.clone();
                 let lossless = requires_lossless_delivery(&rejected);
-                if !lossless {
-                    self.drop_counter.fetch_add(1, Ordering::Relaxed);
-                }
                 if let Some(handle) = self.runtime.get() {
+                    // Only the lossy coalescing lane counts as a drop: the
+                    // lossless lane below waits for queue space and delivers
+                    // the original event.
+                    if !lossless {
+                        self.drop_counter.fetch_add(1, Ordering::Relaxed);
+                    }
                     let delivery = if lossless {
                         rejected
                     } else {
@@ -107,6 +110,14 @@ impl InvalidationSink for InvalidationSinkInner {
                             let _ = tokio::time::timeout(deadline, sender.send(delivery)).await;
                         }
                     });
+                } else {
+                    // No runtime handle was ever captured (`register` ran
+                    // outside Tokio), so nothing can wait for queue space:
+                    // the event is discarded regardless of classification.
+                    // A lossless discard is still a drop - leaving it
+                    // uncounted would hide the loss of control information
+                    // from the one signal built to expose it.
+                    self.drop_counter.fetch_add(1, Ordering::Relaxed);
                 }
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
@@ -236,6 +247,36 @@ mod tests {
             rx.recv().await,
             Some(WatchEvent::Invalidated { .. })
         ));
+    }
+
+    /// With no captured runtime handle nothing can wait for queue space, so
+    /// even a lossless event hitting a full queue is discarded - and a
+    /// discard the metric does not count is control information lost with no
+    /// trace. This test runs entirely off-runtime so `register` never
+    /// captures a handle.
+    #[test]
+    fn no_runtime_discard_of_a_lossless_event_is_counted() {
+        let sink = Arc::new(InvalidationSinkInner::new());
+        let account = AccountId("no-runtime".into());
+        let (tx, mut rx) = mpsc::channel(1);
+        sink.register(account.clone(), tx);
+        sink.senders
+            .get(&account)
+            .expect("registered")
+            .try_send(invalidated())
+            .expect("fill queue");
+
+        sink.push(
+            account,
+            WatchEvent::Warning(Warning::user_safe(WarningKind::Other, "discarded")),
+        );
+
+        assert_eq!(sink.dropped(), 1, "the discarded warning must be counted");
+        assert!(matches!(rx.try_recv(), Ok(WatchEvent::Invalidated { .. })));
+        assert!(
+            rx.try_recv().is_err(),
+            "nothing could redeliver the warning"
+        );
     }
 
     #[test]

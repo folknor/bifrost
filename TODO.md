@@ -470,19 +470,17 @@ They are collected here rather than in the per-crate sections above so they
 can be adjudicated together, from a higher vantage point, later. None is
 blocking; each is a real defect or a real decision, not a cleanup.
 
-- **xc-1 (graph + sync)** The push-teardown retry lane has no retrier.
-  `bifrost-graph` was fixed (G-15, commit 578c1ff) so that a failed webhook
-  DELETE keeps its subscription ids registered under the same handle,
-  specifically so teardown can be retried - an orphaned Graph subscription
-  otherwise keeps delivering to the consumer's webhook endpoint until its 24h
-  expiry. But `SyncEngine::unsubscribe_push` (`crates/sync/src/engine.rs:982`)
-  does `self.subscriptions.take(account_id)` *before* its per-handle loop and
-  only logs a warning when `Account::push_unsubscribe` fails. The registry
-  entry is gone either way, so nothing engine-side can drive the retry the
-  account crate now supports; only a consumer holding its own handle can.
-  Either retain the entry until every teardown reports success, or surface the
-  failure to the caller instead of swallowing it. Tracked crate-side as R6 in
-  `plans/bugs-types-sync.md`.
+- **xc-1 (graph + sync)** The push-teardown retry lane has no *scheduled*
+  retrier. The engine side landed (2026-07 close pass):
+  `SyncEngine::unsubscribe_push` retains a failed handle's registry record
+  as `teardown_unconfirmed` and returns the error, reopen carries
+  unconfirmed records across swaps and retries them, and `bifrost-graph`
+  (G-15) keeps server subscription ids under the handle so those retries
+  can land. What remains is that nothing retries *on its own*: an
+  unconfirmed teardown waits for the next reopen or `unsubscribe_push`
+  call, so an account that never reopens keeps its orphan until the
+  provider expires it (24h for Graph). If that window matters, add a
+  bounded engine-side retry timer for unconfirmed records.
 
 - **xc-2 (types + sync + every account crate)** Subscription teardown depends
   entirely on the caller, and the contract says so deliberately.

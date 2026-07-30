@@ -211,6 +211,10 @@ struct HealAccount {
     unsubscribed: Arc<Mutex<Vec<(usize, SubscriptionHandle)>>>,
     unsubscribe_failures: Arc<AtomicUsize>,
     lifecycle_calls: Arc<Mutex<Vec<usize>>>,
+    /// Events the next `scope_lifecycle_stream` call yields before the
+    /// stream ends. Empty means every stream ends immediately, which is
+    /// the shape most tests want.
+    lifecycle_script: Arc<Mutex<VecDeque<ScopeLifecycleEvent>>>,
 }
 
 struct HealFactory {
@@ -253,6 +257,7 @@ impl AccountFactory for HealFactory {
                 unsubscribed: Arc::new(Mutex::new(Vec::new())),
                 unsubscribe_failures: Arc::new(AtomicUsize::new(0)),
                 lifecycle_calls: Arc::new(Mutex::new(Vec::new())),
+                lifecycle_script: Arc::new(Mutex::new(VecDeque::new())),
             });
             Ok(bifrost_types::OpenedAccount::complete(account))
         })
@@ -308,6 +313,7 @@ impl AccountFactory for RotatingFactory {
                 unsubscribed,
                 unsubscribe_failures,
                 lifecycle_calls,
+                lifecycle_script: Arc::new(Mutex::new(VecDeque::new())),
             });
             Ok(bifrost_types::OpenedAccount::complete(account))
         })
@@ -350,7 +356,13 @@ impl Account for HealAccount {
             .lock()
             .expect("lifecycle calls lock")
             .push(self.generation);
-        Box::pin(stream::empty())
+        let scripted: Vec<ScopeLifecycleEvent> = self
+            .lifecycle_script
+            .lock()
+            .expect("lifecycle script lock")
+            .drain(..)
+            .collect();
+        Box::pin(stream::iter(scripted))
     }
 
     fn establish_initial_cursor(
@@ -1244,6 +1256,7 @@ impl AccountFactory for GatingFactory {
                 unsubscribed: Arc::new(Mutex::new(Vec::new())),
                 unsubscribe_failures: Arc::new(AtomicUsize::new(0)),
                 lifecycle_calls: Arc::new(Mutex::new(Vec::new())),
+                lifecycle_script: Arc::new(Mutex::new(VecDeque::new())),
             });
             Ok(bifrost_types::OpenedAccount::complete(account))
         })
@@ -1419,6 +1432,7 @@ impl AccountFactory for SkippingFactory {
                 unsubscribed: Arc::new(Mutex::new(Vec::new())),
                 unsubscribe_failures: Arc::new(AtomicUsize::new(0)),
                 lifecycle_calls: Arc::new(Mutex::new(Vec::new())),
+                lifecycle_script: Arc::new(Mutex::new(VecDeque::new())),
             });
             Ok(bifrost_types::OpenedAccount {
                 account,
@@ -1485,4 +1499,104 @@ async fn open_skips_surface_on_attach_and_reopen_replaces_them() {
     );
 
     engine.detach(&account_id).await.expect("detach succeeds");
+}
+
+/// Factory whose first open succeeds with a scripted lifecycle stream and
+/// whose every later open fails, so an `Engine(RestartAccount)` recovery can
+/// never bump the account generation.
+struct ParkedReopenFactory {
+    scopes: Vec<CursorScope>,
+    lifecycle_script: Arc<Mutex<VecDeque<ScopeLifecycleEvent>>>,
+    lifecycle_calls: Arc<Mutex<Vec<usize>>>,
+    opens: AtomicUsize,
+}
+
+impl AccountFactory for ParkedReopenFactory {
+    fn open(
+        &self,
+        _account_id: AccountId,
+    ) -> AccountFuture<Result<bifrost_types::OpenedAccount, AccountError>> {
+        let generation = self.opens.fetch_add(1, Ordering::SeqCst);
+        let scopes = self.scopes.clone();
+        let lifecycle_script = Arc::clone(&self.lifecycle_script);
+        let lifecycle_calls = Arc::clone(&self.lifecycle_calls);
+        Box::pin(async move {
+            if generation > 0 {
+                return Err(unsupported(bifrost_types::AccountOperation::Discover));
+            }
+            let account: Arc<dyn Account> = Arc::new(HealAccount {
+                caps: caps(),
+                scopes,
+                established: Arc::new(Mutex::new(Vec::new())),
+                closed: Arc::new(AtomicUsize::new(0)),
+                generation,
+                closed_generations: Arc::new(Mutex::new(Vec::new())),
+                subscribed: Arc::new(Mutex::new(Vec::new())),
+                unsubscribed: Arc::new(Mutex::new(Vec::new())),
+                unsubscribe_failures: Arc::new(AtomicUsize::new(0)),
+                lifecycle_calls,
+                lifecycle_script,
+            });
+            Ok(bifrost_types::OpenedAccount::complete(account))
+        })
+    }
+}
+
+/// End-to-end pin (under paused time) for the lifecycle reader's bounded
+/// reopen park. The stream terminates with an `Engine(RestartAccount)`-class
+/// error, and every replacement open fails, so the account generation never
+/// changes. The reader must neither reconnect immediately (the handover
+/// prefers waiting for the replacement connection) nor park forever (a
+/// reopen that exhausts its budget produces no generation change): it must
+/// come back on its own after the 30s bound.
+#[tokio::test(start_paused = true)]
+async fn lifecycle_reader_unparks_after_the_bounded_reopen_wait() {
+    use bifrost_types::{StateCause, SyncStateErrorKind};
+
+    let account_id = AccountId("bounded-lifecycle-park".to_owned());
+    let terminal = AccountErrorBuilder::new(
+        AccountErrorKind::SyncState(SyncStateErrorKind::CapabilityChanged),
+        Cause::State(StateCause::CapabilityChanged { delta: None }),
+    )
+    .operation(bifrost_types::AccountOperation::SyncChanges)
+    .try_build()
+    .expect("valid account-reopen recovery error");
+    let lifecycle_calls = Arc::new(Mutex::new(Vec::new()));
+    let factory: Arc<dyn AccountFactory> = Arc::new(ParkedReopenFactory {
+        scopes: vec![CursorScope::Account],
+        lifecycle_script: Arc::new(Mutex::new(VecDeque::from([
+            ScopeLifecycleEvent::Terminated(terminal),
+        ]))),
+        lifecycle_calls: Arc::clone(&lifecycle_calls),
+        opens: AtomicUsize::new(0),
+    });
+    let engine = SyncEngine::builder()
+        .build()
+        .expect("default engine config is valid");
+
+    let start = tokio::time::Instant::now();
+    engine
+        .attach(account_id.clone(), factory)
+        .await
+        .expect("attach");
+
+    let mut reconnects = 0;
+    for _ in 0..200 {
+        reconnects = lifecycle_calls.lock().expect("lifecycle calls lock").len();
+        if reconnects >= 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    assert!(
+        reconnects >= 2,
+        "the lifecycle reader must reconnect after the bounded wait"
+    );
+    assert!(
+        start.elapsed() >= std::time::Duration::from_secs(30),
+        "the reader reconnected before the reopen wait elapsed: {:?}",
+        start.elapsed()
+    );
+
+    engine.detach(&account_id).await.expect("detach");
 }

@@ -1029,6 +1029,11 @@ impl SyncEngine {
             .get(account_id)
             .map(|r| Arc::clone(r.value()))
             .ok_or_else(|| Error::AccountNotAttached(account_id.clone()))?;
+        // Serialize against a concurrent reopen. Reattach snapshots the
+        // registry, tears old handles down, and installs a replacement set;
+        // a take/restore interleaved with that window would either resurrect
+        // records the consumer just tore down or race the handle swap.
+        let _reopen_guard = slot.reopen_lock.lock().await;
         let records = self.subscriptions.take(account_id);
         let account = slot.current.load_full();
         let mut failed = Vec::new();
@@ -1068,6 +1073,12 @@ impl SyncEngine {
             .get(account_id)
             .map(|r| Arc::clone(r.value()))
             .ok_or_else(|| Error::AccountNotAttached(account_id.clone()))?;
+        // Serialize against a concurrent reopen. Reattach replaces the
+        // registry rows wholesale from a snapshot; a registration landing
+        // between that snapshot and the swap would be silently erased while
+        // its server-side subscription - created on a handle about to be
+        // closed - kept delivering with nothing left able to tear it down.
+        let _reopen_guard = slot.reopen_lock.lock().await;
         let account = slot.current.load_full();
         let handle = account.push_subscribe(scopes).await?;
         self.subscriptions

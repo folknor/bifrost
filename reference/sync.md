@@ -430,7 +430,12 @@ coalesced into one
 runtime waits for queue space and sends the original event without
 demoting its classification or incrementing the drop counter. Capturing
 the runtime during `register` also lets receiver threads outside Tokio
-use the sink. `Closed` (account detached mid-push) is silently ignored.
+use the sink. If no runtime handle was ever captured (`register` itself
+ran outside Tokio), nothing can wait for queue space, so a full queue
+discards the event regardless of classification - and that discard is
+counted, because an uncounted lossless discard would hide the loss of
+control information from the one signal built to expose it. `Closed`
+(account detached mid-push) is silently ignored.
 
 The in-process push forwarder spawned in `attach` runs the same
 overflow policy against its per-account `tx`: redundant invalidations
@@ -472,7 +477,14 @@ the caller and its registry record is retained, while successful records
 are retired; a later call retries only the failed handles. This composes
 with Graph's retained server ids after a failed DELETE.
 `SyncEngine::subscribe_push` is the engine-side entry that records the
-handle on success.
+handle on success. Both entries serialize on the slot's reopen lock:
+reattach snapshots the registry, tears old handles down, and installs
+the replacement set wholesale, so a registration or teardown landing
+inside that window would either be silently erased - orphaning a
+server-side subscription whose handle is connection-local state on
+Graph and IMAP - or resurrect records the consumer just tore down.
+The lock means both calls queue behind an in-flight reopen (including
+one queued behind a pause) rather than racing it.
 
 ## Mutation pipeline
 
