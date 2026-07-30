@@ -59,6 +59,15 @@ pub(super) fn skip_balanced_parens(mut input: &[u8]) -> IResult<&[u8], ()> {
             return Ok((input, ()));
         }
         match input[0] {
+            // CRLF cannot occur inside a parenthesized extension value except
+            // as part of a literal, which is consumed by the literal arm.
+            // Do not scan into the next response after malformed quoting.
+            b'\r' | b'\n' => {
+                return Err(nom::Err::Error(nom::error::Error::new(
+                    input,
+                    nom::error::ErrorKind::CrLf,
+                )));
+            }
             b'(' => {
                 depth += 1;
                 input = &input[1..];
@@ -71,6 +80,13 @@ pub(super) fn skip_balanced_parens(mut input: &[u8]) -> IResult<&[u8], ()> {
                 // Skip quoted string contents (may contain parens).
                 input = &input[1..];
                 while !input.is_empty() && input[0] != b'"' {
+                    // RFC 3501 Section 9: quoted = DQUOTE *QUOTED-CHAR DQUOTE
+                    // and QUOTED-CHAR excludes CR and LF, escaped or not. A raw
+                    // CR/LF means the quote is unterminated  -  stop here so the
+                    // scan cannot run into the next response.
+                    if input[0] == b'\r' || input[0] == b'\n' {
+                        break;
+                    }
                     if input[0] == b'\\' && input.len() > 1 {
                         // Guard against escapes consuming CR/LF:
                         // RFC 3501 Section 9: QUOTED-CHAR excludes CR and LF.
@@ -85,9 +101,11 @@ pub(super) fn skip_balanced_parens(mut input: &[u8]) -> IResult<&[u8], ()> {
                         input = &input[1..];
                     }
                 }
-                if !input.is_empty() {
+                if input.first() == Some(&b'"') {
                     input = &input[1..]; // skip closing quote
                 }
+                // Otherwise the quote was unterminated; leave the CR/LF in
+                // place for the outer loop's terminator arm to reject.
             }
             // Handle literal8 prefix: ~{n}\r\n<n bytes> (RFC 6855 Section 4)
             b'~' if input.len() > 1 && input[1] == b'{' => {

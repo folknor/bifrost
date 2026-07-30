@@ -26,6 +26,22 @@ dead parked members during checkout and never returns a dead checked-out
 member to the idle list. Tagged NO/BAD responses and local validation or
 capability errors leave the connection reusable.
 
+The codec draws the line that decides which of those two buckets a bad
+response lands in. A response opening with a keyword the codec claims to
+parse cannot degrade to `UntaggedResponse::Unknown`: it becomes
+`nom::Err::Failure`, which the connection surfaces as `Error::Parse` and
+the account boundary maps to `Protocol(ParseFailed)` /
+`ProviderContractViolation`. Inside FETCH the gate is per attribute
+(`codec/decode/envelope_fetch.rs::has_closed_grammar`): attributes with a
+closed grammar (`UID`, `FLAGS`, `RFC822.*`, `INTERNALDATE`, `MODSEQ`,
+`SAVEDATE`, `PREVIEW`, `EMAILID`, `THREADID`, `X-GM-*`, the sectioned
+`BODY[...]` / `BINARY[...]` / `BINARY.SIZE[...]` forms) hard-fail, while
+`ENVELOPE`, `BODYSTRUCTURE`, bare `BODY`, and any attribute the codec does
+not model stay on the tolerant skip path - a failure there is at least as
+likely to be a modelling gap of ours, and parse failure is
+connection-fatal. Separator handling is uniformly multi-space for the same
+reason.
+
 Cancellation safety comes from socket ownership: dropping a caller's
 future does not cancel an in-flight wire exchange. The driver completes
 the command and preserves framing before accepting the next command.

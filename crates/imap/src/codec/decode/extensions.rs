@@ -16,8 +16,8 @@ use super::*;
 /// list of resource triplets: `(resource_name usage limit ...)`.
 pub(super) fn parse_untagged_quota(input: &[u8]) -> IResult<&[u8], UntaggedResponse> {
     let (input, _) = tag_no_case(&b"QUOTA "[..]).parse(input)?;
-    // Distinguish QUOTA from QUOTAROOT  -  QUOTAROOT starts with "QUOTAROOT".
-    // If we got here, it's "QUOTA " followed by a root name (not "ROOT ").
+    // The required trailing space makes this structurally distinct from
+    // QUOTAROOT; parser ordering is not part of that distinction.
     // Quota root is a server-defined opaque identifier (RFC 2087 Section 2),
     // not a mailbox name  -  no MUTF-7 decoding.
     let (input, root) = astring_utf8(input)?;
@@ -361,10 +361,10 @@ pub(super) fn parse_untagged_unknown(input: &[u8]) -> IResult<&[u8], UntaggedRes
 /// responses we parse: `EXISTS`, `RECENT`, and `EXPUNGE` are `number SP
 /// keyword` and nothing else, so any failure really is malformed input.
 /// `FETCH` is excluded on purpose - its `msg-att` body is open-ended, this
-/// parser has known tolerance gaps inside it (two-space separators in
-/// `body-ext-*`, unmodelled data items), and hard-failing there would turn a
-/// shortfall of ours into a dropped connection against a conformant server.
-/// Malformed numbered `FETCH` therefore still degrades to `Unknown`.
+/// parser must tolerate unmodelled data items, and hard-failing by keyword
+/// would turn an extension we do not understand into a dropped connection.
+/// The FETCH parser upgrades violations it recognizes (such as `UID 0`) at
+/// the attribute failure site while leaving unknown attributes skippable.
 fn starts_known_untagged_response(input: &[u8]) -> bool {
     const DIRECT_KEYWORDS: &[&[u8]] = &[
         b"OK",
@@ -624,9 +624,11 @@ fn parse_thread_node(input: &[u8], depth: u32) -> IResult<&[u8], ThreadNode> {
         }
 
         if input.first() == Some(&b'(') {
-            // Nested group  -  branches off the current chain tip.
+            // RFC 5256 permits nested groups only after the bare UID chain.
+            // Keep accepting other shapes without assigning them new meaning:
+            // this bucket layout remains a parser detail for non-conformant input.
             let (rest, child) = parse_thread_node(input, depth + 1)?;
-            // Accumulate branches that attach to the last bare UID.
+            // Accumulate the branch in the current chain slot.
             if let Some(last) = branch_groups.last_mut() {
                 last.push(child);
             } else {
@@ -638,7 +640,7 @@ fn parse_thread_node(input: &[u8], depth: u32) -> IResult<&[u8], ThreadNode> {
             // UIDs are nz-number per RFC 3501 Section 9 (uniqueid = nz-number).
             let (rest, uid) = nz_number(input)?;
             chain_uids.push(Some(uid));
-            // Start a new branch group for the next UID.
+            // Start the slot for branches following this UID.
             branch_groups.push(Vec::new());
             input = rest;
         }

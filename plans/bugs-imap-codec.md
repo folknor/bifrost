@@ -77,55 +77,60 @@ shape.
 
 # Bugs
 
-## C4 - Malformed numbered `FETCH` responses are still laundered into `Unknown`, with no diagnostic
+## C4 - Malformed open-ended `FETCH` attributes are still laundered into `Unknown`
 
-**Severity: medium.** **Where:**
-`codec/decode/extensions.rs::starts_known_untagged_response` (the
-numbered-keyword table) plus `codec/classification.rs`.
+**Severity: low** (was medium; the closed-grammar half is now fixed).
+**Where:** `codec/decode/envelope_fetch.rs::has_closed_grammar`.
 
-**What is closed.** `parse_untagged_unknown` now refuses to swallow a response
-that opens with a keyword this codec claims to parse: it returns
-`nom::Err::Failure`, which `alt` propagates, the connection surfaces as
-`Error::Parse`, and the account boundary maps to `Protocol(ParseFailed)` /
-`ProviderContractViolation` per `reference/error-model.md`. That covers every
-direct keyword (`OK`, `STATUS`, `LIST`, `ESEARCH`, `VANISHED`, `THREAD`, ...)
-and the numbered forms whose entire grammar is `number SP keyword`: `EXISTS`,
-`RECENT`, `EXPUNGE`. The guard tolerates the same multi-space runs the
-numbered parser does, so a malformed `* 1  RECENT junk` is not laundered
-either.
+**What is closed.** `parse_untagged_unknown` refuses to swallow a response
+opening with a keyword this codec claims to parse (`OK`, `STATUS`, `LIST`,
+`ESEARCH`, `VANISHED`, `THREAD`, ... and the numbered `EXISTS` / `RECENT` /
+`EXPUNGE`), and inside `FETCH` the same rule now applies per attribute rather
+than per keyword: `fetch_attr_value` is gated by `has_closed_grammar`, so a
+failure parsing `UID`, `FLAGS`, `RFC822.SIZE`, `RFC822`, `RFC822.HEADER`,
+`RFC822.TEXT`, `INTERNALDATE`, `MODSEQ`, `SAVEDATE`, `PREVIEW`, `EMAILID`,
+`THREADID`, `X-GM-MSGID`, `X-GM-THRID`, or the sectioned `BODY[...]` /
+`BINARY[...]` / `BINARY.SIZE[...]` forms becomes `nom::Err::Failure`. `alt`
+propagates it, the connection surfaces `Error::Parse`, and the account
+boundary maps to `Protocol(ParseFailed)` / `ProviderContractViolation` per
+`reference/error-model.md`. Every attribute separator went to multi-space
+tolerance (`attr_sp`) at the same time, so a server padding with two spaces
+does not pay for the new strictness.
 
-**What is still open.** Numbered `FETCH` is deliberately *not* in the guard's
-keyword table, so `* 1 FETCH (UID 0)` (a `uniqueid = nz-number` violation)
-still lands in `UntaggedResponse::Unknown("1 FETCH (UID 0)")`,
-`classify` routes it as `OnlyUnsolicited`, and a FETCH consumer receives
-neither the response nor an error.
+**What is still open.** `ENVELOPE`, `BODYSTRUCTURE`, and bare `BODY` (a
+`BODYSTRUCTURE` synonym) stay outside the gate, so `* 1 FETCH (BODYSTRUCTURE
+("TEXT"))` still lands in `UntaggedResponse::Unknown`, `classify` routes it as
+`OnlyUnsolicited`, and a FETCH consumer receives neither the response nor an
+error.
 
-**Why FETCH was left out rather than forgotten.** `msg-att` is the one
-open-ended body in the untagged grammar, and this parser is known to be
-incomplete inside it: N4 below (two spaces between `body-ext-*` fields) is a
-tolerance gap of ours, not of the server's, and unmodelled data items are
-routinely added by extensions. Adding `FETCH` to the guard would convert every
-such shortfall into a hard parse failure, which the driver turns into a closed
-connection against a server that is behaving correctly. The current
-laundering is the lesser failure mode, but it is still a failure mode.
+**Why those three are excluded rather than forgotten.** They are the
+open-ended bodies of `msg-att`: extensions append fields to `body-ext-*`, and
+real servers vary inside `ENVELOPE` addresses. A failure there is at least as
+likely to be a modelling gap of ours as a server defect, and parse failure is
+connection-fatal (`reference/imap.md`), so hard-failing would drop connections
+against conformant servers. N4 was exactly such a gap of ours and is now
+closed, which shrinks but does not eliminate the class.
 
 **Why it matters.** In a QRESYNC/CONDSTORE sync a silently-dropped FETCH can
 leave a message unhydrated while the cursor advances, making the loss persist
 until UIDVALIDITY changes.
 
-**Proposed fix (unchanged in shape, now scoped to FETCH).** Distinguish
-"failed inside a recognized `msg-att`" from "unknown data item" at the point
-of failure rather than by keyword lookahead: have `fetch_response_inner`
-return a marker when it consumed a recognized attribute and then failed, and
-surface that as `UntaggedResponse::Malformed { keyword, raw }` which `classify`
-routes as `Impossible` and the driver translates into `Error::Parse`. That
-preserves the extension-tolerance path, which a keyword table cannot.
-Closing N4 first would shrink the risk further.
+**Proposed fix.** Distinguish "failed inside a recognized structure" from
+"unmodelled extension data" *inside* the BODYSTRUCTURE and ENVELOPE parsers -
+the fixed-arity prefix of each is closed (media type / subtype / params /
+id / description / encoding / size; the ten ENVELOPE fields), only the
+extension tail is open. Gating on the prefix would close the rest of C4
+without touching the tolerance that protects the tail.
 
-**Tests landed.** `decode/tests.rs::fetch_uid_zero_rejected` pins the
-remaining `Unknown` result. `malformed_status_is_a_parse_failure` and
-`expunge_zero_rejected` are the corrected controls for the direct and
-numbered halves that are closed.
+**Tests landed.**
+`decode/tests.rs::malformed_closed_grammar_fetch_attributes_are_parse_failures`
+pins the closed half over every gated attribute;
+`unmodelled_and_open_ended_fetch_attributes_stay_tolerated` pins both the
+remaining `Unknown` degradation and the unmodelled-attribute tolerance;
+`connection/wire_tests.rs::read_one_rejects_a_malformed_recognized_fetch_attribute`
+pins the outcome on the path the driver actually takes.
+`malformed_status_is_a_parse_failure` and `expunge_zero_rejected` are the
+controls for the direct and numbered keyword halves.
 
 ---
 
@@ -143,67 +148,6 @@ gap only bites a Gmail account configured as a generic IMAP account.
 The fix needs a `FetchResponse` field, which is `types`, outside my
 scope. Pinned by
 `decode/tests.rs::fetch_x_gm_labels_is_skipped_without_losing_other_attributes`.
-
-## N2 - THREAD attaches a nested group to the wrong chain node when the group precedes a bare UID
-
-`extensions.rs::parse_thread_node` pushes a fresh branch bucket after
-each bare UID and attaches nested groups to `branch_groups.last_mut()`.
-For `(1 (2) 3)` the group `(2)` lands in bucket 0, which
-`build_thread_tree` then treats as the children of chain UID `3` - so
-`2` becomes a child of `3` rather than a sibling branch off `1`.
-
-RFC 5256 Section 5 (`thread-members = nz-number *(SP nz-number)
-[SP thread-nested]`) only allows nested groups at the *end*, so this
-input is non-conformant and the handling is arbitrary-but-not-crashing.
-I did not land a test: pinning arbitrary handling of invalid input
-mostly creates work for whoever changes it later. Noting it because the
-in-function comment claims `branch_groups` is `[[], [...]]` for the
-worked example, which does not match what the code builds
-(`[[...]]`) - the comment is stale even though the result is right.
-
-## N3 - Three paren-skippers can scan past a response-terminating CRLF
-
-`skip_paren_group`, `skip_balanced_parens`, and `scan_section_spec` all
-break out of their quoted-string loop when a backslash precedes CR/LF
-(so the escape cannot swallow the CRLF), but the *outer* loop then
-treats CR and LF as ordinary bytes and keeps looking for the closing
-delimiter - potentially in the next response in the buffer.
-`scan_unknown_response`, by contrast, correctly stops at CR/LF.
-
-I could not construct an input where this produces a *successful*
-over-consuming parse: in every case I tried, `fetch_response_inner`
-subsequently fails on the CR and the whole response degrades to
-`Unknown` with the buffer position intact (which is C4, not
-over-consumption). The existing
-`skip_paren_group_backslash_crlf_in_quoted_string` test already
-acknowledges the concern and asserts the weaker "must not consume past
-CRLF *if* it parses". Recording this as PLAUSIBLE, not CONFIRMED: the
-structural asymmetry with `scan_unknown_response` is real and cheap to
-close (add `b'\r' | b'\n' => break` at depth > 0), but I have no
-failing input.
-
-## N4 - `body_ext_1part` / `body_ext_mpart` tolerate one space but not two
-
-`at_body_ext_end` skips leading spaces only when the next non-space byte
-is `)`; otherwise it returns the *original* position and the caller does
-a strict `sp(input)?`. So `... NIL  NIL)` (two spaces between extension
-fields) fails, while `... NIL NIL )` (space before the close paren)
-succeeds. Every other list position in the BODYSTRUCTURE parser accepts
-`take_while1(|b| b == b' ')`; this one does not. Low impact - I have not
-seen a server do it - but it is the one remaining hole in an otherwise
-uniform whitespace-tolerance story, and `extra_whitespace_still_parses`
-does not reach it (its generator only doubles existing SP positions
-inside the sampled responses, and the BODYSTRUCTURE sample has no
-extension fields).
-
-## N5 - `parse_untagged_quota` depends on `alt` ordering for correctness
-
-`parse_untagged_quota` matches `tag_no_case(b"QUOTA ")`, which cannot
-match `QUOTAROOT` (no space), so it is correct - but the in-function
-comment says "If we got here, it's `QUOTA ` followed by a root name",
-which reads as if it were relying on `parse_untagged_quotaroot` running
-first in the `alt`. It does run first, but the ordering is not what
-makes this safe. Worth rewording so nobody "fixes" the ordering.
 
 ## N6 - `EncodedCommand::segments`'s "never empty" claim is unenforced
 
@@ -255,7 +199,14 @@ tests supersede the former bug-documenting expectations.
 | `encode/tests.rs` | `brace_digits_not_abutting_crlf_is_not_a_literal_marker` | the encoder does not share `connection/wire.rs`'s B4 abutment defect |
 | `decode/tests.rs` | `malformed_status_is_a_parse_failure` | direct known-keyword parse failures do not route as unsolicited data |
 | | `expunge_zero_rejected` | the closed numbered half of **C4**: `EXISTS` / `RECENT` / `EXPUNGE` fail, unmodelled numbered keywords stay `Unknown` |
-| | `fetch_uid_zero_rejected` | **C4**, malformed numbered FETCH is still routed as `Unknown` |
+| | `malformed_fetch_uid_zero_is_parse_failure` | **C4**, `uniqueid = nz-number` violations now hard-fail instead of routing as `Unknown` |
+| | `malformed_closed_grammar_fetch_attributes_are_parse_failures` | **C4**, the same for every FETCH attribute with a closed grammar |
+| | `unmodelled_and_open_ended_fetch_attributes_stay_tolerated` | **C4**'s other edge: unmodelled attributes and `ENVELOPE`/`BODYSTRUCTURE`/bare `BODY` still degrade rather than drop the connection |
+| | `scan_section_spec_incomplete_is_a_parse_failure_not_incomplete` | an unterminated `BODY[` section is an error, never `Incomplete` |
+| | `paren_skippers_do_not_scan_past_backslash_crlf` | **N3**, a backslash-escaped CR/LF cannot bridge two responses |
+| | `paren_skippers_do_not_scan_past_raw_crlf_in_a_quoted_value` | **N3**, raw CR/LF inside a quoted value ends the scan in all three paren-skippers |
+| | `a_raw_crlf_in_a_quoted_fetch_value_does_not_swallow_the_next_response` | **N3** end to end: the following `* 2 EXISTS` survives in the buffer |
+| | `fetch_bodystructure_extension_double_spaces_parse` | **N4**, repeated spaces between `body-ext-*` fields |
 | | `rfc2047_candidate_window_is_capped_for_unbroken_printable_runs` | C2's scan bound is a constant, so a whitespace-free hostile header cannot go quadratic; an overlong real word still fits |
 | | `response_code_overflow_recovery_stops_at_the_closing_bracket` | C5's recovery reads only the code's own value, not the status text after `]` |
 | | `list_mailbox_name_preserves_control_characters_from_the_wire` | C6's resolution: wire names keep the server's identity, and `MailboxName::new`'s invariant is documented as not applying to them |
@@ -266,9 +217,10 @@ tests supersede the former bug-documenting expectations.
 | | `prop_decode_invariants::decode_is_stable_under_reencode` | decode -> encode -> decode is a fixed point |
 | | `prop_decode_invariants::encode_emits_only_printable_ascii` | RFC 3501 Section 5.1.3 printable-wire invariant |
 
-The C4 regression remains documented as a current gap, narrowed to numbered
-`FETCH`; `malformed_status_is_a_parse_failure` and `expunge_zero_rejected` are
-the controls for the halves that are closed.
+C4 remains documented as a current gap, now narrowed from "numbered `FETCH`"
+to the three open-ended attribute bodies (`ENVELOPE`, `BODYSTRUCTURE`, bare
+`BODY`); `malformed_status_is_a_parse_failure` and `expunge_zero_rejected` are
+the controls for the keyword halves that were already closed.
 
 ## C6, and why it is closed without sanitizing
 
@@ -304,10 +256,12 @@ line-oriented sink must escape it themselves; the constructor doc says so.
   so a duplex adds a framing layer that belongs to `connection/**` and
   is already covered by that agent's `wire_tests.rs`. Every finding
   above is reachable with a byte slice. The one place a transcript
-  *would* pay for itself is proving C4's dispatch outcome end to end - but
-  the driver dispatch path is
-  in `connection/driver/`, outside my edit scope, and the segment count
-  is the honest codec-side assertion.
+  *would* pay for itself is proving C4's dispatch outcome end to end;
+  `connection/wire_tests.rs::read_one_rejects_a_malformed_recognized_fetch_attribute`
+  now does that half over an in-memory duplex, which is as far as the
+  reader goes - what the *driver* then does with `Error::Parse`
+  (connection-fatal, per `reference/imap.md`) is still pinned only by the
+  driver's own tests.
 
 - **`classification.rs` beyond reading it.** 27 tests already walk the
   truth table, and the one interesting interaction I found (Unknown ->

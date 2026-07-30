@@ -3080,17 +3080,16 @@ fn quoted_string_incomplete_does_not_block_alt_fallthrough() {
 }
 
 #[test]
-fn scan_section_spec_incomplete_does_not_block_alt_fallthrough() {
+fn scan_section_spec_incomplete_is_a_parse_failure_not_incomplete() {
     // A FETCH response with an unterminated BODY section (missing `]`).
-    // scan_section_spec must return Error (not Incomplete) so that the
-    // unknown-response fallback can preserve wire framing.
+    // `BODY[...]` is a closed grammar, so this is the server violating it:
+    // the result must be a hard parse error, never `Incomplete` (which would
+    // stall the reader waiting for bytes that are not coming) and never
+    // `Unknown` (which would silently drop the FETCH).
     let input = b"* 1 FETCH (BODY[HEADER no-close\r\n";
     let result = parse_response(input);
     assert!(!matches!(result, Err(nom::Err::Incomplete(_))));
-    assert!(matches!(
-        result,
-        Ok((_, Response::Untagged(response))) if matches!(*response, UntaggedResponse::Unknown(_))
-    ));
+    assert!(result.is_err());
 }
 
 #[test]
@@ -3762,22 +3761,48 @@ fn skip_paren_group_backslash_crlf_in_quoted_string() {
     // an error, which is the correct outcome for malformed input.
     let input = b"(\"val\\\r\n\")";
     let result = skip_paren_group(input);
-    // The backslash-CR sequence is malformed. Whether the parser
-    // returns an error or manages to recover, it must NOT consume
-    // past the CRLF into the trailing `")`.
-    // The guard at lines 3582-3590 breaks out of the quoted-string
-    // loop when a backslash precedes CR/LF, so the outer loop sees
-    // the unclosed paren and returns Err  -  the correct outcome.
-    if let Ok((rest, _)) = result {
-        // If it somehow parses, the rest must NOT be empty
-        // (the CRLF + `")` must not have been consumed as part
-        // of the quoted string escape).
-        assert!(
-            !rest.is_empty(),
-            "skip_paren_group consumed past CRLF boundary"
-        );
-    }
-    // Err is also acceptable  -  malformed input
+    assert!(result.is_err());
+}
+
+#[test]
+fn paren_skippers_do_not_scan_past_backslash_crlf() {
+    // Each input contains an apparently matching delimiter only after a
+    // response-terminating CRLF. A scanner must reject rather than accept a
+    // later response as part of the malformed quoted value.
+    let group = b"(\"value\\\r\n* 2 EXISTS\r\n\"next\")";
+    assert!(skip_paren_group(group).is_err());
+    assert!(skip_parenthesized_block(group).is_err());
+
+    let section = b"HEADER.FIELDS (\"X\\\r\n* 2 EXISTS\r\n\"Y\") ]";
+    assert!(scan_section_spec(section).is_err());
+}
+
+#[test]
+fn paren_skippers_do_not_scan_past_raw_crlf_in_a_quoted_value() {
+    // RFC 3501 Section 9: quoted = DQUOTE *QUOTED-CHAR DQUOTE, and QUOTED-CHAR
+    // excludes CR and LF - no backslash required. An unterminated quote must
+    // not let a scanner adopt the *next* response as part of this value: here
+    // the closing quote and paren only appear after `* 2 EXISTS\r\n`.
+    let group = b"(\"value\r\n* 2 EXISTS\r\n\")";
+    assert!(skip_paren_group(group).is_err());
+    assert!(skip_parenthesized_block(group).is_err());
+
+    let section = b"HEADER.FIELDS (\"value\r\n* 2 EXISTS\r\n\") ]";
+    assert!(scan_section_spec(section).is_err());
+}
+
+#[test]
+fn a_raw_crlf_in_a_quoted_fetch_value_does_not_swallow_the_next_response() {
+    // End to end: the unknown-attribute skip path must stop at the response
+    // terminator, leaving `* 2 EXISTS` for the next parse rather than
+    // consuming it as part of the malformed first response.
+    let input = b"* 1 FETCH (X-JUNK (\"value\r\n* 2 EXISTS\r\n\"))\r\n";
+    let (rest, _) = parse_response(input).expect("first response parses or errors, not both");
+    assert!(
+        rest.starts_with(b"* 2 EXISTS\r\n"),
+        "scanner consumed past the response terminator: {:?}",
+        String::from_utf8_lossy(rest)
+    );
 }
 
 #[test]
@@ -7662,12 +7687,93 @@ fn search_empty_results_still_works() {
 }
 
 #[test]
-fn fetch_uid_zero_rejected() {
+fn malformed_fetch_uid_zero_is_parse_failure() {
     // uniqueid = nz-number per RFC 3501 Section 9.
     let input = b"* 1 FETCH (UID 0)\r\n";
+    assert!(parse_response(input).is_err());
+}
+
+#[test]
+fn malformed_closed_grammar_fetch_attributes_are_parse_failures() {
+    // Every attribute whose `msg-att` grammar is closed must surface a parse
+    // failure rather than being laundered into `Unknown`, which would drop the
+    // whole FETCH silently while the sync cursor advanced past it.
+    for input in [
+        &b"* 1 FETCH (FLAGS nope)\r\n"[..],
+        b"* 1 FETCH (RFC822.SIZE huge)\r\n",
+        b"* 1 FETCH (RFC822.TEXT 12)\r\n",
+        b"* 1 FETCH (INTERNALDATE 5)\r\n",
+        b"* 1 FETCH (SAVEDATE 5)\r\n",
+        b"* 1 FETCH (PREVIEW 5)\r\n",
+        b"* 1 FETCH (MODSEQ 12345)\r\n",
+        b"* 1 FETCH (EMAILID M00000001)\r\n",
+        b"* 1 FETCH (THREADID T1)\r\n",
+        b"* 1 FETCH (X-GM-MSGID nope)\r\n",
+        b"* 1 FETCH (X-GM-THRID nope)\r\n",
+        b"* 1 FETCH (BINARY.SIZE[1] nope)\r\n",
+        b"* 1 FETCH (BODY[TEXT] 12)\r\n",
+    ] {
+        assert!(
+            parse_response(input).is_err(),
+            "expected a parse failure for {:?}",
+            String::from_utf8_lossy(input)
+        );
+    }
+}
+
+#[test]
+fn unmodelled_and_open_ended_fetch_attributes_stay_tolerated() {
+    // The other half of the same boundary: syntax this parser does not model,
+    // and the open-ended bodies where a failure is at least as likely to be our
+    // own modelling gap, must never cost the connection.
+    for input in [
+        // Unrecognized attribute with a well-formed value: parsed, skipped.
+        &b"* 1 FETCH (UID 7 X-FUTURE-THING (a b c))\r\n"[..],
+        b"* 1 FETCH (UID 7 X-FUTURE-THING \"opaque\")\r\n",
+    ] {
+        assert!(
+            matches!(
+                parse_response(input),
+                Ok((_, Response::Untagged(response))) if matches!(*response, UntaggedResponse::Fetch(_))
+            ),
+            "expected a tolerated FETCH for {:?}",
+            String::from_utf8_lossy(input)
+        );
+    }
+
+    // ENVELOPE / BODYSTRUCTURE / bare BODY are deliberately outside the strict
+    // gate, so malformed ones still degrade to `Unknown` instead of dropping
+    // the connection. This is the remaining C4 surface, documented as such.
+    for input in [
+        &b"* 1 FETCH (ENVELOPE (\"unterminated subject))\r\n"[..],
+        b"* 1 FETCH (BODYSTRUCTURE (\"TEXT\"))\r\n",
+    ] {
+        assert!(
+            matches!(
+                parse_response(input),
+                Ok((_, Response::Untagged(response))) if matches!(*response, UntaggedResponse::Unknown(_))
+            ),
+            "expected tolerated degradation for {:?}",
+            String::from_utf8_lossy(input)
+        );
+    }
+}
+
+#[test]
+fn fetch_bodystructure_extension_double_spaces_parse() {
+    // Two spaces between optional body-extension fields are tolerated, as in
+    // the other BODYSTRUCTURE list positions.
+    let input =
+        b"* 1 FETCH (BODYSTRUCTURE (\"IMAGE\" \"PNG\" NIL NIL NIL \"BASE64\" 5000 NIL  NIL))\r\n";
     assert!(matches!(
         parse_response(input),
-        Ok((_, Response::Untagged(response))) if matches!(*response, UntaggedResponse::Unknown(_))
+        Ok((_, Response::Untagged(response))) if matches!(*response, UntaggedResponse::Fetch(_))
+    ));
+
+    let input = b"* 1 FETCH (BODYSTRUCTURE ((\"TEXT\" \"PLAIN\" NIL NIL NIL \"7BIT\" 50 3) \"MIXED\" NIL  NIL))\r\n";
+    assert!(matches!(
+        parse_response(input),
+        Ok((_, Response::Untagged(response))) if matches!(*response, UntaggedResponse::Fetch(_))
     ));
 }
 

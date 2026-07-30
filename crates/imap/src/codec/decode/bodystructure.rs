@@ -379,7 +379,7 @@ fn body_ext_1part(input: &[u8]) -> IResult<&[u8], BodyExtData> {
     }
 
     // MD5
-    let (input, _) = sp(input)?;
+    let (input, _) = take_while1(|b: u8| b == b' ').parse(input)?;
     let (input, md5) = nstring_utf8(input)?;
 
     let (input, at_end) = at_body_ext_end(input)?;
@@ -388,7 +388,7 @@ fn body_ext_1part(input: &[u8]) -> IResult<&[u8], BodyExtData> {
     }
 
     // Disposition
-    let (input, _) = sp(input)?;
+    let (input, _) = take_while1(|b: u8| b == b' ').parse(input)?;
     let (input, disposition) = body_disposition(input)?;
 
     let (input, at_end) = at_body_ext_end(input)?;
@@ -397,7 +397,7 @@ fn body_ext_1part(input: &[u8]) -> IResult<&[u8], BodyExtData> {
     }
 
     // Language
-    let (input, _) = sp(input)?;
+    let (input, _) = take_while1(|b: u8| b == b' ').parse(input)?;
     let (input, language) = body_language(input)?;
 
     let (input, at_end) = at_body_ext_end(input)?;
@@ -406,7 +406,7 @@ fn body_ext_1part(input: &[u8]) -> IResult<&[u8], BodyExtData> {
     }
 
     // Location
-    let (input, _) = sp(input)?;
+    let (input, _) = take_while1(|b: u8| b == b' ').parse(input)?;
     let (input, location) = nstring_utf8(input)?;
 
     // Skip any further extension data we don't understand.
@@ -426,7 +426,7 @@ fn body_ext_mpart(input: &[u8]) -> IResult<&[u8], MpartExtData> {
     }
 
     // Params
-    let (input, _) = sp(input)?;
+    let (input, _) = take_while1(|b: u8| b == b' ').parse(input)?;
     let (input, params) = body_params(input)?;
 
     let (input, at_end) = at_body_ext_end(input)?;
@@ -435,7 +435,7 @@ fn body_ext_mpart(input: &[u8]) -> IResult<&[u8], MpartExtData> {
     }
 
     // Disposition
-    let (input, _) = sp(input)?;
+    let (input, _) = take_while1(|b: u8| b == b' ').parse(input)?;
     let (input, disposition) = body_disposition(input)?;
 
     let (input, at_end) = at_body_ext_end(input)?;
@@ -444,7 +444,7 @@ fn body_ext_mpart(input: &[u8]) -> IResult<&[u8], MpartExtData> {
     }
 
     // Language
-    let (input, _) = sp(input)?;
+    let (input, _) = take_while1(|b: u8| b == b' ').parse(input)?;
     let (input, language) = body_language(input)?;
 
     let (input, at_end) = at_body_ext_end(input)?;
@@ -453,7 +453,7 @@ fn body_ext_mpart(input: &[u8]) -> IResult<&[u8], MpartExtData> {
     }
 
     // Location
-    let (input, _) = sp(input)?;
+    let (input, _) = take_while1(|b: u8| b == b' ').parse(input)?;
     let (input, location) = nstring_utf8(input)?;
 
     // Skip any further extension data with proper nesting (RFC 3501 Section 9).

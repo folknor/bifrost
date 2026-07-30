@@ -8,6 +8,17 @@ use super::primitives::*;
 #[allow(clippy::wildcard_imports)]
 use super::*;
 
+/// Preserve a failure from a recognized FETCH attribute through the untagged
+/// response alternatives. Unknown attributes stay on the tolerant skip path.
+fn recognized_fetch_failure(
+    error: nom::Err<nom::error::Error<&[u8]>>,
+) -> nom::Err<nom::error::Error<&[u8]>> {
+    match error {
+        nom::Err::Error(error) | nom::Err::Failure(error) => nom::Err::Failure(error),
+        nom::Err::Incomplete(needed) => nom::Err::Incomplete(needed),
+    }
+}
+
 /// Parse a single address: `(name adl mailbox host)` (RFC 3501 Section 7.4.2).
 ///
 /// When `utf8_mode` is true, the display name is raw UTF-8 per RFC 6532 Section 3 /
@@ -140,7 +151,6 @@ pub(super) fn envelope(input: &[u8], utf8_mode: bool) -> IResult<&[u8], Envelope
 ///
 /// Called after `* <n> FETCH ` is consumed.
 /// When `utf8_mode` is true, ENVELOPE fields use raw UTF-8 per RFC 6532 Section 3 / RFC 6855 Section 3.
-#[allow(clippy::too_many_lines)]
 pub(super) fn fetch_response_inner(input: &[u8], utf8_mode: bool) -> IResult<&[u8], FetchResponse> {
     let (input, _) = char('(').parse(input)?;
     let mut fr = FetchResponse::default();
@@ -161,232 +171,287 @@ pub(super) fn fetch_response_inner(input: &[u8], utf8_mode: bool) -> IResult<&[u
         let upper = String::from_utf8_lossy(attr_name).to_ascii_uppercase();
 
         input = rest;
-        match upper.as_str() {
-            "UID" => {
-                // uniqueid = nz-number (RFC 3501 Section 9)
-                let (rest, _) = sp(input)?;
-                let (rest, n) = nz_number(rest)?;
-                fr.uid = Some(n);
-                input = rest;
+        let strict = has_closed_grammar(&upper, input);
+        let parsed = fetch_attr_value(&upper, input, utf8_mode, &mut fr);
+        let (rest, ()) = if strict {
+            // The attribute is one we model against a closed grammar, so a
+            // failure here is the server violating the RFC, not a shortfall
+            // of ours. Convert to `Failure` so `alt` cannot launder the whole
+            // response into `Unknown` and drop it silently.
+            parsed.map_err(recognized_fetch_failure)?
+        } else {
+            parsed?
+        };
+        input = rest;
+    }
+    Ok((input, fr))
+}
+
+/// Whether a FETCH attribute's grammar is closed enough that a parse failure
+/// means the server is wrong rather than that this parser is incomplete.
+///
+/// Excluded on purpose: `ENVELOPE`, `BODYSTRUCTURE`, and bare `BODY` (a
+/// `BODYSTRUCTURE` synonym). Those are the open-ended bodies of the `msg-att`
+/// grammar - extensions append fields to `body-ext-*`, and real servers vary
+/// inside `ENVELOPE` addresses - so a failure there is at least as likely to be
+/// a modelling gap of ours, and hard-failing would drop the connection against
+/// a conformant server. Unrecognized attributes are likewise tolerated by the
+/// skip path in [`fetch_attr_value`].
+fn has_closed_grammar(upper: &str, input: &[u8]) -> bool {
+    match upper {
+        "UID" | "FLAGS" | "RFC822.SIZE" | "RFC822" | "RFC822.HEADER" | "RFC822.TEXT"
+        | "INTERNALDATE" | "MODSEQ" | "SAVEDATE" | "PREVIEW" | "EMAILID" | "THREADID"
+        | "X-GM-MSGID" | "X-GM-THRID" => true,
+        // Sectioned forms are `section-spec` plus an `nstring` / `number`; the
+        // bare `BODY` form is a BODYSTRUCTURE and stays tolerant.
+        "BINARY.SIZE" | "BINARY" | "BODY" => input.first() == Some(&b'['),
+        _ => false,
+    }
+}
+
+/// Separator before a FETCH attribute value.
+///
+/// The grammar says a single SP, but the attribute loop already tolerates
+/// multi-space runs between attributes, and since a failure inside a modelled
+/// attribute is now hard (see [`has_closed_grammar`]) the tolerance has to be
+/// uniform: a server padding with two spaces must not cost the connection.
+fn attr_sp(input: &[u8]) -> IResult<&[u8], &[u8]> {
+    take_while1(|b: u8| b == b' ').parse(input)
+}
+
+/// Parse one FETCH attribute value into `fr`, given the uppercased attribute
+/// name already consumed from `input`.
+#[allow(clippy::too_many_lines)]
+fn fetch_attr_value<'a>(
+    upper: &str,
+    input: &'a [u8],
+    utf8_mode: bool,
+    fr: &mut FetchResponse,
+) -> IResult<&'a [u8], ()> {
+    match upper {
+        "UID" => {
+            // uniqueid = nz-number (RFC 3501 Section 9)
+            let (rest, _) = attr_sp(input)?;
+            let (rest, n) = nz_number(rest)?;
+            fr.uid = Some(n);
+            Ok((rest, ()))
+        }
+        "FLAGS" => {
+            let (rest, _) = attr_sp(input)?;
+            // RFC 3501 Section 9: msg-att-dynamic uses flag-fetch (= flag / "\Recent"),
+            // which has the same parsing rules as flag-list (both exclude `\*`).
+            let (rest, flags) = flag_list(rest)?;
+            fr.flags = Some(flags);
+            Ok((rest, ()))
+        }
+        "ENVELOPE" => {
+            let (rest, _) = attr_sp(input)?;
+            let (rest, env) = envelope(rest, utf8_mode)?;
+            fr.envelope = Some(env);
+            Ok((rest, ()))
+        }
+        "BODYSTRUCTURE" => {
+            let (rest, _) = attr_sp(input)?;
+            let (rest, bs) = body_structure(rest, utf8_mode, 0)?;
+            fr.body_structure = Some(bs);
+            Ok((rest, ()))
+        }
+        "RFC822.SIZE" => {
+            // RFC 9051 Section 9: "RFC822.SIZE" SP number64
+            let (rest, _) = attr_sp(input)?;
+            let (rest, n) = number64(rest)?;
+            fr.rfc822_size = Some(n);
+            Ok((rest, ()))
+        }
+        "RFC822" => {
+            // RFC 3501 Section 7.4.2: RFC822 SP nstring
+            // Functionally equivalent to BODY[] (entire message).
+            let (rest, _) = attr_sp(input)?;
+            let (rest, data) = nstring(rest)?;
+            fr.body_sections.push(BodySection {
+                section: String::new(),
+                origin: None,
+                data,
+            });
+            Ok((rest, ()))
+        }
+        "RFC822.HEADER" => {
+            // RFC 3501 Section 7.4.2: RFC822.HEADER SP nstring
+            // Functionally equivalent to BODY[HEADER].
+            let (rest, _) = attr_sp(input)?;
+            let (rest, data) = nstring(rest)?;
+            fr.body_sections.push(BodySection {
+                section: "HEADER".to_owned(),
+                origin: None,
+                data,
+            });
+            Ok((rest, ()))
+        }
+        "RFC822.TEXT" => {
+            // RFC 3501 Section 7.4.2: RFC822.TEXT SP nstring
+            // Functionally equivalent to BODY[TEXT].
+            let (rest, _) = attr_sp(input)?;
+            let (rest, data) = nstring(rest)?;
+            fr.body_sections.push(BodySection {
+                section: "TEXT".to_owned(),
+                origin: None,
+                data,
+            });
+            Ok((rest, ()))
+        }
+        "INTERNALDATE" => {
+            // RFC 3501 Section 7.4.2: INTERNALDATE is formally `date-time`
+            // (always a quoted string). However, some servers send NIL for
+            // malformed or draft messages. Accept NIL per Postel's law
+            // (RFC 1122 Section 1.2.2) rather than failing the entire FETCH
+            // response and losing all other attributes (UID, FLAGS, etc.).
+            let (rest, _) = attr_sp(input)?;
+            let (rest, date_val) = nstring_utf8(rest)?;
+            fr.internal_date = date_val;
+            Ok((rest, ()))
+        }
+        "MODSEQ" => {
+            // RFC 7162 Section 3.1.3 formally says mod-sequence-value >= 1, but we
+            // accept 0 per Postel's law (RFC 1122 Section 1.2.2) for consistency
+            // with the STATUS HIGHESTMODSEQ parser which also accepts 0. Real
+            // servers may send 0 as a sentinel for new/empty mailboxes.
+            // If the value is malformed (e.g., overflow), skip this attribute
+            // gracefully rather than losing ALL other FETCH attributes for this
+            // message.
+            let (rest, _) = attr_sp(input)?;
+            let (rest, _) = char('(').parse(rest)?;
+            if let Ok((rest, n)) = number64(rest) {
+                let (rest, _) = char(')').parse(rest)?;
+                fr.mod_seq = Some(n);
+                Ok((rest, ()))
+            } else {
+                // Malformed MODSEQ value  -  skip past the closing ')'.
+                let (rest, _) = take_while(|b: u8| b != b')').parse(rest)?;
+                let (rest, _) = char(')').parse(rest)?;
+                Ok((rest, ()))
             }
-            "FLAGS" => {
-                let (rest, _) = sp(input)?;
-                // RFC 3501 Section 9: msg-att-dynamic uses flag-fetch (= flag / "\Recent"),
-                // which has the same parsing rules as flag-list (both exclude `\*`).
-                let (rest, flags) = flag_list(rest)?;
-                fr.flags = Some(flags);
-                input = rest;
-            }
-            "ENVELOPE" => {
-                let (rest, _) = sp(input)?;
-                let (rest, env) = envelope(rest, utf8_mode)?;
-                fr.envelope = Some(env);
-                input = rest;
-            }
-            "BODYSTRUCTURE" => {
-                let (rest, _) = sp(input)?;
-                let (rest, bs) = body_structure(rest, utf8_mode, 0)?;
-                fr.body_structure = Some(bs);
-                input = rest;
-            }
-            "RFC822.SIZE" => {
-                // RFC 9051 Section 9: "RFC822.SIZE" SP number64
-                let (rest, _) = sp(input)?;
-                let (rest, n) = number64(rest)?;
-                fr.rfc822_size = Some(n);
-                input = rest;
-            }
-            "RFC822" => {
-                // RFC 3501 Section 7.4.2: RFC822 SP nstring
-                // Functionally equivalent to BODY[] (entire message).
-                let (rest, _) = sp(input)?;
-                let (rest, data) = nstring(rest)?;
-                fr.body_sections.push(BodySection {
-                    section: String::new(),
-                    origin: None,
-                    data,
-                });
-                input = rest;
-            }
-            "RFC822.HEADER" => {
-                // RFC 3501 Section 7.4.2: RFC822.HEADER SP nstring
-                // Functionally equivalent to BODY[HEADER].
-                let (rest, _) = sp(input)?;
-                let (rest, data) = nstring(rest)?;
-                fr.body_sections.push(BodySection {
-                    section: "HEADER".to_owned(),
-                    origin: None,
-                    data,
-                });
-                input = rest;
-            }
-            "RFC822.TEXT" => {
-                // RFC 3501 Section 7.4.2: RFC822.TEXT SP nstring
-                // Functionally equivalent to BODY[TEXT].
-                let (rest, _) = sp(input)?;
-                let (rest, data) = nstring(rest)?;
-                fr.body_sections.push(BodySection {
-                    section: "TEXT".to_owned(),
-                    origin: None,
-                    data,
-                });
-                input = rest;
-            }
-            "INTERNALDATE" => {
-                // RFC 3501 Section 7.4.2: INTERNALDATE is formally `date-time`
-                // (always a quoted string). However, some servers send NIL for
-                // malformed or draft messages. Accept NIL per Postel's law
-                // (RFC 1122 Section 1.2.2) rather than failing the entire FETCH
-                // response and losing all other attributes (UID, FLAGS, etc.).
-                let (rest, _) = sp(input)?;
-                let (rest, date_val) = nstring_utf8(rest)?;
-                fr.internal_date = date_val;
-                input = rest;
-            }
-            "MODSEQ" => {
-                // RFC 7162 Section 3.1.3 formally says mod-sequence-value >= 1, but we
-                // accept 0 per Postel's law (RFC 1122 Section 1.2.2) for consistency
-                // with the STATUS HIGHESTMODSEQ parser which also accepts 0. Real
-                // servers may send 0 as a sentinel for new/empty mailboxes.
-                // If the value is malformed (e.g., overflow), skip this attribute
-                // gracefully rather than losing ALL other FETCH attributes for this
-                // message.
-                let (rest, _) = sp(input)?;
-                let (rest, _) = char('(').parse(rest)?;
-                if let Ok((rest, n)) = number64(rest) {
-                    let (rest, _) = char(')').parse(rest)?;
-                    fr.mod_seq = Some(n);
-                    input = rest;
-                } else {
-                    // Malformed MODSEQ value  -  skip past the closing ')'.
-                    let (rest, _) = take_while(|b: u8| b != b')').parse(rest)?;
-                    let (rest, _) = char(')').parse(rest)?;
-                    input = rest;
-                }
-            }
-            "SAVEDATE" => {
-                // SAVEDATE is a quoted date-time string or NIL (RFC 8514 Section 3).
-                // Same format as INTERNALDATE when present.
-                let (rest, _) = sp(input)?;
-                let (rest, val) = nstring_utf8(rest)?;
-                fr.save_date = val;
-                input = rest;
-            }
-            "PREVIEW" => {
-                // PREVIEW is a nstring (quoted string or NIL) per RFC 8970 Section 3.
-                let (rest, _) = sp(input)?;
-                let (rest, val) = nstring_utf8(rest)?;
-                fr.preview = val;
-                input = rest;
-            }
-            "EMAILID" => {
-                // RFC 8474 Section 7: EMAILID is always "(objectid)", never NIL.
-                // fetch-emailid-resp = "EMAILID" SP "(" objectid ")"
-                // objectid = 1*255(ALPHA / DIGIT / "_" / "-") per RFC 8474 Section 7.
-                let (rest, _) = sp(input)?;
+        }
+        "SAVEDATE" => {
+            // SAVEDATE is a quoted date-time string or NIL (RFC 8514 Section 3).
+            // Same format as INTERNALDATE when present.
+            let (rest, _) = attr_sp(input)?;
+            let (rest, val) = nstring_utf8(rest)?;
+            fr.save_date = val;
+            Ok((rest, ()))
+        }
+        "PREVIEW" => {
+            // PREVIEW is a nstring (quoted string or NIL) per RFC 8970 Section 3.
+            let (rest, _) = attr_sp(input)?;
+            let (rest, val) = nstring_utf8(rest)?;
+            fr.preview = val;
+            Ok((rest, ()))
+        }
+        "EMAILID" => {
+            // RFC 8474 Section 7: EMAILID is always "(objectid)", never NIL.
+            // fetch-emailid-resp = "EMAILID" SP "(" objectid ")"
+            // objectid = 1*255(ALPHA / DIGIT / "_" / "-") per RFC 8474 Section 7.
+            let (rest, _) = attr_sp(input)?;
+            let (rest, _) = char('(').parse(rest)?;
+            let (rest, val) =
+                map(objectid, |a| String::from_utf8_lossy(a).into_owned()).parse(rest)?;
+            let (rest, _) = char(')').parse(rest)?;
+            fr.email_id = Some(val);
+            Ok((rest, ()))
+        }
+        "THREADID" => {
+            // THREADID (objectid-val) or THREADID NIL per RFC 8474 Section 4.
+            // objectid = 1*255(ALPHA / DIGIT / "_" / "-") per RFC 8474 Section 7.
+            let (rest, _) = attr_sp(input)?;
+            // Use opt(terminated(..., peek(...))) to handle all case variants of
+            // NIL while verifying a token boundary follows (any atom-special
+            // or EOF). Plain `tag_no_case(&b"NIL"[..])` would greedily match the
+            // prefix of atoms like "NIL2", corrupting the parse
+            // (RFC 3501 Section 9).
+            let (rest, nil_match) = opt(terminated(
+                tag_no_case(&b"NIL"[..]),
+                peek(alt((
+                    // Any atom-special byte (RFC 3501 Section 9):
+                    //   atom-specials = "(" / ")" / "{" / SP / CTL /
+                    //                   list-wildcards / quoted-specials /
+                    //                   resp-specials
+                    value((), verify(take(1u8), |b: &[u8]| !is_atom_char(b[0]))),
+                    value((), eof),
+                ))),
+            ))
+            .parse(rest)?;
+            if nil_match.is_some() {
+                fr.thread_id = None;
+                Ok((rest, ()))
+            } else {
                 let (rest, _) = char('(').parse(rest)?;
                 let (rest, val) =
                     map(objectid, |a| String::from_utf8_lossy(a).into_owned()).parse(rest)?;
                 let (rest, _) = char(')').parse(rest)?;
-                fr.email_id = Some(val);
-                input = rest;
-            }
-            "THREADID" => {
-                // THREADID (objectid-val) or THREADID NIL per RFC 8474 Section 4.
-                // objectid = 1*255(ALPHA / DIGIT / "_" / "-") per RFC 8474 Section 7.
-                let (rest, _) = sp(input)?;
-                // Use opt(terminated(..., peek(...))) to handle all case variants of
-                // NIL while verifying a token boundary follows (any atom-special
-                // or EOF). Plain `tag_no_case(&b"NIL"[..])` would greedily match the
-                // prefix of atoms like "NIL2", corrupting the parse
-                // (RFC 3501 Section 9).
-                let (rest, nil_match) = opt(terminated(
-                    tag_no_case(&b"NIL"[..]),
-                    peek(alt((
-                        // Any atom-special byte (RFC 3501 Section 9):
-                        //   atom-specials = "(" / ")" / "{" / SP / CTL /
-                        //                   list-wildcards / quoted-specials /
-                        //                   resp-specials
-                        value((), verify(take(1u8), |b: &[u8]| !is_atom_char(b[0]))),
-                        value((), eof),
-                    ))),
-                ))
-                .parse(rest)?;
-                if nil_match.is_some() {
-                    fr.thread_id = None;
-                    input = rest;
-                } else {
-                    let (rest, _) = char('(').parse(rest)?;
-                    let (rest, val) =
-                        map(objectid, |a| String::from_utf8_lossy(a).into_owned()).parse(rest)?;
-                    let (rest, _) = char(')').parse(rest)?;
-                    fr.thread_id = Some(val);
-                    input = rest;
-                }
-            }
-            "X-GM-MSGID" => {
-                let (rest, _) = sp(input)?;
-                let (rest, value) = number64(rest)?;
-                fr.gmail_msg_id = Some(value);
-                input = rest;
-            }
-            "X-GM-THRID" => {
-                let (rest, _) = sp(input)?;
-                let (rest, value) = number64(rest)?;
-                fr.gmail_thread_id = Some(value);
-                input = rest;
-            }
-            _ if upper == "BINARY.SIZE" && input.first() == Some(&b'[') => {
-                // BINARY.SIZE[section]  -  RFC 9051 Section 7.5.2 / Section 9 formal
-                // syntax specifies `number` (u32), but we accept number64 as a
-                // Postel's-law leniency for servers that may exceed u32 range.
-                let (rest, section_parts) = binary_section_spec(input)?;
-                let (rest, _) = sp(rest)?;
-                let (rest, size) = number64(rest)?;
-                fr.binary_sizes.push((section_parts, size));
-                input = rest;
-            }
-            _ if upper == "BINARY" && input.first() == Some(&b'[') => {
-                // BINARY[section]<origin> nstring (RFC 3516 Section 4.2)
-                let (rest, (section_parts, origin)) = binary_section_with_origin(input)?;
-                let (rest, _) = sp(rest)?;
-                let (rest, data) = nstring(rest)?;
-                fr.binary_sections.push(BinarySection {
-                    section: section_parts,
-                    origin,
-                    data,
-                });
-                input = rest;
-            }
-            _ if upper == "BODY" && input.first() == Some(&b'[') => {
-                // BODY[section]<origin> nstring (RFC 3501 Section 7.4.2)
-                let (rest, section) = body_section_spec(input)?;
-                let (rest, _) = sp(rest)?;
-                let (rest, data) = nstring(rest)?;
-                fr.body_sections.push(BodySection {
-                    section: section.0,
-                    origin: section.1,
-                    data,
-                });
-                input = rest;
-            }
-            _ if upper == "BODY" => {
-                // BODY without [section]  -  BODYSTRUCTURE synonym
-                let (rest, _) = sp(input)?;
-                let (rest, bs) = body_structure(rest, utf8_mode, 0)?;
-                fr.body_structure = Some(bs);
-                input = rest;
-            }
-            _ => {
-                // Unknown attribute  -  skip value. Try to skip past space + next value.
-                // This is a best-effort approach for forward compatibility.
-                let (rest, _) = sp(input)?;
-                let (rest, ()) = skip_fetch_value(rest)?;
-                input = rest;
+                fr.thread_id = Some(val);
+                Ok((rest, ()))
             }
         }
+        "X-GM-MSGID" => {
+            let (rest, _) = attr_sp(input)?;
+            let (rest, value) = number64(rest)?;
+            fr.gmail_msg_id = Some(value);
+            Ok((rest, ()))
+        }
+        "X-GM-THRID" => {
+            let (rest, _) = attr_sp(input)?;
+            let (rest, value) = number64(rest)?;
+            fr.gmail_thread_id = Some(value);
+            Ok((rest, ()))
+        }
+        "BINARY.SIZE" if input.first() == Some(&b'[') => {
+            // BINARY.SIZE[section]  -  RFC 9051 Section 7.5.2 / Section 9 formal
+            // syntax specifies `number` (u32), but we accept number64 as a
+            // Postel's-law leniency for servers that may exceed u32 range.
+            let (rest, section_parts) = binary_section_spec(input)?;
+            let (rest, _) = attr_sp(rest)?;
+            let (rest, size) = number64(rest)?;
+            fr.binary_sizes.push((section_parts, size));
+            Ok((rest, ()))
+        }
+        "BINARY" if input.first() == Some(&b'[') => {
+            // BINARY[section]<origin> nstring (RFC 3516 Section 4.2)
+            let (rest, (section_parts, origin)) = binary_section_with_origin(input)?;
+            let (rest, _) = attr_sp(rest)?;
+            let (rest, data) = nstring(rest)?;
+            fr.binary_sections.push(BinarySection {
+                section: section_parts,
+                origin,
+                data,
+            });
+            Ok((rest, ()))
+        }
+        "BODY" if input.first() == Some(&b'[') => {
+            // BODY[section]<origin> nstring (RFC 3501 Section 7.4.2)
+            let (rest, section) = body_section_spec(input)?;
+            let (rest, _) = attr_sp(rest)?;
+            let (rest, data) = nstring(rest)?;
+            fr.body_sections.push(BodySection {
+                section: section.0,
+                origin: section.1,
+                data,
+            });
+            Ok((rest, ()))
+        }
+        "BODY" => {
+            // BODY without [section]  -  BODYSTRUCTURE synonym
+            let (rest, _) = attr_sp(input)?;
+            let (rest, bs) = body_structure(rest, utf8_mode, 0)?;
+            fr.body_structure = Some(bs);
+            Ok((rest, ()))
+        }
+        _ => {
+            // Unknown attribute  -  skip value. Try to skip past space + next value.
+            // This is a best-effort approach for forward compatibility.
+            let (rest, _) = attr_sp(input)?;
+            let (rest, ()) = skip_fetch_value(rest)?;
+            Ok((rest, ()))
+        }
     }
-    Ok((input, fr))
 }
 
 /// Parse `[section]<origin>` from a BODY fetch attribute (RFC 3501 Section 7.4.2).
@@ -432,6 +497,14 @@ pub(super) fn scan_section_spec(input: &[u8]) -> IResult<&[u8], &[u8]> {
 
     while pos < input.len() {
         match input[pos] {
+            // CRLF cannot appear in a section spec outside a literal. Stop
+            // here so malformed quoted syntax cannot absorb the next line.
+            b'\r' | b'\n' => {
+                return Err(nom::Err::Error(nom::error::Error::new(
+                    &input[pos..],
+                    nom::error::ErrorKind::CrLf,
+                )));
+            }
             // RFC 3501 Section 7.4.2: `]` at paren depth 0 is the section closer.
             b']' if paren_depth == 0 => {
                 return Ok((&input[pos..], &start[..pos]));
@@ -450,6 +523,13 @@ pub(super) fn scan_section_spec(input: &[u8]) -> IResult<&[u8], &[u8]> {
             b'"' => {
                 pos += 1; // skip opening quote
                 while pos < input.len() && input[pos] != b'"' {
+                    // RFC 3501 Section 9: QUOTED-CHAR excludes CR and LF,
+                    // escaped or not. A raw CR/LF means the quote is
+                    // unterminated  -  stop so the scan cannot run into the
+                    // next response.
+                    if input[pos] == b'\r' || input[pos] == b'\n' {
+                        break;
+                    }
                     if input[pos] == b'\\' && pos + 1 < input.len() {
                         // Guard against escapes consuming CR/LF:
                         // RFC 3501 Section 9: QUOTED-CHAR excludes CR and LF.
@@ -465,9 +545,11 @@ pub(super) fn scan_section_spec(input: &[u8]) -> IResult<&[u8], &[u8]> {
                         pos += 1;
                     }
                 }
-                if pos < input.len() {
+                if input.get(pos) == Some(&b'"') {
                     pos += 1; // skip closing quote
                 }
+                // Otherwise the quote is unterminated and `pos` still points at
+                // the CR/LF, which the outer terminator arm rejects.
             }
             // Handle literal8 prefix: ~{n}\r\n<n bytes> (RFC 6855 Section 4).
             b'~' if pos + 1 < input.len() && input[pos + 1] == b'{' => {
@@ -626,12 +708,22 @@ pub(super) fn skip_paren_group(input: &[u8]) -> IResult<&[u8], &[u8]> {
     let mut i = 0;
     while i < input.len() && depth > 0 {
         match input[i] {
+            // A response terminator is invalid in a parenthesized value
+            // unless it belongs to a literal, which is skipped below.
+            b'\r' | b'\n' => break,
             b'(' => depth += 1,
             b')' => depth -= 1,
             b'"' => {
                 // Skip quoted string contents.
                 i += 1;
                 while i < input.len() && input[i] != b'"' {
+                    // RFC 3501 Section 9: QUOTED-CHAR excludes CR and LF,
+                    // escaped or not. A raw CR/LF means the quote is
+                    // unterminated  -  stop so the scan cannot run into the
+                    // next response.
+                    if input[i] == b'\r' || input[i] == b'\n' {
+                        break;
+                    }
                     if input[i] == b'\\' {
                         // Guard against escapes consuming CR/LF:
                         // RFC 3501 Section 9: QUOTED-CHAR excludes CR and LF.
@@ -647,9 +739,10 @@ pub(super) fn skip_paren_group(input: &[u8]) -> IResult<&[u8], &[u8]> {
                     }
                     i += 1;
                 }
-                // If quote was never closed, bail out early so `i` stays
-                // within bounds for the final slice.
-                if i >= input.len() {
+                // If the quote was never closed  -  end of input, or a raw
+                // CR/LF  -  bail out with `depth` still non-zero so the
+                // unclosed-paren check below turns this into an error.
+                if input.get(i) != Some(&b'"') {
                     break;
                 }
             }
