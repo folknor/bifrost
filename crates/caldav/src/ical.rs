@@ -3,7 +3,7 @@ use bifrost_types::{
     EventCreate, EventId, EventOrganizer, EventPatch, EventRecurrence, EventReminder, EventStatus,
     EventTime, EventVisibility, ProtocolKind, ReminderRelativeTo, ReminderTrigger, RsvpStatus,
 };
-use caldata::ContentLineParser;
+use caldata::{ContentLineParser, LineReader};
 use chrono::{DateTime, NaiveDate, NaiveDateTime, SecondsFormat, Utc};
 use uuid::Uuid;
 
@@ -396,8 +396,14 @@ fn parse_vevents(data: &str) -> Result<Vec<VeventBlock>, IcalParseError> {
     let mut blocks = Vec::new();
     let mut current: Option<VeventBlock> = None;
     let mut alarm: Option<Vec<Prop>> = None;
-    for line in ContentLineParser::from_slice(data.as_bytes()) {
+    for line in LineReader::from_slice(data.as_bytes()) {
         let line = line.map_err(|error| IcalParseError(error.to_string()))?;
+        let normalized = normalize_exchange_cn_param(line.as_str());
+        let mut parser = ContentLineParser::from_slice(normalized.as_bytes());
+        let line = parser
+            .next()
+            .expect("one logical line produces one content line")
+            .map_err(|error| IcalParseError(error.to_string()))?;
         let name = line.name;
         if name == "BEGIN" && line.value.eq_ignore_ascii_case("VEVENT") {
             current = Some(VeventBlock::default());
@@ -435,6 +441,78 @@ fn parse_vevents(data: &str) -> Result<Vec<VeventBlock>, IcalParseError> {
         }
     }
     Ok(blocks)
+}
+
+/// Exchange sometimes emits an unquoted text-escaped CN (`CN=Doe\\, John`).
+/// RFC 5545 requires a quoted parameter value here, and caldata correctly
+/// treats an unquoted comma as a parameter-value separator, so the legacy
+/// form has to be repaired before tokenization or the display name is
+/// truncated at the comma.
+///
+/// The repair is deliberately narrow: only an unquoted CN value that
+/// actually carries an RFC 5545 *text* escape (`\,`, `\;`, `\n`) is
+/// rewritten, and the rewrite resolves those escapes here and re-encodes
+/// the result with [`escape_param`]. Confining the tolerance to this one
+/// legacy shape is what lets the CN read path stay a pure RFC 6868 decode:
+/// a CN that merely contains a literal backslash is left alone and
+/// round-trips verbatim, which a blanket `unescape_text` on every CN would
+/// silently eat. RFC 6868 defines no escape for a backslash, so verbatim is
+/// both the conformant encoding and the only one that survives a round trip.
+fn normalize_exchange_cn_param(line: &str) -> String {
+    let bytes = line.as_bytes();
+    let mut index = 0;
+    let mut in_quotes = false;
+    let mut escaped = false;
+
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' if !in_quotes => escaped = !escaped,
+            b'"' if !escaped => in_quotes = !in_quotes,
+            b';' if !in_quotes && !escaped => {
+                let name_start = index + 1;
+                let mut name_end = name_start;
+                while name_end < bytes.len()
+                    && bytes[name_end] != b'='
+                    && bytes[name_end] != b';'
+                    && bytes[name_end] != b':'
+                {
+                    name_end += 1;
+                }
+                if bytes.get(name_end) == Some(&b'=')
+                    && line[name_start..name_end].eq_ignore_ascii_case("CN")
+                    && bytes.get(name_end + 1) != Some(&b'"')
+                {
+                    let value_start = name_end + 1;
+                    let mut value_end = value_start;
+                    let mut value_escaped = false;
+                    while value_end < bytes.len() {
+                        match bytes[value_end] {
+                            b'\\' => value_escaped = !value_escaped,
+                            b';' | b':' if !value_escaped => break,
+                            _ => value_escaped = false,
+                        }
+                        value_end += 1;
+                    }
+                    let value = &line[value_start..value_end];
+                    // Only a separator escape marks the value as legacy: a
+                    // bare `\` (or `\n`) in an unquoted value does not
+                    // confuse the tokenizer, so it stays verbatim.
+                    if value.contains("\\,") || value.contains("\\;") {
+                        return format!(
+                            "{}{}{}",
+                            &line[..value_start],
+                            escape_param(&unescape_text(value)),
+                            &line[value_end..]
+                        );
+                    }
+                }
+            }
+            b':' if !in_quotes && !escaped => break,
+            _ => escaped = false,
+        }
+        index += 1;
+    }
+    line.to_string()
 }
 
 /// Project each VALARM into an `EventReminder`, dropping alarms with no
@@ -718,7 +796,10 @@ fn ical_event_status(status: EventStatus) -> &'static str {
 fn organizer_from_property(prop: &Prop) -> Option<EventOrganizer> {
     Some(EventOrganizer {
         email: mailto(&prop.value)?,
-        name: prop.text_param("CN").as_deref().map(unescape_text),
+        // A pure RFC 6868 decode. Legacy Exchange text escapes are resolved
+        // before tokenization by `normalize_exchange_cn_param`; applying
+        // `unescape_text` again here would eat a literal backslash.
+        name: prop.text_param("CN"),
     })
 }
 
@@ -736,7 +817,7 @@ fn organizer_to_line(organizer: &EventOrganizer) -> String {
 fn attendee_from_property(prop: &Prop) -> Option<EventAttendee> {
     Some(EventAttendee {
         email: mailto(&prop.value)?,
-        name: prop.text_param("CN").as_deref().map(unescape_text),
+        name: prop.text_param("CN"),
         role: attendee_role(prop.param("ROLE")),
         status: rsvp_status(prop.param("PARTSTAT")),
     })
@@ -2402,6 +2483,64 @@ mod tests {
             event.attendees[0].name.as_deref(),
             Some("Ada \"Ace\" Lovelace")
         );
+    }
+
+    #[test]
+    fn attendee_cn_with_a_literal_backslash_round_trips() {
+        let name = "Doe\\n John";
+        let line = attendee_to_line(&EventAttendee {
+            email: "doe@example.test".to_string(),
+            name: Some(name.to_string()),
+            role: AttendeeRole::Required,
+            status: RsvpStatus::NeedsAction,
+        });
+        let data = format!(
+            "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:u1\r\n{line}\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+        );
+
+        let event = parse_event(
+            "/cal/one.ics".to_string(),
+            CalendarId("/cal/".to_string()),
+            None,
+            &data,
+        );
+
+        // RFC 6868 defines no backslash escape, so the wire form is the
+        // literal character. Doubling it would be invented syntax that only
+        // this crate could read back.
+        assert!(line.contains("CN=Doe\\n John"));
+        assert_eq!(event.attendees[0].name.as_deref(), Some(name));
+    }
+
+    #[test]
+    fn tzid_with_a_literal_backslash_round_trips() {
+        let tzid = "Custom\\Zone";
+        let line = format!("DTSTART;TZID={}:20260602T120000", super::escape_param(tzid));
+        let data = format!(
+            "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:u1\r\n{line}\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+        );
+
+        let event = parse_event(
+            "/cal/one.ics".to_string(),
+            CalendarId("/cal/".to_string()),
+            None,
+            &data,
+        );
+
+        assert!(line.contains("TZID=Custom\\Zone:"));
+        assert_eq!(event.start.timezone.as_deref(), Some(tzid));
+    }
+
+    #[test]
+    fn attendee_cn_accepts_exchange_style_text_escapes_on_read() {
+        let event = parse_event(
+            "/cal/one.ics".to_string(),
+            CalendarId("/cal/".to_string()),
+            None,
+            "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:u1\r\nATTENDEE;CN=Doe\\, John:mailto:doe@example.test\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+        );
+
+        assert_eq!(event.attendees[0].name.as_deref(), Some("Doe, John"));
     }
 
     #[test]

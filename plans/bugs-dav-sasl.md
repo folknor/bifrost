@@ -70,8 +70,51 @@ added coverage for its existing error paths and RFC 7677 SHA-256 vector.
   matching CalDAV.
 - CardDAV contact search sorts by native id before offset paging, making the
   order stable when the remote result set is unchanged.
-- vCard `PREF=1` alone maps to the shared primary flag; lower preference
-  ordinals do not.
+- vCard preference ranking is per property group: the lowest valid ordinal
+  present within EMAIL, TEL, or ADR maps to the shared primary flag, so a
+  card whose only preferred email is `PREF=2` still has a primary. vCard 3's
+  `TYPE=PREF` continues to mark primary on its own.
+
+## Round 2: the correctness gaps
+
+The five gaps filed as "worth a later pass" are closed.
+
+- **Chunked multiget keeps its partial result *and* its recovery class.**
+  Each REPORT - one per multiget chunk, one per searched property - is
+  classified where it happens. A leg that failed wholly no longer aborts the
+  call once other legs returned data; instead the worst recovery class
+  encountered survives in `MultigetFetch::degraded` and the account layer
+  publishes it as a `Page::skipped_scopes` entry (`ErrorScope::Calendar` /
+  `ErrorScope::ContactCollection`). The distinction matters: `failed_ids` is
+  a bare list of ids with no classification, so folding a 401 into it would
+  have kept the cards while destroying the "reauthorize" signal. A refusal
+  with nothing usable anywhere still rides the `Err` arm unchanged.
+- **A 2xx response without `address-data` / `calendar-data` is an absent-data
+  per-resource outcome**, not a synthetic 500. It enters `failed_ids` through
+  the new `missing_data` lane and cannot make a body classify as a complete
+  failure. `as_failed_multiget_resource` now requires an actual non-2xx
+  status.
+- **`is_primary` ranks within the property group** (above).
+- **`escape_param` is RFC 6868 conformant again.** The interim fix doubled
+  backslashes, which RFC 6868 does not define - other peers would have read
+  the doubling literally, and TZID (which shares the encoder but not the
+  tolerant read path) could not round-trip at all. Reads no longer run
+  `unescape_text` over every CN; the Exchange tolerance is confined to
+  `normalize_exchange_cn_param`, which repairs only an unquoted CN carrying a
+  genuine `\,` / `\;` separator escape and re-encodes it conformantly. CN and
+  TZID both round-trip a literal backslash now.
+- **`contact_search` reports the failures each page actually observed.**
+  Every page reruns the remote search, so the failure set is re-observed per
+  page; suppressing it after page one silently discarded any resource that
+  first started failing on page two. `Page::failed_ids` is documented
+  per-page ("resources the provider fetched for this page"), and nothing in
+  bifrost-sync accumulates the lane, so per-page reporting is the honest
+  reading. The residual cost is recorded under Remaining follow-ups.
+- **One outcome per id.** Text search runs a REPORT per property, so the same
+  resource could be reported as both materialized and failed when the REPORTs
+  disagreed. `one_outcome_per_id` now drops any id from the failure lane that
+  materialized in some leg: the data arrived, so success is the true outcome.
+  Both crates.
 
 ## Remaining follow-ups
 
@@ -91,37 +134,22 @@ Accepted trade-offs and residual risk:
   still emitted as a created/updated event change. Hydration then yields
   nothing. Filtering needs either a component-type PROPFIND or a first-fetch
   classification cache.
+- **A literal backslash in a CN survives, an Exchange-style escaped one is
+  normalized.** RFC 6868 defines no escape for a backslash, so the only
+  conformant encoding is the character itself - which means a display name
+  that genuinely reads `Doe\, John` (backslash included) is indistinguishable
+  on the wire from Exchange's escaping of `Doe, John`, and this crate resolves
+  the ambiguity in Exchange's favour. That is the spec's limit, not a bug we
+  can encode our way out of.
+- **`contact_search` names a persistently failing resource once per page.**
+  Each page reruns the search, so a resource failing throughout appears in
+  every page's `failed_ids`. A consumer accumulating across pages must treat
+  the lane as a set. The alternative - carrying the already-reported ids in
+  the page cursor - makes the cursor grow with the failure set, which is
+  worse for the case that matters (a wholly failing address book).
 - `event_in_range` trusts the server for COUNT-bounded recurrence expansion.
   Fully defending against a hostile server would require recurrence expansion
   that does not exist in this crate.
-
-Correctness gaps worth a later pass:
-
-- **Per-chunk complete-failure classification discards earlier successes.**
-  `fetch_vcards` / `fetch_events` classify each `MULTIGET_BATCH_SIZE` chunk
-  independently and return `Err` on the first wholly failed chunk, throwing
-  away the cards already collected from the chunks that succeeded. A walk
-  that hydrates 200 resources and then meets a 401 chunk reports only the
-  error. Accumulating into the report and classifying once at the end (or
-  degrading a late chunk failure into `failed_ids`) keeps the partial page.
-- **A 207 with no `address-data` / `calendar-data` anywhere becomes a
-  synthetic 500.** `as_failed_multiget_resource` counts any non-collection
-  response lacking the data property as failed even when its propstat was
-  200; if every response in a chunk looks like that, `classify` returns
-  `CompleteFailure { status: None }` and `multiget_failure` invents
-  `INTERNAL_SERVER_ERROR`. Both crates share the shape. Requiring an actual
-  non-2xx status before calling a response failed would be truer to the body.
-- **`is_primary` requires literally `PREF=1`.** A card whose only preferred
-  email carries `PREF=2` now has no primary at all. RFC 6350's model is
-  "lowest ordinal wins", which needs sibling context the per-parameter check
-  does not have; doing it properly means ranking within each property group.
-- **`unescape_text` still runs on `CN` after the RFC 6868 decode.** It is
-  kept for Exchange-style `CN=Doe\, John`, but it is not the inverse of
-  `escape_param`, so a display name containing a literal backslash does not
-  round-trip: the write emits it verbatim and the read eats it.
-- **`contact_search` repeats the whole `failed_ids` list on every page.**
-  `page.failed_ids` is assigned after the offset slice, so a consumer paging
-  through N pages sees the same failed ids N times.
 
 Smells and nits:
 

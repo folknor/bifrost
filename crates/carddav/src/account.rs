@@ -9,14 +9,15 @@ use bifrost_types::{
     ContactCreate, ContactId, ContactPatch, ContactProvenance, ContactSearchRequest, ContainerId,
     ContainerKind, ContainerList, CostClass, CursorDescriptor, CursorEstablishment, CursorScope,
     DirectoryCard, DirectoryGroup, DirectoryGroupId, DirectoryGroupMember, DraftHandle, DraftPatch,
-    EventCreate, EventId, EventPatch, EventRange, EventSearchRequest, FilterValidation, FlagOp,
-    HostedAttachment, HydratedObject, HydrationProjection, IdempotencyKey, Identity, IdentityId,
-    IdentityPatch, Importance, InventoryEntry, InventoryPartition, InventoryPartitioning,
-    ItemOutcome, MembershipScope, Message, MutationSuccess, MutationTarget, ObjectChange,
-    ObjectChangeKind, ObjectId, ObjectType, OpaqueChangeState, Page, PageBoundary, Priority,
-    ProtocolKind, QuotaInfo, RsvpStatus, SearchRequest, SendRequest, ServerFilter,
-    ServerFilterCreate, ServerFilterId, ServerFilterPatch, ServerVersion, SubscriptionHandle,
-    SyncEvent, SyncStrategy, ThreadHydration, ThreadId, VacationConfig, WatchEvent,
+    ErrorScope, EventCreate, EventId, EventPatch, EventRange, EventSearchRequest, FilterValidation,
+    FlagOp, HostedAttachment, HydratedObject, HydrationProjection, IdempotencyKey, Identity,
+    IdentityId, IdentityPatch, Importance, InventoryEntry, InventoryPartition,
+    InventoryPartitioning, ItemOutcome, MembershipScope, Message, MutationSuccess, MutationTarget,
+    ObjectChange, ObjectChangeKind, ObjectId, ObjectType, OpaqueChangeState, Page, PageBoundary,
+    Priority, ProtocolKind, QuotaInfo, RsvpStatus, SearchRequest, SendRequest, ServerFilter,
+    ServerFilterCreate, ServerFilterId, ServerFilterPatch, ServerVersion, SkippedScope,
+    SubscriptionHandle, SyncEvent, SyncStrategy, ThreadHydration, ThreadId, VacationConfig,
+    WatchEvent,
 };
 use bytes::Bytes;
 use futures::{StreamExt, stream};
@@ -24,7 +25,9 @@ use uuid::Uuid;
 
 use crate::CardDavConfig;
 use crate::capabilities::carddav_capabilities;
-use crate::client::{CardDavClient, PutCondition, local_error, not_found_error, unsupported_error};
+use crate::client::{
+    CardDavClient, PutCondition, local_error, not_found_error, parse_error, unsupported_error,
+};
 use crate::parse::{AddressBookCollection, CardDavFetchedVCard, CardDavMultigetReport};
 use crate::vcard::{VCardParseError, contact_from_vcard, vcard_from_create, vcard_from_patch};
 
@@ -124,7 +127,18 @@ impl CardDavAccount {
     ) -> Result<CardDavFetchedVCard, AccountError> {
         let report = client
             .fetch_vcards(addressbook, std::slice::from_ref(&contact.0), operation)
-            .await?;
+            .await?
+            .report;
+        if report
+            .missing_data
+            .iter()
+            .any(|href| client.resolve_url(href) == client.resolve_url(&contact.0))
+        {
+            return Err(parse_error(
+                operation,
+                "CardDAV multiget response omitted address-data",
+            ));
+        }
         let (cards, _) = resolved_report(client, report);
         cards
             .into_iter()
@@ -137,18 +151,24 @@ impl CardDavAccount {
         default_addressbook_url: &str,
         address_book: Option<AddressBookId>,
         operation: AccountOperation,
-    ) -> Result<(Vec<ContactCard>, Vec<String>), AccountError> {
+    ) -> Result<SearchedContacts, AccountError> {
         let addressbook = Self::addressbook_url(client, default_addressbook_url, address_book);
         let entries = client.list_contacts(&addressbook).await?;
         let uris = entries
             .iter()
             .map(|entry| entry.uri.clone())
             .collect::<Vec<_>>();
-        let report = client.fetch_vcards(&addressbook, &uris, operation).await?;
-        let (fetched, mut failed_ids) = resolved_report(client, report);
+        let fetch = client.fetch_vcards(&addressbook, &uris, operation).await?;
+        let skipped_scopes = skipped_addressbook_scope(fetch.degraded);
+        let (fetched, mut failed_ids) = resolved_report(client, fetch.report);
         let (cards, projection_failures) = partition_hydrated_vcards(&addressbook, fetched);
         failed_ids.extend(projection_failures);
-        Ok((cards, failed_ids))
+        one_outcome_per_id(&mut failed_ids, &cards);
+        Ok(SearchedContacts {
+            cards,
+            failed_ids,
+            skipped_scopes,
+        })
     }
 
     async fn searched_contacts(
@@ -156,20 +176,24 @@ impl CardDavAccount {
         default_addressbook_url: &str,
         address_book: Option<AddressBookId>,
         query: &str,
-    ) -> Result<(Vec<ContactCard>, Vec<String>), AccountError> {
+    ) -> Result<SearchedContacts, AccountError> {
         let addressbook = Self::addressbook_url(client, default_addressbook_url, address_book);
         let mut seen = HashSet::new();
-        let report = client.query_vcards_text(&addressbook, query).await?;
-        let (fetched, mut failed_ids) = resolved_report(client, report);
+        let fetch = client.query_vcards_text(&addressbook, query).await?;
+        let skipped_scopes = skipped_addressbook_scope(fetch.degraded);
+        let (fetched, mut failed_ids) = resolved_report(client, fetch.report);
         let fetched = fetched
             .into_iter()
             .filter(|card| seen.insert(card.uri.clone()))
             .collect();
         let (cards, projection_failures) = partition_hydrated_vcards(&addressbook, fetched);
         failed_ids.extend(projection_failures);
-        failed_ids.sort_unstable();
-        failed_ids.dedup();
-        Ok((cards, failed_ids))
+        one_outcome_per_id(&mut failed_ids, &cards);
+        Ok(SearchedContacts {
+            cards,
+            failed_ids,
+            skipped_scopes,
+        })
     }
 
     async fn hydrated_contacts_page(
@@ -189,17 +213,19 @@ impl CardDavAccount {
             .take(page_size)
             .map(|entry| entry.uri)
             .collect::<Vec<_>>();
-        let report = client.fetch_vcards(&addressbook, &uris, operation).await?;
-        let (fetched, mut failed_ids) = resolved_report(client, report);
+        let fetch = client.fetch_vcards(&addressbook, &uris, operation).await?;
+        let skipped_scopes = skipped_addressbook_scope(fetch.degraded);
+        let (fetched, mut failed_ids) = resolved_report(client, fetch.report);
         let (cards, projection_failures) = partition_hydrated_vcards(&addressbook, fetched);
         failed_ids.extend(projection_failures);
+        one_outcome_per_id(&mut failed_ids, &cards);
         Ok(Page {
             items: cards,
             next_cursor: (offset + page_size < total)
                 .then(|| (offset + page_size).to_string().into_bytes()),
             estimated_total: Some(estimated_total(total)),
             failed_ids,
-            skipped_scopes: Vec::new(),
+            skipped_scopes,
         })
     }
 
@@ -896,7 +922,7 @@ impl Account for CardDavAccount {
             let offset =
                 decode_offset_cursor(request.page_cursor.clone(), AccountOperation::ContactSearch)?;
             let needle = request.query.to_lowercase();
-            let (cards, failed_ids) = if needle.is_empty() {
+            let searched = if needle.is_empty() {
                 Self::hydrated_contacts(
                     &client,
                     &default_addressbook_url,
@@ -913,20 +939,24 @@ impl Account for CardDavAccount {
                 )
                 .await?
             };
-            let items = cards
+            let mut items = searched
+                .cards
                 .into_iter()
                 .filter(|contact| contact_matches(contact, &needle))
                 .collect::<Vec<_>>();
-            let mut items = items;
             items.sort_by(|left, right| left.native_id.cmp(&right.native_id));
             let page_size = request
                 .limit
                 .and_then(|limit| usize::try_from(limit).ok())
                 .unwrap_or(CONTACT_PAGE_SIZE)
                 .max(1);
-            let mut page = page_from_offset(items, offset, page_size);
-            page.failed_ids = failed_ids;
-            Ok(page)
+            Ok(page_from_offset(
+                items,
+                offset,
+                page_size,
+                searched.failed_ids,
+                searched.skipped_scopes,
+            ))
         })
     }
 
@@ -1334,7 +1364,24 @@ fn decode_offset_cursor(
         .map_err(|error| local_error(operation, format!("invalid CardDAV page cursor: {error}")))
 }
 
-fn page_from_offset<T>(items: Vec<T>, offset: usize, page_size: usize) -> Page<T> {
+/// Slice a materialized result set into one offset page.
+///
+/// `failed_ids` and `skipped_scopes` describe the fetch that produced
+/// `items`, not the slice, and every page of a CardDAV search reruns that
+/// fetch against the server. So both lanes are reported on every page,
+/// which is exactly what `Page::failed_ids` documents ("resources the
+/// provider fetched FOR THIS PAGE"): a resource that first starts failing
+/// while the consumer is on page three is news on page three, and
+/// suppressing it after page one would lose it entirely. The cost is that
+/// a resource failing throughout is named once per page, so a consumer
+/// accumulating across pages must treat the lane as a set, not a tally.
+fn page_from_offset<T>(
+    items: Vec<T>,
+    offset: usize,
+    page_size: usize,
+    failed_ids: Vec<String>,
+    skipped_scopes: Vec<SkippedScope>,
+) -> Page<T> {
     let total = items.len();
     let end = offset.saturating_add(page_size).min(total);
     let page_items = items.into_iter().skip(offset).take(page_size).collect();
@@ -1342,9 +1389,56 @@ fn page_from_offset<T>(items: Vec<T>, offset: usize, page_size: usize) -> Page<T
         items: page_items,
         next_cursor: (end < total).then(|| end.to_string().into_bytes()),
         estimated_total: Some(estimated_total(total)),
-        failed_ids: Vec::new(),
-        skipped_scopes: Vec::new(),
+        failed_ids,
+        skipped_scopes,
     }
+}
+
+/// One CardDAV search or hydration leg: what materialized, the resources
+/// that did not, and any scope the walk could not finish.
+struct SearchedContacts {
+    cards: Vec<ContactCard>,
+    failed_ids: Vec<String>,
+    skipped_scopes: Vec<SkippedScope>,
+}
+
+/// Reduce the failure lane to one outcome per resource id.
+///
+/// Text search runs a REPORT per property, so the resource the EMAIL query
+/// refused can be the same resource the FN query returned in full. The
+/// data arrived, so success is the true outcome; reporting the id in both
+/// lanes would make a consumer count it twice and treat a contact it can
+/// display as lost. The sort and dedup finish the job for ids that failed
+/// in more than one REPORT.
+fn one_outcome_per_id(failed_ids: &mut Vec<String>, cards: &[ContactCard]) {
+    let materialized = cards
+        .iter()
+        .map(|card| card.native_id.as_str())
+        .collect::<HashSet<_>>();
+    failed_ids.retain(|id| !materialized.contains(id.as_str()));
+    failed_ids.sort_unstable();
+    failed_ids.dedup();
+}
+
+/// Publish a partially-refused walk as a skipped scope.
+///
+/// A REPORT leg that failed wholly means this address book was not fully
+/// searched. The cards already collected stay valid, but "no more matches"
+/// is not what happened, and the consumer needs the classified failure to
+/// know whether to reauthorize, retry, or stop. `failed_ids` cannot carry
+/// that: it is a bare list of resource ids with no recovery class, and the
+/// refused leg often does not even name the resources it lost.
+/// `ErrorScope::ContactCollection` carries no id of its own; the refused
+/// address book is the one named by the request, and the error's own
+/// diagnostics carry the URL.
+fn skipped_addressbook_scope(degraded: Option<AccountError>) -> Vec<SkippedScope> {
+    degraded
+        .map(|error| SkippedScope {
+            scope: ErrorScope::ContactCollection,
+            error,
+        })
+        .into_iter()
+        .collect()
 }
 
 fn estimated_total(total: usize) -> u64 {
@@ -1383,7 +1477,9 @@ fn resolved_report(
     let failed = report
         .failed
         .into_iter()
-        .map(|failure| client.resolve_url(&failure.href))
+        .map(|failure| failure.href)
+        .chain(report.missing_data)
+        .map(|href| client.resolve_url(&href))
         .collect();
     (cards, failed)
 }
@@ -1536,12 +1632,19 @@ mod tests {
                 href: "/contacts/two.vcf".to_string(),
                 status: Some(403),
             }],
+            missing_data: vec!["/contacts/empty.vcf".to_string()],
         };
 
         let (cards, failed) = resolved_report(&client, report);
 
         assert_eq!(cards[0].uri, "https://dav.example.test/contacts/one.vcf");
-        assert_eq!(failed, vec!["https://dav.example.test/contacts/two.vcf"]);
+        assert_eq!(
+            failed,
+            vec![
+                "https://dav.example.test/contacts/two.vcf",
+                "https://dav.example.test/contacts/empty.vcf",
+            ]
+        );
     }
 
     #[test]
@@ -1582,15 +1685,84 @@ mod tests {
 
     #[test]
     fn page_from_offset_returns_next_cursor() {
-        let page = page_from_offset(vec![1, 2, 3, 4], 1, 2);
+        let page = page_from_offset(vec![1, 2, 3, 4], 1, 2, Vec::new(), Vec::new());
 
         assert_eq!(page.items, vec![2, 3]);
         assert_eq!(page.next_cursor, Some(b"3".to_vec()));
         assert_eq!(page.estimated_total, Some(4));
 
-        let tail = page_from_offset(vec![1, 2, 3, 4], 3, 2);
+        let tail = page_from_offset(vec![1, 2, 3, 4], 3, 2, Vec::new(), Vec::new());
         assert_eq!(tail.items, vec![4]);
         assert_eq!(tail.next_cursor, None);
+    }
+
+    #[test]
+    fn a_materialized_resource_leaves_the_failure_lane() {
+        let card = ContactCard {
+            id: ContactId("/book/one.vcf".to_string()),
+            address_book_id: Some(AddressBookId("/book/".to_string())),
+            native_id: "/book/one.vcf".to_string(),
+            etag: None,
+            provenance: ContactProvenance {
+                provider: ProtocolKind::CardDav,
+                native: "/book/one.vcf".to_string(),
+                address_book_native: Some("/book/".to_string()),
+            },
+            corpus: ContactCorpus::Main,
+            display_name: None,
+            emails: Vec::new(),
+            phones: Vec::new(),
+            organizations: Vec::new(),
+            addresses: Vec::new(),
+            notes: None,
+            photo_url: None,
+            photo: None,
+        };
+        let mut failed_ids = vec![
+            "/book/one.vcf".to_string(),
+            "/book/two.vcf".to_string(),
+            "/book/two.vcf".to_string(),
+        ];
+
+        one_outcome_per_id(&mut failed_ids, std::slice::from_ref(&card));
+
+        assert_eq!(failed_ids, vec!["/book/two.vcf".to_string()]);
+    }
+
+    #[test]
+    fn a_degraded_leg_becomes_a_skipped_contact_collection_scope() {
+        let error = crate::client::status_error(
+            AccountOperation::ContactSearch,
+            reqwest::StatusCode::UNAUTHORIZED,
+            "refused".to_string(),
+        );
+        let recovery = error.recovery().clone();
+
+        let skipped = skipped_addressbook_scope(Some(error));
+
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].scope, ErrorScope::ContactCollection);
+        assert_eq!(skipped[0].error.recovery(), &recovery);
+        assert!(skipped_addressbook_scope(None).is_empty());
+    }
+
+    #[test]
+    fn a_failure_first_seen_on_a_later_page_is_still_reported() {
+        // Every page reruns the remote search, so the failure set is
+        // re-observed per page. A resource that only starts failing while
+        // the consumer is on page two must be reported on page two - the
+        // page it was observed on is the only page that can report it.
+        let first = page_from_offset(vec![1, 2, 3], 0, 1, Vec::new(), Vec::new());
+        let second = page_from_offset(
+            vec![1, 2, 3],
+            1,
+            1,
+            vec!["/book/failed.vcf".to_string()],
+            Vec::new(),
+        );
+
+        assert!(first.failed_ids.is_empty());
+        assert_eq!(second.failed_ids, vec!["/book/failed.vcf"]);
     }
 
     #[test]

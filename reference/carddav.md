@@ -66,8 +66,8 @@ contact primitives.
   indistinguishable from absent (the shared limitation calcard also has).
   Parameter values use RFC 6868 caret encoding in both directions, so a
   quote or newline in a parameter survives a write/read round trip. For
-  vCard 4 preference ordinals, only `PREF=1` maps to the shared primary
-  flag.
+  vCard 4 preference ordinals, the lowest valid ordinal within each
+  EMAIL/TEL/ADR group maps to the shared primary flag.
 - `capabilities.rs` - contact-only `AccountCapabilities`.
 
 ## Account behavior
@@ -85,10 +85,22 @@ Supported contact primitives:
   dropped, so a consumer can tell a transient per-resource hydration
   failure apart from a real remote deletion and preserve the row. Books
   and cards carry `ContactCorpus::Main`; CardDAV has no auto-collected
-  corpus. Multiget returns a `CardDavMultigetReport` with successful cards
-  and per-resource failures. A wholly failed 207 with any non-404/410
-  failure is routed through normal status classification rather than
-  returned as an empty page; partial failures feed `Page::failed_ids`.
+  corpus. Multiget returns a `CardDavMultigetReport` with successful cards,
+  per-resource failures, and `missing_data` (a 2xx response that omitted
+  `address-data` - an absence, not a DAV failure). A wholly failed 207 with
+  any non-404/410 failure is routed through normal status classification
+  rather than returned as an empty page; partial failures feed
+  `Page::failed_ids`.
+
+  Multiget is chunked and text search runs one REPORT per property, so each
+  REPORT is classified independently. A leg that fails wholly after other
+  legs returned cards no longer aborts the call: the cards are kept, and the
+  worst recovery class encountered rides `MultigetFetch::degraded` into
+  `Page::skipped_scopes` as an `ErrorScope::ContactCollection` entry, because
+  `failed_ids` carries ids without any classification and would have lost the
+  reauthorize/retry signal. A refusal with nothing usable anywhere is still
+  an `Err`. Ids appear in exactly one lane: `one_outcome_per_id` drops from
+  the failure lane anything that materialized in some leg.
 - `contact_get` - single-resource multiget using the contact id as the
   DAV href. A missing resource maps to `NotFound(Contact)`.
 - `contact_create` - creates a vCard 4.0 resource with a UUID-backed
@@ -107,7 +119,11 @@ Supported contact primitives:
   fields, including ADR postal addresses, then keep local filtering and
   offset-cursor paging as a
   defensive guard. Results are sorted by native id before slicing so page
-  order is stable while the remote result set is unchanged. Empty search
+  order is stable while the remote result set is unchanged. Every page
+  reruns the remote search, so `failed_ids` reports what that page's fetch
+  observed - a resource that only starts failing on page three is news on
+  page three, and one failing throughout is named on every page. The lane is
+  a per-page set, not a running tally. Empty search
   hydrates the addressbook to preserve
   match-all behavior. This is the *personal* corpus only;
   `directory_search` (org directory / GAL) returns

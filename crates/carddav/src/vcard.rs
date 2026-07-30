@@ -426,6 +426,9 @@ fn parse_vcard(data: &str) -> Result<ParsedVCard, VCardParseError> {
     };
     let mut pending_org: Option<ContactOrganization> = None;
     let mut structured_name: Option<String> = None;
+    let mut email_preferences = Vec::new();
+    let mut phone_preferences = Vec::new();
+    let mut address_preferences = Vec::new();
 
     // caldata's LineReader unfolds physical lines into logical content lines,
     // deleting exactly one leading WSP per RFC 6350 sec 3.2 (the old
@@ -444,16 +447,22 @@ fn parse_vcard(data: &str) -> Result<ParsedVCard, VCardParseError> {
             "N" if !raw_value.is_empty() => {
                 structured_name = Some(display_name_from_n(raw_value));
             }
-            "EMAIL" if !value.is_empty() => parsed.emails.push(ContactEmail {
-                value,
-                kind: type_from_params(&content.params),
-                is_primary: is_primary(&content.params),
-            }),
-            "TEL" if !value.is_empty() => parsed.phones.push(ContactPhone {
-                value,
-                kind: type_from_params(&content.params),
-                is_primary: is_primary(&content.params),
-            }),
+            "EMAIL" if !value.is_empty() => {
+                parsed.emails.push(ContactEmail {
+                    value,
+                    kind: type_from_params(&content.params),
+                    is_primary: has_type_primary(&content.params),
+                });
+                email_preferences.push(preference_ordinal(&content.params));
+            }
+            "TEL" if !value.is_empty() => {
+                parsed.phones.push(ContactPhone {
+                    value,
+                    kind: type_from_params(&content.params),
+                    is_primary: has_type_primary(&content.params),
+                });
+                phone_preferences.push(preference_ordinal(&content.params));
+            }
             "ORG" if !value.is_empty() => {
                 if let Some(org) = pending_org.take() {
                     parsed.organizations.push(org);
@@ -477,9 +486,12 @@ fn parse_vcard(data: &str) -> Result<ParsedVCard, VCardParseError> {
                 }
             }
             "ADR" if !raw_value.is_empty() => {
-                parsed
-                    .addresses
-                    .push(address_from_adr(raw_value, &content.params));
+                parsed.addresses.push(address_from_adr(
+                    raw_value,
+                    &content.params,
+                    has_type_primary(&content.params),
+                ));
+                address_preferences.push(preference_ordinal(&content.params));
             }
             "NOTE" if !value.is_empty() => parsed.notes = Some(value),
             "PHOTO" => {
@@ -499,6 +511,15 @@ fn parse_vcard(data: &str) -> Result<ParsedVCard, VCardParseError> {
     if parsed.display_name.is_none() {
         parsed.display_name = structured_name.filter(|name| !name.is_empty());
     }
+    mark_lowest_preference_primary(&mut parsed.emails, &email_preferences, |email| {
+        &mut email.is_primary
+    });
+    mark_lowest_preference_primary(&mut parsed.phones, &phone_preferences, |phone| {
+        &mut phone.is_primary
+    });
+    mark_lowest_preference_primary(&mut parsed.addresses, &address_preferences, |address| {
+        &mut address.is_primary
+    });
     Ok(parsed)
 }
 
@@ -595,7 +616,11 @@ fn split_content_line(line: &str) -> Result<ContentLine, String> {
     })
 }
 
-fn address_from_adr(value: &str, params: &[(String, Vec<String>)]) -> ContactAddress {
+fn address_from_adr(
+    value: &str,
+    params: &[(String, Vec<String>)],
+    is_primary: bool,
+) -> ContactAddress {
     let parts = split_components(value);
     // Components 0/1 are po-box and extended-address. The shared model has no
     // dedicated slots, so rather than silently merging them into the street (or
@@ -616,7 +641,7 @@ fn address_from_adr(value: &str, params: &[(String, Vec<String>)]) -> ContactAdd
         region: non_empty_part(parts.get(4)),
         postal_code: non_empty_part(parts.get(5)),
         country: non_empty_part(parts.get(6)),
-        is_primary: is_primary(params),
+        is_primary,
     }
 }
 
@@ -755,20 +780,38 @@ fn type_from_params(params: &[(String, Vec<String>)]) -> Option<String> {
     }
 }
 
-fn is_primary(params: &[(String, Vec<String>)]) -> bool {
+fn has_type_primary(params: &[(String, Vec<String>)]) -> bool {
     params.iter().any(|(key, values)| {
-        // 4.0: only the highest preference, PREF=1, maps to the shared
-        // primary flag. 3.0: TYPE=PREF.
-        if key == "PREF" {
-            return values
-                .iter()
-                .any(|value| value.parse::<u8>().ok() == Some(1));
-        }
         key == "TYPE"
             && values
                 .iter()
                 .any(|value| value.eq_ignore_ascii_case("PREF"))
     })
+}
+
+fn preference_ordinal(params: &[(String, Vec<String>)]) -> Option<u8> {
+    params
+        .iter()
+        .filter(|(key, _)| key == "PREF")
+        .flat_map(|(_, values)| values)
+        .filter_map(|value| value.parse::<u8>().ok())
+        .filter(|value| (1..=100).contains(value))
+        .min()
+}
+
+fn mark_lowest_preference_primary<T>(
+    items: &mut [T],
+    preferences: &[Option<u8>],
+    primary: impl Fn(&mut T) -> &mut bool,
+) {
+    let Some(lowest) = preferences.iter().flatten().min().copied() else {
+        return;
+    };
+    for (item, preference) in items.iter_mut().zip(preferences) {
+        if *preference == Some(lowest) {
+            *primary(item) = true;
+        }
+    }
 }
 
 /// RFC 6868 parameter-value decoding, the inverse of [`escape_param`]:
@@ -1189,6 +1232,23 @@ mod tests {
 
         assert!(!contact.emails[0].is_primary);
         assert!(contact.emails[1].is_primary);
+    }
+
+    #[test]
+    fn lowest_pref_ordinal_is_primary_when_pref_one_is_absent() {
+        let contact = parse_contact(
+            "/ab/1.vcf".to_string(),
+            None,
+            None,
+            "BEGIN:VCARD\r\nVERSION:4.0\r\nFN:Ada\r\nEMAIL;PREF=3:third@example.test\r\nEMAIL;PREF=2:second@example.test\r\nTEL;PREF=3:+3\r\nTEL;PREF=2:+2\r\nADR;PREF=3:;;Third;;;;\r\nADR;PREF=2:;;Second;;;;\r\nEND:VCARD\r\n",
+        );
+
+        assert!(!contact.emails[0].is_primary);
+        assert!(contact.emails[1].is_primary);
+        assert!(!contact.phones[0].is_primary);
+        assert!(contact.phones[1].is_primary);
+        assert!(!contact.addresses[0].is_primary);
+        assert!(contact.addresses[1].is_primary);
     }
 
     #[test]

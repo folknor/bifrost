@@ -42,6 +42,11 @@ impl CardDavFailedResource {
 pub(crate) struct CardDavMultigetReport {
     pub(crate) cards: Vec<CardDavFetchedVCard>,
     pub(crate) failed: Vec<CardDavFailedResource>,
+    /// Resources that returned a successful response but omitted the
+    /// requested `address-data`. They are per-resource absences, not DAV
+    /// failures, so they surface through `Page::failed_ids` but cannot turn
+    /// a 207 into a synthetic server error.
+    pub(crate) missing_data: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,6 +59,7 @@ impl CardDavMultigetReport {
     pub(crate) fn extend(&mut self, other: CardDavMultigetReport) {
         self.cards.extend(other.cards);
         self.failed.extend(other.failed);
+        self.missing_data.extend(other.missing_data);
     }
 
     pub(crate) fn classify(&self) -> MultigetOutcome {
@@ -295,6 +301,8 @@ pub(crate) fn parse_multiget_report(xml: &str) -> Result<CardDavMultigetReport, 
                         report.cards.push(card);
                     } else if let Some(failed) = current.as_failed_multiget_resource() {
                         report.failed.push(failed);
+                    } else if let Some(href) = current.as_missing_multiget_data() {
+                        report.missing_data.push(href);
                     }
                 }
                 stack.pop();
@@ -624,12 +632,23 @@ impl ResponseParts {
             return None;
         }
         let href = self.href.clone()?;
-        let status = self
-            .failed_statuses
-            .first()
-            .copied()
-            .or_else(|| self.status.as_deref().and_then(status_code));
-        Some(CardDavFailedResource { href, status })
+        let status = self.failed_statuses.first().copied().or_else(|| {
+            self.status
+                .as_deref()
+                .and_then(status_code)
+                .filter(|status| !(200..=299).contains(status))
+        })?;
+        Some(CardDavFailedResource {
+            href,
+            status: Some(status),
+        })
+    }
+
+    fn as_missing_multiget_data(&self) -> Option<String> {
+        if self.is_collection || self.address_data.is_some() {
+            return None;
+        }
+        self.href.clone()
     }
 }
 
@@ -794,6 +813,25 @@ END:VCARD</C:address-data>
             report.classify(),
             MultigetOutcome::CompleteFailure { status: Some(401) }
         );
+    }
+
+    #[test]
+    fn multiget_200_without_address_data_is_not_a_complete_failure() {
+        let xml = r#"
+<D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:carddav">
+  <D:response>
+    <D:href>/contacts/empty.vcf</D:href>
+    <D:propstat>
+      <D:prop><D:getetag>"e1"</D:getetag></D:prop>
+      <D:status>HTTP/1.1 200 OK</D:status>
+    </D:propstat>
+  </D:response>
+</D:multistatus>"#;
+
+        let report = parse_multiget_report(xml).expect("valid 207");
+        assert!(report.failed.is_empty());
+        assert_eq!(report.missing_data, vec!["/contacts/empty.vcf"]);
+        assert_eq!(report.classify(), MultigetOutcome::Usable);
     }
 
     // The depth-0 getctag PROPFIND backing the brick-8 ctag

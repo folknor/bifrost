@@ -69,6 +69,11 @@ impl CalDavFailedResource {
 pub(crate) struct CalDavMultigetReport {
     pub(crate) events: Vec<CalDavFetchedEvent>,
     pub(crate) failed: Vec<CalDavFailedResource>,
+    /// Resources that returned a successful response but omitted the
+    /// requested `calendar-data`. They are per-resource absences, not DAV
+    /// failures, so they surface through `Page::failed_ids` but cannot turn
+    /// a 207 into a synthetic server error.
+    pub(crate) missing_data: Vec<String>,
 }
 
 /// What a parsed 207 body actually represents, per RFC 4918 s13.
@@ -91,12 +96,14 @@ impl CalDavMultigetReport {
     pub(crate) fn extend(&mut self, other: CalDavMultigetReport) {
         self.events.extend(other.events);
         self.failed.extend(other.failed);
+        self.missing_data.extend(other.missing_data);
     }
 
     pub(crate) fn failed_hrefs(&self) -> Vec<String> {
         self.failed
             .iter()
             .map(|failure| failure.href.clone())
+            .chain(self.missing_data.iter().cloned())
             .collect()
     }
 
@@ -419,6 +426,8 @@ pub(crate) fn parse_multiget_report(xml: &str) -> Result<CalDavMultigetReport, S
                         // the carried status lets the caller tell a
                         // vanished resource apart from a refusal.
                         report.failed.push(failed);
+                    } else if let Some(href) = current.as_missing_multiget_data() {
+                        report.missing_data.push(href);
                     }
                 }
                 stack.pop();
@@ -767,23 +776,32 @@ impl ResponseParts {
         })
     }
 
-    /// A multiget response that yielded no usable `calendar-data`,
-    /// with the most informative status available: the first non-2xx
-    /// propstat status, else a response-level status. A collection
-    /// response (some servers echo the collection itself alongside the
-    /// requested resources) is not a failed resource and is dropped
-    /// rather than reported.
+    /// A multiget response with an actual non-2xx status, using the first
+    /// refused propstat status or a non-2xx response-level status. A
+    /// collection response (some servers echo the collection itself alongside
+    /// the requested resources) is not a failed resource and is dropped.
     fn as_failed_multiget_resource(&self) -> Option<CalDavFailedResource> {
         if self.is_collection {
             return None;
         }
         let href = self.href.clone()?;
-        let status = self
-            .failed_statuses
-            .first()
-            .copied()
-            .or_else(|| self.status.as_deref().and_then(status_code));
-        Some(CalDavFailedResource { href, status })
+        let status = self.failed_statuses.first().copied().or_else(|| {
+            self.status
+                .as_deref()
+                .and_then(status_code)
+                .filter(|status| !(200..=299).contains(status))
+        })?;
+        Some(CalDavFailedResource {
+            href,
+            status: Some(status),
+        })
+    }
+
+    fn as_missing_multiget_data(&self) -> Option<String> {
+        if self.is_collection || self.calendar_data.is_some() {
+            return None;
+        }
+        self.href.clone()
     }
 
     fn as_sync_entry(&self) -> Option<CalDavSyncEntry> {
@@ -1105,6 +1123,9 @@ END:VCALENDAR</C:calendar-data>
         let report = parse_multiget_report(xml).expect("a 207 is not a parse failure");
         assert!(report.events.is_empty());
         assert_eq!(report.failed_hrefs(), vec!["/cal/empty.ics".to_string()]);
+        assert!(report.failed.is_empty());
+        assert_eq!(report.missing_data, vec!["/cal/empty.ics"]);
+        assert_eq!(report.classify(), MultigetOutcome::Usable);
     }
 
     #[test]
@@ -1281,12 +1302,10 @@ END:VCALENDAR</C:calendar-data></D:prop>
     }
 
     #[test]
-    fn classify_carries_none_status_for_a_statusless_systemic_failure() {
-        // A 2xx propstat with no calendar-data yields a failed resource
-        // with no status code at all. Combined with a benign 404 the body
-        // still classifies as a complete failure (nothing usable came
-        // back, and not every failure was a vanished resource), and the
-        // carried status is None because the systemic failure had none.
+    fn absent_calendar_data_does_not_make_a_missing_resource_systemic() {
+        // A 2xx propstat with no calendar-data is an absent-data outcome,
+        // not a server failure. Combined with a benign 404 the body remains
+        // usable and both hrefs stay in the per-resource failed-id lane.
         let xml = r#"
 <D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
   <D:response>
@@ -1307,11 +1326,9 @@ END:VCALENDAR</C:calendar-data></D:prop>
 
         let report = parse_multiget_report(xml).expect("valid 207");
         assert!(report.events.is_empty());
-        assert_eq!(report.failed.len(), 2);
-        assert_eq!(
-            report.classify(),
-            MultigetOutcome::CompleteFailure { status: None }
-        );
+        assert_eq!(report.failed.len(), 1);
+        assert_eq!(report.missing_data, vec!["/cal/empty.ics"]);
+        assert_eq!(report.classify(), MultigetOutcome::Usable);
     }
 
     #[test]

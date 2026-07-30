@@ -727,6 +727,7 @@ impl Account for CalDavAccount {
                 .into_iter()
                 .map(|href| client.resolve_url(&href))
                 .collect::<Vec<_>>();
+            let mut materialized = HashSet::new();
             for event in fetched.events {
                 let uri = client.resolve_url(&event.uri);
                 match events_from_ical(
@@ -735,14 +736,18 @@ impl Account for CalDavAccount {
                     event.etag,
                     &event.data,
                 ) {
-                    Ok(projected) => events.extend(
-                        projected
-                            .into_iter()
-                            .filter(|event| event_in_range(event, &range.start, &range.end)),
-                    ),
+                    Ok(projected) => {
+                        materialized.insert(uri);
+                        events.extend(
+                            projected
+                                .into_iter()
+                                .filter(|event| event_in_range(event, &range.start, &range.end)),
+                        );
+                    }
                     Err(_) => failed.push(uri),
                 }
             }
+            one_outcome_per_id(&mut failed, &materialized);
             if let Some(limit) = range.limit.and_then(|limit| usize::try_from(limit).ok()) {
                 events.truncate(limit);
             }
@@ -915,7 +920,7 @@ impl Account for CalDavAccount {
                 let mut fetched = client
                     .fetch_events(&calendar_url, &uris, AccountOperation::EventSearch)
                     .await?;
-                fetched.failed.extend(
+                fetched.report.failed.extend(
                     listing
                         .failed_hrefs
                         .into_iter()
@@ -927,6 +932,8 @@ impl Account for CalDavAccount {
                     .query_events_text(&calendar_url, &request.query)
                     .await?
             };
+            let skipped_scopes = skipped_calendar_scope(&calendar_url, fetched.degraded);
+            let fetched = fetched.report;
             let mut seen = HashSet::new();
             // Search dedups across the four per-property REPORTs, so the
             // failed hrefs need the same treatment before they become
@@ -939,6 +946,7 @@ impl Account for CalDavAccount {
             failed.sort_unstable();
             failed.dedup();
             let mut events = Vec::new();
+            let mut materialized = HashSet::new();
             for event in fetched
                 .events
                 .into_iter()
@@ -951,16 +959,18 @@ impl Account for CalDavAccount {
                     event.etag,
                     &event.data,
                 ) {
-                    Ok(projected) => events.extend(
-                        projected
-                            .into_iter()
-                            .filter(|event| event_matches(event, &needle)),
-                    ),
+                    Ok(projected) => {
+                        materialized.insert(uri);
+                        events.extend(
+                            projected
+                                .into_iter()
+                                .filter(|event| event_matches(event, &needle)),
+                        );
+                    }
                     Err(_) => failed.push(uri),
                 }
             }
-            failed.sort_unstable();
-            failed.dedup();
+            one_outcome_per_id(&mut failed, &materialized);
             if let Some(limit) = request.limit.and_then(|limit| usize::try_from(limit).ok()) {
                 events.truncate(limit);
             }
@@ -969,7 +979,7 @@ impl Account for CalDavAccount {
                 next_cursor: None,
                 estimated_total: None,
                 failed_ids: failed,
-                skipped_scopes: Vec::new(),
+                skipped_scopes,
             })
         })
     }
@@ -1024,6 +1034,40 @@ fn append_path(base: &str, path: &str) -> String {
     } else {
         format!("{base}/{path}")
     }
+}
+
+/// Reduce the failure lane to one outcome per resource id.
+///
+/// Search runs a REPORT per property, so the resource the ATTENDEE query
+/// refused can be the same resource the SUMMARY query returned in full.
+/// The data arrived, so success is the true outcome; reporting the id in
+/// both lanes would make a consumer count it twice and treat an event it
+/// can display as lost. The sort and dedup finish the job for ids that
+/// failed in more than one REPORT.
+fn one_outcome_per_id(failed: &mut Vec<String>, materialized: &HashSet<String>) {
+    failed.retain(|href| !materialized.contains(href));
+    failed.sort_unstable();
+    failed.dedup();
+}
+
+/// Publish a partially-refused walk as a skipped scope.
+///
+/// A REPORT leg that failed wholly means this calendar was not fully
+/// searched. The items already collected stay valid, but "no more matches"
+/// is not what happened, and the consumer needs the classified failure to
+/// know whether to reauthorize, retry, or stop. `failed_ids` cannot carry
+/// that: it is a bare list of resource ids with no recovery class, and the
+/// refused leg often does not even name the resources it lost.
+fn skipped_calendar_scope(calendar_url: &str, degraded: Option<AccountError>) -> Vec<SkippedScope> {
+    degraded
+        .map(|error| SkippedScope {
+            scope: ErrorScope::Calendar {
+                id: calendar_url.to_string(),
+            },
+            error,
+        })
+        .into_iter()
+        .collect()
 }
 
 fn put_condition(etag: Option<&str>) -> PutCondition<'_> {
@@ -1478,6 +1522,42 @@ fn contains(value: &str, needle: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_materialized_resource_leaves_the_failure_lane() {
+        let mut failed = vec![
+            "/cal/one.ics".to_string(),
+            "/cal/two.ics".to_string(),
+            "/cal/two.ics".to_string(),
+        ];
+        let materialized = HashSet::from(["/cal/one.ics".to_string()]);
+
+        one_outcome_per_id(&mut failed, &materialized);
+
+        assert_eq!(failed, vec!["/cal/two.ics".to_string()]);
+    }
+
+    #[test]
+    fn a_degraded_leg_becomes_a_skipped_calendar_scope() {
+        let error = crate::client::status_error(
+            AccountOperation::EventSearch,
+            reqwest::StatusCode::UNAUTHORIZED,
+            "refused".to_string(),
+        );
+        let recovery = error.recovery().clone();
+
+        let skipped = skipped_calendar_scope("https://dav.example.test/cal/", Some(error));
+
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(
+            skipped[0].scope,
+            ErrorScope::Calendar {
+                id: "https://dav.example.test/cal/".to_string(),
+            }
+        );
+        assert_eq!(skipped[0].error.recovery(), &recovery);
+        assert!(skipped_calendar_scope("https://dav.example.test/cal/", None).is_empty());
+    }
 
     fn time(value: &str) -> EventTime {
         EventTime {

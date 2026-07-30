@@ -3,8 +3,8 @@ use std::time::Duration;
 use base64::Engine;
 use bifrost_types::{
     AccountError, AccountErrorBuilder, AccountErrorKind, AccountOperation, Cause, DiagnosticText,
-    ErrorScope, Protocol, ProtocolErrorKind, RequestCause, RequestErrorKind, ResourceKind,
-    ServerCause, ServerErrorKind, StateCause, TransmissionState, TransportCause,
+    ErrorScope, Protocol, ProtocolErrorKind, RecoveryClass, RequestCause, RequestErrorKind,
+    ResourceKind, ServerCause, ServerErrorKind, StateCause, TransmissionState, TransportCause,
     TransportErrorKind, TransportKind, WireCause,
 };
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, ETAG, HeaderMap, HeaderValue};
@@ -184,8 +184,9 @@ impl CardDavClient {
         addressbook_url: &str,
         uris: &[String],
         operation: AccountOperation,
-    ) -> Result<CardDavMultigetReport, AccountError> {
+    ) -> Result<MultigetFetch, AccountError> {
         let mut all_results = CardDavMultigetReport::default();
+        let mut degraded = None;
         for chunk in uris.chunks(MULTIGET_BATCH_SIZE) {
             let mut href_elements = String::new();
             for uri in chunk {
@@ -207,19 +208,20 @@ impl CardDavClient {
             let parsed = parse_multiget_report(&response)
                 .map_err(|error| parse_error(operation, format!("multiget: {error}")))?;
             if let Some(error) = multiget_failure(&parsed, operation) {
-                return Err(error);
+                degraded = worse_recovery(degraded, error);
             }
             all_results.extend(parsed);
         }
-        Ok(all_results)
+        MultigetFetch::settle(all_results, degraded)
     }
 
     pub(crate) async fn query_vcards_text(
         &self,
         addressbook_url: &str,
         query: &str,
-    ) -> Result<CardDavMultigetReport, AccountError> {
+    ) -> Result<MultigetFetch, AccountError> {
         let mut all_results = CardDavMultigetReport::default();
+        let mut degraded = None;
         for property in ["FN", "N", "EMAIL", "TEL", "ADR", "ORG", "TITLE", "NOTE"] {
             let body = addressbook_text_query_body(property, query);
             let response = self
@@ -229,11 +231,11 @@ impl CardDavClient {
                 parse_error(AccountOperation::ContactSearch, format!("query: {error}"))
             })?;
             if let Some(error) = multiget_failure(&parsed, AccountOperation::ContactSearch) {
-                return Err(error);
+                degraded = worse_recovery(degraded, error);
             }
             all_results.extend(parsed);
         }
-        Ok(all_results)
+        MultigetFetch::settle(all_results, degraded)
     }
 
     pub(crate) async fn put_vcard(
@@ -492,6 +494,66 @@ fn should_fallback_discovery(error: &AccountError) -> bool {
     )
 }
 
+/// A multi-REPORT fetch: everything that came back usable, plus the
+/// recovery classification of any single REPORT that failed wholly.
+///
+/// Multiget is chunked and text search runs one REPORT per property, so a
+/// walk can meet a 401, 403, or 503 on one leg after other legs already
+/// returned cards. Aborting the whole call throws those cards away;
+/// folding the refusal into anonymous `failed_ids` throws the RECOVERY
+/// signal away, and the consumer can no longer tell "reauthorize" from
+/// "retry later" from "this resource is gone". So each REPORT is
+/// classified where it happens, and the worst class survives to the
+/// caller in `degraded`, which the account layer publishes as a
+/// `Page::skipped_scopes` entry: the walk did not finish this collection.
+pub(crate) struct MultigetFetch {
+    pub(crate) report: CardDavMultigetReport,
+    pub(crate) degraded: Option<AccountError>,
+}
+
+impl MultigetFetch {
+    /// A wholly-failed leg with nothing usable anywhere is still a failed
+    /// call: there is no partial result to preserve, so it keeps riding the
+    /// `Err` arm with its original classification.
+    fn settle(
+        report: CardDavMultigetReport,
+        degraded: Option<AccountError>,
+    ) -> Result<Self, AccountError> {
+        match degraded {
+            Some(error) if report.cards.is_empty() => Err(error),
+            degraded => Ok(Self { report, degraded }),
+        }
+    }
+}
+
+/// Keep whichever failure demands the more drastic recovery, so a 503 on
+/// one chunk cannot hide a 401 on another.
+pub(crate) fn worse_recovery(
+    current: Option<AccountError>,
+    candidate: AccountError,
+) -> Option<AccountError> {
+    match current {
+        Some(existing)
+            if recovery_rank(existing.recovery()) >= recovery_rank(candidate.recovery()) =>
+        {
+            Some(existing)
+        }
+        _ => Some(candidate),
+    }
+}
+
+fn recovery_rank(class: &RecoveryClass) -> u8 {
+    match class {
+        RecoveryClass::AuthLost => 4,
+        RecoveryClass::NeedsAdminConsent { .. }
+        | RecoveryClass::NeedsPolicyChange
+        | RecoveryClass::NoPermission { .. } => 3,
+        RecoveryClass::Retry(_) => 0,
+        RecoveryClass::Reconcile(_) | RecoveryClass::Engine(_) => 1,
+        _ => 2,
+    }
+}
+
 fn multiget_failure(
     report: &CardDavMultigetReport,
     operation: AccountOperation,
@@ -573,7 +635,11 @@ pub(crate) fn transport_error(
     .expect("valid account error classification")
 }
 
-fn status_error(operation: AccountOperation, status: StatusCode, body: String) -> AccountError {
+pub(crate) fn status_error(
+    operation: AccountOperation,
+    status: StatusCode,
+    body: String,
+) -> AccountError {
     let kind = if status == StatusCode::UNAUTHORIZED {
         AccountErrorKind::Authentication(bifrost_types::AuthErrorKind::ReauthorizationRequired)
     } else if status == StatusCode::FORBIDDEN {
@@ -796,6 +862,7 @@ mod tests {
                 href: "/contacts/one.vcf".to_string(),
                 status: Some(401),
             }],
+            missing_data: Vec::new(),
         };
 
         let error = multiget_failure(&report, AccountOperation::ContactsList)
@@ -805,6 +872,99 @@ mod tests {
             &AccountErrorKind::Authentication(
                 bifrost_types::AuthErrorKind::ReauthorizationRequired
             )
+        );
+    }
+
+    #[test]
+    fn accumulated_multiget_success_keeps_a_later_refusal_per_resource() {
+        let report = CardDavMultigetReport {
+            cards: vec![crate::parse::CardDavFetchedVCard {
+                uri: "/contacts/one.vcf".to_string(),
+                etag: None,
+                data: "BEGIN:VCARD\nEND:VCARD".to_string(),
+            }],
+            failed: vec![crate::parse::CardDavFailedResource {
+                href: "/contacts/two.vcf".to_string(),
+                status: Some(401),
+            }],
+            missing_data: Vec::new(),
+        };
+
+        assert!(multiget_failure(&report, AccountOperation::ContactsList).is_none());
+    }
+
+    fn usable_report() -> CardDavMultigetReport {
+        CardDavMultigetReport {
+            cards: vec![crate::parse::CardDavFetchedVCard {
+                uri: "/contacts/one.vcf".to_string(),
+                etag: None,
+                data: "BEGIN:VCARD\nEND:VCARD".to_string(),
+            }],
+            failed: Vec::new(),
+            missing_data: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_refused_leg_after_a_usable_one_keeps_the_cards_and_the_recovery_class() {
+        let refusal = status_error(
+            AccountOperation::ContactSearch,
+            StatusCode::UNAUTHORIZED,
+            "refused".to_string(),
+        );
+
+        let fetch = MultigetFetch::settle(usable_report(), Some(refusal))
+            .expect("a partial result is not a failed call");
+
+        assert_eq!(fetch.report.cards.len(), 1);
+        assert_eq!(
+            fetch.degraded.expect("the refusal survives").recovery(),
+            &RecoveryClass::AuthLost
+        );
+    }
+
+    #[test]
+    fn a_refused_leg_with_nothing_usable_stays_an_error() {
+        let refusal = status_error(
+            AccountOperation::ContactSearch,
+            StatusCode::UNAUTHORIZED,
+            "refused".to_string(),
+        );
+
+        let error = MultigetFetch::settle(CardDavMultigetReport::default(), Some(refusal))
+            .err()
+            .expect("nothing usable came back");
+
+        assert_eq!(error.recovery(), &RecoveryClass::AuthLost);
+    }
+
+    #[test]
+    fn the_worst_recovery_class_wins_whatever_the_chunk_order() {
+        let auth = || {
+            status_error(
+                AccountOperation::ContactSearch,
+                StatusCode::UNAUTHORIZED,
+                "refused".to_string(),
+            )
+        };
+        let transient = || {
+            status_error(
+                AccountOperation::ContactSearch,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "later".to_string(),
+            )
+        };
+
+        let auth_first = worse_recovery(Some(auth()), transient());
+        let transient_first = worse_recovery(Some(transient()), auth());
+
+        assert_eq!(
+            auth_first.expect("kept").recovery(),
+            &RecoveryClass::AuthLost
+        );
+        assert_eq!(
+            transient_first.expect("kept").recovery(),
+            &RecoveryClass::AuthLost
         );
     }
 }

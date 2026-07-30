@@ -85,7 +85,15 @@ calendar primitives.
   write-back that would look like a successful edit. Parameter values use
   RFC 6868 caret encoding in both directions; caldata hands back raw
   parameters, so the decode of free-text parameters (CN, TZID) is this
-  crate's. VTIMEZONE
+  crate's. RFC 6868 defines no backslash escape, so a backslash is written
+  and read verbatim and CN and TZID both round-trip it. The one legacy
+  tolerance is `normalize_exchange_cn_param`: an unquoted `CN=Doe\, John`
+  carrying a genuine `\,` / `\;` separator escape (which caldata would
+  otherwise split at the comma) is resolved and re-encoded conformantly
+  before tokenization. The CN read path is a pure RFC 6868 decode, which is
+  what keeps a literal backslash from being eaten. The cost is that a
+  display name that genuinely contains `\,` is read as Exchange's escaping;
+  the two are indistinguishable on the wire. VTIMEZONE
   generation emits a single STANDARD
   block carrying the real UTC offset for the event's instant (the TZID is
   parsed to a `chrono_tz::Tz` after Windows/Exchange-alias folding, and the
@@ -123,10 +131,24 @@ Supported calendar primitives:
   are equivalent to the consumer: a resource the server refused inside the
   207 (non-2xx propstat, or 2xx with no `calendar-data`), and one that
   fetched 200 but would not tokenize. `parse_multiget_report` returns
-  `CalDavMultigetReport { events, failed }` and reserves `Err` for a
-  malformed document, so a single bad propstat can no longer abort the
+  `CalDavMultigetReport { events, failed, missing_data }` and reserves `Err`
+  for a malformed document, so a single bad propstat can no longer abort the
   whole pull. `event_search` reports the same way, deduped across its four
   per-property REPORTs.
+
+  Ids appear in exactly one lane. `one_outcome_per_id` drops from the failure
+  lane anything that materialized in some leg, because the per-property
+  REPORTs can disagree about the same resource and a consumer that saw it in
+  both would count it twice and treat a displayable event as lost.
+
+  Multiget is chunked and search runs one REPORT per property, so each REPORT
+  is classified independently. A leg that fails wholly after other legs
+  returned events keeps those events, and the worst recovery class
+  encountered rides `MultigetFetch::degraded` into `Page::skipped_scopes` as
+  an `ErrorScope::Calendar` entry - `failed_ids` carries ids with no
+  classification, so folding a 401 into it would keep the data and destroy
+  the reauthorize signal. A refusal with nothing usable anywhere is still an
+  `Err`.
 
   Properties are collected propstat-scoped and promoted to the response
   only by `commit_propstat`, and only from a 2xx propstat. That is what
@@ -137,10 +159,12 @@ Supported calendar primitives:
 
   The body is classified, not merely parsed. Per RFC 4918 s13 a 207 may
   describe success, partial success, or complete failure, so
-  `CalDavMultigetReport::classify` returns `CompleteFailure` when every
-  resource failed and at least one failed for a reason other than
-  404/410 (a resource deleted between listing and multiget is the benign
-  per-resource case). `multiget_failure` routes that through
+  `CalDavMultigetReport::classify` returns `CompleteFailure` when no
+  resource yielded usable data and at least one resource carries an actual
+  non-404/410 DAV failure (a resource deleted between listing and multiget
+  is the benign per-resource case). A 2xx response that omits
+  `calendar-data` remains an absent-data `failed_ids` outcome but is not a
+  server failure. `multiget_failure` routes a complete failure through
   `status_error`, so an all-401 body reauthorizes and an all-503 body
   retries instead of returning an empty page that a consumer would
   record as a completed walk - which would drop those resources

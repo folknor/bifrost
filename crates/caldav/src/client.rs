@@ -3,9 +3,10 @@ use std::time::Duration;
 use base64::Engine;
 use bifrost_types::{
     AccountError, AccountErrorBuilder, AccountErrorKind, AccountOperation, Cause, CursorScope,
-    DiagnosticText, ErrorScope, ObjectType, Protocol, ProtocolErrorKind, RequestCause,
-    RequestErrorKind, ResourceKind, ServerCause, ServerErrorKind, StateCause, SyncStateErrorKind,
-    TransmissionState, TransportCause, TransportErrorKind, TransportKind, WireCause,
+    DiagnosticText, ErrorScope, ObjectType, Protocol, ProtocolErrorKind, RecoveryClass,
+    RequestCause, RequestErrorKind, ResourceKind, ServerCause, ServerErrorKind, StateCause,
+    SyncStateErrorKind, TransmissionState, TransportCause, TransportErrorKind, TransportKind,
+    WireCause,
 };
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use reqwest::{Method, StatusCode, Url};
@@ -205,8 +206,9 @@ impl CalDavClient {
         &self,
         calendar_url: &str,
         query: &str,
-    ) -> Result<CalDavMultigetReport, AccountError> {
+    ) -> Result<MultigetFetch, AccountError> {
         let mut all_results = CalDavMultigetReport::default();
+        let mut degraded = None;
         for property in ["SUMMARY", "DESCRIPTION", "LOCATION", "ATTENDEE"] {
             let body = calendar_text_query_body(property, query);
             let response = self
@@ -216,11 +218,11 @@ impl CalDavClient {
                 parse_error(AccountOperation::EventSearch, format!("query: {error}"))
             })?;
             if let Some(error) = multiget_failure(&parsed, AccountOperation::EventSearch) {
-                return Err(error);
+                degraded = worse_recovery(degraded, error);
             }
             all_results.extend(parsed);
         }
-        Ok(all_results)
+        MultigetFetch::settle(all_results, degraded)
     }
 
     pub(crate) async fn fetch_events(
@@ -228,8 +230,9 @@ impl CalDavClient {
         calendar_url: &str,
         uris: &[String],
         operation: AccountOperation,
-    ) -> Result<CalDavMultigetReport, AccountError> {
+    ) -> Result<MultigetFetch, AccountError> {
         let mut all_results = CalDavMultigetReport::default();
+        let mut degraded = None;
         for chunk in uris.chunks(MULTIGET_BATCH_SIZE) {
             let mut href_elements = String::new();
             for uri in chunk {
@@ -251,11 +254,11 @@ impl CalDavClient {
             let parsed = parse_multiget_report(&response)
                 .map_err(|error| parse_error(operation, format!("multiget: {error}")))?;
             if let Some(error) = multiget_failure(&parsed, operation) {
-                return Err(error);
+                degraded = worse_recovery(degraded, error);
             }
             all_results.extend(parsed);
         }
-        Ok(all_results)
+        MultigetFetch::settle(all_results, degraded)
     }
 
     pub(crate) async fn sync_events(
@@ -696,6 +699,66 @@ fn should_fallback_discovery(error: &AccountError) -> bool {
     )
 }
 
+/// A multi-REPORT fetch: everything that came back usable, plus the
+/// recovery classification of any single REPORT that failed wholly.
+///
+/// Multiget is chunked and text search runs one REPORT per property, so a
+/// walk can meet a 401, 403, or 503 on one leg after other legs already
+/// returned events. Aborting the whole call throws those events away;
+/// folding the refusal into anonymous `failed_ids` throws the RECOVERY
+/// signal away, and the consumer can no longer tell "reauthorize" from
+/// "retry later" from "this resource is gone". So each REPORT is
+/// classified where it happens, and the worst class survives to the
+/// caller in `degraded`, which the account layer publishes as a
+/// `Page::skipped_scopes` entry: the walk did not finish this collection.
+pub(crate) struct MultigetFetch {
+    pub(crate) report: CalDavMultigetReport,
+    pub(crate) degraded: Option<AccountError>,
+}
+
+impl MultigetFetch {
+    /// A wholly-failed leg with nothing usable anywhere is still a failed
+    /// call: there is no partial result to preserve, so it keeps riding the
+    /// `Err` arm with its original classification.
+    fn settle(
+        report: CalDavMultigetReport,
+        degraded: Option<AccountError>,
+    ) -> Result<Self, AccountError> {
+        match degraded {
+            Some(error) if report.events.is_empty() => Err(error),
+            degraded => Ok(Self { report, degraded }),
+        }
+    }
+}
+
+/// Keep whichever failure demands the more drastic recovery, so a 503 on
+/// one chunk cannot hide a 401 on another.
+pub(crate) fn worse_recovery(
+    current: Option<AccountError>,
+    candidate: AccountError,
+) -> Option<AccountError> {
+    match current {
+        Some(existing)
+            if recovery_rank(existing.recovery()) >= recovery_rank(candidate.recovery()) =>
+        {
+            Some(existing)
+        }
+        _ => Some(candidate),
+    }
+}
+
+fn recovery_rank(class: &RecoveryClass) -> u8 {
+    match class {
+        RecoveryClass::AuthLost => 4,
+        RecoveryClass::NeedsAdminConsent { .. }
+        | RecoveryClass::NeedsPolicyChange
+        | RecoveryClass::NoPermission { .. } => 3,
+        RecoveryClass::Retry(_) => 0,
+        RecoveryClass::Reconcile(_) | RecoveryClass::Engine(_) => 1,
+        _ => 2,
+    }
+}
+
 /// Turn a wholly-failed 207 body into a real error.
 ///
 /// RFC 4918 s13: a Multi-Status body can describe success, partial
@@ -787,7 +850,11 @@ pub(crate) fn transport_error(
     .expect("valid account error classification")
 }
 
-fn status_error(operation: AccountOperation, status: StatusCode, body: String) -> AccountError {
+pub(crate) fn status_error(
+    operation: AccountOperation,
+    status: StatusCode,
+    body: String,
+) -> AccountError {
     let kind = if status == StatusCode::UNAUTHORIZED {
         AccountErrorKind::Authentication(bifrost_types::AuthErrorKind::ReauthorizationRequired)
     } else if status == StatusCode::FORBIDDEN {
@@ -1077,5 +1144,98 @@ mod tests {
             "mailto:ada@example.test"
         );
         assert_eq!(schedule_address("urn:uuid:ada"), "urn:uuid:ada");
+    }
+
+    #[test]
+    fn accumulated_multiget_success_keeps_a_later_refusal_per_resource() {
+        let report = crate::parse::CalDavMultigetReport {
+            events: vec![crate::parse::CalDavFetchedEvent {
+                uri: "/cal/one.ics".to_string(),
+                etag: None,
+                data: "BEGIN:VCALENDAR\nEND:VCALENDAR".to_string(),
+            }],
+            failed: vec![crate::parse::CalDavFailedResource {
+                href: "/cal/two.ics".to_string(),
+                status: Some(401),
+            }],
+            missing_data: Vec::new(),
+        };
+
+        assert!(multiget_failure(&report, AccountOperation::EventsInRange).is_none());
+    }
+
+    fn usable_report() -> CalDavMultigetReport {
+        CalDavMultigetReport {
+            events: vec![crate::parse::CalDavFetchedEvent {
+                uri: "/cal/one.ics".to_string(),
+                etag: None,
+                data: "BEGIN:VCALENDAR\nEND:VCALENDAR".to_string(),
+            }],
+            failed: Vec::new(),
+            missing_data: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_refused_leg_after_a_usable_one_keeps_the_events_and_the_recovery_class() {
+        let refusal = status_error(
+            AccountOperation::EventSearch,
+            StatusCode::UNAUTHORIZED,
+            "refused".to_string(),
+        );
+
+        let fetch = MultigetFetch::settle(usable_report(), Some(refusal))
+            .expect("a partial result is not a failed call");
+
+        assert_eq!(fetch.report.events.len(), 1);
+        assert_eq!(
+            fetch.degraded.expect("the refusal survives").recovery(),
+            &RecoveryClass::AuthLost
+        );
+    }
+
+    #[test]
+    fn a_refused_leg_with_nothing_usable_stays_an_error() {
+        let refusal = status_error(
+            AccountOperation::EventSearch,
+            StatusCode::UNAUTHORIZED,
+            "refused".to_string(),
+        );
+
+        let error = MultigetFetch::settle(CalDavMultigetReport::default(), Some(refusal))
+            .err()
+            .expect("nothing usable came back");
+
+        assert_eq!(error.recovery(), &RecoveryClass::AuthLost);
+    }
+
+    #[test]
+    fn the_worst_recovery_class_wins_whatever_the_chunk_order() {
+        let auth = || {
+            status_error(
+                AccountOperation::EventSearch,
+                StatusCode::UNAUTHORIZED,
+                "refused".to_string(),
+            )
+        };
+        let transient = || {
+            status_error(
+                AccountOperation::EventSearch,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "later".to_string(),
+            )
+        };
+
+        let auth_first = worse_recovery(Some(auth()), transient());
+        let transient_first = worse_recovery(Some(transient()), auth());
+
+        assert_eq!(
+            auth_first.expect("kept").recovery(),
+            &RecoveryClass::AuthLost
+        );
+        assert_eq!(
+            transient_first.expect("kept").recovery(),
+            &RecoveryClass::AuthLost
+        );
     }
 }
