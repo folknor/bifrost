@@ -121,34 +121,47 @@ the fatal lane.
 
 No known bug in scope remains: every B and N finding above is fixed and
 pinned by a test that was bite-audited (reverted, observed failing,
-restored). What is left is test reach, not defects.
+restored). The close pass resolved three of the four test-reach items
+below and ruled on the residuals.
 
-- **The metering cap's 60 s sleep ceiling.** `ByteBucket::consume` clamps
-  any single sleep to 60 s, so a cap low enough that one read needs more
-  than 60 s of budget is silently exceeded: a 1 B/s cap with 16 KiB reads
-  behaves like ~273 B/s. Intended or not, nothing states it, and nothing
-  measures it - see the metering item below.
+- **The metering cap's 60 s sleep ceiling - FIXED (close pass).**
+  `ByteBucket::consume` now sleeps the full `bytes / cap` debt for a
+  transfer larger than one second of budget, in slices of at most 60 s;
+  the 60 s value bounds a single timer, never the total, so a 1 B/s cap
+  with 16 KiB reads takes the 16384 s it owes instead of behaving like
+  ~273 B/s. The bucket keeps time with `tokio::time::Instant`, making it
+  testable under `tokio::time::pause()`. Pinned (and bite-audited: the
+  old clamp fails it with "slept only 60s") by
+  `wire_tests.rs::byte_bucket_charges_the_full_budget_for_a_large_transfer`
+  and `wire_tests.rs::byte_bucket_meters_the_deficit_under_a_paused_clock`,
+  which also close the bandwidth-metering test-reach item that used to
+  sit here.
 
-- **`lifecycle.rs` connect / STARTTLS.** `connect_with_tls_connector_metered`
-  starts with `TcpStream::connect`, which is precisely the "can fail
-  because a network did" shape the policy excludes. `ImapStream::into_tcp`
-  returns `None` for `Memory`, so the STARTTLS upgrade path cannot be
-  driven over the duplex either (deliberately - the comment says "STARTTLS
-  tests must use the real transport"). What *is* testable there and now
-  is: `validate_tls_server_name` (done), and `observe_driver_panic`'s
-  three arms (partially covered by the pre-existing driver-panic tests).
-  A hermetic STARTTLS test still needs a fake TLS handshake, which is a
-  larger design question than a byte-stream seam.
+- **`idle.rs` / `driver/idle.rs` transcripts - DONE (close pass).**
+  `tests.rs::idle_returns_the_first_event_and_completes_the_done_handshake`
+  scripts the full RFC 2177 flow (IDLE, `+`, event, DONE, tagged OK) and
+  `tests.rs::idle_surfaces_a_server_terminated_session_without_done` pins
+  the server-terminated lane. The event-mapping half stays in
+  `idle_tests.rs`.
 
-- **Bandwidth metering (`WireMetering` / `ByteBucket`).** Testable with
-  `tokio::time::pause()` and the duplex harness, and worth doing: the cap
-  arithmetic is the kind of thing that is wrong by a factor of
-  60 and nobody notices (see the ceiling note above). The shape is
-  `WireReader::new_metered(ImapStream::Memory(client), None, Some(cap))`
-  plus paused time, asserting the elapsed virtual duration.
+- **`lifecycle.rs` connect / STARTTLS - left, deliberately.**
+  `connect_with_tls_connector_metered` starts with `TcpStream::connect`,
+  which is precisely the "can fail because a network did" shape the
+  policy excludes. `ImapStream::into_tcp` returns `None` for `Memory`, so
+  the STARTTLS upgrade path cannot be driven over the duplex either
+  (deliberately - STARTTLS tests must use the real transport). A hermetic
+  STARTTLS test needs a fake TLS handshake, a larger design question than
+  a byte-stream seam; the close pass judged that machinery heavier than
+  the risk it would retire. What is testable without it is covered:
+  `validate_tls_server_name`, the pre-upgrade guards (`tls_active`,
+  empty-snapshot capability refusal), and `observe_driver_panic`.
 
-- **`idle.rs` / `driver/idle.rs` transcripts.** `idle_tests.rs` covers
-  the event-mapping half; the DONE handshake and the server-terminated
-  path (`IdleEvent::ServerTerminated`) have no transcript test. Out of my
-  survey gap (idle is listed as covered), and IDLE's `done_rx` plumbing
-  makes the script non-trivial.
+- **B7 compile-level guarantee - ruled not worth it (close pass).** The
+  round-2 agent sketched wrapping the result oneshot so an arm *cannot*
+  answer without publishing. All completion arms live in one match in
+  `driver_task`; the two arms that answer directly (SetKeepalive,
+  PeerCertificate) touch no protocol state and say so in comments, and
+  `publish_then_answer` plus its structural test pin the pattern. The
+  wrapper would need either per-arm sender newtypes or a no-op-publish
+  escape hatch that reintroduces the very bypass it exists to forbid.
+  Revisit only if a new state-changing driver command lane is added.

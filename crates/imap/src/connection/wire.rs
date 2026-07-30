@@ -8,7 +8,9 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use tokio::time::Instant;
 
 use bifrost_net::MeterSinkHandle;
 use bytes::BytesMut;
@@ -342,8 +344,17 @@ impl ByteBucket {
         let cap_f = cap as f64;
         let want = n as f64;
         if n > cap {
-            let secs = (want / cap_f).min(60.0);
-            tokio::time::sleep(Duration::from_secs_f64(secs)).await;
+            // A transfer larger than one second of budget owes `want / cap`
+            // seconds in total. Sleep the whole debt  -  in bounded slices so
+            // no single timer is pathological  -  rather than clamping the
+            // total: a clamp would silently let a low cap be exceeded (a
+            // 1 B/s cap with 16 KiB reads would behave like ~273 B/s).
+            let mut secs = want / cap_f;
+            while secs > 0.0 {
+                let slice = secs.min(60.0);
+                tokio::time::sleep(Duration::from_secs_f64(slice)).await;
+                secs -= slice;
+            }
             self.reset_after_large_transfer();
             return;
         }

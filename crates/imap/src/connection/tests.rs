@@ -1175,3 +1175,70 @@ fn expand_uid_ranges_handles_bare_star_and_overlap() {
     .expect("small overlapping ranges expand");
     assert_eq!(uids, (1..=9).collect::<Vec<u32>>());
 }
+
+// ---------------------------------------------------------------------------
+// IDLE transcripts (RFC 2177): the DONE handshake and server termination
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn idle_returns_the_first_event_and_completes_the_done_handshake() {
+    let (conn, mut server) =
+        crate::connection::test_support::driver_pair(&preauth_greeting("IMAP4rev1 IDLE")).await;
+
+    let script = tokio::spawn(async move {
+        let idle = read_line(&mut server).await;
+        assert!(idle.ends_with(" IDLE\r\n"), "expected IDLE, got {idle:?}");
+        let tag = tag_of(&idle).to_owned();
+        respond(&mut server, "+ idling\r\n").await;
+        respond(&mut server, "* 3 EXISTS\r\n").await;
+        // RFC 2177 Section 3: the client ends the session with an untagged
+        // DONE, and only then does the tagged completion arrive.
+        assert_eq!(read_line(&mut server).await, "DONE\r\n");
+        respond(&mut server, &format!("{tag} OK IDLE terminated\r\n")).await;
+        server
+    });
+
+    let event = conn
+        .idle(
+            Duration::from_secs(5),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .expect("IDLE must complete through the DONE handshake");
+    assert!(matches!(event, IdleEvent::Exists(3)), "got {event:?}");
+    let _server = script.await.unwrap();
+
+    assert!(
+        conn.is_alive(),
+        "a completed IDLE session leaves the connection reusable"
+    );
+}
+
+#[tokio::test]
+async fn idle_surfaces_a_server_terminated_session_without_done() {
+    let (conn, mut server) =
+        crate::connection::test_support::driver_pair(&preauth_greeting("IMAP4rev1 IDLE")).await;
+
+    let script = tokio::spawn(async move {
+        let idle = read_line(&mut server).await;
+        let tag = tag_of(&idle).to_owned();
+        respond(&mut server, "+ idling\r\n").await;
+        // RFC 2177 Section 3: the server MAY end IDLE unilaterally by
+        // sending the tagged completion before any DONE.
+        respond(&mut server, &format!("{tag} OK IDLE ended by server\r\n")).await;
+        server
+    });
+
+    let event = conn
+        .idle(
+            Duration::from_secs(5),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .expect("a server-terminated IDLE is not an error");
+    assert!(
+        matches!(event, IdleEvent::ServerTerminated),
+        "got {event:?}"
+    );
+    let _server = script.await.unwrap();
+}

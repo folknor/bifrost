@@ -31,6 +31,51 @@ fn byte_bucket_consume_future_is_send() {
     assert_send(super::ByteBucket::new(Some(1)).consume(1, Some(1)));
 }
 
+/// A transfer bigger than one second of budget owes its whole duration.
+/// The 60 s value bounds a single timer, not the total: a 1 B/s cap fed a
+/// 16 KiB read must take 16384 virtual seconds, not 60.
+#[tokio::test(start_paused = true)]
+async fn byte_bucket_charges_the_full_budget_for_a_large_transfer() {
+    let bucket = super::ByteBucket::new(Some(1));
+    let start = tokio::time::Instant::now();
+
+    bucket.consume(16_384, Some(1)).await;
+
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed >= std::time::Duration::from_secs(16_384),
+        "a low cap must not be silently exceeded: slept only {elapsed:?}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(16_386),
+        "the debt is want/cap, nothing more: slept {elapsed:?}"
+    );
+}
+
+/// Within one second of budget the bucket meters by deficit: a fresh bucket
+/// spends its full initial allowance without sleeping, and the next read
+/// waits exactly for the tokens it lacks.
+#[tokio::test(start_paused = true)]
+async fn byte_bucket_meters_the_deficit_under_a_paused_clock() {
+    let bucket = super::ByteBucket::new(Some(1024));
+    let start = tokio::time::Instant::now();
+
+    bucket.consume(1024, Some(1024)).await;
+    assert_eq!(
+        start.elapsed(),
+        std::time::Duration::ZERO,
+        "a full bucket answers without sleeping"
+    );
+
+    bucket.consume(512, Some(1024)).await;
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed >= std::time::Duration::from_millis(500)
+            && elapsed < std::time::Duration::from_millis(600),
+        "512 missing tokens at 1024 B/s are half a second: slept {elapsed:?}"
+    );
+}
+
 #[test]
 fn framing_no_crlf_is_incomplete() {
     assert!(!buffer_may_contain_complete_response(b""));

@@ -280,7 +280,7 @@ Containers use native mailbox paths as primitive/provenance ids. `containers_lis
 
 ### Bandwidth metering
 
-`ImapAccountConfig` carries a process `BandwidthMeter` or generic `MeterSink`. The factory builds a `MeterSinkHandle` with the engine `AccountId` on every open and passes it to the initial connection plus pool dials. `WireReader` records bytes read/written on every read/write path; the shared bandwidth-cap atomic is read per chunk (`set_bandwidth_cap(None)` unlimited; `Some(0)` clamps to 1 B/s with a warning).
+`ImapAccountConfig` carries a process `BandwidthMeter` or generic `MeterSink`. The factory builds a `MeterSinkHandle` with the engine `AccountId` on every open and passes it to the initial connection plus pool dials. `WireReader` records bytes read/written on every read/write path; the shared bandwidth-cap atomic is read per chunk (`set_bandwidth_cap(None)` unlimited; `Some(0)` clamps to 1 B/s with a warning). The token bucket honors the cap exactly: a chunk larger than one second of budget owes `bytes / cap` seconds in total, slept in slices of at most 60 s (the 60 s value bounds a single timer, never the total debt), so a very low cap makes big reads proportionally slow rather than being silently exceeded. The bucket keeps time with `tokio::time::Instant`, so the metering arithmetic is testable under `tokio::time::pause()`.
 
 ### Folder lifecycle
 
