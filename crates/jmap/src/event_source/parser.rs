@@ -47,6 +47,13 @@ pub(crate) struct EventParser {
     // explicit flag is used rather than `result.data.is_empty()` so that a
     // bare `data:\n\n` still dispatches an event with an empty payload.
     data_seen: bool,
+    // WHATWG: lines end with CRLF, LF, or CR. A CR is treated as a line
+    // terminator immediately; this flag swallows the LF of a CRLF pair,
+    // including one split across two `push_bytes` frames.
+    skip_lf: bool,
+    // WHATWG "process the field": at most ONE space after the colon is
+    // stripped from a value; `data:  x` carries the value ` x`.
+    strip_value_space: bool,
 }
 
 impl EventParser {
@@ -74,8 +81,13 @@ impl EventParser {
         match &self.field[..] {
             b"id" => {
                 // A colonless `id` line carries an empty value, which the
-                // spec treats as clearing the buffer.
-                self.last_event_id = std::mem::take(&mut self.value);
+                // spec treats as clearing the buffer. An id containing
+                // U+0000 NULL is ignored outright (WHATWG); it is the
+                // resume token a reconnect echoes into a `Last-Event-ID`
+                // header, where a NUL is never a legal byte.
+                if !self.value.contains(&0) {
+                    self.last_event_id = std::mem::take(&mut self.value);
+                }
             }
             b"data" => {
                 // Per SSE spec: multiple data lines joined with \n
@@ -119,6 +131,7 @@ impl EventParser {
         self.value.clear();
         self.result = Event::default();
         self.data_seen = false;
+        self.strip_value_space = false;
         self.discard_at_line_start = at_line_start;
     }
 
@@ -152,13 +165,24 @@ impl Iterator for EventParser {
         {
             self.pos += 1;
 
+            // Normalise the three WHATWG line terminators (CRLF, LF, CR)
+            // to a single `\n` before the state machine sees the byte.
+            if std::mem::take(&mut self.skip_lf) && byte == b'\n' {
+                continue;
+            }
+            let byte = if byte == b'\r' {
+                self.skip_lf = true;
+                b'\n'
+            } else {
+                byte
+            };
+
             match self.state {
                 EventParserState::Init => match byte {
                     b':' => {
                         self.state = EventParserState::Comment;
                         self.comment_len = 0;
                     }
-                    b'\r' => (),
                     b'\n' => {
                         // A block that carried no `data` field dispatches
                         // nothing (comment-only keepalives land here); the
@@ -179,7 +203,7 @@ impl Iterator for EventParser {
                 EventParserState::Comment => {
                     if byte == b'\n' {
                         self.state = EventParserState::Init;
-                    } else if byte != b'\r' {
+                    } else {
                         // A comment is skipped, not buffered, so the cap is
                         // a counter: without it a pathological server could
                         // stream one unterminated comment forever.
@@ -191,7 +215,6 @@ impl Iterator for EventParser {
                     }
                 }
                 EventParserState::Field => match byte {
-                    b'\r' => (),
                     b'\n' => {
                         self.state = EventParserState::Init;
                         // A field name with no colon is a field with an
@@ -203,6 +226,7 @@ impl Iterator for EventParser {
                     }
                     b':' => {
                         self.state = EventParserState::Value;
+                        self.strip_value_space = true;
                     }
                     _ => {
                         if self.field.len() >= MAX_EVENT_SIZE {
@@ -213,25 +237,27 @@ impl Iterator for EventParser {
                         self.field.push(byte);
                     }
                 },
-                EventParserState::Value => match byte {
-                    b'\r' => (),
-                    b' ' if self.value.is_empty() => (),
-                    b'\n' => {
-                        self.state = EventParserState::Init;
-                        if !self.commit_field() {
-                            self.discard(true);
-                            return Some(Err(Self::too_long_error()));
+                EventParserState::Value => {
+                    let strip_one_space = std::mem::take(&mut self.strip_value_space);
+                    match byte {
+                        b' ' if strip_one_space => (),
+                        b'\n' => {
+                            self.state = EventParserState::Init;
+                            if !self.commit_field() {
+                                self.discard(true);
+                                return Some(Err(Self::too_long_error()));
+                            }
                         }
-                    }
-                    _ => {
-                        if (self.field.len() + self.value.len()) >= MAX_EVENT_SIZE {
-                            self.discard(false);
-                            return Some(Err(Self::too_long_error()));
-                        }
+                        _ => {
+                            if (self.field.len() + self.value.len()) >= MAX_EVENT_SIZE {
+                                self.discard(false);
+                                return Some(Err(Self::too_long_error()));
+                            }
 
-                        self.value.push(byte);
+                            self.value.push(byte);
+                        }
                     }
-                },
+                }
                 EventParserState::Discard => {
                     if byte == b'\n' {
                         if self.discard_at_line_start {
@@ -240,7 +266,7 @@ impl Iterator for EventParser {
                         } else {
                             self.discard_at_line_start = true;
                         }
-                    } else if byte != b'\r' {
+                    } else {
                         self.discard_at_line_start = false;
                     }
                 }
@@ -311,7 +337,9 @@ mod tests {
             vec![
                 EventString {
                     event: EventType::State,
-                    id: "0".to_string(),
+                    // `id:  0` strips exactly one space; the second is
+                    // part of the value (WHATWG "process the field").
+                    id: " 0".to_string(),
                     data: "test".to_string()
                 },
                 EventString {
@@ -340,7 +368,7 @@ mod tests {
                 EventString {
                     event: EventType::State,
                     id: String::new(),
-                    data: "third event".to_string()
+                    data: " third event".to_string()
                 },
                 EventString {
                     event: EventType::State,
@@ -413,6 +441,53 @@ mod tests {
             String::from_utf8(third.id).unwrap(),
             "",
             "the cleared buffer stays cleared"
+        );
+    }
+
+    // WHATWG "process the field": at most one space after the colon is
+    // stripped. `data:  x` carries ` x`, and a space later in the value
+    // is never touched.
+    #[test]
+    fn only_the_first_leading_space_is_stripped() {
+        let mut parser = super::EventParser::default();
+        parser.push_bytes(Vec::from("data:  two spaces\n\ndata:a b\n\n"));
+
+        let first = parser.next().expect("an event").expect("no parse error");
+        assert_eq!(String::from_utf8(first.data).unwrap(), " two spaces");
+        let second = parser.next().expect("an event").expect("no parse error");
+        assert_eq!(String::from_utf8(second.data).unwrap(), "a b");
+    }
+
+    // WHATWG: CRLF, LF, and CR are all line terminators, and a CRLF pair
+    // split across two frames is still one terminator.
+    #[test]
+    fn cr_and_crlf_terminate_lines() {
+        let mut parser = super::EventParser::default();
+        parser.push_bytes(Vec::from("id: 5\r\ndata: one\rdata: two\r"));
+        parser.push_bytes(Vec::from("\r\r\ndata: three\r\n\r\n"));
+
+        let first = parser.next().expect("an event").expect("no parse error");
+        assert_eq!(String::from_utf8(first.id).unwrap(), "5");
+        assert_eq!(String::from_utf8(first.data).unwrap(), "one\ntwo");
+        let second = parser.next().expect("an event").expect("no parse error");
+        assert_eq!(String::from_utf8(second.data).unwrap(), "three");
+        assert!(parser.next().is_none());
+    }
+
+    // WHATWG: an `id` whose value contains U+0000 NULL is ignored - it is
+    // the resume token a reconnect echoes into a `Last-Event-ID` header.
+    #[test]
+    fn an_id_containing_nul_is_ignored() {
+        let mut parser = super::EventParser::default();
+        parser.push_bytes(Vec::from("id: 9\ndata: a\n\nid: b\0ad\ndata: b\n\n"));
+
+        let first = parser.next().expect("an event").expect("no parse error");
+        assert_eq!(String::from_utf8(first.id).unwrap(), "9");
+        let second = parser.next().expect("an event").expect("no parse error");
+        assert_eq!(
+            String::from_utf8(second.id).unwrap(),
+            "9",
+            "the poisoned id neither replaces nor clears the buffer"
         );
     }
 

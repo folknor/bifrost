@@ -74,7 +74,8 @@ comment directly above them ("BUG, documented rather than endorsed" /
   RFC-shape decodes (`mayRSVP` casing, rights defaulting).
 - `calendar_event_patch_nesting` - calendar membership dotted paths and
   no-overlap, `set_property` dotted paths, Get/Set argument flattening.
-- `misc_mail_object_decode` - N2, `SearchSnippet/get` request shape,
+- `misc_mail_object_decode` - Thread partial-projection decode,
+  `SearchSnippet/get` request shape,
   `Email/import` `iN` create-id keying.
 - `push_subscription_wire` - the non-account-scoped `accountId` omission.
 - `principal_acl_vocabulary` - the RFC 8621 `shareWith` property names
@@ -87,7 +88,10 @@ blocks dispatching nothing, an empty `data` field still dispatching, the
 last-event-ID buffer persisting across events, and a colonless `id` line
 clearing it. The pre-existing `parse` transcript was re-pinned to spec
 behaviour (the keepalive block no longer yields a phantom event, and the
-event after an `id` carries that id forward).
+event after an `id` carries that id forward). The close pass added the
+three WHATWG rules the rounds missed: CR and split-frame CRLF line
+terminators, the exactly-one-space value strip (a `data:  x` value is
+` x`), and ignoring an `id` whose value contains U+0000 NULL.
 
 `crates/jmap/src/event_source/stream.rs` (new `mod tests`, both
 `#[tokio::test]`): malformed event payloads emit one error and terminate
@@ -179,7 +183,8 @@ document.
   `WebSocketMessage_` decode is partly covered by the existing
   `deserializes_single_type_state_change_frame`; the close/error/binary
   arms are inside the `async_stream::stream!` and need a stub WebSocket
-  transport of the same shape as the G1 double.
+  transport of the same shape as the stub `HttpTransport`/`SseTransport`
+  doubles the blob and EventSource tests use.
 - **`principal/availability.rs`, `principal/query.rs`,
   `share_notification/query.rs`, `sieve/query.rs`,
   `calendar_event_notification/query.rs`, `quota/query.rs`.** Read for
