@@ -61,67 +61,58 @@ pub(crate) struct Email {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) received_at: Option<DateTime<Utc>>,
 
-    #[cfg_attr(
-        not(feature = "debug"),
-        serde(alias = "header:Message-ID:asMessageIds")
-    )]
+    #[serde(alias = "header:Message-ID:asMessageIds")]
     #[serde(rename = "messageId")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) message_id: Option<Vec<String>>,
 
     #[serde(rename = "inReplyTo")]
-    #[cfg_attr(
-        not(feature = "debug"),
-        serde(alias = "header:In-Reply-To:asMessageIds")
-    )]
+    #[serde(alias = "header:In-Reply-To:asMessageIds")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) in_reply_to: Option<Vec<String>>,
 
     #[serde(rename = "references")]
-    #[cfg_attr(
-        not(feature = "debug"),
-        serde(alias = "header:References:asMessageIds")
-    )]
+    #[serde(alias = "header:References:asMessageIds")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) references: Option<Vec<String>>,
 
     #[serde(rename = "sender")]
-    #[cfg_attr(not(feature = "debug"), serde(alias = "header:Sender:asAddresses"))]
+    #[serde(alias = "header:Sender:asAddresses")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) sender: Option<Vec<EmailAddress>>,
 
     #[serde(rename = "from")]
-    #[cfg_attr(not(feature = "debug"), serde(alias = "header:From:asAddresses"))]
+    #[serde(alias = "header:From:asAddresses")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) from: Option<Vec<EmailAddress>>,
 
     #[serde(rename = "to")]
-    #[cfg_attr(not(feature = "debug"), serde(alias = "header:To:asAddresses"))]
+    #[serde(alias = "header:To:asAddresses")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) to: Option<Vec<EmailAddress>>,
 
     #[serde(rename = "cc")]
-    #[cfg_attr(not(feature = "debug"), serde(alias = "header:Cc:asAddresses"))]
+    #[serde(alias = "header:Cc:asAddresses")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) cc: Option<Vec<EmailAddress>>,
 
     #[serde(rename = "bcc")]
-    #[cfg_attr(not(feature = "debug"), serde(alias = "header:Bcc:asAddresses"))]
+    #[serde(alias = "header:Bcc:asAddresses")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) bcc: Option<Vec<EmailAddress>>,
 
     #[serde(rename = "replyTo")]
-    #[cfg_attr(not(feature = "debug"), serde(alias = "header:Reply-To:asAddresses"))]
+    #[serde(alias = "header:Reply-To:asAddresses")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) reply_to: Option<Vec<EmailAddress>>,
 
     #[serde(rename = "subject")]
-    #[cfg_attr(not(feature = "debug"), serde(alias = "header:Subject:asText"))]
+    #[serde(alias = "header:Subject:asText")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) subject: Option<String>,
 
     #[serde(rename = "sentAt")]
-    #[cfg_attr(not(feature = "debug"), serde(alias = "header:Date:asDate"))]
+    #[serde(alias = "header:Date:asDate")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) sent_at: Option<DateTime<Utc>>,
 
@@ -1129,5 +1120,21 @@ impl From<Email> for TestEmail {
             preview: email.preview,
             headers: email.headers.into_iter().collect(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn header_form_aliases_decode_into_their_canonical_fields() {
+        let email: Email = serde_json::from_value(serde_json::json!({
+            "header:From:asAddresses": [{ "email": "sender@example.test" }]
+        }))
+        .expect("header-form email decodes");
+
+        let from = email.from.expect("header-form alias populates from");
+        assert_eq!(from[0].email, "sender@example.test");
     }
 }

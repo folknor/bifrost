@@ -62,45 +62,6 @@ the fanout as-is. This is an argument for (a), not a new bug.
     can attribute the change.
 This is a design call, not a mechanical fix.
 
-### B10 - An `Email/set` id the server answers in neither map is reported as a terminal `NotFound`, so a possibly-applied write is never read back
-
-**Where:** `sync/mutation.rs::apply_batch` (244-277) via
-`core/set.rs::updated` (321-329) / `destroyed` (331-343).
-
-**Mechanism.** `apply_batch` is correctly closed - it iterates the ids it
-SUBMITTED and derives one outcome per id - but the classification of the
-leftover case is wrong. RFC 8620 s5.3 requires every id in `update` /
-`destroy` to appear in exactly one of `updated`/`notUpdated` (resp.
-`destroyed`/`notDestroyed`). When it appears in neither, `updated` returns
-`Error::IdNotFound(id)`, which falls to the generic `Err(err)` arm and
-through `into_account_error` -> `convert_id_not_found`. The context carries
-`ErrorScope::Message`, so `resource_from_scope` resolves and the id is
-classified `NotFound(ResourceKind::Message)`, which the central mapping
-derives as `RecoveryClass::ProviderRefused` - terminal.
-
-Note this is NOT the absorbed-notFound path: `classify_set_item`'s
-`Succeeded(Skipped)` absorption only fires for a real `SetError` in
-`notUpdated`. An id the server never mentioned does not reach it.
-
-**Path to failure.** A `BulkMove` of 50 messages. The server answers the
-`Email/set` but omits one id from both maps. The move for that id may or
-may not have landed - the response says nothing. The consumer is told
-`NotFound(Message)`: a fabricated fact (the message exists), classified
-terminal, so the engine files it `failed_terminal`, skips the read-back
-guard, and never discovers whether the move applied. Same for
-`BulkDestroy`.
-
-**Proposed fix.** The same shape hydration now uses, and the same shape
-`bifrost-graph` uses for a short `$batch`: an id present in neither map is
-`Protocol(PartialResponse)` with `Attempt(Acknowledged)`, which the central
-mapping routes to `Retry` for idempotent work and
-`Reconcile(PartialCompletionSignal, [CheckTarget])` for a move or destroy,
-so the caller probes the target instead of guessing. `Error::IdNotFound`
-would need to be distinguishable at the `apply_batch` call site (match it
-before the generic arm) rather than left to `convert_id_not_found`, whose
-`NotFound` classification is right for the single-object read paths that
-also raise it.
-
 ## 2. Gaps and smells
 
 ### G1 - `foreign_namespaces_advertised: false` contradicts what JMAP actually does
@@ -165,40 +126,6 @@ per-accountId state key (which `state_cache` is already shaped for).
 Same for `pim.rs::add_to_container` / `remove_from_container` / `set_keyword` /
 `set_is_read` / `set_importance`, all of which take `self.mail` and
 `self.mail.id_str()` from `account.rs` (477-589).
-
-### G5 - `Client::default_account_id` is nondeterministic when the session lists more than one primary account
-
-`client.rs:235-239` and `278-282` both do
-`session.primary_accounts().next()` on a `HashMap<String, String>`. A session
-that lists mail + calendars + contacts primaries (the normal case) yields an
-arbitrary one, so `Client::build()` stamps an arbitrary `accountId` into every
-method it carries.
-
-Latent today: nothing in the crate calls `client.build()` directly - every
-sync call site goes through `Account::build()`, which overrides. But
-`Client::build` is `pub(crate)` and the next person to reach for it gets a
-random account with no compiler complaint. Either sort the primaries and take
-the lowest, prefer the `mail` URI explicitly, or delete `Client::build` in
-favor of `Account::build`. (`client.rs` is outside my scope; reporting only.)
-
-The test fixtures I added deliberately list at most one primary account so
-this cannot make them flaky, and say so in a comment.
-
-### G6 - Feature-dependent `Email` header decoding
-
-`crates/jmap/src/email/mod.rs` gates the header-form aliases
-(`header:From:asAddresses` etc.) behind `cfg_attr(not(feature = "debug"), ...)`.
-Validation runs `--all-features`, so `debug` is on and the aliases vanish -
-meaning the shape that is tested is not the shape that ships by default.
-
-Impact on my scope is small: neither `hydrate.rs` nor `pim.rs` ever *requests*
-the header form (they use `Property::From` etc.), so a conforming server
-answers with the canonical names either way. The exposure is a server that
-echoes back the header spelling it was not asked for; under the default
-feature set that decodes into `from`, under `--all-features` it silently lands
-in the flattened `header` catch-all and `from` stays `None`, so a hydrated
-message loses its sender. Worth knowing that the crate has two decode
-behaviors selected by a feature that is supposed to be diagnostic-only.
 
 ### G7 - `query_changes` ignores the query definition entirely
 
@@ -292,4 +219,3 @@ file, not a substitute for genericizing the tree.
 ## 4. Doc contradictions found
 
 1. `sync/capabilities.rs:194-196` - the comment claims JMAP foreign accounts are not open-time discovery. They are. See G1.
-2. `reference/jmap.md:219` - lists `Type(Thread)` changes as supported without noting that discovery never offers the scope. See G2.

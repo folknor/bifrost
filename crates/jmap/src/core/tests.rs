@@ -417,10 +417,9 @@ mod envelope {
         }
     }
 
-    /// A session fixture. `primary_accounts` is spelled out per test so
-    /// `Client::default_account_id` (which picks `primary_accounts().next()`
-    /// off a `HashMap`) stays deterministic: every fixture here lists at
-    /// most one primary account.
+    /// A session fixture. `primary_accounts` is spelled out per test so each
+    /// request's account selection stays explicit, even though the generic
+    /// client fallback is now stable.
     fn session(primary_accounts: Value) -> Session {
         serde_json::from_value(json!({
             "capabilities": {

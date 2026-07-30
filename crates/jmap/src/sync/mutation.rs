@@ -250,31 +250,7 @@ async fn apply_batch(
                 response.updated(&email_id).map(|_| ())
             }
         };
-        let outcome: ItemOutcome<MutationSuccess> = match raw {
-            Ok(()) => ItemOutcome::Succeeded(BatchSuccess::new(
-                BatchItemId(id.0.clone()),
-                MutationSuccess::Applied,
-            )),
-            Err(crate::Error::Set(set_error)) => {
-                let ctx = super::error::JmapErrorContext::new(operation);
-                let item_scope = Some(ErrorScope::Message { id: id.0.clone() });
-                super::error::classify_set_item(
-                    set_error,
-                    ctx,
-                    BatchItemId(id.0.clone()),
-                    item_scope,
-                )
-            }
-            Err(err) => ItemOutcome::Failed(BatchFailure::new(
-                BatchItemId(id.0.clone()),
-                super::error::into_account_error(
-                    err,
-                    super::error::JmapErrorContext::new(operation)
-                        .with_scope(ErrorScope::Message { id: id.0.clone() }),
-                ),
-            )),
-        };
-        results.push(outcome);
+        results.push(classify_set_response(raw, id, operation));
     }
 
     Ok(Some(Batch {
@@ -284,6 +260,43 @@ async fn apply_batch(
         bytes_in: 0,
         checkpoint: None,
     }))
+}
+
+/// Turn the answer for one submitted `Email/set` id into exactly one
+/// per-item outcome. The response method has already arrived, so any
+/// protocol-level omission must retain acknowledged transmission evidence.
+fn classify_set_response(
+    raw: crate::Result<()>,
+    id: ObjectId,
+    operation: AccountOperation,
+) -> ItemOutcome<MutationSuccess> {
+    match raw {
+        Ok(()) => ItemOutcome::Succeeded(BatchSuccess::new(
+            BatchItemId(id.0.clone()),
+            MutationSuccess::Applied,
+        )),
+        Err(crate::Error::Set(set_error)) => {
+            let ctx = super::error::JmapErrorContext::new(operation);
+            let item_scope = Some(ErrorScope::Message { id: id.0.clone() });
+            super::error::classify_set_item(set_error, ctx, BatchItemId(id.0.clone()), item_scope)
+        }
+        Err(crate::Error::IdNotFound(_)) => ItemOutcome::Failed(BatchFailure::new(
+            BatchItemId(id.0.clone()),
+            super::error::set_id_unanswered(
+                &id.0,
+                super::error::JmapErrorContext::new(operation)
+                    .with_scope(ErrorScope::Message { id: id.0.clone() }),
+            ),
+        )),
+        Err(err) => ItemOutcome::Failed(BatchFailure::new(
+            BatchItemId(id.0.clone()),
+            super::error::into_account_error(
+                err,
+                super::error::JmapErrorContext::new(operation)
+                    .with_scope(ErrorScope::Message { id: id.0.clone() }),
+            ),
+        )),
+    }
 }
 
 /// Build a per-item `Failed(ConcurrencyConflict)` batch for every id in
@@ -613,5 +626,28 @@ mod tests {
                 other => panic!("expected Failed, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn an_unanswered_set_id_is_a_reconcilable_partial_response() {
+        let outcome = classify_set_response(
+            Err(crate::Error::IdNotFound("m1".to_string())),
+            ObjectId("m1".to_string()),
+            AccountOperation::BulkDestroy,
+        );
+
+        let ItemOutcome::Failed(failure) = outcome else {
+            panic!("an omitted set answer must fail on the item lane");
+        };
+        assert_eq!(failure.item.0, "m1");
+        assert_eq!(
+            failure.error.kind(),
+            &AccountErrorKind::Protocol(bifrost_types::ProtocolErrorKind::PartialResponse)
+        );
+        assert!(failure.error.recovery().requires_reconciliation());
+        assert_eq!(
+            failure.error.telemetry_fields().transmission_state,
+            Some(bifrost_types::TransmissionState::Acknowledged)
+        );
     }
 }

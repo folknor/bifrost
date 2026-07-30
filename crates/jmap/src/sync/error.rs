@@ -1130,6 +1130,30 @@ pub(crate) fn get_id_unanswered(id: &str, ctx: JmapErrorContext) -> AccountError
     .expect("valid account error classification")
 }
 
+/// An `Email/set` response that accounted for a submitted update or destroy
+/// id in neither its success nor its error map. RFC 8620 requires exactly
+/// one answer per submitted id, but the omission says nothing about whether
+/// the write landed. The method response did arrive, so preserve
+/// acknowledged transmission evidence and let non-idempotent work reconcile.
+#[must_use]
+pub(crate) fn set_id_unanswered(id: &str, ctx: JmapErrorContext) -> AccountError {
+    build(
+        AccountErrorKind::Protocol(ProtocolErrorKind::PartialResponse),
+        Cause::Wire(WireCause::MalformedResponse {
+            protocol: Protocol::Jmap,
+            detail: Some(DiagnosticText::support_only(format!(
+                "submitted Email/set id {id} appeared in neither a success nor an error map"
+            ))),
+        }),
+        &ctx,
+    )
+    .push_cause(Cause::Attempt(AttemptCause::new(
+        TransmissionState::Acknowledged,
+    )))
+    .try_build()
+    .expect("valid account error classification")
+}
+
 fn convert_id_not_found(id: String, ctx: JmapErrorContext) -> AccountError {
     if let Some(resource) = resource_from_scope(ctx.scope.as_ref()) {
         build(

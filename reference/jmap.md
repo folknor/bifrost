@@ -59,6 +59,9 @@ returns `Error::Method` for JMAP method-level errors.
 - WebSocket remains reqwest-specific (documented).
 
 All convenience helpers are `impl<Tr: HttpTransport> Client<Tr>` so custom transports get the full API.
+`Client::build()` uses the lexicographically first primary capability as its
+stable generic fallback; account-scoped callers use `Account::build()` and
+therefore select their required capability explicitly.
 
 ## Module pattern
 
@@ -251,7 +254,7 @@ Every await in the reader's lifecycle is cancellation-covered, so `close()` is p
 
 `bulk_set_flags`, `bulk_move`, and `bulk_destroy` share a `mutation_stream` engine. Targets batch at `max_objects_in_set` clamped to `[1, 500]`; each batch is one `Email/set` gated by `ifInState(current_state)`. On `stateMismatch` the pipeline probes current state via `Email/get` (empty ids), updates the cache, and retries the batch once. Other errors abort with `SyncEvent::Terminated(AccountError)`.
 
-`IdempotencyKey` is a wire no-op, so replay safety stays `None` (read-back guard protects against double-apply). Per-id outcomes flow from `SetResponse::updated`/`destroyed`; a `stateMismatch` surviving retry emits `Failed(ConcurrencyConflict)`, other errors map through `into_account_error`. Empty additive/subtractive flag operations short-circuit locally with per-target `Skipped` outcomes rather than transmitting empty patches. `bulk_move` accepts only `MembershipScope::Mailbox`.
+`IdempotencyKey` is a wire no-op, so replay safety stays `None` (read-back guard protects against double-apply). Per-id outcomes flow from `SetResponse::updated`/`destroyed`; an id the server names in neither the success nor error collection becomes `Protocol(PartialResponse)` with `Attempt(Acknowledged)`, so idempotent flag work retries and possibly-applied moves/destroys reconcile rather than being fabricated as `NotFound`. A `stateMismatch` surviving retry emits `Failed(ConcurrencyConflict)`; real per-id set errors map through `classify_set_item`. Empty additive/subtractive flag operations short-circuit locally with per-target `Skipped` outcomes rather than transmitting empty patches. `bulk_move` accepts only `MembershipScope::Mailbox`.
 
 ### PIM primitives and conveniences
 
@@ -406,7 +409,7 @@ Out of A5a's read/sync slice (named follow-ups): foreign-account *mutations* (th
 
 ### Known limitations
 
-- `Thread` and `Query` inventory are not implemented (fatal-unsupported); thread/query changes are supported.
+- `Thread` and `Query` inventory are not implemented (fatal-unsupported). `Query` changes are likewise unavailable because no query definition is registered. Thread changes have an implementation, but discovery never emits a `Thread` cursor, so its state probes and changes path are currently dormant.
 - Foreign bulk mutations and live foreign-mailbox lifecycle are not wired. `get_stream` / `open_blob` / `open_raw_rfc822` DO route to the foreign account (via the qualified object-id codec); the mutation primitives do not. Foreign submission is supported, but scheduled foreign submission is not.
 - Raw-MIME projections unsupported; only `FlagsOnly` and `Metadata` work. Push is WebSocket-subprotocol only (no HTTP/EventSource fallback).
 - `BlobRangeSupport::No`; `open_blob_range` fatals `Error::Unsupported` even when the handle advertises range support (no transport `Range` hook).

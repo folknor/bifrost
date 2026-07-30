@@ -87,12 +87,12 @@ Use `brokkr` (not `cargo`) for check/test. By default output is filtered to chan
 - `brokkr check --all` - show every diagnostic, no cap, no scope filter
 - `brokkr check -p <crate>` - scope to one package (e.g. `-p app`). You generally do not want to run this; a single `brokkr check` is faster than 2-3 `-p` runs, and brokkr intelligently filters which warnings and errors to show you
 - `brokkr check -- --test <file>` - forward args to `cargo test` (args after the second `--` go to the test binary)
-- `brokkr test -p <crate> <NAME>` - release-mode focused single-test runner. Always passes `--release --include-ignored --nocapture --test-threads=1`. `<NAME>` is a case-sensitive substring filter (matches both unit and integration tests). Streams the test's own stdout/stderr live and prints a `[test] PASS/FAIL` footer with wall time. Defaults to `--all-features`; runs a second sweep if `[check].consumer_features` is set in `brokkr.toml`. Gated off for litehtml/sluggrs (use `brokkr visual` there).
+- `brokkr test -p <crate> <NAME>` - focused single-test runner. Always passes `--include-ignored --nocapture --test-threads=1`. Profile comes from `[test] debug` in `brokkr.toml`, which is currently `true`, so it builds dev by default. `<NAME>` is a case-sensitive substring filter (matches both unit and integration tests). Streams the test's own stdout/stderr live and prints a `[test] PASS/FAIL` footer with wall time. Defaults to `--all-features`; runs a second sweep if `[check].consumer_features` is set in `brokkr.toml`. Gated off for litehtml/sluggrs (use `brokkr visual` there).
   - `-p, --package <PKG>` - cargo package. Required in this workspace - no default package, and overrides `[test] default_package` in `brokkr.toml` if set.
   - `-N, --repeat <N>` - run the test N times per sweep (flaky-test hunting).
   - `-j, --jobs <N>` - parallel cargo compile jobs.
   - `--raw` - bypass output filtering, print everything cargo emits.
-  - `--debug` - build and run the test in dev profile instead of release. Use this for subprocess-lifecycle / IPC / boot-path tests where release-LTO compile time (3-4 min for the full workspace) dominates wall time and the optimization level doesn't change the behavior under test. `BROKKR_TEST_BIN_DIR` points at `<target>/debug` accordingly.
+  - `--debug` - force the dev profile. Redundant while `[test] debug = true` is set in `brokkr.toml`, which is the current default; it matters only if that is flipped back. `BROKKR_TEST_BIN_DIR` points at `<target>/debug` accordingly.
   - Example: `brokkr test -p common truncates_without_splitting` or `brokkr test -p calendar extract_tag_value_flattens_nested_text -N 5` or `brokkr test -p app terminal_failure_at_initial_boot_does_not_respawn --debug`.
 - `cargo run -p app` - run the iced app
 

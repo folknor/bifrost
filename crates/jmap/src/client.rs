@@ -233,9 +233,8 @@ impl ClientBuilder {
         let session: Session = serde_json::from_slice(&session_bytes)?;
 
         let default_account_id = session
-            .primary_accounts()
-            .next()
-            .map(|a| crate::core::id::AccountId::new(a.1.clone()))
+            .default_account_id()
+            .map(crate::core::id::AccountId::new)
             .unwrap_or_else(|| crate::core::id::AccountId::new(""));
 
         Ok(Client {
@@ -276,9 +275,8 @@ impl<T: HttpTransport> Client<T> {
     /// Create a client with a custom transport and pre-fetched session.
     pub(crate) fn with_transport(transport: T, session: Session) -> crate::Result<Self> {
         let default_account_id = session
-            .primary_accounts()
-            .next()
-            .map(|a| crate::core::id::AccountId::new(a.1.clone()))
+            .default_account_id()
+            .map(crate::core::id::AccountId::new)
             .unwrap_or_else(|| crate::core::id::AccountId::new(""));
 
         Ok(Client {

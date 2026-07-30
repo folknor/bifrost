@@ -377,6 +377,14 @@ impl Session {
         self.primary_accounts.iter()
     }
 
+    /// Stable fallback account selection for generic request construction.
+    /// Capability-specific callers should select their own primary account.
+    pub(crate) fn default_account_id(&self) -> Option<&str> {
+        self.primary_accounts()
+            .min_by_key(|(capability, _)| *capability)
+            .map(|(_, account_id)| account_id.as_str())
+    }
+
     pub(crate) fn username(&self) -> &str {
         &self.username
     }
@@ -618,5 +626,37 @@ impl<T: URLParser> URLPart<T> {
         }
 
         Ok(parts)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Session;
+
+    fn session_with_multiple_primaries() -> Session {
+        serde_json::from_value(serde_json::json!({
+            "capabilities": {},
+            "accounts": {},
+            "primaryAccounts": {
+                "urn:ietf:params:jmap:mail": "mail-account",
+                "urn:ietf:params:jmap:calendars": "calendar-account",
+                "urn:ietf:params:jmap:contacts": "contacts-account"
+            },
+            "username": "user@example.test",
+            "apiUrl": "https://example.test/jmap",
+            "downloadUrl": "https://example.test/download/{accountId}/{blobId}",
+            "uploadUrl": "https://example.test/upload/{accountId}",
+            "eventSourceUrl": "https://example.test/events",
+            "state": "state-1"
+        }))
+        .expect("session fixture decodes")
+    }
+
+    #[test]
+    fn default_account_id_is_stable_across_session_map_seeds() {
+        for _ in 0..32 {
+            let session = session_with_multiple_primaries();
+            assert_eq!(session.default_account_id(), Some("calendar-account"));
+        }
     }
 }
