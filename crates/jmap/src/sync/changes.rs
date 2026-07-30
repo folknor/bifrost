@@ -3,16 +3,13 @@ use std::time::Instant;
 
 use bifrost_types::{
     AccountStream, Batch, Change, ChangeCursor, Checkpoint, CursorScope,
-    MailboxId as TypesMailboxId, MembershipScope, ObjectChange, ObjectChangeKind, ObjectId,
-    PageBoundary, ScopeChange, ScopeChangeKind, SyncEvent,
+    MailboxId as TypesMailboxId, ObjectChange, ObjectChangeKind, ObjectId, PageBoundary, SyncEvent,
 };
 
 use crate::core::changes::ChangesObject;
-use crate::core::query_changes::QueryChangesResponse;
 use crate::core::transport::HttpTransport;
-use crate::email::{Email, EmailChanges, EmailQueryChanges};
+use crate::email::{Email, EmailChanges};
 use crate::mailbox::{Mailbox, MailboxChanges};
-use crate::thread::{Thread, ThreadChanges};
 
 use super::capabilities::CoreLimits;
 use super::state::{self, JmapScopeRepr};
@@ -29,7 +26,6 @@ pub(crate) fn stream<T: HttpTransport>(
     owner: Option<TypesMailboxId>,
     email_states: StateMap,
     mailbox_states: StateMap,
-    thread_states: StateMap,
 ) -> AccountStream<SyncEvent<Change>> {
     let decoded = state::decode_cursor(&cursor);
     let (scope, state_string) = match decoded {
@@ -82,15 +78,14 @@ pub(crate) fn stream<T: HttpTransport>(
             state_string,
             mailbox_states,
         ),
-        JmapScopeRepr::Thread => thread_changes(
-            mail,
-            account_id,
-            limits,
-            cursor.scope.clone(),
-            state_string,
-            thread_states,
-        ),
-        JmapScopeRepr::Query(query_id) => query_changes(mail, limits, query_id, state_string),
+        // Thread cursor inventory is derived from Email inventory and is
+        // deliberately not exposed. Old opaque Thread cursors must fail
+        // explicitly rather than reviving an unseeded sync path.
+        JmapScopeRepr::Thread => unsupported_scope(cursor.scope.clone(), "Thread"),
+        // Query definitions are absent from the v1 Account contract, so a
+        // query id cannot be turned into a valid filter/sort request. Do
+        // not send an unfiltered Email/queryChanges and mislabel its ids.
+        JmapScopeRepr::Query(_) => unsupported_scope(cursor.scope.clone(), "Query"),
         // A foreign (shared/delegate) account mailbox: its emails sync
         // against that foreign account's `Email/changes` state. The owner
         // tag drives revocation isolation. `Email/changes` is
@@ -249,120 +244,13 @@ fn mailbox_changes<T: HttpTransport>(
     })
 }
 
-fn thread_changes<T: HttpTransport>(
-    mail: MailAccount<T>,
-    account_id: String,
-    limits: CoreLimits,
-    scope: CursorScope,
-    mut since_state: String,
-    thread_states: StateMap,
-) -> AccountStream<SyncEvent<Change>> {
+fn unsupported_scope(scope: CursorScope, name: &'static str) -> AccountStream<SyncEvent<Change>> {
     Box::pin(async_stream::stream! {
-        let max_changes = nonzero(limits.max_objects_in_get);
-        loop {
-            let started = Instant::now();
-            let response = mail
-                .call(ThreadChanges::new(since_state.clone()).max_changes(max_changes))
-                .await;
-
-            let response = match response {
-                Ok(response) => response,
-                Err(err) => {
-                    yield super::error::terminated_from_jmap(
-                        err,
-                        super::error::JmapErrorContext::cursor(
-                            bifrost_types::AccountOperation::SyncChanges,
-                            scope.clone(),
-                        ),
-                    );
-                    break;
-                }
-            };
-
-            let new_state = response.new_state().to_string();
-            let changes = object_changes::<Thread>(response.created(), ObjectChangeKind::Created, None)
-                .into_iter()
-                .chain(object_changes::<Thread>(response.updated(), ObjectChangeKind::Updated, None))
-                .chain(object_changes::<Thread>(
-                    response.destroyed(),
-                    ObjectChangeKind::Destroyed,
-                    None,
-                ))
-                .collect::<Vec<_>>();
-            let checkpoint = checkpoint_for(scope.clone(), new_state.clone());
-            state_cache::advance(&thread_states, &account_id, Some(&since_state), new_state.clone()).await;
-
-            yield SyncEvent::Batch(Batch {
-                items: changes,
-                page_boundary: PageBoundary::Page,
-                server_latency: started.elapsed(),
-                bytes_in: 0,
-                checkpoint: Some(Checkpoint::Change(checkpoint.clone())),
-            });
-
-            since_state = new_state;
-            if !response.has_more_changes() {
-                yield SyncEvent::Done(Some(Checkpoint::Change(checkpoint)));
-                break;
-            }
-        }
-    })
-}
-
-fn query_changes<T: HttpTransport>(
-    mail: MailAccount<T>,
-    limits: CoreLimits,
-    query_id: String,
-    since_state: String,
-) -> AccountStream<SyncEvent<Change>> {
-    Box::pin(async_stream::stream! {
-        let started = Instant::now();
-        let response = mail
-            .call(EmailQueryChanges::new(since_state).max_changes(nonzero(limits.max_objects_in_get)))
-            .await;
-
-        let response: QueryChangesResponse<Email> = match response {
-            Ok(response) => response,
-            Err(err) => {
-                yield super::error::terminated_from_jmap(
-                    err,
-                    super::error::JmapErrorContext::cursor(
-                        bifrost_types::AccountOperation::SyncChanges,
-                        CursorScope::Query(bifrost_types::QueryId(query_id.clone())),
-                    ),
-                );
-                return;
-            }
-        };
-
-        let query_id = bifrost_types::QueryId(query_id);
-        let scope = CursorScope::Query(query_id.clone());
-        let membership = MembershipScope::Query(query_id);
-        let removed = response.removed().iter().map(|id| {
-            Change::ScopeChange(ScopeChange {
-                id: ObjectId(id.to_string()),
-                membership: membership.clone(),
-                kind: ScopeChangeKind::Removed,
-            })
-        });
-        let added = response.added().iter().map(|item| {
-            Change::ScopeChange(ScopeChange {
-                id: ObjectId(item.id().to_string()),
-                membership: membership.clone(),
-                kind: ScopeChangeKind::Added,
-            })
-        });
-        let changes = removed.chain(added).collect::<Vec<_>>();
-        let checkpoint = checkpoint_for(scope, response.new_query_state().to_string());
-
-        yield SyncEvent::Batch(Batch {
-            items: changes,
-            page_boundary: PageBoundary::Page,
-            server_latency: started.elapsed(),
-            bytes_in: 0,
-            checkpoint: Some(Checkpoint::Change(checkpoint.clone())),
-        });
-        yield SyncEvent::Done(Some(Checkpoint::Change(checkpoint)));
+        yield super::error::terminated(super::error::unsupported_error(
+            bifrost_types::AccountOperation::SyncChanges,
+            Some(bifrost_types::ErrorScope::Cursor(scope)),
+            format!("JMAP {name} cursor changes are not supported by the v1 Account contract"),
+        ));
     })
 }
 
@@ -406,6 +294,7 @@ fn nonzero(value: usize) -> NonZeroUsize {
 mod tests {
     use super::*;
     use crate::email::EmailId;
+    use futures::StreamExt;
 
     fn object_ids(changes: &[Change]) -> Vec<String> {
         changes
@@ -462,15 +351,13 @@ mod tests {
     }
 
     #[test]
-    fn every_supported_scope_can_build_its_checkpoint_cursor() {
+    fn every_change_stream_scope_can_build_its_checkpoint_cursor() {
         // `checkpoint_for` unwraps, so any scope reachable from a change
         // loop must encode. The foreign `Folder` shape is the one that
         // round-trips through a codec rather than a fixed tag.
         for scope in [
             CursorScope::Type(bifrost_types::ObjectType::Email),
             CursorScope::Type(bifrost_types::ObjectType::Mailbox),
-            CursorScope::Type(bifrost_types::ObjectType::Thread),
-            CursorScope::Query(bifrost_types::QueryId("q-1".to_string())),
             CursorScope::Folder(super::super::foreign::encode_foreign("acct-9", "mbx-1")),
         ] {
             let cursor = checkpoint_for(scope.clone(), "state-1".to_string());
@@ -483,5 +370,25 @@ mod tests {
                 state::decode_cursor(&cursor).expect("a checkpoint must decode again");
             assert_eq!(state_string, "state-1");
         }
+    }
+
+    #[tokio::test]
+    async fn query_changes_fail_before_an_unfiltered_request_can_be_sent() {
+        let scope = CursorScope::Query(bifrost_types::QueryId("unread-in-inbox".to_string()));
+        let mut stream = unsupported_scope(scope.clone(), "Query");
+
+        match stream.next().await {
+            Some(SyncEvent::Terminated(err)) => {
+                assert_eq!(
+                    err.kind(),
+                    &bifrost_types::AccountErrorKind::Unsupported(
+                        bifrost_types::AccountOperation::SyncChanges
+                    )
+                );
+                assert_eq!(err.scope(), Some(&bifrost_types::ErrorScope::Cursor(scope)));
+            }
+            other => panic!("expected unsupported query termination, got {other:?}"),
+        }
+        assert!(stream.next().await.is_none());
     }
 }

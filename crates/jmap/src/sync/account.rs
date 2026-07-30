@@ -68,7 +68,6 @@ pub(crate) struct JmapAccount {
     /// single `Option<String>` would clobber one with the other.
     pub(crate) email_states: StateMap,
     pub(crate) mailbox_states: StateMap,
-    pub(crate) thread_states: StateMap,
     pub(crate) mailbox_names: Arc<Mutex<HashMap<String, String>>>,
 }
 
@@ -94,7 +93,6 @@ impl JmapAccount {
         shutdown: CancellationToken,
         email_states: HashMap<String, Option<String>>,
         mailbox_states: HashMap<String, Option<String>>,
-        thread_states: HashMap<String, Option<String>>,
         mailbox_names: HashMap<String, String>,
     ) -> Self {
         Self {
@@ -120,7 +118,6 @@ impl JmapAccount {
             subscription_seq: AtomicU64::new(1),
             email_states: Arc::new(Mutex::new(email_states)),
             mailbox_states: Arc::new(Mutex::new(mailbox_states)),
-            thread_states: Arc::new(Mutex::new(thread_states)),
             mailbox_names: Arc::new(Mutex::new(mailbox_names)),
         }
     }
@@ -208,6 +205,42 @@ impl JmapAccount {
     }
 }
 
+/// Pure descriptor logic behind `Account::describe_cursor`, split out
+/// for direct testing.
+///
+/// Decoding alone is not support: legacy `Thread` and `Query` cursors
+/// still decode (their scope tags remain in the V1 envelope so old
+/// durable rows stay readable) but `changes::stream` terminates both
+/// `Unsupported(SyncChanges)` - thread inventory derives from Email
+/// inventory, and the v1 contract registers no query definitions to
+/// turn a query id into a filter. Reporting `Cheap`/`ServerCursor` for
+/// one would promise a strategy that dies on its first poll, so only
+/// the scopes the change stream actually drives report one.
+fn describe_cursor_support(cursor: &ChangeCursor) -> CursorDescriptor {
+    let supported = matches!(
+        state::decode_cursor(cursor),
+        Ok((
+            state::JmapScopeRepr::Email
+                | state::JmapScopeRepr::Mailbox
+                | state::JmapScopeRepr::Folder { .. },
+            _
+        ))
+    );
+    CursorDescriptor {
+        cost_class: if supported {
+            CostClass::Cheap
+        } else {
+            CostClass::Expensive
+        },
+        strategy: if supported {
+            SyncStrategy::ServerCursor
+        } else {
+            SyncStrategy::None
+        },
+        freshness: None,
+    }
+}
+
 impl Account for JmapAccount {
     fn capabilities(&self) -> &AccountCapabilities {
         &self.caps
@@ -222,20 +255,7 @@ impl Account for JmapAccount {
     }
 
     fn describe_cursor(&self, cursor: &ChangeCursor) -> CursorDescriptor {
-        let valid = state::decode_cursor(cursor).is_ok();
-        CursorDescriptor {
-            cost_class: if valid {
-                CostClass::Cheap
-            } else {
-                CostClass::Expensive
-            },
-            strategy: if valid {
-                SyncStrategy::ServerCursor
-            } else {
-                SyncStrategy::None
-            },
-            freshness: None,
-        }
+        describe_cursor_support(cursor)
     }
 
     fn discover_cursor_scopes(&self) -> AccountStream<SyncEvent<CursorScope>> {
@@ -364,7 +384,6 @@ impl Account for JmapAccount {
             owner,
             Arc::clone(&self.email_states),
             Arc::clone(&self.mailbox_states),
-            Arc::clone(&self.thread_states),
         )
     }
 
@@ -1249,11 +1268,12 @@ mod tests {
         QueryId, SendAs,
     };
 
-    use super::super::foreign;
+    use super::super::{foreign, state};
     use super::{
-        foreign_owner_memberships_from_scopes, is_unregistered_foreign, resolve_foreign_account_id,
-        route_send_as,
+        describe_cursor_support, foreign_owner_memberships_from_scopes, is_unregistered_foreign,
+        resolve_foreign_account_id, route_send_as,
     };
+    use bifrost_types::{ChangeCursor, CostClass, SyncStrategy};
 
     fn as_shared() -> SendAs {
         SendAs::As(MailboxId("foreign-id".to_string()))
@@ -1291,6 +1311,54 @@ mod tests {
             err.kind(),
             AccountErrorKind::Unsupported(AccountOperation::Send)
         ));
+    }
+
+    fn cursor(scope: CursorScope) -> ChangeCursor {
+        state::cursor_for_scope(scope, "state-1").expect("scope encodes")
+    }
+
+    #[test]
+    fn supported_scopes_describe_a_server_cursor() {
+        for scope in [
+            CursorScope::Type(ObjectType::Email),
+            CursorScope::Type(ObjectType::Mailbox),
+            CursorScope::Folder(foreign::encode_foreign("acct-9", "mbx-1")),
+        ] {
+            let descriptor = describe_cursor_support(&cursor(scope.clone()));
+            assert_eq!(descriptor.cost_class, CostClass::Cheap, "{scope:?}");
+            assert_eq!(descriptor.strategy, SyncStrategy::ServerCursor, "{scope:?}");
+        }
+    }
+
+    #[test]
+    fn legacy_thread_and_query_cursors_are_not_advertised_as_usable() {
+        // Both decode (their scope tags remain in the V1 envelope) but
+        // `changes::stream` terminates them Unsupported(SyncChanges), so
+        // the descriptor must not promise a strategy that dies on its
+        // first poll. Strategy `None` routes the consumer back through
+        // inventory instead.
+        for scope in [
+            CursorScope::Type(ObjectType::Thread),
+            CursorScope::Query(QueryId("unread-in-inbox".to_string())),
+        ] {
+            let legacy = cursor(scope.clone());
+            assert!(
+                state::decode_cursor(&legacy).is_ok(),
+                "premise: the legacy cursor still decodes ({scope:?})"
+            );
+            let descriptor = describe_cursor_support(&legacy);
+            assert_eq!(descriptor.cost_class, CostClass::Expensive, "{scope:?}");
+            assert_eq!(descriptor.strategy, SyncStrategy::None, "{scope:?}");
+        }
+    }
+
+    #[test]
+    fn an_undecodable_cursor_describes_no_strategy() {
+        let mut broken = cursor(CursorScope::Type(ObjectType::Email));
+        broken.server_state.bytes.pop();
+        let descriptor = describe_cursor_support(&broken);
+        assert_eq!(descriptor.cost_class, CostClass::Expensive);
+        assert_eq!(descriptor.strategy, SyncStrategy::None);
     }
 
     #[test]

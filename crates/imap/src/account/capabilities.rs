@@ -149,9 +149,10 @@ pub(crate) fn build_capabilities(
         },
         // From the open-time NAMESPACE response: IMAP discovers shared /
         // other-user folders only at open (no scope-lifecycle events), so
-        // the consumer needs to know whether a rediscovery reattach can
-        // ever surface anything on this server.
-        foreign_namespaces_advertised,
+        // a reopen is the only door a post-open ACL grant can walk
+        // through - and NAMESPACE is a truthful "never" signal, so a
+        // personal-only server honestly reports false.
+        reopen_discovers_foreign_namespaces: foreign_namespaces_advertised,
     }
 }
 
@@ -282,9 +283,9 @@ mod tests {
     fn foreign_namespace_flag_flows_through_verbatim() {
         let profile = ServerProfile::new(vec![Capability::Idle], Vec::new());
         let without = build_capabilities(&profile, &[], false, None, None, false, false);
-        assert!(!without.foreign_namespaces_advertised);
+        assert!(!without.reopen_discovers_foreign_namespaces);
         let with = build_capabilities(&profile, &[], false, None, None, false, true);
-        assert!(with.foreign_namespaces_advertised);
+        assert!(with.reopen_discovers_foreign_namespaces);
     }
 
     fn mailbox(name: &str, attributes: Vec<MailboxAttribute>) -> MailboxInfo {

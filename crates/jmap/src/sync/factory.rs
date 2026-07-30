@@ -18,7 +18,6 @@ use crate::core::transport::HttpTransport;
 use crate::email::{EmailGet, EmailId};
 use crate::mailbox::{MailboxGet, Property as MailboxProperty};
 use crate::principal::PrincipalGet;
-use crate::thread::ThreadId;
 use crate::transport_reqwest::ReqwestTransport;
 
 use super::account::JmapAccount;
@@ -162,7 +161,7 @@ impl AccountFactory for JmapAccountFactory {
                 Some(caps) => caps.max_delayed_send(),
                 None => 0,
             };
-            let (email_state, mailbox_state, mailbox_names, thread_state) =
+            let (email_state, mailbox_state, mailbox_names) =
                 seed_account_state(&mail).await.map_err(|err| {
                     super::error::into_account_error(
                         err,
@@ -187,14 +186,6 @@ impl AccountFactory for JmapAccountFactory {
                 )
                 .expect("static mailbox cursor scope is supported"),
             );
-            seed_states.insert(
-                CursorScope::Type(ObjectType::Thread),
-                state::encode_for_scope(
-                    &CursorScope::Type(ObjectType::Thread),
-                    thread_state.clone(),
-                )
-                .expect("static thread cursor scope is supported"),
-            );
 
             // Per-accountId state caches. The primary account's id keys
             // the same maps every foreign account does - no primary-vs-
@@ -202,17 +193,15 @@ impl AccountFactory for JmapAccountFactory {
             let primary_id = mail.id_str().to_string();
             let mut email_states: HashMap<String, Option<String>> = HashMap::new();
             let mut mailbox_states: HashMap<String, Option<String>> = HashMap::new();
-            let mut thread_states: HashMap<String, Option<String>> = HashMap::new();
             email_states.insert(primary_id.clone(), Some(email_state.clone()));
             mailbox_states.insert(primary_id.clone(), Some(mailbox_state.clone()));
-            thread_states.insert(primary_id.clone(), Some(thread_state.clone()));
 
             // Foreign (shared/delegate) accounts: the session lists every
-            // non-personal mail account. For each, probe its three states
+            // non-personal mail account. For each, probe its two states
             // and seed one `Folder` cursor scope per mailbox. A
             // permission-denied probe skips that foreign account (the
             // primary and other foreign accounts still open).
-            let foreign_ids = foreign_mail_account_ids(&client, &primary_id);
+            let foreign_ids = foreign_mail_account_ids(&session, &primary_id);
             let mut foreign_mail: HashMap<String, MailAccount> = HashMap::new();
             let mut foreign_submission = HashSet::new();
             for foreign_id in foreign_ids {
@@ -222,7 +211,6 @@ impl AccountFactory for JmapAccountFactory {
                     Ok(seed) => {
                         email_states.insert(foreign_id.clone(), Some(seed.email_state));
                         mailbox_states.insert(foreign_id.clone(), Some(seed.mailbox_state));
-                        thread_states.insert(foreign_id.clone(), Some(seed.thread_state));
                         for mailbox_id in seed.mailbox_ids {
                             let scope = CursorScope::Folder(foreign::encode_foreign(
                                 &foreign_id,
@@ -298,7 +286,6 @@ impl AccountFactory for JmapAccountFactory {
                 shutdown,
                 email_states,
                 mailbox_states,
-                thread_states,
                 mailbox_names,
             );
 
@@ -382,9 +369,14 @@ fn push_email_alias(emails: &mut Vec<String>, email: &str) {
 /// delegate), excluding the primary mail account. JMAP servers list
 /// shared/delegated accounts with `isPersonal: false` and their own
 /// `accountCapabilities`; A5a auto-discovers them from the session (no
-/// config needed, unlike Graph).
-fn foreign_mail_account_ids(client: &Client, primary_id: &str) -> Vec<String> {
-    let session = client.session();
+/// config needed, unlike Graph). Reading the session document alone -
+/// and every `open` fetches a fresh one - is what backs the advertised
+/// `reopen_discovers_foreign_namespaces` capability: a share granted
+/// after the last open appears here on the next open.
+fn foreign_mail_account_ids(
+    session: &crate::core::session::Session,
+    primary_id: &str,
+) -> Vec<String> {
     let mut ids: Vec<String> = session
         .accounts()
         .filter(|id| id.as_str() != primary_id)
@@ -406,7 +398,6 @@ fn foreign_mail_account_ids(client: &Client, primary_id: &str) -> Vec<String> {
 struct ForeignSeed {
     email_state: String,
     mailbox_state: String,
-    thread_state: String,
     /// The foreign account's mailbox ids, one `Folder` cursor scope per.
     mailbox_ids: Vec<String>,
     /// The Email state seeded into each foreign `Folder` cursor (the
@@ -414,44 +405,40 @@ struct ForeignSeed {
     email_state_for_seed: String,
 }
 
-/// Probe one foreign account's `Email` / `Mailbox` / `Thread` states and
-/// enumerate its mailboxes. Mirrors the three primary probes. A failure
+/// Probe one foreign account's `Email` / `Mailbox` states and
+/// enumerate its mailboxes. Mirrors the primary probes. A failure
 /// (permission-denied or transient) returns `Err` so the caller skips
 /// this account without aborting `open`.
 async fn seed_foreign_account<T: HttpTransport>(
     mail: &JmapMailAccount<T>,
 ) -> crate::Result<ForeignSeed> {
-    let (email_state, mailbox_state, mailbox_names, thread_state) =
-        seed_account_state(mail).await?;
+    let (email_state, mailbox_state, mailbox_names) = seed_account_state(mail).await?;
     let mailbox_ids: Vec<String> = mailbox_names.into_keys().collect();
     Ok(ForeignSeed {
         email_state_for_seed: email_state.clone(),
         email_state,
         mailbox_state,
-        thread_state,
         mailbox_ids,
     })
 }
 
-/// The open-time probe set: `Email/get`, `Mailbox/get`, `Thread/get`.
-const OPEN_PROBE_CALLS: usize = 3;
+/// The open-time probe set: `Email/get`, `Mailbox/get`.
+const OPEN_PROBE_CALLS: usize = 2;
 
 type OpenProbeResponses = (
     crate::core::get::GetResponse<crate::email::Email>,
     crate::core::get::GetResponse<crate::mailbox::Mailbox>,
-    crate::core::get::GetResponse<crate::thread::Thread>,
 );
 
-/// Fresh copies of the three open-time probes, in wire order.
-fn open_probe_methods() -> (EmailGet, MailboxGet, crate::thread::ThreadGet) {
+/// Fresh copies of the two open-time probes, in wire order.
+fn open_probe_methods() -> (EmailGet, MailboxGet) {
     (
         EmailGet::new().ids(Vec::<EmailId>::new()),
         MailboxGet::new().properties([MailboxProperty::Id, MailboxProperty::Name]),
-        crate::thread::ThreadGet::new().ids(Vec::<ThreadId>::new()),
     )
 }
 
-/// Issue the three open-time probes, batched into one request when the
+/// Issue the two open-time probes, batched into one request when the
 /// session says one request can hold them and serially when it does not.
 ///
 /// `maxCallsInRequest` and `maxSizeRequest` are both hard limits
@@ -467,16 +454,12 @@ async fn open_probes<T: HttpTransport>(
     if let Some(responses) = batched_open_probes(mail).await? {
         return Ok(responses);
     }
-    let (email, mailboxes, thread) = open_probe_methods();
-    Ok((
-        mail.call(email).await?,
-        mail.call(mailboxes).await?,
-        mail.call(thread).await?,
-    ))
+    let (email, mailboxes) = open_probe_methods();
+    Ok((mail.call(email).await?, mail.call(mailboxes).await?))
 }
 
 /// The batched leg. Returns `Ok(None)` without sending anything when
-/// the advertised limits cannot hold all three calls in one request.
+/// the advertised limits cannot hold both calls in one request.
 async fn batched_open_probes<T: HttpTransport>(
     mail: &JmapMailAccount<T>,
 ) -> crate::Result<Option<OpenProbeResponses>> {
@@ -498,13 +481,13 @@ async fn batched_open_probes<T: HttpTransport>(
         .await
 }
 
-/// Read the three states needed at open. Mailbox names ride the
+/// Read the two states needed at open. Mailbox names ride the
 /// Mailbox/get already needed for its state, so both the primary and
 /// shared-account paths use exactly the same request shape.
 async fn seed_account_state<T: HttpTransport>(
     mail: &JmapMailAccount<T>,
-) -> crate::Result<(String, String, HashMap<String, String>, String)> {
-    let (email, mailboxes, thread) = open_probes(mail).await?;
+) -> crate::Result<(String, String, HashMap<String, String>)> {
+    let (email, mailboxes) = open_probes(mail).await?;
 
     let email_state = email.into_state();
     let mailbox_state = mailboxes.state().to_string();
@@ -516,12 +499,7 @@ async fn seed_account_state<T: HttpTransport>(
         }
     }
 
-    Ok((
-        email_state,
-        mailbox_state,
-        mailbox_names,
-        thread.into_state(),
-    ))
+    Ok((email_state, mailbox_state, mailbox_names))
 }
 
 async fn connect(
@@ -775,6 +753,21 @@ mod tests {
     }
 
     fn session_with_limits(max_calls_in_request: usize, max_size_request: usize) -> Session {
+        session_doc(
+            max_calls_in_request,
+            max_size_request,
+            json!({
+                "primary": {"name": "Primary", "isPersonal": true, "isReadOnly": false, "accountCapabilities": {"urn:ietf:params:jmap:mail": {}}},
+                "shared": {"name": "Shared", "isPersonal": false, "isReadOnly": false, "accountCapabilities": {"urn:ietf:params:jmap:mail": {}}}
+            }),
+        )
+    }
+
+    fn session_doc(
+        max_calls_in_request: usize,
+        max_size_request: usize,
+        accounts: Value,
+    ) -> Session {
         serde_json::from_value(json!({
             "capabilities": {
                 "urn:ietf:params:jmap:core": {
@@ -789,10 +782,7 @@ mod tests {
                 },
                 "urn:ietf:params:jmap:mail": {}
             },
-            "accounts": {
-                "primary": {"name": "Primary", "isPersonal": true, "isReadOnly": false, "accountCapabilities": {"urn:ietf:params:jmap:mail": {}}},
-                "shared": {"name": "Shared", "isPersonal": false, "isReadOnly": false, "accountCapabilities": {"urn:ietf:params:jmap:mail": {}}}
-            },
+            "accounts": accounts,
             "primaryAccounts": {"urn:ietf:params:jmap:mail": "primary"},
             "username": "user@example.test",
             "apiUrl": "https://example.test/jmap/api",
@@ -812,32 +802,26 @@ mod tests {
         json!(["Mailbox/get", {"accountId": account_id, "state": format!("mailbox-{suffix}"), "list": [{"id": format!("inbox-{suffix}"), "name": "Inbox"}], "notFound": []}, call_id])
     }
 
-    fn thread_result(account_id: &str, suffix: &str, call_id: &str) -> Value {
-        json!(["Thread/get", {"accountId": account_id, "state": format!("thread-{suffix}"), "list": [], "notFound": []}, call_id])
-    }
-
     fn method_reply(results: Vec<Value>) -> ScriptedReply {
         ScriptedReply::ok(
             json!({"sessionState": "session-1", "methodResponses": results}).to_string(),
         )
     }
 
-    /// One reply answering all three batched open probes.
+    /// One reply answering both batched open probes.
     fn open_reply(account_id: &str, suffix: &str) -> ScriptedReply {
         method_reply(vec![
             email_result(account_id, suffix, "s0"),
             mailbox_result(account_id, suffix, "s1"),
-            thread_result(account_id, suffix, "s2"),
         ])
     }
 
-    /// Three replies, one per probe, for the serial fallback. Each
+    /// Two replies, one per probe, for the serial fallback. Each
     /// single-call request numbers its one call `s0`.
-    fn serial_open_replies(account_id: &str, suffix: &str) -> [ScriptedReply; 3] {
+    fn serial_open_replies(account_id: &str, suffix: &str) -> [ScriptedReply; 2] {
         [
             method_reply(vec![email_result(account_id, suffix, "s0")]),
             method_reply(vec![mailbox_result(account_id, suffix, "s0")]),
-            method_reply(vec![thread_result(account_id, suffix, "s0")]),
         ]
     }
 
@@ -856,16 +840,58 @@ mod tests {
     }
 
     fn assert_open_batch(request: &Value, account_id: &str) {
-        assert_eq!(request["methodCalls"].as_array().map(Vec::len), Some(3));
+        assert_eq!(request["methodCalls"].as_array().map(Vec::len), Some(2));
         assert_eq!(request["methodCalls"][0][0], "Email/get");
         assert_eq!(request["methodCalls"][1][0], "Mailbox/get");
-        assert_eq!(request["methodCalls"][2][0], "Thread/get");
         for call in request["methodCalls"]
             .as_array()
             .expect("method calls array")
         {
             assert_eq!(call[1]["accountId"], account_id);
         }
+    }
+
+    /// The `reopen_discovers_foreign_namespaces` capability promises
+    /// that a share granted after the last open surfaces at the next
+    /// one. The mechanism is that foreign discovery reads only the
+    /// session document and every `open` fetches a fresh one (the
+    /// factory carries no session cache), so the predicate must track a
+    /// before/after pair of session documents - and must select only
+    /// non-personal accounts that actually advertise mail.
+    #[test]
+    fn foreign_discovery_is_session_driven_so_a_new_grant_surfaces_at_reopen() {
+        let personal_mail = json!({
+            "name": "Primary",
+            "isPersonal": true,
+            "isReadOnly": false,
+            "accountCapabilities": {"urn:ietf:params:jmap:mail": {}}
+        });
+
+        let before = session_doc(8, 100_000, json!({"primary": personal_mail.clone()}));
+        assert_eq!(
+            foreign_mail_account_ids(&before, "primary"),
+            Vec::<String>::new(),
+            "no grant yet: nothing foreign to discover"
+        );
+
+        let after = session_doc(
+            8,
+            100_000,
+            json!({
+                "primary": personal_mail,
+                // The grant that arrived between opens.
+                "delegate": {"name": "Delegate", "isPersonal": false, "isReadOnly": false, "accountCapabilities": {"urn:ietf:params:jmap:mail": {}}},
+                // Personal sibling account: never foreign.
+                "archive": {"name": "Archive", "isPersonal": true, "isReadOnly": false, "accountCapabilities": {"urn:ietf:params:jmap:mail": {}}},
+                // Non-personal but no mail capability: not a mail share.
+                "files": {"name": "Files", "isPersonal": false, "isReadOnly": true, "accountCapabilities": {"urn:ietf:params:jmap:blob": {}}}
+            }),
+        );
+        assert_eq!(
+            foreign_mail_account_ids(&after, "primary"),
+            vec!["delegate".to_string()],
+            "the new grant, and only the new grant, is discovered"
+        );
     }
 
     #[tokio::test]
@@ -915,9 +941,9 @@ mod tests {
     /// rejects wholesale - which fails a primary open and silently drops
     /// every foreign account.
     #[tokio::test]
-    async fn a_session_that_forbids_three_calls_gets_one_request_per_probe() {
+    async fn a_session_that_forbids_two_calls_gets_one_request_per_probe() {
         let client = scripted_client_with_session(
-            session_with_limits(2, 100_000),
+            session_with_limits(1, 100_000),
             serial_open_replies("primary", "p"),
         );
         let primary = client
@@ -928,15 +954,13 @@ mod tests {
 
         assert_eq!(seed.0, "email-p");
         assert_eq!(seed.1, "mailbox-p");
-        assert_eq!(seed.3, "thread-p");
         let requests = client.transport().requests();
-        assert_eq!(requests.len(), 3, "one request per probe");
+        assert_eq!(requests.len(), 2, "one request per probe");
         for request in &requests {
             assert_eq!(request["methodCalls"].as_array().map(Vec::len), Some(1));
         }
         assert_eq!(requests[0]["methodCalls"][0][0], "Email/get");
         assert_eq!(requests[1]["methodCalls"][0][0], "Mailbox/get");
-        assert_eq!(requests[2]["methodCalls"][0][0], "Thread/get");
     }
 
     /// `maxSizeRequest` is the other hard limit, and it can fall between
@@ -944,14 +968,14 @@ mod tests {
     /// alone is not enough.
     #[tokio::test]
     async fn a_size_limit_between_one_probe_and_the_batch_gets_one_request_per_probe() {
-        // Big enough for any single probe, too small for all three.
+        // Big enough for either single probe, too small for both.
         let one_probe = {
             let client = scripted_client([open_reply("primary", "p")]);
             let primary = client
                 .primary_account::<capability::Mail>()
                 .expect("primary mail account");
             let mut request = primary.build();
-            let (email, _, _) = open_probe_methods();
+            let (email, _) = open_probe_methods();
             request.call(email).expect("probe encodes");
             request.encoded_len().expect("probe encodes")
         };
@@ -967,7 +991,7 @@ mod tests {
 
         assert_eq!(seed.0, "email-p");
         let requests = client.transport().requests();
-        assert_eq!(requests.len(), 3, "one request per probe");
+        assert_eq!(requests.len(), 2, "one request per probe");
     }
 
     /// A 429 never reaches a caller as `bifrost_net::Error::Status`:

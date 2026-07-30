@@ -191,9 +191,14 @@ pub(crate) fn build(
             forwarded_via_extended_property: false,
             mdn_sent_via_keyword: true,
         },
-        // JMAP foreign accounts arrive through the session resource, a
-        // per-request surface, not an open-time namespace discovery.
-        foreign_namespaces_advertised: false,
+        // JMAP seeds foreign account scopes from the session during open
+        // and emits no foreign scope lifecycle events, so a reopen is the
+        // only way to discover a newly granted share. Unconditional: no
+        // session signal can prove a server will never grant one (the
+        // accounts list is only the current grants, and RFC 9670
+        // principals support is sufficient but not necessary evidence),
+        // and a false here tells the engine to never look.
+        reopen_discovers_foreign_namespaces: true,
     };
 
     let limits = CoreLimits {
@@ -276,6 +281,7 @@ mod tests {
         assert!(caps.conveniences.forwarded_via_keyword);
         assert!(caps.conveniences.mdn_sent_via_keyword);
         assert!(caps.pim_methods.set_importance);
+        assert!(caps.reopen_discovers_foreign_namespaces);
         assert_eq!(limits.max_objects_in_get, 256);
         assert_eq!(limits.max_objects_in_set, 700);
     }

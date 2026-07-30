@@ -119,12 +119,18 @@ for each (logging but not failing on per-account errors), then
 cancels the engine-root token. Strongly preferred over relying
 on `Drop`, which can only fire a best-effort sync cancel.
 
-`reopen` (driven by `EngineDirective::RestartAccount`) is a staged
-reattach. It opens a replacement, reapplies priority and bandwidth,
-rediscovers cursor scopes and memberships into a temporary registry,
-establishes newly-appeared scopes, removes vanished cursors, recreates
-registered push subscriptions, refreshes the capability snapshot, and
-then swaps the handle and registry topology. A generation watch wakes
+`reopen` (driven by `EngineDirective::RestartAccount`, and also public
+as `SyncEngine::reopen`) is a staged reattach. It opens a replacement,
+reapplies priority and bandwidth, rediscovers cursor scopes and
+memberships into a temporary registry, establishes newly-appeared
+scopes, removes vanished cursors, recreates registered push
+subscriptions, refreshes the capability snapshot, and then swaps the
+handle and registry topology. The public entry is what a consumer pairs
+with `capabilities().reopen_discovers_foreign_namespaces`: when that
+flag is true, a share granted after the last open surfaces only through
+this rediscovery, and the scheduling cadence (how often the reattach's
+wire cost is worth paying) is consumer policy - the engine does not
+schedule speculative reopens on its own. A generation watch wakes
 the push and lifecycle readers even when their old streams never end.
 The old subscriptions are removed through the old handle and
 `Account::close()` is called best-effort. Any failure before the swap

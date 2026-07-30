@@ -37,7 +37,11 @@ pub(crate) fn carddav_capabilities() -> AccountCapabilities {
         },
         filter_rule_shape: FilterRuleShape::None,
         conveniences: ConvenienceShape::default(),
-        foreign_namespaces_advertised: false,
+        // A share arriving in the addressbook home set is presented as
+        // an ordinary own collection; this crate models no foreign
+        // namespace, so there is nothing a rediscovery reopen could
+        // surface under that label.
+        reopen_discovers_foreign_namespaces: false,
     }
 }
 

@@ -64,52 +64,6 @@ This is a design call, not a mechanical fix.
 
 ## 2. Gaps and smells
 
-### G1 - `foreign_namespaces_advertised: false` contradicts what JMAP actually does
-
-`sync/capabilities.rs:196` sets the flag false with the comment *"JMAP foreign
-accounts arrive through the session resource, a per-request surface, not an
-open-time namespace discovery."* That is not what the code does:
-`factory.rs::foreign_mail_account_ids` reads the non-personal accounts out of
-the session **at open** and seeds their scopes there, and
-`reference/jmap.md` records that *"Foreign-account mailbox lifecycle is not
-polled ... a foreign mailbox added after `open` appears at the next reopen."*
-
-Which is precisely the flag's stated semantics
-(`types/src/capabilities.rs:372-383`): "foreign namespaces whose folder set is
-discovered ONLY at account open ... the account emits no scope-lifecycle
-events, so a share granted after open becomes visible only when the consumer
-re-opens the account." Consumers read the flag to decide whether a rediscovery
-reattach is worth its wire cost.
-
-Consequence: a JMAP share granted after open never surfaces, because the
-consumer has been told a reattach could not possibly find anything.
-
-The counter-authority is the types doc itself, which lists "JMAP session
-accounts" in the `false` bucket. Per the bug-hunt rules, contract docs win, so
-this is a **decision for the orchestrator**: either the types doc's
-parenthetical is stale and JMAP should advertise `true`, or the flag's
-semantics are narrower than its doc-comment and the JMAP comment should say
-why. Not a mechanical fix either way.
-
-### G2 - `Type(Thread)` is probed and seeded at open but never discovered, so the probe is pure cost
-
-`factory.rs` runs `probe_thread_state` for the primary account (181) and for
-**every** foreign account (`seed_foreign_account`, 431), seeds
-`CursorScope::Type(ObjectType::Thread)` (203-206), and populates
-`thread_states` per account (221, 238). But `JmapAccount::cursor_scopes`
-(`account.rs:170-196`) only ever offers `Type(Email)`, `Type(Mailbox)`, and
-the foreign `Folder` scopes. `Type(Thread)` is never discovered, so
-`changes::thread_changes` and the whole `thread_states` map are unreachable.
-
-Cost: one `Thread/get` round trip per account at every open, for state nobody
-reads. `reference/jmap.md` lists Thread under "Supported scopes for
-`inventory_stream` and `changes_stream`" without noting that discovery never
-offers it, so the doc reads as if thread changes sync.
-
-Either add `Type(Thread)` to `cursor_scopes` (and accept that its inventory
-fatals) or drop the probe, the seed, and `thread_states` and say so in the
-reference.
-
 ### G3 - Bulk mutations hand a foreign-qualified id to the primary account verbatim
 
 Known and documented (`reference/jmap.md` "Known limitations"), but the exact
@@ -127,28 +81,12 @@ Same for `pim.rs::add_to_container` / `remove_from_container` / `set_keyword` /
 `set_is_read` / `set_importance`, all of which take `self.mail` and
 `self.mail.id_str()` from `account.rs` (477-589).
 
-### G7 - `query_changes` ignores the query definition entirely
-
-`sync/changes.rs::query_changes` (307-362) builds
-`EmailQueryChanges::new(since_state)` with **no filter and no sort**. The
-`query_id` is used only to label the scope and the membership. So a
-`CursorScope::Query("unread-in-inbox")` cursor reports added/removed against
-the *unfiltered, unsorted* email query and tells the engine those are
-membership changes of "unread-in-inbox".
-
-`reference/jmap.md` says registered query definitions are out of scope for the
-v1 trait, and query *inventory* correctly fatals with exactly that reason
-(`inventory.rs:49-55`). The changes leg does not fatal - it answers with
-plausible-looking wrong data. If query scopes are out of scope, this leg
-should fatal too rather than silently mis-attributing every message in the
-account to whatever query id it was handed.
-
 ### G8 - A transient probe failure silently drops a shared account for the whole session
 
-`factory.rs:256-260`: `Err(_skip) => { /* Permission-denied or transient:
+`factory.rs:233-236`: `Err(_skip) => { /* Permission-denied or transient:
 skip */ }`. The comment is accurate about intent but the two cases are not
 equivalent. A permission-denied probe means the share is gone and skipping is
-right. A 503 or a connection reset on one of the four probes means the share
+right. A 503 or a connection reset on one of the two probes means the share
 is fine and the user's shared mailbox vanishes from `containers_list`, from
 `cursor_scopes`, and from `send_as` routing until the account is reopened -
 with no warning anywhere, because `open` returns `Ok`. Classifying through
@@ -177,7 +115,3 @@ fixed. Whoever wires EventSource must route the non-2xx leg through
 real SSE failure arrives with no status, no body, and no recovery signal.
 
 ---
-
-## 3. Doc contradictions found
-
-1. `sync/capabilities.rs:194-196` - the comment claims JMAP foreign accounts are not open-time discovery. They are. See G1.

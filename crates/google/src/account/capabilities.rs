@@ -104,7 +104,10 @@ pub(crate) fn gmail_capabilities() -> AccountCapabilities {
             // Gmail's read-receipt model is read-only.
             mdn_sent_via_keyword: false,
         },
-        foreign_namespaces_advertised: false,
+        // Gmail delegation rides separate authorization, not open-time
+        // discovery: a reopen of this account can never surface another
+        // user's mailbox.
+        reopen_discovers_foreign_namespaces: false,
     }
 }
 

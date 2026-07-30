@@ -477,6 +477,19 @@ blocking; each is a real defect or a real decision, not a cleanup.
   API commitment. Related: `jmap-O2`, the jmap sync layer hardwiring
   `ReqwestTransport`, which is the same testability problem one crate over.
 
+- **xc-4 (sync, maybe app)** Nothing schedules share-rediscovery reopens
+  automatically. `AccountCapabilities::reopen_discovers_foreign_namespaces`
+  (adjudicated during the jmap round: it means reopen-time discovery
+  POTENTIAL - IMAP derives it from NAMESPACE, JMAP is constitutively true)
+  tells a consumer that a share granted after open surfaces only through a
+  reopen, and `SyncEngine::reopen` is the public staged-reattach entry that
+  performs the rediscovery - but no component ever calls it on a cadence.
+  The ruling for now is that cadence is consumer policy (nightly, on
+  opening the folder list, on user action), so ratatoskr must drive it.
+  The open question is whether `bifrost-sync` should grow an optional
+  rediscovery interval (`EngineConfig`) that calls `reopen` for accounts
+  advertising the flag, so every consumer does not reimplement the timer.
+
   UPDATE (commit 6829767): the EWS half is solved Graph-locally. Every EWS
   request goes through one funnel, `EwsClient::execute`, so a crate-private
   `EwsExecute` trait plus a scripted in-crate double made the whole streaming

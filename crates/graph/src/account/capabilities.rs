@@ -110,7 +110,7 @@ pub(crate) fn build_capabilities(push_mode: PushMode) -> AccountCapabilities {
         // Graph's foreign surfaces (delegate mailboxes, public-folder
         // pins) are configuration-driven, not open-time namespace
         // discovery, so a consumer-side rediscovery reattach buys nothing.
-        foreign_namespaces_advertised: false,
+        reopen_discovers_foreign_namespaces: false,
     }
 }
 

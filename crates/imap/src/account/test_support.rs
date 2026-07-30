@@ -111,7 +111,7 @@ pub(crate) fn stub_capabilities() -> AccountCapabilities {
         pim_methods: PimMethodSupport::default(),
         filter_rule_shape: FilterRuleShape::None,
         conveniences: ConvenienceShape::default(),
-        foreign_namespaces_advertised: false,
+        reopen_discovers_foreign_namespaces: false,
     }
 }
 

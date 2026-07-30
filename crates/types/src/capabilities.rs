@@ -369,18 +369,36 @@ pub struct AccountCapabilities {
     /// convenience layer pick the right primitive without matching
     /// on `ProtocolKind`.
     pub conveniences: ConvenienceShape,
-    /// True iff the server advertises foreign (other-user / shared)
-    /// namespaces whose folder set is discovered ONLY at account open.
-    /// IMAP sets this from the open-time NAMESPACE response: the account
-    /// emits no scope-lifecycle events, so a share granted after open
-    /// becomes visible only when the consumer re-opens the account.
-    /// Consumers use this flag to decide whether such a rediscovery
-    /// reattach is ever worth its wire cost; on a personal-only server
-    /// (`false`) a grant can never surface and the reattach is pure
-    /// waste. `false` on every other provider: their foreign surfaces
-    /// (Graph delegates / public-folder pins, JMAP session accounts)
-    /// are configuration-driven, not open-time wire discovery.
-    pub foreign_namespaces_advertised: bool,
+    /// True iff re-opening the account can discover foreign
+    /// (other-user / shared) namespaces that were not visible at the
+    /// last open. This is discovery POTENTIAL, not current membership:
+    /// an account with zero shares today still reports `true` when a
+    /// grant made after open would surface at the next open. Three
+    /// conditions gate it:
+    ///
+    /// - the account discovers its foreign surface from the wire at
+    ///   open (IMAP NAMESPACE walk, the JMAP session's non-personal
+    ///   accounts), and
+    /// - it emits no foreign scope-lifecycle events mid-session, so a
+    ///   reopen is the only door a new grant can walk through, and
+    /// - no provider signal rules foreign namespaces out.
+    ///
+    /// IMAP has such a signal and refines with it: a personal-only
+    /// NAMESPACE response means a grant can never surface, so the flag
+    /// is `false` there and a rediscovery reattach is pure waste. JMAP
+    /// has no "never" signal - any RFC 8620 session can list a foreign
+    /// account tomorrow (RFC 9670 principals support is evidence for
+    /// sharing, but its absence proves nothing) - so JMAP is
+    /// constitutively `true`. `false` on providers whose foreign
+    /// surfaces are configuration-driven rather than discovered while
+    /// opening the account (Graph delegates / public-folder pins,
+    /// Gmail delegation behind separate authorization, DAV home sets).
+    ///
+    /// Consumers act on `true` by scheduling a full reopen/reattach
+    /// (`bifrost-sync` exposes `SyncEngine::reopen`, whose staged
+    /// rediscovery establishes newly-appeared scopes); the cadence is
+    /// consumer policy, weighed against the reattach's wire cost.
+    pub reopen_discovers_foreign_namespaces: bool,
 }
 
 impl AccountCapabilities {
