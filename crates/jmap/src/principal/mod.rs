@@ -254,8 +254,6 @@ pub(crate) enum Property {
     Members = 12,
     #[serde(rename = "accounts")]
     Accounts = 13,
-    #[serde(rename = "shareWith")]
-    ShareWith = 14,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Copy)]
@@ -349,7 +347,6 @@ impl Display for Property {
             Property::Picture => write!(f, "picture"),
             Property::Members => write!(f, "members"),
             Property::Accounts => write!(f, "accounts"),
-            Property::ShareWith => write!(f, "shareWith"),
         }
     }
 }

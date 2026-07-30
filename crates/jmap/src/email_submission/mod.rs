@@ -124,6 +124,10 @@ pub(crate) struct Envelope {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct Address {
     pub(super) email: String,
+    // RFC 8621 s7 types this `String[String|null]|null` - a nullable
+    // member, not an optional one, and RFC 8620 s5.3 only lets a create
+    // omit a property that has a defined default. Keep emitting the
+    // explicit `null` so strict servers accept the envelope.
     pub(super) parameters: Option<HashMap<String, Option<String>>>,
 }
 

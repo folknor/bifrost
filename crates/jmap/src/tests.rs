@@ -423,6 +423,13 @@ mod query_filter_serialization {
         assert_eq!(value, json!({"inAddressBook": "ab-123"}));
     }
 
+    #[test]
+    fn contact_card_nickname_filter() {
+        let filter = CCFilter::nickname("Al");
+        let value = serde_json::to_value(&filter).unwrap();
+        assert_eq!(value, json!({"nickname": "Al"}));
+    }
+
     // -- CalendarEvent filters: inCalendar (singular) vs inCalendars (plural) --
 
     #[test]
@@ -1470,6 +1477,12 @@ mod email_header_property_grammar {
     }
 
     #[test]
+    fn header_format_width_applies_to_the_whole_property() {
+        let header = Header::as_raw("Subject", false);
+        assert_eq!(format!("{header:>20}"), "      header:Subject");
+    }
+
+    #[test]
     fn property_serde_covers_named_and_header_and_vendor_forms() {
         for (prop, wire) in [
             (Property::Id, "id"),
@@ -2129,10 +2142,12 @@ mod email_submission_wire {
             json!({"email": "me@example.com", "parameters": {"body": null}})
         );
 
-        // With no parameters at all the key is still emitted as null
-        // (`parameters` has no `skip_serializing_if`). RFC 8621 s7.1
-        // types it `String[String|null]|null`, so this is legal, just
-        // noisier than it needs to be.
+        // With no parameters at all the key is still emitted, as an
+        // explicit null. RFC 8621 s7 types `parameters` as
+        // `String[String|null]|null`: a nullable member, not an optional
+        // one, and RFC 8620 s5.3 only permits omitting a create property
+        // that has a defined default. Omitting it is therefore a
+        // rejection risk on strict servers, so the null must be PRESENT.
         assert_eq!(
             serde_json::to_value(Address::new("me@example.com")).unwrap(),
             json!({"email": "me@example.com", "parameters": null})
@@ -2808,6 +2823,10 @@ mod url_template_parsing {
         assert!(URLPart::<P>::parse("https://x/a}").is_err());
         // Unknown parameter name.
         assert!(URLPart::<P>::parse("https://x/{zzz}").is_err());
+        // An unterminated empty parameter.
+        assert!(URLPart::<P>::parse("https://x/{").is_err());
+        // A nested opening brace is not part of a parameter name.
+        assert!(URLPart::<P>::parse("https://x/{{a}").is_err());
     }
 
     #[test]
@@ -3242,13 +3261,17 @@ mod misc_mail_object_decode {
     use super::*;
 
     #[test]
-    fn thread_requires_both_properties() {
+    fn thread_partial_projections_decode() {
         let thread: crate::thread::Thread =
             serde_json::from_str(r#"{"id":"t1","emailIds":["e1","e2"]}"#).expect("thread decodes");
-        assert_eq!(thread.email_ids().len(), 2);
+        assert_eq!(thread.email_ids().expect("emailIds requested").len(), 2);
 
-        // Neither field is optional, so a partial `Thread/get`
-        // projection fails the decode outright.
+        let partial: crate::thread::Thread =
+            serde_json::from_str(r#"{"id":"t1"}"#).expect("partial projection decodes");
+        assert!(partial.email_ids().is_none());
+
+        // JMAP always includes an object's id in a /get response, even
+        // when the requested projection excludes it.
         assert!(serde_json::from_str::<crate::thread::Thread>(r#"{"emailIds":["e1"]}"#).is_err());
     }
 
@@ -3315,6 +3338,38 @@ mod push_subscription_wire {
 // ---------------------------------------------------------------------------
 // Principal ACL vocabulary (RFC 8621 s2 shareWith)
 // ---------------------------------------------------------------------------
+
+mod principal_property_wire_names {
+    use super::*;
+    use crate::principal::Property;
+
+    #[test]
+    fn property_display_and_serde_match_rfc_9670() {
+        for (property, wire) in [
+            (Property::Id, "id"),
+            (Property::Type, "type"),
+            (Property::Name, "name"),
+            (Property::Description, "description"),
+            (Property::Email, "email"),
+            (Property::Timezone, "timezone"),
+            (Property::Capabilities, "capabilities"),
+            (Property::Aliases, "aliases"),
+            (Property::Secret, "secret"),
+            (Property::DKIM, "dkim"),
+            (Property::Quota, "quota"),
+            (Property::Picture, "picture"),
+            (Property::Members, "members"),
+            (Property::Accounts, "accounts"),
+        ] {
+            assert_eq!(property.to_string(), wire);
+            assert_eq!(serde_json::to_value(property).unwrap(), json!(wire));
+            assert_eq!(
+                serde_json::from_value::<Property>(json!(wire)).unwrap(),
+                property
+            );
+        }
+    }
+}
 
 mod principal_acl_vocabulary {
     use super::*;

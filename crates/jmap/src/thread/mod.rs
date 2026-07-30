@@ -13,8 +13,8 @@ pub(crate) type ThreadId = crate::core::id::Id<marker::Thread>;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct Thread {
     id: ThreadId,
-    #[serde(rename = "emailIds")]
-    email_ids: Vec<crate::email::EmailId>,
+    #[serde(rename = "emailIds", default, skip_serializing_if = "Option::is_none")]
+    email_ids: Option<Vec<crate::email::EmailId>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Copy)]

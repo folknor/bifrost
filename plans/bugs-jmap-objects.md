@@ -16,90 +16,6 @@ Tests landed in this pass are listed at the end.
 
 ---
 
-## S8 (SMELL) - two residual SSE-parser deviations from the WHATWG rules
-
-**Where:** `crates/jmap/src/event_source/parser.rs`.
-
-The substantive deviations are closed: an oversized field or an oversized
-accumulated `data` buffer now errors once and resynchronises on the next
-blank line; `push_bytes` appends to an unconsumed buffer instead of
-clobbering it at a stale offset; a repeated `id` line replaces rather
-than appends; the last-event-ID buffer persists across events and a
-colonless `id` line clears it; and a block with no `data` field (a
-comment-only keepalive) dispatches nothing at all.
-
-**RESOLVED (round 4 adjudication).** Both residual deviations are fixed:
-`Init` now treats a leading space as the first character of a field name
-(pinned in `a_leading_space_starts_a_field_name`), and a comment line is
-capped at `MAX_EVENT_SIZE` via a skip counter, erroring once and
-resynchronising like the other caps (pinned in
-`an_unbounded_comment_errors_once_and_resynchronises` and
-`bounded_comments_pass_and_reset_the_counter`). The fix rode on the S9
-ruling: with the module retained as supported API, "only matters if the
-path lives" stopped being a reason to leave them.
-
----
-
-## S9 (SMELL, wire-or-remove decision) - the EventSource path has no caller
-
-**Where:** `crates/jmap/src/event_source/` and its `Client::event_source()`
-entry point.
-
-Surfaced by the round-2 fix-and-commit agent: `event_source()` has no
-caller anywhere in the workspace. `sync/` push is WebSocket-only
-(`reference/jmap.md` documents this), so the whole EventSource stack -
-now spec-correct after the round-2 SSE fixes - is dead code from the
-`Account` impl's point of view. The round-2 fixes are latent-correctness
-for a path nothing reaches, and the Last-Event-ID resume semantics have
-no live reconnect path to serve.
-
-**RESOLVED (round 4 adjudication): keep, as supported public API.**
-Wire-or-remove was a false dichotomy: `Client::event_source()` is public
-surface of a client library implementing eventSourceUrl, a mandatory RFC
-8620 session property, while the `sync/` WebSocket path rides an
-extension (RFC 8887) a server may not offer. "No caller in this
-workspace" is not dead code for a library crate. Removing it would strip
-the only push mechanism usable against non-8887 servers; wiring it into
-`sync/push.rs` is feature-sized work in territory this document excludes
-and `bugs-jmap-core-sync.md` just settled, so it is filed as its own
-item in `plans/jmap/DEFERRED.md` ("EventSource as the sync-layer push
-fallback") with the retention decision recorded in `reference/jmap.md`.
-Enforcement, per the ledger rule: S8's residual deviations were fixed
-and pinned in the same commit, so the retained path carries zero known
-spec deviations and its behavior is held by tests, not by a doc note.
-
----
-
-## N1..N6 (NITs)
-
-- **N1** `Address.parameters` (`email_submission/mod.rs:127`) has no
-  `skip_serializing_if`, so every envelope address serialises
-  `"parameters": null`. Legal per RFC 8621 §7.1, just noise on every
-  submission. Pinned in `email_submission_wire::envelope_address_parameters`.
-- **N2** `Thread` (`thread/mod.rs:14-18`) requires both `id` and
-  `emailIds`; a `Thread/get` with a partial `properties` projection fails
-  the decode. Nothing does that today. Pinned in
-  `misc_mail_object_decode::thread_requires_both_properties`.
-- **N3** `principal::Property::ShareWith = 14` - `Principal` has no
-  `shareWith` property in RFC 9670 (it has `accounts`); the variant looks
-  copy-pasted from `Mailbox::Property`.
-- **N4** `contact_card::query::Filter::Nickname` serialises as
-  `"nickname"`. I believe RFC 9610 §2.3.1 spells the filter condition
-  `nickName` (matching the JSContact `nicknames` property), but I could
-  not verify the RFC text offline. Worth one grep of the spec - it is a
-  one-character fix if I am right and a silently-ignored filter if I am
-  not. Deliberately **not** pinned by a test, since I would be pinning a
-  guess.
-- **N5** `URLPart::parse` accepts `"{{a}"` (a second `{` while already in
-  a parameter is silently swallowed). Malformed input that decodes
-  anyway.
-- **N6** `Display for Header` (`email/mod.rs:652-659`) forwards the
-  formatter to `self.name.fmt(f)`, so a `{:>20}` on a `Header` pads the
-  name rather than the whole token. Cosmetic; `Header` is only ever
-  `to_string()`d.
-
----
-
 ## Tests landed
 
 All in files this pass owns. Every test pins behaviour **as it exists
@@ -214,6 +130,49 @@ review turned up):
 
 ---
 
+Round 4 additions (the closing pass). No open findings remain in this
+document.
+
+- `crates/jmap/src/tests.rs::email_header_property_grammar::header_format_width_applies_to_the_whole_property`
+  - `Display for email::Header` wrote its pieces straight to the
+    formatter, so any width/alignment spec applied to the first fragment
+    only. It now renders once and goes through `Formatter::pad`.
+- `crates/jmap/src/tests.rs::url_template_parsing` - `URLPart::parse`
+  accepted an unterminated `{` and a nested `{{a}` as a parameter name;
+  both are now `InvalidUrl`.
+- `crates/jmap/src/tests.rs::misc_mail_object_decode::thread_partial_projections_decode`
+  and `crates/jmap/src/sync/pim.rs` - `Thread.emailIds` is now optional
+  (a `/get` projection may omit it); `id` stays mandatory, since JMAP
+  always returns it. Both sync readers reject a response that omits an
+  emailIds it explicitly requested rather than reading it as an empty
+  thread.
+- `crates/jmap/src/tests.rs::principal_property_wire_names` - the
+  principal `Property` enum carried a `ShareWith` variant that RFC 9670
+  does not define as a Principal property; requesting it is an
+  `invalidArguments`. Removed, and the surviving set pinned.
+- **`Address.parameters` is NOT a bug.** A fix pass added
+  `skip_serializing_if` to drop the `"parameters": null` from envelope
+  addresses. That is wrong: RFC 8621 s7 types the member
+  `String[String|null]|null` (nullable, not optional) and RFC 8620 s5.3
+  only permits omitting a create property with a defined default, so the
+  omission risks rejection of every ordinary and scheduled submission.
+  Reverted; `email_submission_wire::envelope_address_parameters` now
+  asserts the null is PRESENT and says why.
+- **The `ContactCard/query` `nickname` condition is NOT a bug.** RFC 9610
+  really does name the filter condition `nickname` (singular) against the
+  plural `nickNames` property. Pinned by
+  `query_filter_serialization::contact_card_nickname_filter`.
+- `crates/jmap/src/sync/factory.rs::a_missing_thread_fails_under_the_mutation_operation_not_hydration`
+  - `resolve_target` labelled a missing `Thread/get` result
+  `HydrateThread` regardless of the mutation actually running, handing
+  the engine an operation it never issued (and the recovery derived from
+  it). Now labelled with the caller's operation. Found while working
+  this document; `sync/` belongs to the closed
+  `plans/bugs-jmap-core-sync.md`, and the fix is a diagnostic label only,
+  so it landed here rather than reopening that ledger.
+
+---
+
 ## Not done, and why
 
 - **`client_ws.rs` frame handling beyond the subprotocol check.** The
@@ -229,9 +188,6 @@ review turned up):
   the ones now pinned in `email_query_wire` and `tests.rs`'s existing
   `query_filter_serialization`, and I judged a second copy of the same
   table lower value than the findings above.
-- **N4 (`nickName` vs `nickname`).** Needs the RFC 9610 text, which I do
-  not have offline. Flagged, not pinned - pinning a guess is worse than
-  leaving it open.
 - **The `Email::size()` / `has_attachment()` / `EmailBodyPart::size()`
   sentinel collapse.** Already tracked as an open decision in
   `plans/jmap/DEFERRED.md` and `plans/jmap/API.md`; not re-litigated here.

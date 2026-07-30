@@ -1123,7 +1123,14 @@ pub(crate) fn thread_hydrate<T: HttpTransport>(
                 ),
             )
         })?;
-        let order = thread_object.email_ids().to_vec();
+        let order = thread_object
+            .email_ids()
+            .ok_or_else(|| {
+                to_acct_err(AccountOperation::HydrateThread)(crate::Error::NotParsable(
+                    "Thread/get response omitted requested emailIds".to_string(),
+                ))
+            })?
+            .to_vec();
         if order.is_empty() {
             return Ok(ThreadHydration {
                 id: thread,
@@ -1413,15 +1420,27 @@ async fn resolve_target<T: HttpTransport>(
                 .await
                 .map_err(to_acct_err(op))?;
             let thread = response.pop().ok_or_else(|| {
+                // The operation is the MUTATION being performed, not
+                // `HydrateThread`: the thread lookup here only expands a
+                // mutation target, and mislabelling it sends the caller a
+                // hydration failure for an operation it never issued.
                 super::error::into_account_error(
                     crate::Error::IdNotFound(thread.0.clone()),
-                    super::error::JmapErrorContext::new(AccountOperation::HydrateThread)
-                        .with_scope(bifrost_types::ErrorScope::Thread {
+                    super::error::JmapErrorContext::new(op).with_scope(
+                        bifrost_types::ErrorScope::Thread {
                             id: thread.0.clone(),
-                        }),
+                        },
+                    ),
                 )
             })?;
-            Ok(thread.email_ids().to_vec())
+            thread
+                .email_ids()
+                .ok_or_else(|| {
+                    to_acct_err(op)(crate::Error::NotParsable(
+                        "Thread/get response omitted requested emailIds".to_string(),
+                    ))
+                })
+                .map(ToOwned::to_owned)
         }
         _ => Err(super::error::unsupported_error(
             op,

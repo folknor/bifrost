@@ -1251,6 +1251,38 @@ mod tests {
         assert!(call[1]["update"].get(&foreign_id.0).is_none());
     }
 
+    /// A thread target is expanded by a `Thread/get` before the mutation
+    /// runs. When that lookup comes back empty the failure still belongs
+    /// to the operation the caller asked for - the expansion is an
+    /// implementation detail, and reporting `HydrateThread` hands the sync
+    /// engine an operation it never issued (and the recovery derived for
+    /// it).
+    #[tokio::test]
+    async fn a_missing_thread_fails_under_the_mutation_operation_not_hydration() {
+        let client = scripted_client([method_reply(vec![json!([
+            "Thread/get",
+            {"accountId": "primary", "state": "t-1", "list": [], "notFound": ["T9"]},
+            "s0"
+        ])])]);
+        let primary = JmapMailAccount::new(client.clone(), JmapAccountId::new("primary"));
+
+        let error = crate::sync::pim::set_keyword(
+            primary,
+            state_map(&[("primary", "primary-state")]),
+            "primary".to_string(),
+            MutationTarget::Thread(bifrost_types::ThreadId("T9".to_string())),
+            "$seen".to_string(),
+            true,
+        )
+        .await
+        .expect_err("a thread the server does not know cannot be expanded");
+
+        assert_eq!(
+            error.operation(),
+            Some(bifrost_types::AccountOperation::SetKeyword)
+        );
+    }
+
     #[tokio::test]
     async fn foreign_single_message_keyword_uses_native_id_on_its_selected_account() {
         let client = scripted_client([email_set_reply(

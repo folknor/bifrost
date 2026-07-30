@@ -327,7 +327,7 @@ locally-rejected targets emits them without probing Email state.
 
 ### PIM primitives and conveniences
 
-`pim.rs` is the Stage 1 unified mail surface. Message/thread mutation resolves `MutationTarget::Thread` via `Thread/get`, then `Email/set` patches against `mailboxIds`/`keywords`/`$seen`, guarded by the cached `Email` state with one `stateMismatch` retry. Gmail labels, Graph categories/extended properties return `Unsupported`.
+`pim.rs` is the Stage 1 unified mail surface. Message/thread mutation resolves `MutationTarget::Thread` via `Thread/get`, then `Email/set` patches against `mailboxIds`/`keywords`/`$seen`, guarded by the cached `Email` state with one `stateMismatch` retry. Gmail labels, Graph categories/extended properties return `Unsupported`. `Thread.emailIds` decodes as optional, because a `/get` may project it away; both readers (`thread_hydrate` and the mutation-target expansion) reject a response that omits an explicitly requested `emailIds` rather than treating it as an empty thread. That expansion failure is reported under the MUTATION's `AccountOperation`, not `HydrateThread` - the thread lookup is an implementation detail of the mutation, and the operation drives the recovery class the engine derives.
 
 `patch_mailbox_membership` (`add_to_container` / `remove_from_container`, and
 the two legs of `move_thread` / `delete_thread`) applies the same owner check

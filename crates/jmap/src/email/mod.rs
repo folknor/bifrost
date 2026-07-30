@@ -685,10 +685,11 @@ impl Header {
 
 impl Display for Header {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "header:")?;
-        self.name.fmt(f)?;
-        self.form.fmt(f)?;
-        if self.all { write!(f, ":all") } else { Ok(()) }
+        let mut value = format!("header:{}{}", self.name, self.form);
+        if self.all {
+            value.push_str(":all");
+        }
+        f.pad(&value)
     }
 }
 
