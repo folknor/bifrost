@@ -130,13 +130,15 @@ impl SendProgress {
         }
     }
 
-    /// Mark every not-yet-decided recipient as `Unsent`, preserving RCPT
-    /// replies the peer already gave.
+    /// Mark every still-open recipient as `Unsent`, preserving RCPT
+    /// rejections the peer already gave.
     ///
     /// Used for envelope-phase transport failures: `DATA` has not been issued,
     /// so no message content can have reached the peer and `Uncertain` would
-    /// be false evidence. Recipients the server already accepted or rejected
-    /// keep that answer; everything still open becomes a retryable failure.
+    /// be false evidence. Rejections keep the server's answer. `Accepted` is
+    /// rewritten along with `Pending`: with `DATA` never issued, an accepted
+    /// RCPT would otherwise resolve as a delivery that never happened, so it
+    /// too becomes a retryable `Unsent` failure.
     pub(crate) fn mark_unresolved_unsent(&mut self, error_factory: impl Fn() -> AccountError) {
         for rec in &mut self.recipients {
             if matches!(rec.rcpt, RcptProgress::Accepted | RcptProgress::Pending) {

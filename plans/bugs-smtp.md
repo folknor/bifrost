@@ -60,7 +60,9 @@ than parking it.
 
 The trade is one reconnect per LMTP transaction. LMTP is local delivery, so the
 reconnect is cheap relative to recycling a stream that may be off by one reply
-forever. SMTP pooling is untouched.
+forever. SMTP pooling is untouched. A consequence, now documented on
+`PoolConfig::test_on_checkout`: the checkout-probe opt-out buys nothing for
+LMTP, since retired connections never sit idle to be probed.
 
 ### D11 - Envelope transport failures before DATA are `Unsent`
 
@@ -73,9 +75,10 @@ through `SendProgress::mark_unresolved_unsent`. `DATA` and later retain their
 
 ## Test seam and audit gaps
 
-- Batch resolver unit tests do not drive the complete sync and async send
-  paths. The repaired RCPT-option validation needs this harness for broader
-  sequencing coverage.
+- Transcript tests now drive `send_smtp_batch` / `send_lmtp_batch` at the
+  connection level on both drivers, but the transport-level batch entry
+  points (`send_raw_batch_with_options` through the pool) remain undriven,
+  as does broader RCPT-option sequencing coverage.
 - The `Transcript` harness models a peer that answers or a peer that goes
   silent, but not a peer that half-answers a reply line, closes mid-response,
   or interleaves writes with pending replies (which a real full-duplex socket

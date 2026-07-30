@@ -54,6 +54,10 @@ impl PoolConfig {
     /// Defaults to `true`. Set this to `false` to avoid the checkout round
     /// trip when the caller is willing to retry a send on a server-closed idle
     /// connection. Connections already marked broken are always discarded.
+    ///
+    /// This buys nothing for LMTP transports: every LMTP delivery retires its
+    /// connection at recycle, so each transaction starts on a fresh
+    /// connection that is never probed anyway.
     pub fn test_on_checkout(mut self, test_on_checkout: bool) -> Self {
         self.test_on_checkout = test_on_checkout;
         self
