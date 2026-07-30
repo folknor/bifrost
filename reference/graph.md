@@ -262,6 +262,17 @@ Autodiscover lookups), constructs a `GraphAccount`, and runs
   tree nodes and never a scan: the write lock is taken once per hydrated page
   and once per mutation preflight, where a scanning policy would cost
   `messages * capacity` comparisons serialized behind it. Alongside it a
+  per-mailbox `trash_folder_ids` cache resolves `deletedItems` once per
+  opened account (primary key empty, shared key its routing key); a reopen
+  creates a fresh cache. This avoids re-listing all well-known folders for
+  every `delete_thread` while retaining owner-correct routing. ONLY a
+  resolved folder id is cached, and a failed lookup propagates instead of
+  degrading to the well-known name `deletedItems`: that literal is a valid
+  move destination but not the id `container_is_trash` compares against, so
+  answering with it turns "destroy a thread already in Trash" into a
+  no-op move that reports success - and caching it made one transient
+  failure do that for the rest of the account's life. Alongside it
+  is a
   `routing_map: Arc<RwLock<HashMap<FolderId,
   PublicFolderRouting>>>` from public-folder discovery, plus
   `public_folders_enabled` and the discovered `user_email`.
@@ -517,8 +528,8 @@ Foreign}` decodes it. `message_values_for_thread` selects
 `/users/{owner}/messages?$filter=conversationId eq ...`, and the member ids
 they hand back are re-qualified with that owner so the following `$batch`
 subrequest stays in the same mailbox. `delete_thread` scopes the WHOLE
-operation, not just the lookup: Trash is resolved through the owner's own
-well-known folders (a shared mailbox's `deletedItems` id is not the
+operation, not just the lookup: Trash is resolved and cached through the
+owner's own `deletedItems` endpoint (a shared mailbox's id is not the
 primary's) and returned owner-qualified, and the already-in-Trash
 short-circuit compares in that namespace - a bare `deletedItems` is the
 PRIMARY mailbox's Trash and must not send a shared thread down the destroy
@@ -887,12 +898,24 @@ the mailbox; `OnBehalfOf` keeps `from` = mailbox (honoring an explicit
 `from`), `sender` = `user_email` (omitted when `None`). An unconfigured
 mailbox is `Request(Malformed)`.
 
-Search uses `/messages` (`$filter`/`$search`/`$top`, `@odata.nextLink` as
-the opaque page cursor); message search returns native ids, thread search
-dedups `conversationId` per page. It is PRIMARY-mailbox only - the URL is
-built off `account.client` unconditionally - which is why its message and
-thread ids are minted bare while every other projection qualifies them: a
-shared mailbox is never searched, so there is no owner to carry. Graph forbids `$search`+`$filter` together and
+Search uses `/messages` (`$filter`/`$search`/`$top`). It walks the primary
+mailbox first, then configured shared mailboxes in sorted routing-key
+order. Its opaque cursor (`SearchCursor`, `bifrost-graph-search-v1:` +
+JSON) carries the current mailbox owner, that mailbox's Graph
+`@odata.nextLink`, and the sorted shared-mailbox set the cursor was minted
+against. The set is load-bearing, not decoration: the cursor is a position
+in a WALK, so resuming it against a different set silently skips a mailbox
+that now sorts before the position, or ends the walk early. A version
+mismatch, a decode failure, or a set mismatch is therefore REJECTED as
+`Request(Malformed)` (`ClientBug` -> `FixClientRequest`) and the caller
+re-searches from page one; a search cursor holds no durable state, so a
+reject costs one round trip and nothing else. There is deliberately no
+compatibility arm for a bare Graph nextLink - unrecognized cursor bytes are
+never re-issued as a URL. Cursor bytes are request input, so none of these
+rejections is a `Protocol(...)` classification.
+Message and thread ids from shared mailboxes are owner-qualified, while
+primary ids remain bare; thread search dedups `conversationId` within each
+page. Graph forbids `$search`+`$filter` together and
 rejects `$filter` `contains()` on sender/recipient (400), so any
 `SearchFilter::{From,To}` leaf (`filter_requires_search`) routes the whole
 filter onto `$search`/KQL (`kql_filter`), AND-combining any `provider_query`;
@@ -971,9 +994,10 @@ message shape reports neither).
 
 `move_thread` calls Graph move directly (the destination is the container id
 the consumer already holds, which is owner-qualified for a shared folder).
-`delete_thread` resolves Trash via `deletedItems` IN THE THREAD'S OWN MAILBOX
-(Trash source destroys, else moves to Trash); see the foreign-mailbox section
-for why both halves of that operation are owner-scoped.
+`delete_thread` resolves and caches Trash via `deletedItems` IN THE THREAD'S
+OWN MAILBOX (Trash source destroys, else moves to Trash), and fails rather
+than guessing when that lookup does not resolve; see the foreign-mailbox
+section for why both halves of that operation are owner-scoped.
 `apply_label`/`remove_label` inherit the trait default (Graph provenance ->
 `set_category`, `(Folder, non-Graph)` ->
 `add_to_container`/`remove_from_container`, else `Unsupported`).

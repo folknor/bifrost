@@ -11,7 +11,7 @@ use bifrost_types::{
     Warning, WarningKind,
 };
 use chrono::TimeZone;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::types::{
@@ -1936,52 +1936,170 @@ struct SearchRow {
     thread_id: Option<ThreadId>,
 }
 
+const SEARCH_CURSOR_PREFIX: &str = "bifrost-graph-search-v1:";
+
+/// Graph's `nextLink` is only meaningful in the mailbox that minted it.
+/// Wrap it with that mailbox so one `Page` cursor can walk the primary and
+/// every configured shared mailbox in deterministic order.
+///
+/// The cursor also carries the shared-mailbox set it was minted against.
+/// A search cursor is a POSITION IN A WALK, not a position in one result
+/// set: `owner` says which mailbox to resume and `next_search_owner` says
+/// which mailbox follows it, and both answers are only meaningful relative
+/// to the mailbox list that produced them. Resuming a cursor against a
+/// different list silently skips a mailbox added before the current
+/// position, or hands the remainder of the walk to mailboxes the caller
+/// never asked about - a wrong answer that reports success. So the set is
+/// pinned in the cursor and a mismatch is rejected, which costs the caller
+/// a restart from page one and nothing else (unlike a sync cursor, a
+/// search cursor holds no durable state). The version prefix covers the
+/// same ground for a cursor whose SHAPE predates this encoding.
+#[derive(Debug, Serialize, Deserialize)]
+struct SearchCursor {
+    /// Sorted routing keys of every shared mailbox configured when this
+    /// cursor was minted, primary excluded (it is always walked first).
+    mailboxes: Vec<String>,
+    owner: Option<String>,
+    next_link: Option<String>,
+}
+
 async fn search_message_rows(
     account: &GraphAccount,
     request: SearchRequest,
 ) -> Result<Page<SearchRow>, AccountError> {
-    let url = search_url(&account.client.api_path_prefix(), &request)?;
+    let cursor = decode_search_cursor(account, request.page_cursor.as_deref())?;
+    let owner = cursor
+        .as_ref()
+        .and_then(|cursor| cursor.owner.as_deref())
+        .map(str::to_string);
+    let client = account
+        .client_for_owner(owner.as_deref())
+        .map_err(|error| {
+            into_account_error(error, GraphErrorContext::graph(AccountOperation::Search))
+        })?;
+    let url = match cursor.and_then(|cursor| cursor.next_link) {
+        Some(next_link) => next_link,
+        // No `next_link` means "start this mailbox at its first page":
+        // either the whole search, or the mailbox after one whose own
+        // pagination ran out.
+        None => search_url(&client.api_path_prefix(), &request)?,
+    };
     let ctx = GraphErrorContext::graph(AccountOperation::Search);
     let page: ODataCollection<Value> = if url.starts_with("http") {
-        account.client.get_absolute(&url).await
+        client.get_absolute(&url).await
     } else {
-        account.client.get_json(&url).await
+        client.get_json(&url).await
     }
     .map_err(|e| into_account_error(e, ctx))?;
     let mut rows = Vec::new();
     for value in page.value {
-        // Owner is `None` on purpose, not by omission: the URL above is
-        // built off `account.client` unconditionally, so every hit came
-        // from the PRIMARY mailbox and its message / conversation ids are
-        // primary ids. Qualifying them with an owner would name a mailbox
-        // the search never queried. Searching a shared mailbox is not
-        // supported at all (see `reference/graph.md`); when it is, the
-        // owner has to be threaded from the searched prefix to here.
         let id = object_id_from_value(&value, AccountOperation::Search, None)?;
+        let id = ObjectId(super::foreign::qualify_with_owner(owner.as_deref(), &id.0));
         let thread_id = value
             .get("conversationId")
             .and_then(Value::as_str)
-            .map(|id| ThreadId(id.to_string()));
+            .map(|id| ThreadId(super::foreign::qualify_with_owner(owner.as_deref(), id)));
         rows.push(SearchRow { id, thread_id });
     }
+    let next_cursor = match page.next_link {
+        Some(next_link) => Some(encode_search_cursor(
+            account,
+            owner.as_deref(),
+            Some(next_link),
+        )),
+        None => next_search_owner(account, owner.as_deref())
+            .map(|owner| encode_search_cursor(account, Some(&owner), None)),
+    };
     Ok(Page {
         items: rows,
-        next_cursor: page.next_link.map(String::into_bytes),
+        next_cursor,
         estimated_total: None,
         failed_ids: Vec::new(),
     })
 }
 
-fn search_url(prefix: &str, request: &SearchRequest) -> Result<String, AccountError> {
-    if let Some(cursor) = &request.page_cursor {
-        return String::from_utf8(cursor.clone()).map_err(|error| {
-            pim_protocol_error(
-                AccountOperation::Search,
-                None,
-                format!("Graph search cursor is not UTF-8: {error}"),
-            )
-        });
+/// Decode a caller-supplied search page cursor.
+///
+/// Every rejection here is `Request(Malformed)`, not `Protocol(...)`: these
+/// bytes are request INPUT the caller handed back, so corrupt or stale
+/// client state must recommend fixing the request (`ClientBug` ->
+/// `FixClientRequest`) rather than accusing Graph of a contract violation.
+fn decode_search_cursor(
+    account: &GraphAccount,
+    cursor: Option<&[u8]>,
+) -> Result<Option<SearchCursor>, AccountError> {
+    let Some(cursor) = cursor else {
+        return Ok(None);
+    };
+    let cursor = std::str::from_utf8(cursor).map_err(|error| {
+        invalid_account_error(
+            AccountOperation::Search,
+            format!("Graph search cursor is not UTF-8: {error}"),
+        )
+    })?;
+    // No compatibility arm for a bare Graph nextLink: an unrecognized
+    // cursor is never fetched as a URL, because "whatever bytes the caller
+    // held" is not a request this crate is willing to issue.
+    let payload = cursor.strip_prefix(SEARCH_CURSOR_PREFIX).ok_or_else(|| {
+        invalid_account_error(
+            AccountOperation::Search,
+            "Graph search cursor predates the mailbox-aware search encoding",
+        )
+    })?;
+    let cursor: SearchCursor = serde_json::from_str(payload).map_err(|error| {
+        invalid_account_error(
+            AccountOperation::Search,
+            format!("Graph search cursor is malformed: {error}"),
+        )
+    })?;
+    if cursor.mailboxes != search_mailboxes(account) {
+        return Err(invalid_account_error(
+            AccountOperation::Search,
+            "Graph search cursor was minted against a different shared-mailbox set",
+        ));
     }
+    Ok(Some(cursor))
+}
+
+fn encode_search_cursor(
+    account: &GraphAccount,
+    owner: Option<&str>,
+    next_link: Option<String>,
+) -> Vec<u8> {
+    let cursor = SearchCursor {
+        mailboxes: search_mailboxes(account),
+        owner: owner.map(str::to_string),
+        next_link,
+    };
+    let payload = serde_json::to_string(&cursor).expect("SearchCursor serializes");
+    format!("{SEARCH_CURSOR_PREFIX}{payload}").into_bytes()
+}
+
+/// The shared mailboxes the search walk visits after the primary, in the
+/// order it visits them. Sorted, so the walk order does not ride on
+/// `HashMap` iteration order and two runs of the same account agree.
+fn search_mailboxes(account: &GraphAccount) -> Vec<String> {
+    let mut mailboxes: Vec<String> = account.shared_clients.keys().cloned().collect();
+    mailboxes.sort_unstable();
+    mailboxes
+}
+
+fn next_search_owner(account: &GraphAccount, owner: Option<&str>) -> Option<String> {
+    let mailboxes = search_mailboxes(account);
+    match owner {
+        None => mailboxes.into_iter().next(),
+        Some(owner) => mailboxes
+            .into_iter()
+            .skip_while(|mailbox| mailbox != owner)
+            .nth(1),
+    }
+}
+
+/// Build the FIRST-page URL for one mailbox. Continuations never come
+/// through here: `request.page_cursor` is decoded once, by
+/// `decode_search_cursor`, and a decoded cursor either carries the
+/// mailbox's own `nextLink` or asks for this mailbox's first page.
+fn search_url(prefix: &str, request: &SearchRequest) -> Result<String, AccountError> {
     let mut params = vec![
         "$select=id,conversationId".to_string(),
         format!("$top={}", request.limit.unwrap_or(50).clamp(1, 250)),
@@ -2514,22 +2632,63 @@ fn role_from_well_known_name(name: &str) -> Option<FolderRole> {
 /// The well-known lookup itself must run on the owner's client: shared and
 /// primary mailboxes do not share well-known folder ids, so the primary's
 /// `deletedItems` id names nothing in a shared mailbox.
+///
+/// A failed lookup PROPAGATES rather than degrading to the well-known NAME
+/// `deletedItems`. That literal is a valid move destination, so the move
+/// half of `delete_thread` would still appear to work - but it is not the
+/// concrete folder id `container_is_trash` compares against, so a thread
+/// already sitting in Trash would be "moved" there a second time and report
+/// success instead of being destroyed. Only a resolved id is cached, for
+/// the same reason: one transient failure must not outlive itself.
 async fn trash_container_id(
     account: &GraphAccount,
     owner: Option<&str>,
     scope: ErrorScope,
 ) -> Result<ContainerId, AccountError> {
+    let cache_key = owner.unwrap_or_default();
+    if let Some(native) = account
+        .trash_folder_ids
+        .read()
+        .await
+        .get(cache_key)
+        .cloned()
+    {
+        return Ok(ContainerId(super::foreign::qualify_with_owner(
+            owner, &native,
+        )));
+    }
     let client = account.client_for_owner(owner).map_err(|error| {
         into_account_error(
             error,
-            GraphErrorContext::graph(AccountOperation::BulkMove).with_scope(scope),
+            GraphErrorContext::graph(AccountOperation::BulkMove).with_scope(scope.clone()),
         )
     })?;
-    let native = well_known_folder_roles(client)
+    let path = format!(
+        "{}/mailFolders/{DELETED_ITEMS}?$select=id",
+        client.api_path_prefix()
+    );
+    let folder: Value = client.get_json(&path).await.map_err(|error| {
+        into_account_error(
+            error,
+            GraphErrorContext::graph(AccountOperation::BulkMove).with_scope(scope.clone()),
+        )
+    })?;
+    let native = folder
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            pim_protocol_error(
+                AccountOperation::BulkMove,
+                Some(scope),
+                "Graph deletedItems lookup returned no folder id",
+            )
+        })?
+        .to_string();
+    account
+        .trash_folder_ids
+        .write()
         .await
-        .into_iter()
-        .find_map(|(id, role)| (role == FolderRole::Trash).then_some(id))
-        .unwrap_or_else(|| DELETED_ITEMS.to_string());
+        .insert(cache_key.to_string(), native.clone());
     Ok(ContainerId(super::foreign::qualify_with_owner(
         owner, &native,
     )))
@@ -2623,7 +2782,10 @@ mod tests {
     use crate::account::PushMode;
     use crate::account::foreign::{encode_foreign, encode_message_id, encode_public_item_id};
     use crate::client::{GraphClient, ScriptedRestResponse};
-    use bifrost_types::{AccountErrorKind, CursorScope, ObjectType, RequestErrorKind};
+    use bifrost_types::{
+        AccountErrorKind, CursorScope, ObjectType, RecoveryClass, RemediationAction,
+        RequestErrorKind,
+    };
 
     // The single-id hydration door must reach the EWS arm for a public
     // item. Before this, `message_hydrate` fell through to
@@ -3085,11 +3247,194 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn search_walks_shared_mailboxes_and_qualifies_their_ids() {
+        let primary = GraphClient::new("token");
+        primary.script_rest([
+            ScriptedRestResponse::json(
+                reqwest::StatusCode::OK,
+                json!({
+                    "value": [{ "id": "primary-message", "conversationId": "primary-thread" }],
+                    "@odata.nextLink": "https://graph.microsoft.com/v1.0/me/messages?$skiptoken=primary"
+                }),
+            ),
+            ScriptedRestResponse::json(
+                reqwest::StatusCode::OK,
+                json!({ "value": [{ "id": "primary-message-2", "conversationId": "primary-thread-2" }] }),
+            ),
+        ]);
+        let shared_root = GraphClient::new("token");
+        shared_root.script_rest([ScriptedRestResponse::json(
+            reqwest::StatusCode::OK,
+            json!({ "value": [{ "id": "shared-message", "conversationId": "shared-thread" }] }),
+        )]);
+        let mailbox = "shared@contoso.com";
+        let account = GraphAccount::new_for_tests_with_shared_clients(
+            primary.clone(),
+            PushMode::GraphSubscriptions,
+            HashMap::from([(mailbox.to_string(), shared_root.for_shared_mailbox(mailbox))]),
+        );
+
+        let first = search_message_rows(&account, SearchRequest::default())
+            .await
+            .expect("primary page succeeds");
+        assert_eq!(first.items[0].id, ObjectId("primary-message".to_string()));
+        assert_eq!(
+            first.items[0].thread_id,
+            Some(ThreadId("primary-thread".to_string()))
+        );
+        let mut continuation = SearchRequest::default();
+        continuation.page_cursor = first.next_cursor;
+        let primary_continuation = search_message_rows(&account, continuation)
+            .await
+            .expect("primary continuation succeeds");
+        assert_eq!(
+            primary_continuation.items[0].id,
+            ObjectId("primary-message-2".to_string())
+        );
+        let mut continuation = SearchRequest::default();
+        continuation.page_cursor = primary_continuation.next_cursor;
+        let second = search_message_rows(&account, continuation)
+            .await
+            .expect("shared page succeeds");
+        assert_eq!(
+            second.items[0].id,
+            ObjectId(format!("{mailbox}\u{1f}shared-message"))
+        );
+        assert_eq!(
+            second.items[0].thread_id,
+            Some(ThreadId(format!("{mailbox}\u{1f}shared-thread")))
+        );
+        assert!(second.next_cursor.is_none());
+
+        let primary_requests = primary.take_rest_requests();
+        assert_eq!(primary_requests.len(), 2);
+        assert!(primary_requests[0].url.contains("/me/messages?"));
+        assert!(primary_requests[1].url.contains("$skiptoken=primary"));
+        let shared_requests = shared_root.take_rest_requests();
+        assert_eq!(shared_requests.len(), 1);
+        assert!(
+            shared_requests[0]
+                .url
+                .contains("/users/shared%40contoso.com/messages?")
+        );
+    }
+
+    /// A search cursor names a position in a WALK over several mailboxes,
+    /// so it is only meaningful against the mailbox list that minted it.
+    /// Both resuming accounts are armed EMPTY: a cursor that decoded into a
+    /// plausible-looking position would issue its first request and hit the
+    /// seam's exhaustion panic rather than quietly returning a page set
+    /// that silently omits a whole mailbox.
+    #[tokio::test]
+    async fn a_search_cursor_from_another_shared_mailbox_set_is_rejected() {
+        let minting_primary = GraphClient::new("token");
+        minting_primary.script_rest([ScriptedRestResponse::json(
+            reqwest::StatusCode::OK,
+            json!({ "value": [] }),
+        )]);
+        let minting = GraphAccount::new_for_tests_with_shared_clients(
+            minting_primary,
+            PushMode::GraphSubscriptions,
+            shared_clients_for_tests(&["b@contoso.com", "c@contoso.com"]),
+        );
+        let cursor = search_message_rows(&minting, SearchRequest::default())
+            .await
+            .expect("primary page succeeds")
+            .next_cursor
+            .expect("the walk continues into the shared mailboxes");
+
+        // Both sets still configure the cursor's own mailbox, so nothing but
+        // the pinned set can reject them: `a@` sorts BEFORE the position and
+        // would never be searched, and dropping `c@` would end the walk a
+        // mailbox early. Either way the caller gets fewer results than it
+        // asked for and no signal that it did.
+        for mailboxes in [
+            vec!["a@contoso.com", "b@contoso.com", "c@contoso.com"],
+            vec!["b@contoso.com"],
+        ] {
+            let primary = GraphClient::new("token");
+            primary.script_rest([]);
+            let account = GraphAccount::new_for_tests_with_shared_clients(
+                primary,
+                PushMode::GraphSubscriptions,
+                shared_clients_for_tests(&mailboxes),
+            );
+            let mut request = SearchRequest::default();
+            request.page_cursor = Some(cursor.clone());
+            let error = search_message_rows(&account, request)
+                .await
+                .expect_err("a cursor minted against another mailbox set is rejected");
+            assert!(
+                matches!(
+                    error.kind(),
+                    AccountErrorKind::Request(RequestErrorKind::Malformed)
+                ),
+                "{mailboxes:?}: {:?}",
+                error.kind()
+            );
+        }
+    }
+
+    /// Cursor bytes are request INPUT the caller handed back, so a corrupt
+    /// or stale one is the caller's to fix - not evidence that Graph broke
+    /// its contract. `Protocol(ContractViolation)` would derive
+    /// `ProviderContractViolation` / `ContactProviderSupport` and point an
+    /// operator at Microsoft for damaged client state.
+    #[tokio::test]
+    async fn a_corrupt_search_cursor_blames_the_request_not_the_provider() {
+        for cursor in [
+            // truncated payload under the current version prefix
+            format!("{SEARCH_CURSOR_PREFIX}{{\"mailboxes\":[]").into_bytes(),
+            // a bare Graph nextLink - what this crate emitted before the
+            // walk existed, and what a truncated cursor degrades to. It must
+            // be refused, never re-issued as a URL on the caller's word.
+            b"https://graph.microsoft.com/v1.0/me/messages?$skiptoken=x".to_vec(),
+            // not UTF-8 at all
+            vec![0xff, 0xfe],
+        ] {
+            let primary = GraphClient::new("token");
+            primary.script_rest([]);
+            let account = GraphAccount::new_for_tests(primary, PushMode::GraphSubscriptions);
+            let mut request = SearchRequest::default();
+            request.page_cursor = Some(cursor.clone());
+            let error = search_message_rows(&account, request)
+                .await
+                .expect_err("an undecodable cursor is refused");
+            assert!(
+                matches!(
+                    error.kind(),
+                    AccountErrorKind::Request(RequestErrorKind::Malformed)
+                ),
+                "{}: {:?}",
+                String::from_utf8_lossy(&cursor),
+                error.kind()
+            );
+            assert_eq!(error.recovery(), &RecoveryClass::ClientBug);
+            assert_eq!(
+                error.suggested_remediation(),
+                Some(&RemediationAction::FixClientRequest)
+            );
+            assert_eq!(error.operation(), Some(AccountOperation::Search));
+        }
+    }
+
+    fn shared_clients_for_tests(mailboxes: &[&str]) -> HashMap<String, GraphClient> {
+        mailboxes
+            .iter()
+            .map(|mailbox| {
+                let client = GraphClient::new("token");
+                client.script_rest([]);
+                ((*mailbox).to_string(), client.for_shared_mailbox(*mailbox))
+            })
+            .collect()
+    }
+
     /// The complete `delete_thread` operation for a shared thread, not just
     /// its id resolution.
     ///
-    /// Every read leg - the conversation query, the well-known-folder
-    /// lookups that resolve Trash, and the etag preflight - must run on the
+    /// Every read leg - the conversation query, the Trash lookup, and the
+    /// etag preflight - must run on the
     /// owner's client, and the Trash id must come back owner-qualified. The
     /// primary is armed with EXACTLY the one response the operation
     /// legitimately needs (the `/$batch` POST, which is account-wide and
@@ -3116,17 +3461,10 @@ mod tests {
                 reqwest::StatusCode::OK,
                 json!({ "value": [{ "id": "AAMkmsg" }] }),
             ),
-            // 2-7. the shared mailbox's own well-known folder ids, in
-            // `WELL_KNOWN_FOLDERS` order. Deliberately different bytes from
-            // any primary folder id: a shared mailbox's `deletedItems`
-            // resolves to its own id, so the primary's would name nothing.
-            ScriptedRestResponse::json(reqwest::StatusCode::OK, json!({ "id": "SharedInbox" })),
-            ScriptedRestResponse::json(reqwest::StatusCode::OK, json!({ "id": "SharedSent" })),
-            ScriptedRestResponse::json(reqwest::StatusCode::OK, json!({ "id": "SharedDrafts" })),
+            // 2. The shared mailbox's own Trash id. Deliberately different
+            // from any primary folder id: the primary's would name nothing.
             ScriptedRestResponse::json(reqwest::StatusCode::OK, json!({ "id": "SharedTrash" })),
-            ScriptedRestResponse::json(reqwest::StatusCode::OK, json!({ "id": "SharedJunk" })),
-            ScriptedRestResponse::json(reqwest::StatusCode::OK, json!({ "id": "SharedArchive" })),
-            // 8. the move's etag preflight
+            // 3. the move's etag preflight
             ScriptedRestResponse::json(
                 reqwest::StatusCode::OK,
                 json!({ "id": "AAMkmsg", "changeKey": "CK1" }),
@@ -3147,7 +3485,7 @@ mod tests {
         .expect("shared thread deletes");
 
         let shared_requests = shared_root.take_rest_requests();
-        assert_eq!(shared_requests.len(), 8);
+        assert_eq!(shared_requests.len(), 3);
         for request in &shared_requests {
             assert!(
                 request.url.contains("/users/shared%40contoso.com/"),
@@ -3156,7 +3494,7 @@ mod tests {
             );
         }
         assert!(
-            shared_requests[4]
+            shared_requests[1]
                 .url
                 .ends_with("/users/shared%40contoso.com/mailFolders/deletedItems?$select=id"),
             "Trash is resolved against the owner's own well-known folders: {}",
@@ -3176,6 +3514,104 @@ mod tests {
             json!("/users/shared%40contoso.com/messages/AAMkmsg/move")
         );
         assert_eq!(sub["body"]["destinationId"], json!("SharedTrash"));
+    }
+
+    /// The cache is keyed PER MAILBOX, and each key resolves against its
+    /// own client. A single shared slot would hand one mailbox's Trash id to
+    /// another, which is a folder id that names nothing there - so the two
+    /// mailboxes are armed with different ids on independent scripts, and
+    /// each is asserted to have been asked exactly once.
+    #[tokio::test]
+    async fn trash_lookup_is_cached_per_mailbox() {
+        let mailbox = "shared@contoso.com";
+        let primary = GraphClient::new("token");
+        primary.script_rest([ScriptedRestResponse::json(
+            reqwest::StatusCode::OK,
+            json!({ "id": "PrimaryTrash" }),
+        )]);
+        let shared_root = GraphClient::new("token");
+        shared_root.script_rest([ScriptedRestResponse::json(
+            reqwest::StatusCode::OK,
+            json!({ "id": "SharedTrash" }),
+        )]);
+        let account = GraphAccount::new_for_tests_with_shared_clients(
+            primary.clone(),
+            PushMode::GraphSubscriptions,
+            HashMap::from([(mailbox.to_string(), shared_root.for_shared_mailbox(mailbox))]),
+        );
+
+        for round in 0..2 {
+            assert_eq!(
+                trash_container_id(&account, None, ErrorScope::Account)
+                    .await
+                    .expect("primary Trash resolves"),
+                ContainerId("PrimaryTrash".to_string()),
+                "round {round}"
+            );
+            assert_eq!(
+                trash_container_id(&account, Some(mailbox), ErrorScope::Account)
+                    .await
+                    .expect("shared Trash resolves"),
+                ContainerId(format!("{mailbox}\u{1f}SharedTrash")),
+                "round {round}"
+            );
+        }
+
+        assert_eq!(primary.take_rest_requests().len(), 1);
+        let shared_requests = shared_root.take_rest_requests();
+        assert_eq!(shared_requests.len(), 1);
+        assert!(
+            shared_requests[0]
+                .url
+                .ends_with("/users/shared%40contoso.com/mailFolders/deletedItems?$select=id")
+        );
+    }
+
+    /// Only a RESOLVED folder id may enter the cache, and a lookup that did
+    /// not resolve must fail rather than answer with the well-known NAME.
+    ///
+    /// `deletedItems` is a valid move destination, so a degraded answer
+    /// keeps `delete_thread` looking healthy - but it is not the concrete id
+    /// `container_is_trash` compares against, so a thread ALREADY in Trash
+    /// gets moved there again and reports success instead of being
+    /// destroyed. Caching it made one transient 503 do that for the rest of
+    /// the account's life.
+    #[tokio::test]
+    async fn a_failed_trash_lookup_neither_answers_nor_caches() {
+        let client = GraphClient::new("token");
+        client.script_rest([
+            // 1. transient failure
+            ScriptedRestResponse::empty(reqwest::StatusCode::SERVICE_UNAVAILABLE),
+            // 2. a 200 that carries no folder id
+            ScriptedRestResponse::json(reqwest::StatusCode::OK, json!({})),
+            // 3. the real answer, which is the only one worth keeping
+            ScriptedRestResponse::json(reqwest::StatusCode::OK, json!({ "id": "PrimaryTrash" })),
+        ]);
+        let account = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
+
+        let transient = trash_container_id(&account, None, ErrorScope::Account)
+            .await
+            .expect_err("a transient lookup failure propagates");
+        assert!(transient.recovery().is_retryable());
+        let no_id = trash_container_id(&account, None, ErrorScope::Account)
+            .await
+            .expect_err("a 200 without an id is a contract violation");
+        assert!(matches!(
+            no_id.kind(),
+            AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation)
+        ));
+        assert_eq!(no_id.scope(), Some(&ErrorScope::Account));
+
+        let resolved = trash_container_id(&account, None, ErrorScope::Account)
+            .await
+            .expect("the lookup resolves once Graph answers");
+        assert_eq!(resolved, ContainerId("PrimaryTrash".to_string()));
+        let cached = trash_container_id(&account, None, ErrorScope::Account)
+            .await
+            .expect("the resolved id is cached");
+        assert_eq!(cached, resolved);
+        // Three lookups, not four: only the resolved one was retained.
+        assert_eq!(client.take_rest_requests().len(), 3);
     }
 
     #[test]

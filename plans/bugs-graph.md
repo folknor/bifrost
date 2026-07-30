@@ -5,30 +5,37 @@ else. Resolved findings live in git history - the commit that fixed one is
 its record - and so do the per-pass repair logs; retaining either here means
 maintaining a second, drifting copy of `git log`.
 
-There are no open CORRECTNESS findings. One efficiency gap is recorded
-below. The shared-contract subscription-lifecycle question that used to sit
-here as O-7 is tracked as `xc-2` in `TODO.md` instead, since it is a
-contract question rather than a Graph defect.
+One open finding is recorded below. The shared-contract
+subscription-lifecycle question that used to sit here as O-7 is tracked as
+`xc-2` in `TODO.md` instead, since it is a contract question rather than a
+Graph defect.
 
 ## Open findings
 
-### O-26 (efficiency): `delete_thread` re-resolves well-known folders per call
+### O-28 (correctness): one inaccessible shared mailbox kills the whole search
 
-`trash_container_id` runs `well_known_folder_roles`, which is six serial
-`GET /{prefix}/mailFolders/{name}?$select=id` requests, on every
-`delete_thread` - and, since the Trash must now be resolved in the thread's
-own mailbox, once per shared mailbox as well as for the primary. Only the
-`deletedItems` row is ever read on this path, and the mapping is stable for
-the lifetime of an account. `containers_list` pays the same cost for its own
-reason (it needs all six).
+`search_message_rows` now walks the primary mailbox and then every
+configured shared mailbox. Any per-mailbox failure propagates as the
+whole call's `Err`, so a shared mailbox the account has lost delegate
+access to (403 -> `Authorization(PermissionDenied)` -> `NoPermission`,
+terminal) ends the search for every mailbox, including the primary pages
+the caller has not reached yet. Every other shared-mailbox door in this
+crate deliberately does the opposite: a revoked foreign scope is
+quarantined (`ScopeRevoked` -> scope-bearing `DisableScope`) rather than
+escalated account-wide. Search is now the one door where it escalates.
 
-Not a correctness defect and not a regression: the shape predates the
-owner-aware routing, which only made it per-mailbox. A cached
-`FolderRole -> id` map on `GraphAccount` (invalidated at reopen, which is
-already when the folder tree is re-seeded) would collapse it, and a
-`deletedItems`-only lookup would collapse it further for this call site.
-Left open rather than fixed here because it changes account-level caching
-state, which is outside a thread-routing round.
+Not fixed in the round that introduced the walk because the right
+behavior is a contract question, not a local repair: `Page` has no
+warning channel, and its `failed_ids` is documented as native identifiers
+of RESOURCES the provider could not materialize, not of mailboxes that
+were skipped. Silently dropping a mailbox's results is the one option
+that is clearly wrong. Deciding between "widen the page vocabulary",
+"skip and report through a new channel", and "keep failing the call but
+name the mailbox in the scope" needs a `bifrost-types` decision, so it is
+filed rather than guessed at.
+
+Bounded by configuration: an account with no shared mailboxes cannot hit
+it, and a walk that dies still delivered every earlier page.
 
 ## Test coverage: the standing seam
 
@@ -68,8 +75,10 @@ inventory absolute-nextLink walk and neither-link failure, mixed reaction
 batches that send their surviving Graph request, translation's 1,000-id POST
 fan-out, foreign thread hydration and mutation member resolution through the
 owner client, the COMPLETE `delete_thread` operation for a shared thread
-(member query, the well-known-folder lookups that resolve Trash, the etag
-preflight, and the `/$batch` subrequest URL plus its native `destinationId`),
+(member query, the owner Trash lookup, the etag preflight, and the `/$batch`
+subrequest URL plus its native `destinationId`), primary plus shared-mailbox
+search routing with owner-qualified results, the one-request-per-mailbox
+Trash cache and the three ways a Trash lookup must NOT answer,
 inventory tombstone ETag eviction, a write batch that drains past a
 failed subresponse to evict a later confirmed destroy, and the raw-MIME
 import's base64 `text/plain` body. The script is shared with every client
@@ -103,6 +112,41 @@ panics. Each was verified by reverting the production change and watching the
 test fail: the routing reverts panic at
 `Graph REST script exhausted by request: GET .../me/...`, and the container
 requalification revert fails on the id comparison itself.
+
+The mailbox-aware search cursor is pinned the same way the delta walks are,
+because it has the same failure shape: a cursor that decodes into a
+plausible-looking position issues a request, so the resuming account arms
+every client with an EMPTY script and a wrong decode hits the exhaustion
+panic instead of returning a page. Three rejections are pinned - a
+truncated payload, a bare Graph `nextLink` (the shape a cursor minted
+before the walk existed has, and the shape any corruption degrades to), and
+non-UTF-8 bytes - each asserted down to `Request(Malformed)` /
+`RecoveryClass::ClientBug` / `FixClientRequest`, not just "an error",
+because the defect being pinned was a correct rejection with the wrong
+blame. The mailbox-set binding is pinned over BOTH directions that stay
+decodable without it: a mailbox added before the position (never searched)
+and one dropped after it (walk ends early). Both were verified by removing
+the check and watching the cursor resume at
+`GET .../users/b%40contoso.com/messages` on an account it was never minted
+for; the classification test was verified by restoring
+`pim_protocol_error` (fails on `Protocol(ContractViolation)`) and,
+separately, by restoring the bare-nextLink compatibility arm (fails by
+re-issuing the caller's bytes as a GET).
+
+The Trash-id cache is pinned on both axes. Keying: two mailboxes, armed
+with different ids on independent scripts, each asked exactly once, so a
+single shared slot fails on the id itself (`shared@...\u{1f}PrimaryTrash`).
+Admission: a transient 503, then a 200 carrying no `id`, then the real
+answer - the first two must propagate (retryable, then
+`Protocol(ContractViolation)`) and neither may enter the cache, which the
+request count proves. That test fails against the pre-fix code at the very
+first assertion, returning `ContainerId("deletedItems")` where the caller
+expected an error.
+
+What these two seams do NOT reach: no test walks a shared mailbox's OWN
+`nextLink` continuation (only the primary's is exercised), no test walks
+three mailboxes, and the per-mailbox failure behavior of the search walk is
+unpinned entirely - which is O-28 above, not an accident of coverage.
 
 The cursor-envelope v2 bump is pinned at the `changes_stream` door, not just
 at `decode_cursor`: a v1 cursor whose payload still deserializes must

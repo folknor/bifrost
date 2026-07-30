@@ -105,6 +105,11 @@ pub(crate) struct GraphAccount {
     pub(crate) ews_topology: Arc<watch::Sender<u64>>,
     pub(crate) shutdown: CancellationToken,
     pub(crate) etag_index: Arc<RwLock<EtagIndex>>,
+    /// Well-known Trash folder ids keyed by their owning mailbox. The empty
+    /// key is the primary mailbox; shared mailboxes use their routing key.
+    /// Folder ids are stable for one opened account, and a fresh account on
+    /// reopen starts with an empty cache.
+    pub(crate) trash_folder_ids: Arc<RwLock<HashMap<String, String>>>,
     /// Public-folder routing map, keyed by native EWS `FolderId`. A
     /// folder present here is a public folder: it establishes via the
     /// public-folder inventory pass and polls via the no-delta-token
@@ -264,6 +269,7 @@ impl GraphAccount {
             ews_topology: Arc::new(watch::channel(0_u64).0),
             shutdown: CancellationToken::new(),
             etag_index: Arc::new(RwLock::new(EtagIndex::default())),
+            trash_folder_ids: Arc::new(RwLock::new(HashMap::new())),
             routing_map: Arc::new(RwLock::new(HashMap::new())),
             public_folder_meta: Arc::new(RwLock::new(HashMap::new())),
             public_folders,
