@@ -271,7 +271,7 @@ async fn run_folder_mutation(
     results.extend(match outcome {
         Ok(outcome) => {
             account.folders.clear_modseqs(folder, uidvalidity, &uids);
-            mutation_results(valid, &uids, outcome, mutation_operation(kind), folder)
+            mutation_results(valid, outcome, mutation_operation(kind), folder)
         }
         Err(err) => failed_all(
             valid,
@@ -343,7 +343,6 @@ async fn run_destroy_mutation_groups(
             ));
             results.extend(mutation_results(
                 remaining_ids,
-                &uids,
                 outcome,
                 AccountOperation::BulkDestroy,
                 folder,
@@ -352,7 +351,6 @@ async fn run_destroy_mutation_groups(
         }
         results.extend(mutation_results(
             ids,
-            &uids,
             outcome,
             AccountOperation::BulkDestroy,
             folder,
@@ -411,7 +409,7 @@ async fn run_flag_mutation_groups(
                 account
                     .folders
                     .clear_modseqs(folder, uidvalidity, &changed_uids);
-                mutation_results(ids, &uids, outcome, AccountOperation::UpdateFlags, folder)
+                mutation_results(ids, outcome, AccountOperation::UpdateFlags, folder)
             }
             Err(err) => {
                 if matches!(op, FlagOp::Patch { .. }) {
@@ -530,7 +528,6 @@ fn patch_mutation_results(
         StoreWireOutcome::Applied => Vec::new(),
         StoreWireOutcome::Modified(modified) => mutation_results(
             conflicting_ids,
-            requested_uids,
             StoreWireOutcome::Modified(modified),
             AccountOperation::UpdateFlags,
             folder,
@@ -538,7 +535,6 @@ fn patch_mutation_results(
         outcome @ (StoreWireOutcome::PendingRetry(_) | StoreWireOutcome::Failed) => {
             return mutation_results(
                 ids_from_parts(applied_ids, conflicting_ids),
-                requested_uids,
                 outcome,
                 AccountOperation::UpdateFlags,
                 folder,
@@ -549,7 +545,6 @@ fn patch_mutation_results(
     match second {
         Ok(StoreWireOutcome::Applied) => results.extend(mutation_results(
             applied_ids,
-            requested_uids,
             StoreWireOutcome::Applied,
             AccountOperation::UpdateFlags,
             folder,
@@ -738,7 +733,6 @@ fn modified_uids(code: Option<&ResponseCode>) -> Option<Vec<u32>> {
 
 fn mutation_results(
     ids: Vec<DecodedObjectId>,
-    _requested_uids: &[u32],
     outcome: StoreWireOutcome,
     operation: AccountOperation,
     folder: &MailboxName,
@@ -992,7 +986,6 @@ mod tests {
         ];
         let outcomes = mutation_results(
             ids,
-            &[2, 5],
             StoreWireOutcome::PendingRetry(vec![2]),
             AccountOperation::UpdateFlags,
             &folder,
@@ -1146,7 +1139,6 @@ mod tests {
     fn modified_outcome_splits_conflicts_from_successes_per_uid() {
         let outcomes = mutation_results(
             ids(&[1, 2, 3]),
-            &[1, 2, 3],
             StoreWireOutcome::Modified(vec![2]),
             AccountOperation::UpdateFlags,
             &folder(),
@@ -1297,7 +1289,6 @@ mod tests {
     fn applied_outcome_succeeds_every_target() {
         let outcomes = mutation_results(
             ids(&[4, 5]),
-            &[4, 5],
             StoreWireOutcome::Applied,
             AccountOperation::BulkMove,
             &folder(),
@@ -1315,7 +1306,6 @@ mod tests {
     fn failed_outcome_fails_every_target() {
         let outcomes = mutation_results(
             ids(&[4, 5]),
-            &[4, 5],
             StoreWireOutcome::Failed,
             AccountOperation::BulkDestroy,
             &folder(),

@@ -40,7 +40,11 @@ pub(crate) fn build_capabilities(
     );
     AccountCapabilities {
         cursor_freshness: CursorFreshness::Hybrid,
-        blob_range: BlobRangeSupport::Yes,
+        // IMAP can fetch a BODY[] section by range, but this account does
+        // not yet emit attachment BlobHandles backed by those sections.
+        // Advertising range support before a caller can receive such a
+        // handle is dishonest.
+        blob_range: BlobRangeSupport::No,
         blob_digest_pre_download: false,
         push: if profile.supports(Capability::Idle) {
             PushCapability::InProcess
@@ -168,7 +172,7 @@ mod tests {
         );
         let caps = build_capabilities(&profile, &[], false, None, None, false, false);
         assert_eq!(caps.cursor_freshness, CursorFreshness::Hybrid);
-        assert_eq!(caps.blob_range, BlobRangeSupport::Yes);
+        assert_eq!(caps.blob_range, BlobRangeSupport::No);
         assert_eq!(caps.push, PushCapability::InProcess);
         assert_eq!(caps.mutation.concurrency, MutationConcurrency::None);
         assert_eq!(caps.mutation.replay_safety, MutationReplaySafety::None);

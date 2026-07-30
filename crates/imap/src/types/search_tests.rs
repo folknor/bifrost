@@ -167,6 +167,20 @@ fn header() {
 }
 
 #[test]
+fn header_rejects_an_injectable_field_name() {
+    assert!(
+        SearchCriteria::new()
+            .header("X-Trace OR ALL", "value")
+            .is_err()
+    );
+    assert!(
+        SearchCriteria::new()
+            .header("X-Trace\r\nALL", "value")
+            .is_err()
+    );
+}
+
+#[test]
 fn body() {
     assert_eq!(
         SearchCriteria::new()

@@ -27,7 +27,7 @@ use super::*;
 /// The state snapshot is fixed at construction: this is the right double
 /// for the pure capability / session-state gates, which read
 /// `state_rx.borrow()` and never touch the socket.
-pub(in crate::connection) fn detached(
+pub(crate) fn detached(
     session_state: SessionState,
     capabilities: Vec<Capability>,
     enabled: &[&str],
@@ -67,9 +67,7 @@ pub(in crate::connection) fn detached(
 /// the test scripts as a canned transcript. A `* PREAUTH` greeting lands
 /// the session directly in the Authenticated state (RFC 3501 Section 3.2),
 /// which is what most command-level transcripts need.
-pub(in crate::connection) async fn driver_pair(
-    greeting: &[u8],
-) -> (ImapConnection, tokio::io::DuplexStream) {
+pub(crate) async fn driver_pair(greeting: &[u8]) -> (ImapConnection, tokio::io::DuplexStream) {
     let (client, mut server) = tokio::io::duplex(1 << 16);
 
     server.write_all(greeting).await.unwrap();
@@ -112,7 +110,7 @@ pub(in crate::connection) async fn driver_pair(
 }
 
 /// A `* PREAUTH` greeting advertising the given capability atoms.
-pub(in crate::connection) fn preauth_greeting(caps: &str) -> Vec<u8> {
+pub(crate) fn preauth_greeting(caps: &str) -> Vec<u8> {
     format!("* PREAUTH [CAPABILITY {caps}] ready\r\n").into_bytes()
 }
 
@@ -121,7 +119,7 @@ pub(in crate::connection) fn preauth_greeting(caps: &str) -> Vec<u8> {
 /// Reads a byte at a time so the caller can interleave line reads with
 /// exact-length literal reads without an intermediate buffer stealing
 /// bytes that belong to the next read.
-pub(in crate::connection) async fn read_line(server: &mut tokio::io::DuplexStream) -> String {
+pub(crate) async fn read_line(server: &mut tokio::io::DuplexStream) -> String {
     let mut out = Vec::new();
     let mut byte = [0u8; 1];
     loop {
@@ -135,22 +133,19 @@ pub(in crate::connection) async fn read_line(server: &mut tokio::io::DuplexStrea
 }
 
 /// Read exactly `n` bytes from the server end of the duplex.
-pub(in crate::connection) async fn read_exact(
-    server: &mut tokio::io::DuplexStream,
-    n: usize,
-) -> Vec<u8> {
+pub(crate) async fn read_exact(server: &mut tokio::io::DuplexStream, n: usize) -> Vec<u8> {
     let mut buf = vec![0u8; n];
     server.read_exact(&mut buf).await.unwrap();
     buf
 }
 
 /// The command tag of a client line (RFC 3501 Section 2.2.1).
-pub(in crate::connection) fn tag_of(line: &str) -> &str {
+pub(crate) fn tag_of(line: &str) -> &str {
     line.split(' ').next().unwrap_or_default()
 }
 
 /// Write a canned server transcript chunk and flush it.
-pub(in crate::connection) async fn respond(server: &mut tokio::io::DuplexStream, bytes: &str) {
+pub(crate) async fn respond(server: &mut tokio::io::DuplexStream, bytes: &str) {
     server.write_all(bytes.as_bytes()).await.unwrap();
     server.flush().await.unwrap();
 }

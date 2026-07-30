@@ -290,6 +290,10 @@ Containers use native mailbox paths as primitive/provenance ids. `containers_lis
 - `Projection::Preview` asks for headers plus a partial `BODY.PEEK[TEXT]`; the raw-MIME bytes concatenate the HEADER section and the TEXT section rather than keeping whichever arrived first.
 - Full hydration into `Message::body_text` still carries raw wire source; see `TODO.md` types-G2 (no shared inbound MIME parser).
 
+### Blob openers
+
+`AccountCapabilities::blob_range` is `BlobRangeSupport::No` and `open_blob` / `open_blob_range` return `Unsupported`. IMAP can fetch a `BODY[]` section by range, but nothing in inventory or hydration mints a `BlobHandle` for a MIME part, so there is no handle a caller could hand back to an opener. `blob.rs` therefore serves only `open_raw_rfc822`, which streams the whole message via `BODY.PEEK[]`. Building the real capability (BODYSTRUCTURE traversal, a stable part-handle encoding, a consumer-facing projection that attaches handles) is filed as `TODO.md` imap-G1.
+
 ### Bandwidth metering
 
 `ImapAccountConfig` carries a process `BandwidthMeter` or generic `MeterSink`. The factory builds a `MeterSinkHandle` with the engine `AccountId` on every open and passes it to the initial connection plus pool dials. `WireReader` records bytes read/written on every read/write path; the shared bandwidth-cap atomic is read per chunk (`set_bandwidth_cap(None)` unlimited; `Some(0)` clamps to 1 B/s with a warning). The token bucket honors the cap exactly: a chunk larger than one second of budget owes `bytes / cap` seconds in total, slept in slices of at most 60 s (the 60 s value bounds a single timer, never the total debt), so a very low cap makes big reads proportionally slow rather than being silently exceeded. The bucket keeps time with `tokio::time::Instant`, so the metering arithmetic is testable under `tokio::time::pause()`.
@@ -333,7 +337,7 @@ IMAP diverges from the `MutationSuccess::Skipped` lane other crates use for the 
 
 ### Output-channel-dropped contract
 
-Every streaming task (`inventory_stream`, `changes_stream`, `get_stream`, `open_blob`, `mutation_stream`) treats a `tx.send` failure on a dropped output receiver as silent termination: the task returns without synthesizing any `crate::Error` or fatal `Terminated`. The error funnel is reserved for wire failures and structural invariant breaks; a consumer walking away from its stream is not an error.
+Every streaming task (`inventory_stream`, `changes_stream`, `get_stream`, `open_raw_rfc822`, `mutation_stream`) treats a `tx.send` failure on a dropped output receiver as silent termination: the task returns without synthesizing any `crate::Error` or fatal `Terminated`. The error funnel is reserved for wire failures and structural invariant breaks; a consumer walking away from its stream is not an error.
 
 ### Terminated-event helper
 
@@ -356,7 +360,7 @@ crates/imap/src/
 |   |-- seq_ops.rs   - sequence-number command surface
 |   `-- uid_ops.rs   - UID command surface
 |-- account/         - bifrost_types::Account implementation
-|   |-- blob.rs            - open_blob, open_blob_range, open_raw_rfc822 (BODY.PEEK[])
+|   |-- blob.rs            - open_raw_rfc822 (BODY.PEEK[]); no blob openers
 |   |-- capabilities.rs    - AccountCapabilities builder
 |   |-- changes.rs         - QRESYNC / CONDSTORE / Basic diff dispatch
 |   |-- close.rs           - graceful shutdown

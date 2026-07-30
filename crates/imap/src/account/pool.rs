@@ -96,6 +96,52 @@ impl Pool {
         })
     }
 
+    /// Check out a pooled connection without imposing a selected-mailbox
+    /// affinity. Callers that do not issue mailbox-relative commands can
+    /// safely reuse any parked connection, including one left selected by a
+    /// folder-scoped operation.
+    pub(crate) async fn checkout_any(&self) -> Result<PooledConn, Error> {
+        if self.inner.closed.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(Error::closed());
+        }
+        let permit = Arc::clone(&self.inner.permits)
+            .acquire_owned()
+            .await
+            .map_err(|_| Error::closed())?;
+        let member = {
+            let mut idle = self.inner.idle.lock().expect("pool lock poisoned");
+            idle.retain(|member| member.conn.is_alive());
+            idle.pop()
+        };
+        let member = match member {
+            Some(member) => member,
+            None => {
+                let (conn, _auth) = self
+                    .inner
+                    .config
+                    .imap
+                    .connect_authenticated_metered(
+                        &self.inner.config.credentials,
+                        &self.inner.config.auth_policy,
+                        self.inner.meter.clone(),
+                        Some(Arc::clone(&self.inner.bandwidth_cap)),
+                    )
+                    .await?;
+                PoolMember {
+                    conn,
+                    selected: None,
+                }
+            }
+        };
+        Ok(PooledConn {
+            member: Some(member),
+            pool: Arc::clone(&self.inner),
+            _permit: permit,
+        })
+    }
+
+    /// Dial the dedicated connection used exclusively by the long-lived IDLE
+    /// loop. Ordinary account operations must use a checkout method instead.
     pub(crate) async fn dial_idle(&self) -> Result<ImapConnection, Error> {
         if self.inner.closed.load(std::sync::atomic::Ordering::Acquire) {
             return Err(Error::closed());

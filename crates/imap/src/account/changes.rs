@@ -503,7 +503,8 @@ async fn run_condstore_with_baseline(
         .map_err(|err| select_error(&account, &folder, err))?;
     let uidvalidity = selected_uidvalidity(&selected.mailbox)?;
     validate_uidvalidity(&folder, cursor.uidvalidity(), uidvalidity)?;
-    if !known_uids_complete {
+    let seeded_baseline = !known_uids_complete;
+    if seeded_baseline {
         send_warning(
             &tx,
             WarningKind::Other,
@@ -546,7 +547,14 @@ async fn run_condstore_with_baseline(
             changes.push(updated_change(&folder, uidvalidity, uid));
         }
     }
-    let live = search_all(&account, conn.connection()).await?;
+    // The first complete baseline has no prior snapshot to diff against. It
+    // is also the current UID snapshot, so issuing a second immediate SEARCH
+    // would only repeat the same work before we checkpoint it.
+    let live = if seeded_baseline {
+        known_uids.to_uids()
+    } else {
+        search_all(&account, conn.connection()).await?
+    };
     let live_set = CompactUidSet::from_uids(live);
     warn_if_uid_count_mismatch(&tx, &folder, selected.mailbox.exists, live_set.len()).await?;
     let diff = known_uids.diff(&live_set);

@@ -63,6 +63,26 @@ re-auditors don't re-raise them.)
   `let _ = &mut t;`, and the unused `with_thread_id` constructor.
 - **imap-N5.** Consolidate `terminated_event` / `fatal_event` into a
   single helper taking `impl Into<AccountError>`.
+- **imap-G1.** (gap, feature-sized) Expose IMAP MIME-part downloads as
+  real `BlobHandle`s. Symptom: the account used to advertise
+  `BlobRangeSupport::Yes` and accept any `BlobHandle` in `open_blob` /
+  `open_blob_range`, but nothing in inventory or hydration ever minted
+  such a handle - no part identity, no part size, no encoding - so the
+  only handles that reached the openers were ones a caller had to invent
+  by hand from a private id encoding. What would have to ship: a
+  BODYSTRUCTURE-to-part traversal, a stable part-handle encoding (folder,
+  UIDVALIDITY, UID, part path, transfer encoding), and a consumer-facing
+  projection that attaches those handles to hydrated MIME parts so
+  `InventoryEntry::blob_id` and attachment metadata are populated.
+  Coordinate with **types-G2** so decoded MIME structure is shared
+  rather than recreated in the IMAP account. What was done instead:
+  the capability now reports `BlobRangeSupport::No` and both openers
+  return `Unsupported`, with the private blob id codec and its openers
+  deleted; `open_raw_rfc822` (whole-message `BODY.PEEK[]`) is unchanged
+  and remains the supported byte path. What remains merely disclosed:
+  consumers that want per-attachment streaming from IMAP still cannot
+  have it - they now get an honest `Unsupported` instead of a handle
+  shape they could not obtain.
 - **imap-T1.** Account-layer conformance test additions inside
   `crates/imap/src/account/` modules are still outstanding (the
   reference doc and code landed in P3-A2; the focused tests did not).

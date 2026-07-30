@@ -29,6 +29,7 @@ use super::{
     DecodedObjectId, ImapAccount, account_error_with, decode_object_id, decode_thread_id,
     encode_object_id, encode_thread_id, factory, uid_set_from_u32,
 };
+use crate::connection::ImapConnection;
 use crate::error::Error;
 
 /// Build a `map_err` closure that stamps every internal IMAP `Error` with
@@ -199,8 +200,9 @@ pub(crate) fn draft_create(
             .ok_or_else(|| super::error::unsupported(AccountOperation::DraftCreate))?;
         let raw = draft_patch_to_rfc5322(&patch)?;
         let err = op_err(AccountOperation::DraftCreate);
-        let conn = account.pool.dial_idle().await.map_err(err)?;
+        let conn = account.pool.checkout_any().await.map_err(err)?;
         let appended = conn
+            .connection()
             .append(
                 folder.as_str(),
                 &[Flag::Draft],
@@ -368,7 +370,7 @@ async fn append_to_sent_or_fallback(
         );
         return fallback();
     };
-    let conn = match account.pool.dial_idle().await {
+    let conn = match account.pool.checkout_any().await {
         Ok(conn) => conn,
         Err(err) => {
             tracing::warn!(
@@ -381,6 +383,7 @@ async fn append_to_sent_or_fallback(
         }
     };
     match conn
+        .connection()
         .append(
             sent.as_str(),
             &[Flag::Seen],
@@ -870,11 +873,17 @@ pub(crate) fn container_create(
         }
         let full_name = child_name(&account, parent.as_ref(), &name)?;
         let err = op_err(AccountOperation::ContainerCreate);
-        let conn = account.pool.dial_idle().await.map_err(err)?;
-        conn.create(full_name.as_str(), account.command_timeout())
+        let conn = account.pool.checkout_any().await.map_err(err)?;
+        conn.connection()
+            .create(full_name.as_str(), account.command_timeout())
             .await
             .map_err(err)?;
-        refresh_folders(&account, AccountOperation::ContainerCreate).await?;
+        refresh_folders(
+            &account,
+            conn.connection(),
+            AccountOperation::ContainerCreate,
+        )
+        .await?;
         Ok(ContainerId(full_name.as_str().to_owned()))
     })
 }
@@ -890,15 +899,21 @@ pub(crate) fn container_rename(
         let folder = folder_from_container(&container)?;
         let new_name = renamed_sibling(&account, &folder, &name)?;
         let err = op_err(AccountOperation::ContainerRename);
-        let conn = account.pool.dial_idle().await.map_err(err)?;
-        conn.rename(
-            folder.as_str(),
-            new_name.as_str(),
-            account.command_timeout(),
+        let conn = account.pool.checkout_any().await.map_err(err)?;
+        conn.connection()
+            .rename(
+                folder.as_str(),
+                new_name.as_str(),
+                account.command_timeout(),
+            )
+            .await
+            .map_err(err)?;
+        refresh_folders(
+            &account,
+            conn.connection(),
+            AccountOperation::ContainerRename,
         )
         .await
-        .map_err(err)?;
-        refresh_folders(&account, AccountOperation::ContainerRename).await
     })
 }
 
@@ -912,15 +927,16 @@ pub(crate) fn container_move(
         let leaf = leaf_name(&account, &folder);
         let new_name = child_name(&account, new_parent.as_ref(), &leaf)?;
         let err = op_err(AccountOperation::ContainerMove);
-        let conn = account.pool.dial_idle().await.map_err(err)?;
-        conn.rename(
-            folder.as_str(),
-            new_name.as_str(),
-            account.command_timeout(),
-        )
-        .await
-        .map_err(err)?;
-        refresh_folders(&account, AccountOperation::ContainerMove).await
+        let conn = account.pool.checkout_any().await.map_err(err)?;
+        conn.connection()
+            .rename(
+                folder.as_str(),
+                new_name.as_str(),
+                account.command_timeout(),
+            )
+            .await
+            .map_err(err)?;
+        refresh_folders(&account, conn.connection(), AccountOperation::ContainerMove).await
     })
 }
 
@@ -931,8 +947,9 @@ pub(crate) fn container_delete(
     Box::pin(async move {
         let folder = folder_from_container(&container)?;
         let err = op_err(AccountOperation::ContainerDelete);
-        let conn = account.pool.dial_idle().await.map_err(err)?;
+        let conn = account.pool.checkout_any().await.map_err(err)?;
         let status = conn
+            .connection()
             .status(folder.as_str(), "MESSAGES", account.command_timeout())
             .await
             .map_err(err)?;
@@ -943,10 +960,16 @@ pub(crate) fn container_delete(
         if non_empty {
             return Err(pim_malformed("refusing to delete non-empty IMAP mailbox"));
         }
-        conn.delete(folder.as_str(), account.command_timeout())
+        conn.connection()
+            .delete(folder.as_str(), account.command_timeout())
             .await
             .map_err(err)?;
-        refresh_folders(&account, AccountOperation::ContainerDelete).await
+        refresh_folders(
+            &account,
+            conn.connection(),
+            AccountOperation::ContainerDelete,
+        )
+        .await
     })
 }
 
@@ -980,8 +1003,9 @@ pub(crate) fn quota_get(
             return Ok(None);
         };
         let err = op_err(AccountOperation::QuotaGet);
-        let conn = account.pool.dial_idle().await.map_err(err)?;
+        let conn = account.pool.checkout_any().await.map_err(err)?;
         let quota = conn
+            .connection()
             .get_quota_root(folder.as_str(), account.command_timeout())
             .await
             .map_err(err)?;
@@ -1895,11 +1919,21 @@ fn leaf_name(account: &ImapAccount, folder: &MailboxName) -> String {
         .to_owned()
 }
 
-async fn refresh_folders(account: &ImapAccount, op: AccountOperation) -> Result<(), AccountError> {
+/// Re-LIST the personal namespace over a connection the caller already holds.
+///
+/// The connection is a parameter rather than a fresh checkout on purpose: every
+/// caller is mid-mutation and still owns a pooled permit, so acquiring a second
+/// one here would deadlock whenever the in-flight mutations exhaust the pool
+/// cap. LIST is not mailbox-relative, so reusing the mutation's own connection
+/// is safe regardless of what it has selected.
+async fn refresh_folders(
+    account: &ImapAccount,
+    conn: &ImapConnection,
+    op: AccountOperation,
+) -> Result<(), AccountError> {
     let err = op_err(op);
-    let conn = account.pool.dial_idle().await.map_err(err)?;
     let profile = conn.server_profile();
-    let folders = factory::list_folders(&conn, &account.config, &profile)
+    let folders = factory::list_folders(conn, &account.config, &profile)
         .await
         .map_err(err)?;
     // Personal-root re-LIST only. `replace_all` would clear the shared /

@@ -1,5 +1,5 @@
 use bifrost_types::{
-    AccountError, AccountErrorBuilder, AccountErrorKind, BlobId, Cause, ChangeCursor, CursorScope,
+    AccountError, AccountErrorBuilder, AccountErrorKind, Cause, ChangeCursor, CursorScope,
     DiagnosticText, ObjectId, OpaqueChangeState, Protocol, ProtocolKind, RequestCause,
     RequestErrorKind, SyncStateErrorKind, ThreadId,
 };
@@ -276,14 +276,6 @@ pub(crate) struct DecodedObjectId {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct DecodedBlobId {
-    pub(crate) folder: MailboxName,
-    pub(crate) uidvalidity: u32,
-    pub(crate) uid: u32,
-    pub(crate) section: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DecodedThreadId {
     pub(crate) folder: MailboxName,
     pub(crate) uidvalidity: u32,
@@ -312,41 +304,6 @@ pub(crate) fn decode_object_id(id: &ObjectId) -> Result<DecodedObjectId, Account
         folder,
         uidvalidity,
         uid,
-    })
-}
-
-#[cfg(test)]
-pub(crate) fn encode_blob_id(
-    folder: &MailboxName,
-    uidvalidity: u32,
-    uid: u32,
-    section: Option<&str>,
-) -> BlobId {
-    let section = section.unwrap_or("");
-    BlobId(format!(
-        "imapblob1:{}:{}:{}:{}:{}",
-        folder.as_str().len(),
-        folder.as_str(),
-        uidvalidity,
-        uid,
-        section
-    ))
-}
-
-pub(crate) fn decode_blob_id(id: &BlobId) -> Result<DecodedBlobId, AccountError> {
-    let (folder, rest) = decode_len_prefixed("imapblob1", &id.0)?;
-    let mut parts = rest.splitn(3, ':');
-    let uidvalidity = parse_u32(parts.next())?;
-    let uid = parse_u32(parts.next())?;
-    let section = parts
-        .next()
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned);
-    Ok(DecodedBlobId {
-        folder,
-        uidvalidity,
-        uid,
-        section,
     })
 }
 
@@ -611,18 +568,13 @@ mod tests {
     }
 
     #[test]
-    fn object_and_blob_ids_tolerate_colons_in_folder_names() {
+    fn object_ids_tolerate_colons_in_folder_names() {
         let folder = MailboxName::new("Work:Clients").expect("valid folder");
         let id = encode_object_id(&folder, 10, 42);
         let decoded = decode_object_id(&id).expect("object id");
         assert_eq!(decoded.folder, folder);
         assert_eq!(decoded.uidvalidity, 10);
         assert_eq!(decoded.uid, 42);
-
-        let blob = encode_blob_id(&folder, 10, 42, Some("2.1"));
-        let decoded = decode_blob_id(&blob).expect("blob id");
-        assert_eq!(decoded.folder, folder);
-        assert_eq!(decoded.section.as_deref(), Some("2.1"));
     }
 
     #[test]
@@ -750,20 +702,5 @@ mod tests {
         let err = decode_thread_id(&ThreadId("imapthread1:5:INBOX".to_owned()))
             .expect_err("missing uid field");
         assert!(is_malformed(&err));
-    }
-
-    #[test]
-    fn blob_id_section_survives_colons_and_empty_means_none() {
-        let folder = MailboxName::new("INBOX").expect("valid folder");
-        // A section spec can itself contain colons (HEADER.FIELDS lists),
-        // so only the first two separators after the folder are structural.
-        let id = encode_blob_id(&folder, 4, 8, Some("HEADER.FIELDS (TO:CC)"));
-        let decoded = decode_blob_id(&id).expect("blob id decodes");
-        assert_eq!(decoded.section.as_deref(), Some("HEADER.FIELDS (TO:CC)"));
-        assert_eq!(decoded.uidvalidity, 4);
-        assert_eq!(decoded.uid, 8);
-
-        let whole = encode_blob_id(&folder, 4, 8, None);
-        assert_eq!(decode_blob_id(&whole).expect("whole message").section, None);
     }
 }

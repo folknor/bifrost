@@ -353,8 +353,10 @@ impl SearchCriteria {
     /// RFC 3501 Section 6.4.4 / RFC 9051 Section 6.4.4:
     /// `"HEADER" SP header-fld-name SP astring`.
     ///
-    /// Returns an error if `value` contains NUL, CR, or LF (RFC 3501 Section 9).
+    /// Returns an error if `name` is not an IMAP atom or `value` contains
+    /// NUL, CR, or LF (RFC 3501 Section 9).
     pub fn header(mut self, name: &str, value: &str) -> Result<Self, crate::Error> {
+        validate_atom_bytes(name.as_bytes(), "HEADER field name")?;
         self.sep();
         self.buf.push_str("HEADER ");
         self.buf.push_str(name);

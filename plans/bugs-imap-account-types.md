@@ -32,45 +32,6 @@ the current bug.
 
 ## Gaps and smells
 
-### G1 - blob support is advertised but production code mints no IMAP blob IDs
-
-`blob_range` is advertised as supported and the openers decode
-`imapblob1:` handles, but inventory and hydration emit no `BlobHandle`.
-Either derive part handles from BODYSTRUCTURE and expose them, or
-advertise `BlobRangeSupport::No` until the surface is reachable.
-
-### G2 - `close()` does not close composed DAV sub-accounts
-
-`account/close.rs` stops IMAP push and the pool without calling
-`close()` on the optional CardDAV and CalDAV accounts. Both delegates are
-no-ops today, but this becomes a resource leak when either delegate gains
-real shutdown work.
-
-### G3 - CONDSTORE baseline seeding issues `UID SEARCH ALL` twice
-
-`account/changes.rs` searches once to seed an incomplete known-UID
-baseline, then immediately searches again to calculate a necessarily
-empty diff. Reuse the first result or skip the first diff when seeding.
-
-### G4 - `dial_idle()` bypasses pooling and the pool cap
-
-Folder CRUD, quota, draft, sent-copy, refresh, and push paths open fresh
-authenticated connections. Non-push callers should use a pooled
-`checkout_any()`; the IDLE loop is the legitimate dedicated-connection
-case.
-
-### G6 - `SearchCriteria::header` does not validate the field name
-
-`types/search.rs::header` quotes the value but appends the header name
-verbatim. Validate the name as an atom or encode it as an astring before
-building SEARCH syntax.
-
-### G7 - `mutation_results` carries a dead requested-UID parameter
-
-`account/mutate.rs::mutation_results` accepts `_requested_uids` and never
-reads it. Remove the parameter and the temporary vectors that exist only
-to populate it.
-
 ### G8 - push subscription lifecycle has small races
 
 `account/push.rs` has three issues:
@@ -80,12 +41,6 @@ to populate it.
 - a new subscription can start a second IDLE loop while the cancelled
   loop is still unwinding;
 - folder choice comes from HashMap iteration and is nondeterministic.
-
-### G10 - `encode_blob_id` is test-only while `decode_blob_id` is production
-
-The visibility mismatch is part of G1. Wiring blob handles requires
-promoting the encoder; dropping unreachable blob support should remove
-the decoder and openers instead.
 
 ### G11 - `discover_memberships` emits duplicate mailbox memberships
 

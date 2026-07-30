@@ -43,6 +43,9 @@ mod pim;
 mod pool;
 mod push;
 mod scopes;
+#[cfg(test)]
+#[path = "scripted_tests.rs"]
+mod scripted_tests;
 mod sieve;
 mod submission;
 #[cfg(test)]
@@ -57,8 +60,8 @@ pub use submission::{SmtpSubmissionConfig, SubmissionCredentials, SubmissionTls}
 pub(crate) use submission::SubmissionTransport;
 
 pub(crate) use envelope::{
-    DecodedObjectId, FolderCursor, decode_blob_id, decode_cursor, decode_object_id,
-    decode_thread_id, encode_cursor, encode_object_id, encode_thread_id,
+    DecodedObjectId, FolderCursor, decode_cursor, decode_object_id, decode_thread_id,
+    encode_cursor, encode_object_id, encode_thread_id,
 };
 pub(crate) use folder_registry::{CompactUidSet, FolderRegistry};
 pub(crate) use pool::{Pool, PooledConn};
@@ -378,18 +381,18 @@ impl Account for ImapAccount {
         push::push_stream(self.clone())
     }
 
-    // Account: streams a bifrost BlobHandle; direct users fetch BODY[] sections.
-    fn open_blob(&self, handle: BlobHandle) -> AccountStream<SyncEvent<bytes::Bytes>> {
-        blob::open_blob(self.clone(), handle)
+    // IMAP does not yet mint BlobHandles from BODYSTRUCTURE part metadata.
+    fn open_blob(&self, _handle: BlobHandle) -> AccountStream<SyncEvent<bytes::Bytes>> {
+        unsupported_stream(AccountOperation::OpenBlob)
     }
 
-    // Account: maps shared byte ranges to IMAP partial BODY[]; direct users choose sections.
+    // IMAP has no production BlobHandle surface to range yet.
     fn open_blob_range(
         &self,
-        handle: BlobHandle,
-        range: ByteRange,
+        _handle: BlobHandle,
+        _range: ByteRange,
     ) -> AccountStream<SyncEvent<bytes::Bytes>> {
-        blob::open_blob_range(self.clone(), handle, range)
+        unsupported_stream(AccountOperation::OpenBlobRange)
     }
 
     // Account: streams the whole message via BODY.PEEK[]; verbatim RFC822 octets.
@@ -861,6 +864,15 @@ fn unsupported_future<T: Send + 'static>(
     operation: AccountOperation,
 ) -> AccountFuture<Result<T, AccountError>> {
     Box::pin(async move { Err(error::unsupported(operation)) })
+}
+
+fn unsupported_stream<T: Send + 'static>(
+    operation: AccountOperation,
+) -> AccountStream<SyncEvent<T>> {
+    Box::pin(futures::stream::iter([
+        SyncEvent::Terminated(error::unsupported(operation)),
+        SyncEvent::Done(None),
+    ]))
 }
 
 /// Convert a crate-private `crate::Error` into a public `AccountError`
