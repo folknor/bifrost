@@ -20,6 +20,9 @@ struct TranscriptState {
     /// instead of reporting EOF, which is what a timeout or a cancellation
     /// test needs to observe.
     stalled: bool,
+    /// The pending server bytes arrived as one TCP segment, so a single read
+    /// hands out all of them rather than one reply line.
+    coalesced: bool,
 }
 
 #[derive(Debug)]
@@ -27,6 +30,7 @@ struct TranscriptStep {
     client: Vec<u8>,
     server: Vec<u8>,
     stall: bool,
+    coalesced: bool,
 }
 
 impl Transcript {
@@ -46,21 +50,40 @@ impl Transcript {
                 pending_server_bytes,
                 steps: VecDeque::new(),
                 stalled,
+                coalesced: false,
             })),
         }
     }
 
     pub(super) fn expect(self, client: impl AsRef<[u8]>, server: impl AsRef<[u8]>) -> Self {
-        self.push(client, server, false)
+        self.push(client, server, false, false)
+    }
+
+    /// A step whose reply bytes arrive as one segment, the way a real peer's
+    /// TCP stack coalesces adjacent replies. A `BufReader` over the stream
+    /// therefore prefetches all of them, which is how the driver can observe
+    /// bytes it did not ask for without a blocking read.
+    pub(super) fn expect_coalesced(
+        self,
+        client: impl AsRef<[u8]>,
+        server: impl AsRef<[u8]>,
+    ) -> Self {
+        self.push(client, server, false, true)
     }
 
     /// Accept the client bytes, then never answer.
     #[cfg(feature = "tokio")]
     pub(super) fn expect_then_stall(self, client: impl AsRef<[u8]>) -> Self {
-        self.push(client, b"", true)
+        self.push(client, b"", true, false)
     }
 
-    fn push(self, client: impl AsRef<[u8]>, server: impl AsRef<[u8]>, stall: bool) -> Self {
+    fn push(
+        self,
+        client: impl AsRef<[u8]>,
+        server: impl AsRef<[u8]>,
+        stall: bool,
+        coalesced: bool,
+    ) -> Self {
         self.shared
             .lock()
             .expect("transcript lock")
@@ -69,6 +92,7 @@ impl Transcript {
                 client: client.as_ref().to_vec(),
                 server: server.as_ref().to_vec(),
                 stall,
+                coalesced,
             });
         self
     }
@@ -122,11 +146,15 @@ impl std::io::Read for TranscriptStream {
         // `pending_server_bytes` after the first parsed response, and let the
         // driver write the next command without draining the rest - which is
         // exactly the sequencing bug these transcripts exist to catch.
-        let line_end = state
-            .pending_server_bytes
-            .iter()
-            .position(|byte| *byte == b'\n')
-            .map_or(state.pending_server_bytes.len(), |index| index + 1);
+        let line_end = if state.coalesced {
+            state.pending_server_bytes.len()
+        } else {
+            state
+                .pending_server_bytes
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(state.pending_server_bytes.len(), |index| index + 1)
+        };
         let count = buf.len().min(line_end);
         for destination in &mut buf[..count] {
             *destination = state
@@ -164,6 +192,7 @@ impl std::io::Write for TranscriptStream {
         }
         state.pending_server_bytes.extend(step.server);
         state.stalled = step.stall;
+        state.coalesced = step.coalesced;
         Ok(buf.len())
     }
 

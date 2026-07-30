@@ -12,6 +12,7 @@ pub struct PoolConfig {
     min_idle: u32,
     max_size: u32,
     idle_timeout: Duration,
+    test_on_checkout: bool,
 }
 
 impl PoolConfig {
@@ -47,6 +48,16 @@ impl PoolConfig {
         self.idle_timeout = idle_timeout;
         self
     }
+
+    /// Whether reused connections are probed with `NOOP` before checkout.
+    ///
+    /// Defaults to `true`. Set this to `false` to avoid the checkout round
+    /// trip when the caller is willing to retry a send on a server-closed idle
+    /// connection. Connections already marked broken are always discarded.
+    pub fn test_on_checkout(mut self, test_on_checkout: bool) -> Self {
+        self.test_on_checkout = test_on_checkout;
+        self
+    }
 }
 
 impl Default for PoolConfig {
@@ -55,6 +66,18 @@ impl Default for PoolConfig {
             min_idle: 0,
             max_size: 10,
             idle_timeout: Duration::from_secs(60),
+            test_on_checkout: true,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PoolConfig;
+
+    #[test]
+    fn checkout_probe_defaults_to_enabled_and_can_be_disabled() {
+        assert!(PoolConfig::default().test_on_checkout);
+        assert!(!PoolConfig::new().test_on_checkout(false).test_on_checkout);
     }
 }

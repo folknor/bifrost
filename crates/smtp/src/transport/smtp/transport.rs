@@ -54,6 +54,10 @@ pub struct SmtpTransport {
 /// LMTP uses `LHLO` for capability discovery and returns one status per
 /// envelope recipient. Rejected recipients carry their `RCPT` response;
 /// accepted recipients carry their post-DATA delivery response.
+///
+/// Direct sends return only the ordered statuses. Use
+/// [`LmtpTransport::send_raw_batch_with_options`] when callers need the
+/// RCPT-versus-final-status phase and per-recipient recovery classification.
 #[derive(Clone)]
 pub struct LmtpTransport {
     inner: Arc<Pool>,
@@ -82,6 +86,9 @@ impl Transport for LmtpTransport {
     type Error = Error;
 
     /// Sends an email and returns one LMTP status per recipient.
+    ///
+    /// For per-recipient command-phase and recovery details, use
+    /// [`LmtpTransport::send_raw_batch_with_options`].
     fn send_raw(&self, envelope: &Envelope, email: &[u8]) -> Result<Self::Ok, Self::Error> {
         let mut conn = self.inner.connection()?;
 
@@ -435,6 +442,9 @@ impl LmtpTransport {
     }
 
     /// Sends an email over LMTP with per-message SMTP options.
+    ///
+    /// For per-recipient command-phase and recovery details, use
+    /// [`Self::send_raw_batch_with_options`].
     pub fn send_raw_with_options(
         &self,
         envelope: &Envelope,

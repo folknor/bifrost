@@ -62,6 +62,10 @@ pub struct AsyncSmtpTransport<E: Executor> {
 /// [`AsyncSmtpTransport`]. LMTP uses `LHLO` for capability discovery and
 /// returns one status per envelope recipient. Rejected recipients carry their
 /// `RCPT` response; accepted recipients carry their post-DATA delivery response.
+///
+/// Direct sends return only the ordered statuses. Use
+/// [`AsyncLmtpTransport::send_raw_batch_with_options`] when callers need the
+/// RCPT-versus-final-status phase and per-recipient recovery classification.
 #[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
 pub struct AsyncLmtpTransport<E: Executor> {
     inner: Arc<Pool<E>>,
@@ -90,6 +94,9 @@ impl AsyncTransport for AsyncLmtpTransport<TokioExecutor> {
     type Error = Error;
 
     /// Sends an email and returns one LMTP status per recipient.
+    ///
+    /// For per-recipient command-phase and recovery details, use
+    /// [`AsyncLmtpTransport::send_raw_batch_with_options`].
     async fn send_raw(&self, envelope: &Envelope, email: &[u8]) -> Result<Self::Ok, Self::Error> {
         let mut conn = self.inner.connection().await?;
 
@@ -501,6 +508,9 @@ where
     }
 
     /// Sends an email over LMTP with per-message SMTP options.
+    ///
+    /// For per-recipient command-phase and recovery details, use
+    /// [`Self::send_raw_batch_with_options`].
     #[allow(private_bounds)]
     pub async fn send_raw_with_options(
         &self,

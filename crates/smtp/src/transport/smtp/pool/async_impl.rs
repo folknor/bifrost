@@ -178,7 +178,15 @@ impl<E: SmtpExecutor> Pool<E> {
                     }
                     let mut conn = conn.unpark();
 
-                    if !conn.test_connected().await {
+                    if conn.has_broken() {
+                        #[cfg(feature = "tracing")]
+                        tracing::debug!("dropping a broken connection");
+
+                        conn.abort().await;
+                        continue;
+                    }
+
+                    if self.config.test_on_checkout && !conn.test_connected().await {
                         #[cfg(feature = "tracing")]
                         tracing::debug!("dropping a broken connection");
 
@@ -205,9 +213,13 @@ impl<E: SmtpExecutor> Pool<E> {
 
 impl<E: Executor> Pool<E> {
     async fn recycle(&self, mut conn: AsyncSmtpConnection) {
-        if conn.has_broken() {
+        // A connection that has served an LMTP final-status drain is retired
+        // rather than recycled: a surplus final status below the read buffer
+        // cannot be detected without a read that would block on a well-behaved
+        // peer, so reuse could silently consume it as the next reply.
+        if conn.has_broken() || conn.should_retire() {
             #[cfg(feature = "tracing")]
-            tracing::debug!("dropping a broken connection instead of recycling it");
+            tracing::debug!("dropping a broken or retired connection instead of recycling it");
 
             conn.abort().await;
             drop(conn);

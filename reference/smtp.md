@@ -29,7 +29,9 @@ EHLO is re-sent after STARTTLS and AUTH because capabilities can change.
 
 Sync and async streams carry an explicit state: `Ok` / `Broken` / `Closed`. Writes, flushes, reads, and TLS upgrades set `Broken` before the await; only success restores `Ok`. Dropped futures leave state `Broken`; the pool drops the connection.
 
-LMTP final delivery-status loop holds `Broken` until every accepted recipient's status has been read.
+LMTP final delivery-status loop holds `Broken` until every accepted recipient's status has been read. A surplus final status that already reached the read buffer is a protocol violation: the connection is marked `Broken` and the drain fails (the batch driver keeps the per-recipient outcomes it already has, since the surplus changes only the stream's reusability).
+
+Surplus bytes that have not yet crossed into the `BufReader` - still in the socket or a TLS record - cannot be observed without a read that would block against a well-behaved peer, and native-tls exposes no nonblocking peek that would make such a probe honest. So cleanliness is never positively established: every LMTP final-status drain sets a retirement flag (`should_retire()`), and the pool discards those connections at recycle instead of parking them. The cost is one reconnect per LMTP transaction; LMTP is local delivery, so that is cheaper than recycling a possibly desynchronized stream. SMTP connections are unaffected and still pool normally.
 
 `test_connected()` (pooled NOOP probe) aborts on failure so a stale connection cannot be recycled.
 
@@ -104,6 +106,8 @@ source.
 
 Per-recipient response model: vector length equals envelope recipient count. RCPT-time rejection responses are preserved at the original recipient index; accepted recipients receive the post-DATA delivery response in original order.
 
+Direct LMTP sends expose only that ordered response vector. Use the account-oriented batch send API when the caller needs each recipient's RCPT-versus-final-status phase and recovery classification.
+
 Unix-domain LMTP constructors are `#[cfg(unix)]` on sync and Tokio. Unix sockets refuse STARTTLS explicitly.
 
 ## Native-tls only
@@ -140,7 +144,7 @@ Canonicalization follows RFC 6376 for empty bodies and missing final CRLFs. Rela
 
 ## Pool
 
-`PoolConfig` configures min idle, max size, and idle timeout. `min_idle` defaults to 0: no background pool worker is started, and expired connections are discarded at checkout. A positive `min_idle` enables the worker that expires and replenishes warm connections. `test_connected()` runs before reuse and aborts on failure.
+`PoolConfig` configures min idle, max size, idle timeout, and the checkout NOOP probe. Recycling refuses connections that are `Broken` and connections flagged for retirement by an LMTP final-status drain (see "Connection state and cancel-safety"). `min_idle` defaults to 0: no background pool worker is started, and expired connections are discarded at checkout. A positive `min_idle` enables the worker that expires and replenishes warm connections. `test_on_checkout(false)` opts out of the default NOOP probe for callers willing to retry one stale idle connection; it does not permit a connection already marked `Broken` to be reused.
 
 ## Error model
 
@@ -172,6 +176,11 @@ hermetic nor deterministic. A transcript is a greeting plus an ordered list of
   a whole pipelined reply group, and a driver that skipped replies would still
   pass. Writing while replies are pending is an error, which is how the
   PIPELINING window drain and the LMTP surplus-final-reply desync are detected.
+- `expect_coalesced(...)` opts one step out of the line split so its replies
+  arrive as a single segment, the way a real peer's TCP stack coalesces
+  adjacent replies. That is what a `BufReader` prefetches, so it drives the
+  same surplus-detection path production has. The harness has no visibility
+  below the buffer that a real transport lacks.
 
 `expect_then_stall` and `Transcript::silent()` model a peer that accepts and
 then never answers; reads park with no waker, so only the caller's own timeout

@@ -3,25 +3,6 @@
 Current gaps after the first repair pass. Resolved findings are intentionally
 removed rather than retained as history.
 
-## Open bugs
-
-### B19 - A surplus LMTP final reply silently desynchronizes the connection
-
-A peer that emits more post-DATA final replies than it accepted recipients
-leaves the extra replies queued. `send_lmtp` returns the expected number of
-statuses, does not mark the connection broken, and the pooled connection is
-handed back for reuse - so the next command reads a stale reply as its own
-response, off by one forever.
-
-`lmtp_surplus_final_status_desynchronizes_the_next_command` pins the current
-behavior: the transcript harness refuses the following write while replies are
-still pending, which is exactly the desync a real socket would hide.
-
-Proposed fix: after draining the expected finals, treat any residual buffered
-input as a protocol violation - mark the connection `Broken` so the pool
-discards it rather than recycling a desynchronized stream. Symmetric with the
-too-few case, which already breaks the connection.
-
 ## Deviations and deliberate choices
 
 ### D8 - `Message::formatted()` is not byte-identical to DATA delivery
@@ -55,50 +36,57 @@ DKIM signing does not emit the body-length tag because `l=` permits
 content-append attacks. This is deliberate and should stay documented in the
 SMTP reference.
 
-## Efficiency and API follow-ups
+### D12 - LMTP connections are retired after every final-status drain (B19)
 
-### E2 - Command serialization allocates one `String` per command
+B19 was a surplus post-DATA final reply desynchronizing a pooled LMTP
+connection: the extra reply stayed queued and the next command read it as its
+own response.
 
-`connection.rs` uses `command.to_string()` for individual commands. A reusable
-command buffer would remove small allocations from the send path.
+Detection is only partial by construction. A surplus reply that already reached
+the driver's `BufReader` is provable and is now a hard failure: the stream is
+marked `Broken` and `send_lmtp` / `message_lmtp_*` return
+"more final statuses than accepted recipients". The batch drivers apply the same
+check but keep the per-recipient outcomes they already resolved - the surplus
+changes the stream's reusability, not the delivery result.
 
-### E4 - Pooled checkout performs a NOOP round trip
+Bytes still below the buffer (socket receive queue, TLS record layer) cannot be
+observed without a read that would block against a well-behaved peer, and
+native-tls exposes no nonblocking peek that would make such a probe honest. The
+first fix attempt papered over this with a test-only accessor into the
+`Transcript` peer, which gave the harness visibility production does not have.
+The decision instead is conservative retirement: every LMTP final-status drain
+sets a retirement flag and the pool discards the connection at recycle rather
+than parking it.
 
-The defensive NOOP probe avoids reusing a server-closed connection but costs an
-extra RTT. Consider an explicit `PoolConfig` opt-out for callers willing to
-retry one broken send.
+The trade is one reconnect per LMTP transaction. LMTP is local delivery, so the
+reconnect is cheap relative to recycling a stream that may be off by one reply
+forever. SMTP pooling is untouched.
 
-### E5 - LMTP direct sends do not expose RCPT versus final-status phase
+### D11 - Envelope transport failures before DATA are `Unsent`
 
-`send_lmtp_with_options` preserves recipient order but returns only
-`Vec<Response>`. The batch API carries the phase through `SmtpCommandPhase` and
-should be documented as the richer API.
-
-### E6 - `Address::new_dangerous` and `Address::new_unchecked` duplicate one API
-
-The public constructors have identical behavior and documentation. Deprecate
-one name in the next API cleanup.
+For both sync and async SMTP and LMTP batch drivers, a failed write or reply
+drain from `MAIL FROM` through `RCPT TO` carries `Unsent` evidence: `DATA` has
+not been issued, so no message content can have reached the peer. Existing
+recipient rejections remain authoritative, and all still-open recipients move
+through `SendProgress::mark_unresolved_unsent`. `DATA` and later retain their
+`InFlight` / `Acknowledged` evidence semantics.
 
 ## Test seam and audit gaps
 
 - Batch resolver unit tests do not drive the complete sync and async send
   paths. The repaired RCPT-option validation needs this harness for broader
   sequencing coverage.
-- Envelope-phase transport failures now split into two evidence classes, and
-  only one of them is settled. A failed *write* of a later PIPELINING recipient
-  window is `Unsent` (B-round fix). A failed *read* while draining RCPT replies
-  is still stamped `InFlight`, in both the pipelined and non-pipelined paths,
-  even though `DATA` has not been issued there either and no content can have
-  reached the peer. The existing comment in `connection.rs` treats "transport
-  drop is `InFlight`" as a blanket rule; that rule is too coarse for the
-  envelope phase. Deliberately out of scope for this round because it changes
-  pre-existing non-pipelined behavior. Decide the phase-aware rule, then apply
-  it to both drivers at once.
 - The `Transcript` harness models a peer that answers or a peer that goes
   silent, but not a peer that half-answers a reply line, closes mid-response,
   or interleaves writes with pending replies (which a real full-duplex socket
   permits and the harness deliberately rejects). The write-while-pending
-  refusal is a sequencing assertion, not a fidelity claim.
+  refusal is a sequencing assertion, not a fidelity claim. `expect_coalesced`
+  now models one real segmentation shape (adjacent replies in one segment), but
+  partial lines and mid-response close remain unmodelled.
+- No test covers the pool's retirement of a drained LMTP connection end to end;
+  retirement is pinned at the connection level (`should_retire()`) and the pool
+  branch is a one-line predicate. A pooled-transport harness would close that
+  gap.
 - TLS/network modules, mailbox parsers, and direct async transport tests remain
   outside this pass. `starttls` upgrade past the capability check is not
   covered: the transcript has no TLS handshake.

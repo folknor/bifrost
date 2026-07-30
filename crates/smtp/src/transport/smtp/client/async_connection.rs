@@ -2,7 +2,11 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 #[cfg(unix)]
 use std::path::Path;
-use std::{fmt::Display, future::Future, time::Duration};
+use std::{
+    fmt::{Display, Write as _},
+    future::Future,
+    time::Duration,
+};
 
 use bifrost_sasl::ScramChannelBinding;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -101,6 +105,11 @@ pub(crate) struct AsyncSmtpConnection {
     protocol: Protocol,
     /// Timeout applied to each async SMTP I/O operation.
     timeout: Option<Duration>,
+    /// Reused storage for serializing individual SMTP commands.
+    command_buffer: String,
+    /// Set once an LMTP final-status drain has run: the connection must not
+    /// go back into the pool because stream cleanliness cannot be proven.
+    retire: bool,
 }
 
 impl AsyncSmtpConnection {
@@ -219,6 +228,8 @@ impl AsyncSmtpConnection {
             hello_name: hello_name.clone(),
             protocol,
             timeout,
+            command_buffer: String::new(),
+            retire: false,
         };
         let _response = conn.read_response_with_budget(setup_budget).await?;
 
@@ -623,10 +634,9 @@ impl AsyncSmtpConnection {
                 .await;
         }
 
-        // Non-pipelined path. Split the wire event the same way the pipelined
-        // sibling does so identical events yield identical transmission
-        // evidence regardless of PIPELINING: a transport drop is `InFlight`,
-        // an acknowledged negative reply is `Acknowledged` (not `Unsent`).
+        // Before DATA, no message content can have reached the peer,
+        // regardless of whether the failed operation was a write or a reply
+        // drain. Negative replies remain `Acknowledged`.
         let mail_cmd = Mail::new(from, mail_options);
         match self.command_accepting_status(mail_cmd).await {
             Ok(resp) if resp.is_positive() => {}
@@ -642,7 +652,7 @@ impl AsyncSmtpConnection {
             Err(e) => {
                 self.abort().await;
                 return Err((
-                    e.with_attempt(SmtpTransmissionState::InFlight)
+                    e.with_attempt(SmtpTransmissionState::Unsent)
                         .with_phase(SmtpCommandPhase::MailFrom),
                     progress,
                 ));
@@ -670,12 +680,11 @@ impl AsyncSmtpConnection {
                         SmtpErrorContext, into_account_error,
                     };
                     let ae = into_account_error(
-                        e.with_attempt(SmtpTransmissionState::InFlight)
+                        e.with_attempt(SmtpTransmissionState::Unsent)
                             .with_phase(SmtpCommandPhase::RcptTo),
                         SmtpErrorContext::send(Protocol::Smtp).with_phase(SmtpCommandPhase::RcptTo),
                     );
-                    let ae2 = ae.clone();
-                    progress.mark_uncertain_unresolved(|| ae2.clone());
+                    progress.mark_unresolved_unsent(|| ae.clone());
                     self.abort().await;
                     return Ok(progress);
                 }
@@ -789,7 +798,7 @@ impl AsyncSmtpConnection {
             self.stream.get_ref().state().verify().map_err(|error| {
                 (
                     error
-                        .with_attempt(SmtpTransmissionState::InFlight)
+                        .with_attempt(SmtpTransmissionState::Unsent)
                         .with_phase(SmtpCommandPhase::RcptTo),
                     progress.clone(),
                 )
@@ -805,7 +814,7 @@ impl AsyncSmtpConnection {
                     Err(e) => {
                         self.abort().await;
                         return Err((
-                            e.with_attempt(SmtpTransmissionState::InFlight)
+                            e.with_attempt(SmtpTransmissionState::Unsent)
                                 .with_phase(SmtpCommandPhase::MailFrom),
                             progress,
                         ));
@@ -834,13 +843,12 @@ impl AsyncSmtpConnection {
                             SmtpErrorContext, into_account_error,
                         };
                         let ae = into_account_error(
-                            e.with_attempt(SmtpTransmissionState::InFlight)
+                            e.with_attempt(SmtpTransmissionState::Unsent)
                                 .with_phase(SmtpCommandPhase::RcptTo),
                             SmtpErrorContext::send(Protocol::Smtp)
                                 .with_phase(SmtpCommandPhase::RcptTo),
                         );
-                        let ae2 = ae.clone();
-                        progress.mark_uncertain_unresolved(|| ae2.clone());
+                        progress.mark_unresolved_unsent(|| ae.clone());
                         self.abort().await;
                         return Ok(progress);
                     }
@@ -953,9 +961,8 @@ impl AsyncSmtpConnection {
                 )
             })?;
 
-        // MAIL FROM: an acknowledged negative reply is `Acknowledged`, a
-        // transport drop is `InFlight` - never `Unsent` for either. See the
-        // SMTP non-pipelined path for the same split.
+        // Before DATA, a transport drop is `Unsent`; a server rejection is
+        // still `Acknowledged`. The SMTP path applies the same split.
         let mail_cmd = Mail::new(from, mail_options);
         match self.command_accepting_status(mail_cmd).await {
             Ok(resp) if resp.is_positive() => {}
@@ -971,7 +978,7 @@ impl AsyncSmtpConnection {
             Err(e) => {
                 self.abort().await;
                 return Err((
-                    e.with_attempt(SmtpTransmissionState::InFlight)
+                    e.with_attempt(SmtpTransmissionState::Unsent)
                         .with_phase(SmtpCommandPhase::MailFrom),
                     progress,
                 ));
@@ -1003,12 +1010,11 @@ impl AsyncSmtpConnection {
                         SmtpErrorContext, into_account_error,
                     };
                     let ae = into_account_error(
-                        e.with_attempt(SmtpTransmissionState::InFlight)
+                        e.with_attempt(SmtpTransmissionState::Unsent)
                             .with_phase(SmtpCommandPhase::RcptTo),
                         SmtpErrorContext::send(Protocol::Lmtp).with_phase(SmtpCommandPhase::RcptTo),
                     );
-                    let ae2 = ae.clone();
-                    progress.mark_uncertain_unresolved(|| ae2.clone());
+                    progress.mark_unresolved_unsent(|| ae.clone());
                     self.abort().await;
                     return Ok(progress);
                 }
@@ -1091,6 +1097,12 @@ impl AsyncSmtpConnection {
                 }
             }
         }
+
+        // Every recipient outcome is already recorded, so a surplus final
+        // status does not change the send result - it only means this stream
+        // must never be reused. `finish_lmtp_final_drain` marks it broken and
+        // retires it; the batch outcome stands.
+        let _surplus = self.finish_lmtp_final_drain();
 
         Ok(progress)
     }
@@ -1823,8 +1835,7 @@ impl AsyncSmtpConnection {
     }
 
     pub(crate) async fn message_bdat(&mut self, message: &[u8]) -> Result<Response, Error> {
-        self.write(Bdat::last(message.len()).to_string().as_bytes())
-            .await?;
+        self.write_command(Bdat::last(message.len())).await?;
         self.write(message).await?;
         self.read_response().await
     }
@@ -1834,8 +1845,7 @@ impl AsyncSmtpConnection {
         message: &[u8],
         recipients: usize,
     ) -> Result<Vec<Response>, Error> {
-        self.write(Bdat::last(message.len()).to_string().as_bytes())
-            .await?;
+        self.write_command(Bdat::last(message.len())).await?;
         self.write(message).await?;
 
         // A dropped LMTP BDAT send cannot safely reuse the stream until every
@@ -1850,6 +1860,8 @@ impl AsyncSmtpConnection {
                     .await?,
             );
         }
+
+        self.finish_lmtp_final_drain()?;
 
         self.stream.get_mut().set_state(ConnectionState::Ok);
         Ok(responses)
@@ -1905,6 +1917,8 @@ impl AsyncSmtpConnection {
             );
         }
 
+        self.finish_lmtp_final_drain()?;
+
         self.stream.get_mut().set_state(ConnectionState::Ok);
         Ok(responses)
     }
@@ -1920,8 +1934,7 @@ impl AsyncSmtpConnection {
         command: C,
         budget: TimeoutBudget,
     ) -> Result<Response, Error> {
-        self.write_with_budget(command.to_string().as_bytes(), budget)
-            .await?;
+        self.write_command_with_budget(command, budget).await?;
         self.read_response_with_budget(budget).await
     }
 
@@ -1929,8 +1942,53 @@ impl AsyncSmtpConnection {
         &mut self,
         command: C,
     ) -> Result<Response, Error> {
-        self.write(command.to_string().as_bytes()).await?;
+        self.write_command(command).await?;
         self.read_response_accepting_status().await
+    }
+
+    async fn write_command<C: Display>(&mut self, command: C) -> Result<(), Error> {
+        self.write_command_with_budget(command, self.per_operation_budget())
+            .await
+    }
+
+    async fn write_command_with_budget<C: Display>(
+        &mut self,
+        command: C,
+        budget: TimeoutBudget,
+    ) -> Result<(), Error> {
+        self.command_buffer.clear();
+        write!(&mut self.command_buffer, "{command}")
+            .map_err(|_| error::internal("failed to serialize SMTP command"))?;
+        Self::write_stream_with_budget(&mut self.stream, self.command_buffer.as_bytes(), budget)
+            .await
+    }
+
+    /// Closes out an LMTP final-status drain.
+    ///
+    /// A surplus final status that already reached the read buffer is a
+    /// protocol violation we can prove: the stream is marked `Broken` and the
+    /// caller gets an error. Bytes still below the buffer (in the socket or
+    /// TLS record layer) cannot be observed without a read that would block on
+    /// a well-behaved peer, so cleanliness is never positively established:
+    /// every LMTP drain retires the connection instead of returning it to the
+    /// pool. LMTP is local delivery, so a reconnect is cheap next to reusing a
+    /// desynchronized stream.
+    fn finish_lmtp_final_drain(&mut self) -> Result<(), Error> {
+        self.retire = true;
+
+        if self.stream.buffer().is_empty() {
+            return Ok(());
+        }
+
+        self.stream.get_mut().set_state(ConnectionState::Broken);
+        Err(error::parse(
+            "LMTP server returned more final statuses than accepted recipients",
+        ))
+    }
+
+    /// Whether this connection must not be returned to the pool.
+    pub(crate) fn should_retire(&self) -> bool {
+        self.retire
     }
 
     fn error_from_status(response: Response) -> Error {
@@ -1948,24 +2006,28 @@ impl AsyncSmtpConnection {
         string: &[u8],
         budget: TimeoutBudget,
     ) -> Result<(), Error> {
-        self.stream.get_ref().state().verify()?;
-        self.stream.get_mut().set_state(ConnectionState::Broken);
+        Self::write_stream_with_budget(&mut self.stream, string, budget).await
+    }
+
+    async fn write_stream_with_budget(
+        stream: &mut BufReader<AsyncNetworkStream>,
+        string: &[u8],
+        budget: TimeoutBudget,
+    ) -> Result<(), Error> {
+        stream.get_ref().state().verify()?;
+        stream.get_mut().set_state(ConnectionState::Broken);
 
         with_timeout(
             budget,
             "SMTP write timed out",
-            self.stream.get_mut().write_all(string),
+            stream.get_mut().write_all(string),
         )
         .await?
         .map_err(error::network)?;
-        with_timeout(
-            budget,
-            "SMTP flush timed out",
-            self.stream.get_mut().flush(),
-        )
-        .await?
-        .map_err(error::network)?;
-        self.stream.get_mut().set_state(ConnectionState::Ok);
+        with_timeout(budget, "SMTP flush timed out", stream.get_mut().flush())
+            .await?
+            .map_err(error::network)?;
+        stream.get_mut().set_state(ConnectionState::Ok);
 
         #[cfg(feature = "tracing")]
         tracing::debug!("Wrote {} bytes", string.len());
@@ -2066,11 +2128,13 @@ mod transcript_tests {
         transport::smtp::{
             Protocol,
             authentication::{Credentials, Mechanism},
+            batch::SmtpBatchRecipient,
             commands::Noop,
             extension::{ClientId, Extension, MailBodyParameter, MailParameter},
             test_support::Transcript,
         },
     };
+    use bifrost_types::error::BatchItemId;
 
     use super::{AsyncSmtpConnection, SendOptions};
 
@@ -2112,6 +2176,53 @@ mod transcript_tests {
                 .unwrap();
         connection.send(&envelope, b"body").await.unwrap();
         transcript.assert_exhausted();
+    }
+
+    #[tokio::test(crate = "tokio")]
+    async fn pipelined_rcpt_reply_read_failure_reports_unsent_not_uncertain() {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let addresses: Vec<crate::address::Address> = (0..32)
+            .map(|index| format!("recipient-{index}@example.com").parse().unwrap())
+            .collect();
+        let mut window = "MAIL FROM:<sender@example.com>\r\n".to_owned();
+        window.extend(
+            addresses
+                .iter()
+                .map(|recipient| format!("RCPT TO:<{recipient}>\r\n")),
+        );
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250-smtp.example\r\n250 PIPELINING\r\n")
+            .expect(
+                window,
+                "250 sender ok\r\n250 first accepted\r\n550 second rejected\r\n",
+            );
+        let batch = addresses
+            .into_iter()
+            .enumerate()
+            .map(|(index, address)| SmtpBatchRecipient {
+                id: BatchItemId(format!("item-{index}")),
+                address,
+            })
+            .collect();
+
+        let mut connection =
+            AsyncSmtpConnection::from_transcript(transcript, &hello, Protocol::Smtp)
+                .await
+                .unwrap();
+        let outcome = connection
+            .send_smtp_batch(
+                Some("sender@example.com".parse().unwrap()),
+                batch,
+                b"body",
+                &Default::default(),
+            )
+            .await
+            .unwrap()
+            .resolve();
+
+        assert!(outcome.uncertain().is_empty());
+        assert_eq!(outcome.failed().len(), 32);
+        assert_eq!(outcome.failed()[1].item.0, "item-1");
     }
 
     #[tokio::test(crate = "tokio")]
@@ -2486,5 +2597,74 @@ mod transcript_tests {
             error.is_connection(),
             "expected connection error: {error:?}"
         );
+    }
+
+    #[tokio::test(crate = "tokio")]
+    async fn lmtp_drain_retires_the_connection_and_breaks_it_on_a_surplus_status() {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let recipients = vec![
+            "first@example.com".parse().unwrap(),
+            "second@example.com".parse().unwrap(),
+        ];
+        let clean = Transcript::new("220 lmtp.example\r\n")
+            .expect("LHLO client.example\r\n", "250 lmtp.example\r\n")
+            .expect("MAIL FROM:<sender@example.com>\r\n", "250 sender ok\r\n")
+            .expect("RCPT TO:<first@example.com>\r\n", "250 first ok\r\n")
+            .expect("RCPT TO:<second@example.com>\r\n", "250 second ok\r\n")
+            .expect("DATA\r\n", "354 send body\r\n")
+            .expect("body", "")
+            .expect(
+                "\r\n.\r\n",
+                "250 first delivered\r\n250 second delivered\r\n",
+            );
+        let envelope = Envelope::new(
+            Some("sender@example.com".parse().unwrap()),
+            recipients.clone(),
+        )
+        .unwrap();
+        let mut connection = AsyncSmtpConnection::from_transcript(clean, &hello, Protocol::Lmtp)
+            .await
+            .unwrap();
+        assert_eq!(
+            connection
+                .send_lmtp(&envelope, b"body")
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        // Cleanliness below the read buffer is unprovable, so the connection
+        // is retired rather than recycled - but it is not an error.
+        assert!(connection.should_retire());
+        assert!(!connection.has_broken());
+
+        // Surplus bytes that arrive in the same segment do reach the read
+        // buffer, and that case is a hard error.
+        let surplus = Transcript::new("220 lmtp.example\r\n")
+            .expect("LHLO client.example\r\n", "250 lmtp.example\r\n")
+            .expect("MAIL FROM:<sender@example.com>\r\n", "250 sender ok\r\n")
+            .expect("RCPT TO:<first@example.com>\r\n", "250 first ok\r\n")
+            .expect("RCPT TO:<second@example.com>\r\n", "250 second ok\r\n")
+            .expect("DATA\r\n", "354 send body\r\n")
+            .expect("body", "")
+            .expect_coalesced(
+                "\r\n.\r\n",
+                "250 first delivered\r\n250 second delivered\r\n250 surplus response\r\n",
+            );
+        let envelope =
+            Envelope::new(Some("sender@example.com".parse().unwrap()), recipients).unwrap();
+        let mut connection = AsyncSmtpConnection::from_transcript(surplus, &hello, Protocol::Lmtp)
+            .await
+            .unwrap();
+        let error = connection
+            .send_lmtp(&envelope, b"body")
+            .await
+            .expect_err("a surplus final status desynchronizes the stream");
+        assert!(
+            error.to_string().contains("more final statuses"),
+            "expected an honest LMTP final-status error, got: {error}"
+        );
+        assert!(connection.has_broken());
+        assert!(connection.should_retire());
     }
 }

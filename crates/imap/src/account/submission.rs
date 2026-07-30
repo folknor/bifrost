@@ -321,8 +321,8 @@ fn hold_until_rfc3339(at: std::time::SystemTime) -> String {
 /// `bifrost-smtp`'s own envelope builder takes.
 fn to_smtp_address(address: &bifrost_types::Address) -> SmtpAddress {
     match address.address.rsplit_once('@') {
-        Some((user, domain)) => SmtpAddress::new_unchecked(user, domain),
-        None => SmtpAddress::new_unchecked(address.address.as_str(), ""),
+        Some((user, domain)) => SmtpAddress::new_dangerous(user, domain),
+        None => SmtpAddress::new_dangerous(address.address.as_str(), ""),
     }
 }
 
