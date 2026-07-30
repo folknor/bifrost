@@ -442,8 +442,12 @@ wire, and re-qualifies on the way out so an outcome id is byte-identical to
 the id the caller handed in. `blob::foreign_split` does the same selection
 for `open_blob` and both legs of `open_raw_rfc822` (the `blobId` fetch AND
 the download). An id naming an account this session cannot reach falls back
-to the primary handle deliberately, so the miss surfaces as a real
-not-found rather than a fabricated local error.
+to the primary handle deliberately, and - like the mutation pipeline's
+`wire_email_id` - stays LITERAL on that wire (`hydrate::wire_object_id`
+strips the qualification only for the routed owner), so the miss surfaces
+as a real not-found rather than either a fabricated local error or, on a
+native-id collision, an unrelated primary object hydrated under the
+foreign id.
 
 `pim::message_hydrate` (the one-id door, and the one
 `SyncEngine::message_hydrate` funnels into) routes on the SAME

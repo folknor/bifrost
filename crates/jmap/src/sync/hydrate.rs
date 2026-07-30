@@ -125,11 +125,35 @@ async fn fetch_route<T: HttpTransport>(
     projection: Projection,
     batch: &mut Vec<ObjectId>,
 ) -> crate::Result<Option<Batch<ItemOutcome<HydratedObject>>>> {
-    let handle = match route {
-        HydrationRoute::Primary => mail,
-        HydrationRoute::Foreign(account) => foreign_mail.get(account).unwrap_or(mail),
+    let (handle, owner) = match route {
+        HydrationRoute::Primary => (mail, None),
+        HydrationRoute::Foreign(account) => match foreign_mail.get(account) {
+            Some(handle) => (handle, Some(account.as_str())),
+            None => (mail, None),
+        },
     };
-    fetch_batch(handle, projection, batch).await
+    fetch_batch(handle, projection, batch, owner).await
+}
+
+/// The wire form of a routed hydration id: the native id when the batch
+/// is running against the id's own foreign account, the submitted id
+/// LITERAL otherwise.
+///
+/// The literal fallback is what keeps the unregistered-foreign case
+/// honest, and it must match what the mutation pipeline
+/// (`mutation::wire_email_id`, `pim::wire_id_for_mail`) does: an id
+/// qualified for an account this session has no handle for runs on the
+/// primary route, and stripping it there would send the bare native id
+/// to the PRIMARY `Email/get` - which, on an id collision, resolves an
+/// unrelated primary message and reports its data under the foreign id.
+/// Kept literal, the id cannot name any real primary object (`\u{1f}`
+/// never occurs in an RFC 8620 id), so the server answers `notFound` -
+/// the honest result for an id we can no longer reach.
+pub(crate) fn wire_object_id<'a>(id: &'a ObjectId, owner: Option<&str>) -> &'a str {
+    match (owner, super::foreign::parse_object(&id.0)) {
+        (Some(owner), Some((account, native))) if account == owner => native,
+        _ => &id.0,
+    }
 }
 
 /// Fetch one route's buffered ids and reconcile the answer against them.
@@ -141,17 +165,19 @@ async fn fetch_batch<T: HttpTransport>(
     mail: &MailAccount<T>,
     projection: Projection,
     batch: &mut Vec<ObjectId>,
+    owner: Option<&str>,
 ) -> crate::Result<Option<Batch<ItemOutcome<HydratedObject>>>> {
     let started = Instant::now();
     let requested: Vec<ObjectId> = std::mem::take(batch);
     if requested.is_empty() {
         return Ok(None);
     }
-    // The wire call takes the NATIVE id: the owning account is expressed by
-    // the handle we selected, not by the id string.
+    // The wire call takes the native id only when the batch runs against
+    // the id's own foreign account; an unregistered-foreign id stays
+    // literal on the primary route (see `wire_object_id`).
     let ids = requested
         .iter()
-        .map(|id| EmailId::new(super::foreign::native_object(&id.0).to_string()))
+        .map(|id| EmailId::new(wire_object_id(id, owner).to_string()))
         .collect::<Vec<_>>();
     let properties = properties_for_projection(projection);
     let response = mail
@@ -166,6 +192,7 @@ async fn fetch_batch<T: HttpTransport>(
         &not_found,
         projection,
         &state,
+        owner,
     );
 
     if items.is_empty() {
@@ -206,10 +233,15 @@ fn reconcile_hydration(
     not_found: &[EmailId],
     projection: Projection,
     state: &str,
+    owner: Option<&str>,
 ) -> Vec<ItemOutcome<HydratedObject>> {
+    // Keyed by the exact id that went on the wire (`wire_object_id`):
+    // native for the routed foreign owner, literal otherwise - so an
+    // unregistered-foreign id can never be correlated with a primary
+    // object that happens to share its native part.
     let by_native: HashMap<&str, &ObjectId> = requested
         .iter()
-        .map(|id| (super::foreign::native_object(&id.0), id))
+        .map(|id| (wire_object_id(id, owner), id))
         .collect();
     let mut answered: HashSet<&str> = HashSet::new();
     let mut items = Vec::new();
@@ -251,7 +283,11 @@ fn reconcile_hydration(
                 // native `mailboxIds` collide with same-id primary
                 // mailboxes, and the bare entry/blob ids would route
                 // later reads through the primary account.
-                if let Some((owner, _)) = super::foreign::parse_object(&id.0) {
+                // Gated on the ROUTE owner, not on parsing the submitted
+                // id: an unregistered-foreign id rides the primary route
+                // with its literal wire form, and qualifying its entry
+                // under the dead account would double-encode the ids.
+                if let Some(owner) = owner {
                     let owner = bifrost_types::MailboxId(owner.to_string());
                     super::inventory::qualify_foreign_memberships(&mut entry.memberships, &owner);
                     super::inventory::qualify_foreign_ids(&mut entry, &owner);
@@ -290,7 +326,7 @@ fn reconcile_hydration(
     }
 
     for id in requested {
-        let native = super::foreign::native_object(&id.0);
+        let native = wire_object_id(id, owner);
         if !answered.insert(native) {
             continue;
         }
@@ -422,6 +458,7 @@ mod tests {
             &[EmailId::new("m2")],
             Projection::FlagsOnly,
             "s1",
+            None,
         );
 
         assert_eq!(reported_ids(&outcomes), vec!["m0", "m1", "m2"]);
@@ -486,6 +523,7 @@ mod tests {
             &[],
             Projection::FlagsOnly,
             "s1",
+            Some("acct-9"),
         );
 
         assert_eq!(outcomes.len(), 1);
@@ -518,8 +556,14 @@ mod tests {
         }))
         .expect("email fixture decodes");
 
-        let outcomes =
-            reconcile_hydration(&requested, vec![answered], &[], Projection::Metadata, "s1");
+        let outcomes = reconcile_hydration(
+            &requested,
+            vec![answered],
+            &[],
+            Projection::Metadata,
+            "s1",
+            Some("acct-9"),
+        );
 
         assert_eq!(outcomes.len(), 1);
         let ItemOutcome::Succeeded(success) = &outcomes[0] else {
@@ -564,7 +608,7 @@ mod tests {
         );
 
         // A primary id's metadata stays bare: qualification keys off the
-        // submitted id's namespace, never off which route fetched it.
+        // route's owner, and the primary route has none.
         let bare = vec![ObjectId("M1".to_string())];
         let answered: crate::email::Email = serde_json::from_value(serde_json::json!({
             "id": "M1",
@@ -572,7 +616,8 @@ mod tests {
             "keywords": {}
         }))
         .expect("email fixture decodes");
-        let outcomes = reconcile_hydration(&bare, vec![answered], &[], Projection::Metadata, "s1");
+        let outcomes =
+            reconcile_hydration(&bare, vec![answered], &[], Projection::Metadata, "s1", None);
         let ItemOutcome::Succeeded(success) = &outcomes[0] else {
             panic!("the primary id hydrated");
         };
@@ -586,6 +631,46 @@ mod tests {
                     bifrost_types::MailboxId("inbox".to_string())
                 ))
         );
+    }
+
+    /// An id qualified for an account this session has no handle for rides
+    /// the PRIMARY route with its literal (still-qualified) wire form, so
+    /// the primary `Email/get` answers `notFound` - it can never resolve a
+    /// primary message that happens to share the native part. Stripping
+    /// instead (what hydration used to do) would, on such a collision,
+    /// hydrate the unrelated primary message's data under the foreign id.
+    /// The mutation pipeline (`wire_email_id` / `wire_id_for_mail`)
+    /// already keeps these ids literal; hydration must agree.
+    #[test]
+    fn an_unregistered_foreign_id_is_never_correlated_with_a_primary_object() {
+        let departed = ObjectId(super::super::foreign::encode_object("acct-gone", "M1"));
+        let requested = vec![departed.clone()];
+        // A primary message whose id collides with the foreign native id.
+        // With the literal wire form the server cannot echo it for this
+        // request, but a hostile/confused response must still not match.
+        let outcomes = reconcile_hydration(
+            &requested,
+            vec![email("M1")],
+            &[],
+            Projection::FlagsOnly,
+            "s1",
+            // Primary route: the account is not registered.
+            None,
+        );
+
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcome_id(&outcomes[0]), departed.0);
+        assert!(
+            matches!(&outcomes[0], ItemOutcome::Failed(_)),
+            "a same-native-id primary object must not answer the foreign id: {:?}",
+            outcomes[0]
+        );
+
+        // And the wire form itself stays literal on the primary route.
+        assert_eq!(wire_object_id(&departed, None), departed.0);
+        // ...while the registered-owner route strips to the native id.
+        assert_eq!(wire_object_id(&departed, Some("acct-gone")), "M1");
+        assert_eq!(wire_object_id(&departed, Some("acct-other")), departed.0);
     }
 
     /// A response object that does not correlate with a submitted id is
@@ -606,6 +691,7 @@ mod tests {
             &[EmailId::new("also-a-stranger")],
             Projection::FlagsOnly,
             "s1",
+            None,
         );
 
         assert_eq!(reported_ids(&outcomes), vec!["m0", "m1"]);

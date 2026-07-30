@@ -1235,9 +1235,13 @@ pub(crate) fn message_hydrate<T: HttpTransport>(
             Some(handle) => handle.clone(),
             None => mail,
         };
-        // The wire call takes the NATIVE id: the owning account is expressed
-        // by the handle, not by the id string.
-        let native = super::foreign::native_object(&message.0).to_string();
+        // The wire call takes the native id only when the call runs against
+        // the id's own foreign account. An id for an UNREGISTERED account
+        // rides the primary route with its literal (still-qualified) form,
+        // matching `wire_id_for_mail` and the bulk pipeline: stripped, the
+        // bare native id could resolve an unrelated same-id primary message;
+        // literal, the primary `Email/get` reports the honest `notFound`.
+        let native = super::hydrate::wire_object_id(&message, owner.as_deref()).to_string();
         let mut get = EmailGet::new()
             .ids([EmailId::new(native)])
             .properties(message_properties(projection));
