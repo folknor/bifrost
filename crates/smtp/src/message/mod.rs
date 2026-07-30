@@ -461,14 +461,17 @@ impl MessageBuilder {
         })
     }
 
-    /// Create [`Message`] using a [`Vec<u8>`], [`String`], or [`Body`] body
+    /// Create [`Message`] using a [`Vec<u8>`], [`String`], or [`Body`] body.
+    ///
+    /// `Vec<u8>` and `String` inputs normalize bare LF line endings to CRLF
+    /// before encoding. A pre-encoded [`Body`] remains unchanged.
     ///
     /// Automatically gets encoded with `7bit`, `quoted-printable` or `base64`
     /// `Content-Transfer-Encoding`, based on the most efficient and valid encoding
     /// for `body`.
     pub fn body<T: IntoBody>(mut self, body: T) -> Result<Message, EmailError> {
         let maybe_encoding = self.headers.get::<ContentTransferEncoding>();
-        let body = body.into_body(maybe_encoding);
+        let body = body.into_message_body(maybe_encoding);
 
         if self.headers.get::<header::ContentType>().is_none()
             && let Some(content_type) = body.default_content_type()
@@ -851,6 +854,54 @@ mod test {
             .unwrap();
 
         assert!(email.headers().get::<header::ContentType>().is_none());
+    }
+
+    #[test]
+    fn byte_message_body_normalizes_bare_lf_before_data_stuffing() {
+        let email = Message::builder()
+            .from("sender@example.com".parse().unwrap())
+            .to("recipient@example.com".parse().unwrap())
+            .body(b"before\n.\nafter".to_vec())
+            .unwrap();
+
+        let formatted = email.formatted();
+        assert!(formatted.ends_with(b"\r\nbefore\r\n.\r\nafter"));
+    }
+
+    #[cfg(feature = "dkim")]
+    #[test]
+    fn byte_message_body_normalization_matches_dkim_body_input() {
+        let email = Message::builder()
+            .from("sender@example.com".parse().unwrap())
+            .to("recipient@example.com".parse().unwrap())
+            .body(b"before\n.\nafter".to_vec())
+            .unwrap();
+
+        assert_eq!(email.body_raw(), b"before\r\n.\r\nafter\r\n");
+    }
+
+    #[test]
+    fn binary_message_body_survives_base64_round_trip_with_lf_bytes() {
+        // Opaque payload: `0x0A` here is data, not a line ending. It must
+        // reach base64 untouched or the peer decodes different bytes.
+        let payload = vec![0x00_u8, 0x0a, 0xff, 0x0a, 0x0d, 0x0a, 0x80, 0x0a];
+        let email = Message::builder()
+            .from("sender@example.com".parse().unwrap())
+            .to("recipient@example.com".parse().unwrap())
+            .body(payload.clone())
+            .unwrap();
+
+        assert_eq!(
+            email.headers().get::<header::ContentTransferEncoding>(),
+            Some(header::ContentTransferEncoding::Base64)
+        );
+
+        let formatted = String::from_utf8(email.formatted()).unwrap();
+        let (_headers, body) = formatted.split_once("\r\n\r\n").unwrap();
+        let encoded: String = body.split("\r\n").collect();
+        let decoded =
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encoded).unwrap();
+        assert_eq!(decoded, payload);
     }
 
     #[test]

@@ -11,8 +11,8 @@ use super::async_net::AsyncDeadline;
 #[cfg(feature = "tracing")]
 use super::escape_crlf;
 use super::{
-    ClientCodec, ConnectionState, MAX_RESPONSE_BYTES, MAX_RESPONSE_LINE_BYTES, TlsParameters,
-    async_net::AsyncNetworkStream, smtp_data_size,
+    ClientCodec, ConnectionState, MAX_RESPONSE_BYTES, MAX_RESPONSE_LINE_BYTES,
+    PIPELINING_RECIPIENT_WINDOW, TlsParameters, async_net::AsyncNetworkStream, smtp_data_size,
 };
 use crate::{
     Envelope,
@@ -144,6 +144,7 @@ impl AsyncSmtpConnection {
     /// # }
     /// ```
     #[cfg(test)]
+    #[allow(dead_code)]
     #[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
     pub(crate) async fn connect<T: tokio::net::ToSocketAddrs>(
         server: T,
@@ -227,6 +228,42 @@ impl AsyncSmtpConnection {
         #[cfg(feature = "tracing")]
         tracing::debug!("server {}", conn.server_info);
         Ok(conn)
+    }
+
+    #[cfg(test)]
+    async fn from_transcript(
+        transcript: crate::transport::smtp::test_support::Transcript,
+        hello_name: &ClientId,
+        protocol: Protocol,
+    ) -> Result<Self, Error> {
+        Self::connect_impl(
+            AsyncNetworkStream::from_transcript(transcript),
+            hello_name,
+            None,
+            TimeoutBudget::PerOperation(None),
+            protocol,
+        )
+        .await
+    }
+
+    /// Transcript setup that goes through the same single setup deadline the
+    /// real `connect` path uses, so banner and EHLO share one budget.
+    #[cfg(test)]
+    async fn from_transcript_with_timeout(
+        transcript: crate::transport::smtp::test_support::Transcript,
+        hello_name: &ClientId,
+        protocol: Protocol,
+        timeout: Duration,
+    ) -> Result<Self, Error> {
+        let deadline = AsyncDeadline::new(Some(timeout));
+        Self::connect_impl(
+            AsyncNetworkStream::from_transcript(transcript),
+            hello_name,
+            Some(timeout),
+            TimeoutBudget::SetupDeadline(deadline),
+            protocol,
+        )
+        .await
     }
 
     pub(crate) async fn send(
@@ -324,85 +361,75 @@ impl AsyncSmtpConnection {
         mail_options: Vec<MailParameter>,
         rcpt_options: Vec<Vec<RcptParameter>>,
     ) -> Result<Response, Error> {
-        let mut commands = Mail::new(envelope.from().cloned(), mail_options).to_string();
-        for (to_address, rcpt_options) in envelope.to().iter().zip(&rcpt_options) {
-            commands.push_str(&Rcpt::new(to_address.clone(), rcpt_options.clone()).to_string());
-        }
-        commands.push_str(&Data.to_string());
-
-        self.write(commands.as_bytes()).await?;
-
-        // A dropped pipelined send cannot safely reuse the stream until every
-        // queued MAIL/RCPT/DATA response has been consumed.
-        // Keep verification and marking broken synchronous with no await gap.
-        self.stream.get_ref().state().verify()?;
-        self.stream.get_mut().set_state(ConnectionState::Broken);
-
-        let mail_response = self
-            .read_response_with_budget_inner(self.per_operation_budget(), true, false)
-            .await?;
-        let mut recipient_responses = Vec::with_capacity(envelope.to().len());
-        for _ in envelope.to() {
-            recipient_responses.push(
-                self.read_response_with_budget_inner(self.per_operation_budget(), true, false)
-                    .await?,
-            );
-        }
-        let data_response = self
-            .read_response_with_budget_inner(self.per_operation_budget(), true, false)
-            .await?;
-        let accepted_recipients = recipient_responses
-            .iter()
-            .filter(|response| response.is_positive())
-            .count();
-
-        self.stream.get_mut().set_state(ConnectionState::Ok);
-
-        if !mail_response.is_positive() {
-            self.reset_or_abort_pipelined_transaction(&data_response, accepted_recipients)
-                .await;
-            return Err(Self::error_from_status(mail_response));
-        }
-
-        if let Some(response) = recipient_responses
-            .iter()
-            .find(|response| !response.is_positive())
+        for (window_index, recipients) in envelope
+            .to()
+            .chunks(PIPELINING_RECIPIENT_WINDOW)
+            .zip(rcpt_options.chunks(PIPELINING_RECIPIENT_WINDOW))
+            .enumerate()
         {
-            self.reset_or_abort_pipelined_transaction(&data_response, accepted_recipients)
-                .await;
-            return Err(Self::error_from_status(response.clone()));
+            let mut commands = String::new();
+            if window_index == 0 {
+                commands.push_str(
+                    &Mail::new(envelope.from().cloned(), mail_options.clone()).to_string(),
+                );
+            }
+            for (to_address, rcpt_options) in recipients.0.iter().zip(recipients.1) {
+                commands.push_str(&Rcpt::new(to_address.clone(), rcpt_options.clone()).to_string());
+            }
+            self.write(commands.as_bytes()).await?;
+
+            // Keep the stream broken while this whole window is outstanding.
+            // If this future is cancelled after only part of the replies have
+            // been drained, the pool must not reuse a misaligned connection.
+            self.stream.get_ref().state().verify()?;
+            self.stream.get_mut().set_state(ConnectionState::Broken);
+
+            if window_index == 0 {
+                let mail_response = self
+                    .read_response_with_budget_inner(self.per_operation_budget(), true, false)
+                    .await?;
+                if !mail_response.is_positive() {
+                    for _ in recipients.0 {
+                        self.read_response_with_budget_inner(
+                            self.per_operation_budget(),
+                            true,
+                            false,
+                        )
+                        .await?;
+                    }
+                    self.stream.get_mut().set_state(ConnectionState::Ok);
+                    return Err(Self::error_from_status(mail_response));
+                }
+            }
+
+            let mut failure = None;
+            for _ in recipients.0 {
+                let response = self
+                    .read_response_with_budget_inner(self.per_operation_budget(), true, false)
+                    .await?;
+                if failure.is_none() && !response.is_positive() {
+                    failure = Some(response);
+                }
+            }
+            self.stream.get_mut().set_state(ConnectionState::Ok);
+            if let Some(response) = failure {
+                if self.command_accepting_status(Rset).await.is_err() {
+                    self.abort().await;
+                }
+                return Err(Self::error_from_status(response));
+            }
         }
 
+        let data_response = self.command_accepting_status(Data).await?;
         if !data_response.is_positive() {
-            self.reset_or_abort_pipelined_transaction(&data_response, accepted_recipients)
-                .await;
+            if self.command_accepting_status(Rset).await.is_err() {
+                self.abort().await;
+            }
             return Err(Self::error_from_status(data_response));
         }
 
         let result = try_smtp!(self.message(email).await, self);
         Ok(result)
-    }
-
-    async fn reset_or_abort_pipelined_transaction(
-        &mut self,
-        data_response: &Response,
-        accepted_recipients: usize,
-    ) {
-        if data_response.is_positive() {
-            if accepted_recipients == 0 {
-                if self.write(b".\r\n").await.is_err() {
-                    self.abort().await;
-                    return;
-                }
-                if self.read_response_accepting_status().await.is_err() {
-                    self.abort().await;
-                }
-            } else {
-                self.abort().await;
-            }
-        } else if self.command_accepting_status(Rset).await.is_err() {
-            self.abort().await;
-        }
     }
 
     pub(crate) async fn send_lmtp(
@@ -720,65 +747,122 @@ impl AsyncSmtpConnection {
         rcpt_options_all: Vec<Vec<RcptParameter>>,
         mut progress: SendProgress,
     ) -> Result<SendProgress, (Error, SendProgress)> {
-        let mut commands = Mail::new(from, mail_options).to_string();
-        for (rec, rcpt_opts) in progress.recipients.iter().zip(&rcpt_options_all) {
-            commands.push_str(&Rcpt::new(rec.address.clone(), rcpt_opts.clone()).to_string());
-        }
-        commands.push_str(&Data.to_string());
-
-        if let Err(e) = self.write(commands.as_bytes()).await {
-            self.abort().await;
-            return Err((
-                e.with_attempt(SmtpTransmissionState::Unsent)
-                    .with_phase(SmtpCommandPhase::MailFrom),
-                progress,
-            ));
-        }
-
-        let mail_response = match self.read_response_accepting_status().await {
-            Ok(r) => r,
-            Err(e) => {
-                self.abort().await;
-                return Err((
-                    e.with_attempt(SmtpTransmissionState::InFlight)
-                        .with_phase(SmtpCommandPhase::MailFrom),
-                    progress,
-                ));
+        for window_start in (0..progress.recipients.len()).step_by(PIPELINING_RECIPIENT_WINDOW) {
+            let window_end =
+                (window_start + PIPELINING_RECIPIENT_WINDOW).min(progress.recipients.len());
+            let mut commands = String::new();
+            if window_start == 0 {
+                commands.push_str(&Mail::new(from.clone(), mail_options.clone()).to_string());
             }
-        };
-        if !mail_response.is_positive() {
-            self.abort().await;
-            return Err((
-                error::status(mail_response)
-                    .with_attempt(SmtpTransmissionState::Acknowledged)
-                    .with_phase(SmtpCommandPhase::MailFrom),
-                progress,
-            ));
-        }
-
-        let n_recipients = progress.recipients.len();
-        for i in 0..n_recipients {
-            match self.read_response_accepting_status().await {
-                Ok(resp) if resp.is_positive() => progress.record_rcpt_accepted(i),
-                Ok(resp) => progress.record_rcpt_rejected(i, resp),
-                Err(e) => {
-                    use crate::transport::smtp::account_error::{
-                        SmtpErrorContext, into_account_error,
-                    };
-                    let ae = into_account_error(
-                        e.with_attempt(SmtpTransmissionState::InFlight)
-                            .with_phase(SmtpCommandPhase::RcptTo),
-                        SmtpErrorContext::send(Protocol::Smtp).with_phase(SmtpCommandPhase::RcptTo),
-                    );
-                    let ae2 = ae.clone();
-                    progress.mark_uncertain_unresolved(|| ae2.clone());
+            for (rec, rcpt_opts) in progress.recipients[window_start..window_end]
+                .iter()
+                .zip(&rcpt_options_all[window_start..window_end])
+            {
+                commands.push_str(&Rcpt::new(rec.address.clone(), rcpt_opts.clone()).to_string());
+            }
+            if let Err(e) = self.write(commands.as_bytes()).await {
+                if window_start == 0 {
                     self.abort().await;
-                    return Ok(progress);
+                    return Err((
+                        e.with_attempt(SmtpTransmissionState::Unsent)
+                            .with_phase(SmtpCommandPhase::MailFrom),
+                        progress,
+                    ));
+                }
+                // A later recipient window failed to write. `DATA` is only
+                // issued after every window, so no message content can have
+                // reached the peer: the still-open recipients are `Unsent`,
+                // and the RCPT replies already collected stay authoritative.
+                use crate::transport::smtp::account_error::{SmtpErrorContext, into_account_error};
+                let ae = into_account_error(
+                    e.with_attempt(SmtpTransmissionState::Unsent)
+                        .with_phase(SmtpCommandPhase::RcptTo),
+                    SmtpErrorContext::send(Protocol::Smtp).with_phase(SmtpCommandPhase::RcptTo),
+                );
+                progress.mark_unresolved_unsent(|| ae.clone());
+                self.abort().await;
+                return Ok(progress);
+            }
+
+            // A batch keeps recipient indexes across windows, but the stream
+            // is only reusable after every reply for this window is drained.
+            self.stream.get_ref().state().verify().map_err(|error| {
+                (
+                    error
+                        .with_attempt(SmtpTransmissionState::InFlight)
+                        .with_phase(SmtpCommandPhase::RcptTo),
+                    progress.clone(),
+                )
+            })?;
+            self.stream.get_mut().set_state(ConnectionState::Broken);
+
+            if window_start == 0 {
+                let mail_response = match self
+                    .read_response_with_budget_inner(self.per_operation_budget(), true, false)
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        self.abort().await;
+                        return Err((
+                            e.with_attempt(SmtpTransmissionState::InFlight)
+                                .with_phase(SmtpCommandPhase::MailFrom),
+                            progress,
+                        ));
+                    }
+                };
+                if !mail_response.is_positive() {
+                    self.abort().await;
+                    return Err((
+                        error::status(mail_response)
+                            .with_attempt(SmtpTransmissionState::Acknowledged)
+                            .with_phase(SmtpCommandPhase::MailFrom),
+                        progress,
+                    ));
                 }
             }
+
+            for i in window_start..window_end {
+                match self
+                    .read_response_with_budget_inner(self.per_operation_budget(), true, false)
+                    .await
+                {
+                    Ok(resp) if resp.is_positive() => progress.record_rcpt_accepted(i),
+                    Ok(resp) => progress.record_rcpt_rejected(i, resp),
+                    Err(e) => {
+                        use crate::transport::smtp::account_error::{
+                            SmtpErrorContext, into_account_error,
+                        };
+                        let ae = into_account_error(
+                            e.with_attempt(SmtpTransmissionState::InFlight)
+                                .with_phase(SmtpCommandPhase::RcptTo),
+                            SmtpErrorContext::send(Protocol::Smtp)
+                                .with_phase(SmtpCommandPhase::RcptTo),
+                        );
+                        let ae2 = ae.clone();
+                        progress.mark_uncertain_unresolved(|| ae2.clone());
+                        self.abort().await;
+                        return Ok(progress);
+                    }
+                }
+            }
+            self.stream.get_mut().set_state(ConnectionState::Ok);
         }
 
-        let data_response = match self.read_response_accepting_status().await {
+        let accepted = progress.recipients.iter().any(|r| {
+            matches!(
+                r.rcpt,
+                crate::transport::smtp::batch::RcptProgress::Accepted
+            )
+        });
+        if !accepted {
+            if self.command_accepting_status(Rset).await.is_err() {
+                self.abort().await;
+            }
+            return Ok(progress);
+        }
+
+        let data_response = match self.command_accepting_status(Data).await {
             Ok(r) => r,
             Err(e) => {
                 use crate::transport::smtp::account_error::{SmtpErrorContext, into_account_error};
@@ -794,13 +878,6 @@ impl AsyncSmtpConnection {
                 return Ok(progress);
             }
         };
-
-        let accepted = progress.recipients.iter().any(|r| {
-            matches!(
-                r.rcpt,
-                crate::transport::smtp::batch::RcptProgress::Accepted
-            )
-        });
 
         if !data_response.is_positive() {
             progress.mark_accepted_rejected_with_response(data_response);
@@ -1980,336 +2057,153 @@ impl AsyncSmtpConnection {
     }
 }
 
-#[cfg(test)]
-#[cfg(feature = "tokio")]
-mod test {
-    use std::{
-        io::{BufRead, BufReader, Read, Write},
-        net::TcpListener,
-        sync::mpsc,
-        thread,
-        time::Duration,
-    };
+#[cfg(all(test, feature = "tokio"))]
+mod transcript_tests {
+    use std::time::Duration;
 
     use crate::{
         address::Envelope,
         transport::smtp::{
-            AsyncSmtpConnection,
+            Protocol,
             authentication::{Credentials, Mechanism},
             commands::Noop,
-            extension::{ClientId, Extension, MailBodyParameter, MailParameter, SendOptions},
+            extension::{ClientId, Extension, MailBodyParameter, MailParameter},
+            test_support::Transcript,
         },
     };
 
+    use super::{AsyncSmtpConnection, SendOptions};
+
+    const HELLO: &str = "EHLO client.example\r\n";
+
     #[tokio::test(crate = "tokio")]
-    async fn abort_closes_without_quit_command() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let (observed_tx, observed_rx) = mpsc::channel();
-
-        let handle = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
-            stream.write_all(b"220 localhost\r\n").unwrap();
-
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut ehlo = String::new();
-            reader.read_line(&mut ehlo).unwrap();
-            stream.write_all(b"250 localhost\r\n").unwrap();
-
-            let mut after_abort = String::new();
-            let observed = match reader.read_line(&mut after_abort) {
-                Ok(bytes) => format!("{bytes}:{after_abort}"),
-                Err(error) => format!("error:{:?}", error.kind()),
-            };
-            observed_tx.send(observed).unwrap();
-        });
+    async fn pipelining_drains_each_recipient_window_before_writing_the_next() {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let recipients: Vec<crate::address::Address> = (0..33)
+            .map(|index| format!("recipient-{index}@example.com").parse().unwrap())
+            .collect();
+        let mut first_window = "MAIL FROM:<sender@example.com>\r\n".to_owned();
+        first_window.extend(
+            recipients[..32]
+                .iter()
+                .map(|recipient| format!("RCPT TO:<{recipient}>\r\n")),
+        );
+        let mut first_replies = "250 sender ok\r\n".to_owned();
+        first_replies.push_str(&"250 recipient ok\r\n".repeat(32));
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(
+                "EHLO client.example\r\n",
+                "250-smtp.example\r\n250 PIPELINING\r\n",
+            )
+            .expect(first_window, first_replies)
+            .expect(
+                format!("RCPT TO:<{}>\r\n", recipients[32]),
+                "250 recipient ok\r\n",
+            )
+            .expect("DATA\r\n", "354 send body\r\n")
+            .expect("body", "")
+            .expect("\r\n.\r\n", "250 queued\r\n");
+        let envelope =
+            Envelope::new(Some("sender@example.com".parse().unwrap()), recipients).unwrap();
 
         let mut connection =
-            AsyncSmtpConnection::connect(address, None, &ClientId::default(), None, None)
+            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp)
                 .await
                 .unwrap();
-        connection.abort().await;
-
-        let observed = observed_rx.recv_timeout(Duration::from_secs(3)).unwrap();
-        assert!(
-            !observed.contains("QUIT"),
-            "abort must close without sending QUIT, got {observed:?}"
-        );
-        handle.join().unwrap();
+        connection.send(&envelope, b"body").await.unwrap();
+        transcript.assert_exhausted();
     }
 
     #[tokio::test(crate = "tokio")]
-    async fn async_peer_certificate_der_is_none_on_plaintext() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-
-        let handle = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
-            stream.write_all(b"220 localhost\r\n").unwrap();
-
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut ehlo = String::new();
-            reader.read_line(&mut ehlo).unwrap();
-            stream.write_all(b"250 localhost\r\n").unwrap();
-        });
-
-        let connection =
-            AsyncSmtpConnection::connect(address, None, &ClientId::default(), None, None)
+    async fn starttls_downgrade_is_refused_without_a_wire_command() {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect("EHLO client.example\r\n", "250 smtp.example\r\n")
+            .expect("NOOP\r\n", "250 noop\r\n");
+        let mut connection =
+            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp)
                 .await
                 .unwrap();
+
+        assert!(!connection.can_starttls());
+        let tls = super::TlsParameters::new("smtp.example".to_owned()).unwrap();
+        let error = connection
+            .starttls(tls, &hello)
+            .await
+            .expect_err("a server without the STARTTLS capability must not be upgraded");
+        assert!(
+            error.to_string().contains("STARTTLS is not supported"),
+            "expected a capability refusal, got: {error}"
+        );
+
+        // The refusal happened before any byte hit the wire: the very next
+        // scripted step is NOOP, so a stray STARTTLS write would be rejected.
+        connection.command(Noop).await.unwrap();
+        transcript.assert_exhausted();
+    }
+
+    // The tests below replace the socket-listener tests this harness retired.
+    // Same behaviors, same assertions, no listener or thread.
+
+    #[tokio::test(crate = "tokio")]
+    async fn abort_closes_without_quit_command() {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let transcript =
+            Transcript::new("220 smtp.example\r\n").expect(HELLO, "250 smtp.example\r\n");
+        let mut connection =
+            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp)
+                .await
+                .unwrap();
+
+        connection.abort().await;
+        transcript.assert_exhausted();
+    }
+
+    #[tokio::test(crate = "tokio")]
+    async fn peer_certificate_der_is_none_on_plaintext() {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let transcript =
+            Transcript::new("220 smtp.example\r\n").expect(HELLO, "250 smtp.example\r\n");
+        let connection = AsyncSmtpConnection::from_transcript(transcript, &hello, Protocol::Smtp)
+            .await
+            .unwrap();
+
         assert!(
             connection.peer_certificate_der().is_none(),
             "plaintext connection must have no peer certificate DER"
         );
-        handle.join().unwrap();
     }
 
     #[tokio::test(crate = "tokio")]
     async fn failed_test_connected_marks_connection_broken() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-
-        let handle = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
-            stream.write_all(b"220 localhost\r\n").unwrap();
-
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut ehlo = String::new();
-            reader.read_line(&mut ehlo).unwrap();
-            stream.write_all(b"250 localhost\r\n").unwrap();
-
-            let mut noop = String::new();
-            reader.read_line(&mut noop).unwrap();
-        });
-
+        let hello = ClientId::Domain("client.example".to_owned());
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250 smtp.example\r\n")
+            .expect("NOOP\r\n", "");
         let mut connection =
-            AsyncSmtpConnection::connect(address, None, &ClientId::default(), None, None)
+            AsyncSmtpConnection::from_transcript(transcript, &hello, Protocol::Smtp)
                 .await
                 .unwrap();
 
         assert!(!connection.test_connected().await);
         assert!(connection.has_broken());
-        handle.join().unwrap();
-    }
-
-    #[tokio::test(crate = "tokio")]
-    async fn send_uses_pipelining_for_mail_and_recipients() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let (commands_tx, commands_rx) = mpsc::channel();
-
-        let handle = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
-            stream.write_all(b"220 localhost\r\n").unwrap();
-
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut commands = Vec::new();
-
-            let mut ehlo = String::new();
-            reader.read_line(&mut ehlo).unwrap();
-            commands.push(ehlo);
-            stream
-                .write_all(b"250-localhost\r\n250-PIPELINING\r\n250 SIZE 1024\r\n")
-                .unwrap();
-
-            let expected_batch = concat!(
-                "MAIL FROM:<sender@example.com> SIZE=24\r\n",
-                "RCPT TO:<first@example.com>\r\n",
-                "RCPT TO:<second@example.com>\r\n",
-                "DATA\r\n",
-            );
-            let mut batch = vec![0; expected_batch.len()];
-            reader.read_exact(&mut batch).unwrap();
-            assert_eq!(batch, expected_batch.as_bytes());
-            let batch = String::from_utf8(batch).unwrap();
-            commands.extend(batch.split_inclusive('\n').map(str::to_owned));
-            stream
-                .write_all(b"250 sender ok\r\n250 first ok\r\n250 second ok\r\n354 send body\r\n")
-                .unwrap();
-
-            let mut line = String::new();
-            loop {
-                line.clear();
-                reader.read_line(&mut line).unwrap();
-                if line == ".\r\n" {
-                    break;
-                }
-            }
-            stream.write_all(b"250 queued\r\n").unwrap();
-
-            commands_tx.send(commands).unwrap();
-        });
-
-        let mut connection =
-            AsyncSmtpConnection::connect(address, None, &ClientId::default(), None, None)
-                .await
-                .unwrap();
-        let envelope = Envelope::new(
-            Some("sender@example.com".parse().unwrap()),
-            vec![
-                "first@example.com".parse().unwrap(),
-                "second@example.com".parse().unwrap(),
-            ],
-        )
-        .unwrap();
-
-        let response = connection
-            .send(&envelope, b"Subject: test\r\n\r\nHello")
-            .await
-            .unwrap();
-        assert!(response.has_code(250));
-
-        let commands = commands_rx.recv_timeout(Duration::from_secs(3)).unwrap();
-        assert!(commands[0].starts_with("EHLO "));
-        assert_eq!(commands[1], "MAIL FROM:<sender@example.com> SIZE=24\r\n");
-        assert_eq!(commands[2], "RCPT TO:<first@example.com>\r\n");
-        assert_eq!(commands[3], "RCPT TO:<second@example.com>\r\n");
-        assert_eq!(commands[4], "DATA\r\n");
-        handle.join().unwrap();
-    }
-
-    #[tokio::test(crate = "tokio")]
-    async fn pipelined_send_rsets_when_data_is_rejected() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let (commands_tx, commands_rx) = mpsc::channel();
-
-        let handle = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
-            stream.write_all(b"220 localhost\r\n").unwrap();
-
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut commands = Vec::new();
-
-            let mut ehlo = String::new();
-            reader.read_line(&mut ehlo).unwrap();
-            commands.push(ehlo);
-            stream
-                .write_all(b"250-localhost\r\n250-PIPELINING\r\n250 SIZE 1024\r\n")
-                .unwrap();
-
-            let expected_batch = concat!(
-                "MAIL FROM:<sender@example.com> SIZE=24\r\n",
-                "RCPT TO:<recipient@example.com>\r\n",
-                "DATA\r\n",
-            );
-            let mut batch = vec![0; expected_batch.len()];
-            reader.read_exact(&mut batch).unwrap();
-            assert_eq!(batch, expected_batch.as_bytes());
-            let batch = String::from_utf8(batch).unwrap();
-            commands.extend(batch.split_inclusive('\n').map(str::to_owned));
-
-            stream
-                .write_all(b"250 sender ok\r\n550 recipient rejected\r\n554 no recipients\r\n")
-                .unwrap();
-
-            let mut rset = String::new();
-            reader.read_line(&mut rset).unwrap();
-            commands.push(rset);
-            stream.write_all(b"250 reset ok\r\n").unwrap();
-
-            let mut noop = String::new();
-            reader.read_line(&mut noop).unwrap();
-            commands.push(noop);
-            stream.write_all(b"250 noop ok\r\n").unwrap();
-
-            commands_tx.send(commands).unwrap();
-        });
-
-        let mut connection =
-            AsyncSmtpConnection::connect(address, None, &ClientId::default(), None, None)
-                .await
-                .unwrap();
-        let envelope = Envelope::new(
-            Some("sender@example.com".parse().unwrap()),
-            vec!["recipient@example.com".parse().unwrap()],
-        )
-        .unwrap();
-
-        let result = connection
-            .send(&envelope, b"Subject: test\r\n\r\nHello")
-            .await;
-        assert!(result.is_err());
-        assert!(!connection.has_broken());
-        assert!(connection.test_connected().await);
-
-        let commands = commands_rx.recv_timeout(Duration::from_secs(3)).unwrap();
-        assert!(commands[0].starts_with("EHLO "));
-        assert_eq!(commands[1], "MAIL FROM:<sender@example.com> SIZE=24\r\n");
-        assert_eq!(commands[2], "RCPT TO:<recipient@example.com>\r\n");
-        assert_eq!(commands[3], "DATA\r\n");
-        assert_eq!(commands[4], "RSET\r\n");
-        assert_eq!(commands[5], "NOOP\r\n");
-        handle.join().unwrap();
     }
 
     #[tokio::test(crate = "tokio")]
     async fn explicit_mail_parameters_are_not_duplicated() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let (commands_tx, commands_rx) = mpsc::channel();
-
-        let handle = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
-            stream.write_all(b"220 localhost\r\n").unwrap();
-
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut commands = Vec::new();
-
-            let mut ehlo = String::new();
-            reader.read_line(&mut ehlo).unwrap();
-            commands.push(ehlo);
-            stream
-                .write_all(
-                    b"250-localhost\r\n250-PIPELINING\r\n250-SIZE 1024\r\n250-SMTPUTF8\r\n250 8BITMIME\r\n",
-                )
-                .unwrap();
-
-            for _ in 0..3 {
-                let mut command = String::new();
-                reader.read_line(&mut command).unwrap();
-                commands.push(command);
-            }
-
-            stream
-                .write_all(b"250 sender ok\r\n250 recipient ok\r\n354 send body\r\n")
-                .unwrap();
-
-            let mut line = String::new();
-            loop {
-                line.clear();
-                reader.read_line(&mut line).unwrap();
-                if line == ".\r\n" {
-                    break;
-                }
-            }
-            stream.write_all(b"250 queued\r\n").unwrap();
-
-            commands_tx.send(commands).unwrap();
-        });
-
-        let mut connection =
-            AsyncSmtpConnection::connect(address, None, &ClientId::default(), None, None)
-                .await
-                .unwrap();
+        let hello = ClientId::Domain("client.example".to_owned());
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(
+                HELLO,
+                "250-smtp.example\r\n250-PIPELINING\r\n250-SIZE 1024\r\n250-SMTPUTF8\r\n250 8BITMIME\r\n",
+            )
+            .expect(
+                "MAIL FROM:<sender@example.com> SIZE=25 SMTPUTF8 BODY=8BITMIME\r\nRCPT TO:<recipient@exämple.com>\r\n",
+                "250 sender ok\r\n250 recipient ok\r\n",
+            )
+            .expect("DATA\r\n", "354 send body\r\n")
+            .expect("Subject: test\r\n\r\nHéllo", "")
+            .expect("\r\n.\r\n", "250 queued\r\n");
         let envelope = Envelope::new(
             Some("sender@example.com".parse().unwrap()),
             vec![crate::address::Address::new_dangerous(
@@ -2322,68 +2216,78 @@ mod test {
             .mail_parameter(MailParameter::SmtpUtfEight)
             .mail_parameter(MailParameter::Body(MailBodyParameter::EightBitMime));
 
+        let mut connection =
+            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp)
+                .await
+                .unwrap();
         let response = connection
             .send_with_options(&envelope, "Subject: test\r\n\r\nHéllo".as_bytes(), &options)
             .await
             .unwrap();
-        assert!(response.has_code(250));
 
-        let commands = commands_rx.recv_timeout(Duration::from_secs(3)).unwrap();
-        assert_eq!(
-            commands[1],
-            "MAIL FROM:<sender@example.com> SIZE=25 SMTPUTF8 BODY=8BITMIME\r\n"
+        assert!(response.has_code(250));
+        transcript.assert_exhausted();
+    }
+
+    #[tokio::test(crate = "tokio")]
+    async fn pipelined_send_rsets_when_a_recipient_is_rejected() {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(
+                HELLO,
+                "250-smtp.example\r\n250-PIPELINING\r\n250 SIZE 1024\r\n",
+            )
+            .expect(
+                "MAIL FROM:<sender@example.com> SIZE=24\r\nRCPT TO:<recipient@example.com>\r\n",
+                "250 sender ok\r\n550 recipient rejected\r\n",
+            )
+            .expect("RSET\r\n", "250 reset ok\r\n")
+            .expect("NOOP\r\n", "250 noop ok\r\n");
+        let envelope = Envelope::new(
+            Some("sender@example.com".parse().unwrap()),
+            vec!["recipient@example.com".parse().unwrap()],
+        )
+        .unwrap();
+
+        let mut connection =
+            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp)
+                .await
+                .unwrap();
+        assert!(
+            connection
+                .send(&envelope, b"Subject: test\r\n\r\nHello")
+                .await
+                .is_err()
         );
-        handle.join().unwrap();
+        assert!(!connection.has_broken());
+        assert!(connection.test_connected().await);
+        transcript.assert_exhausted();
     }
 
     #[tokio::test(crate = "tokio")]
     async fn auth_refreshes_server_info_with_ehlo() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let (commands_tx, commands_rx) = mpsc::channel();
-
-        let handle = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
-            stream.write_all(b"220 localhost\r\n").unwrap();
-
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut commands = Vec::new();
-
-            let mut initial_ehlo = String::new();
-            reader.read_line(&mut initial_ehlo).unwrap();
-            commands.push(initial_ehlo);
-            stream
-                .write_all(b"250-localhost\r\n250-AUTH PLAIN\r\n250 SIZE 100\r\n")
-                .unwrap();
-
-            let mut auth = String::new();
-            reader.read_line(&mut auth).unwrap();
-            commands.push(auth);
-            stream.write_all(b"235 authenticated\r\n").unwrap();
-
-            let mut post_auth_ehlo = String::new();
-            reader.read_line(&mut post_auth_ehlo).unwrap();
-            commands.push(post_auth_ehlo);
-            stream
-                .write_all(b"250-localhost\r\n250 8BITMIME\r\n")
-                .unwrap();
-
-            commands_tx.send(commands).unwrap();
-        });
-
+        let hello = ClientId::Domain("client.example".to_owned());
+        let plain = format!(
+            "AUTH PLAIN {}\r\n",
+            crate::base64::encode("\u{0}user\u{0}pass")
+        );
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(
+                HELLO,
+                "250-smtp.example\r\n250-AUTH PLAIN\r\n250 SIZE 100\r\n",
+            )
+            .expect(plain, "235 authenticated\r\n")
+            .expect(HELLO, "250-smtp.example\r\n250 8BITMIME\r\n");
         let mut connection =
-            AsyncSmtpConnection::connect(address, None, &ClientId::default(), None, None)
+            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp)
                 .await
                 .unwrap();
+
         assert!(
             connection
                 .server_info()
                 .supports_auth_mechanism(Mechanism::Plain)
         );
-
         let response = connection
             .auth(
                 &[Mechanism::Plain],
@@ -2403,54 +2307,25 @@ mod test {
                 .server_info()
                 .supports_feature(Extension::EightBitMime)
         );
-
-        let commands = commands_rx.recv_timeout(Duration::from_secs(3)).unwrap();
-        assert!(commands[0].starts_with("EHLO "));
-        assert!(commands[1].starts_with("AUTH PLAIN "));
-        assert!(commands[2].starts_with("EHLO "));
-        handle.join().unwrap();
+        transcript.assert_exhausted();
     }
 
     #[tokio::test(crate = "tokio")]
     async fn oauthbearer_auth_sends_initial_response_and_refreshes_ehlo() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let (commands_tx, commands_rx) = mpsc::channel();
-
-        let handle = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
-            stream.write_all(b"220 localhost\r\n").unwrap();
-
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut commands = Vec::new();
-
-            let mut initial_ehlo = String::new();
-            reader.read_line(&mut initial_ehlo).unwrap();
-            commands.push(initial_ehlo);
-            stream
-                .write_all(b"250-localhost\r\n250 AUTH OAUTHBEARER\r\n")
-                .unwrap();
-
-            let mut auth = String::new();
-            reader.read_line(&mut auth).unwrap();
-            commands.push(auth);
-            stream.write_all(b"235 authenticated\r\n").unwrap();
-
-            let mut post_auth_ehlo = String::new();
-            reader.read_line(&mut post_auth_ehlo).unwrap();
-            commands.push(post_auth_ehlo);
-            stream.write_all(b"250 localhost\r\n").unwrap();
-
-            commands_tx.send(commands).unwrap();
-        });
-
+        let hello = ClientId::Domain("client.example".to_owned());
+        let initial = crate::base64::encode("n,a=us=2Cer=3Done,\u{1}auth=Bearer token\u{1}\u{1}");
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250-smtp.example\r\n250 AUTH OAUTHBEARER\r\n")
+            .expect(
+                format!("AUTH OAUTHBEARER {initial}\r\n"),
+                "235 authenticated\r\n",
+            )
+            .expect(HELLO, "250 smtp.example\r\n");
         let mut connection =
-            AsyncSmtpConnection::connect(address, None, &ClientId::default(), None, None)
+            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp)
                 .await
                 .unwrap();
+
         let response = connection
             .auth(
                 &[Mechanism::OAuthBearer],
@@ -2460,59 +2335,24 @@ mod test {
             .unwrap();
 
         assert!(response.has_code(235));
-
-        let commands = commands_rx.recv_timeout(Duration::from_secs(3)).unwrap();
-        assert!(commands[0].starts_with("EHLO "));
-        assert!(commands[1].starts_with("AUTH OAUTHBEARER "));
-        assert!(commands[2].starts_with("EHLO "));
-
-        let encoded_response = commands[1]
-            .trim_end()
-            .strip_prefix("AUTH OAUTHBEARER ")
-            .unwrap();
-        let decoded_response = crate::base64::decode(encoded_response).unwrap();
-        assert_eq!(
-            String::from_utf8(decoded_response).unwrap(),
-            "n,a=us=2Cer=3Done,\x01auth=Bearer token\x01\x01"
-        );
-        handle.join().unwrap();
+        transcript.assert_exhausted();
     }
 
     #[tokio::test(crate = "tokio")]
     async fn oauthbearer_immediate_rejection_marks_connection_broken() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let (commands_tx, commands_rx) = mpsc::channel();
-
-        let handle = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
-            stream.write_all(b"220 localhost\r\n").unwrap();
-
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut commands = Vec::new();
-
-            let mut initial_ehlo = String::new();
-            reader.read_line(&mut initial_ehlo).unwrap();
-            commands.push(initial_ehlo);
-            stream
-                .write_all(b"250-localhost\r\n250 AUTH OAUTHBEARER\r\n")
-                .unwrap();
-
-            let mut auth = String::new();
-            reader.read_line(&mut auth).unwrap();
-            commands.push(auth);
-            stream.write_all(b"535 rejected\r\n").unwrap();
-
-            commands_tx.send(commands).unwrap();
-        });
-
+        let hello = ClientId::Domain("client.example".to_owned());
+        let initial = crate::base64::encode("n,a=user,\u{1}auth=Bearer token\u{1}\u{1}");
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250-smtp.example\r\n250 AUTH OAUTHBEARER\r\n")
+            .expect(
+                format!("AUTH OAUTHBEARER {initial}\r\n"),
+                "535 rejected\r\n",
+            );
         let mut connection =
-            AsyncSmtpConnection::connect(address, None, &ClientId::default(), None, None)
+            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp)
                 .await
                 .unwrap();
+
         let error = connection
             .auth(
                 &[Mechanism::OAuthBearer],
@@ -2526,53 +2366,22 @@ mod test {
             "expected permanent SMTP error: {error:?}"
         );
         assert!(connection.has_broken());
-
-        let commands = commands_rx.recv_timeout(Duration::from_secs(3)).unwrap();
-        assert!(commands[0].starts_with("EHLO "));
-        assert!(commands[1].starts_with("AUTH OAUTHBEARER "));
-        handle.join().unwrap();
+        transcript.assert_exhausted();
     }
 
     #[tokio::test(crate = "tokio")]
     async fn oauthbearer_failed_challenge_sends_cancel_response() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let (commands_tx, commands_rx) = mpsc::channel();
-
-        let handle = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
-            stream.write_all(b"220 localhost\r\n").unwrap();
-
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut commands = Vec::new();
-
-            let mut initial_ehlo = String::new();
-            reader.read_line(&mut initial_ehlo).unwrap();
-            commands.push(initial_ehlo);
-            stream
-                .write_all(b"250-localhost\r\n250 AUTH OAUTHBEARER\r\n")
-                .unwrap();
-
-            let mut auth = String::new();
-            reader.read_line(&mut auth).unwrap();
-            commands.push(auth);
-            stream.write_all(b"334 e30=\r\n").unwrap();
-
-            let mut cancel = String::new();
-            reader.read_line(&mut cancel).unwrap();
-            commands.push(cancel);
-            stream.write_all(b"535 rejected\r\n").unwrap();
-
-            commands_tx.send(commands).unwrap();
-        });
-
+        let hello = ClientId::Domain("client.example".to_owned());
+        let initial = crate::base64::encode("n,a=user,\u{1}auth=Bearer token\u{1}\u{1}");
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250-smtp.example\r\n250 AUTH OAUTHBEARER\r\n")
+            .expect(format!("AUTH OAUTHBEARER {initial}\r\n"), "334 e30=\r\n")
+            .expect("AQ==\r\n", "535 rejected\r\n");
         let mut connection =
-            AsyncSmtpConnection::connect(address, None, &ClientId::default(), None, None)
+            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp)
                 .await
                 .unwrap();
+
         let error = connection
             .auth(
                 &[Mechanism::OAuthBearer],
@@ -2585,155 +2394,90 @@ mod test {
             error.is_permanent(),
             "expected permanent SMTP error: {error:?}"
         );
-
-        let commands = commands_rx.recv_timeout(Duration::from_secs(3)).unwrap();
-        assert!(commands[0].starts_with("EHLO "));
-        assert!(commands[1].starts_with("AUTH OAUTHBEARER "));
-        assert_eq!(commands[2], "AQ==\r\n");
         assert!(connection.has_broken());
-        handle.join().unwrap();
+        transcript.assert_exhausted();
     }
 
-    #[tokio::test(crate = "tokio")]
+    #[tokio::test(crate = "tokio", start_paused = true)]
     async fn connect_times_out_waiting_for_banner() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-
-        let handle = thread::spawn(move || {
-            let (_stream, _) = listener.accept().unwrap();
-            thread::sleep(Duration::from_millis(500));
-        });
-
-        let result = AsyncSmtpConnection::connect(
-            address,
-            Some(Duration::from_millis(50)),
-            &ClientId::default(),
-            None,
-            None,
+        let hello = ClientId::Domain("client.example".to_owned());
+        // The peer accepts and then says nothing at all.
+        let Err(error) = AsyncSmtpConnection::from_transcript_with_timeout(
+            Transcript::silent(),
+            &hello,
+            Protocol::Smtp,
+            Duration::from_millis(50),
         )
-        .await;
-
-        let Err(error) = result else {
+        .await
+        else {
             panic!("connect must time out while waiting for banner");
         };
+
         assert!(error.is_timeout(), "expected timeout, got {error:?}");
-        handle.join().unwrap();
     }
 
-    #[tokio::test(crate = "tokio")]
+    #[tokio::test(crate = "tokio", start_paused = true)]
     async fn connect_setup_uses_single_deadline_for_banner_and_ehlo() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let (ehlo_tx, ehlo_rx) = mpsc::channel();
-
-        let handle = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
-            thread::sleep(Duration::from_millis(75));
-            stream.write_all(b"220 localhost\r\n").unwrap();
-
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut ehlo = String::new();
-            reader.read_line(&mut ehlo).unwrap();
-            ehlo_tx.send(ehlo.starts_with("EHLO ")).unwrap();
-
-            thread::sleep(Duration::from_millis(75));
-            let _ = stream.write_all(b"250 localhost\r\n");
-        });
-
-        let result = AsyncSmtpConnection::connect(
-            address,
-            Some(Duration::from_millis(120)),
-            &ClientId::default(),
-            None,
-            None,
+        let hello = ClientId::Domain("client.example".to_owned());
+        // The banner arrives, EHLO is written, and then the peer goes silent.
+        // A per-operation timeout would restart the clock at EHLO; a single
+        // setup deadline must still fire.
+        let transcript = Transcript::new("220 smtp.example\r\n").expect_then_stall(HELLO);
+        let Err(error) = AsyncSmtpConnection::from_transcript_with_timeout(
+            transcript,
+            &hello,
+            Protocol::Smtp,
+            Duration::from_millis(120),
         )
-        .await;
-
-        let Err(error) = result else {
+        .await
+        else {
             panic!("connect must use one setup deadline across banner and EHLO");
         };
+
         assert!(error.is_timeout(), "expected timeout, got {error:?}");
-        assert!(ehlo_rx.recv_timeout(Duration::from_secs(3)).unwrap());
-        handle.join().unwrap();
     }
 
-    #[tokio::test(crate = "tokio")]
+    #[tokio::test(crate = "tokio", start_paused = true)]
     async fn command_times_out_waiting_for_response() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-
-        let handle = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
-            stream.write_all(b"220 localhost\r\n").unwrap();
-
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut ehlo = String::new();
-            reader.read_line(&mut ehlo).unwrap();
-            stream.write_all(b"250 localhost\r\n").unwrap();
-
-            let mut noop = String::new();
-            reader.read_line(&mut noop).unwrap();
-            thread::sleep(Duration::from_millis(500));
-        });
-
-        let mut connection = AsyncSmtpConnection::connect(
-            address,
-            Some(Duration::from_millis(50)),
-            &ClientId::default(),
-            None,
-            None,
+        let hello = ClientId::Domain("client.example".to_owned());
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250 smtp.example\r\n")
+            .expect_then_stall("NOOP\r\n");
+        let mut connection = AsyncSmtpConnection::from_transcript_with_timeout(
+            transcript,
+            &hello,
+            Protocol::Smtp,
+            Duration::from_millis(50),
         )
         .await
         .unwrap();
 
-        let Err(error) = connection.command(Noop).await else {
-            panic!("NOOP must time out while waiting for response");
-        };
+        let error = connection
+            .command(Noop)
+            .await
+            .expect_err("NOOP must time out while waiting for response");
         assert!(error.is_timeout(), "expected timeout, got {error:?}");
-        handle.join().unwrap();
     }
 
-    #[tokio::test(crate = "tokio")]
+    #[tokio::test(crate = "tokio", start_paused = true)]
     async fn cancelled_command_marks_connection_broken() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-
-        let handle = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
-            stream.write_all(b"220 localhost\r\n").unwrap();
-
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut ehlo = String::new();
-            reader.read_line(&mut ehlo).unwrap();
-            stream.write_all(b"250 localhost\r\n").unwrap();
-
-            let mut noop = String::new();
-            reader.read_line(&mut noop).unwrap();
-            thread::sleep(Duration::from_millis(250));
-        });
-
-        let mut connection = AsyncSmtpConnection::connect(
-            address,
-            Some(Duration::from_secs(2)),
-            &ClientId::default(),
-            None,
-            None,
+        let hello = ClientId::Domain("client.example".to_owned());
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250 smtp.example\r\n")
+            .expect_then_stall("NOOP\r\n");
+        let mut connection = AsyncSmtpConnection::from_transcript_with_timeout(
+            transcript,
+            &hello,
+            Protocol::Smtp,
+            Duration::from_secs(2),
         )
         .await
         .unwrap();
 
+        // Dropping a read mid-response loses stream position, so the
+        // connection must not be reused.
         let result =
             tokio::time::timeout(Duration::from_millis(50), connection.command(Noop)).await;
-
         assert!(result.is_err(), "command future must be cancelled");
         assert!(connection.has_broken());
 
@@ -2742,6 +2486,5 @@ mod test {
             error.is_connection(),
             "expected connection error: {error:?}"
         );
-        handle.join().unwrap();
     }
 }

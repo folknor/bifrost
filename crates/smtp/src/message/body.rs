@@ -199,6 +199,30 @@ impl MaybeString {
             Self::Binary(_) => {}
         }
     }
+
+    /// Normalize a top-level message body before it reaches the SMTP DATA
+    /// encoder.
+    ///
+    /// Raw byte input that ends up on the wire as literal `7bit`/`8bit` text
+    /// is line-oriented data, so it must obey the same CRLF boundary as
+    /// `String` input: otherwise a bare `LF` reaches the DATA writer, which
+    /// dot-stuffs it defensively and a CRLF-strict relay delivers the extra
+    /// dot as content. Byte input that gets re-encoded (base64, and the
+    /// `binary` extension) is opaque payload - rewriting `0x0A` there would
+    /// corrupt what the peer decodes, so it is left exactly as supplied.
+    fn encode_message_crlf(&mut self, encoding: ContentTransferEncoding) {
+        match self {
+            Self::String(string) => in_place_crlf_line_endings(string),
+            Self::Binary(bytes) => {
+                if matches!(
+                    encoding,
+                    ContentTransferEncoding::SevenBit | ContentTransferEncoding::EightBit
+                ) {
+                    in_place_crlf_bytes(bytes);
+                }
+            }
+        }
+    }
 }
 
 /// A trait for something that takes an encoded [`Body`].
@@ -217,6 +241,14 @@ impl MaybeString {
 pub trait IntoBody {
     /// Encode as valid body
     fn into_body(self, encoding: Option<ContentTransferEncoding>) -> Body;
+
+    /// Encode a top-level message body.
+    fn into_message_body(self, encoding: Option<ContentTransferEncoding>) -> Body
+    where
+        Self: Sized,
+    {
+        self.into_body(encoding)
+    }
 }
 
 impl<T> IntoBody for T
@@ -227,6 +259,19 @@ where
         match encoding {
             Some(encoding) => Body::new_with_encoding(self, encoding).expect("invalid encoding"),
             None => Body::new(self),
+        }
+    }
+
+    fn into_message_body(self, encoding: Option<ContentTransferEncoding>) -> Body {
+        let mut body: MaybeString = self.into();
+        // The encoding that will actually be applied below decides whether the
+        // buffer is line-oriented text or opaque payload.
+        let effective = encoding.unwrap_or_else(|| body.encoding(false));
+        body.encode_message_crlf(effective);
+
+        match encoding {
+            Some(encoding) => Body::new_with_encoding(body, encoding).expect("invalid encoding"),
+            None => Body::new(body),
         }
     }
 }
@@ -292,6 +337,28 @@ fn in_place_crlf_line_endings(string: &mut String) {
     }
 }
 
+/// Convert bare LF bytes to CRLF without interpreting the rest of a raw body.
+fn in_place_crlf_bytes(bytes: &mut Vec<u8>) {
+    if !bytes
+        .iter()
+        .enumerate()
+        .any(|(index, byte)| *byte == b'\n' && (index == 0 || bytes[index - 1] != b'\r'))
+    {
+        return;
+    }
+
+    let mut normalized = Vec::with_capacity(bytes.len());
+    let mut previous = None;
+    for byte in bytes.drain(..) {
+        if byte == b'\n' && previous != Some(b'\r') {
+            normalized.push(b'\r');
+        }
+        normalized.push(byte);
+        previous = Some(byte);
+    }
+    *bytes = normalized;
+}
+
 /// Find indices to all places where `\r` should be inserted
 /// in order to make `s` have CRLF line endings
 ///
@@ -320,7 +387,16 @@ fn find_all_lf_char_indices(s: &str) -> Vec<usize> {
 #[cfg(test)]
 mod test {
 
-    use super::{Body, ContentTransferEncoding, in_place_crlf_line_endings};
+    use super::{Body, ContentTransferEncoding, in_place_crlf_bytes, in_place_crlf_line_endings};
+
+    #[test]
+    fn raw_byte_message_normalization_converts_only_bare_lf() {
+        let mut bytes = b"first\nsecond\r\nthird\n".to_vec();
+
+        in_place_crlf_bytes(&mut bytes);
+
+        assert_eq!(bytes, b"first\r\nsecond\r\nthird\r\n");
+    }
 
     #[test]
     fn seven_bit_detect() {

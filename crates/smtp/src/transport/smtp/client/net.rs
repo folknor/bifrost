@@ -37,6 +37,9 @@ enum InnerNetworkStream {
     Unix(UnixStream),
     /// Encrypted TCP stream
     NativeTls(TlsStream<TcpStream>),
+    /// Test-only scripted in-process peer.
+    #[cfg(test)]
+    Transcript(crate::transport::smtp::test_support::TranscriptStream),
 }
 
 impl NetworkStream {
@@ -45,6 +48,13 @@ impl NetworkStream {
             inner: Some(inner),
             state: ConnectionState::Ok,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_transcript(
+        transcript: crate::transport::smtp::test_support::Transcript,
+    ) -> Self {
+        Self::new(InnerNetworkStream::Transcript(transcript.stream()))
     }
 
     pub(super) fn state(&self) -> ConnectionState {
@@ -64,6 +74,8 @@ impl NetworkStream {
             #[cfg(unix)]
             Some(InnerNetworkStream::Unix(s)) => s.shutdown(how),
             Some(InnerNetworkStream::NativeTls(s)) => s.get_ref().shutdown(how),
+            #[cfg(test)]
+            Some(InnerNetworkStream::Transcript(_)) => Ok(()),
             None => Ok(()),
         }
     }
@@ -179,6 +191,8 @@ impl NetworkStream {
             #[cfg(unix)]
             Some(InnerNetworkStream::Unix(_)) => false,
             Some(InnerNetworkStream::NativeTls(_)) => true,
+            #[cfg(test)]
+            Some(InnerNetworkStream::Transcript(_)) => false,
             None => false,
         }
     }
@@ -212,6 +226,8 @@ impl NetworkStream {
             Some(InnerNetworkStream::NativeTls(stream)) => {
                 stream.get_ref().set_read_timeout(duration)
             }
+            #[cfg(test)]
+            Some(InnerNetworkStream::Transcript(_)) => Ok(()),
             None => Err(not_connected()),
         }
     }
@@ -226,6 +242,8 @@ impl NetworkStream {
             Some(InnerNetworkStream::NativeTls(stream)) => {
                 stream.get_ref().set_write_timeout(duration)
             }
+            #[cfg(test)]
+            Some(InnerNetworkStream::Transcript(_)) => Ok(()),
             None => Err(not_connected()),
         }
     }
@@ -238,6 +256,8 @@ impl Read for NetworkStream {
             #[cfg(unix)]
             Some(InnerNetworkStream::Unix(s)) => s.read(buf),
             Some(InnerNetworkStream::NativeTls(s)) => s.read(buf),
+            #[cfg(test)]
+            Some(InnerNetworkStream::Transcript(s)) => s.read(buf),
             None => Err(not_connected()),
         }
     }
@@ -250,6 +270,8 @@ impl Write for NetworkStream {
             #[cfg(unix)]
             Some(InnerNetworkStream::Unix(s)) => s.write(buf),
             Some(InnerNetworkStream::NativeTls(s)) => s.write(buf),
+            #[cfg(test)]
+            Some(InnerNetworkStream::Transcript(s)) => s.write(buf),
             None => Err(not_connected()),
         }
     }
@@ -260,6 +282,8 @@ impl Write for NetworkStream {
             #[cfg(unix)]
             Some(InnerNetworkStream::Unix(s)) => s.flush(),
             Some(InnerNetworkStream::NativeTls(s)) => s.flush(),
+            #[cfg(test)]
+            Some(InnerNetworkStream::Transcript(s)) => s.flush(),
             None => Err(not_connected()),
         }
     }

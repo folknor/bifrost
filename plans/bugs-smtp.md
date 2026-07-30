@@ -5,36 +5,22 @@ removed rather than retained as history.
 
 ## Open bugs
 
-### B17 - Large PIPELINING groups can deadlock against a peer that stops reading commands
+### B19 - A surplus LMTP final reply silently desynchronizes the connection
 
-`crates/smtp/src/transport/smtp/client/connection.rs` and
-`async_connection.rs` serialize `MAIL FROM`, every `RCPT TO`, and `DATA` into
-one write before draining a reply. RFC 2920 section 3.1 says the client SHOULD
-respect the TCP window. With a very large recipient list, the client can block
-writing commands while the server blocks writing replies.
+A peer that emits more post-DATA final replies than it accepted recipients
+leaves the extra replies queued. `send_lmtp` returns the expected number of
+statuses, does not mark the connection broken, and the pooled connection is
+handed back for reuse - so the next command reads a stale reply as its own
+response, off by one forever.
 
-Assessment: this is a real robustness risk, but not a confirmed protocol
-correctness bug. The RFC wording is SHOULD, and the configured write timeout
-eventually breaks the stalemate. Keep it open as a throughput and reliability
-improvement, not a security issue.
+`lmtp_surplus_final_status_desynchronizes_the_next_command` pins the current
+behavior: the transcript harness refuses the following write while replies are
+still pending, which is exactly the desync a real socket would hide.
 
-Proposed fix: pipeline bounded recipient chunks and drain the corresponding
-replies before writing the next chunk, preserving `SendProgress` indexes.
-
-### B18 - Bare-LF bodies gain a literal extra dot on CRLF-strict relays
-
-`ClientCodec::encode` now treats a bare `LF` as a line break, so a body carrying
-`\n.` is stuffed to `\n..`. That closes the command-injection hole against
-relays that accept bare LF as a terminator, but a relay that de-stuffs only
-after CRLF delivers the extra dot as content.
-
-Assessment: the trade is correct as it stands - corrupting one line beats
-letting an attacker-supplied body end DATA early. The real fix is upstream:
-`MessageBuilder::body` normalizes line endings for `String` input but not for
-`Vec<u8>`, so byte bodies reach the codec un-normalized in the first place.
-
-Proposed fix: CRLF-normalize byte bodies at the builder boundary, or reject them
-when they carry bare LF, and leave the codec's defensive stuffing in place.
+Proposed fix: after draining the expected finals, treat any residual buffered
+input as a protocol violation - mark the connection `Broken` so the pool
+discards it rather than recycling a desynchronized stream. Symmetric with the
+too-few case, which already breaks the connection.
 
 ## Deviations and deliberate choices
 
@@ -95,14 +81,24 @@ one name in the next API cleanup.
 
 ## Test seam and audit gaps
 
-- The connection drivers still have no in-process transcript harness. Their
-  existing socket-listener tests do not meet this repository's hermetic test
-  policy. A test-only duplex stream variant should replace those tests and
-  cover PIPELINING, LMTP final-status drain, and STARTTLS downgrade behavior.
 - Batch resolver unit tests do not drive the complete sync and async send
   paths. The repaired RCPT-option validation needs this harness for broader
   sequencing coverage.
-- LMTP final-status handling has not been exercised against a peer that sends
-  too many or too few final responses.
+- Envelope-phase transport failures now split into two evidence classes, and
+  only one of them is settled. A failed *write* of a later PIPELINING recipient
+  window is `Unsent` (B-round fix). A failed *read* while draining RCPT replies
+  is still stamped `InFlight`, in both the pipelined and non-pipelined paths,
+  even though `DATA` has not been issued there either and no content can have
+  reached the peer. The existing comment in `connection.rs` treats "transport
+  drop is `InFlight`" as a blanket rule; that rule is too coarse for the
+  envelope phase. Deliberately out of scope for this round because it changes
+  pre-existing non-pipelined behavior. Decide the phase-aware rule, then apply
+  it to both drivers at once.
+- The `Transcript` harness models a peer that answers or a peer that goes
+  silent, but not a peer that half-answers a reply line, closes mid-response,
+  or interleaves writes with pending replies (which a real full-duplex socket
+  permits and the harness deliberately rejects). The write-while-pending
+  refusal is a sequencing assertion, not a fidelity claim.
 - TLS/network modules, mailbox parsers, and direct async transport tests remain
-  outside this pass.
+  outside this pass. `starttls` upgrade past the capability check is not
+  covered: the transcript has no TLS handshake.

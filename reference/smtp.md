@@ -39,7 +39,7 @@ LMTP final delivery-status loop holds `Broken` until every accepted recipient's 
 
 ## PIPELINING
 
-When the server advertises PIPELINING, `MAIL FROM`, every `RCPT TO`, and `DATA` are written in one batch. Replies are drained in order before the body is sent. The body is never in the pipelined batch. On RCPT failure mid-pipeline the transaction is aborted before the body. Very large recipient groups remain a bounded-write-timeout robustness concern; chunked pipelining is future work.
+When the server advertises PIPELINING, `MAIL FROM` and `RCPT TO` commands are written in bounded recipient windows, with every reply in one window drained before the next is written. `DATA` is issued only after all recipient windows complete; the body is never in the pipelined batch. On RCPT failure mid-pipeline the transaction is reset before the body. The shared window bound respects the peer TCP window while preserving the original recipient indexes in `SendProgress`.
 
 ## DSN and SendOptions
 
@@ -124,6 +124,8 @@ Multipart builders ensure a `boundary` is present even when a caller supplies a 
 
 `SinglePartBuilder::body(String)` and `MessageBuilder::body(String)` infer `Content-Type: text/plain; charset=utf-8` when no content type is set.
 
+`MessageBuilder::body` CRLF-normalizes bare LF at the builder boundary, so a byte body never reaches the DATA writer's defensive bare-LF dot-stuffing and gains a literal extra dot on a CRLF-strict relay. Normalization is scoped by the encoding that will actually be emitted: `String` input always normalizes, and `Vec<u8>` input normalizes only when it goes on the wire as literal `7bit`/`8bit` text. Byte input that is re-encoded (base64, `binary`) is opaque payload and is passed through untouched, so `0x0A` inside a binary attachment survives the round trip. `body_raw()` (DKIM) and the DATA writer both see the normalized buffer, so signing and delivery still agree. A pre-encoded `Body` is never rewritten.
+
 Typed headers for list management: `List-ID`, `List-Help`, `List-Unsubscribe`, `List-Unsubscribe-Post` (fixed value `List-Unsubscribe=One-Click` per RFC 8058), `List-Subscribe`, `List-Post`, `List-Owner`, `List-Archive`.
 
 Content-type helpers: `text_plain_flowed()`, `text_plain_flowed_delsp()` (RFC 3676).
@@ -151,7 +153,30 @@ Internal pipeline errors carry two value-side decorations the classifier reads:
 
 `crates/smtp/src/transport/smtp/account_error.rs` is the single translation boundary into the shared `AccountError`. It funnels through `AccountErrorBuilder::try_build` (never the removed `.build()`), reads `error.phase()` in preference to the context phase, and routes `InvalidInput` + `SmtpCommandPhase::Auth` (e.g. "no compatible authentication mechanism") to `Authorization(PolicyBlocked)` so consumers see a reauth/policy-change UX instead of `Request(Malformed) -> ClientBug` (internal telemetry). It also maps `FeatureUnsupported` to `Unsupported(AccountOperation::Send)` (so the IMAP layer surfaces a stable `Unsupported(Send)` kind when a relay lacks FUTURERELEASE) and `ParameterOverLimit` to `Request(Malformed)` (the hold time is outside the allowed window). `message_error_to_account_error(MessageError, Protocol) -> AccountError` is the boundary for builder-side validation failures (`MissingFrom`, `MissingTo`, `EmailMissingAt`, ...); every variant maps to `Request(Malformed)`.
 
+Evidence must match what actually crossed the wire. A transport failure in the envelope phase (`MAIL FROM` / `RCPT TO`), including a failed write of a later PIPELINING recipient window, is `Unsent` and resolves through `SendProgress::mark_unresolved_unsent`: `DATA` has not been issued, so no message content can have reached the peer and an `Uncertain` lane would falsely claim a possible delivery. RCPT replies the server already gave are preserved; only still-open recipients are rewritten, into `failed` lanes that `RecoveryClass` derives as `Retry(SameRequest)`. `InFlight` is reserved for failures from the `DATA` command onward.
+
 `batch.rs` `SendProgress::resolve` is the per-recipient lane resolver. LMTP `DATA`-command negative replies route through `mark_accepted_rejected_with_response` so accepted recipients become per-recipient `Failed` lanes - never a batch-level `Err` (the previous shape let the engine resend the entire non-idempotent `Send` after the server rejected it). DATA-final-negative replies tag `SmtpCommandPhase::DataFinal`. LMTP `Accepted` at resolve time without a per-recipient `Final` is a programming bug caught by `debug_assert!` in debug builds and falls back to an `Uncertain` lane in release. Every failed and uncertain lane carries the envelope recipient as `DiagnosticText::support_only` so support exports preserve per-recipient correlation when N lanes share the same wire response text.
+
+## Connection test harness
+
+`test_support::Transcript` is the in-process scripted peer both connection
+drivers test against; it replaced the socket-listener tests, which were neither
+hermetic nor deterministic. A transcript is a greeting plus an ordered list of
+`expect(client_bytes, server_bytes)` steps. Three properties make it bite:
+
+- Each client write must match one scripted step byte-for-byte, so command
+  batching shape (which commands share a write) is pinned, not just command
+  order.
+- Server bytes become readable only after their step's write.
+- Reads hand out at most one reply line. Without this, a `BufReader` prefetches
+  a whole pipelined reply group, and a driver that skipped replies would still
+  pass. Writing while replies are pending is an error, which is how the
+  PIPELINING window drain and the LMTP surplus-final-reply desync are detected.
+
+`expect_then_stall` and `Transcript::silent()` model a peer that accepts and
+then never answers; reads park with no waker, so only the caller's own timeout
+or cancellation resumes the task. That is what the async timeout, setup-deadline
+and cancellation tests observe, under `start_paused` tokio time.
 
 ## Example validation
 
@@ -171,7 +196,7 @@ crates/smtp/src/
 │       ├── commands.rs  - EHLO, MAIL, RCPT, DATA, BDAT, AUTH, NOOP, RSET, QUIT, VRFY, EXPN, STARTTLS, LHLO
 │       ├── extension.rs - ServerInfo, SendOptions, MAIL/RCPT parameters
 │       ├── response.rs  - parser, enhanced status codes
-│       └── test_support.rs - shared mock servers
+│       └── test_support.rs - in-process `Transcript` harness + mock servers
 └── error.rs             - Error, ErrorKind
 ```
 

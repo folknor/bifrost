@@ -59,6 +59,11 @@ pub(crate) enum RcptProgress {
     /// Transport drop / connection failure happened while the recipient's
     /// outcome was still ambiguous. Will become an `uncertain` lane.
     Uncertain(AccountError),
+    /// Transport failure happened before any message content could have
+    /// reached the peer (the transaction died in the envelope phase, with
+    /// `DATA` never issued). Will become a `failed` lane carrying `Unsent`
+    /// evidence, so the caller may safely retry the whole recipient.
+    Unsent(AccountError),
 }
 
 #[derive(Clone, Debug)]
@@ -121,6 +126,21 @@ impl SendProgress {
         for rec in &mut self.recipients {
             if matches!(rec.rcpt, RcptProgress::Accepted | RcptProgress::Pending) {
                 rec.rcpt = RcptProgress::Uncertain(error_factory());
+            }
+        }
+    }
+
+    /// Mark every not-yet-decided recipient as `Unsent`, preserving RCPT
+    /// replies the peer already gave.
+    ///
+    /// Used for envelope-phase transport failures: `DATA` has not been issued,
+    /// so no message content can have reached the peer and `Uncertain` would
+    /// be false evidence. Recipients the server already accepted or rejected
+    /// keep that answer; everything still open becomes a retryable failure.
+    pub(crate) fn mark_unresolved_unsent(&mut self, error_factory: impl Fn() -> AccountError) {
+        for rec in &mut self.recipients {
+            if matches!(rec.rcpt, RcptProgress::Accepted | RcptProgress::Pending) {
+                rec.rcpt = RcptProgress::Unsent(error_factory());
             }
         }
     }
@@ -232,6 +252,12 @@ impl SendProgress {
                 }
                 RcptProgress::Uncertain(err) => {
                     builder.push_uncertain(rec.id, with_recipient_text(err, &rec.address));
+                }
+                RcptProgress::Unsent(err) => {
+                    // Nothing was transmitted for this recipient, so this is a
+                    // plain failure with `Unsent` evidence - not an uncertain
+                    // lane the caller has to reconcile by hand.
+                    builder.push_failed(rec.id, with_recipient_text(err, &rec.address));
                 }
                 RcptProgress::Pending => {
                     // Pending at resolve time means the drain never reached
@@ -531,6 +557,35 @@ mod tests {
 
         let outcome = progress.resolve();
         assert_eq!(outcome.uncertain().len(), 3);
+    }
+
+    #[test]
+    fn envelope_phase_write_failure_marks_unresolved_unsent_and_keeps_rejections() {
+        let mut progress = SendProgress::new(
+            Protocol::Smtp,
+            vec![
+                recip("a", "x@x.com"),
+                recip("b", "y@x.com"),
+                recip("c", "z@x.com"),
+            ],
+        );
+        progress.record_rcpt_accepted(0);
+        progress.record_rcpt_rejected(1, rcpt_reject());
+        // c never got its RCPT written: a later PIPELINING window failed to
+        // write, and DATA was never issued.
+        progress.mark_unresolved_unsent(|| {
+            partial_completion_error(Protocol::Smtp, &"z@x.com".parse::<Address>().unwrap())
+        });
+
+        let outcome = progress.resolve();
+        assert!(
+            outcome.uncertain().is_empty(),
+            "no content reached the peer, so nothing may claim uncertain evidence"
+        );
+        assert_eq!(outcome.failed().len(), 3);
+        assert_eq!(outcome.succeeded().len(), 0);
+        // The peer's own RCPT rejection survives the transport failure.
+        assert_eq!(outcome.failed()[1].item.0, "b");
     }
 
     #[test]

@@ -49,6 +49,13 @@ pub(super) const MAX_RESPONSE_BYTES: usize = 100_000;
 /// Single-line byte cap (Postfix `line_length_limit`).
 pub(super) const MAX_RESPONSE_LINE_BYTES: usize = 1000;
 
+/// Maximum number of RCPT commands outstanding in a PIPELINING window.
+///
+/// RFC 2920 requires clients to respect the peer's TCP window. Draining each
+/// window before writing the next prevents a very large recipient group from
+/// filling both directions at once when a peer waits to send replies.
+pub(super) const PIPELINING_RECIPIENT_WINDOW: usize = 32;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ConnectionState {
     Ok,

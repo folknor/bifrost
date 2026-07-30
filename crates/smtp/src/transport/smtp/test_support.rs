@@ -1,10 +1,240 @@
 use std::{
+    collections::VecDeque,
     io::{BufRead, BufReader, Write},
     net::{SocketAddr, TcpListener},
     sync::mpsc,
     thread,
     time::Duration,
 };
+
+#[derive(Clone, Debug)]
+pub(super) struct Transcript {
+    shared: std::sync::Arc<std::sync::Mutex<TranscriptState>>,
+}
+
+#[derive(Debug)]
+struct TranscriptState {
+    pending_server_bytes: VecDeque<u8>,
+    steps: VecDeque<TranscriptStep>,
+    /// The peer accepted the command and then went silent forever. Reads park
+    /// instead of reporting EOF, which is what a timeout or a cancellation
+    /// test needs to observe.
+    stalled: bool,
+}
+
+#[derive(Debug)]
+struct TranscriptStep {
+    client: Vec<u8>,
+    server: Vec<u8>,
+    stall: bool,
+}
+
+impl Transcript {
+    pub(super) fn new(greeting: impl AsRef<[u8]>) -> Self {
+        Self::with_state(greeting.as_ref().iter().copied().collect(), false)
+    }
+
+    /// A peer that accepts the connection and never sends its banner.
+    #[cfg(feature = "tokio")]
+    pub(super) fn silent() -> Self {
+        Self::with_state(VecDeque::new(), true)
+    }
+
+    fn with_state(pending_server_bytes: VecDeque<u8>, stalled: bool) -> Self {
+        Self {
+            shared: std::sync::Arc::new(std::sync::Mutex::new(TranscriptState {
+                pending_server_bytes,
+                steps: VecDeque::new(),
+                stalled,
+            })),
+        }
+    }
+
+    pub(super) fn expect(self, client: impl AsRef<[u8]>, server: impl AsRef<[u8]>) -> Self {
+        self.push(client, server, false)
+    }
+
+    /// Accept the client bytes, then never answer.
+    #[cfg(feature = "tokio")]
+    pub(super) fn expect_then_stall(self, client: impl AsRef<[u8]>) -> Self {
+        self.push(client, b"", true)
+    }
+
+    fn push(self, client: impl AsRef<[u8]>, server: impl AsRef<[u8]>, stall: bool) -> Self {
+        self.shared
+            .lock()
+            .expect("transcript lock")
+            .steps
+            .push_back(TranscriptStep {
+                client: client.as_ref().to_vec(),
+                server: server.as_ref().to_vec(),
+                stall,
+            });
+        self
+    }
+
+    pub(super) fn stream(&self) -> TranscriptStream {
+        TranscriptStream {
+            transcript: self.clone(),
+        }
+    }
+
+    pub(super) fn assert_exhausted(&self) {
+        let state = self.shared.lock().expect("transcript lock");
+        assert!(
+            state.steps.is_empty(),
+            "SMTP transcript has {} unconsumed client step(s)",
+            state.steps.len()
+        );
+        assert!(
+            state.pending_server_bytes.is_empty(),
+            "SMTP transcript has {} unconsumed server byte(s)",
+            state.pending_server_bytes.len()
+        );
+    }
+}
+
+/// A synchronous side of an in-process SMTP transcript.
+///
+/// Each client write exactly matches one scripted step. Its paired server
+/// bytes become readable only after that write, so transcripts preserve the
+/// request-response sequence a real peer can produce.
+#[derive(Clone, Debug)]
+pub(super) struct TranscriptStream {
+    transcript: Transcript,
+}
+
+impl std::io::Read for TranscriptStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let mut state = self
+            .transcript
+            .shared
+            .lock()
+            .map_err(|_| std::io::Error::other("SMTP transcript lock poisoned"))?;
+        if state.pending_server_bytes.is_empty() {
+            if state.stalled {
+                return Err(std::io::ErrorKind::WouldBlock.into());
+            }
+            return Ok(0);
+        }
+        // Hand out at most one reply line per read. A `BufReader` over this
+        // stream would otherwise prefetch a whole pipelined reply group, empty
+        // `pending_server_bytes` after the first parsed response, and let the
+        // driver write the next command without draining the rest - which is
+        // exactly the sequencing bug these transcripts exist to catch.
+        let line_end = state
+            .pending_server_bytes
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(state.pending_server_bytes.len(), |index| index + 1);
+        let count = buf.len().min(line_end);
+        for destination in &mut buf[..count] {
+            *destination = state
+                .pending_server_bytes
+                .pop_front()
+                .ok_or_else(|| std::io::Error::other("SMTP transcript server bytes disappeared"))?;
+        }
+        Ok(count)
+    }
+}
+
+impl std::io::Write for TranscriptStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut state = self
+            .transcript
+            .shared
+            .lock()
+            .map_err(|_| std::io::Error::other("SMTP transcript lock poisoned"))?;
+        if !state.pending_server_bytes.is_empty() {
+            return Err(std::io::Error::other(
+                "SMTP client wrote before draining the scripted server replies",
+            ));
+        }
+        let Some(step) = state.steps.pop_front() else {
+            return Err(std::io::Error::other(
+                "SMTP transcript exhausted by client write",
+            ));
+        };
+        if step.client != buf {
+            return Err(std::io::Error::other(format!(
+                "unexpected SMTP client bytes: expected {:?}, got {:?}",
+                String::from_utf8_lossy(&step.client),
+                String::from_utf8_lossy(buf)
+            )));
+        }
+        state.pending_server_bytes.extend(step.server);
+        state.stalled = step.stall;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(feature = "tokio")]
+#[derive(Clone, Debug)]
+pub(super) struct AsyncTranscriptStream {
+    inner: TranscriptStream,
+}
+
+#[cfg(feature = "tokio")]
+impl AsyncTranscriptStream {
+    pub(super) fn new(transcript: Transcript) -> Self {
+        Self {
+            inner: transcript.stream(),
+        }
+    }
+}
+
+#[cfg(feature = "tokio")]
+impl tokio::io::AsyncRead for AsyncTranscriptStream {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let unfilled = buf.initialize_unfilled();
+        let read = match std::io::Read::read(&mut self.inner, unfilled) {
+            Ok(read) => read,
+            // A stalled peer parks the read. No waker is registered on
+            // purpose: the only thing that may resume this task is the
+            // caller's own timeout or cancellation, which is exactly the
+            // behavior these transcripts pin.
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                return std::task::Poll::Pending;
+            }
+            Err(error) => return std::task::Poll::Ready(Err(error)),
+        };
+        buf.advance(read);
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+#[cfg(feature = "tokio")]
+impl tokio::io::AsyncWrite for AsyncTranscriptStream {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::task::Poll::Ready(std::io::Write::write(&mut self.inner, buf))
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(std::io::Write::flush(&mut self.inner))
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
 
 #[cfg(unix)]
 use std::{

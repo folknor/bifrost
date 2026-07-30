@@ -14,7 +14,7 @@ use bifrost_sasl::ScramChannelBinding;
 use super::escape_crlf;
 use super::{
     ClientCodec, ConnectionState, MAX_RESPONSE_BYTES, MAX_RESPONSE_LINE_BYTES, NetworkStream,
-    TlsParameters, smtp_data_size,
+    PIPELINING_RECIPIENT_WINDOW, TlsParameters, smtp_data_size,
 };
 use crate::{
     address::{Address, Envelope},
@@ -87,6 +87,7 @@ impl SmtpConnection {
     ///
     /// Sends EHLO and parses server information
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn connect<A: ToSocketAddrs>(
         server: A,
         timeout: Option<Duration>,
@@ -102,6 +103,24 @@ impl SmtpConnection {
             local_address,
             Protocol::Smtp,
         )
+    }
+
+    #[cfg(test)]
+    fn from_transcript(
+        transcript: crate::transport::smtp::test_support::Transcript,
+        hello_name: &ClientId,
+        protocol: Protocol,
+    ) -> Result<Self, Error> {
+        let stream = BufReader::new(NetworkStream::from_transcript(transcript));
+        let mut conn = Self {
+            stream,
+            server_info: ServerInfo::default(),
+            hello_name: hello_name.clone(),
+            protocol,
+        };
+        let _response = conn.read_response()?;
+        conn.hello(hello_name)?;
+        Ok(conn)
     }
 
     pub(crate) fn connect_with_protocol<A: ToSocketAddrs>(
@@ -232,67 +251,58 @@ impl SmtpConnection {
         mail_options: Vec<MailParameter>,
         rcpt_options: Vec<Vec<RcptParameter>>,
     ) -> Result<Response, Error> {
-        let mut commands = Mail::new(envelope.from().cloned(), mail_options).to_string();
-        for (to_address, rcpt_options) in envelope.to().iter().zip(&rcpt_options) {
-            commands.push_str(&Rcpt::new(to_address.clone(), rcpt_options.clone()).to_string());
-        }
-        commands.push_str(&Data.to_string());
-
-        self.write(commands.as_bytes())?;
-
-        let mail_response = self.read_response_accepting_status()?;
-        let mut recipient_responses = Vec::with_capacity(envelope.to().len());
-        for _ in envelope.to() {
-            recipient_responses.push(self.read_response_accepting_status()?);
-        }
-        let data_response = self.read_response_accepting_status()?;
-        let accepted_recipients = recipient_responses
-            .iter()
-            .filter(|response| response.is_positive())
-            .count();
-
-        if !mail_response.is_positive() {
-            self.reset_or_abort_pipelined_transaction(&data_response, accepted_recipients);
-            return Err(Self::error_from_status(mail_response));
-        }
-
-        if let Some(response) = recipient_responses
-            .iter()
-            .find(|response| !response.is_positive())
+        for (window_index, recipients) in envelope
+            .to()
+            .chunks(PIPELINING_RECIPIENT_WINDOW)
+            .zip(rcpt_options.chunks(PIPELINING_RECIPIENT_WINDOW))
+            .enumerate()
         {
-            self.reset_or_abort_pipelined_transaction(&data_response, accepted_recipients);
-            return Err(Self::error_from_status(response.clone()));
+            let mut commands = String::new();
+            if window_index == 0 {
+                commands.push_str(
+                    &Mail::new(envelope.from().cloned(), mail_options.clone()).to_string(),
+                );
+            }
+            for (to_address, rcpt_options) in recipients.0.iter().zip(recipients.1) {
+                commands.push_str(&Rcpt::new(to_address.clone(), rcpt_options.clone()).to_string());
+            }
+            self.write(commands.as_bytes())?;
+
+            if window_index == 0 {
+                let mail_response = self.read_response_accepting_status()?;
+                if !mail_response.is_positive() {
+                    for _ in recipients.0 {
+                        self.read_response_accepting_status()?;
+                    }
+                    return Err(Self::error_from_status(mail_response));
+                }
+            }
+
+            let mut failure = None;
+            for _ in recipients.0 {
+                let response = self.read_response_accepting_status()?;
+                if failure.is_none() && !response.is_positive() {
+                    failure = Some(response);
+                }
+            }
+            if let Some(response) = failure {
+                if self.command_accepting_status(Rset).is_err() {
+                    self.abort();
+                }
+                return Err(Self::error_from_status(response));
+            }
         }
 
+        let data_response = self.command_accepting_status(Data)?;
         if !data_response.is_positive() {
-            self.reset_or_abort_pipelined_transaction(&data_response, accepted_recipients);
+            if self.command_accepting_status(Rset).is_err() {
+                self.abort();
+            }
             return Err(Self::error_from_status(data_response));
         }
 
         let result = try_smtp!(self.message(email), self);
         Ok(result)
-    }
-
-    fn reset_or_abort_pipelined_transaction(
-        &mut self,
-        data_response: &Response,
-        accepted_recipients: usize,
-    ) {
-        if data_response.is_positive() {
-            if accepted_recipients == 0 {
-                if self
-                    .write(b".\r\n")
-                    .and_then(|_| self.read_response_accepting_status())
-                    .is_err()
-                {
-                    self.abort();
-                }
-            } else {
-                self.abort();
-            }
-        } else if self.command_accepting_status(Rset).is_err() {
-            self.abort();
-        }
     }
 
     pub(crate) fn send_lmtp(
@@ -625,70 +635,104 @@ impl SmtpConnection {
         rcpt_options_all: Vec<Vec<RcptParameter>>,
         mut progress: SendProgress,
     ) -> Result<SendProgress, (Error, SendProgress)> {
-        // Build and write the pipelined command batch (MAIL FROM + all RCPTs + DATA).
-        let mut commands = Mail::new(from, mail_options).to_string();
-        for (rec, rcpt_opts) in progress.recipients.iter().zip(&rcpt_options_all) {
-            commands.push_str(&Rcpt::new(rec.address.clone(), rcpt_opts.clone()).to_string());
-        }
-        commands.push_str(&Data.to_string());
-
-        if let Err(e) = self.write(commands.as_bytes()) {
-            self.abort();
-            return Err((
-                e.with_attempt(SmtpTransmissionState::Unsent)
-                    .with_phase(SmtpCommandPhase::MailFrom),
-                progress,
-            ));
-        }
-
-        // Drain MAIL FROM reply.
-        let mail_response = match self.read_response_accepting_status() {
-            Ok(r) => r,
-            Err(e) => {
-                self.abort();
-                return Err((
-                    e.with_attempt(SmtpTransmissionState::InFlight)
-                        .with_phase(SmtpCommandPhase::MailFrom),
-                    progress,
-                ));
+        for window_start in (0..progress.recipients.len()).step_by(PIPELINING_RECIPIENT_WINDOW) {
+            let window_end =
+                (window_start + PIPELINING_RECIPIENT_WINDOW).min(progress.recipients.len());
+            let mut commands = String::new();
+            if window_start == 0 {
+                commands.push_str(&Mail::new(from.clone(), mail_options.clone()).to_string());
             }
-        };
-        if !mail_response.is_positive() {
-            self.abort();
-            return Err((
-                error::status(mail_response)
-                    .with_attempt(SmtpTransmissionState::Acknowledged)
-                    .with_phase(SmtpCommandPhase::MailFrom),
-                progress,
-            ));
-        }
-
-        // Drain RCPT replies.
-        let n_recipients = progress.recipients.len();
-        for i in 0..n_recipients {
-            match self.read_response_accepting_status() {
-                Ok(resp) if resp.is_positive() => progress.record_rcpt_accepted(i),
-                Ok(resp) => progress.record_rcpt_rejected(i, resp),
-                Err(e) => {
-                    // Transport drop during RCPT drain: remaining recipients uncertain.
-                    use crate::transport::smtp::account_error::{
-                        SmtpErrorContext, into_account_error,
-                    };
-                    let ae = into_account_error(
-                        e.with_attempt(SmtpTransmissionState::InFlight)
-                            .with_phase(SmtpCommandPhase::RcptTo),
-                        SmtpErrorContext::send(Protocol::Smtp).with_phase(SmtpCommandPhase::RcptTo),
-                    );
-                    let ae2 = ae.clone();
-                    progress.mark_uncertain_unresolved(|| ae2.clone());
+            for (rec, rcpt_opts) in progress.recipients[window_start..window_end]
+                .iter()
+                .zip(&rcpt_options_all[window_start..window_end])
+            {
+                commands.push_str(&Rcpt::new(rec.address.clone(), rcpt_opts.clone()).to_string());
+            }
+            if let Err(e) = self.write(commands.as_bytes()) {
+                if window_start == 0 {
                     self.abort();
-                    return Ok(progress);
+                    return Err((
+                        e.with_attempt(SmtpTransmissionState::Unsent)
+                            .with_phase(SmtpCommandPhase::MailFrom),
+                        progress,
+                    ));
+                }
+                // A later recipient window failed to write. `DATA` is only
+                // issued after every window, so no message content can have
+                // reached the peer: the still-open recipients are `Unsent`,
+                // and the RCPT replies already collected stay authoritative.
+                use crate::transport::smtp::account_error::{SmtpErrorContext, into_account_error};
+                let ae = into_account_error(
+                    e.with_attempt(SmtpTransmissionState::Unsent)
+                        .with_phase(SmtpCommandPhase::RcptTo),
+                    SmtpErrorContext::send(Protocol::Smtp).with_phase(SmtpCommandPhase::RcptTo),
+                );
+                progress.mark_unresolved_unsent(|| ae.clone());
+                self.abort();
+                return Ok(progress);
+            }
+
+            if window_start == 0 {
+                let mail_response = match self.read_response_accepting_status() {
+                    Ok(r) => r,
+                    Err(e) => {
+                        self.abort();
+                        return Err((
+                            e.with_attempt(SmtpTransmissionState::InFlight)
+                                .with_phase(SmtpCommandPhase::MailFrom),
+                            progress,
+                        ));
+                    }
+                };
+                if !mail_response.is_positive() {
+                    self.abort();
+                    return Err((
+                        error::status(mail_response)
+                            .with_attempt(SmtpTransmissionState::Acknowledged)
+                            .with_phase(SmtpCommandPhase::MailFrom),
+                        progress,
+                    ));
+                }
+            }
+
+            for i in window_start..window_end {
+                match self.read_response_accepting_status() {
+                    Ok(resp) if resp.is_positive() => progress.record_rcpt_accepted(i),
+                    Ok(resp) => progress.record_rcpt_rejected(i, resp),
+                    Err(e) => {
+                        // Transport drop during RCPT drain: remaining recipients uncertain.
+                        use crate::transport::smtp::account_error::{
+                            SmtpErrorContext, into_account_error,
+                        };
+                        let ae = into_account_error(
+                            e.with_attempt(SmtpTransmissionState::InFlight)
+                                .with_phase(SmtpCommandPhase::RcptTo),
+                            SmtpErrorContext::send(Protocol::Smtp)
+                                .with_phase(SmtpCommandPhase::RcptTo),
+                        );
+                        let ae2 = ae.clone();
+                        progress.mark_uncertain_unresolved(|| ae2.clone());
+                        self.abort();
+                        return Ok(progress);
+                    }
                 }
             }
         }
 
-        // Drain DATA reply.
-        let data_response = match self.read_response_accepting_status() {
+        let accepted = progress.recipients.iter().any(|r| {
+            matches!(
+                r.rcpt,
+                crate::transport::smtp::batch::RcptProgress::Accepted
+            )
+        });
+        if !accepted {
+            if self.command_accepting_status(Rset).is_err() {
+                self.abort();
+            }
+            return Ok(progress);
+        }
+
+        let data_response = match self.command_accepting_status(Data) {
             Ok(r) => r,
             Err(e) => {
                 use crate::transport::smtp::account_error::{SmtpErrorContext, into_account_error};
@@ -704,13 +748,6 @@ impl SmtpConnection {
                 return Ok(progress);
             }
         };
-
-        let accepted = progress.recipients.iter().any(|r| {
-            matches!(
-                r.rcpt,
-                crate::transport::smtp::batch::RcptProgress::Accepted
-            )
-        });
 
         if !data_response.is_positive() {
             // DATA negative: all accepted recipients failed with this response.
@@ -1811,177 +1848,322 @@ impl SmtpConnection {
 }
 
 #[cfg(test)]
-mod test {
-    use std::{
-        io::{BufRead, BufReader, Read, Write},
-        net::TcpListener,
-        sync::mpsc,
-        thread,
-        time::Duration,
-    };
-
+mod transcript_tests {
     use crate::{
         address::Envelope,
         transport::smtp::{
-            SmtpConnection,
+            Protocol,
             authentication::{Credentials, Mechanism},
+            batch::SmtpBatchRecipient,
+            commands::Noop,
             extension::{
                 ClientId, DeliverByMode, DsnNotify, DsnReturn, Extension, MailBodyParameter,
-                MailParameter, SendOptions,
+                MailParameter,
             },
+            test_support::Transcript,
         },
     };
+    use bifrost_types::error::BatchItemId;
+
+    use super::{SendOptions, SmtpConnection};
+
+    const HELLO: &str = "EHLO client.example\r\n";
+
+    fn recipients(count: usize) -> Vec<crate::address::Address> {
+        (0..count)
+            .map(|index| format!("recipient-{index}@example.com").parse().unwrap())
+            .collect()
+    }
+
+    fn recipient_commands(recipients: &[crate::address::Address]) -> String {
+        recipients
+            .iter()
+            .map(|recipient| format!("RCPT TO:<{recipient}>\r\n"))
+            .collect()
+    }
+
+    #[test]
+    fn pipelining_drains_each_recipient_window_before_writing_the_next() {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let recipients = recipients(33);
+        let mut first_window = "MAIL FROM:<sender@example.com>\r\n".to_owned();
+        first_window.push_str(&recipient_commands(&recipients[..32]));
+        let mut first_replies = "250 sender ok\r\n".to_owned();
+        first_replies.push_str(&"250 recipient ok\r\n".repeat(32));
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250-smtp.example\r\n250 PIPELINING\r\n")
+            .expect(first_window, first_replies)
+            .expect(
+                format!("RCPT TO:<{}>\r\n", recipients[32]),
+                "250 recipient ok\r\n",
+            )
+            .expect("DATA\r\n", "354 send body\r\n")
+            .expect("body", "")
+            .expect("\r\n.\r\n", "250 queued\r\n");
+        let envelope =
+            Envelope::new(Some("sender@example.com".parse().unwrap()), recipients).unwrap();
+
+        let mut connection =
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp).unwrap();
+        connection.send(&envelope, b"body").unwrap();
+        transcript.assert_exhausted();
+    }
+
+    #[test]
+    fn pipelined_batch_keeps_original_indexes_across_a_window_boundary() {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let addresses = recipients(33);
+        let mut first_window = "MAIL FROM:<sender@example.com>\r\n".to_owned();
+        first_window.push_str(&recipient_commands(&addresses[..32]));
+        let mut first_replies = "250 sender ok\r\n".to_owned();
+        first_replies.push_str(&"250 recipient ok\r\n".repeat(31));
+        first_replies.push_str("550 recipient rejected\r\n");
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250-smtp.example\r\n250 PIPELINING\r\n")
+            .expect(first_window, first_replies)
+            .expect(
+                format!("RCPT TO:<{}>\r\n", addresses[32]),
+                "250 recipient ok\r\n",
+            )
+            .expect("DATA\r\n", "354 send body\r\n")
+            .expect("body", "")
+            .expect("\r\n.\r\n", "250 queued\r\n");
+        let recipients = addresses
+            .into_iter()
+            .enumerate()
+            .map(|(index, address)| SmtpBatchRecipient {
+                id: BatchItemId(format!("item-{index}")),
+                address,
+            })
+            .collect();
+
+        let mut connection =
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp).unwrap();
+        let outcome = connection
+            .send_smtp_batch(
+                Some("sender@example.com".parse().unwrap()),
+                recipients,
+                b"body",
+                &Default::default(),
+            )
+            .unwrap()
+            .resolve();
+
+        assert_eq!(outcome.failed().len(), 1);
+        assert_eq!(outcome.failed()[0].item.0, "item-31");
+        assert_eq!(outcome.succeeded().last().unwrap().item.0, "item-32");
+        transcript.assert_exhausted();
+    }
+
+    /// A later recipient window fails to write. `DATA` was never issued, so no
+    /// content can have reached the peer: every still-open recipient must land
+    /// in the `failed` lane with `Unsent` evidence, and the RCPT rejection the
+    /// server already gave must survive. `uncertain` here would be a false
+    /// claim that the message might have been delivered.
+    #[test]
+    fn later_window_write_failure_reports_unsent_not_uncertain() {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let addresses = recipients(33);
+        let mut first_window = "MAIL FROM:<sender@example.com>\r\n".to_owned();
+        first_window.push_str(&recipient_commands(&addresses[..32]));
+        let mut first_replies = "250 sender ok\r\n".to_owned();
+        first_replies.push_str(&"250 recipient ok\r\n".repeat(31));
+        first_replies.push_str("550 recipient rejected\r\n");
+        // No step for the second window: its write fails at the transport.
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250-smtp.example\r\n250 PIPELINING\r\n")
+            .expect(first_window, first_replies);
+        let batch = addresses
+            .into_iter()
+            .enumerate()
+            .map(|(index, address)| SmtpBatchRecipient {
+                id: BatchItemId(format!("item-{index}")),
+                address,
+            })
+            .collect();
+
+        let mut connection =
+            SmtpConnection::from_transcript(transcript, &hello, Protocol::Smtp).unwrap();
+        let outcome = connection
+            .send_smtp_batch(
+                Some("sender@example.com".parse().unwrap()),
+                batch,
+                b"body",
+                &Default::default(),
+            )
+            .unwrap()
+            .resolve();
+
+        assert!(
+            outcome.uncertain().is_empty(),
+            "DATA was never issued, so nothing may be reported as uncertain"
+        );
+        assert_eq!(outcome.succeeded().len(), 0);
+        assert_eq!(outcome.failed().len(), 33);
+        assert_eq!(outcome.failed()[31].item.0, "item-31");
+    }
+
+    #[test]
+    fn lmtp_drains_one_final_status_per_accepted_recipient() {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let recipients = vec![
+            "first@example.com".parse().unwrap(),
+            "second@example.com".parse().unwrap(),
+        ];
+        let transcript = Transcript::new("220 lmtp.example\r\n")
+            .expect("LHLO client.example\r\n", "250 lmtp.example\r\n")
+            .expect("MAIL FROM:<sender@example.com>\r\n", "250 sender ok\r\n")
+            .expect("RCPT TO:<first@example.com>\r\n", "250 first ok\r\n")
+            .expect("RCPT TO:<second@example.com>\r\n", "250 second ok\r\n")
+            .expect("DATA\r\n", "354 send body\r\n")
+            .expect("body", "")
+            .expect(
+                "\r\n.\r\n",
+                "250 first delivered\r\n550 second rejected\r\n",
+            );
+        let envelope =
+            Envelope::new(Some("sender@example.com".parse().unwrap()), recipients).unwrap();
+
+        let mut connection =
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Lmtp).unwrap();
+        let statuses = connection.send_lmtp(&envelope, b"body").unwrap();
+
+        assert!(statuses[0].is_positive());
+        assert!(!statuses[1].is_positive());
+        transcript.assert_exhausted();
+    }
+
+    #[test]
+    fn lmtp_too_few_final_statuses_breaks_the_connection() {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let recipients = vec![
+            "first@example.com".parse().unwrap(),
+            "second@example.com".parse().unwrap(),
+        ];
+        let transcript = Transcript::new("220 lmtp.example\r\n")
+            .expect("LHLO client.example\r\n", "250 lmtp.example\r\n")
+            .expect("MAIL FROM:<sender@example.com>\r\n", "250 sender ok\r\n")
+            .expect("RCPT TO:<first@example.com>\r\n", "250 first ok\r\n")
+            .expect("RCPT TO:<second@example.com>\r\n", "250 second ok\r\n")
+            .expect("DATA\r\n", "354 send body\r\n")
+            .expect("body", "")
+            .expect("\r\n.\r\n", "250 first delivered\r\n");
+        let envelope =
+            Envelope::new(Some("sender@example.com".parse().unwrap()), recipients).unwrap();
+
+        let mut connection =
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Lmtp).unwrap();
+        assert!(connection.send_lmtp(&envelope, b"body").is_err());
+        assert!(connection.has_broken());
+        transcript.assert_exhausted();
+    }
+
+    /// A peer that emits more final replies than accepted recipients leaves
+    /// the surplus queued, and nothing in the driver notices: the next command
+    /// would read the stale reply as its own. The transcript refuses the write
+    /// while replies are pending, which is exactly this desync. Recorded as an
+    /// open gap in the SMTP bug-hunt doc.
+    #[test]
+    fn lmtp_surplus_final_status_desynchronizes_the_next_command() {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let recipients = vec![
+            "first@example.com".parse().unwrap(),
+            "second@example.com".parse().unwrap(),
+        ];
+        let transcript = Transcript::new("220 lmtp.example\r\n")
+            .expect("LHLO client.example\r\n", "250 lmtp.example\r\n")
+            .expect("MAIL FROM:<sender@example.com>\r\n", "250 sender ok\r\n")
+            .expect("RCPT TO:<first@example.com>\r\n", "250 first ok\r\n")
+            .expect("RCPT TO:<second@example.com>\r\n", "250 second ok\r\n")
+            .expect("DATA\r\n", "354 send body\r\n")
+            .expect("body", "")
+            .expect(
+                "\r\n.\r\n",
+                "250 first delivered\r\n250 second delivered\r\n250 surplus response\r\n",
+            );
+        let envelope =
+            Envelope::new(Some("sender@example.com".parse().unwrap()), recipients).unwrap();
+
+        let mut connection =
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Lmtp).unwrap();
+        // The send itself reports two per-recipient statuses and, today, does
+        // not flag the connection as unusable.
+        assert_eq!(connection.send_lmtp(&envelope, b"body").unwrap().len(), 2);
+        assert!(!connection.has_broken());
+
+        let error = connection
+            .command(Noop)
+            .expect_err("the surplus final reply is still queued");
+        assert!(
+            error.to_string().contains("before draining"),
+            "expected a pending-reply desync, got: {error}"
+        );
+    }
+
+    // The tests below replace the socket-listener tests this harness retired.
+    // Same behaviors, same assertions, no listener or thread.
 
     #[test]
     fn abort_closes_without_quit_command() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let (observed_tx, observed_rx) = mpsc::channel();
-
-        let handle = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
-            stream.write_all(b"220 localhost\r\n").unwrap();
-
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut ehlo = String::new();
-            reader.read_line(&mut ehlo).unwrap();
-            stream.write_all(b"250 localhost\r\n").unwrap();
-
-            let mut after_abort = String::new();
-            let observed = match reader.read_line(&mut after_abort) {
-                Ok(bytes) => format!("{bytes}:{after_abort}"),
-                Err(error) => format!("error:{:?}", error.kind()),
-            };
-            observed_tx.send(observed).unwrap();
-        });
-
+        let hello = ClientId::Domain("client.example".to_owned());
+        // No step after EHLO: any byte `abort` writes is a transcript failure.
+        let transcript =
+            Transcript::new("220 smtp.example\r\n").expect(HELLO, "250 smtp.example\r\n");
         let mut connection =
-            SmtpConnection::connect(address, None, &ClientId::default(), None, None).unwrap();
-        connection.abort();
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp).unwrap();
 
-        let observed = observed_rx.recv_timeout(Duration::from_secs(3)).unwrap();
-        assert!(
-            !observed.contains("QUIT"),
-            "abort must close without sending QUIT, got {observed:?}"
-        );
-        handle.join().unwrap();
+        connection.abort();
+        transcript.assert_exhausted();
     }
 
     #[test]
     fn peer_certificate_der_is_none_on_plaintext() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-
-        let handle = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
-            stream.write_all(b"220 localhost\r\n").unwrap();
-
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut ehlo = String::new();
-            reader.read_line(&mut ehlo).unwrap();
-            stream.write_all(b"250 localhost\r\n").unwrap();
-        });
-
+        let hello = ClientId::Domain("client.example".to_owned());
+        let transcript =
+            Transcript::new("220 smtp.example\r\n").expect(HELLO, "250 smtp.example\r\n");
         let connection =
-            SmtpConnection::connect(address, None, &ClientId::default(), None, None).unwrap();
+            SmtpConnection::from_transcript(transcript, &hello, Protocol::Smtp).unwrap();
+
         assert!(
             connection.peer_certificate_der().is_none(),
             "plaintext connection must have no peer certificate DER"
         );
-        handle.join().unwrap();
     }
 
     #[test]
     fn failed_test_connected_marks_connection_broken() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-
-        let handle = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
-            stream.write_all(b"220 localhost\r\n").unwrap();
-
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut ehlo = String::new();
-            reader.read_line(&mut ehlo).unwrap();
-            stream.write_all(b"250 localhost\r\n").unwrap();
-
-            let mut noop = String::new();
-            reader.read_line(&mut noop).unwrap();
-        });
-
+        let hello = ClientId::Domain("client.example".to_owned());
+        // The NOOP probe is scripted, but the peer never answers it.
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250 smtp.example\r\n")
+            .expect("NOOP\r\n", "");
         let mut connection =
-            SmtpConnection::connect(address, None, &ClientId::default(), None, None).unwrap();
+            SmtpConnection::from_transcript(transcript, &hello, Protocol::Smtp).unwrap();
 
         assert!(!connection.test_connected());
         assert!(connection.has_broken());
-        handle.join().unwrap();
     }
 
     #[test]
-    fn send_uses_pipelining_for_mail_and_recipients() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let (commands_tx, commands_rx) = mpsc::channel();
+    fn send_with_options_pipelines_envelope_parameters_in_one_window() {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(
+                HELLO,
+                "250-smtp.example\r\n250-PIPELINING\r\n250-SIZE 1024\r\n250-FUTURERELEASE 3600\r\n250-DELIVERBY 240\r\n250-MT-PRIORITY\r\n250 DSN\r\n",
+            )
+            .expect(
+                concat!(
+                    "MAIL FROM:<sender@example.com> SIZE=24 HOLDFOR=60 BY=300;R MT-PRIORITY=-1 RET=HDRS ENVID=env+3D1\r\n",
+                    "RCPT TO:<first@example.com> NOTIFY=FAILURE,DELAY ORCPT=rfc822;alias+3Dfirst@example.com\r\n",
+                    "RCPT TO:<second@example.com> NOTIFY=FAILURE,DELAY\r\n",
+                ),
+                "250 sender ok\r\n250 first ok\r\n250 second ok\r\n",
+            )
+            .expect("DATA\r\n", "354 send body\r\n")
+            .expect("Subject: test\r\n\r\nHello", "")
+            .expect("\r\n.\r\n", "250 queued\r\n");
 
-        let handle = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
-            stream.write_all(b"220 localhost\r\n").unwrap();
-
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut commands = Vec::new();
-
-            let mut ehlo = String::new();
-            reader.read_line(&mut ehlo).unwrap();
-            commands.push(ehlo);
-            stream
-                .write_all(
-                    b"250-localhost\r\n250-PIPELINING\r\n250-SIZE 1024\r\n250-FUTURERELEASE 3600\r\n250-DELIVERBY 240\r\n250-MT-PRIORITY\r\n250 DSN\r\n",
-                )
-                .unwrap();
-
-            let expected_batch = concat!(
-                "MAIL FROM:<sender@example.com> SIZE=24 HOLDFOR=60 BY=300;R MT-PRIORITY=-1 RET=HDRS ENVID=env+3D1\r\n",
-                "RCPT TO:<first@example.com> NOTIFY=FAILURE,DELAY ORCPT=rfc822;alias+3Dfirst@example.com\r\n",
-                "RCPT TO:<second@example.com> NOTIFY=FAILURE,DELAY\r\n",
-                "DATA\r\n",
-            );
-            let mut batch = vec![0; expected_batch.len()];
-            reader.read_exact(&mut batch).unwrap();
-            assert_eq!(batch, expected_batch.as_bytes());
-            let batch = String::from_utf8(batch).unwrap();
-            commands.extend(batch.split_inclusive('\n').map(str::to_owned));
-
-            stream
-                .write_all(b"250 sender ok\r\n250 first ok\r\n250 second ok\r\n354 send body\r\n")
-                .unwrap();
-
-            let mut line = String::new();
-            loop {
-                line.clear();
-                reader.read_line(&mut line).unwrap();
-                if line == ".\r\n" {
-                    break;
-                }
-            }
-            stream.write_all(b"250 queued\r\n").unwrap();
-
-            commands_tx.send(commands).unwrap();
-        });
-
-        let mut connection =
-            SmtpConnection::connect(address, None, &ClientId::default(), None, None).unwrap();
         let first_recipient: crate::address::Address = "first@example.com".parse().unwrap();
         let envelope = Envelope::new(
             Some("sender@example.com".parse().unwrap()),
@@ -2003,153 +2185,66 @@ mod test {
             .unwrap()
             .recipient_original_recipient(first_recipient, "rfc822", "alias=first@example.com");
 
+        let mut connection =
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp).unwrap();
         let response = connection
             .send_with_options(&envelope, b"Subject: test\r\n\r\nHello", &options)
             .unwrap();
-        assert!(response.has_code(250));
 
-        let commands = commands_rx.recv_timeout(Duration::from_secs(3)).unwrap();
-        assert!(commands[0].starts_with("EHLO "));
-        assert_eq!(
-            commands[1],
-            "MAIL FROM:<sender@example.com> SIZE=24 HOLDFOR=60 BY=300;R MT-PRIORITY=-1 RET=HDRS ENVID=env+3D1\r\n"
-        );
-        assert_eq!(
-            commands[2],
-            "RCPT TO:<first@example.com> NOTIFY=FAILURE,DELAY ORCPT=rfc822;alias+3Dfirst@example.com\r\n"
-        );
-        assert_eq!(
-            commands[3],
-            "RCPT TO:<second@example.com> NOTIFY=FAILURE,DELAY\r\n"
-        );
-        assert_eq!(commands[4], "DATA\r\n");
-        handle.join().unwrap();
+        assert!(response.has_code(250));
+        transcript.assert_exhausted();
     }
 
     #[test]
-    fn pipelined_send_rsets_when_data_is_rejected() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let (commands_tx, commands_rx) = mpsc::channel();
-
-        let handle = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
-            stream.write_all(b"220 localhost\r\n").unwrap();
-
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut commands = Vec::new();
-
-            let mut ehlo = String::new();
-            reader.read_line(&mut ehlo).unwrap();
-            commands.push(ehlo);
-            stream
-                .write_all(b"250-localhost\r\n250-PIPELINING\r\n250 SIZE 1024\r\n")
-                .unwrap();
-
-            let expected_batch = concat!(
-                "MAIL FROM:<sender@example.com> SIZE=24\r\n",
-                "RCPT TO:<recipient@example.com>\r\n",
-                "DATA\r\n",
-            );
-            let mut batch = vec![0; expected_batch.len()];
-            reader.read_exact(&mut batch).unwrap();
-            assert_eq!(batch, expected_batch.as_bytes());
-            let batch = String::from_utf8(batch).unwrap();
-            commands.extend(batch.split_inclusive('\n').map(str::to_owned));
-
-            stream
-                .write_all(b"250 sender ok\r\n550 recipient rejected\r\n554 no recipients\r\n")
-                .unwrap();
-
-            let mut rset = String::new();
-            reader.read_line(&mut rset).unwrap();
-            commands.push(rset);
-            stream.write_all(b"250 reset ok\r\n").unwrap();
-
-            let mut noop = String::new();
-            reader.read_line(&mut noop).unwrap();
-            commands.push(noop);
-            stream.write_all(b"250 noop ok\r\n").unwrap();
-
-            commands_tx.send(commands).unwrap();
-        });
-
-        let mut connection =
-            SmtpConnection::connect(address, None, &ClientId::default(), None, None).unwrap();
+    fn pipelined_send_rsets_when_a_recipient_is_rejected() {
+        let hello = ClientId::Domain("client.example".to_owned());
+        // DATA is no longer pipelined, so a rejected RCPT is cleaned up with
+        // RSET before any DATA command is issued, and the connection stays
+        // reusable.
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(
+                HELLO,
+                "250-smtp.example\r\n250-PIPELINING\r\n250 SIZE 1024\r\n",
+            )
+            .expect(
+                "MAIL FROM:<sender@example.com> SIZE=24\r\nRCPT TO:<recipient@example.com>\r\n",
+                "250 sender ok\r\n550 recipient rejected\r\n",
+            )
+            .expect("RSET\r\n", "250 reset ok\r\n")
+            .expect("NOOP\r\n", "250 noop ok\r\n");
         let envelope = Envelope::new(
             Some("sender@example.com".parse().unwrap()),
             vec!["recipient@example.com".parse().unwrap()],
         )
         .unwrap();
 
-        let result = connection.send(&envelope, b"Subject: test\r\n\r\nHello");
-        assert!(result.is_err());
+        let mut connection =
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp).unwrap();
+        assert!(
+            connection
+                .send(&envelope, b"Subject: test\r\n\r\nHello")
+                .is_err()
+        );
         assert!(!connection.has_broken());
         assert!(connection.test_connected());
-
-        let commands = commands_rx.recv_timeout(Duration::from_secs(3)).unwrap();
-        assert!(commands[0].starts_with("EHLO "));
-        assert_eq!(commands[1], "MAIL FROM:<sender@example.com> SIZE=24\r\n");
-        assert_eq!(commands[2], "RCPT TO:<recipient@example.com>\r\n");
-        assert_eq!(commands[3], "DATA\r\n");
-        assert_eq!(commands[4], "RSET\r\n");
-        assert_eq!(commands[5], "NOOP\r\n");
-        handle.join().unwrap();
+        transcript.assert_exhausted();
     }
 
     #[test]
     fn explicit_mail_parameters_are_not_duplicated() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let (commands_tx, commands_rx) = mpsc::channel();
-
-        let handle = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
-            stream.write_all(b"220 localhost\r\n").unwrap();
-
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut commands = Vec::new();
-
-            let mut ehlo = String::new();
-            reader.read_line(&mut ehlo).unwrap();
-            commands.push(ehlo);
-            stream
-                .write_all(
-                    b"250-localhost\r\n250-PIPELINING\r\n250-SIZE 1024\r\n250-SMTPUTF8\r\n250 8BITMIME\r\n",
-                )
-                .unwrap();
-
-            for _ in 0..3 {
-                let mut command = String::new();
-                reader.read_line(&mut command).unwrap();
-                commands.push(command);
-            }
-
-            stream
-                .write_all(b"250 sender ok\r\n250 recipient ok\r\n354 send body\r\n")
-                .unwrap();
-
-            let mut line = String::new();
-            loop {
-                line.clear();
-                reader.read_line(&mut line).unwrap();
-                if line == ".\r\n" {
-                    break;
-                }
-            }
-            stream.write_all(b"250 queued\r\n").unwrap();
-
-            commands_tx.send(commands).unwrap();
-        });
-
-        let mut connection =
-            SmtpConnection::connect(address, None, &ClientId::default(), None, None).unwrap();
+        let hello = ClientId::Domain("client.example".to_owned());
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(
+                HELLO,
+                "250-smtp.example\r\n250-PIPELINING\r\n250-SIZE 1024\r\n250-SMTPUTF8\r\n250 8BITMIME\r\n",
+            )
+            .expect(
+                "MAIL FROM:<sender@example.com> SIZE=25 SMTPUTF8 BODY=8BITMIME\r\nRCPT TO:<recipient@exämple.com>\r\n",
+                "250 sender ok\r\n250 recipient ok\r\n",
+            )
+            .expect("DATA\r\n", "354 send body\r\n")
+            .expect("Subject: test\r\n\r\nHéllo", "")
+            .expect("\r\n.\r\n", "250 queued\r\n");
         let envelope = Envelope::new(
             Some("sender@example.com".parse().unwrap()),
             vec![crate::address::Address::new_dangerous(
@@ -2162,65 +2257,37 @@ mod test {
             .mail_parameter(MailParameter::SmtpUtfEight)
             .mail_parameter(MailParameter::Body(MailBodyParameter::EightBitMime));
 
+        let mut connection =
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp).unwrap();
         let response = connection
             .send_with_options(&envelope, "Subject: test\r\n\r\nHéllo".as_bytes(), &options)
             .unwrap();
-        assert!(response.has_code(250));
 
-        let commands = commands_rx.recv_timeout(Duration::from_secs(3)).unwrap();
-        assert_eq!(
-            commands[1],
-            "MAIL FROM:<sender@example.com> SIZE=25 SMTPUTF8 BODY=8BITMIME\r\n"
-        );
-        handle.join().unwrap();
+        assert!(response.has_code(250));
+        transcript.assert_exhausted();
     }
 
     #[test]
     fn send_bdat_uses_chunking_without_dot_stuffing() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let (commands_tx, commands_rx) = mpsc::channel();
+        let hello = ClientId::Domain("client.example".to_owned());
         let message = b"Subject: test\r\n\r\n.Line\r\nBinary\0";
-        let expected = message.to_vec();
-
-        let handle = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
-            stream.write_all(b"220 localhost\r\n").unwrap();
-
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut commands = Vec::new();
-
-            let mut ehlo = String::new();
-            reader.read_line(&mut ehlo).unwrap();
-            commands.push(ehlo);
-            stream
-                .write_all(b"250-localhost\r\n250-CHUNKING\r\n250 BINARYMIME\r\n")
-                .unwrap();
-
-            for response in [b"250 sender ok\r\n".as_slice(), b"250 recipient ok\r\n"] {
-                let mut command = String::new();
-                reader.read_line(&mut command).unwrap();
-                commands.push(command);
-                stream.write_all(response).unwrap();
-            }
-
-            let mut bdat = String::new();
-            reader.read_line(&mut bdat).unwrap();
-            commands.push(bdat);
-
-            let mut body = vec![0; expected.len()];
-            reader.read_exact(&mut body).unwrap();
-            assert_eq!(body, expected);
-            stream.write_all(b"250 queued\r\n").unwrap();
-
-            commands_tx.send(commands).unwrap();
-        });
-
-        let mut connection =
-            SmtpConnection::connect(address, None, &ClientId::default(), None, None).unwrap();
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(
+                HELLO,
+                "250-smtp.example\r\n250-CHUNKING\r\n250 BINARYMIME\r\n",
+            )
+            .expect(
+                "MAIL FROM:<sender@example.com> BODY=BINARYMIME\r\n",
+                "250 sender ok\r\n",
+            )
+            .expect(
+                "RCPT TO:<recipient@example.com>\r\n",
+                "250 recipient ok\r\n",
+            )
+            .expect(format!("BDAT {} LAST\r\n", message.len()), "")
+            // The leading dot is transmitted verbatim: BDAT is length-framed,
+            // so dot-stuffing would corrupt the body.
+            .expect(message, "250 queued\r\n");
         let envelope = Envelope::new(
             Some("sender@example.com".parse().unwrap()),
             vec!["recipient@example.com".parse().unwrap()],
@@ -2229,68 +2296,38 @@ mod test {
         let options =
             SendOptions::new().mail_parameter(MailParameter::Body(MailBodyParameter::BinaryMime));
 
+        let mut connection =
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp).unwrap();
         let response = connection
             .send_bdat_with_options(&envelope, message, &options)
             .unwrap();
-        assert!(response.has_code(250));
 
-        let commands = commands_rx.recv_timeout(Duration::from_secs(3)).unwrap();
-        assert!(commands[0].starts_with("EHLO "));
-        assert_eq!(
-            commands[1],
-            "MAIL FROM:<sender@example.com> BODY=BINARYMIME\r\n"
-        );
-        assert_eq!(commands[2], "RCPT TO:<recipient@example.com>\r\n");
-        assert_eq!(commands[3], format!("BDAT {} LAST\r\n", message.len()));
-        handle.join().unwrap();
+        assert!(response.has_code(250));
+        transcript.assert_exhausted();
     }
 
     #[test]
     fn auth_refreshes_server_info_with_ehlo() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let (commands_tx, commands_rx) = mpsc::channel();
-
-        let handle = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
-            stream.write_all(b"220 localhost\r\n").unwrap();
-
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut commands = Vec::new();
-
-            let mut initial_ehlo = String::new();
-            reader.read_line(&mut initial_ehlo).unwrap();
-            commands.push(initial_ehlo);
-            stream
-                .write_all(b"250-localhost\r\n250-AUTH PLAIN\r\n250 SIZE 100\r\n")
-                .unwrap();
-
-            let mut auth = String::new();
-            reader.read_line(&mut auth).unwrap();
-            commands.push(auth);
-            stream.write_all(b"235 authenticated\r\n").unwrap();
-
-            let mut post_auth_ehlo = String::new();
-            reader.read_line(&mut post_auth_ehlo).unwrap();
-            commands.push(post_auth_ehlo);
-            stream
-                .write_all(b"250-localhost\r\n250 8BITMIME\r\n")
-                .unwrap();
-
-            commands_tx.send(commands).unwrap();
-        });
-
+        let hello = ClientId::Domain("client.example".to_owned());
+        let plain = format!(
+            "AUTH PLAIN {}\r\n",
+            crate::base64::encode("\u{0}user\u{0}pass")
+        );
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(
+                HELLO,
+                "250-smtp.example\r\n250-AUTH PLAIN\r\n250 SIZE 100\r\n",
+            )
+            .expect(plain, "235 authenticated\r\n")
+            .expect(HELLO, "250-smtp.example\r\n250 8BITMIME\r\n");
         let mut connection =
-            SmtpConnection::connect(address, None, &ClientId::default(), None, None).unwrap();
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp).unwrap();
+
         assert!(
             connection
                 .server_info()
                 .supports_auth_mechanism(Mechanism::Plain)
         );
-
         let response = connection
             .auth(
                 &[Mechanism::Plain],
@@ -2299,6 +2336,7 @@ mod test {
             .unwrap();
 
         assert!(response.has_code(235));
+        // The post-AUTH EHLO replaced the capability set wholesale.
         assert!(
             !connection
                 .server_info()
@@ -2309,52 +2347,24 @@ mod test {
                 .server_info()
                 .supports_feature(Extension::EightBitMime)
         );
-
-        let commands = commands_rx.recv_timeout(Duration::from_secs(3)).unwrap();
-        assert!(commands[0].starts_with("EHLO "));
-        assert!(commands[1].starts_with("AUTH PLAIN "));
-        assert!(commands[2].starts_with("EHLO "));
-        handle.join().unwrap();
+        transcript.assert_exhausted();
     }
 
     #[test]
     fn oauthbearer_auth_sends_initial_response_and_refreshes_ehlo() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let (commands_tx, commands_rx) = mpsc::channel();
-
-        let handle = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
-            stream.write_all(b"220 localhost\r\n").unwrap();
-
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut commands = Vec::new();
-
-            let mut initial_ehlo = String::new();
-            reader.read_line(&mut initial_ehlo).unwrap();
-            commands.push(initial_ehlo);
-            stream
-                .write_all(b"250-localhost\r\n250 AUTH OAUTHBEARER\r\n")
-                .unwrap();
-
-            let mut auth = String::new();
-            reader.read_line(&mut auth).unwrap();
-            commands.push(auth);
-            stream.write_all(b"235 authenticated\r\n").unwrap();
-
-            let mut post_auth_ehlo = String::new();
-            reader.read_line(&mut post_auth_ehlo).unwrap();
-            commands.push(post_auth_ehlo);
-            stream.write_all(b"250 localhost\r\n").unwrap();
-
-            commands_tx.send(commands).unwrap();
-        });
-
+        let hello = ClientId::Domain("client.example".to_owned());
+        // GS2 header escaping of the authzid is part of the wire contract.
+        let initial = crate::base64::encode("n,a=us=2Cer=3Done,\u{1}auth=Bearer token\u{1}\u{1}");
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250-smtp.example\r\n250 AUTH OAUTHBEARER\r\n")
+            .expect(
+                format!("AUTH OAUTHBEARER {initial}\r\n"),
+                "235 authenticated\r\n",
+            )
+            .expect(HELLO, "250 smtp.example\r\n");
         let mut connection =
-            SmtpConnection::connect(address, None, &ClientId::default(), None, None).unwrap();
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp).unwrap();
+
         let response = connection
             .auth(
                 &[Mechanism::OAuthBearer],
@@ -2363,57 +2373,22 @@ mod test {
             .unwrap();
 
         assert!(response.has_code(235));
-
-        let commands = commands_rx.recv_timeout(Duration::from_secs(3)).unwrap();
-        assert!(commands[0].starts_with("EHLO "));
-        assert!(commands[1].starts_with("AUTH OAUTHBEARER "));
-        assert!(commands[2].starts_with("EHLO "));
-
-        let encoded_response = commands[1]
-            .trim_end()
-            .strip_prefix("AUTH OAUTHBEARER ")
-            .unwrap();
-        let decoded_response = crate::base64::decode(encoded_response).unwrap();
-        assert_eq!(
-            String::from_utf8(decoded_response).unwrap(),
-            "n,a=us=2Cer=3Done,\x01auth=Bearer token\x01\x01"
-        );
-        handle.join().unwrap();
+        transcript.assert_exhausted();
     }
 
     #[test]
     fn oauthbearer_immediate_rejection_marks_connection_broken() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let (commands_tx, commands_rx) = mpsc::channel();
-
-        let handle = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
-            stream.write_all(b"220 localhost\r\n").unwrap();
-
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut commands = Vec::new();
-
-            let mut initial_ehlo = String::new();
-            reader.read_line(&mut initial_ehlo).unwrap();
-            commands.push(initial_ehlo);
-            stream
-                .write_all(b"250-localhost\r\n250 AUTH OAUTHBEARER\r\n")
-                .unwrap();
-
-            let mut auth = String::new();
-            reader.read_line(&mut auth).unwrap();
-            commands.push(auth);
-            stream.write_all(b"535 rejected\r\n").unwrap();
-
-            commands_tx.send(commands).unwrap();
-        });
-
+        let hello = ClientId::Domain("client.example".to_owned());
+        let initial = crate::base64::encode("n,a=user,\u{1}auth=Bearer token\u{1}\u{1}");
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250-smtp.example\r\n250 AUTH OAUTHBEARER\r\n")
+            .expect(
+                format!("AUTH OAUTHBEARER {initial}\r\n"),
+                "535 rejected\r\n",
+            );
         let mut connection =
-            SmtpConnection::connect(address, None, &ClientId::default(), None, None).unwrap();
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp).unwrap();
+
         let error = connection
             .auth(
                 &[Mechanism::OAuthBearer],
@@ -2426,51 +2401,22 @@ mod test {
             "expected permanent SMTP error: {error:?}"
         );
         assert!(connection.has_broken());
-
-        let commands = commands_rx.recv_timeout(Duration::from_secs(3)).unwrap();
-        assert!(commands[0].starts_with("EHLO "));
-        assert!(commands[1].starts_with("AUTH OAUTHBEARER "));
-        handle.join().unwrap();
+        transcript.assert_exhausted();
     }
 
     #[test]
     fn oauthbearer_failed_challenge_sends_cancel_response() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let (commands_tx, commands_rx) = mpsc::channel();
-
-        let handle = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
-            stream.write_all(b"220 localhost\r\n").unwrap();
-
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut commands = Vec::new();
-
-            let mut initial_ehlo = String::new();
-            reader.read_line(&mut initial_ehlo).unwrap();
-            commands.push(initial_ehlo);
-            stream
-                .write_all(b"250-localhost\r\n250 AUTH OAUTHBEARER\r\n")
-                .unwrap();
-
-            let mut auth = String::new();
-            reader.read_line(&mut auth).unwrap();
-            commands.push(auth);
-            stream.write_all(b"334 e30=\r\n").unwrap();
-
-            let mut cancel = String::new();
-            reader.read_line(&mut cancel).unwrap();
-            commands.push(cancel);
-            stream.write_all(b"535 rejected\r\n").unwrap();
-
-            commands_tx.send(commands).unwrap();
-        });
-
+        let hello = ClientId::Domain("client.example".to_owned());
+        let initial = crate::base64::encode("n,a=user,\u{1}auth=Bearer token\u{1}\u{1}");
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250-smtp.example\r\n250 AUTH OAUTHBEARER\r\n")
+            .expect(format!("AUTH OAUTHBEARER {initial}\r\n"), "334 e30=\r\n")
+            // RFC 7628 requires the client to answer a failure challenge with
+            // the single `0x01` cancel byte before reading the final reply.
+            .expect("AQ==\r\n", "535 rejected\r\n");
         let mut connection =
-            SmtpConnection::connect(address, None, &ClientId::default(), None, None).unwrap();
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp).unwrap();
+
         let error = connection
             .auth(
                 &[Mechanism::OAuthBearer],
@@ -2482,12 +2428,34 @@ mod test {
             error.is_permanent(),
             "expected permanent SMTP error: {error:?}"
         );
-
-        let commands = commands_rx.recv_timeout(Duration::from_secs(3)).unwrap();
-        assert!(commands[0].starts_with("EHLO "));
-        assert!(commands[1].starts_with("AUTH OAUTHBEARER "));
-        assert_eq!(commands[2], "AQ==\r\n");
         assert!(connection.has_broken());
-        handle.join().unwrap();
+        transcript.assert_exhausted();
+    }
+
+    #[test]
+    fn starttls_downgrade_is_refused_without_a_wire_command() {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250 smtp.example\r\n")
+            .expect("NOOP\r\n", "250 noop\r\n");
+        let mut connection =
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp).unwrap();
+
+        assert!(!connection.can_starttls());
+        let tls = super::TlsParameters::new("smtp.example".to_owned()).unwrap();
+        let error = connection
+            .starttls(&tls, &hello)
+            .expect_err("a server without the STARTTLS capability must not be upgraded");
+        assert!(
+            error.to_string().contains("STARTTLS is not supported"),
+            "expected a capability refusal, got: {error}"
+        );
+
+        // The refusal happened before any byte hit the wire: the very next
+        // scripted step is NOOP, so a stray STARTTLS write would be rejected.
+        connection
+            .command(crate::transport::smtp::commands::Noop)
+            .unwrap();
+        transcript.assert_exhausted();
     }
 }
