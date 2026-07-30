@@ -7741,11 +7741,12 @@ fn unmodelled_and_open_ended_fetch_attributes_stay_tolerated() {
 
     // Valid fixed prefixes followed by a tail this parser does not model stay
     // tolerant. The tests use an unsupported field after a valid basic body
-    // prefix and an address-list shape that is balanced but not typed.
+    // prefix (top-level and nested inside a multipart child) and an
+    // address-list shape that is balanced but not typed.
     for input in [
         &b"* 1 FETCH (ENVELOPE (\"date\" \"subject\" (NIL) NIL NIL NIL NIL NIL NIL NIL))\r\n"[..],
         b"* 1 FETCH (BODYSTRUCTURE (\"IMAGE\" \"PNG\" NIL NIL NIL \"BASE64\" 5000 NIL (bad)))\r\n",
-        b"* 1 FETCH (BODYSTRUCTURE ((\"TEXT\") \"MIXED\"))\r\n",
+        b"* 1 FETCH (BODYSTRUCTURE ((\"IMAGE\" \"PNG\" NIL NIL NIL \"BASE64\" 5000 NIL (bad)) \"MIXED\"))\r\n",
     ] {
         assert!(
             matches!(
@@ -7769,6 +7770,11 @@ fn malformed_open_ended_fetch_fixed_prefixes_are_parse_failures() {
         b"* 1 FETCH (BODYSTRUCTURE (\"TEXT\"))\r\n",
         b"* 1 FETCH (BODY (\"TEXT\" \"PLAIN\" NIL NIL NIL \"7BIT\" huge))\r\n",
         b"* 1 FETCH (BODYSTRUCTURE ((\"TEXT\")))\r\n",
+        // A multipart child is a body too: its fixed-arity prefix is checked
+        // recursively, so an arity violation cannot hide one level down (or
+        // deeper) behind a balanced group.
+        b"* 1 FETCH (BODYSTRUCTURE ((\"TEXT\") \"MIXED\"))\r\n",
+        b"* 1 FETCH (BODYSTRUCTURE (((\"TEXT\") \"ALTERNATIVE\") \"MIXED\"))\r\n",
         // Truncation of the outer structure: the fixed prefix parses, but the
         // body never closes. An open-ended extension tail is open in its
         // contents, not in its framing, so requiring the balanced close costs
@@ -8003,10 +8009,17 @@ fn expunge_zero_rejected() {
 
 #[test]
 fn fetch_seq_zero_rejected() {
-    // message-data uses nz-number for FETCH (RFC 3501 Section 7.4.2).
+    // message-data uses nz-number for FETCH (RFC 3501 Section 7.4.2). FETCH
+    // is excluded from the numbered known-response guard because its msg-att
+    // body is open-ended, but the sequence number itself is fully modelled:
+    // zero is a contract violation, not an extension, and treating it as
+    // `Unknown` would silently drop the whole FETCH.
     let input = b"* 0 FETCH (UID 1 FLAGS (\\Seen))\r\n";
+    assert!(parse_response(input).is_err());
+    // Control: a zero-numbered response with an unmodelled keyword is still
+    // an extension.
     assert!(matches!(
-        parse_response(input),
+        parse_response(b"* 0 XSOMETHING (a b)\r\n"),
         Ok((_, Response::Untagged(response))) if matches!(*response, UntaggedResponse::Unknown(_))
     ));
 }

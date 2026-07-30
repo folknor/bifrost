@@ -76,9 +76,10 @@ pre-encode capability check calls it.
 
 # Bugs
 
-## C4 - A malformed nested multipart BODYSTRUCTURE child can still be laundered into `Unknown`
+No open bugs. C4, the last open finding, is closed; its ledger follows.
 
-**Severity: low** (was medium; the closed-grammar half is now fixed).
+## C4 - closed: malformed BODYSTRUCTURE shapes can no longer be laundered into `Unknown`
+
 **Where:** `codec/decode/envelope_fetch.rs::has_closed_grammar`.
 
 **What is closed.** `parse_untagged_unknown` refuses to swallow a response
@@ -118,26 +119,43 @@ decimal some Gmail proxies emit. This is the general hazard of the strict
 lane: every attribute promoted into it must first be checked against what
 servers actually send, not only against the ABNF.
 
-**What is still open.** A nested multipart child is intentionally checked only
-as a balanced parenthesized group while validating its parent. For example,
-`* 1 FETCH (BODYSTRUCTURE (("TEXT") "MIXED"))` still reaches
-`UntaggedResponse::Unknown`: the inner child is malformed, but a strict
-recursive parser would also reject a balanced child whose optional extension
-tail this codec does not yet model. Since parse failure is connection-fatal,
-the generic IMAP client must retain that tolerance until it can distinguish
-those two cases without guessing.
+**What the close pass closed (final disposition).** The residual - a
+malformed nested multipart child such as
+`* 1 FETCH (BODYSTRUCTURE (("TEXT") "MIXED"))` degrading to `Unknown` - was
+recorded as a permanent tolerance on the premise that a strict *recursive
+parser* would also reject a balanced child carrying an unmodelled-but-
+conformant extension tail. That premise does not hold for a recursive
+*prefix* check: `body_group_is_malformed` applies the same fixed-arity rule
+the top level already used (six fields plus size for a single part; children
+plus subtype for a multipart) to every child, recursively, depth-capped at
+the typed decoder's own limit of 64. An arity violation is caught at any
+depth; a balanced child whose *prefix* is conformant keeps its extension
+tail tolerant, exactly as at the top level, so no conformant server shape
+became connection-fatal. C4 is closed in full.
 
-**Why it matters.** In a QRESYNC/CONDSTORE sync a silently-dropped FETCH can
+**Also closed at the same time.** `* 0 FETCH (...)` was still laundered into
+`Unknown` (silently dropping the FETCH) while `* 0 EXPUNGE` was already
+connection-fatal. FETCH stays out of the numbered known-response guard's
+keyword table because its `msg-att` body is open-ended, but the sequence
+number itself is `nz-number`, a grammar this codec fully implements - so the
+guard now recognizes a zero (or all-zero) sequence number followed by
+`FETCH` as a known-response violation. Zero-numbered unmodelled keywords
+(`* 0 XSOMETHING`) remain extensions.
+
+**Why it mattered.** In a QRESYNC/CONDSTORE sync a silently-dropped FETCH can
 leave a message unhydrated while the cursor advances, making the loss persist
 until UIDVALIDITY changes.
 
 **Tests landed.**
 `decode/tests.rs::malformed_closed_grammar_fetch_attributes_are_parse_failures`
 pins the closed half over every gated attribute;
-`malformed_open_ended_fetch_fixed_prefixes_are_parse_failures` pins round 3's
-ENVELOPE / BODYSTRUCTURE / bare-BODY prefix gate;
-`unmodelled_and_open_ended_fetch_attributes_stay_tolerated` pins both the
-narrow nested-child remainder and the unmodelled-attribute tolerance;
+`malformed_open_ended_fetch_fixed_prefixes_are_parse_failures` pins the
+ENVELOPE / BODYSTRUCTURE / bare-BODY prefix gate, including the recursive
+nested-child arity check; `fetch_seq_zero_rejected` pins the zero-sequence
+FETCH closure with its unmodelled-keyword control;
+`unmodelled_and_open_ended_fetch_attributes_stay_tolerated` pins the
+unmodelled-attribute tolerance and the extension-tail tolerance at both the
+top level and inside a multipart child;
 `connection/wire_tests.rs::read_one_rejects_a_malformed_recognized_fetch_attribute`
 pins the outcome on the path the driver actually takes.
 `malformed_status_is_a_parse_failure` and `expunge_zero_rejected` are the
@@ -160,7 +178,7 @@ tests supersede the former bug-documenting expectations.
 | | `malformed_fetch_uid_zero_is_parse_failure` | **C4**, `uniqueid = nz-number` violations now hard-fail instead of routing as `Unknown` |
 | | `malformed_closed_grammar_fetch_attributes_are_parse_failures` | **C4**, the same for every FETCH attribute with a closed grammar |
 | | `malformed_open_ended_fetch_fixed_prefixes_are_parse_failures` | **C4**, malformed ENVELOPE and BODYSTRUCTURE / bare-BODY fixed prefixes are connection-fatal |
-| | `unmodelled_and_open_ended_fetch_attributes_stay_tolerated` | **C4**'s narrow other edge: unmodelled attributes, body extension tails, and malformed nested multipart children still tolerate rather than drop the connection |
+| | `unmodelled_and_open_ended_fetch_attributes_stay_tolerated` | **C4**'s other edge: unmodelled attributes and body extension tails (top-level and inside multipart children) tolerate rather than drop the connection |
 | | `scan_section_spec_incomplete_is_a_parse_failure_not_incomplete` | an unterminated `BODY[` section is an error, never `Incomplete` |
 | | `paren_skippers_do_not_scan_past_backslash_crlf` | **N3**, a backslash-escaped CR/LF cannot bridge two responses |
 | | `paren_skippers_do_not_scan_past_raw_crlf_in_a_quoted_value` | **N3**, raw CR/LF inside a quoted value ends the scan in all three paren-skippers |
@@ -183,11 +201,10 @@ tests supersede the former bug-documenting expectations.
 | | `prop_decode_invariants::decode_is_stable_under_reencode` | decode -> encode -> decode is a fixed point |
 | | `prop_decode_invariants::encode_emits_only_printable_ascii` | RFC 3501 Section 5.1.3 printable-wire invariant |
 
-C4 remains documented as a current gap only for malformed nested multipart
-BODYSTRUCTURE children whose balanced shape could also be an unmodelled
-extension tail. `malformed_status_is_a_parse_failure` and
-`expunge_zero_rejected` are the controls for the keyword halves that were
-already closed.
+C4 is closed in full; there is no remaining gap. The tolerance boundary now
+sits exactly on the fixed-arity prefix rule, applied recursively.
+`malformed_status_is_a_parse_failure` and `expunge_zero_rejected` are the
+controls for the keyword halves that were closed earlier.
 
 ## N7, settled: not a bug on the literal path
 

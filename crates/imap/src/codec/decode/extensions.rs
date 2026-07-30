@@ -417,7 +417,18 @@ fn starts_known_untagged_response(input: &[u8]) -> bool {
     // (Postel's law), so the guard must too or it stops recognizing exactly
     // the malformed-but-recognizable forms it exists for.
     let spaces = input[digits..].iter().take_while(|b| **b == b' ').count();
-    spaces > 0 && starts_keyword(&input[digits + spaces..], NUMBERED_KEYWORDS)
+    if spaces == 0 {
+        return false;
+    }
+    let keyword = &input[digits + spaces..];
+    if starts_keyword(keyword, NUMBERED_KEYWORDS) {
+        return true;
+    }
+    // FETCH stays out of the numbered table because its msg-att body is
+    // open-ended, but its sequence number is nz-number, a grammar this codec
+    // fully implements. A zero sequence number is a contract violation on a
+    // fully recognized form, and tolerating it silently drops the FETCH.
+    input[..digits].iter().all(|b| *b == b'0') && starts_keyword(keyword, &[b"FETCH"])
 }
 
 /// Scans through an unknown response body, consuming all bytes including any

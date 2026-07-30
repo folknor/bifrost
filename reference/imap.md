@@ -37,11 +37,12 @@ closed grammar (`UID`, `FLAGS`, `RFC822.*`, `INTERNALDATE`, `MODSEQ`,
 `SAVEDATE`, `PREVIEW`, `EMAILID`, `THREADID`, `X-GM-*`, the sectioned
 `BODY[...]` / `BINARY[...]` / `BINARY.SIZE[...]` forms) hard-fail.
 `ENVELOPE`, `BODYSTRUCTURE`, and bare `BODY` additionally gate their safe
-fixed prefixes (ENVELOPE's ten fields; single-part and multipart outer body
-prefixes) *and* the balanced close of the outer structure, since an extension
-tail is open in its contents but never in its framing. They retain tolerance
-for the contents of those tails and for balanced nested multipart children
-that this codec cannot safely model yet. Any entirely unmodelled attribute
+fixed prefixes (ENVELOPE's ten fields; single-part and multipart body
+prefixes, applied recursively to every multipart child up to the typed
+decoder's depth cap) *and* the balanced close of the outer structure, since
+an extension tail is open in its contents but never in its framing. They
+retain tolerance for the contents of those tails at every nesting level;
+only fixed-arity violations hard-fail. Any entirely unmodelled attribute
 also stays on the tolerant skip path: a failure there is at least as likely to
 be a modelling gap of ours, and parse failure is connection-fatal. Separator
 handling is uniformly multi-space for the same reason.

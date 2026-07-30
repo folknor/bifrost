@@ -233,8 +233,10 @@ fn envelope_fixed_prefix_is_malformed(input: &[u8]) -> bool {
 
 /// Check the BODYSTRUCTURE fixed prefix. A single part has media type/subtype,
 /// params, id, description, encoding, and size. A multipart has one or more
-/// balanced child bodies followed by its subtype. The child bodies themselves
-/// retain tolerant tails: their optional extensions are explicitly open-ended.
+/// child bodies followed by its subtype, and every child is checked with the
+/// same rule recursively, so an arity violation such as `("TEXT")` is caught
+/// at any depth. Extension tails retain their tolerance: only the fixed-arity
+/// prefix of each body is required, never the tail contents.
 ///
 /// The outer structure must also close. Extension tails are open-ended in
 /// their *contents*, not in their framing: a truncated
@@ -243,21 +245,35 @@ fn envelope_fixed_prefix_is_malformed(input: &[u8]) -> bool {
 /// tolerance and removes the last top-level path on which a malformed body
 /// could be laundered into `Unknown` and dropped.
 fn bodystructure_fixed_prefix_is_malformed(input: &[u8]) -> bool {
-    let Ok((mut input, _)) = attr_sp(input) else {
+    let Ok((input, _)) = attr_sp(input) else {
         return true;
     };
+    body_group_is_malformed(input, 0)
+}
+
+/// Nesting bound for the recursive body-prefix check. Matches the typed
+/// decoder's own depth cap; anything deeper is a shape the typed parser
+/// refuses on its own terms, and the prefix check stays tolerant rather than
+/// promoting a depth limit of ours into a provider contract violation.
+const BODY_PREFIX_MAX_DEPTH: u32 = 64;
+
+/// Check one parenthesized body group: balanced framing plus the fixed-arity
+/// prefix of whichever body form it opens with. `input` must start at `(`.
+fn body_group_is_malformed(input: &[u8], depth: u32) -> bool {
+    if depth > BODY_PREFIX_MAX_DEPTH {
+        return false;
+    }
     if skip_paren_group(input).is_err() {
         return true;
     }
-    let Some(rest) = input.strip_prefix(b"(") else {
+    let Some(mut input) = input.strip_prefix(b"(") else {
         return true;
     };
-    input = rest;
     while input.first() == Some(&b' ') {
         input = &input[1..];
     }
     if input.first() == Some(&b'(') {
-        return multipart_fixed_prefix_is_malformed(input);
+        return multipart_fixed_prefix_is_malformed(input, depth);
     }
 
     for _ in 0..6 {
@@ -272,14 +288,18 @@ fn bodystructure_fixed_prefix_is_malformed(input: &[u8]) -> bool {
     number64(input).is_err()
 }
 
-/// Check a multipart body's outer prefix without attempting to interpret the
-/// extension tails of its children. This is deliberately lexical: a balanced
-/// child shape this typed decoder does not support remains connection-safe.
-fn multipart_fixed_prefix_is_malformed(mut input: &[u8]) -> bool {
+/// Check a multipart body's prefix: one or more child bodies, each satisfying
+/// [`body_group_is_malformed`] recursively, followed by the subtype. Only the
+/// fixed-arity prefix of each child is required; a child whose extension tail
+/// this typed decoder does not support remains connection-safe.
+fn multipart_fixed_prefix_is_malformed(mut input: &[u8], depth: u32) -> bool {
     let mut child_count = 0;
     loop {
         if input.first() != Some(&b'(') {
             break;
+        }
+        if body_group_is_malformed(input, depth + 1) {
+            return true;
         }
         let Ok((rest, _)) = skip_paren_group(input) else {
             return true;
