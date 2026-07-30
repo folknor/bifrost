@@ -1609,32 +1609,19 @@ mod email_object_decode {
         }
     }
 
-    // BUG, documented rather than endorsed. `Email` routes every
-    // unrecognised top-level key into `#[serde(flatten)] headers:
-    // HashMap<Header, _>`, and `Header`'s deserializer hard-errors on
-    // anything that is not `header:<name>[:<form>][:all]`. One vendor
-    // extension property in an `Email/get` response therefore fails the
-    // decode of the WHOLE response, not just that property. Fix: make
-    // the flattened key type fall back to a non-header variant (or
-    // deserialize the map with a `deserialize_with` that drops keys
-    // `Header::parse` rejects) instead of erroring.
     #[test]
-    fn one_unknown_property_fails_the_entire_email_decode() {
+    fn unknown_properties_do_not_fail_the_email_decode() {
         let ok = serde_json::from_value::<Email>(json!({"id": "e1", "subject": "Hi"}));
         assert!(ok.is_ok(), "control: the same object without the extension");
 
-        let result = serde_json::from_value::<Email>(json!({
+        let email = serde_json::from_value::<Email>(json!({
             "id": "e1",
             "subject": "Hi",
             "example.com:snoozedUntil": "2026-02-01T00:00:00Z"
-        }));
-        assert!(
-            result.is_err(),
-            "a single vendor extension property must not be able to fail \
-             the whole decode, but today it does; if this assertion ever \
-             starts failing the bug has been fixed and the test should be \
-             inverted"
-        );
+        }))
+        .expect("an extension property is ignored");
+        assert_eq!(email.subject(), Some("Hi"));
+        assert!(email.headers.is_empty());
     }
 }
 
@@ -1945,35 +1932,19 @@ mod mailbox_wire {
         );
     }
 
-    // BUG, documented rather than endorsed. `Role`'s hand-written
-    // deserializer calls `<&str>::deserialize`, which only succeeds when
-    // the deserializer can lend a borrowed `&'de str`. `Response::get`
-    // happens to use `serde_json::from_str` over a `RawValue`, so the
-    // common path works - but any escaped character in the JSON string
-    // (serde_json then has to unescape into a scratch buffer) or any
-    // `from_value` call fails the whole `Mailbox` decode with
-    // "invalid type: string ..., expected a borrowed string". Fix:
-    // deserialize through `String` or a `Visitor` implementing
-    // `visit_str`, as every other hand-written deserializer in this
-    // crate already does.
     #[test]
-    fn role_cannot_be_decoded_when_the_string_is_not_borrowable() {
-        // An owned `serde_json::Value` cannot lend a `&'de str`.
-        assert!(serde_json::from_value::<Role>(json!("inbox")).is_err());
-        // Neither can `from_str` once serde_json has to unescape into a
-        // scratch buffer. 92 is the backslash byte, so the JSON below
-        // spells `inbox` with a `u0069` escape for the leading `i` - it
-        // unescapes to exactly "inbox", but the borrow is gone.
+    fn role_decodes_when_the_string_is_not_borrowable() {
+        assert_eq!(
+            serde_json::from_value::<Role>(json!("inbox")).unwrap(),
+            Role::Inbox
+        );
+        // 92 is the backslash byte, so the JSON below spells `inbox`
+        // with a `u0069` escape for the leading `i`.
         let escaped = String::from_utf8(vec![
             b'"', 92, b'u', b'0', b'0', b'6', b'9', b'n', b'b', b'o', b'x', b'"',
         ])
         .expect("ascii");
-        assert!(serde_json::from_str::<Role>(&escaped).is_err());
-        // The borrowed path is the only one that works.
-        assert_eq!(
-            serde_json::from_str::<Role>(r#""inbox""#).unwrap(),
-            Role::Inbox
-        );
+        assert_eq!(serde_json::from_str::<Role>(&escaped).unwrap(), Role::Inbox);
     }
 
     #[test]
@@ -2541,61 +2512,81 @@ mod set_error_vocabulary {
 // `#[non_exhaustive]` wire enums with no catch-all
 // ---------------------------------------------------------------------------
 //
-// These enums are marked `#[non_exhaustive]` (the crate reserves the
-// right to grow them) but their deserializers have no `#[serde(other)]`
-// arm, so an unrecognised wire value fails the decode of the ENTIRE
-// containing response rather than degrading. `DataType`, `Role`,
-// `AlertTrigger` and `SetErrorType` all do have a catch-all; the ones
-// below do not. Pinned as-is.
+// These enums are marked `#[non_exhaustive]` and degrade unknown wire
+// values rather than failing the containing response. `DataType`, `Role`,
+// `AlertTrigger`, and `SetErrorType` follow the same policy.
 
 mod wire_enums_without_a_catch_all {
     #[cfg(feature = "mail")]
     #[test]
-    fn undo_status_rejects_an_unknown_value() {
-        assert!(
-            serde_json::from_str::<crate::email_submission::UndoStatus>(r#""queued""#).is_err()
+    fn undo_status_degrades_an_unknown_value() {
+        assert_eq!(
+            serde_json::from_str::<crate::email_submission::UndoStatus>(r#""queued""#).unwrap(),
+            crate::email_submission::UndoStatus::Unknown
         );
     }
 
     #[cfg(feature = "mail")]
     #[test]
-    fn delivery_state_rejects_an_unknown_value() {
-        assert!(
-            serde_json::from_str::<crate::email_submission::Delivered>(r#""bounced""#).is_err()
+    fn delivery_state_degrades_an_unknown_value() {
+        assert_eq!(
+            serde_json::from_str::<crate::email_submission::Delivered>(r#""bounced""#).unwrap(),
+            crate::email_submission::Delivered::Other
         );
-        assert!(serde_json::from_str::<crate::email_submission::Displayed>(r#""no""#).is_err());
-    }
-
-    #[cfg(feature = "calendars")]
-    #[test]
-    fn alert_action_rejects_an_unknown_value() {
-        assert!(
-            serde_json::from_str::<crate::calendar_event::AlertAction>(r#""audio""#).is_err(),
-            "RFC 8984 only defines display/email today, but the enum is #[non_exhaustive]"
+        assert_eq!(
+            serde_json::from_str::<crate::email_submission::Displayed>(r#""no""#).unwrap(),
+            crate::email_submission::Displayed::Other
         );
     }
 
     #[cfg(feature = "calendars")]
     #[test]
-    fn include_in_availability_rejects_an_unknown_value() {
-        assert!(
-            serde_json::from_str::<crate::calendar::IncludeInAvailability>(r#""maybe""#).is_err()
+    fn calendar_enums_degrade_unknown_values() {
+        assert_eq!(
+            serde_json::from_str::<crate::calendar_event::AlertAction>(r#""audio""#).unwrap(),
+            crate::calendar_event::AlertAction::Unknown
+        );
+        assert_eq!(
+            serde_json::from_str::<crate::calendar_event::RelativeTo>(r#""alarm""#).unwrap(),
+            crate::calendar_event::RelativeTo::Unknown
+        );
+        assert_eq!(
+            serde_json::from_str::<crate::calendar_event_notification::NotificationType>(
+                r#""sent""#
+            )
+            .unwrap(),
+            crate::calendar_event_notification::NotificationType::Unknown
+        );
+    }
+
+    #[cfg(feature = "calendars")]
+    #[test]
+    fn include_in_availability_degrades_an_unknown_value() {
+        assert_eq!(
+            serde_json::from_str::<crate::calendar::IncludeInAvailability>(r#""maybe""#).unwrap(),
+            crate::calendar::IncludeInAvailability::Unknown
         );
     }
 
     #[test]
-    fn principal_type_rejects_an_unknown_value() {
-        // Note `Type::Other` exists but is spelled "other" on the wire -
-        // it is a real RFC value, not a catch-all.
-        assert!(serde_json::from_str::<crate::principal::Type>(r#""room""#).is_err());
-        assert!(serde_json::from_str::<crate::principal::Type>(r#""other""#).is_ok());
+    fn principal_type_degrades_an_unknown_value() {
+        // `Type::Other` is a real RFC value, distinct from the
+        // deserialize-only catch-all.
+        assert_eq!(
+            serde_json::from_str::<crate::principal::Type>(r#""room""#).unwrap(),
+            crate::principal::Type::Unknown
+        );
+        assert_eq!(
+            serde_json::from_str::<crate::principal::Type>(r#""other""#).unwrap(),
+            crate::principal::Type::Other
+        );
     }
 
     #[test]
     fn data_type_does_have_a_catch_all() {
         assert_eq!(
             serde_json::from_str::<crate::DataType>(r#""SomeFutureType""#).unwrap(),
-            crate::DataType::Other
+            crate::DataType::Other("SomeFutureType".to_string())
         );
     }
 }
@@ -2661,17 +2652,12 @@ mod data_type_wire {
         assert_eq!(serde_json::to_value(DataType::Mdn).unwrap(), json!("MDN"));
     }
 
-    // Documented, not endorsed: `DataType::Other` is a
-    // deserialize-only catch-all, but it still SERIALISES, as the
-    // literal `"Other"`. Anything that decodes a server's type name and
-    // echoes it back (the `WebSocketPushEnable.dataTypes` union, a
-    // `PushSubscription.types` round-trip) will therefore ask the server
-    // to subscribe to a type called `Other`.
     #[test]
-    fn other_serialises_as_a_literal_that_is_not_a_jmap_type() {
+    fn other_preserves_its_wire_value() {
+        let other = serde_json::from_str::<DataType>(r#""SomeFutureType""#).unwrap();
         assert_eq!(
-            serde_json::to_value(DataType::Other).unwrap(),
-            json!("Other")
+            serde_json::to_value(other).unwrap(),
+            json!("SomeFutureType")
         );
     }
 }
@@ -2712,28 +2698,16 @@ mod session_capability_fallbacks {
         assert!(ws.supports_push());
     }
 
-    // Documented, not endorsed. `deserialize_capabilities_map` falls
-    // back to `Capabilities::Other` whenever the typed struct fails to
-    // parse. `WebSocketCapabilities` has no `#[serde(default)]` and both
-    // of its fields are required, so a server that omits `supportsPush`
-    // does not produce a decode error the operator can see - it produces
-    // a session where `websocket_capabilities()` is `None` and push is
-    // silently switched off for the whole account. Fix: either default
-    // the field (`supportsPush` absent == false is the RFC 8887 reading)
-    // or surface the fallback so it is diagnosable.
     #[test]
-    fn a_malformed_capability_silently_degrades_to_other() {
+    fn websocket_capability_defaults_missing_supports_push_to_false() {
         let session = session_with(json!({
             "urn:ietf:params:jmap:websocket": {"url": "wss://example.org/jmap/ws"}
         }));
-        assert!(
-            session.websocket_capabilities().is_none(),
-            "push is silently disabled rather than reported"
-        );
-        assert!(matches!(
-            session.capability("urn:ietf:params:jmap:websocket"),
-            Some(Capabilities::Other(_))
-        ));
+        let websocket = session
+            .websocket_capabilities()
+            .expect("websocket capability");
+        assert_eq!(websocket.url(), "wss://example.org/jmap/ws");
+        assert!(!websocket.supports_push());
     }
 
     #[test]

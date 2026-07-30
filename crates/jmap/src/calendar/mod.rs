@@ -187,6 +187,8 @@ pub(crate) enum IncludeInAvailability {
     Attending,
     #[serde(rename = "none")]
     None,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -24,6 +24,7 @@ enum EventParserState {
     Comment,
     Field,
     Value,
+    Discard,
 }
 
 #[derive(Default, Debug)]
@@ -34,15 +35,95 @@ pub(crate) struct EventParser {
     bytes: Option<Vec<u8>>,
     pos: usize,
     result: Event,
+    discard_at_line_start: bool,
+    // WHATWG "interpreting an event stream": the last event ID buffer is
+    // NOT reset between events. It survives until another `id` field
+    // changes it, and every dispatched event carries the current value.
+    last_event_id: Vec<u8>,
+    // The spec dispatches nothing when the data buffer is empty, which is
+    // what makes a comment-only keepalive block (":\n\n") a no-op. An
+    // explicit flag is used rather than `result.data.is_empty()` so that a
+    // bare `data:\n\n` still dispatches an event with an empty payload.
+    data_seen: bool,
 }
 
 impl EventParser {
-    pub(crate) fn push_bytes(&mut self, bytes: Vec<u8>) {
-        self.bytes = Some(bytes);
+    pub(crate) fn push_bytes(&mut self, mut bytes: Vec<u8>) {
+        if let Some(mut buffered) = self.bytes.take() {
+            let offset = self.pos.min(buffered.len());
+            let mut remaining = buffered.split_off(offset);
+            remaining.append(&mut bytes);
+            bytes = remaining;
+        }
+
+        self.bytes = (!bytes.is_empty()).then_some(bytes);
+        self.pos = 0;
     }
 
     pub(crate) fn needs_bytes(&self) -> bool {
         self.bytes.is_none()
+    }
+
+    /// Applies the buffered `field`/`value` pair, per the WHATWG
+    /// "processing the field" rules. Returns `false` when the accumulated
+    /// data would exceed [`MAX_EVENT_SIZE`], in which case the caller must
+    /// enter the discard state.
+    fn commit_field(&mut self) -> bool {
+        match &self.field[..] {
+            b"id" => {
+                // A colonless `id` line carries an empty value, which the
+                // spec treats as clearing the buffer.
+                self.last_event_id = std::mem::take(&mut self.value);
+            }
+            b"data" => {
+                // Per SSE spec: multiple data lines joined with \n
+                let separator_len = usize::from(self.data_seen);
+                if self.result.data.len() + separator_len + self.value.len() > MAX_EVENT_SIZE {
+                    return false;
+                }
+                if separator_len != 0 {
+                    self.result.data.push(b'\n');
+                }
+                self.result.data.extend_from_slice(&self.value);
+                self.data_seen = true;
+            }
+            b"event" => match &self.value[..] {
+                #[cfg(feature = "calendars")]
+                b"calendarAlert" => {
+                    self.result.event = EventType::CalendarAlert;
+                }
+                b"ping" => {
+                    self.result.event = EventType::Ping;
+                }
+                _ => {
+                    self.result.event = EventType::State;
+                }
+            },
+            _ => {
+                //ignore
+            }
+        }
+
+        self.field.clear();
+        self.value.clear();
+        true
+    }
+
+    /// Drops every partial buffer except the persistent last event ID and
+    /// enters the resynchronising discard state.
+    fn discard(&mut self, at_line_start: bool) {
+        self.state = EventParserState::Discard;
+        self.field.clear();
+        self.value.clear();
+        self.result = Event::default();
+        self.data_seen = false;
+        self.discard_at_line_start = at_line_start;
+    }
+
+    fn too_long_error() -> crate::Error {
+        crate::Error::Transport(crate::core::transport::TransportError::new(
+            "EventSource response is too long.",
+        ))
     }
 }
 
@@ -50,9 +131,23 @@ impl Iterator for EventParser {
     type Item = crate::Result<Event>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let bytes = self.bytes.as_ref()?;
+        if self
+            .bytes
+            .as_ref()
+            .is_some_and(|bytes| self.pos >= bytes.len())
+        {
+            self.bytes = None;
+            self.pos = 0;
+            return None;
+        }
+        self.bytes.as_ref()?;
 
-        for byte in bytes.get(self.pos..)? {
+        while let Some(byte) = self
+            .bytes
+            .as_ref()
+            .and_then(|bytes| bytes.get(self.pos))
+            .copied()
+        {
             self.pos += 1;
 
             match self.state {
@@ -62,15 +157,24 @@ impl Iterator for EventParser {
                     }
                     b'\r' | b' ' => (),
                     b'\n' => {
-                        return Some(Ok(std::mem::take(&mut self.result)));
+                        // A block that carried no `data` field dispatches
+                        // nothing (comment-only keepalives land here); the
+                        // event type buffer is still reset.
+                        if self.data_seen {
+                            self.data_seen = false;
+                            let mut event = std::mem::take(&mut self.result);
+                            event.id.clone_from(&self.last_event_id);
+                            return Some(Ok(event));
+                        }
+                        self.result = Event::default();
                     }
                     _ => {
                         self.state = EventParserState::Field;
-                        self.field.push(*byte);
+                        self.field.push(byte);
                     }
                 },
                 EventParserState::Comment => {
-                    if *byte == b'\n' {
+                    if byte == b'\n' {
                         self.state = EventParserState::Init;
                     }
                 }
@@ -78,21 +182,23 @@ impl Iterator for EventParser {
                     b'\r' => (),
                     b'\n' => {
                         self.state = EventParserState::Init;
-                        self.field.clear();
+                        // A field name with no colon is a field with an
+                        // empty value, not a line to throw away.
+                        if !self.commit_field() {
+                            self.discard(true);
+                            return Some(Err(Self::too_long_error()));
+                        }
                     }
                     b':' => {
                         self.state = EventParserState::Value;
                     }
                     _ => {
                         if self.field.len() >= MAX_EVENT_SIZE {
-                            return Some(Err(crate::Error::Transport(
-                                crate::core::transport::TransportError::new(
-                                    "EventSource response is too long.",
-                                ),
-                            )));
+                            self.discard(false);
+                            return Some(Err(Self::too_long_error()));
                         }
 
-                        self.field.push(*byte);
+                        self.field.push(byte);
                     }
                 },
                 EventParserState::Value => match byte {
@@ -100,48 +206,32 @@ impl Iterator for EventParser {
                     b' ' if self.value.is_empty() => (),
                     b'\n' => {
                         self.state = EventParserState::Init;
-                        match &self.field[..] {
-                            b"id" => {
-                                self.result.id.extend_from_slice(&self.value);
-                            }
-                            b"data" => {
-                                // Per SSE spec: multiple data lines joined with \n
-                                if !self.result.data.is_empty() {
-                                    self.result.data.push(b'\n');
-                                }
-                                self.result.data.extend_from_slice(&self.value);
-                            }
-                            b"event" => match &self.value[..] {
-                                #[cfg(feature = "calendars")]
-                                b"calendarAlert" => {
-                                    self.result.event = EventType::CalendarAlert;
-                                }
-                                b"ping" => {
-                                    self.result.event = EventType::Ping;
-                                }
-                                _ => {
-                                    self.result.event = EventType::State;
-                                }
-                            },
-                            _ => {
-                                //ignore
-                            }
+                        if !self.commit_field() {
+                            self.discard(true);
+                            return Some(Err(Self::too_long_error()));
                         }
-                        self.field.clear();
-                        self.value.clear();
                     }
                     _ => {
                         if (self.field.len() + self.value.len()) >= MAX_EVENT_SIZE {
-                            return Some(Err(crate::Error::Transport(
-                                crate::core::transport::TransportError::new(
-                                    "EventSource response is too long.",
-                                ),
-                            )));
+                            self.discard(false);
+                            return Some(Err(Self::too_long_error()));
                         }
 
-                        self.value.push(*byte);
+                        self.value.push(byte);
                     }
                 },
+                EventParserState::Discard => {
+                    if byte == b'\n' {
+                        if self.discard_at_line_start {
+                            self.state = EventParserState::Init;
+                            self.discard_at_line_start = false;
+                        } else {
+                            self.discard_at_line_start = true;
+                        }
+                    } else if byte != b'\r' {
+                        self.discard_at_line_start = false;
+                    }
+                }
             }
         }
 
@@ -217,14 +307,12 @@ mod tests {
                     id: "123".to_string(),
                     data: "ping payload".to_string()
                 },
+                // `:comment\n\n` carries no data field, so it dispatches
+                // nothing at all - it is a keepalive.
                 EventString {
                     event: EventType::State,
-                    id: String::new(),
-                    data: String::new()
-                },
-                EventString {
-                    event: EventType::State,
-                    id: String::new(),
+                    // The last event ID buffer persists across events.
+                    id: "123".to_string(),
                     data: "YHOO\n+2\n10".to_string()
                 },
                 EventString {
@@ -256,29 +344,78 @@ mod tests {
         );
     }
 
-    // The SSE spec (WHATWG, "Interpreting an event stream") says the
-    // `id` field SETS the last-event-id buffer: a second `id:` line
-    // replaces the first. This parser appends. Documented, not
-    // endorsed - `Last-Event-ID` resumption sends a fabricated id.
+    // Servers send comment-only blocks as keepalive heartbeats. Per the
+    // WHATWG event-stream rules a block whose data buffer is empty
+    // dispatches nothing; emitting an empty event here used to make the
+    // consumer in `stream.rs` fail an empty JSON parse and hang up on a
+    // live connection.
     #[test]
-    fn repeated_id_fields_concatenate_instead_of_replacing() {
+    fn comment_only_blocks_dispatch_nothing() {
+        let mut parser = super::EventParser::default();
+        parser.push_bytes(Vec::from(
+            ": keepalive\n\n:\n\nevent: state\n\ndata: real\n\n",
+        ));
+
+        let event = parser.next().expect("an event").expect("no parse error");
+        assert_eq!(String::from_utf8(event.data).unwrap(), "real");
+        assert!(parser.next().is_none(), "only one event was dispatched");
+    }
+
+    // A `data` line with an empty value is still a data field, so it
+    // dispatches an event with an empty payload.
+    #[test]
+    fn an_empty_data_field_still_dispatches() {
+        let mut parser = super::EventParser::default();
+        parser.push_bytes(Vec::from("data\n\n"));
+
+        let event = parser.next().expect("an event").expect("no parse error");
+        assert_eq!(String::from_utf8(event.data).unwrap(), "");
+    }
+
+    #[test]
+    fn the_last_event_id_buffer_persists_across_events() {
+        let mut parser = super::EventParser::default();
+        parser.push_bytes(Vec::from("id: 7\ndata: a\n\ndata: b\n\n"));
+
+        let first = parser.next().expect("an event").expect("no parse error");
+        assert_eq!(String::from_utf8(first.id).unwrap(), "7");
+        let second = parser.next().expect("an event").expect("no parse error");
+        assert_eq!(
+            String::from_utf8(second.id).unwrap(),
+            "7",
+            "an event without an `id` field keeps the previous resume token"
+        );
+    }
+
+    #[test]
+    fn a_colonless_id_line_clears_the_buffer() {
+        let mut parser = super::EventParser::default();
+        parser.push_bytes(Vec::from("id: 7\ndata: a\n\nid\ndata: b\n\ndata: c\n\n"));
+
+        let first = parser.next().expect("an event").expect("no parse error");
+        assert_eq!(String::from_utf8(first.id).unwrap(), "7");
+        let second = parser.next().expect("an event").expect("no parse error");
+        assert_eq!(String::from_utf8(second.id).unwrap(), "");
+        let third = parser.next().expect("an event").expect("no parse error");
+        assert_eq!(
+            String::from_utf8(third.id).unwrap(),
+            "",
+            "the cleared buffer stays cleared"
+        );
+    }
+
+    #[test]
+    fn repeated_id_fields_replace_the_previous_value() {
         let mut parser = super::EventParser::default();
         parser.push_bytes(Vec::from("id: 1\nid: 2\ndata: x\n\n"));
 
         let event = parser.next().expect("an event").expect("no parse error");
-        assert_eq!(String::from_utf8(event.id).unwrap(), "12");
+        assert_eq!(String::from_utf8(event.id).unwrap(), "2");
         assert_eq!(String::from_utf8(event.data).unwrap(), "x");
     }
 
-    // `push_bytes` overwrites the buffer without resetting `pos`, and
-    // nothing enforces the `needs_bytes()` precondition. A caller that
-    // stops draining the iterator early - which `event_source::stream`
-    // does on every yielded error, because its `break` only leaves the
-    // inner `for` loop - resumes at a stale offset inside the NEW
-    // buffer. Documented, not endorsed: the fix is for `push_bytes` to
-    // append to (or refuse to clobber) an unconsumed buffer.
     #[test]
-    fn push_bytes_over_a_partially_consumed_buffer_resumes_at_a_stale_offset() {
+    fn push_bytes_preserves_an_unconsumed_buffer() {
         let mut parser = super::EventParser::default();
         parser.push_bytes(Vec::from("data: one\n\ndata: two\n\n"));
 
@@ -289,52 +426,44 @@ mod tests {
             "the buffer still holds the second event"
         );
 
-        // 11 bytes have been consumed. Pushing a 13-byte frame resumes
-        // at index 11 of it, i.e. at the two trailing newlines, so the
-        // `three` payload is never seen and a bogus empty event is
-        // emitted instead.
         parser.push_bytes(Vec::from("data: three\n\n"));
-        let next = parser.next().expect("an event").expect("no parse error");
-        assert_eq!(
-            String::from_utf8(next.data).unwrap(),
-            "",
-            "`two` was dropped and `three` was skipped"
-        );
+        let second = parser.next().expect("an event").expect("no parse error");
+        assert_eq!(String::from_utf8(second.data).unwrap(), "two");
+        let third = parser.next().expect("an event").expect("no parse error");
+        assert_eq!(String::from_utf8(third.data).unwrap(), "three");
     }
 
-    // The size guard returns an error without clearing the overflowing
-    // field or resynchronising, so the same buffer keeps producing the
-    // same error. Documented, not endorsed.
     #[test]
-    fn an_oversized_field_errors_repeatedly_without_resyncing() {
+    fn an_oversized_field_errors_once_and_resynchronises() {
         let mut parser = super::EventParser::default();
         let mut frame = vec![b'x'; super::MAX_EVENT_SIZE + 4];
-        frame.extend_from_slice(b": v\n\n");
+        frame.extend_from_slice(b": v\n\ndata: recovered\n\n");
         parser.push_bytes(frame);
 
         assert!(parser.next().expect("an item").is_err());
-        assert!(
-            parser.next().expect("another item").is_err(),
-            "the parser never drops the oversized field, so it cannot recover"
-        );
+        let recovered = parser
+            .next()
+            .expect("a recovered event")
+            .expect("no parse error");
+        assert_eq!(String::from_utf8(recovered.data).unwrap(), "recovered");
     }
 
-    // Only `data` accumulation is unbounded: MAX_EVENT_SIZE caps a
-    // single field/value pair, but `result.data` grows across every
-    // `data:` line of one event with no cap at all.
     #[test]
-    fn multi_line_data_accumulates_past_the_single_line_cap() {
+    fn multi_line_data_is_capped_and_resynchronises() {
         let mut parser = super::EventParser::default();
         let line = format!("data: {}\n", "y".repeat(1024));
         let mut frame = String::new();
-        for _ in 0..64 {
+        for _ in 0..=(super::MAX_EVENT_SIZE / 1024) {
             frame.push_str(&line);
         }
-        frame.push('\n');
+        frame.push_str("\ndata: recovered\n\n");
         parser.push_bytes(frame.into_bytes());
 
-        let event = parser.next().expect("an event").expect("no parse error");
-        // 64 lines of 1024 bytes plus 63 joining newlines.
-        assert_eq!(event.data.len(), 64 * 1024 + 63);
+        assert!(parser.next().expect("an item").is_err());
+        let recovered = parser
+            .next()
+            .expect("a recovered event")
+            .expect("no parse error");
+        assert_eq!(String::from_utf8(recovered.data).unwrap(), "recovered");
     }
 }

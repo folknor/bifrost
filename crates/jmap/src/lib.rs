@@ -79,87 +79,130 @@ pub(crate) use crate::core::{
     },
 };
 
-#[derive(Debug, Serialize, Deserialize, Eq, PartialEq, Hash, Clone)]
+#[derive(Debug, Eq, PartialEq, Hash, Clone)]
 #[non_exhaustive]
 pub(crate) enum DataType {
     // Core (always available)
-    #[serde(rename = "Core")]
     Core,
-    #[serde(rename = "PushSubscription")]
     PushSubscription,
-    #[serde(rename = "Principal")]
     Principal,
-    #[serde(rename = "ShareNotification")]
     ShareNotification,
 
     // Mail
     #[cfg(feature = "mail")]
-    #[serde(rename = "Email")]
     Email,
     #[cfg(feature = "mail")]
-    #[serde(rename = "EmailDelivery")]
     EmailDelivery,
     #[cfg(feature = "mail")]
-    #[serde(rename = "EmailSubmission")]
     EmailSubmission,
     #[cfg(feature = "mail")]
-    #[serde(rename = "Mailbox")]
     Mailbox,
     #[cfg(feature = "mail")]
-    #[serde(rename = "Thread")]
     Thread,
     #[cfg(feature = "mail")]
-    #[serde(rename = "Identity")]
     Identity,
     #[cfg(feature = "mail")]
-    #[serde(rename = "SearchSnippet")]
     SearchSnippet,
     #[cfg(feature = "mail")]
-    #[serde(rename = "VacationResponse")]
     VacationResponse,
     #[cfg(feature = "mail")]
-    #[serde(rename = "MDN")]
     Mdn,
     #[cfg(feature = "mail")]
-    #[serde(rename = "SieveScript")]
     SieveScript,
 
     // Calendars
     #[cfg(feature = "calendars")]
-    #[serde(rename = "Calendar")]
     Calendar,
     #[cfg(feature = "calendars")]
-    #[serde(rename = "CalendarEvent")]
     CalendarEvent,
     #[cfg(feature = "calendars")]
-    #[serde(rename = "CalendarEventNotification")]
     CalendarEventNotification,
     #[cfg(feature = "calendars")]
-    #[serde(rename = "ParticipantIdentity")]
     ParticipantIdentity,
     #[cfg(feature = "calendars")]
-    #[serde(rename = "CalendarAlert")]
     CalendarAlert,
 
     // Contacts
     #[cfg(feature = "contacts")]
-    #[serde(rename = "AddressBook")]
     AddressBook,
     #[cfg(feature = "contacts")]
-    #[serde(rename = "ContactCard")]
     ContactCard,
 
     // Quota
     #[cfg(feature = "quota")]
-    #[serde(rename = "Quota")]
     Quota,
 
-    #[serde(rename = "FileNode")]
     FileNode,
 
-    /// Unknown or feature-gated data type.
-    #[serde(other)]
-    Other,
+    /// Unknown or feature-gated data type, preserved for wire round-trips.
+    Other(String),
+}
+
+impl DataType {
+    fn parse(value: &str) -> Self {
+        match value {
+            "Core" => Self::Core,
+            "PushSubscription" => Self::PushSubscription,
+            "Principal" => Self::Principal,
+            "ShareNotification" => Self::ShareNotification,
+            #[cfg(feature = "mail")]
+            "Email" => Self::Email,
+            #[cfg(feature = "mail")]
+            "EmailDelivery" => Self::EmailDelivery,
+            #[cfg(feature = "mail")]
+            "EmailSubmission" => Self::EmailSubmission,
+            #[cfg(feature = "mail")]
+            "Mailbox" => Self::Mailbox,
+            #[cfg(feature = "mail")]
+            "Thread" => Self::Thread,
+            #[cfg(feature = "mail")]
+            "Identity" => Self::Identity,
+            #[cfg(feature = "mail")]
+            "SearchSnippet" => Self::SearchSnippet,
+            #[cfg(feature = "mail")]
+            "VacationResponse" => Self::VacationResponse,
+            #[cfg(feature = "mail")]
+            "MDN" => Self::Mdn,
+            #[cfg(feature = "mail")]
+            "SieveScript" => Self::SieveScript,
+            #[cfg(feature = "calendars")]
+            "Calendar" => Self::Calendar,
+            #[cfg(feature = "calendars")]
+            "CalendarEvent" => Self::CalendarEvent,
+            #[cfg(feature = "calendars")]
+            "CalendarEventNotification" => Self::CalendarEventNotification,
+            #[cfg(feature = "calendars")]
+            "ParticipantIdentity" => Self::ParticipantIdentity,
+            #[cfg(feature = "calendars")]
+            "CalendarAlert" => Self::CalendarAlert,
+            #[cfg(feature = "contacts")]
+            "AddressBook" => Self::AddressBook,
+            #[cfg(feature = "contacts")]
+            "ContactCard" => Self::ContactCard,
+            #[cfg(feature = "quota")]
+            "Quota" => Self::Quota,
+            "FileNode" => Self::FileNode,
+            other => Self::Other(other.to_string()),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for DataType {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        String::deserialize(deserializer).map(|value| Self::parse(&value))
+    }
+}
+
+impl Serialize for DataType {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -447,7 +490,7 @@ impl Display for DataType {
             DataType::ContactCard => write!(f, "ContactCard"),
             #[cfg(feature = "quota")]
             DataType::Quota => write!(f, "Quota"),
-            DataType::Other => write!(f, "Other"),
+            DataType::Other(value) => write!(f, "{value}"),
         }
     }
 }

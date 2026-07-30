@@ -164,6 +164,7 @@ pub(crate) struct WebSocketCapabilities {
     #[serde(rename = "url")]
     url: String,
     #[serde(rename = "supportsPush")]
+    #[serde(default)]
     supports_push: bool,
 }
 

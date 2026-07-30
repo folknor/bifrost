@@ -11,7 +11,10 @@ pub(crate) mod search_snippet;
 pub(crate) mod set;
 
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize, de::Visitor};
+use serde::{
+    Deserialize, Serialize,
+    de::{IgnoredAny, MapAccess, Visitor},
+};
 use std::collections::HashMap;
 use std::fmt::{self, Display, Formatter};
 
@@ -145,8 +148,48 @@ pub(crate) struct Email {
     pub(super) preview: Option<String>,
 
     #[serde(flatten)]
+    #[serde(deserialize_with = "deserialize_headers")]
     #[serde(skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub(super) headers: HashMap<Header, Option<HeaderValue>>,
+}
+
+/// Retain only dynamic `header:*` properties in the flattened map. Servers
+/// may include extension properties alongside an Email projection; those are
+/// not headers and must not make the whole object undecodable.
+fn deserialize_headers<'de, D>(
+    deserializer: D,
+) -> Result<HashMap<Header, Option<HeaderValue>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct HeadersVisitor;
+
+    impl<'de> Visitor<'de> for HeadersVisitor {
+        type Value = HashMap<Header, Option<HeaderValue>>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("a map of dynamic JMAP header properties")
+        }
+
+        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            let mut headers = HashMap::new();
+
+            while let Some(key) = map.next_key::<String>()? {
+                if let Some(header) = Header::parse(&key) {
+                    headers.insert(header, map.next_value()?);
+                } else {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+
+            Ok(headers)
+        }
+    }
+
+    deserializer.deserialize_map(HeadersVisitor)
 }
 
 #[derive(Debug, Clone, Serialize, Default)]

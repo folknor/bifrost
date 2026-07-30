@@ -136,6 +136,8 @@ pub(crate) enum UndoStatus {
     Final,
     #[serde(rename = "canceled")]
     Canceled,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -161,6 +163,8 @@ pub(crate) enum Delivered {
     No,
     #[serde(rename = "unknown")]
     Unknown,
+    #[serde(other)]
+    Other,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -170,6 +174,8 @@ pub(crate) enum Displayed {
     Unknown,
     #[serde(rename = "yes")]
     Yes,
+    #[serde(other)]
+    Other,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Copy)]

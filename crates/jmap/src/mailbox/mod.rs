@@ -402,7 +402,7 @@ impl<'de> Deserialize<'de> for Role {
     where
         D: serde::Deserializer<'de>,
     {
-        match <&str>::deserialize(deserializer)?
+        match String::deserialize(deserializer)?
             .to_ascii_lowercase()
             .as_str()
         {

@@ -79,6 +79,8 @@ pub(crate) enum NotificationType {
     Updated,
     #[serde(rename = "destroyed")]
     Destroyed,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Copy)]

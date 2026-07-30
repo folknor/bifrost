@@ -300,6 +300,8 @@ pub(crate) enum Type {
     List,
     #[serde(rename = "other")]
     Other,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

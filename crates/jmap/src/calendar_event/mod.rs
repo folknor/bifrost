@@ -71,6 +71,8 @@ pub(crate) enum AlertAction {
     Display,
     #[serde(rename = "email")]
     Email,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -80,6 +82,8 @@ pub(crate) enum RelativeTo {
     Start,
     #[serde(rename = "end")]
     End,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]

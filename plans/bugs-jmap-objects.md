@@ -16,143 +16,6 @@ Tests landed in this pass are listed at the end.
 
 ---
 
-## B5 (BUG, severity: medium, latent-but-easy-to-trip) - one unknown property fails the whole `Email/get` decode
-
-**Where:** `crates/jmap/src/email/mod.rs:156-158` (the flattened
-`headers: HashMap<Header, Option<HeaderValue>>`), `:630-649`
-(`Header::parse`).
-
-`Email` collects every key it does not recognise into a `#[serde(flatten)]`
-map whose KEY type is `Header`. `Header`'s deserializer calls
-`Header::parse`, which returns `None` for anything that is not
-`header:<name>[:<form>][:all]`, and the visitor turns that into a hard
-serde error.
-
-**Path to failure.** A server includes any property this struct does not
-name - a vendor extension (`example.com:snoozedUntil`), a future RFC
-property, or a JMAP extension the crate has not modelled - in an
-`Email/get` response. `Response::get::<EmailGet>` returns
-`Error::ResponseDecode`, which `sync/error.rs` maps to
-`Protocol(ParseFailed)` / `ProviderContractViolation`. Not one property
-is lost: the entire batch of hydrated emails is.
-
-This is mitigated in practice because the sync layer always sends an
-explicit `properties` list and RFC 8620 §5.1 says the server MUST honour
-it. It is not mitigated for `Email/parse` (whose `properties` is
-optional), for any future caller that omits `properties`, or for a server
-that is merely sloppy.
-
-**Proposed fix.** Give the flattened map a key type that cannot fail -
-either reuse `Property` (which already has an `Other(String)` catch-all,
-except that it *also* propagates `Header::parse` failure and would need
-the same treatment), or attach a `deserialize_with` to the flattened
-field that drops keys `Header::parse` rejects. A one-line alternative is
-to make `Header::parse` fall back to `Header { name: value, form: Raw,
-all: false }`, but that changes `Display` round-tripping and would let
-non-header keys masquerade as headers.
-
-Pinned by `tests.rs::email_object_decode::one_unknown_property_fails_the_entire_email_decode`
-(with the positive control next to it).
-
----
-
-## B6 (BUG, severity: low, latent) - `Role` cannot be decoded from a non-borrowable string
-
-**Where:** `crates/jmap/src/mailbox/mod.rs:385-404`.
-
-```rust
-match <&str>::deserialize(deserializer)?.to_ascii_lowercase().as_str() { ... }
-```
-
-`&str`'s `Deserialize` only accepts `visit_borrowed_str`. Two real inputs
-fail with `invalid type: string "inbox", expected a borrowed string`:
-
-1. Any `serde_json::from_value` path (owned `Value` cannot lend `&'de`).
-2. `serde_json::from_str` where the JSON string contains an escape -
-   serde_json then has to unescape into a scratch buffer and calls
-   `visit_str`, not `visit_borrowed_str`. `"inbox"` is a legal
-   encoding of `"inbox"` and fails.
-
-The whole `Mailbox` (hence the whole `Mailbox/get` response) fails, not
-just the role.
-
-Today's main path survives by luck: `Response::get` uses
-`serde_json::from_str` over a `RawValue`, and role strings are
-unescaped ASCII. But an `x-` role containing any escaped character, or
-any future use of `from_value` on a `Mailbox`, trips it. Every other
-hand-written deserializer in the crate (`Header`, `Property`,
-`SetErrorType`, `define_open_property_enum!`) uses a `Visitor` with
-`visit_str` or goes through `String`; `Role` is the outlier.
-
-**Proposed fix.** `String::deserialize(deserializer)?` (one extra
-allocation on a path that already allocates for `to_ascii_lowercase`), or
-a `Visitor` implementing `visit_str`.
-
-Pinned by `tests.rs::mailbox_wire::role_cannot_be_decoded_when_the_string_is_not_borrowable`.
-
-Related, separately: the same deserializer lower-cases before matching,
-so `Role::Other` does not round-trip byte for byte
-(`"x-MyRole"` decodes to `Other("x-myrole")` and re-serialises
-lower-cased). Pinned by `unknown_roles_survive_as_other_but_are_lower_cased`.
-
----
-
-## B7 (BUG, severity: medium, latent) - the SSE stream's error handling breaks out of the wrong loop, and the parser then desynchronises
-
-**Where:** `crates/jmap/src/event_source/stream.rs:68-112` and
-`crates/jmap/src/event_source/parser.rs:40-47, 52-55, 148-151`.
-
-```rust
-loop {
-    for event_result in parser.by_ref() {
-        match event_result {
-            ...
-            Err(err) => { yield Err(err); break; }   // breaks the FOR
-        }
-        continue;                                     // no-op, last stmt
-    }
-    if let Some(result) = stream.next().await { parser.push_bytes(bytes); continue; }
-    else { break; }
-}
-```
-
-Every `break` inside the `match` leaves the **inner `for`**, not the
-outer `loop`. Two consequences:
-
-1. The intended "terminate the stream on a decode error" never happens.
-   The stream yields the error, pulls more bytes and carries on. A server
-   emitting malformed `data:` payloads produces an infinite error stream
-   instead of a terminal failure.
-2. Worse, the `break` leaves the parser mid-buffer. `EventParser::push_bytes`
-   overwrites `self.bytes` **without resetting `self.pos`**, and nothing
-   checks the `needs_bytes()` precondition the parser exposes for exactly
-   this. The next poll resumes at a stale offset inside the *new* frame.
-
-**Path to failure (2).** Frame A is `"data: one\n\ndata: two\n\n"` (22
-bytes). One event is yielded at `pos = 11`. Something breaks the loop.
-Frame B `"data: three\n\n"` (13 bytes) is pushed. Parsing resumes at index
-11 of frame B, i.e. at its two trailing newlines: `two` is lost, `three`
-is never seen, and a bogus empty `StateChange` event is emitted instead.
-If frame B were shorter than 11 bytes, `bytes.get(self.pos..)` returns
-`None`, `next()` returns `None` **without clearing `self.bytes`**, and the
-loop spins pulling and discarding frames forever.
-
-**Reachability:** `Client::event_source` has no caller - the Account layer
-uses the WebSocket push path - so this is latent. It is the entire
-correctness of the SSE path if it is ever switched on.
-
-**Proposed fix.** Two independent edits: (a) label the outer loop and
-`break 'outer`, or restructure so the error path returns; (b) make
-`push_bytes` either assert `needs_bytes()`, append to the unconsumed
-remainder, or reset `pos` and drop the old buffer explicitly. (b) alone
-makes the parser safe against any caller.
-
-Pinned (parser half only, since the stream half is async and this crate
-has no async test harness - see G1) by
-`event_source/parser.rs::tests::push_bytes_over_a_partially_consumed_buffer_resumes_at_a_stale_offset`.
-
----
-
 ## B9 (BUG, severity: medium, latent) - `ParticipantIdentity` models `sendTo`, which the calendars draft this crate targets may no longer define
 
 **Where:** `crates/jmap/src/participant_identity/mod.rs:49-94`
@@ -212,104 +75,33 @@ way it did on `VacationResponsePatch`.
 
 ---
 
-## G1 (GAP) - this crate cannot host an async test at all
+## G1 (GAP) - the request envelope has no test double
 
-`crates/jmap/Cargo.toml` has **no `[dev-dependencies]` section**. `tokio`
-is an optional *runtime* dependency without the `macros` feature, and the
-workspace pins `futures = { default-features = false }`, so
-`futures::executor::block_on` is not available either.
+**Correction.** The original G1 claimed this crate could not host an async
+test because `crates/jmap/Cargo.toml` had no `[dev-dependencies]`. That
+was **false when it was written**: line 64 of the manifest already
+carries `tokio = { workspace = true, features = ["macros", "rt",
+"test-util"] }`. Nothing about the manifest changed in either fix round;
+the blocker was believed, not real. `#[tokio::test]` works today - see
+`event_source/stream.rs::tests`, which drives the whole EventSource
+stream through a stub `SseTransport`.
 
-Consequence for this pass: the deliberate new capability the brief
-described - a byte-level protocol transcript over `tokio::io::duplex` -
-is not reachable. Neither is a `StubTransport` implementing the crate's
-own `HttpTransport` trait, which is the higher-value double here:
-`Client::with_transport(stub, session)` + `Account::call` would pin the
-request envelope (`using` array construction, `methodCalls` tuple shape,
-`accountId` injection, `Response::get` call-id matching, method-error
-routing) end to end, in-process, with no network and no listener.
+What actually remains is a **coverage** gap, not a tooling one. Nothing
+exercises the request envelope: `Client::with_transport(stub, session)`
+plus a `HttpTransport` stub that captures the outgoing body would pin
+`using` array construction and de-duplication, the `methodCalls` tuple
+encoding, `accountId` injection via `JmapMethod::set_account_id`,
+`CallHandle` -> `Response::get` call-id matching, method-error routing,
+and `send_methods` tuple extraction. None of that has a single test.
 
-I did not add the dependency (the brief forbids editing `Cargo.toml`, and
-the manifest is shared). **Ask:** add to `crates/jmap/Cargo.toml`
+The stub is cheap - `event_source/stream.rs::tests` already writes the
+`HttpTransport` half of one (every method `unreachable!()`) purely to
+satisfy the trait bound. Turning that into a capture-and-assert double is
+the highest-value follow-up in this file.
 
-```toml
-[dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt"] }
-```
-
-which is what `crates/caldav` already does. With that one line the
-transport-stub tests become writable and I would expect them to be worth
-more than everything else in this pass combined - the request envelope is
-currently entirely unproven.
-
-(A hand-rolled `block_on` built on `std::task::Wake` would avoid the
-dependency, but shipping a bespoke executor in a test module to dodge a
-one-line manifest change is the wrong trade.)
-
----
-
-## G2 (GAP) - `#[non_exhaustive]` wire enums with no `#[serde(other)]` arm
-
-`DataType`, `Role`, `AlertTrigger` and `SetErrorType` all have a
-catch-all: an unknown wire value degrades. These do not, and an
-unrecognised value fails the decode of the whole containing response:
-
-| type | file | RFC-defined values |
-|---|---|---|
-| `UndoStatus` | `email_submission/mod.rs:132` | pending / final / canceled |
-| `Delivered` | `email_submission/mod.rs:155` | queued / yes / no / unknown |
-| `Displayed` | `email_submission/mod.rs:168` | unknown / yes |
-| `AlertAction` | `calendar_event/mod.rs:69` | display / email |
-| `RelativeTo` | `calendar_event/mod.rs:78` | start / end |
-| `IncludeInAvailability` | `calendar/mod.rs:183` | all / attending / none |
-| `NotificationType` | `calendar_event_notification/mod.rs:75` | created / updated / destroyed |
-| `principal::Type` | `principal/mod.rs:288` | individual / group / resource / location / domain / list / other |
-
-Each is marked `#[non_exhaustive]`, which is the crate declaring that the
-value set will grow - but the deserializers refuse to grow with it. The
-calendars draft in particular is at -26 and still moving; a server
-shipping a newer `alerts[].action` fails every `CalendarEvent/get`.
-
-This is a judgement call rather than an outright bug (the RFC values are
-closed today), so it is pinned as-is, with the divergence made explicit,
-in `tests.rs::wire_enums_without_a_catch_all`. If the answer is "add
-`#[serde(other)] Unknown` everywhere", `AlertTrigger` is the model.
-
-Related, and slightly worse: `DataType::Other` is a deserialize-only
-catch-all that nonetheless **serialises**, as the literal `"Other"`.
-Anything that decodes a server's type name and echoes it back - the
-`WebSocketPushEnable.dataTypes` union built in `sync/push.rs`, a
-`PushSubscription.types` round-trip - will ask the server to subscribe to
-a data type called `Other`. Pinned by
-`tests.rs::data_type_wire::other_serialises_as_a_literal_that_is_not_a_jmap_type`.
-
----
-
-## G3 (GAP) - a malformed capability object silently disables the feature
-
-**Where:** `crates/jmap/src/core/session.rs:84-132` (`try_cap!`). Out of
-my edit scope; reported because the failure is invisible.
-
-`try_cap!` falls back to `Capabilities::Other(value)` on **any** parse
-failure. `WebSocketCapabilities` has no `#[serde(default)]` and both of
-its fields are required, so a server that advertises
-
-```json
-"urn:ietf:params:jmap:websocket": {"url": "wss://..."}
-```
-
-(no `supportsPush`) produces a session where `websocket_capabilities()`
-is `None`. `sync/capabilities.rs` reads that as "no push", the account
-opens with `push: None`, and nothing anywhere reports why. The same
-shape applies to `BlobCapabilities` (has defaults, safe),
-`SieveCapabilities` (has defaults, safe) and `CoreCapabilities` (has
-defaults - which is why a `{}` core capability decodes to all-zero limits
-rather than falling to `Other`).
-
-**Proposed fix.** `#[serde(default)]` on `WebSocketCapabilities` (absent
-`supportsPush` == false is the natural RFC 8887 reading), and/or make the
-`Other` fallback observable.
-
-Pinned by `tests.rs::session_capability_fallbacks`.
+A byte-level transcript over `tokio::io::duplex` is likewise reachable,
+but it buys less here: the crate's transport seam is `HttpTransport` /
+`SseTransport`, not a socket, so a duplex would only re-test reqwest.
 
 ---
 
@@ -375,33 +167,23 @@ neither.
 
 ---
 
-## S4 (SMELL) - the SSE parser's `data` accumulation is uncapped
+## S8 (SMELL) - two residual SSE-parser deviations from the WHATWG rules
 
-**Where:** `crates/jmap/src/event_source/parser.rs:87, 134` (the
-`MAX_EVENT_SIZE` guards) vs `:108-113` (the `data` join).
+**Where:** `crates/jmap/src/event_source/parser.rs`.
 
-The 1 MiB guard bounds a single `field`/`value` pair. `self.result.data`
-accumulates across every `data:` line of one event with no bound at all,
-so a stream of 1 MiB-minus-epsilon `data:` lines with no blank line grows
-the buffer without limit. Also, the guard errors without clearing the
-offending field, so the parser cannot resynchronise (see B7). Both pinned
-in `event_source/parser.rs::tests`.
+The substantive deviations are closed: an oversized field or an oversized
+accumulated `data` buffer now errors once and resynchronises on the next
+blank line; `push_bytes` appends to an unconsumed buffer instead of
+clobbering it at a stale offset; a repeated `id` line replaces rather
+than appends; the last-event-ID buffer persists across events and a
+colonless `id` line clears it; and a block with no `data` field (a
+comment-only keepalive) dispatches nothing at all.
 
----
-
-## S5 (SMELL) - the SSE parser's `id` field concatenates instead of replacing
-
-**Where:** `crates/jmap/src/event_source/parser.rs:104-106`.
-
-`self.result.id.extend_from_slice(&self.value)`. The SSE spec says the
-`id` field *sets* the last-event-id buffer, so a second `id:` line in one
-event replaces the first. Here `"id: 1\nid: 2\n\n"` yields id `"12"` -
-which is then what `Last-Event-ID` resumption would send back. Pinned by
-`event_source/parser.rs::tests::repeated_id_fields_concatenate_instead_of_replacing`.
-
-Two smaller deviations in the same state machine: `Init` silently ignores
-a leading space (SSE treats it as the first character of a field name),
-and a field name is capped but a comment line is not.
+What is left is cosmetic. `Init` silently ignores a leading space, where
+SSE treats it as the first character of a field name; and a field name is
+capped at `MAX_EVENT_SIZE` but a comment line is not, so a pathological
+server could stream an unbounded comment. Neither is reachable from a
+JMAP server behaving even approximately correctly.
 
 ---
 
@@ -471,7 +253,7 @@ comment directly above them ("BUG, documented rather than endorsed" /
   grammar both directions, all seven forms, the malformed cases, and
   `Property` serde including `Other`.
 - `email_object_decode` - `Email` decode, the header-form aliases, the
-  flattened header map, and B5.
+  flattened header map, and extension-property tolerance.
 - `email_query_wire` - every `Email/query` filter condition's wire name,
   the `header` two-element form, UTCDate formatting, comparator
   flattening (incl. `hasKeyword`'s extra field), `collapseThreads`,
@@ -481,7 +263,8 @@ comment directly above them ("BUG, documented rather than endorsed" /
   property; a wholesale setter drops both the children and an exact raw
   entry, so a `null_property("keywords")` cannot survive alongside
   `keywords(...)` as a duplicate key), the raw/null escape hatches.
-- `mailbox_wire` - role wire names + case folding, B6, the
+- `mailbox_wire` - role wire names + case folding, owned and escaped role
+  decoding, the
   create sentinels, create-id references, `Mailbox` decode incl. rights
   defaulting.
 - `email_submission_wire` - envelope/parameter shapes incl. the RFC 4865
@@ -493,10 +276,11 @@ comment directly above them ("BUG, documented rather than endorsed" /
 - `patch_defaults` - empty default PatchObjects and create sentinels.
 - `set_error_vocabulary` - all 25 known `SetErrorType` codes both
   directions plus the `Other(code)` gate-5 invariant and `Display`.
-- `wire_enums_without_a_catch_all` - G2.
+- `wire_enums_without_a_catch_all` - unknown wire-enum fallbacks.
 - `data_type_wire` - Display/Serialize agreement for every `DataType`,
-  `MDN` casing, and the `Other` serialisation hazard.
-- `session_capability_fallbacks` - G3 plus the `Other` passthrough.
+  `MDN` casing, and unknown-value round-tripping.
+- `session_capability_fallbacks` - the WebSocket `supportsPush` default
+  plus the `Other` passthrough.
 - `url_template_parsing` - `URLPart::parse` happy paths and all four
   rejection cases, plus the blob parameter set.
 - `blob_management_wire` - RFC 9404 `Blob/upload` create shape and
@@ -514,35 +298,51 @@ comment directly above them ("BUG, documented rather than endorsed" /
   across all ten variants.
 
 `crates/jmap/src/event_source/parser.rs` (appended to the existing
-`mod tests`): S5, B7's parser half, S4's two halves.
+`mod tests`): repeated-id replacement, unconsumed-buffer preservation,
+bounded and resynchronising oversized fields and data, comment-only
+blocks dispatching nothing, an empty `data` field still dispatching, the
+last-event-ID buffer persisting across events, and a colonless `id` line
+clearing it. The pre-existing `parse` transcript was re-pinned to spec
+behaviour (the keepalive block no longer yields a phantom event, and the
+event after an `id` carries that id forward).
+
+`crates/jmap/src/event_source/stream.rs` (new `mod tests`, both
+`#[tokio::test]`): malformed event payloads emit one error and terminate
+the EventSource stream; comment heartbeats neither surface as events nor
+tear the stream down, and the resume token survives them. Both drive a
+stub `HttpTransport` + `SseTransport` - the first async tests in this
+crate, and the pattern G1 asks to be extended to the request envelope.
 
 ---
 
 ## Not done, and why
 
-- **A transport-level test double.** The highest-value thing in scope and
-  blocked on G1 (no `[dev-dependencies]`, so no async test can compile in
-  this crate). This is the one item I would put at the top of the
-  follow-up list: `Client::with_transport` + a stub `HttpTransport` would
-  pin the request envelope (`using` construction and de-duplication,
-  `methodCalls` tuple encoding, `accountId` injection via
-  `JmapMethod::set_account_id`, `CallHandle` -> `Response::get` matching,
-  method-error routing, `send_methods` tuple extraction) and none of that
-  has a single test today.
+- **A transport-level test double** (G1). Still the highest-value thing
+  in scope, but nothing blocks it: the manifest has always had the tokio
+  dev-dependency, and `event_source/stream.rs::tests` now proves an async
+  test with a stub transport compiles and runs here. A capturing
+  `HttpTransport` stub behind `Client::with_transport` would pin the
+  request envelope (`using` construction and de-duplication, `methodCalls`
+  tuple encoding, `accountId` injection via `JmapMethod::set_account_id`,
+  `CallHandle` -> `Response::get` matching, method-error routing,
+  `send_methods` tuple extraction) and none of that has a single test
+  today. It was left because this round was scoped to the decode and
+  parser cluster.
 - **`blob/download.rs` URL construction.** The templating + percent-encoding
   logic (S6) is inside an `async fn` that immediately calls the transport,
-  so it is untestable without either G1 or extracting a pure
-  `build_download_url(&[URLPart], &BlobRef) -> String`. That extraction is
-  a refactor, and the brief splits tests from fixes, so I left it. It is a
-  five-line change and would make S6 verifiable.
+  so pinning it wants either the G1 stub or a pure
+  `build_download_url(&[URLPart], &BlobRef) -> String` extraction. That
+  extraction is a refactor, and the brief splits tests from fixes, so I
+  left it. It is a five-line change and would make S6 verifiable.
 - **`client_ws.rs` frame handling beyond the subprotocol check.** The
   `WebSocketMessage_` decode is partly covered by the existing
   `deserializes_single_type_state_change_frame`; the close/error/binary
-  arms are inside the `async_stream::stream!` and need G1.
+  arms are inside the `async_stream::stream!` and need a stub WebSocket
+  transport of the same shape as the G1 double.
 - **`principal/availability.rs`, `principal/query.rs`,
   `share_notification/query.rs`, `sieve/query.rs`,
   `calendar_event_notification/query.rs`, `quota/query.rs`.** Read for
-  bugs (none found beyond G2's `NotificationType`), not covered by new
+  bugs (the `NotificationType` catch-all is closed), not covered by new
   tests - they are thin filter/comparator enums structurally identical to
   the ones now pinned in `email_query_wire` and `tests.rs`'s existing
   `query_filter_serialization`, and I judged a second copy of the same
