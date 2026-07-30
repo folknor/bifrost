@@ -55,6 +55,29 @@ state-change notifications, not bulk data.
 **Revisit when:** SSE is used for high-volume event delivery, or the
 parser is rewritten for other reasons.
 
+## EventSource as the sync-layer push fallback
+
+`Client::event_source()` and `event_source/` are spec-correct (WHATWG
+parser semantics closed out in the 2026-07 protocol-objects sweep,
+including resynchronising size caps and Last-Event-ID resume) and
+hermetically pinned, but the `sync/` Account impl's push is RFC 8887
+WebSocket-only. Against a server that does not advertise the WebSocket
+extension the engine has no push at all and falls back to polling, even
+though eventSourceUrl is a mandatory RFC 8620 session property every
+server provides.
+
+The intended fix is a push-reader fallback in `sync/push.rs`: when the
+session lacks `urn:ietf:params:jmap:websocket` with `supportsPush`,
+drive the same `PushRouting` snapshot from an EventSource stream
+(`closeafter=no`, `ping` keepalives, Last-Event-ID reconnect resume)
+and advertise `push: InProcess` for that case too. This is deliberately
+NOT bundled into a bug-hunt pass: it is feature-sized, it lives in the
+push-reconciler territory `plans/bugs-jmap-core-sync.md` settled, and
+it deserves its own review cycle.
+
+**Revisit when:** the next planned change touches `sync/push.rs`, or a
+target server without RFC 8887 push shows up in practice.
+
 ## API cleanup still pending
 
 ### Sentinel getters on typed structs

@@ -36,6 +36,8 @@ pub(crate) struct EventParser {
     pos: usize,
     result: Event,
     discard_at_line_start: bool,
+    // Running length of the comment line being skipped; see the Comment arm.
+    comment_len: usize,
     // WHATWG "interpreting an event stream": the last event ID buffer is
     // NOT reset between events. It survives until another `id` field
     // changes it, and every dispatched event carries the current value.
@@ -154,8 +156,9 @@ impl Iterator for EventParser {
                 EventParserState::Init => match byte {
                     b':' => {
                         self.state = EventParserState::Comment;
+                        self.comment_len = 0;
                     }
-                    b'\r' | b' ' => (),
+                    b'\r' => (),
                     b'\n' => {
                         // A block that carried no `data` field dispatches
                         // nothing (comment-only keepalives land here); the
@@ -176,6 +179,15 @@ impl Iterator for EventParser {
                 EventParserState::Comment => {
                     if byte == b'\n' {
                         self.state = EventParserState::Init;
+                    } else if byte != b'\r' {
+                        // A comment is skipped, not buffered, so the cap is
+                        // a counter: without it a pathological server could
+                        // stream one unterminated comment forever.
+                        self.comment_len += 1;
+                        if self.comment_len > MAX_EVENT_SIZE {
+                            self.discard(false);
+                            return Some(Err(Self::too_long_error()));
+                        }
                     }
                 }
                 EventParserState::Field => match byte {
@@ -431,6 +443,53 @@ mod tests {
         assert_eq!(String::from_utf8(second.data).unwrap(), "two");
         let third = parser.next().expect("an event").expect("no parse error");
         assert_eq!(String::from_utf8(third.data).unwrap(), "three");
+    }
+
+    // WHATWG: a line's first character is part of the field name unless it
+    // is a colon. A space-prefixed `data` line is therefore the unknown
+    // field " data" (ignored), never a data field.
+    #[test]
+    fn a_leading_space_starts_a_field_name() {
+        let mut parser = super::EventParser::default();
+        parser.push_bytes(Vec::from(" data: skipped\ndata: kept\n\n"));
+
+        let event = parser.next().expect("an event").expect("no parse error");
+        assert_eq!(String::from_utf8(event.data).unwrap(), "kept");
+        assert!(
+            parser.next().is_none(),
+            "the ignored field dispatched nothing"
+        );
+    }
+
+    #[test]
+    fn an_unbounded_comment_errors_once_and_resynchronises() {
+        let mut parser = super::EventParser::default();
+        let mut frame = Vec::from(":");
+        frame.extend_from_slice(&vec![b'z'; super::MAX_EVENT_SIZE + 4]);
+        frame.extend_from_slice(b"\n\ndata: recovered\n\n");
+        parser.push_bytes(frame);
+
+        assert!(parser.next().expect("an item").is_err());
+        let recovered = parser
+            .next()
+            .expect("a recovered event")
+            .expect("no parse error");
+        assert_eq!(String::from_utf8(recovered.data).unwrap(), "recovered");
+    }
+
+    // A bounded comment does not trip the cap, and the counter resets for
+    // the next comment line.
+    #[test]
+    fn bounded_comments_pass_and_reset_the_counter() {
+        let mut parser = super::EventParser::default();
+        let long_comment = format!(":{}\n", "c".repeat(super::MAX_EVENT_SIZE - 1));
+        let mut frame = long_comment.clone().into_bytes();
+        frame.extend_from_slice(long_comment.as_bytes());
+        frame.extend_from_slice(b"data: alive\n\n");
+        parser.push_bytes(frame);
+
+        let event = parser.next().expect("an event").expect("no parse error");
+        assert_eq!(String::from_utf8(event.data).unwrap(), "alive");
     }
 
     #[test]

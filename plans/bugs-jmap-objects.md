@@ -28,11 +28,15 @@ than appends; the last-event-ID buffer persists across events and a
 colonless `id` line clears it; and a block with no `data` field (a
 comment-only keepalive) dispatches nothing at all.
 
-What is left is cosmetic. `Init` silently ignores a leading space, where
-SSE treats it as the first character of a field name; and a field name is
-capped at `MAX_EVENT_SIZE` but a comment line is not, so a pathological
-server could stream an unbounded comment. Neither is reachable from a
-JMAP server behaving even approximately correctly.
+**RESOLVED (round 4 adjudication).** Both residual deviations are fixed:
+`Init` now treats a leading space as the first character of a field name
+(pinned in `a_leading_space_starts_a_field_name`), and a comment line is
+capped at `MAX_EVENT_SIZE` via a skip counter, erroring once and
+resynchronising like the other caps (pinned in
+`an_unbounded_comment_errors_once_and_resynchronises` and
+`bounded_comments_pass_and_reset_the_counter`). The fix rode on the S9
+ruling: with the module retained as supported API, "only matters if the
+path lives" stopped being a reason to leave them.
 
 ---
 
@@ -49,10 +53,20 @@ now spec-correct after the round-2 SSE fixes - is dead code from the
 for a path nothing reaches, and the Last-Event-ID resume semantics have
 no live reconnect path to serve.
 
-Decision needed: either wire EventSource in as the push fallback for
-servers without RFC 8887 WebSocket support (its plausible purpose), or
-remove the module. S8's residual parser deviations only matter under the
-"wire it" branch.
+**RESOLVED (round 4 adjudication): keep, as supported public API.**
+Wire-or-remove was a false dichotomy: `Client::event_source()` is public
+surface of a client library implementing eventSourceUrl, a mandatory RFC
+8620 session property, while the `sync/` WebSocket path rides an
+extension (RFC 8887) a server may not offer. "No caller in this
+workspace" is not dead code for a library crate. Removing it would strip
+the only push mechanism usable against non-8887 servers; wiring it into
+`sync/push.rs` is feature-sized work in territory this document excludes
+and `bugs-jmap-core-sync.md` just settled, so it is filed as its own
+item in `plans/jmap/DEFERRED.md` ("EventSource as the sync-layer push
+fallback") with the retention decision recorded in `reference/jmap.md`.
+Enforcement, per the ledger rule: S8's residual deviations were fixed
+and pinned in the same commit, so the retained path carries zero known
+spec deviations and its behavior is held by tests, not by a doc note.
 
 ---
 
