@@ -110,20 +110,13 @@ fn unknown_keys_are_treated_as_zero_operand() {
     assert!(has("UNKNOWNKEY MODSEQ 5", "MODSEQ"));
 }
 
-/// DOCUMENTS A BUG, NOT AN ENDORSEMENT.
-///
-/// `UID` is on the one-operand key list, so it consumes the `$` that
-/// follows it. `UID $` (RFC 5182 Section 2.1 - a saved-result reference
-/// used as the UID set) therefore does not trip the SEARCHRES gate, and
-/// the command goes out to a server that may not support `$`.
-///
-///
 #[test]
-fn saved_search_marker_missed_after_uid_key() {
-    assert!(
-        !has("UID $", "$"),
-        "current behavior: the SEARCHRES gate does not see `$` here"
-    );
+fn saved_search_marker_is_detected_after_uid_key() {
+    assert!(has("UID $", "$"));
+    assert!(matches!(
+        conn(vec![Capability::Imap4Rev1]).validate_search_criteria_capabilities("UID $"),
+        Err(Error::MissingCapability(capability)) if capability == "SEARCHRES"
+    ));
 }
 
 // ---------------------------------------------------------------------------

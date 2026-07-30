@@ -12,6 +12,10 @@ The driver model is load-bearing for cancellation safety, atomic stream upgrades
 
 No boxed-transport escape hatch. Supported transport is `tokio::net::TcpStream` plus optional `tokio_native_tls::TlsStream`.
 
+Before the nom parser runs, `WireReader` asks a framing pre-check whether the buffer can hold a whole response, because the parser is in `complete` mode and cannot distinguish "truncated" from "malformed". The pre-check has three answers, not two: complete, need more bytes, and *unreachable*. Unreachable is a literal count this process can never be handed the octets for  -  above the RFC 9051 `number64` ceiling, or above `usize` on a narrow target, or a chain of counts whose running offset leaves the addressable buffer. Those return `Error::Parse` (connection-fatal, `ProviderContractViolation`) rather than "need more bytes", which would park the read loop until the peer closed. The bound matches `codec::decode::literal`, so the pre-check never accepts a count the decoder would reject and never rejects one the decoder would take.
+
+Send-side literal scanning (`connection/literals.rs`) shares one marker parser with the read side and is length-aware in both directions: an already non-synchronizing (`{N+}`) body is skipped by its declared length, so marker-shaped bytes inside an APPEND payload are never mistaken for command syntax.
+
 ## Connection state machine
 
 The driver-owned command channel is the connection liveness signal.

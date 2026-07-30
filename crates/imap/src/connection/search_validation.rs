@@ -210,7 +210,15 @@ impl ImapConnection {
             | "UNKEYWORD" | "EMAILID" | "THREADID" | "LARGER" | "SMALLER" | "BEFORE" | "ON"
             | "SINCE" | "SENTBEFORE" | "SENTON" | "SENTSINCE" | "OLDER" | "YOUNGER"
             | "SAVEDBEFORE" | "SAVEDON" | "SAVEDSINCE" | "UID" => {
-                let _ = Self::search_criteria_consume_item(criteria, bytes, pos);
+                let operand = Self::search_criteria_consume_item(criteria, bytes, pos);
+                // RFC 5182 Section 2.1 permits `$` as UID's sequence-set
+                // operand. It needs the same SEARCHRES gate as bare `$`.
+                if upper == "UID"
+                    && atom == "$"
+                    && matches!(operand, Some(SearchCriteriaItem::Bare("$")))
+                {
+                    return true;
+                }
             }
 
             // HEADER takes two astring operands

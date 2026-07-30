@@ -911,6 +911,30 @@ async fn append_uses_a_non_synchronizing_literal_under_literal_plus() {
 }
 
 #[tokio::test]
+async fn literal_plus_append_does_not_wait_on_a_marker_shaped_body_line() {
+    let (conn, mut server) = crate::connection::test_support::driver_pair(&preauth_greeting(
+        "IMAP4rev1 LITERAL+ UIDPLUS",
+    ))
+    .await;
+
+    let script = tokio::spawn(async move {
+        let header = read_line(&mut server).await;
+        assert!(header.trim_end().ends_with("{11+}"));
+        let tag = tag_of(&header).to_owned();
+        let body = crate::connection::test_support::read_exact(&mut server, 11).await;
+        assert_eq!(&body[..], b"abc{3}\r\ndef");
+        assert_eq!(read_line(&mut server).await, "\r\n");
+        respond(&mut server, &format!("{tag} OK APPEND completed\r\n")).await;
+        server
+    });
+
+    conn.append("INBOX", &[], None, b"abc{3}\r\ndef", Duration::from_secs(5))
+        .await
+        .unwrap();
+    let _server = script.await.unwrap();
+}
+
+#[tokio::test]
 async fn append_rejects_oversized_messages_before_the_wire() {
     // RFC 7889: APPENDLIMIT is enforced client-side.
     let (conn, _server) =

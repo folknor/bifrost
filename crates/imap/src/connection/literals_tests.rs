@@ -44,27 +44,11 @@ fn boundary_zero_length_literal() {
     assert_eq!(find_literal_boundary(buf), Some((10, 0)));
 }
 
-/// DOCUMENTS A BUG, NOT AN ENDORSEMENT.
-///
-/// `find_literal_boundary` is not length-aware: it returns the first
-/// `{digits}\r\n` anywhere in the slice, including bytes that are part of
-/// a preceding literal's payload. `driver::wire_send::send_with_literal_sync`
-/// calls it on a whole pre-built APPEND (header + message octets), so on a
-/// LITERAL+ server - where the real APPEND marker is `{N+}` and therefore
-/// skipped - any line of the message body that ends in `{digits}` is
-/// mistaken for a synchronizing marker. The driver then stops mid-payload
-/// and waits for a `+` the server will never send.
-///
-///
 #[test]
-fn boundary_matches_inside_literal_payload() {
-    // `{10+}` is the real (non-synchronizing) marker; `{3}` is payload.
+fn boundary_skips_markers_inside_a_non_synchronizing_literal_payload() {
+    // `{10+}` is the real marker; `{3}` is opaque payload data.
     let buf = b"A1 APPEND INBOX {10+}\r\nabc{3}\r\ndef\r\n";
-    assert_eq!(
-        find_literal_boundary(buf),
-        Some((31, 3)),
-        "current behavior: the in-payload `{{3}}` is reported as a marker"
-    );
+    assert_eq!(find_literal_boundary(buf), None);
 }
 
 // ---------------------------------------------------------------------------
@@ -81,6 +65,12 @@ fn literal_plus_patches_every_classic_marker() {
 fn literal_plus_skips_markers_inside_payload() {
     // Length-aware: the `{9}\r\n` inside the 7-octet payload stays intact.
     let out = patch_literals_to_plus_with_binary(b"A1 X {7}\r\n{9}\r\nab\r\n", false);
+    assert_eq!(&out[..], b"A1 X {7+}\r\n{9}\r\nab\r\n");
+}
+
+#[test]
+fn literal_plus_skips_payload_of_an_already_non_synchronizing_literal() {
+    let out = patch_literals_to_plus_with_binary(b"A1 X {7+}\r\n{9}\r\nab\r\n", false);
     assert_eq!(&out[..], b"A1 X {7+}\r\n{9}\r\nab\r\n");
 }
 

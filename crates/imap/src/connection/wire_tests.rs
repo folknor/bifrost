@@ -14,6 +14,16 @@ use crate::types::response::UntaggedResponse;
 // positive hands truncated bytes to the nom parser.
 // ===========================================================================
 
+/// Shims for the two fallible framing helpers. The cases below all expect a
+/// decision rather than a framing error; the error lane has its own tests.
+fn buffer_may_contain_complete_response(buf: &[u8]) -> bool {
+    super::buffer_may_contain_complete_response(buf).expect("framing decision, not an error")
+}
+
+fn try_parse_literal_marker(buf: &[u8], crlf_pos: usize) -> Option<usize> {
+    super::try_parse_literal_marker(buf, crlf_pos).expect("framing decision, not an error")
+}
+
 #[test]
 fn framing_no_crlf_is_incomplete() {
     assert!(!buffer_may_contain_complete_response(b""));
@@ -115,24 +125,10 @@ fn framing_non_synchronizing_literal_marker_is_honored() {
     ));
 }
 
-/// DOCUMENTS A BUG, NOT AN ENDORSEMENT.
-///
-/// `try_parse_literal_marker` only requires that *some* `}` follow the
-/// last `{` before the CRLF - it never checks that the `}` abuts the
-/// CRLF. So a quoted string ending in `{digits}` (a mailbox name, a
-/// Subject, a regex quantifier in an ENVELOPE) is read as a literal
-/// declaration, `pos` jumps past the end of a response that is in fact
-/// complete, and the reader blocks waiting for octets that will never
-/// arrive until the next server write unblocks it.
-///
-///
 #[test]
-fn framing_quoted_brace_digits_misread_as_literal() {
+fn framing_quoted_brace_digits_are_not_a_literal_marker() {
     let buf = b"* LIST (\\HasNoChildren) \"/\" \"Order {12}\"\r\n";
-    assert!(
-        !buffer_may_contain_complete_response(buf),
-        "current behavior: a complete LIST response is reported incomplete"
-    );
+    assert!(buffer_may_contain_complete_response(buf));
 }
 
 #[test]
@@ -175,6 +171,47 @@ fn marker_uses_the_last_open_brace() {
     assert_eq!(try_parse_literal_marker(b"* X {a} {7}\r\n", 11), Some(7));
 }
 
+/// A count that cannot be delivered must be fatal, not "wait for more".
+/// Both values are out of range on every target width  -  `u64::MAX` and one
+/// past the RFC 9051 `number64` ceiling  -  so the assertion does not depend
+/// on the pointer size.
+#[test]
+fn framing_unreachable_literal_size_is_a_parse_error_not_a_stall() {
+    for marker in [
+        &b"* 1 FETCH (BODY[] {18446744073709551615}\r\n"[..],
+        &b"* 1 FETCH (BODY[] {9223372036854775808}\r\n"[..],
+    ] {
+        assert!(
+            matches!(
+                super::buffer_may_contain_complete_response(marker),
+                Err(Error::Parse(_))
+            ),
+            "expected a fatal framing error for {}",
+            String::from_utf8_lossy(marker)
+        );
+    }
+    // A digit run too long for `u64` is not a marker at all, so framing hands
+    // the line to the decoder, which rejects it. Fatal either way; what must
+    // never happen is `Ok(false)`.
+    assert!(matches!(
+        super::buffer_may_contain_complete_response(
+            b"* 1 FETCH (BODY[] {99999999999999999999}\r\n"
+        ),
+        Ok(true)
+    ));
+}
+
+/// The largest count this target can actually address stays on the ordinary
+/// "need more bytes" path: a real server may legitimately send a big literal.
+#[test]
+fn framing_addressable_literal_size_is_merely_incomplete() {
+    let biggest = u64::try_from(usize::MAX)
+        .unwrap_or(u64::MAX)
+        .min(i64::MAX as u64);
+    let marker = format!("* 1 FETCH (BODY[] {{{biggest}}}\r\n");
+    assert!(!buffer_may_contain_complete_response(marker.as_bytes()));
+}
+
 // ===========================================================================
 // WireReader over an in-memory duplex
 // ===========================================================================
@@ -204,6 +241,26 @@ async fn read_greeting_parses_ok_greeting() {
         other => panic!("expected greeting, got {other:?}"),
     }
     assert!(reader.buffer_is_empty());
+}
+
+/// The whole point of making the framing helper fallible: `read_one` must
+/// return, not park in its read loop, when the declared literal can never
+/// arrive.
+#[tokio::test]
+async fn read_one_fails_fast_on_an_undeliverable_literal_count() {
+    let (mut reader, mut server) = memory_reader();
+    server
+        .write_all(b"* 1 FETCH (BODY[] {9223372036854775808}\r\n")
+        .await
+        .unwrap();
+    server.flush().await.unwrap();
+
+    let err = tokio::time::timeout(std::time::Duration::from_secs(5), reader.read_one(false))
+        .await
+        .expect("read_one must not wait for octets that cannot exist")
+        .expect_err("an unreachable literal count is fatal");
+    assert!(matches!(err, Error::Parse(_)), "got {err:?}");
+    let _server = server;
 }
 
 #[tokio::test]

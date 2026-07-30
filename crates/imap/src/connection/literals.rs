@@ -19,6 +19,62 @@ pub(super) enum AppendLiteralKind {
     Utf8Literal8,
 }
 
+/// Parse a literal marker at `pos`, returning its data offset, byte count, and
+/// whether it is synchronizing.
+///
+/// The count is returned as `u64`, not `usize`: RFC 9051 Section 9 declares it
+/// as `number64`, so a marker can name a value that no `usize` on a 32-bit
+/// target can hold. Narrowing here would make the parse result depend on the
+/// pointer width; callers decide what an unrepresentable count means for them.
+///
+/// Both classic and LITERAL+ markers use the same counted framing. Callers
+/// that scan a complete command must skip an already non-synchronizing body,
+/// too, or marker-like data in that body becomes command syntax.
+pub(super) fn literal_marker_at(buf: &[u8], pos: usize) -> Option<(usize, u64, bool)> {
+    if buf.get(pos) != Some(&b'{') {
+        return None;
+    }
+
+    let start = pos + 1;
+    let mut end = start;
+    while end < buf.len() && buf[end].is_ascii_digit() {
+        end += 1;
+    }
+    if end == start {
+        return None;
+    }
+
+    let synchronizing = match buf.get(end) {
+        Some(b'}') => true,
+        Some(b'+') => {
+            end += 1;
+            false
+        }
+        _ => return None,
+    };
+    if buf.get(end) != Some(&b'}')
+        || buf.get(end + 1) != Some(&b'\r')
+        || buf.get(end + 2) != Some(&b'\n')
+    {
+        return None;
+    }
+
+    let digit_end = if synchronizing { end } else { end - 1 };
+    let size = std::str::from_utf8(&buf[start..digit_end])
+        .ok()?
+        .parse::<u64>()
+        .ok()?;
+    Some((end + 3, size, synchronizing))
+}
+
+/// [`literal_marker_at`] for callers that scan a buffer we built ourselves, so
+/// a count that no `usize` can hold cannot be a marker they own: it is treated
+/// as ordinary text, exactly like a malformed marker.
+fn literal_marker_at_usize(buf: &[u8], pos: usize) -> Option<(usize, usize, bool)> {
+    let (data_start, size, synchronizing) = literal_marker_at(buf, pos)?;
+    Some((data_start, usize::try_from(size).ok()?, synchronizing))
+}
+
 /// Find the next synchronizing literal boundary (`{digits}\r\n`) in `buf`.
 ///
 /// Returns `Some((offset, size))` where `offset` is past the `\r\n` (i.e., the
@@ -29,35 +85,19 @@ pub(super) enum AppendLiteralKind {
 pub(super) fn find_literal_boundary(buf: &[u8]) -> Option<(usize, usize)> {
     let mut i = 0;
     while i < buf.len() {
-        if buf[i] == b'{' {
-            let start = i + 1;
-            // Scan for digits
-            let mut j = start;
-            while j < buf.len() && buf[j].is_ascii_digit() {
-                j += 1;
+        if let Some((data_start, size, synchronizing)) = literal_marker_at_usize(buf, i) {
+            if synchronizing {
+                return Some((data_start, size));
             }
-            // Must have at least one digit, then `}\r\n`
-            if j > start
-                && j + 2 < buf.len()
-                && buf[j] == b'}'
-                && buf[j + 1] == b'\r'
-                && buf[j + 2] == b'\n'
-            {
-                // Parse the literal size so callers can skip the body.
-                // If the digit sequence is not valid UTF-8 or overflows usize,
-                // skip this candidate and keep scanning  -  returning a 0-byte
-                // literal would desynchronize the caller (RFC 3501 Section 4.3).
-                let Ok(size_str) = std::str::from_utf8(&buf[start..j]) else {
-                    i += 1;
-                    continue;
-                };
-                let Ok(size) = size_str.parse::<usize>() else {
-                    i += 1;
-                    continue;
-                };
-                // This is a synchronizing literal (no `+` before `}`)
-                return Some((j + 3, size));
+
+            // LITERAL+ has no continuation, but its counted payload is still
+            // opaque command data. Do not inspect marker-like bytes in it.
+            let data_end = data_start.checked_add(size)?;
+            if data_end > buf.len() {
+                return None;
             }
+            i = data_end;
+            continue;
         }
         i += 1;
     }
@@ -77,56 +117,28 @@ pub(super) fn patch_literals_to_plus_with_binary(buf: &[u8], allow_literal8: boo
     let mut result = BytesMut::with_capacity(buf.len() + 16);
     let mut i = 0;
     while i < buf.len() {
-        if buf[i] == b'{' {
-            let start = i + 1;
-            let mut j = start;
-            while j < buf.len() && buf[j].is_ascii_digit() {
-                j += 1;
-            }
-            if j > start
-                && j + 2 < buf.len()
-                && buf[j] == b'}'
-                && buf[j + 1] == b'\r'
-                && buf[j + 2] == b'\n'
-            {
-                // Parse the literal size to skip the body.
-                // If the digit sequence overflows usize, treat the `{...}` as
-                // plain text  -  do not patch it (RFC 3501 Section 4.3).
-                let Ok(size_str) = std::str::from_utf8(&buf[start..j]) else {
-                    result.extend_from_slice(&buf[i..=i]);
-                    i += 1;
-                    continue;
-                };
-                let Ok(size) = size_str.parse::<usize>() else {
-                    result.extend_from_slice(&buf[i..=i]);
-                    i += 1;
-                    continue;
-                };
-
+        if let Some((data_start, size, synchronizing)) = literal_marker_at_usize(buf, i) {
+            if synchronizing {
                 // RFC 7888 Section 6 / RFC 3516: literal8 markers (`~{N}\r\n`)
                 // may only use the non-synchronizing form when BINARY is also
                 // advertised alongside LITERAL+.
                 let is_literal8 = i > 0 && buf[i - 1] == b'~';
-
-                // Copy `{digits` then insert `+}\r\n` for non-synchronizing
-                // literals that the server advertised support for.
-                result.extend_from_slice(&buf[i..j]);
+                result.extend_from_slice(&buf[i..data_start - 3]);
                 if !is_literal8 || allow_literal8 {
                     result.extend_from_slice(b"+}\r\n");
                 } else {
                     result.extend_from_slice(b"}\r\n");
                 }
-                let body_start = j + 3;
-                // Copy the literal body verbatim (RFC 3501 Section 4.3).
-                // Use checked arithmetic to prevent overflow when `size`
-                // is near `usize::MAX` (e.g., from a crafted command).
-                let body_end = body_start
-                    .checked_add(size)
-                    .map_or(buf.len(), |end| end.min(buf.len()));
-                result.extend_from_slice(&buf[body_start..body_end]);
-                i = body_end;
-                continue;
+            } else {
+                result.extend_from_slice(&buf[i..data_start]);
             }
+
+            let body_end = data_start
+                .checked_add(size)
+                .map_or(buf.len(), |end| end.min(buf.len()));
+            result.extend_from_slice(&buf[data_start..body_end]);
+            i = body_end;
+            continue;
         }
         result.extend_from_slice(&buf[i..=i]);
         i += 1;
@@ -157,39 +169,13 @@ pub(super) fn patch_small_literals_to_plus_with_binary(
     let mut result = BytesMut::with_capacity(buf.len() + 16);
     let mut i = 0;
     while i < buf.len() {
-        if buf[i] == b'{' {
-            let start = i + 1;
-            let mut j = start;
-            while j < buf.len() && buf[j].is_ascii_digit() {
-                j += 1;
-            }
-            if j > start
-                && j + 2 < buf.len()
-                && buf[j] == b'}'
-                && buf[j + 1] == b'\r'
-                && buf[j + 2] == b'\n'
-            {
-                // Parse the literal size to decide whether to patch and to skip the body.
-                // If the digit sequence is not valid UTF-8 or overflows usize,
-                // treat the `{` as plain text  -  do not patch it (RFC 3501 Section 4.3).
-                let Ok(size_str) = std::str::from_utf8(&buf[start..j]) else {
-                    result.extend_from_slice(&buf[i..=i]);
-                    i += 1;
-                    continue;
-                };
-                let Ok(size) = size_str.parse::<usize>() else {
-                    result.extend_from_slice(&buf[i..=i]);
-                    i += 1;
-                    continue;
-                };
-
+        if let Some((data_start, size, synchronizing)) = literal_marker_at_usize(buf, i) {
+            if synchronizing {
                 // RFC 7888 Section 6 / RFC 3516: literal8 markers (`~{N}\r\n`)
                 // may only use the non-synchronizing form when BINARY is also
                 // advertised alongside the literal extension.
                 let is_literal8 = i > 0 && buf[i - 1] == b'~';
-
-                // Copy `{digits`
-                result.extend_from_slice(&buf[i..j]);
+                result.extend_from_slice(&buf[i..data_start - 3]);
                 if size <= LITERAL_MINUS_MAX && (!is_literal8 || allow_literal8) {
                     // RFC 7888 Section 5: small literal, upgrade to non-synchronizing.
                     result.extend_from_slice(b"+}\r\n");
@@ -197,17 +183,16 @@ pub(super) fn patch_small_literals_to_plus_with_binary(
                     // Large literal or literal8: leave as synchronizing.
                     result.extend_from_slice(b"}\r\n");
                 }
-                let body_start = j + 3;
-                // Copy the literal body verbatim (RFC 3501 Section 4.3).
-                // Use checked arithmetic to prevent overflow when `size`
-                // is near `usize::MAX` (e.g., from a crafted command).
-                let body_end = body_start
-                    .checked_add(size)
-                    .map_or(buf.len(), |end| end.min(buf.len()));
-                result.extend_from_slice(&buf[body_start..body_end]);
-                i = body_end;
-                continue;
+            } else {
+                result.extend_from_slice(&buf[i..data_start]);
             }
+
+            let body_end = data_start
+                .checked_add(size)
+                .map_or(buf.len(), |end| end.min(buf.len()));
+            result.extend_from_slice(&buf[data_start..body_end]);
+            i = body_end;
+            continue;
         }
         result.extend_from_slice(&buf[i..=i]);
         i += 1;

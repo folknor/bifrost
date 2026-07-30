@@ -181,7 +181,7 @@ impl WireReader {
         if self.buf.is_empty() {
             return Ok(Option::None);
         }
-        if !buffer_may_contain_complete_response(&self.buf) {
+        if !buffer_may_contain_complete_response(&self.buf)? {
             return Ok(Option::None);
         }
         match parse_greeting(&self.buf) {
@@ -223,7 +223,7 @@ impl WireReader {
         //
         // Every IMAP response ends with \r\n. If the buffer doesn't contain
         // \r\n at all, the first response is definitely incomplete.
-        if !buffer_may_contain_complete_response(&self.buf) {
+        if !buffer_may_contain_complete_response(&self.buf)? {
             return Ok(Option::None);
         }
 
@@ -387,10 +387,18 @@ impl ByteBucket {
 /// literal markers `{N}\r\n`, we verify that N bytes of literal data
 /// follow each one, iterating through all literals in the response
 /// (e.g., multi-body FETCH responses).
-pub(super) fn buffer_may_contain_complete_response(buf: &[u8]) -> bool {
+///
+/// `Ok(false)` means "not yet"  -  the caller must read more bytes.
+/// `Err(Error::Parse)` means "never": the server declared a literal whose
+/// octets cannot be delivered to this process, so no amount of reading will
+/// complete the response. Returning `Ok(false)` there would park the read
+/// loop forever, which is why this is fallible at all. The threshold matches
+/// `codec::decode::literal`, so a buffer this accepts is one the decoder can
+/// still reject on its own terms, never the reverse.
+pub(super) fn buffer_may_contain_complete_response(buf: &[u8]) -> Result<bool, Error> {
     // Fast path: no \r\n means definitely incomplete.
     let Some(first_crlf) = buf.windows(2).position(|w| w == b"\r\n") else {
-        return false;
+        return Ok(false);
     };
 
     // Check for a literal marker `{digits[+]}\r\n` ending at first_crlf.
@@ -458,57 +466,81 @@ pub(super) fn buffer_may_contain_complete_response(buf: &[u8]) -> bool {
 
     if first_crlf >= 2
         && may_contain_literal
-        && let Some(literal_len) = try_parse_literal_marker(buf, first_crlf)
+        && let Some(literal_len) = try_parse_literal_marker(buf, first_crlf)?
     {
         // Skip past the first literal body and iteratively check
         // for additional literals (e.g., multi-body FETCH).
-        let mut pos = first_crlf + 2 + literal_len;
+        let mut pos = advance_past_literal(first_crlf, 2, literal_len)?;
         loop {
             if pos > buf.len() {
-                return false;
+                return Ok(false);
             }
             // Find the next \r\n after the current literal body.
             let remaining = &buf[pos..];
             let Some(next_crlf) = remaining.windows(2).position(|w| w == b"\r\n") else {
-                return false;
+                return Ok(false);
             };
             // Check if there's another literal marker at this CRLF.
-            if let Some(next_literal_len) = try_parse_literal_marker(remaining, next_crlf) {
+            if let Some(next_literal_len) = try_parse_literal_marker(remaining, next_crlf)? {
                 // Another literal  -  skip past it and continue.
-                pos += next_crlf + 2 + next_literal_len;
+                pos = advance_past_literal(pos, next_crlf + 2, next_literal_len)?;
                 continue;
             }
             // No more literals  -  this CRLF terminates the response.
-            return true;
+            return Ok(true);
         }
     }
 
     // No literal  -  the first \r\n likely terminates a complete response.
-    true
+    Ok(true)
+}
+
+/// Offset of the byte after a literal body that starts `marker` bytes past
+/// `base`.
+///
+/// Each individual count is already bounded by `try_parse_literal_marker`, but
+/// a response can chain many literals, and the running total is what has to
+/// fit in the buffer. A total that no `usize` can address is unreachable in
+/// the same way an oversized single count is, so it fails the same way rather
+/// than stalling the read loop.
+fn advance_past_literal(base: usize, marker: usize, literal_len: usize) -> Result<usize, Error> {
+    base.checked_add(marker)
+        .and_then(|offset| offset.checked_add(literal_len))
+        .ok_or_else(|| {
+            Error::Parse("literal framing offsets exceed the addressable buffer".to_owned())
+        })
 }
 
 /// Try to parse a literal marker `{digits[+]}` ending just before `crlf_pos`
 /// in `buf`. Returns the literal byte count if a valid marker is found.
-fn try_parse_literal_marker(buf: &[u8], crlf_pos: usize) -> Option<usize> {
+///
+/// A well-formed marker whose count is out of range is an error, not a
+/// non-marker: it is recognized framing that names octets we can never
+/// receive (RFC 9051 Section 9 caps `number64` at `i64::MAX`, and a 32-bit
+/// target caps it lower still). Reporting `None` would let the caller declare
+/// the response complete and hand truncated bytes to the parser; reporting
+/// "incomplete" would wait for those octets forever.
+fn try_parse_literal_marker(buf: &[u8], crlf_pos: usize) -> Result<Option<usize>, Error> {
     let before_crlf = &buf[..crlf_pos];
-    let brace_pos = before_crlf.iter().rposition(|&b| b == b'{')?;
-    let close_offset = buf[brace_pos + 1..crlf_pos]
-        .iter()
-        .position(|&b| b == b'}')?;
-    let between = &buf[brace_pos + 1..brace_pos + 1 + close_offset];
-    // Strip optional trailing '+' for LITERAL+ (RFC 7888) or
-    // LITERAL- (RFC 7888 Section 5).
-    let digits = if between.last() == Some(&b'+') {
-        &between[..between.len() - 1]
-    } else {
-        between
+    let Some(brace_pos) = before_crlf.iter().rposition(|&b| b == b'{') else {
+        return Ok(None);
     };
-    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
-        return None;
+    let Some((data_start, size, _)) = super::literals::literal_marker_at(buf, brace_pos) else {
+        return Ok(None);
+    };
+    if data_start != crlf_pos + 2 {
+        return Ok(None);
     }
-    std::str::from_utf8(digits)
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
+    if size > i64::MAX as u64 {
+        return Err(Error::Parse(format!(
+            "literal count {size} exceeds the RFC 9051 number64 range"
+        )));
+    }
+    usize::try_from(size).map(Some).map_err(|_| {
+        Error::Parse(format!(
+            "literal count {size} exceeds this platform's addressable range"
+        ))
+    })
 }
 
 #[cfg(test)]

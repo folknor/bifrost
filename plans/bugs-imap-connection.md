@@ -55,133 +55,6 @@ tests in `tests.rs`.
 
 Ordered by severity.
 
-## B1 - `search_criteria_contains_atom` spins forever on an unbalanced `)`
-
-**Where:** `connection/search_validation.rs`, `search_criteria_contains_atom`
-(the top-level `while i < bytes.len()` loop) plus
-`search_criteria_contains_atom_in_key` / `search_criteria_consume_item`.
-
-**Path to failure.** `search_criteria_consume_item` treats `(` and `)` as
-token delimiters, so when the scan cursor sits on a top-level `)` it
-consumes nothing and returns `None`. `search_criteria_contains_atom_in_key`
-then returns `false` **without advancing `pos`**, and
-`search_criteria_skip_whitespace` does not advance either (`)` is not
-whitespace). The outer `while i < bytes.len()` re-enters with the same `i`
-forever.
-
-Concrete input: `validate_search_criteria_capabilities(")")`. Also
-`"OR (SEEN) (FLAGGED))"`, `"SEEN)"`, and any criteria with a trailing or
-stray close-paren at depth 0.
-
-**Reachability.** This is consumer-controlled, unvalidated input, not just
-a hand-written criteria string. `crates/imap/src/account/pim.rs`
-`search_plan()` appends `SearchRequest::provider_query` verbatim
-(`plan.criteria.push_str(raw.trim())`) with no syntax check, and
-`search_messages` hands the result to `uid_search`, which calls
-`validate_search_criteria_capabilities` first thing. A provider query of
-`")"` wedges the calling task in a tight, non-yielding CPU loop. It never
-awaits, so a `tokio::time::timeout` around the call does not help and, on
-a current-thread runtime, the whole runtime is starved.
-
-**What should happen instead:** unbalanced criteria should terminate the
-scan (returning `false`, since the gate is advisory and the server is the
-real syntax authority) or be rejected as `Error::Protocol`.
-
-**Proposed fix.** Make the outer loop guarantee progress:
-
-```rust
-while i < bytes.len() {
-    let before = i;
-    if Self::search_criteria_contains_atom_in_key(criteria, bytes, &mut i, atom) {
-        return true;
-    }
-    Self::search_criteria_skip_whitespace(bytes, &mut i);
-    if i == before {
-        // Unbalanced ')' (or any byte the item scanner refuses to
-        // consume at depth 0). Skip it; the server validates syntax.
-        i += 1;
-    }
-}
-```
-
-A belt-and-braces variant additionally makes the `(`-group loop in
-`search_criteria_contains_atom_in_key` bail on a non-advancing recursion.
-
-**No test landed** - a test would hang the suite. The scanner tests that
-did land (`search_validation_tests.rs`) cover the terminating cases only,
-including `"(SEEN"` (unclosed *open* paren, which does terminate).
-
----
-
-## B2 - `find_literal_boundary` is not length-aware, so a LITERAL+ APPEND whose body contains `{digits}` at end-of-line deadlocks the driver
-
-**Where:** `connection/literals.rs::find_literal_boundary`, consumed by
-`connection/driver/wire_send.rs::send_with_literal_sync`, which is the
-send path for *every* command and for `run_prebuilt_command`
-(APPEND / MULTIAPPEND).
-
-**Path to failure.**
-
-1. `ImapConnection::append` builds the whole command - header **plus the
-   raw message octets** - into one `BytesMut` and submits it as a
-   pre-built command.
-2. On a LITERAL+ server `effective_non_sync` is true, so the APPEND
-   marker is written as `{N+}`.
-3. `send_with_literal_sync` calls `find_literal_boundary(&buf[pos..])`,
-   which scans for the *first* `{digits}\r\n` in the slice. `{N+}` does
-   not match (the `+` breaks the `}` check), so the scan runs on into the
-   message body.
-4. Any body line ending in `{<digits>}` matches: `find_literal_boundary`
-   requires `{`, one or more ASCII digits, `}`, CRLF - it does **not**
-   require the `{` to start the line.
-5. The driver writes the header plus the leading part of the message,
-   then calls `wait_for_continuation` and blocks on `read_one`. The
-   server is counting down N literal octets and will never send `+`.
-
-**Concrete input.** APPEND (draft save, Sent copy after `send_message`,
-`draft_create`) of a message whose body contains a line ending in a brace
-quantifier or a template placeholder, e.g.
-
-```
-Try the regex /^\d{3}$/
-```
-or
-```
-Hello {0}
-```
-
-Both end a line with `}` immediately preceded by digits and `{`.
-
-**Result.** The caller's `tokio::time::timeout` fires with
-`Error::Timeout`, but the **driver task stays blocked in `read_one`
-forever**: it has no timeout of its own. The pooled connection is wedged
-and the socket half-written, so the connection is unusable but never
-observed as broken.
-
-A second, sharper variant: if the false marker's declared size exceeds
-the bytes remaining in `buf`, `send_with_literal_sync` panics on
-`&buf[send_end..send_end + literal_size]` (slice index out of range).
-That surfaces as `Error::DriverPanicked`, which is at least visible.
-
-**What should happen instead.** The send path must skip literal payloads
-the same way `patch_literals_to_plus_with_binary` already does.
-
-**Proposed fix.** Teach the boundary scanner about non-synchronizing
-markers so it can skip their payloads, and bound the body slice:
-
-- Change `find_literal_boundary` to also recognize `{digits+}\r\n` and
-  return a third value ("non-synchronizing, payload length N") so
-  `send_with_literal_sync` can advance `pos` past that payload instead of
-  scanning into it. Symmetrically handle `~{N}` / `~{N+}`.
-- Clamp the second write: `&buf[send_end..(send_end + literal_size).min(buf.len())]`,
-  and treat a marker whose payload runs past the buffer as a bug
-  (`Error::Internal`) rather than a panic.
-
-**Test landed:** `literals_tests.rs::boundary_matches_inside_literal_payload`
-pins the current (wrong) return value and points here.
-
----
-
 ## B3 - `run_one_command` swallows `* BYE`: the reason is lost and a non-closing server wedges the driver
 
 **Where:** `connection/driver/mod.rs:589` (`run_one_command`) and
@@ -241,165 +114,6 @@ points here.
 
 ---
 
-## B4 - `buffer_may_contain_complete_response` mistakes `{digits}` in a quoted string for a literal declaration
-
-**Where:** `connection/wire.rs::try_parse_literal_marker`.
-
-```rust
-let brace_pos = before_crlf.iter().rposition(|&b| b == b'{')?;
-let close_offset = buf[brace_pos + 1..crlf_pos].iter().position(|&b| b == b'}')?;
-```
-
-It never checks that the `}` actually *abuts* the CRLF. Any `{digits}`
-before the CRLF, at any position, is read as a literal declaration.
-
-**Path to failure.** Server sends a complete, self-contained response
-whose last brace group before the CRLF is `{digits}`:
-
-```
-* LIST (\HasNoChildren) "/" "Order {12}"\r\n
-```
-
-`try_parse_literal_marker` returns `Some(12)`; the caller sets
-`pos = first_crlf + 2 + 12`, which is past the end of the buffer, and
-`buffer_may_contain_complete_response` returns `false`.
-`WireReader::read_one` therefore does **not** parse the response it
-already holds and blocks in `read_buf` waiting for octets that are not
-coming.
-
-**Result.** The command stalls until the next server write unblocks it,
-or until the caller's command timeout if nothing else is in flight (IDLE,
-a final untagged response before a delayed tagged line, a
-`NOTIFY`-delivered LIST). Realistic triggers: a mailbox name or a FETCH
-ENVELOPE `Subject` ending in a brace quantifier or a template
-placeholder - the same family as B2.
-
-**What should happen instead:** the marker must terminate the line.
-
-**Proposed fix.** Add the abutment check:
-
-```rust
-let close_pos = brace_pos + 1 + close_offset;
-if close_pos + 1 != crlf_pos {
-    return None; // `}` does not abut the CRLF, so this is not a marker
-}
-```
-
-**Test landed:**
-`wire_tests.rs::framing_quoted_brace_digits_misread_as_literal` pins the
-false `false`, plus
-`framing_brace_digits_not_before_crlf_still_completes_when_more_follows`
-showing why the defect usually only bites on the last buffered response.
-
----
-
-## B5 - `buffer_may_contain_complete_response` overflows `usize` on a hostile literal size
-
-**Where:** `connection/wire.rs::buffer_may_contain_complete_response`:
-
-```rust
-let mut pos = first_crlf + 2 + literal_len;
-...
-pos += next_crlf + 2 + next_literal_len;
-```
-
-`try_parse_literal_marker` returns whatever `str::parse::<usize>()`
-accepts, so `literal_len` can be `usize::MAX`.
-
-**Path to failure.** A malicious or broken server sends
-
-```
-* 1 FETCH (BODY[] {18446744073709551615}\r\n
-```
-
-`first_crlf + 2 + usize::MAX` overflows. The workspace has no
-`overflow-checks` override in the root `Cargo.toml`, so:
-
-- **debug / `brokkr check` test builds:** panic inside the driver task ->
-  `Error::DriverPanicked`. Remotely triggerable panic.
-- **release:** silent wraparound to a small `pos`, after which the scan
-  reads from an arbitrary offset and returns a meaningless verdict.
-
-**What should happen instead:** an unrepresentable literal length means
-"cannot be complete" -> `false`.
-
-**Proposed fix.** Use checked arithmetic, mirroring what `literals.rs`
-already does (`body_start.checked_add(size)`):
-
-```rust
-let Some(mut pos) = first_crlf.checked_add(2).and_then(|p| p.checked_add(literal_len))
-else { return false };
-...
-let Some(next) = pos.checked_add(next_crlf).and_then(|p| p.checked_add(2))
-    .and_then(|p| p.checked_add(next_literal_len)) else { return false };
-pos = next;
-```
-
-Optionally also cap `try_parse_literal_marker` at a sane ceiling
-(the crate already caps UID-range expansion at 1e6).
-
-**No test landed** - the current behavior is profile-dependent (panic vs.
-wrap), so there is nothing stable to pin. Once fixed, the natural test is
-`assert!(!buffer_may_contain_complete_response(b"* 1 FETCH (BODY[] {18446744073709551615}\r\n"))`.
-
----
-
-## B6 - `list_status_return_option_items` eats the first octet of the STATUS item list, silently disabling item validation
-
-**Where:** `connection/helpers.rs::list_status_return_option_items`.
-
-```rust
-Some(if let Some(suffix) = trimmed[6..].strip_prefix(" (") {
-    if suffix.ends_with(')') && suffix.len() >= 2 {
-        Ok(&suffix[1..suffix.len() - 1])
-```
-
-`strip_prefix(" (")` has already removed the opening paren, and then the
-body is sliced `[1..len-1]` as if it had not been. The leading `(` is
-removed twice.
-
-**Path to failure.** `list_extended(reference, patterns, &[], &["STATUS (MESSAGES UNSEEN)"], t)`.
-
-- `list_status_return_option_items` returns `"ESSAGES UNSEEN"`.
-- `validate_requested_status_items("ESSAGES UNSEEN")` tokenizes to
-  `["ESSAGES", "UNSEEN"]`. `"ESSAGES"` matches no gated item name, so it
-  falls into the catch-all `_ => {}` arm.
-
-**Result.** Every gate on the *first* STATUS item in a LIST-STATUS return
-option is dead:
-
-- `STATUS (RECENT)` is accepted on an IMAP4rev2 connection, where RECENT
-  was removed (RFC 9051 Section 6.3.11).
-- `STATUS (HIGHESTMODSEQ ...)` is accepted without CONDSTORE.
-- `STATUS (DELETED-STORAGE ...)` is accepted without `QUOTA=RES-STORAGE`.
-- `STATUS (SIZE)` is accepted on rev1 without `STATUS=SIZE`.
-- Single-item options with a one-character item degenerate to `""` and
-  fail with the "must contain at least one data item" error instead.
-
-The malformed items still go to the server verbatim (the raw option
-string, not the parsed one, is what gets encoded), so this is a lost
-client-side guard rather than a corrupted wire command. Still, the whole
-point of the gate is to fail before the round trip.
-
-**Proposed fix.** Drop the redundant slice:
-
-```rust
-if let Some(suffix) = trimmed[6..].strip_prefix(" (") {
-    match suffix.strip_suffix(')') {
-        Some(items) => Ok(items),
-        None => Err(Error::Protocol(...)),
-    }
-}
-```
-
-which also fixes the `len() >= 2` special case (`STATUS (X)` currently
-errors).
-
-**Test landed:** `helpers_tests.rs::list_status_option_drops_the_first_item_octet`
-pins `"ESSAGES UNSEEN"` and points here.
-
----
-
 ## B7 - The state snapshot is published *after* the command result, so `session_state()` / `capabilities()` can be stale right after a command returns
 
 **Where:** `connection/driver/mod.rs`, driver loop:
@@ -446,33 +160,6 @@ skipping the publish.
 
 **No test landed** - reproducing this needs a multi-thread runtime and a
 timing race, which is not a hermetic test.
-
----
-
-## B8 - `UID $` slips past the SEARCHRES gate
-
-**Where:** `connection/search_validation.rs::search_criteria_contains_atom_in_key`.
-`"UID"` is on the one-operand key list, so the scanner consumes the token
-after it as an operand and never inspects it as a key.
-
-**Path to failure.** `uid_search("UID $")` (RFC 5182 Section 2.1: `$` as a
-sequence-set operand). `search_criteria_contains_atom(criteria, "$")`
-returns `false`, `require_searchres()` is never called, and the command
-goes out to a server that may not implement SEARCHRES - producing a
-server `BAD` instead of a local `MissingCapability`.
-
-**Severity:** low. The failure is a worse error message, not data loss,
-and the parallel `sequence_set.as_str().contains('$')` checks in
-`uid_ops.rs` / `seq_ops.rs` catch the typed-`SequenceSet` paths. Only the
-free-form criteria path is affected.
-
-**Proposed fix.** Special-case the `$` atom: when `atom == "$"`, also
-match it in operand position for the sequence-set-shaped keys (`UID`, and
-the bare sequence-set key which already works). Or, more simply, treat
-`$` with a whole-string token scan since `$` cannot legally appear inside
-an unquoted operand for any other purpose.
-
-**Test landed:** `search_validation_tests.rs::saved_search_marker_missed_after_uid_key`.
 
 ---
 
@@ -687,37 +374,47 @@ Two doubles, both in the new `connection/test_support.rs`:
 | file | wired into | what it covers |
 |---|---|---|
 | `test_support.rs` | `mod.rs` (`#[cfg(test)] mod test_support;`) | the two doubles above |
-| `literals_tests.rs` | `literals.rs` | `find_literal_boundary`, both `patch_*` functions: LITERAL+ vs LITERAL-, the 4096 boundary, literal8-needs-BINARY gating, payload skipping, oversized declared bodies, non-marker braces |
-| `wire_tests.rs` | `wire.rs` | `buffer_may_contain_complete_response` (status-text braces, tagged-status forms with and without resp-text, continuations, single and multi literal FETCH, `{N+}`), `try_parse_literal_marker`, plus `WireReader` duplex transcripts: greeting parse, split-response reassembly, split-literal reassembly, two responses from one segment, EOF -> `Closed`, hard parse error, `write_all` reaching the peer, `take_buffer` handover, keepalive/peer-cert unavailability on memory streams |
+| `literals_tests.rs` | `literals.rs` | `find_literal_boundary`, both `patch_*` functions: LITERAL+ vs LITERAL-, the 4096 boundary, literal8-needs-BINARY gating, payload skipping (including inside an already non-synchronizing body), oversized declared bodies, non-marker braces |
+| `wire_tests.rs` | `wire.rs` | `buffer_may_contain_complete_response` (status-text braces, tagged-status forms with and without resp-text, continuations, single and multi literal FETCH, `{N+}`, quoted `{digits}` that is not a marker, and the fatal lane: an undeliverable literal count is `Error::Parse`, not an indefinite wait, on any target width), `try_parse_literal_marker`, plus `WireReader` duplex transcripts: greeting parse, split-response reassembly, split-literal reassembly, two responses from one segment, EOF -> `Closed`, hard parse error, `write_all` reaching the peer, `take_buffer` handover, keepalive/peer-cert unavailability on memory streams |
 | `helpers_tests.rs` | `helpers.rs` | `inbox_eq`, `status_item_tokens` (bare/parenthesized/empty/unbalanced/nested), `list_status_return_option_items`, `quota_resource_name` + `has_quota_resource`, `search_return_requests_save`, `require_condstore` / `require_searchres` / `require_state` / `check_utf8_only_enforced`, dual-mode rev2 ENABLE gating, the full STATUS and FETCH item validation matrices, `literal_mode` / `supports_non_sync_literal` / `supports_non_sync_literal8` / `append_literal_kind` / `append_literal_is_non_sync`, `validate_list_extended_request` |
 | `search_validation_tests.rs` | `search_validation.rs` | `search_criteria_contains_atom`: bare keys, nested groups, `NOT` / `OR` recursion, the `CHARSET` prefix, one- and two-operand key skipping, MODSEQ's variable operand forms, quoted and literal operand skipping, unknown-key zero-operand handling, non-ASCII byte-boundary safety, termination on unterminated quotes/literals and unclosed groups; then the five capability gates `validate_search_criteria_capabilities` drives |
 | `extensions_tests.rs` | `extensions.rs` | `compute_notify_flags` across selected / selected-delayed / non-selected filters, `MailboxName`, metadata events, empty event lists, `Other(_)` fan-out, multi-group union; plus every extension command's capability gate and ENABLE's authenticated-state-only rule |
 | `mailbox_tests.rs` | `mailbox.rs` | `validate_qresync_params` (ENABLE requirement, seq-match-data ABNF rule), SELECT CONDSTORE gating, state gates for SELECT/CLOSE/UNSELECT, UNSELECT capability-or-rev2, LSUB rejected on rev2, CREATE-SPECIAL-USE capability and use-attr validation, LIST-STATUS needing both capabilities on rev1, STATUS item pre-validation, the single-pattern LIST-EXTENDED fallback, CRLF injection rejection across six mailbox commands |
 | `uid_ops_tests.rs` | `uid_ops.rs` | `filter_store_flags`, UID EXPUNGE's UIDPLUS-or-rev2 gate, UID MOVE's refusal without MOVE or UIDPLUS, sequence MOVE's stricter gate, VANISHED needing QRESYNC *enabled*, the `$` SEARCHRES gate across fetch/copy/store/expunge, CHANGEDSINCE/UNCHANGEDSINCE needing CONDSTORE, Selected-state gates, ESEARCH capability, the SAVE return option's SEARCHRES gate, SEARCH RETURN (SAVE), SORT and THREAD capability gating including the algorithm upper-casing, and SORT inheriting the SEARCH criteria gates |
 | `config_tests.rs` | `config.rs` | `ImapConfig` constructors (ports and modes), defaults, builder overrides, `TlsMode` predicates, `Debug` output |
-| `tests.rs` (extended) | already wired | `validate_tls_server_name`, `filter_store_flags`, `expand_uid_ranges` (singles, ranges, the `*` sentinel, the 1e6 cap, inverted ranges), `selected_mailbox_effective_responses` (the `[CLOSED]` split, last-marker-wins), `build_selected_mailbox` (full code extraction, tagged-code extraction, missing UIDVALIDITY staying `None`, `HIGHESTMODSEQ 0` -> `NOMODSEQ`, VANISHED EARLIER filtering, pre-`[CLOSED]` state ignored), `is_notify_list_event` / `is_notify_selection_mismatch`, `next_prebuilt_tag`; then byte-level transcripts: SELECT round trip with state transition, SELECT NO leaving the session Authenticated, UID FETCH with a literal body section, unsolicited EXISTS/EXPUNGE during NOOP becoming typed events, CAPABILITY updating the cached snapshot, BYE mid-command (B3), APPEND waiting for `+` on a synchronizing literal, APPEND skipping the wait under LITERAL+, and APPENDLIMIT rejection before the wire |
+| `tests.rs` (extended) | already wired | `validate_tls_server_name`, `filter_store_flags`, `expand_uid_ranges` (singles, ranges, the `*` sentinel, the 1e6 cap, inverted ranges), `selected_mailbox_effective_responses` (the `[CLOSED]` split, last-marker-wins), `build_selected_mailbox` (full code extraction, tagged-code extraction, missing UIDVALIDITY staying `None`, `HIGHESTMODSEQ 0` -> `NOMODSEQ`, VANISHED EARLIER filtering, pre-`[CLOSED]` state ignored), `is_notify_list_event` / `is_notify_selection_mismatch`, `next_prebuilt_tag`; then byte-level transcripts: SELECT round trip with state transition, SELECT NO leaving the session Authenticated, UID FETCH with a literal body section, unsolicited EXISTS/EXPUNGE during NOOP becoming typed events, CAPABILITY updating the cached snapshot, BYE mid-command (B3), APPEND waiting for `+` on a synchronizing literal, APPEND skipping the wait under LITERAL+, a LITERAL+ APPEND whose body carries a marker-shaped line, and APPENDLIMIT rejection before the wire |
 
-Three of those tests carry an explicit
-`DOCUMENTS A BUG, NOT AN ENDORSEMENT` header and name this file:
-`boundary_matches_inside_literal_payload` (B2),
-`framing_quoted_brace_digits_misread_as_literal` (B4),
-`list_status_option_drops_the_first_item_octet` (B6),
-`bye_mid_command_is_swallowed_and_surfaces_as_closed` (B3), and
-`saved_search_marker_missed_after_uid_key` (B8). (Five, not three.)
+One test still carries an explicit `DOCUMENTS A BUG, NOT AN ENDORSEMENT`
+header and names this file:
+`bye_mid_command_is_swallowed_and_surfaces_as_closed` (B3).
 
-No existing test was modified. No `Cargo.toml` was touched; the manifest
-already carries tokio `io-util` plus dev `test-util`, `proptest` and
-`pretty_assertions`.
+The bug-documenting tests for B1, B2, B4, B5, B6 and B8 were rewritten
+into invariant tests when those bugs were fixed, and the fixes added
+their own regressions:
+
+| former bug | test now pinning the fix |
+|---|---|
+| B1 (scanner spin on unbalanced `)`) | `search_validation_tests.rs::scanner_terminates_on_unmatched_closing_parentheses` |
+| B2 (`find_literal_boundary` not length-aware) | `literals_tests.rs::boundary_skips_markers_inside_a_non_synchronizing_literal_payload`, `literals_tests.rs::literal_plus_skips_payload_of_an_already_non_synchronizing_literal`, and the driver transcript `tests.rs::literal_plus_append_does_not_wait_on_a_marker_shaped_body_line` |
+| B4 (quoted `{digits}` read as a marker) | `wire_tests.rs::framing_quoted_brace_digits_are_not_a_literal_marker` |
+| B5 (framing overflow on a hostile literal size) | `wire_tests.rs::framing_unreachable_literal_size_is_a_parse_error_not_a_stall`, `wire_tests.rs::framing_addressable_literal_size_is_merely_incomplete`, `wire_tests.rs::read_one_fails_fast_on_an_undeliverable_literal_count` |
+| B6 (`list_status_return_option_items` ate an octet) | `helpers_tests.rs::list_status_option_extracts_the_whole_item_list` (the helper now delegates to the codec's single implementation) |
+| B8 (`UID $` past the SEARCHRES gate) | `search_validation_tests.rs::saved_search_marker_is_detected_after_uid_key` |
+
+Fixing those bugs did modify tests landed by this sweep (the six above
+were rewritten or renamed). No test outside this sweep's own additions
+was changed. No `Cargo.toml` was touched; the manifest already carries
+tokio `io-util` plus dev `test-util`, `proptest` and `pretty_assertions`.
 
 **`proptest` and `pretty_assertions` are still unused in this crate.**
 I did not reach for either: the properties worth stating here
 (`patch_literals_to_plus_with_binary` is a no-op on input with no
 markers; a round trip of "encode a literal, then find its boundary"
 always agrees) are cheap as example tests and much clearer as such. If
-the orchestrator wants proptest coverage, the strongest candidate is
-`buffer_may_contain_complete_response` against a generated stream of
-well-formed responses - but that is only worth writing *after* B4 and B5
-are fixed, since the generator would otherwise be tuned around the bugs.
+the orchestrator wants proptest coverage, the strongest candidate is now
+unblocked: `buffer_may_contain_complete_response` against a generated
+stream of well-formed responses, asserting the generator never lands on
+the fatal lane.
 
 ---
 

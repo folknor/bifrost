@@ -69,7 +69,19 @@ pub(super) async fn send_with_literal_sync(
     while pos < buf.len() {
         if let Some((marker_end, literal_size)) = super::super::find_literal_boundary(&buf[pos..]) {
             // marker_end is the offset past `\r\n` within buf[pos..]
-            let send_end = pos + marker_end;
+            let Some(send_end) = pos.checked_add(marker_end) else {
+                return Err(Error::Internal(
+                    "synchronizing literal marker offset overflowed command buffer".into(),
+                ));
+            };
+            let Some(body_end) = send_end
+                .checked_add(literal_size)
+                .filter(|&end| end <= buf.len())
+            else {
+                return Err(Error::Internal(
+                    "synchronizing literal marker exceeds command buffer".into(),
+                ));
+            };
             wire_reader
                 .write_all(&buf[pos..send_end])
                 .await
@@ -80,10 +92,10 @@ pub(super) async fn send_with_literal_sync(
             // our literal bytes, so a send failure here is InFlight: the
             // preceding pre-literal bytes were accepted.
             wire_reader
-                .write_all(&buf[send_end..send_end + literal_size])
+                .write_all(&buf[send_end..body_end])
                 .await
                 .map_err(|e| e.with_attempt(TransmissionState::InFlight))?;
-            pos = send_end + literal_size;
+            pos = body_end;
         } else {
             // No more literals; send the rest.
             wire_reader
