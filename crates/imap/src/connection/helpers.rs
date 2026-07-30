@@ -1,17 +1,6 @@
 #![allow(clippy::wildcard_imports)]
 use super::*;
-
-/// Compare two decoded mailbox names for command-response correlation.
-///
-/// RFC 3501 Section 5.1: `INBOX` is case-insensitive; all other mailbox
-/// names are compared byte-for-byte. Both arguments must be decoded
-/// (user-facing UTF-8), not wire-form.
-pub(crate) fn inbox_eq(a: &str, b: &str) -> bool {
-    if a.eq_ignore_ascii_case("INBOX") && b.eq_ignore_ascii_case("INBOX") {
-        return true;
-    }
-    a == b
-}
+pub(crate) use crate::codec::classification::mailbox_names_eq as inbox_eq;
 
 impl ImapConnection {
     /// Current session state (RFC 3501 Section3 / RFC 9051 Section3).
@@ -419,7 +408,7 @@ impl ImapConnection {
                         return Err(Error::MissingCapability("OBJECTID".into()));
                     }
                 }
-                FetchAttr::GmailMsgId | FetchAttr::GmailThreadId => {
+                FetchAttr::GmailMsgId | FetchAttr::GmailThreadId | FetchAttr::GmailLabels => {
                     if !snap.capabilities.contains(&Capability::XGmExt1) {
                         return Err(Error::MissingCapability("X-GM-EXT-1".into()));
                     }

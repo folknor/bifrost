@@ -29,6 +29,36 @@ fn inbox_compare_is_case_insensitive_for_inbox_only() {
     assert!(!inbox_eq("INBOX", "INBOX/Sub"));
 }
 
+/// RFC 6855 Section 5: non-ASCII credentials require AUTHENTICATE. The check
+/// runs before the command reaches the driver, and shares the encoder's
+/// implementation so the two boundaries cannot drift.
+#[tokio::test]
+async fn login_rejects_non_ascii_before_submitting_to_the_driver() {
+    let connection = detached(SessionState::NotAuthenticated, vec![], &[]);
+    let error = connection
+        .login("älice", "password", std::time::Duration::from_secs(1))
+        .await
+        .expect_err("non-ASCII LOGIN credentials must not reach the driver");
+    assert!(matches!(error, Error::Protocol(message) if message.contains("ASCII-only")));
+}
+
+/// X-GM-LABELS is a Gmail extension attribute like X-GM-MSGID / X-GM-THRID,
+/// so requesting it without X-GM-EXT-1 is a client error, not a request the
+/// server gets to reject.
+#[test]
+fn gmail_labels_fetch_requires_x_gm_ext_1() {
+    let without = conn(vec![]);
+    assert!(matches!(
+        without.validate_requested_fetch_items(&[FetchAttr::GmailLabels]),
+        Err(Error::MissingCapability(capability)) if capability == "X-GM-EXT-1"
+    ));
+    let with = conn(vec![Capability::XGmExt1]);
+    assert!(
+        with.validate_requested_fetch_items(&[FetchAttr::GmailLabels])
+            .is_ok()
+    );
+}
+
 // ---------------------------------------------------------------------------
 // status_item_tokens (RFC 3501 Section 6.3.10 / RFC 9051 Section 6.3.11)
 // ---------------------------------------------------------------------------

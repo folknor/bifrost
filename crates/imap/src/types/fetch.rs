@@ -70,6 +70,11 @@ pub struct FetchResponse {
     ///
     /// Gmail assigns this stable unsigned 64-bit identifier to each thread.
     pub gmail_thread_id: Option<u64>,
+    /// Gmail `X-GM-LABELS` values.
+    ///
+    /// These are exposed as the server returned them. The generic IMAP
+    /// account layer does not assign Gmail-specific label semantics.
+    pub gmail_labels: Option<Vec<String>>,
 }
 
 /// A single fetched BINARY section (RFC 3516 Section 4.2).
@@ -190,6 +195,8 @@ pub enum FetchAttr {
     GmailMsgId,
     /// Gmail `X-GM-THRID`.
     GmailThreadId,
+    /// Gmail `X-GM-LABELS`.
+    GmailLabels,
 }
 
 impl FetchAttr {
@@ -269,6 +276,7 @@ impl FetchAttr {
             Self::ThreadId => "THREADID".into(),
             Self::GmailMsgId => "X-GM-MSGID".into(),
             Self::GmailThreadId => "X-GM-THRID".into(),
+            Self::GmailLabels => "X-GM-LABELS".into(),
         }
     }
 }

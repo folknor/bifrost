@@ -171,42 +171,164 @@ pub(super) fn fetch_response_inner(input: &[u8], utf8_mode: bool) -> IResult<&[u
         let upper = String::from_utf8_lossy(attr_name).to_ascii_uppercase();
 
         input = rest;
-        let strict = has_closed_grammar(&upper, input);
         let parsed = fetch_attr_value(&upper, input, utf8_mode, &mut fr);
-        let (rest, ()) = if strict {
-            // The attribute is one we model against a closed grammar, so a
-            // failure here is the server violating the RFC, not a shortfall
-            // of ours. Convert to `Failure` so `alt` cannot launder the whole
-            // response into `Unknown` and drop it silently.
-            parsed.map_err(recognized_fetch_failure)?
-        } else {
-            parsed?
-        };
+        let (rest, ()) = parsed?;
         input = rest;
     }
     Ok((input, fr))
 }
 
-/// Whether a FETCH attribute's grammar is closed enough that a parse failure
-/// means the server is wrong rather than that this parser is incomplete.
+/// Whether a FETCH attribute's failed parse must survive as a connection-fatal
+/// recognized response failure.
 ///
-/// Excluded on purpose: `ENVELOPE`, `BODYSTRUCTURE`, and bare `BODY` (a
-/// `BODYSTRUCTURE` synonym). Those are the open-ended bodies of the `msg-att`
-/// grammar - extensions append fields to `body-ext-*`, and real servers vary
-/// inside `ENVELOPE` addresses - so a failure there is at least as likely to be
-/// a modelling gap of ours, and hard-failing would drop the connection against
-/// a conformant server. Unrecognized attributes are likewise tolerated by the
-/// skip path in [`fetch_attr_value`].
+/// Fully modelled attributes always return true. For the three open-ended
+/// bodies, only a malformed fixed-arity prefix returns true: their extension
+/// tail remains tolerant so an unmodelled but conformant shape cannot make the
+/// driver close the connection. Unrecognized attributes remain false and use
+/// the forward-compatible skip path.
 fn has_closed_grammar(upper: &str, input: &[u8]) -> bool {
     match upper {
         "UID" | "FLAGS" | "RFC822.SIZE" | "RFC822" | "RFC822.HEADER" | "RFC822.TEXT"
         | "INTERNALDATE" | "MODSEQ" | "SAVEDATE" | "PREVIEW" | "EMAILID" | "THREADID"
-        | "X-GM-MSGID" | "X-GM-THRID" => true,
+        | "X-GM-MSGID" | "X-GM-THRID" | "X-GM-LABELS" => true,
+        "ENVELOPE" => envelope_fixed_prefix_is_malformed(input),
+        "BODYSTRUCTURE" => bodystructure_fixed_prefix_is_malformed(input),
         // Sectioned forms are `section-spec` plus an `nstring` / `number`; the
-        // bare `BODY` form is a BODYSTRUCTURE and stays tolerant.
-        "BINARY.SIZE" | "BINARY" | "BODY" => input.first() == Some(&b'['),
+        // bare `BODY` form is a BODYSTRUCTURE synonym with the same prefix
+        // gate as BODYSTRUCTURE.
+        "BINARY.SIZE" | "BINARY" => input.first() == Some(&b'['),
+        "BODY" if input.first() == Some(&b'[') => true,
+        "BODY" => bodystructure_fixed_prefix_is_malformed(input),
         _ => false,
     }
+}
+
+/// Check ENVELOPE's closed ten-field outer shape without requiring every
+/// address-list variation to fit our typed decoder. This closes truncated and
+/// unbalanced envelopes while keeping unfamiliar but balanced address forms
+/// on the tolerant path.
+fn envelope_fixed_prefix_is_malformed(input: &[u8]) -> bool {
+    let Ok((mut input, _)) = attr_sp(input) else {
+        return true;
+    };
+    let Some(rest) = input.strip_prefix(b"(") else {
+        return true;
+    };
+    input = rest;
+
+    for field in 0..10 {
+        let Ok((rest, ())) = skip_fetch_value(input) else {
+            return true;
+        };
+        input = rest;
+        if field < 9 {
+            let Ok((rest, _)) = attr_sp(input) else {
+                return true;
+            };
+            input = rest;
+        }
+    }
+    !input.starts_with(b")")
+}
+
+/// Check the BODYSTRUCTURE fixed prefix. A single part has media type/subtype,
+/// params, id, description, encoding, and size. A multipart has one or more
+/// balanced child bodies followed by its subtype. The child bodies themselves
+/// retain tolerant tails: their optional extensions are explicitly open-ended.
+///
+/// The outer structure must also close. Extension tails are open-ended in
+/// their *contents*, not in their framing: a truncated
+/// `BODYSTRUCTURE ("IMAGE" "PNG" NIL NIL NIL "BASE64" 5000` has no shape a
+/// conformant server can produce, so requiring the balanced close costs no
+/// tolerance and removes the last top-level path on which a malformed body
+/// could be laundered into `Unknown` and dropped.
+fn bodystructure_fixed_prefix_is_malformed(input: &[u8]) -> bool {
+    let Ok((mut input, _)) = attr_sp(input) else {
+        return true;
+    };
+    if skip_paren_group(input).is_err() {
+        return true;
+    }
+    let Some(rest) = input.strip_prefix(b"(") else {
+        return true;
+    };
+    input = rest;
+    while input.first() == Some(&b' ') {
+        input = &input[1..];
+    }
+    if input.first() == Some(&b'(') {
+        return multipart_fixed_prefix_is_malformed(input);
+    }
+
+    for _ in 0..6 {
+        let Ok((rest, ())) = skip_fetch_value(input) else {
+            return true;
+        };
+        let Ok((rest, _)) = attr_sp(rest) else {
+            return true;
+        };
+        input = rest;
+    }
+    number64(input).is_err()
+}
+
+/// Check a multipart body's outer prefix without attempting to interpret the
+/// extension tails of its children. This is deliberately lexical: a balanced
+/// child shape this typed decoder does not support remains connection-safe.
+fn multipart_fixed_prefix_is_malformed(mut input: &[u8]) -> bool {
+    let mut child_count = 0;
+    loop {
+        if input.first() != Some(&b'(') {
+            break;
+        }
+        let Ok((rest, _)) = skip_paren_group(input) else {
+            return true;
+        };
+        child_count += 1;
+        input = rest;
+
+        if input.first() == Some(&b'(') {
+            continue;
+        }
+        let Ok((rest, _)) = attr_sp(input) else {
+            return true;
+        };
+        if rest.first() == Some(&b'(') {
+            input = rest;
+            continue;
+        }
+        return skip_fetch_value(rest).is_err();
+    }
+    child_count == 0
+}
+
+/// Parse one `X-GM-LABELS` label.
+///
+/// Google's IMAP extension documentation shows system labels on the wire as
+/// bare backslash-prefixed atoms (`(\Inbox \Sent Important)`), which the
+/// `astring` grammar cannot express: `\` is a `quoted-special` and therefore
+/// excluded from `ATOM-CHAR`. Since this attribute is gated strict, parsing
+/// labels as plain `astring` would make an ordinary Gmail FETCH response
+/// connection-fatal. User labels arrive as normal astrings, quoted when they
+/// contain spaces, and in modified UTF-7.
+fn gmail_label(input: &[u8]) -> IResult<&[u8], String> {
+    alt((
+        map((char('\\'), atom), |(_, name)| {
+            format!("\\{}", String::from_utf8_lossy(name))
+        }),
+        map(astring, |label| crate::codec::utf7::decode_utf7(&label)),
+    ))
+    .parse(input)
+}
+
+/// Parse an `X-GM-MSGID` / `X-GM-THRID` value.
+///
+/// Gmail sends these as bare unsigned 64-bit decimals. Some proxies in front
+/// of Gmail quote them; both attributes are gated strict, so the quoted form
+/// is accepted rather than dropping the connection over a shape that carries
+/// the same value.
+fn gmail_id(input: &[u8]) -> IResult<&[u8], u64> {
+    alt((number64, delimited(char('"'), number64, char('"')))).parse(input)
 }
 
 /// Separator before a FETCH attribute value.
@@ -223,6 +345,27 @@ fn attr_sp(input: &[u8]) -> IResult<&[u8], &[u8]> {
 /// name already consumed from `input`.
 #[allow(clippy::too_many_lines)]
 fn fetch_attr_value<'a>(
+    upper: &str,
+    input: &'a [u8],
+    utf8_mode: bool,
+    fr: &mut FetchResponse,
+) -> IResult<&'a [u8], ()> {
+    let strict = has_closed_grammar(upper, input);
+    let parsed = fetch_attr_value_inner(upper, input, utf8_mode, fr);
+    if strict {
+        // Keep this decision at the value boundary. `alt` may otherwise turn
+        // an error in a recognised response into `Unknown`, which the driver
+        // treats as unsolicited rather than connection-fatal.
+        parsed.map_err(recognized_fetch_failure)
+    } else {
+        parsed
+    }
+}
+
+/// Parse one FETCH attribute value after [`fetch_attr_value`] has selected
+/// the strictness policy for this attribute.
+#[allow(clippy::too_many_lines)]
+fn fetch_attr_value_inner<'a>(
     upper: &str,
     input: &'a [u8],
     utf8_mode: bool,
@@ -393,14 +536,22 @@ fn fetch_attr_value<'a>(
         }
         "X-GM-MSGID" => {
             let (rest, _) = attr_sp(input)?;
-            let (rest, value) = number64(rest)?;
+            let (rest, value) = gmail_id(rest)?;
             fr.gmail_msg_id = Some(value);
             Ok((rest, ()))
         }
         "X-GM-THRID" => {
             let (rest, _) = attr_sp(input)?;
-            let (rest, value) = number64(rest)?;
+            let (rest, value) = gmail_id(rest)?;
             fr.gmail_thread_id = Some(value);
+            Ok((rest, ()))
+        }
+        "X-GM-LABELS" => {
+            let (rest, _) = attr_sp(input)?;
+            let (rest, labels) =
+                delimited(char('('), separated_list0(attr_sp, gmail_label), char(')'))
+                    .parse(rest)?;
+            fr.gmail_labels = Some(labels);
             Ok((rest, ()))
         }
         "BINARY.SIZE" if input.first() == Some(&b'[') => {

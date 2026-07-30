@@ -3066,17 +3066,15 @@ fn untagged_fetch_missing_closing_paren() {
 // the `parse_untagged_unknown` catch-all (RFC 9051 Section 2.2.2).
 
 #[test]
-fn quoted_string_incomplete_does_not_block_alt_fallthrough() {
+fn quoted_string_incomplete_in_envelope_is_a_parse_failure() {
     // A FETCH response whose ENVELOPE has an unterminated quoted string.
-    // The quoted_string parser must return Error (not Incomplete) so that
-    // the unknown-response fallback can preserve wire framing.
+    // The quoted_string parser must return Error (not Incomplete); ENVELOPE's
+    // closed ten-field prefix then promotes it to the connection-fatal
+    // recognized-response path instead of the Unknown fallback.
     let input = b"* 1 FETCH (ENVELOPE (\"unterminated subject))\r\n";
     let result = parse_response(input);
     assert!(!matches!(result, Err(nom::Err::Incomplete(_))));
-    assert!(matches!(
-        result,
-        Ok((_, Response::Untagged(response))) if matches!(*response, UntaggedResponse::Unknown(_))
-    ));
+    assert!(result.is_err());
 }
 
 #[test]
@@ -3133,17 +3131,19 @@ fn untagged_status_bare_bye_no_text() {
 }
 
 #[test]
-fn skip_paren_group_incomplete_does_not_block_alt_fallthrough() {
+fn skip_paren_group_incomplete_is_an_error_not_incomplete() {
     // A FETCH BODYSTRUCTURE with unclosed parentheses in extension data.
-    // skip_paren_group must return Error (not Incomplete) so that the
-    // unknown-response fallback can preserve wire framing.
+    // skip_paren_group must return Error, never Incomplete: this codec runs
+    // in complete mode, and `Incomplete` would stall the reader waiting for
+    // bytes that are already all present.
+    //
+    // The outer body is unbalanced, so the BODYSTRUCTURE prefix gate treats
+    // it as a provider contract violation rather than laundering the FETCH
+    // into `Unknown` and silently dropping the message's body (C4).
     let input = b"* 1 FETCH (BODYSTRUCTURE (\"text\" \"plain\" NIL NIL NIL \"7bit\" 42 3 NIL NIL NIL NIL (unclosed-ext\r\n";
     let result = parse_response(input);
     assert!(!matches!(result, Err(nom::Err::Incomplete(_))));
-    assert!(matches!(
-        result,
-        Ok((_, Response::Untagged(response))) if matches!(*response, UntaggedResponse::Unknown(_))
-    ));
+    assert!(result.is_err(), "got: {result:?}");
 }
 
 #[test]
@@ -7723,9 +7723,7 @@ fn malformed_closed_grammar_fetch_attributes_are_parse_failures() {
 
 #[test]
 fn unmodelled_and_open_ended_fetch_attributes_stay_tolerated() {
-    // The other half of the same boundary: syntax this parser does not model,
-    // and the open-ended bodies where a failure is at least as likely to be our
-    // own modelling gap, must never cost the connection.
+    // Syntax this parser does not model must never cost the connection.
     for input in [
         // Unrecognized attribute with a well-formed value: parsed, skipped.
         &b"* 1 FETCH (UID 7 X-FUTURE-THING (a b c))\r\n"[..],
@@ -7741,12 +7739,13 @@ fn unmodelled_and_open_ended_fetch_attributes_stay_tolerated() {
         );
     }
 
-    // ENVELOPE / BODYSTRUCTURE / bare BODY are deliberately outside the strict
-    // gate, so malformed ones still degrade to `Unknown` instead of dropping
-    // the connection. This is the remaining C4 surface, documented as such.
+    // Valid fixed prefixes followed by a tail this parser does not model stay
+    // tolerant. The tests use an unsupported field after a valid basic body
+    // prefix and an address-list shape that is balanced but not typed.
     for input in [
-        &b"* 1 FETCH (ENVELOPE (\"unterminated subject))\r\n"[..],
-        b"* 1 FETCH (BODYSTRUCTURE (\"TEXT\"))\r\n",
+        &b"* 1 FETCH (ENVELOPE (\"date\" \"subject\" (NIL) NIL NIL NIL NIL NIL NIL NIL))\r\n"[..],
+        b"* 1 FETCH (BODYSTRUCTURE (\"IMAGE\" \"PNG\" NIL NIL NIL \"BASE64\" 5000 NIL (bad)))\r\n",
+        b"* 1 FETCH (BODYSTRUCTURE ((\"TEXT\") \"MIXED\"))\r\n",
     ] {
         assert!(
             matches!(
@@ -7754,6 +7753,33 @@ fn unmodelled_and_open_ended_fetch_attributes_stay_tolerated() {
                 Ok((_, Response::Untagged(response))) if matches!(*response, UntaggedResponse::Unknown(_))
             ),
             "expected tolerated degradation for {:?}",
+            String::from_utf8_lossy(input)
+        );
+    }
+}
+
+#[test]
+fn malformed_open_ended_fetch_fixed_prefixes_are_parse_failures() {
+    // ENVELOPE has ten mandatory outer fields. BODYSTRUCTURE and bare BODY
+    // share the single-part fixed prefix: media type/subtype, params, id,
+    // description, encoding, and size. A malformed prefix is a provider
+    // contract violation, not an extension-tail modelling gap.
+    for input in [
+        &b"* 1 FETCH (ENVELOPE (\"date\"))\r\n"[..],
+        b"* 1 FETCH (BODYSTRUCTURE (\"TEXT\"))\r\n",
+        b"* 1 FETCH (BODY (\"TEXT\" \"PLAIN\" NIL NIL NIL \"7BIT\" huge))\r\n",
+        b"* 1 FETCH (BODYSTRUCTURE ((\"TEXT\")))\r\n",
+        // Truncation of the outer structure: the fixed prefix parses, but the
+        // body never closes. An open-ended extension tail is open in its
+        // contents, not in its framing, so requiring the balanced close costs
+        // no server tolerance.
+        b"* 1 FETCH (BODYSTRUCTURE (\"IMAGE\" \"PNG\" NIL NIL NIL \"BASE64\" 5000\r\n",
+        b"* 1 FETCH (BODY (\"IMAGE\" \"PNG\" NIL NIL NIL \"BASE64\" 5000 NIL (\"INLINE\"\r\n",
+        b"* 1 FETCH (BODYSTRUCTURE ((\"TEXT\" \"PLAIN\" NIL NIL NIL \"7BIT\" 50 3) \"MIXED\"\r\n",
+    ] {
+        assert!(
+            parse_response(input).is_err(),
+            "expected a parse failure for {:?}",
             String::from_utf8_lossy(input)
         );
     }
@@ -13973,20 +13999,35 @@ fn malformed_status_is_a_parse_failure() {
     assert!(parse_response(input).is_err());
 }
 
-/// Gmail's `X-GM-LABELS` FETCH data item has no field on `FetchResponse`, so
-/// the unknown-attribute skipper discards it. `X-GM-MSGID` and `X-GM-THRID`
-/// *are* modelled, which makes labels a conspicuous omission rather than a
-/// deliberate exclusion -.
-///
-/// Pinned here so the drop is visible: the surrounding attributes survive.
+/// Gmail's `X-GM-LABELS` FETCH data item is decoded alongside the other Gmail
+/// extension attributes. The generic IMAP account layer deliberately does not
+/// interpret those labels as folder membership.
 #[test]
-fn fetch_x_gm_labels_is_skipped_without_losing_other_attributes() {
-    let input = b"* 1 FETCH (UID 9 X-GM-LABELS (\"\\\\Inbox\" \"Work\") FLAGS (\\Seen))\r\n";
+fn fetch_x_gm_labels_are_exposed_without_losing_other_attributes() {
+    // Google's IMAP extension documentation shows system labels as bare
+    // backslash-prefixed atoms, not quoted strings: `\` is a quoted-special
+    // and so cannot appear in an `astring` atom. This is the real wire form.
+    let input = b"* 1 FETCH (UID 9 X-GM-MSGID 1278455344230334865 \
+                  X-GM-LABELS (\\Inbox \\Sent Important \"Muy Importante\" \"&ZeVnLIqe-\") \
+                  FLAGS (\\Seen))\r\n";
     let (rest, resp) = parse_response(input).unwrap();
     assert!(rest.is_empty());
     if let Response::Untagged(u) = resp {
         if let UntaggedResponse::Fetch(fr) = *u {
             assert_eq!(fr.uid, Some(9), "UID before the unknown item survives");
+            assert_eq!(fr.gmail_msg_id, Some(1_278_455_344_230_334_865));
+            assert_eq!(
+                fr.gmail_labels,
+                Some(vec![
+                    "\\Inbox".to_owned(),
+                    "\\Sent".to_owned(),
+                    "Important".to_owned(),
+                    "Muy Importante".to_owned(),
+                    "日本語".to_owned(),
+                ]),
+                "system labels arrive unquoted with a leading backslash; user \
+                 labels are astrings in modified UTF-7"
+            );
             assert_eq!(
                 fr.flags,
                 Some(vec![Flag::Seen]),

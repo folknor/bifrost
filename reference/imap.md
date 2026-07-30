@@ -35,12 +35,26 @@ the account boundary maps to `Protocol(ParseFailed)` /
 (`codec/decode/envelope_fetch.rs::has_closed_grammar`): attributes with a
 closed grammar (`UID`, `FLAGS`, `RFC822.*`, `INTERNALDATE`, `MODSEQ`,
 `SAVEDATE`, `PREVIEW`, `EMAILID`, `THREADID`, `X-GM-*`, the sectioned
-`BODY[...]` / `BINARY[...]` / `BINARY.SIZE[...]` forms) hard-fail, while
-`ENVELOPE`, `BODYSTRUCTURE`, bare `BODY`, and any attribute the codec does
-not model stay on the tolerant skip path - a failure there is at least as
-likely to be a modelling gap of ours, and parse failure is
-connection-fatal. Separator handling is uniformly multi-space for the same
-reason.
+`BODY[...]` / `BINARY[...]` / `BINARY.SIZE[...]` forms) hard-fail.
+`ENVELOPE`, `BODYSTRUCTURE`, and bare `BODY` additionally gate their safe
+fixed prefixes (ENVELOPE's ten fields; single-part and multipart outer body
+prefixes) *and* the balanced close of the outer structure, since an extension
+tail is open in its contents but never in its framing. They retain tolerance
+for the contents of those tails and for balanced nested multipart children
+that this codec cannot safely model yet. Any entirely unmodelled attribute
+also stays on the tolerant skip path: a failure there is at least as likely to
+be a modelling gap of ours, and parse failure is connection-fatal. Separator
+handling is uniformly multi-space for the same reason.
+
+The strict lane must therefore never fire on a shape a real server sends.
+`X-GM-LABELS` is the worked example: Gmail sends system labels as bare
+backslash-prefixed atoms (`(\Inbox \Sent Important "Muy Importante")`), which
+`astring` cannot express, so the label grammar is `"\" atom / astring` and
+`X-GM-MSGID` / `X-GM-THRID` accept the quoted decimal some proxies emit.
+Labels are decoded into `FetchResponse::gmail_labels` (modified UTF-7 decoded
+for astring labels, system labels verbatim); requesting them needs
+`X-GM-EXT-1`, and they count toward the buffered-FETCH byte estimate. The
+generic IMAP account layer assigns them no folder semantics.
 
 Cancellation safety comes from socket ownership: dropping a caller's
 future does not cancel an in-flight wire exchange. The driver completes

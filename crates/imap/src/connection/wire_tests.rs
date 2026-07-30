@@ -311,10 +311,15 @@ async fn read_one_reports_a_hard_parse_error() {
 
 #[tokio::test]
 async fn read_one_rejects_a_malformed_recognized_fetch_attribute() {
-    let (mut reader, mut server) = memory_reader();
-    server.write_all(b"* 1 FETCH (UID 0)\r\n").await.unwrap();
-    server.flush().await.unwrap();
-    assert!(matches!(reader.read_one(false).await, Err(Error::Parse(_))));
+    for response in [
+        &b"* 1 FETCH (UID 0)\r\n"[..],
+        b"* 1 FETCH (BODYSTRUCTURE (\"TEXT\"))\r\n",
+    ] {
+        let (mut reader, mut server) = memory_reader();
+        server.write_all(response).await.unwrap();
+        server.flush().await.unwrap();
+        assert!(matches!(reader.read_one(false).await, Err(Error::Parse(_))));
+    }
 }
 
 #[tokio::test]

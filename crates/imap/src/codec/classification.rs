@@ -52,9 +52,7 @@ pub(crate) struct ClassificationContext<'a> {
 /// names are compared byte-for-byte. Both arguments must be decoded
 /// (user-facing UTF-8), not wire-form.
 ///
-/// Note: mirrors `connection::helpers::inbox_eq`  -  that module is
-/// private to `connection`, so the codec cannot import it.
-fn mailbox_names_eq(a: &str, b: &str) -> bool {
+pub(crate) fn mailbox_names_eq(a: &str, b: &str) -> bool {
     if a.eq_ignore_ascii_case("INBOX") && b.eq_ignore_ascii_case("INBOX") {
         return true;
     }

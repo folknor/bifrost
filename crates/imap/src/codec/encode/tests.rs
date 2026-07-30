@@ -1912,25 +1912,41 @@ fn encode_select_mailbox_with_spaces() {
     assert_eq!(&buf[..], b"A001 SELECT \"my folder\"\r\n");
 }
 
-/// Login with CRLF in password falls back to literal.
+/// A LOGIN credential containing CR/LF cannot escape its literal framing.
+///
+/// `password` is an `astring`, and RFC 9051 Section 4.3 lets a literal carry
+/// any CHAR8. The injection this would have to become is a credential whose
+/// bytes leave the literal early and are read as a command line; that is
+/// impossible because the emitted octet count is taken from exactly the bytes
+/// written, so the CRLF is payload the server consumes inside the literal.
 #[test]
-fn encode_login_crlf_in_password_uses_literal() {
+fn encode_login_crlf_credential_stays_inside_its_literal() {
+    let pass = "pass\r\nword A002 DELETE INBOX\r\n";
     let mut buf = BytesMut::new();
     encode_login(
         &mut buf,
         "A001",
         "user",
-        "pass\r\nword",
+        pass,
         false,
         LiteralMode::Synchronizing,
     )
     .unwrap();
-    // CRLF in password means it can't be quoted
-    let output = String::from_utf8_lossy(&buf);
-    assert!(
-        output.contains("{10}\r\n"),
-        "expected literal for password with CRLF"
+
+    let marker = format!("{{{}}}\r\n", pass.len());
+    let output = String::from_utf8(buf.to_vec()).unwrap();
+    assert_eq!(
+        output,
+        format!("A001 LOGIN \"user\" {marker}{pass}\r\n"),
+        "the credential is framed as a counted literal, verbatim"
     );
+
+    // The count is what makes this safe: everything after the marker up to
+    // `pass.len()` octets is literal payload, so the embedded `A002 DELETE`
+    // line is never at a command boundary.
+    let body_start = output.find(&marker).unwrap() + marker.len();
+    assert_eq!(&output[body_start..body_start + pass.len()], pass);
+    assert_eq!(&output[body_start + pass.len()..], "\r\n");
 }
 
 /// Very long quoted string is still properly quoted if all chars are quotable.
@@ -5067,17 +5083,15 @@ fn from_utf8_lossy_with_nul_bytes_in_output() {
 
 /// RFC 7888 Section 4: when the server advertises LITERAL+, the client
 /// SHOULD use the non-synchronizing literal form `{N+}\r\n` instead of
-/// the synchronizing `{N}\r\n`. This test verifies that `encode_command`
-/// with `literal_plus = true` produces `{N+}\r\n` for a LOGIN command
-/// whose password contains CRLF (forcing literal form).
+/// the synchronizing `{N}\r\n`. A LOGIN password containing CRLF is a
+/// legal `astring` that cannot be quoted, so it forces the literal form.
 #[test]
 fn encode_command_login_literal_plus() {
-    let mut buf = BytesMut::new();
-    // Password with CR/LF forces literal form (not quotable).
     let cmd = Command::Login {
         user: "alice".into(),
         pass: "pass\r\nword".into(),
     };
+    let mut buf = BytesMut::new();
     encode_command_to_buf(
         &mut buf,
         "A001",
@@ -5086,7 +5100,6 @@ fn encode_command_login_literal_plus() {
     )
     .unwrap();
     let output = std::str::from_utf8(&buf).unwrap();
-    // RFC 7888 Section 4: non-synchronizing literal must use `{N+}\r\n`.
     assert!(
         output.contains("{10+}\r\n"),
         "with literal_plus=true, literal must use non-synchronizing form {{N+}}; got: {output}"
@@ -5104,7 +5117,6 @@ fn encode_command_login_synchronizing_literal() {
     };
     encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts()).unwrap();
     let output = std::str::from_utf8(&buf).unwrap();
-    // Must use synchronizing form `{10}\r\n`, no `+` before `}`.
     assert!(
         output.contains("{10}\r\n"),
         "with literal_plus=false, literal must use synchronizing form {{N}}; got: {output}"
@@ -5119,29 +5131,18 @@ fn encode_command_login_synchronizing_literal() {
 // Synchronizing literal segmentation (RFC 3501 Section 4.3)
 // -----------------------------------------------------------------------
 
-/// RFC 3501 Section 4.3: when `literal_plus` is `false` and the password
-/// requires a literal (contains CRLF), `encode_command` must split the
-/// output into segments at the synchronizing literal boundary. The first
-/// segment ends with the literal marker `{N}\r\n`; the second segment
-/// contains the literal body and the command terminator.
-///
-/// Previously the encoder returned a flat buffer with no split information,
-/// violating RFC 3501 Section 4.3 which requires the client to wait for a
-/// `+` continuation response before sending literal data.
+/// RFC 3501 Section 4.3 splits a synchronizing literal without relying on an
+/// invalid LOGIN credential as the literal source.
 #[test]
-fn encode_login_sync_literal_splits_into_segments() {
-    let cmd = Command::Login {
-        user: "alice".into(),
-        pass: "pass\r\nword".into(),
-    };
-    let encoded = encode_command("A001", &cmd, &default_opts()).unwrap();
+fn synchronizing_literal_splits_into_segments() {
+    let encoded = EncodedCommand::from_flat_buffer(b"A001 X {10}\r\npass\r\nword\r\n");
     let segments = encoded.segments();
 
     // Must have exactly 2 segments: header+marker, then literal body+CRLF.
     assert_eq!(
         segments.len(),
         2,
-        "LOGIN with synchronizing literal must produce 2 segments \
+        "a synchronizing literal must produce 2 segments \
          (RFC 3501 Section 4.3); got {} segment(s): {:?}",
         segments.len(),
         segments
@@ -5153,7 +5154,7 @@ fn encode_login_sync_literal_splits_into_segments() {
     // Segment 0: command prefix + literal marker `{10}\r\n`.
     let seg0 = std::str::from_utf8(&segments[0]).unwrap();
     assert!(
-        seg0.starts_with("A001 LOGIN \"alice\" {10}\r\n"),
+        seg0.starts_with("A001 X {10}\r\n"),
         "first segment should be the command prefix ending with {{10}}\\r\\n; \
          got: {seg0:?}"
     );
@@ -5166,46 +5167,34 @@ fn encode_login_sync_literal_splits_into_segments() {
     );
 }
 
-/// When `literal_plus` is `true`, `encode_command` must return a single
-/// segment because non-synchronizing literals do not require a `+`
+/// Non-synchronizing markers stay in one segment because they require no `+`
 /// continuation pause (RFC 7888 Section 4).
 #[test]
-fn encode_login_literal_plus_single_segment() {
-    let cmd = Command::Login {
-        user: "alice".into(),
-        pass: "pass\r\nword".into(),
-    };
-    let encoded = encode_command("A001", &cmd, &opts(LiteralMode::LiteralPlus, false)).unwrap();
+fn literal_plus_marker_stays_in_one_segment() {
+    let encoded = EncodedCommand::from_flat_buffer(b"A001 X {10+}\r\npass\r\nword\r\n");
     let segments = encoded.segments();
 
     assert_eq!(
         segments.len(),
         1,
-        "LOGIN with literal_plus=true must be a single segment \
+        "a non-synchronizing literal must be a single segment \
          (RFC 7888 Section 4); got {} segments",
         segments.len()
     );
 }
 
-/// When both username and password require literals (both contain CRLF),
-/// the encoder must produce 3 segments with `literal_plus=false`:
-/// one for each synchronizing literal boundary plus the trailing data.
-///
 /// RFC 3501 Section 4.3: each synchronizing literal requires a separate
 /// continuation exchange.
 #[test]
-fn encode_login_two_sync_literals_three_segments() {
-    let cmd = Command::Login {
-        user: "us\r\ner".into(),
-        pass: "pass\r\nword".into(),
-    };
-    let encoded = encode_command("A001", &cmd, &default_opts()).unwrap();
+fn two_synchronizing_literals_produce_three_segments() {
+    let encoded =
+        EncodedCommand::from_flat_buffer(b"A001 X {6}\r\nus\r\ner {10}\r\npass\r\nword\r\n");
     let segments = encoded.segments();
 
     assert_eq!(
         segments.len(),
         3,
-        "LOGIN with two synchronizing literals must produce 3 segments \
+        "two synchronizing literals must produce 3 segments \
          (RFC 3501 Section 4.3); got {} segment(s): {:?}",
         segments.len(),
         segments
@@ -5214,7 +5203,7 @@ fn encode_login_two_sync_literals_three_segments() {
             .collect::<Vec<_>>()
     );
 
-    // Segment 0: tag + LOGIN + first literal marker.
+    // Segment 0: command prefix + first literal marker.
     let seg0 = std::str::from_utf8(&segments[0]).unwrap();
     assert!(
         seg0.ends_with("{6}\r\n"),
@@ -5321,23 +5310,21 @@ fn encode_command_no_literal_single_segment() {
 /// by concatenating all segments.
 #[test]
 fn encoded_command_into_buf_round_trips() {
-    let cmd = Command::Login {
-        user: "alice".into(),
-        pass: "pass\r\nword".into(),
-    };
-    // Encode with literal_plus=false to get segments.
-    let encoded = encode_command("A001", &cmd, &default_opts()).unwrap();
+    let flat = b"A001 X {10}\r\npass\r\nword\r\n";
+    let encoded = EncodedCommand::from_flat_buffer(flat);
     let concatenated = encoded.into_buf();
-
-    // Also encode to a flat buffer directly for comparison.
-    let mut flat = BytesMut::new();
-    encode_command_to_buf(&mut flat, "A001", &cmd, &default_opts()).unwrap();
 
     assert_eq!(
         &concatenated[..],
-        &flat[..],
+        flat,
         "into_buf() must produce the same bytes as the flat encoder"
     );
+}
+
+#[test]
+#[should_panic(expected = "EncodedCommand requires a non-empty command buffer")]
+fn encoded_command_rejects_an_empty_buffer() {
+    let _ = EncodedCommand::from_flat_buffer(b"");
 }
 
 // --- UTF-8 mode: RFC 6855 Section 3 / RFC 9051 Section 9 ---
@@ -5455,23 +5442,16 @@ fn encode_mailbox_cmds_utf8_quoted() {
 /// This test verifies the encoder natively enforces the 4096-byte limit.
 #[test]
 fn literal_minus_large_literal_uses_synchronizing_form() {
-    // Build a password longer than 4096 bytes that forces literal form
-    // (contains CRLF so it can't be quoted).
-    let large_pass = format!("pass\r\n{}", "x".repeat(4100));
-    let cmd = Command::Login {
-        user: "alice".into(),
-        pass: large_pass.clone().into(),
-    };
+    let large_data = format!("data\r\n{}", "x".repeat(4100));
     let mut buf = BytesMut::new();
-    encode_command_to_buf(
+    encode_quoted_or_literal_utf8(
         &mut buf,
-        "A001",
-        &cmd,
-        &opts(LiteralMode::LiteralMinus, false),
-    )
-    .unwrap();
+        large_data.as_bytes(),
+        false,
+        LiteralMode::LiteralMinus,
+    );
     let output = std::str::from_utf8(&buf).unwrap();
-    let expected_size = large_pass.len();
+    let expected_size = large_data.len();
     // RFC 7888 Section 5: literal > 4096 bytes MUST use synchronizing form.
     assert!(
         output.contains(&format!("{{{expected_size}}}\r\n")),
@@ -5489,19 +5469,8 @@ fn literal_minus_large_literal_uses_synchronizing_form() {
 /// non-synchronizing form `{N+}\r\n`.
 #[test]
 fn literal_minus_small_literal_uses_non_synchronizing_form() {
-    // Password with CRLF forces literal form, and it's small (<= 4096).
-    let cmd = Command::Login {
-        user: "alice".into(),
-        pass: "pass\r\nword".into(),
-    };
     let mut buf = BytesMut::new();
-    encode_command_to_buf(
-        &mut buf,
-        "A001",
-        &cmd,
-        &opts(LiteralMode::LiteralMinus, false),
-    )
-    .unwrap();
+    encode_quoted_or_literal_utf8(&mut buf, b"pass\r\nword", false, LiteralMode::LiteralMinus);
     let output = std::str::from_utf8(&buf).unwrap();
     // RFC 7888 Section 5: literal <= 4096 bytes uses non-synchronizing form.
     assert!(
@@ -5515,21 +5484,10 @@ fn literal_minus_small_literal_uses_non_synchronizing_form() {
 /// should use non-synchronizing form in LITERAL- mode.
 #[test]
 fn literal_minus_boundary_4096_uses_non_synchronizing() {
-    // Build a password that is exactly 4096 bytes and forces literal form.
-    let pass = format!("x\r\n{}", "a".repeat(4093));
-    assert_eq!(pass.len(), 4096);
-    let cmd = Command::Login {
-        user: "u".into(),
-        pass: pass.into(),
-    };
+    let data = format!("x\r\n{}", "a".repeat(4093));
+    assert_eq!(data.len(), 4096);
     let mut buf = BytesMut::new();
-    encode_command_to_buf(
-        &mut buf,
-        "A001",
-        &cmd,
-        &opts(LiteralMode::LiteralMinus, false),
-    )
-    .unwrap();
+    encode_quoted_or_literal_utf8(&mut buf, data.as_bytes(), false, LiteralMode::LiteralMinus);
     let output = std::str::from_utf8(&buf).unwrap();
     assert!(
         output.contains("{4096+}\r\n"),
@@ -5542,20 +5500,10 @@ fn literal_minus_boundary_4096_uses_non_synchronizing() {
 /// synchronizing form in LITERAL- mode.
 #[test]
 fn literal_minus_boundary_4097_uses_synchronizing() {
-    let pass = format!("x\r\n{}", "a".repeat(4094));
-    assert_eq!(pass.len(), 4097);
-    let cmd = Command::Login {
-        user: "u".into(),
-        pass: pass.into(),
-    };
+    let data = format!("x\r\n{}", "a".repeat(4094));
+    assert_eq!(data.len(), 4097);
     let mut buf = BytesMut::new();
-    encode_command_to_buf(
-        &mut buf,
-        "A001",
-        &cmd,
-        &opts(LiteralMode::LiteralMinus, false),
-    )
-    .unwrap();
+    encode_quoted_or_literal_utf8(&mut buf, data.as_bytes(), false, LiteralMode::LiteralMinus);
     let output = std::str::from_utf8(&buf).unwrap();
     assert!(
         output.contains("{4097}\r\n"),
@@ -5573,21 +5521,16 @@ fn literal_minus_boundary_4097_uses_synchronizing() {
 /// regardless of literal size  -  even for very large literals.
 #[test]
 fn literal_plus_large_literal_uses_non_synchronizing() {
-    let large_pass = format!("pass\r\n{}", "x".repeat(10_000));
-    let cmd = Command::Login {
-        user: "alice".into(),
-        pass: large_pass.clone().into(),
-    };
+    let large_data = format!("data\r\n{}", "x".repeat(10_000));
     let mut buf = BytesMut::new();
-    encode_command_to_buf(
+    encode_quoted_or_literal_utf8(
         &mut buf,
-        "A001",
-        &cmd,
-        &opts(LiteralMode::LiteralPlus, false),
-    )
-    .unwrap();
+        large_data.as_bytes(),
+        false,
+        LiteralMode::LiteralPlus,
+    );
     let output = std::str::from_utf8(&buf).unwrap();
-    let expected_size = large_pass.len();
+    let expected_size = large_data.len();
     assert!(
         output.contains(&format!("{{{expected_size}+}}\r\n")),
         "LITERAL+ must use non-synchronizing form {{N+}}\\r\\n for all sizes \
@@ -5599,12 +5542,9 @@ fn literal_plus_large_literal_uses_non_synchronizing() {
 /// produce synchronizing boundaries that split into multiple segments.
 #[test]
 fn literal_minus_large_literal_produces_segments() {
-    let large_pass = format!("pass\r\n{}", "x".repeat(5000));
-    let cmd = Command::Login {
-        user: "alice".into(),
-        pass: large_pass.into(),
-    };
-    let encoded = encode_command("A001", &cmd, &opts(LiteralMode::LiteralMinus, false)).unwrap();
+    let data = format!("data\r\n{}", "x".repeat(5000));
+    let wire = format!("A001 X {{{}}}\r\n{data}\r\n", data.len());
+    let encoded = EncodedCommand::from_flat_buffer(wire.as_bytes());
     let segments = encoded.segments();
     // The large literal must produce a synchronizing boundary, resulting
     // in multiple segments (RFC 3501 Section 4.3).
@@ -5620,11 +5560,7 @@ fn literal_minus_large_literal_produces_segments() {
 /// segment (no synchronizing boundary needed).
 #[test]
 fn literal_minus_small_literal_produces_single_segment() {
-    let cmd = Command::Login {
-        user: "alice".into(),
-        pass: "pass\r\nword".into(),
-    };
-    let encoded = encode_command("A001", &cmd, &opts(LiteralMode::LiteralMinus, false)).unwrap();
+    let encoded = EncodedCommand::from_flat_buffer(b"A001 X {10+}\r\npass\r\nword\r\n");
     let segments = encoded.segments();
     assert_eq!(
         segments.len(),

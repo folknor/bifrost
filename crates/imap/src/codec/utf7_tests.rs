@@ -108,15 +108,13 @@ fn non_ascii_passthrough_outside_base64() {
     // Should not panic or error
 }
 
-// L9: Unterminated Base64 segment (missing trailing '-').
-// RFC 3501 Section 5.1.3 requires '-' at the end but we accept
-// gracefully for robustness against non-conformant servers.
+// An unterminated shifted segment is invalid MUTF-7. Preserve its raw bytes
+// rather than decoding a prefix and changing the mailbox identity.
 #[test]
 fn unterminated_base64_segment() {
     // &- is the encoding of '&'. &AE4- is '日'. Without trailing '-':
     let result = decode_utf7(b"test&AE4");
-    assert!(result.starts_with("test"));
-    // Should not panic
+    assert_eq!(result, "test&AE4");
 }
 
 /// RFC 3501 Section5.1.3 / Postel's law: non-conformant servers send raw UTF-8

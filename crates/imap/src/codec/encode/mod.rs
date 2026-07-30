@@ -179,7 +179,19 @@ fn search_criteria_starts_with_charset(criteria: &str) -> bool {
 /// RFC 6855 Section 5 does not extend `LOGIN` to permit UTF-8 usernames or
 /// passwords. Clients needing internationalized credentials MUST use
 /// `AUTHENTICATE` instead.
-fn validate_login_credential_ascii(value: &str, field: &str) -> Result<(), crate::Error> {
+///
+/// CR/LF is deliberately *not* rejected here. `login = "LOGIN" SP userid SP
+/// password` with both arguments `astring`, and RFC 9051 Section 4.3 allows a
+/// literal to carry any CHAR8 including CR and LF. A credential containing a
+/// line break is therefore encoded as a counted literal whose octet count is
+/// taken from the same bytes that are written, so the line break is payload
+/// the server consumes inside the literal and can never begin a new command.
+/// Rejecting it would lock out accounts whose password legitimately contains
+/// one on servers that offer no SASL mechanism.
+pub(crate) fn validate_login_credential_ascii(
+    value: &str,
+    field: &str,
+) -> Result<(), crate::Error> {
     if !value.is_ascii() {
         return Err(crate::Error::Protocol(format!(
             "LOGIN {field} must be ASCII-only; RFC 6855 Section 5 requires \

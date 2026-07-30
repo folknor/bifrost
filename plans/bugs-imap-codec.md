@@ -70,14 +70,13 @@ A third sibling turned up unprompted: `connection/helpers.rs`'s
 with the identical off-by-one**, in `codec/encode/commands/list.rs` (C3). Both
 are fixed, and the duplication is gone rather than fixed twice: the encoder
 owns the single implementation (`pub(crate)`) and the connection layer's
-pre-encode capability check calls it. N9 below is the remaining copy of this
-shape.
+pre-encode capability check calls it.
 
 ---
 
 # Bugs
 
-## C4 - Malformed open-ended `FETCH` attributes are still laundered into `Unknown`
+## C4 - A malformed nested multipart BODYSTRUCTURE child can still be laundered into `Unknown`
 
 **Severity: low** (was medium; the closed-grammar half is now fixed).
 **Where:** `codec/decode/envelope_fetch.rs::has_closed_grammar`.
@@ -97,93 +96,52 @@ boundary maps to `Protocol(ParseFailed)` / `ProviderContractViolation` per
 tolerance (`attr_sp`) at the same time, so a server padding with two spaces
 does not pay for the new strictness.
 
-**What is still open.** `ENVELOPE`, `BODYSTRUCTURE`, and bare `BODY` (a
-`BODYSTRUCTURE` synonym) stay outside the gate, so `* 1 FETCH (BODYSTRUCTURE
-("TEXT"))` still lands in `UntaggedResponse::Unknown`, `classify` routes it as
-`OnlyUnsolicited`, and a FETCH consumer receives neither the response nor an
-error.
+**What round 3 closed.** `has_closed_grammar`, now applied within
+`fetch_attr_value`, promotes malformed ENVELOPE ten-field shapes, malformed
+single-part BODYSTRUCTURE / bare-BODY prefixes (media type/subtype, params,
+id, description, encoding, size), and malformed multipart outer prefixes
+(one or more child groups plus subtype). Both body prefixes additionally
+require the outer structure to *close*: an extension tail is open-ended in its
+contents, never in its framing, so a truncated
+`BODYSTRUCTURE ("IMAGE" "PNG" NIL NIL NIL "BASE64" 5000` is a contract
+violation and no longer degrades to `Unknown`. This preserves multi-space
+attribute separators and keeps the contents of extension tails tolerant.
 
-**Why those three are excluded rather than forgotten.** They are the
-open-ended bodies of `msg-att`: extensions append fields to `body-ext-*`, and
-real servers vary inside `ENVELOPE` addresses. A failure there is at least as
-likely to be a modelling gap of ours as a server defect, and parse failure is
-connection-fatal (`reference/imap.md`), so hard-failing would drop connections
-against conformant servers. N4 was exactly such a gap of ours and is now
-closed, which shrinks but does not eliminate the class.
+**What round 3 also had to widen.** Gating `X-GM-LABELS` strict made the
+label grammar load-bearing, and `astring` cannot express Gmail's actual wire
+form: system labels arrive as bare backslash-prefixed atoms
+(`(\Inbox \Sent Important)`), and `\` is a `quoted-special` excluded from
+`ATOM-CHAR`. Parsing labels as plain `astring` therefore turned a routine
+Gmail FETCH into a connection-fatal failure. The grammar is now
+`"\" atom / astring`, and `X-GM-MSGID` / `X-GM-THRID` also accept the quoted
+decimal some Gmail proxies emit. This is the general hazard of the strict
+lane: every attribute promoted into it must first be checked against what
+servers actually send, not only against the ABNF.
+
+**What is still open.** A nested multipart child is intentionally checked only
+as a balanced parenthesized group while validating its parent. For example,
+`* 1 FETCH (BODYSTRUCTURE (("TEXT") "MIXED"))` still reaches
+`UntaggedResponse::Unknown`: the inner child is malformed, but a strict
+recursive parser would also reject a balanced child whose optional extension
+tail this codec does not yet model. Since parse failure is connection-fatal,
+the generic IMAP client must retain that tolerance until it can distinguish
+those two cases without guessing.
 
 **Why it matters.** In a QRESYNC/CONDSTORE sync a silently-dropped FETCH can
 leave a message unhydrated while the cursor advances, making the loss persist
 until UIDVALIDITY changes.
 
-**Proposed fix.** Distinguish "failed inside a recognized structure" from
-"unmodelled extension data" *inside* the BODYSTRUCTURE and ENVELOPE parsers -
-the fixed-arity prefix of each is closed (media type / subtype / params /
-id / description / encoding / size; the ten ENVELOPE fields), only the
-extension tail is open. Gating on the prefix would close the rest of C4
-without touching the tolerance that protects the tail.
-
 **Tests landed.**
 `decode/tests.rs::malformed_closed_grammar_fetch_attributes_are_parse_failures`
 pins the closed half over every gated attribute;
+`malformed_open_ended_fetch_fixed_prefixes_are_parse_failures` pins round 3's
+ENVELOPE / BODYSTRUCTURE / bare-BODY prefix gate;
 `unmodelled_and_open_ended_fetch_attributes_stay_tolerated` pins both the
-remaining `Unknown` degradation and the unmodelled-attribute tolerance;
+narrow nested-child remainder and the unmodelled-attribute tolerance;
 `connection/wire_tests.rs::read_one_rejects_a_malformed_recognized_fetch_attribute`
 pins the outcome on the path the driver actually takes.
 `malformed_status_is_a_parse_failure` and `expunge_zero_rejected` are the
 controls for the direct and numbered keyword halves.
-
----
-
-# Non-bug findings
-
-## N1 - `X-GM-LABELS` is silently dropped
-
-`FetchResponse` models `gmail_msg_id` (`X-GM-MSGID`) and
-`gmail_thread_id` (`X-GM-THRID`) but not `X-GM-LABELS`, so labels fall
-into `fetch_response_inner`'s unknown-attribute arm and are skipped.
-Since Gmail's IMAP label model *is* its folder model, and the other two
-Gmail extensions are modelled, this reads as an oversight rather than a
-decision. `bifrost-google` uses the Gmail API rather than IMAP, so the
-gap only bites a Gmail account configured as a generic IMAP account.
-The fix needs a `FetchResponse` field, which is `types`, outside my
-scope. Pinned by
-`decode/tests.rs::fetch_x_gm_labels_is_skipped_without_losing_other_attributes`.
-
-## N6 - `EncodedCommand::segments`'s "never empty" claim is unenforced
-
-The doc on `EncodedCommand::segments` says "Each segment is never
-empty". It holds today (every marker is at least 4 octets, so each
-split advances), but nothing checks it, and `from_flat_buffer` on an
-empty buffer returns *zero* segments, which `send_encoded_segments`
-would treat as "nothing to send". Unreachable today because every
-encoder writes at least a tag; a `debug_assert!(!segments.is_empty())`
-would make the contract self-checking.
-
-## N7 - `validate_login_credential_ascii` permits CR/LF in credentials
-
-It rejects only non-ASCII (`!value.is_ascii()`), and CR/LF are ASCII.
-A password containing CRLF therefore reaches
-`encode_quoted_or_literal_utf8`, fails the `quotable` check, and is sent
-as a literal - which is legal and safe (RFC 3501 Section 4.3 literals
-carry CHAR8). It was also the trigger condition for C1 and C7 on the
-LOGIN path, both now fixed. The behavior is correct; it is just surprising that the
-function named "validate credential" does not reject the one byte class
-everything else in `encode/mod.rs` rejects. A comment would do.
-
-## N8 - `decode_utf7` accepts an unterminated shift segment without complaint
-
-`&AOk` (no closing `-`) decodes to `é` with no `tracing` event, while
-`&` alone is preserved as a literal ampersand and malformed Base64 falls
-back to emitting `&<raw>-`. Three different recovery strategies, only
-one of them logged. Deliberate Postel behavior per the existing
-`unterminated_base64_segment` test; noting the inconsistency only.
-
-## N9 - `classification.rs` `mailbox_names_eq` duplicates `connection::helpers::inbox_eq`
-
-The comment already says so and explains why (module privacy). Both are
-four lines. C3's fix showed the cheap way out - move the single
-implementation into the codec and re-export it `pub(crate)` - and this is the
-next candidate for the same treatment.
 
 ---
 
@@ -201,7 +159,8 @@ tests supersede the former bug-documenting expectations.
 | | `expunge_zero_rejected` | the closed numbered half of **C4**: `EXISTS` / `RECENT` / `EXPUNGE` fail, unmodelled numbered keywords stay `Unknown` |
 | | `malformed_fetch_uid_zero_is_parse_failure` | **C4**, `uniqueid = nz-number` violations now hard-fail instead of routing as `Unknown` |
 | | `malformed_closed_grammar_fetch_attributes_are_parse_failures` | **C4**, the same for every FETCH attribute with a closed grammar |
-| | `unmodelled_and_open_ended_fetch_attributes_stay_tolerated` | **C4**'s other edge: unmodelled attributes and `ENVELOPE`/`BODYSTRUCTURE`/bare `BODY` still degrade rather than drop the connection |
+| | `malformed_open_ended_fetch_fixed_prefixes_are_parse_failures` | **C4**, malformed ENVELOPE and BODYSTRUCTURE / bare-BODY fixed prefixes are connection-fatal |
+| | `unmodelled_and_open_ended_fetch_attributes_stay_tolerated` | **C4**'s narrow other edge: unmodelled attributes, body extension tails, and malformed nested multipart children still tolerate rather than drop the connection |
 | | `scan_section_spec_incomplete_is_a_parse_failure_not_incomplete` | an unterminated `BODY[` section is an error, never `Incomplete` |
 | | `paren_skippers_do_not_scan_past_backslash_crlf` | **N3**, a backslash-escaped CR/LF cannot bridge two responses |
 | | `paren_skippers_do_not_scan_past_raw_crlf_in_a_quoted_value` | **N3**, raw CR/LF inside a quoted value ends the scan in all three paren-skippers |
@@ -211,41 +170,43 @@ tests supersede the former bug-documenting expectations.
 | | `response_code_overflow_recovery_stops_at_the_closing_bracket` | C5's recovery reads only the code's own value, not the status text after `]` |
 | | `list_mailbox_name_preserves_control_characters_from_the_wire` | C6's resolution: wire names keep the server's identity, and `MailboxName::new`'s invariant is documented as not applying to them |
 | `connection/helpers_tests.rs` | `list_status_option_extracts_the_whole_item_list` | C3, on the path `ImapConnection` actually calls |
-| | `fetch_x_gm_labels_is_skipped_without_losing_other_attributes` | **N1**, labels dropped, neighbours survive |
+| `connection/wire_tests.rs` | `read_one_rejects_a_malformed_recognized_fetch_attribute` | **C4**, decoder hard failure becomes the driver-facing `Error::Parse` for both closed attributes and BODYSTRUCTURE prefixes |
+| `decode/tests.rs` | `fetch_x_gm_labels_are_exposed_without_losing_other_attributes` | **N1**, Gmail's real wire form (unquoted `\Inbox`, unquoted atom, quoted user label, modified UTF-7) decodes into `FetchResponse` without changing account-layer semantics |
+| `connection/dispatch_tests.rs` | `fetch_byte_estimate_counts_gmail_labels` | labels are heap data the server controls, so they count toward `uid_fetch_limited` and the buffered-fetch warning |
+| `connection/helpers_tests.rs` | `gmail_labels_fetch_requires_x_gm_ext_1` | `FetchAttr::GmailLabels` is capability-gated like the other Gmail attributes |
+| `encode/tests.rs` | `encoded_command_rejects_an_empty_buffer` | **N6**, the non-empty segment invariant is enforced in release builds |
+| | `encode_login_crlf_credential_stays_inside_its_literal` | **N7**, a CR/LF credential is counted-literal framed verbatim and cannot reach a command boundary |
+| `utf7_tests.rs` | `unterminated_base64_segment` | **N8**, invalid unterminated shifts preserve raw identity rather than decode a prefix |
+| `connection/helpers_tests.rs` | `inbox_compare_is_case_insensitive_for_inbox_only` | **N9**, connection consumers use the codec-owned mailbox comparison |
 | `utf7_tests.rs` | `prop_decode_invariants::decode_utf7_never_panics` | arbitrary wire bytes |
 | | `prop_decode_invariants::roundtrip_identity_including_control_characters` | MUTF-7 identity over all strings, not only NUL/CR/LF-free ones |
 | | `prop_decode_invariants::decode_is_stable_under_reencode` | decode -> encode -> decode is a fixed point |
 | | `prop_decode_invariants::encode_emits_only_printable_ascii` | RFC 3501 Section 5.1.3 printable-wire invariant |
 
-C4 remains documented as a current gap, now narrowed from "numbered `FETCH`"
-to the three open-ended attribute bodies (`ENVELOPE`, `BODYSTRUCTURE`, bare
-`BODY`); `malformed_status_is_a_parse_failure` and `expunge_zero_rejected` are
-the controls for the keyword halves that were already closed.
+C4 remains documented as a current gap only for malformed nested multipart
+BODYSTRUCTURE children whose balanced shape could also be an unmodelled
+extension tail. `malformed_status_is_a_parse_failure` and
+`expunge_zero_rejected` are the controls for the keyword halves that were
+already closed.
 
-## C6, and why it is closed without sanitizing
+## N7, settled: not a bug on the literal path
 
-C6 reported that `MailboxName`'s doc block promises a "no NUL / CR / LF"
-invariant that `from_decoded` does not enforce. Two ways to make that true;
-we took the one that does not change data.
-
-Sanitizing (mapping those code points to U+FFFD) makes the type honest at the
-cost of the server's own identifier: distinct mailboxes collide in the folder
-registry and in sync scope identity, and every subsequent command names a
-mailbox the server never advertised in its LIST reply. RFC 3501 Section 5.1 /
-RFC 9051 Section 5.1 make the name the server's opaque handle, and modified
-UTF-7 can represent control characters, so that rewrite is a correctness
-regression, not a hardening step.
-
-The invariant is therefore documented as belonging to `MailboxName::new`
-alone, and the CRLF-safety claim is discharged where it actually holds - the
-encoder. `encode_utf7` folds every non-printable character back into a Base64
-shift segment (pinned by `encode_emits_only_printable_ascii`), and in
-UTF8=ACCEPT mode a name with CR or LF fails `quotable` in
-`encode_quoted_or_literal_utf8` and goes out as a literal, where CHAR8 is
-legal (RFC 3501 Section 4.3). Consumers that embed a mailbox name in a
-line-oriented sink must escape it themselves; the constructor doc says so.
-
----
+Round 3 first rejected CR/LF in LOGIN credentials outright. That was wrong and
+has been reverted. `login = "LOGIN" SP userid SP password` takes two
+`astring`s, and RFC 9051 Section 4.3 allows a literal to carry any CHAR8.
+A credential containing a line break fails the `quotable` check in
+`encode_quoted_or_literal_utf8` and goes out as a counted literal whose octet
+count is computed from exactly the bytes written, so the line break is payload
+the server consumes inside the literal. The injection the reject was defending
+against would require credential bytes to *escape* that framing, which the
+count makes impossible;
+`encode_login_crlf_credential_stays_inside_its_literal` proves it by encoding
+a password containing a full `A002 DELETE INBOX` line and asserting the exact
+framing. Rejecting would have locked out accounts whose valid password
+contains a line break on servers offering only LOGIN. The ASCII-only check
+(RFC 6855 Section 5) stands, and now runs once in the encoder with the
+connection layer calling the same function before submitting to the driver
+(`login_rejects_non_ascii_before_submitting_to_the_driver`).
 
 # Not reached, and why
 

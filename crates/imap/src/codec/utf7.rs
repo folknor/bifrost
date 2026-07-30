@@ -123,12 +123,14 @@ pub(crate) fn decode_utf7(input: &[u8]) -> String {
                 }
                 // Decode the modified Base64 segment.
                 let b64_slice = &input[start..i];
-                // Unterminated `&` with no base64 content  -  preserve
-                // the ampersand as a literal per Postel's law.
-                // RFC 3501 Section5.1.3 requires a closing `-`, but silently
-                // dropping the `&` loses data.
-                if b64_slice.is_empty() && i >= input.len() {
+                // RFC 3501 Section 5.1.3 requires every shifted segment to
+                // end in `-`. An unterminated segment is not a mailbox name
+                // the server can validly produce, so preserve its raw bytes
+                // rather than decoding a prefix and inventing a different
+                // mailbox identity.
+                if i >= input.len() {
                     out.push('&');
+                    out.push_str(&String::from_utf8_lossy(b64_slice));
                     continue;
                 }
                 if i < input.len() {

@@ -24,6 +24,7 @@ fn fetch_response_default() {
     assert!(resp.thread_id.is_none());
     assert!(resp.gmail_msg_id.is_none());
     assert!(resp.gmail_thread_id.is_none());
+    assert!(resp.gmail_labels.is_none());
 }
 
 #[test]
@@ -300,10 +301,15 @@ fn fetch_response_with_gmail_ids() {
         seq: 1,
         gmail_msg_id: Some(1_278_455_344_230_334_864),
         gmail_thread_id: Some(1_278_455_344_230_334_865),
+        gmail_labels: Some(vec!["\\Inbox".to_owned(), "Work".to_owned()]),
         ..Default::default()
     };
     assert_eq!(resp.gmail_msg_id, Some(1_278_455_344_230_334_864));
     assert_eq!(resp.gmail_thread_id, Some(1_278_455_344_230_334_865));
+    assert_eq!(
+        resp.gmail_labels,
+        Some(vec!["\\Inbox".to_owned(), "Work".to_owned()])
+    );
 }
 
 #[test]
@@ -535,6 +541,7 @@ fn fetch_attr_simple_items() {
     assert_eq!(FetchAttr::ThreadId.to_imap_string(), "THREADID");
     assert_eq!(FetchAttr::GmailMsgId.to_imap_string(), "X-GM-MSGID");
     assert_eq!(FetchAttr::GmailThreadId.to_imap_string(), "X-GM-THRID");
+    assert_eq!(FetchAttr::GmailLabels.to_imap_string(), "X-GM-LABELS");
 }
 
 #[test]

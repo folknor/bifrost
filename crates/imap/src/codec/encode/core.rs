@@ -198,6 +198,14 @@ impl EncodedCommand {
     /// RFC 3501 Section 4.3: "The client MUST wait for a continuation request
     /// before sending the octets of a synchronizing literal."
     pub(super) fn from_flat_buffer(buf: &[u8]) -> Self {
+        // Every caller has first encoded a complete tagged command. Keeping
+        // this as a release assertion makes the non-empty segment contract
+        // structural instead of merely documenting a property of current
+        // command encoders.
+        assert!(
+            !buf.is_empty(),
+            "EncodedCommand requires a non-empty command buffer"
+        );
         let mut segments = Vec::new();
         let mut seg_start = 0;
         // `scan_pos` tracks our scanning position; it may jump ahead past

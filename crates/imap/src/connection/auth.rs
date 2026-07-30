@@ -191,6 +191,12 @@ impl ImapConnection {
     pub async fn login(&self, user: &str, pass: &str, timeout: Duration) -> Result<(), Error> {
         use super::dispatch::LoginConsumer;
 
+        // Reject before the command enters the driver. SASL credentials take
+        // their separately framed AUTHENTICATE paths; this validation is only
+        // for the line-oriented LOGIN command.
+        crate::codec::encode::validate_login_credential_ascii(user, "user")?;
+        crate::codec::encode::validate_login_credential_ascii(pass, "password")?;
+
         // Validate state and capabilities from the driver's snapshot.
         {
             let snap = self.state_rx.borrow();
@@ -242,16 +248,6 @@ impl ImapConnection {
                      AUTH=PLAIN"
                 );
             }
-        }
-
-        // RFC 6855 Section 5: LOGIN must not be used for non-ASCII
-        // credentials. Clients must use AUTHENTICATE instead.
-        if !user.is_ascii() || !pass.is_ascii() {
-            return Err(Error::Protocol(
-                "LOGIN does not support non-ASCII credentials; \
-                 use AUTHENTICATE (RFC 6855 Section 5)"
-                    .into(),
-            ));
         }
 
         let deadline = tokio::time::Instant::now() + timeout;

@@ -33,6 +33,14 @@ pub(crate) fn estimate_fetch_response_bytes(fr: &FetchResponse) -> usize {
     for bin in &fr.binary_sections {
         size += bin.data.as_ref().map_or(0, Vec::len);
     }
+    // Gmail labels are unbounded server-supplied heap strings, so a
+    // labels-only FETCH would otherwise contribute only the flat overhead
+    // and slip past both `uid_fetch_limited` and the warn threshold.
+    if let Some(labels) = &fr.gmail_labels {
+        for label in labels {
+            size += label.len();
+        }
+    }
     size
 }
 

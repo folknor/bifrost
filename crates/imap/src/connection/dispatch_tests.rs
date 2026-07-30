@@ -75,6 +75,26 @@ async fn streaming_fetch_consumer_does_not_drop_slow_receiver_backlog() {
     assert_eq!(received.last().map(|fetch| fetch.seq), Some(300));
 }
 
+/// Gmail labels are heap strings the server controls, so they must be part of
+/// the byte estimate that drives `uid_fetch_limited` and the buffered-fetch
+/// warning. A labels-only FETCH would otherwise report the flat overhead.
+#[test]
+fn fetch_byte_estimate_counts_gmail_labels() {
+    let bare = FetchResponse {
+        seq: 1,
+        ..Default::default()
+    };
+    let labelled = FetchResponse {
+        seq: 1,
+        gmail_labels: Some(vec!["x".repeat(4096), "y".repeat(2048)]),
+        ..Default::default()
+    };
+    assert_eq!(
+        fetch::estimate_fetch_response_bytes(&labelled),
+        fetch::estimate_fetch_response_bytes(&bare) + 4096 + 2048
+    );
+}
+
 #[test]
 fn fetch_consumer_propagates_terminal_no_after_data() {
     let mut consumer = FetchConsumer::new();
