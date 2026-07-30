@@ -212,7 +212,10 @@ fetch (`get_profile`, whose `mail`/`userPrincipalName` seeds the public-folder
 Autodiscover lookups), constructs a `GraphAccount`, and runs
 `list_mail_folders_recursive` to seed the `FolderTree`. Cursors mint lazily from
 `establish_initial_cursor` plus the first `inventory_stream` page. Returns
-`Arc<dyn Account>`.
+`OpenedAccount`; the only skip Graph records on its lane is a failed
+opt-in delegate-Autodiscover pass (account-scoped, since discovery is
+what failed and no narrower scope is knowable) - config-supplied shared
+mailboxes always install.
 
 `GraphAccount` owns:
 
@@ -573,7 +576,9 @@ any `with_shared_mailbox` entries additively, empty-dropping and
 exact-string-deduping across the whole merged set (config first, discovered
 appended). Discovery is best-effort and non-fatal: malformed/truncated XML or
 a request failure degrades to the config-supplied mailboxes rather than
-failing `open`. The EWS twin `ews_shared_scope_error` applies the same
+failing `open`, and the skipped pass is recorded on
+`OpenedAccount::skipped_scopes` with its classified error so the
+degradation is reportable, not just logged. The EWS twin `ews_shared_scope_error` applies the same
 `ScopeRevoked` -> `DisableScope` isolation to public-folder scopes.
 
 ## Public-folder discovery (Autodiscover)
@@ -978,15 +983,16 @@ appends two namespaced legs:
   a container joins its sync scope by id), `owner_local_id` = the bare Graph
   folder id. The primary role map is deliberately NOT applied here - a shared
   mailbox's well-known folder ids are not the primary's. A per-mailbox listing
-  failure degrades to a `Warning` plus the remaining containers.
+  failure degrades to a `SkippedScope` (naming the mailbox, carrying the
+  classified error) plus the remaining containers.
 - Each `routing_map` public folder, `namespace = Public`, no owner,
   `content_class` from the EWS `FolderClass`, `rights` from the EWS
   `EffectiveRights`. Purely local (reads the discovery-seeded maps, no EWS
   round-trip) and includes folders that are visible but NOT pinned for sync -
   the consumer has to see a folder before it can pin it.
 
-`containers_list` has no warning lane in the `Account` trait, so the
-degradation `Warning`s are logged rather than yielded.
+The skips ride out on `ContainerList::skipped_scopes` (and are also
+warn-logged), so a consumer can tell a degraded share from a deleted one.
 
 Create/rename/move/delete call `mailFolders`; root moves target
 `msgfolderroot`.

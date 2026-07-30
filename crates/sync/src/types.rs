@@ -205,6 +205,13 @@ pub(crate) struct AccountSlot {
     /// in the decisions doc; recorded today, not yet read by the
     /// poll/push paths.
     pub throttles: Arc<std::sync::Mutex<crate::recovery::ThrottleBucket>>,
+    /// The `OpenedAccount::skipped_scopes` lane from the most recent
+    /// successful `factory.open` (attach or reopen swap): the parts of
+    /// the account surface the protocol crate discovered but could not
+    /// bring up, with their classified errors. Exposed via
+    /// `SyncEngine::open_skipped_scopes` so a consumer can tell a
+    /// degraded shared namespace apart from one that does not exist.
+    pub open_skips: Arc<Mutex<Vec<bifrost_types::SkippedScope>>>,
 }
 
 pub(crate) struct WorkerTask {

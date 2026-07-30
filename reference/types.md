@@ -15,7 +15,20 @@ The shared structured error contract is documented separately in
 `Arc<dyn Account>` / `Arc<dyn AccountFactory>`. The workspace is
 async-only.
 
-`AccountFactory::open(account_id)` creates one live account handle.
+`AccountFactory::open(account_id)` creates one live account handle,
+returned as `OpenedAccount { account, skipped_scopes }`. The skip lane
+names the parts of the account's discovered surface open could not
+bring up and left out of the handle - a foreign JMAP account whose
+seeding probe failed, an IMAP-composed DAV sub-account that did not
+open, a failed Graph delegate-Autodiscover pass - each with its
+classified `AccountError`. The lane exists because both alternative
+shapes are wrong: failing the whole open blocks the user's primary
+mail on someone else's shared mailbox being down (initial attach does
+not retry `factory.open`), and skipping silently erases the share for
+the session. `Err(_)` from `open` therefore means the PRIMARY surface
+is unavailable. Like `Page`, `OpenedAccount` is deliberately not
+`#[non_exhaustive]`: every factory constructs it, so a future lane
+breaks every constructor.
 `Account::close()` is idempotent local teardown. It closes protocol
 connections and workers but does not delete durable server-side push
 subscriptions, which use `push_unsubscribe`.
@@ -161,6 +174,17 @@ NOT `#[non_exhaustive]`: protocol impls construct them directly, and a new
 lane must break every constructor so each one answers the new question
 instead of silently defaulting it.
 
+`SkippedScope` is the shared degradation vocabulary, not a search-only
+one. Two sibling envelopes reuse it under the same
+not-`#[non_exhaustive]` rule: `OpenedAccount` (`account.rs`), the
+`AccountFactory::open` result described above, and `ContainerList`
+(`container.rs`), the `containers_list` envelope pairing the
+materialized containers with the namespaces a multi-namespace
+enumeration skipped instead of listing. In all three the skip is
+advisory - the returned data remains valid - and the classified error
+lets a consumer distinguish a transient outage (a retry or reopen
+heals it) from a revoked grant.
+
 ## Provenance and container vocabulary
 
 Identifiers are typed newtypes. `Container`, `Label`, and related
@@ -193,14 +217,16 @@ server-assembled message bytes.
 ```
 crates/types/src/
   lib.rs              public module and re-export surface
-  account.rs          Account, AccountFactory, convenience defaults
+  account.rs          Account, AccountFactory, OpenedAccount,
+                      convenience defaults
   capabilities.rs     declarative feature and dispatch shapes
   cursor.rs           cursor scope, membership scope, cursor state
   events.rs           SyncEvent, Batch, Checkpoint, Control, push hints
   mutation.rs         mutation targets, flags, labels, fingerprints
   hydration.rs        projections and hydrated object vocabulary
   blob.rs             blob handles, byte ranges, range support
-  container.rs        containers, labels, roles, provenance
+  container.rs        containers, labels, roles, provenance,
+                      ContainerList skip-lane envelope
   compose.rs          send and draft request vocabulary
   account_compose.rs  compose validation and helpers
   search.rs           message search requests and results

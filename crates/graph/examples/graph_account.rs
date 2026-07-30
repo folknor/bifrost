@@ -17,13 +17,21 @@ async fn main() {
         env::var("BIFROST_GRAPH_ACCOUNT_ID").unwrap_or_else(|_| "graph-example".to_string()),
     );
 
-    let account = match factory.open(account_id).await {
-        Ok(account) => account,
+    let opened = match factory.open(account_id).await {
+        Ok(opened) => opened,
         Err(error) => {
             eprintln!("failed to open Graph account: {error:?}");
             return;
         }
     };
+    let account = opened.account;
+    for skip in &opened.skipped_scopes {
+        eprintln!(
+            "open skipped {:?}: {}",
+            skip.scope,
+            skip.error.message_key()
+        );
+    }
 
     let capabilities = account.capabilities();
     println!(
@@ -32,7 +40,7 @@ async fn main() {
     );
 
     match account.containers_list().await {
-        Ok(containers) => println!("graph account has {} mail folders", containers.len()),
+        Ok(list) => println!("graph account has {} mail folders", list.containers.len()),
         Err(error) => eprintln!("failed to list Graph containers: {error:?}"),
     }
 

@@ -523,7 +523,7 @@ impl Account for CalDavAccount {
         unsupported_future(AccountOperation::SearchMessages)
     }
 
-    fn containers_list(&self) -> AccountFuture<Result<Vec<Container>, AccountError>> {
+    fn containers_list(&self) -> AccountFuture<Result<ContainerList, AccountError>> {
         unsupported_future(AccountOperation::ContainersList)
     }
 

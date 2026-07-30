@@ -69,8 +69,10 @@ production specialization because WebSocket push is reqwest-specific. Factory
 tests use an armed scripted transport that records exact API JSON and derives
 each reply's error shape from the same decision table `crates/net/src/request.rs`
 walks, so a fixture cannot pin behavior against a response shape production
-cannot produce: 2xx bodies reach the protocol decoder, a passed-through 3xx is
-body-preserving at the JMAP boundary, a second 401 is `AuthLost`, statuses
+cannot produce: 2xx bodies reach the protocol decoder, a passed-through 3xx
+carries status + headers with a knowably EMPTY body (bifrost-net's redirect
+`PassThrough` arm discards passthrough bodies, so the fixture drops any
+scripted body too), a second 401 is `AuthLost`, statuses
 retryable under `RetryPolicy::default()` (429 plus the 5xx family, read off the
 policy rather than restated) come back as `RateLimited` / `RetryBudgetExhausted`
 with their final response preserved, and only a genuinely non-retryable 4xx is
@@ -184,7 +186,7 @@ crates/jmap/src/sync/
 
 ### `JmapAccount` / `JmapAccountFactory` shape and lifecycle
 
-`JmapAccountFactory` carries a `JmapAccountFactoryBuilder` config (URL, `JmapCredentials::Basic`/`Bearer`, optional timeout, `accept_invalid_certs`, `ReconnectPolicy`). `AccountFactory::open(account_id)` connects a `Client`, passing the engine account id into the `bifrost-net` attachment so metering / priority / caps / trace use the real key on reopen. Open resolves the primary `Mail` account plus optional `Submission`/`VacationResponse`/`Quota`/`Sieve`, reads the session, builds `AccountCapabilities` + `CoreLimits`, then batches the initial `Email/get` and `Mailbox/get` (including names) probes into one request for the primary and one request per foreign account. It spawns the WebSocket reader with a `CancellationToken`, and returns `Arc<dyn Account>`.
+`JmapAccountFactory` carries a `JmapAccountFactoryBuilder` config (URL, `JmapCredentials::Basic`/`Bearer`, optional timeout, `accept_invalid_certs`, `ReconnectPolicy`). `AccountFactory::open(account_id)` connects a `Client`, passing the engine account id into the `bifrost-net` attachment so metering / priority / caps / trace use the real key on reopen. Open resolves the primary `Mail` account plus optional `Submission`/`VacationResponse`/`Quota`/`Sieve`, reads the session, builds `AccountCapabilities` + `CoreLimits`, then batches the initial `Email/get` and `Mailbox/get` (including names) probes into one request for the primary and one request per foreign account. It spawns the WebSocket reader with a `CancellationToken`, and returns `OpenedAccount` (the handle plus the foreign-account skip lane; see Foreign accounts below).
 
 The batch is conditional on the session's own numbers. `maxCallsInRequest` and `maxSizeRequest` are hard limits (RFC 8620 §2) the server enforces by rejecting the whole request with a request-level `limit` error, and the commonly quoted 16 calls is the minimum a server is *recommended* to support, never a floor a client may assume. So `batched_open_probes` sends the two-call batch only when the advertised call count allows it and `Request::send_methods_within` finds the encoded request inside `maxSizeRequest`; otherwise nothing is sent and the probes go out one request each. `send_methods_within` takes the size limit as a required argument (and returns `Ok(None)` without sending when the batch does not fit) precisely so a future batching call site cannot forget the question.
 
@@ -364,7 +366,7 @@ response-shape mismatches). Both take the caller's `AccountOperation`.
 
 ### Foreign (shared/delegate) accounts
 
-JMAP auto-discovers shared/delegate accounts from the session: at `open`, `foreign_mail_account_ids` selects session accounts with `isPersonal: false` advertising `urn:ietf:params:jmap:mail`, excluding the primary; each becomes a scoped `Account::new(client, accountId)` handle in `foreign_mail`. `seed_foreign_account` runs the primary's two probes (`Email`/`Mailbox` state), inserting per-accountId `state_cache` entries and seeding one `CursorScope::Folder(encode_foreign(accountId, mailboxId))` per mailbox into `seed_states`. A successfully seeded foreign account that also advertises Submission is included in `foreign_submission`; only that same routing set enables `pim_methods.send_as`, so an account skipped by probing never produces an advertised but unreachable send path. A failed probe is skipped (others still open); cost is O(foreign accounts) round-trips at open. Since foreign account discovery happens only here and there is no foreign scope lifecycle stream, the capabilities flag advertises that reopening can discover a newly granted share.
+JMAP auto-discovers shared/delegate accounts from the session: at `open`, `foreign_mail_account_ids` selects session accounts with `isPersonal: false` advertising `urn:ietf:params:jmap:mail`, excluding the primary; each becomes a scoped `Account::new(client, accountId)` handle in `foreign_mail`. `seed_foreign_account` runs the primary's two probes (`Email`/`Mailbox` state), inserting per-accountId `state_cache` entries and seeding one `CursorScope::Folder(encode_foreign(accountId, mailboxId))` per mailbox into `seed_states`. A successfully seeded foreign account that also advertises Submission is included in `foreign_submission`; only that same routing set enables `pim_methods.send_as`, so a revoked share never produces an advertised but unreachable send path. A probe failure - revoked grant (terminal `NoPermission`) and exhausted transient retry (retryable) alike - skips that foreign account and records a `SkippedScope` naming its accountId, with the classified error, on `OpenedAccount::skipped_scopes` (`seed_foreign_account_or_skip`). Open itself neither fails (initial attach does not retry `factory.open`, so failing would block the user's own primary mail on a delegate outage) nor skips silently (the original G8 defect); the recovery class on the skip tells the consumer whether a reopen can heal it. Cost is O(foreign accounts) round-trips at open. Since foreign account discovery happens only here and there is no foreign scope lifecycle stream, the capabilities flag advertises that reopening can discover a newly granted share.
 
 Owner-email resolution for those accounts is a two-level RFC 9670 gate
 (`owner_email_plans`): no session `urn:ietf:params:jmap:principals`
@@ -424,11 +426,11 @@ contract change, not a wiring fix.
 seeded `CursorScope::Folder` string), `owner_local_id` = the bare mailbox id,
 and the parent re-encoded in the same namespace so a foreign child never
 points at a same-id primary mailbox. A per-account `Mailbox/get` failure
-degrades to a `Warning` plus the remaining containers. `containers_list` has
-no warning lane in the `Account` trait and this crate carries no logging
-dependency, so `fetch_foreign_containers` returns the structured `Warning`s
-and the caller drops them; the load-bearing half (one unreachable share does
-not blank the sidebar) is live regardless.
+degrades to a `SkippedScope` (naming the foreign accountId, carrying the
+classified error) on the returned `ContainerList::skipped_scopes`, plus the
+remaining containers: one unreachable share neither blanks the sidebar nor
+vanishes from it silently. A primary enumeration failure still fails the
+call.
 
 Out of A5a's read/sync slice (named follow-ups): foreign-account *mutations* (the `ifInState` cache is shaped for it via the per-accountId maps, but unwired - a mutation primitive handed a foreign-qualified id today would pass the whole encoded string to the primary account) and foreign *mailbox lifecycle* (the `scope_lifecycle` worker polls only the primary; a foreign mailbox added after `open` appears at the next reopen).
 

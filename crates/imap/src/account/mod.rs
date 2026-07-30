@@ -10,15 +10,16 @@ use std::time::Duration;
 use bifrost_types::{
     Account, AccountError, AccountFuture, AccountOperation, AccountStream, AttachmentHandle,
     BlobHandle, ByteRange, Calendar, CalendarEvent, Change, ChangeCursor, CloudUploadMeta,
-    ContactCard, ContactCreate, ContactId, ContactPatch, ContactSearchRequest, Container,
-    ContainerId, ContainerKind, CursorDescriptor, CursorEstablishment, CursorScope, DirectoryCard,
-    DirectoryGroup, DirectoryGroupId, DirectoryGroupMember, DraftHandle, DraftPatch, EventCreate,
-    EventId, EventPatch, EventRange, EventSearchRequest, FilterValidation, HostedAttachment,
-    HydratedObject, HydrationProjection, IdempotencyKey, Identity, IdentityId, IdentityPatch,
-    Importance, InventoryEntry, ItemOutcome, MembershipScope, Message, MutationSuccess,
-    MutationTarget, ObjectId, Page, Priority, Projection, QuotaInfo, RsvpStatus, SearchRequest,
-    SendRequest, ServerFilter, ServerFilterCreate, ServerFilterId, ServerFilterPatch,
-    SubscriptionHandle, SyncEvent, ThreadHydration, ThreadId, VacationConfig, WatchEvent,
+    ContactCard, ContactCreate, ContactId, ContactPatch, ContactSearchRequest, ContainerId,
+    ContainerKind, ContainerList, CursorDescriptor, CursorEstablishment, CursorScope,
+    DirectoryCard, DirectoryGroup, DirectoryGroupId, DirectoryGroupMember, DraftHandle, DraftPatch,
+    EventCreate, EventId, EventPatch, EventRange, EventSearchRequest, FilterValidation,
+    HostedAttachment, HydratedObject, HydrationProjection, IdempotencyKey, Identity, IdentityId,
+    IdentityPatch, Importance, InventoryEntry, ItemOutcome, MembershipScope, Message,
+    MutationSuccess, MutationTarget, ObjectId, Page, Priority, Projection, QuotaInfo, RsvpStatus,
+    SearchRequest, SendRequest, ServerFilter, ServerFilterCreate, ServerFilterId,
+    ServerFilterPatch, SubscriptionHandle, SyncEvent, ThreadHydration, ThreadId, VacationConfig,
+    WatchEvent,
 };
 use bifrost_types::{AddressBook, AddressBookId};
 use futures::stream::Stream;
@@ -572,7 +573,7 @@ impl Account for ImapAccount {
         pim::search_messages(self.clone(), request)
     }
 
-    fn containers_list(&self) -> AccountFuture<Result<Vec<Container>, AccountError>> {
+    fn containers_list(&self) -> AccountFuture<Result<ContainerList, AccountError>> {
         pim::containers_list(self.clone())
     }
 

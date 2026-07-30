@@ -14,7 +14,7 @@ use bifrost_types::{
     AccountFuture, AccountOperation, AccountStream, AddressBook, AddressBookId, AttachmentHandle,
     Batch, BatchingPolicy, BlobHandle, BlobRangeSupport, ByteRange, Calendar, CalendarEvent, Cause,
     Change, ChangeCursor, CloudUploadMeta, ContactCard, ContactCreate, ContactId, ContactPatch,
-    ContactSearchRequest, Container, ContainerId, ContainerKind, ConvenienceShape, CostClass,
+    ContactSearchRequest, ContainerId, ContainerKind, ContainerList, ConvenienceShape, CostClass,
     CursorDescriptor, CursorEstablishment, CursorFreshness, CursorScope, DirectoryCard,
     DirectoryGroup, DirectoryGroupId, DirectoryGroupMember, DraftHandle, DraftPatch, EventCreate,
     EventId, EventPatch, EventRange, EventSearchRequest, FilterRuleShape, FilterValidation, FlagOp,
@@ -430,7 +430,7 @@ impl Account for StubAccount {
         Box::pin(async { Err(unsupported(AccountOperation::SearchMessages)) })
     }
 
-    fn containers_list(&self) -> AccountFuture<Result<Vec<Container>, AccountError>> {
+    fn containers_list(&self) -> AccountFuture<Result<ContainerList, AccountError>> {
         Box::pin(async { Err(unsupported(AccountOperation::ContainersList)) })
     }
 

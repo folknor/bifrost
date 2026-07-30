@@ -17,8 +17,9 @@ use bifrost_types::{
     AccountId, AccountStream, BackfillCheckpoint, BackfillProgress, Batch, ChangeCursor,
     Checkpoint, CursorEstablishment, CursorScope, DiagnosticText, EngineDirective, ErrorScope,
     InvalidationSink, InventoryPartition, InventoryPartitioning, ItemOutcome, MembershipScope,
-    MutationSuccess, PageBoundary, PauseReason, Priority, ReconcileAction, ReconcileAdvice,
-    RecoveryClass, RetryAdvice, SubscriptionHandle, SyncEvent, WatchEvent,
+    MutationSuccess, OpenedAccount, PageBoundary, PauseReason, Priority, ReconcileAction,
+    ReconcileAdvice, RecoveryClass, RetryAdvice, SkippedScope, SubscriptionHandle, SyncEvent,
+    WatchEvent,
 };
 use dashmap::DashMap;
 use futures::stream::StreamExt;
@@ -225,12 +226,18 @@ impl SyncEngine {
         account_id: AccountId,
         factory: Arc<dyn AccountFactory>,
     ) -> Result<SyncControl, Error> {
-        let opened = factory
+        let OpenedAccount {
+            account: opened,
+            skipped_scopes,
+        } = factory
             .open(account_id.clone())
             .await
             .map_err(Error::OpenFailed)?;
+        log_open_skips(&account_id, &skipped_scopes, "attach");
         let cleanup = Arc::clone(&opened);
-        let result = self.attach_opened(account_id, factory, opened).await;
+        let result = self
+            .attach_opened(account_id, factory, opened, skipped_scopes)
+            .await;
         if result.is_err()
             && let Err(error) = cleanup.close().await
         {
@@ -248,7 +255,12 @@ impl SyncEngine {
         account_id: AccountId,
         factory: Arc<dyn AccountFactory>,
         opened: Arc<dyn Account>,
+        skipped_scopes: Vec<SkippedScope>,
     ) -> Result<SyncControl, Error> {
+        // The open-time skip lane, kept live for the slot's lifetime:
+        // reopen replaces it with the replacement open's answer, and
+        // `open_skipped_scopes` exposes it to the consumer.
+        let open_skips = Arc::new(std::sync::Mutex::new(skipped_scopes));
         let capabilities = Arc::new(std::sync::RwLock::new(opened.capabilities().clone()));
 
         let cursors = Arc::new(CursorRegistry::new());
@@ -635,6 +647,7 @@ impl SyncEngine {
             let inventory_subscriptions = Arc::clone(&self.subscriptions);
             let inventory_account_generation_tx = account_generation_tx.clone();
             let inventory_reopen_lock = Arc::clone(&reopen_lock);
+            let inventory_open_skips = Arc::clone(&open_skips);
             spawn(tokio::spawn(async move {
                 run_deferred_inventory_establishment(
                     inventory_factory,
@@ -653,6 +666,7 @@ impl SyncEngine {
                     inventory_subscriptions,
                     inventory_account_generation_tx,
                     inventory_reopen_lock,
+                    inventory_open_skips,
                     deferred_inventory_scopes,
                 )
                 .await;
@@ -675,6 +689,7 @@ impl SyncEngine {
         let reopen_subscriptions = Arc::clone(&self.subscriptions);
         let reopen_account_generation_tx = account_generation_tx.clone();
         let reopen_serial = Arc::clone(&reopen_lock);
+        let reopen_open_skips = Arc::clone(&open_skips);
         spawn(tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -698,6 +713,7 @@ impl SyncEngine {
                                     subscriptions: &reopen_subscriptions,
                                     account_generation_tx: &reopen_account_generation_tx,
                                     reopen_lock: &reopen_serial,
+                                    open_skips: &reopen_open_skips,
                                 };
                                 handle_account_error(&ctx, scope, error).await;
                             }
@@ -752,6 +768,7 @@ impl SyncEngine {
             subscriber_notify,
             reopen_tx: reopen_tx.clone(),
             throttles: Arc::clone(&throttles),
+            open_skips,
         });
 
         self.accounts.insert(account_id.clone(), slot);
@@ -903,9 +920,30 @@ impl SyncEngine {
             subscriptions: &self.subscriptions,
             account_generation_tx: &slot.account_generation_tx,
             reopen_lock: &slot.reopen_lock,
+            open_skips: &slot.open_skips,
         };
         let _reopen_guard = slot.reopen_lock.lock().await;
         reattach_account(&ctx, next).await
+    }
+
+    /// The `OpenedAccount::skipped_scopes` lane from the account's most
+    /// recent successful open (initial attach or reopen swap): parts of
+    /// the account surface - typically foreign / shared namespaces -
+    /// the protocol crate discovered but could not bring up, each with
+    /// its classified `AccountError`. Empty when the whole discovered
+    /// surface is live. A skip whose error is retryable heals on a
+    /// later `reopen`; a terminal one (revoked grant) will keep
+    /// reappearing until the grant returns or goes away.
+    pub fn open_skipped_scopes(&self, account_id: &AccountId) -> Result<Vec<SkippedScope>, Error> {
+        let slot = self
+            .accounts
+            .get(account_id)
+            .ok_or_else(|| Error::AccountNotAttached(account_id.clone()))?;
+        let skips = slot
+            .open_skips
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Ok(skips.clone())
     }
 
     /// Subscribe to the per-account unified change stream. Each
@@ -1967,7 +2005,7 @@ impl SyncEngine {
     pub async fn containers_list(
         &self,
         account_id: &AccountId,
-    ) -> Result<Vec<bifrost_types::Container>, Error> {
+    ) -> Result<bifrost_types::ContainerList, Error> {
         Ok(self.live_account(account_id)?.containers_list().await?)
     }
 
@@ -3137,6 +3175,7 @@ async fn run_deferred_inventory_establishment(
     subscriptions: Arc<SubscriptionRegistry>,
     account_generation_tx: watch::Sender<u64>,
     reopen_lock: Arc<AsyncMutex<()>>,
+    open_skips: Arc<std::sync::Mutex<Vec<SkippedScope>>>,
     scopes: Vec<CursorScope>,
 ) {
     if !wait_for_real_subscriber(&changes_tx, &subscriber_notify, &shutdown).await {
@@ -3204,6 +3243,7 @@ async fn run_deferred_inventory_establishment(
                     subscriptions: &subscriptions,
                     account_generation_tx: &account_generation_tx,
                     reopen_lock: &reopen_lock,
+                    open_skips: &open_skips,
                 };
                 handle_account_error(&ctx, Some(scope.clone()), error).await;
             }
@@ -3364,6 +3404,9 @@ pub(crate) struct RecoveryContext<'a> {
     pub subscriptions: &'a Arc<SubscriptionRegistry>,
     pub account_generation_tx: &'a watch::Sender<u64>,
     pub reopen_lock: &'a Arc<AsyncMutex<()>>,
+    /// Slot-lifetime open-skip lane; a successful reattach replaces it
+    /// with the replacement open's `OpenedAccount::skipped_scopes`.
+    pub open_skips: &'a Arc<std::sync::Mutex<Vec<SkippedScope>>>,
 }
 
 /// Dispatch an `AccountError` to the engine's recovery machinery.
@@ -3752,7 +3795,11 @@ async fn re_establish_scope_with_backoff(ctx: &RecoveryContext<'_>, scope: Curso
 /// is paused with `PauseReason::RetryBudgetExhausted` and the last
 /// `AccountError` is broadcast as `SyncEvent::Terminated`. (sync-D6,
 /// sync-D7)
-async fn reattach_account(ctx: &RecoveryContext<'_>, next: Arc<dyn Account>) -> Result<(), Error> {
+async fn reattach_account(ctx: &RecoveryContext<'_>, next: OpenedAccount) -> Result<(), Error> {
+    let OpenedAccount {
+        account: next,
+        skipped_scopes: next_skips,
+    } = next;
     next.set_priority(ctx.control.priority_snapshot());
     next.set_bandwidth_cap(ctx.control.bandwidth_cap_snapshot());
     let _activity = ctx.control.begin_activity().ok_or(Error::Paused)?;
@@ -3863,6 +3910,17 @@ async fn reattach_account(ctx: &RecoveryContext<'_>, next: Arc<dyn Account>) -> 
         }
         ctx.subscriptions
             .replace(ctx.account_id.clone(), replacement_subscriptions);
+        // The replacement open's skip lane supersedes the previous
+        // one: a healed namespace disappears from it, a still-degraded
+        // one reappears with a fresh classification.
+        log_open_skips(ctx.account_id, &next_skips, "reopen");
+        {
+            let mut skips = ctx
+                .open_skips
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *skips = next_skips;
+        }
         ctx.account_generation_tx
             .send_modify(|generation| *generation = generation.saturating_add(1));
 
@@ -3974,6 +4032,25 @@ fn engine_pause(ctx: &RecoveryContext<'_>, reason: PauseReason) {
     // `Control::resume`).
     ctx.boundary_tx
         .send_replace(crate::cancel::BoundaryRequest::Pause);
+}
+
+/// Emit one structured `warn!` per open-time skip. The durable record
+/// is the slot's `open_skips` lane (read via
+/// `SyncEngine::open_skipped_scopes`); the log line exists so a
+/// degraded shared namespace is visible in telemetry even when the
+/// consumer never queries the lane.
+fn log_open_skips(account_id: &AccountId, skips: &[SkippedScope], phase: &'static str) {
+    for skip in skips {
+        tracing::warn!(
+            target: "bifrost.sync.attach",
+            account = ?account_id,
+            scope = ?skip.scope,
+            kind = ?skip.error.kind(),
+            message_key = skip.error.message_key(),
+            phase,
+            "open skipped a degraded scope; primary surface attached without it"
+        );
+    }
 }
 
 fn jittered(base: Duration) -> Duration {

@@ -16,12 +16,16 @@ async fn main() {
         AuthPolicy::default(),
     );
     let factory: Arc<dyn AccountFactory> = Arc::new(ImapAccountFactory::new(config));
-    let account = factory
+    let opened = factory
         .open(AccountId("imap-example".to_owned()))
         .await
         .expect("account opens");
+    let account = opened.account;
+    // Composed DAV sub-accounts that failed to open are reported here.
+    let _degraded = opened.skipped_scopes;
 
     let _capabilities = account.capabilities();
-    let _containers = account.containers_list().await.expect("containers list");
+    let containers = account.containers_list().await.expect("containers list");
+    let _list = containers.containers;
     account.close().await.expect("account closes");
 }

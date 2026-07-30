@@ -38,10 +38,10 @@ use bifrost_types::{
     EventCreate, EventId, EventPatch, EventRange, EventSearchRequest, FilterValidation,
     HostedAttachment, HydratedObject, HydrationProjection, IdempotencyKey, Importance,
     InventoryEntry, ItemOutcome, MembershipScope, Message, MutationSuccess, MutationTarget,
-    ObjectId, Page, Priority, Projection, RsvpStatus, ScopeLifecycleEvent, SearchRequest,
-    SendRequest, ServerFilter, ServerFilterCreate, ServerFilterId, ServerFilterPatch,
-    SubscriptionHandle, SyncEvent, SyncStrategy, ThreadHydration, ThreadId, VacationConfig,
-    WatchEvent,
+    ObjectId, OpenedAccount, Page, Priority, Projection, RsvpStatus, ScopeLifecycleEvent,
+    SearchRequest, SendRequest, ServerFilter, ServerFilterCreate, ServerFilterId,
+    ServerFilterPatch, SkippedScope, SubscriptionHandle, SyncEvent, SyncStrategy, ThreadHydration,
+    ThreadId, VacationConfig, WatchEvent,
 };
 use bytes::Bytes;
 use futures::{StreamExt, stream};
@@ -520,7 +520,7 @@ impl AccountFactory for GraphAccountFactory {
     fn open(
         &self,
         account_id: bifrost_types::AccountId,
-    ) -> AccountFuture<Result<Arc<dyn Account>, AccountError>> {
+    ) -> AccountFuture<Result<OpenedAccount, AccountError>> {
         let client = self.client.clone();
         let push_mode = self.push_mode;
         let push_endpoint = self.push_endpoint.clone();
@@ -553,6 +553,7 @@ impl AccountFactory for GraphAccountFactory {
             // primary SMTP to query with) degrades to "no delegates
             // found" and the account still opens with its configured
             // mailboxes, rather than failing the whole open.
+            let mut skipped_scopes: Vec<SkippedScope> = Vec::new();
             if delegate_discovery && let Some(email) = user_email.as_deref() {
                 match account.discover_shared_mailboxes(email).await {
                     Ok(discovered) => {
@@ -570,6 +571,15 @@ impl AccountFactory for GraphAccountFactory {
                             "[Graph] delegate Autodiscover failed, opening with \
                              config-supplied shared mailboxes only: {error:?}"
                         );
+                        // The whole delegate-discovery pass was skipped,
+                        // so shares it would have found are absent from
+                        // this handle. Account-scoped because no
+                        // narrower scope is knowable - discovery is what
+                        // failed.
+                        skipped_scopes.push(SkippedScope {
+                            scope: bifrost_types::ErrorScope::Account,
+                            error,
+                        });
                     }
                 }
             }
@@ -586,7 +596,10 @@ impl AccountFactory for GraphAccountFactory {
                     .into_iter()
                     .map(|folder| (folder.id, folder.parent_folder_id)),
             );
-            Ok(Arc::new(account) as Arc<dyn Account>)
+            Ok(OpenedAccount {
+                account: Arc::new(account) as Arc<dyn Account>,
+                skipped_scopes,
+            })
         })
     }
 }
@@ -960,9 +973,7 @@ impl Account for GraphAccount {
         Box::pin(async move { pim::search_messages(account, request).await })
     }
 
-    fn containers_list(
-        &self,
-    ) -> AccountFuture<Result<Vec<bifrost_types::Container>, AccountError>> {
+    fn containers_list(&self) -> AccountFuture<Result<bifrost_types::ContainerList, AccountError>> {
         let account = self.clone();
         Box::pin(async move { pim::containers_list(account).await })
     }

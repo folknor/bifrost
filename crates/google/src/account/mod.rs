@@ -22,16 +22,16 @@ use bifrost_types::{
     Account, AccountCapabilities, AccountError, AccountFactory, AccountFuture, AccountId,
     AccountOperation, AccountStream, AddressBook, AddressBookId, AttachmentHandle, BlobHandle,
     ByteRange, Calendar, CalendarEvent, Change, ChangeCursor, CloudUploadMeta, ContactCard,
-    ContactCreate, ContactId, ContactPatch, ContactSearchRequest, Container, ContainerId,
-    ContainerKind, CostClass, CursorDescriptor, CursorEstablishment, CursorScope, DirectoryCard,
+    ContactCreate, ContactId, ContactPatch, ContactSearchRequest, ContainerId, ContainerKind,
+    ContainerList, CostClass, CursorDescriptor, CursorEstablishment, CursorScope, DirectoryCard,
     DirectoryGroup, DirectoryGroupId, DirectoryGroupMember, DraftHandle, DraftPatch, EventCreate,
     EventId, EventPatch, EventRange, EventSearchRequest, FilterValidation, FlagOp,
     HostedAttachment, HydratedObject, HydrationProjection, IdempotencyKey, Identity, IdentityId,
     IdentityPatch, Importance, InventoryEntry, ItemOutcome, MembershipScope, Message,
-    MutationSuccess, MutationTarget, ObjectId, OpaqueChangeState, Page, Priority, Projection,
-    QuotaInfo, RsvpStatus, ScopeLifecycleEvent, SearchRequest, SendRequest, ServerFilter,
-    ServerFilterCreate, ServerFilterId, ServerFilterPatch, SubscriptionHandle, SyncEvent,
-    SyncStrategy, ThreadHydration, ThreadId, VacationConfig, WatchEvent,
+    MutationSuccess, MutationTarget, ObjectId, OpaqueChangeState, OpenedAccount, Page, Priority,
+    Projection, QuotaInfo, RsvpStatus, ScopeLifecycleEvent, SearchRequest, SendRequest,
+    ServerFilter, ServerFilterCreate, ServerFilterId, ServerFilterPatch, SubscriptionHandle,
+    SyncEvent, SyncStrategy, ThreadHydration, ThreadId, VacationConfig, WatchEvent,
 };
 use bytes::Bytes;
 use tokio_util::sync::CancellationToken;
@@ -141,12 +141,14 @@ impl GoogleAccountFactory {
 }
 
 impl AccountFactory for GoogleAccountFactory {
-    fn open(&self, account_id: AccountId) -> AccountFuture<Result<Arc<dyn Account>, AccountError>> {
+    fn open(&self, account_id: AccountId) -> AccountFuture<Result<OpenedAccount, AccountError>> {
         let client = Arc::new(self.client.for_account(account_id));
         let pubsub = self.pubsub.clone();
         Box::pin(async move {
             match GoogleAccount::open(Arc::clone(&client), pubsub).await {
-                Ok(account) => Ok(account as Arc<dyn Account>),
+                // Single-namespace account: open probes only the
+                // principal's own profile, so nothing can be skipped.
+                Ok(account) => Ok(OpenedAccount::complete(account as Arc<dyn Account>)),
                 Err(error) => {
                     client.detach_account();
                     Err(error)
@@ -586,7 +588,7 @@ impl Account for GoogleAccount {
         pim::search_messages(Arc::clone(&self.client), request)
     }
 
-    fn containers_list(&self) -> AccountFuture<Result<Vec<Container>, AccountError>> {
+    fn containers_list(&self) -> AccountFuture<Result<ContainerList, AccountError>> {
         pim::containers_list(Arc::clone(&self.client), Arc::clone(&self.scope_cache))
     }
 

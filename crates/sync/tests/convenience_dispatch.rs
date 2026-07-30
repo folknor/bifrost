@@ -17,7 +17,7 @@ use bifrost_types::{
     AccountFuture, AccountOperation, AccountStream, AttachmentHandle, BatchingPolicy, BlobHandle,
     BlobRangeSupport, ByteRange, Calendar, CalendarEvent, Cause, Change, ChangeCursor,
     CloudUploadMeta, ContactCard, ContactCreate, ContactId, ContactPatch, ContactSearchRequest,
-    Container, ContainerId, ContainerKind, ConvenienceShape, CursorDescriptor, CursorEstablishment,
+    ContainerId, ContainerKind, ConvenienceShape, CursorDescriptor, CursorEstablishment,
     CursorFreshness, CursorScope, DraftHandle, DraftPatch, EventCreate, EventId, EventPatch,
     EventRange, EventSearchRequest, FilterRuleShape, FilterValidation, FlagOp, HostedAttachment,
     HydratedObject, HydrationProjection, IdempotencyKey, Identity, IdentityId, IdentityPatch,
@@ -360,7 +360,7 @@ impl Account for RecorderAccount {
         Box::pin(async { Err(unsupported(AccountOperation::SearchMessages)) })
     }
 
-    fn containers_list(&self) -> AccountFuture<Result<Vec<Container>, AccountError>> {
+    fn containers_list(&self) -> AccountFuture<Result<bifrost_types::ContainerList, AccountError>> {
         Box::pin(async { Err(unsupported(AccountOperation::ContainersList)) })
     }
 

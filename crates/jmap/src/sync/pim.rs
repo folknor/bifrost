@@ -4,10 +4,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use bifrost_types::{
     AccountError, AccountFuture, AccountOperation, AccountStream, BlobCapabilities, BlobEncoding,
-    BlobHandle, BlobId, Container, ContainerId, ContainerKind, ContainerNamespace, ContainerRights,
-    FolderRole, HydrationProjection, Importance, LabelId, Message, MutationTarget, ObjectId, Page,
-    Provenance, QuotaInfo, SearchFilter, SearchRequest, ThreadHydration, ThreadId, VacationConfig,
-    Warning, WarningKind,
+    BlobHandle, BlobId, Container, ContainerId, ContainerKind, ContainerList, ContainerNamespace,
+    ContainerRights, FolderRole, HydrationProjection, Importance, LabelId, Message, MutationTarget,
+    ObjectId, Page, Provenance, QuotaInfo, SearchFilter, SearchRequest, SkippedScope,
+    ThreadHydration, ThreadId, VacationConfig,
 };
 /// Convert a crate-internal error to `AccountError` with the correct
 /// `AccountOperation` for this call site. Every call site in this
@@ -677,18 +677,17 @@ pub(crate) fn search_messages<T: HttpTransport>(
 /// Every container the account exposes: the primary account's mailboxes
 /// plus each foreign (shared/delegate) account's, namespaced by owner.
 ///
-/// A per-share enumeration failure degrades to a `Warning` plus the
-/// remaining containers. `containers_list` has no warning lane in the
-/// `Account` trait, and this crate deliberately carries no logging
-/// dependency, so the structured `Warning`s cannot be surfaced from here
-/// yet - they are built and returned by `fetch_foreign_containers` so
-/// wiring them into a warning-carrying containers surface is a call-site
-/// change rather than a rewrite. The load-bearing half of the degradation
-/// (the remaining containers still return) is live either way.
+/// A per-share enumeration failure degrades to a `SkippedScope` on the
+/// returned `ContainerList` plus the remaining containers: one
+/// unreachable share must not blank the whole sidebar, and it must not
+/// vanish from it silently either - the skip entry names the foreign
+/// account and carries the classified error, so the consumer can tell
+/// "share degraded" from "share deleted". A primary enumeration
+/// failure still fails the call.
 pub(crate) fn containers_list<T: HttpTransport>(
     mail: MailAccount<T>,
     foreign_mail: Arc<HashMap<String, MailAccount<T>>>,
-) -> AccountFuture<Result<Vec<Container>, AccountError>> {
+) -> AccountFuture<Result<ContainerList, AccountError>> {
     Box::pin(async move {
         let mut containers = fetch_containers(&mail, AccountOperation::ContainersList).await?;
         // Owner emails are resolved once per foreign account per call
@@ -698,14 +697,17 @@ pub(crate) fn containers_list<T: HttpTransport>(
         // container-listing error as an attach failure, and a missing
         // cosmetic email must never cause an account outage.
         let owner_emails = resolve_owner_emails(&mail, &foreign_mail).await;
-        let (foreign, _warnings) = fetch_foreign_containers(
+        let (foreign, skipped_scopes) = fetch_foreign_containers(
             &foreign_mail,
             &owner_emails,
             AccountOperation::ContainersList,
         )
         .await;
         containers.extend(foreign);
-        Ok(containers)
+        Ok(ContainerList {
+            containers,
+            skipped_scopes,
+        })
     })
 }
 
@@ -1813,16 +1815,17 @@ async fn fetch_principal_email<T: HttpTransport>(
 /// `Shared`-namespace containers.
 ///
 /// Each foreign account is independent, so a per-account `Mailbox/get`
-/// failure degrades to a `Warning` plus the remaining containers - matching
-/// the shape the discovery path already uses for a revoked share. One
-/// unreachable share must not blank the whole sidebar.
+/// failure degrades to a `SkippedScope` (naming the foreign accountId,
+/// carrying the classified error) plus the remaining containers -
+/// matching the shape open-time seeding uses for an unreachable share.
+/// One unreachable share must not blank the whole sidebar.
 async fn fetch_foreign_containers<T: HttpTransport>(
     foreign_mail: &HashMap<String, MailAccount<T>>,
     owner_emails: &HashMap<String, String>,
     op: AccountOperation,
-) -> (Vec<Container>, Vec<Warning>) {
+) -> (Vec<Container>, Vec<SkippedScope>) {
     let mut containers = Vec::new();
-    let mut warnings = Vec::new();
+    let mut skipped = Vec::new();
     // Deterministic order so the projection is stable across calls.
     let mut account_ids: Vec<&String> = foreign_mail.keys().collect();
     account_ids.sort();
@@ -1833,13 +1836,15 @@ async fn fetch_foreign_containers<T: HttpTransport>(
             Ok(mailboxes) => containers.extend(mailboxes.into_iter().filter_map(|mailbox| {
                 container_from_mailbox(mailbox, Some(account_id), owner_email)
             })),
-            Err(_) => warnings.push(Warning::support_only(
-                WarningKind::OperatorAttentionNeeded,
-                format!("shared JMAP account {account_id} skipped: mailbox listing failed"),
-            )),
+            Err(error) => skipped.push(SkippedScope {
+                scope: bifrost_types::ErrorScope::Mailbox {
+                    id: account_id.clone(),
+                },
+                error,
+            }),
         }
     }
-    (containers, warnings)
+    (containers, skipped)
 }
 
 async fn fetch_mailboxes<T: HttpTransport>(

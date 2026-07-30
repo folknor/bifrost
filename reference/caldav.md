@@ -15,7 +15,9 @@ Current Stage 4 standalone CalDAV account implementation.
 - `CalDavAccountFactory` - implements `AccountFactory`.
 
 `CalDavAccountFactory::open(account_id)` discovers the CalDAV calendar
-home, caches the default calendar URL, and returns an `Arc<dyn Account>`.
+home, caches the default calendar URL, and returns an `Arc<dyn Account>`
+inside an `OpenedAccount` whose skip lane is always empty
+(single-principal surface).
 The raw DAV client, XML parser, and iCalendar projection stay
 crate-private; consumers use only the factory and the shared `Account`
 calendar primitives.

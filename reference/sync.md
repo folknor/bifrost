@@ -71,10 +71,18 @@ engine.shutdown().await?; // explicit cleanup; preferred over Drop
    `Error::AccountAlreadyAttached`. The guard is released on both
    success and failure paths so a failed `attach_inner` does not
    strand the slot.
-2. `factory.open(account_id).await` -> `Arc<dyn Account>`. The
-   engine threads its own `AccountId` through so the protocol crate
-   can register against `bifrost-net` / `MeterSink` / trace
-   correlation under the same key the engine knows the account by.
+2. `factory.open(account_id).await` -> `OpenedAccount { account,
+   skipped_scopes }`. The engine threads its own `AccountId` through
+   so the protocol crate can register against `bifrost-net` /
+   `MeterSink` / trace correlation under the same key the engine knows
+   the account by. The skip lane - parts of the surface the protocol
+   crate discovered but could not bring up (an unreachable foreign
+   JMAP account, a failed composed-DAV open), each with its classified
+   error - is warn-logged and stored on the slot;
+   `SyncEngine::open_skipped_scopes(account)` exposes the current
+   lane. `Err(_)` still fails the attach as `OpenFailed`: the contract
+   reserves it for the primary surface being unavailable, precisely
+   because this path has no retry budget (only the reopen path does).
 3. Read `capabilities()` (snapshotted on the slot).
 4. `discover_cursor_scopes()` -> for each, `establish_initial_cursor(scope)`:
    - `Ready(cursor)`: persist, start `changes_stream` immediately.
@@ -125,7 +133,10 @@ reapplies priority and bandwidth, rediscovers cursor scopes and
 memberships into a temporary registry, establishes newly-appeared
 scopes, removes vanished cursors, recreates registered push
 subscriptions, refreshes the capability snapshot, and then swaps the
-handle and registry topology. The public entry is what a consumer pairs
+handle and registry topology. On a successful swap the replacement
+open's `skipped_scopes` replace the slot's stored lane, so a healed
+namespace disappears from `open_skipped_scopes` and a still-degraded
+one reappears with a fresh classification. The public entry is what a consumer pairs
 with `capabilities().reopen_discovers_foreign_namespaces`: when that
 flag is true, a share granted after the last open surfaces only through
 this rediscovery, and the scheduling cadence (how often the reattach's
@@ -872,6 +883,7 @@ crates/sync/src/
                           // attach/detach/reopen/shutdown,
                           // ack_checkpoint, ack_writer,
                           // handle_recovery, scope_covers_membership,
+                          // open_skipped_scopes (open-time skip lane),
                           // live_account + hydration passthrough
   control.rs              // SyncControl + record_checkpoint hook
   error.rs                // engine Error wrapping AccountError + Warning

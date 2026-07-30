@@ -135,10 +135,12 @@ impl ReqwestTransport {
             // Only a passed-through 3xx reaches here: bifrost-net turns
             // every 4xx/5xx into a typed `Error` before `send` returns,
             // so `Ok(response)` with a non-2xx status means a 304 / 305 /
-            // 306 or a `Location`-less redirect. Keep the body attached
-            // anyway - it costs nothing and a server that answers a
-            // conditional request with a problem document still gets
-            // interpreted.
+            // 306 or a `Location`-less redirect. On the production stack
+            // `body` is always empty - the redirect loop's `PassThrough`
+            // arm replaces the body with an empty stream
+            // (`crates/net/src/request.rs`) - so the status is the whole
+            // evidence; the body is threaded through for shape, not
+            // because a problem document can arrive on it.
             Err(TransportError::with_body(format!("HTTP {status}"), body))
         }
     }
@@ -213,15 +215,27 @@ impl SseTransport for ReqwestTransport {
             .map_err(transport_error_from_net)?;
 
         if response.status().is_success() {
-            Ok(ReqwestByteStream {
+            return Ok(ReqwestByteStream {
                 inner: response.body,
-            })
-        } else {
-            Err(TransportError::new(format!(
-                "SSE: HTTP {}",
-                response.status()
-            )))
+            });
         }
+
+        // `send_streaming` already turns every 4xx/5xx into a typed
+        // bifrost-net error, so the only non-2xx response it can hand
+        // us is a passed-through redirect (304/305/306, or a
+        // `Location`-less 3xx). Preserve its status and headers through
+        // the same typed error boundary instead of discarding them
+        // behind a generic network error. The body is knowably empty:
+        // `ReqwestTransport` always rides bifrost-net's redirect loop,
+        // whose `PassThrough` arm deliberately replaces the body with
+        // an empty stream (`crates/net/src/request.rs`), so there is no
+        // problem-details document to capture here and this path does
+        // not pretend otherwise.
+        Err(TransportError::from_net(bifrost_net::Error::Status {
+            code: response.status,
+            body: Bytes::new(),
+            headers: response.headers,
+        }))
     }
 }
 

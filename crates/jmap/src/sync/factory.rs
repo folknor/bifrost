@@ -5,6 +5,7 @@ use std::time::Duration;
 use bifrost_net::{StaticTokenSource, TokenSource};
 use bifrost_types::{
     Account, AccountError, AccountFactory, AccountFuture, AccountId, CursorScope, ObjectType,
+    OpenedAccount, SkippedScope,
 };
 
 use tokio_util::sync::CancellationToken;
@@ -126,7 +127,7 @@ impl JmapAccountFactoryBuilder {
 }
 
 impl AccountFactory for JmapAccountFactory {
-    fn open(&self, account_id: AccountId) -> AccountFuture<Result<Arc<dyn Account>, AccountError>> {
+    fn open(&self, account_id: AccountId) -> AccountFuture<Result<OpenedAccount, AccountError>> {
         let config = self.config.clone();
         Box::pin(async move {
             let client = connect(config.clone(), account_id).await.map_err(|err| {
@@ -198,16 +199,23 @@ impl AccountFactory for JmapAccountFactory {
 
             // Foreign (shared/delegate) accounts: the session lists every
             // non-personal mail account. For each, probe its two states
-            // and seed one `Folder` cursor scope per mailbox. A
-            // permission-denied probe skips that foreign account (the
-            // primary and other foreign accounts still open).
+            // and seed one `Folder` cursor scope per mailbox. A probe
+            // failure - revoked grant and exhausted transient retry
+            // alike - skips that foreign account and records the
+            // omission on `OpenedAccount::skipped_scopes` with its
+            // classified error. Open itself must not fail here: initial
+            // attach does not retry `factory.open`, so failing would
+            // block the user's own primary mail on someone else's
+            // shared mailbox being down. And skipping silently would
+            // erase the share for the session with no signal anywhere.
             let foreign_ids = foreign_mail_account_ids(&session, &primary_id);
             let mut foreign_mail: HashMap<String, MailAccount> = HashMap::new();
             let mut foreign_submission = HashSet::new();
+            let mut skipped_scopes: Vec<SkippedScope> = Vec::new();
             for foreign_id in foreign_ids {
                 let foreign_account =
                     MailAccount::new(client.clone(), JmapAccountId::new(&foreign_id));
-                match seed_foreign_account(&foreign_account).await {
+                match seed_foreign_account_or_skip(&foreign_id, &foreign_account).await {
                     Ok(seed) => {
                         email_states.insert(foreign_id.clone(), Some(seed.email_state));
                         mailbox_states.insert(foreign_id.clone(), Some(seed.mailbox_state));
@@ -230,9 +238,12 @@ impl AccountFactory for JmapAccountFactory {
                         }
                         foreign_mail.insert(foreign_id, foreign_account);
                     }
-                    Err(_skip) => {
-                        // Permission-denied or transient: skip this
-                        // foreign account, do not abort open.
+                    Err(skip) => {
+                        // Leave the share out of this session's surface
+                        // and report the omission. Reopen re-reads the
+                        // session, so a restored grant or a recovered
+                        // server brings the share back.
+                        skipped_scopes.push(skip);
                     }
                 }
             }
@@ -289,7 +300,10 @@ impl AccountFactory for JmapAccountFactory {
                 mailbox_names,
             );
 
-            Ok(Arc::new(account) as Arc<dyn Account>)
+            Ok(OpenedAccount {
+                account: Arc::new(account) as Arc<dyn Account>,
+                skipped_scopes,
+            })
         })
     }
 }
@@ -405,10 +419,8 @@ struct ForeignSeed {
     email_state_for_seed: String,
 }
 
-/// Probe one foreign account's `Email` / `Mailbox` states and
-/// enumerate its mailboxes. Mirrors the primary probes. A failure
-/// (permission-denied or transient) returns `Err` so the caller skips
-/// this account without aborting `open`.
+/// Probe one foreign account's `Email` / `Mailbox` states and enumerate its
+/// mailboxes. Mirrors the primary probes.
 async fn seed_foreign_account<T: HttpTransport>(
     mail: &JmapMailAccount<T>,
 ) -> crate::Result<ForeignSeed> {
@@ -420,6 +432,43 @@ async fn seed_foreign_account<T: HttpTransport>(
         mailbox_state,
         mailbox_ids,
     })
+}
+
+/// Seed one foreign account, or turn its probe failure into the
+/// open-time skip entry the factory records on
+/// `OpenedAccount::skipped_scopes`.
+///
+/// Every failure lane lands here: a revoked grant classifies terminal
+/// (`NoPermission`) and an exhausted transient retry classifies
+/// retryable. Neither is allowed to take either unacceptable shape: a
+/// probe failure must not fail the whole open (initial attach does not
+/// retry `factory.open`, so that blocks the user's own primary mail on
+/// a delegate outage), and it must not skip silently (that erases the
+/// share for the session, the original G8 defect). The skip's scope
+/// names the foreign accountId so the consumer knows WHICH share is
+/// degraded and the recovery class says whether a reopen can heal it.
+async fn seed_foreign_account_or_skip<T: HttpTransport>(
+    foreign_id: &str,
+    mail: &JmapMailAccount<T>,
+) -> Result<ForeignSeed, SkippedScope> {
+    match seed_foreign_account(mail).await {
+        Ok(seed) => Ok(seed),
+        Err(err) => {
+            let error = super::error::into_account_error(
+                err,
+                super::error::JmapErrorContext::new(bifrost_types::AccountOperation::Discover)
+                    .with_scope(bifrost_types::ErrorScope::Mailbox {
+                        id: foreign_id.to_string(),
+                    }),
+            );
+            Err(SkippedScope {
+                scope: bifrost_types::ErrorScope::Mailbox {
+                    id: foreign_id.to_string(),
+                },
+                error,
+            })
+        }
+    }
 }
 
 /// The open-time probe set: `Email/get`, `Mailbox/get`.
@@ -615,9 +664,12 @@ mod tests {
         ///
         /// - 2xx: the body reaches the protocol decoder.
         /// - 3xx: bifrost-net returns 304 / 305 / 306 and `Location`-less
-        ///   redirects as `Ok`, so `ReqwestTransport::handle_response`
-        ///   turns them into a bodied `TransportError` with no net
-        ///   evidence attached.
+        ///   redirects as `Ok` with the body replaced by an empty stream
+        ///   (the redirect loop's `PassThrough` arm discards passthrough
+        ///   bodies), so `ReqwestTransport::handle_response` turns them
+        ///   into a body-less `TransportError` with no net evidence
+        ///   attached. The fixture drops any scripted body for the same
+        ///   reason: production cannot deliver one.
         /// - 401: the forced refresh retries once, and the second 401 is
         ///   `AuthLost` with acknowledged transmission evidence.
         /// - Retryable per `RetryPolicy::default()` - 429 plus the whole
@@ -642,7 +694,10 @@ mod tests {
                 return Ok(body);
             }
             if status.is_redirection() {
-                return Err(TransportError::with_body(format!("HTTP {status}"), body));
+                return Err(TransportError::with_body(
+                    format!("HTTP {status}"),
+                    Bytes::new(),
+                ));
             }
             let final_response = bifrost_net::FinalResponse {
                 status,
@@ -806,6 +861,14 @@ mod tests {
         ScriptedReply::ok(
             json!({"sessionState": "session-1", "methodResponses": results}).to_string(),
         )
+    }
+
+    fn method_error(account_id: &str, error_type: &str) -> ScriptedReply {
+        method_reply(vec![json!([
+            "error",
+            {"type": error_type, "accountId": account_id},
+            "s0"
+        ])])
     }
 
     /// One reply answering both batched open probes.
@@ -1112,6 +1175,54 @@ mod tests {
             .await
             .expect_err("scripted transport error");
         assert!(matches!(error, crate::Error::Transport(_)));
+    }
+
+    #[tokio::test]
+    async fn a_revoked_foreign_share_becomes_a_terminal_named_skip() {
+        let client = scripted_client([method_error("shared", "forbidden")]);
+        let shared = JmapMailAccount::new(client, JmapAccountId::new("shared"));
+
+        let Err(skip) = seed_foreign_account_or_skip("shared", &shared).await else {
+            panic!("a forbidden foreign probe must become a skip, not a seed");
+        };
+
+        assert!(
+            matches!(&skip.scope, bifrost_types::ErrorScope::Mailbox { id } if id == "shared"),
+            "the skip names the degraded foreign account: {:?}",
+            skip.scope
+        );
+        assert!(
+            matches!(
+                skip.error.recovery(),
+                bifrost_types::RecoveryClass::NoPermission { .. }
+            ),
+            "a revoked grant classifies terminal NoPermission: {:?}",
+            skip.error.recovery()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_retry_exhausted_foreign_probe_becomes_a_retryable_skip() {
+        let client = scripted_client([ScriptedReply::status(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            Bytes::from_static(br#"{"type":"about:blank","status":503}"#),
+        )]);
+        let shared = JmapMailAccount::new(client, JmapAccountId::new("shared"));
+
+        let Err(skip) = seed_foreign_account_or_skip("shared", &shared).await else {
+            panic!("a transient foreign probe must not erase the share silently");
+        };
+
+        assert!(
+            matches!(&skip.scope, bifrost_types::ErrorScope::Mailbox { id } if id == "shared"),
+            "the skip names the degraded foreign account: {:?}",
+            skip.scope
+        );
+        assert!(
+            skip.error.recovery().is_retryable(),
+            "retry exhaustion from bifrost-net stays retryable on the skip \
+             lane, so a consumer knows a reopen can heal it"
+        );
     }
 
     #[test]

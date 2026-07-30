@@ -38,7 +38,8 @@ pub mod settings;
 
 // Account trait + factory + erased return aliases.
 pub use account::{
-    Account, AccountFactory, AccountFuture, AccountStream, CategoryDefinition, MessageReactionState,
+    Account, AccountFactory, AccountFuture, AccountStream, CategoryDefinition,
+    MessageReactionState, OpenedAccount,
 };
 
 // Blob types.
@@ -84,8 +85,9 @@ pub use mime::{
 
 // Container / label / mutation-target types.
 pub use container::{
-    Container, ContainerContentClass, ContainerId, ContainerKind, ContainerNamespace,
-    ContainerRights, ContainerStyle, FolderRole, Label, MutationTarget, Provenance,
+    Container, ContainerContentClass, ContainerId, ContainerKind, ContainerList,
+    ContainerNamespace, ContainerRights, ContainerStyle, FolderRole, Label, MutationTarget,
+    Provenance,
 };
 
 // Address book and contact-card primitives.

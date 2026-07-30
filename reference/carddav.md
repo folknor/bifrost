@@ -16,7 +16,8 @@ Current Stage 3 W2 standalone CardDAV account implementation.
 
 `CardDavAccountFactory::open(account_id)` discovers the CardDAV
 addressbook home, caches the default address book URL, and returns an
-`Arc<dyn Account>`. The raw DAV client and parser modules stay
+`Arc<dyn Account>` inside an `OpenedAccount` whose skip lane is always
+empty (single-principal surface). The raw DAV client and parser modules stay
 crate-private; consumers use only the factory and the shared `Account`
 contact primitives.
 

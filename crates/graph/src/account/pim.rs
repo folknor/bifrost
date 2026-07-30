@@ -4,12 +4,11 @@ use std::time::SystemTime;
 use base64::Engine;
 use bifrost_types::{
     AccessErrorKind, AccountError, AccountErrorKind, AccountOperation, Address, AttachmentInline,
-    Container, ContainerContentClass, ContainerId, ContainerKind, ContainerNamespace,
-    ContainerRights, DraftHandle, DraftPatch, ErrorScope, FolderId, FolderRole,
+    Container, ContainerContentClass, ContainerId, ContainerKind, ContainerList,
+    ContainerNamespace, ContainerRights, DraftHandle, DraftPatch, ErrorScope, FolderId, FolderRole,
     HydrationProjection, Identity, IdentityId, Importance, LabelId, MailboxId, Message,
     MutationTarget, ObjectId, Page, ProtocolErrorKind, ProtocolKind, Provenance, SearchFilter,
-    SearchRequest, SendAs, SkippedScope, ThreadHydration, ThreadId, VacationConfig, Warning,
-    WarningKind,
+    SearchRequest, SendAs, SkippedScope, ThreadHydration, ThreadId, VacationConfig,
 };
 use chrono::TimeZone;
 use serde::{Deserialize, Serialize};
@@ -632,7 +631,7 @@ pub(crate) async fn search_messages(
     })
 }
 
-pub(crate) async fn containers_list(account: GraphAccount) -> Result<Vec<Container>, AccountError> {
+pub(crate) async fn containers_list(account: GraphAccount) -> Result<ContainerList, AccountError> {
     let folders = account
         .client
         .list_mail_folders_recursive()
@@ -656,17 +655,22 @@ pub(crate) async fn containers_list(account: GraphAccount) -> Result<Vec<Contain
 
     // Shared (delegate) mailboxes, then public folders. Both are additive:
     // a failure in either leg leaves the primary mailbox's containers intact.
-    let (shared, warnings) = shared_containers(&account).await;
+    // A per-mailbox degradation rides the `ContainerList::skipped_scopes`
+    // lane (with its classified error) and is logged for telemetry.
+    let (shared, skipped_scopes) = shared_containers(&account).await;
     containers.extend(shared);
-    // `containers_list` has no warning lane in the `Account` trait, so a
-    // per-mailbox degradation is logged here; the `Warning` values are built
-    // in the same shape the discovery path emits so the behavior stays
-    // testable.
-    for warning in &warnings {
-        tracing::warn!("[Graph] containers_list: {}", warning.message.as_str());
+    for skip in &skipped_scopes {
+        tracing::warn!(
+            "[Graph] containers_list skipped {:?}: {}",
+            skip.scope,
+            skip.error.message_key()
+        );
     }
     containers.extend(public_folder_containers(&account).await);
-    Ok(containers)
+    Ok(ContainerList {
+        containers,
+        skipped_scopes,
+    })
 }
 
 /// Enumerate each configured shared (delegate) mailbox's folders as
@@ -679,12 +683,13 @@ pub(crate) async fn containers_list(account: GraphAccount) -> Result<Vec<Contain
 /// scope - while `owner_local_id` keeps the bare Graph folder id for requests
 /// made against the owner's own mailbox.
 ///
-/// A per-mailbox enumeration failure degrades to a `Warning` plus the
-/// remaining containers, matching the shape the discovery path already uses:
-/// one revoked share must not blank the whole sidebar.
-async fn shared_containers(account: &GraphAccount) -> (Vec<Container>, Vec<Warning>) {
+/// A per-mailbox enumeration failure degrades to a `SkippedScope` (naming
+/// the shared mailbox, carrying the classified error) plus the remaining
+/// containers: one revoked share must not blank the whole sidebar, and it
+/// must not vanish from it silently either.
+async fn shared_containers(account: &GraphAccount) -> (Vec<Container>, Vec<SkippedScope>) {
     let mut containers = Vec::new();
-    let mut warnings = Vec::new();
+    let mut skipped = Vec::new();
     // Deterministic order so the projection is stable across calls.
     let mut mailboxes: Vec<&String> = account.shared_clients.keys().collect();
     mailboxes.sort();
@@ -699,13 +704,18 @@ async fn shared_containers(account: &GraphAccount) -> (Vec<Container>, Vec<Warni
                     // here; role falls back to the well-known-name match.
                     .map(|folder| container_from_folder(folder, &HashMap::new(), Some(mailbox))),
             ),
-            Err(_) => warnings.push(Warning::support_only(
-                WarningKind::OperatorAttentionNeeded,
-                format!("shared mailbox {mailbox} skipped: folder listing failed"),
-            )),
+            Err(error) => skipped.push(SkippedScope {
+                scope: ErrorScope::Mailbox {
+                    id: mailbox.clone(),
+                },
+                error: into_account_error(
+                    error,
+                    GraphErrorContext::graph(AccountOperation::ContainersList),
+                ),
+            }),
         }
     }
-    (containers, warnings)
+    (containers, skipped)
 }
 
 /// Project every discovered public folder as a `Public`-namespace container.

@@ -36,7 +36,7 @@ use crate::contact::{
     ContactSearchRequest,
 };
 use crate::container::{
-    Container, ContainerId, ContainerKind, ContainerStyle, Label, MutationTarget,
+    ContainerId, ContainerKind, ContainerList, ContainerStyle, Label, MutationTarget,
 };
 use crate::cursor::{
     ChangeCursor, CursorDescriptor, CursorEstablishment, CursorScope, MembershipScope,
@@ -57,7 +57,7 @@ use crate::filter::{
 use crate::hydration::{HydrationProjection, Importance, Message, ThreadHydration};
 use crate::ids::{AccountId, ObjectId, SubscriptionHandle, ThreadId};
 use crate::mutation::{FlagOp, HydratedObject, IdempotencyKey, Projection};
-use crate::page::Page;
+use crate::page::{Page, SkippedScope};
 use crate::search::SearchRequest;
 use crate::settings::{Identity, IdentityPatch, QuotaInfo, VacationConfig};
 
@@ -554,7 +554,14 @@ pub trait Account: Send + Sync {
     // ------------------------------------------------------------
 
     /// Enumerate containers (folders, labels, mailboxes).
-    fn containers_list(&self) -> AccountFuture<Result<Vec<Container>, AccountError>>;
+    ///
+    /// A multi-namespace provider that cannot enumerate one namespace
+    /// (an unreachable shared account, a revoked grant) lists the
+    /// namespaces it can and records the rest on
+    /// [`ContainerList::skipped_scopes`] with their classified errors,
+    /// rather than failing the whole enumeration or silently omitting
+    /// them. `Err(_)` means the enumeration itself failed.
+    fn containers_list(&self) -> AccountFuture<Result<ContainerList, AccountError>>;
 
     /// Create a new container of the given `kind` with `name` under
     /// `parent`. Returns the engine-facing id.
@@ -1055,7 +1062,66 @@ pub trait AccountFactory: Send + Sync + 'static {
     /// it as the registration key. On reopen the engine calls
     /// `open` with the same id so attached resources can be
     /// re-registered against the same key.
-    fn open(&self, account_id: AccountId) -> AccountFuture<Result<Arc<dyn Account>, AccountError>>;
+    ///
+    /// `Err(_)` means the account did not open: the primary surface
+    /// is unavailable. A failure confined to an independently
+    /// quarantinable part of the surface - a foreign (shared /
+    /// delegate) namespace whose open-time probe failed - must NOT
+    /// take that arm: the primary opens, the degraded part is left
+    /// out of the handle's surface, and the omission is recorded on
+    /// [`OpenedAccount::skipped_scopes`] with its classified error.
+    fn open(&self, account_id: AccountId) -> AccountFuture<Result<OpenedAccount, AccountError>>;
+}
+
+/// The result of a successful [`AccountFactory::open`].
+///
+/// `account` is the live handle. `skipped_scopes` names the parts of
+/// the account's potential surface that open discovered but could not
+/// bring up and therefore left out of this handle - a shared JMAP
+/// account whose seeding probe hit a 503 after retries, a delegate
+/// grant the server now refuses. Each entry carries the classified
+/// `AccountError`, so a consumer can tell a transient outage (a
+/// reopen rediscovers the namespace) from a revoked grant, and can
+/// surface either instead of learning about it from a support ticket.
+///
+/// The lane exists because neither of the alternative shapes is
+/// acceptable: failing the whole open blocks the user's primary mail
+/// on someone else's shared mailbox being down, and skipping silently
+/// erases the share for the session with no signal anywhere.
+///
+/// Like `Page`, deliberately not `#[non_exhaustive]`: every factory
+/// constructs it directly, so a future lane must break every
+/// constructor and each protocol answers the new question instead of
+/// silently defaulting it.
+#[derive(Clone)]
+pub struct OpenedAccount {
+    /// The live account handle.
+    pub account: Arc<dyn Account>,
+    /// Parts of the account surface open skipped instead of bringing
+    /// up, with their classified failures. Empty when the whole
+    /// discovered surface opened.
+    pub skipped_scopes: Vec<SkippedScope>,
+}
+
+impl OpenedAccount {
+    /// An open with nothing skipped: the whole discovered surface is
+    /// live on `account`.
+    #[must_use]
+    pub fn complete(account: Arc<dyn Account>) -> Self {
+        Self {
+            account,
+            skipped_scopes: Vec::new(),
+        }
+    }
+}
+
+impl std::fmt::Debug for OpenedAccount {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenedAccount")
+            .field("account", &"Arc<dyn Account>")
+            .field("skipped_scopes", &self.skipped_scopes)
+            .finish()
+    }
 }
 
 /// Shared dispatch for `apply_label` / `remove_label`.

@@ -80,38 +80,3 @@ per-accountId state key (which `state_cache` is already shaped for).
 Same for `pim.rs::add_to_container` / `remove_from_container` / `set_keyword` /
 `set_is_read` / `set_importance`, all of which take `self.mail` and
 `self.mail.id_str()` from `account.rs` (477-589).
-
-### G8 - A transient probe failure silently drops a shared account for the whole session
-
-`factory.rs:233-236`: `Err(_skip) => { /* Permission-denied or transient:
-skip */ }`. The comment is accurate about intent but the two cases are not
-equivalent. A permission-denied probe means the share is gone and skipping is
-right. A 503 or a connection reset on one of the two probes means the share
-is fine and the user's shared mailbox vanishes from `containers_list`, from
-`cursor_scopes`, and from `send_as` routing until the account is reopened -
-with no warning anywhere, because `open` returns `Ok`. Classifying through
-`into_account_error` and retrying (or at least surfacing) the retry classes
-would separate them.
-
-### G9 - The SSE leg classifies a status shape `bifrost-net` cannot hand it
-
-`transport_reqwest.rs::open_sse` calls `request.send_streaming()` and then
-branches on `response.status().is_success()`, building a bare
-`TransportError::new(format!("SSE: HTTP {status}"))` for anything else. But
-`send_streaming` only returns `Ok` for 2xx and for passed-through 3xx
-(304/305/306, `Location`-less redirects); every 4xx/5xx has already become a
-typed `bifrost_net::Error` by then. So that branch fires only for a 3xx, and
-when it does it discards the body and the net evidence both - the resulting
-`TransportError` has `net: None`, which `convert_transport` can only classify
-as a generic `Transport(Network)`.
-
-This is the same defect class the API leg had (fixed in this round for
-`api_request` / `handle_response`): a branch written against a response shape
-the production stack never delivers. It is currently unreachable in practice -
-the `Account` impl drives WebSocket push, not EventSource, and
-`ReqwestByteStream` is `#[allow(dead_code)]` - so it is filed rather than
-fixed. Whoever wires EventSource must route the non-2xx leg through
-`TransportError::from_net` the way `send`/`handle_response` does, or the first
-real SSE failure arrives with no status, no body, and no recovery signal.
-
----

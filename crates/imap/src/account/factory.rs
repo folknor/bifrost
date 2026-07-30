@@ -1,7 +1,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use bifrost_types::{Account, AccountError, AccountFactory, AccountFuture, AccountId};
+use bifrost_types::{
+    Account, AccountError, AccountFactory, AccountFuture, AccountId, OpenedAccount, SkippedScope,
+};
 
 use bifrost_caldav::{CalDavAccountFactory, CalDavConfig};
 use bifrost_carddav::{CardDavAccountFactory, CardDavConfig};
@@ -119,7 +121,7 @@ impl ImapAccountFactory {
 }
 
 impl AccountFactory for ImapAccountFactory {
-    fn open(&self, account_id: AccountId) -> AccountFuture<Result<Arc<dyn Account>, AccountError>> {
+    fn open(&self, account_id: AccountId) -> AccountFuture<Result<OpenedAccount, AccountError>> {
         let cfg = Arc::clone(&self.cfg);
         Box::pin(async move {
             let bandwidth_cap = Arc::new(std::sync::atomic::AtomicU64::new(
@@ -156,14 +158,20 @@ impl AccountFactory for ImapAccountFactory {
             let foreign_namespaces_advertised = shared.foreign_namespaces_advertised;
             let shared = shared.entries;
             // Fail-soft: a DAV open failure degrades to IMAP-only for
-            // this cycle instead of failing the whole IMAP account.
+            // this cycle instead of failing the whole IMAP account. The
+            // degradation is recorded twice on purpose: as a `Warning`
+            // surfaced through the first discovery stream (the live
+            // signal), and as an open-time `SkippedScope` so the
+            // engine's `open_skipped_scopes` lane reports the missing
+            // sub-account with its classified error.
             let mut dav_degraded = Vec::new();
+            let mut skipped_scopes = Vec::new();
             let contacts = open_carddav(&cfg, account_id.clone())
                 .await
-                .into_attached(&mut dav_degraded);
+                .into_attached(&mut dav_degraded, &mut skipped_scopes);
             let calendars = open_caldav(&cfg, account_id.clone())
                 .await
-                .into_attached(&mut dav_degraded);
+                .into_attached(&mut dav_degraded, &mut skipped_scopes);
             let submission = open_submission(&cfg)?;
             let caps = capabilities::build_capabilities(
                 &profile,
@@ -196,7 +204,10 @@ impl AccountFactory for ImapAccountFactory {
                 submission,
                 dav_degraded,
             });
-            Ok(Arc::new(account) as Arc<dyn Account>)
+            Ok(OpenedAccount {
+                account: Arc::new(account) as Arc<dyn Account>,
+                skipped_scopes,
+            })
         })
     }
 }
@@ -212,6 +223,9 @@ enum DavAttach {
     /// Configured but open failed; attach IMAP-only this cycle.
     Degraded {
         warning: bifrost_types::Warning,
+        /// The open-time skip entry (classified error + collection
+        /// scope) recorded on `OpenedAccount::skipped_scopes`.
+        skip: SkippedScope,
         // Retried on the engine's next reopen by design. Carried for
         // telemetry/clarity; the engine's reopen re-runs the open either
         // way.
@@ -222,13 +236,20 @@ enum DavAttach {
 
 impl DavAttach {
     /// Resolve to the optional sub-account handle, pushing any degraded
-    /// warning into `degraded` so the first discovery surfaces it.
-    fn into_attached(self, degraded: &mut Vec<bifrost_types::Warning>) -> Option<Arc<dyn Account>> {
+    /// warning into `degraded` (surfaced by the first discovery) and the
+    /// matching skip entry into `skipped` (surfaced by
+    /// `OpenedAccount::skipped_scopes`).
+    fn into_attached(
+        self,
+        degraded: &mut Vec<bifrost_types::Warning>,
+        skipped: &mut Vec<SkippedScope>,
+    ) -> Option<Arc<dyn Account>> {
         match self {
             DavAttach::Attached(account) => Some(account),
             DavAttach::None => None,
-            DavAttach::Degraded { warning, .. } => {
+            DavAttach::Degraded { warning, skip, .. } => {
                 degraded.push(warning);
+                skipped.push(skip);
                 None
             }
         }
@@ -240,9 +261,16 @@ impl DavAttach {
 /// `RecoveryClass` (read `reference/error-model.md`) to decide whether
 /// the degradation is transient (retried on the engine's next reopen) or
 /// a terminal config-fix.
-fn classify_dav_open(result: Result<Arc<dyn Account>, AccountError>, label: &str) -> DavAttach {
+fn classify_dav_open(
+    result: Result<OpenedAccount, AccountError>,
+    label: &str,
+    scope: bifrost_types::ErrorScope,
+) -> DavAttach {
     match result {
-        Ok(account) => DavAttach::Attached(account),
+        // The DAV factories are single-namespace and answer an empty
+        // skip lane; the composed account's own lane carries only the
+        // sub-account-level degradations classified below.
+        Ok(opened) => DavAttach::Attached(opened.account),
         Err(error) => {
             // A retryable recovery class means the failure is transient
             // (transport blip, server unavailable, throttle); anything
@@ -269,7 +297,12 @@ fn classify_dav_open(result: Result<Arc<dyn Account>, AccountError>, label: &str
             .with_protocol_detail(bifrost_types::DiagnosticText::support_only(
                 label.to_string(),
             ));
-            DavAttach::Degraded { warning, transient }
+            let skip = SkippedScope { scope, error };
+            DavAttach::Degraded {
+                warning,
+                skip,
+                transient,
+            }
         }
     }
 }
@@ -281,6 +314,7 @@ async fn open_carddav(cfg: &ImapAccountConfig, account_id: AccountId) -> DavAtta
     classify_dav_open(
         CardDavAccountFactory::new(config).open(account_id).await,
         "CardDAV",
+        bifrost_types::ErrorScope::ContactCollection,
     )
 }
 
@@ -301,6 +335,7 @@ async fn open_caldav(cfg: &ImapAccountConfig, account_id: AccountId) -> DavAttac
     classify_dav_open(
         CalDavAccountFactory::new(config).open(account_id).await,
         "CalDAV",
+        bifrost_types::ErrorScope::CalendarCollection,
     )
 }
 
@@ -804,16 +839,30 @@ mod tests {
 
     #[test]
     fn dav_open_classify_maps_transient_and_terminal_and_success() {
-        // Transport failure -> degraded, transient.
-        match classify_dav_open(Err(transport_error()), "CardDAV") {
-            DavAttach::Degraded { transient, .. } => assert!(transient, "transport is transient"),
+        let contact_scope = || bifrost_types::ErrorScope::ContactCollection;
+        // Transport failure -> degraded, transient, skip recorded with
+        // the collection scope + retryable classification.
+        match classify_dav_open(Err(transport_error()), "CardDAV", contact_scope()) {
+            DavAttach::Degraded {
+                transient, skip, ..
+            } => {
+                assert!(transient, "transport is transient");
+                assert!(matches!(
+                    skip.scope,
+                    bifrost_types::ErrorScope::ContactCollection
+                ));
+                assert!(skip.error.recovery().is_retryable());
+            }
             other => panic!("expected Degraded, got {}", attach_label(&other)),
         }
 
         // Auth-lost -> degraded, terminal (not transient).
-        match classify_dav_open(Err(auth_lost_error()), "CardDAV") {
-            DavAttach::Degraded { transient, .. } => {
+        match classify_dav_open(Err(auth_lost_error()), "CardDAV", contact_scope()) {
+            DavAttach::Degraded {
+                transient, skip, ..
+            } => {
                 assert!(!transient, "auth-lost is a terminal config fix");
+                assert!(skip.error.recovery().is_terminal());
             }
             other => panic!("expected Degraded, got {}", attach_label(&other)),
         }
@@ -822,7 +871,11 @@ mod tests {
         let stub = crate::account::test_support::stub_arc(
             crate::account::test_support::StubAccount::new(Vec::new()),
         );
-        match classify_dav_open(Ok(stub), "CardDAV") {
+        match classify_dav_open(
+            Ok(OpenedAccount::complete(stub)),
+            "CardDAV",
+            contact_scope(),
+        ) {
             DavAttach::Attached(_) => {}
             other => panic!("expected Attached, got {}", attach_label(&other)),
         }

@@ -23,7 +23,7 @@ use bifrost_types::{
     AccountFactory, AccountFuture, AccountId, AccountStream, AttachmentHandle, BackfillCheckpoint,
     Batch, BatchingPolicy, BlobHandle, BlobRangeSupport, ByteRange, Cause, Change, ChangeCursor,
     CloudUploadMeta, ContactCard, ContactCreate, ContactId, ContactPatch, ContactSearchRequest,
-    Container, ContainerId, ContainerKind, ConvenienceShape, CursorDescriptor, CursorEstablishment,
+    ContainerId, ContainerKind, ConvenienceShape, CursorDescriptor, CursorEstablishment,
     CursorFreshness, CursorScope, DraftHandle, DraftPatch, EventCreate, EventId, EventPatch,
     EventRange, EventSearchRequest, FilterRuleShape, FilterValidation, FlagOp, HostedAttachment,
     HydratedObject, HydrationProjection, IdempotencyKey, Identity, IdentityId, IdentityPatch,
@@ -236,7 +236,7 @@ impl AccountFactory for HealFactory {
     fn open(
         &self,
         _account_id: AccountId,
-    ) -> AccountFuture<Result<Arc<dyn Account>, AccountError>> {
+    ) -> AccountFuture<Result<bifrost_types::OpenedAccount, AccountError>> {
         let scopes = self.scopes.clone();
         let established = Arc::clone(&self.established);
         let closed = Arc::clone(&self.closed);
@@ -252,7 +252,7 @@ impl AccountFactory for HealFactory {
                 unsubscribed: Arc::new(Mutex::new(Vec::new())),
                 lifecycle_calls: Arc::new(Mutex::new(Vec::new())),
             });
-            Ok(account)
+            Ok(bifrost_types::OpenedAccount::complete(account))
         })
     }
 }
@@ -272,7 +272,7 @@ impl AccountFactory for RotatingFactory {
     fn open(
         &self,
         _account_id: AccountId,
-    ) -> AccountFuture<Result<Arc<dyn Account>, AccountError>> {
+    ) -> AccountFuture<Result<bifrost_types::OpenedAccount, AccountError>> {
         let scopes = self
             .scopes
             .lock()
@@ -304,7 +304,7 @@ impl AccountFactory for RotatingFactory {
                 unsubscribed,
                 lifecycle_calls,
             });
-            Ok(account)
+            Ok(bifrost_types::OpenedAccount::complete(account))
         })
     }
 }
@@ -612,7 +612,7 @@ impl Account for HealAccount {
         Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::SearchMessages)) })
     }
 
-    fn containers_list(&self) -> AccountFuture<Result<Vec<Container>, AccountError>> {
+    fn containers_list(&self) -> AccountFuture<Result<bifrost_types::ContainerList, AccountError>> {
         Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::ContainersList)) })
     }
 
@@ -1078,4 +1078,106 @@ async fn reopen_refreshes_topology_subscriptions_and_lifecycle_handle() {
         *closed_generations.lock().expect("closed generations lock"),
         vec![0, 1]
     );
+}
+
+/// Factory whose successive opens answer a scripted
+/// `OpenedAccount::skipped_scopes` lane, so the engine-side plumbing of
+/// the lane (store on attach, replace on reopen, expose via
+/// `open_skipped_scopes`) is pinned without any protocol crate.
+struct SkippingFactory {
+    skips: Mutex<VecDeque<Vec<bifrost_types::SkippedScope>>>,
+    established: Arc<Mutex<Vec<CursorScope>>>,
+    closed: Arc<AtomicUsize>,
+}
+
+impl AccountFactory for SkippingFactory {
+    fn open(
+        &self,
+        _account_id: AccountId,
+    ) -> AccountFuture<Result<bifrost_types::OpenedAccount, AccountError>> {
+        let skipped_scopes = self
+            .skips
+            .lock()
+            .expect("skips lock")
+            .pop_front()
+            .expect("one skip set per expected open");
+        let established = Arc::clone(&self.established);
+        let closed = Arc::clone(&self.closed);
+        Box::pin(async move {
+            let account: Arc<dyn Account> = Arc::new(HealAccount {
+                caps: caps(),
+                scopes: vec![CursorScope::Account],
+                established,
+                closed,
+                generation: 0,
+                closed_generations: Arc::new(Mutex::new(Vec::new())),
+                subscribed: Arc::new(Mutex::new(Vec::new())),
+                unsubscribed: Arc::new(Mutex::new(Vec::new())),
+                lifecycle_calls: Arc::new(Mutex::new(Vec::new())),
+            });
+            Ok(bifrost_types::OpenedAccount {
+                account,
+                skipped_scopes,
+            })
+        })
+    }
+}
+
+#[tokio::test]
+async fn open_skips_surface_on_attach_and_reopen_replaces_them() {
+    let account_id = AccountId("open-skips".to_owned());
+    let skip = bifrost_types::SkippedScope {
+        scope: bifrost_types::ErrorScope::Mailbox {
+            id: "shared-acct".to_owned(),
+        },
+        error: unsupported(bifrost_types::AccountOperation::Discover),
+    };
+    let factory: Arc<dyn AccountFactory> = Arc::new(SkippingFactory {
+        // First open (attach) reports one degraded scope; the second
+        // (reopen) reports none - the outage healed.
+        skips: Mutex::new(VecDeque::from([vec![skip.clone()], Vec::new()])),
+        established: Arc::new(Mutex::new(Vec::new())),
+        closed: Arc::new(AtomicUsize::new(0)),
+    });
+    let engine = SyncEngine::builder()
+        .build()
+        .expect("default engine config is valid");
+
+    assert!(
+        matches!(
+            engine.open_skipped_scopes(&account_id),
+            Err(Error::AccountNotAttached(_))
+        ),
+        "an unattached account has no skip lane"
+    );
+
+    engine
+        .attach(account_id.clone(), factory)
+        .await
+        .expect("attach succeeds despite the skipped scope");
+    let skips = engine
+        .open_skipped_scopes(&account_id)
+        .expect("attached account exposes its skip lane");
+    assert_eq!(skips.len(), 1, "attach stores the open-time skip");
+    assert!(
+        matches!(&skips[0].scope, bifrost_types::ErrorScope::Mailbox { id } if id == "shared-acct"),
+        "the lane preserves WHICH scope was skipped: {:?}",
+        skips[0].scope
+    );
+    assert_eq!(
+        skips[0].error.message_key(),
+        skip.error.message_key(),
+        "the lane preserves the classified error"
+    );
+
+    engine.reopen(&account_id).await.expect("reopen succeeds");
+    assert!(
+        engine
+            .open_skipped_scopes(&account_id)
+            .expect("attached account exposes its skip lane")
+            .is_empty(),
+        "a reopen whose open reports no skips replaces the stale lane"
+    );
+
+    engine.detach(&account_id).await.expect("detach succeeds");
 }

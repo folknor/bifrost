@@ -6,8 +6,8 @@ use bifrost_types::compose::{
     Address, AttachmentHandle, DraftHandle, DraftPatch, IdentityId, SendRequest,
 };
 use bifrost_types::container::{
-    Container, ContainerId, ContainerKind, ContainerNamespace, ContainerRights, FolderRole,
-    MutationTarget, Provenance,
+    Container, ContainerId, ContainerKind, ContainerList, ContainerNamespace, ContainerRights,
+    FolderRole, MutationTarget, Provenance,
 };
 use bifrost_types::hydration::{HydrationProjection, Importance, Message, ThreadHydration};
 use bifrost_types::ids::{ObjectId, ThreadId};
@@ -848,8 +848,11 @@ pub(crate) fn search_messages(
 
 pub(crate) fn containers_list(
     account: ImapAccount,
-) -> AccountFuture<Result<Vec<Container>, AccountError>> {
-    Box::pin(async move { Ok(containers_snapshot(&account)) })
+) -> AccountFuture<Result<ContainerList, AccountError>> {
+    // The snapshot already folds in shared/other-user folders discovered
+    // at open; per-prefix degradations were handled (and skipped) during
+    // that discovery, so the enumeration itself has nothing to skip.
+    Box::pin(async move { Ok(ContainerList::complete(containers_snapshot(&account))) })
 }
 
 pub(crate) fn container_create(

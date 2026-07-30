@@ -4,10 +4,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use bifrost_types::{
     AccountError, AccountFuture, AccountStream, Address, AttachmentHandle, AttachmentInline,
-    Container, ContainerId, ContainerKind, ContainerStyle, DraftHandle, DraftPatch, FolderRole,
-    HydrationProjection, Identity, IdentityId, IdentityPatch, Importance, Message, MutationTarget,
-    ObjectId, Page, ProtocolKind, Provenance, QuotaInfo, SearchFilter, SearchRequest, SendRequest,
-    ThreadHydration, ThreadId, VacationConfig,
+    Container, ContainerId, ContainerKind, ContainerList, ContainerStyle, DraftHandle, DraftPatch,
+    FolderRole, HydrationProjection, Identity, IdentityId, IdentityPatch, Importance, Message,
+    MutationTarget, ObjectId, Page, ProtocolKind, Provenance, QuotaInfo, SearchFilter,
+    SearchRequest, SendRequest, ThreadHydration, ThreadId, VacationConfig,
 };
 use bytes::Bytes;
 use chrono::{DateTime, Datelike, Utc};
@@ -306,7 +306,7 @@ pub(crate) fn search_messages(
 pub(crate) fn containers_list(
     client: Arc<GmailClient>,
     cache: ScopeCache,
-) -> AccountFuture<Result<Vec<Container>, AccountError>> {
+) -> AccountFuture<Result<ContainerList, AccountError>> {
     Box::pin(async move {
         let snapshot = refresh_scope_snapshot(&client, &cache)
             .await
@@ -314,7 +314,9 @@ pub(crate) fn containers_list(
         let mut containers = Vec::with_capacity(snapshot.labels.len() + 1);
         containers.push(archive_container());
         containers.extend(snapshot.labels.iter().map(container_from_label));
-        Ok(containers)
+        // Single-namespace enumeration: one `labels.list` answers for
+        // the whole account, so there is never a skipped namespace.
+        Ok(ContainerList::complete(containers))
     })
 }
 

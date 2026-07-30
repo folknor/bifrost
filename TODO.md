@@ -370,14 +370,6 @@ public-folder containers, EWS public-folder hydration, allowlisted public-folder
 scopes). Each was deliberately out of that brick's scope; none blocks the
 container projection itself.
 
-- **nc-1 (types/all)** `Account::containers_list` has no warning lane. Its
-  signature is `Result<Vec<Container>, AccountError>`, so the per-mailbox
-  enumeration degradations the shared and foreign projections implement can
-  build a structured `Warning` but cannot yield it - graph logs it, jmap drops
-  it (that crate carries no logging dependency by design). The contract wants
-  "degrade to a warning plus the remaining containers", which is only half
-  expressible today. Widen to `(Vec<Container>, Vec<Warning>)` or route the
-  warnings onto a `SyncEvent` stream.
 - **nc-2 (graph)** `get_item_body` is message-shaped: it requests
   `message:ToRecipients` and friends, so a mixed-class public folder hydrates
   its mail correctly and then fails per item on `Contact` / `CalendarItem` with
@@ -413,7 +405,8 @@ container projection itself.
   primary account from `Mailbox/myRights`, but a foreign account's mailboxes go
   through the same `container_from_mailbox`, so a share whose `Mailbox/get`
   omits `myRights` silently projects as unreported rather than as a
-  degradation. No warning lane exists to say which (see nc-1).
+  degradation. The `ContainerList::skipped_scopes` lane (which closed nc-1)
+  could now carry it, but nothing classifies the omission today.
 - **nc-9 (graph)** `GraphClient::with_account_net` hardcodes
   `rate_limit_host = GRAPH_HOST` instead of deriving it from the supplied
   api-base, unlike every other constructor. A consumer injecting its own

@@ -15,9 +15,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         token.to_string_lossy().into_owned(),
     ));
 
-    let account = factory
+    let opened = factory
         .open(AccountId("google-example".to_string()))
         .await?;
+    let account = opened.account;
     let _push_in_process = account.capabilities().push_in_process();
     let _cursor = account
         .establish_initial_cursor(CursorScope::Account)

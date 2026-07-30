@@ -6,7 +6,7 @@ use bifrost_types::{
     Account, AccountCapabilities, AccountError, AccountFuture, AccountOperation, AccountStream,
     AddressBook, AddressBookId, AttachmentHandle, BlobHandle, ByteRange, Calendar, CalendarEvent,
     ChangeCursor, CloudUploadMeta, ContactCard, ContactCreate, ContactId, ContactPatch,
-    ContactSearchRequest, Container, ContainerId, ContainerKind, CostClass, CursorDescriptor,
+    ContactSearchRequest, ContainerId, ContainerKind, ContainerList, CostClass, CursorDescriptor,
     CursorEstablishment, CursorScope, DirectoryCard, DirectoryGroup, DirectoryGroupId,
     DirectoryGroupMember, DraftHandle, DraftPatch, ErrorScope, EventCreate, EventId, EventPatch,
     EventRange, EventSearchRequest, FilterValidation, HostedAttachment, HydratedObject,
@@ -809,7 +809,7 @@ impl Account for JmapAccount {
         pim::search_messages(self.mail.clone(), request)
     }
 
-    fn containers_list(&self) -> AccountFuture<Result<Vec<Container>, AccountError>> {
+    fn containers_list(&self) -> AccountFuture<Result<ContainerList, AccountError>> {
         pim::containers_list(self.mail.clone(), Arc::clone(&self.foreign_mail))
     }
 

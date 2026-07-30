@@ -26,9 +26,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .build(),
     );
 
-    let account = factory.open(AccountId("example-jmap".to_owned())).await?;
+    let opened = factory.open(AccountId("example-jmap".to_owned())).await?;
+    let account = opened.account;
+    // Foreign (shared/delegate) accounts whose open-time probe failed
+    // are reported here rather than silently omitted or failing open.
+    let _degraded_shares = opened.skipped_scopes;
     let _capabilities = account.capabilities();
-    let _containers = account.containers_list().await?;
+    let containers = account.containers_list().await?;
+    let _sidebar = containers.containers;
+    let _degraded_namespaces = containers.skipped_scopes;
     account.close().await?;
 
     Ok(())

@@ -16,18 +16,18 @@ use bifrost_types::{
     AccountFactory, AccountFuture, AccountId, AccountStream, AddressBook, AddressBookId,
     AttachmentHandle, BatchingPolicy, BlobHandle, BlobRangeSupport, ByteRange, Calendar,
     CalendarEvent, Cause, Change, ChangeCursor, CloudUploadMeta, ContactCard, ContactCreate,
-    ContactId, ContactPatch, ContactSearchRequest, Container, ContainerId, ContainerKind,
-    ConvenienceShape, CursorDescriptor, CursorEstablishment, CursorFreshness, CursorScope,
-    DraftHandle, DraftPatch, EventCreate, EventId, EventPatch, EventRange, EventSearchRequest,
-    FilterDiagnostic, FilterDiagnosticSeverity, FilterRuleShape, FilterScriptCreate,
-    FilterScriptPatch, FilterValidation, FlagOp, HostedAttachment, HydratedObject,
-    HydrationProjection, IdempotencyKey, Identity, IdentityId, IdentityPatch, Importance,
-    InventoryEntry, ItemOutcome, MembershipScope, Message, MutationCapabilities,
-    MutationConcurrency, MutationReplaySafety, MutationSuccess, MutationTarget, ObjectId, Page,
-    PimMethodSupport, Priority, Projection, PushCapability, QuotaInfo, QuotaSignal, RateLimitClass,
-    RequestCause, RsvpStatus, ScopeLifecycleEvent, ScriptLanguage, SearchRequest, SendRequest,
-    ServerFilter, ServerFilterCreate, ServerFilterId, ServerFilterPatch, SubscriptionHandle,
-    SyncEvent, ThreadHydration, ThreadId, VacationConfig, WatchEvent,
+    ContactId, ContactPatch, ContactSearchRequest, ContainerId, ContainerKind, ConvenienceShape,
+    CursorDescriptor, CursorEstablishment, CursorFreshness, CursorScope, DraftHandle, DraftPatch,
+    EventCreate, EventId, EventPatch, EventRange, EventSearchRequest, FilterDiagnostic,
+    FilterDiagnosticSeverity, FilterRuleShape, FilterScriptCreate, FilterScriptPatch,
+    FilterValidation, FlagOp, HostedAttachment, HydratedObject, HydrationProjection,
+    IdempotencyKey, Identity, IdentityId, IdentityPatch, Importance, InventoryEntry, ItemOutcome,
+    MembershipScope, Message, MutationCapabilities, MutationConcurrency, MutationReplaySafety,
+    MutationSuccess, MutationTarget, ObjectId, Page, PimMethodSupport, Priority, Projection,
+    PushCapability, QuotaInfo, QuotaSignal, RateLimitClass, RequestCause, RsvpStatus,
+    ScopeLifecycleEvent, ScriptLanguage, SearchRequest, SendRequest, ServerFilter,
+    ServerFilterCreate, ServerFilterId, ServerFilterPatch, SubscriptionHandle, SyncEvent,
+    ThreadHydration, ThreadId, VacationConfig, WatchEvent,
 };
 use bytes::Bytes;
 use futures::stream;
@@ -101,13 +101,17 @@ impl AccountFactory for FilterFactory {
     fn open(
         &self,
         _account_id: AccountId,
-    ) -> AccountFuture<Result<Arc<dyn Account>, AccountError>> {
+    ) -> AccountFuture<Result<bifrost_types::OpenedAccount, AccountError>> {
         let account = FilterAccount {
             caps: caps(),
             rec: Arc::clone(&self.rec),
             fail: self.fail,
         };
-        Box::pin(async move { Ok(Arc::new(account) as Arc<dyn Account>) })
+        Box::pin(async move {
+            Ok(bifrost_types::OpenedAccount::complete(
+                Arc::new(account) as Arc<dyn Account>
+            ))
+        })
     }
 }
 
@@ -396,7 +400,7 @@ impl Account for FilterAccount {
         Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::SearchMessages)) })
     }
 
-    fn containers_list(&self) -> AccountFuture<Result<Vec<Container>, AccountError>> {
+    fn containers_list(&self) -> AccountFuture<Result<bifrost_types::ContainerList, AccountError>> {
         Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::ContainersList)) })
     }
 

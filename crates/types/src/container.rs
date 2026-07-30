@@ -11,6 +11,7 @@
 
 use crate::cursor::ProtocolKind;
 use crate::ids::{MailboxId, ObjectId};
+use crate::page::SkippedScope;
 
 /// Which namespace a container lives in.
 ///
@@ -403,6 +404,44 @@ impl Container {
     pub fn with_content_class(mut self, content_class: Option<ContainerContentClass>) -> Self {
         self.content_class = content_class;
         self
+    }
+}
+
+/// Result envelope of `Account::containers_list`.
+///
+/// `containers` is every container the enumeration materialized.
+/// `skipped_scopes` names the namespaces a multi-namespace enumeration
+/// skipped instead of listing - a foreign (shared/delegate) JMAP
+/// account whose `Mailbox/get` failed, a Graph shared mailbox that
+/// answered its folder walk with an error. A skip is advisory: the
+/// listed containers remain valid, but the absence of a skipped
+/// namespace's containers is not evidence they were deleted. Each entry
+/// carries the classified `AccountError` that caused the skip, so the
+/// consumer can distinguish a transient outage (retry / reopen heals
+/// it) from a revoked grant.
+///
+/// Like `Page`, deliberately not `#[non_exhaustive]`: protocol Account
+/// impls construct it directly, and a future lane must break every
+/// constructor so each one answers the new question instead of
+/// silently defaulting it.
+#[derive(Debug, Clone)]
+pub struct ContainerList {
+    /// Containers the enumeration materialized.
+    pub containers: Vec<Container>,
+    /// Namespaces skipped instead of listed, with their classified
+    /// failures. Empty for single-namespace providers and for
+    /// enumerations where every namespace answered.
+    pub skipped_scopes: Vec<SkippedScope>,
+}
+
+impl ContainerList {
+    /// A fully-enumerated list: every namespace answered.
+    #[must_use]
+    pub fn complete(containers: Vec<Container>) -> Self {
+        Self {
+            containers,
+            skipped_scopes: Vec::new(),
+        }
     }
 }
 

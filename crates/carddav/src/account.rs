@@ -6,8 +6,8 @@ use bifrost_types::{
     Account, AccountCapabilities, AccountError, AccountFuture, AccountId, AccountOperation,
     AccountStream, AddressBook, AddressBookId, AttachmentHandle, BlobHandle, ByteRange, Calendar,
     CalendarEvent, Change, ChangeCursor, Checkpoint, CloudUploadMeta, ContactCard, ContactCorpus,
-    ContactCreate, ContactId, ContactPatch, ContactProvenance, ContactSearchRequest, Container,
-    ContainerId, ContainerKind, CostClass, CursorDescriptor, CursorEstablishment, CursorScope,
+    ContactCreate, ContactId, ContactPatch, ContactProvenance, ContactSearchRequest, ContainerId,
+    ContainerKind, ContainerList, CostClass, CursorDescriptor, CursorEstablishment, CursorScope,
     DirectoryCard, DirectoryGroup, DirectoryGroupId, DirectoryGroupMember, DraftHandle, DraftPatch,
     EventCreate, EventId, EventPatch, EventRange, EventSearchRequest, FilterValidation, FlagOp,
     HostedAttachment, HydratedObject, HydrationProjection, IdempotencyKey, Identity, IdentityId,
@@ -642,7 +642,7 @@ impl Account for CardDavAccount {
         unsupported_future(AccountOperation::SearchMessages)
     }
 
-    fn containers_list(&self) -> AccountFuture<Result<Vec<Container>, AccountError>> {
+    fn containers_list(&self) -> AccountFuture<Result<ContainerList, AccountError>> {
         unsupported_future(AccountOperation::ContainersList)
     }
 

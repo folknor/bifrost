@@ -19,7 +19,7 @@ through `messages.batchModify` / `batchDelete`.
 Public modules:
 
 - `account` - public `GoogleAccountFactory` and `PubSubConfig`; the
-  opened account itself is returned as `Arc<dyn Account>`.
+  opened account itself is returned inside `OpenedAccount`.
 
 Internal modules:
 
@@ -104,7 +104,9 @@ failed open detaches that registration before returning the error.
 There is no public custom-`Net` constructor after S1-W3; callers use
 the factory and the shared `Account` trait.
 
-`AccountFactory::open(account_id)` returns `Arc<dyn Account>`. `reopen`
+`AccountFactory::open(account_id)` returns `OpenedAccount` with an
+always-empty skip lane (single-namespace account; open probes only the
+principal's own profile). `reopen`
 flows from the engine: it drops the previous `Arc` and calls the factory
 again with the same `AccountId`. The factory holds the credentials and
 client, so the new `GoogleAccount` carries a fresh

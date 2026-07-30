@@ -11,7 +11,9 @@ use std::fmt;
 use std::sync::Arc;
 
 use bifrost_net::{StaticTokenSource, TokenSource};
-use bifrost_types::{Account, AccountError, AccountFactory, AccountFuture, AccountId};
+use bifrost_types::{
+    Account, AccountError, AccountFactory, AccountFuture, AccountId, OpenedAccount,
+};
 
 /// Authentication mode for a CardDAV account.
 //
@@ -117,11 +119,15 @@ impl CardDavAccountFactory {
 }
 
 impl AccountFactory for CardDavAccountFactory {
-    fn open(&self, account_id: AccountId) -> AccountFuture<Result<Arc<dyn Account>, AccountError>> {
+    fn open(&self, account_id: AccountId) -> AccountFuture<Result<OpenedAccount, AccountError>> {
         let config = self.config.clone();
         Box::pin(async move {
             let account = account::CardDavAccount::open(account_id, config).await?;
-            Ok(Arc::new(account) as Arc<dyn Account>)
+            // Single-principal DAV surface: nothing discoverable can be
+            // skipped at open.
+            Ok(OpenedAccount::complete(
+                Arc::new(account) as Arc<dyn Account>
+            ))
         })
     }
 }
