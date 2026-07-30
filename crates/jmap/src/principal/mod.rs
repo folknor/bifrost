@@ -354,17 +354,23 @@ impl Display for Property {
 
 impl Display for ACL {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl ACL {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
-            ACL::Rename => write!(f, "rename"),
-            ACL::Delete => write!(f, "delete"),
-            ACL::ReadItems => write!(f, "readItems"),
-            ACL::AddItems => write!(f, "addItems"),
-            ACL::SetKeywords => write!(f, "setKeywords"),
-            ACL::RemoveItems => write!(f, "removeItems"),
-            ACL::CreateChild => write!(f, "createChild"),
-            ACL::Administer => write!(f, "administer"),
-            ACL::Submit => write!(f, "submit"),
-            ACL::SetSeen => write!(f, "setSeen"),
+            ACL::Rename => "mayRename",
+            ACL::Delete => "mayDelete",
+            ACL::ReadItems => "mayReadItems",
+            ACL::AddItems => "mayAddItems",
+            ACL::SetKeywords => "maySetKeywords",
+            ACL::RemoveItems => "mayRemoveItems",
+            ACL::CreateChild => "mayCreateChild",
+            ACL::Administer => "mayShare",
+            ACL::Submit => "maySubmit",
+            ACL::SetSeen => "maySetSeen",
         }
     }
 }

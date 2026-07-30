@@ -4,7 +4,7 @@ Scope: `crates/jmap/src/` **excluding** `core/` and `sync/`. That is the
 ~20 protocol object modules plus `client.rs`, `client_ws.rs`,
 `account.rs`, `transport_reqwest.rs`, `lib.rs`, `tests.rs`.
 
-`core/` and `sync/` were read but not edited; where a finding in my scope
+`core/` and `sync/` were read; where a finding in my scope
 is only reachable through a `sync/` call site, that call site is named so
 the triage has the whole path.
 
@@ -12,172 +12,7 @@ Everything below is either **BUG** (a wrong thing that a server will act
 on), **GAP** (untested/unprotected behaviour that matters), **SMELL**
 (works today, easy to hold wrong) or **NIT**.
 
-Tests landed in this pass are listed at the end. Fixes were deliberately
-NOT applied.
-
----
-
-## B1 (BUG, severity: high, live) - every `Mailbox/set update` clears `role` and `shareWith`
-
-**Where:** `crates/jmap/src/mailbox/mod.rs:152-181` (`MailboxPatch`),
-`crates/jmap/src/mailbox/set.rs:120` (`role_not_set`),
-`crates/jmap/src/core/set.rs:507` (`skip_if_empty_map`).
-**Live call sites:** `crates/jmap/src/sync/pim.rs::container_rename`
-(~line 751), `container_move` (~line 784).
-
-`MailboxPatch` is `#[derive(Default)]`. Two of its fields use skip
-predicates that return `false` for `None`:
-
-```rust
-#[serde(skip_serializing_if = "role_not_set")]  role: Option<Role>,
-// role_not_set(r) == matches!(r, Some(Role::None))
-#[serde(skip_serializing_if = "skip_if_empty_map")] share_with: Option<HashMap<..>>,
-// skip_if_empty_map(m) == matches!(m, Some(m) if m.is_empty())
-```
-
-So `None` is not skipped; serde emits it as JSON `null`. A
-default-constructed patch therefore serialises to:
-
-```json
-{"role": null, "shareWith": null}
-```
-
-RFC 8620 §5.3: a `null` value in a PatchObject **removes** the property.
-
-**Path to failure.** User renames a folder. `container_rename` does
-`set.update(mailbox).name(name)` and sends
-
-```json
-{"update": {"mb1": {"name": "Renamed", "role": null, "shareWith": null}}}
-```
-
-The server sets `role` to null and empties `shareWith`. If the renamed
-mailbox was the Inbox (or Sent/Drafts/Trash/Junk), it loses its role -
-which is exactly the value `sync/pim.rs::role_mailboxes` and
-`containers_list` use to resolve Sent/Drafts for sending and to map
-`FolderRole`. A shared mailbox loses every ACL grant. Neither is
-recoverable from the client. `container_move` sends the same two nulls
-on top of its own bug (B2).
-
-**Why `MailboxCreate` is fine and `MailboxPatch` is not:** `MailboxCreate`
-has a hand-written `SetCreate::new` that installs the sentinels
-(`Some(Role::None)`, `Some(HashMap::new())`) the predicates look for.
-`MailboxPatch` uses `#[derive(Default)]`, which cannot.
-
-**Proposed fix.** Move the nullable Patch properties to `Field<T>`
-(default `Field::Omitted`, `skip_serializing_if = "Field::is_omitted"`),
-which is already the pattern `Calendar`/`AddressBook` use and which also
-fixes B2 and B3 in the same edit. A narrower fix is a hand-written
-`impl Default for MailboxPatch` installing the same sentinels
-`MailboxCreate::new` does, but that leaves the type easy to hold wrong
-again.
-
-Pinned by `tests.rs::mailbox_wire::an_empty_mailbox_patch_still_clears_role_and_share_with`
-and `tests.rs::patch_defaults::patches_that_leak_property_removals`.
-
----
-
-## B2 (BUG, severity: high, live) - every `Identity/set update` clears `replyTo` and `bcc`
-
-**Where:** `crates/jmap/src/identity/mod.rs:87-108` (`IdentityPatch`).
-**Live call site:** `crates/jmap/src/sync/pim.rs::identity_update`
-(~line 952).
-
-Same root cause as B1, different predicate: `replyTo` and `bcc` use
-`skip_if_empty_list`, which returns `false` for `None`. A default
-`IdentityPatch` serialises to `{"replyTo": null, "bcc": null}`.
-
-**Path to failure.** `identity_update` only touches the fields the
-`bifrost_types::IdentityPatch` names. A caller who edits just the display
-name (`patch.name = Some(..)`, `patch.reply_to = None`) produces
-
-```json
-{"update": {"i1": {"name": "Alice", "replyTo": null, "bcc": null}}}
-```
-
-RFC 8621 §6 types both as `EmailAddress[]|null`, so the server clears
-them. The user's configured reply-to address and auto-Bcc silently
-disappear on the next name/signature edit.
-
-**Proposed fix.** As B1: `Field<Vec<EmailAddress>>` on the Patch shape.
-Note the fix cannot be "make `skip_if_empty_list` skip `None`" - a
-deliberate `reply_to(None)` genuinely means "clear it", and
-`IdentityCreate` relies on the current semantics. The two intents need
-two states, which is what `Field` is for.
-
-Pinned by `tests.rs::settings_object_wire::an_empty_identity_patch_still_clears_reply_to_and_bcc`.
-
----
-
-## B3 (BUG, severity: medium, live) - `container_move(container, None)` silently does nothing
-
-**Where:** `crates/jmap/src/mailbox/mod.rs:158-160`
-(`MailboxPatch::parent_id` is `skip_serializing_if = "Option::is_none"`),
-`crates/jmap/src/mailbox/set.rs:61`.
-**Live call site:** `crates/jmap/src/sync/pim.rs::container_move` (~line 795).
-
-`MailboxPatch::parent_id` takes `Option<impl Into<MailboxId>>`, so `None`
-is the only way to express "move this mailbox to the top level". But the
-field is skipped when `None`, so the intent never reaches the wire.
-
-**Path to failure.** Engine calls `container_move(ContainerId("mb1"),
-None)` to un-nest a folder. The request is
-`{"update": {"mb1": {"role": null, "shareWith": null}}}` (per B1 the two
-nulls are there too). The server reports success, `unwrap_update_errors`
-passes, the function returns `Ok(())`, and the mailbox has not moved -
-but has lost its role and shares.
-
-Note the asymmetry: `MailboxCreate::parent_id(None)` DOES emit
-`"parentId": null` correctly, because Create uses `skip_if_empty_id`
-(which returns `false` for `None`). The two halves of the same object
-disagree about what `None` means.
-
-**Proposed fix.** `Field<MailboxId>` on `MailboxPatch`, same edit as B1.
-
-Pinned by `tests.rs::mailbox_wire::patching_parent_id_to_none_emits_no_parent_id_at_all`.
-
----
-
-## B4 (BUG, severity: medium, latent) - `MailboxPatch::acl_set` emits a property name no server has
-
-**Where:** `crates/jmap/src/mailbox/set.rs:112-117`,
-`crates/jmap/src/principal/mod.rs:261-284` (serde names) vs `:355-370`
-(`Display`).
-
-`ACL` has two incompatible string renderings:
-
-| variant | `Serialize` | `Display` |
-|---|---|---|
-| `ReadItems` | `mayReadItems` | `readItems` |
-| `Administer` | `mayShare` | `administer` |
-| `SetSeen` | `maySetSeen` | `setSeen` |
-| ... | `may*` | bare verb |
-
-`MailboxPatch::acl_set` builds its dotted patch path with `Display`:
-
-```rust
-self.acl_patch.insert(format!("shareWith/{id}/{acl}"), ACLPatch::Set(set));
-```
-
-producing `"shareWith/u1/readItems": true`. RFC 8621 §2 names the
-`shareWith` sub-properties `mayReadItems`, `mayShare`, ... - so the path
-addresses a property that does not exist. A strict server answers
-`invalidPatch`/`invalidProperties`; a lenient one creates a junk key.
-`MailboxPatch::acl` (whole-map form, same struct) uses the serde name and
-is correct, so the two builders on one type disagree.
-
-**Reachability:** `acl_set` has no caller in `sync/` today, so this is
-latent. It is a loaded gun for the sharing-aware stage the module header
-says is coming.
-
-**Proposed fix.** Build the path from the serde name. Cheapest is an
-`ACL::as_str()` returning the `may*` spelling and having both `Display`
-and `Serialize` delegate to it; the divergent `Display` vocabulary looks
-like a leftover and has no other consumer (`Mailbox::acl_list` returns
-typed `ACL`s, not strings).
-
-Pinned by `tests.rs::mailbox_wire::acl_set_builds_a_patch_path_the_server_will_not_recognise`
-and `tests.rs::principal_acl_vocabulary::acl_display_does_not_match_the_wire_names`.
+Tests landed in this pass are listed at the end.
 
 ---
 
@@ -318,53 +153,62 @@ has no async test harness - see G1) by
 
 ---
 
-## B8 (BUG, severity: low, latent) - `VacationResponsePatch` setters cannot clear a property
+## B9 (BUG, severity: medium, latent) - `ParticipantIdentity` models `sendTo`, which the calendars draft this crate targets may no longer define
 
-**Where:** `crates/jmap/src/vacation_response/mod.rs:84-113`,
-`crates/jmap/src/vacation_response/set.rs:5-42`.
+**Where:** `crates/jmap/src/participant_identity/mod.rs:49-94`
+(`ParticipantIdentity`, `ParticipantIdentityCreate`,
+`ParticipantIdentityPatch`, `Property::SendTo`).
 
-The mirror image of B1/B2 on the same type family. Every
-`VacationResponsePatch` setter takes an `Option`, but the fields are
-`skip_serializing_if = "Option::is_none"`, so `subject(None)`,
-`to_date(None)`, `text_body(None)`, `html_body(None)`, `from_date(None)`
-emit nothing at all instead of `null`. The Create shape uses
-`skip_if_empty_str` / `skip_if_zero_date` and gets it right.
+The original B9 was the default-patch leak on `PushSubscriptionPatch` and
+`ParticipantIdentityPatch` (plus the two Create shapes missing their
+sentinels). That half is closed: those Patch shapes are `Field<T>` now
+and the creates install sentinels. What remains is the shape itself.
 
-The tell that this is a known-broken API: `sync/pim.rs::vacation_set`
-does not use the setters for the clearing case at all - it calls
-`patch.null_property("subject")` etc. by hand for all five nullable
-properties. So the bug is worked around rather than fixed, and the next
-caller will not know to work around it.
+The crate targets draft-ietf-jmap-calendars-26. A review pass reports
+that -26 section 3 defines `ParticipantIdentity` with a **required
+`calendarAddress`** and no `sendTo` at all. I could not check the draft
+text (this environment has no network), and per N4's precedent a guess is
+not worth pinning, so nothing here has been renamed and no test asserts
+either spelling.
 
-**Proposed fix.** `Field<T>` here too, then delete the `null_property`
-workaround in `vacation_set`.
+If the report is right, three things follow: a compliant identity's
+address is silently dropped on decode (serde ignores the unknown key, so
+`ParticipantIdentity/get` still succeeds but `send_to()` is always
+`None`); `ParticipantIdentityCreate` cannot express a valid create and a
+server should answer `invalidProperties`; and `Property::SendTo` names a
+property that will not round-trip through `properties`.
 
-Pinned by `tests.rs::settings_object_wire::vacation_patch_setters_cannot_clear_a_property`.
+**Reachability:** the module is `#![allow(dead_code)]` with no `sync/`
+call site, so this is latent until the calendar conveniences are wired.
+
+**Next step.** Read draft-ietf-jmap-calendars-26 section 3 and, if it
+says `calendarAddress`, rename the field on all three shapes (a required
+`String` on Create, `Field<String>` or plain `Option<String>` on Patch),
+rename the `Property` variant, and pin the wire name in
+`tests.rs::patch_defaults` / a new participant-identity module.
 
 ---
 
-## B9 (BUG, severity: low, latent) - the same default-patch leak on `PushSubscriptionPatch` and `ParticipantIdentityPatch`
+## S7 (SMELL) - `IdentityPatch::reply_to(Some(<empty>))` / `bcc(Some(<empty>))` silently send nothing
 
-Same mechanism as B1/B2, no live call site today.
+**Where:** `crates/jmap/src/identity/mod.rs:93-99` (`skip_if_empty_list`),
+`crates/jmap/src/identity/set.rs:51-67`.
+**Live call site:** `crates/jmap/src/sync/pim.rs::identity_update` (~line 996).
 
-- `PushSubscriptionPatch::default()` -> `{"types": null}`. RFC 8620 §7.2
-  reads a null `types` as "notify me about **every** data type", so an
-  update that only sets `verificationCode` also widens the subscription
-  to everything.
-- `ParticipantIdentityPatch::default()` -> `{"sendTo": null}`.
+Noticed while confirming that B2 does not reproduce - it does not:
+`IdentityPatch` has a hand-written `Default` installing the
+`Some(Vec::new())` sentinels the predicate wants, and `reply_to(None)`
+does emit `null` and does clear. But the sentinel is also the encoding of
+"an empty list", so the *value* `Some([])` is indistinguishable from the
+default and is skipped. `identity_update` forwards
+`bifrost_types::IdentityPatch::reply_to` straight through as
+`item.reply_to(Some(values))`; if a caller expresses "no reply-to" as an
+empty vector rather than `None`, the edit is a silent no-op.
 
-And two Create shapes whose `SetCreate::new` forgot the sentinel the
-predicate needs, so a fresh create carries a stray null:
-
-- `AddressBookCreate::new(_)` -> `{"name": null}` (`name` is a
-  non-nullable String in RFC 9610; the server should answer
-  `invalidProperties`). Harmless only because every caller sets a name.
-- `ParticipantIdentityCreate::new(_)` -> `{"sendTo": null}`.
-
-The whole family is pinned as one table in
-`tests.rs::patch_defaults` (three tests: the shapes that are correct, the
-four patches that leak, the two creates that leak). That test is the
-regression net for the B1/B2/B3/B8/B9 fix.
+Whether an empty vector is a legal way to say "clear" is a
+`bifrost_types` contract question, which is why this is a smell and not a
+bug. `Field<Vec<EmailAddress>>` would remove the ambiguity here the same
+way it did on `VacationResponsePatch`.
 
 ---
 
@@ -466,27 +310,6 @@ rather than falling to `Other`).
 `Other` fallback observable.
 
 Pinned by `tests.rs::session_capability_fallbacks`.
-
----
-
-## G4 (GAP) - `EmailPatch`'s wholesale setters do not clear their own dotted paths
-
-**Where:** `crates/jmap/src/email/set.rs:206-236`.
-
-`mailbox_id(id, set)` and `keyword(kw, set)` correctly null out
-`self.mailbox_ids` / `self.keywords` so a path and its parent property
-never co-occur (RFC 8620 §5.3 forbids it). The reverse is not true:
-`mailbox_ids([..])` and `keywords([..])` do not clear the paths a
-previous `mailbox_id` / `keyword` installed, so
-
-```rust
-patch.keyword("$flagged", true);
-patch.keywords(["$seen"]);
-```
-
-emits both `"keywords"` and `"keywords/$flagged"`. No live call site
-mixes the two forms today. Pinned by
-`tests.rs::email_set_patch_shapes::a_wholesale_setter_does_not_clear_previously_set_paths`.
 
 ---
 
@@ -628,28 +451,6 @@ into an existing query" - but the set should just include `&` and `=`.
 
 ---
 
-## Cross-cutting observation: the skip-predicate family is the single defect
-
-B1, B2, B3, B8 and B9 are all one design problem:
-`skip_if_empty_str` / `_list` / `_map` / `skip_if_zero_date` /
-`skip_if_empty_id` all encode "`None` means send `null`", and rely on a
-hand-written `SetCreate::new` to install a `Some(<empty>)` sentinel so the
-*default* is still skipped. `#[derive(Default)]` on the Patch shapes
-cannot install a sentinel, so every Patch type that uses one of those
-predicates leaks a property removal, and every Patch type that uses
-`Option::is_none` instead loses the ability to clear.
-
-`Field<T>` is already in the crate, already documented as "use instead of
-`Option<Option<T>>`", and `Calendar` / `AddressBook` / `Quota` already
-use it correctly for exactly these properties. Migrating the remaining
-Patch shapes to `Field<T>` fixes five findings with one mechanical edit
-and deletes the `null_property` workaround in `sync/pim.rs::vacation_set`.
-`tests.rs::patch_defaults` is the regression net for that edit: it asserts
-the correct shapes stay `{}` and lists the leaking ones explicitly, so
-flipping each one over is a visible, reviewable diff.
-
----
-
 ## Tests landed
 
 All in files this pass owns. Every test pins behaviour **as it exists
@@ -676,18 +477,20 @@ comment directly above them ("BUG, documented rather than endorsed" /
   flattening (incl. `hasKeyword`'s extra field), `collapseThreads`,
   filter-operator nesting.
 - `email_set_patch_shapes` - dotted-path null/true semantics, the
-  path-clears-wholesale rule, G4, the raw/null escape hatches.
-- `mailbox_wire` - role wire names + case folding, B1, B3, B4, B6, the
+  clearing rule in both directions (a path setter drops the wholesale
+  property; a wholesale setter drops both the children and an exact raw
+  entry, so a `null_property("keywords")` cannot survive alongside
+  `keywords(...)` as a duplicate key), the raw/null escape hatches.
+- `mailbox_wire` - role wire names + case folding, B6, the
   create sentinels, create-id references, `Mailbox` decode incl. rights
   defaulting.
 - `email_submission_wire` - envelope/parameter shapes incl. the RFC 4865
   `holduntil` form, `#c0` create-id references on both onSuccess
   arguments, `undoStatus` patch, delivery-status decode.
-- `settings_object_wire` - B2, B8, the `null_property` workaround,
+- `settings_object_wire` - identity and vacation patch wire shapes,
   vacation decode, Sieve activation references, `SieveScript/validate`
   error decode.
-- `patch_defaults` - the cross-cutting table (correct patches / leaking
-  patches / leaking creates).
+- `patch_defaults` - empty default PatchObjects and create sentinels.
 - `set_error_vocabulary` - all 25 known `SetErrorType` codes both
   directions plus the `Other(code)` gate-5 invariant and `Display`.
 - `wire_enums_without_a_catch_all` - G2.
@@ -707,8 +510,8 @@ comment directly above them ("BUG, documented rather than endorsed" /
 - `misc_mail_object_decode` - N2, `SearchSnippet/get` request shape,
   `Email/import` `iN` create-id keying.
 - `push_subscription_wire` - the non-account-scoped `accountId` omission.
-- `principal_acl_vocabulary` - the RFC 8621 `shareWith` property names,
-  and B4's `Display`/`Serialize` divergence across all ten variants.
+- `principal_acl_vocabulary` - the RFC 8621 `shareWith` property names
+  across all ten variants.
 
 `crates/jmap/src/event_source/parser.rs` (appended to the existing
 `mod tests`): S5, B7's parser half, S4's two halves.

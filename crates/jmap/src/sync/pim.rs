@@ -1051,31 +1051,11 @@ pub(crate) fn vacation_set<T: HttpTransport>(
         let mut set = VacationResponseSet::new();
         let patch = set.update(VacationResponseId::new("singleton"));
         patch.is_enabled(config.is_enabled);
-        if let Some(subject) = config.subject {
-            patch.subject(Some(subject));
-        } else {
-            patch.null_property("subject");
-        }
-        if let Some(body_text) = config.body_text {
-            patch.text_body(Some(body_text));
-        } else {
-            patch.null_property("textBody");
-        }
-        if let Some(body_html) = config.body_html {
-            patch.html_body(Some(body_html));
-        } else {
-            patch.null_property("htmlBody");
-        }
-        if let Some(starts_at) = config.starts_at {
-            patch.from_date(Some(system_time_to_unix(starts_at)));
-        } else {
-            patch.null_property("fromDate");
-        }
-        if let Some(ends_at) = config.ends_at {
-            patch.to_date(Some(system_time_to_unix(ends_at)));
-        } else {
-            patch.null_property("toDate");
-        }
+        patch.subject(config.subject);
+        patch.text_body(config.body_text);
+        patch.html_body(config.body_html);
+        patch.from_date(config.starts_at.map(system_time_to_unix));
+        patch.to_date(config.ends_at.map(system_time_to_unix));
         let response = account
             .call(set)
             .await

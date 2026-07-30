@@ -8,11 +8,11 @@ pub(crate) mod set;
 
 use std::fmt::Display;
 
+use crate::core::field::Field;
 use crate::core::set::skip_if_empty_str;
 use crate::core::set::skip_if_zero_date;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
 mod marker {
     pub(crate) enum VacationResponse {}
@@ -88,28 +88,24 @@ pub(crate) struct VacationResponsePatch {
     pub(super) is_enabled: Option<bool>,
 
     #[serde(rename = "fromDate")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) from_date: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Field::is_omitted")]
+    pub(super) from_date: Field<DateTime<Utc>>,
 
     #[serde(rename = "toDate")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) to_date: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Field::is_omitted")]
+    pub(super) to_date: Field<DateTime<Utc>>,
 
     #[serde(rename = "subject")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) subject: Option<String>,
+    #[serde(skip_serializing_if = "Field::is_omitted")]
+    pub(super) subject: Field<String>,
 
     #[serde(rename = "textBody")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) text_body: Option<String>,
+    #[serde(skip_serializing_if = "Field::is_omitted")]
+    pub(super) text_body: Field<String>,
 
     #[serde(rename = "htmlBody")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) html_body: Option<String>,
-
-    #[serde(flatten)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) patch: Option<HashMap<String, serde_json::Value>>,
+    #[serde(skip_serializing_if = "Field::is_omitted")]
+    pub(super) html_body: Field<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Copy)]

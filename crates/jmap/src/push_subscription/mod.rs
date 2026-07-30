@@ -12,6 +12,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::DataType;
+use crate::core::field::Field;
 use crate::core::set::skip_if_empty_list;
 
 mod marker {
@@ -92,8 +93,8 @@ pub(crate) struct PushSubscriptionPatch {
     pub(super) expires: Option<DateTime<Utc>>,
 
     #[serde(rename = "types")]
-    #[serde(skip_serializing_if = "skip_if_empty_list")]
-    pub(super) types: Option<Vec<DataType>>,
+    #[serde(skip_serializing_if = "Field::is_omitted")]
+    pub(super) types: Field<Vec<DataType>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Copy)]

@@ -192,6 +192,7 @@ impl EmailPatch {
     /// Set/clear a single mailbox membership via dotted-path patch.
     pub(crate) fn mailbox_id(&mut self, mailbox_id: &MailboxId, set: bool) -> &mut Self {
         self.mailbox_ids = None;
+        self.remove_patch_property("mailboxIds");
         self.patch.get_or_insert_with(HashMap::new).insert(
             format!("mailboxIds/{mailbox_id}"),
             if set {
@@ -209,12 +210,14 @@ impl EmailPatch {
         U: Into<MailboxId>,
     {
         self.mailbox_ids = Some(mailbox_ids.into_iter().map(|s| (s.into(), true)).collect());
+        self.remove_patch_entries("mailboxIds");
         self
     }
 
     /// Set/clear a single keyword via dotted-path patch.
     pub(crate) fn keyword(&mut self, keyword: &str, set: bool) -> &mut Self {
         self.keywords = None;
+        self.remove_patch_property("keywords");
         self.patch.get_or_insert_with(HashMap::new).insert(
             format!("keywords/{keyword}"),
             if set {
@@ -232,6 +235,7 @@ impl EmailPatch {
         U: Into<String>,
     {
         self.keywords = Some(keywords.into_iter().map(|s| (s.into(), true)).collect());
+        self.remove_patch_entries("keywords");
         self
     }
 
@@ -256,6 +260,27 @@ impl EmailPatch {
             .get_or_insert_with(HashMap::new)
             .insert(property.into(), serde_json::Value::Null);
         self
+    }
+
+    fn remove_patch_property(&mut self, property: &str) {
+        if let Some(patch) = &mut self.patch {
+            patch.remove(property);
+        }
+    }
+
+    /// Drop the raw entry for `property` and every dotted path into it.
+    ///
+    /// RFC 8620 s5.3 forbids a PatchObject from naming both a property
+    /// and a pointer inside it, so a wholesale setter has to clear the
+    /// exact key a previous `null_property`/`raw_property` installed as
+    /// well as the children a previous path setter installed. Otherwise
+    /// the flattened map and the typed field both serialise `keywords`
+    /// and the request carries duplicate, conflicting keys.
+    fn remove_patch_entries(&mut self, property: &str) {
+        if let Some(patch) = &mut self.patch {
+            let prefix = format!("{property}/");
+            patch.retain(|key, _| key != property && !key.starts_with(&prefix));
+        }
     }
 
     /// The `onSuccessUpdateEmail` patch for a message that has just

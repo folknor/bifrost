@@ -210,7 +210,7 @@ impl crate::core::SetCreate for AddressBookCreate {
     fn new(create_id: Option<usize>) -> Self {
         AddressBookCreate {
             _create_id: create_id,
-            name: None,
+            name: Some(String::new()),
             description: Field::Omitted,
             sort_order: None,
             is_subscribed: None,

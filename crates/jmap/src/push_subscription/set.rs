@@ -1,4 +1,4 @@
-use crate::{DataType, core::set::from_timestamp};
+use crate::{DataType, core::field::Field, core::set::from_timestamp};
 
 use super::{Keys, PushSubscriptionCreate, PushSubscriptionPatch};
 
@@ -29,7 +29,7 @@ impl PushSubscriptionCreate {
     }
 
     pub(crate) fn types(&mut self, types: Option<impl IntoIterator<Item = DataType>>) -> &mut Self {
-        self.types = types.map(|s| s.into_iter().collect());
+        self.types = types.map(|types| types.into_iter().collect());
         self
     }
 }
@@ -46,7 +46,10 @@ impl PushSubscriptionPatch {
     }
 
     pub(crate) fn types(&mut self, types: Option<impl IntoIterator<Item = DataType>>) -> &mut Self {
-        self.types = types.map(|s| s.into_iter().collect());
+        self.types = match types {
+            Some(types) => Field::Value(types.into_iter().collect()),
+            None => Field::Null,
+        };
         self
     }
 }

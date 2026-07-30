@@ -114,9 +114,10 @@ impl MailboxPatch {
     }
 
     pub(crate) fn acl_set(&mut self, id: &str, acl: ACL, set: bool) -> &mut Self {
-        self.acl_patch
-            .get_or_insert_with(HashMap::new)
-            .insert(format!("shareWith/{id}/{acl}"), ACLPatch::Set(set));
+        self.acl_patch.get_or_insert_with(HashMap::new).insert(
+            format!("shareWith/{id}/{}", acl.as_str()),
+            ACLPatch::Set(set),
+        );
         self
     }
 }

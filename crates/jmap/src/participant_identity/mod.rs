@@ -10,6 +10,7 @@ use std::fmt::Display;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use crate::core::field::Field;
 use crate::core::set::skip_if_empty_map;
 
 mod marker {
@@ -75,8 +76,8 @@ pub(crate) struct ParticipantIdentityPatch {
     pub(super) name: Option<String>,
 
     #[serde(rename = "sendTo")]
-    #[serde(skip_serializing_if = "skip_if_empty_map")]
-    pub(super) send_to: Option<HashMap<String, String>>,
+    #[serde(skip_serializing_if = "Field::is_omitted")]
+    pub(super) send_to: Field<HashMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Copy)]
@@ -134,7 +135,7 @@ impl crate::core::SetCreate for ParticipantIdentityCreate {
         ParticipantIdentityCreate {
             _create_id: create_id,
             name: None,
-            send_to: None,
+            send_to: Some(HashMap::new()),
         }
     }
 }

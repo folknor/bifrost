@@ -1838,26 +1838,49 @@ mod email_set_patch_shapes {
         assert_eq!(value.get("keywords/$flagged"), Some(&json!(true)));
     }
 
-    // BUG, documented rather than endorsed. The reverse order is not
-    // symmetric: `keywords()` / `mailbox_ids()` do NOT clear the dotted
-    // paths a previous `keyword()` / `mailbox_id()` installed, so the
-    // patch carries both the wholesale property and a path into it -
-    // exactly what RFC 8620 s5.3 forbids ("the value for the key MUST
-    // NOT also be given ... as part of a larger object"). Fix: have the
-    // wholesale setters clear the matching prefix out of `self.patch`,
-    // mirroring what the path setters already do.
     #[test]
-    fn a_wholesale_setter_does_not_clear_previously_set_paths() {
+    fn wholesale_setters_clear_previously_set_paths() {
         let mut patch = EmailPatch::default();
         patch.keyword("$flagged", true);
         patch.keywords(["$seen"]);
+        patch.mailbox_id(&MailboxId::new("mb1"), true);
+        patch.mailbox_ids([MailboxId::new("mb2")]);
         let value = serde_json::to_value(&patch).unwrap();
         assert_eq!(value.get("keywords"), Some(&json!({"$seen": true})));
+        assert!(value.get("keywords/$flagged").is_none());
+        assert_eq!(value.get("mailboxIds"), Some(&json!({"mb2": true})));
+        assert!(value.get("mailboxIds/mb1").is_none());
+    }
+
+    // A raw entry for the exact property is not a child path, so the
+    // wholesale setter has to remove it by name as well. Serialising is
+    // checked on the JSON text, not on a `Value`: two writes of the same
+    // key collapse in a `serde_json::Map` but both reach the wire.
+    #[test]
+    fn wholesale_setters_clear_a_raw_entry_for_the_same_property() {
+        let mut patch = EmailPatch::default();
+        patch.null_property("keywords");
+        patch.keywords(["$seen"]);
+        patch
+            .raw_property("mailboxIds", &json!({"mb9": true}))
+            .expect("serializable");
+        patch.mailbox_ids([MailboxId::new("mb2")]);
+        let text = serde_json::to_string(&patch).unwrap();
         assert_eq!(
-            value.get("keywords/$flagged"),
-            Some(&json!(true)),
-            "both forms are emitted; RFC 8620 s5.3 says a server may reject this"
+            text.matches("\"keywords\"").count(),
+            1,
+            "duplicate `keywords` keys in {text}"
         );
+        assert_eq!(
+            text.matches("\"mailboxIds\"").count(),
+            1,
+            "duplicate `mailboxIds` keys in {text}"
+        );
+        assert!(!text.contains("\"keywords\":null"), "{text}");
+        assert!(!text.contains("mb9"), "{text}");
+        let value = serde_json::to_value(&patch).unwrap();
+        assert_eq!(value.get("keywords"), Some(&json!({"$seen": true})));
+        assert_eq!(value.get("mailboxIds"), Some(&json!({"mb2": true})));
     }
 
     #[test]
@@ -2058,33 +2081,15 @@ mod mailbox_wire {
         );
     }
 
-    // BUG, documented rather than endorsed. `ACL` serialises with the
-    // RFC 8621 `shareWith` property names (`mayReadItems`, `mayShare`,
-    // ...) but its `Display` impl renders a different vocabulary
-    // (`readItems`, `administer`, ...). `MailboxPatch::acl_set` builds
-    // its dotted patch path with `Display`, so it names a property no
-    // JMAP server has; `MailboxPatch::acl` (the whole-map form on the
-    // same struct) uses the serde name. The two disagree. Fix: build the
-    // path from the serde name (e.g. via
-    // `serde_json::to_value(acl)`/`as_str()`), or delete the divergent
-    // `Display` impl.
     #[test]
-    fn acl_set_builds_a_patch_path_the_server_will_not_recognise() {
+    fn acl_set_builds_a_patch_path_the_server_recognises() {
         let mut patch = MailboxPatch::default();
         patch.acl_set("u1", ACL::ReadItems, true);
         patch.acl_set("u1", ACL::Administer, false);
         let value = serde_json::to_value(&patch).unwrap();
 
-        assert_eq!(value.get("shareWith/u1/readItems"), Some(&json!(true)));
-        assert_eq!(value.get("shareWith/u1/administer"), Some(&json!(false)));
-        assert!(
-            value.get("shareWith/u1/mayReadItems").is_none(),
-            "the RFC 8621 property name is `mayReadItems`"
-        );
-        assert!(
-            value.get("shareWith/u1/mayShare").is_none(),
-            "the RFC 8621 property name for Administer is `mayShare`"
-        );
+        assert_eq!(value.get("shareWith/u1/mayReadItems"), Some(&json!(true)));
+        assert_eq!(value.get("shareWith/u1/mayShare"), Some(&json!(false)));
     }
 
     #[test]
@@ -2254,9 +2259,7 @@ mod settings_object_wire {
     use super::*;
     use crate::identity::IdentityPatch;
     use crate::sieve::SieveScriptSet;
-    use crate::vacation_response::{
-        VacationResponseId, VacationResponsePatch, VacationResponseSet,
-    };
+    use crate::vacation_response::VacationResponsePatch;
 
     #[test]
     fn an_empty_identity_patch_omits_reply_to_and_bcc() {
@@ -2300,42 +2303,15 @@ mod settings_object_wire {
         );
     }
 
-    // BUG, documented rather than endorsed. Every `VacationResponsePatch`
-    // setter takes an `Option`, but the fields are
-    // `skip_serializing_if = "Option::is_none"`, so passing `None`
-    // (the caller's "clear this") silently emits nothing. The Create
-    // shape does the opposite - it uses `skip_if_empty_str` /
-    // `skip_if_zero_date`, which let `None` through as `null`.
-    // `sync/pim.rs::vacation_set` already works around this by calling
-    // `null_property(...)` by hand for all five nullable properties,
-    // which is the tell. Fix: make the Patch fields `Field<T>` (or reuse
-    // the Create shape's skip predicates) so the setters mean what their
-    // signatures say.
     #[test]
-    fn vacation_patch_setters_cannot_clear_a_property() {
+    fn vacation_patch_setters_clear_nullable_properties() {
         let mut patch = VacationResponsePatch::default();
         patch.is_enabled(false);
         patch.subject(None::<String>);
         patch.to_date(None);
         assert_eq!(
             serde_json::to_value(&patch).unwrap(),
-            json!({"isEnabled": false}),
-            "`subject(None)` and `to_date(None)` vanish instead of clearing"
-        );
-    }
-
-    #[test]
-    fn vacation_patch_null_property_is_the_working_escape_hatch() {
-        let mut set = VacationResponseSet::new();
-        let patch = set.update(VacationResponseId::new("singleton"));
-        patch.is_enabled(true);
-        patch.subject(Some("Away"));
-        patch.null_property("toDate");
-        assert_eq!(
-            serde_json::to_value(&set).unwrap().get("update"),
-            Some(&json!({
-                "singleton": {"isEnabled": true, "subject": "Away", "toDate": null}
-            }))
+            json!({"isEnabled": false, "subject": null, "toDate": null})
         );
     }
 
@@ -2406,9 +2382,8 @@ mod settings_object_wire {
 // default patch happens to serialise is a property every update in this
 // crate silently deletes.
 //
-// Nullable Patch properties must use `Field<T>` or a hand-written Default
-// with the same sentinels as the Create type. Deriving Default gives a plain
-// `None`, which a nullable property's skip predicate may serialize as null.
+// Nullable Patch properties use `Field<T>` whenever they need to distinguish
+// omission from an explicit property removal.
 
 mod patch_defaults {
     use super::*;
@@ -2433,10 +2408,14 @@ mod patch_defaults {
             empty::<crate::sieve::SieveScriptPatch>("SieveScriptPatch");
         }
         empty::<crate::principal::PrincipalPatch>("PrincipalPatch");
+        empty::<crate::push_subscription::PushSubscriptionPatch>("PushSubscriptionPatch");
         #[cfg(feature = "calendars")]
         {
             empty::<crate::calendar::CalendarPatch>("CalendarPatch");
             empty::<crate::calendar_event::CalendarEventPatch>("CalendarEventPatch");
+            empty::<crate::participant_identity::ParticipantIdentityPatch>(
+                "ParticipantIdentityPatch",
+            );
         }
         #[cfg(feature = "contacts")]
         {
@@ -2445,36 +2424,13 @@ mod patch_defaults {
         }
     }
 
-    // BUG, documented rather than endorsed. These default patches are not
-    // empty; each null below is a property removal the caller never asked for.
     #[test]
-    fn patches_that_leak_property_removals() {
-        assert_eq!(
-            serde_json::to_value(crate::push_subscription::PushSubscriptionPatch::default())
-                .unwrap(),
-            json!({"types": null}),
-            "RFC 8620 s7.2: a null `types` means `every type`, so a \
-             verification-code update also widens the subscription"
-        );
-        #[cfg(feature = "calendars")]
-        assert_eq!(
-            serde_json::to_value(crate::participant_identity::ParticipantIdentityPatch::default())
-                .unwrap(),
-            json!({"sendTo": null})
-        );
-    }
-
-    // The same predicate family bites two Create shapes whose
-    // `SetCreate::new` forgot to install the sentinel. Less severe (a
-    // create always sets the property in practice) but the same defect.
-    #[test]
-    fn creates_whose_sentinels_are_missing() {
+    fn creates_install_empty_sentinels() {
         use crate::core::SetCreate;
         #[cfg(feature = "contacts")]
         assert_eq!(
             serde_json::to_value(crate::address_book::AddressBookCreate::new(Some(0))).unwrap(),
-            json!({"name": null}),
-            "AddressBook `name` is a non-nullable String in RFC 9610"
+            json!({})
         );
         #[cfg(feature = "calendars")]
         assert_eq!(
@@ -2482,9 +2438,8 @@ mod patch_defaults {
                 Some(0)
             ))
             .unwrap(),
-            json!({"sendTo": null})
+            json!({})
         );
-        // The ones that do install sentinels.
         #[cfg(feature = "mail")]
         {
             assert_eq!(
@@ -3046,8 +3001,8 @@ mod address_book_wire {
 
     #[test]
     fn patching_a_nullable_field_to_null_reaches_the_wire() {
-        // Contrast with `MailboxPatch::parent_id` / the
-        // `VacationResponsePatch` setters: `Field<T>` gets this right.
+        // Like `MailboxPatch::parent_id` and `VacationResponsePatch`, this
+        // uses `Field<T>` to preserve explicit property removal.
         let mut patch = AddressBookPatch::default();
         patch.name("Work");
         patch.description(None::<String>);
@@ -3317,13 +3272,10 @@ mod principal_acl_vocabulary {
         }
     }
 
-    // Documented, not endorsed: see
-    // `mailbox_wire::acl_set_builds_a_patch_path_the_server_will_not_recognise`.
-    // `Display` renders a second, incompatible vocabulary.
     #[test]
-    fn acl_display_does_not_match_the_wire_names() {
-        assert_eq!(ACL::ReadItems.to_string(), "readItems");
-        assert_eq!(ACL::Administer.to_string(), "administer");
+    fn acl_display_matches_the_wire_names() {
+        assert_eq!(ACL::ReadItems.to_string(), "mayReadItems");
+        assert_eq!(ACL::Administer.to_string(), "mayShare");
         for acl in [
             ACL::Rename,
             ACL::Delete,
@@ -3337,11 +3289,10 @@ mod principal_acl_vocabulary {
             ACL::SetSeen,
         ] {
             let wire = serde_json::to_value(acl).unwrap();
-            assert_ne!(
+            assert_eq!(
                 json!(acl.to_string()),
                 wire,
-                "Display and Serialize disagree for every ACL variant; \
-                 anything that builds a wire key from Display is wrong"
+                "Display and Serialize must agree for every ACL variant"
             );
         }
     }
