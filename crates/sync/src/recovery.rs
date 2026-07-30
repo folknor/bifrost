@@ -12,8 +12,9 @@
 //! - `retry_delay` resolves a `RetryAdvice` to a concrete `Duration`
 //!   using the cause's [`RetryHint`] when present.
 //! - `directive_target_scope` resolves the `CursorScope` an
-//!   [`EngineDirective`] targets, when any. `#[non_exhaustive]` on
-//!   `EngineDirective` is enforced: no catch-all fallthrough arm.
+//!   [`EngineDirective`] targets, when any. Its required catch-all
+//!   defaults an unknown future variant to account-wide until a human
+//!   adds the appropriate scope-bearing arm.
 //! - `restart_scope_error` constructs the single account-error shape
 //!   the engine itself emits when synthesizing a `RestartScope`
 //!   directive (scope lifecycle Created / Renamed, or fresh
@@ -115,7 +116,7 @@ pub(crate) fn directive_target_scope(directive: &EngineDirective) -> Option<Curs
         // this wildcard is REQUIRED for compilation across the crate
         // boundary even though every current variant is named above. A new
         // scope-bearing variant still defaults account-wide here until a
-        // human adds its arm (the sync-N1 residual).
+        // human adds its arm.
         _ => None,
     }
 }

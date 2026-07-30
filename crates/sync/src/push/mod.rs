@@ -83,9 +83,11 @@ impl InvalidationSink for InvalidationSinkInner {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(rejected)) => {
                 let sender = tx.clone();
-                self.drop_counter.fetch_add(1, Ordering::Relaxed);
+                let lossless = requires_lossless_delivery(&rejected);
+                if !lossless {
+                    self.drop_counter.fetch_add(1, Ordering::Relaxed);
+                }
                 if let Some(handle) = self.runtime.get() {
-                    let lossless = requires_lossless_delivery(&rejected);
                     let delivery = if lossless {
                         rejected
                     } else {
@@ -181,6 +183,7 @@ mod tests {
         ));
         let delivered = rx.recv().await;
         assert!(matches!(delivered, Some(WatchEvent::Warning(_))));
+        assert_eq!(sink.dropped(), 0, "a delivered warning was not dropped");
     }
 
     #[tokio::test]
@@ -207,6 +210,32 @@ mod tests {
         ));
         let delivered = rx.recv().await;
         assert!(matches!(delivered, Some(WatchEvent::Terminated(_))));
+        assert_eq!(sink.dropped(), 0, "a delivered termination was not dropped");
+    }
+
+    #[tokio::test]
+    async fn full_sink_counts_a_coalesced_invalidation_as_dropped() {
+        let sink = Arc::new(InvalidationSinkInner::new());
+        let account = AccountId("coalesced".into());
+        let (tx, mut rx) = mpsc::channel(1);
+        sink.register(account.clone(), tx);
+        sink.senders
+            .get(&account)
+            .expect("registered")
+            .try_send(invalidated())
+            .expect("fill queue");
+
+        sink.push(account, invalidated());
+
+        assert_eq!(sink.dropped(), 1, "the replaced invalidation was dropped");
+        assert!(matches!(
+            rx.recv().await,
+            Some(WatchEvent::Invalidated { .. })
+        ));
+        assert!(matches!(
+            rx.recv().await,
+            Some(WatchEvent::Invalidated { .. })
+        ));
     }
 
     #[test]

@@ -492,7 +492,6 @@ impl SyncEngine {
                                     return;
                                 }
                             }
-                            () = tokio::time::sleep(Duration::from_secs(1)) => {}
                         }
                         continue;
                     }
@@ -3582,10 +3581,9 @@ async fn handle_engine_directive(
     directive: EngineDirective,
     error: AccountError,
 ) {
-    // Match exhaustively over the current `EngineDirective` variants.
-    // `EngineDirective` is `#[non_exhaustive]`; a new variant must
-    // fail to compile here rather than silently route through a
-    // catch-all to a generic warning. (sync-N1 / sync-D8.)
+    // Every current directive has an explicit dispatch arm. The required
+    // non-exhaustive fallback makes a future variant visible in logs until a
+    // human gives it an intentional engine action.
     match directive {
         EngineDirective::RestartScope(directive_scope) => {
             // Pass the directive's own scope to broadcast_warning so

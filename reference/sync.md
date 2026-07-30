@@ -422,14 +422,15 @@ the reconciler reads; `detach` calls `unregister`. The drop
 counter is exposed as `bifrost_sync_push_dropped_total`.
 
 Implements `bifrost_types::InvalidationSink::push`:
-`try_send` first; on `Full`, increment the drop counter. Invalidations
-and connection-health transitions are coalesced into one
+`try_send` first; on `Full`, increment the drop counter only for
+coalescible invalidations and connection-health transitions. They are
+coalesced into one
 `HintPayload::Unknown` send with a 100ms bound. `Terminated` and
 `Warning` are lossless control information: the captured engine
 runtime waits for queue space and sends the original event without
-demoting its classification. Capturing the runtime during `register`
-also lets receiver threads outside Tokio use the sink. `Closed`
-(account detached mid-push) is silently ignored.
+demoting its classification or incrementing the drop counter. Capturing
+the runtime during `register` also lets receiver threads outside Tokio
+use the sink. `Closed` (account detached mid-push) is silently ignored.
 
 The in-process push forwarder spawned in `attach` runs the same
 overflow policy against its per-account `tx`: redundant invalidations
