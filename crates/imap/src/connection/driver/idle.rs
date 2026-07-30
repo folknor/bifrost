@@ -1,9 +1,9 @@
 use tokio::sync::oneshot;
-use tracing::{debug, trace, warn};
+use tracing::{debug, trace};
 
 use crate::error::Error;
 use crate::types::Command;
-use crate::types::response::{StatusKind, UntaggedResponse};
+use crate::types::response::StatusKind;
 
 use super::IdleTermination;
 use super::event_sink;
@@ -77,14 +77,7 @@ pub(super) async fn run_idle(
                     }
                     crate::types::Response::Untagged(u) => {
                         let code_emitted = super::emit_untagged_response_code_events(&u, event_sink);
-                        if digest.had_bye {
-                            let (text, code) = match *u {
-                                UntaggedResponse::Status { text, code, .. } => (text, code),
-                                _ => (String::new(), None),
-                            };
-                            warn!(text, "received BYE during IDLE");
-                            return Err(Error::bye_with_code(text, code));
-                        }
+                        super::short_circuit_on_bye(digest, &u)?;
                         if !code_emitted {
                             let _ = event_sink.emit((*u).into());
                         }
@@ -140,14 +133,7 @@ async fn drain_idle_responses(
             }
             crate::types::Response::Untagged(u) => {
                 let code_emitted = super::emit_untagged_response_code_events(&u, event_sink);
-                if digest.had_bye {
-                    let (text, code) = match *u {
-                        UntaggedResponse::Status { text, code, .. } => (text, code),
-                        _ => (String::new(), None),
-                    };
-                    warn!(text, "received BYE during IDLE drain");
-                    return Err(Error::bye_with_code(text, code));
-                }
+                super::short_circuit_on_bye(digest, &u)?;
                 if !code_emitted {
                     let _ = event_sink.emit((*u).into());
                 }

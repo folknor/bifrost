@@ -208,3 +208,21 @@ fn group_searchres_pipeline_respects_save_ordering() {
     assert_eq!(batches[1][0].0, 1); // original index 1
     assert_eq!(batches[1][1].0, 2); // original index 2
 }
+
+// ---------------------------------------------------------------------------
+// Driver completion ordering
+// ---------------------------------------------------------------------------
+
+#[test]
+fn command_answer_follows_state_publication() {
+    let order = std::cell::RefCell::new(Vec::new());
+    let (result_tx, mut result_rx) = tokio::sync::oneshot::channel();
+
+    publish_then_answer(|| order.borrow_mut().push("published"), result_tx, ());
+
+    assert_eq!(*order.borrow(), ["published"]);
+    assert!(
+        result_rx.try_recv().is_ok(),
+        "the caller is answered after publication"
+    );
+}

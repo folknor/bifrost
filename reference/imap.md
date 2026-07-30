@@ -30,6 +30,21 @@ dead parked members during checkout and never returns a dead checked-out
 member to the idle list. Tagged NO/BAD responses and local validation or
 capability errors leave the connection reusable.
 
+An untagged `* BYE` is fatal in every driver read loop - regular command,
+prebuilt command, pipeline batch, IDLE (and its drain), literal
+continuation wait, and best-effort LOGOUT - through one shared guard
+(`short_circuit_on_bye`) fed by `ProtocolState::apply_side_effects`'s
+`SideEffectDigest`. The digest is `#[must_use]` and its `had_bye` field is
+private, so a new loop cannot silently ignore it. BYE is recognized from
+the status tag alone, independently of the response code it carries, so
+`* BYE [CAPABILITY ...]` cannot be routed away by the capability
+side-effect arm. The error preserves the BYE text and structured response
+code (`Error::bye_with_code`), which is what the account layer maps to a
+specific `RecoveryClass`; response-code events (e.g. ALERT) are emitted
+before the short-circuit fires. Command results are published to the state
+watch channel *before* the caller's oneshot is answered, so a caller that
+observes the result always sees the matching snapshot.
+
 The codec draws the line that decides which of those two buckets a bad
 response lands in. A response opening with a keyword the codec claims to
 parse cannot degrade to `UntaggedResponse::Unknown`: it becomes
@@ -73,13 +88,15 @@ the command and preserves framing before accepting the next command.
 
 ## Streaming FETCH
 
-Streaming uses an **unbounded** mpsc channel (the prior bounded `try_send` silently dropped responses under load). Slow consumers create memory pressure rather than data loss.
+Streaming never drops responses. The driver-side consumer is a bounded pipe (`BoundedStreamingPipe`, default capacity 64) that pre-reserves an `OwnedPermit` *before* each socket read, so a slow consumer applies TCP backpressure instead of either buffering without limit or silently discarding under a failed `try_send`.
 
 Three entry points:
 
-- `uid_fetch_streaming()` / `fetch_streaming()` - raw stream; caller drains the receiver.
-- `uid_fetch_each(...)` - callback-based wrapper.
+- `uid_fetch_streaming()` / `fetch_streaming()` - caller supplies an unbounded sender; the bounded receiver is drained onto it internally.
+- `uid_fetch_each(...)` - callback-based wrapper over the same bounded receiver.
 - `uid_fetch_limited(budget, ...)` - hard client-side byte budget enforced inside the driver consumer; returns `Error::FetchLimit` when crossed. Driver keeps reading until tagged OK, so parser/TCP buffers may continue past the limit.
+
+**Early consumer stop.** When a callback returns an error (or the caller's own sender is gone), the shared drain helper *drops* the bounded receiver rather than closing and draining it. The distinction is load-bearing: with an `OwnedPermit` outstanding, `recv()` on a merely closed receiver stays pending forever, so a server that stalls mid-response would outlive the command timeout and hang the joined future. Dropping makes the driver's next `reserve_owned` fail; it marks the pipe drained and keeps reading through the tagged completion so IMAP framing stays synchronized. Items already buffered when the consumer stopped are discarded, and the callback's error is the returned error.
 
 Buffered `uid_fetch()` uses the driver buffer path directly, not the streaming channel. `uid_fetch_full_messages(budget, ...)` requires an explicit budget and routes through the limited path.
 

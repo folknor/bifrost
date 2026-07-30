@@ -752,12 +752,6 @@ pub(super) fn is_notify_selection_mismatch(info: &MailboxInfo, selection_options
     false
 }
 
-/// Find the index of the first `[NOTIFICATIONOVERFLOW]` response code in a
-/// stream of untagged responses, or `responses.len()` if there is none.
-///
-/// Used by LIST/LIST-EXTENDED/LIST-STATUS handlers to classify each
-/// Collect solicited FETCH responses from untagged data
-/// (RFC 3501 Section 7.4.2 / RFC 9051 Section 7.5.2).
 /// Check whether a LIST response carries markers that identify it as a
 /// NOTIFY event rather than a solicited LIST result (RFC 5465 Section 5.4).
 ///

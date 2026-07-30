@@ -270,15 +270,8 @@ impl ImapConnection {
         tx: tokio::sync::mpsc::UnboundedSender<Result<FetchResponse, Error>>,
         timeout: Duration,
     ) -> Result<(), Error> {
-        let (mut rx, fetch_fut) = self.uid_fetch_stream(sequence_set, items, timeout)?;
-        let drain_fut = async move {
-            while let Some(item) = rx.recv().await {
-                if tx.send(item).is_err() {
-                    break;
-                }
-            }
-            Ok::<(), Error>(())
-        };
+        let (rx, fetch_fut) = self.uid_fetch_stream(sequence_set, items, timeout)?;
+        let drain_fut = super::ergonomics::drain_fetch_stream(rx, |item| Ok(tx.send(item).is_ok()));
         let (fetch_result, drain_result) = tokio::join!(fetch_fut, drain_fut);
         drain_result?;
         fetch_result

@@ -312,8 +312,9 @@ impl ImapConnection {
 
     /// Upgrade to TLS via STARTTLS (RFC 3501 Section 6.2.1).
     ///
-    /// Only valid if `TlsMode::StartTls` was used and `connect` did not already
-    /// perform the upgrade. Errors if the server doesn't advertise STARTTLS.
+    /// Valid on an unencrypted, not-authenticated connection when the server
+    /// advertises STARTTLS. `TlsMode::None` creates that reachable state;
+    /// `TlsMode::StartTls` performs the upgrade during connection setup.
     ///
     /// The upgrade is atomic via the `Poisoned` sentinel pattern (I9, I10)
     ///  -  handled entirely by the driver task.
@@ -342,16 +343,22 @@ impl ImapConnection {
         tls_connector: native_tls::TlsConnector,
         timeout: Duration,
     ) -> Result<(), Error> {
+        if self.tls_active.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(Error::InvalidInput(
+                "STARTTLS requires an unencrypted connection".into(),
+            ));
+        }
         self.require_state(&[SessionState::NotAuthenticated])?;
 
-        // Check STARTTLS capability from the snapshot.
+        // A direct upgrade from a plaintext connection follows the same
+        // capability rule as connection-time STARTTLS. An empty snapshot is
+        // not evidence that STARTTLS is available.
         {
             let snap = self.state_rx.borrow();
-            if !snap.capabilities.is_empty()
-                && !snap
-                    .capabilities
-                    .iter()
-                    .any(|c| matches!(c, Capability::StartTls))
+            if !snap
+                .capabilities
+                .iter()
+                .any(|c| matches!(c, Capability::StartTls))
             {
                 return Err(Error::StartTlsUnavailable);
             }

@@ -130,6 +130,30 @@ fn apply_capability_fetch_replaces_caps() {
 }
 
 // ---------------------------------------------------------------------------
+// apply_side_effects  -  BYE is detected independently of its response code
+// ---------------------------------------------------------------------------
+
+#[test]
+fn bye_carrying_a_capability_code_still_reports_shutdown() {
+    let mut state = ProtocolState::new();
+
+    let caps = vec![Capability::Imap4Rev1];
+    let resp = Response::Untagged(Box::new(UntaggedResponse::Status {
+        status: UntaggedStatus::Bye,
+        code: Some(ResponseCode::Capability(caps.clone())),
+        text: "shutting down".into(),
+    }));
+    let digest = state.apply_side_effects(&resp);
+
+    assert!(
+        digest.had_bye(),
+        "a response code with its own side-effect arm must not shadow the BYE tag"
+    );
+    assert_eq!(state.session_state(), SessionState::Logout);
+    assert_eq!(state.capabilities(), &caps);
+}
+
+// ---------------------------------------------------------------------------
 // apply_side_effects  -  ENABLED appends to state
 // ---------------------------------------------------------------------------
 
@@ -145,8 +169,7 @@ fn enabled_appends_to_state() {
     let digest = state.apply_side_effects(&resp);
 
     assert_eq!(state.enabled(), &["CONDSTORE", "QRESYNC"]);
-    assert!(!digest.had_bye);
-    assert!(!digest.had_notification_overflow);
+    assert!(!digest.had_bye());
 }
 
 // ---------------------------------------------------------------------------
@@ -160,13 +183,13 @@ fn enabled_dedup_case_insensitive() {
     let resp1 = Response::Untagged(Box::new(UntaggedResponse::Enabled(vec![
         "IMAP4rev2".into(),
     ])));
-    state.apply_side_effects(&resp1);
+    let _ = state.apply_side_effects(&resp1);
 
     // Same extension, different case  -  should NOT duplicate.
     let resp2 = Response::Untagged(Box::new(UntaggedResponse::Enabled(vec![
         "imap4rev2".into(),
     ])));
-    state.apply_side_effects(&resp2);
+    let _ = state.apply_side_effects(&resp2);
 
     assert_eq!(state.enabled().len(), 1);
     assert_eq!(state.enabled()[0], "IMAP4rev2");
@@ -183,10 +206,10 @@ fn enabled_accumulates_across_calls() {
     let resp1 = Response::Untagged(Box::new(UntaggedResponse::Enabled(vec![
         "CONDSTORE".into(),
     ])));
-    state.apply_side_effects(&resp1);
+    let _ = state.apply_side_effects(&resp1);
 
     let resp2 = Response::Untagged(Box::new(UntaggedResponse::Enabled(vec!["QRESYNC".into()])));
-    state.apply_side_effects(&resp2);
+    let _ = state.apply_side_effects(&resp2);
 
     assert_eq!(state.enabled().len(), 2);
     assert!(state.enabled().contains(&"CONDSTORE".to_owned()));
@@ -217,7 +240,7 @@ fn unauthenticate_ok_transitions_to_not_authenticated() {
     let enabled_resp = Response::Untagged(Box::new(UntaggedResponse::Enabled(vec![
         "CONDSTORE".into(),
     ])));
-    state.apply_side_effects(&enabled_resp);
+    let _ = state.apply_side_effects(&enabled_resp);
     assert_eq!(state.enabled().len(), 1);
 
     // Mark UNAUTHENTICATE in flight.
@@ -230,7 +253,7 @@ fn unauthenticate_ok_transitions_to_not_authenticated() {
         code: None,
         text: "unauthenticated".into(),
     });
-    state.apply_side_effects(&tagged_ok);
+    let _ = state.apply_side_effects(&tagged_ok);
 
     assert_eq!(state.session_state(), SessionState::NotAuthenticated);
     assert!(state.enabled().is_empty());
@@ -267,7 +290,7 @@ fn unauthenticate_ok_from_selected_clears_mailbox() {
         code: None,
         text: "selected".into(),
     });
-    state.apply_side_effects(&select_ok);
+    let _ = state.apply_side_effects(&select_ok);
     assert_eq!(state.session_state(), SessionState::Selected);
 
     // Mark UNAUTHENTICATE in flight.
@@ -280,7 +303,7 @@ fn unauthenticate_ok_from_selected_clears_mailbox() {
         code: None,
         text: "unauthenticated".into(),
     });
-    state.apply_side_effects(&tagged_ok);
+    let _ = state.apply_side_effects(&tagged_ok);
 
     assert_eq!(state.session_state(), SessionState::NotAuthenticated);
 }
@@ -309,7 +332,7 @@ fn unauthenticate_no_preserves_state() {
         code: None,
         text: "not allowed".into(),
     });
-    state.apply_side_effects(&tagged_no);
+    let _ = state.apply_side_effects(&tagged_no);
 
     assert_eq!(state.session_state(), SessionState::Authenticated);
 }
@@ -338,7 +361,7 @@ fn unauthenticate_bad_preserves_state() {
         code: None,
         text: "unknown command".into(),
     });
-    state.apply_side_effects(&tagged_bad);
+    let _ = state.apply_side_effects(&tagged_bad);
 
     assert_eq!(state.session_state(), SessionState::Authenticated);
 }

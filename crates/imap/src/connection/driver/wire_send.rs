@@ -1,11 +1,11 @@
 use bifrost_types::TransmissionState;
 use bytes::BytesMut;
-use tracing::{trace, warn};
+use tracing::trace;
 
 use crate::codec::encode::{LiteralMode, encode_command};
 use crate::error::Error;
 use crate::types::Command;
-use crate::types::response::{Capability, StatusKind, UntaggedResponse};
+use crate::types::response::{Capability, StatusKind};
 
 use super::event_sink;
 
@@ -187,17 +187,7 @@ pub(super) async fn wait_for_continuation(
                 // are not lost.
                 let code_emitted = super::emit_untagged_response_code_events(&u, event_sink);
 
-                // RFC 3501 Section7.1.5: BYE means the server is closing.
-                // State already transitioned to Logout by
-                // apply_side_effects.
-                if digest.had_bye {
-                    let (text, code) = match *u {
-                        UntaggedResponse::Status { text, code, .. } => (text, code),
-                        _ => (String::new(), None),
-                    };
-                    warn!(text, "received BYE during literal sync");
-                    return Err(Error::bye_with_code(text, code));
-                }
+                super::short_circuit_on_bye(digest, &u)?;
                 if !code_emitted {
                     let _ = event_sink.emit((*u).into());
                 }

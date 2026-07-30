@@ -3,13 +3,7 @@
 Scope: `crates/imap/src/connection/**`, exclusively. Written against the
 tree as of this sweep; nothing outside the scope was edited.
 
-Two halves, kept separate on purpose:
-
-- **Tests landed.** They pin behavior *as it exists today*. Where a test
-  pins behavior I believe is wrong, the test carries a
-  `DOCUMENTS A BUG, NOT AN ENDORSEMENT` doc comment naming this file.
-- **Bugs reported, not fixed.** Each has a proposed fix; triage is the
-  orchestrator's.
+Tests pin behavior as it exists today.
 
 ## 0. Coverage survey (verified, not assumed)
 
@@ -51,228 +45,7 @@ tests in `tests.rs`.
 
 ---
 
-# Bugs
-
-Ordered by severity.
-
-## B3 - `run_one_command` swallows `* BYE`: the reason is lost and a non-closing server wedges the driver
-
-**Where:** `connection/driver/mod.rs:589` (`run_one_command`) and
-`:709` (`run_prebuilt_command`); same shape in
-`connection/driver/pipeline.rs:312` and `connection/driver/upgrade.rs:266`.
-All four write `let _digest = state.apply_side_effects(&resp);` and drop
-the digest. `connection/driver/idle.rs:52,143` and
-`connection/driver/wire_send.rs:153` *do* consult `digest.had_bye` and
-return `Error::bye_with_code`.
-
-**Path to failure.** Server sends `* BYE [UNAVAILABLE] too many
-connections` in the middle of, say, a NOOP or a SELECT.
-
-1. `apply_side_effects` sets the session state to `Logout` and sets
-   `digest.had_bye` - which nobody reads.
-2. `classify(_, UntaggedResponse::Status { .. })` returns `Either`
-   (`codec/classification.rs:212`), so the BYE is handed to the
-   *consumer*, which buffers it for `finalize`.
-3. `finalize` never runs, because the tagged response never arrives.
-4. The read loop keeps going. If the server closes, `read_one` returns
-   `Error::Closed { attempt: InFlight }`. If it does not close, the
-   driver blocks forever.
-
-**Result.**
-
-- The BYE text and response code are lost **entirely** - not in the
-  error, not in the typed-event queue (the consumer that buffered it is
-  dropped un-finalized).
-- The account boundary sees a bare transport drop instead of a
-  server-acknowledged shutdown. `error.rs` distinguishes these: `Bye`
-  with a code routes through `response_code()` into a specific
-  `RecoveryClass`; `Closed` collapses to a generic retryable drop. So an
-  `[UNAVAILABLE]` / `[ALERT]` shutdown gets the wrong recovery class and
-  the operator-visible alert never fires.
-- A BYE-without-close permanently wedges the driver task (no per-read
-  timeout in the driver; the caller's timeout only drops the caller's
-  future).
-
-**What should happen instead:** identical to `wait_for_continuation` -
-return `Err(Error::bye_with_code(text, code))` as soon as
-`digest.had_bye` is set, after emitting the response-code events.
-
-**Proposed fix.** In all four loops, replace `let _digest = ...` with
-
-```rust
-let digest = state.apply_side_effects(&resp);
-```
-
-and, in the `Response::Untagged(u)` arm (after
-`emit_untagged_response_code_events`), add the same `if digest.had_bye`
-early return `wire_send.rs` already has. Factor it into one helper so the
-six call sites cannot drift again.
-
-**Test landed:** `tests.rs::bye_mid_command_is_swallowed_and_surfaces_as_closed`
-pins the current behavior (a `Closed` error and an empty event queue) and
-points here.
-
----
-
-## B7 - The state snapshot is published *after* the command result, so `session_state()` / `capabilities()` can be stale right after a command returns
-
-**Where:** `connection/driver/mod.rs`, driver loop:
-
-```rust
-let _ = result_tx.send(result);      // caller can wake here
-...
-let _ = state_tx.send_replace(state.snapshot());   // ...but state lands here
-```
-
-**Path to failure.** On a multi-thread runtime (which is what
-`bifrost-sync` runs on - `bifrost-imap` enables `rt-multi-thread`), the
-oneshot `send` wakes the caller's task on another worker. If that worker
-runs to the caller's next `state_rx.borrow()` before the driver executes
-one more statement, the caller reads the pre-command snapshot.
-
-Concrete: `select("INBOX").await` returns `Ok`, the account layer
-immediately calls `uid_fetch(...)`, `require_state(&[Selected])` reads a
-snapshot that still says `Authenticated`, and the fetch fails with
-`Error::Protocol("command not valid in Authenticated state (expected one
-of [Selected])")` - a spurious, unretryable-looking client bug.
-
-The same window applies to `capabilities()` / `server_profile()` after
-`ENABLE` or `CAPABILITY`, and to `is_rev2()` after `ENABLE IMAP4rev2`.
-
-**Why it has not been seen:** the window is a couple of instructions
-wide, and `#[tokio::test]` uses the current-thread runtime, where the
-driver always reaches `send_replace` before the caller is polled. That is
-exactly why the tests in this sweep are stable and would not catch a
-regression here.
-
-**Proposed fix.** Publish first, answer second:
-
-```rust
-let _ = state_tx.send_replace(state.snapshot());
-let _ = result_tx.send(result);
-```
-
-This requires hoisting `state_tx.send_replace` into each command arm (or
-computing `result` into a local and moving the send below the publish),
-and it also removes the `continue` special-casing for `SetKeepalive` /
-`PeerCertificate` - those arms genuinely do not mutate state and can keep
-skipping the publish.
-
-**No test landed** - reproducing this needs a multi-thread runtime and a
-timing race, which is not a hermetic test.
-
----
-
-## B9 - `uid_fetch_each` / `uid_fetch_streaming` stall for the full command timeout when the consumer stops early
-
-**Where:** `connection/ergonomics.rs::uid_fetch_each`,
-`connection/uid_ops.rs::uid_fetch_streaming`,
-`connection/seq_ops.rs::fetch_streaming`.
-
-```rust
-let drain_fut = async {
-    while let Some(fetch) = rx.recv().await {
-        on_fetch(fetch?)?;          // early return leaves `rx` alive
-    }
-    Ok::<(), Error>(())
-};
-let (fetch_result, drain_result) = tokio::join!(fetch_fut, drain_fut);
-```
-
-`rx` is borrowed by the async block, not moved into it. When `on_fetch`
-returns `Err` (or `tx.send` fails in the `uid_fetch_streaming` variant),
-the drain future returns but `rx` stays alive and un-drained. The
-bounded streaming consumer's `prepare_to_read` then blocks on channel
-capacity, so `fetch_fut` cannot make progress and `tokio::join!` parks
-until `fetch_stream_bounded_impl`'s `tokio::time::timeout` fires.
-
-**Result.** A callback that aborts on the first item still costs the full
-command timeout (60 s by default via `ImapConfig::command_timeout`)
-before `uid_fetch_each` returns the callback's error. Account-layer
-hydration uses `uid_fetch_each`, so a hydration budget breach or a
-serialization error on message 1 of 5000 blocks that folder's task for a
-minute.
-
-**Proposed fix.** Close the receiver on early exit so the driver's
-`prepare_to_read` observes a dropped consumer and drains to the tagged
-response promptly:
-
-```rust
-let drain_fut = async {
-    let mut result = Ok(());
-    while let Some(fetch) = rx.recv().await {
-        match fetch.and_then(&mut on_fetch) {
-            Ok(()) => {}
-            Err(e) => { result = Err(e); break; }
-        }
-    }
-    rx.close();          // <- unblocks the sender side
-    while rx.recv().await.is_some() {}   // drain what is already queued
-    result
-};
-```
-
-(`Receiver::close` stops new sends and lets queued items be drained; the
-driver keeps reading to the tagged OK, which is the documented contract.)
-
-**No test landed** - proving it needs either a real timeout or paused
-time plus a bounded-channel fill, which is more machinery than the
-finding warrants right now.
-
----
-
 # Non-bug findings
-
-## N1 - Doc rot in `connection/mod.rs`
-
-The doc comment on `is_notify_list_event` (`mod.rs` ~line 743) begins with
-two orphaned paragraphs left over from deleted functions:
-
-```
-/// Find the index of the first `[NOTIFICATIONOVERFLOW]` response code in a
-/// stream of untagged responses, or `responses.len()` if there is none.
-///
-/// Used by LIST/LIST-EXTENDED/LIST-STATUS handlers to classify each
-/// Collect solicited FETCH responses from untagged data
-/// (RFC 3501 Section 7.4.2 / RFC 9051 Section 7.5.2).
-/// Check whether a LIST response carries markers that identify it as a
-```
-
-Note the sentence that just stops mid-clause ("to classify each"). The
-actual doc for `is_notify_list_event` starts at "Check whether a LIST
-response...". Delete the first six lines.
-
-## N2 - The `SideEffectDigest` contract is enforced by convention only
-
-Six call sites take `apply_side_effects`'s digest; two use it, four bind
-it to `_digest`. `SideEffectDigest` is not `#[must_use]`, so nothing
-flags the drop. Marking the struct `#[must_use]` would not help (the
-binding satisfies it), but making the BYE handling a shared helper -
-`fn short_circuit_on_bye(digest, resp) -> Option<Error>` - would collapse
-the four divergent copies into one. Same argument applies to
-`had_notification_overflow`, which no driver loop consumes at all (the
-state mutation happens inside `apply_untagged`, so nothing is currently
-broken, but the digest field is dead weight advertising a contract that
-is not honoured).
-
-## N3 - `TlsMode::None` is reachable but `starttls()` still guards on capabilities being non-empty
-
-`starttls_with_connector` only rejects when the capability list is
-*non-empty and* lacks STARTTLS:
-
-```rust
-if !snap.capabilities.is_empty() && !snap.capabilities.iter().any(...) {
-    return Err(Error::StartTlsUnavailable);
-}
-```
-
-An empty capability list (server never sent `* CAPABILITY` and the
-greeting carried none) therefore permits the upgrade attempt. That is
-deliberate Postel behavior, but it is the one place in the crate where a
-missing capability is treated as "maybe" rather than "no", and it is a
-downgrade-adjacent decision. Worth a comment at minimum. Contrast
-`connect_with_tls_connector_metered`, which *does* hard-fail on a missing
-STARTTLS capability - the two paths to the same upgrade disagree.
 
 ## N4 - `ByteBucket::consume` holds a `std::sync::Mutex` guard across a computed sleep, but never across an `.await`
 
@@ -382,15 +155,12 @@ Two doubles, both in the new `connection/test_support.rs`:
 | `mailbox_tests.rs` | `mailbox.rs` | `validate_qresync_params` (ENABLE requirement, seq-match-data ABNF rule), SELECT CONDSTORE gating, state gates for SELECT/CLOSE/UNSELECT, UNSELECT capability-or-rev2, LSUB rejected on rev2, CREATE-SPECIAL-USE capability and use-attr validation, LIST-STATUS needing both capabilities on rev1, STATUS item pre-validation, the single-pattern LIST-EXTENDED fallback, CRLF injection rejection across six mailbox commands |
 | `uid_ops_tests.rs` | `uid_ops.rs` | `filter_store_flags`, UID EXPUNGE's UIDPLUS-or-rev2 gate, UID MOVE's refusal without MOVE or UIDPLUS, sequence MOVE's stricter gate, VANISHED needing QRESYNC *enabled*, the `$` SEARCHRES gate across fetch/copy/store/expunge, CHANGEDSINCE/UNCHANGEDSINCE needing CONDSTORE, Selected-state gates, ESEARCH capability, the SAVE return option's SEARCHRES gate, SEARCH RETURN (SAVE), SORT and THREAD capability gating including the algorithm upper-casing, and SORT inheriting the SEARCH criteria gates |
 | `config_tests.rs` | `config.rs` | `ImapConfig` constructors (ports and modes), defaults, builder overrides, `TlsMode` predicates, `Debug` output |
-| `tests.rs` (extended) | already wired | `validate_tls_server_name`, `filter_store_flags`, `expand_uid_ranges` (singles, ranges, the `*` sentinel, the 1e6 cap, inverted ranges), `selected_mailbox_effective_responses` (the `[CLOSED]` split, last-marker-wins), `build_selected_mailbox` (full code extraction, tagged-code extraction, missing UIDVALIDITY staying `None`, `HIGHESTMODSEQ 0` -> `NOMODSEQ`, VANISHED EARLIER filtering, pre-`[CLOSED]` state ignored), `is_notify_list_event` / `is_notify_selection_mismatch`, `next_prebuilt_tag`; then byte-level transcripts: SELECT round trip with state transition, SELECT NO leaving the session Authenticated, UID FETCH with a literal body section, unsolicited EXISTS/EXPUNGE during NOOP becoming typed events, CAPABILITY updating the cached snapshot, BYE mid-command (B3), APPEND waiting for `+` on a synchronizing literal, APPEND skipping the wait under LITERAL+, a LITERAL+ APPEND whose body carries a marker-shaped line, and APPENDLIMIT rejection before the wire |
+| `ergonomics_tests.rs` | `ergonomics.rs` | bounded FETCH shutdown after a callback stops early: the receiver is released, buffered items are discarded, the callback error is preserved, and the driver still reaches tagged completion; plus the stalled-server case (no tagged completion, paused clock) proving the drain cannot outlive the command timeout while the driver holds a reserved permit |
+| `tests.rs` (extended) | already wired | `validate_tls_server_name`, `filter_store_flags`, `expand_uid_ranges` (singles, ranges, the `*` sentinel, the 1e6 cap, inverted ranges), `selected_mailbox_effective_responses` (the `[CLOSED]` split, last-marker-wins), `build_selected_mailbox` (full code extraction, tagged-code extraction, missing UIDVALIDITY staying `None`, `HIGHESTMODSEQ 0` -> `NOMODSEQ`, VANISHED EARLIER filtering, pre-`[CLOSED]` state ignored), `is_notify_list_event` / `is_notify_selection_mismatch`, `next_prebuilt_tag`; then byte-level transcripts: SELECT round trip with state transition, SELECT NO leaving the session Authenticated, UID FETCH with a literal body section, unsolicited EXISTS/EXPUNGE during NOOP becoming typed events, CAPABILITY updating the cached snapshot, BYE mid-command preserving its response code without waiting for close, `* BYE [CAPABILITY ...]` still ending the command (the capability side-effect arm must not shadow the BYE tag), APPEND waiting for `+` on a synchronizing literal, APPEND skipping the wait under LITERAL+, a LITERAL+ APPEND whose body carries a marker-shaped line, and APPENDLIMIT rejection before the wire |
 
-One test still carries an explicit `DOCUMENTS A BUG, NOT AN ENDORSEMENT`
-header and names this file:
-`bye_mid_command_is_swallowed_and_surfaces_as_closed` (B3).
-
-The bug-documenting tests for B1, B2, B4, B5, B6 and B8 were rewritten
-into invariant tests when those bugs were fixed, and the fixes added
-their own regressions:
+The bug-documenting tests for B1 through B9 were rewritten into invariant
+tests when those bugs were fixed, and the fixes added their own
+regressions:
 
 | former bug | test now pinning the fix |
 |---|---|
@@ -400,9 +170,12 @@ their own regressions:
 | B5 (framing overflow on a hostile literal size) | `wire_tests.rs::framing_unreachable_literal_size_is_a_parse_error_not_a_stall`, `wire_tests.rs::framing_addressable_literal_size_is_merely_incomplete`, `wire_tests.rs::read_one_fails_fast_on_an_undeliverable_literal_count` |
 | B6 (`list_status_return_option_items` ate an octet) | `helpers_tests.rs::list_status_option_extracts_the_whole_item_list` (the helper now delegates to the codec's single implementation) |
 | B8 (`UID $` past the SEARCHRES gate) | `search_validation_tests.rs::saved_search_marker_is_detected_after_uid_key` |
+| B3 (mid-command BYE swallowed) | `tests.rs::bye_mid_command_preserves_the_response_code_without_waiting_for_close`, `tests.rs::bye_carrying_a_capability_code_still_ends_the_command`, `state_tests.rs::bye_carrying_a_capability_code_still_reports_shutdown`; all driver read loops route the `SideEffectDigest` through `short_circuit_on_bye`, and BYE is now detected from the status tag independently of the response code |
+| B7 (state published after the command result) | `driver/mod_tests.rs::command_answer_follows_state_publication` (every completion arm goes through `publish_then_answer`) |
+| B9 (streaming FETCH stall on an early consumer stop) | `ergonomics_tests.rs::uid_fetch_each_finishes_after_the_callback_stops_a_full_bounded_stream`, `ergonomics_tests.rs::uid_fetch_each_gives_up_when_the_server_stalls_after_an_early_consumer_stop` (the drain drops the receiver instead of awaiting drainage past an outstanding permit) |
 
-Fixing those bugs did modify tests landed by this sweep (the six above
-were rewritten or renamed). No test outside this sweep's own additions
+Fixing those bugs did modify tests landed by this sweep (the six B1-B8
+codec/validation entries above were rewritten or renamed). No test outside this sweep's own additions
 was changed. No `Cargo.toml` was touched; the manifest already carries
 tokio `io-util` plus dev `test-util`, `proptest` and `pretty_assertions`.
 
@@ -434,17 +207,6 @@ the fatal lane.
 
 - **`extensions.rs` COMPRESS round trip.** Blocked on N6 for the same
   reason. Only the capability and state gates are covered.
-
-- **`driver/pipeline.rs` and `driver/upgrade.rs` BYE handling.** Both
-  share B3's defect, and both are inside another agent's likely blast
-  radius (`driver/**` has existing tests, so it was outside my survey
-  gap). I read them to confirm the defect but wrote no tests there.
-
-- **`ergonomics.rs`.** `select_for_sync` / `sync_fetch` / `uid_fetch_each`
-  / `uid_fetch_limited` are thin compositions over the surfaces above.
-  They are worth transcript tests, but each needs a multi-command script
-  (ENABLE -> SELECT -> UID FETCH) and the payoff is mostly re-testing the
-  pieces. B9 is the finding that came out of reading them.
 
 - **Bandwidth metering (`WireMetering` / `ByteBucket`).** Testable with
   `tokio::time::pause()` and the duplex harness, and worth doing: the cap

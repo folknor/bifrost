@@ -1,6 +1,42 @@
 #![allow(clippy::wildcard_imports)]
 use super::*;
 
+/// Drain a bounded FETCH stream, releasing the receiver before returning early.
+///
+/// Dropping the receiver tells the driver that no consumer capacity will ever
+/// be available again; its next `reserve_owned` fails, it marks the pipe
+/// drained, and it keeps reading through the tagged completion to preserve
+/// IMAP framing. Already-buffered items are discarded because the caller has
+/// explicitly stopped consuming them.
+///
+/// The receiver is dropped rather than closed-and-drained: the driver
+/// pre-reserves an `OwnedPermit` before each socket read, and `recv()` on a
+/// closed receiver stays pending while a permit is outstanding. Awaiting full
+/// drainage would therefore outlive the command timeout whenever the server
+/// stalls mid-response, hanging the joined future forever.
+pub(super) async fn drain_fetch_stream<F>(
+    mut rx: tokio::sync::mpsc::Receiver<Result<FetchResponse, Error>>,
+    mut on_item: F,
+) -> Result<(), Error>
+where
+    F: FnMut(Result<FetchResponse, Error>) -> Result<bool, Error>,
+{
+    let mut result = Ok(());
+    while let Some(item) = rx.recv().await {
+        match on_item(item) {
+            Ok(true) => {}
+            Ok(false) => break,
+            Err(error) => {
+                result = Err(error);
+                break;
+            }
+        }
+    }
+
+    drop(rx);
+    result
+}
+
 impl ImapConnection {
     /// SELECT or EXAMINE a mailbox using sync-oriented options.
     ///
@@ -99,13 +135,11 @@ impl ImapConnection {
     where
         F: FnMut(FetchResponse) -> Result<(), Error>,
     {
-        let (mut rx, fetch_fut) = self.uid_fetch_stream(uids.as_sequence_set(), attrs, timeout)?;
-        let drain_fut = async {
-            while let Some(fetch) = rx.recv().await {
-                on_fetch(fetch?)?;
-            }
-            Ok::<(), Error>(())
-        };
+        let (rx, fetch_fut) = self.uid_fetch_stream(uids.as_sequence_set(), attrs, timeout)?;
+        let drain_fut = drain_fetch_stream(rx, |fetch| {
+            on_fetch(fetch?)?;
+            Ok(true)
+        });
         let (fetch_result, drain_result) = tokio::join!(fetch_fut, drain_fut);
         match (drain_result, fetch_result) {
             (Err(err), _) => Err(err),
@@ -186,3 +220,7 @@ impl ImapConnection {
         Ok(self.next_event(timeout).await?.map(|event| event.impact()))
     }
 }
+
+#[cfg(test)]
+#[path = "ergonomics_tests.rs"]
+mod tests;

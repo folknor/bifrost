@@ -281,7 +281,7 @@ impl ProtocolState {
                 }
             }
             Response::Tagged(t) => {
-                self.apply_tagged(t, &mut digest);
+                self.apply_tagged(t);
             }
             Response::Continuation(_) | Response::Greeting(_) => {}
         }
@@ -292,12 +292,26 @@ impl ProtocolState {
 
     /// Handle side effects from untagged responses.
     ///
-    /// Each arm handles one of:
+    /// The BYE state transition (RFC 3501 Section7.1.5) is handled first and
+    /// independently of the response code. Each arm of the code-dispatch
+    /// match then handles one of:
     /// - CAPABILITY refresh (RFC 3501 Section7.2.1)
-    /// - BYE state transition (RFC 3501 Section7.1.5)
     /// - NOTIFICATIONOVERFLOW clear (RFC 5465 Section5.8)
     /// - ENABLED accumulation (RFC 5161 Section3.2)
     fn apply_untagged(&mut self, u: &UntaggedResponse, digest: &mut SideEffectDigest) {
+        // RFC 3501 Section7.1.5: BYE is fatal regardless of which response
+        // code it carries. Detect it from the status tag alone, before the
+        // code-dispatch match below, so a code with its own arm (e.g.
+        // `* BYE [CAPABILITY ...]`) cannot shadow the shutdown.
+        if let UntaggedResponse::Status {
+            status: UntaggedStatus::Bye,
+            ..
+        } = u
+        {
+            self.state = SessionState::Logout;
+            digest.had_bye = true;
+        }
+
         match u {
             // RFC 3501 Section7.2.1: server MAY send unsolicited
             // `* CAPABILITY ...` at any time  -  update cached set.
@@ -309,14 +323,6 @@ impl ProtocolState {
                 ..
             } => {
                 self.capabilities.clone_from(caps);
-            }
-            // RFC 3501 Section7.1.5: BYE means the server is closing.
-            UntaggedResponse::Status {
-                status: UntaggedStatus::Bye,
-                ..
-            } => {
-                self.state = SessionState::Logout;
-                digest.had_bye = true;
             }
             // RFC 5465 Section5.8: NOTIFICATIONOVERFLOW means the server
             // dropped the NOTIFY registration. Clear all per-type flags.
@@ -332,7 +338,6 @@ impl ProtocolState {
                 // Cancel any pending NOTIFY SET  -  overflow takes precedence
                 // over the new registration (RFC 5465 Section5.8).
                 self.in_notify_set = None;
-                digest.had_notification_overflow = true;
             }
             // RFC 5161 Section3.2: `* ENABLED <ext1> <ext2> ...` updates the
             // set of active extensions. Accumulates across multiple ENABLE
@@ -354,7 +359,7 @@ impl ProtocolState {
     ///
     /// RFC 3501 Section7.1: tagged OK/NO/BAD may carry response codes.
     /// Also handles the LOGOUT state transition when `in_logout` is set.
-    fn apply_tagged(&mut self, t: &TaggedResponse, digest: &mut SideEffectDigest) {
+    fn apply_tagged(&mut self, t: &TaggedResponse) {
         match &t.code {
             // RFC 3501 Section7.1 / Section7.2.1: "[CAPABILITY ...]" updates the
             // cached capability set.
@@ -372,7 +377,6 @@ impl ProtocolState {
                 // Cancel any pending NOTIFY SET  -  overflow takes precedence
                 // over the new registration (RFC 5465 Section5.8).
                 self.in_notify_set = None;
-                digest.had_notification_overflow = true;
             }
             _ => {}
         }
@@ -455,15 +459,20 @@ impl ProtocolState {
 /// Summary of side effects applied during a single
 /// [`ProtocolState::apply_side_effects`] call.
 ///
-/// Returned to the caller so it can take action (e.g., wake an event
-/// queue) without re-inspecting the response.
+/// Returned to the driver so it can stop response processing on a fatal
+/// server shutdown without re-inspecting protocol state.
+#[must_use = "route the digest through the driver's BYE short-circuit"]
 #[derive(Debug, Default)]
 pub(crate) struct SideEffectDigest {
-    /// A `[NOTIFICATIONOVERFLOW]` cleared the NOTIFY registration
-    /// (RFC 5465 Section5.8).
-    pub(crate) had_notification_overflow: bool,
     /// A `* BYE` was received (RFC 3501 Section7.1.5).
-    pub(crate) had_bye: bool,
+    had_bye: bool,
+}
+
+impl SideEffectDigest {
+    /// Whether the response was an untagged server shutdown.
+    pub(super) const fn had_bye(&self) -> bool {
+        self.had_bye
+    }
 }
 
 #[cfg(test)]

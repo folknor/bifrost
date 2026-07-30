@@ -17,7 +17,7 @@ use crate::codec::classification::{self, ClassificationContext, SolicitationRule
 use crate::codec::encode::{EncodeOptions, LiteralMode};
 use crate::error::Error;
 use crate::types::Command;
-use crate::types::response::{Capability, UntaggedResponse};
+use crate::types::response::{Capability, UntaggedResponse, UntaggedStatus};
 use crate::types::validated::MailboxName;
 
 use super::NotifyFlags;
@@ -434,7 +434,13 @@ pub(super) async fn driver_task(
                             state.apply_infrastructure_failure();
                             cmd_rx.close();
                         }
-                        let _ = result_tx.send(result);
+                        publish_then_answer(
+                            || {
+                                let _ = state_tx.send_replace(state.snapshot());
+                            },
+                            result_tx,
+                            result,
+                        );
                     }
                     DriverCommand::Upgrade { payload, result_tx } => {
                         let result = run_upgrade(
@@ -448,9 +454,14 @@ pub(super) async fn driver_task(
                             state.apply_infrastructure_failure();
                             cmd_rx.close();
                         }
-                        let _ = result_tx.send(result.map(|()| {
-                            Box::new(()) as Box<dyn std::any::Any + Send>
-                        }));
+                        let result = result.map(|()| Box::new(()) as Box<dyn std::any::Any + Send>);
+                        publish_then_answer(
+                            || {
+                                let _ = state_tx.send_replace(state.snapshot());
+                            },
+                            result_tx,
+                            result,
+                        );
                     }
                     DriverCommand::Pipeline { commands, consumers, result_tx } => {
                         let result = run_pipeline(
@@ -465,7 +476,13 @@ pub(super) async fn driver_task(
                             state.apply_infrastructure_failure();
                             cmd_rx.close();
                         }
-                        let _ = result_tx.send(result);
+                        publish_then_answer(
+                            || {
+                                let _ = state_tx.send_replace(state.snapshot());
+                            },
+                            result_tx,
+                            result,
+                        );
                     }
                     DriverCommand::SetKeepalive { keepalive, result_tx } => {
                         let result = wire_reader.set_keepalive(&keepalive);
@@ -490,10 +507,15 @@ pub(super) async fn driver_task(
                             state.apply_infrastructure_failure();
                             cmd_rx.close();
                         }
-                        let _ = result_tx.send(result);
+                        publish_then_answer(
+                            || {
+                                let _ = state_tx.send_replace(state.snapshot());
+                            },
+                            result_tx,
+                            result,
+                        );
                     }
                 }
-                let _ = state_tx.send_replace(state.snapshot());
 
                 // RFC 3501 Section3.4: once the session reaches Logout state
                 // (either via BYE or tagged OK for LOGOUT), the
@@ -509,7 +531,7 @@ pub(super) async fn driver_task(
 
     // Graceful shutdown: send LOGOUT if still authenticated.
     // Best-effort; ignore errors.
-    let _ = logout_best_effort(&mut wire_reader, &mut state, &mut tag_gen).await;
+    let _ = logout_best_effort(&mut wire_reader, &mut state, &mut tag_gen, &mut event_sink).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -602,7 +624,7 @@ pub(in crate::connection) async fn run_one_command(
             .read_one(utf8)
             .await
             .map_err(|e| e.with_attempt(TransmissionState::InFlight))?;
-        let _digest = state.apply_side_effects(&resp);
+        let digest = state.apply_side_effects(&resp);
 
         match resp {
             crate::types::Response::Tagged(t) if t.tag == tag => {
@@ -639,6 +661,7 @@ pub(in crate::connection) async fn run_one_command(
                 // classification so they reach the event queue even
                 // when the response is routed to a consumer.
                 let code_emitted = emit_untagged_response_code_events(&u, event_sink);
+                short_circuit_on_bye(digest, &u)?;
 
                 let class_ctx = ClassificationContext {
                     notify: notify_before,
@@ -722,7 +745,7 @@ pub(in crate::connection) async fn run_prebuilt_command(
             .read_one(utf8)
             .await
             .map_err(|e| e.with_attempt(TransmissionState::InFlight))?;
-        let _digest = state.apply_side_effects(&resp);
+        let digest = state.apply_side_effects(&resp);
 
         match resp {
             crate::types::Response::Tagged(t) if t.tag == tag => {
@@ -746,6 +769,7 @@ pub(in crate::connection) async fn run_prebuilt_command(
             }
             crate::types::Response::Untagged(u) => {
                 let code_emitted = emit_untagged_response_code_events(&u, event_sink);
+                short_circuit_on_bye(digest, &u)?;
 
                 let class_ctx = ClassificationContext {
                     notify: notify_before,
@@ -776,6 +800,38 @@ pub(in crate::connection) async fn run_prebuilt_command(
             }
         }
     }
+}
+
+/// Publish the state snapshot before waking the command caller.
+///
+/// A oneshot send may schedule the caller on another runtime worker
+/// immediately, so the watch snapshot must be visible first.
+fn publish_then_answer<T>(publish: impl FnOnce(), result_tx: oneshot::Sender<T>, result: T) {
+    publish();
+    let _ = result_tx.send(result);
+}
+
+/// Turn a side-effect digest for an untagged response into the fatal BYE
+/// result every active driver read loop must honor.
+///
+/// Call this after response-code events are emitted so an ALERT carried by
+/// BYE reaches the event queue before the command exits.
+pub(super) fn short_circuit_on_bye(
+    digest: super::state::SideEffectDigest,
+    response: &UntaggedResponse,
+) -> Result<(), Error> {
+    if !digest.had_bye() {
+        return Ok(());
+    }
+
+    let UntaggedResponse::Status { status, text, code } = response else {
+        debug_assert!(false, "only an untagged BYE may set the BYE digest");
+        return Err(Error::Internal(
+            "BYE digest without a status response".into(),
+        ));
+    };
+    debug_assert!(matches!(status, UntaggedStatus::Bye));
+    Err(Error::bye_with_code(text.clone(), code.clone()))
 }
 
 // ---------------------------------------------------------------------------

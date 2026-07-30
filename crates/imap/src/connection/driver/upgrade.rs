@@ -249,6 +249,7 @@ pub(super) async fn logout_best_effort(
     wire_reader: &mut super::super::wire::WireReader,
     state: &mut super::super::state::ProtocolState,
     tag_gen: &mut super::super::tag::TagGenerator,
+    event_sink: &mut event_sink::DriverEventSink,
 ) -> Result<(), Error> {
     if state.session_state() == SessionState::Logout {
         return Ok(());
@@ -263,11 +264,18 @@ pub(super) async fn logout_best_effort(
     loop {
         let utf8 = super::utf8_mode(state);
         let resp = wire_reader.read_one(utf8).await?;
-        let _digest = state.apply_side_effects(&resp);
+        let digest = state.apply_side_effects(&resp);
         match resp {
             crate::types::Response::Tagged(t) if t.tag == tag => break,
             crate::types::Response::Tagged(_) => break,
-            _ => {}
+            crate::types::Response::Untagged(u) => {
+                let code_emitted = super::emit_untagged_response_code_events(&u, event_sink);
+                super::short_circuit_on_bye(digest, &u)?;
+                if !code_emitted {
+                    let _ = event_sink.emit((*u).into());
+                }
+            }
+            crate::types::Response::Continuation(_) | crate::types::Response::Greeting(_) => {}
         }
     }
     Ok(())

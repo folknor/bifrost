@@ -788,49 +788,96 @@ async fn capability_response_updates_the_cached_snapshot() {
     assert!(conn.capabilities().contains(&Capability::Move));
 }
 
-/// DOCUMENTS A BUG, NOT AN ENDORSEMENT.
-///
-/// `run_one_command` discards the `SideEffectDigest` (`let _digest = ...`),
-/// so an untagged `* BYE` mid-command does not terminate the read loop the
-/// way `wire_send::wait_for_continuation` and `driver::idle` both do.
-/// `classify` routes `* BYE` as `Either`, so the consumer buffers it for
-/// `finalize` - and `finalize` never runs, because the tagged response
-/// never arrives. The BYE text and its response code (`[UNAVAILABLE]`,
-/// `[ALERT]`, ...) are therefore lost entirely: the caller sees a bare
-/// `Error::Closed` and the event queue stays empty. A server that sends
-/// BYE without closing the socket wedges the driver task indefinitely.
-///
-///
 #[tokio::test]
-async fn bye_mid_command_is_swallowed_and_surfaces_as_closed() {
+async fn bye_mid_command_preserves_the_response_code_without_waiting_for_close() {
     let (conn, mut server) =
         crate::connection::test_support::driver_pair(&preauth_greeting("IMAP4rev1")).await;
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
 
     let script = tokio::spawn(async move {
         let _line = read_line(&mut server).await;
         respond(&mut server, "* BYE [UNAVAILABLE] server shutting down\r\n").await;
-        // Close the socket; without this the driver would block forever.
-        drop(server);
+        let _ = release_rx.await;
     });
 
     let err = conn
         .noop(Duration::from_secs(5))
         .await
         .expect_err("the command cannot complete after BYE");
-    script.await.unwrap();
 
     assert!(
-        matches!(err, Error::Closed { .. }),
-        "current behavior is Closed, not Bye: {err:?}"
-    );
-    assert!(
-        conn.drain_events().await.is_empty(),
-        "current behavior: the BYE never reaches the event queue either"
+        matches!(
+            err,
+            Error::Bye {
+                code: Some(ResponseCode::Unavailable),
+                ..
+            }
+        ),
+        "BYE must preserve its structured response code: {err:?}"
     );
     assert!(
         !conn.is_alive(),
-        "a closed wire must close the driver command channel"
+        "BYE must close the driver command channel even while the peer stays open"
     );
+    let _ = release_tx.send(());
+    script.await.unwrap();
+}
+
+#[tokio::test]
+async fn bye_carrying_a_capability_code_still_ends_the_command() {
+    // `* BYE [CAPABILITY ...]` is a real shutdown shape (servers repeat their
+    // pre-login capabilities on the way out). The response code must not
+    // route the response away from the fatal-BYE lane.
+    let (conn, mut server) =
+        crate::connection::test_support::driver_pair(&preauth_greeting("IMAP4rev1")).await;
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+
+    let script = tokio::spawn(async move {
+        let _line = read_line(&mut server).await;
+        respond(
+            &mut server,
+            "* BYE [CAPABILITY IMAP4rev1 MOVE] shutting down\r\n",
+        )
+        .await;
+        let _ = release_rx.await;
+    });
+
+    let err = tokio::time::timeout(Duration::from_secs(5), conn.noop(Duration::from_secs(30)))
+        .await
+        .expect("BYE must end the command without waiting for the peer to close")
+        .expect_err("the command cannot complete after BYE");
+
+    assert!(
+        matches!(
+            err,
+            Error::Bye {
+                code: Some(ResponseCode::Capability(_)),
+                ..
+            }
+        ),
+        "BYE must preserve its structured response code: {err:?}"
+    );
+    assert!(
+        !conn.is_alive(),
+        "BYE must close the driver command channel"
+    );
+    let _ = release_tx.send(());
+    script.await.unwrap();
+}
+
+#[tokio::test]
+async fn starttls_rejects_an_empty_capability_snapshot_before_touching_the_driver() {
+    // This models the plaintext `TlsMode::None` connection state. A missing
+    // capability is not permission to attempt a downgrade-adjacent upgrade.
+    let conn =
+        crate::connection::test_support::detached(SessionState::NotAuthenticated, Vec::new(), &[]);
+    let connector = native_tls::TlsConnector::builder().build().unwrap();
+
+    assert!(matches!(
+        conn.starttls_with_connector(connector, Duration::from_secs(1))
+            .await,
+        Err(Error::StartTlsUnavailable)
+    ));
 }
 
 #[tokio::test]

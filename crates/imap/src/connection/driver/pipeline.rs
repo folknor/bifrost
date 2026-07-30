@@ -309,7 +309,7 @@ async fn run_pipeline_batch(
             }
         }
 
-        let _digest = state.apply_side_effects(&resp);
+        let digest = state.apply_side_effects(&resp);
 
         match resp {
             crate::types::Response::Tagged(t) => {
@@ -344,6 +344,7 @@ async fn run_pipeline_batch(
             }
             crate::types::Response::Untagged(u) => {
                 let code_emitted = super::emit_untagged_response_code_events(&u, event_sink);
+                super::short_circuit_on_bye(digest, &u)?;
 
                 // Find the head consumer: first still-active
                 // (non-finalized) consumer. Per the tag-completion
