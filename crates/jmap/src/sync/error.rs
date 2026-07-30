@@ -118,6 +118,22 @@ pub(crate) fn into_account_error(error: crate::Error, ctx: JmapErrorContext) -> 
         )
         .try_build()
         .expect("valid account error classification"),
+        crate::Error::UnexpectedMethodResponse {
+            call_id,
+            expected,
+            actual,
+        } => build(
+            AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
+            Cause::Wire(WireCause::MalformedResponse {
+                protocol: Protocol::Jmap,
+                detail: Some(DiagnosticText::support_only(format!(
+                    "call {call_id} returned {actual}, expected {expected}"
+                ))),
+            }),
+            &ctx,
+        )
+        .try_build()
+        .expect("valid account error classification"),
         crate::Error::IdNotFound(id) => convert_id_not_found(id, ctx),
         crate::Error::NotParsable(detail) => build(
             AccountErrorKind::Protocol(ProtocolErrorKind::ParseFailed),
@@ -1069,6 +1085,49 @@ fn convert_method(method: crate::core::error::MethodError, ctx: JmapErrorContext
     builder
         .try_build()
         .expect("valid account error classification")
+}
+
+/// An id the server listed in a `/get` response's `notFound`: the object
+/// is gone, or this account cannot reach it. Terminal for the id, which
+/// is the honest answer - re-requesting it will produce the same
+/// `notFound`.
+#[must_use]
+pub(crate) fn get_id_not_found(id: impl Into<String>, ctx: JmapErrorContext) -> AccountError {
+    convert_id_not_found(id.into(), ctx)
+}
+
+/// An id that a `/get` answered in NEITHER `list` nor `notFound`.
+///
+/// RFC 8620 s5.1 requires a conforming server to account for every
+/// requested id in exactly one of the two, so an unanswered id is a
+/// contract breach - but it must not classify as
+/// `Protocol(ContractViolation)`, which derives the terminal
+/// `ProviderContractViolation` and would drop the id for good. `/get` is
+/// idempotent and the omission says nothing about the object, so
+/// `Protocol(PartialResponse)` is the right class: the shared recovery
+/// mapping retries it and the next `/get` normally answers. Transmission
+/// evidence is `Acknowledged` - the method response itself arrived, only
+/// this id's answer is missing.
+///
+/// This is the same shape `bifrost-graph` uses for a `$batch` request
+/// that comes back with fewer responses than it submitted.
+#[must_use]
+pub(crate) fn get_id_unanswered(id: &str, ctx: JmapErrorContext) -> AccountError {
+    build(
+        AccountErrorKind::Protocol(ProtocolErrorKind::PartialResponse),
+        Cause::Wire(WireCause::MalformedResponse {
+            protocol: Protocol::Jmap,
+            detail: Some(DiagnosticText::support_only(format!(
+                "requested id {id} appeared in neither `list` nor `notFound`"
+            ))),
+        }),
+        &ctx,
+    )
+    .push_cause(Cause::Attempt(AttemptCause::new(
+        TransmissionState::Acknowledged,
+    )))
+    .try_build()
+    .expect("valid account error classification")
 }
 
 fn convert_id_not_found(id: String, ctx: JmapErrorContext) -> AccountError {

@@ -229,9 +229,9 @@ pub(crate) fn search(
     })
 }
 
-/// A hydrated page of cards plus the native ids the server reported as
-/// `notFound`. An id that the query returned but `ContactCard/get` could
-/// not materialize is a transient per-resource hydration failure, not a
+/// A hydrated page of cards plus the native ids `ContactCard/get` did not
+/// answer with a card. An id that the query returned but the get could not
+/// materialize is a transient per-resource hydration failure, not a
 /// deletion; it rides `Page::failed_ids` so the consumer preserves the
 /// row rather than destroying it.
 struct HydratedCards {
@@ -250,22 +250,61 @@ async fn get_cards(
             failed_ids: Vec::new(),
         });
     }
-    let response = contacts
-        .call(ContactCardGet::new().ids(ids))
-        .await
-        .map_err(to_acct_err(operation))?;
-    let failed_ids = response
-        .not_found()
+    let requested: Vec<String> = ids
         .iter()
         .cloned()
         .map(ContactCardId::into_string)
         .collect();
-    let cards = response
-        .into_list()
-        .into_iter()
-        .map(contact_from_jmap)
-        .collect();
-    Ok(HydratedCards { cards, failed_ids })
+    let response = contacts
+        .call(ContactCardGet::new().ids(ids))
+        .await
+        .map_err(to_acct_err(operation))?;
+    let not_found = response.not_found().to_vec();
+    let (cards, unanswered) = reconcile_cards(requested, &not_found, response.into_list());
+    Ok(HydratedCards {
+        cards,
+        failed_ids: unanswered,
+    })
+}
+
+/// Split a `ContactCard/get` answer into hydrated cards and the ids the
+/// server did not hand back a card for.
+///
+/// `notFound` alone is not that set. An absent `notFound` decodes as
+/// empty (RFC 8620 s5.1 requires the property, but the decoder is lenient
+/// so one missing empty array cannot fail the whole request), and even a
+/// present list can omit an id the server also left out of `list`. Either
+/// way the id must reach `Page::failed_ids`, or the consumer reads its
+/// absence from `items` as a deletion and destroys a row that still
+/// exists.
+fn reconcile_cards(
+    requested: Vec<String>,
+    not_found: &[ContactCardId],
+    list: Vec<JmapContactCard>,
+) -> (Vec<ContactCard>, Vec<String>) {
+    let mut answered: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut failed_ids: Vec<String> = Vec::new();
+    for missing in not_found {
+        let missing = missing.clone().into_string();
+        if answered.insert(missing.clone()) {
+            failed_ids.push(missing);
+        }
+    }
+
+    let mut cards = Vec::with_capacity(list.len());
+    for card in list {
+        if let Some(id) = card.id() {
+            answered.insert(id.into_string());
+        }
+        cards.push(contact_from_jmap(card));
+    }
+
+    for id in requested {
+        if answered.insert(id.clone()) {
+            failed_ids.push(id);
+        }
+    }
+    (cards, failed_ids)
 }
 
 fn address_book_from_jmap(book: crate::address_book::AddressBook) -> AddressBook {
@@ -762,6 +801,49 @@ fn to_acct_err(operation: AccountOperation) -> impl Fn(crate::Error) -> AccountE
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn card(id: &str) -> JmapContactCard {
+        JmapContactCard {
+            properties: serde_json::from_value(json!({ "id": id })).expect("object"),
+        }
+    }
+
+    /// `Page::failed_ids` is what stops a consumer reading "absent from
+    /// `items`" as "deleted, destroy the row". A `ContactCard/get` that
+    /// answers an id in neither `list` nor `notFound` therefore has to
+    /// land there too - and it cannot be detected from `notFound` alone,
+    /// which decodes as empty whenever the server omits it.
+    #[test]
+    fn an_id_answered_in_neither_list_nor_not_found_rides_failed_ids() {
+        let requested = vec!["c0".to_string(), "c1".to_string(), "c2".to_string()];
+        let (cards, failed_ids) = reconcile_cards(
+            requested,
+            // Empty is exactly what an omitted `notFound` decodes to.
+            &[],
+            vec![card("c1")],
+        );
+
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].id.0, "c1");
+        let mut failed_ids = failed_ids;
+        failed_ids.sort();
+        assert_eq!(failed_ids, vec!["c0".to_string(), "c2".to_string()]);
+    }
+
+    /// A declared `notFound` and an unanswered id both mean "no card for
+    /// this row", and neither may be double-counted when the two overlap.
+    #[test]
+    fn declared_not_found_and_unanswered_ids_are_each_reported_once() {
+        let requested = vec!["c0".to_string(), "c1".to_string(), "c2".to_string()];
+        let (cards, failed_ids) = reconcile_cards(
+            requested,
+            &[ContactCardId::new("c0"), ContactCardId::new("c0")],
+            vec![card("c1")],
+        );
+
+        assert_eq!(cards.len(), 1);
+        assert_eq!(failed_ids, vec!["c0".to_string(), "c2".to_string()]);
+    }
 
     #[test]
     fn jscontact_maps_to_shared_contact() {

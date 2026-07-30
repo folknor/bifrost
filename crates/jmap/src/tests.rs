@@ -1983,34 +1983,12 @@ mod mailbox_wire {
         );
     }
 
-    // BUG, documented rather than endorsed. A default-constructed
-    // `MailboxPatch` - which is exactly what `SetRequest::update` hands
-    // every caller, via `or_default()` - does NOT serialise to `{}`. Two
-    // of its fields use skip predicates that return `false` for `None`:
-    //
-    //   role       skip_if = role_not_set   -> matches!(Some(Role::None))
-    //   shareWith  skip_if = skip_if_empty_map -> matches!(Some(empty))
-    //
-    // so `None` reaches the wire as an explicit `null`. On a JMAP
-    // PatchObject `null` means REMOVE, so every `Mailbox/set update`
-    // this crate sends also clears the mailbox's `role` and its whole
-    // `shareWith` ACL map. `sync/pim.rs::container_rename` is the live
-    // path: renaming the Inbox de-roles it and drops every share.
-    //
-    // `MailboxCreate` avoids this only because its `SetCreate::new`
-    // hand-initialises the sentinels (`Some(Role::None)`, an empty
-    // `shareWith`); `MailboxPatch` uses `#[derive(Default)]`, which
-    // cannot.
-    //
-    // Fix: make the Patch fields `Field<T>` (defaulting to `Omitted`),
-    // or give `MailboxPatch` a hand-written `Default` that installs the
-    // same sentinels `MailboxCreate::new` does.
     #[test]
-    fn an_empty_mailbox_patch_still_clears_role_and_share_with() {
+    fn an_empty_mailbox_patch_omits_role_and_share_with() {
         assert_eq!(
             serde_json::to_value(MailboxPatch::default()).unwrap(),
-            json!({"role": null, "shareWith": null}),
-            "an untouched patch must be `{{}}`; today it removes two properties"
+            json!({}),
+            "an untouched patch must not remove any properties"
         );
 
         // The live rename path, verbatim.
@@ -2019,30 +1997,17 @@ mod mailbox_wire {
         assert_eq!(
             serde_json::to_value(&set).unwrap().get("update"),
             Some(&json!({
-                "mb1": {"name": "Renamed", "role": null, "shareWith": null}
+                "mb1": {"name": "Renamed"}
             }))
         );
     }
 
-    // BUG, documented rather than endorsed. `MailboxPatch::parent_id`
-    // takes an `Option`, so `None` is the only way a caller can say
-    // "move this mailbox to the top level" - but that field IS
-    // `skip_serializing_if = "Option::is_none"`, so the intent is
-    // dropped entirely. This is live:
-    // `sync/pim.rs::container_move(container, None)` takes exactly this
-    // path and then reports success. Fix: `Field<MailboxId>`, as
-    // `Calendar`/`AddressBook` already use for their nullable
-    // properties; `MailboxCreate` already gets it right via
-    // `skip_if_empty_id`.
     #[test]
-    fn patching_parent_id_to_none_emits_no_parent_id_at_all() {
+    fn patching_parent_id_to_none_emits_a_null_parent_id() {
         let mut patch = MailboxPatch::default();
         patch.parent_id(None::<MailboxId>);
         let value = serde_json::to_value(&patch).unwrap();
-        assert!(
-            value.get("parentId").is_none(),
-            "the `move to root` intent is lost on the wire"
-        );
+        assert_eq!(value.get("parentId"), Some(&serde_json::Value::Null));
     }
 
     #[test]
@@ -2293,30 +2258,18 @@ mod settings_object_wire {
         VacationResponseId, VacationResponsePatch, VacationResponseSet,
     };
 
-    // BUG, documented rather than endorsed. Same root cause as
-    // `mailbox_wire::an_empty_mailbox_patch_still_clears_role_and_share_with`:
-    // `replyTo` and `bcc` use `skip_if_empty_list`, which returns
-    // `false` for `None`, so a default-constructed `IdentityPatch`
-    // serialises to `{"replyTo": null, "bcc": null}`. On a JMAP
-    // PatchObject that is a removal, so
-    // `sync/pim.rs::identity_update` - which only ever touches the
-    // fields the caller named - silently wipes the identity's reply-to
-    // and Bcc lists every time someone renames an identity or edits a
-    // signature. Fix: `Field<Vec<EmailAddress>>`, or a hand-written
-    // `Default` that installs the `Some(empty)` sentinels the way
-    // `IdentityCreate::new` does.
     #[test]
-    fn an_empty_identity_patch_still_clears_reply_to_and_bcc() {
+    fn an_empty_identity_patch_omits_reply_to_and_bcc() {
         assert_eq!(
             serde_json::to_value(IdentityPatch::default()).unwrap(),
-            json!({"replyTo": null, "bcc": null})
+            json!({})
         );
 
         let mut patch = IdentityPatch::default();
         patch.name("Alice");
         assert_eq!(
             serde_json::to_value(&patch).unwrap(),
-            json!({"name": "Alice", "replyTo": null, "bcc": null}),
+            json!({"name": "Alice"}),
             "renaming an identity must not touch replyTo/bcc"
         );
     }
@@ -2453,14 +2406,9 @@ mod settings_object_wire {
 // default patch happens to serialise is a property every update in this
 // crate silently deletes.
 //
-// The rule the crate follows elsewhere is: a nullable property uses a
-// skip predicate that lets `None` through as `null` (`skip_if_empty_str`
-// / `_list` / `_map` / `skip_if_zero_date` / `skip_if_empty_id` all
-// return `false` for `None`), and the Create type's hand-written
-// `SetCreate::new` installs `Some(empty)` sentinels so the default is
-// still skipped. The Patch types use `#[derive(Default)]`, which cannot
-// install a sentinel - so wherever a Patch field uses one of those
-// predicates, the default leaks a `null`.
+// Nullable Patch properties must use `Field<T>` or a hand-written Default
+// with the same sentinels as the Create type. Deriving Default gives a plain
+// `None`, which a nullable property's skip predicate may serialize as null.
 
 mod patch_defaults {
     use super::*;
@@ -2479,6 +2427,8 @@ mod patch_defaults {
         {
             empty::<crate::email::EmailPatch>("EmailPatch");
             empty::<crate::email_submission::EmailSubmissionPatch>("EmailSubmissionPatch");
+            empty::<crate::identity::IdentityPatch>("IdentityPatch");
+            empty::<crate::mailbox::MailboxPatch>("MailboxPatch");
             empty::<crate::vacation_response::VacationResponsePatch>("VacationResponsePatch");
             empty::<crate::sieve::SieveScriptPatch>("SieveScriptPatch");
         }
@@ -2495,25 +2445,10 @@ mod patch_defaults {
         }
     }
 
-    // BUG, documented rather than endorsed. These four default patches
-    // are not empty; each `null` below is a property removal the caller
-    // never asked for. Two of them are on live paths
-    // (`container_rename` / `container_move` for Mailbox,
-    // `identity_update` for Identity).
+    // BUG, documented rather than endorsed. These default patches are not
+    // empty; each null below is a property removal the caller never asked for.
     #[test]
     fn patches_that_leak_property_removals() {
-        #[cfg(feature = "mail")]
-        assert_eq!(
-            serde_json::to_value(crate::mailbox::MailboxPatch::default()).unwrap(),
-            json!({"role": null, "shareWith": null}),
-            "every Mailbox/set update de-roles the mailbox and drops its shares"
-        );
-        #[cfg(feature = "mail")]
-        assert_eq!(
-            serde_json::to_value(crate::identity::IdentityPatch::default()).unwrap(),
-            json!({"replyTo": null, "bcc": null}),
-            "every Identity/set update clears reply-to and Bcc"
-        );
         assert_eq!(
             serde_json::to_value(crate::push_subscription::PushSubscriptionPatch::default())
                 .unwrap(),

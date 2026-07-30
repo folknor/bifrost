@@ -84,7 +84,7 @@ pub(crate) struct IdentityCreate {
     pub(super) html_signature: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Default)]
+#[derive(Debug, Clone, Serialize)]
 pub(crate) struct IdentityPatch {
     #[serde(rename = "name")]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -105,6 +105,18 @@ pub(crate) struct IdentityPatch {
     #[serde(rename = "htmlSignature")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) html_signature: Option<String>,
+}
+
+impl Default for IdentityPatch {
+    fn default() -> Self {
+        Self {
+            name: None,
+            reply_to: Some(Vec::new()),
+            bcc: Some(Vec::new()),
+            text_signature: None,
+            html_signature: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Copy)]

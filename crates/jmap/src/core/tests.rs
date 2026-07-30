@@ -146,6 +146,24 @@ fn response_get_extracts_typed_result() {
     assert_eq!(result.list()[0].name.as_deref(), Some("hello"));
 }
 
+// Decode leniency only. An absent `notFound` decoding as empty is NOT
+// evidence that every requested id was answered - `GetResponse` does not
+// know which ids were requested. Callers with a closed per-item
+// accounting contract reconcile against their own submitted ids
+// (`sync::hydrate::reconcile_hydration`, `sync::contacts::reconcile_cards`).
+#[test]
+fn get_response_accepts_an_omitted_empty_not_found_list() {
+    let raw_json = json!({
+        "accountId": "A1",
+        "state": "s1",
+        "list": []
+    });
+
+    let response: GetResponse<TestObj> = serde_json::from_value(raw_json)
+        .expect("servers that omit an empty notFound list are accepted");
+    assert!(response.not_found().is_empty());
+}
+
 #[test]
 fn response_get_returns_call_not_found_for_wrong_id() {
     let raw_json = json!({
@@ -701,23 +719,8 @@ mod envelope {
     }
 }
 
-// BUG, documented rather than endorsed. `reference/jmap.md` states
-// "`CallHandle<M>` validates call_id and method name", but
-// `Response::get` matches ONLY on the call id - `handle.method_name` is
-// never compared against the name the server echoed back. A server that
-// answers call `s0` with a different method's result silently
-// deserializes into `M::Response` whenever the two shapes are
-// compatible, and every JMAP `/get` response IS shape-compatible
-// (accountId + state + list + notFound, with all object fields
-// optional). So a `Mailbox/get` body extracted through an `EmailGet`
-// handle yields a list of blank `Email`s rather than an error, and the
-// hydration path reports them as successfully hydrated.
-//
-// Fix: compare `name` against `handle.method_name` in `Response::get`
-// (the field is already stored on the handle for exactly this purpose)
-// and return a contract-violation error on mismatch.
 #[test]
-fn response_get_matches_the_call_id_only_and_ignores_the_method_name() {
+fn response_get_rejects_a_method_name_mismatch() {
     let raw_json = json!({
         "sessionState": "abc",
         "methodResponses": [
@@ -732,8 +735,15 @@ fn response_get_matches_the_call_id_only_and_ignores_the_method_name() {
 
     let mut response: Response = serde_json::from_value(raw_json).unwrap();
     let handle = make_handle::<TestGet>("s0");
-    let result = response
-        .get(&handle)
-        .expect("today this succeeds; it should be a contract violation");
-    assert_eq!(result.list().len(), 1);
+    let err = response
+        .get::<TestGet>(&handle)
+        .expect_err("a mismatched method name must be rejected");
+    assert!(matches!(
+        err,
+        Error::UnexpectedMethodResponse {
+            call_id,
+            expected: "Test/get",
+            actual,
+        } if call_id == "s0" && actual == "Definitely/not-what-was-asked"
+    ));
 }

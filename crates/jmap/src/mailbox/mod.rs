@@ -7,6 +7,7 @@ pub(crate) mod get;
 pub(crate) mod query;
 pub(crate) mod set;
 
+use crate::core::field::Field;
 use crate::core::set::skip_if_empty_map;
 use crate::mailbox::set::role_not_set;
 use crate::principal::ACL;
@@ -149,15 +150,15 @@ pub(crate) struct MailboxCreate {
 }
 
 /// Client-sent Mailbox/set `update` patch payload.
-#[derive(Debug, Clone, Serialize, Default)]
+#[derive(Debug, Clone, Serialize)]
 pub(crate) struct MailboxPatch {
     #[serde(rename = "name")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) name: Option<String>,
 
     #[serde(rename = "parentId")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) parent_id: Option<MailboxId>,
+    #[serde(skip_serializing_if = "Field::is_omitted")]
+    pub(super) parent_id: Field<MailboxId>,
 
     #[serde(rename = "role")]
     #[serde(skip_serializing_if = "role_not_set")]
@@ -178,6 +179,20 @@ pub(crate) struct MailboxPatch {
     #[serde(flatten)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) acl_patch: Option<HashMap<String, ACLPatch>>,
+}
+
+impl Default for MailboxPatch {
+    fn default() -> Self {
+        Self {
+            name: None,
+            parent_id: Field::Omitted,
+            role: Some(Role::None),
+            sort_order: None,
+            is_subscribed: None,
+            share_with: Some(HashMap::new()),
+            acl_patch: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]

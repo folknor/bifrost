@@ -1,8 +1,8 @@
 # bifrost-jmap `core/` + `sync/` sweep
 
-Scope: implementation fixes are confined to `crates/jmap/src/core/**` and
-`crates/jmap/src/sync/**`; supporting plans and references track their current
-state.
+Scope: implementation fixes primarily concern `crates/jmap/src/core/**` and
+`crates/jmap/src/sync/**`, with their directly-owned wire types where needed;
+supporting plans and references track their current state.
 
 Read first: `reference/jmap.md`, `reference/error-model.md`,
 `plans/bug-hunt-2026-06-17.md`, `plans/jmap/*`. Nothing below re-reports a
@@ -13,131 +13,6 @@ Ordering inside each section is by blast radius, not by discovery order.
 ---
 
 ## 1. Bugs
-
-### B1 - Every `Mailbox/set update` and `Identity/set update` this crate sends carries removal-nulls
-
-**Where:** `sync/pim.rs::container_rename` (752), `sync/pim.rs::container_move`
-(784), `sync/pim.rs::identity_update` (952).
-
-**Mechanism.** All three build their patch through `SetRequest::update`, which
-is `entry(id).or_default()` (`core/set.rs:278`). The default patch is *not*
-empty:
-
-- `MailboxPatch::default()` -> `{"role": null, "shareWith": null}`.
-  `role`'s skip predicate is `role_not_set` = `matches!(Some(Role::None))` and
-  `shareWith`'s is `skip_if_empty_map` = `matches!(Some(empty))`. Both return
-  `false` for a plain `None`, so `None` reaches the wire as an explicit null.
-- `IdentityPatch::default()` -> `{"replyTo": null, "bcc": null}`, same shape via
-  `skip_if_empty_list`.
-
-RFC 8620 s5.3 reads an explicit `null` in a PatchObject as *remove this
-property*. `MailboxCreate` escapes this only because `SetCreate::new`
-hand-installs the sentinels; the Patch types use `#[derive(Default)]`, which
-cannot.
-
-**Path to failure, mailbox.** User renames their Sent folder to "Sent Mail".
-`container_rename` sends
-`Mailbox/set {"update": {"mb-sent": {"name": "Sent Mail", "role": null, "shareWith": null}}}`.
-Two possible outcomes, both wrong:
-
-1. Permissive server (role is settable per RFC 8621 s2.5): the rename succeeds
-   and the mailbox's `role` becomes null and its `shareWith` map is emptied.
-   Now `role_mailboxes` (`pim.rs:1537`) can no longer find `FolderRole::Sent`,
-   so `send_message` (263, 388), `draft_send` (584), and `draft_create` (484,
-   for Drafts) all fail with `missing_role_mailbox` ->
-   `Unsupported("JMAP required mailbox role not found")`. Renaming the Trash
-   folder breaks `delete_thread` (1323) the same way. Renaming *any* folder
-   also drops its `FolderRole` in `containers_list`, so the consumer's sidebar
-   loses its special-folder identity. And every ACL on the renamed mailbox is
-   gone - a shared team folder becomes private on rename.
-2. Strict / sharing-aware server: `shareWith` is admin-only (RFC 8621 s2:
-   settable only with `mayAdmin`), so an ordinary user renaming a folder they
-   do not administer gets `notUpdated: {id: {type: "forbidden" |
-   "invalidProperties", properties: ["shareWith"]}}`. `unwrap_update_errors`
-   turns that into an error and the rename fails outright for a property the
-   user never mentioned.
-
-**Path to failure, identity.** `identity_update(id, IdentityPatch { name:
-Some("New Name"), .. })` sends `{"name": "New Name", "replyTo": null, "bcc":
-null}`. Renaming an identity silently wipes its Reply-To addresses and its
-default Bcc. A user who set "always Bcc my archive address" loses it the next
-time they edit the signature.
-
-**Proposed fix.** The patch types are the other agent's files, so the fix
-belongs there: give `MailboxPatch` / `IdentityPatch` a hand-written `Default`
-that installs the same sentinels `SetCreate::new` does (`Some(Role::None)`,
-`Some(HashMap::new())`, `Some(Vec::new())`), or move the fields to
-`Field<T>` (defaulting to `Omitted`), which is what `Calendar` /
-`AddressBook` already do for nullable properties. No sync-side change is then
-needed; the call sites are correct once the default is.
-
-**Status:** the type-level half is already pinned in `crates/jmap/src/tests.rs`
-(`an_empty_mailbox_patch_still_clears_role_and_share_with`, which even
-replicates the `container_rename` construction verbatim). I did not duplicate
-that test. Confirmed independently against the sync call sites; the
-`role_mailboxes` / `identity_update` consequences above are the sync-side
-half and are not covered by those tests.
-
-### B2 - `container_move(id, None)` silently does nothing and reports success
-
-**Where:** `sync/pim.rs::container_move` (784-813).
-
-**Mechanism.** `new_parent.map(|id| MailboxId::new(id.0))` is `None`, so
-`MailboxPatch::parent_id(None)` sets `self.parent_id = None`. That field is
-`#[serde(skip_serializing_if = "Option::is_none")]`, so the only field that
-expresses the caller's intent is dropped from the wire. What actually goes out
-is `{"update": {"mb-1": {"role": null, "shareWith": null}}}`.
-
-**Path to failure.** User drags a nested folder to the top level of the folder
-tree. The consumer calls `container_move(ContainerId("mb-1"), None)`. The
-server receives a patch that says nothing about `parentId`, applies the
-role/shareWith removals from B1, and answers `updated: {"mb-1": null}`.
-`unwrap_update_errors` sees an empty `notUpdated`, so the function returns
-`Ok(())`. The mailbox state cache is advanced. The consumer marks the move
-applied. The folder never moved, and it lost its role and its ACLs on the way.
-
-Note the asymmetry: `MailboxCreate::parent_id(None)` *does* emit `null`
-(`skip_if_empty_id` only skips `Some("")`), so creating a top-level mailbox
-works and moving one to the top level does not.
-
-**Proposed fix.** Same as B1 - `Field<MailboxId>` on `MailboxPatch::parent_id`
-so `Field::Null` is expressible and distinct from `Field::Omitted`. Until then
-`container_move(_, None)` should not report success; but the honest fix is the
-field type, not a guard at the call site.
-
-### B8 - `Response::get` matches on the call id only; the method name is never checked
-
-**Where:** `core/response.rs::get` (31-49); the handle field it ignores is
-`core/request.rs::CallHandle::method_name` (20).
-
-**Mechanism.** The lookup is
-`self.raw.iter().position(|(_, _, id)| id == &handle.call_id)`. The first
-tuple element - the method name the server echoed - is discarded. The handle
-stores `method_name`, and `reference/jmap.md` line 46 asserts
-*"`CallHandle<M>` validates call_id and method name"*, but nothing compares
-them.
-
-**Path to failure.** A server (or a proxy, or a version skew) answers call
-`s0` with a different method's result. Every JMAP `/get` response has the
-identical envelope (`accountId` / `state` / `list` / `notFound`) and every
-field on this crate's object structs is `Option`, so a `Mailbox/get` body
-deserializes cleanly into `GetResponse<Email>`: `id` maps across (both spell
-it `"id"`), everything else lands as `None`. `hydrate::fetch_batch` then emits
-one `ItemOutcome::Succeeded` per object - N "hydrated messages" keyed by
-*mailbox* ids, with empty keyword sets and blank metadata. The engine records
-them as successfully hydrated. No error anywhere, and the resulting flags-hash
-mismatch looks like ordinary drift on the next inventory pass.
-
-This also silently masks the more mundane case: a server that renumbers or
-reuses call ids.
-
-**Proposed fix.** Compare the stored `name` against `handle.method_name` in
-`Response::get` and return a contract-violation error on mismatch (the `error`
-name is already special-cased above, so the comparison only needs to run on
-the success branch). One line, and it makes the doc true.
-
-Pinned by `response_get_matches_the_call_id_only_and_ignores_the_method_name`
-in `core/tests.rs` (documents current behavior, explicitly labelled a bug).
 
 ### B9 - Every foreign mailbox scope replays the whole account-wide `Email/changes`
 
@@ -186,6 +61,45 @@ the fanout as-is. This is an argument for (a), not a new bug.
     `mailboxIds` for each changed id and emit `ScopeChange`s, so the engine
     can attribute the change.
 This is a design call, not a mechanical fix.
+
+### B10 - An `Email/set` id the server answers in neither map is reported as a terminal `NotFound`, so a possibly-applied write is never read back
+
+**Where:** `sync/mutation.rs::apply_batch` (244-277) via
+`core/set.rs::updated` (321-329) / `destroyed` (331-343).
+
+**Mechanism.** `apply_batch` is correctly closed - it iterates the ids it
+SUBMITTED and derives one outcome per id - but the classification of the
+leftover case is wrong. RFC 8620 s5.3 requires every id in `update` /
+`destroy` to appear in exactly one of `updated`/`notUpdated` (resp.
+`destroyed`/`notDestroyed`). When it appears in neither, `updated` returns
+`Error::IdNotFound(id)`, which falls to the generic `Err(err)` arm and
+through `into_account_error` -> `convert_id_not_found`. The context carries
+`ErrorScope::Message`, so `resource_from_scope` resolves and the id is
+classified `NotFound(ResourceKind::Message)`, which the central mapping
+derives as `RecoveryClass::ProviderRefused` - terminal.
+
+Note this is NOT the absorbed-notFound path: `classify_set_item`'s
+`Succeeded(Skipped)` absorption only fires for a real `SetError` in
+`notUpdated`. An id the server never mentioned does not reach it.
+
+**Path to failure.** A `BulkMove` of 50 messages. The server answers the
+`Email/set` but omits one id from both maps. The move for that id may or
+may not have landed - the response says nothing. The consumer is told
+`NotFound(Message)`: a fabricated fact (the message exists), classified
+terminal, so the engine files it `failed_terminal`, skips the read-back
+guard, and never discovers whether the move applied. Same for
+`BulkDestroy`.
+
+**Proposed fix.** The same shape hydration now uses, and the same shape
+`bifrost-graph` uses for a short `$batch`: an id present in neither map is
+`Protocol(PartialResponse)` with `Attempt(Acknowledged)`, which the central
+mapping routes to `Retry` for idempotent work and
+`Reconcile(PartialCompletionSignal, [CheckTarget])` for a move or destroy,
+so the caller probes the target instead of guessing. `Error::IdNotFound`
+would need to be distinguishable at the `apply_batch` call site (match it
+before the generic arm) rather than left to `convert_id_not_found`, whose
+`NotFound` classification is right for the single-object read paths that
+also raise it.
 
 ## 2. Gaps and smells
 
@@ -251,19 +165,6 @@ per-accountId state key (which `state_cache` is already shaped for).
 Same for `pim.rs::add_to_container` / `remove_from_container` / `set_keyword` /
 `set_is_read` / `set_importance`, all of which take `self.mail` and
 `self.mail.id_str()` from `account.rs` (477-589).
-
-### G4 - `GetResponse` requires `notFound`, and a missing one is misclassified
-
-`core/get.rs:46-47`: `not_found: Vec<O::Id>` has no `#[serde(default)]`. RFC
-8620 s5.1 does require the property, but implementations omit it when empty
-often enough to matter. When it is missing, the whole `Response::get`
-deserialization fails with `crate::Error::ResponseDecode`, which
-`sync/error.rs` maps to a protocol parse failure - correct classification for
-a genuinely malformed body, but it takes down the entire batch (every sibling
-call in the same request) over one absent empty array. `#[serde(default)]` on
-`not_found` (and arguably on `list`) makes the decode tolerant without
-weakening anything real. Same consideration for
-`ChangesResponse`/`QueryResponse` list fields - not audited in detail.
 
 ### G5 - `Client::default_account_id` is nondeterministic when the session lists more than one primary account
 
@@ -373,7 +274,7 @@ factory's variant). `Client<T>` and `Account<Tr>` are both generic over
 `HttpTransport`, and `Client::with_transport` is `pub(crate)` - the seam
 exists and the sync layer opts out of it.
 
-Consequence for the remaining stream bugs, notably B2 and B9: their async
+Consequence for the remaining stream bug, B9: its async
 behavior cannot be pinned with an in-process transport stub without a
 mechanical genericization across the sync tree.
 
@@ -390,6 +291,5 @@ file, not a substitute for genericizing the tree.
 
 ## 4. Doc contradictions found
 
-1. `reference/jmap.md:46` - *`CallHandle<M>` validates call_id and method name*. It validates the call id only. See B8.
-2. `sync/capabilities.rs:194-196` - the comment claims JMAP foreign accounts are not open-time discovery. They are. See G1.
-3. `reference/jmap.md:219` - lists `Type(Thread)` changes as supported without noting that discovery never offers the scope. See G2.
+1. `sync/capabilities.rs:194-196` - the comment claims JMAP foreign accounts are not open-time discovery. They are. See G1.
+2. `reference/jmap.md:219` - lists `Type(Thread)` changes as supported without noting that discovery never offers the scope. See G2.

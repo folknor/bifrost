@@ -241,6 +241,13 @@ pub(crate) enum Error {
     Set(SetError<String>),
     /// Requested call ID not found in the response.
     CallNotFound(String),
+    /// Server returned a successful response whose method name did not match
+    /// the method registered for the call ID.
+    UnexpectedMethodResponse {
+        call_id: String,
+        expected: &'static str,
+        actual: String,
+    },
     /// Requested object ID not found in set/copy/parse response.
     IdNotFound(String),
     /// Not parsable as the expected format.
@@ -370,6 +377,11 @@ impl Display for Error {
             Error::Method(e) => write!(f, "Method error: {e}"),
             Error::Set(e) => write!(f, "Set error: {e}"),
             Error::CallNotFound(id) => write!(f, "Call {id} not found in response"),
+            Error::UnexpectedMethodResponse {
+                call_id,
+                expected,
+                actual,
+            } => write!(f, "Call {call_id} returned {actual}, expected {expected}"),
             Error::IdNotFound(id) => write!(f, "Id {id} not found"),
             Error::NotParsable(id) => write!(f, "{id} is not parsable"),
             Error::InvalidUrl(msg) => write!(f, "Invalid URL: {msg}"),

@@ -38,10 +38,17 @@ impl Response {
             .position(|(_, _, id)| id == &handle.call_id)
             .ok_or_else(|| crate::Error::CallNotFound(handle.call_id.clone()))?;
 
-        let (_, result, _) = self.raw.swap_remove(pos);
+        let (method_name, result, call_id) = self.raw.swap_remove(pos);
 
         match result {
             RawCallResult::Success(raw) => {
+                if method_name != handle.method_name {
+                    return Err(crate::Error::UnexpectedMethodResponse {
+                        call_id,
+                        expected: handle.method_name,
+                        actual: method_name,
+                    });
+                }
                 serde_json::from_str(raw.get()).map_err(crate::Error::from)
             }
             RawCallResult::Error(e) => Err(e.into()),
