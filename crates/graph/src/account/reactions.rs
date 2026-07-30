@@ -164,7 +164,8 @@ pub(crate) async fn message_reactions(
 ///
 /// Pure so the mixed-batch rule is pinnable: the Graph ids of a batch that
 /// also names a public-folder item must still reach `$batch`. Their actual
-/// round trip needs a `GraphClient` transport seam this crate does not have.
+/// round trip is pinned through the `GraphClient` REST seam
+/// (`a_mixed_reaction_batch_posts_its_surviving_graph_id`).
 fn partition_supported_ids(ids: Vec<ObjectId>) -> (Vec<ObjectId>, Vec<ObjectId>) {
     ids.into_iter()
         .partition(|id| ews_read_folder(id).is_none())
@@ -469,9 +470,9 @@ mod tests {
     }
 
     /// The mixed-batch rule the per-item split exists for: one public id
-    /// must not strand the ordinary Graph messages beside it. Their `$batch`
-    /// round trip needs a transport seam this crate does not have, so the
-    /// pure partition is what is pinned - order preserved on both sides.
+    /// must not strand the ordinary Graph messages beside it. The `$batch`
+    /// round trip is pinned above through the REST seam; this pins the pure
+    /// partition itself - order preserved on both sides.
     #[test]
     fn a_public_id_does_not_take_the_graph_ids_of_its_batch_with_it() {
         let (supported, unsupported) = partition_supported_ids(vec![

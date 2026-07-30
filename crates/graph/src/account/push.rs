@@ -1627,9 +1627,8 @@ mod tests {
     ///
     /// The tick here is driven with paused time and the map holds only a
     /// condemned group, so the worker reaches its exit without a single HTTP
-    /// call - the renewal leg itself stays unpinnable in-process (Graph has
-    /// no transport seam: `bifrost_net::Response` has no public constructor
-    /// and net's `Dispatch` is crate-private).
+    /// call. (The renewal HTTP legs themselves are scripted through the
+    /// REST seam where a test needs them - see the recreate test below.)
     #[tokio::test(start_paused = true)]
     async fn a_retiring_worker_clears_its_slot_so_the_next_subscribe_respawns() {
         let account =
@@ -1676,6 +1675,102 @@ mod tests {
             account.graph_worker.lock().await.is_some(),
             "a live subscription must always have a renewal worker"
         );
+        account.shutdown.cancel();
+    }
+
+    /// The recreate leg, end to end through the REST seam with paused time:
+    /// a renewal PATCH that 404s (Graph retains no deleted subscription)
+    /// must mint a fresh create for the SAME resource, install it in place
+    /// of the vanished row under the same handle, and emit `Reconnected` -
+    /// the engine's full-reconcile trigger - because nothing was delivered
+    /// between the disappearance and the replacement. No `Disconnected`
+    /// precedes it: the recovery succeeded within one tick.
+    #[tokio::test(start_paused = true)]
+    async fn a_vanished_subscription_is_recreated_and_reconnected_on_the_next_tick() {
+        let client = GraphClient::new("token");
+        client.script_rest([
+            // The renewal PATCH answers 404: the subscription vanished.
+            ScriptedRestResponse::json(
+                reqwest::StatusCode::NOT_FOUND,
+                serde_json::json!({"error":{"code":"ResourceNotFound","message":"gone"}}),
+            ),
+            // The replacement create.
+            ScriptedRestResponse::json(
+                reqwest::StatusCode::CREATED,
+                serde_json::json!({"id":"fresh","expirationDateTime":"2099-01-01T00:00:00Z"}),
+            ),
+        ]);
+        let mut account = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
+        account.push_endpoint = Some(PushEndpoint {
+            webhook_url: "https://example.test/hook".to_string(),
+            client_state: Some("secret".to_string()),
+        });
+        let mut events = account.push_tx.subscribe();
+        let handle = SubscriptionHandle("h".to_string());
+        account.graph_subscriptions.write().await.insert(
+            handle.clone(),
+            GraphSubscriptionGroup::live(vec![expiring("stale", "/me/mailFolders/inbox/messages")]),
+        );
+
+        ensure_graph_worker(account.clone()).await;
+        // Drive renewal ticks until the replacement lands. Paused time, so
+        // this advances the test clock; the loop bound only covers task
+        // scheduling slack.
+        for _ in 0..64 {
+            let installed = account
+                .graph_subscriptions
+                .read()
+                .await
+                .get(&handle)
+                .is_some_and(|group| {
+                    group
+                        .subscriptions
+                        .iter()
+                        .any(|state| state.server_id == "fresh")
+                });
+            if installed {
+                break;
+            }
+            tokio::time::advance(RENEWAL_CHECK_INTERVAL + Duration::from_secs(1)).await;
+            tokio::task::yield_now().await;
+        }
+
+        {
+            let groups = account.graph_subscriptions.read().await;
+            let group = groups.get(&handle).expect("the handle stays registered");
+            assert_eq!(group.subscriptions.len(), 1, "in place, not beside");
+            assert_eq!(group.subscriptions[0].server_id, "fresh");
+            assert_eq!(
+                group.subscriptions[0].resource,
+                "/me/mailFolders/inbox/messages"
+            );
+        }
+
+        // The failed PATCH, then the create for the same resource - and the
+        // create carries the caller-owned clientState like any first-time
+        // subscribe would.
+        let requests = client.take_rest_requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].method, "PATCH");
+        assert!(requests[0].url.ends_with("/subscriptions/stale"));
+        assert_eq!(requests[1].method, "POST");
+        assert!(requests[1].url.ends_with("/subscriptions"));
+        let created = requests[1].body.as_ref().expect("create body");
+        assert_eq!(
+            created["resource"].as_str(),
+            Some("/me/mailFolders/inbox/messages")
+        );
+        assert_eq!(created["clientState"].as_str(), Some("secret"));
+
+        match events.try_recv() {
+            Ok(WatchEvent::Reconnected) => {}
+            other => panic!("expected Reconnected, got {other:?}"),
+        }
+        assert!(
+            events.try_recv().is_err(),
+            "a within-tick recovery emits no Disconnected"
+        );
+
         account.shutdown.cancel();
     }
 

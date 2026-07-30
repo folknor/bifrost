@@ -726,8 +726,8 @@ mod tests {
     /// reconcilers had to unlearn once already.
     ///
     /// The routing split is what is pinned here; the round trip the
-    /// routable half then makes still needs the REST transport seam this
-    /// crate does not have.
+    /// routable half then makes is pinned separately through the
+    /// `GraphClient` REST seam.
     #[test]
     fn a_stale_foreign_id_is_split_out_and_its_siblings_still_route() {
         let account = GraphAccount::new_for_tests_with_shared(

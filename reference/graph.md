@@ -58,7 +58,8 @@ arrived with cursor envelope v2, which forces a reseed.
   the EWS arm's `restId` -> `ewsId` translation
   (`translation_input_chunks` / `reconcile_translated_ews_scopes`).
 - `push_stream.rs` - the broadcast-backed `push_stream` adapter, selecting the
-  receiver against the shutdown token and spawning the EWS worker on demand.
+  receiver against the shutdown token, plus `ensure_ews_worker`, the
+  spawn-on-demand helper `subscribe_ews` calls.
 - `ews_stream.rs` - EWS Streaming Notifications fallback:
   Subscribe / GetStreamingEvents / Unsubscribe XML, scope
   recovery, the long-lived worker loop - generic over the crate-private
@@ -766,7 +767,9 @@ that reads as a provider fault. The predicate returns the scope's native
 `restId` instead of a bool, so the check and the extraction are one step and
 no later phase can re-derive the id differently. `push_stream` is a
 `broadcast::Receiver<WatchEvent>` adapter that selects against shutdown;
-the EWS branch re-spawns its worker on demand.
+the EWS worker is (re-)spawned by `subscribe_ews`, whose
+`ensure_ews_worker` helper starts a fresh worker whenever the slot is
+empty or its task has finished.
 
 #### REST-to-EWS id translation
 

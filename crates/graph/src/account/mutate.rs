@@ -857,9 +857,9 @@ mod tests {
     }
 
     /// The other half of the same rule: the routing decision is per id, so
-    /// a live sibling of a stale id still builds its request. Whether that
-    /// request then reaches `$batch` alongside nothing else is the part
-    /// that needs the REST transport seam this crate does not yet have.
+    /// a live sibling of a stale id still builds its request. The `$batch`
+    /// round trip that request then makes is exercised through the
+    /// `GraphClient` REST seam by the wire-level batch tests.
     #[test]
     fn a_stale_id_rejects_while_its_live_sibling_still_builds() {
         let account = shared_account();

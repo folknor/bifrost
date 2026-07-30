@@ -140,11 +140,12 @@ retryable - the caller's retry of the same cursor can succeed, a skip could
 not - and a primary-mailbox 403 still fails terminal, since a permission
 loss on the account's own mailbox is not something a walk may step around.
 
-What these two seams still do NOT reach: no test walks a shared mailbox's
-OWN `nextLink` continuation (only the primary's pagination is exercised),
-and no test PAGES through three mailboxes - the quarantine test routes
-across three, but only the primary and one live shared mailbox return
-result pages.
+What these two seams still do NOT reach on the SEARCH surface: no search
+test walks a shared mailbox's OWN `nextLink` continuation (only the
+primary's search pagination is exercised - the DELTA walks do pin a shared
+mailbox's continuation, see above), and no test PAGES through three
+mailboxes - the quarantine test routes across three, but only the primary
+and one live shared mailbox return result pages.
 
 The cursor-envelope v2 bump is pinned at the `changes_stream` door, not just
 at `decode_cursor`: a v1 cursor whose payload still deserializes must
@@ -164,10 +165,18 @@ fixed: Graph's typed `error.code` table never reached an ordinary REST call,
 and `subscription_is_gone` never matched the shape a REST 404 actually
 arrives in.
 
+The renewal worker's recreate leg is now driven THROUGH the worker's own
+tick, not just as pure parts: with paused time and the REST seam scripted
+(renew PATCH 404, then the create), a tick replaces the vanished
+subscription in place under the same handle and emits `Reconnected` with no
+`Disconnected` - verified by disabling the recreate branch and watching the
+test fail as the handle vanishes down the terminal path instead.
+
 Still not reached, and still pinned only as pure functions or not at all:
 blob byte streams (`download_stream`), the OneDrive resumable chunk PUT
 (pre-authed, no bearer, its own builder), the Autodiscover POST, the renewal
-worker's timing loop as a loop (`due_renewals` and `install_replacement` are
-pinned, the 10-minute tick is not), and anything whose behavior depends on
-bifrost-net's own retry, backoff, or redirect walk - the seam answers at the
-funnel, below which none of that runs.
+worker's SUCCESS leg as a loop (`due_renewals` and `install_replacement` are
+pinned pure, and the recreate leg is driven through a tick; a plain
+successful renew across ticks is not), and anything whose behavior depends
+on bifrost-net's own retry, backoff, or redirect walk - the seam answers at
+the funnel, below which none of that runs.

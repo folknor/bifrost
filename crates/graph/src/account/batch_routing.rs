@@ -16,8 +16,8 @@
 //! wire, unroutable ids go to the failed lane, and the chunk proceeds.
 //!
 //! The partition is pure and generic over the per-site URL builder, so the
-//! rule itself is pinnable here; what still needs the (missing) REST
-//! transport seam is only the round trip the routable half then makes.
+//! rule itself is pinnable here; the round trip the routable half then
+//! makes is pinned at each call site through the `GraphClient` REST seam.
 
 use bifrost_types::ObjectId;
 

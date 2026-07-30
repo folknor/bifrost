@@ -1282,11 +1282,11 @@ impl Account for GraphAccount {
 }
 
 /// Build the `/users/{id}`-keyed foreign-mailbox client map from a list
-/// of routing keys (SMTP addresses or user ids). The map key is the
-/// exact string later looked up by `client_for_scope` / `client_for_owner`
-/// and minted into foreign scope/owner tags by `discover_cursor_scopes`,
-/// so seeding a key here is self-consistent with every routing site.
-/// Build the per-mailbox client map, dropping empty routing keys.
+/// of routing keys (SMTP addresses or user ids), dropping empty keys. The
+/// map key is the exact string later looked up by `client_for_scope` /
+/// `client_for_owner` and minted into foreign scope/owner tags by
+/// `discover_cursor_scopes`, so seeding a key here is self-consistent with
+/// every routing site.
 ///
 /// `with_shared_mailbox("")` is constructible, and an empty key used to
 /// install a client whose prefix is the malformed `/users/` - which every
