@@ -454,9 +454,7 @@ blocking; each is a real defect or a real decision, not a cleanup.
   provider-side expiry as the only backstop. This is the documented contract
   rather than a defect, and `bifrost-graph` correctly must NOT add best-effort
   deletion in `close`. The open question is whether the shared contract should
-  keep placing that burden on the consumer at all. Tracked crate-side as O-7
-  in `plans/bugs-graph.md`, where it is explicitly marked as not belonging to
-  that crate.
+  keep placing that burden on the consumer at all.
 
 - **xc-3 (net + graph, related in jmap)** `bifrost-net` exposes no in-process
   seam for staging a canned HTTP response, so account crates that ride it

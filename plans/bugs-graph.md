@@ -5,36 +5,43 @@ else. Resolved findings live in git history - the commit that fixed one is
 its record - and so do the per-pass repair logs; retaining either here means
 maintaining a second, drifting copy of `git log`.
 
-Open work, in full: O-7 and O-24. O-7 is a shared-contract question rather than a
-Graph defect and is tracked as `xc-2` in `TODO.md`. This file is not
-finished while that list has entries.
+Open work, in full: O-25. The shared-contract subscription-lifecycle question
+that used to sit here as O-7 is tracked as `xc-2` in `TODO.md` instead, since
+it is a contract question rather than a Graph defect. This file is not
+finished while the list below has entries.
 
 ## Open findings
 
-**O-24 - foreign-scope routing rides entirely in the URL prefix, and nothing
-enforces that.** Inventory and changes requests for a foreign scope are
-issued on the PRIMARY client, with the owning mailbox expressed only as the
-`/users/{id}` prefix. That is correct today for exactly one reason: a client
-built by `for_shared_mailbox` differs from the primary client in nothing but
-`mailbox_id`. The moment it grows a distinct auth token, a routing header,
-or its own rate-limit host, those two paths silently stop honoring it while
-every other foreign path keeps working - the failure would look like a
-mailbox-specific auth or throttling bug, not a routing bug. `reference/graph.md`
-documents the design but not the invariant it rests on. Either state the
-invariant at both sites and in the reference, or route these two paths
-through the same per-owner client the object paths use.
+**O-25 - thread-keyed operations are silently primary-mailbox only.** Every
+per-message door decodes the foreign-encoded `ObjectId` and routes via
+`client_for_owner`, so a shared-mailbox message reads and writes under
+`/users/{owner}`. The thread-keyed doors cannot: a `ThreadId` is Graph's bare
+`conversationId`, minted with no owner tag by `inventory_entry_from_value`
+and by search, and `message_values_for_thread` builds its filter query off
+`account.client.api_path_prefix()` unconditionally. So `thread_hydrate`,
+`move_thread`, `delete_thread`, and every `MutationTarget::Thread` fan-out
+resolve their members against `/me`, where a shared mailbox's conversation
+does not exist.
 
-**O-7 - Subscription teardown depends entirely on the caller.** Settled as a
-Graph question: `Account::close` is idempotent LOCAL teardown and explicitly
-does not delete durable server-side push subscriptions
-(`reference/types.md`); engine detach cancels workers and calls `close`, and
-the engine tells consumers to call `unsubscribe_push` themselves
-(`SubscriptionRegistry` exists for exactly that). So leaving subscriptions
-live across `close` is the contract, not a defect, and Graph must not add
-best-effort deletion there. What remains is an API ergonomics risk: a
-consumer that detaches without unsubscribing strands subscriptions for up to
-24h, and Graph's 24h expiry is the only backstop. Worth revisiting at the
-shared-contract level, not in this crate.
+The failure is silent in both directions, which is what makes it worth
+filing rather than accepting: zero matches is not an error, so hydration
+returns `ThreadHydration { messages: [] }` and a thread-targeted flag / move
+/ destroy submits an empty batch and reports success having touched nothing.
+Foreign scopes are minted for `ObjectType::Email` only, so this is exactly
+the shared-mail case, and a consumer cannot see it coming - the `thread_id`
+on a shared mailbox's `InventoryEntry` is indistinguishable from a primary
+one.
+
+Two honest closes. Either give `ThreadId` the same owner tag `ObjectId`
+carries (mint it encoded at both projection sites, decode it in
+`message_values_for_thread`, and route the filter query through
+`client_for_owner`), which makes thread operations work per-mailbox and
+keeps one wire form per logical thread; or leave the surface primary-only
+and say so on the wire - reject a thread whose members cannot be located
+rather than returning an empty success - plus in `reference/types.md`, since
+no consumer can infer it. The first is the real fix; the second is only
+acceptable if owner-tagging the thread id is judged too invasive for the id
+codec.
 
 ## Test coverage: the standing seam
 
@@ -79,6 +86,23 @@ request - issued by a client minted inside `GraphAccount::new` - is scripted
 and recorded alongside the primary's. The EWS seam remains the matching SOAP
 half (`EwsExecute` with a scripted in-crate double).
 
+That sharing has one consequence worth stating, because it silently weakens
+any test written past it: a derived client answers from the primary's queue
+and records into the primary's log, so the seam alone cannot say WHICH client
+issued a request. Asserting the URL does not recover it either on the delta
+paths - `initial_delta_url` builds its `/users/{mailbox}` prefix off
+`client_for_scope` independently of which client then sends it, and a
+`nextLink` / `deltaLink` is whatever Graph minted - so a walk that fell back
+to the primary would produce byte-identical requests. The per-message write
+paths do not have that problem: there the URL is built from the selected
+client's own prefix, so the URL IS the routing evidence. Where the
+distinction matters, the test roots the shared client in its own
+`GraphClient` (`new_for_tests_with_shared_clients`) and arms the primary with
+an EMPTY script, so a fallback hits the exhaustion panic instead of passing
+quietly. Both foreign delta walks (inventory and changes-resume) are pinned
+that way, over a `nextLink` continuation, and both fail against a reverted
+routing change.
+
 The seam is pinned as an EQUIVALENCE, not just a convenience, because every
 test built on it inherits its correctness: a scripted status takes the shape
 bifrost-net's retry loop would have produced (2xx and passed-through 3xx are
@@ -91,6 +115,8 @@ and `subscription_is_gone` never matched the shape a REST 404 actually
 arrives in.
 
 Still not reached, and still pinned only as pure functions or not at all:
+the thread-keyed fan-out's mailbox routing (reachable through the seam, but
+pinning today's behavior would pin O-25's bug, so it waits on that decision),
 blob byte streams (`download_stream`), the OneDrive resumable chunk PUT
 (pre-authed, no bearer, its own builder), the Autodiscover POST, the renewal
 worker's timing loop as a loop (`due_renewals` and `install_replacement` are

@@ -285,6 +285,31 @@ impl GraphAccount {
         Self::new(client, push_mode, None, shared_mailboxes, None, None)
     }
 
+    /// Install an explicit shared-client map instead of deriving one from
+    /// the primary client.
+    ///
+    /// `new_for_tests_with_shared` goes through `shared_clients_map`, whose
+    /// `for_shared_mailbox` clients share the primary's scripted-response
+    /// queue (as they share its `AccountNet` and semaphore). That is right
+    /// for a test that only wants foreign requests scripted, and useless for
+    /// a test that has to prove WHICH client issued a request: either client
+    /// answers from the same queue and records into the same log, so a path
+    /// that wrongly falls back to the primary looks identical to one that
+    /// routes correctly. Rooting the shared client in its own `GraphClient`
+    /// splits the two queues, which lets a test arm the primary with an
+    /// EMPTY script and turn any fallback onto it into the seam's exhaustion
+    /// panic.
+    #[cfg(test)]
+    pub(crate) fn new_for_tests_with_shared_clients(
+        client: GraphClient,
+        push_mode: PushMode,
+        shared_clients: HashMap<String, GraphClient>,
+    ) -> Self {
+        let mut account = Self::new(client, push_mode, None, &[], None, None);
+        account.shared_clients = Arc::new(shared_clients);
+        account
+    }
+
     /// Seed a public-folder routing entry for tests. Mirrors what
     /// Autodiscover discovery does at runtime.
     #[cfg(test)]

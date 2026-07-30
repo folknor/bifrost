@@ -211,8 +211,11 @@ Autodiscover lookups), constructs a `GraphAccount`, and runs
 
 - The shared primary `GraphClient` plus `shared_clients: Arc<HashMap<String,
   GraphClient>>`, one `for_shared_mailbox(id)` client per foreign mailbox.
-  Foreign folder and object ids are routed only through an owner present in
-  that map, and an EMPTY routing key never enters it (`with_shared_mailbox("")`
+  Every foreign operation, including initial inventory and delta-link resume,
+  selects that owner client before it builds or follows a URL; continuations
+  retain the selected client even though Graph's `nextLink` and `deltaLink`
+  are absolute. Foreign folder and object ids are routed only through an owner
+  present in that map, and an EMPTY routing key never enters it (`with_shared_mailbox("")`
   is constructible and used to install a client whose prefix was the
   malformed `/users/`, turning a local configuration error into an opaque
   remote 400; `merge_shared_mailboxes` already applied the same rule on the
@@ -482,9 +485,20 @@ as a stable primary key, and a shared-mailbox message never also surfaces bare
 via `/me`. Every per-message request decodes it and routes via
 `client_for_owner(parsed.owner())` using `parsed.native_id()`: hydration
 (`get.rs hydrate_url_for_id`), blob + raw (`blob.rs`), mutations (`mutate.rs`
-flag/move/destroy and the `pim.rs` writes), and the typed `message_hydrate` /
-`thread_hydrate`. A foreign id builds `/users/{owner}/messages/{native}`, a
-primary id `/me/messages/{id}`. `bulk_move` also decodes the destination
+flag/move/destroy and the `pim.rs` writes), and the typed `message_hydrate`. A
+foreign id builds `/users/{owner}/messages/{native}`, a primary id
+`/me/messages/{id}`.
+
+The THREAD-keyed doors are the exception, and it is a gap rather than a
+design: a `ThreadId` is Graph's bare `conversationId`, minted with no owner
+tag, so `thread_hydrate` and every `MutationTarget::Thread` fan-out resolve
+their member ids through `/me/messages?$filter=conversationId eq ...` -
+`message_values_for_thread` reads `account.client.api_path_prefix()`
+unconditionally. A thread id a consumer took off a shared mailbox's
+`InventoryEntry` therefore resolves against the PRIMARY mailbox, where that
+conversation does not exist, and the empty result is not an error: hydration
+returns an empty thread and a thread-targeted write reports success having
+touched nothing. Tracked as O-25 in `plans/bugs-graph.md`. `bulk_move` also decodes the destination
 `FolderId` (the `destinationId` body must be the native id) and rejects a
 cross-mailbox move - destination owner != source owner - as `Request(Malformed)`,
 since one endpoint can't express it. The etag cache stays keyed by the encoded

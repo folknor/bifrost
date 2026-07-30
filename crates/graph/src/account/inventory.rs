@@ -28,6 +28,17 @@ pub(crate) fn inventory_stream(
         let sync_ctx = GraphErrorContext::graph(AccountOperation::SyncInventory)
             .with_scope(ErrorScope::Cursor(scope.clone()));
 
+        let client = match account.client_for_scope(&scope) {
+            Ok(client) => client.clone(),
+            Err(error) => {
+                yield SyncEvent::Terminated(cursor_error_to_account_error(
+                    super::cursor::routing_error(error),
+                    sync_ctx,
+                ));
+                yield SyncEvent::Done(None);
+                return;
+            }
+        };
         let mut current_url = match initial_delta_url(&account, &scope) {
             Ok(url) => url,
             Err(error) => {
@@ -54,7 +65,7 @@ pub(crate) fn inventory_stream(
         };
 
         loop {
-            let page: ODataCollection<Value> = match fetch_page(&account, &current_url).await {
+            let page: ODataCollection<Value> = match fetch_page(&client, &current_url).await {
                 Ok(page) => page,
                 Err(error) => {
                     let ctx = GraphErrorContext::graph(AccountOperation::SyncInventory)
@@ -147,10 +158,10 @@ pub(crate) fn inventory_stream(
 }
 
 pub(crate) async fn fetch_delta_page(
-    account: &GraphAccount,
+    client: &crate::client::GraphClient,
     url: &str,
 ) -> Result<ODataCollection<Value>, crate::error::GraphError> {
-    fetch_page(account, url).await
+    fetch_page(client, url).await
 }
 
 pub(crate) fn inventory_entry_from_value(
@@ -331,13 +342,13 @@ fn event_aliases(a: &CursorScope, b: &CursorScope) -> bool {
 }
 
 async fn fetch_page(
-    account: &GraphAccount,
+    client: &crate::client::GraphClient,
     url: &str,
 ) -> Result<ODataCollection<Value>, crate::error::GraphError> {
     if url.starts_with("http") {
-        account.client.get_absolute(url).await
+        client.get_absolute(url).await
     } else {
-        account.client.get_json(url).await
+        client.get_json(url).await
     }
 }
 
@@ -390,6 +401,8 @@ fn flags_hash(value: &Value) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use bifrost_types::QueryId;
     use futures::StreamExt;
     use serde_json::json;
@@ -587,6 +600,75 @@ mod tests {
         assert!(
             url.starts_with("/users/shared%40contoso.com/mailFolders/AAMk/messages/delta?"),
             "unexpected url: {url}"
+        );
+    }
+
+    /// Every page of a foreign inventory walk rides the OWNING mailbox's
+    /// client, including the absolute `@odata.nextLink` continuation.
+    ///
+    /// The primary client is armed with an empty script, so a walk that
+    /// falls back to it panics at the offending request rather than
+    /// answering from a queue it shares with the shared client. Asserting
+    /// the URL alone would prove nothing here: `initial_delta_url` has
+    /// always built the `/users/{mailbox}` prefix off `client_for_scope`,
+    /// and the continuation URL is whatever Graph minted, so both are
+    /// identical whichever client carries them.
+    #[tokio::test]
+    async fn every_page_of_a_foreign_inventory_walk_rides_the_owner_client() {
+        let primary = GraphClient::new("primary-token");
+        // Armed, empty: the primary must not be asked for anything.
+        primary.script_rest([]);
+        let shared = GraphClient::new("shared-token").for_shared_mailbox("shared@contoso.com");
+        shared.script_rest([
+            ScriptedRestResponse::json(
+                reqwest::StatusCode::OK,
+                json!({
+                    "value": [{ "id": "m1", "changeKey": "ck1" }],
+                    "@odata.nextLink": "https://graph.example/users/shared%40contoso.com/delta?$skiptoken=p2"
+                }),
+            ),
+            ScriptedRestResponse::json(
+                reqwest::StatusCode::OK,
+                json!({
+                    "value": [],
+                    "@odata.deltaLink": "https://graph.example/users/shared%40contoso.com/delta?$deltatoken=d1"
+                }),
+            ),
+        ]);
+        let account = GraphAccount::new_for_tests_with_shared_clients(
+            primary.clone(),
+            PushMode::GraphSubscriptions,
+            HashMap::from([("shared@contoso.com".to_string(), shared.clone())]),
+        );
+        let scope = CursorScope::FolderType {
+            folder: super::super::foreign::encode_foreign("shared@contoso.com", "AAMk"),
+            ty: ObjectType::Email,
+        };
+
+        let mut stream = inventory_stream(account, scope);
+        assert!(matches!(stream.next().await, Some(SyncEvent::Batch(_))));
+        assert!(matches!(stream.next().await, Some(SyncEvent::Batch(_))));
+        assert!(matches!(
+            stream.next().await,
+            Some(SyncEvent::Done(Some(_)))
+        ));
+
+        let requests = shared.take_rest_requests();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests[0]
+                .url
+                .contains("/users/shared%40contoso.com/mailFolders/AAMk/messages/delta?"),
+            "unexpected first URL: {}",
+            requests[0].url,
+        );
+        assert_eq!(
+            requests[1].url,
+            "https://graph.example/users/shared%40contoso.com/delta?$skiptoken=p2"
+        );
+        assert!(
+            primary.take_rest_requests().is_empty(),
+            "the primary client must not see a foreign-scope request"
         );
     }
 

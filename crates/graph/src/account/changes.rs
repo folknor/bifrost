@@ -44,25 +44,29 @@ pub(crate) fn changes_stream(
         // configures. That is worse than a wrong-namespace request: the
         // scope stays live and emits changes whose object ids then fail
         // hydration and every mutation terminally, because those paths do
-        // consult the shared-client map. Reject the scope here for the same
-        // reason `initial_delta_url` does, so the engine disables it once
-        // rather than syncing a scope it can never read through.
-        if let Err(error) = account.client_for_scope(&cursor.scope) {
-            let ctx = GraphErrorContext::graph(AccountOperation::SyncChanges)
-                .with_scope(ErrorScope::Cursor(cursor.scope.clone()));
-            yield SyncEvent::Terminated(cursor_error_to_account_error(
-                super::cursor::routing_error(error),
-                ctx,
-            ));
-            yield SyncEvent::Done(None);
-            return;
-        }
+        // consult the shared-client map. Select and retain the scope's
+        // client here, so the engine disables an unconfigured scope and a
+        // configured foreign scope keeps its own transport for the complete
+        // delta-link walk.
+        let client = match account.client_for_scope(&cursor.scope) {
+            Ok(client) => client.clone(),
+            Err(error) => {
+                let ctx = GraphErrorContext::graph(AccountOperation::SyncChanges)
+                    .with_scope(ErrorScope::Cursor(cursor.scope.clone()));
+                yield SyncEvent::Terminated(cursor_error_to_account_error(
+                    super::cursor::routing_error(error),
+                    ctx,
+                ));
+                yield SyncEvent::Done(None);
+                return;
+            }
+        };
 
         let scope = cursor.scope.clone();
         let mut current_url = payload.resume_url().to_string();
 
         loop {
-            let page = match fetch_delta_page(&account, &current_url).await {
+            let page = match fetch_delta_page(&client, &current_url).await {
                 Ok(page) => page,
                 Err(error) => {
                     let ctx = GraphErrorContext::graph(AccountOperation::SyncChanges)
@@ -194,11 +198,14 @@ pub(crate) fn changes_stream(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use bifrost_types::{
         AccountErrorKind, CursorScope, FolderId, ObjectType, OpaqueChangeState, ProtocolKind,
         SyncStateErrorKind,
     };
     use futures::StreamExt;
+    use serde_json::json;
 
     use super::super::PushMode;
     use super::super::cursor::{
@@ -206,7 +213,7 @@ mod tests {
         encode_cursor, kind_for_scope,
     };
     use super::*;
-    use crate::client::GraphClient;
+    use crate::client::{GraphClient, ScriptedRestResponse};
 
     fn account() -> GraphAccount {
         GraphAccount::new_for_tests(GraphClient::new("token"), PushMode::GraphSubscriptions)
@@ -364,6 +371,76 @@ mod tests {
             error.recovery(),
             bifrost_types::RecoveryClass::Engine(bifrost_types::EngineDirective::DisableScope(_))
         ));
+    }
+
+    /// A foreign delta-link resume holds the owning mailbox's client for
+    /// the WHOLE walk, continuation pages included.
+    ///
+    /// Both URLs here are absolute links Graph minted, so they are the same
+    /// bytes whichever client sends them - the only observable difference
+    /// is which client's script answers. The primary is armed with an empty
+    /// script so a resume that falls back to it hits the seam's exhaustion
+    /// panic instead of quietly borrowing the shared client's queue.
+    #[tokio::test]
+    async fn every_page_of_a_foreign_delta_resume_rides_the_owner_client() {
+        let primary = GraphClient::new("primary-token");
+        // Armed, empty: the primary must not be asked for anything.
+        primary.script_rest([]);
+        let shared = GraphClient::new("shared-token").for_shared_mailbox("shared@contoso.com");
+        shared.script_rest([
+            ScriptedRestResponse::json(
+                reqwest::StatusCode::OK,
+                json!({
+                    "value": [{ "id": "m1", "changeKey": "ck1" }],
+                    "@odata.nextLink": "https://graph.example/users/shared%40contoso.com/delta?$skiptoken=p2"
+                }),
+            ),
+            ScriptedRestResponse::json(
+                reqwest::StatusCode::OK,
+                json!({
+                    "value": [],
+                    "@odata.deltaLink": "https://graph.example/users/shared%40contoso.com/delta?$deltatoken=d1"
+                }),
+            ),
+        ]);
+        let account = GraphAccount::new_for_tests_with_shared_clients(
+            primary.clone(),
+            PushMode::GraphSubscriptions,
+            HashMap::from([("shared@contoso.com".to_string(), shared.clone())]),
+        );
+        let scope = CursorScope::FolderType {
+            folder: super::super::foreign::encode_foreign("shared@contoso.com", "AAMk"),
+            ty: ObjectType::Email,
+        };
+        let payload = GraphCursorPayload::new(
+            kind_for_scope(&scope).expect("email scope maps"),
+            "https://graph.example/users/shared%40contoso.com/delta".to_string(),
+            None,
+        );
+        let cursor = encode_cursor(scope, payload).expect("cursor encodes");
+
+        let mut stream = changes_stream(account, cursor);
+        assert!(matches!(stream.next().await, Some(SyncEvent::Batch(_))));
+        assert!(matches!(stream.next().await, Some(SyncEvent::Batch(_))));
+        assert!(matches!(
+            stream.next().await,
+            Some(SyncEvent::Done(Some(_)))
+        ));
+
+        let requests = shared.take_rest_requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0].url,
+            "https://graph.example/users/shared%40contoso.com/delta"
+        );
+        assert_eq!(
+            requests[1].url,
+            "https://graph.example/users/shared%40contoso.com/delta?$skiptoken=p2"
+        );
+        assert!(
+            primary.take_rest_requests().is_empty(),
+            "the primary client must not see a foreign-scope request"
+        );
     }
 
     #[tokio::test]
