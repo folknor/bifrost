@@ -17,9 +17,9 @@ use super::{Consumer, ConsumerContext, Finalized};
 /// 2. Tagless ESEARCH (servers that omit the correlator)
 /// 3. Legacy SEARCH (`IMAP4rev1` fallback)
 ///
-/// ESEARCH UID ranges are expanded into individual IDs. The `truncated`
-/// flag on [`SearchResult`] signals when the expansion was capped at the
-/// internal safety limit (RFC 4731 Section3, RFC 3501 Section6.4.4).
+/// ESEARCH UID ranges are expanded into individual IDs. An expansion that
+/// would exceed the internal safety limit fails rather than returning a
+/// partial [`SearchResult`] (RFC 4731 Section3, RFC 3501 Section6.4.4).
 pub(crate) struct SearchConsumer {
     /// Tag-correlated ESEARCH responses (highest priority).
     tag_correlated: Vec<EsearchResponse>,
@@ -54,6 +54,35 @@ impl SearchConsumer {
                 .push(UntaggedResponse::Search { uids, mod_seq });
         }
     }
+
+    /// Everything except the response this command consumed.
+    ///
+    /// The chosen ESEARCH is solicited: it answers this tag, so it belongs to
+    /// the command whether or not the command can turn it into a flat
+    /// [`SearchResult`]. Only genuinely extra or unsolicited responses may
+    /// reach the event queue, and they keep the order they arrived in.
+    fn reclassified_extras(self, chosen: Chosen) -> Vec<UntaggedResponse> {
+        let mut buffered = self.buffered;
+        let skip_tag_correlated = usize::from(matches!(chosen, Chosen::TagCorrelated));
+        for e in self.tag_correlated.into_iter().skip(skip_tag_correlated) {
+            buffered.push(UntaggedResponse::Esearch(e));
+        }
+        let skip_tagless = usize::from(matches!(chosen, Chosen::Tagless));
+        for e in self.tagless_esearch.into_iter().skip(skip_tagless) {
+            buffered.push(UntaggedResponse::Esearch(e));
+        }
+        for (uids, mod_seq) in self.search_responses {
+            buffered.push(UntaggedResponse::Search { uids, mod_seq });
+        }
+        buffered
+    }
+}
+
+/// Which solicited response this command consumed.
+#[derive(Clone, Copy)]
+enum Chosen {
+    TagCorrelated,
+    Tagless,
 }
 
 impl Consumer for SearchConsumer {
@@ -103,47 +132,28 @@ impl Consumer for SearchConsumer {
 
         // Pass 1: tag-correlated ESEARCH.
         if let Some(esearch) = self.tag_correlated.first() {
-            let (ids, truncated) = expand_uid_ranges(&esearch.all);
-            let result = SearchResult {
+            // The expansion may fail, but the response is consumed either
+            // way: it is this tag's answer, so it must not be republished as
+            // an asynchronous event.
+            let output = expand_uid_ranges(&esearch.all).map(|ids| SearchResult {
                 ids,
                 mod_seq: esearch.mod_seq,
-                truncated,
-            };
-            // Consumed the first tag-correlated; reclassify the rest.
-            let mut buffered = self.buffered;
-            for e in self.tag_correlated.into_iter().skip(1) {
-                buffered.push(UntaggedResponse::Esearch(e));
-            }
-            for e in self.tagless_esearch {
-                buffered.push(UntaggedResponse::Esearch(e));
-            }
-            for (uids, mod_seq) in self.search_responses {
-                buffered.push(UntaggedResponse::Search { uids, mod_seq });
-            }
+            });
             return Ok(Finalized {
-                output: Ok(result),
-                reclassified_as_events: buffered,
+                output,
+                reclassified_as_events: (*self).reclassified_extras(Chosen::TagCorrelated),
             });
         }
 
         // Pass 2: tagless ESEARCH.
         if let Some(esearch) = self.tagless_esearch.first() {
-            let (ids, truncated) = expand_uid_ranges(&esearch.all);
-            let result = SearchResult {
+            let output = expand_uid_ranges(&esearch.all).map(|ids| SearchResult {
                 ids,
                 mod_seq: esearch.mod_seq,
-                truncated,
-            };
-            let mut buffered = self.buffered;
-            for e in self.tagless_esearch.into_iter().skip(1) {
-                buffered.push(UntaggedResponse::Esearch(e));
-            }
-            for (uids, mod_seq) in self.search_responses {
-                buffered.push(UntaggedResponse::Search { uids, mod_seq });
-            }
+            });
             return Ok(Finalized {
-                output: Ok(result),
-                reclassified_as_events: buffered,
+                output,
+                reclassified_as_events: (*self).reclassified_extras(Chosen::Tagless),
             });
         }
 
@@ -155,11 +165,7 @@ impl Consumer for SearchConsumer {
                 buffered.push(UntaggedResponse::Search { uids, mod_seq });
             }
             return Ok(Finalized {
-                output: Ok(SearchResult {
-                    ids: uids,
-                    mod_seq,
-                    truncated: false,
-                }),
+                output: Ok(SearchResult { ids: uids, mod_seq }),
                 reclassified_as_events: buffered,
             });
         }

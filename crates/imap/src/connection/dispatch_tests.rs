@@ -1,7 +1,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use super::*;
-use crate::types::response::{NamespaceDescriptor, StatusKind, TaggedResponse};
+use crate::types::UidRange;
+use crate::types::response::{EsearchResponse, NamespaceDescriptor, StatusKind, TaggedResponse};
 
 // ---------------------------------------------------------------------------
 // Helper  -  tagged OK with no response code
@@ -171,8 +172,140 @@ fn sort_consumer_empty_result_returns_ok() {
     let result = consumer.finalize(tagged_ok(), &default_ctx()).unwrap();
     assert!(result.output.ids.is_empty());
     assert_eq!(result.output.mod_seq, None);
-    assert!(!result.output.truncated);
     assert!(result.reclassified_as_events.is_empty());
+}
+
+fn esearch_all(tag: Option<&str>, all: Vec<UidRange>) -> UntaggedResponse {
+    UntaggedResponse::Esearch(EsearchResponse {
+        tag: tag.map(ToOwned::to_owned),
+        uid: true,
+        all,
+        ..EsearchResponse::default()
+    })
+}
+
+/// A solicited ESEARCH answers this tag. A failed expansion changes what the
+/// command can return, not who the response belongs to: it must NOT be
+/// republished on the asynchronous event queue, and the genuine events must
+/// keep their wire order.
+#[test]
+fn search_consumer_keeps_the_solicited_reply_when_uid_expansion_is_incomplete() {
+    let mut consumer = SearchConsumer::new();
+    let ctx = default_ctx();
+    consumer.on_response(UntaggedResponse::Exists(1), NotifyFlags::default(), &ctx);
+    consumer.on_response(
+        esearch_all(
+            Some("A001"),
+            vec![UidRange {
+                start: 1,
+                end: Some(3_000_000),
+            }],
+        ),
+        NotifyFlags::default(),
+        &ctx,
+    );
+    consumer.on_response(UntaggedResponse::Expunge(7), NotifyFlags::default(), &ctx);
+
+    let result = Box::new(consumer).finalize(tagged_ok(), &ctx).unwrap();
+    assert!(matches!(
+        result.output,
+        Err(Error::SearchResultTruncated {
+            returned: 1_000_000,
+            omitted: Some(2_000_000),
+        })
+    ));
+    assert_eq!(
+        result.reclassified_as_events,
+        vec![UntaggedResponse::Exists(1), UntaggedResponse::Expunge(7)],
+        "only unsolicited responses may become events, in wire order"
+    );
+}
+
+/// The same partitioning on the success path: the chosen ESEARCH is consumed,
+/// a second one is an extra and is reclassified.
+#[test]
+fn search_consumer_reclassifies_only_the_extra_esearch() {
+    let mut consumer = SearchConsumer::new();
+    let ctx = default_ctx();
+    consumer.on_response(UntaggedResponse::Exists(1), NotifyFlags::default(), &ctx);
+    consumer.on_response(
+        esearch_all(Some("A001"), vec![UidRange::single(4)]),
+        NotifyFlags::default(),
+        &ctx,
+    );
+    consumer.on_response(
+        esearch_all(Some("A001"), vec![UidRange::single(9)]),
+        NotifyFlags::default(),
+        &ctx,
+    );
+
+    let result = Box::new(consumer).finalize(tagged_ok(), &ctx).unwrap();
+    assert_eq!(result.output.unwrap().ids, vec![4]);
+    assert_eq!(
+        result.reclassified_as_events,
+        vec![
+            UntaggedResponse::Exists(1),
+            esearch_all(Some("A001"), vec![UidRange::single(9)]),
+        ]
+    );
+}
+
+/// `*` is special wherever it appears in a sequence-set, not only as a range
+/// endpoint, and a set may legally repeat itself.
+#[test]
+fn search_consumer_rejects_a_bare_star_and_counts_overlap_once() {
+    let ctx = default_ctx();
+
+    let mut consumer = SearchConsumer::new();
+    consumer.on_response(
+        // `ALL *` - the parser maps a standalone `*` to start = u32::MAX.
+        esearch_all(
+            Some("A001"),
+            vec![UidRange {
+                start: u32::MAX,
+                end: None,
+            }],
+        ),
+        NotifyFlags::default(),
+        &ctx,
+    );
+    assert!(
+        matches!(
+            Box::new(consumer)
+                .finalize(tagged_ok(), &ctx)
+                .unwrap()
+                .output,
+            Err(Error::SearchResultTruncated { omitted: None, .. })
+        ),
+        "a standalone `*` must not expand to the literal id 4294967295"
+    );
+
+    let mut consumer = SearchConsumer::new();
+    consumer.on_response(
+        esearch_all(
+            Some("A001"),
+            vec![
+                UidRange {
+                    start: 1,
+                    end: Some(600_000),
+                },
+                UidRange {
+                    start: 1,
+                    end: Some(600_000),
+                },
+            ],
+        ),
+        NotifyFlags::default(),
+        &ctx,
+    );
+    let ids = Box::new(consumer)
+        .finalize(tagged_ok(), &ctx)
+        .unwrap()
+        .output
+        .expect("an overlapping set of 600000 UIDs is under the cap");
+    assert_eq!(ids.ids.len(), 600_000);
+    assert_eq!(ids.ids[0], 1);
+    assert_eq!(ids.ids[599_999], 600_000);
 }
 
 // ---------------------------------------------------------------------------

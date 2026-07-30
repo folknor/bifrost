@@ -367,6 +367,10 @@ fn all_variants_are_distinguishable() {
             seq: 3,
             uid: Some(4),
         },
+        Error::SearchResultTruncated {
+            returned: 1,
+            omitted: Some(2),
+        },
         Error::InvalidAppendDate("bad date".into()),
         Error::Internal("internal err".into()),
         Error::DriverPanicked {
@@ -393,6 +397,7 @@ fn all_variants_are_distinguishable() {
             Error::MissingCapability(_) => "capability",
             Error::AppendLimit { .. } => "appendlimit",
             Error::FetchLimit { .. } => "fetchlimit",
+            Error::SearchResultTruncated { .. } => "searchresulttruncated",
             Error::InvalidAppendDate(_) => "invalidappenddate",
             Error::Internal(_) => "internal",
             Error::DriverPanicked { .. } => "driverpanicked",
@@ -427,6 +432,10 @@ fn other_variants_have_no_source() {
         Error::StartTlsUnavailable,
         Error::MissingCapability("CAP".into()),
         Error::AppendLimit { size: 1, limit: 0 },
+        Error::SearchResultTruncated {
+            returned: 1,
+            omitted: None,
+        },
         Error::InvalidAppendDate("bad".into()),
         Error::Internal("test".into()),
         Error::DriverPanicked {

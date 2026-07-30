@@ -137,6 +137,18 @@ pub(crate) enum Error {
         uid: Option<u32>,
     },
 
+    /// ESEARCH UID ranges could not be expanded without dropping results.
+    ///
+    /// `omitted` is `None` when the server used the `*` sentinel, whose
+    /// concrete upper bound is unknown from the response alone.
+    #[error(
+        "UID SEARCH result cannot be represented completely after {returned} IDs; omitted {omitted:?}"
+    )]
+    SearchResultTruncated {
+        returned: usize,
+        omitted: Option<u64>,
+    },
+
     /// Invalid APPEND date-time (RFC 3501 Section 9 `date-time`).
     #[error("invalid APPEND date-time: {0}")]
     InvalidAppendDate(String),
@@ -282,6 +294,16 @@ impl PartialEq for Error {
                     uid: u2,
                 },
             ) => e1 == e2 && l1 == l2 && s1 == s2 && u1 == u2,
+            (
+                Self::SearchResultTruncated {
+                    returned: r1,
+                    omitted: o1,
+                },
+                Self::SearchResultTruncated {
+                    returned: r2,
+                    omitted: o2,
+                },
+            ) => r1 == r2 && o1 == o2,
             _ => false,
         }
     }

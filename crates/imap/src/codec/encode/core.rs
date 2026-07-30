@@ -190,7 +190,9 @@ impl EncodedCommand {
     /// markers and splitting at synchronizing boundaries.
     ///
     /// A synchronizing literal marker is `{digits}\r\n` where digits parse as
-    /// a valid `usize` and there is no `+` before `}`. The buffer is split so
+    /// a valid RFC 9051 `number64` (counts above `i64::MAX` are text, not
+    /// framing), fit in this process's `usize`, and there
+    /// is no `+` before `}`. The buffer is split so
     /// that the marker ends the current segment and the literal body begins
     /// the next segment. The caller sends each segment and waits for a `+`
     /// continuation response between consecutive segments.
@@ -225,8 +227,10 @@ impl EncodedCommand {
             // A malformed marker cannot delimit a literal body. In particular,
             // do not allow an attacker-controlled size to wrap scan_pos or make
             // us rescan bytes that a valid preceding literal owns.
-            let Some(payload_end) = abs_marker_end
-                .checked_add(literal_size)
+            let Some(payload_end) = u64::try_from(abs_marker_end)
+                .ok()
+                .and_then(|marker_end| marker_end.checked_add(literal_size))
+                .and_then(|payload_end| usize::try_from(payload_end).ok())
                 .filter(|&end| end <= buf.len())
             else {
                 break;
@@ -266,36 +270,27 @@ impl EncodedCommand {
 /// markers (`~{N}\r\n`). RFC 9051 Section 9 defines
 /// `literal8 = "~{" number64 "}" CRLF *OCTET` with no `["+"]` modifier,
 /// so literal8 is unconditionally synchronizing (RFC 3516 Section 4).
-fn find_literal_marker(buf: &[u8]) -> Option<(usize, usize, bool)> {
+fn find_literal_marker(buf: &[u8]) -> Option<(usize, u64, bool)> {
+    use crate::connection::literals::{LiteralMarker, literal_marker_at};
+
     let mut i = 0;
     while i < buf.len() {
-        if buf[i] == b'{' {
-            let start = i + 1;
-            let mut j = start;
-            while j < buf.len() && buf[j].is_ascii_digit() {
-                j += 1;
+        match literal_marker_at(buf, i) {
+            LiteralMarker::Counted {
+                data_start,
+                size,
+                synchronizing,
+            } => {
+                // A legal number64 is a marker even on a narrow target;
+                // `from_flat_buffer` then rejects it as an unavailable body
+                // boundary uniformly on every pointer width.
+                return Some((data_start, size, synchronizing));
             }
-            let non_synchronizing = j > start && buf.get(j) == Some(&b'+');
-            let close = j + usize::from(non_synchronizing);
-            // Must have at least one digit, then optional `+` and `}\r\n`.
-            if j > start
-                && close + 2 < buf.len()
-                && buf[close] == b'}'
-                && buf[close + 1] == b'\r'
-                && buf[close + 2] == b'\n'
-            {
-                let Ok(size_str) = std::str::from_utf8(&buf[start..j]) else {
-                    i += 1;
-                    continue;
-                };
-                let Ok(size) = size_str.parse::<usize>() else {
-                    i += 1;
-                    continue;
-                };
-                return Some((close + 3, size, !non_synchronizing));
-            }
+            // Above the RFC 9051 ceiling this cannot be a literal we emitted,
+            // so on the send path it is ordinary text: keep scanning for the
+            // real boundary instead of stopping at a private parse failure.
+            LiteralMarker::CountOutOfRange { .. } | LiteralMarker::NotAMarker => i += 1,
         }
-        i += 1;
     }
     None
 }

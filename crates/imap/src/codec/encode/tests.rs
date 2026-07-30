@@ -5327,6 +5327,56 @@ fn encoded_command_rejects_an_empty_buffer() {
     let _ = EncodedCommand::from_flat_buffer(b"");
 }
 
+#[test]
+fn literal_marker_scanner_uses_the_shared_number64_parser() {
+    // 2^63 parses as a `u64` but is above the RFC 9051 `number64` ceiling, so
+    // it is the interval a `u64`-only parser silently accepts. It is not a
+    // marker on the send path: the scanner must continue and find the
+    // following valid body boundary.
+    let encoded = EncodedCommand::from_flat_buffer(b"A001 X {9223372036854775808}\r\n{1}\r\nx\r\n");
+    assert_eq!(encoded.segments().len(), 2);
+    assert!(encoded.segments()[0].ends_with(b"{1}\r\n"));
+
+    // A digit run too long for `u64` is likewise not a marker.
+    let encoded =
+        EncodedCommand::from_flat_buffer(b"A001 X {18446744073709551616}\r\n{1}\r\nx\r\n");
+    assert_eq!(encoded.segments().len(), 2);
+    assert!(encoded.segments()[0].ends_with(b"{1}\r\n"));
+}
+
+#[test]
+fn out_of_range_literal_count_is_not_a_marker_for_the_shared_parser() {
+    use crate::connection::literals::{LiteralMarker, literal_marker_at};
+
+    assert!(matches!(
+        literal_marker_at(b"{9223372036854775807}\r\n", 0),
+        LiteralMarker::Counted {
+            size: 9_223_372_036_854_775_807,
+            ..
+        }
+    ));
+    assert!(matches!(
+        literal_marker_at(b"{9223372036854775808}\r\n", 0),
+        LiteralMarker::CountOutOfRange {
+            size: 9_223_372_036_854_775_808,
+            ..
+        }
+    ));
+    assert!(matches!(
+        literal_marker_at(b"{18446744073709551616}\r\n", 0),
+        LiteralMarker::NotAMarker
+    ));
+}
+
+#[test]
+fn number64_marker_has_the_same_boundary_on_every_pointer_width() {
+    // This count fits RFC 9051 `number64`, but not a 32-bit usize. It is a
+    // valid marker on both targets, so the following marker is inside its
+    // declared opaque body rather than a second synchronization boundary.
+    let encoded = EncodedCommand::from_flat_buffer(b"A001 X {4294967296}\r\n{1}\r\nx\r\n");
+    assert_eq!(encoded.segments().len(), 1);
+}
+
 // --- UTF-8 mode: RFC 6855 Section 3 / RFC 9051 Section 9 ---
 
 /// When UTF8=ACCEPT is enabled (RFC 6855 Section 3), non-ASCII UTF-8

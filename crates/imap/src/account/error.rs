@@ -454,6 +454,21 @@ fn classify(error: &Error, ctx: &ImapErrorContext) -> Translation {
             t.attempt = Some(TransmissionState::Acknowledged);
             t
         }
+        Error::SearchResultTruncated { returned, omitted } => {
+            let mut t = Translation::new(
+                AccountErrorKind::Request(RequestErrorKind::Malformed),
+                Cause::Request(RequestCause::Malformed {
+                    detail: DiagnosticText::support_only(format!(
+                        "UID SEARCH result exceeded the local expansion limit after {returned} IDs; \
+                         omitted {omitted:?}"
+                    )),
+                }),
+            );
+            // The server answered the search. The account boundary must not
+            // return a partial Page as a successful result.
+            t.attempt = Some(TransmissionState::Acknowledged);
+            t
+        }
         Error::InvalidAppendDate(msg) => Translation::new(
             AccountErrorKind::Request(RequestErrorKind::Malformed),
             Cause::Request(RequestCause::Malformed {

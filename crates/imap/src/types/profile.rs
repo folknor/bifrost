@@ -50,14 +50,27 @@ impl ServerProfile {
                 _ => None,
             })
             .collect();
-        let append_limit = capabilities
+        // RFC 7889 normally advertises exactly one APPENDLIMIT form. If a
+        // server sends the contradictory bare and numeric forms together,
+        // preserve the safer bare interpretation: the destination mailbox
+        // may be more restrictive than the global-looking value.
+        let has_mailbox_specific_limit = capabilities
             .iter()
-            .find_map(|cap| match cap {
-                Capability::AppendLimit(None) => Some(AppendLimitPolicy::PerMailbox),
-                Capability::AppendLimit(Some(limit)) => Some(AppendLimitPolicy::Limit(*limit)),
+            .any(|cap| matches!(cap, Capability::AppendLimit(None)));
+        let global_append_limit = capabilities
+            .iter()
+            .filter_map(|cap| match cap {
+                Capability::AppendLimit(Some(limit)) => Some(*limit),
                 _ => None,
             })
-            .unwrap_or_default();
+            .min();
+        let append_limit = if has_mailbox_specific_limit {
+            AppendLimitPolicy::PerMailbox
+        } else {
+            global_append_limit
+                .map(AppendLimitPolicy::Limit)
+                .unwrap_or_default()
+        };
         let thread_algorithms = capabilities
             .iter()
             .filter_map(|cap| match cap {

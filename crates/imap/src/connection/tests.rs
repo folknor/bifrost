@@ -255,7 +255,7 @@ fn store_flag_filter_drops_server_only_and_wildcard_flags() {
 
 #[test]
 fn expand_uid_ranges_singles_and_ranges() {
-    let (uids, truncated) = expand_uid_ranges(&[
+    let uids = expand_uid_ranges(&[
         UidRange {
             start: 1,
             end: None,
@@ -264,51 +264,60 @@ fn expand_uid_ranges_singles_and_ranges() {
             start: 4,
             end: Some(6),
         },
-    ]);
+    ])
+    .expect("small ranges expand");
     assert_eq!(uids, vec![1, 4, 5, 6]);
-    assert!(!truncated);
 }
 
 #[test]
 fn expand_uid_ranges_empty_input() {
-    let (uids, truncated) = expand_uid_ranges(&[]);
+    let uids = expand_uid_ranges(&[]).expect("empty range list expands");
     assert!(uids.is_empty());
-    assert!(!truncated);
 }
 
 #[test]
 fn expand_uid_ranges_star_sentinel_is_not_expanded() {
     // RFC 4731 Section 3.1: `*` is the highest UID in the mailbox, which
     // the ESEARCH response alone does not reveal.
-    let (uids, truncated) = expand_uid_ranges(&[UidRange {
+    let err = expand_uid_ranges(&[UidRange {
         start: 10,
         end: Some(u32::MAX),
-    }]);
-    assert_eq!(uids, vec![10]);
-    assert!(truncated, "an unexpandable `*` range must be flagged");
+    }])
+    .expect_err("an unexpandable `*` range must not look complete");
+    assert!(matches!(
+        err,
+        Error::SearchResultTruncated {
+            returned: 0,
+            omitted: None
+        }
+    ));
 }
 
 #[test]
 fn expand_uid_ranges_caps_at_one_million() {
-    let (uids, truncated) = expand_uid_ranges(&[UidRange {
+    let err = expand_uid_ranges(&[UidRange {
         start: 1,
         end: Some(3_000_000),
-    }]);
-    assert_eq!(uids.len(), 1_000_000);
-    assert_eq!(uids[0], 1);
-    assert_eq!(uids[999_999], 1_000_000);
-    assert!(truncated);
+    }])
+    .expect_err("an over-cap range must not be returned partially");
+    assert!(matches!(
+        err,
+        Error::SearchResultTruncated {
+            returned: 1_000_000,
+            omitted: Some(2_000_000)
+        }
+    ));
 }
 
 #[test]
 fn expand_uid_ranges_inverted_range_yields_nothing() {
     // Defensive: a non-conformant server sending `10:5` must not panic.
-    let (uids, truncated) = expand_uid_ranges(&[UidRange {
+    let uids = expand_uid_ranges(&[UidRange {
         start: 10,
         end: Some(5),
-    }]);
+    }])
+    .expect("inverted range is empty, not incomplete");
     assert!(uids.is_empty());
-    assert!(!truncated);
 }
 
 // ---------------------------------------------------------------------------
@@ -997,4 +1006,172 @@ async fn append_rejects_oversized_messages_before_the_wire() {
         }
         other => panic!("expected AppendLimit, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn append_uses_the_most_restrictive_global_appendlimit() {
+    let conn = crate::connection::test_support::detached(
+        SessionState::Authenticated,
+        vec![
+            Capability::AppendLimit(Some(10)),
+            Capability::AppendLimit(Some(4)),
+        ],
+        &[],
+    );
+
+    assert!(matches!(
+        conn.append("INBOX", &[], None, b"HELLO", Duration::from_secs(5))
+            .await,
+        Err(Error::AppendLimit { size: 5, limit: 4 })
+    ));
+}
+
+#[tokio::test]
+async fn append_checks_the_mailbox_specific_appendlimit_before_writing() {
+    let (conn, mut server) =
+        crate::connection::test_support::driver_pair(&preauth_greeting("IMAP4rev1 APPENDLIMIT"))
+            .await;
+    let script = tokio::spawn(async move {
+        let status = read_line(&mut server).await;
+        assert!(
+            status.ends_with(" STATUS \"INBOX\" (APPENDLIMIT)\r\n"),
+            "expected an APPENDLIMIT STATUS query, got {status:?}"
+        );
+        let tag = tag_of(&status).to_owned();
+        respond(
+            &mut server,
+            &format!("* STATUS INBOX (APPENDLIMIT 4)\r\n{tag} OK STATUS completed\r\n"),
+        )
+        .await;
+        server
+    });
+
+    assert!(matches!(
+        conn.append("INBOX", &[], None, b"HELLO", Duration::from_secs(5))
+            .await,
+        Err(Error::AppendLimit { size: 5, limit: 4 })
+    ));
+    let _server = script.await.expect("STATUS transcript");
+}
+
+/// The APPENDLIMIT STATUS is a preflight. Its own transmission evidence is
+/// about the STATUS, not about the APPEND, and APPEND is non-idempotent: a
+/// preflight failure that reported `InFlight` would send DraftCreate recovery
+/// down the reconcile path for a message no server ever saw.
+#[tokio::test]
+async fn append_preflight_failure_is_unsent_evidence_for_the_append() {
+    let (conn, mut server) =
+        crate::connection::test_support::driver_pair(&preauth_greeting("IMAP4rev1 APPENDLIMIT"))
+            .await;
+    let script = tokio::spawn(async move {
+        let status = read_line(&mut server).await;
+        let tag = tag_of(&status).to_owned();
+        // A tagged NO is Acknowledged evidence for the STATUS.
+        respond(&mut server, &format!("{tag} NO STATUS failed\r\n")).await;
+        server
+    });
+
+    let err = conn
+        .append("INBOX", &[], None, b"HELLO", Duration::from_secs(5))
+        .await
+        .expect_err("a failed preflight must fail the APPEND");
+    assert_eq!(
+        err.attempt(),
+        Some(bifrost_types::TransmissionState::Unsent),
+        "no APPEND octet was written, so the evidence must say so: {err:?}"
+    );
+    let _server = script.await.expect("STATUS transcript");
+}
+
+/// RFC 5465 Section 4: with NOTIFY STATUS active the solicited reply may land
+/// in `ambiguous` instead of `items`. Reading only `items` invents a protocol
+/// error, or applies a stale higher limit.
+#[test]
+fn mailbox_append_limit_reads_every_plausible_status_reply() {
+    use crate::connection::append::mailbox_append_limit;
+    use crate::types::StatusItem;
+    use crate::types::mailbox::StatusResult;
+
+    // The heuristic picked a notification; the real answer is ambiguous.
+    let status = StatusResult {
+        items: vec![StatusItem::Messages(3)],
+        ambiguous: vec![vec![StatusItem::AppendLimit(Some(4))]],
+    };
+    assert_eq!(mailbox_append_limit(&status).unwrap(), Some(4));
+
+    // Both plausible replies name a limit: the smallest one governs.
+    let status = StatusResult {
+        items: vec![StatusItem::AppendLimit(Some(9))],
+        ambiguous: vec![vec![StatusItem::AppendLimit(Some(4))]],
+    };
+    assert_eq!(mailbox_append_limit(&status).unwrap(), Some(4));
+
+    // An explicit NIL is "no limit", not a missing item.
+    let status = StatusResult {
+        items: vec![StatusItem::AppendLimit(None)],
+        ambiguous: vec![],
+    };
+    assert_eq!(mailbox_append_limit(&status).unwrap(), None);
+
+    // No reply named APPENDLIMIT at all: the server contradicts itself.
+    let status = StatusResult {
+        items: vec![StatusItem::Messages(3)],
+        ambiguous: vec![vec![StatusItem::Messages(3)]],
+    };
+    assert!(matches!(
+        mailbox_append_limit(&status),
+        Err(Error::Protocol(_))
+    ));
+}
+
+/// RFC 9051 Section 9: `seq-number = nz-number / "*"`, so `*` is special
+/// wherever it appears, and a sequence-set may repeat or overlap elements.
+#[test]
+fn expand_uid_ranges_handles_bare_star_and_overlap() {
+    let err = expand_uid_ranges(&[UidRange {
+        start: u32::MAX,
+        end: None,
+    }])
+    .expect_err("a standalone `*` is not the literal id 4294967295");
+    assert!(matches!(
+        err,
+        Error::SearchResultTruncated {
+            returned: 0,
+            omitted: None
+        }
+    ));
+
+    // Overlap is legal and must be counted once, both for the cap and for the
+    // expansion itself.
+    let uids = expand_uid_ranges(&[
+        UidRange {
+            start: 1,
+            end: Some(600_000),
+        },
+        UidRange {
+            start: 1,
+            end: Some(600_000),
+        },
+    ])
+    .expect("600000 distinct UIDs are under the 1e6 cap");
+    assert_eq!(uids.len(), 600_000);
+
+    // Partial overlap merges rather than duplicating, and the result is
+    // ascending.
+    let uids = expand_uid_ranges(&[
+        UidRange {
+            start: 5,
+            end: Some(9),
+        },
+        UidRange {
+            start: 1,
+            end: Some(6),
+        },
+        UidRange {
+            start: 7,
+            end: None,
+        },
+    ])
+    .expect("small overlapping ranges expand");
+    assert_eq!(uids, (1..=9).collect::<Vec<u32>>());
 }

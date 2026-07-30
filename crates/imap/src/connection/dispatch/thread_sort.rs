@@ -89,11 +89,7 @@ impl Consumer for SortConsumer {
         // untagged SORT response entirely and sending only tagged OK.
         let (ids, mod_seq) = self.result.unwrap_or_default();
         Ok(Finalized {
-            output: SearchResult {
-                ids,
-                mod_seq,
-                truncated: false,
-            },
+            output: SearchResult { ids, mod_seq },
             reclassified_as_events: self.buffered,
         })
     }

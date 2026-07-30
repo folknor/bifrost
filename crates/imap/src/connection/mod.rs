@@ -36,7 +36,7 @@ mod extensions;
 mod helpers;
 mod idle;
 mod lifecycle;
-mod literals;
+pub(crate) mod literals;
 mod mailbox;
 pub(super) mod pipeline;
 mod search_validation;
@@ -282,10 +282,6 @@ pub(crate) struct SearchResult {
     /// Highest mod-sequence of matching messages, if MODSEQ was used
     /// in the search criteria (RFC 7162 Section 3.1.5).
     pub(crate) mod_seq: Option<u64>,
-    /// `true` when ESEARCH UID range expansion was capped at the internal
-    /// safety limit and the returned `ids` do not faithfully represent the
-    /// full server response (RFC 4731 Section 3, RFC 3501 Section 6.4.4).
-    pub(crate) truncated: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -479,11 +475,18 @@ fn filter_store_flags(flags: &[Flag]) -> Vec<Flag> {
 /// Expansion is capped at [`MAX_EXPANDED_UIDS`] to prevent OOM when a
 /// server returns extremely large ranges (e.g. `1:4294967295`).
 ///
-/// Ranges whose end is `u32::MAX` (the sentinel for `*` in sequence-sets,
-/// per RFC 4731 Section 3.1) are NOT expanded because `*` means "the
-/// highest UID in the mailbox"  -  a value unknown from the ESEARCH response
-/// alone.  Only the `start` UID is emitted and `truncated` is set to `true`.
-fn expand_uid_ranges(ranges: &[UidRange]) -> (Vec<u32>, bool) {
+/// `*` (mapped by the parser to `u32::MAX`) is special wherever it appears in
+/// a sequence-set, not only as a range endpoint (RFC 9051 Section 9:
+/// `seq-number = nz-number / "*"`).  It means "the highest UID in the mailbox",
+/// a value unknown from the ESEARCH response alone, so any set naming it
+/// cannot be expanded at all.  Rather than return a partial result as if it
+/// were complete, this reports the incomplete expansion to the caller.
+///
+/// A sequence-set may legally repeat or overlap its elements, so the ranges
+/// are sorted and merged before both the cap check and the expansion: the
+/// result is ascending and duplicate-free, and `1:600000,1:600000` names
+/// 600000 UIDs, not 1200000.
+fn expand_uid_ranges(ranges: &[UidRange]) -> Result<Vec<u32>, Error> {
     /// Safety cap to prevent OOM from malicious or buggy server responses.
     const MAX_EXPANDED_UIDS: usize = 1_000_000;
 
@@ -491,54 +494,62 @@ fn expand_uid_ranges(ranges: &[UidRange]) -> (Vec<u32>, bool) {
     /// (RFC 4731 Section 3.1 / RFC 3501 Section 9).
     const STAR_SENTINEL: u32 = u32::MAX;
 
-    let mut uids = Vec::new();
-    let mut truncated = false;
+    let mut saw_star = false;
+    let mut bounds: Vec<(u32, u32)> = Vec::with_capacity(ranges.len());
     for range in ranges {
-        if let Some(end) = range.end {
-            // RFC 4731 Section 3.1: `*` in a uid-set means "the highest UID
-            // in the mailbox."  The parser maps `*` to u32::MAX as a sentinel.
-            // Since the actual highest UID is unknown from the ESEARCH response
-            // alone, we cannot expand this range.  Emit only the start UID and
-            // signal truncation so callers know the result is incomplete.
-            if end == STAR_SENTINEL {
-                uids.push(range.start);
-                truncated = true;
-                continue;
-            }
-            let count = (end.saturating_sub(range.start).saturating_add(1)) as usize;
-            if uids.len().saturating_add(count) > MAX_EXPANDED_UIDS {
-                warn!(
-                    start = range.start,
-                    end = end,
-                    "UID range too large to expand ({count} UIDs), \
-                     truncating to {MAX_EXPANDED_UIDS} total"
-                );
-                let remaining = MAX_EXPANDED_UIDS.saturating_sub(uids.len());
-                if remaining > 0 {
-                    // remaining > 0 is guaranteed by the guard above.
-                    // Use saturating_add + min(end) to avoid u32 overflow
-                    // when range.start is near u32::MAX (RFC 3501 Section 9:
-                    // nz-number can be up to 4294967295).
-                    #[allow(clippy::cast_possible_truncation)]
-                    let last = end.min(range.start.saturating_add((remaining - 1) as u32));
-                    for uid in range.start..=last {
-                        uids.push(uid);
-                    }
-                }
-                // RFC 4731 Section 3 / RFC 3501 Section 6.4.4: signal that
-                // the expanded result does not faithfully represent the full
-                // server response.
-                truncated = true;
-                break;
-            }
-            for uid in range.start..=end {
-                uids.push(uid);
-            }
-        } else {
-            uids.push(range.start);
+        let end = range.end.unwrap_or(range.start);
+        if range.start == STAR_SENTINEL || end == STAR_SENTINEL {
+            saw_star = true;
+            continue;
+        }
+        // The decoder normalizes descending ranges (Postel), so a range that
+        // still arrives inverted is not a legal sequence-set element and
+        // names no messages.
+        if end >= range.start {
+            bounds.push((range.start, end));
         }
     }
-    (uids, truncated)
+
+    bounds.sort_unstable();
+    let mut merged: Vec<(u32, u32)> = Vec::with_capacity(bounds.len());
+    for (start, end) in bounds {
+        match merged.last_mut() {
+            // Adjacent ranges merge too: it changes no member of the set and
+            // keeps the count exact.
+            Some(last) if start <= last.1.saturating_add(1) => last.1 = last.1.max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+
+    let requested: u64 = merged
+        .iter()
+        .map(|&(start, end)| u64::from(end) - u64::from(start) + 1)
+        .sum();
+
+    if saw_star {
+        return Err(Error::SearchResultTruncated {
+            returned: usize::try_from(requested).unwrap_or(usize::MAX),
+            omitted: None,
+        });
+    }
+
+    let max_expanded = u64::try_from(MAX_EXPANDED_UIDS).unwrap_or(u64::MAX);
+    if requested > max_expanded {
+        warn!(
+            requested,
+            "UID ranges exceed the {MAX_EXPANDED_UIDS}-UID expansion limit"
+        );
+        return Err(Error::SearchResultTruncated {
+            returned: MAX_EXPANDED_UIDS,
+            omitted: Some(requested.saturating_sub(max_expanded)),
+        });
+    }
+
+    let mut uids = Vec::with_capacity(usize::try_from(requested).unwrap_or(MAX_EXPANDED_UIDS));
+    for (start, end) in merged {
+        uids.extend(start..=end);
+    }
+    Ok(uids)
 }
 
 /// Build a `SelectedMailbox` from collected untagged and tagged responses.

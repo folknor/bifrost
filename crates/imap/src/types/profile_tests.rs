@@ -87,6 +87,15 @@ fn append_limit_policy_is_explicit() {
 
     let profile = ServerProfile::new(vec![Capability::AppendLimit(Some(1024))], vec![]);
     assert_eq!(profile.append_limit, AppendLimitPolicy::Limit(1024));
+
+    let profile = ServerProfile::new(
+        vec![
+            Capability::AppendLimit(Some(1024)),
+            Capability::AppendLimit(None),
+        ],
+        vec![],
+    );
+    assert_eq!(profile.append_limit, AppendLimitPolicy::PerMailbox);
 }
 
 #[test]

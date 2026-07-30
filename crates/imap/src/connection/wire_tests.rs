@@ -25,6 +25,13 @@ fn try_parse_literal_marker(buf: &[u8], crlf_pos: usize) -> Option<usize> {
 }
 
 #[test]
+fn byte_bucket_consume_future_is_send() {
+    fn assert_send<T: Send>(_: T) {}
+
+    assert_send(super::ByteBucket::new(Some(1)).consume(1, Some(1)));
+}
+
+#[test]
 fn framing_no_crlf_is_incomplete() {
     assert!(!buffer_may_contain_complete_response(b""));
     assert!(!buffer_may_contain_complete_response(b"* 3 EXIST"));

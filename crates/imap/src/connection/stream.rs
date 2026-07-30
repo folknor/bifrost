@@ -17,6 +17,11 @@ use super::TcpKeepalive;
 pub(super) enum InnerStream {
     Plain(TcpStream),
     Tls(TlsStream<TcpStream>),
+    /// In-memory byte stream used to test COMPRESS=DEFLATE without a socket.
+    /// It has the same ordered byte-stream behavior as the production inner
+    /// transports, unlike a mock that could invent impossible I/O results.
+    #[cfg(test)]
+    Memory(tokio::io::DuplexStream),
 }
 
 impl InnerStream {
@@ -24,6 +29,8 @@ impl InnerStream {
         match self {
             Self::Plain(s) => s.read_buf(buf).await,
             Self::Tls(s) => s.read_buf(buf).await,
+            #[cfg(test)]
+            Self::Memory(s) => s.read_buf(buf).await,
         }
     }
 
@@ -31,6 +38,8 @@ impl InnerStream {
         match self {
             Self::Plain(s) => s.write_all(data).await,
             Self::Tls(s) => s.write_all(data).await,
+            #[cfg(test)]
+            Self::Memory(s) => s.write_all(data).await,
         }
     }
 
@@ -38,6 +47,8 @@ impl InnerStream {
         match self {
             Self::Plain(s) => s.flush().await,
             Self::Tls(s) => s.flush().await,
+            #[cfg(test)]
+            Self::Memory(s) => s.flush().await,
         }
     }
 }
@@ -168,6 +179,8 @@ impl CompressedStream {
             let consumed = (self.compress.total_in() - before_in) as usize;
             let produced = (self.compress.total_out() - before_out) as usize;
 
+            ensure_deflate_progress(consumed, produced)?;
+
             input_offset += consumed;
 
             if produced > 0 {
@@ -216,6 +229,16 @@ impl CompressedStream {
     async fn flush(&mut self) -> std::io::Result<()> {
         self.inner.flush().await
     }
+}
+
+fn ensure_deflate_progress(consumed: usize, produced: usize) -> std::io::Result<()> {
+    if consumed == 0 && produced == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WriteZero,
+            "deflate made no progress while compressing IMAP data",
+        ));
+    }
+    Ok(())
 }
 
 /// Wraps either a plain TCP, TLS, or compressed stream.
@@ -302,6 +325,15 @@ impl ImapStream {
                 InnerStream::Tls(tls) => {
                     SockRef::from(tls.get_ref().get_ref().get_ref()).set_tcp_keepalive(&sock_ka)
                 }
+                #[cfg(test)]
+                InnerStream::Memory(_) => {
+                    return Err(Error::Io {
+                        source: std::sync::Arc::new(std::io::Error::other(
+                            "keepalive not supported on memory streams",
+                        )),
+                        attempt: None,
+                    });
+                }
             },
             Self::Poisoned => {
                 return Err(Error::Io {
@@ -340,6 +372,8 @@ impl ImapStream {
             Self::Compressed(c) => match &c.inner {
                 InnerStream::Tls(s) => Some(s),
                 InnerStream::Plain(_) => None,
+                #[cfg(test)]
+                InnerStream::Memory(_) => None,
             },
             Self::Plain(_) | Self::Poisoned => None,
             #[cfg(test)]
@@ -366,3 +400,7 @@ impl ImapStream {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "stream_tests.rs"]
+mod tests;

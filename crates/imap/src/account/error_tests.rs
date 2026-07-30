@@ -214,6 +214,27 @@ fn bad_without_code_maps_to_request_malformed() {
 }
 
 #[test]
+fn incomplete_uid_expansion_is_an_acknowledged_local_request_limit() {
+    let account = into_account_error(
+        Error::SearchResultTruncated {
+            returned: 1_000_000,
+            omitted: Some(2_000_000),
+        },
+        ImapErrorContext::operation(AccountOperation::SearchMessages),
+    );
+
+    assert!(matches!(
+        account.kind(),
+        AccountErrorKind::Request(RequestErrorKind::Malformed)
+    ));
+    assert!(account.chain().iter().any(|cause| matches!(
+        cause,
+        Cause::Attempt(attempt) if attempt.transmission_state == TransmissionState::Acknowledged
+    )));
+    assert!(account.recovery().is_terminal());
+}
+
+#[test]
 fn bad_with_serverbug_maps_to_contract_violation() {
     let err = Error::bad_with_code("bug".into(), Some(ResponseCode::ServerBug));
     let account = into_account_error(err, ImapErrorContext::operation(AccountOperation::Discover));

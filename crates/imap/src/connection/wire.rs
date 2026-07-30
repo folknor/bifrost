@@ -344,27 +344,43 @@ impl ByteBucket {
         if n > cap {
             let secs = (want / cap_f).min(60.0);
             tokio::time::sleep(Duration::from_secs_f64(secs)).await;
-            let mut state = self.state.lock().expect("byte bucket lock poisoned");
-            state.tokens = 0.0;
-            state.last_refill = Instant::now();
+            self.reset_after_large_transfer();
             return;
         }
-        loop {
-            let wait = {
-                let mut state = self.state.lock().expect("byte bucket lock poisoned");
-                let now = Instant::now();
-                let elapsed = now.duration_since(state.last_refill).as_secs_f64();
-                state.tokens = (state.tokens + elapsed * cap_f).min(cap_f);
-                state.last_refill = now;
-                if state.tokens >= want {
-                    state.tokens -= want;
-                    return;
-                }
-                let deficit = want - state.tokens;
-                Duration::from_secs_f64((deficit / cap_f).min(60.0))
-            };
+        while let Some(wait) = self.consume_or_wait(want, cap_f) {
             tokio::time::sleep(wait).await;
         }
+    }
+
+    /// This is synchronous by design: keeping the lock acquisition and token
+    /// calculation out of `consume` makes it structurally impossible for the
+    /// mutex guard to cross that async function's sleep.
+    fn consume_or_wait(&self, want: f64, cap: f64) -> Option<Duration> {
+        let mut state = self.lock_state();
+        let now = Instant::now();
+        let elapsed = now.duration_since(state.last_refill).as_secs_f64();
+        state.tokens = (state.tokens + elapsed * cap).min(cap);
+        state.last_refill = now;
+        if state.tokens >= want {
+            state.tokens -= want;
+            None
+        } else {
+            let deficit = want - state.tokens;
+            Some(Duration::from_secs_f64((deficit / cap).min(60.0)))
+        }
+    }
+
+    fn reset_after_large_transfer(&self) {
+        let mut state = self.lock_state();
+        state.tokens = 0.0;
+        state.last_refill = Instant::now();
+    }
+
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, ByteBucketState> {
+        self.state.lock().unwrap_or_else(|poisoned| {
+            warn!("byte bucket lock poisoned; recovering metering state");
+            poisoned.into_inner()
+        })
     }
 }
 
@@ -525,13 +541,22 @@ fn try_parse_literal_marker(buf: &[u8], crlf_pos: usize) -> Result<Option<usize>
     let Some(brace_pos) = before_crlf.iter().rposition(|&b| b == b'{') else {
         return Ok(None);
     };
-    let Some((data_start, size, _)) = super::literals::literal_marker_at(buf, brace_pos) else {
-        return Ok(None);
+    use super::literals::LiteralMarker;
+
+    let parsed = super::literals::literal_marker_at(buf, brace_pos);
+    let (data_start, size) = match parsed {
+        LiteralMarker::Counted {
+            data_start, size, ..
+        }
+        | LiteralMarker::CountOutOfRange { data_start, size } => (data_start, size),
+        LiteralMarker::NotAMarker => return Ok(None),
     };
+    // A marker that does not end at this CRLF is not this line's framing,
+    // whatever its count says.
     if data_start != crlf_pos + 2 {
         return Ok(None);
     }
-    if size > i64::MAX as u64 {
+    if let LiteralMarker::CountOutOfRange { size, .. } = parsed {
         return Err(Error::Parse(format!(
             "literal count {size} exceeds the RFC 9051 number64 range"
         )));

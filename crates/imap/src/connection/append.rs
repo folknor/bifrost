@@ -3,6 +3,29 @@ use bytes::BytesMut;
 
 use super::*;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct AdvertisedAppendLimits {
+    global: Option<u64>,
+    mailbox_specific: bool,
+}
+
+impl AdvertisedAppendLimits {
+    fn from_capabilities(capabilities: &[Capability]) -> Self {
+        let mut limits = Self::default();
+        for capability in capabilities {
+            match capability {
+                Capability::AppendLimit(Some(limit)) => {
+                    limits.global =
+                        Some(limits.global.map_or(*limit, |current| current.min(*limit)));
+                }
+                Capability::AppendLimit(None) => limits.mailbox_specific = true,
+                _ => {}
+            }
+        }
+        limits
+    }
+}
+
 impl ImapConnection {
     // -----------------------------------------------------------------------
     // Append
@@ -31,22 +54,9 @@ impl ImapConnection {
         // RFC 3501 Section 6.3.11: APPEND is valid in Authenticated and Selected states.
         self.require_state(&[SessionState::Authenticated, SessionState::Selected])?;
 
-        // Check APPENDLIMIT (RFC 7889)  -  reject early if the message is too large.
-        // Compare in u64 space to avoid truncating the limit on 32-bit
-        // platforms where usize is 32 bits (RFC 7889 Section5: number64).
-        {
-            let snap = self.state_rx.borrow();
-            for cap in &snap.capabilities {
-                if let Capability::AppendLimit(Some(limit)) = cap {
-                    if (message.len() as u64) > *limit {
-                        return Err(Error::AppendLimit {
-                            size: message.len() as u64,
-                            limit: *limit,
-                        });
-                    }
-                    break;
-                }
-            }
+        let deadline = tokio::time::Instant::now() + timeout;
+        if let Some(limit) = self.append_limit_for_mailbox(mailbox, timeout).await? {
+            self.check_append_limit(message.len(), limit)?;
         }
 
         let utf8_enabled = self.utf8_enabled();
@@ -132,7 +142,7 @@ impl ImapConnection {
 
         // Submit the pre-built bytes to the driver task.
         tokio::time::timeout(
-            timeout,
+            remaining_timeout(deadline)?,
             self.submit_prebuilt(
                 buf,
                 tag,
@@ -172,17 +182,12 @@ impl ImapConnection {
         self.require_state(&[SessionState::Authenticated, SessionState::Selected])?;
 
         // Require MULTIAPPEND capability (RFC 3502 Section 3).
-        // Also snapshot capabilities for APPENDLIMIT + BINARY checks.
-        let (has_multiappend, append_limit, allow_literal8) = {
+        // Also snapshot APPENDLIMIT and BINARY behavior before any STATUS
+        // lookup for a mailbox-specific limit.
+        let (has_multiappend, advertised_limits, allow_literal8) = {
             let snap = self.state_rx.borrow();
             let has_multiappend = snap.capabilities.contains(&Capability::MultiAppend);
-            let append_limit: Option<u64> = snap.capabilities.iter().find_map(|cap| {
-                if let Capability::AppendLimit(Some(limit)) = cap {
-                    Some(*limit)
-                } else {
-                    None
-                }
-            });
+            let advertised_limits = AdvertisedAppendLimits::from_capabilities(&snap.capabilities);
             // RFC 7888 Section 6 / RFC 9051 Section 9: literal8 may use
             // non-synchronizing `+` only when BINARY is advertised AND the
             // connection is NOT pure IMAP4rev2 (rev2 literal8 is always
@@ -190,7 +195,7 @@ impl ImapConnection {
             let allow_literal8 = snap.capabilities.contains(&Capability::Binary)
                 && !super::auth::is_rev2_from_snapshot(&snap);
             drop(snap);
-            (has_multiappend, append_limit, allow_literal8)
+            (has_multiappend, advertised_limits, allow_literal8)
         };
 
         if !has_multiappend {
@@ -203,17 +208,13 @@ impl ImapConnection {
             ));
         }
 
-        // Validate all message sizes up front.
-        // Compare in u64 space to avoid truncating the limit on 32-bit
-        // platforms where usize is 32 bits (RFC 7889 Section5: number64).
-        if let Some(limit) = append_limit {
+        let deadline = tokio::time::Instant::now() + timeout;
+        if let Some(limit) = self
+            .append_limit_from_advertisement(mailbox, advertised_limits, timeout)
+            .await?
+        {
             for msg in messages {
-                if (msg.data.len() as u64) > limit {
-                    return Err(Error::AppendLimit {
-                        size: msg.data.len() as u64,
-                        limit,
-                    });
-                }
+                self.check_append_limit(msg.data.len(), limit)?;
             }
         }
 
@@ -289,7 +290,7 @@ impl ImapConnection {
 
         // Submit the pre-built bytes to the driver task.
         tokio::time::timeout(
-            timeout,
+            remaining_timeout(deadline)?,
             self.submit_prebuilt(
                 buf,
                 tag,
@@ -301,4 +302,113 @@ impl ImapConnection {
         .await
         .map_err(|_| Error::timeout_inflight())?
     }
+
+    /// Resolve the effective APPENDLIMIT for one destination mailbox.
+    ///
+    /// RFC 7889 defines `APPENDLIMIT=<n>` as a global limit and bare
+    /// `APPENDLIMIT` as a request to obtain the mailbox value with STATUS.
+    /// A conforming server advertises one form, but a contradictory capability
+    /// list is handled conservatively: obtain a mailbox value when requested
+    /// and apply the smallest numeric value available.
+    async fn append_limit_for_mailbox(
+        &self,
+        mailbox: &str,
+        timeout: Duration,
+    ) -> Result<Option<u64>, Error> {
+        let advertised = {
+            let snapshot = self.state_rx.borrow();
+            AdvertisedAppendLimits::from_capabilities(&snapshot.capabilities)
+        };
+        self.append_limit_from_advertisement(mailbox, advertised, timeout)
+            .await
+    }
+
+    async fn append_limit_from_advertisement(
+        &self,
+        mailbox: &str,
+        advertised: AdvertisedAppendLimits,
+        timeout: Duration,
+    ) -> Result<Option<u64>, Error> {
+        let mailbox_limit = if advertised.mailbox_specific {
+            // This STATUS is a preflight: the APPEND itself has not been
+            // written, so every failure here is Unsent evidence relative to
+            // the APPEND. Leaving the STATUS attempt state in place would make
+            // a non-idempotent APPEND look uncertain and send recovery down
+            // the reconcile path instead of simply retrying.
+            let status = self
+                .status(mailbox, "APPENDLIMIT", timeout)
+                .await
+                .map_err(unsent_preflight)?;
+            mailbox_append_limit(&status)?
+        } else {
+            None
+        };
+
+        Ok(match (advertised.global, mailbox_limit) {
+            (Some(global), Some(mailbox)) => Some(global.min(mailbox)),
+            (Some(global), None) => Some(global),
+            (None, Some(mailbox)) => Some(mailbox),
+            (None, None) => None,
+        })
+    }
+
+    fn check_append_limit(&self, size: usize, limit: u64) -> Result<(), Error> {
+        let size = u64::try_from(size).unwrap_or(u64::MAX);
+        if size > limit {
+            return Err(Error::AppendLimit { size, limit });
+        }
+        Ok(())
+    }
+}
+
+/// The most restrictive APPENDLIMIT any plausible reply to this STATUS named.
+///
+/// RFC 5465 Section 4: with NOTIFY STATUS active the solicited reply is
+/// wire-identical to a notification, so the heuristic that picked
+/// [`StatusResult::items`] may have picked a stale notification and left the
+/// real answer in [`StatusResult::ambiguous`]. Ignoring `ambiguous` therefore
+/// either invents a protocol error (the answer is there, just not where we
+/// looked) or applies a higher, stale limit. RFC 7889 Section 3.1: an APPEND
+/// over the limit is refused, so the smallest named value is the safe choice.
+///
+/// `None` means "no limit for this mailbox" (an explicit `APPENDLIMIT NIL`),
+/// which is different from the absence of the item altogether: the latter is a
+/// server contradicting its own advertised capability.
+pub(super) fn mailbox_append_limit(status: &StatusResult) -> Result<Option<u64>, Error> {
+    let mut saw_append_limit = false;
+    let mut limit = None;
+    for item in status.items.iter().chain(status.ambiguous.iter().flatten()) {
+        if let StatusItem::AppendLimit(value) = item {
+            saw_append_limit = true;
+            if let Some(value) = *value {
+                limit = Some(limit.map_or(value, |current: u64| current.min(value)));
+            }
+        }
+    }
+    if !saw_append_limit {
+        return Err(Error::Protocol(
+            "APPENDLIMIT capability but STATUS response omitted APPENDLIMIT".into(),
+        ));
+    }
+    Ok(limit)
+}
+
+/// Restamp a preflight failure as `Unsent` relative to the APPEND.
+///
+/// The helper command carries its own transmission evidence, which is about
+/// the helper, not about the APPEND. APPEND is non-idempotent, so publishing
+/// the helper's `InFlight` / `Acknowledged` evidence would make recovery
+/// reconcile a message that was never written.
+fn unsent_preflight(error: Error) -> Error {
+    error.with_attempt(bifrost_types::TransmissionState::Unsent)
+}
+
+/// Time left before the caller's deadline.
+///
+/// Expiry here is still before `submit_prebuilt`, so it is `Unsent`: no APPEND
+/// octet has reached the driver.
+fn remaining_timeout(deadline: tokio::time::Instant) -> Result<Duration, Error> {
+    deadline
+        .checked_duration_since(tokio::time::Instant::now())
+        .ok_or_else(|| Error::timeout().with_attempt(bifrost_types::TransmissionState::Unsent))
 }
