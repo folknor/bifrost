@@ -247,6 +247,29 @@ Surfaced while authoring `reference/error-model.md` (a read of
   cause may match perfectly; the actual fault is the throttle scope.
   Add a dedicated `ThrottleScopeNotApplicable` build-error variant so
   the producer is pointed at the right thing.
+- **types-G2.** (gap, cross-crate prerequisite) `bifrost-types::mime`
+  has no inbound MIME parser: it serializes outgoing RFC 5322 messages
+  only. Every account crate that hydrates a full message therefore has
+  no shared way to turn fetched octets into decoded text, HTML, and
+  attachments. Symptom in bifrost-imap (`account/pim.rs`,
+  `attrs_for_hydration` / `fetch_to_message`): full hydration fetches
+  `BODY[]` and stores the entire raw wire message, lossy-UTF-8 decoded,
+  in `Message::body_text`; `body_html` is always `None` and attachments
+  are always empty, so multipart, base64, and quoted-printable messages
+  surface wire source instead of content. What bifrost-types would need
+  to ship: a parser over raw RFC 5322 octets producing the header set,
+  a decoded part tree (content-type, charset, disposition, filename,
+  cid), transfer-decoding for base64 and quoted-printable, charset
+  decoding to UTF-8, and a text/HTML body selection rule - the inbound
+  mirror of the existing outbound serializer, so IMAP, JMAP, Graph, and
+  Google all decode identically. What was done locally: nothing beyond
+  documenting the defect; the bug is pinned by the bifrost-imap test
+  `full_hydration_puts_the_whole_raw_message_in_body_text`. What remains
+  wrong: full hydration still returns raw source. A narrower
+  `BODY[TEXT]` change would only drop the headers and stay wrong for
+  multipart and transfer encodings, so it was deliberately not taken.
+  Do not build the parser as a side effect of an IMAP fix; it is a
+  shared-crate design item.
 - **types-N3.** (nit) `RequestCause::InvalidArgument` has no distinct
   `AccountErrorKind`: `kind_matches_cause` maps it onto
   `Request(Malformed)`, and message-key / recovery treat it

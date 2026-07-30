@@ -1,8 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use bifrost_types::{
-    AccountStream, BatchFailure, BatchItemId, BatchSuccess, BatchUncertain, HydratedObject,
-    HydratedObjectKind, ItemOutcome, PageBoundary, Projection, SyncEvent,
+    AccountError, AccountErrorBuilder, AccountErrorKind, AccountOperation, AccountStream,
+    BatchFailure, BatchItemId, BatchSuccess, BatchUncertain, Cause, DiagnosticText, HydratedObject,
+    HydratedObjectKind, ItemOutcome, PageBoundary, Projection, Protocol, RequestCause,
+    RequestErrorKind, ResourceKind, SyncEvent,
 };
 use futures::StreamExt;
 
@@ -113,6 +115,69 @@ impl From<crate::Error> for GetError {
     }
 }
 
+fn uidvalidity_changed_error(folder: &MailboxName) -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::Request(RequestErrorKind::Malformed),
+        Cause::Request(RequestCause::Malformed {
+            detail: DiagnosticText::support_only("UIDVALIDITY changed before hydration"),
+        }),
+    )
+    .protocol(Protocol::Imap)
+    .operation(AccountOperation::Hydrate)
+    .scope(bifrost_types::ErrorScope::Mailbox {
+        id: folder.as_str().to_owned(),
+    })
+    .try_build()
+    .expect("valid account error classification")
+}
+
+fn message_not_found_error(id: &DecodedObjectId) -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::NotFound(ResourceKind::Message),
+        Cause::Request(RequestCause::NotFound {
+            what: ResourceKind::Message,
+            id: Some(super::encode_object_id(&id.folder, id.uidvalidity, id.uid).0),
+        }),
+    )
+    .protocol(Protocol::Imap)
+    .operation(AccountOperation::Hydrate)
+    .scope(bifrost_types::ErrorScope::Message {
+        id: super::encode_object_id(&id.folder, id.uidvalidity, id.uid).0,
+    })
+    .try_build()
+    .expect("valid account error classification")
+}
+
+fn failed_hydration(
+    ids: impl IntoIterator<Item = DecodedObjectId>,
+    error: AccountError,
+) -> Vec<ItemOutcome<HydratedObject>> {
+    ids.into_iter()
+        .map(|id| {
+            let item = BatchItemId(super::encode_object_id(&id.folder, id.uidvalidity, id.uid).0);
+            ItemOutcome::Failed(BatchFailure::new(item, error.clone()))
+        })
+        .collect()
+}
+
+/// Publish the stale-UIDVALIDITY failures for a folder. Called before the
+/// hydration FETCH: these outcomes are already known, and holding them until
+/// after a fallible command would lose them whenever that command fails and
+/// the folder collapses into the uncertain lane.
+async fn emit_stale_failures(
+    tx: &tokio::sync::mpsc::Sender<SyncEvent<ItemOutcome<HydratedObject>>>,
+    stale: Vec<DecodedObjectId>,
+    folder: &MailboxName,
+) -> Result<(), GetError> {
+    if stale.is_empty() {
+        return Ok(());
+    }
+    let outcomes = failed_hydration(stale, uidvalidity_changed_error(folder));
+    tx.send(batch(outcomes, PageBoundary::Page, None))
+        .await
+        .map_err(|_| GetError::ChannelDropped)
+}
+
 async fn run_folder_get(
     account: &ImapAccount,
     folder: &MailboxName,
@@ -151,12 +216,18 @@ async fn run_folder_get(
         .mailbox
         .uid_validity
         .ok_or_else(|| crate::Error::Protocol("SELECT missing UIDVALIDITY".into()))?;
-    let valid: Vec<u32> = ids
+    let (valid, stale): (Vec<_>, Vec<_>) = ids
         .into_iter()
-        .filter(|id| id.uidvalidity == uidvalidity)
-        .map(|id| id.uid)
-        .collect();
-    let Some(uid_set) = uid_set_from_u32(&valid) else {
+        .partition(|id| id.uidvalidity == uidvalidity);
+    let requested: Vec<u32> = valid.iter().map(|id| id.uid).collect();
+    let requested_uids: HashSet<u32> = requested.iter().copied().collect();
+    // Stale-UIDVALIDITY failures are known before any wire work, so they are
+    // emitted first. Buffering them behind the FETCH would lose established
+    // per-item truth if that FETCH fails and the folder falls back to the
+    // uncertain lane.
+    emit_stale_failures(tx, stale, folder).await?;
+    let mut out: Vec<ItemOutcome<HydratedObject>> = Vec::with_capacity(BATCH_ITEMS);
+    let Some(uid_set) = uid_set_from_u32(&requested) else {
         return Ok(());
     };
     let include_modseq = selected.mailbox.highest_mod_seq.is_some() && !selected.mailbox.no_mod_seq;
@@ -168,27 +239,64 @@ async fn run_folder_get(
             account.command_timeout(),
         )
         .await?;
-    let mut out: Vec<ItemOutcome<HydratedObject>> = Vec::with_capacity(BATCH_ITEMS);
+    // A server may emit several FETCH responses for one UID: the solicited
+    // one plus unsolicited FLAGS updates that carry none of the requested
+    // data items. Merge them per UID before conversion so a trailing partial
+    // response cannot replace the complete one.
+    let mut fetched_by_uid: HashMap<u32, FetchResponse> = HashMap::new();
     for fetch in fetches {
-        if let (Some(uid), Some(modseq)) = (fetch.uid, fetch.mod_seq) {
+        let Some(uid) = fetch.uid else {
+            continue;
+        };
+        if !requested_uids.contains(&uid) {
+            continue;
+        }
+        if let Some(modseq) = fetch.mod_seq {
             account
                 .folders
                 .record_modseq(folder, uidvalidity, uid, modseq)?;
         }
-        if let Some(object) = fetch_to_hydrated(
-            folder,
-            uidvalidity,
-            fetch,
-            projection,
-            shared_owner.as_ref(),
-        ) {
-            let item = BatchItemId(object.id.0.clone());
-            out.push(ItemOutcome::Succeeded(BatchSuccess::new(item, object)));
-            if out.len() >= BATCH_ITEMS {
-                tx.send(batch(std::mem::take(&mut out), PageBoundary::Page, None))
-                    .await
-                    .map_err(|_| GetError::ChannelDropped)?;
+        match fetched_by_uid.entry(uid) {
+            std::collections::hash_map::Entry::Occupied(mut existing) => {
+                merge_fetch_response(existing.get_mut(), fetch);
             }
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(fetch);
+            }
+        }
+    }
+    let hydrated_by_uid: HashMap<u32, HydratedObject> = fetched_by_uid
+        .into_iter()
+        .filter_map(|(uid, fetch)| {
+            let object = fetch_to_hydrated(
+                folder,
+                uidvalidity,
+                fetch,
+                projection,
+                shared_owner.as_ref(),
+            )?;
+            Some((uid, object))
+        })
+        .collect();
+    for id in valid {
+        match hydrated_by_uid.get(&id.uid).cloned() {
+            Some(object) => {
+                let item = BatchItemId(object.id.0.clone());
+                out.push(ItemOutcome::Succeeded(BatchSuccess::new(item, object)));
+            }
+            None => {
+                let item =
+                    BatchItemId(super::encode_object_id(&id.folder, id.uidvalidity, id.uid).0);
+                out.push(ItemOutcome::Failed(BatchFailure::new(
+                    item,
+                    message_not_found_error(&id),
+                )));
+            }
+        }
+        if out.len() >= BATCH_ITEMS {
+            tx.send(batch(std::mem::take(&mut out), PageBoundary::Page, None))
+                .await
+                .map_err(|_| GetError::ChannelDropped)?;
         }
     }
     if !out.is_empty() {
@@ -270,20 +378,91 @@ fn fetch_to_hydrated(
             fetch,
             shared_owner,
         )),
-        _ => {
-            let bytes = fetch
-                .body_sections
-                .into_iter()
-                .find_map(|section| section.data)
-                .unwrap_or_default();
-            HydratedObjectKind::RawMime(bytes::Bytes::from(bytes))
-        }
+        _ => HydratedObjectKind::RawMime(bytes::Bytes::from(raw_mime_bytes(
+            fetch.body_sections,
+            projection,
+        ))),
     };
     Some(HydratedObject {
         id,
         kind,
         blobs: Vec::new(),
     })
+}
+
+/// Fold a later FETCH response for the same UID into the one already held.
+/// Data items only ever fill gaps: a second response may add `FLAGS` or a
+/// section the first lacked, but it must never blank out data the first
+/// response carried.
+fn merge_fetch_response(existing: &mut FetchResponse, later: FetchResponse) {
+    if later.flags.is_some() {
+        existing.flags = later.flags;
+    }
+    if later.mod_seq.is_some() {
+        existing.mod_seq = later.mod_seq;
+    }
+    if existing.envelope.is_none() {
+        existing.envelope = later.envelope;
+    }
+    if existing.body_structure.is_none() {
+        existing.body_structure = later.body_structure;
+    }
+    if existing.rfc822_size.is_none() {
+        existing.rfc822_size = later.rfc822_size;
+    }
+    if existing.internal_date.is_none() {
+        existing.internal_date = later.internal_date;
+    }
+    if existing.save_date.is_none() {
+        existing.save_date = later.save_date;
+    }
+    for section in later.body_sections {
+        if existing
+            .body_sections
+            .iter()
+            .any(|held| held.section.eq_ignore_ascii_case(&section.section) && held.data.is_some())
+        {
+            continue;
+        }
+        existing
+            .body_sections
+            .retain(|held| !held.section.eq_ignore_ascii_case(&section.section));
+        existing.body_sections.push(section);
+    }
+    for section in later.binary_sections {
+        if existing
+            .binary_sections
+            .iter()
+            .any(|held| held.section == section.section)
+        {
+            continue;
+        }
+        existing.binary_sections.push(section);
+    }
+}
+
+fn raw_mime_bytes(
+    sections: Vec<crate::types::fetch::BodySection>,
+    projection: Projection,
+) -> Vec<u8> {
+    if matches!(projection, Projection::Preview(_)) {
+        let mut header = None;
+        let mut text = None;
+        for section in sections {
+            if section.section.eq_ignore_ascii_case("HEADER") {
+                header = section.data;
+            } else if section.section.eq_ignore_ascii_case("TEXT") {
+                text = section.data;
+            }
+        }
+        let mut bytes = header.unwrap_or_default();
+        bytes.extend(text.unwrap_or_default());
+        return bytes;
+    }
+    sections
+        .into_iter()
+        .find_map(|section| section.data)
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -457,14 +636,8 @@ mod tests {
         }
     }
 
-    // NOTE: this pins CURRENT behavior, which is believed WRONG. A
-    // `Preview` fetch asks for both RFC822.HEADER and a partial
-    // BODY.PEEK[TEXT], but `fetch_to_hydrated` keeps only the FIRST
-    // section that carried data, so the preview text is discarded and the
-    // consumer receives headers labelled as raw MIME. See
-    //
     #[test]
-    fn preview_hydration_keeps_only_the_first_returned_section() {
+    fn preview_hydration_combines_headers_and_preview_text() {
         let fetch = FetchResponse {
             uid: Some(3),
             body_sections: vec![
@@ -485,13 +658,143 @@ mod tests {
             .expect("uid present");
         match object.kind {
             HydratedObjectKind::RawMime(bytes) => {
-                assert_eq!(bytes.as_ref(), &b"Subject: hi\r\n\r\n"[..]);
                 assert!(
-                    !bytes.as_ref().ends_with(&b"preview body"[..]),
-                    "documents the dropped preview text; not an endorsement",
+                    bytes.as_ref().ends_with(b"Subject: hi\r\n\r\npreview body"),
+                    "preview MIME must retain the requested text after its headers",
                 );
             }
             other => panic!("expected RawMime, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unreturned_and_stale_hydration_ids_are_failed() {
+        let stale = DecodedObjectId {
+            folder: folder(),
+            uidvalidity: 8,
+            uid: 2,
+        };
+        let stale = failed_hydration(vec![stale], uidvalidity_changed_error(&folder()));
+        assert!(
+            matches!(stale.as_slice(), [ItemOutcome::Failed(failure)] if matches!(
+                failure.error.kind(),
+                AccountErrorKind::Request(RequestErrorKind::Malformed)
+            ))
+        );
+
+        let missing = DecodedObjectId {
+            folder: folder(),
+            uidvalidity: 9,
+            uid: 3,
+        };
+        let error = message_not_found_error(&missing);
+        assert!(matches!(
+            error.kind(),
+            AccountErrorKind::NotFound(bifrost_types::ResourceKind::Message)
+        ));
+    }
+
+    fn body_section(section: &str, data: &[u8]) -> crate::types::fetch::BodySection {
+        crate::types::fetch::BodySection {
+            section: section.to_owned(),
+            origin: None,
+            data: Some(data.to_vec()),
+        }
+    }
+
+    // A server is free to append an unsolicited FLAGS-only FETCH for a UID
+    // it has already answered fully. Folding it in must not blank the body
+    // that the solicited response carried.
+    #[test]
+    fn trailing_flags_update_does_not_erase_a_complete_hydration() {
+        let mut complete = FetchResponse {
+            uid: Some(7),
+            rfc822_size: Some(120),
+            body_sections: vec![body_section("", b"From: a\r\n\r\nfull body")],
+            ..Default::default()
+        };
+        let trailing = FetchResponse {
+            uid: Some(7),
+            flags: Some(vec![crate::types::Flag::Seen]),
+            mod_seq: Some(42),
+            ..Default::default()
+        };
+        merge_fetch_response(&mut complete, trailing);
+        assert_eq!(complete.mod_seq, Some(42));
+        assert_eq!(complete.rfc822_size, Some(120));
+        assert!(
+            complete
+                .flags
+                .as_ref()
+                .is_some_and(|flags| flags.contains(&crate::types::Flag::Seen)),
+            "the later FLAGS update must be adopted",
+        );
+        let object =
+            fetch_to_hydrated(&folder(), 9, complete, Projection::Full, None).expect("uid present");
+        match object.kind {
+            HydratedObjectKind::RawMime(bytes) => assert_eq!(
+                bytes.as_ref(),
+                &b"From: a\r\n\r\nfull body"[..],
+                "a partial trailing FETCH must not replace the fetched body",
+            ),
+            other => panic!("expected RawMime, got {other:?}"),
+        }
+    }
+
+    // The preview projection spans two sections; a trailing partial response
+    // may add a section but must not overwrite one that already has data.
+    #[test]
+    fn merging_fetches_fills_gaps_without_overwriting_returned_sections() {
+        let mut first = FetchResponse {
+            uid: Some(7),
+            body_sections: vec![body_section("HEADER", b"Subject: hi\r\n\r\n")],
+            ..Default::default()
+        };
+        merge_fetch_response(
+            &mut first,
+            FetchResponse {
+                uid: Some(7),
+                body_sections: vec![
+                    body_section("HEADER", b"Subject: WRONG\r\n\r\n"),
+                    body_section("TEXT", b"preview body"),
+                ],
+                ..Default::default()
+            },
+        );
+        let object = fetch_to_hydrated(&folder(), 9, first, Projection::Preview(16), None)
+            .expect("uid present");
+        match object.kind {
+            HydratedObjectKind::RawMime(bytes) => {
+                assert_eq!(bytes.as_ref(), &b"Subject: hi\r\n\r\npreview body"[..]);
+            }
+            other => panic!("expected RawMime, got {other:?}"),
+        }
+    }
+
+    // Stale-UIDVALIDITY failures are known truth before the FETCH runs. They
+    // must already be on the channel when a later step fails, otherwise the
+    // folder-level error path relabels them uncertain.
+    #[tokio::test]
+    async fn stale_failures_reach_the_consumer_before_the_fetch_can_fail() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let stale = vec![DecodedObjectId {
+            folder: folder(),
+            uidvalidity: 8,
+            uid: 2,
+        }];
+        assert!(emit_stale_failures(&tx, stale, &folder()).await.is_ok());
+        // Simulate the hydration FETCH blowing up after this point.
+        drop(tx);
+        let event = rx.recv().await.expect("stale failures already published");
+        match event {
+            SyncEvent::Batch(batch) => assert!(matches!(
+                batch.items.as_slice(),
+                [ItemOutcome::Failed(failure)] if matches!(
+                    failure.error.kind(),
+                    AccountErrorKind::Request(RequestErrorKind::Malformed)
+                )
+            )),
+            other => panic!("expected a batch, got {other:?}"),
         }
     }
 }

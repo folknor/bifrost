@@ -9,44 +9,6 @@ renumbering.
 
 ## Bugs
 
-### B5 - a partially conflicting `FlagOp::Patch` reports full success for half-applied messages
-
-`account/mutate.rs:apply_patch`.
-
-`FlagOp::Patch { add, remove }` expands into two STORE commands. The
-guarded add command can return tagged OK with `MODIFIED` UIDs, meaning the
-add landed for every non-conflicting UID. `apply_patch` returns early on
-that outcome, so the remove command never runs for those UIDs.
-`mutation_results` then reports the non-conflicting UIDs as
-`Succeeded(Applied)` even though only half of their requested patch
-landed.
-
-The clean fix is to expand patch handling where the requested UID vector
-is available:
-
-1. Run the guarded add against the whole group.
-2. Subtract conflicts with `applied_uids_after_store`.
-3. Run the unguarded remove against the applied subset.
-4. Merge both command outcomes without reporting partial application as
-   success.
-
-The conservative fallback is to report the non-conflicting UIDs as
-`Uncertain`, which at least routes them through engine read-back.
-
-### B8 - `Projection::Preview` returns headers and drops preview text
-
-`account/get.rs:attrs_for_projection` and `fetch_to_hydrated`.
-
-Preview requests `RFC822.HEADER` followed by a partial `BODY[TEXT]`.
-Both decode into `body_sections`, but hydration takes only the first
-section containing data. Servers normally answer in request order, so
-the returned `RawMime` contains headers and no snippet.
-
-The result should combine the returned header and text sections into a
-parseable MIME payload. The existing
-`preview_hydration_keeps_only_the_first_returned_section` test documents
-the current bug.
-
 ### B9 - full hydration puts raw RFC 5322 source into `Message::body_text`
 
 `account/pim.rs:attrs_for_hydration` and `fetch_to_message`.
@@ -57,40 +19,16 @@ lossy UTF-8 string and stores the entire raw message in `body_text`.
 base64, and quoted-printable messages therefore surface wire source
 instead of decoded content.
 
-The correct fix is to parse the fetched octets with the shared
-`bifrost-types::mime` machinery and populate text, HTML, and attachments.
+OPEN, blocked on a cross-crate prerequisite. The correct fix is to parse
+the fetched octets with shared `bifrost-types` MIME machinery and populate
+text, HTML, and attachments; `bifrost-types::mime` only serializes outgoing
+RFC 5322 messages today, so the shared inbound parser/decoder must land
+first. That prerequisite is filed as **types-G2** in `TODO.md` (symptom,
+what bifrost-types must ship, what was done here, what remains wrong).
 A narrower `BODY[TEXT]` change would remove headers but would still be
 wrong for multipart and transfer encodings. The existing
 `full_hydration_puts_the_whole_raw_message_in_body_text` test documents
 the current bug.
-
-### B11 - `get_stream` silently drops stale or missing targets
-
-`account/get.rs:run_folder_get`.
-
-Targets whose UIDVALIDITY differs from the freshly selected mailbox are
-filtered out without any `ItemOutcome`. Requested UIDs that the server
-does not return are also absent from every lane. This violates the
-streaming form of the three-lane accounting contract.
-
-Mirror the mutation path:
-
-- partition stale targets and emit per-item `Failed` outcomes carrying a
-  UIDVALIDITY-changed error;
-- reconcile requested UIDs against returned FETCH data and emit an
-  explicit outcome for missing messages, normally `Failed(NotFound)`.
-
-### B13 - an invalid bulk-move destination is reported `Uncertain`
-
-`account/mutate.rs:run_folder_mutation`.
-
-`MailboxName::new` validates the shared destination inside each
-per-folder operation. An invalid destination escapes through `?`, and
-the outer stream converts the folder error to `Uncertain` even though no
-mutation command was transmitted.
-
-Validate the destination once before the folder loop and emit per-item
-`Failed(Request(Malformed))` for the whole batch on rejection.
 
 ## Gaps and smells
 
@@ -142,13 +80,6 @@ to populate it.
 - a new subscription can start a second IDLE loop while the cancelled
   loop is still unwinding;
 - folder choice comes from HashMap iteration and is nondeterministic.
-
-### G9 - the LIST-STATUS double-strip bug is not reachable from `account/`
-
-`connection/helpers.rs` corrupts the first STATUS item while parsing a
-LIST-STATUS return option. The account layer currently requests only
-`SPECIAL-USE`, so the defect is dormant here. It becomes live if folder
-listing is optimized to use LIST-STATUS.
 
 ### G10 - `encode_blob_id` is test-only while `decode_blob_id` is production
 

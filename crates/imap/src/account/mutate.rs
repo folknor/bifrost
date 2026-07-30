@@ -102,6 +102,25 @@ fn mutation_stream(
             }
         }
 
+        let move_destination = match validated_move_destination(&kind) {
+            Ok(destination) => destination,
+            Err(error) => {
+                let outcomes = grouped
+                    .into_values()
+                    .flat_map(|(_, ids)| failed_all(ids, error.clone()))
+                    .collect();
+                if tx
+                    .send(batch(outcomes, PageBoundary::Page, None))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                let _ = tx.send(SyncEvent::Done(None)).await;
+                return;
+            }
+        };
+
         // Per-folder failure semantics:
         // - A folder error after per-item emissions in any prior folder
         //   must NOT collapse those items by emitting a global
@@ -118,7 +137,15 @@ fn mutation_stream(
         //   server error) emits per-item `Uncertain` for the failing
         //   folder and continues to the next folder.
         for (folder, ids) in sorted_mutation_groups(grouped) {
-            match run_folder_mutation(&account, &folder, ids.clone(), &kind).await {
+            match run_folder_mutation(
+                &account,
+                &folder,
+                ids.clone(),
+                &kind,
+                move_destination.as_ref(),
+            )
+            .await
+            {
                 Ok(results) => {
                     let _ = tx.send(batch(results, PageBoundary::Page, None)).await;
                 }
@@ -158,11 +185,27 @@ fn sorted_mutation_groups(
     grouped
 }
 
+/// Validate a bulk-move destination before opening any source folder. This
+/// is our own request validation, so every submitted target must fail rather
+/// than being labelled uncertain by the per-folder error path.
+fn validated_move_destination(kind: &MutationKind) -> Result<Option<MailboxName>, AccountError> {
+    let MutationKind::Move(destination) = kind else {
+        return Ok(None);
+    };
+    let MembershipScope::Folder(destination) = destination else {
+        return Err(invalid_move_destination_error());
+    };
+    MailboxName::new(destination.0.clone())
+        .map(Some)
+        .map_err(|_| invalid_move_destination_error())
+}
+
 async fn run_folder_mutation(
     account: &ImapAccount,
     folder: &MailboxName,
     ids: Vec<DecodedObjectId>,
     kind: &MutationKind,
+    move_destination: Option<&MailboxName>,
 ) -> Result<Vec<ItemOutcome<MutationSuccess>>, crate::Error> {
     let mut conn = account.checkout_for_folder(folder).await?;
     let cursor = account.folders.get(folder).and_then(|entry| entry.cursor());
@@ -209,19 +252,13 @@ async fn run_folder_mutation(
 
     let outcome = match kind {
         MutationKind::Flags(_) => unreachable!("flags handled above"),
-        MutationKind::Move(destination) => {
-            let folder = if let MembershipScope::Folder(id) = destination {
-                MailboxName::new(id.0.clone()).map_err(crate::Error::from)?
-            } else {
-                return Ok(failed_all(
-                    valid,
-                    super::error::unsupported(AccountOperation::BulkMove),
-                ));
-            };
+        MutationKind::Move(_) => {
+            let destination =
+                move_destination.expect("bulk-move destination validated before folder loop");
             conn.connection()
                 .uid_move_messages(
                     uid_set.as_sequence_set(),
-                    folder.as_str(),
+                    destination.as_str(),
                     account.command_timeout(),
                 )
                 .await
@@ -338,6 +375,28 @@ async fn run_flag_mutation_groups(
         let Some(uid_set) = uid_set_from_u32(&uids) else {
             continue;
         };
+        if let FlagOp::Patch { add, remove } = op
+            && !add.is_empty()
+            && !remove.is_empty()
+        {
+            results.extend(
+                run_patch_mutation_group(
+                    account,
+                    conn,
+                    folder,
+                    uidvalidity,
+                    PatchMutationWork {
+                        ids,
+                        uids: &uids,
+                        add,
+                        remove,
+                        unchanged_since,
+                    },
+                )
+                .await,
+            );
+            continue;
+        }
         let outcome = apply_flag_op(
             conn,
             uid_set.as_sequence_set(),
@@ -370,6 +429,146 @@ async fn run_flag_mutation_groups(
         });
     }
     Ok(results)
+}
+
+/// Apply the two halves of a flag patch with exact per-item accounting.
+/// A guarded add can apply to the non-conflicting subset, so its successful
+/// UIDs must receive the unguarded remove before they can be reported as
+/// `Succeeded(Applied)`.
+struct PatchMutationWork<'a> {
+    ids: Vec<DecodedObjectId>,
+    uids: &'a [u32],
+    add: &'a HashSet<String>,
+    remove: &'a HashSet<String>,
+    unchanged_since: Option<u64>,
+}
+
+async fn run_patch_mutation_group(
+    account: &ImapAccount,
+    conn: &super::PooledConn,
+    folder: &MailboxName,
+    uidvalidity: u32,
+    work: PatchMutationWork<'_>,
+) -> Vec<ItemOutcome<MutationSuccess>> {
+    let set = uid_set_from_u32(work.uids).expect("non-empty UID list has a sequence set");
+    let first = match store_flags(
+        conn,
+        set.as_sequence_set(),
+        StoreOperation::AddSilent,
+        work.add,
+        work.unchanged_since,
+        account.command_timeout(),
+    )
+    .await
+    {
+        Ok(first) => first,
+        // A failure of the first STORE decides only this MODSEQ group. It
+        // must not escape the group loop: outcomes already established for
+        // earlier groups are known truth and may never be downgraded to the
+        // folder-wide uncertain lane.
+        Err(err) => {
+            account
+                .folders
+                .clear_modseqs(folder, uidvalidity, work.uids);
+            return patch_first_store_failure(work.ids, err, folder);
+        }
+    };
+    let applied = applied_uids_after_store(work.uids, &first);
+    account.folders.clear_modseqs(folder, uidvalidity, &applied);
+
+    let second = match uid_set_from_u32(&applied) {
+        Some(set) => store_flags(
+            conn,
+            set.as_sequence_set(),
+            StoreOperation::RemoveSilent,
+            work.remove,
+            None,
+            account.command_timeout(),
+        )
+        .await
+        .map_err(|err| {
+            super::account_error_with(
+                err,
+                super::error::ImapErrorContext::operation(AccountOperation::UpdateFlags)
+                    .with_folder_scope(folder),
+            )
+        }),
+        None => Ok(StoreWireOutcome::Applied),
+    };
+    patch_mutation_results(work.ids, work.uids, first, second, folder)
+}
+
+/// Per-item outcomes for a MODSEQ group whose guarded add STORE errored on
+/// the wire. Scoped to the group's own ids: the surrounding loop keeps the
+/// outcomes it has already established for other groups, matching the
+/// single-outcome-per-id contract the sync engine relies on.
+fn patch_first_store_failure(
+    ids: Vec<DecodedObjectId>,
+    err: crate::Error,
+    folder: &MailboxName,
+) -> Vec<ItemOutcome<MutationSuccess>> {
+    failed_all(
+        ids,
+        super::account_error_with(
+            err,
+            super::error::ImapErrorContext::operation(AccountOperation::UpdateFlags)
+                .with_folder_scope(folder),
+        ),
+    )
+}
+
+fn patch_mutation_results(
+    ids: Vec<DecodedObjectId>,
+    requested_uids: &[u32],
+    first: StoreWireOutcome,
+    second: Result<StoreWireOutcome, AccountError>,
+    folder: &MailboxName,
+) -> Vec<ItemOutcome<MutationSuccess>> {
+    let applied = applied_uids_after_store(requested_uids, &first);
+    let (applied_ids, conflicting_ids) = split_ids_by_uid(ids, &applied);
+    let mut results = match first {
+        StoreWireOutcome::Applied => Vec::new(),
+        StoreWireOutcome::Modified(modified) => mutation_results(
+            conflicting_ids,
+            requested_uids,
+            StoreWireOutcome::Modified(modified),
+            AccountOperation::UpdateFlags,
+            folder,
+        ),
+        outcome @ (StoreWireOutcome::PendingRetry(_) | StoreWireOutcome::Failed) => {
+            return mutation_results(
+                ids_from_parts(applied_ids, conflicting_ids),
+                requested_uids,
+                outcome,
+                AccountOperation::UpdateFlags,
+                folder,
+            );
+        }
+    };
+
+    match second {
+        Ok(StoreWireOutcome::Applied) => results.extend(mutation_results(
+            applied_ids,
+            requested_uids,
+            StoreWireOutcome::Applied,
+            AccountOperation::UpdateFlags,
+            folder,
+        )),
+        Ok(_) => results.extend(uncertain_all(
+            applied_ids,
+            store_failed_error(AccountOperation::UpdateFlags, folder),
+        )),
+        Err(error) => results.extend(uncertain_all(applied_ids, error)),
+    }
+    results
+}
+
+fn ids_from_parts(
+    mut matching: Vec<DecodedObjectId>,
+    mut remaining: Vec<DecodedObjectId>,
+) -> Vec<DecodedObjectId> {
+    matching.append(&mut remaining);
+    matching
 }
 
 fn applied_uids_after_store(requested_uids: &[u32], outcome: &StoreWireOutcome) -> Vec<u32> {
@@ -450,89 +649,35 @@ async fn apply_flag_op(
             )
             .await
         }
-        FlagOp::Patch { add, remove } => {
-            apply_patch(conn, set, add, remove, unchanged_since, timeout).await
+        FlagOp::Patch { add, remove } if add.is_empty() && remove.is_empty() => {
+            Ok(StoreWireOutcome::Applied)
+        }
+        FlagOp::Patch { add, remove } if add.is_empty() => {
+            store_flags(
+                conn,
+                set,
+                StoreOperation::RemoveSilent,
+                remove,
+                unchanged_since,
+                timeout,
+            )
+            .await
+        }
+        FlagOp::Patch { add, remove } if remove.is_empty() => {
+            store_flags(
+                conn,
+                set,
+                StoreOperation::AddSilent,
+                add,
+                unchanged_since,
+                timeout,
+            )
+            .await
+        }
+        FlagOp::Patch { .. } => {
+            unreachable!("two-sided patches are handled with per-UID accounting before this call")
         }
         _ => Err(crate::Error::Protocol("unsupported flag operation".into())),
-    }
-}
-
-/// Apply a `FlagOp::Patch` (independent add + remove sets) as the two
-/// STORE commands IMAP requires (no combined add-and-remove STORE
-/// exists), threading the MODSEQ guard.
-///
-/// The lost-update guard belongs on the *first* command: it is the
-/// checkpoint that proves no concurrent writer touched these messages
-/// since we cached their MODSEQ. If the first STORE rejects with
-/// `UNCHANGEDSINCE` (MODIFIED), the whole patch conflicts and we return
-/// that outcome without running the second command. Once the first STORE
-/// wins the race, the server has bumped each touched message's MODSEQ, so
-/// re-using the original `unchanged_since` on the second command would
-/// spuriously self-conflict on the very UIDs we just changed; the second
-/// command therefore runs unprotected (it is our own follow-up on rows we
-/// now own, equivalent to one logical patch). A patch that only adds or
-/// only removes degenerates to a single guarded STORE.
-async fn apply_patch(
-    conn: &super::PooledConn,
-    set: &crate::types::SequenceSet,
-    add: &HashSet<String>,
-    remove: &HashSet<String>,
-    unchanged_since: Option<u64>,
-    timeout: std::time::Duration,
-) -> Result<StoreWireOutcome, crate::Error> {
-    let has_add = !add.is_empty();
-    let has_remove = !remove.is_empty();
-    match (has_add, has_remove) {
-        (false, false) => Ok(StoreWireOutcome::Applied),
-        (true, false) => {
-            store_flags(
-                conn,
-                set,
-                StoreOperation::AddSilent,
-                add,
-                unchanged_since,
-                timeout,
-            )
-            .await
-        }
-        (false, true) => {
-            store_flags(
-                conn,
-                set,
-                StoreOperation::RemoveSilent,
-                remove,
-                unchanged_since,
-                timeout,
-            )
-            .await
-        }
-        (true, true) => {
-            // First command carries the guard.
-            let first = store_flags(
-                conn,
-                set,
-                StoreOperation::AddSilent,
-                add,
-                unchanged_since,
-                timeout,
-            )
-            .await?;
-            // A guard rejection (or any non-applied outcome) on the first
-            // command means the patch did not fully land; surface it
-            // rather than charging ahead with the second.
-            if !matches!(first, StoreWireOutcome::Applied) {
-                return Ok(first);
-            }
-            store_flags(
-                conn,
-                set,
-                StoreOperation::RemoveSilent,
-                remove,
-                None,
-                timeout,
-            )
-            .await
-        }
     }
 }
 
@@ -661,6 +806,31 @@ fn failed_all(ids: Vec<DecodedObjectId>, error: AccountError) -> Vec<ItemOutcome
             ItemOutcome::Failed(BatchFailure::new(item, error.clone()))
         })
         .collect()
+}
+
+fn uncertain_all(
+    ids: Vec<DecodedObjectId>,
+    error: AccountError,
+) -> Vec<ItemOutcome<MutationSuccess>> {
+    ids.into_iter()
+        .map(|id| {
+            let item = BatchItemId(super::encode_object_id(&id.folder, id.uidvalidity, id.uid).0);
+            ItemOutcome::Uncertain(BatchUncertain::new(item, error.clone()))
+        })
+        .collect()
+}
+
+fn invalid_move_destination_error() -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::Request(RequestErrorKind::Malformed),
+        Cause::Request(RequestCause::Malformed {
+            detail: DiagnosticText::support_only("bulk-move destination is not a sendable mailbox"),
+        }),
+    )
+    .protocol(Protocol::Imap)
+    .operation(AccountOperation::BulkMove)
+    .try_build()
+    .expect("valid account error classification")
 }
 
 /// Build a `ConcurrencyConflict` `AccountError` for STORE UNCHANGEDSINCE
@@ -1006,6 +1176,121 @@ mod tests {
                 .count(),
             2,
         );
+    }
+
+    #[test]
+    fn partially_conflicting_patch_only_succeeds_after_the_remove_lands() {
+        let outcomes = patch_mutation_results(
+            ids(&[1, 2, 3]),
+            &[1, 2, 3],
+            StoreWireOutcome::Modified(vec![2]),
+            Ok(StoreWireOutcome::Applied),
+            &folder(),
+        );
+        assert_eq!(outcomes.len(), 3);
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, ItemOutcome::Succeeded(_)))
+                .count(),
+            2,
+            "only the add-applied subset may succeed after the remove does too",
+        );
+        assert!(outcomes.iter().any(|outcome| {
+            matches!(outcome, ItemOutcome::Failed(failure) if matches!(
+                failure.error.kind(),
+                AccountErrorKind::ConcurrencyConflict
+            ))
+        }));
+    }
+
+    #[test]
+    fn failed_second_half_of_a_partially_applied_patch_is_uncertain() {
+        let outcomes = patch_mutation_results(
+            ids(&[1, 2]),
+            &[1, 2],
+            StoreWireOutcome::Modified(vec![2]),
+            Err(store_failed_error(AccountOperation::UpdateFlags, &folder())),
+            &folder(),
+        );
+        assert!(
+            outcomes
+                .iter()
+                .any(|outcome| matches!(outcome, ItemOutcome::Uncertain(_)))
+        );
+        assert!(outcomes.iter().any(|outcome| {
+            matches!(outcome, ItemOutcome::Failed(failure) if matches!(
+                failure.error.kind(),
+                AccountErrorKind::ConcurrencyConflict
+            ))
+        }));
+        assert!(
+            outcomes
+                .iter()
+                .all(|outcome| !matches!(outcome, ItemOutcome::Succeeded(_))),
+            "a failed remove after a successful add must not claim a complete patch",
+        );
+    }
+
+    // A wire error on the first STORE of a two-sided patch decides only the
+    // MODSEQ group it belongs to. Earlier groups already carry known
+    // outcomes, and known truth must never be downgraded by a later failure.
+    #[test]
+    fn first_store_error_in_a_patch_group_keeps_earlier_group_outcomes() {
+        let mut results = patch_mutation_results(
+            ids(&[1, 2]),
+            &[1, 2],
+            StoreWireOutcome::Applied,
+            Ok(StoreWireOutcome::Applied),
+            &folder(),
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|outcome| matches!(outcome, ItemOutcome::Succeeded(_)))
+                .count(),
+            2,
+        );
+        results.extend(patch_first_store_failure(
+            ids(&[5]),
+            crate::Error::Protocol("STORE never answered".into()),
+            &folder(),
+        ));
+        assert_eq!(results.len(), 3);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|outcome| matches!(outcome, ItemOutcome::Succeeded(_)))
+                .count(),
+            2,
+            "the failing group must not erase outcomes proven for other groups",
+        );
+        let failed: Vec<&BatchFailure> = results
+            .iter()
+            .filter_map(|outcome| match outcome {
+                ItemOutcome::Failed(failure) => Some(failure),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(
+            failed[0].item,
+            BatchItemId(super::super::encode_object_id(&folder(), 7, 5).0),
+            "only the failing group's id may carry the failure",
+        );
+    }
+
+    #[test]
+    fn invalid_bulk_move_destination_is_rejected_before_folder_work() {
+        let kind = MutationKind::Move(MembershipScope::Folder(bifrost_types::FolderId(
+            "IN\r\nBOX".to_owned(),
+        )));
+        let err = validated_move_destination(&kind).expect_err("CRLF cannot be sent as a mailbox");
+        assert!(matches!(
+            err.kind(),
+            AccountErrorKind::Request(RequestErrorKind::Malformed)
+        ));
+        assert_eq!(err.operation(), Some(AccountOperation::BulkMove));
     }
 
     #[test]
