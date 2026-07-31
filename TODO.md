@@ -412,6 +412,31 @@ any item; some may already be obsolete.
      not yet ruled.
   3. Keep open as a guard against a future `ReconcileAction` variant.
 
+  RULED AND DONE (2026-07-31): option 2, in the form that actually carries
+  the weight. Re-verified first - the two producers are still the only ones
+  (`recovery.rs:721` partial-response and `recovery.rs:751` transport drop;
+  the third `RecoveryClass::Reconcile` hit in that file is a test), and the
+  engine loop at `engine.rs:1238` is unchanged.
+
+  The test landed in `bifrost-types`, not `bifrost-sync`, because the
+  load-bearing claim is a PRODUCER invariant: every producible
+  `ReconcileAdvice` contains `CheckTarget`. That invariant is what makes the
+  engine's unconditional `PendingReadback` correct, and since `try_build`
+  always routes through `derive` and producers cannot set `RecoveryClass`
+  directly, pinning both `derive` arms pins the entire producible space.
+  `every_producible_reconcile_requests_check_target` asserts both arms carry
+  `CheckTarget` and that the partial-response arm is what makes
+  `DedupeByClientId` reachable at all. Verified sensitive by dropping
+  `CheckTarget` from that arm and confirming the failure.
+
+  The engine half (drive a real mutation and observe the queue plus the
+  warning) was NOT built: it needs an attached account and a failing
+  non-idempotent mutation, and it would be pinning a behaviour that is only
+  correct BECAUSE of the producer invariant now pinned above. Worth adding
+  if the mutation-loop harness ever grows for another reason.
+
+  Point 3 stands as filed and still belongs to sync-N1, not here.
+
   On 3: `ReconcileAction` is `#[non_exhaustive]` and the match at
   `engine.rs:1244` ends in `_ => {}`, so a new variant is silently ignored
   here. That is a real concern but it is the same shape as sync-N1
@@ -642,17 +667,35 @@ blocking; each is a real defect or a real decision, not a cleanup.
      though the engine still holds them. The consumer's only opportunity
      to do the job the contract assigns them ends at detach, with nothing
      enforcing or signalling that.
-  2. The registry records OUTLIVE the account. `detach` never touches
-     `self.subscriptions`; `take` is called only by `unsubscribe_push` and
-     `replace` only by the reopen path, so nothing prunes on detach.
-     Re-attaching the same `AccountId` finds the previous incarnation's
-     records still present, so a later `unsubscribe_push` or reopen
-     operates on handles minted by a dead connection. This one looks like
-     a plain defect rather than a contract question - it is wrong under
-     every option below - but it has not been ruled either, so it is
-     recorded, not fixed.
+  2. FIXED (2026-07-31). The registry records used to OUTLIVE the account:
+     `detach` forgot the sink, the scheduler budget, the backfill registry,
+     throttles, and the bandwidth meter, but never touched
+     `self.subscriptions`, so re-attaching the same `AccountId` inherited
+     the previous incarnation's handles and a later `unsubscribe_push` or
+     reopen would present handles minted by a dead connection to the
+     provider as though they were live. Fixed independently of the contract
+     question, because it was wrong under every option below. `detach` now
+     takes the records; dropping loses nothing retryable, since after
+     detach `unsubscribe_push` rejects with `AccountNotAttached` and reopen
+     only runs on an attached slot, so nothing could reach them anyway.
+     Pinned by
+     `detach_drops_push_records_so_a_reattach_cannot_reuse_dead_handles`,
+     which reproduces the original defect when the fix is reverted.
 
-  Options considered, stated neutrally:
+     Option D also landed in its low-cost form: a detach with records still
+     registered logs on `bifrost.sync.push` rather than absorbing the case,
+     since it means `unsubscribe_push` was never called and the provider
+     will hold live subscriptions until its own expiry. A structured
+     `Warning` was NOT used - detach has already torn the account's change
+     stream down, so there is no lane left to carry one.
+
+     Still UNRULED, and untouched by this: whether the shared contract
+     should keep placing server-side teardown on the consumer at all
+     (options A-D below). The fix above is pure hygiene and forecloses
+     none of them.
+
+  Options considered, stated neutrally (A is now DONE; B/C remain open,
+  and D landed as a log line rather than a typed warning):
   - **A** Hygiene only: `detach` clears the registry, and the window is
     documented explicitly. Fixes (2), leaves the contract alone.
   - **B** `detach` always tears down. Fixes both. Argument against: push
@@ -670,10 +713,9 @@ blocking; each is a real defect or a real decision, not a cleanup.
   asks. That was disputed and is NOT settled - re-derive the choice rather
   than inheriting it.
 
-  Whichever option lands should also add a note to `reference/sync.md`
-  disambiguating the two entry points above; anyone reading the teardown
-  path meets both names and has no way to tell whether the difference is
-  meaningful.
+  The `reference/sync.md` note disambiguating the two entry points is
+  DONE (2026-07-31), under "Push reconciler", alongside the detach
+  semantics above.
 
 - **xc-3 (net + graph, related in jmap)** RESOLVED on the net side
   (2026-07-31). `bifrost-net` now publishes the wire seam under a

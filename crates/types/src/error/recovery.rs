@@ -1207,6 +1207,71 @@ mod tests {
         );
     }
 
+    /// Every `Reconcile` the mapping can produce carries `CheckTarget`.
+    ///
+    /// `bifrost-sync`'s mutation loop queues `PendingReadback` for every
+    /// unresolved id on ANY reconcile advice, consulting the action list
+    /// only to decide whether to ALSO warn about dedupe. That is correct
+    /// exactly as long as this holds: the read-back guard IS the target
+    /// probe, so a reconcile that did not ask for `CheckTarget` would be
+    /// getting a probe it never requested.
+    ///
+    /// Producers cannot set `RecoveryClass` directly - `try_build` always
+    /// routes through `derive` - so pinning both arms here pins the whole
+    /// producible space. A new `Reconcile` arm that omits `CheckTarget`
+    /// breaks this test rather than silently changing engine behaviour.
+    #[test]
+    fn every_producible_reconcile_requests_check_target() {
+        // Arm 1: transport drop after send, non-idempotent op.
+        let transport_drop = derive(
+            &AccountErrorKind::Transport(super::super::kind::TransportErrorKind::Network),
+            None,
+            Some(AccountOperation::Send),
+            &transport_chain(TransmissionState::InFlight),
+            None,
+            None,
+        );
+        // Arm 2: partial-response signal, non-idempotent op. The only arm
+        // that also asks for dedupe-by-client-id.
+        let partial = derive(
+            &AccountErrorKind::Protocol(ProtocolErrorKind::PartialResponse),
+            None,
+            Some(AccountOperation::Send),
+            &chain(Cause::Wire(crate::error::WireCause::Jmap(
+                crate::error::JmapMethod::ServerPartialFail,
+            ))),
+            None,
+            None,
+        );
+
+        for recovery in [&transport_drop, &partial] {
+            let RecoveryClass::Reconcile(advice) = recovery else {
+                panic!("expected Reconcile, got {recovery:?}");
+            };
+            assert!(
+                advice
+                    .guidance
+                    .actions
+                    .contains(&ReconcileAction::CheckTarget),
+                "reconcile advice must request CheckTarget: {advice:?}"
+            );
+        }
+
+        // The dedupe action is reachable, and only alongside CheckTarget -
+        // so the engine's warn-and-still-queue behaviour is right, not an
+        // over-reach.
+        let RecoveryClass::Reconcile(advice) = &partial else {
+            panic!("expected Reconcile");
+        };
+        assert!(
+            advice
+                .guidance
+                .actions
+                .contains(&ReconcileAction::DedupeByClientId),
+            "the partial-response arm is what makes DedupeByClientId reachable"
+        );
+    }
+
     #[test]
     fn engine_directives_preserve_state_payloads() {
         let downgrade = derive(

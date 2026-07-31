@@ -526,6 +526,32 @@ Graph and IMAP - or resurrect records the consumer just tore down.
 The lock means both calls queue behind an in-flight reopen (including
 one queued behind a pause) rather than racing it.
 
+Two entry points sit one layer apart and their names read as near
+anagrams of each other, so it is worth naming the difference:
+`Account::push_unsubscribe(handle)` is the protocol-crate trait method
+and destroys ONE subscription; `SyncEngine::unsubscribe_push(account)`
+is the engine method that takes the account's registry records and
+calls the trait method once per record. An application holds an engine,
+not an `Account`, so an application calls the second.
+
+`detach` drops the detaching incarnation's registry records. The handles
+in the registry are connection-local on Graph and IMAP, so carrying them
+across a detach would let a later attach of the same `AccountId` inherit
+handles minted by a dead connection and present them to the provider as
+live. Dropping loses nothing retryable: after detach, `unsubscribe_push`
+rejects with `AccountNotAttached` and reopen only runs on an attached
+slot, so nothing could have reached those records anyway.
+
+Detach is therefore the last point at which server-side teardown is
+possible, and it deliberately does NOT perform it - the contract leaves
+that with the consumer, because push delivers to a consumer-owned
+endpoint and an application that shuts down wanting events to queue for
+its next start is a legitimate pattern that unconditional teardown would
+break silently. A detach with records still registered means
+`unsubscribe_push` was never called, so the provider holds live
+subscriptions until it expires them itself (24h for Graph); that case is
+logged on `bifrost.sync.push` rather than absorbed.
+
 ## Mutation pipeline
 
 `bulk_set_flags` flow:

@@ -844,7 +844,16 @@ impl SyncEngine {
     /// aborts workers within `detach_timeout`, closes the live account,
     /// and removes engine registrations. It does not wait for a
     /// consumer-acked safe boundary and does not destroy server-side
-    /// push subscriptions; call `unsubscribe_push` first for that.
+    /// push subscriptions; call [`Self::unsubscribe_push`] first for that.
+    ///
+    /// Detach is the LAST point at which that call is possible: it drops
+    /// this incarnation's push registry records, and afterwards
+    /// `unsubscribe_push` rejects with `AccountNotAttached`. Records still
+    /// present at detach are logged as stranded rather than torn down,
+    /// because the contract places the teardown decision with the
+    /// consumer. Push delivers to a consumer-owned endpoint, so an app
+    /// that wants events to queue while it is down is a legitimate
+    /// pattern that unconditional teardown would break silently.
     pub async fn detach(&self, account_id: &AccountId) -> Result<(), Error> {
         let Some((_, slot)) = self.accounts.remove(account_id) else {
             return Err(Error::AccountNotAttached(account_id.clone()));
@@ -888,6 +897,35 @@ impl SyncEngine {
         let current = slot.current.load_full();
         if let Err(e) = current.close().await {
             tracing::warn!(target: "bifrost.sync.changes", error=?e, "account close failed");
+        }
+        // Drop the push registry records for this incarnation.
+        //
+        // Nothing can reach them after this point - `unsubscribe_push`
+        // rejects with `AccountNotAttached` and reopen only runs on an
+        // attached slot - so leaving them behind does not preserve a
+        // teardown opportunity; it only means a later attach of the same
+        // `AccountId` inherits handles minted by a dead connection and
+        // hands them to the provider as if they were live. A handle whose
+        // connection is gone is not retryable, so dropping is strictly
+        // better than carrying.
+        //
+        // This does NOT delete the server-side subscriptions: per
+        // `reference/types.md` that stays the consumer's job via
+        // `SyncEngine::unsubscribe_push` BEFORE detach. Records still
+        // present here mean that call never happened, so the provider will
+        // hold live subscriptions until it expires them on its own
+        // schedule (24h for Graph). That is a consumer bug the contract
+        // cannot prevent, so it is reported rather than silently absorbed.
+        let stranded = self.subscriptions.take(account_id);
+        if !stranded.is_empty() {
+            tracing::warn!(
+                target: "bifrost.sync.push",
+                account = ?account_id,
+                count = stranded.len(),
+                "detached with live push subscriptions still registered; call \
+                 SyncEngine::unsubscribe_push before detach or the provider \
+                 keeps delivering until they expire",
+            );
         }
         self.sink.unregister(account_id);
         self.scheduler.budget().forget(account_id);

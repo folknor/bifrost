@@ -1270,6 +1270,77 @@ async fn reopen_refreshes_topology_subscriptions_and_lifecycle_handle() {
     );
 }
 
+/// Detach must drop this incarnation's push registry records.
+///
+/// The registry is per-engine and keyed by `AccountId`, but the handles in
+/// it belong to one connection. `detach` used to forget the sink, the
+/// budget, the backfill registry, throttles, and the bandwidth meter while
+/// leaving `subscriptions` untouched, so re-attaching the same id inherited
+/// the previous incarnation's handles and would hand them to the provider
+/// as though they were live.
+///
+/// Observed through `unsubscribed`: after a detach and a fresh attach, a
+/// teardown must find nothing to tear down. Nothing here asserts that the
+/// SERVER-side subscription was deleted - it deliberately is not, since
+/// that stays the consumer's job via `unsubscribe_push` BEFORE detach.
+#[tokio::test]
+async fn detach_drops_push_records_so_a_reattach_cannot_reuse_dead_handles() {
+    let account_id = AccountId("detach-clears-registry".to_owned());
+    let scope = CursorScope::Account;
+    let subscribed = Arc::new(Mutex::new(Vec::new()));
+    let unsubscribed = Arc::new(Mutex::new(Vec::new()));
+    let factory = Arc::new(RotatingFactory {
+        scopes: Mutex::new(VecDeque::from([vec![scope.clone()], vec![scope.clone()]])),
+        established: Arc::new(Mutex::new(Vec::new())),
+        closed: Arc::new(AtomicUsize::new(0)),
+        closed_generations: Arc::new(Mutex::new(Vec::new())),
+        subscribed: Arc::clone(&subscribed),
+        unsubscribed: Arc::clone(&unsubscribed),
+        unsubscribe_failures: Arc::new(AtomicUsize::new(0)),
+        lifecycle_calls: Arc::new(Mutex::new(Vec::new())),
+        opens: AtomicUsize::new(0),
+    });
+    let engine = SyncEngine::builder()
+        .checkpoints(Arc::new(InMemoryCheckpointStore::new()) as Arc<dyn CheckpointStore>)
+        .build()
+        .expect("default engine config is valid");
+    let factory_trait: Arc<dyn AccountFactory> = Arc::clone(&factory) as Arc<dyn AccountFactory>;
+
+    engine
+        .attach(account_id.clone(), Arc::clone(&factory_trait))
+        .await
+        .expect("initial attach");
+    engine
+        .subscribe_push(&account_id, std::slice::from_ref(&scope))
+        .await
+        .expect("push subscription");
+    assert_eq!(
+        subscribed.lock().expect("subscribed lock").len(),
+        1,
+        "the subscription must actually register, or the test proves nothing"
+    );
+
+    // Detach WITHOUT unsubscribing - the case the contract warns about.
+    engine.detach(&account_id).await.expect("detach");
+
+    engine
+        .attach(account_id.clone(), factory_trait)
+        .await
+        .expect("reattach under the same id");
+    engine
+        .unsubscribe_push(&account_id)
+        .await
+        .expect("teardown on the fresh incarnation");
+
+    assert!(
+        unsubscribed.lock().expect("unsubscribed lock").is_empty(),
+        "a reattached account must not inherit the previous incarnation's \
+         handles; tearing one down targets a connection that is gone"
+    );
+
+    engine.detach(&account_id).await.expect("final detach");
+}
+
 #[tokio::test]
 async fn reopen_waits_for_resume_without_opening_during_pause() {
     let account_id = AccountId("paused-reopen".to_owned());
