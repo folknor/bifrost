@@ -401,6 +401,406 @@ mod tests {
         }
     }
 
+    /// A JMAP HTTP boundary that records every request and answers any
+    /// `*/changes` call with an empty, terminal change page echoing the
+    /// method name and call id it was asked for. Enough to observe WHICH
+    /// method a cursor scope routed to without pinning any payload.
+    struct RecordingTransport {
+        requests: RequestLog,
+    }
+
+    /// Shared handle on the recorded requests. The transport is moved
+    /// into the client, so the log has to be held separately.
+    #[derive(Clone)]
+    struct RequestLog(std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>);
+
+    impl RequestLog {
+        fn new() -> Self {
+            Self(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())))
+        }
+
+        fn methods(&self) -> Vec<String> {
+            self.0
+                .lock()
+                .expect("recorded requests")
+                .iter()
+                .flat_map(|request| {
+                    request["methodCalls"]
+                        .as_array()
+                        .expect("methodCalls array")
+                        .iter()
+                        .map(|call| call[0].as_str().expect("method name").to_string())
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        }
+
+        fn account_ids(&self) -> Vec<String> {
+            self.0
+                .lock()
+                .expect("recorded requests")
+                .iter()
+                .flat_map(|request| {
+                    request["methodCalls"]
+                        .as_array()
+                        .expect("methodCalls array")
+                        .iter()
+                        .map(|call| call[1]["accountId"].as_str().unwrap_or("").to_string())
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        }
+
+        fn push(&self, request: serde_json::Value) {
+            self.0.lock().expect("recorded requests").push(request);
+        }
+    }
+
+    impl RecordingTransport {
+        fn reply(
+            &self,
+            body: Vec<u8>,
+        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+            let request: serde_json::Value = serde_json::from_slice(&body).map_err(|error| {
+                crate::core::transport::TransportError::with_source(
+                    "JMAP client emitted a non-JSON API request",
+                    error,
+                )
+            })?;
+            let call = request["methodCalls"][0].clone();
+            self.requests.push(request);
+            let name = call[0]
+                .as_str()
+                .unwrap_or_else(|| panic!("request has no method name: {call}"))
+                .to_string();
+            let call_id = call[2]
+                .as_str()
+                .unwrap_or_else(|| panic!("request has no call id: {call}"))
+                .to_string();
+            let account_id = call[1]["accountId"].clone();
+            let since = call[1]["sinceState"].clone();
+            let response = serde_json::json!({
+                "sessionState": "session-1",
+                "methodResponses": [[
+                    name,
+                    {
+                        "accountId": account_id,
+                        "oldState": since,
+                        "newState": "state-2",
+                        "hasMoreChanges": false,
+                        "created": [],
+                        "updated": [],
+                        "destroyed": []
+                    },
+                    call_id
+                ]]
+            });
+            Ok(bytes::Bytes::from(response.to_string()))
+        }
+    }
+
+    impl HttpTransport for RecordingTransport {
+        async fn api_request(
+            &self,
+            _url: &str,
+            body: Vec<u8>,
+        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+            self.reply(body)
+        }
+
+        async fn upload(
+            &self,
+            _url: &str,
+            _body: Vec<u8>,
+            _content_type: Option<&str>,
+        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+            Err(crate::core::transport::TransportError::new(
+                "no upload reply",
+            ))
+        }
+
+        async fn download(
+            &self,
+            _url: &str,
+        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+            Err(crate::core::transport::TransportError::new(
+                "no download reply",
+            ))
+        }
+
+        async fn get_session(
+            &self,
+            _url: &str,
+        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+            Err(crate::core::transport::TransportError::new(
+                "no session reply",
+            ))
+        }
+    }
+
+    fn test_session() -> crate::core::session::Session {
+        serde_json::from_value(serde_json::json!({
+            "capabilities": {
+                "urn:ietf:params:jmap:core": {
+                    "maxSizeUpload": 1000,
+                    "maxConcurrentUpload": 2,
+                    "maxSizeRequest": 100_000,
+                    "maxConcurrentRequests": 4,
+                    "maxCallsInRequest": 8,
+                    "maxObjectsInGet": 256,
+                    "maxObjectsInSet": 256,
+                    "collationAlgorithms": []
+                },
+                "urn:ietf:params:jmap:mail": {}
+            },
+            "accounts": {
+                "primary": {"name": "Primary", "isPersonal": true, "isReadOnly": false, "accountCapabilities": {"urn:ietf:params:jmap:mail": {}}},
+                "shared": {"name": "Shared", "isPersonal": false, "isReadOnly": false, "accountCapabilities": {"urn:ietf:params:jmap:mail": {}}}
+            },
+            "primaryAccounts": {"urn:ietf:params:jmap:mail": "primary"},
+            "username": "user@example.test",
+            "apiUrl": "https://example.test/jmap/api",
+            "downloadUrl": "https://example.test/download/{accountId}/{blobId}/{name}/{type}",
+            "uploadUrl": "https://example.test/upload/{accountId}",
+            "eventSourceUrl": "https://example.test/eventsource",
+            "state": "session-1"
+        }))
+        .expect("test session parses")
+    }
+
+    fn limits() -> CoreLimits {
+        CoreLimits {
+            max_objects_in_get: 256,
+            max_objects_in_set: 256,
+        }
+    }
+
+    fn empty_states() -> StateMap {
+        std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()))
+    }
+
+    /// Drive `stream` to exhaustion against a recording transport and
+    /// return the events plus the request log.
+    async fn drive(
+        account_id: &str,
+        cursor: ChangeCursor,
+        owner: Option<TypesMailboxId>,
+    ) -> (Vec<SyncEvent<Change>>, RequestLog) {
+        let log = RequestLog::new();
+        let client = crate::client::Client::with_transport(
+            RecordingTransport {
+                requests: log.clone(),
+            },
+            test_session(),
+            "https://example.test/.well-known/jmap",
+        )
+        .expect("client builds");
+        let mail = crate::account::Account::new(client, account_id);
+        let events = stream(
+            mail,
+            account_id.to_string(),
+            limits(),
+            cursor,
+            owner,
+            empty_states(),
+            empty_states(),
+        )
+        .collect::<Vec<_>>()
+        .await;
+        (events, log)
+    }
+
+    /// The scope-to-method dispatch table. A cursor scope selects the
+    /// JMAP method the change loop polls, and getting this wrong is
+    /// silent: a Mailbox scope answered by `Email/changes` would emit
+    /// message ids as container changes. The foreign `Folder` scope is
+    /// the one that is NOT self-evident - it is a mailbox-shaped scope
+    /// that must poll `Email/changes` against the OWNING account.
+    #[tokio::test]
+    async fn each_cursor_scope_polls_its_own_jmap_method() {
+        for (account_id, scope, method, owner) in [
+            (
+                "primary",
+                CursorScope::Type(bifrost_types::ObjectType::Email),
+                "Email/changes",
+                None,
+            ),
+            (
+                "primary",
+                CursorScope::Type(bifrost_types::ObjectType::Mailbox),
+                "Mailbox/changes",
+                None,
+            ),
+            (
+                "shared",
+                CursorScope::Folder(super::super::foreign::encode_foreign_account("shared")),
+                "Email/changes",
+                Some(TypesMailboxId("shared".to_string())),
+            ),
+            (
+                "shared",
+                CursorScope::Folder(super::super::foreign::encode_foreign("shared", "mbx-1")),
+                "Email/changes",
+                Some(TypesMailboxId("shared".to_string())),
+            ),
+        ] {
+            let cursor = state::cursor_for_scope(scope.clone(), "state-1").expect("scope encodes");
+            let (events, log) = drive(account_id, cursor, owner).await;
+
+            assert_eq!(log.methods(), vec![method.to_string()], "{scope:?}");
+            assert_eq!(
+                log.account_ids(),
+                vec![account_id.to_string()],
+                "{scope:?}: the poll must address the scope's own account"
+            );
+            // One page, then a terminal Done carrying the advanced cursor.
+            assert!(
+                matches!(events.first(), Some(SyncEvent::Batch(_))),
+                "{scope:?}: expected a Batch, got {:?}",
+                events.first()
+            );
+            match events.last() {
+                Some(SyncEvent::Done(Some(Checkpoint::Change(cursor)))) => {
+                    assert_eq!(cursor.scope, scope, "checkpoint keeps its scope");
+                    let (_, state_string) =
+                        state::decode_cursor(cursor).expect("checkpoint decodes");
+                    assert_eq!(state_string, "state-2", "checkpoint advances");
+                }
+                other => panic!("{scope:?}: expected a terminal Done, got {other:?}"),
+            }
+        }
+    }
+
+    /// The two scopes the v1 contract decodes but does not drive.
+    /// Both must terminate before a request is built - an unfiltered
+    /// `Email/queryChanges` would return the whole account mislabelled
+    /// as one query's result set.
+    #[tokio::test]
+    async fn undriven_scopes_terminate_without_touching_the_wire() {
+        for scope in [
+            CursorScope::Type(bifrost_types::ObjectType::Thread),
+            CursorScope::Query(bifrost_types::QueryId("unread-in-inbox".to_string())),
+        ] {
+            let cursor = state::cursor_for_scope(scope.clone(), "state-1").expect("scope encodes");
+            let (events, log) = drive("primary", cursor, None).await;
+
+            assert!(
+                log.methods().is_empty(),
+                "{scope:?}: no request may be sent"
+            );
+            match events.as_slice() {
+                [SyncEvent::Terminated(err)] => {
+                    assert_eq!(
+                        err.kind(),
+                        &bifrost_types::AccountErrorKind::Unsupported(
+                            bifrost_types::AccountOperation::SyncChanges
+                        ),
+                        "{scope:?}"
+                    );
+                    assert_eq!(
+                        err.scope(),
+                        Some(&bifrost_types::ErrorScope::Cursor(scope.clone()))
+                    );
+                }
+                other => panic!("{scope:?}: expected one Terminated, got {other:?}"),
+            }
+        }
+    }
+
+    /// A durable cursor row this build cannot read is schema drift: the
+    /// engine clears schema-versioned state account-wide and reseeds
+    /// through inventory. Both directions count - an envelope from an
+    /// older build (whose foreign thread ids were minted bare) and one
+    /// from a newer build.
+    #[tokio::test]
+    async fn an_unreadable_cursor_envelope_clears_the_schema() {
+        for version in [1, state::ENVELOPE_VERSION_V2 + 1] {
+            let scope = CursorScope::Type(bifrost_types::ObjectType::Email);
+            let mut cursor =
+                state::cursor_for_scope(scope.clone(), "state-1").expect("scope encodes");
+            cursor.server_state.envelope_version = version;
+
+            let (events, log) = drive("primary", cursor, None).await;
+            assert!(log.methods().is_empty(), "envelope {version}");
+            match events.as_slice() {
+                [SyncEvent::Terminated(err)] => {
+                    assert_eq!(
+                        err.kind(),
+                        &bifrost_types::AccountErrorKind::SyncState(
+                            bifrost_types::SyncStateErrorKind::SchemaIncompatible
+                        ),
+                        "envelope {version}"
+                    );
+                    assert_eq!(
+                        err.recovery(),
+                        &bifrost_types::RecoveryClass::Engine(
+                            bifrost_types::EngineDirective::SchemaIncompatible
+                        ),
+                        "envelope {version}"
+                    );
+                }
+                other => panic!("envelope {version}: expected one Terminated, got {other:?}"),
+            }
+        }
+    }
+
+    /// A row that is readable but MIS-KEYED - tagged with another
+    /// protocol, or whose payload scope disagrees with the scope it rode
+    /// in on - is a store bug, not schema drift. Paying the account-wide
+    /// schema clear for it would re-hydrate everything to heal one bad
+    /// row, so it restarts just that scope instead.
+    #[tokio::test]
+    async fn a_mis_keyed_cursor_row_restarts_only_its_own_scope() {
+        let scope = CursorScope::Type(bifrost_types::ObjectType::Email);
+        let good = state::cursor_for_scope(scope.clone(), "state-1").expect("scope encodes");
+
+        let foreign_protocol = ChangeCursor {
+            scope: scope.clone(),
+            server_state: bifrost_types::OpaqueChangeState {
+                protocol: bifrost_types::ProtocolKind::Gmail,
+                envelope_version: state::ENVELOPE_VERSION_V2,
+                bytes: good.server_state.bytes.clone(),
+            },
+            advanced_through: None,
+            envelope_version: state::CHANGE_CURSOR_ENVELOPE_VERSION,
+        };
+        // Same payload, but the row is filed under a different scope.
+        let crossed = ChangeCursor {
+            scope: CursorScope::Type(bifrost_types::ObjectType::Mailbox),
+            server_state: good.server_state.clone(),
+            advanced_through: None,
+            envelope_version: state::CHANGE_CURSOR_ENVELOPE_VERSION,
+        };
+
+        for (label, cursor) in [
+            ("wrong protocol", foreign_protocol),
+            ("scope mismatch", crossed),
+        ] {
+            let expected_scope = cursor.scope.clone();
+            let (events, log) = drive("primary", cursor, None).await;
+            assert!(log.methods().is_empty(), "{label}");
+            match events.as_slice() {
+                [SyncEvent::Terminated(err)] => {
+                    assert_eq!(
+                        err.kind(),
+                        &bifrost_types::AccountErrorKind::SyncState(
+                            bifrost_types::SyncStateErrorKind::CursorInvalid
+                        ),
+                        "{label}"
+                    );
+                    assert_eq!(
+                        err.recovery(),
+                        &bifrost_types::RecoveryClass::Engine(
+                            bifrost_types::EngineDirective::RestartScope(expected_scope)
+                        ),
+                        "{label}"
+                    );
+                }
+                other => panic!("{label}: expected one Terminated, got {other:?}"),
+            }
+        }
+    }
+
     #[tokio::test]
     async fn query_changes_fail_before_an_unfiltered_request_can_be_sent() {
         let scope = CursorScope::Query(bifrost_types::QueryId("unread-in-inbox".to_string()));

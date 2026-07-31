@@ -1926,4 +1926,303 @@ mod tests {
             "expected Attempt(Acknowledged) on the chain"
         );
     }
+
+    /// Every `type` string RFC 8620 s3.6.2 defines for a method-level
+    /// error, plus an unregistered one.
+    const METHOD_ERROR_CODES: &[&str] = &[
+        "serverUnavailable",
+        "serverFail",
+        "serverPartialFail",
+        "unknownMethod",
+        "invalidArguments",
+        "invalidResultReference",
+        "forbidden",
+        "accountNotFound",
+        "accountNotSupportedByMethod",
+        "accountReadOnly",
+        "requestTooLarge",
+        "cannotCalculateChanges",
+        "stateMismatch",
+        "alreadyExists",
+        "fromAccountNotFound",
+        "fromAccountNotSupportedByMethod",
+        "anchorNotFound",
+        "unsupportedSort",
+        "unsupportedFilter",
+        "tooManyChanges",
+        "someCodeThisBuildHasNeverSeen",
+    ];
+
+    /// Every `SetError` `type` string the crate recognises, plus an
+    /// unregistered one.
+    const SET_ERROR_CODES: &[&str] = &[
+        "forbidden",
+        "overQuota",
+        "tooLarge",
+        "rateLimit",
+        "notFound",
+        "invalidPatch",
+        "willDestroy",
+        "invalidProperties",
+        "singleton",
+        "mailboxHasChild",
+        "mailboxHasEmail",
+        "blobNotFound",
+        "tooManyKeywords",
+        "tooManyMailboxes",
+        "forbiddenFrom",
+        "invalidEmail",
+        "tooManyRecipients",
+        "noRecipients",
+        "invalidRecipients",
+        "forbiddenMailFrom",
+        "forbiddenToSend",
+        "cannotUnsend",
+        "alreadyExists",
+        "invalidScript",
+        "scriptIsActive",
+        "someCodeThisBuildHasNeverSeen",
+    ];
+
+    fn assert_wire_shape(err: &AccountError, code: &str) {
+        assert_eq!(err.protocol(), Some(Protocol::Jmap), "{code}");
+        let mut saw_wire = false;
+        let mut saw_acknowledged = false;
+        for cause in err.chain().iter() {
+            match cause {
+                Cause::Wire(WireCause::Jmap(_)) => saw_wire = true,
+                Cause::Attempt(attempt)
+                    if attempt.transmission_state == TransmissionState::Acknowledged =>
+                {
+                    saw_acknowledged = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_wire, "{code}: no typed JMAP wire cause on the chain");
+        assert!(
+            saw_acknowledged,
+            "{code}: a server-returned error crossed the side-effect boundary \
+             and must carry Attempt(Acknowledged)"
+        );
+    }
+
+    /// Total conformance sweep over the method-error code space. Every
+    /// arm of `convert_method` ends in
+    /// `try_build().expect("valid account error classification")`, so a
+    /// kind/cause pair that violates the builder's `kind_matches_cause`
+    /// or scope invariants panics in production rather than degrading.
+    /// This pins that no code panics, that each carries the protocol,
+    /// the caller's operation, a typed wire cause, and acknowledged
+    /// transmission evidence, and that a scoped call keeps its scope.
+    #[test]
+    fn every_method_error_code_builds_a_well_formed_account_error() {
+        let scope = CursorScope::Type(bifrost_types::ObjectType::Email);
+        for code in METHOD_ERROR_CODES {
+            let bare = into_account_error(
+                method_error(code),
+                JmapErrorContext::new(AccountOperation::SyncChanges),
+            );
+            assert_eq!(
+                bare.operation(),
+                Some(AccountOperation::SyncChanges),
+                "{code}"
+            );
+            assert_eq!(bare.scope(), None, "{code}");
+            assert_wire_shape(&bare, code);
+
+            let scoped = into_account_error(
+                method_error(code),
+                JmapErrorContext::cursor(AccountOperation::SyncChanges, scope.clone()),
+            );
+            assert_eq!(
+                scoped.scope(),
+                Some(&ErrorScope::Cursor(scope.clone())),
+                "{code}"
+            );
+            assert_wire_shape(&scoped, code);
+        }
+    }
+
+    /// The three method errors that mean "your cursor is no longer
+    /// usable" classify as `SyncState(CursorInvalid)` -> restart THIS
+    /// scope only when the caller actually threaded a cursor scope.
+    /// Without one, the server answered a cursor-specific error to a
+    /// non-cursored request, which is a contract violation - and
+    /// `CursorInvalid` without a scope is refused by the builder anyway.
+    #[test]
+    fn cursor_method_errors_need_a_cursor_scope_to_restart_a_scope() {
+        let scope = CursorScope::Type(bifrost_types::ObjectType::Email);
+        for code in ["cannotCalculateChanges", "anchorNotFound", "tooManyChanges"] {
+            let scoped = into_account_error(
+                method_error(code),
+                JmapErrorContext::cursor(AccountOperation::SyncChanges, scope.clone()),
+            );
+            assert_eq!(
+                scoped.kind(),
+                &AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
+                "{code}"
+            );
+            assert_eq!(
+                scoped.recovery(),
+                &RecoveryClass::Engine(bifrost_types::EngineDirective::RestartScope(scope.clone())),
+                "{code}"
+            );
+
+            let bare = into_account_error(
+                method_error(code),
+                JmapErrorContext::new(AccountOperation::SyncChanges),
+            );
+            assert_eq!(
+                bare.kind(),
+                &AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
+                "{code}"
+            );
+        }
+    }
+
+    /// A method error naming an account the session no longer resolves
+    /// is a capability shift, not a permission or protocol failure: the
+    /// engine must reopen and re-run discovery.
+    #[test]
+    fn account_scoped_method_errors_reopen_the_account() {
+        for code in [
+            "accountNotFound",
+            "fromAccountNotFound",
+            "accountNotSupportedByMethod",
+            "fromAccountNotSupportedByMethod",
+        ] {
+            let err = into_account_error(
+                method_error(code),
+                JmapErrorContext::new(AccountOperation::SyncChanges),
+            );
+            assert_eq!(
+                err.kind(),
+                &AccountErrorKind::SyncState(SyncStateErrorKind::CapabilityChanged),
+                "{code}"
+            );
+            assert_eq!(
+                err.recovery(),
+                &RecoveryClass::Engine(bifrost_types::EngineDirective::RestartAccount),
+                "{code}"
+            );
+        }
+    }
+
+    fn set_error(code: &str) -> SetError<String> {
+        serde_json::from_str(&format!(r#"{{"type":"{code}"}}"#)).expect("set error parses")
+    }
+
+    /// Total conformance sweep over the set-error code space, in both
+    /// scope shapes. The unscoped shape is the one that historically
+    /// produced a kind/cause pair the builder rejects (see the
+    /// `NotFound` comment in `set_error_to_account_error`), so both are
+    /// exercised.
+    #[test]
+    fn every_set_error_code_builds_a_well_formed_account_error() {
+        for code in SET_ERROR_CODES {
+            let bare = set_error_to_account_error(
+                set_error(code),
+                JmapErrorContext::new(AccountOperation::UpdateFlags),
+                None,
+            );
+            assert_eq!(
+                bare.operation(),
+                Some(AccountOperation::UpdateFlags),
+                "{code}"
+            );
+            assert_wire_shape(&bare, code);
+
+            let item_scope = ErrorScope::Message {
+                id: "msg-1".to_string(),
+            };
+            let scoped = set_error_to_account_error(
+                set_error(code),
+                JmapErrorContext::new(AccountOperation::UpdateFlags),
+                Some(item_scope.clone()),
+            );
+            assert_eq!(scoped.scope(), Some(&item_scope), "{code}");
+            assert_wire_shape(&scoped, code);
+        }
+    }
+
+    /// The `/set` NotFound family only resolves to a typed `NotFound`
+    /// when a scope names WHAT was missing. Without one there is no
+    /// resource to report, and the classification falls back to a typed
+    /// protocol-shape error rather than inventing a resource.
+    #[test]
+    fn set_not_found_without_a_scope_stays_a_protocol_shape_error() {
+        for code in ["notFound", "blobNotFound"] {
+            let err = set_error_to_account_error(
+                set_error(code),
+                JmapErrorContext::new(AccountOperation::UpdateFlags),
+                None,
+            );
+            assert_eq!(
+                err.kind(),
+                &AccountErrorKind::Protocol(ProtocolErrorKind::Unknown),
+                "{code}"
+            );
+        }
+    }
+
+    /// Per-item NotFound absorption is scoped to the bulk/idempotent
+    /// operations that can tolerate a vanished object. Every other
+    /// operation must surface the miss as a failure - absorbing a
+    /// `notFound` on a create or a send would report success for work
+    /// the server never did.
+    #[test]
+    fn not_found_absorption_is_limited_to_idempotent_bulk_operations() {
+        let absorbing = [
+            AccountOperation::UpdateFlags,
+            AccountOperation::BulkMove,
+            AccountOperation::BulkDestroy,
+            AccountOperation::SetKeyword,
+            AccountOperation::SetIsRead,
+            AccountOperation::AddToContainer,
+            AccountOperation::RemoveFromContainer,
+        ];
+        for operation in absorbing {
+            for code in ["notFound", "blobNotFound"] {
+                let outcome = classify_set_item(
+                    set_error(code),
+                    JmapErrorContext::new(operation),
+                    BatchItemId("msg-1".to_string()),
+                    Some(ErrorScope::Message {
+                        id: "msg-1".to_string(),
+                    }),
+                );
+                assert!(
+                    matches!(
+                        outcome,
+                        ItemOutcome::Succeeded(BatchSuccess {
+                            output: MutationSuccess::Skipped,
+                            ..
+                        })
+                    ),
+                    "{operation:?} / {code}"
+                );
+            }
+        }
+
+        for operation in [
+            AccountOperation::Send,
+            AccountOperation::DraftCreate,
+            AccountOperation::ContainerCreate,
+            AccountOperation::SetImportance,
+        ] {
+            let outcome = classify_set_item(
+                set_error("notFound"),
+                JmapErrorContext::new(operation),
+                BatchItemId("msg-1".to_string()),
+                Some(ErrorScope::Message {
+                    id: "msg-1".to_string(),
+                }),
+            );
+            assert!(
+                matches!(outcome, ItemOutcome::Failed(_)),
+                "{operation:?} must not absorb a notFound"
+            );
+        }
+    }
 }

@@ -18,12 +18,27 @@ any item; some may already be obsolete.
   `calendar_event_notification/query.rs`, `quota/query.rs` - untested:
   they are structurally identical to the pinned `email_query_wire`
   tables and a second copy of the same table was judged lower value.)
-- **jmap-T1.** Account-layer conformance tests (cursor envelope
-  round-trip, capability shape, error classification, scope-to-method
-  wiring) were deferred during Phase 3 behind in-flight sync-engine
-  `InventoryPartition` rework in `crates/jmap/src/sync/`. The other
-  three protocols have these; jmap does not. Pick up once that tree
-  settles. (Carried from the deleted `plans/orchestration.md` P3-A1.)
+- **jmap-O2.** The jmap sync layer hardwires `ReqwestTransport`
+  (`sync/account.rs` pins `type MailAccount = Account<ReqwestTransport>`),
+  so `JmapAccount`'s own `Account` impl surface - `capabilities()`,
+  `describe_cursor`, `discover_cursor_scopes`, `establish_initial_cursor`,
+  `inventory_partitioning`, the mutation doors - cannot be driven
+  hermetically. Closing jmap-T1 covered everything below that boundary;
+  the three named casualties are `cursor_scopes()` (seed-filtered
+  ordering + foreign sort), the `inventory_partitioning` scope table,
+  and `establish_initial_cursor`'s unseeded-scope `Unsupported`. All
+  three are pure given their inputs; unblocking needs either the
+  transport generic threaded through (the xc-3 discussion) or the
+  free-function extraction pattern `route_object_id` already uses.
+- **jmap-S1.** (smell, found while closing jmap-T1) `sync/state.rs`
+  holds two near-identically named version consts on different axes:
+  `CHANGE_CURSOR_ENVELOPE_VERSION = 1` (outer `ChangeCursor` envelope)
+  two lines from `ENVELOPE_VERSION_V2 = 2` (inner payload envelope);
+  every call site must know which is which. A rename
+  (`OUTER_`/`PAYLOAD_`) would remove the footgun. Related nit:
+  `JmapScopeRepr::from_cursor_scope` happily encodes `Type(Thread)` and
+  `Query(_)` cursors that `changes::stream` then terminates
+  `Unsupported` - a legal-but-dead codec path.
 
 ## bifrost-imap
 

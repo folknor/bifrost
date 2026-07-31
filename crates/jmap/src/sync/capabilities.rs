@@ -339,6 +339,298 @@ mod tests {
         assert!(err.recovery().is_terminal());
     }
 
+    /// A session document with a configurable `maxObjectsInSet` and an
+    /// optional WebSocket capability block. The other core limits are
+    /// held at legal non-zero values so each test varies exactly one
+    /// input.
+    fn session_with(max_objects_in_set: usize, websocket: bool) -> Session {
+        let ws = if websocket {
+            r#""urn:ietf:params:jmap:websocket": {"url": "wss://example.test/jmap/ws", "supportsPush": true},"#
+        } else {
+            ""
+        };
+        session(&format!(
+            r#"{{
+                "capabilities": {{
+                    "urn:ietf:params:jmap:core": {{
+                        "maxSizeUpload": 1000,
+                        "maxConcurrentUpload": 2,
+                        "maxSizeRequest": 100000,
+                        "maxConcurrentRequests": 4,
+                        "maxCallsInRequest": 8,
+                        "maxObjectsInGet": 256,
+                        "maxObjectsInSet": {max_objects_in_set},
+                        "collationAlgorithms": []
+                    }},
+                    {ws}
+                    "urn:ietf:params:jmap:mail": {{}}
+                }},
+                "accounts": {{}},
+                "primaryAccounts": {{}},
+                "username": "user",
+                "apiUrl": "https://example.test/jmap/api",
+                "downloadUrl": "https://example.test/download/{{accountId}}/{{blobId}}/{{name}}/{{type}}",
+                "uploadUrl": "https://example.test/upload/{{accountId}}",
+                "eventSourceUrl": "https://example.test/eventsource",
+                "state": "session-state"
+            }}"#
+        ))
+    }
+
+    /// A server that advertises none of the optional PIM families.
+    fn no_pim_support() -> PimSupport {
+        PimSupport {
+            submission: false,
+            max_delayed_send: 0,
+            foreign_submission: false,
+            vacation: false,
+            quota: false,
+            sieve: false,
+            contacts: false,
+            calendar: false,
+        }
+    }
+
+    /// Without `urn:ietf:params:jmap:websocket` (or with a block that
+    /// does not support push) there is no in-process push channel, and
+    /// the engine must be told so rather than subscribing into a
+    /// transport that cannot deliver.
+    #[test]
+    fn a_session_without_websocket_push_advertises_no_push() {
+        let (caps, _) = build(&session_with(256, false), no_pim_support()).unwrap();
+        assert_eq!(caps.push, PushCapability::None);
+
+        let (with_ws, _) = build(&session_with(256, true), no_pim_support()).unwrap();
+        assert_eq!(with_ws.push, PushCapability::InProcess);
+    }
+
+    /// Every optional-family flag tracks its `PimSupport` input, and the
+    /// unconditional flags stay on. This is the capability-shape half of
+    /// the account contract: the engine calls exactly what is advertised,
+    /// so a flag that turns on without its backing account handle is a
+    /// guaranteed `Unsupported` at runtime.
+    #[test]
+    fn optional_pim_families_are_gated_by_their_session_support() {
+        let (off, _) = build(&session_with(256, false), no_pim_support()).unwrap();
+        let pim = &off.pim_methods;
+        for (name, flag) in [
+            ("send_message", pim.send_message),
+            ("draft_send", pim.draft_send),
+            ("scheduled_send", pim.scheduled_send),
+            ("send_as", pim.send_as),
+            ("identities_list", pim.identities_list),
+            ("identity_update", pim.identity_update),
+            ("vacation_get", pim.vacation_get),
+            ("vacation_set", pim.vacation_set),
+            ("quota_get", pim.quota_get),
+            ("filters_list", pim.filters_list),
+            ("filter_create", pim.filter_create),
+            ("filter_update", pim.filter_update),
+            ("filter_delete", pim.filter_delete),
+            ("filter_validate", pim.filter_validate),
+            ("address_books_list", pim.address_books_list),
+            ("contacts_list", pim.contacts_list),
+            ("contact_get", pim.contact_get),
+            ("contact_create", pim.contact_create),
+            ("contact_update", pim.contact_update),
+            ("contact_delete", pim.contact_delete),
+            ("contact_search", pim.contact_search),
+            ("contact_autocomplete", pim.contact_autocomplete),
+            ("calendars_list", pim.calendars_list),
+            ("events_in_range", pim.events_in_range),
+            ("event_get", pim.event_get),
+            ("event_create", pim.event_create),
+            ("event_update", pim.event_update),
+            ("event_delete", pim.event_delete),
+            ("event_rsvp", pim.event_rsvp),
+            ("event_search", pim.event_search),
+            ("event_autocomplete", pim.event_autocomplete),
+        ] {
+            assert!(!flag, "{name} must stay off without its session support");
+        }
+        assert_eq!(off.filter_rule_shape, FilterRuleShape::None);
+
+        // Directory and the Graph/Gmail-shaped conveniences have no JMAP
+        // backing at all: they are false regardless of session support.
+        for (name, flag) in [
+            ("directory_search", pim.directory_search),
+            ("directory_groups_list", pim.directory_groups_list),
+            ("directory_group_expand", pim.directory_group_expand),
+            ("set_label_membership", pim.set_label_membership),
+            ("set_category", pim.set_category),
+            ("set_extended_property", pim.set_extended_property),
+            ("category_definitions", pim.category_definitions),
+            ("message_reactions", pim.message_reactions),
+            ("host_attachment", pim.host_attachment),
+        ] {
+            assert!(!flag, "{name} has no JMAP implementation");
+        }
+
+        // The mail-core doors do not depend on any optional capability.
+        for (name, flag) in [
+            ("add_to_container", pim.add_to_container),
+            ("remove_from_container", pim.remove_from_container),
+            ("set_keyword", pim.set_keyword),
+            ("set_is_read", pim.set_is_read),
+            ("set_importance", pim.set_importance),
+            ("attachment_upload", pim.attachment_upload),
+            ("draft_create", pim.draft_create),
+            ("draft_update", pim.draft_update),
+            ("draft_discard", pim.draft_discard),
+            ("search", pim.search),
+            ("search_messages", pim.search_messages),
+            ("containers_list", pim.containers_list),
+            ("container_create", pim.container_create),
+            ("container_rename", pim.container_rename),
+            ("container_move", pim.container_move),
+            ("container_delete", pim.container_delete),
+            ("thread_hydrate", pim.thread_hydrate),
+            ("message_hydrate", pim.message_hydrate),
+            ("open_raw_rfc822", pim.open_raw_rfc822),
+        ] {
+            assert!(flag, "{name} is unconditional in JMAP");
+        }
+
+        let mut all = no_pim_support();
+        all.submission = true;
+        all.max_delayed_send = 3600;
+        all.foreign_submission = true;
+        all.vacation = true;
+        all.quota = true;
+        all.sieve = true;
+        all.contacts = true;
+        all.calendar = true;
+        let (on, _) = build(&session_with(256, false), all).unwrap();
+        assert!(on.pim_methods.send_message);
+        assert!(on.pim_methods.draft_send);
+        assert!(on.pim_methods.scheduled_send);
+        assert!(on.pim_methods.send_as);
+        assert!(on.pim_methods.vacation_set);
+        assert!(on.pim_methods.quota_get);
+        assert!(on.pim_methods.filter_validate);
+        assert!(on.pim_methods.contact_autocomplete);
+        assert!(on.pim_methods.event_rsvp);
+        assert_eq!(on.filter_rule_shape, FilterRuleShape::Scripts);
+    }
+
+    /// The batch window is the server's `maxObjectsInSet`, clamped into
+    /// `1..=500`. A server that advertises a tiny limit must not have the
+    /// engine batch past it, and one that advertises a huge limit must
+    /// not produce an unbounded in-memory batch.
+    #[test]
+    fn batching_window_clamps_max_objects_in_set() {
+        for (advertised, expected) in [(1usize, 1usize), (10, 10), (500, 500), (5000, 500)] {
+            let (caps, limits) = build(&session_with(advertised, false), no_pim_support()).unwrap();
+            assert_eq!(
+                caps.batching_policy.max_items, expected,
+                "maxObjectsInSet {advertised}"
+            );
+            // The raw limit is passed through unclamped: it sizes the
+            // per-request `/set` call, not the engine's batch window.
+            assert_eq!(limits.max_objects_in_set, advertised);
+        }
+    }
+
+    /// A session that does not advertise the core capability at all is a
+    /// capability shift relative to whatever the last open saw, so it
+    /// must derive a full account reopen - not a terminal failure and not
+    /// a scope-level restart.
+    #[test]
+    fn a_session_without_the_core_capability_restarts_the_account() {
+        let session = session(
+            r#"{
+                "capabilities": {"urn:ietf:params:jmap:mail": {}},
+                "accounts": {},
+                "primaryAccounts": {},
+                "username": "user",
+                "apiUrl": "https://example.test/jmap/api",
+                "downloadUrl": "https://example.test/download/{accountId}/{blobId}/{name}/{type}",
+                "uploadUrl": "https://example.test/upload/{accountId}",
+                "eventSourceUrl": "https://example.test/eventsource",
+                "state": "session-state"
+            }"#,
+        );
+
+        let err = build(&session, no_pim_support()).unwrap_err();
+        assert_eq!(
+            err.kind(),
+            &AccountErrorKind::SyncState(SyncStateErrorKind::CapabilityChanged)
+        );
+        assert_eq!(
+            err.recovery(),
+            &bifrost_types::RecoveryClass::Engine(bifrost_types::EngineDirective::RestartAccount)
+        );
+        assert_eq!(err.protocol(), Some(Protocol::Jmap));
+        assert_eq!(err.operation(), Some(AccountOperation::Discover));
+    }
+
+    /// Each of the four core limits is independently load-bearing: a zero
+    /// in any one of them is a contract violation, not just in
+    /// `maxCallsInRequest`.
+    #[test]
+    fn any_zero_core_limit_is_a_contract_violation() {
+        for field in [
+            "maxCallsInRequest",
+            "maxObjectsInGet",
+            "maxObjectsInSet",
+            "maxSizeRequest",
+        ] {
+            let mut core = serde_json::json!({
+                "maxSizeUpload": 1000,
+                "maxConcurrentUpload": 2,
+                "maxSizeRequest": 100_000,
+                "maxConcurrentRequests": 4,
+                "maxCallsInRequest": 8,
+                "maxObjectsInGet": 256,
+                "maxObjectsInSet": 256,
+                "collationAlgorithms": []
+            });
+            core[field] = serde_json::json!(0);
+            let doc = serde_json::json!({
+                "capabilities": {
+                    "urn:ietf:params:jmap:core": core,
+                    "urn:ietf:params:jmap:mail": {}
+                },
+                "accounts": {},
+                "primaryAccounts": {},
+                "username": "user",
+                "apiUrl": "https://example.test/jmap/api",
+                "downloadUrl": "https://example.test/download/{accountId}/{blobId}/{name}/{type}",
+                "uploadUrl": "https://example.test/upload/{accountId}",
+                "eventSourceUrl": "https://example.test/eventsource",
+                "state": "session-state"
+            });
+            let session: Session = serde_json::from_value(doc).unwrap();
+            let err = build(&session, no_pim_support())
+                .err()
+                .unwrap_or_else(|| panic!("zero {field} must be refused"));
+            assert_eq!(
+                err.kind(),
+                &AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
+                "zero {field}"
+            );
+        }
+    }
+
+    /// The invariants the engine reads before it reads anything else.
+    /// JMAP states cursors server-side, has no UIDVALIDITY analogue, and
+    /// its cursors do not expire on a clock.
+    #[test]
+    fn cursor_and_state_shape_is_server_issued_and_non_expiring() {
+        let (caps, _) = build(&session_with(256, false), no_pim_support()).unwrap();
+        assert_eq!(caps.cursor_freshness, CursorFreshness::ServerIssued);
+        assert!(!caps.requires_uidvalidity_recheck);
+        assert_eq!(caps.historyid_expires_after, None);
+        assert_eq!(caps.delta_token_expires_after, None);
+        assert_eq!(caps.mutation.concurrency, MutationConcurrency::StateBased);
+        assert_eq!(caps.mutation.replay_safety, MutationReplaySafety::None);
+        assert_eq!(caps.blob_range, BlobRangeSupport::No);
+        assert!(!caps.blob_digest_pre_download);
+        assert_eq!(caps.quota_signal, QuotaSignal::None);
+        assert_eq!(caps.rate_limit_class, RateLimitClass::Generous);
+        assert!(caps.reopen_discovers_foreign_namespaces);
+    }
+
     fn scheduled_session() -> Session {
         session(
             r#"{
