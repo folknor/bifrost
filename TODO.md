@@ -299,21 +299,33 @@ re-auditors don't re-raise them.)
   read-back guard runs anyway. Per sync-D4 plumbing is correct; revisit
   when a consumer (ratatoskr) starts using
   `MutationCounters::dedupe_by_client_id` to suppress the read-back.
-- **sync-F4.** `ThrottleBucket` is write-only. `apply_throttle`
-  (`engine.rs:1740-1757`) records deadlines on `Retry` dispatch but no
-  production path reads the bucket via `wait_for(...)` before driving
-  work. Tenant- and provider-wide throttles recorded by one scope do
-  not pause sibling scopes or sibling accounts. Wire
-  `ThrottleBucket::wait_for(key, now)` into the poll loop
-  (`multiplexer/mod.rs` per-scope drive) and the push reconciler
-  (`push/reconciler.rs::reconcile`). Coupled with sync-F5.
-- **sync-F5.** `apply_throttle` only resolves `Account` scope.
-  `throttle_key_for(scope, ctx.account_id, None, None, None)` returns
-  `None` for `Mailbox` / `Tenant` / `Provider` because
-  `RecoveryContext` doesn't carry those identities. Extend
-  `RecoveryContext` with `Option<MailboxId>`, tenant, and `Provider`;
-  thread them through `apply_throttle`. Doing F5 alone has no
-  observable effect because the read side (F4) isn't wired.
+- **sync-F6.** (residuals of the closed F4+F5 throttle wiring) What
+  bounds the now-wired `ThrottleBucket`:
+  (a) `ThrottleScope::Tenant` degrades to the `Account` key because the
+  error contract carries no tenant identity string - `ThrottleKey::
+  Tenant(String)` exists but nothing can mint one, so a Graph tenant
+  429 pauses only the observing account, not tenant siblings. Fixing it
+  is a `bifrost-types` change (a tenant identity on the error or the
+  advice) plus producer support in graph/net.
+  (b) `Mailbox` keys are recorded (from `ErrorScope::Mailbox`) but
+  excluded from the account-wide wait: the engine has no
+  scope-to-mailbox mapping, so it cannot pause anything narrower than
+  the account without widening a per-mailbox throttle to every scope.
+  Needs a scope-to-mailbox channel (or a ruling that mailbox throttles
+  stay advisory).
+  (c) Cross-account enrollment is lazy (an account joins a shared
+  `Provider` key only when its own error stream names the identity),
+  so the FIRST provider-wide deadline is invisible to a sibling that
+  has never failed. Attach-time enrollment needs the account's
+  provider identity at attach - the same identity-channel shape as (a).
+  (d) Backfill and deferred-inventory walks do not consult the bucket
+  before issuing account calls; only polls, push reconciles, and
+  mutation campaigns do.
+  (e) No hermetic worker-level test proves a recorded deadline defers
+  `changes_stream` or that two attached slots share a provider
+  deadline - blocked on the same `Account`/`AccountFactory` stub
+  sync-F1 wants; the bucket mechanics are unit-pinned in
+  `recovery.rs`.
 - **sync-N1.** (partially addressed) `directive_target_scope` and other
   `_ => None` after-exhaustive arms route a new scope-bearing
   `EngineDirective` variant account-wide instead of failing to compile.

@@ -26,13 +26,13 @@
 //!   [`ThrottleKey`]. `ThrottleScope::CurrentOperation` never enters
 //!   the bucket; the caller delays the single work item inline.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, SystemTime};
 
 use bifrost_types::{
     AccountError, AccountErrorBuilder, AccountErrorKind, AccountId, AccountOperation, Cause,
-    CursorScope, EngineDirective, ErrorScope, Fatal, MailboxId, Provider, ReconcileAdvice,
-    RecoveryClass, RetryAdvice, StateCause, SyncStateErrorKind, ThrottleKey, ThrottleScope,
+    CursorScope, EngineDirective, ErrorScope, Fatal, MailboxId, ReconcileAdvice, RecoveryClass,
+    RetryAdvice, StateCause, SyncStateErrorKind, ThrottleKey, ThrottleScope,
 };
 
 /// Closed four-arm plan derived from a `RecoveryClass`. Every engine
@@ -185,13 +185,23 @@ pub(crate) fn cursor_decode_failure(operation: AccountOperation) -> AccountError
 /// key before `wait_until`" deadlines and answers "how long should I
 /// pause work that maps to this key now?".
 ///
+/// One bucket per `SyncEngine`, shared by every attached account.
 /// `Tenant` and `Provider` keys cross account boundaries by design: a
 /// tenant throttle pauses every account on that tenant, and a
 /// provider-wide throttle pauses every account on that provider.
 /// `Mailbox` and `Account` keys are per-account.
+///
+/// Cross-account keys reach a sibling account through the membership
+/// index: an account joins a `Tenant` / `Provider` bucket the first
+/// time its own error stream names that identity, and from then on a
+/// deadline any account records under the key pauses it too. The index
+/// survives `cleanup_expired` deliberately - membership is an identity
+/// fact, not a deadline - and is bounded by the identity space (a
+/// handful of providers and tenants per process).
 #[derive(Debug, Default)]
 pub struct ThrottleBucket {
     waits: HashMap<ThrottleKey, SystemTime>,
+    memberships: HashMap<AccountId, HashSet<ThrottleKey>>,
 }
 
 impl ThrottleBucket {
@@ -214,6 +224,21 @@ impl ThrottleBucket {
             .or_insert(wait_until);
     }
 
+    /// Record a deadline observed by `account`. Cross-account keys
+    /// (`Tenant`, `Provider`) also enroll the account in the key's
+    /// membership so `wait_for_account` sees deadlines siblings record
+    /// later. Per-account keys (`Account`, `Mailbox`) embed their
+    /// account and need no membership entry.
+    pub fn record_for(&mut self, account: &AccountId, key: ThrottleKey, wait_until: SystemTime) {
+        if matches!(key, ThrottleKey::Tenant(_) | ThrottleKey::Provider(_)) {
+            self.memberships
+                .entry(account.clone())
+                .or_default()
+                .insert(key.clone());
+        }
+        self.record(key, wait_until);
+    }
+
     /// Return the remaining wait for `key` at `now`. `None` means no
     /// throttle applies (or the recorded deadline has expired).
     #[must_use]
@@ -222,33 +247,81 @@ impl ThrottleBucket {
         until.duration_since(now).ok().filter(|d| !d.is_zero())
     }
 
+    /// Longest remaining wait that applies to `account` as a whole at
+    /// `now`: the account's own `Account` key plus every cross-account
+    /// key it is enrolled in. `Mailbox` keys are deliberately excluded -
+    /// a per-mailbox throttle must not pause the whole account, and the
+    /// engine has no scope-to-mailbox mapping to pause anything
+    /// narrower with (see `TODO.md`).
+    #[must_use]
+    pub fn wait_for_account(&self, account: &AccountId, now: SystemTime) -> Option<Duration> {
+        let own = self.wait_for(&ThrottleKey::Account(account.clone()), now);
+        let shared = self
+            .memberships
+            .get(account)
+            .into_iter()
+            .flatten()
+            .filter_map(|key| self.wait_for(key, now));
+        shared.chain(own).max()
+    }
+
     /// Drop expired entries. Called opportunistically by the engine
-    /// (e.g. between work items) to keep the map small.
+    /// (e.g. between work items) to keep the map small. Memberships are
+    /// retained: they record identity, not deadlines.
     pub fn cleanup_expired(&mut self, now: SystemTime) {
         self.waits.retain(|_, until| *until > now);
     }
+
+    /// Forget an account's memberships. Called at detach: without it,
+    /// unique detached ids accumulate for the engine's lifetime, and an
+    /// `AccountId` reattached against a different factory or provider
+    /// would inherit the previous life's enrollments and pause on an
+    /// unrelated provider's deadline. Deadlines under the account's own
+    /// key are left to expire on their own - they are per-account facts
+    /// a reattach of the same account may still want to honor.
+    pub fn forget_account(&mut self, account: &AccountId) {
+        self.memberships.remove(account);
+    }
 }
 
-/// Build a `ThrottleKey` from a `ThrottleScope` plus the relevant
-/// identities. `CurrentOperation` returns `None` because it is a
-/// per-call hint, not a bucket entry.
+/// Resolve the `ThrottleKey` a `ThrottleScope` maps to, given the
+/// identities the classified error actually carries. Falls back toward
+/// the account key rather than dropping the deadline: the throttle
+/// applies to at least this account, so an `Account` entry is a subset
+/// of the provider-documented scope - never wider - and a recorded
+/// subset beats an unrecorded truth.
+///
+/// - `CurrentOperation` never enters the bucket (per-call hint).
+/// - `Mailbox` uses the error's `ErrorScope::Mailbox` identity; an
+///   error that names no mailbox degrades to `Account`.
+/// - `Tenant` ALWAYS degrades to `Account` today: the error contract
+///   carries no tenant identity, so there is nothing to key a
+///   cross-account tenant bucket on. Cross-account tenant pausing is
+///   blocked on that types-level identity channel (see `TODO.md`).
+/// - `Provider` uses `AccountError::provider()`, degrading to
+///   `Account` when absent.
 #[must_use]
-pub(crate) fn throttle_key_for(
+pub(crate) fn resolve_throttle_key(
     scope: ThrottleScope,
     account: &AccountId,
-    mailbox: Option<&MailboxId>,
-    tenant: Option<&str>,
-    provider: Option<Provider>,
+    error: &AccountError,
 ) -> Option<ThrottleKey> {
+    let account_key = || ThrottleKey::Account(account.clone());
     match scope {
         ThrottleScope::CurrentOperation => None,
-        ThrottleScope::Mailbox => mailbox.map(|m| ThrottleKey::Mailbox {
-            account: account.clone(),
-            mailbox: m.clone(),
+        ThrottleScope::Mailbox => Some(match error.scope() {
+            Some(ErrorScope::Mailbox { id }) => ThrottleKey::Mailbox {
+                account: account.clone(),
+                mailbox: MailboxId(id.clone()),
+            },
+            _ => account_key(),
         }),
-        ThrottleScope::Account => Some(ThrottleKey::Account(account.clone())),
-        ThrottleScope::Tenant => tenant.map(|t| ThrottleKey::Tenant(t.to_string())),
-        ThrottleScope::Provider => provider.map(ThrottleKey::Provider),
+        ThrottleScope::Account | ThrottleScope::Tenant => Some(account_key()),
+        ThrottleScope::Provider => Some(
+            error
+                .provider()
+                .map_or_else(account_key, ThrottleKey::Provider),
+        ),
         // ThrottleScope is #[non_exhaustive]; new variants default to
         // "no bucket entry" (the conservative classification) and
         // require explicit handling here.
@@ -256,11 +329,52 @@ pub(crate) fn throttle_key_for(
     }
 }
 
+/// Record a `RetryAdvice`'s throttle deadline on the shared bucket,
+/// resolving the key from the error's own identities. No-ops when the
+/// advice carries no throttle scope or no retry hint, and when the
+/// bucket mutex is poisoned (a throttle wait is advisory; panicking a
+/// worker over it would trade a pause for an outage).
+pub(crate) fn record_throttle(
+    bucket: &std::sync::Mutex<ThrottleBucket>,
+    account: &AccountId,
+    advice: &RetryAdvice,
+    error: &AccountError,
+) {
+    let Some(scope) = advice.throttle_scope else {
+        return;
+    };
+    let Some(hint) = advice.retry_hint else {
+        return;
+    };
+    let Some(key) = resolve_throttle_key(scope, account, error) else {
+        return;
+    };
+    let wait_until = hint.not_before(SystemTime::now());
+    if let Ok(mut guard) = bucket.lock() {
+        guard.record_for(account, key, wait_until);
+    }
+}
+
+/// Longest account-wide throttle wait currently pending for `account`,
+/// pruning expired deadlines on the way. `None` when the account may
+/// drive work now (including when the mutex is poisoned - see
+/// [`record_throttle`]).
+#[must_use]
+pub(crate) fn account_throttle_wait(
+    bucket: &std::sync::Mutex<ThrottleBucket>,
+    account: &AccountId,
+    now: SystemTime,
+) -> Option<Duration> {
+    let mut guard = bucket.lock().ok()?;
+    guard.cleanup_expired(now);
+    guard.wait_for_account(account, now)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use bifrost_types::{
-        AttemptCause, AuthCause, AuthErrorKind, RetryDisposition, RetryHint, RetryReason,
+        AttemptCause, AuthCause, AuthErrorKind, Provider, RetryDisposition, RetryHint, RetryReason,
         TransmissionState, TransportCause, TransportErrorKind, TransportKind,
     };
 
@@ -450,46 +564,167 @@ mod tests {
     }
 
     #[test]
-    fn throttle_bucket_tenant_crosses_accounts() {
-        // A `Tenant` key is a single map entry; multiple accounts
-        // querying it observe the same wait.
+    fn throttle_bucket_shared_key_crosses_enrolled_accounts() {
+        // A cross-account key is a single map entry; every account
+        // enrolled in it observes a deadline any of them records.
+        // Enrollment is a PRECONDITION, and it only happens when an
+        // account's own error stream names the identity - so the very
+        // first provider-wide deadline is invisible to a sibling that
+        // has never failed. Attach-time enrollment needs a provider
+        // identity channel that does not exist yet (see `TODO.md`).
         let mut bucket = ThrottleBucket::new();
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
-        let key = ThrottleKey::Tenant("tenant-x".into());
-        bucket.record(key.clone(), now + Duration::from_secs(10));
-        // Two accounts; both observe the same tenant throttle because
-        // the key does not include account identity.
-        let a = throttle_key_for(
-            ThrottleScope::Tenant,
-            &AccountId("acc-1".into()),
-            None,
-            Some("tenant-x"),
-            None,
-        )
-        .expect("tenant key");
-        let b = throttle_key_for(
-            ThrottleScope::Tenant,
-            &AccountId("acc-2".into()),
-            None,
-            Some("tenant-x"),
-            None,
-        )
-        .expect("tenant key");
-        assert_eq!(a, b);
-        assert_eq!(a, key);
-        assert!(bucket.wait_for(&a, now).is_some());
-        assert!(bucket.wait_for(&b, now).is_some());
+        let a = AccountId("acc-1".into());
+        let b = AccountId("acc-2".into());
+        let key = ThrottleKey::Provider(Provider::Microsoft);
+        // Both accounts have observed the provider identity at some
+        // point (enrollment); only `a` records the live deadline.
+        bucket.record_for(&b, key.clone(), now);
+        bucket.record_for(&a, key, now + Duration::from_secs(10));
+
+        assert_eq!(
+            bucket.wait_for_account(&a, now),
+            Some(Duration::from_secs(10))
+        );
+        assert_eq!(
+            bucket.wait_for_account(&b, now),
+            Some(Duration::from_secs(10))
+        );
+        // An account never enrolled sees nothing.
+        assert_eq!(
+            bucket.wait_for_account(&AccountId("acc-3".into()), now),
+            None
+        );
     }
 
     #[test]
-    fn throttle_scope_current_operation_does_not_enter_bucket() {
-        let key = throttle_key_for(
-            ThrottleScope::CurrentOperation,
-            &AccountId("a".into()),
-            None,
-            None,
+    fn wait_for_account_takes_the_longest_applicable_wait() {
+        let mut bucket = ThrottleBucket::new();
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
+        let a = AccountId("acc-1".into());
+        bucket.record_for(
+            &a,
+            ThrottleKey::Account(a.clone()),
+            now + Duration::from_secs(3),
+        );
+        bucket.record_for(
+            &a,
+            ThrottleKey::Provider(Provider::Microsoft),
+            now + Duration::from_secs(8),
+        );
+        assert_eq!(
+            bucket.wait_for_account(&a, now),
+            Some(Duration::from_secs(8))
+        );
+    }
+
+    #[test]
+    fn wait_for_account_excludes_mailbox_keys() {
+        // A per-mailbox throttle must not pause the whole account.
+        let mut bucket = ThrottleBucket::new();
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
+        let a = AccountId("acc-1".into());
+        bucket.record_for(
+            &a,
+            ThrottleKey::Mailbox {
+                account: a.clone(),
+                mailbox: MailboxId("shared@example.com".into()),
+            },
+            now + Duration::from_secs(30),
+        );
+        assert_eq!(bucket.wait_for_account(&a, now), None);
+    }
+
+    #[test]
+    fn membership_survives_cleanup() {
+        // Enrollment is identity, not a deadline: after the deadline
+        // expires and cleanup prunes it, a NEW deadline recorded by a
+        // sibling still reaches the enrolled account.
+        let mut bucket = ThrottleBucket::new();
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
+        let a = AccountId("acc-1".into());
+        let key = ThrottleKey::Provider(Provider::Microsoft);
+        bucket.record_for(&a, key.clone(), now + Duration::from_secs(1));
+        bucket.cleanup_expired(now + Duration::from_secs(5));
+        // Sibling records without enrolling `a` again.
+        bucket.record(key, now + Duration::from_secs(60));
+        assert!(
+            bucket
+                .wait_for_account(&a, now + Duration::from_secs(5))
+                .is_some()
+        );
+    }
+
+    fn throttled_error(scope: Option<ErrorScope>, provider: Option<Provider>) -> AccountError {
+        let mut builder = AccountErrorBuilder::new(
+            AccountErrorKind::Transport(TransportErrorKind::Network),
+            Cause::Transport(TransportCause::new(TransportKind::Network, None)),
+        )
+        .push_cause(Cause::Attempt(AttemptCause::new(TransmissionState::Unsent)))
+        .operation(AccountOperation::SyncChanges);
+        if let Some(scope) = scope {
+            builder = builder.scope(scope);
+        }
+        if let Some(provider) = provider {
+            builder = builder.provider(provider);
+        }
+        builder.try_build().expect("valid")
+    }
+
+    #[test]
+    fn resolve_throttle_key_current_operation_does_not_enter_bucket() {
+        let account = AccountId("a".into());
+        let error = throttled_error(None, None);
+        assert!(resolve_throttle_key(ThrottleScope::CurrentOperation, &account, &error).is_none());
+    }
+
+    #[test]
+    fn resolve_throttle_key_reads_identities_from_the_error() {
+        let account = AccountId("a".into());
+        let mailbox_err = throttled_error(
+            Some(ErrorScope::Mailbox {
+                id: "shared@example.com".into(),
+            }),
             None,
         );
-        assert!(key.is_none());
+        assert_eq!(
+            resolve_throttle_key(ThrottleScope::Mailbox, &account, &mailbox_err),
+            Some(ThrottleKey::Mailbox {
+                account: account.clone(),
+                mailbox: MailboxId("shared@example.com".into()),
+            })
+        );
+        let provider_err = throttled_error(None, Some(Provider::Microsoft));
+        assert_eq!(
+            resolve_throttle_key(ThrottleScope::Provider, &account, &provider_err),
+            Some(ThrottleKey::Provider(Provider::Microsoft))
+        );
+    }
+
+    #[test]
+    fn resolve_throttle_key_degrades_toward_the_account_key() {
+        // A throttle whose documented scope cannot be keyed still
+        // applies to at least this account; recording the subset beats
+        // dropping the deadline. Tenant always degrades today (no
+        // tenant identity channel in the error contract).
+        let account = AccountId("a".into());
+        let bare = throttled_error(None, None);
+        let account_key = Some(ThrottleKey::Account(account.clone()));
+        assert_eq!(
+            resolve_throttle_key(ThrottleScope::Tenant, &account, &bare),
+            account_key
+        );
+        assert_eq!(
+            resolve_throttle_key(ThrottleScope::Mailbox, &account, &bare),
+            account_key
+        );
+        assert_eq!(
+            resolve_throttle_key(ThrottleScope::Provider, &account, &bare),
+            account_key
+        );
+        assert_eq!(
+            resolve_throttle_key(ThrottleScope::Account, &account, &bare),
+            account_key
+        );
     }
 }

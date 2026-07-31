@@ -63,6 +63,11 @@ pub struct SyncEngine {
     /// `attach` calls for the same account from spawning duplicate
     /// workers between the existence check and the final insert.
     attaching: Arc<AsyncMutex<std::collections::HashSet<AccountId>>>,
+    /// Engine-wide throttle bucket, shared by every attached account
+    /// so `Tenant` / `Provider` deadlines recorded by one account can
+    /// pause its siblings. Recovery paths record; the per-scope poll
+    /// loop and the push reconciler consult it before driving work.
+    throttles: Arc<std::sync::Mutex<crate::recovery::ThrottleBucket>>,
 }
 
 impl std::fmt::Debug for SyncEngine {
@@ -142,6 +147,7 @@ impl SyncEngineBuilder {
             bandwidth_meter: self.bandwidth_meter,
             ack_senders: DashMap::new(),
             attaching: Arc::new(AsyncMutex::new(std::collections::HashSet::new())),
+            throttles: Arc::new(std::sync::Mutex::new(crate::recovery::ThrottleBucket::new())),
         })
     }
 }
@@ -283,9 +289,11 @@ impl SyncEngine {
         // inventory workers can park without hot-polling.
         let subscriber_notify = Arc::new(Notify::new());
 
-        // Per-account throttle bucket. Shared via Mutex because the
-        // engine's recovery paths cross task boundaries.
-        let throttles = Arc::new(std::sync::Mutex::new(crate::recovery::ThrottleBucket::new()));
+        // Engine-wide throttle bucket (one per SyncEngine, shared via
+        // Mutex because recovery paths cross task boundaries). Shared
+        // across accounts so `Tenant` / `Provider` deadlines recorded
+        // by one account pause its siblings.
+        let throttles = Arc::clone(&self.throttles);
 
         // Drive cursor establishment per scope. We do this before
         // spawning long-running tasks because multiplexer + backfill
@@ -464,6 +472,7 @@ impl SyncEngine {
             control: control.clone(),
             ack_tx: Some(ack_tx.clone()),
             reopen_tx: reopen_tx.clone(),
+            throttles: Arc::clone(&throttles),
         };
         spawn(tokio::spawn(reconciler.run(watch_rx)));
 
@@ -584,6 +593,7 @@ impl SyncEngine {
             reopen_tx: reopen_tx.clone(),
             ack_tx: Some(ack_tx.clone()),
             scope_tokens: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            throttles: Arc::clone(&throttles),
         };
         spawn(tokio::spawn(mux.run()));
 
@@ -880,6 +890,9 @@ impl SyncEngine {
         self.sink.unregister(account_id);
         self.scheduler.budget().forget(account_id);
         self.backfill_registry.forget_account(account_id);
+        if let Ok(mut throttles) = self.throttles.lock() {
+            throttles.forget_account(account_id);
+        }
         if let Some(meter) = &self.bandwidth_meter {
             meter.forget_account(account_id);
         }
@@ -1145,6 +1158,17 @@ impl SyncEngine {
                 );
                 tokio::time::sleep(delay).await;
             }
+            // Honor any account-wide throttle deadline (recorded by
+            // this campaign's previous attempt, a poll, or a sibling
+            // account via a shared key) before submitting. Re-checked
+            // after waking: a longer deadline can land mid-sleep.
+            while let Some(wait) = crate::recovery::account_throttle_wait(
+                &slot.throttles,
+                account_id,
+                std::time::SystemTime::now(),
+            ) {
+                tokio::time::sleep(wait).await;
+            }
 
             let account = slot.current.load_full();
             let target_stream: AccountStream<bifrost_types::ObjectId> =
@@ -1166,6 +1190,8 @@ impl SyncEngine {
                                 &mut outcomes,
                                 &mut retry_ids,
                                 &mut dedupe_count,
+                                &slot.throttles,
+                                account_id,
                             ) {
                                 if should_forward_engine_recovery(
                                     &mut forwarded_directives,
@@ -1196,6 +1222,14 @@ impl SyncEngine {
                         match plan_recovery(err) {
                             RecoveryPlan::Retry(advice) => {
                                 queue_unresolved_for_retry(&remaining, &outcomes, &mut retry_ids);
+                                // Share the throttle deadline before the
+                                // next attempt sleeps it off locally.
+                                crate::recovery::record_throttle(
+                                    &slot.throttles,
+                                    account_id,
+                                    &advice,
+                                    &original,
+                                );
                                 stream_termination_advice = Some(advice);
                                 break;
                             }
@@ -1460,6 +1494,17 @@ impl SyncEngine {
                 );
                 tokio::time::sleep(delay).await;
             }
+            // Honor any account-wide throttle deadline (recorded by
+            // this campaign's previous attempt, a poll, or a sibling
+            // account via a shared key) before submitting. Re-checked
+            // after waking: a longer deadline can land mid-sleep.
+            while let Some(wait) = crate::recovery::account_throttle_wait(
+                &slot.throttles,
+                account_id,
+                std::time::SystemTime::now(),
+            ) {
+                tokio::time::sleep(wait).await;
+            }
 
             let account = slot.current.load_full();
             let target_stream: AccountStream<bifrost_types::ObjectId> =
@@ -1492,6 +1537,8 @@ impl SyncEngine {
                                 &mut outcomes,
                                 &mut retry_ids,
                                 &mut dedupe_count,
+                                &slot.throttles,
+                                account_id,
                             ) {
                                 if should_forward_engine_recovery(
                                     &mut forwarded_directives,
@@ -1512,6 +1559,14 @@ impl SyncEngine {
                         match plan_recovery(err) {
                             RecoveryPlan::Retry(advice) => {
                                 queue_unresolved_for_retry(&remaining, &outcomes, &mut retry_ids);
+                                // Share the throttle deadline before the
+                                // next attempt sleeps it off locally.
+                                crate::recovery::record_throttle(
+                                    &slot.throttles,
+                                    account_id,
+                                    &advice,
+                                    &original,
+                                );
                                 stream_termination_advice = Some(advice);
                                 break;
                             }
@@ -3489,7 +3544,7 @@ pub(crate) async fn handle_account_error(
             // after such a sleep, and blocking this task would hold
             // RestartScope / RestartAccount requests behind an inert
             // provider Retry-After delay.
-            apply_throttle(ctx, &advice);
+            apply_throttle(ctx, &advice, &error);
             tracing::debug!(
                 target: "bifrost.sync.recovery",
                 account = ?ctx.account_id,
@@ -3533,26 +3588,12 @@ pub(crate) async fn handle_account_error(
 }
 
 /// Record any provider-documented throttle scope on the engine's
-/// shared `ThrottleBucket`. `CurrentOperation` is a per-call hint and
-/// never enters the bucket (the originating caller owns any inline
-/// delay).
-fn apply_throttle(ctx: &RecoveryContext<'_>, advice: &RetryAdvice) {
-    let Some(scope) = advice.throttle_scope else {
-        return;
-    };
-    let Some(hint) = advice.retry_hint else {
-        return;
-    };
-    let now = std::time::SystemTime::now();
-    let Some(key) = crate::recovery::throttle_key_for(scope, ctx.account_id, None, None, None)
-    else {
-        // CurrentOperation, or unresolvable identity; nothing to bucket.
-        return;
-    };
-    let wait_until = hint.not_before(now);
-    if let Ok(mut bucket) = ctx.throttles.lock() {
-        bucket.record(key, wait_until);
-    }
+/// shared `ThrottleBucket`, resolving the key from the identities the
+/// classified error carries (`ErrorScope::Mailbox`, provider).
+/// `CurrentOperation` is a per-call hint and never enters the bucket
+/// (the originating caller owns any inline delay).
+fn apply_throttle(ctx: &RecoveryContext<'_>, advice: &RetryAdvice, error: &AccountError) {
+    crate::recovery::record_throttle(ctx.throttles, ctx.account_id, advice, error);
 }
 
 fn log_reconcile_advice(
@@ -4476,6 +4517,8 @@ fn classify_item_outcome(
     outcomes: &mut HashMap<bifrost_types::ObjectId, MutationBucket>,
     retry_ids: &mut Vec<bifrost_types::ObjectId>,
     dedupe_count: &mut u64,
+    throttles: &std::sync::Mutex<crate::recovery::ThrottleBucket>,
+    account_id: &AccountId,
 ) -> Option<(EngineDirective, AccountError)> {
     use crate::recovery::{RecoveryPlan, plan_recovery};
     match item {
@@ -4493,25 +4536,32 @@ fn classify_item_outcome(
             let id = bifrost_types::ObjectId(failure.item.0);
             let original = failure.error.clone();
             match plan_recovery(failure.error) {
-                RecoveryPlan::Retry(advice) => match advice.disposition {
-                    bifrost_types::RetryDisposition::AfterStateRefresh => {
-                        outcomes.insert(id, MutationBucket::PendingReadback);
-                        None
+                RecoveryPlan::Retry(advice) => {
+                    // A per-item 429 (Graph files them per `$batch`
+                    // subresponse) carries the same shared deadline a
+                    // stream-level one would; record it so polls and
+                    // sibling accounts observe it too.
+                    crate::recovery::record_throttle(throttles, account_id, &advice, &original);
+                    match advice.disposition {
+                        bifrost_types::RetryDisposition::AfterStateRefresh => {
+                            outcomes.insert(id, MutationBucket::PendingReadback);
+                            None
+                        }
+                        bifrost_types::RetryDisposition::SameRequest
+                        | bifrost_types::RetryDisposition::AfterAuthRefresh => {
+                            retry_ids.push(id.clone());
+                            outcomes.insert(id, MutationBucket::PendingRetry);
+                            None
+                        }
+                        // RetryDisposition is #[non_exhaustive]; new variants
+                        // default to read-back (the safe path) and require
+                        // explicit handling here when added.
+                        _ => {
+                            outcomes.insert(id, MutationBucket::PendingReadback);
+                            None
+                        }
                     }
-                    bifrost_types::RetryDisposition::SameRequest
-                    | bifrost_types::RetryDisposition::AfterAuthRefresh => {
-                        retry_ids.push(id.clone());
-                        outcomes.insert(id, MutationBucket::PendingRetry);
-                        None
-                    }
-                    // RetryDisposition is #[non_exhaustive]; new variants
-                    // default to read-back (the safe path) and require
-                    // explicit handling here when added.
-                    _ => {
-                        outcomes.insert(id, MutationBucket::PendingReadback);
-                        None
-                    }
-                },
+                }
                 RecoveryPlan::Reconcile(advice) => {
                     for action in &advice.guidance.actions {
                         if matches!(action, ReconcileAction::DedupeByClientId) {
@@ -4699,9 +4749,17 @@ mod tests {
         let mut retry = Vec::new();
         let mut dedupe = 0;
 
-        let (directive, forwarded) =
-            classify_item_outcome(item, &mut outcomes, &mut retry, &mut dedupe)
-                .expect("engine recovery must be forwarded");
+        let throttles = std::sync::Mutex::new(crate::recovery::ThrottleBucket::new());
+        let account = bifrost_types::AccountId("acc".into());
+        let (directive, forwarded) = classify_item_outcome(
+            item,
+            &mut outcomes,
+            &mut retry,
+            &mut dedupe,
+            &throttles,
+            &account,
+        )
+        .expect("engine recovery must be forwarded");
 
         assert_eq!(
             crate::recovery::directive_target_scope(&directive),

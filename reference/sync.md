@@ -917,13 +917,50 @@ a `Warning::OperatorAttentionNeeded` carrying the protocol-supplied
 reason. The reason rides on the warning's free-form fields; the
 `PauseReason` enum is bounded.
 
-`crate::recovery::ThrottleBucket` is a `HashMap<ThrottleKey,
-SystemTime>` keyed by `ThrottleKey::{Mailbox, Account, Tenant,
-Provider}`. `Tenant` and `Provider` keys cross account boundaries
-- a `Tenant` throttle pauses every account on that tenant.
+`crate::recovery::ThrottleBucket` is engine-wide (one per
+`SyncEngine`, shared by every slot): deadlines keyed by
+`ThrottleKey::{Mailbox, Account, Tenant, Provider}` plus a
+membership index recording which cross-account (`Tenant` /
+`Provider`) keys each account belongs to. An account joins a shared
+key the first time its own error stream names that identity;
+membership survives `cleanup_expired` because it is an identity
+fact, not a deadline, and is bounded by the identity space.
 `ThrottleScope::CurrentOperation` is a per-call hint and never
-enters the bucket. The engine records `RetryAdvice::throttle_scope
-+ retry_hint` on `Retry` dispatch via `apply_throttle`.
+enters the bucket.
+
+Both sides are wired. Recording: the reopen listener
+(`apply_throttle`), the poll loop's and push reconciler's Retry
+arms (both the per-drive terminations and the reconciler's
+top-level retryable `WatchEvent::Terminated`), and the mutation
+campaigns (per-item Retry outcomes in `classify_item_outcome` and
+stream-level Retry terminations) all funnel through
+`recovery::record_throttle`, which resolves the key from the
+identities the classified error actually carries
+(`ErrorScope::Mailbox`, `AccountError::provider()`) and degrades
+toward the `Account` key rather than dropping the deadline - the
+throttle applies to at least this account, so recording the subset
+beats an unrecorded truth. `Tenant` ALWAYS degrades today: the
+error contract carries no tenant identity string, so cross-account
+tenant pausing is blocked on that types-level channel (tracked in
+`TODO.md`). Reading: the poll loop (before each drive), the
+reconciler (before each hinted scope), and the mutation campaigns
+(before each attempt) call `recovery::account_throttle_wait` - the
+longest pending wait across the account's own key and its shared
+memberships, re-checked after waking since a longer deadline can
+land mid-sleep. Backfill and deferred inventory do not consult the
+bucket yet (tracked in `TODO.md`). `detach` forgets the account's
+memberships so a reattached id cannot inherit a previous life's
+provider enrollment.
+
+Two documented limits on the cross-account reach. Enrollment is
+lazy - an account joins a shared key only when its own error stream
+names the identity - so the very FIRST provider-wide deadline is
+invisible to a sibling that has never failed; attach-time
+enrollment needs a provider identity channel the contract does not
+carry. `Mailbox` keys are recorded but deliberately excluded from
+the account-wide wait: a per-mailbox throttle must not pause the
+whole account, and the engine has no scope-to-mailbox mapping to
+pause anything narrower with (both in `TODO.md`).
 
 Cursor envelope schema mismatches at `get_change_cursor` are
 translated through `crate::recovery::cursor_decode_failure` into an
@@ -955,7 +992,9 @@ crates/sync/src/
                           // BackfillConfig, MutationConfig, PushConfig,
                           // SchedulerConfig, AccountSlot, WorkerTask
   recovery.rs             // plan_recovery + RecoveryPlan dispatch;
-                          // ThrottleBucket + throttle_key_for;
+                          // ThrottleBucket (engine-wide) +
+                          // resolve_throttle_key / record_throttle /
+                          // account_throttle_wait;
                           // retry_delay; restart_scope_error;
                           // cursor_decode_failure translator
   multiplexer/

@@ -31,6 +31,10 @@ pub struct Reconciler {
     pub control: SyncControl,
     pub ack_tx: Option<mpsc::Sender<AckRequest>>,
     pub reopen_tx: mpsc::Sender<ReopenRequest>,
+    /// Engine-wide throttle bucket. The reconciler honors account-wide
+    /// deadlines before driving a hinted scope and records deadlines
+    /// its own Retry outcomes carry.
+    pub throttles: Arc<std::sync::Mutex<crate::recovery::ThrottleBucket>>,
 }
 
 impl Reconciler {
@@ -116,11 +120,35 @@ impl Reconciler {
                             })
                             .await;
                     }
-                    RecoveryPlan::Retry(_) | RecoveryPlan::Reconcile(_) => {
+                    RecoveryPlan::Retry(advice) => {
                         // Push streams cannot retry inline; the
                         // forwarder reconnects on the next iteration.
+                        // But a retryable termination can still carry a
+                        // provider-documented throttle deadline (the
+                        // stream died on a 429), and dropping it here
+                        // would hide it from polls and sibling
+                        // accounts. Record, then surface the warning.
+                        crate::recovery::record_throttle(
+                            &self.throttles,
+                            &self.account_id,
+                            &advice,
+                            &original,
+                        );
+                        let warning = bifrost_types::Warning::user_safe(
+                            bifrost_types::WarningKind::Other,
+                            "push stream terminated with retryable recovery",
+                        );
+                        let me = MultiplexerEvent {
+                            scope: CursorScope::Account,
+                            event: Arc::new(bifrost_types::SyncEvent::Warning(warning)),
+                            checkpoint: None,
+                        };
+                        let _ = self.changes_tx.send(me);
+                    }
+                    RecoveryPlan::Reconcile(_) => {
                         // Surface a warning so dashboards observe the
-                        // hiccup.
+                        // hiccup; the forwarder reconnects on its next
+                        // iteration.
                         let warning = bifrost_types::Warning::user_safe(
                             bifrost_types::WarningKind::Other,
                             "push stream terminated with retryable recovery",
@@ -153,6 +181,27 @@ impl Reconciler {
     async fn reconcile(&self, hint: &InvalidationHint) -> Result<(), Error> {
         let scopes = scopes_for_hint(&self.cursors, &hint.payload);
         for scope in scopes {
+            // Honor any account-wide throttle deadline (a sibling
+            // scope's Retry-After, or a shared tenant/provider key)
+            // before driving the wire for this hint. Re-checked after
+            // waking: a longer deadline can land mid-sleep.
+            while let Some(wait) = crate::recovery::account_throttle_wait(
+                &self.throttles,
+                &self.account_id,
+                std::time::SystemTime::now(),
+            ) {
+                tracing::debug!(
+                    target: "bifrost.sync.reconcile",
+                    account = ?self.account_id,
+                    scope = ?scope,
+                    wait_secs = wait.as_secs(),
+                    "reconcile deferred by shared throttle deadline"
+                );
+                tokio::select! {
+                    () = self.shutdown.cancelled() => return Ok(()),
+                    () = tokio::time::sleep(wait) => {}
+                }
+            }
             let Some(cursor) = self.cursors.snapshot(&scope) else {
                 continue;
             };
@@ -184,6 +233,15 @@ impl Reconciler {
                     let original = error.clone();
                     match plan_recovery(error) {
                         RecoveryPlan::Retry(advice) => {
+                            // Share the throttle deadline with the poll
+                            // loop and sibling accounts before sleeping
+                            // it off locally.
+                            crate::recovery::record_throttle(
+                                &self.throttles,
+                                &self.account_id,
+                                &advice,
+                                &original,
+                            );
                             let delay = retry_delay(
                                 &advice,
                                 std::time::SystemTime::now(),

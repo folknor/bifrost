@@ -18,7 +18,7 @@ pub mod poll;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use arc_swap::ArcSwap;
 use bifrost_types::{
@@ -142,6 +142,11 @@ pub struct Multiplexer {
     /// Per-scope cancellation tokens keyed by membership-id so
     /// `ScopeLifecycle::Deleted` can stop the matching poll task.
     pub scope_tokens: Arc<StdMutex<HashMap<CursorScope, CancellationToken>>>,
+    /// Engine-wide throttle bucket. Poll tasks consult it before each
+    /// drive so a tenant- or account-wide `Retry-After` recorded by one
+    /// scope (or a sibling account) pauses the others; the Retry arm
+    /// records deadlines it observes.
+    pub throttles: Arc<StdMutex<crate::recovery::ThrottleBucket>>,
 }
 
 impl Multiplexer {
@@ -201,6 +206,7 @@ impl Multiplexer {
             reopen_tx,
             ack_tx,
             scope_tokens,
+            throttles,
         } = self;
 
         // Snapshot the known scopes from the registry; the engine has
@@ -217,6 +223,7 @@ impl Multiplexer {
             reopen_tx.clone(),
             ack_tx.clone(),
             Arc::clone(&scope_tokens),
+            Arc::clone(&throttles),
         );
 
         // Drive scope_lifecycle in the background. `Created` asks the
@@ -436,6 +443,7 @@ impl Multiplexer {
                         reopen_tx.clone(),
                         ack_tx.clone(),
                         Arc::clone(&scope_tokens),
+                        Arc::clone(&throttles),
                     );
                 }
             }
@@ -500,6 +508,7 @@ fn spawn_and_track_scope_poll(
     reopen_tx: mpsc::Sender<ReopenRequest>,
     ack_tx: Option<mpsc::Sender<AckRequest>>,
     scope_tokens: Arc<StdMutex<HashMap<CursorScope, CancellationToken>>>,
+    throttles: Arc<StdMutex<crate::recovery::ThrottleBucket>>,
     scope: CursorScope,
 ) {
     let scope_cancel = shutdown.child_token();
@@ -523,6 +532,7 @@ fn spawn_and_track_scope_poll(
             scope_cancel,
             reopen_tx,
             ack_tx,
+            throttles,
             scope,
         )
         .await;
@@ -548,6 +558,7 @@ fn spawn_missing_scope_polls(
     reopen_tx: mpsc::Sender<ReopenRequest>,
     ack_tx: Option<mpsc::Sender<AckRequest>>,
     scope_tokens: Arc<StdMutex<HashMap<CursorScope, CancellationToken>>>,
+    throttles: Arc<StdMutex<crate::recovery::ThrottleBucket>>,
 ) {
     for scope in cursors.all_scopes() {
         let should_spawn = {
@@ -574,6 +585,7 @@ fn spawn_missing_scope_polls(
                 reopen_tx.clone(),
                 ack_tx.clone(),
                 Arc::clone(&scope_tokens),
+                Arc::clone(&throttles),
                 scope,
             );
         }
@@ -597,6 +609,7 @@ async fn spawn_scope_poll_inner(
     scope_cancel: CancellationToken,
     reopen_tx: mpsc::Sender<ReopenRequest>,
     ack_tx: Option<mpsc::Sender<AckRequest>>,
+    throttles: Arc<StdMutex<crate::recovery::ThrottleBucket>>,
     scope: CursorScope,
 ) {
     let mut cadence = AdaptiveCadence {
@@ -625,6 +638,27 @@ async fn spawn_scope_poll_inner(
                 }
             }
         }
+        // Honor any account-wide throttle deadline (recorded by a
+        // sibling scope's Retry-After, or by a sibling account via a
+        // shared tenant/provider key) before driving the wire.
+        // Re-checked after waking: a longer deadline can land while
+        // this scope sleeps off the first one.
+        while let Some(wait) =
+            crate::recovery::account_throttle_wait(&throttles, &account_id, SystemTime::now())
+        {
+            tracing::debug!(
+                target: "bifrost.sync.changes",
+                account = ?account_id,
+                scope = ?scope,
+                wait_secs = wait.as_secs(),
+                "poll deferred by shared throttle deadline"
+            );
+            tokio::select! {
+                () = shutdown.cancelled() => return,
+                () = scope_cancel.cancelled() => return,
+                () = tokio::time::sleep(wait) => {}
+            }
+        }
         let Some(cursor) = cursors.snapshot(&scope) else {
             // Scope was removed from the registry; exit cleanly.
             return;
@@ -651,6 +685,7 @@ async fn spawn_scope_poll_inner(
             &pre_advance_state,
             &reopen_tx,
             &account_id,
+            &throttles,
         )
         .await;
 
@@ -705,6 +740,7 @@ async fn handle_drive_outcome(
     pre_advance_state: &[u8],
     reopen_tx: &mpsc::Sender<ReopenRequest>,
     account_id: &AccountId,
+    throttles: &StdMutex<crate::recovery::ThrottleBucket>,
 ) -> DriveRecovery {
     match outcome {
         Ok(ChangesEvent::Advanced | ChangesEvent::Done) => {
@@ -748,6 +784,11 @@ async fn handle_drive_outcome(
             let original = error.clone();
             match plan_recovery(error) {
                 RecoveryPlan::Retry(advice) => {
+                    // Share any provider-documented throttle deadline
+                    // with sibling scopes (and, via tenant/provider
+                    // keys, sibling accounts) before sleeping it off
+                    // locally.
+                    crate::recovery::record_throttle(throttles, account_id, &advice, &original);
                     let delay = retry_delay(
                         &advice,
                         std::time::SystemTime::now(),
