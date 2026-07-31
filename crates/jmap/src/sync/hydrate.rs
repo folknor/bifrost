@@ -34,6 +34,15 @@ pub(crate) enum HydrationRoute {
     Foreign(String),
 }
 
+/// Deterministic flush ordering for the trailing per-route buffers:
+/// primary first, then foreign accounts by account id.
+fn flush_order(route: &HydrationRoute) -> (u8, &str) {
+    match route {
+        HydrationRoute::Primary => (0, ""),
+        HydrationRoute::Foreign(account) => (1, account.as_str()),
+    }
+}
+
 /// Route one hydration id. Pure over the registration predicate so the
 /// selection is unit-pinnable without a live session.
 pub(crate) fn route_for_id<F>(id: &ObjectId, is_registered: F) -> HydrationRoute
@@ -93,7 +102,15 @@ pub(crate) fn stream<T: HttpTransport>(
             }
         }
 
-        for (route, mut buffer) in buffers {
+        // Flush the trailing buffers in a deterministic order - primary
+        // first, then foreign accounts by id. The buffers live in a
+        // `HashMap`, whose iteration order would otherwise make the
+        // batch GROUPING across routing targets vary run to run
+        // (per-item outcomes are unaffected; only the order the final
+        // partial batches emit in).
+        let mut trailing: Vec<(HydrationRoute, Vec<ObjectId>)> = buffers.into_iter().collect();
+        trailing.sort_by(|(a, _), (b, _)| flush_order(a).cmp(&flush_order(b)));
+        for (route, mut buffer) in trailing {
             if buffer.is_empty() {
                 continue;
             }

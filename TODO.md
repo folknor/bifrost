@@ -405,10 +405,6 @@ container projection itself.
   mailbox, so shared-mailbox containers fall back to display-name matching and
   their Inbox / Sent carry no `FolderRole`. A correct fix costs about six extra
   round-trips per shared mailbox; decide whether the roles are worth it.
-- **nc-6 (jmap)** Hydration flushes its trailing per-target buffers in
-  `HashMap` iteration order, so batch ordering across routing targets is
-  nondeterministic. Per-item outcomes are unaffected; only the grouping order
-  varies.
 - **nc-8 (jmap)** `pim::containers_list` reports `Container::rights` for the
   primary account from `Mailbox/myRights`, but a foreign account's mailboxes go
   through the same `container_from_mailbox`, so a share whose `Mailbox/get`
