@@ -1972,6 +1972,70 @@ mod tests {
         );
     }
 
+    /// A mis-keyed cursor row - wrong protocol tag, or a payload whose
+    /// scope disagrees with the `ChangeCursor` it rode in on - is a
+    /// consumer/store bug, not schema drift. It must classify
+    /// `CursorInvalid` and derive `Engine(RestartScope(scope))`: heal the
+    /// one bogus row, not the account-wide schema clear that now also
+    /// drops every backfill checkpoint and forces a full re-hydration.
+    #[tokio::test]
+    async fn a_mis_keyed_cursor_restarts_its_scope_instead_of_reseeding_the_account() {
+        let limits = super::capabilities::CoreLimits {
+            max_objects_in_get: 4,
+            max_objects_in_set: 4,
+        };
+        let scope = CursorScope::Type(ObjectType::Email);
+
+        // Wrong protocol tag on the envelope.
+        let mut foreign_protocol =
+            state::cursor_for_scope(scope.clone(), "s1").expect("scope encodes");
+        foreign_protocol.server_state.protocol = bifrost_types::ProtocolKind::Gmail;
+
+        // Payload scope disagreeing with the ChangeCursor scope.
+        let mut scope_mismatch =
+            state::cursor_for_scope(CursorScope::Type(ObjectType::Mailbox), "s1")
+                .expect("scope encodes");
+        scope_mismatch.scope = scope.clone();
+
+        for cursor in [foreign_protocol, scope_mismatch] {
+            // No replies armed: reaching the wire at all is a failure.
+            let client = scripted_client([]);
+            let primary = client
+                .primary_account::<capability::Mail>()
+                .expect("primary mail account");
+            let mut stream = crate::sync::changes::stream(
+                primary,
+                "primary".to_string(),
+                limits,
+                cursor,
+                None,
+                state_map(&[("primary", "s1")]),
+                state_map(&[("primary", "s1")]),
+            );
+            match stream.next().await {
+                Some(bifrost_types::SyncEvent::Terminated(err)) => {
+                    assert_eq!(
+                        err.kind(),
+                        &bifrost_types::AccountErrorKind::SyncState(
+                            bifrost_types::SyncStateErrorKind::CursorInvalid
+                        )
+                    );
+                    assert_eq!(
+                        err.recovery(),
+                        &bifrost_types::RecoveryClass::Engine(
+                            bifrost_types::EngineDirective::RestartScope(scope.clone())
+                        )
+                    );
+                }
+                other => panic!("expected a cursor-invalid termination, got {other:?}"),
+            }
+            assert!(
+                client.transport().requests().is_empty(),
+                "a mis-keyed cursor must not reach Email/changes at all"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn a_foreign_thread_hydration_runs_in_the_share_and_requalifies_its_members() {
         let client = scripted_client([

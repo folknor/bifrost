@@ -31,30 +31,56 @@ pub(crate) fn stream<T: HttpTransport>(
     let (scope, state_string) = match decoded {
         Ok(decoded) => decoded,
         Err(err) => {
+            // Cursor decode failure. `decode_cursor` reports a plain
+            // crate error, so the classified `AccountError` is
+            // synthesized at this boundary - and the CLASS matters,
+            // because the two failure families want opposite recoveries:
+            //
+            // - A version this engine has disowned (older envelope) or
+            //   cannot read yet (future envelope) is schema drift.
+            //   `SyncState(SchemaIncompatible)` derives the account-wide
+            //   schema clear, which also drops every backfill checkpoint
+            //   so the inventory re-walk re-mints ids - reseeding is the
+            //   migration.
+            // - A cursor tagged with another PROTOCOL, or whose payload
+            //   scope disagrees with the `ChangeCursor` it rode in on,
+            //   is a mis-keyed row: a consumer/store bug, not schema
+            //   drift. `SyncState(CursorInvalid)` derives
+            //   `Engine(RestartScope(scope))` - delete the bogus row and
+            //   re-establish THIS scope - instead of paying the
+            //   account-wide clear plus full re-hydration for a row the
+            //   schema machinery cannot heal anyway.
+            let schema_drift = matches!(
+                err,
+                state::JmapCursorError::SchemaIncompatible
+                    | state::JmapCursorError::CursorEnvelopeUnknown
+            );
+            let (kind, cause, text) = if schema_drift {
+                (
+                    bifrost_types::AccountErrorKind::SyncState(
+                        bifrost_types::SyncStateErrorKind::SchemaIncompatible,
+                    ),
+                    bifrost_types::Cause::State(bifrost_types::StateCause::SchemaIncompatible),
+                    "JMAP change cursor envelope version is not readable by this engine",
+                )
+            } else {
+                (
+                    bifrost_types::AccountErrorKind::SyncState(
+                        bifrost_types::SyncStateErrorKind::CursorInvalid,
+                    ),
+                    bifrost_types::Cause::State(bifrost_types::StateCause::CursorInvalid),
+                    "JMAP change cursor row is mis-keyed (wrong protocol or scope mismatch)",
+                )
+            };
             return Box::pin(async_stream::stream! {
-                // Cursor decode failure: the cursor envelope produced
-                // by `state::decode_cursor` is a local cursor schema
-                // error. `decode_cursor` reports it as a plain
-                // `crate::Error` rather than a classified `AccountError`,
-                // so we synthesize the SchemaIncompatible AccountError at
-                // this boundary (the engine routes it to
-                // `SchemaIncompatible`).
-                let _ = err;
                 yield super::error::terminated(
-                    bifrost_types::AccountErrorBuilder::new(
-                        bifrost_types::AccountErrorKind::SyncState(
-                            bifrost_types::SyncStateErrorKind::SchemaIncompatible,
-                        ),
-                        bifrost_types::Cause::State(bifrost_types::StateCause::SchemaIncompatible),
-                    )
-                    .protocol(bifrost_types::Protocol::Jmap)
-                    .operation(bifrost_types::AccountOperation::SyncChanges)
-                    .scope(bifrost_types::ErrorScope::Cursor(cursor.scope.clone()))
-                    .text(bifrost_types::DiagnosticText::support_only(
-                        "failed to decode JMAP change cursor",
-                    ))
-                    .try_build()
-                    .expect("valid account error classification"),
+                    bifrost_types::AccountErrorBuilder::new(kind, cause)
+                        .protocol(bifrost_types::Protocol::Jmap)
+                        .operation(bifrost_types::AccountOperation::SyncChanges)
+                        .scope(bifrost_types::ErrorScope::Cursor(cursor.scope.clone()))
+                        .text(bifrost_types::DiagnosticText::support_only(text))
+                        .try_build()
+                        .expect("valid account error classification"),
                 );
             });
         }

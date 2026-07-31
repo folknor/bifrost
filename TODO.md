@@ -37,18 +37,6 @@ re-auditors don't re-raise them.)
   coverage.
 - **jmap-N4.** `capabilities.rs` "core limits zero" path: reclassify
   as `Protocol(ContractViolation)`.
-- **jmap-N5.** (gap, surfaced during the nc-7 fix) `changes::stream`
-  collapses EVERY `decode_cursor` failure into
-  `SyncState(SchemaIncompatible)`, including `CursorProtocolMismatch`
-  and the payload-scope-disagreement `Other(_)`. Those are
-  consumer/store bugs, not schema drift, and the derived directive
-  tells the engine to reseed rather than surface the mis-keyed
-  checkpoint.
-- **jmap-N6.** (smell, surfaced during the nc-7 fix)
-  `hydrate::fetch_route` silently degrades a foreign route whose handle
-  vanished mid-stream to the primary handle with the literal id - safe,
-  but signal-free, while the same condition at `open` produces a
-  `SkippedScope`.
 - **jmap-N7.** (test smell, surfaced during the nc-7 fix)
   `ScriptedTransport` replies purely positionally: it never checks that
   a request's `accountId` or `ids` match the canned answer, so any test

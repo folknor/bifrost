@@ -129,7 +129,23 @@ async fn fetch_route<T: HttpTransport>(
         HydrationRoute::Primary => (mail, None),
         HydrationRoute::Foreign(account) => match foreign_mail.get(account) {
             Some(handle) => (handle, Some(account.as_str())),
-            None => (mail, None),
+            None => {
+                // A route minted while the handle existed, drained after
+                // it vanished (the map is fixed per account instance, so
+                // this means a routing bug rather than a live topology
+                // change). Degrading to the primary with the LITERAL id
+                // is safe - the qualified form cannot collide with a
+                // real primary id and comes back notFound - but it must
+                // not be silent: the same condition at open produces a
+                // SkippedScope, and a warn is the stream-side analog.
+                tracing::warn!(
+                    target: "bifrost.jmap.hydrate",
+                    account,
+                    "foreign hydration route has no handle; ids run on \
+                     the primary route in literal form"
+                );
+                (mail, None)
+            }
         },
     };
     fetch_batch(handle, projection, batch, owner).await

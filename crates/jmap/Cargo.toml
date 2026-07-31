@@ -32,6 +32,7 @@ reqwest = { workspace = true, features = ["stream", "native-tls"] }
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["raw_value"] }
 tokio = { workspace = true, features = ["io-util", "rt", "sync", "time"], optional = true }
+tracing = { workspace = true, features = ["std"], optional = true }
 tokio-native-tls = { workspace = true, optional = true }
 tokio-util = { workspace = true, features = ["rt"], optional = true }
 tokio-websockets = { version = "0.13", default-features = false, features = ["client", "native-tls", "sha1_smol", "getrandom"], optional = true }
@@ -53,6 +54,7 @@ quota = []
 sync = [
     "dep:bifrost-types",
     "dep:tokio-util",
+    "dep:tracing",
     "tokio",
     "websockets",
     "mail",
