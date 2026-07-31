@@ -22,7 +22,7 @@ const DEFAULT_CALENDAR_ID: &str = "calendar";
 /// routing honest.
 const MAILBOX_SCOPE: &str = "$mailbox";
 const EVENT_ID_SEPARATOR: &str = "::";
-const EVENT_SELECT: &str = "id,subject,body,location,start,end,isAllDay,showAs,sensitivity,organizer,attendees,seriesMasterId,webLink,categories,responseStatus,isCancelled,changeKey,recurrence";
+const EVENT_SELECT: &str = "id,subject,body,location,start,end,isAllDay,showAs,sensitivity,organizer,attendees,originalStart,webLink,categories,responseStatus,isCancelled,changeKey,recurrence";
 const EVENT_TIMEZONE_PREFER: &str = "outlook.timezone=\"UTC\"";
 const EVENT_SEARCH_FIELDS: &[&str] = &[
     "id",
@@ -36,7 +36,7 @@ const EVENT_SEARCH_FIELDS: &[&str] = &[
     "sensitivity",
     "organizer",
     "attendees",
-    "seriesMasterId",
+    "originalStart",
     "webLink",
     "categories",
     "responseStatus",
@@ -504,7 +504,12 @@ fn event_from_graph(calendar_id: String, event: GraphEvent) -> CalendarEvent {
         reminders: Vec::new(),
         recurrence: EventRecurrence {
             rrule: event.recurrence.as_ref().and_then(rrule_from_graph),
-            recurrence_id: event.series_master_id,
+            // The shared model documents `recurrence_id` as identifying
+            // an OVERRIDDEN OCCURRENCE (iCalendar RECURRENCE-ID
+            // semantics). Graph's `originalStart` is that identity;
+            // `seriesMasterId` - the previous mapping - names the whole
+            // series and misled consumers following the docstring.
+            recurrence_id: event.original_start,
             ..EventRecurrence::default()
         },
         html_link: event.web_link,
@@ -1291,7 +1296,11 @@ struct GraphEvent {
     sensitivity: Option<String>,
     organizer: Option<GraphRecipient>,
     attendees: Option<Vec<GraphAttendee>>,
-    series_master_id: Option<String>,
+    /// Present only on occurrence / exception events: the instant the
+    /// occurrence ORIGINALLY started, before any override moved it -
+    /// Graph's analog of iCalendar RECURRENCE-ID and of Google's
+    /// `originalStartTime`.
+    original_start: Option<String>,
     recurrence: Option<GraphRecurrence>,
     web_link: Option<String>,
     response_status: Option<Value>,
@@ -1483,7 +1492,7 @@ mod tests {
                         response: Some("accepted".to_string()),
                     }),
                 }]),
-                series_master_id: None,
+                original_start: None,
                 recurrence: None,
                 web_link: None,
                 response_status: Some(json!({"response": "tentativelyAccepted"})),
@@ -1497,6 +1506,56 @@ mod tests {
         assert_eq!(event.self_response, RsvpStatus::Tentative);
         assert_eq!(event.attendees[0].role, AttendeeRole::Resource);
         assert_eq!(event.attendees[0].status, RsvpStatus::Accepted);
+    }
+
+    /// The shared model documents `recurrence_id` as RECURRENCE-ID
+    /// semantics: the identity of an OVERRIDDEN OCCURRENCE. Graph's
+    /// carrier is `originalStart` (present only on occurrence /
+    /// exception events), mirroring Google's `originalStartTime` - NOT
+    /// `seriesMasterId`, which names the whole series and was the
+    /// previous, misleading mapping.
+    #[test]
+    fn graph_recurrence_id_is_the_original_start_never_the_series_master() {
+        let base = || GraphEvent {
+            id: "e1".to_string(),
+            subject: None,
+            body: None,
+            location: None,
+            start: Some(graph_time("2026-06-02T12:00:00")),
+            end: Some(graph_time("2026-06-02T13:00:00")),
+            is_all_day: Some(false),
+            show_as: None,
+            sensitivity: None,
+            organizer: None,
+            attendees: None,
+            original_start: None,
+            recurrence: None,
+            web_link: None,
+            response_status: None,
+            is_cancelled: None,
+            change_key: None,
+        };
+
+        let exception = GraphEvent {
+            original_start: Some("2026-06-09T12:00:00Z".to_string()),
+            ..base()
+        };
+        assert_eq!(
+            event_from_graph("calendar".to_string(), exception)
+                .recurrence
+                .recurrence_id
+                .as_deref(),
+            Some("2026-06-09T12:00:00Z")
+        );
+
+        // A series master (or plain single event) carries no
+        // originalStart and must project no recurrence_id.
+        assert_eq!(
+            event_from_graph("calendar".to_string(), base())
+                .recurrence
+                .recurrence_id,
+            None
+        );
     }
 
     #[test]
@@ -1784,7 +1843,7 @@ mod tests {
                 sensitivity: None,
                 organizer: None,
                 attendees: None,
-                series_master_id: None,
+                original_start: None,
                 recurrence: None,
                 web_link: None,
                 response_status: None,
@@ -1849,7 +1908,7 @@ mod tests {
                 sensitivity: None,
                 organizer: None,
                 attendees: None,
-                series_master_id: None,
+                original_start: None,
                 recurrence: Some(GraphRecurrence {
                     pattern: Some(GraphRecurrencePattern {
                         kind: Some("weekly".to_string()),
@@ -2013,7 +2072,7 @@ mod tests {
                 sensitivity: None,
                 organizer: None,
                 attendees: None,
-                series_master_id: None,
+                original_start: None,
                 recurrence: None,
                 web_link: None,
                 response_status: None,

@@ -350,12 +350,6 @@ deliberate "accepted fidelity limits" from that doc are documented in
 
 Smells:
 
-- **s34-S2 (graph)** `calendar.rs` (`event_from_graph`) -
-  `recurrence_id` is populated from `seriesMasterId` (master series
-  id), but the shared model documents it as RECURRENCE-ID semantics
-  (an overridden occurrence). Consumers following the docstring will
-  misinterpret it. (Google resolved this correctly via
-  `originalStartTime`.)
 - **s34-S3 (graph)** `contacts.rs` - `ContactEmail.kind` maps
   to/from Graph `emailAddress.name`, a display name, not a type label.
   Round-trip is consistent (no loss) but semantically conflated.
