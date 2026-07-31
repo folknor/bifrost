@@ -2,7 +2,30 @@ use bifrost_types::{
     ChangeCursor, CursorScope, ObjectType, OpaqueChangeState, ProtocolKind, QueryId,
 };
 
-pub(crate) const ENVELOPE_VERSION_V1: u32 = 1;
+/// JMAP's inner (protocol-owned) cursor envelope version.
+///
+/// v2: a foreign (shared/delegate) account's `ThreadId`s carry the owning
+/// JMAP `accountId` (`"{accountId}\u{1f}{threadId}"`), the same object
+/// namespace their `Email` ids and `blobId`s already used. That is an
+/// OBJECT-ID encoding change, not a payload-shape change, so it cannot be
+/// expressed as an additive field: a v1 bare foreign thread id still
+/// parses - as PRIMARY - and there is no way to tell the two apart after
+/// the fact. A v1 account would resume its `Email/changes` state, never
+/// re-run inventory, and keep handing the consumer bare foreign thread
+/// ids, so `thread_hydrate` and every thread-keyed mutation
+/// (`set_keyword`/`set_is_read`/`set_importance` on
+/// `MutationTarget::Thread`, `move_thread`, `delete_thread`) would resolve
+/// an unrelated PRIMARY thread through `Thread/get` on an id collision and
+/// apply the write to its messages - `delete_thread` destroys them.
+///
+/// Bumping makes `decode` refuse a v1 cursor as `SchemaIncompatible`,
+/// which derives `Engine(SchemaIncompatible)`: the engine drops every
+/// durable cursor and re-establishes each scope through a full
+/// `inventory_stream` pass, which re-mints the ids under the new
+/// encoding. The ids are server-issued and not reconstructable from the
+/// stored bytes, so reseeding IS the migration (identical reasoning to
+/// bifrost-graph's v2 bump).
+pub(crate) const ENVELOPE_VERSION_V2: u32 = 2;
 pub(crate) const CHANGE_CURSOR_ENVELOPE_VERSION: u32 = 1;
 
 const STATE_TAG_V1: u8 = 1;
@@ -11,9 +34,10 @@ const SCOPE_TAG_EMAIL: u8 = 1;
 const SCOPE_TAG_MAILBOX: u8 = 2;
 const SCOPE_TAG_THREAD: u8 = 3;
 const SCOPE_TAG_QUERY: u8 = 4;
-// Additive: foreign (shared/delegate) account mailbox scope. Existing
-// primary cursors carry tags 1-4 and still decode, so no envelope-version
-// bump is required.
+// Additive: foreign (shared/delegate) account mailbox scope. The tag
+// itself needed no envelope-version bump when it landed (tags 1-4 kept
+// decoding); the LATER v2 bump was forced by the object-id encoding
+// change (bare foreign thread ids), not by this tag.
 const SCOPE_TAG_FOLDER: u8 = 5;
 
 // types: protocol-owned cursor payload inside bifrost-types::OpaqueChangeState.
@@ -86,7 +110,7 @@ impl JmapScopeRepr {
 pub(crate) fn encode(state: &JmapCursorState) -> OpaqueChangeState {
     OpaqueChangeState {
         protocol: ProtocolKind::Jmap,
-        envelope_version: ENVELOPE_VERSION_V1,
+        envelope_version: ENVELOPE_VERSION_V2,
         bytes: encode_state(state),
     }
 }
@@ -105,8 +129,16 @@ pub(crate) fn decode(raw: &OpaqueChangeState) -> Result<JmapCursorState, JmapCur
     if raw.protocol != ProtocolKind::Jmap {
         return Err(JmapCursorError::CursorProtocolMismatch);
     }
-    if raw.envelope_version != ENVELOPE_VERSION_V1 {
+    // A FUTURE envelope is unknown - this build cannot read it and cannot
+    // reason about what it means. An OLDER envelope is understood exactly
+    // well enough to know it must not be resumed: its foreign thread ids
+    // were minted bare (see `ENVELOPE_VERSION_V2`), so it is reported as
+    // `SchemaIncompatible` and the engine reseeds through inventory.
+    if raw.envelope_version > ENVELOPE_VERSION_V2 {
         return Err(JmapCursorError::CursorEnvelopeUnknown);
+    }
+    if raw.envelope_version < ENVELOPE_VERSION_V2 {
+        return Err(JmapCursorError::SchemaIncompatible);
     }
 
     decode_state(&raw.bytes)
@@ -269,7 +301,7 @@ mod tests {
 
         let encoded = encode(&state);
         assert_eq!(encoded.protocol, ProtocolKind::Jmap);
-        assert_eq!(encoded.envelope_version, ENVELOPE_VERSION_V1);
+        assert_eq!(encoded.envelope_version, ENVELOPE_VERSION_V2);
         assert_eq!(decode(&encoded).unwrap(), state);
     }
 
@@ -277,7 +309,7 @@ mod tests {
     fn rejects_other_protocol_cursor() {
         let raw = OpaqueChangeState {
             protocol: ProtocolKind::Gmail,
-            envelope_version: ENVELOPE_VERSION_V1,
+            envelope_version: ENVELOPE_VERSION_V2,
             bytes: Vec::new(),
         };
 
@@ -293,11 +325,34 @@ mod tests {
             scope: JmapScopeRepr::Mailbox,
             state_string: "s456".to_string(),
         });
-        raw.envelope_version = ENVELOPE_VERSION_V1 + 1;
+        raw.envelope_version = ENVELOPE_VERSION_V2 + 1;
 
         assert!(matches!(
             decode(&raw),
             Err(JmapCursorError::CursorEnvelopeUnknown)
+        ));
+    }
+
+    #[test]
+    fn refuses_a_v1_cursor_as_schema_incompatible_rather_than_resuming_it() {
+        // The v1 -> v2 bump exists because v1 minted foreign thread ids
+        // BARE, and a bare foreign thread id is indistinguishable from a
+        // primary one. Resuming a v1 cursor would skip the inventory pass
+        // that re-mints them, so the payload must be refused as
+        // `SchemaIncompatible` (which derives
+        // `Engine(SchemaIncompatible)`), not as merely "unknown".
+        let mut raw = encode(&JmapCursorState::V1 {
+            scope: JmapScopeRepr::Folder {
+                account_id: "acct-9".to_string(),
+                mailbox_id: String::new(),
+            },
+            state_string: "s-old".to_string(),
+        });
+        raw.envelope_version = 1;
+
+        assert!(matches!(
+            decode(&raw),
+            Err(JmapCursorError::SchemaIncompatible)
         ));
     }
 
@@ -365,7 +420,7 @@ mod tests {
     fn rejects_unknown_state_tag() {
         let raw = OpaqueChangeState {
             protocol: ProtocolKind::Jmap,
-            envelope_version: ENVELOPE_VERSION_V1,
+            envelope_version: ENVELOPE_VERSION_V2,
             bytes: vec![0xff],
         };
         assert!(matches!(
@@ -378,7 +433,7 @@ mod tests {
     fn rejects_unknown_scope_tag() {
         let raw = OpaqueChangeState {
             protocol: ProtocolKind::Jmap,
-            envelope_version: ENVELOPE_VERSION_V1,
+            envelope_version: ENVELOPE_VERSION_V2,
             bytes: vec![STATE_TAG_V1, 0xff, 0, 0, 0, 0],
         };
         assert!(matches!(
@@ -397,7 +452,7 @@ mod tests {
         bytes.pop();
         let raw = OpaqueChangeState {
             protocol: ProtocolKind::Jmap,
-            envelope_version: ENVELOPE_VERSION_V1,
+            envelope_version: ENVELOPE_VERSION_V2,
             bytes,
         };
         assert!(matches!(
@@ -416,7 +471,7 @@ mod tests {
         bytes.push(0);
         let raw = OpaqueChangeState {
             protocol: ProtocolKind::Jmap,
-            envelope_version: ENVELOPE_VERSION_V1,
+            envelope_version: ENVELOPE_VERSION_V2,
             bytes,
         };
         assert!(matches!(
@@ -484,7 +539,7 @@ mod tests {
     fn rejects_non_utf8_string() {
         let raw = OpaqueChangeState {
             protocol: ProtocolKind::Jmap,
-            envelope_version: ENVELOPE_VERSION_V1,
+            envelope_version: ENVELOPE_VERSION_V2,
             bytes: vec![STATE_TAG_V1, SCOPE_TAG_EMAIL, 1, 0, 0, 0, 0xff],
         };
         assert!(matches!(

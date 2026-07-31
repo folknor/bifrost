@@ -194,6 +194,14 @@ impl CheckpointStore for PoisonedStore {
             .retain(|s| s != scope);
         self.inner.delete_change_cursor(account, scope)
     }
+
+    fn delete_backfill<'a>(
+        &'a self,
+        account: &'a AccountId,
+        scope: &'a CursorScope,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send + 'a>> {
+        self.inner.delete_backfill(account, scope)
+    }
 }
 
 /// Account that discovers a fixed scope list and establishes a cursor

@@ -272,3 +272,65 @@ async fn put_backfill_replaces_the_same_partition_row() {
         .expect("present");
     assert_eq!(got.progress.items_done, 400);
 }
+
+/// `delete_backfill` is the schema-clear half of the reseed contract:
+/// it must drop EVERY partition row for the named `(account, scope)` -
+/// the completion marker included, since that marker is what makes the
+/// next attach skip the inventory re-walk that re-mints ids - while
+/// leaving other scopes and accounts untouched.
+#[tokio::test]
+async fn delete_backfill_drops_every_partition_for_the_scope_only() {
+    let store = InMemoryCheckpointStore::new();
+    let email = CursorScope::Type(ObjectType::Email);
+    let contact = CursorScope::Type(ObjectType::Contact);
+    store
+        .put_backfill(&account("a"), backfill(&email, b"page:0:500", 500))
+        .await
+        .expect("put");
+    store
+        .put_backfill(&account("a"), backfill(&email, b"complete", 1001))
+        .await
+        .expect("put");
+    store
+        .put_backfill(&account("a"), backfill(&contact, b"page:0:500", 42))
+        .await
+        .expect("put");
+    store
+        .put_backfill(&account("b"), backfill(&email, b"page:0:500", 7))
+        .await
+        .expect("put");
+
+    store
+        .delete_backfill(&account("a"), &email)
+        .await
+        .expect("delete");
+
+    assert!(
+        store
+            .get_backfill(&account("a"), &email)
+            .await
+            .expect("get")
+            .is_none(),
+        "every partition row for the scope is gone, completion marker included"
+    );
+    assert_eq!(
+        store
+            .get_backfill(&account("a"), &contact)
+            .await
+            .expect("get")
+            .expect("sibling scope survives")
+            .progress
+            .items_done,
+        42
+    );
+    assert_eq!(
+        store
+            .get_backfill(&account("b"), &email)
+            .await
+            .expect("get")
+            .expect("sibling account survives")
+            .progress
+            .items_done,
+        7
+    );
+}

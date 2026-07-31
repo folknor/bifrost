@@ -88,8 +88,9 @@ pub(crate) fn owner_tag(account_id: &str) -> MembershipScope {
     MembershipScope::Mailbox(MailboxId(account_id.to_string()))
 }
 
-/// Encode a foreign account's native object id (an `Email` id, a `blobId`)
-/// into the same `accountId\u{1f}native` namespace the folder codec uses.
+/// Encode a foreign account's native object id (an `Email` id, a `blobId`,
+/// a `threadId`) into the same `accountId\u{1f}native` namespace the folder
+/// codec uses.
 ///
 /// This is what makes hydration and blob reads route to the FOREIGN
 /// account. `Email/get` and blob download are both accountId-scoped calls,
@@ -100,6 +101,13 @@ pub(crate) fn owner_tag(account_id: &str) -> MembershipScope {
 /// inventory / changes projections; the request sites decode and select the
 /// foreign handle. A primary id is never encoded, so one logical object has
 /// exactly one wire form.
+///
+/// A `threadId` rides here for the same reason and with a sharper
+/// consequence: `Thread/get` is accountId-scoped and the thread id is its
+/// only operand, so a bare foreign thread id asserts PRIMARY ownership.
+/// On an id collision the primary `Thread/get` resolves an unrelated
+/// thread and every thread-keyed mutation lands on ITS messages -
+/// `delete_thread` destroys them.
 pub(crate) fn encode_object(account_id: &str, native: &str) -> String {
     format!("{account_id}{FOREIGN_SEP}{native}")
 }

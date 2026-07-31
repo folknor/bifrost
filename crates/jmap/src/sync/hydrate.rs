@@ -581,6 +581,13 @@ mod tests {
             Some(super::super::foreign::encode_object("acct-9", "B1").as_str()),
             "a bare blob id would download through the primary account"
         );
+        assert_eq!(
+            entry.thread_id.as_ref().map(|thread| thread.0.as_str()),
+            Some(super::super::foreign::encode_object("acct-9", "T1").as_str()),
+            "a bare thread id would expand through the primary Thread/get, and on \
+             an id collision a thread-keyed mutation would rewrite an unrelated \
+             primary thread's messages"
+        );
         assert!(
             entry
                 .memberships

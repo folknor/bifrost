@@ -37,6 +37,24 @@ re-auditors don't re-raise them.)
   coverage.
 - **jmap-N4.** `capabilities.rs` "core limits zero" path: reclassify
   as `Protocol(ContractViolation)`.
+- **jmap-N5.** (gap, surfaced during the nc-7 fix) `changes::stream`
+  collapses EVERY `decode_cursor` failure into
+  `SyncState(SchemaIncompatible)`, including `CursorProtocolMismatch`
+  and the payload-scope-disagreement `Other(_)`. Those are
+  consumer/store bugs, not schema drift, and the derived directive
+  tells the engine to reseed rather than surface the mis-keyed
+  checkpoint.
+- **jmap-N6.** (smell, surfaced during the nc-7 fix)
+  `hydrate::fetch_route` silently degrades a foreign route whose handle
+  vanished mid-stream to the primary handle with the literal id - safe,
+  but signal-free, while the same condition at `open` produces a
+  `SkippedScope`.
+- **jmap-N7.** (test smell, surfaced during the nc-7 fix)
+  `ScriptedTransport` replies purely positionally: it never checks that
+  a request's `accountId` or `ids` match the canned answer, so any test
+  that does not explicitly assert the recorded request can pass while
+  the code addressed the wrong account. An opt-in expectation on the
+  reply (match this accountId or panic) would harden the whole suite.
 - **jmap-T2.** (coverage) `client_ws.rs` frame handling beyond the
   subprotocol check: the close / error / binary arms live inside the
   `async_stream::stream!` and need a stub WebSocket transport of the same
@@ -537,23 +555,6 @@ container projection itself.
   `HashMap` iteration order, so batch ordering across routing targets is
   nondeterministic. Per-item outcomes are unaffected; only the grouping order
   varies.
-- **nc-7 (jmap)** Foreign inventory does not qualify `InventoryEntry::thread_id`,
-  and neither does `message_hydrate`'s `qualify_foreign_message_ids` (it
-  qualifies `id`, containers, and attachment blob ids, not `thread_id`), so a
-  foreign account's thread ids reach the consumer bare. Consequences:
-  a foreign thread id collides in the consumer's index with a primary thread
-  that happens to share the id; `thread_hydrate` (which is therefore left
-  unrouted on purpose - there is no encoded form to route) runs `Thread/get`
-  against the primary account for a foreign thread; and, now that the
-  mutation primitives route, every thread-taking MUTATION
-  (`set_keyword`/`set_is_read`/`set_importance` on `MutationTarget::Thread`,
-  `move_thread`, `delete_thread`) does the same. That last one is the sharp
-  edge: a bare foreign thread id is indistinguishable from a primary one, so
-  on a collision the primary `Thread/get` resolves an UNRELATED thread and
-  the mutation is applied to its messages - `delete_thread` destroys them.
-  Owner validation cannot catch it, because a bare id asserts primary
-  ownership. Qualifying thread ids is a contract change on an id the consumer
-  groups by, not a wiring fix, so it wants a decision rather than a patch.
 - **nc-8 (jmap)** `pim::containers_list` reports `Container::rights` for the
   primary account from `Mailbox/myRights`, but a foreign account's mailboxes go
   through the same `container_from_mailbox`, so a share whose `Mailbox/get`

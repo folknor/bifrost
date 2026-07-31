@@ -3714,10 +3714,19 @@ async fn handle_engine_directive(
 
 async fn handle_schema_incompatible(ctx: &RecoveryContext<'_>) {
     // Stop trusting durable cursor envelopes. Clear every in-memory
-    // cursor and delete every durable change cursor we know about,
-    // then re-establish each from the current account handle. Failure
-    // to re-establish a single scope escalates per-scope (sync-D7):
-    // the account keeps running for the scopes that succeed.
+    // cursor, delete every durable change cursor we know about, AND
+    // delete every backfill checkpoint - the completion marker
+    // included. The ids the consumer holds were minted under an
+    // encoding the protocol has disowned (that is what a schema bump
+    // asserts), and re-minting them requires the inventory re-walk
+    // the completion marker would otherwise skip at the next attach.
+    // For protocols whose establishment returns a `Ready` cursor from
+    // live state (JMAP), that next-attach re-walk IS the migration;
+    // this session's re-established cursor only covers changes from
+    // now on. Then re-establish each scope from the current account
+    // handle. Failure to re-establish a single scope escalates
+    // per-scope (sync-D7): the account keeps running for the scopes
+    // that succeed.
     let scopes: Vec<CursorScope> = ctx.cursors.all_scopes();
     for s in &scopes {
         ctx.cursors.delete(s);
@@ -3728,6 +3737,15 @@ async fn handle_schema_incompatible(ctx: &RecoveryContext<'_>) {
                 scope = ?s,
                 error = %err,
                 "SchemaIncompatible: delete_change_cursor failed"
+            );
+        }
+        if let Err(err) = ctx.store.delete_backfill(ctx.account_id, s).await {
+            tracing::warn!(
+                target: "bifrost.sync.changes",
+                account = ?ctx.account_id,
+                scope = ?s,
+                error = %err,
+                "SchemaIncompatible: delete_backfill failed"
             );
         }
     }

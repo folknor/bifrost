@@ -249,10 +249,22 @@ pub(crate) fn qualify_foreign_memberships(
 /// accountId into both the object id and the whole-message `blobId` is what
 /// makes those reads self-routing, exactly as the folder codec makes the
 /// cursor scope self-routing on a cold resume.
+///
+/// The `thread_id` rides the same object namespace. It is not a read-only
+/// grouping key: the consumer hands it straight back as
+/// `thread_hydrate(thread)` and as `MutationTarget::Thread`, and every one
+/// of those doors expands it through an accountId-scoped `Thread/get`.
+/// Left bare, a foreign thread id is indistinguishable from a primary one,
+/// so on an id collision the primary `Thread/get` resolves an UNRELATED
+/// thread and the mutation lands on its messages - `delete_thread`
+/// destroys them.
 pub(crate) fn qualify_foreign_ids(entry: &mut InventoryEntry, owner: &TypesMailboxId) {
     entry.id = ObjectId(super::foreign::encode_object(&owner.0, &entry.id.0));
     if let Some(blob) = entry.blob_id.take() {
         entry.blob_id = Some(BlobId(super::foreign::encode_object(&owner.0, &blob.0)));
+    }
+    if let Some(thread) = entry.thread_id.take() {
+        entry.thread_id = Some(ThreadId(super::foreign::encode_object(&owner.0, &thread.0)));
     }
 }
 
@@ -767,7 +779,7 @@ mod tests {
                 size: Some(10),
                 flags_hash: 0,
             },
-            thread_id: None,
+            thread_id: Some(ThreadId("T1".to_string())),
             message_id: None,
             references: Vec::new(),
             in_reply_to: None,
@@ -784,5 +796,44 @@ mod tests {
         let blob = entry.blob_id.expect("blob id present");
         assert_eq!(blob.0, super::super::foreign::encode_object("acct-9", "B1"));
         assert_eq!(super::super::foreign::native_object(&blob.0), "B1");
+
+        // The thread id is qualified in the same namespace and decodes
+        // back to the native id the foreign `Thread/get` expects. Left
+        // bare it would assert PRIMARY ownership, and a thread-keyed
+        // mutation on an id collision would rewrite an unrelated primary
+        // thread's messages.
+        let thread = entry.thread_id.expect("thread id present");
+        assert_eq!(
+            thread.0,
+            super::super::foreign::encode_object("acct-9", "T1")
+        );
+        assert_eq!(super::super::foreign::native_object(&thread.0), "T1");
+    }
+
+    /// A primary entry keeps every id bare: one logical object, one wire
+    /// form, and a bare thread id is exactly the assertion "this is the
+    /// primary account's thread".
+    #[test]
+    fn a_primary_entry_is_never_qualified() {
+        let email: Email = serde_json::from_value(serde_json::json!({
+            "id": "M1",
+            "blobId": "B1",
+            "threadId": "T1",
+            "size": 10,
+            "mailboxIds": {"inbox": true},
+            "keywords": {}
+        }))
+        .expect("email deserializes");
+        let entry = email_to_inventory(email, "s1");
+
+        assert_eq!(entry.id.0, "M1");
+        assert_eq!(
+            entry.blob_id.as_ref().map(|blob| blob.0.as_str()),
+            Some("B1")
+        );
+        assert_eq!(
+            entry.thread_id.as_ref().map(|thread| thread.0.as_str()),
+            Some("T1")
+        );
     }
 }

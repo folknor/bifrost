@@ -24,7 +24,7 @@ use crate::error::Error;
 
 /// Persistence contract.
 ///
-/// All five methods are async because real persistence backends are
+/// All methods are async because real persistence backends are
 /// IO-bound. The in-memory impl returns ready futures.
 pub trait CheckpointStore: Send + Sync {
     /// Persist or replace the change cursor for `(account, scope)`.
@@ -74,6 +74,23 @@ pub trait CheckpointStore: Send + Sync {
     /// required because a no-op delete silently preserves the stale
     /// durable cursor and makes restart-scope recovery ineffective.
     fn delete_change_cursor<'a>(
+        &'a self,
+        account: &'a AccountId,
+        scope: &'a CursorScope,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + 'a>>;
+
+    /// Drop every backfill checkpoint for `(account, scope)`, the
+    /// durable completion marker included. Used ONLY by the engine's
+    /// `SchemaIncompatible` recovery: a schema bump means the ids the
+    /// consumer holds were minted under an encoding the protocol has
+    /// disowned, and the completion marker is what makes the next
+    /// attach skip the inventory re-walk that re-mints them - so a
+    /// no-op here silently pins the consumer to the old ids forever.
+    /// Routine `RestartScope` recovery deliberately does NOT call
+    /// this: re-walking a completed backfill after every cursor
+    /// invalidation would re-hydrate the whole scope for no schema
+    /// reason.
+    fn delete_backfill<'a>(
         &'a self,
         account: &'a AccountId,
         scope: &'a CursorScope,
@@ -192,6 +209,22 @@ impl CheckpointStore for InMemoryCheckpointStore {
         Box::pin(async move {
             let mut guard = self.inner.lock().expect("poisoned");
             guard.change.remove(&(account, scope));
+            Ok(())
+        })
+    }
+
+    fn delete_backfill<'a>(
+        &'a self,
+        account: &'a AccountId,
+        scope: &'a CursorScope,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + 'a>> {
+        let account = account.clone();
+        let scope = scope.clone();
+        Box::pin(async move {
+            let mut guard = self.inner.lock().expect("poisoned");
+            guard
+                .backfill
+                .retain(|(aid, s, _), _| !(aid == &account && s == &scope));
             Ok(())
         })
     }

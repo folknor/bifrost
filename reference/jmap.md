@@ -234,7 +234,7 @@ Reopen is engine-delegated: on drop or `close()`, the engine calls `JmapAccountF
 
 ### Cursor envelope
 
-`OpaqueChangeState` for JMAP is tagged with `ProtocolKind::Jmap` and `envelope_version = ENVELOPE_VERSION_V1` (currently `1`). `CHANGE_CURSOR_ENVELOPE_VERSION` is the matching `ChangeCursor.envelope_version`.
+`OpaqueChangeState` for JMAP is tagged with `ProtocolKind::Jmap` and `envelope_version = ENVELOPE_VERSION_V2` (currently `2`). `CHANGE_CURSOR_ENVELOPE_VERSION` is the matching `ChangeCursor.envelope_version`. v2 is an OBJECT-ID encoding change, not a payload-shape change, exactly like graph's v2: v1 minted foreign thread ids bare, and a bare id still parses - as PRIMARY - so no additive field can detect one. A v1 cursor is therefore refused: `state::decode` distinguishes an OLDER envelope (`SchemaIncompatible` - reseed) from a FUTURE one (`CursorEnvelopeUnknown`), the refusal is pinned at the `changes_stream` door with its derived `Engine(SchemaIncompatible)` directive, and the engine's schema-clear deletes both the change cursors and every backfill checkpoint (completion marker included) so the next attach re-walks inventory and re-mints the ids - reseeding is the migration. Within the clearing session itself the re-established cursor covers changes from the open-time state onward only; the consumer's stored bare thread ids heal at that next-attach re-walk.
 
 The payload is hand-rolled, length-prefixed bytes (little-endian `u32` lengths, single-byte tags):
 
@@ -246,7 +246,7 @@ scope-tag:u8        // 1=Email 2=Mailbox 3=Thread 4=Query 5=Folder
 state-string:length-prefixed-utf8
 ```
 
-`JmapCursorState::V1 { scope: JmapScopeRepr, state_string }` is the only current variant. Its envelope can decode `Email`, `Mailbox`, legacy `Thread`/`Query(String)`, and `Folder { account_id, mailbox_id }` (a foreign account; round-trips through the `foreign.rs` codec). The SEEDED foreign shape is account-level - `encode_foreign_account(accountId)`, an empty `mailbox_id` (unambiguous: RFC 8620 ids are 1-255 chars) - one scope per share, because `Email/changes` state is per `(accountId, type)`. A legacy per-mailbox `Folder` cursor (non-empty `mailbox_id`) still decodes and still drives correctly if handed to `changes_stream`, but is no longer seeded or discovered. Discovery only exposes Email, Mailbox, and foreign Folder scopes; legacy Thread and Query cursors terminate unsupported rather than silently taking an unseeded or undefined path. `SCOPE_TAG_FOLDER = 5` is additive under the same `ENVELOPE_VERSION_V1` - existing primary cursors (tags 1-4) still decode, no version bump.
+`JmapCursorState::V1 { scope: JmapScopeRepr, state_string }` is the only current variant. Its envelope can decode `Email`, `Mailbox`, legacy `Thread`/`Query(String)`, and `Folder { account_id, mailbox_id }` (a foreign account; round-trips through the `foreign.rs` codec). The SEEDED foreign shape is account-level - `encode_foreign_account(accountId)`, an empty `mailbox_id` (unambiguous: RFC 8620 ids are 1-255 chars) - one scope per share, because `Email/changes` state is per `(accountId, type)`. A legacy per-mailbox `Folder` cursor (non-empty `mailbox_id`) still decodes and still drives correctly if handed to `changes_stream`, but is no longer seeded or discovered. Discovery only exposes Email, Mailbox, and foreign Folder scopes; legacy Thread and Query cursors terminate unsupported rather than silently taking an unseeded or undefined path. `SCOPE_TAG_FOLDER = 5` was additive when it landed (tags 1-4 kept decoding, no bump); the later v2 bump was forced by the thread-id encoding change, not by this tag.
 
 Validation rules in `state::decode`:
 
@@ -480,13 +480,23 @@ OBJECT namespace (`encode_object`, what `open_blob` decodes), each
 `containers_list` and the cursor scopes key on). The two namespaces are not
 interchangeable and the projection must not confuse them.
 
-`thread_hydrate` is NOT routed, deliberately: foreign inventory never
-qualifies `InventoryEntry::thread_id`, so there is no foreign-encoded thread
-id in circulation to route. That is a statement about routability, not about
-safety - a bare foreign thread id is indistinguishable from a primary one, so
-every thread-taking read AND mutation runs against the primary account and
-can resolve an unrelated thread on an id collision. See the `nc-7` TODO;
-qualifying thread ids is a contract change, not a wiring fix.
+Thread ids ride the same object namespace (nc-7's fix): foreign inventory
+and hydration qualify `InventoryEntry::thread_id` / `Message.thread_id`
+through the one `qualify_foreign_ids` hook, so a foreign thread id carries
+its owner everywhere the consumer sees it, and every thread-keyed door
+decodes it - `thread_hydrate` selects the owning handle, sends the bare
+native id, and re-qualifies each returned member's id/thread/containers/
+attachments; `MutationTarget::Thread` fan-outs, `move_thread`, and
+`delete_thread` route the same way, with `delete_thread` minting its
+resolved Trash id in the thread's own namespace so the cross-account guard
+and the already-in-Trash comparison see one account. The handle-selection
+boundary itself (`route_object_id` / `route_mutation_target`) is
+transport-generic and pinned over string handles, because `JmapAccount`
+hardwires `ReqwestTransport` (xc-3) and the account door cannot be driven
+scripted; the account methods are one-line delegations to keep that pin
+meaningful. A thread id qualified for an account this session no longer
+holds stays LITERAL on the primary route - same rule as message ids - so
+the server reports the miss instead of a collision-prone local strip.
 
 `containers_list` appends each foreign account's mailboxes with
 `namespace = Shared`, `owner = MailboxId(accountId)`,

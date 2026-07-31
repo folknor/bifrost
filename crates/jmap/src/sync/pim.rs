@@ -1100,14 +1100,45 @@ pub(crate) fn quota_get<T: HttpTransport>(
     })
 }
 
+/// Route a thread id to the account that owns it.
+///
+/// `Thread/get` is accountId-scoped and the thread id is the ONLY operand,
+/// so an owner-qualified foreign thread id has to select its own account's
+/// handle before the qualification is stripped. An id naming an account
+/// this session has no handle for stays on the primary route with its
+/// LITERAL (still-qualified) form - the same rule `hydrate::route_for_id`
+/// plus `wire_id_for_mail` apply to message ids: stripped, the bare native
+/// id could resolve an unrelated same-id primary thread; literal, it can
+/// name no real primary thread (`\u{1f}` never occurs in an RFC 8620 id)
+/// and the server reports the honest `notFound`.
+/// Pure over the registration predicate, so the selection is unit-pinnable
+/// without a live session - the same shape as `hydrate::route_for_id`.
+pub(crate) fn thread_owner<F>(thread: &ThreadId, is_registered: F) -> Option<String>
+where
+    F: Fn(&str) -> bool,
+{
+    super::foreign::parse_object(&thread.0)
+        .filter(|(account, _)| is_registered(account))
+        .map(|(account, _)| account.to_string())
+}
+
 pub(crate) fn thread_hydrate<T: HttpTransport>(
     mail: MailAccount<T>,
+    foreign_mail: Arc<HashMap<String, MailAccount<T>>>,
     thread: ThreadId,
 ) -> AccountFuture<Result<ThreadHydration, AccountError>> {
     Box::pin(async move {
-        let jmap_thread_id = JmapThreadId::new(thread.0.clone());
+        let owner = thread_owner(&thread, |account| foreign_mail.contains_key(account));
+        let mail = match owner
+            .as_deref()
+            .and_then(|account| foreign_mail.get(account))
+        {
+            Some(handle) => handle.clone(),
+            None => mail,
+        };
+        let jmap_thread_id = JmapThreadId::new(wire_id_for_mail(&thread.0, mail.id_str()));
         let mut thread_response = mail
-            .call(ThreadGet::new().ids([jmap_thread_id.clone()]).properties([
+            .call(ThreadGet::new().ids([jmap_thread_id]).properties([
                 crate::thread::Property::Id,
                 crate::thread::Property::EmailIds,
             ]))
@@ -1156,9 +1187,27 @@ pub(crate) fn thread_hydrate<T: HttpTransport>(
         let mut messages = Vec::new();
         for id in order {
             if let Some(email) = by_id.remove(id.as_str()) {
-                messages.push(email_to_message(email, HydrationProjection::Full));
+                let mut message = email_to_message(email, HydrationProjection::Full);
+                // The member ids came off the wire in the foreign
+                // account's own namespace. Handed back bare they would
+                // route every follow-on request (blob download, container
+                // join, a per-message mutation) through the PRIMARY
+                // account, so re-qualify them into the same namespace the
+                // foreign inventory and `message_hydrate` mint.
+                if let Some(account) = owner.as_deref() {
+                    qualify_foreign_message_ids(
+                        &mut message.id,
+                        message.thread_id.as_mut(),
+                        &mut message.containers,
+                        &mut message.attachments,
+                        account,
+                    );
+                }
+                messages.push(message);
             }
         }
+        // The hydration's own id is the id the CALLER submitted, verbatim,
+        // so a round-trip through this door is byte-stable.
         Ok(ThreadHydration {
             id: thread,
             messages,
@@ -1175,15 +1224,26 @@ pub(crate) fn thread_hydrate<T: HttpTransport>(
 /// all come back in the PRIMARY namespace, so the follow-up blob download
 /// 404s against the primary account and the container ids join nothing.
 ///
-/// Pure over the three id slices so the qualification is unit-pinnable
+/// The `thread_id` is qualified for the same reason, and it is the
+/// sharpest one: the consumer hands it back as `thread_hydrate(thread)`
+/// and as `MutationTarget::Thread`, each of which expands it through an
+/// accountId-scoped `Thread/get`. A bare foreign thread id asserts primary
+/// ownership, so on an id collision the write lands on an unrelated
+/// primary thread's messages.
+///
+/// Pure over the id slices so the qualification is unit-pinnable
 /// without constructing a whole `Message`.
 fn qualify_foreign_message_ids(
     id: &mut ObjectId,
+    thread_id: Option<&mut ThreadId>,
     containers: &mut [ContainerId],
     attachments: &mut [BlobHandle],
     account: &str,
 ) {
     id.0 = super::foreign::encode_object(account, &id.0);
+    if let Some(thread) = thread_id {
+        thread.0 = super::foreign::encode_object(account, &thread.0);
+    }
     for container in containers {
         // A container id is a MAILBOX id, so it carries the same namespace
         // `containers_list` mints for a foreign mailbox - not the object
@@ -1264,6 +1324,7 @@ pub(crate) fn message_hydrate<T: HttpTransport>(
         if let Some(account) = owner.as_deref() {
             qualify_foreign_message_ids(
                 &mut hydrated.id,
+                hydrated.thread_id.as_mut(),
                 &mut hydrated.containers,
                 &mut hydrated.attachments,
                 account,
@@ -1317,6 +1378,18 @@ pub(crate) fn delete_thread<T: HttpTransport>(
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
         let trash = role_mailbox(&mail, FolderRole::Trash, AccountOperation::BulkDestroy).await?;
+        // `role_mailbox` ran against the account the thread id routed to,
+        // so it answered a NATIVE mailbox id in that account. Every other
+        // container id crossing this boundary - the caller's `current`, the
+        // ids `containers_list` mints - is owner-qualified for a foreign
+        // account, and `cross_account_container` compares the two owners
+        // before anything is sent. Mint the trash id in the thread's own
+        // namespace so the comparison sees one account, not a bare id that
+        // reads as primary.
+        let trash = match super::foreign::owner_of(&thread.0) {
+            Some(owner) => ContainerId(super::foreign::encode_foreign(owner, trash.as_str()).0),
+            None => ContainerId(trash.into_string()),
+        };
         // JMAP mailbox ids are server-issued opaque strings and RFC
         // 8620 leaves case-sensitivity to the server, but two
         // mailboxes that differ only in case is a pathological shape
@@ -1326,7 +1399,7 @@ pub(crate) fn delete_thread<T: HttpTransport>(
         // already in Trash" branch correctly.
         let already_in_trash = current
             .as_ref()
-            .is_some_and(|id| id.0.eq_ignore_ascii_case(trash.as_str()));
+            .is_some_and(|id| id.0.eq_ignore_ascii_case(&trash.0));
         if already_in_trash {
             let ids = resolve_target(
                 &mail,
@@ -1348,7 +1421,7 @@ pub(crate) fn delete_thread<T: HttpTransport>(
                 &email_states,
                 &account_id,
                 MutationTarget::Thread(thread.clone()),
-                ContainerId(trash.into_string()),
+                trash,
                 true,
                 AccountOperation::BulkMove,
             )
@@ -1411,10 +1484,18 @@ async fn resolve_target<T: HttpTransport>(
             Ok(vec![EmailId::new(wire_id_for_mail(&id.0, mail.id_str()))])
         }
         MutationTarget::Thread(thread) => {
+            // Same rule as the `Message` arm above: the account layer has
+            // already selected `mail` from the thread id's owner, so strip
+            // the qualification only when it names this exact account. An
+            // unreachable foreign thread id stays literal and the server
+            // reports the honest miss instead of a same-id primary thread.
             let mut response = mail
                 .call(
                     ThreadGet::new()
-                        .ids([JmapThreadId::new(thread.0.clone())])
+                        .ids([JmapThreadId::new(wire_id_for_mail(
+                            &thread.0,
+                            mail.id_str(),
+                        ))])
                         .properties([crate::thread::Property::EmailIds]),
                 )
                 .await
@@ -1459,9 +1540,10 @@ async fn resolve_target<T: HttpTransport>(
 /// foreign account does not fail: it names whatever mailbox that account
 /// holds under the same id, and the message is filed somewhere the caller
 /// never asked for with no error reported. Compare owners before anything is
-/// sent. Threads never route foreign, so their owner is the primary account
-/// (`None`); other target shapes keep `resolve_target`'s `Unsupported`
-/// classification and are left alone here.
+/// sent. A thread target declares its owner the same way a message does -
+/// a foreign thread id is owner-qualified in the object namespace, a bare
+/// one is primary - so the two arms are symmetric; other target shapes keep
+/// `resolve_target`'s `Unsupported` classification and are left alone here.
 ///
 /// `Request(Malformed)` matches bifrost-graph's cross-mailbox `bulk_move`
 /// rejection: the caller asked for something one endpoint cannot express.
@@ -1472,7 +1554,7 @@ fn cross_account_container(
 ) -> Result<(), AccountError> {
     let (target_id, target_owner) = match target {
         MutationTarget::Message(id) => (id.0.as_str(), super::foreign::owner_of(&id.0)),
-        MutationTarget::Thread(thread) => (thread.0.as_str(), None),
+        MutationTarget::Thread(thread) => (thread.0.as_str(), super::foreign::owner_of(&thread.0)),
         _ => return Ok(()),
     };
     let container_owner = super::foreign::owner_of(&container.0);
@@ -2889,6 +2971,7 @@ mod tests {
     #[test]
     fn foreign_hydration_requalifies_message_container_and_blob_ids() {
         let mut id = ObjectId("M1".to_string());
+        let mut thread_id = ThreadId("T1".to_string());
         let mut containers = vec![ContainerId("inbox".to_string())];
         let mut attachments = vec![BlobHandle {
             id: BlobId("B1".to_string()),
@@ -2903,11 +2986,24 @@ mod tests {
             },
         }];
 
-        qualify_foreign_message_ids(&mut id, &mut containers, &mut attachments, "acct-9");
+        qualify_foreign_message_ids(
+            &mut id,
+            Some(&mut thread_id),
+            &mut containers,
+            &mut attachments,
+            "acct-9",
+        );
 
         // Object ids (message, blob) ride the OBJECT namespace, which
         // `open_blob` / `get_stream` decode.
         assert_eq!(id.0, super::super::foreign::encode_object("acct-9", "M1"));
+        // The thread id rides the same namespace: it is what the consumer
+        // hands to `thread_hydrate` and `MutationTarget::Thread`, and both
+        // expand it through an accountId-scoped `Thread/get`.
+        assert_eq!(
+            thread_id.0,
+            super::super::foreign::encode_object("acct-9", "T1")
+        );
         assert_eq!(
             attachments[0].id.0,
             super::super::foreign::encode_object("acct-9", "B1")
@@ -2918,6 +3014,102 @@ mod tests {
         assert_eq!(
             containers[0].0,
             super::super::foreign::encode_foreign("acct-9", "inbox").0
+        );
+    }
+
+    /// The routing decision behind every thread-keyed door.
+    ///
+    /// A bare id is PRIMARY by construction (only foreign ids are ever
+    /// encoded), a qualified id names its share, and a qualified id for a
+    /// share that has gone away deliberately does NOT resolve to a
+    /// registered account - it rides the primary route with its literal
+    /// form so the server reports the miss, rather than being stripped
+    /// into a bare native id that could collide with a real primary
+    /// thread.
+    #[test]
+    fn a_thread_id_declares_the_account_that_must_expand_it() {
+        let registered = |account: &str| account == "shared";
+
+        let foreign = ThreadId(super::super::foreign::encode_object("shared", "T9"));
+        assert_eq!(
+            thread_owner(&foreign, registered),
+            Some("shared".to_string())
+        );
+
+        assert_eq!(thread_owner(&ThreadId("T9".to_string()), registered), None);
+
+        let departed = ThreadId(super::super::foreign::encode_object("revoked", "T9"));
+        assert_eq!(thread_owner(&departed, registered), None);
+        // ...and the primary route keeps it literal, so the wire id can
+        // name no real primary thread.
+        assert_eq!(wire_id_for_mail(&departed.0, "primary"), departed.0);
+    }
+
+    /// The qualification round-trip a thread-keyed door performs: qualify
+    /// at the projection site, decode at the door, and the wire id is the
+    /// native id the owning account issued.
+    #[test]
+    fn a_qualified_thread_id_round_trips_to_its_native_wire_form() {
+        let qualified = super::super::foreign::encode_object("shared", "T9");
+        assert_eq!(wire_id_for_mail(&qualified, "shared"), "T9");
+        // Byte-stable: re-qualifying the decoded native id reproduces it.
+        assert_eq!(
+            super::super::foreign::encode_object("shared", &wire_id_for_mail(&qualified, "shared")),
+            qualified
+        );
+        // A bare (primary) thread id is untouched on the primary route.
+        assert_eq!(wire_id_for_mail("T9", "primary"), "T9");
+    }
+
+    /// A thread target answers the cross-account question the same way a
+    /// message target does. Before this, threads asserted primary
+    /// ownership unconditionally, so a foreign thread paired with a bare
+    /// primary container passed the guard.
+    #[test]
+    fn a_thread_target_and_its_container_must_name_the_same_account() {
+        let foreign_thread = MutationTarget::Thread(ThreadId(
+            super::super::foreign::encode_object("shared", "T9"),
+        ));
+        let foreign_container =
+            ContainerId(super::super::foreign::encode_foreign("shared", "inbox").0);
+        let primary_container = ContainerId("inbox".to_string());
+
+        assert!(
+            cross_account_container(
+                &foreign_thread,
+                &foreign_container,
+                AccountOperation::BulkMove
+            )
+            .is_ok()
+        );
+        let err = cross_account_container(
+            &foreign_thread,
+            &primary_container,
+            AccountOperation::BulkMove,
+        )
+        .expect_err("a foreign thread cannot be filed into a primary mailbox id");
+        assert_eq!(
+            err.kind(),
+            &bifrost_types::AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed)
+        );
+
+        // The mirror case: a primary thread and a foreign container.
+        let primary_thread = MutationTarget::Thread(ThreadId("T9".to_string()));
+        assert!(
+            cross_account_container(
+                &primary_thread,
+                &primary_container,
+                AccountOperation::BulkMove
+            )
+            .is_ok()
+        );
+        assert!(
+            cross_account_container(
+                &primary_thread,
+                &foreign_container,
+                AccountOperation::BulkMove
+            )
+            .is_err()
         );
     }
 

@@ -148,19 +148,26 @@ impl JmapAccount {
     /// stays on the primary route so the server, not a guessed local route,
     /// reports the miss.
     fn mail_for_object_id(&self, id: &ObjectId) -> MailAccount {
-        foreign_account_id_for_object(id, |account_id| self.foreign_mail.contains_key(account_id))
-            .as_deref()
-            .and_then(|account_id| self.foreign_mail.get(account_id))
-            .cloned()
-            .unwrap_or_else(|| self.mail.clone())
+        route_object_id(&id.0, &self.mail, &self.foreign_mail).clone()
+    }
+
+    /// Resolve a thread-keyed operation to its owning account.
+    ///
+    /// A foreign thread id is owner-qualified in the object namespace (the
+    /// foreign inventory and hydration mint it that way), and `Thread/get`
+    /// is accountId-scoped with the thread id as its only operand. Routed
+    /// to the primary account, a foreign thread id either finds nothing
+    /// or, on an id collision, resolves an UNRELATED primary thread whose
+    /// messages the caller's mutation then rewrites. As with a message id,
+    /// an id naming an account this session no longer holds stays on the
+    /// primary route in its literal form so the server, not a guessed
+    /// local route, reports the miss.
+    fn mail_for_thread(&self, thread: &ThreadId) -> MailAccount {
+        route_object_id(&thread.0, &self.mail, &self.foreign_mail).clone()
     }
 
     fn mail_for_mutation_target(&self, target: &MutationTarget) -> MailAccount {
-        match target {
-            MutationTarget::Message(id) => self.mail_for_object_id(id),
-            MutationTarget::Thread(_) => self.mail.clone(),
-            _ => self.mail.clone(),
-        }
+        route_mutation_target(target, &self.mail, &self.foreign_mail).clone()
     }
 
     /// The owning shared-account identity for a foreign `Folder` scope,
@@ -235,11 +242,43 @@ where
         .map(|(account_id, _)| account_id.to_string())
 }
 
+/// Select the handle an object-namespace id routes to. Message and
+/// thread ids ride the same `accountId\u{1f}native` encoding, so one
+/// selector covers both; an id whose account is not registered (a
+/// departed share) stays on the primary route in its literal form.
+///
+/// Generic over the handle type because `JmapAccount` hardwires
+/// `ReqwestTransport` and cannot be built over a scripted transport, so
+/// this exact boundary - the one a primary-fallback regression would
+/// cross - is pinned over plain string handles instead. The account
+/// methods above are one-line delegations to keep that pin meaningful.
+fn route_object_id<'a, H>(raw: &str, primary: &'a H, foreign: &'a HashMap<String, H>) -> &'a H {
+    super::foreign::parse_object(raw)
+        .and_then(|(account_id, _)| foreign.get(account_id))
+        .unwrap_or(primary)
+}
+
+/// Handle selection for a `MutationTarget`: message and thread targets
+/// route by their id's owner; any other (future) target shape stays
+/// primary, the conservative default for an id form this codec cannot
+/// attribute.
+fn route_mutation_target<'a, H>(
+    target: &MutationTarget,
+    primary: &'a H,
+    foreign: &'a HashMap<String, H>,
+) -> &'a H {
+    match target {
+        MutationTarget::Message(id) => route_object_id(&id.0, primary, foreign),
+        MutationTarget::Thread(thread) => route_object_id(&thread.0, primary, foreign),
+        _ => primary,
+    }
+}
+
 /// Pure descriptor logic behind `Account::describe_cursor`, split out
 /// for direct testing.
 ///
 /// Decoding alone is not support: legacy `Thread` and `Query` cursors
-/// still decode (their scope tags remain in the V1 envelope so old
+/// still decode (their scope tags survive the envelope bump so old
 /// durable rows stay readable) but `changes::stream` terminates both
 /// `Unsupported(SyncChanges)` - thread inventory derives from Email
 /// inventory, and the v1 contract registers no query definitions to
@@ -1095,7 +1134,7 @@ impl Account for JmapAccount {
         &self,
         thread: ThreadId,
     ) -> AccountFuture<Result<ThreadHydration, AccountError>> {
-        pim::thread_hydrate(self.mail.clone(), thread)
+        pim::thread_hydrate(self.mail.clone(), Arc::clone(&self.foreign_mail), thread)
     }
 
     fn message_hydrate(
@@ -1117,10 +1156,11 @@ impl Account for JmapAccount {
         target: ContainerId,
         source: Option<ContainerId>,
     ) -> AccountFuture<Result<(), AccountError>> {
+        let mail = self.mail_for_thread(&thread);
         pim::move_thread(
-            self.mail.clone(),
+            mail.clone(),
             Arc::clone(&self.email_states),
-            self.mail.id_str().to_string(),
+            mail.id_str().to_string(),
             thread,
             target,
             source,
@@ -1170,10 +1210,11 @@ impl Account for JmapAccount {
         thread: ThreadId,
         current: Option<ContainerId>,
     ) -> AccountFuture<Result<(), AccountError>> {
+        let mail = self.mail_for_thread(&thread);
         pim::delete_thread(
-            self.mail.clone(),
+            mail.clone(),
             Arc::clone(&self.email_states),
-            self.mail.id_str().to_string(),
+            mail.id_str().to_string(),
             thread,
             current,
         )
@@ -1307,9 +1348,63 @@ mod tests {
     use super::{
         describe_cursor_support, foreign_account_id_for_object,
         foreign_owner_memberships_from_scopes, is_unregistered_foreign, resolve_foreign_account_id,
-        route_send_as,
+        route_mutation_target, route_object_id, route_send_as,
     };
-    use bifrost_types::{ChangeCursor, CostClass, SyncStrategy};
+    use bifrost_types::{ChangeCursor, CostClass, MutationTarget, SyncStrategy, ThreadId};
+
+    /// The handle-selection boundary every thread- and message-keyed
+    /// door delegates to. `JmapAccount` hardwires `ReqwestTransport`,
+    /// so this is pinned over string handles: a regression that sends
+    /// a foreign target down the primary route fails HERE, on the
+    /// selected handle itself.
+    #[test]
+    fn object_and_thread_targets_route_to_the_owning_handle() {
+        let primary = "PRIMARY".to_string();
+        let foreign_map =
+            std::collections::HashMap::from([("shared".to_string(), "SHARED".to_string())]);
+
+        let foreign_thread = ThreadId(foreign::encode_object("shared", "T1"));
+        let foreign_message = ObjectId(foreign::encode_object("shared", "M1"));
+        let departed_thread = ThreadId(foreign::encode_object("gone", "T1"));
+
+        // The raw selector, both namespaces.
+        assert_eq!(
+            route_object_id(&foreign_thread.0, &primary, &foreign_map),
+            "SHARED"
+        );
+        assert_eq!(route_object_id("T1", &primary, &foreign_map), "PRIMARY");
+        assert_eq!(
+            route_object_id(&departed_thread.0, &primary, &foreign_map),
+            "PRIMARY",
+            "a departed share's id stays literal on the primary route"
+        );
+
+        // The MutationTarget dispatch the flag/read/importance doors use.
+        assert_eq!(
+            route_mutation_target(
+                &MutationTarget::Thread(foreign_thread),
+                &primary,
+                &foreign_map
+            ),
+            "SHARED"
+        );
+        assert_eq!(
+            route_mutation_target(
+                &MutationTarget::Message(foreign_message),
+                &primary,
+                &foreign_map
+            ),
+            "SHARED"
+        );
+        assert_eq!(
+            route_mutation_target(
+                &MutationTarget::Thread(ThreadId("bare".into())),
+                &primary,
+                &foreign_map
+            ),
+            "PRIMARY"
+        );
+    }
 
     fn as_shared() -> SendAs {
         SendAs::As(MailboxId("foreign-id".to_string()))
@@ -1368,7 +1463,8 @@ mod tests {
 
     #[test]
     fn legacy_thread_and_query_cursors_are_not_advertised_as_usable() {
-        // Both decode (their scope tags remain in the V1 envelope) but
+        // Both decode (their scope tags are unchanged by the envelope
+        // version bump, so old durable rows stay readable) but
         // `changes::stream` terminates them Unsupported(SyncChanges), so
         // the descriptor must not promise a strategy that dies on its
         // first poll. Strategy `None` routes the consumer back through

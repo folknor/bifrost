@@ -813,6 +813,8 @@ pub trait CheckpointStore: Send + Sync {
         -> Pin<Box<dyn Future<Output = Result<Option<BackfillCheckpoint>, Error>> + Send + 'a>>;
     fn delete_change_cursor<'a>(&'a self, account: &'a AccountId, scope: &'a CursorScope)
         -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + 'a>>;
+    fn delete_backfill<'a>(&'a self, account: &'a AccountId, scope: &'a CursorScope)
+        -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + 'a>>;
 }
 ```
 
@@ -823,6 +825,12 @@ drop the durable cursor so the next establish re-runs via inventory;
 a no-op delete would silently preserve the stale cursor. It is also
 what attach calls to clear an undecodable envelope, so a store that
 no-ops here strands the account on a row it cannot read.
+`delete_backfill` drops every backfill row for the scope, completion
+marker included; only `SchemaIncompatible` recovery calls it (the
+marker is what would make the next attach skip the inventory re-walk
+that re-mints ids under the new encoding), and routine `RestartScope`
+deliberately does not - re-walking a completed backfill after every
+cursor invalidation would re-hydrate the scope for no schema reason.
 
 A store that decodes durable bytes must surface a schema it cannot
 read as `Error::SchemaIncompatible` from `get_change_cursor`; that is
@@ -1027,7 +1035,7 @@ crates/sync/src/
   cursor/
     mod.rs                // CursorRegistry + membership index
     envelope.rs           // MIN_MIGRATABLE / ENGINE_VERSION + migrations
-    store.rs              // CheckpointStore trait (5 methods) +
+    store.rs              // CheckpointStore trait (6 methods) +
                           // InMemoryCheckpointStore
   scheduler/
     mod.rs                // four-lane Scheduler (NOT WIRED into work paths)

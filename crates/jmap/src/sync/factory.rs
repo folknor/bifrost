@@ -1868,4 +1868,465 @@ mod tests {
 
         assert_eq!(emails, vec!["ada@example.test"]);
     }
+
+    // ---------------------------------------------------------------
+    // Foreign thread-id qualification (nc-7).
+    //
+    // A foreign thread id is owner-qualified in the object namespace, the
+    // same way its account's `Email` ids and `blobId`s already were. Every
+    // thread-keyed door decodes that qualification and runs its
+    // accountId-scoped `Thread/get` - plus the mutation that follows -
+    // against the OWNING account. The doubles below arrange the loud
+    // failure deliberately: the primary handle is always supplied
+    // alongside the share, and every assertion names the accountId that
+    // actually went on the wire, so a fallback to the primary shows up as
+    // a failed assertion rather than a quietly passing test.
+    // ---------------------------------------------------------------
+
+    fn thread_get_reply(account_id: &str, thread_id: &str, email_ids: &[&str]) -> ScriptedReply {
+        method_reply(vec![json!([
+            "Thread/get",
+            {"accountId": account_id, "state": "t-1", "list": [
+                {"id": thread_id, "emailIds": email_ids}
+            ], "notFound": []},
+            "s0"
+        ])])
+    }
+
+    /// One hydrated message inside a thread: enough properties for
+    /// `email_to_message` to fill the id, thread id, and containers.
+    fn thread_email_get_reply(account_id: &str, id: &str, thread_id: &str) -> ScriptedReply {
+        method_reply(vec![json!([
+            "Email/get",
+            {"accountId": account_id, "state": "email-1", "list": [
+                {"id": id, "threadId": thread_id, "blobId": "B1", "size": 10,
+                 "mailboxIds": {"inbox": true}, "keywords": {}}
+            ], "notFound": []},
+            "s0"
+        ])])
+    }
+
+    fn foreign_thread(account_id: &str, native: &str) -> bifrost_types::ThreadId {
+        bifrost_types::ThreadId(foreign::encode_object(account_id, native))
+    }
+
+    fn foreign_map(
+        account_id: &str,
+        account: JmapMailAccount<ScriptedTransport>,
+    ) -> Arc<HashMap<String, JmapMailAccount<ScriptedTransport>>> {
+        Arc::new(HashMap::from([(account_id.to_string(), account)]))
+    }
+
+    /// A stale (v1) cursor must be refused at the `changes_stream` DOOR,
+    /// not merely inside the cursor decoder: the door is what the engine
+    /// calls, and what it yields is what drives the recovery. The v1
+    /// encoding minted foreign thread ids bare, so resuming one would skip
+    /// the inventory pass that re-mints them - reseeding is the migration.
+    #[tokio::test]
+    async fn a_v1_cursor_is_refused_at_the_changes_door_before_any_request() {
+        // No replies armed: reaching the wire at all is a failure.
+        let client = scripted_client([]);
+        let primary = client
+            .primary_account::<capability::Mail>()
+            .expect("primary mail account");
+        let scope = CursorScope::Type(ObjectType::Email);
+        let mut cursor = state::cursor_for_scope(scope.clone(), "s1").expect("scope encodes");
+        cursor.server_state.envelope_version = 1;
+
+        let mut stream = crate::sync::changes::stream(
+            primary,
+            "primary".to_string(),
+            super::capabilities::CoreLimits {
+                max_objects_in_get: 4,
+                max_objects_in_set: 4,
+            },
+            cursor,
+            None,
+            state_map(&[("primary", "s1")]),
+            state_map(&[("primary", "s1")]),
+        );
+
+        match stream.next().await {
+            Some(bifrost_types::SyncEvent::Terminated(err)) => {
+                assert_eq!(
+                    err.kind(),
+                    &bifrost_types::AccountErrorKind::SyncState(
+                        bifrost_types::SyncStateErrorKind::SchemaIncompatible
+                    )
+                );
+                // The directive is the point: the engine drops every
+                // durable cursor and re-establishes through inventory,
+                // which re-mints the ids under the new encoding.
+                assert_eq!(
+                    err.recovery(),
+                    &bifrost_types::RecoveryClass::Engine(
+                        bifrost_types::EngineDirective::SchemaIncompatible
+                    )
+                );
+            }
+            other => panic!("expected a schema-incompatible termination, got {other:?}"),
+        }
+        assert!(
+            client.transport().requests().is_empty(),
+            "a stale cursor must not reach Email/changes at all"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_foreign_thread_hydration_runs_in_the_share_and_requalifies_its_members() {
+        let client = scripted_client([
+            thread_get_reply("shared", "T9", &["M9"]),
+            thread_email_get_reply("shared", "M9", "T9"),
+        ]);
+        let primary = client
+            .primary_account::<capability::Mail>()
+            .expect("primary mail account");
+        let shared = JmapMailAccount::new(client.clone(), JmapAccountId::new("shared"));
+        let thread = foreign_thread("shared", "T9");
+
+        let hydration = crate::sync::pim::thread_hydrate(
+            primary,
+            foreign_map("shared", shared),
+            thread.clone(),
+        )
+        .await
+        .expect("the share answers its own thread");
+
+        // The hydration echoes the caller's id verbatim, so a round trip
+        // through this door is byte-stable.
+        assert_eq!(hydration.id, thread);
+        let message = match &hydration.messages[..] {
+            [message] => message,
+            other => panic!("expected the one thread member, got {other:?}"),
+        };
+        // Every member id comes back in the share's namespace so the
+        // consumer's follow-on blob read / container join / per-message
+        // mutation stays in the same account.
+        assert_eq!(message.id.0, foreign::encode_object("shared", "M9"));
+        assert_eq!(
+            message.thread_id.as_ref().map(|id| id.0.as_str()),
+            Some(foreign::encode_object("shared", "T9").as_str())
+        );
+        assert_eq!(
+            message.containers.first().map(|id| id.0.as_str()),
+            Some(foreign::encode_foreign("shared", "inbox").0.as_str())
+        );
+
+        let requests = client.transport().requests();
+        assert_eq!(requests.len(), 2);
+        let thread_get = &requests[0]["methodCalls"][0];
+        assert_eq!(thread_get[0], "Thread/get");
+        assert_eq!(
+            thread_get[1]["accountId"], "shared",
+            "a foreign thread must never be expanded against the primary account"
+        );
+        assert_eq!(thread_get[1]["ids"][0], "T9");
+        assert_eq!(requests[1]["methodCalls"][0][1]["accountId"], "shared");
+    }
+
+    /// A bare thread id asserts primary ownership, and that assertion must
+    /// keep holding: registering a share changes nothing for it.
+    #[tokio::test]
+    async fn a_bare_thread_id_still_hydrates_against_the_primary_account() {
+        let client = scripted_client([
+            thread_get_reply("primary", "T9", &["M9"]),
+            thread_email_get_reply("primary", "M9", "T9"),
+        ]);
+        let primary = client
+            .primary_account::<capability::Mail>()
+            .expect("primary mail account");
+        let shared = JmapMailAccount::new(client.clone(), JmapAccountId::new("shared"));
+
+        let hydration = crate::sync::pim::thread_hydrate(
+            primary,
+            foreign_map("shared", shared),
+            bifrost_types::ThreadId("T9".to_string()),
+        )
+        .await
+        .expect("the primary answers its own thread");
+
+        assert_eq!(hydration.id.0, "T9");
+        let message = &hydration.messages[0];
+        // Nothing is qualified on the primary route: one logical object,
+        // one wire form.
+        assert_eq!(message.id.0, "M9");
+        assert_eq!(
+            message.thread_id.as_ref().map(|id| id.0.as_str()),
+            Some("T9")
+        );
+        assert_eq!(message.containers[0].0, "inbox");
+
+        let requests = client.transport().requests();
+        assert_eq!(requests[0]["methodCalls"][0][1]["accountId"], "primary");
+        assert_eq!(requests[0]["methodCalls"][0][1]["ids"][0], "T9");
+    }
+
+    /// `set_keyword` / `set_is_read` / `set_importance` on a thread target
+    /// all funnel through `resolve_target` + `send_email_set_with_retry`,
+    /// so pinning one pins the expansion contract for all three: the
+    /// `Thread/get` carries the NATIVE id inside the share, and the
+    /// `Email/set` that follows names the same account.
+    #[tokio::test]
+    async fn a_foreign_thread_keyword_expands_and_writes_inside_the_share() {
+        let client = scripted_client([
+            thread_get_reply("shared", "T9", &["M9"]),
+            email_set_reply("shared", "shared-state", "shared-next", "M9"),
+        ]);
+        let shared = JmapMailAccount::new(client.clone(), JmapAccountId::new("shared"));
+
+        crate::sync::pim::set_keyword(
+            shared,
+            state_map(&[("primary", "primary-state"), ("shared", "shared-state")]),
+            "shared".to_string(),
+            MutationTarget::Thread(foreign_thread("shared", "T9")),
+            "$seen".to_string(),
+            true,
+        )
+        .await
+        .expect("the share accepts a keyword on its own thread");
+
+        let requests = client.transport().requests();
+        assert_eq!(requests.len(), 2);
+        let thread_get = &requests[0]["methodCalls"][0];
+        assert_eq!(thread_get[0], "Thread/get");
+        assert_eq!(thread_get[1]["accountId"], "shared");
+        assert_eq!(
+            thread_get[1]["ids"][0], "T9",
+            "the qualification is stripped only for the owning account"
+        );
+        let set = &requests[1]["methodCalls"][0];
+        assert_eq!(set[0], "Email/set");
+        assert_eq!(set[1]["accountId"], "shared");
+        assert_eq!(set[1]["ifInState"], "shared-state");
+        assert_eq!(set[1]["update"]["M9"]["keywords/$seen"], true);
+    }
+
+    /// The collision the whole change exists to prevent, pinned at the
+    /// wire.
+    ///
+    /// A thread id qualified for an account this session no longer holds
+    /// falls back to the primary route - and it must stay LITERAL there.
+    /// Stripped to its bare native id it would be indistinguishable from a
+    /// primary thread id, and the primary `Thread/get` would happily
+    /// resolve an unrelated same-id thread whose messages the mutation
+    /// then rewrites. What pins it is the id that actually goes on the
+    /// wire: the primary account here HOLDS a thread called `T9` (with
+    /// entirely different messages), so if the qualification is ever
+    /// stripped on the primary route the recorded `ids[0]` becomes `T9`
+    /// and this test fails - loudly - instead of quietly mutating a thread
+    /// the caller never named. Only one reply is armed, so a mutation
+    /// reaching the wire also fails rather than passing.
+    #[tokio::test]
+    async fn a_departed_shares_thread_id_can_never_resolve_a_primary_thread() {
+        let client = scripted_client([method_reply(vec![json!([
+            "Thread/get",
+            {"accountId": "primary", "state": "t-1", "list": [],
+             "notFound": [foreign::encode_object("revoked", "T9")]},
+            "s0"
+        ])])]);
+        let primary = client
+            .primary_account::<capability::Mail>()
+            .expect("primary mail account");
+
+        let error = crate::sync::pim::set_keyword(
+            primary,
+            state_map(&[("primary", "primary-state")]),
+            "primary".to_string(),
+            MutationTarget::Thread(foreign_thread("revoked", "T9")),
+            "$seen".to_string(),
+            true,
+        )
+        .await
+        .expect_err("an unreachable thread must fail, not hit a same-id primary thread");
+        assert_eq!(
+            error.operation(),
+            Some(bifrost_types::AccountOperation::SetKeyword)
+        );
+
+        let requests = client.transport().requests();
+        assert_eq!(
+            requests.len(),
+            1,
+            "the mutation must never be sent: {requests:?}"
+        );
+        assert_eq!(
+            requests[0]["methodCalls"][0][1]["ids"][0],
+            foreign::encode_object("revoked", "T9"),
+            "the id stays literal on the primary route, so it names no real thread"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_foreign_thread_move_files_into_the_shares_own_mailbox() {
+        let client = scripted_client([
+            thread_get_reply("shared", "T9", &["M9"]),
+            email_set_reply("shared", "shared-state", "shared-next", "M9"),
+        ]);
+        let shared = JmapMailAccount::new(client.clone(), JmapAccountId::new("shared"));
+
+        crate::sync::pim::move_thread(
+            shared,
+            state_map(&[("shared", "shared-state")]),
+            "shared".to_string(),
+            foreign_thread("shared", "T9"),
+            ContainerId(foreign::encode_foreign("shared", "archive").0),
+            None,
+        )
+        .await
+        .expect("a share-local move is expressible");
+
+        let requests = client.transport().requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["methodCalls"][0][1]["accountId"], "shared");
+        assert_eq!(requests[0]["methodCalls"][0][1]["ids"][0], "T9");
+        let set = &requests[1]["methodCalls"][0];
+        assert_eq!(set[1]["accountId"], "shared");
+        assert_eq!(
+            set[1]["update"]["M9"]["mailboxIds/archive"], true,
+            "the container qualification is stripped for the owning account"
+        );
+    }
+
+    /// A foreign thread paired with a PRIMARY container id is
+    /// inexpressible: `Email/set` names one accountId and resolves both
+    /// operands inside it, so a bare "archive" addressed to the share
+    /// files the thread into whatever mailbox the share holds under that
+    /// id, with no error. Before thread ids were qualified this guard
+    /// could not fire at all, because a thread always claimed primary
+    /// ownership.
+    #[tokio::test]
+    async fn a_foreign_thread_move_into_a_primary_container_never_reaches_the_wire() {
+        let client = scripted_client([
+            thread_get_reply("shared", "T9", &["M9"]),
+            email_set_reply("shared", "shared-state", "shared-next", "M9"),
+        ]);
+        let shared = JmapMailAccount::new(client.clone(), JmapAccountId::new("shared"));
+
+        let error = crate::sync::pim::move_thread(
+            shared,
+            state_map(&[("shared", "shared-state")]),
+            "shared".to_string(),
+            foreign_thread("shared", "T9"),
+            ContainerId("archive".to_string()),
+            None,
+        )
+        .await
+        .expect_err("a cross-account destination is not expressible");
+        assert_eq!(
+            error.kind(),
+            &bifrost_types::AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed)
+        );
+        assert!(
+            client.transport().requests().is_empty(),
+            "the owner disagreement is caught before anything is sent"
+        );
+    }
+
+    /// `delete_thread` is the sharp edge: routed to the wrong account it
+    /// destroys an unrelated thread's messages. The Trash it resolves must
+    /// also be the SHARE's Trash, minted in the share's namespace so the
+    /// cross-account guard sees one account rather than a bare id that
+    /// reads as primary.
+    #[tokio::test]
+    async fn a_foreign_thread_delete_resolves_and_trashes_inside_the_share() {
+        let client = scripted_client([
+            method_reply(vec![json!([
+                "Mailbox/get",
+                {"accountId": "shared", "state": "mailbox-s", "list": [
+                    {"id": "shared-trash", "name": "Trash", "role": "trash"}
+                ], "notFound": []},
+                "s0"
+            ])]),
+            thread_get_reply("shared", "T9", &["M9"]),
+            email_set_reply("shared", "shared-state", "shared-next", "M9"),
+        ]);
+        let shared = JmapMailAccount::new(client.clone(), JmapAccountId::new("shared"));
+
+        crate::sync::pim::delete_thread(
+            shared,
+            state_map(&[("shared", "shared-state")]),
+            "shared".to_string(),
+            foreign_thread("shared", "T9"),
+            None,
+        )
+        .await
+        .expect("the share trashes its own thread");
+
+        let requests = client.transport().requests();
+        assert_eq!(requests.len(), 3);
+        for request in &requests {
+            assert_eq!(
+                request["methodCalls"][0][1]["accountId"], "shared",
+                "every leg of the delete stays in the share: {request}"
+            );
+        }
+        assert_eq!(requests[1]["methodCalls"][0][1]["ids"][0], "T9");
+        assert_eq!(
+            requests[2]["methodCalls"][0][1]["update"]["M9"]["mailboxIds/shared-trash"],
+            true
+        );
+    }
+
+    /// The DESTRUCTIVE branch of the same door: a foreign thread whose
+    /// `current` container already IS the share's Trash must compare
+    /// equal against the owner-qualified Trash the delete resolves (one
+    /// namespace, not a bare id that reads as primary) and then DESTROY
+    /// inside the share - the sharpest consequence a routing regression
+    /// has.
+    #[tokio::test]
+    async fn a_foreign_thread_already_in_the_shares_trash_is_destroyed_in_the_share() {
+        let client = scripted_client([
+            method_reply(vec![json!([
+                "Mailbox/get",
+                {"accountId": "shared", "state": "mailbox-s", "list": [
+                    {"id": "shared-trash", "name": "Trash", "role": "trash"}
+                ], "notFound": []},
+                "s0"
+            ])]),
+            thread_get_reply("shared", "T9", &["M9"]),
+            method_reply(vec![json!([
+                "Email/set",
+                {
+                    "accountId": "shared",
+                    "oldState": "shared-state",
+                    "newState": "shared-next",
+                    "destroyed": ["M9"],
+                    "notDestroyed": {}
+                },
+                "s0"
+            ])]),
+        ]);
+        let shared = JmapMailAccount::new(client.clone(), JmapAccountId::new("shared"));
+
+        crate::sync::pim::delete_thread(
+            shared,
+            state_map(&[("shared", "shared-state")]),
+            "shared".to_string(),
+            foreign_thread("shared", "T9"),
+            // The caller's container id arrives owner-qualified, the way
+            // `containers_list` mints it for a share.
+            Some(ContainerId(foreign::encode_object(
+                "shared",
+                "shared-trash",
+            ))),
+        )
+        .await
+        .expect("the share destroys its own trashed thread");
+
+        let requests = client.transport().requests();
+        assert_eq!(requests.len(), 3);
+        for request in &requests {
+            assert_eq!(
+                request["methodCalls"][0][1]["accountId"], "shared",
+                "every leg of the destroy stays in the share: {request}"
+            );
+        }
+        assert_eq!(requests[1]["methodCalls"][0][1]["ids"][0], "T9");
+        let set_args = &requests[2]["methodCalls"][0][1];
+        assert_eq!(set_args["destroy"][0], "M9");
+        assert!(
+            set_args.get("update").is_none(),
+            "already-in-Trash must destroy, not move: {set_args}"
+        );
+    }
 }
