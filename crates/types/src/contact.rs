@@ -156,6 +156,15 @@ pub struct ContactCard {
 }
 
 /// Contact creation payload.
+///
+/// Deliberately carries no inline `photo` (unlike `ContactCard` and
+/// `ContactPatch`): Google People and Microsoft Graph both model photo
+/// upload as a separate call against an EXISTING contact, so an inline
+/// photo at create time would force those providers into a hidden
+/// create-then-update whose second half can fail after the contact
+/// exists. A consumer that wants an inline photo does the two-step
+/// explicitly - `contact_create`, then `contact_update` with
+/// `ContactPatch::photo` - and owns the partial-failure handling.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ContactCreate {
     pub address_book_id: Option<AddressBookId>,

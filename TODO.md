@@ -348,14 +348,6 @@ intent loss or pending design decision), **smell**, **nit**. The
 deliberate "accepted fidelity limits" from that doc are documented in
 `reference/*.md` and are not tracked here.
 
-Gaps:
-
-- **s34-G2 (types)** `contact.rs` - `ContactCreate` has `photo_url`
-  but no inline `photo` (unlike `ContactCard` / `ContactPatch`), so
-  inline-photo contacts require create-then-update. Likely intentional
-  (CardDAV/People treat photo upload as a separate step) but
-  undocumented. Add the field or document the two-step requirement.
-
 Smells:
 
 - **s34-S2 (graph)** `calendar.rs` (`event_from_graph`) -
