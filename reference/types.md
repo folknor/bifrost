@@ -232,6 +232,17 @@ Blob methods return byte streams. `open_blob_range` is only usable when
 advertised by `blob_range`; `open_raw_rfc822` returns verbatim
 server-assembled message bytes.
 
+Header decoding is bounded on two independent axes. `ENCODED_WORD_SCAN_LIMIT`
+(998, the RFC 5322 line limit) caps what a SINGLE RFC 2047 candidate may scan,
+so an overlong word is never recognized and is echoed verbatim.
+`DECODED_OUTPUT_LIMIT` (64 KiB) caps the TOTAL decoded output of one
+`decode_encoded_words` call, because chained in-window words in a legacy
+single-byte charset expand about 2.2x with base64 contraction already applied.
+Past the total cap the remaining words are emitted verbatim rather than
+truncated - the RFC 2047 Section 6.3 display rule for a word the decoder will
+not decode - so no bytes are lost and output stays under the cap plus the input
+length.
+
 ## File map
 
 ```

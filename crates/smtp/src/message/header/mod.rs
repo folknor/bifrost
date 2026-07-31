@@ -585,6 +585,62 @@ mod tests {
         );
     }
 
+    /// A pathological (500+ char) non-ASCII display name folds on every
+    /// address-header path, typed and raw alike. RFC 2047 words are
+    /// individually short and the writer folds between them, so the length of
+    /// the NAME never reaches the emitted line - the recorded worry that long
+    /// names flatten their folds does not hold for a name that actually needs
+    /// encoding.
+    ///
+    /// What does still emit an over-long line is an unbreakable ALLOWED token
+    /// (all-ASCII, no spaces) next to encoded ones: it is written verbatim,
+    /// because folding inside an atom would change the value and encoding it
+    /// is not this encoder's rule. That is the same deliberate behavior
+    /// `format_ascii_with_folding_giant_word` pins, and it stays under the
+    /// RFC 5322 Section 2.1.1 hard 998-octet limit - only the SHOULD-78 is
+    /// missed. Both shapes are asserted here so the split stays visible.
+    #[test]
+    fn long_non_ascii_display_names_fold_on_every_address_path() {
+        fn longest_line(headers: &Headers) -> usize {
+            headers
+                .to_string()
+                .split("\r\n")
+                .map(str::len)
+                .max()
+                .expect("at least one line")
+        }
+
+        let name = "Иванов".repeat(100);
+
+        let mut typed = Headers::new();
+        typed.set(To::from(Mailboxes::from_iter([format!(
+            "{name} <long@example.com>"
+        )
+        .parse()
+        .expect("mailbox parses")])));
+        assert!(longest_line(&typed) <= 78, "typed To path did not fold");
+
+        let mut raw = Headers::new();
+        raw.insert_raw(HeaderValue::new(
+            HeaderName::new_from_ascii_str("To"),
+            format!("{name} <long@example.com>"),
+        ));
+        assert!(longest_line(&raw) <= 78, "raw To path did not fold");
+
+        // The unfoldable case: a giant all-ASCII token beside an encoded word.
+        let mut giant_token = Headers::new();
+        giant_token.insert_raw(HeaderValue::new(
+            HeaderName::new_from_ascii_str("To"),
+            format!("{}, Ltd \u{e9} <long@example.com>", "Ivanov".repeat(100)),
+        ));
+        let longest = longest_line(&giant_token);
+        assert!(
+            longest > 78,
+            "the giant-token case is the one that overflows"
+        );
+        assert!(longest < 998, "but it stays inside the RFC 5322 hard limit");
+    }
+
     #[test]
     fn format_special() {
         let mut headers = Headers::new();

@@ -11,13 +11,6 @@ any item; some may already be obsolete.
 - **jmap-D4.** Generic JMAP `Provider`. Wire `Provider::Fastmail` (and
   any other JMAP host the factory needs) when documented. Continue
   setting `Provider: None` until then.
-- **jmap-T2-residual.** (carried context from the closed jmap objects
-  ledger, which deliberately left the thin query filter/comparator enums -
-  `principal/availability.rs`, `principal/query.rs`,
-  `share_notification/query.rs`, `sieve/query.rs`,
-  `calendar_event_notification/query.rs`, `quota/query.rs` - untested:
-  they are structurally identical to the pinned `email_query_wire`
-  tables and a second copy of the same table was judged lower value.)
 - **jmap-O2.** The jmap sync layer hardwires `ReqwestTransport`
   (`sync/account.rs` pins `type MailAccount = Account<ReqwestTransport>`),
   so `JmapAccount`'s own `Account` impl surface - `capabilities()`,
@@ -70,16 +63,6 @@ any item; some may already be obsolete.
   `reference/error-model.md`. ManageSieve and submission were checked only
   for unsafe text ingress, not full logic. (Carried from the closed imap
   bug-hunt ledger.)
-- **types-G1.** (gap, found while closing imap-T4) No cap on total
-  decoded encoded-word output in `bifrost-types::mime::words`. Per-word
-  expansion is bounded by the 998-byte `ENCODED_WORD_SCAN_LIMIT` window
-  (a 100 KB single-word payload never finds its `?=` and is echoed
-  verbatim - the original imap-T4 concern was already bounded), but
-  chained, individually in-window words have no aggregate cap: ~100 KB
-  of Shift_JIS words decodes to ~220 KB (worst realistic factor ~2.2x;
-  halfwidth katakana beats base64's 4:3 contraction). The decoder
-  inherits whatever cap the caller puts on the raw header. Pinned by
-  `chained_encoded_words_expand_past_the_input_with_no_output_cap`.
 - **imap-T5.** (deferred, connection sweep rulings - revisit triggers,
   not work items) Hermetic STARTTLS needs a fake TLS handshake
   (`ImapStream::into_tcp` returns `None` for `Memory`, deliberately);
@@ -102,10 +85,21 @@ any item; some may already be obsolete.
   document that bandwidth caps apply only to HTTP- and IMAP-shaped
   accounts. (Carried from the deleted `plans/unification.md` decision
   point 8, which was never stamped resolved.)
-- **smtp-N2.** (minor) A pathological non-ASCII display *name* (~500+
-  chars) in an address header can still have its RFC 2047 folds flattened
-  by the address-header path; the encoded-word fix fully handles Subject.
-  Names are near-universally short, so low impact.
+- **smtp-N2.** (minor, re-scoped after measuring - the filed symptom does
+  not reproduce) A 600-char non-ASCII display name folds correctly at 73
+  columns on every address path, typed and raw: RFC 2047 words are
+  individually short and the writer folds between them, so the name's
+  length never reaches the emitted line. What DOES emit an over-long line
+  is an unbreakable ALLOWED token (all-ASCII, no spaces, ~600 chars) next
+  to encoded words: `HeaderValueEncoder::format` splits on spaces and
+  writes an allowed word verbatim, since folding inside an atom would
+  change the value and RFC 2047-encoding an all-ASCII word is not this
+  encoder's rule - the same deliberate behavior
+  `format_ascii_with_folding_giant_word` pins for Subject. It misses the
+  RFC 5322 SHOULD-78 and stays well inside the MUST-998. Both shapes are
+  now pinned by `long_non_ascii_display_names_fold_on_every_address_path`.
+  Open only as a decision: encode over-long allowed tokens when the header
+  already carries encoded words, at the cost of changing that pinned test.
 - **smtp-T1.** (coverage) Residual test-seam gaps. The batch entry
   points through the pool (sync and async), pool retirement / reuse end
   to end, RCPT-option sequencing on the wire, mailbox list parsing, a
@@ -310,9 +304,6 @@ Smells:
 - **s34-S3 (graph)** `contacts.rs` - `ContactEmail.kind` maps
   to/from Graph `emailAddress.name`, a display name, not a type label.
   Round-trip is consistent (no loss) but semantically conflated.
-- **s34-S7 (carddav)** `parse.rs` - `ResponseParts` carries fields
-  unused by each of its three parser call sites; shared staging/commit
-  logic touches fields irrelevant per site. Mild maintenance tax.
 
 Nits:
 

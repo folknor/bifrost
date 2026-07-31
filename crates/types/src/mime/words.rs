@@ -4,16 +4,41 @@
 ///
 /// Handles `=?charset?encoding?text?=` sequences. Non-UTF-8 charsets are
 /// lossy-converted to UTF-8 via `encoding_rs`.
+///
+/// Decoding can expand: base64 contracts 4:3, but a legacy single-byte
+/// charset can then triple, so a chain of words nets roughly 2.2x. Total
+/// decoded output is bounded by [`DECODED_OUTPUT_LIMIT`]; past it, further
+/// words are left verbatim (see [`DECODED_OUTPUT_LIMIT`] for why that is the
+/// right degradation), so the returned string never exceeds that limit plus
+/// the input length.
 pub fn decode_encoded_words(input: &[u8]) -> String {
     let s = String::from_utf8_lossy(input);
     decode_rfc2047_str(&s)
 }
+
+/// Cap on the total bytes of DECODED encoded-word output one call may produce.
+///
+/// [`ENCODED_WORD_SCAN_LIMIT`] bounds a single word, but nothing bounded the
+/// sum: a header of chained, individually in-window Shift_JIS words decodes to
+/// roughly 2.2x its own size, and that scales with however large a header the
+/// caller accepted. 64 KiB is orders of magnitude above any real header field
+/// (RFC 5322 Section 2.1.1 caps one line at 998 octets, and even a heavily
+/// folded recipient list of encoded display names stays in the low kilobytes),
+/// so nothing legitimate reaches it.
+///
+/// Past the cap, remaining words are emitted verbatim rather than truncated.
+/// That is the behavior RFC 2047 Section 6.3 already specifies for a word this
+/// decoder will not decode, so the degradation reuses an existing, tested path
+/// and loses no bytes - the reader sees `=?...?=` source text instead of a
+/// silently shortened string.
+const DECODED_OUTPUT_LIMIT: usize = 64 * 1024;
 
 /// Decode encoded words in a string (RFC 2047 Section 2).
 fn decode_rfc2047_str(input: &str) -> String {
     let mut result = String::new();
     let mut remaining = input;
     let mut last_was_encoded = false;
+    let mut decoded_bytes = 0usize;
 
     while let Some(start) = remaining.find("=?") {
         let before = &remaining[..start];
@@ -40,11 +65,16 @@ fn decode_rfc2047_str(input: &str) -> String {
                 Some(c) => c == ' ' || c == '\t',
             };
 
-            if candidate_has_valid_suffix {
+            // Over the aggregate budget this word is treated as one this
+            // decoder will not decode, so it falls through to the verbatim
+            // path below (RFC 2047 Section 6.3).
+            let within_budget = decoded_bytes.saturating_add(decoded.len()) <= DECODED_OUTPUT_LIMIT;
+            if candidate_has_valid_suffix && within_budget {
                 // RFC 2047 Section 5: decode only when the token is
                 // separated from adjacent text by linear whitespace.
                 // RFC 2047 Section 6.2: both adjacent words are valid,
                 // so drop the inter-word whitespace.
+                decoded_bytes += decoded.len();
                 result.push_str(&decoded);
                 last_was_encoded = true;
                 continue;

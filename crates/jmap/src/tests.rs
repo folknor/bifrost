@@ -3419,3 +3419,216 @@ mod principal_acl_vocabulary {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Thin query filter + comparator wire tables (jmap-T2 residual)
+// ---------------------------------------------------------------------------
+//
+// The five small query modules were left untested on the argument that they
+// are structurally identical to the pinned `email_query_wire` tables. What
+// that argument does not cover is the part where they DIFFER from each other:
+// every one of these enums is `#[serde(untagged)]` over single-field structs,
+// so a `#[serde(rename)]` typo produces a syntactically valid request that the
+// server answers with `unsupportedFilter` (or, worse, silently ignores) rather
+// than anything this crate could notice. The property name IS the contract, so
+// each is pinned against its RFC here. Comparators go through the shared
+// `query::Comparator` envelope, which is why the tag lands flattened alongside
+// `isAscending`.
+
+mod thin_query_wire {
+    use super::*;
+
+    fn wire(value: &impl serde::Serialize) -> serde_json::Value {
+        serde_json::to_value(value).expect("query fragments serialize")
+    }
+
+    /// RFC 9670 Section 2.4 (`Principal/query`).
+    #[test]
+    fn principal_filter_and_comparator_property_names() {
+        use crate::principal::Type;
+        use crate::principal::query::{Comparator, Filter};
+
+        assert_eq!(
+            wire(&Filter::account_ids(["acct-1", "acct-2"])),
+            json!({"accountIds": ["acct-1", "acct-2"]})
+        );
+        assert_eq!(
+            wire(&Filter::email("a@example.test")),
+            json!({"email": "a@example.test"})
+        );
+        assert_eq!(wire(&Filter::name("Ops")), json!({"name": "Ops"}));
+        assert_eq!(
+            wire(&Filter::domain_name("example.test")),
+            json!({"domainName": "example.test"})
+        );
+        assert_eq!(wire(&Filter::text("ops")), json!({"text": "ops"}));
+        assert_eq!(
+            wire(&Filter::ptype(Type::Group)),
+            json!({"type": "group"}),
+            "the principal type filter carries the wire token, not the Rust name"
+        );
+        assert_eq!(
+            wire(&Filter::timezone("Europe/Oslo")),
+            json!({"timezone": "Europe/Oslo"})
+        );
+        assert_eq!(wire(&Filter::members("p-1")), json!({"members": "p-1"}));
+        assert_eq!(
+            wire(&Filter::quota_lower_than(10)),
+            json!({"quotaLowerThan": 10})
+        );
+        assert_eq!(
+            wire(&Filter::quota_greater_than(20)),
+            json!({"quotaGreaterThan": 20})
+        );
+
+        assert_eq!(
+            wire(&Comparator::name()),
+            json!({"isAscending": true, "property": "name"})
+        );
+        assert_eq!(
+            wire(&Comparator::email()),
+            json!({"isAscending": true, "property": "email"})
+        );
+        assert_eq!(
+            wire(&Comparator::ptype().descending()),
+            json!({"isAscending": false, "property": "type"})
+        );
+    }
+
+    /// An untagged enum is decided by the SHAPE of the value, and
+    /// `accountIds` is the only array-valued variant - which is why it is
+    /// declared first. Pin that the array form still round-trips to the
+    /// intended property rather than being claimed by a string variant.
+    #[test]
+    fn principal_account_ids_filter_survives_untagged_trial_order() {
+        use crate::principal::query::Filter;
+
+        let value = wire(&Filter::account_ids(["acct-1"]));
+        assert_eq!(
+            value.as_object().expect("an object").keys().next(),
+            Some(&"accountIds".to_string())
+        );
+    }
+
+    /// RFC 9670 Section 3.2 (`ShareNotification/query`).
+    #[test]
+    fn share_notification_filter_and_comparator_property_names() {
+        use crate::share_notification::query::{Comparator, Filter};
+
+        assert_eq!(
+            wire(&Filter::after("2026-01-02T03:04:05Z")),
+            json!({"after": "2026-01-02T03:04:05Z"})
+        );
+        assert_eq!(
+            wire(&Filter::before("2026-01-02T03:04:05Z")),
+            json!({"before": "2026-01-02T03:04:05Z"})
+        );
+        assert_eq!(
+            wire(&Filter::object_type("Mailbox")),
+            json!({"objectType": "Mailbox"})
+        );
+        assert_eq!(
+            wire(&Filter::object_account_id("acct-9")),
+            json!({"objectAccountId": "acct-9"})
+        );
+
+        assert_eq!(
+            wire(&Comparator::created()),
+            json!({"isAscending": true, "property": "created"})
+        );
+    }
+
+    /// RFC 9404 Section 2.3 (`Quota/query`). The first three filters are
+    /// pinned in `query_filter_serialization`; `type` and both comparators
+    /// were the gap.
+    #[cfg(feature = "quota")]
+    #[test]
+    fn quota_type_filter_and_comparator_property_names() {
+        use crate::quota::query::{Comparator, Filter};
+
+        assert_eq!(wire(&Filter::type_("Mail")), json!({"type": "Mail"}));
+
+        assert_eq!(
+            wire(&Comparator::name()),
+            json!({"isAscending": true, "property": "name"})
+        );
+        assert_eq!(
+            wire(&Comparator::used().descending()),
+            json!({"isAscending": false, "property": "used"})
+        );
+    }
+
+    /// draft-ietf-jmap-sieve Section 2.3 (`SieveScript/query`).
+    #[cfg(feature = "mail")]
+    #[test]
+    fn sieve_script_filter_and_comparator_property_names() {
+        use crate::sieve::query::{Comparator, Filter};
+
+        assert_eq!(wire(&Filter::name("vacation")), json!({"name": "vacation"}));
+        assert_eq!(wire(&Filter::is_active(true)), json!({"isActive": true}));
+
+        assert_eq!(
+            wire(&Comparator::name()),
+            json!({"isAscending": true, "property": "name"})
+        );
+        assert_eq!(
+            wire(&Comparator::is_active().descending()),
+            json!({"isAscending": false, "property": "isActive"})
+        );
+    }
+
+    /// draft-ietf-jmap-calendars (`CalendarEventNotification/query`).
+    #[cfg(feature = "calendars")]
+    #[test]
+    fn calendar_event_notification_filter_and_comparator_property_names() {
+        use crate::calendar_event_notification::query::{Comparator, Filter};
+
+        assert_eq!(wire(&Filter::type_("created")), json!({"type": "created"}));
+        assert_eq!(
+            wire(&Filter::calendar_event_id("ev-1")),
+            json!({"calendarEventId": "ev-1"})
+        );
+
+        assert_eq!(
+            wire(&Comparator::created()),
+            json!({"isAscending": true, "property": "created"})
+        );
+    }
+
+    /// `Principal/getAvailability` (RFC 9670 Section 4.1): the request is a
+    /// plain method object, so the only thing worth pinning is that every
+    /// field carries its camelCase wire name and that `showDetails` is
+    /// omitted rather than sent as null when unset.
+    #[test]
+    fn principal_get_availability_request_wire_shape() {
+        use crate::principal::availability::PrincipalGetAvailabilityRequest;
+
+        let bare = PrincipalGetAvailabilityRequest::new(
+            "p-1",
+            "2026-01-02T00:00:00Z",
+            "2026-01-03T00:00:00Z",
+        );
+        assert_eq!(
+            wire(&bare),
+            json!({
+                "accountId": "",
+                "id": "p-1",
+                "utcStart": "2026-01-02T00:00:00Z",
+                "utcEnd": "2026-01-03T00:00:00Z",
+            }),
+            "showDetails must be absent, not null, when the caller did not set it"
+        );
+
+        let detailed = PrincipalGetAvailabilityRequest::new(
+            "p-1",
+            "2026-01-02T00:00:00Z",
+            "2026-01-03T00:00:00Z",
+        )
+        .show_details(true);
+        assert_eq!(
+            wire(&detailed).get("showDetails"),
+            Some(&json!(true)),
+            "showDetails rides the request once set"
+        );
+    }
+}

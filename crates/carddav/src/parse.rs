@@ -182,13 +182,13 @@ pub(crate) fn parse_addressbook_collections(
                     match (parent, name.as_str()) {
                         (Some("response"), "href") => current.href = trimmed(&text),
                         (Some("prop"), "displayname") => {
-                            current.propstat_display_name = trimmed(&text);
+                            current.staged.display_name = trimmed(&text);
                         }
                         (Some("prop"), "getctag") => {
-                            current.propstat_ctag = trimmed(&text);
+                            current.staged.ctag = trimmed(&text);
                         }
                         (Some("propstat"), "status") => {
-                            current.propstat_success = Some(is_success_status(&text));
+                            current.staged.success = Some(is_success_status(&text));
                         }
                         _ => {}
                     }
@@ -248,12 +248,12 @@ pub(crate) fn parse_propfind_contacts(xml: &str) -> Result<CardDavContactListing
                 if current.in_response {
                     match (parent, name.as_str()) {
                         (Some("response"), "href") => current.href = trimmed(&text),
-                        (Some("prop"), "getetag") => current.propstat_etag = normalize_etag(&text),
+                        (Some("prop"), "getetag") => current.staged.etag = normalize_etag(&text),
                         (Some("prop"), "getcontenttype") => {
-                            current.propstat_content_type = trimmed(&text);
+                            current.staged.content_type = trimmed(&text);
                         }
                         (Some("propstat"), "status") => {
-                            current.propstat_success = Some(is_success_status(&text));
+                            current.staged.success = Some(is_success_status(&text));
                         }
                         _ => {}
                     }
@@ -330,13 +330,13 @@ pub(crate) fn parse_multiget_report(xml: &str) -> Result<CardDavMultigetReport, 
                 if current.in_response {
                     match (parent, name.as_str()) {
                         (Some("response"), "href") => current.href = trimmed(&text),
-                        (Some("prop"), "getetag") => current.propstat_etag = normalize_etag(&text),
+                        (Some("prop"), "getetag") => current.staged.etag = normalize_etag(&text),
                         (Some("prop"), "address-data") => {
-                            current.propstat_address_data = trimmed(&text);
+                            current.staged.address_data = trimmed(&text);
                         }
                         (Some("propstat"), "status") => {
-                            current.propstat_status = trimmed(&text);
-                            current.propstat_success = Some(is_success_status(&text));
+                            current.staged.status = trimmed(&text);
+                            current.staged.success = Some(is_success_status(&text));
                         }
                         (Some("response"), "status") => current.status = trimmed(&text),
                         _ => {}
@@ -542,88 +542,90 @@ fn local_name(raw: &[u8]) -> String {
     }
 }
 
+/// Properties read from the `propstat` currently being parsed, held apart
+/// from the committed values until its `status` is known.
+///
+/// One struct rather than a `propstat_`-prefixed twin of every committed
+/// field: the two reset lists this replaces had to be kept in sync by hand
+/// (a `begin` that forgot a field would leak the previous propstat's value
+/// into this one), and each of the three parsers below reads only the subset
+/// it asked the server for - the rest simply stay `None` and commit nothing.
+#[derive(Default)]
+struct PropStat {
+    /// `None` when the propstat carried no `status` element at all, which
+    /// `commit` reads as success.
+    success: Option<bool>,
+    status: Option<String>,
+    is_addressbook: bool,
+    etag: Option<String>,
+    content_type: Option<String>,
+    address_data: Option<String>,
+    display_name: Option<String>,
+    ctag: Option<String>,
+}
+
 #[derive(Default)]
 struct ResponseParts {
     in_response: bool,
     in_propstat: bool,
-    propstat_success: Option<bool>,
     has_success_propstat: bool,
     saw_failed_propstat: bool,
     is_collection: bool,
     is_addressbook: bool,
-    propstat_is_addressbook: bool,
     href: Option<String>,
     etag: Option<String>,
-    propstat_etag: Option<String>,
     content_type: Option<String>,
-    propstat_content_type: Option<String>,
     address_data: Option<String>,
-    propstat_address_data: Option<String>,
     status: Option<String>,
-    propstat_status: Option<String>,
     failed_statuses: Vec<u16>,
     display_name: Option<String>,
-    propstat_display_name: Option<String>,
     ctag: Option<String>,
-    propstat_ctag: Option<String>,
+    staged: PropStat,
+}
+
+/// Commit a staged property over its committed slot, leaving the committed
+/// value alone when this propstat did not carry the property.
+fn commit_if_present<T>(committed: &mut Option<T>, staged: Option<T>) {
+    if staged.is_some() {
+        *committed = staged;
+    }
 }
 
 impl ResponseParts {
     fn begin_propstat(&mut self) {
         self.in_propstat = true;
-        self.propstat_success = None;
-        self.propstat_is_addressbook = false;
-        self.propstat_etag = None;
-        self.propstat_content_type = None;
-        self.propstat_address_data = None;
-        self.propstat_status = None;
-        self.propstat_display_name = None;
-        self.propstat_ctag = None;
+        self.staged = PropStat::default();
     }
 
     fn mark_addressbook(&mut self) {
         if self.in_propstat {
-            self.propstat_is_addressbook = true;
+            self.staged.is_addressbook = true;
         } else {
             self.is_addressbook = true;
         }
     }
 
     fn commit_propstat(&mut self) {
-        if self.propstat_success == Some(false) {
+        let staged = std::mem::take(&mut self.staged);
+        self.in_propstat = false;
+
+        if staged.success == Some(false) {
             self.saw_failed_propstat = true;
-            if let Some(code) = self.propstat_status.as_deref().and_then(status_code) {
+            if let Some(code) = staged.status.as_deref().and_then(status_code) {
                 self.failed_statuses.push(code);
             }
         }
-        if self.propstat_success.unwrap_or(true) {
+        // An absent status is success (RFC 4918 Section 14.22 requires one,
+        // but servers omit it and the properties are still there).
+        if staged.success.unwrap_or(true) {
             self.has_success_propstat = true;
-            self.is_addressbook |= self.propstat_is_addressbook;
-            if self.propstat_etag.is_some() {
-                self.etag = self.propstat_etag.take();
-            }
-            if self.propstat_content_type.is_some() {
-                self.content_type = self.propstat_content_type.take();
-            }
-            if self.propstat_address_data.is_some() {
-                self.address_data = self.propstat_address_data.take();
-            }
-            if self.propstat_display_name.is_some() {
-                self.display_name = self.propstat_display_name.take();
-            }
-            if self.propstat_ctag.is_some() {
-                self.ctag = self.propstat_ctag.take();
-            }
+            self.is_addressbook |= staged.is_addressbook;
+            commit_if_present(&mut self.etag, staged.etag);
+            commit_if_present(&mut self.content_type, staged.content_type);
+            commit_if_present(&mut self.address_data, staged.address_data);
+            commit_if_present(&mut self.display_name, staged.display_name);
+            commit_if_present(&mut self.ctag, staged.ctag);
         }
-        self.in_propstat = false;
-        self.propstat_success = None;
-        self.propstat_is_addressbook = false;
-        self.propstat_etag = None;
-        self.propstat_content_type = None;
-        self.propstat_address_data = None;
-        self.propstat_status = None;
-        self.propstat_display_name = None;
-        self.propstat_ctag = None;
     }
 
     fn as_addressbook_collection(&self) -> Option<AddressBookCollection> {
