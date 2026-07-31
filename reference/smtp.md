@@ -148,6 +148,46 @@ Canonicalization follows RFC 6376 for empty bodies and missing final CRLFs. Rela
 
 `PoolConfig` configures min idle, max size, idle timeout, and the checkout NOOP probe. Recycling refuses connections that are `Broken` and connections flagged for retirement by an LMTP final-status drain (see "Connection state and cancel-safety"). `min_idle` defaults to 0: no background pool worker is started, and expired connections are discarded at checkout. A positive `min_idle` enables the worker that expires and replenishes warm connections. `test_on_checkout(false)` opts out of the default NOOP probe for callers willing to retry one stale idle connection; it does not permit a connection already marked `Broken` to be reused. It buys nothing for LMTP transports, whose connections are retired at recycle and therefore never checked out idle.
 
+## Bandwidth metering
+
+`SmtpTransportBuilder::bandwidth_metering(sink, cap)` (and the async / LMTP
+siblings) installs a `bifrost_net::MeterSinkHandle` and an
+`Arc<AtomicU64>` cap on every connection the transport dials. Opt-in:
+without it, `SmtpInfo::metering` is `WireMetering::disabled()` and both
+socket funnels are unchanged. `UNLIMITED_BANDWIDTH` (`u64::MAX`) in the
+atomic means no cap - the same encoding `bifrost-imap` uses, so ONE value
+drives both halves of an IMAP-shaped account.
+
+This exists because SMTP was the only protocol in the workspace whose
+bytes reached the wire unmetered, which made `Account::set_bandwidth_cap`
+silently PARTIAL rather than absent: `ImapAccount` implements it and
+honours it on fetch traffic, but its `submission.rs` built an
+`AsyncSmtpTransport` with no meter and no cap - so the cap was ignored on
+exactly the upstream-heavy path a cap usually exists to protect.
+`open_submission` now passes the account's own meter handle and cap
+atomic, so one `set_bandwidth_cap` governs both halves.
+
+Both socket funnels are metered: `AsyncNetworkStream`'s
+`poll_read`/`poll_write` and `NetworkStream`'s blocking `Read`/`Write`.
+The bucket in `client/metering.rs` RETURNS the debt it wants slept rather
+than sleeping itself, which is the one design difference from IMAP's
+`WireMetering`: SMTP has three call shapes over one bucket (an `async
+fn`, a `poll_write` that cannot await, a blocking `Write`) and a
+debt-returning bucket serves all three without a second implementation to
+drift from the first. The async funnel parks the debt as a `Sleep` in the
+stream so a throttled connection yields to the runtime; the blocking
+funnel sleeps its calling thread, the semantic that caller already
+accepted.
+
+Two properties worth not regressing: tokens may go NEGATIVE, so a
+transfer larger than one second of budget owes proportional time instead
+of being clamped to one second (clamping would let a 1 B/s cap run at
+hundreds of B/s), and the cap is re-read on every transfer, so a consumer
+can retune or lift it without reconnecting. Inbound and outbound are
+separate buckets: a large send must not throttle the reply to it. Bytes
+are charged as ACCEPTED by the socket, not as offered, so a short write
+charges the remainder on its retry.
+
 ## Error model
 
 `Error::kind()` returns `&ErrorKind`. SMTP reply failures are `Transient(Response)` or `Permanent(Response)`, so callers can inspect the full server reply through `smtp_response()`, `status()`, and `enhanced_status_code()`. Local buckets are `Parse`, `InvalidInput`, `FeatureUnsupported`, `ParameterOverLimit`, `Internal`, `Policy`, `Connection`, `Network`, `Timeout`, `Tls`, and `TransportShutdown`. `Policy` covers local refusals such as plaintext-AUTH refusal. `FeatureUnsupported` / `ParameterOverLimit` are the FUTURERELEASE discriminators (a relay that did not advertise the extension vs a HOLDFOR over the advertised max interval), kept distinct from generic `InvalidInput` so the account-error mapping can tell scheduled-send-unsupported apart from a malformed parameter. SMTP replies are line-bounded before allocation and decoded from bytes, so oversized or non-UTF-8 replies are `Parse`, not retryable network errors.

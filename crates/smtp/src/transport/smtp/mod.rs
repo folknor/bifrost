@@ -193,6 +193,10 @@
 
 use std::{path::PathBuf, time::Duration};
 
+pub(crate) use self::client::WireMetering;
+// pub: the "no cap" sentinel for `bandwidth_metering`.
+pub use self::client::UNLIMITED_BANDWIDTH;
+
 pub(crate) use bifrost_types::error::Protocol;
 
 #[cfg(feature = "tokio")]
@@ -291,6 +295,14 @@ struct SmtpInfo {
     /// Define network timeout
     /// It can be changed later for specific needs (like a different timeout for each SMTP command)
     timeout: Option<Duration>,
+    /// Per-account byte accounting and bandwidth cap, applied to every
+    /// connection this transport dials. `disabled()` unless a consumer
+    /// supplied one, which is the shape every non-account caller gets.
+    ///
+    /// Cloned into each connection rather than owned by it, so a pooled
+    /// transport's connections share ONE budget instead of each getting
+    /// the full cap.
+    metering: WireMetering,
 }
 
 impl Default for SmtpInfo {
@@ -307,6 +319,7 @@ impl Default for SmtpInfo {
             authentication_configured: false,
             timeout: Some(DEFAULT_TIMEOUT),
             tls: Tls::None,
+            metering: WireMetering::disabled(),
         }
     }
 }

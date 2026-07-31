@@ -172,7 +172,7 @@ impl AccountFactory for ImapAccountFactory {
             let calendars = open_caldav(&cfg, account_id.clone())
                 .await
                 .into_attached(&mut dav_degraded, &mut skipped_scopes);
-            let submission = open_submission(&cfg)?;
+            let submission = open_submission(&cfg, meter.clone(), Arc::clone(&bandwidth_cap))?;
             let caps = capabilities::build_capabilities(
                 &profile,
                 &folders,
@@ -320,11 +320,18 @@ async fn open_carddav(cfg: &ImapAccountConfig, account_id: AccountId) -> DavAtta
 
 fn open_submission(
     cfg: &ImapAccountConfig,
+    meter: Option<bifrost_net::MeterSinkHandle>,
+    bandwidth_cap: Arc<std::sync::atomic::AtomicU64>,
 ) -> Result<Option<Arc<SubmissionTransport>>, AccountError> {
     let Some(config) = &cfg.submission else {
         return Ok(None);
     };
-    let transport = SubmissionTransport::build(config, &cfg.credentials).map_err(discover_err)?;
+    // The submission transport shares the account's meter and cap atomic,
+    // so `set_bandwidth_cap` governs sends as well as fetches. Without
+    // this the cap is honoured on IMAP traffic and silently ignored on
+    // the upstream-heavy send path.
+    let transport = SubmissionTransport::build(config, &cfg.credentials, meter, bandwidth_cap)
+        .map_err(discover_err)?;
     Ok(Some(Arc::new(transport)))
 }
 

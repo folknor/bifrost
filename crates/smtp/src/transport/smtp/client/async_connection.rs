@@ -14,6 +14,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use super::async_net::AsyncDeadline;
 #[cfg(feature = "tracing")]
 use super::escape_crlf;
+use super::metering::WireMetering;
 use super::{
     ClientCodec, ConnectionState, MAX_RESPONSE_BYTES, MAX_RESPONSE_LINE_BYTES,
     PIPELINING_RECIPIENT_WINDOW, TlsParameters, async_net::AsyncNetworkStream, smtp_data_size,
@@ -169,6 +170,7 @@ impl AsyncSmtpConnection {
             tls_parameters,
             local_address,
             Protocol::Smtp,
+            WireMetering::disabled(),
         )
         .await
     }
@@ -180,11 +182,15 @@ impl AsyncSmtpConnection {
         tls_parameters: Option<TlsParameters>,
         local_address: Option<IpAddr>,
         protocol: Protocol,
+        metering: WireMetering,
     ) -> Result<AsyncSmtpConnection, Error> {
         let deadline = AsyncDeadline::new(timeout);
-        let stream =
+        let mut stream =
             AsyncNetworkStream::connect_until(server, deadline, tls_parameters, local_address)
                 .await?;
+        // Installed on the dialed stream rather than threaded into the
+        // dialer: the TCP/TLS handshake is not the account's traffic.
+        stream.set_metering(metering);
         Self::connect_impl(
             stream,
             hello_name,
@@ -201,9 +207,11 @@ impl AsyncSmtpConnection {
         timeout: Option<Duration>,
         hello_name: &ClientId,
         protocol: Protocol,
+        metering: WireMetering,
     ) -> Result<AsyncSmtpConnection, Error> {
         let deadline = AsyncDeadline::new(timeout);
-        let stream = AsyncNetworkStream::connect_unix_until(path, deadline).await?;
+        let mut stream = AsyncNetworkStream::connect_unix_until(path, deadline).await?;
+        stream.set_metering(metering);
         Self::connect_impl(
             stream,
             hello_name,
@@ -251,6 +259,27 @@ impl AsyncSmtpConnection {
     ) -> Result<Self, Error> {
         Self::connect_impl(
             AsyncNetworkStream::from_transcript(transcript),
+            hello_name,
+            None,
+            TimeoutBudget::PerOperation(None),
+            protocol,
+        )
+        .await
+    }
+
+    /// Transcript setup with byte accounting installed, so a test can
+    /// observe what the real send path would have metered.
+    #[cfg(test)]
+    pub(in crate::transport::smtp) async fn from_transcript_metered(
+        transcript: crate::transport::smtp::test_support::Transcript,
+        hello_name: &ClientId,
+        protocol: Protocol,
+        metering: WireMetering,
+    ) -> Result<Self, Error> {
+        let mut stream = AsyncNetworkStream::from_transcript(transcript);
+        stream.set_metering(metering);
+        Self::connect_impl(
+            stream,
             hello_name,
             None,
             TimeoutBudget::PerOperation(None),

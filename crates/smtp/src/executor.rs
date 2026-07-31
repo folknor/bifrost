@@ -10,6 +10,7 @@ use crate::transport::smtp::Error;
 use crate::transport::smtp::Protocol;
 #[cfg(feature = "tokio")]
 use crate::transport::smtp::Tls;
+use crate::transport::smtp::WireMetering;
 #[cfg(feature = "tokio")]
 use crate::transport::smtp::extension::ClientId;
 
@@ -44,6 +45,11 @@ pub(crate) trait SmtpExecutor: Executor {
     // Keep SMTP dialing out of the public `Executor` trait. Public async
     // transport constructors intentionally use this private sealed bound, so
     // those call sites carry `#[allow(private_bounds)]`.
+    //
+    // Every parameter is one field of the transport's dial configuration.
+    // Bundling them into a struct would buy nothing here: this is a
+    // crate-private trait with exactly one implementor and one caller.
+    #[allow(clippy::too_many_arguments)]
     fn connect<'a>(
         hostname: &'a str,
         port: u16,
@@ -52,6 +58,7 @@ pub(crate) trait SmtpExecutor: Executor {
         hello_name: &'a ClientId,
         tls: &'a Tls,
         protocol: Protocol,
+        metering: WireMetering,
     ) -> impl Future<Output = Result<AsyncSmtpConnection, Error>> + Send + 'a;
 }
 
@@ -95,6 +102,7 @@ impl SmtpExecutor for TokioExecutor {
         hello_name: &ClientId,
         tls: &Tls,
         protocol: Protocol,
+        metering: WireMetering,
     ) -> Result<AsyncSmtpConnection, Error> {
         if let Some(path) = unix_socket {
             #[cfg(unix)]
@@ -105,7 +113,7 @@ impl SmtpExecutor for TokioExecutor {
                     ));
                 }
                 return AsyncSmtpConnection::connect_unix_with_protocol(
-                    path, timeout, hello_name, protocol,
+                    path, timeout, hello_name, protocol, metering,
                 )
                 .await;
             }
@@ -131,6 +139,7 @@ impl SmtpExecutor for TokioExecutor {
             tls_parameters,
             None,
             protocol,
+            metering,
         )
         .await?;
 

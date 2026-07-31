@@ -12,6 +12,7 @@ use bifrost_sasl::ScramChannelBinding;
 
 #[cfg(feature = "tracing")]
 use super::escape_crlf;
+use super::metering::WireMetering;
 use super::{
     ClientCodec, ConnectionState, MAX_RESPONSE_BYTES, MAX_RESPONSE_LINE_BYTES, NetworkStream,
     PIPELINING_RECIPIENT_WINDOW, TlsParameters, smtp_data_size,
@@ -107,6 +108,7 @@ impl SmtpConnection {
             tls_parameters,
             local_address,
             Protocol::Smtp,
+            WireMetering::disabled(),
         )
     }
 
@@ -139,8 +141,12 @@ impl SmtpConnection {
         tls_parameters: Option<&TlsParameters>,
         local_address: Option<IpAddr>,
         protocol: Protocol,
+        metering: WireMetering,
     ) -> Result<SmtpConnection, Error> {
-        let stream = NetworkStream::connect(server, timeout, tls_parameters, local_address)?;
+        let mut stream = NetworkStream::connect(server, timeout, tls_parameters, local_address)?;
+        // Installed on the dialed stream rather than threaded into the
+        // dialer: the TCP/TLS handshake is not the account's traffic.
+        stream.set_metering(metering);
         let stream = BufReader::new(stream);
         let mut conn = SmtpConnection {
             stream,
@@ -167,8 +173,10 @@ impl SmtpConnection {
         timeout: Option<Duration>,
         hello_name: &ClientId,
         protocol: Protocol,
+        metering: WireMetering,
     ) -> Result<SmtpConnection, Error> {
-        let stream = NetworkStream::connect_unix(path, timeout)?;
+        let mut stream = NetworkStream::connect_unix(path, timeout)?;
+        stream.set_metering(metering);
         let stream = BufReader::new(stream);
         let mut conn = SmtpConnection {
             stream,

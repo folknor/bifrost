@@ -178,6 +178,8 @@ impl SubmissionTransport {
     pub(crate) fn build(
         cfg: &SmtpSubmissionConfig,
         imap_credentials: &Credentials,
+        meter: Option<bifrost_net::MeterSinkHandle>,
+        bandwidth_cap: std::sync::Arc<std::sync::atomic::AtomicU64>,
     ) -> Result<Self, crate::Error> {
         let credentials = resolve_credentials(cfg, imap_credentials);
         let port = cfg.port.unwrap_or_else(|| cfg.tls.default_port());
@@ -201,7 +203,13 @@ impl SubmissionTransport {
             }
         };
 
-        builder = builder.port(port).credentials(credentials);
+        // Same meter handle and same cap atomic the IMAP connections use,
+        // so one `set_bandwidth_cap` governs both halves of the account
+        // and a send cannot burst past a cap the fetch path is honouring.
+        builder = builder
+            .port(port)
+            .credentials(credentials)
+            .bandwidth_metering(meter, Some(bandwidth_cap));
         if let Some(timeout) = cfg.timeout {
             builder = builder.timeout(Some(timeout));
         }

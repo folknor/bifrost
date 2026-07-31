@@ -124,14 +124,24 @@ any item; some may already be obsolete.
 
 ## bifrost-smtp
 
-- **smtp-M1.** SMTP raw-socket bandwidth metering is unwired. IMAP
-  drives `bifrost_net::MeterSink` + a `bandwidth_cap` through
-  `account/{factory,pool}.rs` and `connection/wire.rs`; SMTP has no
-  equivalent (zero `MeterSink` references in `crates/smtp/src`).
-  Decide: add a metering adapter the raw-socket transport drives, or
-  document that bandwidth caps apply only to HTTP- and IMAP-shaped
-  accounts. (Carried from the deleted `plans/unification.md` decision
-  point 8, which was never stamped resolved.)
+- **smtp-M1.** DONE (2026-07-31). Ruled: wire it, rather than document the
+  limit. The deciding fact was not that SMTP lacked metering but that the
+  cap was silently PARTIAL WITHIN ONE ACCOUNT - `ImapAccount` implements
+  the required `set_bandwidth_cap` and honours it on fetch traffic, while
+  its `submission.rs` built an `AsyncSmtpTransport` with no meter and no
+  cap. So a consumer setting a cap had it enforced downstream and ignored
+  upstream, on the one path most likely to saturate an uplink, with no way
+  to learn that from the trait signature.
+
+  Both socket funnels are metered (`AsyncNetworkStream` poll_read/write,
+  `NetworkStream` blocking Read/Write) via a debt-returning bucket in
+  `client/metering.rs`; `bandwidth_metering(sink, cap)` on every transport
+  builder is the opt-in, and `open_submission` passes the IMAP account's
+  own meter handle and cap atomic so one `set_bandwidth_cap` governs both
+  halves. Design notes in `reference/smtp.md` under "Bandwidth metering".
+  Verified end to end by driving a real send through a scripted peer and
+  asserting the sink saw both directions; sensitivity checked by making
+  the charge a no-op and confirming the test fails.
 - **smtp-N2.** (minor, re-scoped after measuring - the filed symptom does
   not reproduce) A 600-char non-ASCII display name folds correctly at 73
   columns on every address path, typed and raw: RFC 2047 words are
@@ -455,13 +465,71 @@ blocking; each is a real defect or a real decision, not a cleanup.
   entirely on the caller, and the contract says so deliberately.
   `Account::close` is idempotent LOCAL teardown and explicitly does not delete
   durable server-side subscriptions (`reference/types.md`); engine detach
-  cancels workers and calls `close`; the engine tells consumers to call
-  `unsubscribe_push` themselves. So a consumer that detaches without
+  cancels workers and calls `close`; the engine tells consumers to tear the
+  subscriptions down themselves. So a consumer that detaches without
   unsubscribing strands live server subscriptions - for Graph, up to 24h, with
   provider-side expiry as the only backstop. This is the documented contract
   rather than a defect, and `bifrost-graph` correctly must NOT add best-effort
   deletion in `close`. The open question is whether the shared contract should
   keep placing that burden on the consumer at all.
+
+  UNRULED as of 2026-07-31. Context below was verified against the code
+  during a review pass; the ruling was explicitly deferred, and the
+  reviewer disagreed with the recommendation recorded at the bottom, so
+  treat that recommendation as one input rather than a plan of record.
+
+  First, a naming trap worth knowing before reading any of this. There are
+  TWO entries, one per layer, and their names are near-anagrams:
+  - `Account::push_unsubscribe(handle)` - protocol-crate trait method
+    (`crates/types/src/account.rs`), destroys ONE subscription.
+  - `SyncEngine::unsubscribe_push(account_id)` - engine method
+    (`crates/sync/src/engine.rs`), takes the account's registry records
+    and calls the trait method once per record.
+  `Account::close`'s doc points at the first; `SyncEngine::detach`'s doc
+  points at the second. Both are correct for their layer, and an app calls
+  the engine one because an app holds an engine, not an `Account`. Read
+  within a page of each other they look like a typo for one another.
+
+  Two facts the original entry does not capture, both verified:
+
+  1. The cleanup window closes SILENTLY. `SyncEngine::unsubscribe_push`
+     looks up `self.accounts` first and returns `AccountNotAttached`, so
+     after `detach` there is no API that can reach the handles - even
+     though the engine still holds them. The consumer's only opportunity
+     to do the job the contract assigns them ends at detach, with nothing
+     enforcing or signalling that.
+  2. The registry records OUTLIVE the account. `detach` never touches
+     `self.subscriptions`; `take` is called only by `unsubscribe_push` and
+     `replace` only by the reopen path, so nothing prunes on detach.
+     Re-attaching the same `AccountId` finds the previous incarnation's
+     records still present, so a later `unsubscribe_push` or reopen
+     operates on handles minted by a dead connection. This one looks like
+     a plain defect rather than a contract question - it is wrong under
+     every option below - but it has not been ruled either, so it is
+     recorded, not fixed.
+
+  Options considered, stated neutrally:
+  - **A** Hygiene only: `detach` clears the registry, and the window is
+    documented explicitly. Fixes (2), leaves the contract alone.
+  - **B** `detach` always tears down. Fixes both. Argument against: push
+    delivers to a consumer-owned endpoint (webhook, Pub/Sub topic), so an
+    app that shuts down and wants events to queue for its next start is a
+    legitimate pattern that unconditional teardown breaks silently.
+  - **C** A, plus an explicit opt-in (`detach_with_teardown`, or a flag),
+    leaving plain `detach` unchanged. Consumer states intent; neither
+    pattern is penalised. Costs public API surface.
+  - **D** A, plus a `Warning` emitted on detach when records were still
+    live, so an app that forgot finds out. No API addition.
+
+  The recommendation offered at the time was A + D, on the grounds that
+  (2) is a defect regardless and that surface should wait until ratatoskr
+  asks. That was disputed and is NOT settled - re-derive the choice rather
+  than inheriting it.
+
+  Whichever option lands should also add a note to `reference/sync.md`
+  disambiguating the two entry points above; anyone reading the teardown
+  path meets both names and has no way to tell whether the difference is
+  meaningful.
 
 - **xc-3 (net + graph, related in jmap)** RESOLVED on the net side
   (2026-07-31). `bifrost-net` now publishes the wire seam under a

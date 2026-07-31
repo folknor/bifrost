@@ -9,9 +9,14 @@ use std::{
 
 use bifrost_types::error::{AccountError, BatchItem, BatchOutcome};
 
+use std::sync::atomic::AtomicU64;
+
+use bifrost_net::MeterSinkHandle;
+
 use super::PoolConfig;
 #[cfg(feature = "tokio")]
 use super::Tls;
+use super::WireMetering;
 use super::batch::{SmtpBatchRecipient, batch_input_invalid_error, batch_level_error};
 use super::pool::async_impl::Pool;
 use super::{
@@ -772,6 +777,29 @@ impl AsyncSmtpTransportBuilder {
         self
     }
 
+    /// Meter this transport's socket bytes, and optionally cap its
+    /// throughput.
+    ///
+    /// `sink` receives every byte read and written; `bandwidth_cap` is a
+    /// live bytes-per-second ceiling read fresh on each transfer, so a
+    /// consumer can retune or lift it without reconnecting.
+    /// `UNLIMITED_BANDWIDTH` (`u64::MAX`) in the atomic means no cap -
+    /// the same encoding `bifrost-imap` uses, so one value can drive
+    /// both halves of an IMAP-shaped account.
+    ///
+    /// Without this, an account that sets a bandwidth cap has it honoured
+    /// on its other protocols and silently ignored on submission, which
+    /// is the upstream-heavy path a cap usually exists to protect.
+    #[must_use]
+    pub fn bandwidth_metering(
+        mut self,
+        sink: Option<MeterSinkHandle>,
+        bandwidth_cap: Option<Arc<AtomicU64>>,
+    ) -> Self {
+        self.info.metering = WireMetering::new(sink, bandwidth_cap);
+        self
+    }
+
     /// Set the TLS settings to use.
     ///
     /// LMTP-over-TLS and STARTTLS are supported through the same TLS modes as
@@ -978,6 +1006,7 @@ where
             &self.info.hello_name,
             &self.info.tls,
             self.info.protocol,
+            self.info.metering.clone(),
         )
         .await?;
 
@@ -1247,6 +1276,99 @@ mod tests {
                 "a drained LMTP connection must be retired, not parked"
             );
             transcript.assert_exhausted();
+        }
+
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        use super::super::WireMetering;
+
+        /// Records every byte the transport reads and writes, per account.
+        #[derive(Default)]
+        struct CountingSink {
+            bytes_in: AtomicU64,
+            bytes_out: AtomicU64,
+        }
+
+        impl bifrost_net::MeterSink for CountingSink {
+            fn record_bytes_in(&self, _account: &bifrost_net::AccountId, n: u64) {
+                self.bytes_in.fetch_add(n, Ordering::Relaxed);
+            }
+            fn record_bytes_out(&self, _account: &bifrost_net::AccountId, n: u64) {
+                self.bytes_out.fetch_add(n, Ordering::Relaxed);
+            }
+        }
+
+        /// smtp-M1. SMTP was the one protocol whose bytes reached the wire
+        /// unmetered, which made an account's bandwidth cap silently
+        /// PARTIAL: honoured on its other traffic, ignored on submission -
+        /// the upstream-heavy path a cap usually exists to protect.
+        ///
+        /// Drives a real send through the transport and asserts the sink
+        /// saw traffic in both directions, rather than asserting the
+        /// adapter was merely installed.
+        #[tokio::test(crate = "tokio")]
+        async fn a_metered_transport_reports_its_socket_bytes_to_the_sink() {
+            let transcript = Transcript::new("220 smtp.example\r\n")
+                .expect("EHLO client.example\r\n", "250 smtp.example\r\n")
+                .expect("MAIL FROM:<sender@example.com>\r\n", "250 sender ok\r\n")
+                .expect("RCPT TO:<first@example.com>\r\n", "250 first ok\r\n")
+                .expect("DATA\r\n", "354 send body\r\n")
+                .expect("body", "")
+                .expect("\r\n.\r\n", "250 queued\r\n");
+
+            let sink = Arc::new(CountingSink::default());
+            let erased: Arc<dyn bifrost_net::MeterSink> = Arc::<CountingSink>::clone(&sink);
+            let handle = bifrost_net::MeterSinkHandle::new(
+                erased,
+                bifrost_net::AccountId("metered".to_owned()),
+            );
+            let conn = AsyncSmtpConnection::from_transcript_metered(
+                transcript.clone(),
+                &hello(),
+                Protocol::Smtp,
+                WireMetering::new(Some(handle), None),
+            )
+            .await
+            .unwrap();
+            let pool = pool_with(conn, Protocol::Smtp).await;
+            let transport = AsyncSmtpTransport::<TokioExecutor> {
+                inner: Arc::clone(&pool),
+            };
+
+            let outcome = transport
+                .send_raw_batch_with_options(
+                    Some("sender@example.com".parse().unwrap()),
+                    batch(&["first@example.com"]),
+                    b"body",
+                    &SendOptions::default(),
+                )
+                .await
+                .unwrap();
+            settle().await;
+            assert_eq!(outcome.succeeded().len(), 1);
+
+            let sent = sink.bytes_out.load(Ordering::Relaxed);
+            let received = sink.bytes_in.load(Ordering::Relaxed);
+            assert!(
+                sent > 0,
+                "the commands and body the transport wrote must be metered"
+            );
+            assert!(
+                received > 0,
+                "the server's replies must be metered too - a cap that\
+                 counted only one direction would misreport usage"
+            );
+        }
+
+        /// The complement: an unmetered transport is the default, and must
+        /// stay free of any accounting overhead or behaviour change.
+        #[tokio::test(crate = "tokio")]
+        async fn an_unmetered_transport_is_the_default() {
+            let info = SmtpInfo::new("transcript.invalid", Protocol::Smtp);
+            assert!(
+                !info.metering.is_enabled(),
+                "metering is opt-in; a plain transport must not meter"
+            );
         }
 
         /// The SMTP contrast case on the async path: the connection goes back

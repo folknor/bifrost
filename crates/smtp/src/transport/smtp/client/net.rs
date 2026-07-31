@@ -16,6 +16,7 @@ use native_tls::TlsStream;
 use socket2::SockAddr;
 use socket2::{Domain, Protocol, Type};
 
+use super::metering::WireMetering;
 use super::{ConnectionState, TlsParameters};
 use crate::transport::smtp::{Error, error};
 
@@ -23,6 +24,14 @@ use crate::transport::smtp::{Error, error};
 pub(crate) struct NetworkStream {
     inner: Option<InnerNetworkStream>,
     state: ConnectionState,
+    /// Byte accounting and cap for this connection. `disabled()` unless
+    /// an account wired one in.
+    ///
+    /// This transport is blocking by construction, so the cap is honoured
+    /// by sleeping the calling thread - the same semantic its caller has
+    /// already accepted by choosing the blocking API. The async transport
+    /// parks a timer instead.
+    metering: WireMetering,
 }
 
 /// Represents the different types of underlying network streams
@@ -47,6 +56,28 @@ impl NetworkStream {
         NetworkStream {
             inner: Some(inner),
             state: ConnectionState::Ok,
+            metering: WireMetering::disabled(),
+        }
+    }
+
+    /// Install byte accounting / capping for this connection.
+    pub(super) fn set_metering(&mut self, metering: WireMetering) {
+        self.metering = metering;
+    }
+
+    /// Record `n` transferred bytes and sleep off any debt the cap
+    /// imposes. Blocking, matching this transport's contract.
+    fn charge(&mut self, n: usize, inbound: bool) {
+        if n == 0 || !self.metering.is_enabled() {
+            return;
+        }
+        let debt = if inbound {
+            self.metering.record_in(n)
+        } else {
+            self.metering.record_out(n)
+        };
+        if let Some(debt) = debt {
+            std::thread::sleep(debt);
         }
     }
 
@@ -251,7 +282,7 @@ impl NetworkStream {
 
 impl Read for NetworkStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        match self.inner.as_mut() {
+        let read = match self.inner.as_mut() {
             Some(InnerNetworkStream::Tcp(s)) => s.read(buf),
             #[cfg(unix)]
             Some(InnerNetworkStream::Unix(s)) => s.read(buf),
@@ -259,13 +290,15 @@ impl Read for NetworkStream {
             #[cfg(test)]
             Some(InnerNetworkStream::Transcript(s)) => s.read(buf),
             None => Err(not_connected()),
-        }
+        }?;
+        self.charge(read, true);
+        Ok(read)
     }
 }
 
 impl Write for NetworkStream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        match self.inner.as_mut() {
+        let written = match self.inner.as_mut() {
             Some(InnerNetworkStream::Tcp(s)) => s.write(buf),
             #[cfg(unix)]
             Some(InnerNetworkStream::Unix(s)) => s.write(buf),
@@ -273,7 +306,10 @@ impl Write for NetworkStream {
             #[cfg(test)]
             Some(InnerNetworkStream::Transcript(s)) => s.write(buf),
             None => Err(not_connected()),
-        }
+        }?;
+        // Charge what the socket accepted, not what was offered.
+        self.charge(written, false);
+        Ok(written)
     }
 
     fn flush(&mut self) -> io::Result<()> {

@@ -15,8 +15,10 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 #[cfg(unix)]
 use tokio::net::UnixStream as TokioUnixStream;
 use tokio::net::{TcpSocket, TcpStream, ToSocketAddrs};
+use tokio::time::Sleep;
 use tokio_native_tls::TlsStream as TokioTlsStream;
 
+use super::metering::WireMetering;
 use super::net::resolved_address_filter;
 use super::{ConnectionState, TlsParameters};
 use crate::transport::smtp::{Error, error};
@@ -84,6 +86,17 @@ where
 pub(crate) struct AsyncNetworkStream {
     inner: InnerAsyncNetworkStream,
     state: ConnectionState,
+    /// Byte accounting and cap for this connection. `disabled()` unless
+    /// an account wired one in, so the non-account path is unchanged.
+    metering: WireMetering,
+    /// Outstanding throttle debt. Polled to completion before the next
+    /// read or write touches the socket.
+    ///
+    /// Held here rather than awaited inline because both the read and
+    /// write funnels are `poll_` methods that cannot await. Parking the
+    /// sleep in the stream means a throttled connection yields to the
+    /// runtime like any other pending IO instead of blocking the task.
+    throttle: Option<Pin<Box<Sleep>>>,
 }
 
 pub(crate) trait AsyncTokioStream:
@@ -126,6 +139,41 @@ impl AsyncNetworkStream {
         AsyncNetworkStream {
             inner,
             state: ConnectionState::Ok,
+            metering: WireMetering::disabled(),
+            throttle: None,
+        }
+    }
+
+    /// Install byte accounting / capping for this connection. Called by
+    /// the transport when an account supplied a meter sink or cap.
+    pub(super) fn set_metering(&mut self, metering: WireMetering) {
+        self.metering = metering;
+    }
+
+    /// Wait out any throttle debt owed from the previous transfer.
+    ///
+    /// Returns `Pending` while the debt is outstanding, which parks the
+    /// caller the same way a not-yet-readable socket would.
+    fn poll_throttle(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        if let Some(delay) = &mut self.throttle {
+            std::task::ready!(delay.as_mut().poll(cx));
+            self.throttle = None;
+        }
+        Poll::Ready(())
+    }
+
+    /// Record `n` transferred bytes and park the resulting debt, if any.
+    fn charge(&mut self, n: usize, inbound: bool) {
+        if n == 0 || !self.metering.is_enabled() {
+            return;
+        }
+        let debt = if inbound {
+            self.metering.record_in(n)
+        } else {
+            self.metering.record_out(n)
+        };
+        if let Some(debt) = debt {
+            self.throttle = Some(Box::pin(tokio::time::sleep(debt)));
         }
     }
 
@@ -311,7 +359,10 @@ impl AsyncRead for AsyncNetworkStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<IoResult<()>> {
-        match &mut self.inner {
+        let this = self.as_mut().get_mut();
+        std::task::ready!(this.poll_throttle(cx));
+        let before = buf.filled().len();
+        let result = match &mut this.inner {
             InnerAsyncNetworkStream::TokioTcp(s) => Pin::new(s).poll_read(cx, buf),
             #[cfg(unix)]
             InnerAsyncNetworkStream::TokioUnix(s) => Pin::new(s).poll_read(cx, buf),
@@ -322,7 +373,11 @@ impl AsyncRead for AsyncNetworkStream {
                 debug_assert!(false, "InnerAsyncNetworkStream::None must never be built");
                 Poll::Ready(Ok(()))
             }
+        };
+        if matches!(result, Poll::Ready(Ok(()))) {
+            this.charge(buf.filled().len().saturating_sub(before), true);
         }
+        result
     }
 }
 
@@ -332,7 +387,9 @@ impl AsyncWrite for AsyncNetworkStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<IoResult<usize>> {
-        match &mut self.inner {
+        let this = self.as_mut().get_mut();
+        std::task::ready!(this.poll_throttle(cx));
+        let result = match &mut this.inner {
             InnerAsyncNetworkStream::TokioTcp(s) => Pin::new(s).poll_write(cx, buf),
             #[cfg(unix)]
             InnerAsyncNetworkStream::TokioUnix(s) => Pin::new(s).poll_write(cx, buf),
@@ -343,7 +400,14 @@ impl AsyncWrite for AsyncNetworkStream {
                 debug_assert!(false, "InnerAsyncNetworkStream::None must never be built");
                 Poll::Ready(Ok(0))
             }
+        };
+        // Charge what the socket ACCEPTED, not what was offered: a short
+        // write means the rest has not crossed the wire yet and will be
+        // charged on the retry.
+        if let Poll::Ready(Ok(n)) = &result {
+            this.charge(*n, false);
         }
+        result
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<IoResult<()>> {

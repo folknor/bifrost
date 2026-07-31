@@ -5,7 +5,12 @@ use std::{fmt::Debug, time::Duration};
 
 use bifrost_types::error::{AccountError, BatchItem, BatchOutcome};
 
+use std::sync::atomic::AtomicU64;
+
+use bifrost_net::MeterSinkHandle;
+
 use super::PoolConfig;
+use super::WireMetering;
 use super::batch::{SmtpBatchRecipient, batch_input_invalid_error, batch_level_error};
 use super::pool::sync_impl::Pool;
 use super::{
@@ -619,6 +624,22 @@ impl SmtpTransportBuilder {
         self
     }
 
+    /// Meter this transport's socket bytes, and optionally cap its
+    /// throughput.
+    ///
+    /// See `AsyncSmtpTransportBuilder::bandwidth_metering`. This blocking
+    /// transport honours the cap by sleeping the calling thread, which is
+    /// the semantic its caller accepted by choosing the blocking API.
+    #[must_use]
+    pub fn bandwidth_metering(
+        mut self,
+        sink: Option<MeterSinkHandle>,
+        bandwidth_cap: Option<Arc<AtomicU64>>,
+    ) -> Self {
+        self.info.metering = WireMetering::new(sink, bandwidth_cap);
+        self
+    }
+
     /// Set the port to use
     ///
     /// # Warning
@@ -766,6 +787,22 @@ impl LmtpTransportBuilder {
         self
     }
 
+    /// Meter this transport's socket bytes, and optionally cap its
+    /// throughput.
+    ///
+    /// See `AsyncSmtpTransportBuilder::bandwidth_metering`. This blocking
+    /// transport honours the cap by sleeping the calling thread, which is
+    /// the semantic its caller accepted by choosing the blocking API.
+    #[must_use]
+    pub fn bandwidth_metering(
+        mut self,
+        sink: Option<MeterSinkHandle>,
+        bandwidth_cap: Option<Arc<AtomicU64>>,
+    ) -> Self {
+        self.info.metering = WireMetering::new(sink, bandwidth_cap);
+        self
+    }
+
     /// Set the port to use
     pub fn port(mut self, port: u16) -> Self {
         self.info.port = port;
@@ -833,6 +870,7 @@ impl SmtpClient {
                     self.info.timeout,
                     &self.info.hello_name,
                     self.info.protocol,
+                    self.info.metering.clone(),
                 )?;
 
                 if let Some(credentials) = &self.info.credentials {
@@ -862,6 +900,7 @@ impl SmtpClient {
             tls_parameters,
             None,
             self.info.protocol,
+            self.info.metering.clone(),
         )?;
 
         match &self.info.tls {
