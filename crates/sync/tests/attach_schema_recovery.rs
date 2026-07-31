@@ -24,16 +24,16 @@ use bifrost_types::{
     Batch, BatchingPolicy, BlobHandle, BlobRangeSupport, ByteRange, Cause, Change, ChangeCursor,
     CloudUploadMeta, ContactCard, ContactCreate, ContactId, ContactPatch, ContactSearchRequest,
     ContainerId, ContainerKind, Control, ConvenienceShape, CursorDescriptor, CursorEstablishment,
-    CursorFreshness, CursorScope, DraftHandle, DraftPatch, EventCreate, EventId, EventPatch,
-    EventRange, EventSearchRequest, FilterRuleShape, FilterValidation, FlagOp, HostedAttachment,
-    HydratedObject, HydrationProjection, IdempotencyKey, Identity, IdentityId, IdentityPatch,
-    Importance, InventoryEntry, ItemOutcome, MembershipScope, Message, MutationCapabilities,
-    MutationConcurrency, MutationReplaySafety, MutationSuccess, MutationTarget, ObjectId,
-    OpaqueChangeState, Page, PimMethodSupport, Priority, Projection, ProtocolKind, PushCapability,
-    QuotaInfo, QuotaSignal, RateLimitClass, RequestCause, RsvpStatus, ScopeLifecycleEvent,
-    SearchRequest, SendRequest, ServerFilter, ServerFilterCreate, ServerFilterId,
-    ServerFilterPatch, SubscriptionHandle, SyncEvent, ThreadHydration, ThreadId, VacationConfig,
-    WatchEvent,
+    CursorFreshness, CursorScope, DraftHandle, DraftPatch, ErrorScope, EventCreate, EventId,
+    EventPatch, EventRange, EventSearchRequest, FilterRuleShape, FilterValidation, FlagOp,
+    HostedAttachment, HydratedObject, HydrationProjection, IdempotencyKey, Identity, IdentityId,
+    IdentityPatch, Importance, InventoryEntry, ItemOutcome, MembershipScope, Message,
+    MutationCapabilities, MutationConcurrency, MutationReplaySafety, MutationSuccess,
+    MutationTarget, ObjectId, OpaqueChangeState, Page, PimMethodSupport, Priority, Projection,
+    ProtocolKind, PushCapability, QuotaInfo, QuotaSignal, RateLimitClass, RequestCause, RsvpStatus,
+    ScopeLifecycleEvent, SearchRequest, SendRequest, ServerFilter, ServerFilterCreate,
+    ServerFilterId, ServerFilterPatch, SubscriptionHandle, SyncEvent, ThreadHydration, ThreadId,
+    VacationConfig, WatchEvent,
 };
 use bifrost_types::{AddressBook, AddressBookId};
 use bifrost_types::{Calendar, CalendarEvent};
@@ -223,12 +223,17 @@ struct HealAccount {
     /// stream ends. Empty means every stream ends immediately, which is
     /// the shape most tests want.
     lifecycle_script: Arc<Mutex<VecDeque<ScopeLifecycleEvent>>>,
+    /// When set, `contacts_list` answers with a page carrying both loss
+    /// lanes populated. Off by default so the stub stays neutral for
+    /// every test that does not care.
+    degraded_contacts: bool,
 }
 
 struct HealFactory {
     scopes: Vec<CursorScope>,
     established: Arc<Mutex<Vec<CursorScope>>>,
     closed: Arc<AtomicUsize>,
+    degraded_contacts: bool,
 }
 
 impl HealFactory {
@@ -241,6 +246,20 @@ impl HealFactory {
             scopes,
             established,
             closed,
+            degraded_contacts: false,
+        }
+    }
+
+    /// Opens accounts whose `contacts_list` returns a page that lost
+    /// resources and skipped a scope.
+    fn with_degraded_contacts(
+        scopes: Vec<CursorScope>,
+        established: Arc<Mutex<Vec<CursorScope>>>,
+        closed: Arc<AtomicUsize>,
+    ) -> Self {
+        Self {
+            degraded_contacts: true,
+            ..Self::new(scopes, established, closed)
         }
     }
 }
@@ -253,6 +272,7 @@ impl AccountFactory for HealFactory {
         let scopes = self.scopes.clone();
         let established = Arc::clone(&self.established);
         let closed = Arc::clone(&self.closed);
+        let degraded_contacts = self.degraded_contacts;
         Box::pin(async move {
             let account: Arc<dyn Account> = Arc::new(HealAccount {
                 caps: caps(),
@@ -266,6 +286,7 @@ impl AccountFactory for HealFactory {
                 unsubscribe_failures: Arc::new(AtomicUsize::new(0)),
                 lifecycle_calls: Arc::new(Mutex::new(Vec::new())),
                 lifecycle_script: Arc::new(Mutex::new(VecDeque::new())),
+                degraded_contacts,
             });
             Ok(bifrost_types::OpenedAccount::complete(account))
         })
@@ -322,6 +343,7 @@ impl AccountFactory for RotatingFactory {
                 unsubscribe_failures,
                 lifecycle_calls,
                 lifecycle_script: Arc::new(Mutex::new(VecDeque::new())),
+                degraded_contacts: false,
             });
             Ok(bifrost_types::OpenedAccount::complete(account))
         })
@@ -774,7 +796,29 @@ impl Account for HealAccount {
         _address_book: Option<AddressBookId>,
         _page_cursor: Option<Vec<u8>>,
     ) -> AccountFuture<Result<Page<ContactCard>, AccountError>> {
-        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::ContactsList)) })
+        if !self.degraded_contacts {
+            // A successful page with both lanes empty - the shape that
+            // must stay silent. An `Err` here would exercise the `?`
+            // instead of the emptiness guard.
+            return Box::pin(async { Ok(Page::single(Vec::new())) });
+        }
+        // A walk that returned some cards, could not materialize one
+        // resource, and gave up on a whole address book part way
+        // through - the DAV shape xc-5 was filed from.
+        Box::pin(async {
+            Ok(Page {
+                items: Vec::new(),
+                next_cursor: None,
+                estimated_total: None,
+                failed_ids: vec!["urn:uuid:unparseable-vcard".to_owned()],
+                skipped_scopes: vec![bifrost_types::SkippedScope {
+                    scope: ErrorScope::Mailbox {
+                        id: "shared-book".to_owned(),
+                    },
+                    error: unsupported(bifrost_types::AccountOperation::ContactsList),
+                }],
+            })
+        })
     }
 
     fn contact_get(&self, _contact: ContactId) -> AccountFuture<Result<ContactCard, AccountError>> {
@@ -903,6 +947,103 @@ impl Account for HealAccount {
     ) -> AccountFuture<Result<Message, AccountError>> {
         Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::HydrateMessage)) })
     }
+}
+
+/// xc-5. Both page loss lanes ride out in the returned `Page`, so this
+/// warning reveals no new DATA - it closes an asymmetry. An open-time
+/// skip is announced (`open_skipped_scopes` plus a log line) while a
+/// page-time skip was entirely silent, so a consumer had to already know
+/// to look at the lanes. The warning gives them the reason to look; the
+/// `Page` in hand stays the actionable copy.
+#[tokio::test]
+async fn a_forwarded_page_with_a_loss_lane_warns_on_the_change_stream() {
+    let account_id = AccountId("page-loss".to_owned());
+    let scope = CursorScope::Account;
+    let engine = SyncEngine::builder()
+        .build()
+        .expect("default engine config is valid");
+    let factory: Arc<dyn AccountFactory> = Arc::new(HealFactory::with_degraded_contacts(
+        vec![scope],
+        Arc::new(Mutex::new(Vec::new())),
+        Arc::new(AtomicUsize::new(0)),
+    ));
+    engine
+        .attach(account_id.clone(), factory)
+        .await
+        .expect("attach succeeds");
+    let mut events = engine
+        .account_changes_stream(&account_id)
+        .expect("attached account has a change stream");
+
+    let page = engine
+        .contacts_list(&account_id, None, None)
+        .await
+        .expect("a degraded page is still a successful call");
+
+    // The lanes reach the caller untouched - the warning is additive.
+    assert_eq!(page.failed_ids.len(), 1);
+    assert_eq!(page.skipped_scopes.len(), 1);
+
+    let warning = loop {
+        let event = events.recv().await.expect("the warning is broadcast");
+        if let SyncEvent::Warning(warning) = event.event.as_ref() {
+            break warning.clone();
+        }
+    };
+    assert_eq!(
+        warning.kind,
+        bifrost_types::WarningKind::OperatorAttentionNeeded
+    );
+    let text = warning.message.value.clone();
+    assert!(text.contains("contacts_list"), "{text}");
+    assert!(text.contains('1'), "the counts ride in the message: {text}");
+    // `failed_ids` holds native provider identifiers, which are not
+    // user-safe text. The message counts them and never names them.
+    assert!(!text.contains("urn:uuid"), "{text}");
+    assert!(
+        warning.next_action.is_some(),
+        "the warning must point at the lanes that carry the detail"
+    );
+
+    engine.detach(&account_id).await.expect("detach succeeds");
+}
+
+/// The complement: a clean page must stay silent, or the warning is
+/// noise on every successful call and consumers learn to ignore it.
+#[tokio::test]
+async fn a_clean_forwarded_page_emits_no_warning() {
+    let account_id = AccountId("page-clean".to_owned());
+    let engine = SyncEngine::builder()
+        .build()
+        .expect("default engine config is valid");
+    let factory: Arc<dyn AccountFactory> = Arc::new(HealFactory::new(
+        vec![CursorScope::Account],
+        Arc::new(Mutex::new(Vec::new())),
+        Arc::new(AtomicUsize::new(0)),
+    ));
+    engine
+        .attach(account_id.clone(), factory)
+        .await
+        .expect("attach succeeds");
+    let mut events = engine
+        .account_changes_stream(&account_id)
+        .expect("attached account has a change stream");
+
+    let page = engine
+        .contacts_list(&account_id, None, None)
+        .await
+        .expect("the clean page succeeds");
+    assert!(page.failed_ids.is_empty() && page.skipped_scopes.is_empty());
+
+    assert!(
+        matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ),
+        "a call with no page-lane loss must not warn"
+    );
+
+    engine.detach(&account_id).await.expect("detach succeeds");
 }
 
 #[tokio::test]
@@ -1265,6 +1406,7 @@ impl AccountFactory for GatingFactory {
                 unsubscribe_failures: Arc::new(AtomicUsize::new(0)),
                 lifecycle_calls: Arc::new(Mutex::new(Vec::new())),
                 lifecycle_script: Arc::new(Mutex::new(VecDeque::new())),
+                degraded_contacts: false,
             });
             Ok(bifrost_types::OpenedAccount::complete(account))
         })
@@ -1441,6 +1583,7 @@ impl AccountFactory for SkippingFactory {
                 unsubscribe_failures: Arc::new(AtomicUsize::new(0)),
                 lifecycle_calls: Arc::new(Mutex::new(Vec::new())),
                 lifecycle_script: Arc::new(Mutex::new(VecDeque::new())),
+                degraded_contacts: false,
             });
             Ok(bifrost_types::OpenedAccount {
                 account,
@@ -1544,6 +1687,7 @@ impl AccountFactory for ParkedReopenFactory {
                 unsubscribe_failures: Arc::new(AtomicUsize::new(0)),
                 lifecycle_calls,
                 lifecycle_script,
+                degraded_contacts: false,
             });
             Ok(bifrost_types::OpenedAccount::complete(account))
         })
@@ -1653,6 +1797,7 @@ impl AccountFactory for ExhaustingFactory {
                 unsubscribe_failures: Arc::new(AtomicUsize::new(0)),
                 lifecycle_calls: Arc::new(Mutex::new(Vec::new())),
                 lifecycle_script,
+                degraded_contacts: false,
             });
             Ok(bifrost_types::OpenedAccount::complete(account))
         })

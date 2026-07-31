@@ -546,22 +546,106 @@ blocking; each is a real defect or a real decision, not a cleanup.
   separately. This item stays open on the net side; the Graph consumer no
   longer blocks on it.
 
-- **xc-5 (types + sync, surfaced from the DAV crates)** The engine is blind
-  to page-level loss lanes. `bifrost-sync` consumes only the open-time
-  `OpenedAccount::skipped_scopes` (surfaced via `open_skipped_scopes`);
-  nothing engine-side reads `Page::failed_ids` or a search/range page's
-  `Page::skipped_scopes`. For the DAV crates this means a walk that quietly
-  loses resources - a vCard that will not parse, a resource refused inside a
-  207, a search REPORT leg that met a 401 mid-walk - is visible only to a
-  consumer that inspects the returned `Page` directly; an app that routes
-  everything through the engine never sees the loss or the recovery class the
-  degraded lane was built to preserve. The DAV account layers now populate
-  both lanes correctly (2026-07 close pass), so the producer side is done;
-  what is open is whether the shared contract should grow engine-side
-  accounting for page-lane loss (fold page `skipped_scopes` into the same
-  consumer surface as open skips, or at least a counter/warning), or whether
-  "page lanes are the app's job" stays the documented ruling. A decision,
-  not a bug: nothing is dropped silently at the crate boundary today.
+- **xc-5 (types + sync, surfaced from the DAV crates)** DECIDED and closed
+  (2026-07-31). The engine now announces page-level loss instead of
+  accumulating it: `announce_page_loss` emits a `SyncEvent::Warning`
+  (`OperatorAttentionNeeded`, `next_action` pointing at the lanes, counts
+  only - `failed_ids` holds native ids and is not user-safe text) on the
+  account change stream when one of the four forwarded query methods
+  returns a page with `failed_ids` or `skipped_scopes` non-empty. A clean
+  page stays silent.
+
+  The item's original framing was wrong in a way that changed the answer,
+  and the correction is worth keeping: "an app that routes everything
+  through the engine never sees the loss" is not true. `Page` appears only
+  on on-demand query surfaces, never in the sync pipeline, and the engine
+  either forwards the page verbatim (`contacts_list`, `directory_*`) or
+  does not expose the method at all (`search`, `search_messages`,
+  `contacts_search`, the calendar walks) - so the consumer always holds
+  both lanes. Nothing was ever dropped. The real gap was an ASYMMETRY:
+  open-time skips got an accessor and a log line, page-time skips got
+  silence, so a consumer had to already know to look.
+
+  Rejected: folding page skips into a queryable lane beside
+  `open_skipped_scopes`. A page lane is true of one walk at one moment and
+  has no healing point, so it would need an invented expiry, dedupe key,
+  and cap; and because the engine does not expose every query surface, the
+  accessor would report "no skips" while a direct `Account` call had just
+  quarantined three scopes. A surface that looks authoritative and is
+  systematically incomplete is worse than none, since it invites consumers
+  to stop reading the pages. Reasoning recorded in `reference/sync.md`
+  under "Page loss lanes".
+
+## Workspace sweep: local copies of a contract (2026-07-31)
+
+- **sweep-1 (workspace)** Sweep every crate for the failure mode the
+  xc-3 / xc-3a / imap-T3 / imap-S1 slices each hit independently. It has
+  one shape: **a local restatement of a rule that lives somewhere else,
+  kept alive by a test that exercises the copy rather than the original.**
+  The copy and its test agree with each other indefinitely; only the
+  original disagrees, and nothing asks it. These do not surface as
+  failures - they surface as tests passing - which is why review rounds
+  keep missing them and why this wants a deliberate sweep rather than
+  another read-through.
+
+  The four found so far, as calibration for what to look for:
+
+  - `bifrost-graph` `ScriptedRestResponse::into_net_outcome` reimplemented
+    bifrost-net's status contract. It answered a 401 with `AuthLost`
+    directly, hiding that the transport forces a token refresh and
+    reissues on a separate budget - so a Graph path meeting a transient
+    401 recovers with no error at all, and every test asking about a 401
+    was asking the copy.
+  - `bifrost-graph`'s download queue answered ranged reads with neither a
+    206 nor a `Content-Range`, so a ranged test recorded a `ByteRange` the
+    account never had to actually put on the wire. It asserted the range
+    it LOGGED, not the range it SENT.
+  - `bifrost-imap` `id_from_scope` / `mailbox_throttle` matched only
+    `ErrorScope::Mailbox { id }` after producers had migrated to
+    `Cursor(Folder(_))`. `ThrottleScope::Mailbox` became unreachable in
+    production while its test kept passing, because the test used the
+    now-production-dead `with_mailbox` helper.
+  - `bifrost-imap` `Translation::skip_attempt_cause` documented a guard it
+    never armed (never assigned `true`), so a `try_build` invariant was
+    upheld by comment only.
+
+  What that suggests looking for, in rough order of yield:
+
+  1. **Re-derived contracts.** Any crate-local function that decides what
+     another layer would have decided: status-to-error mappings, retry or
+     backoff simulations, idempotency or transmission-state inference,
+     capability gating restated away from the capability source. The tell
+     is a comment of the form "mirrors X" / "same as X" / "what X would
+     have produced" with no mechanism keeping the two in step. `grep` for
+     `mirrors`, `same shape as`, `would have`, `equivalent to`.
+  2. **Partially-migrated readers.** A producer changed its shape and only
+     some consumers followed. The tell is a `match` on an enum where a
+     sibling arm handles a case this one silently drops to `_ => None` /
+     a default. `resource_from_scope` handled both shapes; the two beside
+     it did not, and nothing made that visible.
+  3. **Test-only helpers used by no production path.** Every one is a
+     potential fake target for a passing assertion. Enumerate helpers
+     reachable only from `#[cfg(test)]` and check whether a test built on
+     one is claiming something about production. (`with_mailbox` and
+     `with_transmission_state` are the known pair; there are likely more.)
+  4. **Documented guards.** Any comment promising an invariant is enforced
+     - check the enforcement exists and is reachable. `skip_attempt_cause`
+     was dead; the doc read as though it were not.
+  5. **Doubles above the layer they describe.** A seam that intercepts
+     above the component whose behavior the test names cannot observe that
+     behavior. EWS (`EwsExecute`) is the known remaining one, deliberately
+     kept (see graph-T1).
+
+  Method note, learned the hard way: three of the four were found by
+  DELETING the local copy and routing through the real thing, not by
+  reading either. Reading the copy tells you what it claims; deleting it
+  tells you whether the claim was true. Where a copy cannot be deleted
+  outright, the cheaper version is to route ONE test through the real path
+  and see whether it still passes.
+
+  Not scheduled, no blast radius bound yet - sizing is part of the job.
+  Deliverable is a findings list triaged bug / gap / smell / nit, not a
+  fix wave; fixes get scheduled per finding.
 
 ## Rules for agents working bug-hunt items
 

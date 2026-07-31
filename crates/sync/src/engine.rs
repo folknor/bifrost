@@ -1736,6 +1736,62 @@ impl SyncEngine {
     /// Loads through the slot's `ArcSwap` so the caller sees the handle
     /// installed by the most recent reopen. Errors with
     /// `AccountNotAttached` when no slot exists for `account_id`.
+    /// Announce that a forwarded page came back with a non-empty loss
+    /// lane, on the account's normal warning channel.
+    ///
+    /// This surfaces nothing the caller does not already hold - both
+    /// lanes ride out in the returned `Page`, and that copy stays the
+    /// actionable one (it names the scopes and carries their classified
+    /// errors). What it fixes is an asymmetry: an open-time skip is
+    /// announced (`open_skipped_scopes` plus a log line) while a
+    /// page-time skip was entirely silent, so a consumer had to know to
+    /// look. A warning gives them a reason to.
+    ///
+    /// Deliberately an event rather than engine state. A page lane is
+    /// true of ONE walk at ONE moment: there is no later point at which
+    /// it can be said to have healed, so accumulating it would need an
+    /// invented expiry, an invented dedupe key, and a cap. It would also
+    /// be systematically incomplete - `search`, `search_messages`,
+    /// `contacts_search`, and the calendar range walks are not exposed
+    /// by the engine at all, so an accessor that looked authoritative
+    /// would report "no skips" while a direct `Account` call had just
+    /// quarantined three scopes. A warning stream carries no such claim.
+    ///
+    /// The message counts; it never names ids. `failed_ids` holds native
+    /// provider identifiers, which are not user-safe text.
+    fn announce_page_loss<T>(
+        &self,
+        account_id: &AccountId,
+        method: &'static str,
+        page: &bifrost_types::Page<T>,
+    ) {
+        if page.failed_ids.is_empty() && page.skipped_scopes.is_empty() {
+            return;
+        }
+        let Some(slot) = self.accounts.get(account_id) else {
+            return;
+        };
+        let warning = bifrost_types::Warning::user_safe(
+            bifrost_types::WarningKind::OperatorAttentionNeeded,
+            format!(
+                "{method} returned an incomplete page: {} unsearched scope(s), \
+                 {} resource(s) the provider could not return",
+                page.skipped_scopes.len(),
+                page.failed_ids.len(),
+            ),
+        )
+        .with_next_action(bifrost_types::DiagnosticText::user_safe(
+            "inspect Page::skipped_scopes and Page::failed_ids; results from a \
+             skipped scope are missing, not absent",
+        ));
+        let event = MultiplexerEvent {
+            scope: CursorScope::Account,
+            event: Arc::new(SyncEvent::Warning(warning)),
+            checkpoint: None,
+        };
+        let _ = slot.multiplexer.changes_tx.send(event);
+    }
+
     fn live_account(&self, account_id: &AccountId) -> Result<Arc<Arc<dyn Account>>, Error> {
         let slot = self
             .accounts
@@ -2346,10 +2402,12 @@ impl SyncEngine {
         address_book: Option<bifrost_types::AddressBookId>,
         page_cursor: Option<Vec<u8>>,
     ) -> Result<bifrost_types::Page<bifrost_types::ContactCard>, Error> {
-        Ok(self
+        let page = self
             .live_account(account_id)?
             .contacts_list(address_book, page_cursor)
-            .await?)
+            .await?;
+        self.announce_page_loss(account_id, "contacts_list", &page);
+        Ok(page)
     }
 
     /// Fetch one contact card by engine-facing id. Forwards to
@@ -2411,10 +2469,12 @@ impl SyncEngine {
         limit: Option<u32>,
         page_cursor: Option<Vec<u8>>,
     ) -> Result<bifrost_types::Page<bifrost_types::DirectoryCard>, Error> {
-        Ok(self
+        let page = self
             .live_account(account_id)?
             .directory_search(query, limit, page_cursor)
-            .await?)
+            .await?;
+        self.announce_page_loss(account_id, "directory_search", &page);
+        Ok(page)
     }
 
     /// List the mail-enabled organization-directory groups the account's
@@ -2427,10 +2487,12 @@ impl SyncEngine {
         account_id: &AccountId,
         page_cursor: Option<Vec<u8>>,
     ) -> Result<bifrost_types::Page<bifrost_types::DirectoryGroup>, Error> {
-        Ok(self
+        let page = self
             .live_account(account_id)?
             .directory_groups_list(page_cursor)
-            .await?)
+            .await?;
+        self.announce_page_loss(account_id, "directory_groups_list", &page);
+        Ok(page)
     }
 
     /// Expand one directory group to its user members (transitive,
@@ -2444,10 +2506,12 @@ impl SyncEngine {
         group: bifrost_types::DirectoryGroupId,
         page_cursor: Option<Vec<u8>>,
     ) -> Result<bifrost_types::Page<bifrost_types::DirectoryGroupMember>, Error> {
-        Ok(self
+        let page = self
             .live_account(account_id)?
             .directory_group_expand(group, page_cursor)
-            .await?)
+            .await?;
+        self.announce_page_loss(account_id, "directory_group_expand", &page);
+        Ok(page)
     }
 
     /// List an account's server-side filter rules or scripts. Forwards

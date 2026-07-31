@@ -83,6 +83,9 @@ engine.shutdown().await?; // explicit cleanup; preferred over Drop
    lane. `Err(_)` still fails the attach as `OpenFailed`: the contract
    reserves it for the primary surface being unavailable, precisely
    because this path has no retry budget (only the reopen path does).
+
+   This open-time lane is the only skip lane the engine STORES. For the
+   page-level lanes see "Page loss lanes" below.
 3. Read `capabilities()` (snapshotted on the slot).
 4. `discover_cursor_scopes()` -> for each, `establish_initial_cursor(scope)`:
    - `Ready(cursor)`: persist, start `changes_stream` immediately.
@@ -144,6 +147,43 @@ this rediscovery, and the scheduling cadence (how often the reattach's
 wire cost is worth paying) is consumer policy - the engine does not
 schedule speculative reopens on its own. A generation watch wakes
 the push and lifecycle readers even when their old streams never end.
+
+## Page loss lanes
+
+`Page<T>` carries two lanes beside `items`: `failed_ids` (resources the
+provider fetched but could not materialize - an unparseable vCard, a
+resource refused inside a 207) and `skipped_scopes` (scopes a multi-scope
+walk quarantined rather than visited, each with its classified error).
+Absence of results from a skipped scope is missing data, not evidence of
+absence.
+
+`Page` appears only on on-demand QUERY surfaces (`search`,
+`search_messages`, `contacts_list`, `contacts_search`, `directory_*`, the
+calendar list/range walks), never in the background sync pipeline, which
+runs on streams and `SyncEvent`. The engine forwards four of them
+(`contacts_list`, `directory_search`, `directory_groups_list`,
+`directory_group_expand`) and does not expose the rest at all, so in every
+case the consumer physically receives both lanes in the returned `Page`.
+That copy is the actionable one: it names the scopes and carries their
+errors.
+
+What the engine adds is an announcement, not a record.
+`announce_page_loss` emits a `SyncEvent::Warning`
+(`OperatorAttentionNeeded`, with a `next_action` pointing at the lanes) on
+the account's normal change stream when a forwarded page comes back with
+either lane non-empty. The message carries COUNTS only - `failed_ids`
+holds native provider identifiers, which are not user-safe text. A page
+with both lanes empty emits nothing.
+
+This is deliberately an event rather than engine state, and the reasoning
+is worth keeping: a page lane is true of one walk at one moment. Unlike
+the open-time lane there is no later point at which it can be said to have
+healed, so accumulating it would need an invented expiry, an invented
+dedupe key, and a cap. Worse, an accessor would be systematically
+incomplete - the query surfaces the engine does not expose would never
+contribute - so it would report "no skips" while a direct `Account` call
+had just quarantined three scopes. A warning stream makes no completeness
+claim; a queryable lane named after the data would.
 If every requested scope of a registered push subscription vanished,
 the record is dropped rather than widened to all discovered scopes; its
 old handle is explicitly unsubscribed before the swap. All old-handle
