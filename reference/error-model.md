@@ -52,14 +52,18 @@ AccountErrorBuildError>`**, not an infallible `build`. The `Err` arm is
 a producer-bug surface, not recoverable runtime state: protocol-crate
 translation boundaries call
 `.expect("valid account error classification")`. `AccountErrorBuildError`
-(`#[non_exhaustive]`) enumerates the four enforced invariants:
+(`#[non_exhaustive]`) enumerates the five enforced invariants:
 
 - `EmptyChain` - every error carries at least one primary `Cause`.
   (In practice unreachable from `new`, which requires a primary.)
 - `KindCauseMismatch { kind, primary_cause }` - the declared `kind`
   and the outermost `Cause` disagree (`recovery::kind_matches_cause`).
-  **Also** the carrier for a `throttle_scope` attached to anything but
-  `Server(RateLimited | QuotaExhausted)`.
+- `ThrottleScopeNotApplicable { kind, throttle_scope }` - a
+  `throttle_scope` attached to anything but
+  `Server(RateLimited | QuotaExhausted)`. Its own variant because the
+  kind and cause may match each other perfectly; the diagnosis must
+  point the producer at the throttle scope, not a mismatch that is
+  not there.
 - `TransportAcknowledged` - `Transport(_)` kind paired with any
   `Attempt(Acknowledged)` cause. Transport failure means no complete
   server response arrived; an acknowledged attempt belongs on a

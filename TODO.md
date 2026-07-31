@@ -332,12 +332,6 @@ Surfaced while authoring `reference/error-model.md` (a read of
   flow (reachable only by calling `pub(crate) derive` directly, as the
   tests do). Belt-and-suspenders, but the debug-panic-vs-release-demote
   fork is a real behavior split worth being aware of.
-- **types-G1.** (gap) A `throttle_scope` attached to a non-rate/quota
-  kind returns `AccountErrorBuildError::KindCauseMismatch { kind,
-  primary_cause }` from `try_build`. That misdiagnoses: the kind and
-  cause may match perfectly; the actual fault is the throttle scope.
-  Add a dedicated `ThrottleScopeNotApplicable` build-error variant so
-  the producer is pointed at the right thing.
 - **types-N3.** (nit) `RequestCause::InvalidArgument` has no distinct
   `AccountErrorKind`: `kind_matches_cause` maps it onto
   `Request(Malformed)`, and message-key / recovery treat it

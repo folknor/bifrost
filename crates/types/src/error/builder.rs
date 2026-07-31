@@ -36,6 +36,15 @@ pub enum AccountErrorBuildError {
     /// Producers must thread the cursor scope from the call site;
     /// the engine cannot route a scope-less cursor restart.
     CursorInvalidWithoutScope,
+    /// A `throttle_scope` attached to a kind that is not
+    /// `Server(RateLimited | QuotaExhausted)`. The kind and cause may
+    /// match each other perfectly; the fault is the throttle scope
+    /// alone, so this points the producer at it instead of
+    /// misdiagnosing a kind/cause mismatch.
+    ThrottleScopeNotApplicable {
+        kind: AccountErrorKind,
+        throttle_scope: ThrottleScope,
+    },
 }
 
 impl fmt::Display for AccountErrorBuildError {
@@ -56,6 +65,14 @@ impl fmt::Display for AccountErrorBuildError {
             Self::CursorInvalidWithoutScope => {
                 write!(f, "SyncState(CursorInvalid) requires an ErrorScope::Cursor",)
             }
+            Self::ThrottleScopeNotApplicable {
+                kind,
+                throttle_scope,
+            } => write!(
+                f,
+                "throttle_scope {throttle_scope:?} is only meaningful on \
+                 Server(RateLimited | QuotaExhausted), not {kind:?}",
+            ),
         }
     }
 }
@@ -227,7 +244,7 @@ impl AccountErrorBuilder {
     /// classification")` because an invalid combination is a library
     /// bug, not recoverable runtime state.
     pub fn try_build(self) -> Result<AccountError, AccountErrorBuildError> {
-        if self.throttle_scope.is_some()
+        if let Some(throttle_scope) = self.throttle_scope
             && !matches!(
                 &self.kind,
                 AccountErrorKind::Server(
@@ -237,10 +254,12 @@ impl AccountErrorBuilder {
         {
             // throttle_scope is meaningful only on rate-limit/quota
             // failures; producers attaching it elsewhere is a bug.
-            // Caught here so the error surfaces at construction.
-            return Err(AccountErrorBuildError::KindCauseMismatch {
+            // Caught here, and named for what it is: the kind and cause
+            // may match perfectly, so a KindCauseMismatch here would
+            // send the producer hunting the wrong invariant.
+            return Err(AccountErrorBuildError::ThrottleScopeNotApplicable {
                 kind: self.kind,
-                primary_cause: self.primary_cause,
+                throttle_scope,
             });
         }
 
@@ -365,9 +384,15 @@ mod tests {
         .try_build()
         .expect_err("throttle_scope on transport is invalid");
 
+        // The dedicated variant, not KindCauseMismatch: the kind and
+        // cause here agree with each other, and the diagnosis must
+        // point at the throttle scope alone.
         assert!(matches!(
             err,
-            AccountErrorBuildError::KindCauseMismatch { .. }
+            AccountErrorBuildError::ThrottleScopeNotApplicable {
+                throttle_scope: ThrottleScope::Account,
+                ..
+            }
         ));
     }
 
