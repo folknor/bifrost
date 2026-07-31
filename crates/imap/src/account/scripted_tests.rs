@@ -819,6 +819,116 @@ async fn condstore_cursor_diffs_changedsince_flags_against_a_uid_search_snapshot
     let _server = script.await.unwrap();
 }
 
+/// A server that advertises QRESYNC but not ENABLE fails the ENABLE leg of
+/// `select_for_sync` with `MissingCapability("ENABLE")` before writing a
+/// byte. That must downgrade to CONDSTORE, not terminate the stream, and
+/// the retry must not deadlock on the pool permit the failed QRESYNC
+/// attempt still holds: at `pool_cap = 1` this test hangs (and fails on
+/// `collect_changes`' timeout) if the checkout is not released before the
+/// retry re-enters `checkout_for_folder`.
+#[tokio::test]
+async fn qresync_without_enable_capability_downgrades_and_does_not_deadlock() {
+    let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1 QRESYNC CONDSTORE")).await;
+    let account = scripted_sync_account(conn, 1, true, None, inbox_registry());
+
+    let script = tokio::spawn(async move {
+        // The failed QRESYNC leg writes nothing: the first command on the
+        // wire is already the CONDSTORE retry's EXAMINE.
+        let select = read_line(&mut server).await;
+        assert!(
+            select.contains("EXAMINE")
+                && select.contains("CONDSTORE")
+                && !select.contains("QRESYNC"),
+            "expected the CONDSTORE retry's EXAMINE as the first command, got {select}"
+        );
+        respond(
+            &mut server,
+            &format!(
+                "{SELECT_PREAMBLE}\
+                 * 3 EXISTS\r\n\
+                 * OK [UIDVALIDITY 7] ok\r\n\
+                 * OK [UIDNEXT 12] ok\r\n\
+                 * OK [HIGHESTMODSEQ 60] ok\r\n\
+                 {} OK [READ-ONLY] EXAMINE done\r\n",
+                tag_of(&select)
+            ),
+        )
+        .await;
+
+        let fetch = read_line(&mut server).await;
+        assert!(
+            fetch.contains("CHANGEDSINCE 50"),
+            "the retry diffs against the QRESYNC cursor's modseq, got {fetch}"
+        );
+        respond(
+            &mut server,
+            &format!(
+                "* 1 FETCH (UID 2 FLAGS (\\Seen) MODSEQ (55))\r\n\
+                 {} OK UID FETCH done\r\n",
+                tag_of(&fetch)
+            ),
+        )
+        .await;
+
+        let search = read_line(&mut server).await;
+        assert!(
+            search.contains("UID SEARCH ALL"),
+            "CONDSTORE detects expunges by UID-list diff, got {search}"
+        );
+        respond(
+            &mut server,
+            &format!(
+                "* SEARCH 2 3 4\r\n{} OK UID SEARCH done\r\n",
+                tag_of(&search)
+            ),
+        )
+        .await;
+        server
+    });
+
+    let events = collect_changes(
+        account,
+        cursor_for(&FolderCursor::QResync {
+            uidvalidity: 7,
+            modseq: 50,
+            known_uids: CompactUidSet::from_uids([1, 2, 3]),
+            known_uids_complete: true,
+        }),
+    )
+    .await;
+
+    let warnings = warnings_of(&events);
+    assert_eq!(warnings.len(), 1, "one downgrade warning: {warnings:?}");
+    assert_eq!(warnings[0].kind, WarningKind::StrategyDowngraded);
+    assert_eq!(
+        warnings[0]
+            .protocol_detail
+            .as_ref()
+            .map(DiagnosticText::as_str),
+        Some(downgrade_detail(SyncStrategy::QResync, SyncStrategy::Condstore).as_str())
+    );
+    assert_eq!(
+        change_labels(&events),
+        vec![
+            (id(7, 2), "updated"),
+            (id(7, 4), "added"),
+            (id(7, 1), "removed"),
+        ]
+    );
+    match done_cursor(&events) {
+        FolderCursor::Condstore {
+            uidvalidity,
+            modseq,
+            known_uids,
+        } => {
+            assert_eq!((uidvalidity, modseq), (7, 60));
+            assert_eq!(known_uids.to_uids(), vec![2, 3, 4]);
+        }
+        other => panic!("expected a CONDSTORE checkpoint, got {other:?}"),
+    }
+    let _server = script.await.unwrap();
+}
+
 /// A Basic cursor on a server with neither extension: no CONDSTORE parameter,
 /// no CHANGEDSINCE, both lanes derived from the UID-list diff, and the
 /// checkpoint carrying UIDNEXT rather than a mod-sequence.

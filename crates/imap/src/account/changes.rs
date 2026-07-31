@@ -268,6 +268,11 @@ async fn run_qresync(
                 "QRESYNC SELECT failed during response parsing; continuing with CONDSTORE",
             )
             .await?;
+            // Release the checkout (and its pool permit) before the retry:
+            // run_condstore_with_baseline re-enters checkout_for_folder, and
+            // holding the permit across that call deadlocks at data_cap == 1
+            // and needlessly dials a second connection above it.
+            drop(conn);
             return run_condstore_with_baseline(
                 account,
                 folder,
@@ -347,84 +352,92 @@ async fn run_qresync(
     }
     let attrs = [FetchAttr::Uid, FetchAttr::Flags, FetchAttr::ModSeq];
     let all_uids = UidSet::all();
-    let (fallback_error, flushed_qresync_changes) = {
-        let (mut fetch_rx, fetch_fut) = conn.connection().uid_fetch_vanished_stream(
+    // Setup failure flows into the same fallback lane as a mid-stream
+    // failure: the only setup error is MissingCapability (QRESYNC ACKed by
+    // ENABLE but never echoed via `* ENABLED`), which must downgrade to
+    // CONDSTORE below rather than terminate the stream.
+    let (fallback_error, flushed_qresync_changes) = match conn
+        .connection()
+        .uid_fetch_vanished_stream(
             all_uids.as_sequence_set(),
             &attrs,
             modseq,
             account.command_timeout(),
-        )?;
-        tokio::pin!(fetch_fut);
+        ) {
+        Err(err) => (Some(err), false),
+        Ok((mut fetch_rx, fetch_fut)) => {
+            tokio::pin!(fetch_fut);
 
-        let mut fetch_result = None;
-        let mut fallback_error = None;
-        let mut flushed_qresync_changes = false;
-        loop {
-            tokio::select! {
-                result = &mut fetch_fut, if fetch_result.is_none() => {
-                    fetch_result = Some(result);
-                }
-                item = fetch_rx.recv() => {
-                    match item {
-                        Some(Ok(FetchStreamItem::Fetch(fetch))) => {
-                            if let (Some(uid), Some(modseq)) = (fetch.uid, fetch.mod_seq) {
-                                account.folders.record_modseq(&folder, uidvalidity, uid, modseq)?;
-                            }
-                            record_fetch_change(
-                                &folder,
-                                uidvalidity,
-                                fetch.uid,
-                                &mut live_uids,
-                                &mut fetch_change_seen,
-                                &mut removed_seen,
-                                &mut changes,
-                            );
-                        }
-                        Some(Ok(FetchStreamItem::VanishedEarlier(ranges))) => {
-                            for uid in ranges.into_iter().flat_map(expand_range) {
-                                if seeded_qresync_baseline {
-                                    fallback_known_uids.insert(uid);
+            let mut fetch_result = None;
+            let mut fallback_error = None;
+            let mut flushed_qresync_changes = false;
+            loop {
+                tokio::select! {
+                    result = &mut fetch_fut, if fetch_result.is_none() => {
+                        fetch_result = Some(result);
+                    }
+                    item = fetch_rx.recv() => {
+                        match item {
+                            Some(Ok(FetchStreamItem::Fetch(fetch))) => {
+                                if let (Some(uid), Some(modseq)) = (fetch.uid, fetch.mod_seq) {
+                                    account.folders.record_modseq(&folder, uidvalidity, uid, modseq)?;
                                 }
-                                record_removed_change(
+                                record_fetch_change(
                                     &folder,
                                     uidvalidity,
-                                    uid,
+                                    fetch.uid,
                                     &mut live_uids,
+                                    &mut fetch_change_seen,
                                     &mut removed_seen,
                                     &mut changes,
                                 );
-                                account.folders.clear_modseqs(&folder, uidvalidity, &[uid]);
-                                if changes.len() >= BATCH_ITEMS {
-                                    let out = std::mem::take(&mut changes);
-                                    tx.send(batch(out, PageBoundary::Page, None))
-                                        .await
-                                        .map_err(|_| ChangeError::ChannelDropped)?;
-                                    flushed_qresync_changes = true;
+                            }
+                            Some(Ok(FetchStreamItem::VanishedEarlier(ranges))) => {
+                                for uid in ranges.into_iter().flat_map(expand_range) {
+                                    if seeded_qresync_baseline {
+                                        fallback_known_uids.insert(uid);
+                                    }
+                                    record_removed_change(
+                                        &folder,
+                                        uidvalidity,
+                                        uid,
+                                        &mut live_uids,
+                                        &mut removed_seen,
+                                        &mut changes,
+                                    );
+                                    account.folders.clear_modseqs(&folder, uidvalidity, &[uid]);
+                                    if changes.len() >= BATCH_ITEMS {
+                                        let out = std::mem::take(&mut changes);
+                                        tx.send(batch(out, PageBoundary::Page, None))
+                                            .await
+                                            .map_err(|_| ChangeError::ChannelDropped)?;
+                                        flushed_qresync_changes = true;
+                                    }
                                 }
                             }
-                        }
-                        Some(Err(err)) => {
-                            fallback_error = Some(err);
-                            break;
-                        }
-                        None => {
-                            if let Some(Err(err)) = fetch_result.take() {
+                            Some(Err(err)) => {
                                 fallback_error = Some(err);
+                                break;
                             }
-                            break;
+                            None => {
+                                if let Some(Err(err)) = fetch_result.take() {
+                                    fallback_error = Some(err);
+                                }
+                                break;
+                            }
                         }
-                    }
-                    if changes.len() >= BATCH_ITEMS {
-                        let out = std::mem::take(&mut changes);
-                        tx.send(batch(out, PageBoundary::Page, None))
-                            .await
-                            .map_err(|_| ChangeError::ChannelDropped)?;
-                        flushed_qresync_changes = true;
+                        if changes.len() >= BATCH_ITEMS {
+                            let out = std::mem::take(&mut changes);
+                            tx.send(batch(out, PageBoundary::Page, None))
+                                .await
+                                .map_err(|_| ChangeError::ChannelDropped)?;
+                            flushed_qresync_changes = true;
+                        }
                     }
                 }
             }
+            (fallback_error, flushed_qresync_changes)
         }
-        (fallback_error, flushed_qresync_changes)
     };
     if let Some(err) = fallback_error {
         if should_disable_qresync(&err) && !flushed_qresync_changes {
@@ -447,6 +460,12 @@ async fn run_qresync(
             // Any buffered QRESYNC changes are intentionally discarded:
             // the CONDSTORE retry re-derives them from the same modseq
             // before a checkpoint is committed.
+            //
+            // Release the checkout (and its pool permit) before the retry:
+            // run_condstore_with_baseline re-enters checkout_for_folder, and
+            // holding the permit across that call deadlocks at data_cap == 1
+            // and needlessly dials a second connection above it.
+            drop(conn);
             return run_condstore_with_baseline(account, folder, cursor, known_uids_complete, tx)
                 .await;
         }
@@ -860,7 +879,13 @@ async fn send_strategy_downgrade<T>(
 fn should_disable_qresync(err: &crate::Error) -> bool {
     match err {
         crate::Error::Parse(_) => true,
-        crate::Error::MissingCapability(cap) => mentions_qresync_capability(cap),
+        // "ENABLE" covers select_for_sync's enable() leg on a server that
+        // advertises QRESYNC without ENABLE (possible pre-rev2): in this
+        // QRESYNC-only context a missing ENABLE means QRESYNC cannot be
+        // negotiated, which is a downgrade, not a terminal error.
+        crate::Error::MissingCapability(cap) => {
+            mentions_qresync_capability(cap) || cap.eq_ignore_ascii_case("ENABLE")
+        }
         _ => false,
     }
 }
@@ -1173,6 +1198,10 @@ mod tests {
         )));
         assert!(should_disable_qresync(&crate::Error::MissingCapability(
             "QRESYNC (not ENABLEd)".to_string(),
+        )));
+        // The enable() leg on a server advertising QRESYNC without ENABLE.
+        assert!(should_disable_qresync(&crate::Error::MissingCapability(
+            "ENABLE".to_string(),
         )));
         assert!(!should_disable_qresync(&crate::Error::Protocol(
             "missing FLAGS".to_string(),
