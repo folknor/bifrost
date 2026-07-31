@@ -316,18 +316,6 @@ Gaps:
 
 Smells:
 
-- **s34-S1 (caldav)** `ical.rs` - TZID datetimes are read as
-  wall-clock digits with a `Z` appended, so `EventTime.value`
-  (documented RFC 3339 UTC) holds local time mislabelled as UTC - off
-  by the zone offset for any consumer that trusts it. A consequence of
-  the VTIMEZONE-stub limit, but the docs frame it only as
-  "fixed-offset stubs", not mislabelled instants. Now a standalone
-  item: deliberately scoped out of the DAV-composition wave because a
-  correct fix must resolve a named IANA zone (`Europe/Oslo`) to a UTC
-  offset on a specific date, which needs `chrono-tz` (absent from
-  `Cargo.lock`; `chrono` alone cannot resolve arbitrary named zones).
-  Whoever schedules this must add `chrono-tz` and commit `Cargo.lock`
-  before a network-isolated build.
 - **s34-S2 (graph)** `calendar.rs` (`event_from_graph`) -
   `recurrence_id` is populated from `seriesMasterId` (master series
   id), but the shared model documents it as RECURRENCE-ID semantics
@@ -352,13 +340,6 @@ Nits:
   organizer-email guard is unreachable on the success path because
   `rsvp_reply_ical` already errors when the organizer is absent.
   Redundant, harmless.
-- **s34-N3 (carddav)** `account.rs` - multiget failures (failed
-  propstat for a requested href) silently drop the contact from list
-  pages; no error, no Destroyed.
-- **s34-N4 (carddav)** `account.rs` - an empty multiget result stamps
-  `Unsupported(operation)` instead of `NotFound(Contact)`; the HTTP
-  404 path maps NotFound correctly, so the taxonomy is inconsistent
-  for the same condition.
 - **s34-N5 (types)** `error/scope.rs` - `EventRsvp` is classified
   non-idempotent; setting a fixed RSVP status is semantically
   idempotent. Consistent with the patch-setter convention, so a
@@ -558,6 +539,23 @@ blocking; each is a real defect or a real decision, not a cleanup.
   status contract, and every crate that builds one re-derives it
   separately. This item stays open on the net side; the Graph consumer no
   longer blocks on it.
+
+- **xc-5 (types + sync, surfaced from the DAV crates)** The engine is blind
+  to page-level loss lanes. `bifrost-sync` consumes only the open-time
+  `OpenedAccount::skipped_scopes` (surfaced via `open_skipped_scopes`);
+  nothing engine-side reads `Page::failed_ids` or a search/range page's
+  `Page::skipped_scopes`. For the DAV crates this means a walk that quietly
+  loses resources - a vCard that will not parse, a resource refused inside a
+  207, a search REPORT leg that met a 401 mid-walk - is visible only to a
+  consumer that inspects the returned `Page` directly; an app that routes
+  everything through the engine never sees the loss or the recovery class the
+  degraded lane was built to preserve. The DAV account layers now populate
+  both lanes correctly (2026-07 close pass), so the producer side is done;
+  what is open is whether the shared contract should grow engine-side
+  accounting for page-lane loss (fold page `skipped_scopes` into the same
+  consumer surface as open skips, or at least a counter/warning), or whether
+  "page lanes are the app's job" stays the documented ruling. A decision,
+  not a bug: nothing is dropped silently at the crate boundary today.
 
 ## Notes
 

@@ -157,7 +157,11 @@ Supported calendar primitives:
   an `ErrorScope::Calendar` entry - `failed_ids` carries ids with no
   classification, so folding a 401 into it would keep the data and destroy
   the reauthorize signal. A refusal with nothing usable anywhere is still an
-  `Err`.
+  `Err`. The degraded lane exists only where a call spans several REPORTs
+  (`event_search`'s per-property legs and the chunked multiget hydration
+  behind its empty-query branch); `events_in_range` itself is a single
+  `calendar-query` REPORT, so a wholly-failed body there stays an `Err` and
+  its pages never carry a skipped scope.
 
   Properties are collected propstat-scoped and promoted to the response
   only by `commit_propstat`, and only from a 2xx propstat. That is what
