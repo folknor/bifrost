@@ -765,3 +765,245 @@ fn rfc2231_continuation_bomb_is_linear_and_capped() {
         "reassembled value must stay inside the header-block budget"
     );
 }
+
+// ===== Structure-aware generative pass (imap-T4) =====
+//
+// The hand-written cases above each pin one named shape. This pass instead
+// builds well-formed RFC 2231 parameter lists from a grammar, applies targeted
+// mutations to them, and asserts the invariants that must hold for *every*
+// input - the ones a hand-written case can only sample. Deterministic by
+// construction: a fixed-seed SplitMix64 and a fixed iteration count, no
+// wall-clock and no I/O.
+
+/// SplitMix64. Deterministic, seeded, and small enough to keep the generator
+/// auditable; the point is reproducible coverage, not statistical quality.
+struct Rng(u64);
+
+impl Rng {
+    fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    fn below(&mut self, n: usize) -> usize {
+        assert!(n > 0);
+        usize::try_from(self.next_u64() % u64::try_from(n).unwrap()).unwrap()
+    }
+
+    fn pick<'a, T>(&mut self, options: &'a [T]) -> &'a T {
+        &options[self.below(options.len())]
+    }
+}
+
+const BASE_NAMES: [&str; 4] = ["name", "Filename", "boundary", "charset"];
+const CHARSETS: [&str; 4] = ["utf-8", "iso-8859-1", "shift_jis", "x-not-a-charset"];
+const SEGMENT_TEXT: [&str; 6] = ["plain", "a%20b", "%C3%A6", "", "%%%", "=?utf-8?B?QQ==?="];
+
+/// Build one well-formed parameter list: a handful of base names, each given
+/// one of the four RFC 2231 shapes (plain, Section 4 standalone-encoded,
+/// Section 3 continuation, or a mixed continuation with a leading charset).
+fn generate_params(rng: &mut Rng) -> Vec<(String, String)> {
+    let mut params = Vec::new();
+    let count = 1 + rng.below(4);
+    for _ in 0..count {
+        let base = *rng.pick(&BASE_NAMES);
+        match rng.below(4) {
+            0 => params.push((base.to_owned(), (*rng.pick(&SEGMENT_TEXT)).to_owned())),
+            1 => {
+                let charset = *rng.pick(&CHARSETS);
+                let text = *rng.pick(&SEGMENT_TEXT);
+                params.push((format!("{base}*"), format!("{charset}''{text}")));
+            }
+            2 => {
+                let segments = 1 + rng.below(3);
+                for index in 0..segments {
+                    let text = *rng.pick(&SEGMENT_TEXT);
+                    params.push((format!("{base}*{index}"), text.to_owned()));
+                }
+            }
+            _ => {
+                let charset = *rng.pick(&CHARSETS);
+                let segments = 1 + rng.below(3);
+                for index in 0..segments {
+                    let text = *rng.pick(&SEGMENT_TEXT);
+                    if index == 0 {
+                        params.push((format!("{base}*0*"), format!("{charset}''{text}")));
+                    } else {
+                        params.push((format!("{base}*{index}*"), text.to_owned()));
+                    }
+                }
+            }
+        }
+    }
+    params
+}
+
+/// Damage a well-formed list the way a non-conformant server would: drop a
+/// pair, duplicate one, renumber a continuation index (including the leading
+/// zero and out-of-range forms), truncate a value, or splice in stray
+/// delimiters.
+fn mutate_params(rng: &mut Rng, params: &mut Vec<(String, String)>) {
+    if params.is_empty() {
+        return;
+    }
+    let slot = rng.below(params.len());
+    match rng.below(6) {
+        0 => {
+            params.remove(slot);
+        }
+        1 => {
+            let clone = params[slot].clone();
+            params.insert(slot, clone);
+        }
+        2 => {
+            let suffix = *rng.pick(&["*0", "*00", "*1", "*9", "*4294967296", "*-1", "**"]);
+            let key = params[slot].0.clone();
+            let base = key.split('*').next().unwrap_or("").to_owned();
+            params[slot].0 = format!("{base}{suffix}");
+        }
+        3 => {
+            let length = params[slot].1.len();
+            let mut keep = if length == 0 { 0 } else { rng.below(length) };
+            let value = &mut params[slot].1;
+            while keep > 0 && !value.is_char_boundary(keep) {
+                keep -= 1;
+            }
+            value.truncate(keep);
+        }
+        4 => {
+            let stray = *rng.pick(&["'", "''", "%", "%A", "\"", ";", "*"]);
+            params[slot].1.push_str(stray);
+        }
+        _ => {
+            params[slot].0.clear();
+        }
+    }
+}
+
+/// How an input key claims a slot in the result, restated independently of
+/// `classify_key` so the test is an oracle rather than an echo.
+enum SlotClaim {
+    /// The key carries no parseable RFC 2231 suffix, so it is emitted as-is.
+    Verbatim,
+    /// `name*` - RFC 2231 Section 4, its own slot under the base name.
+    Own(String),
+    /// `name*N[*]` - RFC 2231 Section 3, shares one slot per base name.
+    Shared(String),
+}
+
+fn slot_claim(key: &str) -> SlotClaim {
+    let Some((base, suffix)) = key.split_once('*') else {
+        return SlotClaim::Verbatim;
+    };
+    if suffix.is_empty() {
+        return SlotClaim::Own(base.to_owned());
+    }
+    let digits = suffix.strip_suffix('*').unwrap_or(suffix);
+    if digits.len() > 1 && digits.starts_with('0') {
+        return SlotClaim::Verbatim;
+    }
+    if digits.parse::<u32>().is_err() {
+        return SlotClaim::Verbatim;
+    }
+    SlotClaim::Shared(base.to_owned())
+}
+
+/// The keys of the result slots, in the order the input reserves them. The
+/// decoder may drop slots (an unterminated continuation, a plain duplicate of
+/// an encoded name), but it must never reorder or rename them - so the real
+/// output has to be a subsequence of this.
+fn expected_slot_keys(params: &[(String, String)]) -> Vec<String> {
+    let mut slots = Vec::new();
+    let mut shared_seen: Vec<String> = Vec::new();
+    for (key, _) in params {
+        match slot_claim(key) {
+            SlotClaim::Verbatim => slots.push(key.clone()),
+            SlotClaim::Own(base) => slots.push(base),
+            SlotClaim::Shared(base) => {
+                let lower = base.to_ascii_lowercase();
+                if !shared_seen.contains(&lower) {
+                    shared_seen.push(lower);
+                    slots.push(base);
+                }
+            }
+        }
+    }
+    slots
+}
+
+/// Invariants that must hold for any parameter list, well-formed or not.
+fn assert_decode_invariants(params: &[(String, String)]) {
+    let decoded = decode_rfc2231_params(params);
+
+    // Pure function: no interior mutability, no global state, no ordering
+    // dependence on hash iteration leaking into the result.
+    assert_eq!(
+        decoded,
+        decode_rfc2231_params(params),
+        "decode_rfc2231_params must be deterministic for {params:?}"
+    );
+
+    // Every RFC 2231 shape either passes a pair through or collapses several
+    // into one, so the decoder can never manufacture entries.
+    assert!(
+        decoded.len() <= params.len(),
+        "decoding invented parameters for {params:?}"
+    );
+
+    let cap = super::super::limits::MimeLimits::default().max_header_bytes;
+    for (key, value) in &decoded {
+        // Reassembly stays inside the header budget. Charset decoding can
+        // widen the assembled octets, but only by a bounded UTF-8 factor.
+        assert!(
+            value.len() <= cap.saturating_mul(4),
+            "value for {key:?} escaped the allocation budget"
+        );
+    }
+
+    // Provenance and ordering in one shot: every output key was claimed by
+    // some input key, and the claims are consumed left to right.
+    let expected = expected_slot_keys(params);
+    let mut cursor = 0;
+    for (key, _) in &decoded {
+        let offset = expected[cursor..].iter().position(|slot| slot == key);
+        let Some(offset) = offset else {
+            panic!("output key {key:?} is not a remaining slot of {expected:?} for {params:?}");
+        };
+        cursor += offset + 1;
+    }
+}
+
+#[test]
+fn generated_wellformed_param_lists_hold_the_decode_invariants() {
+    let mut rng = Rng(0x5EED_0001);
+    for _ in 0..2000 {
+        let params = generate_params(&mut rng);
+        assert_decode_invariants(&params);
+    }
+}
+
+#[test]
+fn mutated_param_lists_hold_the_decode_invariants() {
+    let mut rng = Rng(0x5EED_0002);
+    for _ in 0..4000 {
+        let mut params = generate_params(&mut rng);
+        for _ in 0..=rng.below(3) {
+            mutate_params(&mut rng, &mut params);
+        }
+        assert_decode_invariants(&params);
+    }
+}
+
+/// The generator itself must be reproducible, or a failure found in CI cannot
+/// be replayed locally.
+#[test]
+fn the_param_generator_is_seed_deterministic() {
+    let mut left = Rng(0x5EED_0001);
+    let mut right = Rng(0x5EED_0001);
+    for _ in 0..64 {
+        assert_eq!(generate_params(&mut left), generate_params(&mut right));
+    }
+}

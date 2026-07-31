@@ -14144,3 +14144,419 @@ fn list_mailbox_name_preserves_control_characters_from_the_wire() {
         panic!("expected Untagged, got: {resp:?}");
     }
 }
+
+// ===== skip_tagged_ext_simple terminator matrix (imap-T4) =====
+//
+// `skip_tagged_ext_simple` has exactly two callers, each with its own
+// terminator set: ESEARCH (`parse_untagged_esearch`) passes SP/CR, STATUS
+// (`parse_status_items`) passes SP/`)`. The four `tagged-ext-simple` forms
+// (NIL, literal, quoted string, atom) interact with the terminator set in
+// non-obvious ways, because only the NIL arm boundary-checks against it and
+// the atom fallback is defined as "everything that is not a terminator".
+// The matrix below pins the whole cross product.
+
+/// The ESEARCH terminator set (RFC 9051 Section 7.3.4): SP or CR.
+fn esearch_terminator(b: u8) -> bool {
+    b == b' ' || b == b'\r'
+}
+
+/// The STATUS terminator set (RFC 9051 Section 7.3.2): SP or `)`.
+fn status_terminator(b: u8) -> bool {
+    b == b' ' || b == b')'
+}
+
+/// Run both caller terminator sets over one input and return the remaining
+/// bytes for each, or `None` where the parser rejects the input.
+fn skip_ext_both(input: &[u8]) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+    let esearch = skip_tagged_ext_simple(esearch_terminator)(input)
+        .ok()
+        .map(|(rest, ())| rest.to_vec());
+    let status = skip_tagged_ext_simple(status_terminator)(input)
+        .ok()
+        .map(|(rest, ())| rest.to_vec());
+    (esearch, status)
+}
+
+/// `esearch` / `status` give the expected remaining bytes, or `None` where the
+/// parser must reject the input.
+fn assert_skip_ext(input: &[u8], esearch: Option<&str>, status: Option<&str>) {
+    let (got_esearch, got_status) = skip_ext_both(input);
+    assert_eq!(
+        got_esearch.as_deref(),
+        esearch.map(str::as_bytes),
+        "ESEARCH terminator set (SP/CR) on {:?}",
+        String::from_utf8_lossy(input)
+    );
+    assert_eq!(
+        got_status.as_deref(),
+        status.map(str::as_bytes),
+        "STATUS terminator set (SP/`)`) on {:?}",
+        String::from_utf8_lossy(input)
+    );
+}
+
+#[test]
+fn skip_tagged_ext_simple_nil_form_across_terminator_sets() {
+    // SP is a terminator for both, so the NIL arm claims it in both.
+    assert_skip_ext(b"NIL rest", Some(" rest"), Some(" rest"));
+    // End of input satisfies the NIL boundary check for both (RFC 9051
+    // Section 4: `tagged-ext-simple` may be the last token).
+    assert_skip_ext(b"NIL", Some(""), Some(""));
+    // Case-insensitive per the ABNF's literal-string rules.
+    assert_skip_ext(b"nil rest", Some(" rest"), Some(" rest"));
+
+    // `)` terminates only for STATUS. For ESEARCH the boundary check fails and
+    // the atom fallback swallows the paren too - harmless there, since ESEARCH
+    // values never sit inside a parenthesized list.
+    assert_skip_ext(b"NIL)", Some(""), Some(")"));
+
+    // The mirror image: CR terminates only for ESEARCH. For STATUS the atom
+    // fallback runs past the response-terminating CRLF, because CR is not in
+    // its terminator set. See the boundary test below.
+    assert_skip_ext(b"NIL\r\n", Some("\r\n"), Some(""));
+
+    // An atom that merely starts with NIL must not be partially consumed
+    // (the boundary check exists for exactly this).
+    assert_skip_ext(b"NILSIMSA rest", Some(" rest"), Some(" rest"));
+    assert_skip_ext(b"NILSIMSA", Some(""), Some(""));
+}
+
+#[test]
+fn skip_tagged_ext_simple_literal_form_across_terminator_sets() {
+    // The literal arm is terminator-blind by construction: the octet count
+    // decides where the value ends (RFC 9051 Section 4).
+    assert_skip_ext(b"{3}\r\nabc rest", Some(" rest"), Some(" rest"));
+    // Terminator bytes inside the literal body are data, not delimiters.
+    assert_skip_ext(b"{5}\r\na b)c rest", Some(" rest"), Some(" rest"));
+    assert_skip_ext(b"{2}\r\n\r\n)", Some(")"), Some(")"));
+    // literal8 (RFC 6855 Section 4) and LITERAL+ (RFC 7888) prefixes.
+    assert_skip_ext(b"~{2}\r\nxy)", Some(")"), Some(")"));
+    assert_skip_ext(b"{2+}\r\nxy)", Some(")"), Some(")"));
+    // A literal whose body is shorter than its count is not a literal at all;
+    // the atom fallback takes over and the terminator set decides where the
+    // scan stops - `{9}` for ESEARCH (stops at CR), `{9}\r\nab` for STATUS
+    // (runs to the `)`).
+    assert_skip_ext(b"{9}\r\nab)", Some("\r\nab)"), Some(")"));
+}
+
+#[test]
+fn skip_tagged_ext_simple_quoted_form_across_terminator_sets() {
+    // The quoted arm is tried before the atom fallback, so terminator bytes
+    // inside the quotes stay inside the value for both callers.
+    assert_skip_ext(b"\"a b)c\" rest", Some(" rest"), Some(" rest"));
+    assert_skip_ext(b"\"\" )", Some(" )"), Some(" )"));
+    // RFC 9051 Section 4: `\"` and `\\` are the quoted-specials.
+    assert_skip_ext(b"\"a\\\"b\" )", Some(" )"), Some(" )"));
+    // An unterminated quote is not a quoted string; the atom fallback runs and
+    // the two terminator sets diverge on where it stops.
+    assert_skip_ext(b"\"abc)", Some(""), Some(")"));
+    assert_skip_ext(b"\"abc rest", Some(" rest"), Some(" rest"));
+}
+
+#[test]
+fn skip_tagged_ext_simple_atom_form_across_terminator_sets() {
+    assert_skip_ext(b"123 rest", Some(" rest"), Some(" rest"));
+    assert_skip_ext(b"1:*,5 )", Some(" )"), Some(" )"));
+    // Numbers and sequence sets butted against the caller's own closer.
+    assert_skip_ext(b"42)", Some(""), Some(")"));
+    assert_skip_ext(b"42\r\n", Some("\r\n"), Some(""));
+
+    // Nothing to consume: `take_while1` needs at least one non-terminator
+    // byte, so a value position that opens with a terminator is an error.
+    assert_skip_ext(b"", None, None);
+    assert_skip_ext(b" x", None, None);
+    assert_skip_ext(b")x", Some(""), None);
+    assert_skip_ext(b"\r\n", None, Some(""));
+}
+
+/// SMELL (not fixed here - imap-T4 is test-only): with the STATUS terminator
+/// set, CR is not a terminator, so the atom fallback consumes straight through
+/// the response-terminating CRLF and into whatever is buffered behind it. The
+/// STATUS caller then fails to find its `)` and the whole response errors out,
+/// so this is a parse failure rather than a mis-parse - but the scan crossing
+/// the response boundary at all is the kind of thing every other skip helper
+/// in this module (`skip_balanced_parens`, `skip_paren_group`) explicitly
+/// guards against with a CR/LF arm.
+#[test]
+fn skip_tagged_ext_simple_status_atom_scans_past_the_response_boundary() {
+    let input = b"badvalue\r\n* OK next\r\n";
+    let (rest, ()) = skip_tagged_ext_simple(status_terminator)(input).unwrap();
+    assert_eq!(
+        rest, b" OK next\r\n",
+        "the atom fallback consumed the CRLF and the next response's `* `"
+    );
+
+    // The ESEARCH terminator set stops at the CR, as the other skip helpers do.
+    let (rest, ()) = skip_tagged_ext_simple(esearch_terminator)(input).unwrap();
+    assert_eq!(rest, b"\r\n* OK next\r\n");
+}
+
+// ===== Structure-aware BODYSTRUCTURE generative pass (imap-T4) =====
+//
+// Two phases, both deterministic (fixed-seed SplitMix64, fixed iteration
+// counts, no wall clock, no I/O):
+//
+//   1. Build well-formed BODYSTRUCTURE trees from a grammar, render them to
+//      wire bytes, and assert the parser recovers the exact tree shape. This
+//      is what the hand-written cases above cannot do: it walks the cross
+//      product of nesting, part kind, parameter form, and extension-data
+//      arity.
+//   2. Mutate those same renderings the way a broken server would (truncate,
+//      delete, or splice a structural byte) and assert the parser stays
+//      well-behaved: it either errors or returns, never panics, never reports
+//      more remaining input than it was given, and never recurses past
+//      `MAX_BODY_NESTING_DEPTH`.
+
+struct BodyRng(u64);
+
+impl BodyRng {
+    fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    fn below(&mut self, n: usize) -> usize {
+        assert!(n > 0);
+        usize::try_from(self.next_u64() % u64::try_from(n).unwrap()).unwrap()
+    }
+
+    fn pick<'a, T>(&mut self, options: &'a [T]) -> &'a T {
+        &options[self.below(options.len())]
+    }
+}
+
+/// A BODYSTRUCTURE tree, independent of its wire spelling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BodyNode {
+    Text(&'static str),
+    Basic(&'static str, &'static str),
+    Message(Box<BodyNode>),
+    Multipart(&'static str, Vec<BodyNode>),
+}
+
+/// The wire spellings of `body-fld-param` that must all round-trip.
+const PARAM_FORMS: [&str; 4] = [
+    "NIL",
+    "()",
+    "(\"CHARSET\" \"UTF-8\")",
+    "(\"NAME*0*\" \"utf-8''caf%C3%A9\" \"NAME*1*\" \".txt\")",
+];
+
+/// Optional single-part extension data, in increasing arity
+/// (RFC 3501 Section 7.4.2: md5, disposition, language, location, then
+/// unparsed `body-extension`).
+const EXT_1PART_FORMS: [&str; 6] = [
+    "",
+    " NIL",
+    " \"deadbeef\"",
+    " NIL (\"attachment\" (\"FILENAME\" \"a.txt\"))",
+    " NIL NIL (\"en\" \"no\")",
+    " NIL NIL NIL \"http://example.invalid/p\" (\"future\" \"extension\")",
+];
+
+/// Optional multipart extension data (params, disposition, language,
+/// location, then unparsed `body-extension`).
+const EXT_MPART_FORMS: [&str; 5] = [
+    "",
+    " NIL",
+    " (\"BOUNDARY\" \"b1\")",
+    " NIL (\"inline\" NIL)",
+    " NIL NIL (\"en\") \"http://example.invalid/m\" 42",
+];
+
+/// A minimal well-formed ENVELOPE, reused for every message/rfc822 part.
+const EMBEDDED_ENVELOPE: &str = "(NIL \"embedded\" NIL NIL NIL NIL NIL NIL NIL NIL)";
+
+fn generate_body_node(rng: &mut BodyRng, depth: usize) -> BodyNode {
+    // Leaf-only below the budget, so tree size stays bounded.
+    let choice = if depth == 0 {
+        rng.below(2)
+    } else {
+        rng.below(4)
+    };
+    match choice {
+        0 => BodyNode::Text(rng.pick(&["PLAIN", "HTML", "CALENDAR"])),
+        1 => BodyNode::Basic(
+            rng.pick(&["IMAGE", "APPLICATION", "AUDIO"]),
+            rng.pick(&["GIF", "OCTET-STREAM", "PDF"]),
+        ),
+        2 => BodyNode::Message(Box::new(generate_body_node(rng, depth - 1))),
+        _ => {
+            let children = 1 + rng.below(3);
+            let kids = (0..children)
+                .map(|_| generate_body_node(rng, depth - 1))
+                .collect();
+            BodyNode::Multipart(rng.pick(&["MIXED", "ALTERNATIVE", "RELATED"]), kids)
+        }
+    }
+}
+
+fn render_body_node(rng: &mut BodyRng, node: &BodyNode, out: &mut String) {
+    match node {
+        BodyNode::Text(subtype) => {
+            let params = *rng.pick(&PARAM_FORMS);
+            let ext = *rng.pick(&EXT_1PART_FORMS);
+            out.push_str(&format!(
+                "(\"TEXT\" \"{subtype}\" {params} NIL NIL \"7BIT\" 1234 42{ext})"
+            ));
+        }
+        BodyNode::Basic(ty, subtype) => {
+            let params = *rng.pick(&PARAM_FORMS);
+            let ext = *rng.pick(&EXT_1PART_FORMS);
+            out.push_str(&format!(
+                "(\"{ty}\" \"{subtype}\" {params} \"<cid@x>\" \"a description\" \"BASE64\" 9876{ext})"
+            ));
+        }
+        BodyNode::Message(inner) => {
+            let params = *rng.pick(&PARAM_FORMS);
+            out.push_str(&format!(
+                "(\"MESSAGE\" \"RFC822\" {params} NIL NIL \"7BIT\" 5000 {EMBEDDED_ENVELOPE} "
+            ));
+            render_body_node(rng, inner, out);
+            let ext = *rng.pick(&EXT_1PART_FORMS);
+            out.push_str(&format!(" 77{ext})"));
+        }
+        BodyNode::Multipart(subtype, kids) => {
+            out.push('(');
+            for kid in kids {
+                render_body_node(rng, kid, out);
+            }
+            let ext = *rng.pick(&EXT_MPART_FORMS);
+            out.push_str(&format!(" \"{subtype}\"{ext})"));
+        }
+    }
+}
+
+/// Project a parsed structure back onto the generator's tree model, so the
+/// comparison is over shape (kind, subtype, children) and not over the
+/// incidental field values the renderer chose.
+fn parsed_body_node(bs: &BodyStructure) -> BodyNode {
+    match bs {
+        BodyStructure::Text { media_subtype, .. } => {
+            BodyNode::Text(static_label(media_subtype, &["PLAIN", "HTML", "CALENDAR"]))
+        }
+        BodyStructure::Basic {
+            media_type,
+            media_subtype,
+            ..
+        } => BodyNode::Basic(
+            static_label(media_type, &["IMAGE", "APPLICATION", "AUDIO"]),
+            static_label(media_subtype, &["GIF", "OCTET-STREAM", "PDF"]),
+        ),
+        BodyStructure::Message { body, .. } => BodyNode::Message(Box::new(parsed_body_node(body))),
+        BodyStructure::Multipart {
+            media_subtype,
+            bodies,
+            ..
+        } => BodyNode::Multipart(
+            static_label(media_subtype, &["MIXED", "ALTERNATIVE", "RELATED"]),
+            bodies.iter().map(parsed_body_node).collect(),
+        ),
+    }
+}
+
+/// The parser lowercases media types (RFC 2045 Section 5.1); map back to the
+/// generator's uppercase label so the tree comparison is exact.
+fn static_label(parsed: &str, candidates: &[&'static str]) -> &'static str {
+    candidates
+        .iter()
+        .copied()
+        .find(|candidate| candidate.eq_ignore_ascii_case(parsed))
+        .unwrap_or_else(|| panic!("parser produced unexpected media label {parsed:?}"))
+}
+
+#[test]
+fn generated_bodystructures_round_trip_to_their_tree_shape() {
+    let mut rng = BodyRng(0xB0D1_0001);
+    for _ in 0..1500 {
+        let node = generate_body_node(&mut rng, 3);
+        let mut wire = String::new();
+        render_body_node(&mut rng, &node, &mut wire);
+        let parsed = body_structure(wire.as_bytes(), false, 0);
+        let Ok((rest, bs)) = parsed else {
+            panic!("well-formed BODYSTRUCTURE failed to parse: {wire}");
+        };
+        assert!(rest.is_empty(), "trailing bytes {rest:?} for {wire}");
+        assert_eq!(parsed_body_node(&bs), node, "shape diverged for {wire}");
+    }
+}
+
+#[test]
+fn mutated_bodystructures_never_panic_or_overrun() {
+    let mut rng = BodyRng(0xB0D1_0002);
+    for _ in 0..4000 {
+        let node = generate_body_node(&mut rng, 3);
+        let mut wire = String::new();
+        render_body_node(&mut rng, &node, &mut wire);
+        let mut bytes = wire.into_bytes();
+        assert!(!bytes.is_empty());
+
+        // One targeted structural mutation: the interesting damage is to the
+        // delimiters, not to random payload bytes.
+        let at = rng.below(bytes.len());
+        match rng.below(4) {
+            0 => bytes.truncate(at),
+            1 => {
+                bytes.remove(at);
+            }
+            2 => bytes[at] = *rng.pick(b"()\"{} N\r"),
+            _ => bytes.insert(at, *rng.pick(b"()\"{} N\r")),
+        }
+
+        match body_structure(&bytes, false, 0) {
+            Ok((rest, _)) => {
+                assert!(
+                    bytes.ends_with(rest),
+                    "remaining input must be a suffix of the input"
+                );
+                assert!(
+                    rest.len() < bytes.len(),
+                    "a successful parse consumes at least the opening paren"
+                );
+            }
+            Err(nom::Err::Error(_) | nom::Err::Failure(_)) => {}
+            Err(other) => panic!("streaming error from a complete-mode parser: {other:?}"),
+        }
+    }
+}
+
+/// The generator has to be replayable, or a seed printed by a CI failure is
+/// useless.
+#[test]
+fn the_bodystructure_generator_is_seed_deterministic() {
+    let mut left = BodyRng(0xB0D1_0001);
+    let mut right = BodyRng(0xB0D1_0001);
+    for _ in 0..64 {
+        let (a, b) = (
+            generate_body_node(&mut left, 3),
+            generate_body_node(&mut right, 3),
+        );
+        assert_eq!(a, b);
+        let (mut wire_a, mut wire_b) = (String::new(), String::new());
+        render_body_node(&mut left, &a, &mut wire_a);
+        render_body_node(&mut right, &b, &mut wire_b);
+        assert_eq!(wire_a, wire_b);
+    }
+}
+
+/// The depth guard is what keeps the mutation pass above from being able to
+/// blow the stack, so pin it directly: one level past
+/// `MAX_BODY_NESTING_DEPTH` is a `Failure`, not a stack overflow.
+#[test]
+fn bodystructure_nesting_beyond_the_depth_guard_is_a_failure() {
+    let leaf = "(\"TEXT\" \"PLAIN\" NIL NIL NIL \"7BIT\" 1 1)";
+    let mut wire = leaf.to_owned();
+    for _ in 0..80 {
+        wire = format!("({wire} \"MIXED\")");
+    }
+    assert!(
+        matches!(
+            body_structure(wire.as_bytes(), false, 0),
+            Err(nom::Err::Failure(_))
+        ),
+        "over-deep nesting must be rejected by the depth guard"
+    );
+}

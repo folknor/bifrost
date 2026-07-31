@@ -87,20 +87,25 @@ any item; some may already be obsolete.
   `reference/error-model.md`. ManageSieve and submission were checked only
   for unsafe text ingress, not full logic. (Carried from the closed imap
   bug-hunt ledger.)
-- **imap-T4.** (deferred, codec sweep leftovers) Cheap-to-large test
-  candidates the codec sweep named but did not build:
-  `decode_rfc2231_params` (now `bifrost-types::mime::params`, moved out
-  of the IMAP crate; its quadratic group-lookup and rescan were rewritten
-  to O(1) as part of the move) still needs a structure-aware BODYSTRUCTURE
-  fuzz pass, unbuilt here; `parse_encoded_word_inner` (now
-  `bifrost-types::mime::words`) decodes arbitrary charset labels via
-  `encoding_rs` (linear and well-audited, but a 100 KB base64 payload in a
-  legacy multi-byte charset expands several-fold and nothing caps the
-  resulting subject length); the `skip_tagged_ext_simple` terminator
-  matrix (NIL / literal / quoted / atom against both caller terminator
-  sets) is a mechanical test matrix; a structure-aware BODYSTRUCTURE
-  fuzz generator (well-formed trees, then targeted mutations) is about a
-  day of generator work.
+- **types-G1.** (gap, found while closing imap-T4) No cap on total
+  decoded encoded-word output in `bifrost-types::mime::words`. Per-word
+  expansion is bounded by the 998-byte `ENCODED_WORD_SCAN_LIMIT` window
+  (a 100 KB single-word payload never finds its `?=` and is echoed
+  verbatim - the original imap-T4 concern was already bounded), but
+  chained, individually in-window words have no aggregate cap: ~100 KB
+  of Shift_JIS words decodes to ~220 KB (worst realistic factor ~2.2x;
+  halfwidth katakana beats base64's 4:3 contraction). The decoder
+  inherits whatever cap the caller puts on the raw header. Pinned by
+  `chained_encoded_words_expand_past_the_input_with_no_output_cap`.
+- **imap-S1.** (smell, found while closing imap-T4) With the STATUS
+  terminator set, `skip_tagged_ext_simple`'s atom fallback
+  (`codec/decode/envelope_fetch.rs`) does not treat CR as a terminator,
+  so it scans through the response-terminating CRLF into the next
+  buffered response. Degrades to a parse failure, not a mis-parse, but
+  every sibling helper (`skip_balanced_parens`, `skip_paren_group`,
+  `skip_fetch_value`) has an explicit CR/LF guard; candidate one-line
+  fix is a CR/LF exclusion in the atom arm. Pinned by
+  `skip_tagged_ext_simple_status_atom_scans_past_the_response_boundary`.
 - **imap-T5.** (deferred, connection sweep rulings - revisit triggers,
   not work items) Hermetic STARTTLS needs a fake TLS handshake
   (`ImapStream::into_tcp` returns `None` for `Memory`, deliberately);
