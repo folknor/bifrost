@@ -1198,3 +1198,164 @@ async fn the_final_batch_and_done_carry_the_same_checkpoint() {
     );
     let _server = script.await.unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// Account-lifetime conformance: the trait-surface contracts a transcript test
+// cannot express, because they are about what the account does WITHOUT
+// speaking to a server - closing, refusing an unsupported lane, and holding a
+// lifecycle stream open.
+// ---------------------------------------------------------------------------
+
+/// `Account::close` is idempotent and terminal.
+///
+/// The engine may close an account it already closed (shutdown racing a
+/// failed reopen). The second call must be a no-op `Ok`, not a second
+/// LOGOUT sweep, and after either call the pool must refuse every
+/// checkout instead of dialing a replacement session that would outlive
+/// the account handle.
+#[tokio::test]
+async fn close_is_idempotent_and_leaves_the_pool_refusing() {
+    use bifrost_types::Account;
+
+    let (conn, server) = driver_pair(&preauth_greeting("IMAP4rev1")).await;
+    let account = scripted_account(conn, 1);
+    // No responder for the LOGOUT close issues: drop the server end so it
+    // fails fast rather than blocking on a read that never completes.
+    drop(server);
+
+    let first = tokio::time::timeout(Duration::from_secs(5), account.close())
+        .await
+        .expect("close must not block on an unresponsive peer");
+    assert!(first.is_ok(), "close reports success: {first:?}");
+
+    let second = tokio::time::timeout(Duration::from_secs(5), account.close())
+        .await
+        .expect("the second close must return immediately");
+    assert!(second.is_ok(), "close is idempotent: {second:?}");
+
+    assert!(
+        account.shutdown.is_cancelled(),
+        "close cancels the account shutdown token",
+    );
+    let Err(err) = account
+        .checkout_for_folder(&crate::types::MailboxName::new("INBOX").unwrap())
+        .await
+    else {
+        panic!("a closed account must not hand out connections");
+    };
+    assert!(matches!(err, crate::Error::Closed { .. }), "got {err:?}");
+}
+
+/// The two blob openers are statically unsupported (`blob_range` is
+/// `BlobRangeSupport::No`, and nothing mints a `BlobHandle`), so both must
+/// terminate the stream with `Unsupported(<their own operation>)` and then
+/// end - never hang, and never mis-tag the operation, which is what the
+/// engine's recovery mapping keys on.
+#[tokio::test]
+async fn the_blob_openers_terminate_unsupported_with_their_own_operation() {
+    use bifrost_types::{
+        Account, AccountErrorKind, AccountOperation, BlobCapabilities, BlobEncoding, BlobHandle,
+        BlobId, ByteRange,
+    };
+    use futures::StreamExt;
+
+    let (conn, _server) = driver_pair(&preauth_greeting("IMAP4rev1")).await;
+    let account = scripted_account(conn, 1);
+
+    let handle = || BlobHandle {
+        id: BlobId("imapblob1:INBOX:1:2:1.2".to_owned()),
+        size: None,
+        content_type: None,
+        digest: None,
+        capabilities: BlobCapabilities {
+            supports_range: false,
+            supports_parallel: false,
+            digest_available_pre_download: false,
+            encoding: BlobEncoding::Raw8Bit,
+        },
+    };
+
+    for (mut stream, op) in [
+        (account.open_blob(handle()), AccountOperation::OpenBlob),
+        (
+            account.open_blob_range(
+                handle(),
+                ByteRange {
+                    start: 0,
+                    length: Some(16),
+                },
+            ),
+            AccountOperation::OpenBlobRange,
+        ),
+    ] {
+        let first = stream.next().await.expect("the stream emits a terminal");
+        let SyncEvent::Terminated(err) = first else {
+            panic!("expected Terminated, got {first:?}");
+        };
+        assert_eq!(err.kind(), &AccountErrorKind::Unsupported(op));
+        assert_eq!(err.operation(), Some(op));
+        assert!(
+            matches!(stream.next().await, Some(SyncEvent::Done(None))),
+            "an unsupported lane still closes with Done",
+        );
+        assert!(stream.next().await.is_none(), "Done is terminal");
+    }
+}
+
+/// The engine's bandwidth knob writes the SHARED atomic every pooled dial
+/// reads, and `None` means unlimited while `Some(0)` is clamped to 1 B/s.
+///
+/// The clamp is the load-bearing half: `0` in the token bucket is a divisor
+/// that would stall the transport forever, and `None` and `Some(0)` are the
+/// two spellings a caller is most likely to confuse.
+#[tokio::test]
+async fn the_bandwidth_cap_knob_writes_the_shared_atomic_and_clamps_zero() {
+    use std::sync::atomic::Ordering;
+
+    use bifrost_types::Account;
+
+    let (conn, _server) = driver_pair(&preauth_greeting("IMAP4rev1")).await;
+    let account = scripted_account(conn, 1);
+    let shared = Arc::clone(&account.bandwidth_cap);
+
+    account.set_bandwidth_cap(Some(4_096));
+    assert_eq!(shared.load(Ordering::Acquire), 4_096);
+
+    account.set_bandwidth_cap(None);
+    assert_eq!(
+        shared.load(Ordering::Acquire),
+        u64::MAX,
+        "None is unlimited, not zero",
+    );
+
+    account.set_bandwidth_cap(Some(0));
+    assert_eq!(
+        shared.load(Ordering::Acquire),
+        1,
+        "Some(0) clamps to 1 B/s rather than stalling the transport",
+    );
+}
+
+/// IMAP emits no scope-lifecycle events, but the stream must stay OPEN:
+/// the engine's lifecycle worker treats an early close as a fault. It ends
+/// only when the account shuts down.
+#[tokio::test]
+async fn the_scope_lifecycle_stream_stays_open_until_shutdown() {
+    use bifrost_types::Account;
+    use futures::{FutureExt, StreamExt};
+
+    let (conn, _server) = driver_pair(&preauth_greeting("IMAP4rev1")).await;
+    let account = scripted_account(conn, 1);
+
+    let mut stream = account.scope_lifecycle_stream();
+    assert!(
+        stream.next().now_or_never().is_none(),
+        "the lifecycle stream must be pending, not closed, while the account lives",
+    );
+
+    account.shutdown.cancel();
+    let end = tokio::time::timeout(Duration::from_secs(5), stream.next())
+        .await
+        .expect("shutdown must end the lifecycle stream");
+    assert!(end.is_none(), "shutdown closes the stream, got {end:?}");
+}

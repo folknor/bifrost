@@ -53,10 +53,16 @@ any item; some may already be obsolete.
   consumers that want per-attachment streaming from IMAP still cannot
   have it - they now get an honest `Unsupported` instead of a handle
   shape they could not obtain.
-- **imap-T1.** Account-layer conformance test additions inside
-  `crates/imap/src/account/` modules are still outstanding (the
-  reference doc and code landed in P3-A2; the focused tests did not).
-  (Carried from the deleted `plans/orchestration.md` P3-A2.)
+- **imap-S2.** (smell, found while closing imap-T1) `Pool::close()`
+  awaits `logout()` serially per member with no timeout, and `close.rs`
+  adds none, so a hung or silent server blocks `Account::close` for the
+  whole pool. Everything else in the account layer goes through
+  `command_timeout()`. Candidate: a bounded logout or `join_all` +
+  timeout. Related nit: `checkout_for_folder`, `checkout_any`, and
+  `dial_idle` carry three byte-identical dial blocks; a private
+  `async fn dial(&self)` would collapse them - the duplication is
+  exactly where a future meter/cap wiring change gets applied twice and
+  forgotten once.
 - **imap-B1.** (bug, found while closing imap-T2) `run_qresync`'s
   downgrade retries (`account/changes.rs:271`, `:450`) call
   `run_condstore_with_baseline(...).await` as a tail expression while

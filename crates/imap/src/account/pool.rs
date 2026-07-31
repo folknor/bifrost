@@ -293,3 +293,244 @@ impl Drop for PooledConn {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicU64;
+    use std::time::Duration;
+
+    use super::super::factory::ImapAccountConfig;
+    use super::{Pool, PoolMember};
+    use crate::connection::test_support::{driver_pair, preauth_greeting};
+    use crate::error::Error;
+    use crate::types::{AuthPolicy, Capability, Credentials, MailboxName};
+
+    /// A config whose dial target is unroutable on purpose: every test
+    /// below must be served from parked members, so any code path that
+    /// decides to dial shows up as a failure instead of silently passing.
+    fn config() -> Arc<ImapAccountConfig> {
+        Arc::new(ImapAccountConfig::new(
+            crate::ImapConfig::plaintext("test.invalid"),
+            Credentials::password("user", "pass"),
+            AuthPolicy::default(),
+        ))
+    }
+
+    fn folder(name: &str) -> MailboxName {
+        MailboxName::new(name).unwrap()
+    }
+
+    /// A live connection tagged with an otherwise unused capability atom,
+    /// so a checkout can be identified without writing a byte to the wire.
+    ///
+    /// The returned server end must stay alive for the duration of the
+    /// test: dropping it ends the driver task, and the pool's liveness
+    /// filter would then evict the member before affinity is consulted.
+    async fn marked(mark: &str) -> (crate::ImapConnection, tokio::io::DuplexStream) {
+        driver_pair(&preauth_greeting(&format!("IMAP4rev1 {mark}"))).await
+    }
+
+    fn pool_of(primed: crate::ImapConnection, data_cap: usize) -> Pool {
+        Pool::new(
+            config(),
+            primed,
+            data_cap,
+            None,
+            Arc::new(AtomicU64::new(0)),
+        )
+    }
+
+    /// Park an extra member directly. `Pool::new` accepts only one primed
+    /// connection and the only other way in is a real dial, which no
+    /// hermetic test may perform.
+    fn park(pool: &Pool, conn: crate::ImapConnection, selected: Option<MailboxName>) {
+        pool.inner
+            .idle
+            .lock()
+            .unwrap()
+            .push(PoolMember { conn, selected });
+    }
+
+    fn set_primed_affinity(pool: &Pool, selected: MailboxName) {
+        pool.inner.idle.lock().unwrap()[0].selected = Some(selected);
+    }
+
+    fn idle_len(pool: &Pool) -> usize {
+        pool.inner.idle.lock().unwrap().len()
+    }
+
+    fn idle_selection(pool: &Pool) -> Vec<Option<MailboxName>> {
+        pool.inner
+            .idle
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|member| member.selected.clone())
+            .collect()
+    }
+
+    /// Checkout affinity is by selected mailbox, not by parking order.
+    ///
+    /// Two parked members, both usable; the one already SELECTed on the
+    /// requested folder must win, otherwise every folder-scoped operation
+    /// pays a re-SELECT round trip on a connection that was already there.
+    #[tokio::test]
+    async fn checkout_prefers_the_member_already_selected_on_the_folder() {
+        let (primed, _primed_server) = marked("ACL").await;
+        let (extra, _extra_server) = marked("BINARY").await;
+        let pool = pool_of(primed, 2);
+        set_primed_affinity(&pool, folder("INBOX"));
+        park(&pool, extra, Some(folder("Archive")));
+
+        let archive = pool.checkout_for_folder(&folder("Archive")).await.unwrap();
+        assert!(
+            archive
+                .connection()
+                .capabilities()
+                .contains(&Capability::Binary),
+            "the member selected on Archive must serve the Archive checkout",
+        );
+
+        let inbox = pool.checkout_for_folder(&folder("INBOX")).await.unwrap();
+        assert!(
+            inbox.connection().capabilities().contains(&Capability::Acl),
+            "the member selected on INBOX must serve the INBOX checkout",
+        );
+    }
+
+    /// `checkout_any` is the affinity-free lane: it reuses a parked member
+    /// even though that member is selected on some unrelated mailbox.
+    /// Dialing instead would burn a connection for a command that does not
+    /// care which mailbox is selected.
+    #[tokio::test]
+    async fn checkout_any_reuses_a_member_selected_elsewhere() {
+        let (primed, _primed_server) = marked("ACL").await;
+        let pool = pool_of(primed, 2);
+        set_primed_affinity(&pool, folder("Archive"));
+
+        let conn = pool.checkout_any().await.unwrap();
+        assert!(conn.connection().capabilities().contains(&Capability::Acl));
+        assert_eq!(idle_len(&pool), 0, "the parked member was reused, not left");
+    }
+
+    /// Dropping a checkout parks it again WITH its selection, which is what
+    /// makes the affinity above reachable on the next checkout.
+    #[tokio::test]
+    async fn dropping_a_checkout_parks_it_with_its_selection() {
+        let (primed, _primed_server) = marked("ACL").await;
+        let pool = pool_of(primed, 1);
+
+        {
+            let mut conn = pool.checkout_for_folder(&folder("INBOX")).await.unwrap();
+            assert_eq!(idle_len(&pool), 0);
+            conn.set_selected(folder("INBOX"));
+        }
+
+        assert_eq!(idle_selection(&pool), vec![Some(folder("INBOX"))]);
+    }
+
+    /// `discard` is the "this connection is suspect" exit: the member must
+    /// not come back to the pool, or the next checkout hands the same
+    /// broken session to another caller.
+    #[tokio::test]
+    async fn a_discarded_checkout_is_not_parked_again() {
+        let (primed, _primed_server) = marked("ACL").await;
+        let pool = pool_of(primed, 1);
+
+        {
+            let mut conn = pool.checkout_for_folder(&folder("INBOX")).await.unwrap();
+            conn.discard();
+        }
+
+        assert_eq!(idle_len(&pool), 0, "a discarded member must not be parked");
+    }
+
+    /// Dropping a checkout releases its permit. A leaked permit is
+    /// invisible until the pool is saturated, and at `data_cap == 1` it is
+    /// a permanent deadlock, so pin it at the smallest cap.
+    #[tokio::test]
+    async fn dropping_a_checkout_releases_its_permit() {
+        let (primed, _primed_server) = marked("ACL").await;
+        let pool = pool_of(primed, 1);
+
+        drop(pool.checkout_for_folder(&folder("INBOX")).await.unwrap());
+
+        let second = tokio::time::timeout(
+            Duration::from_secs(5),
+            pool.checkout_for_folder(&folder("INBOX")),
+        )
+        .await
+        .expect("the released permit must be reacquirable");
+        assert!(second.is_ok());
+    }
+
+    /// `Semaphore::new(0)` never hands out a permit, so a misconfigured
+    /// `pool_cap` of zero would hang the first checkout forever rather than
+    /// erroring. `Pool::new` clamps to one; pin the clamp.
+    #[tokio::test]
+    async fn a_zero_data_cap_is_clamped_to_one_permit() {
+        let (primed, _primed_server) = marked("ACL").await;
+        let pool = pool_of(primed, 0);
+
+        let conn = tokio::time::timeout(
+            Duration::from_secs(5),
+            pool.checkout_for_folder(&folder("INBOX")),
+        )
+        .await
+        .expect("a zero cap must still yield one permit");
+        assert!(conn.is_ok());
+    }
+
+    /// After `close`, every way into the pool refuses instead of dialing.
+    /// A post-close dial would outlive the account and leak a session the
+    /// consumer believes is gone.
+    #[tokio::test]
+    async fn close_gates_every_way_into_the_pool() {
+        let (primed, primed_server) = marked("ACL").await;
+        let pool = pool_of(primed, 1);
+        // No responder for the LOGOUT close issues: dropping the server end
+        // makes it fail fast instead of blocking on a read.
+        drop(primed_server);
+
+        tokio::time::timeout(Duration::from_secs(5), pool.close())
+            .await
+            .expect("close must not block on an unresponsive peer");
+
+        assert!(matches!(
+            pool.checkout_for_folder(&folder("INBOX")).await,
+            Err(Error::Closed { .. })
+        ));
+        assert!(matches!(
+            pool.checkout_any().await,
+            Err(Error::Closed { .. })
+        ));
+        assert!(matches!(pool.dial_idle().await, Err(Error::Closed { .. })));
+        assert_eq!(idle_len(&pool), 0, "close drains the parked members");
+    }
+
+    /// A checkout in flight when `close` runs is outside the idle list, so
+    /// `close` cannot log it out. Its drop must not resurrect the pool by
+    /// parking a live connection nobody will ever close.
+    #[tokio::test]
+    async fn a_checkout_outstanding_at_close_is_not_parked_on_drop() {
+        let (primed, _primed_server) = marked("ACL").await;
+        let pool = pool_of(primed, 1);
+
+        let conn = pool.checkout_for_folder(&folder("INBOX")).await.unwrap();
+        // The idle list is empty while the checkout is held, so close has
+        // nothing to log out and cannot block.
+        tokio::time::timeout(Duration::from_secs(5), pool.close())
+            .await
+            .expect("close must not block");
+        drop(conn);
+
+        assert_eq!(
+            idle_len(&pool),
+            0,
+            "a closed pool must not accept a returning checkout",
+        );
+    }
+}
