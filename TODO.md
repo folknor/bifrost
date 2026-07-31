@@ -326,10 +326,7 @@ re-auditors don't re-raise them.)
   so the FIRST provider-wide deadline is invisible to a sibling that
   has never failed. Attach-time enrollment needs the account's
   provider identity at attach - the same identity-channel shape as (a).
-  (d) Backfill and deferred-inventory walks do not consult the bucket
-  before issuing account calls; only polls, push reconciles, and
-  mutation campaigns do.
-  (e) No hermetic worker-level test proves a recorded deadline defers
+  (d) No hermetic worker-level test proves a recorded deadline defers
   `changes_stream` or that two attached slots share a provider
   deadline - blocked on the same `Account`/`AccountFactory` stub
   sync-F1 wants; the bucket mechanics are unit-pinned in

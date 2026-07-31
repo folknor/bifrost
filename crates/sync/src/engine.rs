@@ -618,6 +618,7 @@ impl SyncEngine {
         let bf_subscriber_notify = Arc::clone(&subscriber_notify);
         let bf_config = self.config.backfill;
         let bf_control = control.clone();
+        let bf_throttles = Arc::clone(&throttles);
         spawn(tokio::spawn(async move {
             run_backfill_orchestrator(
                 bf_account,
@@ -631,6 +632,7 @@ impl SyncEngine {
                 bf_subscriber_notify,
                 bf_config,
                 bf_control,
+                bf_throttles,
             )
             .await;
         }));
@@ -2807,6 +2809,7 @@ async fn run_backfill_orchestrator(
     subscriber_notify: Arc<Notify>,
     config: BackfillConfig,
     control: SyncControl,
+    throttles: Arc<std::sync::Mutex<crate::recovery::ThrottleBucket>>,
 ) {
     // Cold-start backfill pages broadcast onto the per-account channel
     // during `attach`, but a consumer can only call
@@ -2877,12 +2880,14 @@ async fn run_backfill_orchestrator(
                     }
                     let Some(result) = run_backfill_partition_at_boundary(
                         &account,
+                        &account_id,
                         scope.clone(),
                         partition,
                         &live,
                         changes_tx.clone(),
                         &control,
                         &shutdown,
+                        &throttles,
                     )
                     .await
                     else {
@@ -2971,12 +2976,14 @@ async fn run_backfill_orchestrator(
                     let partition = InventoryPartition::Page { from, to };
                     let Some(result) = run_backfill_partition_at_boundary(
                         &account,
+                        &account_id,
                         scope.clone(),
                         partition,
                         &live,
                         changes_tx.clone(),
                         &control,
                         &shutdown,
+                        &throttles,
                     )
                     .await
                     else {
@@ -3042,16 +3049,42 @@ async fn run_backfill_orchestrator(
 #[allow(clippy::too_many_arguments)]
 async fn run_backfill_partition_at_boundary(
     account: &Arc<ArcSwap<Arc<dyn Account>>>,
+    account_id: &AccountId,
     scope: CursorScope,
     partition: InventoryPartition,
     live: &Arc<LiveSupersedes>,
     changes_tx: Option<broadcast::Sender<MultiplexerEvent>>,
     control: &SyncControl,
     shutdown: &CancellationToken,
+    throttles: &std::sync::Mutex<crate::recovery::ThrottleBucket>,
 ) -> Option<Result<crate::backfill::BackfillPartitionOutcome, Error>> {
     loop {
         if !control.wait_until_running(shutdown).await {
             return None;
+        }
+        // Honor any account-wide throttle deadline before walking the
+        // partition: cold-start hydration is the heaviest request lane
+        // the engine drives, so barreling through a provider Retry-After
+        // that paused the polls would defeat the pause. Re-checked after
+        // waking, and boundary-checked again, since a pause or a longer
+        // deadline can land mid-sleep.
+        if let Some(wait) = crate::recovery::account_throttle_wait(
+            throttles,
+            account_id,
+            std::time::SystemTime::now(),
+        ) {
+            tracing::debug!(
+                target: "bifrost.sync.backfill",
+                account = ?account_id,
+                scope = ?scope,
+                wait_secs = wait.as_secs(),
+                "backfill partition deferred by shared throttle deadline"
+            );
+            tokio::select! {
+                () = shutdown.cancelled() => return None,
+                () = tokio::time::sleep(wait) => {}
+            }
+            continue;
         }
         let current = account.load_full();
         let result = BackfillRunner::run_partition(
@@ -3296,6 +3329,28 @@ async fn run_deferred_inventory_establishment(
         let outcome = loop {
             if !control.wait_until_running(&shutdown).await {
                 return;
+            }
+            // Honor any account-wide throttle deadline before the
+            // inventory walk, mirroring the backfill partition runner:
+            // deferred establishment drives the same heavy inventory
+            // lane. Loop back to the boundary check after waking.
+            if let Some(wait) = crate::recovery::account_throttle_wait(
+                &throttles,
+                &account_id,
+                std::time::SystemTime::now(),
+            ) {
+                tracing::debug!(
+                    target: "bifrost.sync.backfill",
+                    account = ?account_id,
+                    scope = ?scope,
+                    wait_secs = wait.as_secs(),
+                    "deferred inventory deferred by shared throttle deadline"
+                );
+                tokio::select! {
+                    () = shutdown.cancelled() => return,
+                    () = tokio::time::sleep(wait) => {}
+                }
+                continue;
             }
             let acc_arc = account.load_full();
             let acc: &dyn Account = acc_arc.as_ref().as_ref();

@@ -955,8 +955,11 @@ reconciler (before each hinted scope), and the mutation campaigns
 (before each attempt) call `recovery::account_throttle_wait` - the
 longest pending wait across the account's own key and its shared
 memberships, re-checked after waking since a longer deadline can
-land mid-sleep. Backfill and deferred inventory do not consult the
-bucket yet (tracked in `TODO.md`). `detach` forgets the account's
+land mid-sleep. The backfill partition runner and the
+deferred-inventory worker consult it too, at the same boundary as
+their pause checks: cold-start hydration is the heaviest request
+lane the engine drives, so it must not barrel through a Retry-After
+that paused the polls. `detach` forgets the account's
 memberships so a reattached id cannot inherit a previous life's
 provider enrollment.
 
