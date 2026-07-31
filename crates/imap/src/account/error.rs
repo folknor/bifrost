@@ -133,8 +133,8 @@ pub(crate) fn into_account_error(error: Error, ctx: ImapErrorContext) -> Account
         throttle_scope,
         diagnostic_text,
         native_code,
-        skip_attempt_cause,
     } = translation;
+    let is_transport = matches!(kind, AccountErrorKind::Transport(_));
 
     // CursorInvalid requires a cursor scope or `try_build` rejects
     // (`CursorInvalidWithoutScope`). Folder-scoped producers use
@@ -175,10 +175,27 @@ pub(crate) fn into_account_error(error: Error, ctx: ImapErrorContext) -> Account
         builder = builder.push_cause(Cause::Wire(WireCause::Imap(code)));
     }
 
-    // Attach attempt cause unless explicitly suppressed (transport
-    // failures must never carry `Acknowledged`; the builder asserts).
-    let effective_attempt = explicit_attempt.or(attempt);
-    if !skip_attempt_cause && let Some(state) = effective_attempt {
+    // A `Transport(_)` kind means no complete server response arrived, so
+    // pairing it with `Acknowledged` is a contradiction `try_build`
+    // rejects outright (`TransportAcknowledged`) - which at this boundary
+    // means the `.expect` below panics. Nothing constructs that pair
+    // today, but nothing prevents it either: `Error::with_attempt` accepts
+    // any state on the transport variants, and the driver does apply
+    // `Acknowledged` after a tagged response.
+    //
+    // Demote rather than drop. Dropping the cause entirely would leave
+    // `derive` reading its `Unsent` default, which routes a non-idempotent
+    // operation to a blind retry; `InFlight` routes it to reconciliation
+    // instead, and matches what `recovery::derive` itself does with this
+    // pair in release builds.
+    let effective_attempt = explicit_attempt.or(attempt).map(|state| {
+        if is_transport && state == TransmissionState::Acknowledged {
+            TransmissionState::InFlight
+        } else {
+            state
+        }
+    });
+    if let Some(state) = effective_attempt {
         builder = builder.push_cause(Cause::Attempt(AttemptCause::new(state)));
     }
 
@@ -327,10 +344,6 @@ struct Translation {
     throttle_scope: Option<ThrottleScope>,
     diagnostic_text: Option<DiagnosticText>,
     native_code: Option<String>,
-    /// Set when the kind is `Transport(_)` and the effective attempt
-    /// would be `Acknowledged` - the builder asserts that combination
-    /// is impossible, so we drop the attempt rather than panic.
-    skip_attempt_cause: bool,
 }
 
 impl Translation {
@@ -343,7 +356,6 @@ impl Translation {
             throttle_scope: None,
             diagnostic_text: None,
             native_code: None,
-            skip_attempt_cause: false,
         }
     }
 }
@@ -592,14 +604,22 @@ fn classify_response_code(code: &ResponseCode, ctx: &ImapErrorContext) -> Option
         Some(ErrorScope::Thread { .. }) => Some(ResourceKind::Thread),
         _ => None,
     };
+    // All three scope readers must accept BOTH mailbox shapes. Folder
+    // producers carry `ErrorScope::Cursor(Folder(id))` (see
+    // `with_folder_scope`), not `ErrorScope::Mailbox { id }` - so a reader
+    // matching only the latter silently degrades on every real
+    // folder-scoped failure rather than on none of them.
     let id_from_scope = || match ctx.scope.as_ref() {
         Some(ErrorScope::Mailbox { id }) => Some(id.clone()),
+        Some(ErrorScope::Cursor(CursorScope::Folder(folder))) => Some(folder.0.clone()),
         Some(ErrorScope::Message { id }) => Some(id.clone()),
         Some(ErrorScope::Thread { id }) => Some(id.clone()),
         _ => None,
     };
     let mailbox_throttle = || match ctx.scope.as_ref() {
-        Some(ErrorScope::Mailbox { .. }) => ThrottleScope::Mailbox,
+        Some(ErrorScope::Mailbox { .. } | ErrorScope::Cursor(CursorScope::Folder(_))) => {
+            ThrottleScope::Mailbox
+        }
         _ => ThrottleScope::Account,
     };
 

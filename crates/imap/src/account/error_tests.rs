@@ -10,8 +10,8 @@
 use bifrost_types::{
     AccessErrorKind, AccountErrorKind, AccountOperation, AuthErrorKind, Cause, CursorScope,
     EngineDirective, ErrorScope, FolderId, ImapResponseCode, ProtocolErrorKind, RecoveryClass,
-    RequestErrorKind, ResourceKind, ServerErrorKind, StrategyDowngrade, SyncStateErrorKind,
-    ThrottleScope, TransmissionState, TransportErrorKind, WireCause,
+    RequestCause, RequestErrorKind, ResourceKind, ServerErrorKind, StrategyDowngrade,
+    SyncStateErrorKind, ThrottleScope, TransmissionState, TransportErrorKind, WireCause,
 };
 
 use super::{ImapErrorContext, into_account_error, shared_folder_error, strategy_failure};
@@ -56,6 +56,41 @@ fn io_inflight_non_idempotent_reconciles() {
         AccountErrorKind::Transport(TransportErrorKind::Network)
     ));
     assert!(account.recovery().requires_reconciliation());
+}
+
+/// `Transport(_)` + `Acknowledged` is rejected by `try_build`
+/// (`TransportAcknowledged`), and this boundary `.expect`s - so producing
+/// that pair would panic rather than misclassify. `Error::with_attempt`
+/// accepts any state on the transport variants and the driver does apply
+/// `Acknowledged` after a tagged response, so the pair is constructible
+/// even though no path builds it today.
+///
+/// It must demote to `InFlight`, not drop the cause: dropping would leave
+/// `derive` reading its `Unsent` default and blind-retry a non-idempotent
+/// operation, where `InFlight` reconciles instead.
+#[test]
+fn a_transport_error_claiming_acknowledged_demotes_to_inflight() {
+    let err =
+        Error::io(std::io::Error::other("reset")).with_attempt(TransmissionState::Acknowledged);
+    let account = into_account_error(err, ImapErrorContext::operation(AccountOperation::BulkMove));
+
+    assert!(matches!(
+        account.kind(),
+        AccountErrorKind::Transport(TransportErrorKind::Network)
+    ));
+    let attempt = account.chain().iter().find_map(|cause| match cause {
+        Cause::Attempt(attempt) => Some(attempt.transmission_state),
+        _ => None,
+    });
+    assert_eq!(
+        attempt,
+        Some(TransmissionState::InFlight),
+        "acknowledged is a contradiction on a transport failure"
+    );
+    assert!(
+        account.recovery().requires_reconciliation(),
+        "a non-idempotent op must reconcile, never blind-retry"
+    );
 }
 
 #[test]
@@ -365,6 +400,48 @@ fn response_code_limit_in_mailbox_scope_throttles_mailbox() {
     } else {
         panic!("expected Retry");
     }
+}
+
+/// The shape production actually builds. Every folder-scoped producer
+/// uses `with_folder_scope`, so the scope is `Cursor(Folder(_))` and not
+/// `Mailbox { id }` - a throttle reader matching only the latter would
+/// widen every real per-mailbox `[LIMIT]` to an account-wide pause while
+/// the `with_mailbox` test above still passed.
+#[test]
+fn response_code_limit_in_folder_scope_throttles_mailbox() {
+    let err = Error::no_with_code("limit".into(), Some(ResponseCode::Limit));
+    let ctx = ImapErrorContext::operation(AccountOperation::SyncChanges)
+        .with_folder_scope(&mailbox("INBOX"));
+    let account = into_account_error(err, ctx);
+
+    if let RecoveryClass::Retry(advice) = account.recovery() {
+        assert_eq!(advice.throttle_scope, Some(ThrottleScope::Mailbox));
+    } else {
+        panic!("expected Retry");
+    }
+}
+
+/// Same migration gap on the id reader: the folder id is present in the
+/// scope, so it must reach `RequestCause::NotFound { id }` rather than
+/// being dropped because the scope is a `Cursor` rather than a `Mailbox`.
+#[test]
+fn response_code_nonexistent_in_folder_scope_keeps_the_folder_id() {
+    let err = Error::no_with_code("nope".into(), Some(ResponseCode::NonExistent));
+    let ctx = ImapErrorContext::operation(AccountOperation::ContainerDelete)
+        .with_folder_scope(&mailbox("INBOX/old"));
+    let account = into_account_error(err, ctx);
+
+    assert!(matches!(
+        account.kind(),
+        AccountErrorKind::NotFound(ResourceKind::Mailbox)
+    ));
+    let found = account.chain().iter().any(|cause| {
+        matches!(
+            cause,
+            Cause::Request(RequestCause::NotFound { id: Some(id), .. }) if id == "INBOX/old"
+        )
+    });
+    assert!(found, "the folder id must survive into the cause chain");
 }
 
 #[test]

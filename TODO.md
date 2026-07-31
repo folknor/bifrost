@@ -58,11 +58,58 @@ any item; some may already be obsolete.
   consumers that want per-attachment streaming from IMAP still cannot
   have it - they now get an honest `Unsupported` instead of a handle
   shape they could not obtain.
-- **imap-T3.** (audit) `account/error.rs`, crate `error.rs`, and their
-  recovery-mapping tests still merit a dedicated audit against
-  `reference/error-model.md`. ManageSieve and submission were checked only
-  for unsafe text ingress, not full logic. (Carried from the closed imap
-  bug-hunt ledger.)
+- **imap-T3.** DONE (2026-07-31). The audit of `account/error.rs` against
+  `reference/error-model.md` found and fixed two defects, both from the
+  `with_folder_scope` migration leaving scope READERS behind:
+  `id_from_scope` and `mailbox_throttle` matched only
+  `ErrorScope::Mailbox { id }`, but every production folder producer builds
+  `ErrorScope::Cursor(Folder(_))` - `with_mailbox` is called by tests only.
+  So `ThrottleScope::Mailbox` was unreachable in production (every
+  per-mailbox `[LIMIT]` widened to an account-wide pause) and the folder id
+  was dropped from `RequestCause::NotFound` despite sitting in the scope.
+  Both readers now accept either shape, pinned by folder-scoped tests
+  alongside the pre-existing mailbox-scoped ones, which were passing
+  precisely because they used the dead helper.
+
+  Also fixed: `Translation::skip_attempt_cause` was documented as
+  suppressing the `Transport(_)` + `Acknowledged` pair `try_build` rejects,
+  but was never set to `true` - so the guarantee was a comment, and the
+  pair would have panicked at the boundary's `.expect`. It is now a
+  demotion to `InFlight` (dropping the cause would let `derive` read its
+  `Unsent` default and blind-retry a non-idempotent op). Nothing builds the
+  pair today, but `Error::with_attempt` accepts any state on the transport
+  variants and the driver does apply `Acknowledged` after a tagged
+  response.
+
+  Left as dead-but-harmless: `ImapErrorContext::with_transmission_state` is
+  never called (so `ctx.transmission_state` is always `None`), and
+  `with_mailbox` is production-dead. Both are reasonable API surface; the
+  scope readers now handle what they produce, so neither is a trap.
+
+  The one finding NOT fixed is filed as imap-S1 below.
+
+- **imap-S1.** (bug, feature-sized; found by the imap-T3 audit) ManageSieve
+  response codes are never parsed, so every `NO` misclassifies as terminal.
+  `SieveStatus::parse` hands the whole remainder to `status_message`, which
+  keeps it as one opaque string, and `ensure_ok` then builds
+  `Error::no_with_code(message, None)` - always a `None` code. That falls
+  through to `fallback_status(No)` -> `Server(Error { status: None })` with
+  an `Acknowledged` attempt, which derives `ProviderRefused`: terminal.
+
+  RFC 5804 defines the codes this discards. The damaging one is
+  `[TRYLATER]`, which explicitly means "transient, retry later" and is
+  currently permanent, so the engine never retries it. Also lost:
+  `[QUOTA/MAXSCRIPTS]` and `[QUOTA/MAXSIZE]` (should be
+  `Server(QuotaExhausted)` with a throttle scope), `[NONEXISTENT]` (should
+  be `NotFound`), `[ALREADYEXISTS]` (should be `ConcurrencyConflict`).
+  `check_script` has the same root cause with a worse symptom: it maps any
+  `NO` to a `FilterValidation` diagnostic, so a `[TRYLATER]` tells the user
+  their Sieve script is invalid when the server was merely busy.
+
+  Fix: parse the parenthesized response code off the status line and map it
+  the way `classify_response_code` maps IMAP codes. Feature-sized rather
+  than an audit correction (a parser plus a mapping table plus tests),
+  which is why it was not folded into the T3 fix.
 - **imap-T5.** (deferred, connection sweep rulings - revisit triggers,
   not work items) Hermetic STARTTLS needs a fake TLS handshake
   (`ImapStream::into_tcp` returns `None` for `Memory`, deliberately);
