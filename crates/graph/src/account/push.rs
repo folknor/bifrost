@@ -1774,6 +1774,140 @@ mod tests {
         account.shutdown.cancel();
     }
 
+    /// The plain SUCCESS leg, driven as a loop across ticks.
+    ///
+    /// A due subscription is PATCHed once; the new expiry it returns is
+    /// written back into the state the NEXT tick reads, so the subscription
+    /// stops being due and no further request is issued no matter how many
+    /// ticks fire. Renewing on every tick (the failure mode a state that
+    /// never updates produces) would be an unbounded request loop against
+    /// Graph, and the seam is armed with exactly one response, so a second
+    /// PATCH panics rather than passing.
+    ///
+    /// The quiet path is also pinned: a healthy renewal emits no push event
+    /// at all - neither `Disconnected` nor a spurious `Reconnected`.
+    #[tokio::test(start_paused = true)]
+    async fn a_successful_renewal_updates_the_expiry_and_the_next_tick_finds_nothing_due() {
+        let client = GraphClient::new("token");
+        client.script_rest([ScriptedRestResponse::empty(reqwest::StatusCode::OK)]);
+        let account = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
+        let mut events = account.push_tx.subscribe();
+        let handle = SubscriptionHandle("h".to_string());
+        account.graph_subscriptions.write().await.insert(
+            handle.clone(),
+            GraphSubscriptionGroup::live(vec![expiring("sub", "/me/mailFolders/inbox/messages")]),
+        );
+
+        ensure_graph_worker(account.clone()).await;
+        // Many more ticks than renewals: the point is that the extra ticks
+        // issue nothing.
+        for _ in 0..64 {
+            tokio::time::advance(RENEWAL_CHECK_INTERVAL + Duration::from_secs(1)).await;
+            tokio::task::yield_now().await;
+        }
+
+        {
+            let groups = account.graph_subscriptions.read().await;
+            let group = groups.get(&handle).expect("the handle stays registered");
+            assert_eq!(group.subscriptions.len(), 1);
+            assert_eq!(group.subscriptions[0].server_id, "sub", "renewed in place");
+            assert_ne!(
+                group.subscriptions[0].expires_at, "2000-01-01T00:00:00Z",
+                "the renewed expiry must replace the stale one, or every \
+                 tick re-renews forever"
+            );
+            assert!(!is_expiring_soon(
+                &group.subscriptions[0].expires_at,
+                RENEWAL_THRESHOLD_MINUTES
+            ));
+        }
+
+        let requests = client.take_rest_requests();
+        assert_eq!(requests.len(), 1, "one renewal, not one per tick");
+        assert_eq!(requests[0].method, "PATCH");
+        assert!(requests[0].url.ends_with("/subscriptions/sub"));
+        assert!(
+            requests[0].body.as_ref().expect("renewal body")["expirationDateTime"]
+                .as_str()
+                .is_some_and(|expiry| expiry.ends_with('Z')),
+            "the PATCH carries the new expiry it then stores"
+        );
+        assert!(
+            events.try_recv().is_err(),
+            "a healthy renewal is silent on the push channel"
+        );
+
+        account.shutdown.cancel();
+    }
+
+    /// The recovery edge of the same loop: a retryable renewal failure
+    /// announces `Disconnected` ONCE, and the tick that finally succeeds
+    /// announces `Reconnected`. Without the success leg clearing the
+    /// latch, a recovered subscription would stay reported as
+    /// disconnected for the life of the account.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_tick_disconnects_and_the_next_successful_tick_reconnects() {
+        let client = GraphClient::new("token");
+        client.script_rest([
+            // Retryable (429), so the subscription stays installed and due.
+            ScriptedRestResponse::json(
+                reqwest::StatusCode::TOO_MANY_REQUESTS,
+                serde_json::json!({"error":{"code":"activityLimitReached","message":"slow down"}}),
+            ),
+            ScriptedRestResponse::empty(reqwest::StatusCode::OK),
+        ]);
+        let account = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
+        let mut events = account.push_tx.subscribe();
+        let handle = SubscriptionHandle("h".to_string());
+        account.graph_subscriptions.write().await.insert(
+            handle.clone(),
+            GraphSubscriptionGroup::live(vec![expiring("sub", "/me/events")]),
+        );
+
+        ensure_graph_worker(account.clone()).await;
+        for _ in 0..64 {
+            let renewed = account
+                .graph_subscriptions
+                .read()
+                .await
+                .get(&handle)
+                .is_some_and(|group| {
+                    !is_expiring_soon(
+                        &group.subscriptions[0].expires_at,
+                        RENEWAL_THRESHOLD_MINUTES,
+                    )
+                });
+            if renewed {
+                break;
+            }
+            tokio::time::advance(RENEWAL_CHECK_INTERVAL + Duration::from_secs(1)).await;
+            tokio::task::yield_now().await;
+        }
+
+        // Let the tick that renewed finish its post-loop bookkeeping (the
+        // `Reconnected` it owes) before the channel is read.
+        tokio::task::yield_now().await;
+
+        let requests = client.take_rest_requests();
+        assert_eq!(requests.len(), 2, "the failed renewal is retried once");
+        assert!(requests.iter().all(|request| request.method == "PATCH"));
+
+        match events.try_recv() {
+            Ok(WatchEvent::Disconnected) => {}
+            other => panic!("expected Disconnected, got {other:?}"),
+        }
+        match events.try_recv() {
+            Ok(WatchEvent::Reconnected) => {}
+            other => panic!("expected Reconnected, got {other:?}"),
+        }
+        assert!(
+            events.try_recv().is_err(),
+            "the latch must not re-announce on later quiet ticks"
+        );
+
+        account.shutdown.cancel();
+    }
+
     #[test]
     fn condemned_only_groups_do_not_keep_the_renewal_worker_alive() {
         let handle = SubscriptionHandle("condemned".to_string());

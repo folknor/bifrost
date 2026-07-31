@@ -59,10 +59,10 @@ struct ClientInner {
 /// Graph-owned response shape at the one REST funnel.  Keeping this small
 /// adapter local lets tests script Graph responses without reaching into
 /// bifrost-net's private dispatch seam.
-struct RestResponse {
-    status: reqwest::StatusCode,
-    headers: reqwest::header::HeaderMap,
-    body: Bytes,
+pub(crate) struct RestResponse {
+    pub(crate) status: reqwest::StatusCode,
+    pub(crate) headers: reqwest::header::HeaderMap,
+    pub(crate) body: Bytes,
 }
 
 impl From<bifrost_net::Response> for RestResponse {
@@ -149,6 +149,15 @@ impl ScriptedRestResponse {
             status,
             headers: reqwest::header::HeaderMap::new(),
             body: Bytes::from(serde_json::to_vec(&body).expect("JSON response serializes")),
+        }
+    }
+
+    /// A non-JSON body: the Autodiscover surfaces answer XML, not JSON.
+    pub(crate) fn text(status: reqwest::StatusCode, body: &str) -> Self {
+        Self {
+            status,
+            headers: reqwest::header::HeaderMap::new(),
+            body: Bytes::from(body.to_string()),
         }
     }
 
@@ -247,6 +256,67 @@ struct ScriptedRest {
     armed: bool,
     responses: VecDeque<ScriptedRestResponse>,
     requests: Vec<RestRequest>,
+    /// Armed independently of the REST script: a test that only scripts
+    /// REST must not have its unrelated aux paths silently answered, and a
+    /// test that only scripts an aux path must not have to arm REST.
+    aux_armed: bool,
+    aux_responses: VecDeque<ScriptedRestResponse>,
+    aux_requests: Vec<AuxRequest>,
+    download_armed: bool,
+    downloads: VecDeque<ScriptedDownload>,
+    download_requests: Vec<DownloadRequest>,
+}
+
+/// A request recorded at the auxiliary wire funnel: the pre-authed OneDrive
+/// chunk PUT and the Autodiscover POST. Both are outside `execute_wire`
+/// because neither is a Graph REST JSON call - one drops the bearer and
+/// carries `Content-Range`, the other posts XML to the Autodiscover origin -
+/// so they get their own recorded shape rather than being forced into
+/// `RestRequest`'s JSON-shaped one.
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub(crate) struct AuxRequest {
+    pub(crate) method: String,
+    pub(crate) url: String,
+    /// Every header the caller set, in the order it set them.
+    pub(crate) headers: Vec<(String, String)>,
+    /// `false` for the OneDrive chunk PUT: the session URL is
+    /// pre-authenticated and sending the Graph bearer to it is a leak.
+    pub(crate) bearer: bool,
+    pub(crate) body: Bytes,
+}
+
+#[cfg(test)]
+impl AuxRequest {
+    pub(crate) fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(header, _)| header.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub(crate) struct DownloadRequest {
+    pub(crate) url: String,
+    pub(crate) range: Option<bifrost_types::ByteRange>,
+}
+
+/// A scripted answer to `GraphClient::download_stream`.
+///
+/// `bifrost-net` resolves the status BEFORE handing back a stream (a 4xx is
+/// an `Err`, never a body), so the two shapes here are the two the caller
+/// can actually see: an accepted stream, or a failure at open. `Chunks`
+/// carries the chunk boundaries verbatim so a test can pin that the blob
+/// stream forwards them rather than re-framing.
+#[cfg(test)]
+pub(crate) enum ScriptedDownload {
+    Chunks(Vec<Bytes>),
+    /// Chunks that arrive before the transport fails mid-stream - the one
+    /// failure mode that is NOT resolved at open.
+    ChunksThenError(Vec<Bytes>, bifrost_net::Error),
+    Failed(bifrost_net::Error),
 }
 
 impl GraphClient {
@@ -715,6 +785,180 @@ impl GraphClient {
             .await
             .map(RestResponse::from)
             .map_err(GraphError::Net)
+    }
+
+    /// The one place the two NON-REST wire paths leave this crate: the
+    /// pre-authenticated OneDrive chunk PUT (bearer suppressed, because the
+    /// session URL carries its own credential and forwarding the Graph
+    /// token to it would leak it) and the Autodiscover POST (XML to the
+    /// Autodiscover origin, which is not the Graph host).
+    ///
+    /// Deliberately NOT folded into `execute_wire`: that funnel takes the
+    /// client's concurrency permit and always sends a bearer, and a chunked
+    /// upload holding a Graph permit per chunk is a different production
+    /// behavior than the one this path has always had. Keeping it separate
+    /// makes the seam an extraction of the existing code rather than a
+    /// change to it.
+    pub(crate) async fn execute_aux(
+        &self,
+        method: &str,
+        url: &str,
+        headers: &[(&str, &str)],
+        bearer: bool,
+        body: Bytes,
+    ) -> Result<RestResponse, GraphError> {
+        #[cfg(test)]
+        if let Some(outcome) = self.scripted_aux(method, url, headers, bearer, &body) {
+            return outcome;
+        }
+        let account_net = self.account_net().ok_or_else(|| {
+            GraphError::Net(bifrost_net::Error::Network {
+                message: "Graph client is not attached to an account".to_string(),
+                transmission_state: TransmissionState::Unsent,
+                source: None,
+            })
+        })?;
+        let mut builder = match method {
+            "POST" => account_net.post(url),
+            "PUT" => account_net.put(url),
+            other => {
+                unreachable!("unsupported HTTP method passed to GraphClient::execute_aux: {other}")
+            }
+        };
+        if !bearer {
+            builder = builder.without_bearer_auth();
+        }
+        for (name, value) in headers {
+            builder = builder.header(name, value);
+        }
+        builder
+            .body(body)
+            .send()
+            .await
+            .map(RestResponse::from)
+            .map_err(GraphError::Net)
+    }
+
+    /// The one place a Graph blob byte stream is opened. Production is the
+    /// `AccountNet` download (retry, rate limit, bandwidth metering, the
+    /// `Range` / `206` contract); tests script the chunk sequence or the
+    /// open failure.
+    pub(crate) async fn download_stream(
+        &self,
+        url: &str,
+        range: Option<bifrost_types::ByteRange>,
+    ) -> Result<bifrost_net::ByteStream, bifrost_net::Error> {
+        #[cfg(test)]
+        if let Some(outcome) = self.scripted_download(url, range) {
+            return outcome;
+        }
+        let account_net = self.account_net().ok_or(bifrost_net::Error::Network {
+            message: "Graph client is not attached to an account".to_string(),
+            transmission_state: TransmissionState::Unsent,
+            source: None,
+        })?;
+        account_net.download_stream(url, range).await
+    }
+
+    #[cfg(test)]
+    fn scripted_aux(
+        &self,
+        method: &str,
+        url: &str,
+        headers: &[(&str, &str)],
+        bearer: bool,
+        body: &Bytes,
+    ) -> Option<Result<RestResponse, GraphError>> {
+        let mut scripted = self.inner.scripted.lock().expect("REST script lock");
+        if !scripted.aux_armed {
+            return None;
+        }
+        let Some(response) = scripted.aux_responses.pop_front() else {
+            panic!("Graph aux script exhausted by request: {method} {url}");
+        };
+        scripted.aux_requests.push(AuxRequest {
+            method: method.to_string(),
+            url: url.to_string(),
+            headers: headers
+                .iter()
+                .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+                .collect(),
+            bearer,
+            body: body.clone(),
+        });
+        Some(response.into_net_outcome())
+    }
+
+    #[cfg(test)]
+    fn scripted_download(
+        &self,
+        url: &str,
+        range: Option<bifrost_types::ByteRange>,
+    ) -> Option<Result<bifrost_net::ByteStream, bifrost_net::Error>> {
+        use futures::StreamExt;
+
+        let mut scripted = self.inner.scripted.lock().expect("REST script lock");
+        if !scripted.download_armed {
+            return None;
+        }
+        let Some(scripted_download) = scripted.downloads.pop_front() else {
+            panic!("Graph download script exhausted by request: {url}");
+        };
+        scripted.download_requests.push(DownloadRequest {
+            url: url.to_string(),
+            range,
+        });
+        Some(match scripted_download {
+            ScriptedDownload::Chunks(chunks) => {
+                Ok(futures::stream::iter(chunks.into_iter().map(Ok)).boxed())
+            }
+            ScriptedDownload::ChunksThenError(chunks, error) => Ok(futures::stream::iter(
+                chunks
+                    .into_iter()
+                    .map(Ok)
+                    .chain(std::iter::once(Err(error))),
+            )
+            .boxed()),
+            ScriptedDownload::Failed(error) => Err(error),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn script_aux(&self, responses: impl IntoIterator<Item = ScriptedRestResponse>) {
+        let mut scripted = self.inner.scripted.lock().expect("REST script lock");
+        scripted.aux_armed = true;
+        scripted.aux_responses.extend(responses);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_aux_requests(&self) -> Vec<AuxRequest> {
+        std::mem::take(
+            &mut self
+                .inner
+                .scripted
+                .lock()
+                .expect("REST script lock")
+                .aux_requests,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn script_downloads(&self, downloads: impl IntoIterator<Item = ScriptedDownload>) {
+        let mut scripted = self.inner.scripted.lock().expect("REST script lock");
+        scripted.download_armed = true;
+        scripted.downloads.extend(downloads);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_download_requests(&self) -> Vec<DownloadRequest> {
+        std::mem::take(
+            &mut self
+                .inner
+                .scripted
+                .lock()
+                .expect("REST script lock")
+                .download_requests,
+        )
     }
 
     /// Answer a request from the installed script, or `None` when this

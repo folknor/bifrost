@@ -228,20 +228,35 @@ any item; some may already be obsolete.
   non-mail classes A5b-3 added. Fixing it needs a modification signal
   (e.g. `LastModifiedTime`) or a different watermark model entirely - a
   known poll-model limitation, not a regression.
-- **graph-T1.** (coverage) What the REST/EWS test seams still do not
-  reach (see `reference/graph.md` for the seams themselves): blob byte
-  streams (`download_stream`), the OneDrive resumable chunk PUT
-  (pre-authed, no bearer, its own builder), the Autodiscover POST, the
-  renewal worker's plain SUCCESS leg driven as a loop across ticks
-  (`due_renewals` / `install_replacement` are pinned pure and the
-  recreate leg is driven through a tick), and anything whose behavior
-  depends on bifrost-net's own retry, backoff, or redirect walk - the
-  seam answers at the funnel, below which none of that runs. On the
-  SEARCH surface specifically: no test walks a shared mailbox's OWN
-  `nextLink` continuation (only primary search pagination is exercised;
-  the delta walks do pin a shared continuation), and no test PAGES
-  through three mailboxes (the quarantine test routes across three, but
-  only two return result pages).
+- **graph-T1.** (coverage) What the REST/EWS/download/aux test seams
+  still do not reach (see `reference/graph.md` for the seams themselves):
+  anything whose behavior depends on bifrost-net's own retry, backoff,
+  rate-limit permit, or redirect walk. Every seam answers at the funnel,
+  below which none of that runs, so a test written on one of them can
+  pin WHICH outcome a status produces but never how many attempts,
+  how long they waited, or which host a 3xx chain ended on. Closing it
+  needs a seam inside bifrost-net, not another one in bifrost-graph.
+  (The blob byte streams, the pre-authed OneDrive chunk PUT, the
+  Autodiscover POST including its in-body redirect chain, the renewal
+  worker's SUCCESS leg across ticks, and the three-mailbox search walk
+  with a shared mailbox's own `nextLink` are covered as of the
+  download/aux seams.)
+- **graph-B1.** (bug/smell, found while closing graph-T1) Byte-stream
+  `Batch`es in `account/blob.rs` set `bytes_in: 0`, so blob and
+  raw-RFC822 downloads report zero bytes to the engine's metering while
+  the EWS attachment path reports the real length - inconsistent
+  accounting on the same event type. Related nit: every streamed chunk
+  is `PageBoundary::Page`; no chunk is ever `Final`, so a consumer
+  keying off the boundary never sees a terminal page for a blob (only
+  the trailing `Done`).
+- **graph-S2.** (smell, found while closing graph-T1) Two near-dead
+  non-2xx branches: the chunk-PUT `_ =>` arm in `account/cloud.rs` and
+  the `!status.is_success()` branch in `account/autodiscover.rs` can
+  only be reached by a passed-through 3xx, because bifrost-net returns
+  `Err` for every 4xx/5xx before the response surfaces. The
+  autodiscover one additionally passes `HeaderMap::new()` into
+  `GraphResponseError::from_response`, discarding the real response
+  headers (`Retry-After`, `WWW-Authenticate`) from classification.
 
 ## bifrost-sync
 

@@ -3517,6 +3517,120 @@ mod tests {
         );
     }
 
+    /// A full walk across THREE shared mailboxes where every one of them
+    /// returns results, and where the first shared mailbox pages twice on
+    /// its own.
+    ///
+    /// Two things only this shape can catch. A shared mailbox's own
+    /// `@odata.nextLink` must be followed against THAT mailbox's client -
+    /// the cursor carries the owner beside the link, and a continuation
+    /// that forgot the owner would issue the absolute link on the primary
+    /// (which is armed empty here, so it panics rather than passing).
+    /// And the hand-off must be `owner -> the NEXT mailbox after it`, not
+    /// `owner -> the first`: with only two mailboxes an off-by-one that
+    /// restarted the tail is indistinguishable from a correct walk.
+    #[tokio::test]
+    async fn search_pages_within_and_across_three_shared_mailboxes() {
+        let primary = GraphClient::new("token");
+        primary.script_rest([ScriptedRestResponse::json(
+            reqwest::StatusCode::OK,
+            json!({ "value": [{ "id": "p1", "conversationId": "pt" }] }),
+        )]);
+        let a_root = GraphClient::new("token");
+        a_root.script_rest([
+            ScriptedRestResponse::json(
+                reqwest::StatusCode::OK,
+                json!({
+                    "value": [{ "id": "a1", "conversationId": "at" }],
+                    "@odata.nextLink": "https://graph.microsoft.com/v1.0/users/a%40contoso.com/messages?$skiptoken=a2"
+                }),
+            ),
+            ScriptedRestResponse::json(
+                reqwest::StatusCode::OK,
+                json!({ "value": [{ "id": "a2", "conversationId": "at2" }] }),
+            ),
+        ]);
+        let b_root = GraphClient::new("token");
+        b_root.script_rest([ScriptedRestResponse::json(
+            reqwest::StatusCode::OK,
+            json!({ "value": [{ "id": "b1", "conversationId": "bt" }] }),
+        )]);
+        let c_root = GraphClient::new("token");
+        c_root.script_rest([ScriptedRestResponse::json(
+            reqwest::StatusCode::OK,
+            json!({ "value": [{ "id": "c1", "conversationId": "ct" }] }),
+        )]);
+        let account = GraphAccount::new_for_tests_with_shared_clients(
+            primary.clone(),
+            PushMode::GraphSubscriptions,
+            HashMap::from([
+                (
+                    "a@contoso.com".to_string(),
+                    a_root.for_shared_mailbox("a@contoso.com"),
+                ),
+                (
+                    "b@contoso.com".to_string(),
+                    b_root.for_shared_mailbox("b@contoso.com"),
+                ),
+                (
+                    "c@contoso.com".to_string(),
+                    c_root.for_shared_mailbox("c@contoso.com"),
+                ),
+            ]),
+        );
+
+        // Walk the whole surface, one page at a time, exactly as a consumer
+        // would: feed each page's cursor back until there is none.
+        let mut ids = Vec::new();
+        let mut cursor = None;
+        let mut pages = 0;
+        loop {
+            let mut request = SearchRequest::default();
+            request.page_cursor = cursor;
+            let page = search_message_rows(&account, request)
+                .await
+                .expect("every page of the walk succeeds");
+            ids.extend(page.items.iter().map(|row| row.id.0.clone()));
+            assert!(page.skipped_scopes.is_empty());
+            pages += 1;
+            assert!(pages <= 8, "the walk must terminate");
+            match page.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+
+        assert_eq!(pages, 5, "primary, a@ twice, b@, c@");
+        assert_eq!(
+            ids,
+            vec![
+                "p1".to_string(),
+                "a@contoso.com\u{1f}a1".to_string(),
+                "a@contoso.com\u{1f}a2".to_string(),
+                "b@contoso.com\u{1f}b1".to_string(),
+                "c@contoso.com\u{1f}c1".to_string(),
+            ]
+        );
+
+        assert_eq!(primary.take_rest_requests().len(), 1);
+        let a_requests = a_root.take_rest_requests();
+        assert_eq!(a_requests.len(), 2);
+        assert!(
+            a_requests[0]
+                .url
+                .contains("/users/a%40contoso.com/messages?"),
+            "{}",
+            a_requests[0].url
+        );
+        assert!(
+            a_requests[1].url.ends_with("$skiptoken=a2"),
+            "the shared mailbox's own continuation is issued verbatim: {}",
+            a_requests[1].url
+        );
+        assert_eq!(b_root.take_rest_requests().len(), 1);
+        assert_eq!(c_root.take_rest_requests().len(), 1);
+    }
+
     /// O-28: search was the one shared-mailbox door where a revoked share
     /// escalated account-wide. The dead mailbox stays configured, so the
     /// old `Err(NoPermission)` did not just fail one call - every retry

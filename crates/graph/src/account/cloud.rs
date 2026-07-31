@@ -239,14 +239,6 @@ async fn upload_chunks(
     // data is non-empty and the loop always runs at least once.
     let total = data.len();
 
-    let account_net = client.account_net().ok_or_else(|| {
-        GraphError::Net(bifrost_net::Error::Network {
-            message: "Graph client is not attached to an account".to_string(),
-            transmission_state: bifrost_types::TransmissionState::Unsent,
-            source: None,
-        })
-    })?;
-
     let mut offset = 0usize;
     while offset < total {
         if shutdown.is_cancelled() {
@@ -256,16 +248,19 @@ async fn upload_chunks(
         let chunk = data.slice(offset..end);
         let content_range = format!("bytes {offset}-{}/{total}", end - 1);
 
-        let response = account_net
-            .put(upload_url)
-            .without_bearer_auth()
-            .header("Content-Range", &content_range)
-            .body(chunk)
-            .send()
-            .await
-            .map_err(GraphError::Net)?;
+        // The session URL is pre-authenticated: sending the Graph bearer to
+        // it would leak the token to whatever host OneDrive minted.
+        let response = client
+            .execute_aux(
+                "PUT",
+                upload_url,
+                &[("Content-Range", content_range.as_str())],
+                false,
+                chunk,
+            )
+            .await?;
 
-        let status = response.status();
+        let status = response.status;
         match status.as_u16() {
             200 | 201 => {
                 let item: DriveItemResponse = serde_json::from_slice(response.body.as_ref())
@@ -375,6 +370,221 @@ fn malformed_response(detail: String) -> GraphError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::account::PushMode;
+    use crate::client::ScriptedRestResponse;
+    use serde_json::json;
+    use tokio_util::sync::CancellationToken;
+
+    const SESSION_URL: &str = "https://upload.example/session/abc?token=preauth";
+
+    /// The resumable chunk PUT, end to end through the aux wire seam.
+    ///
+    /// Three things this leg cannot get wrong without corrupting an upload
+    /// or leaking a credential: the session URL is pre-authenticated, so the
+    /// Graph bearer must NOT ride along; each chunk declares its absolute
+    /// `Content-Range` against the total; and a 202 resumes from the
+    /// SERVER's `nextExpectedRanges` start, not from the end of the chunk
+    /// just sent - a server is allowed to accept only part of a chunk, and
+    /// advancing to the chunk end would skip the unaccepted tail.
+    #[tokio::test]
+    async fn chunked_upload_drops_the_bearer_and_resumes_from_the_server_offset() {
+        let client = GraphClient::new("token");
+        client.script_aux([
+            // Accepted only the first three bytes of a five-byte chunk.
+            ScriptedRestResponse::json(
+                reqwest::StatusCode::ACCEPTED,
+                json!({ "nextExpectedRanges": ["3-11"] }),
+            ),
+            ScriptedRestResponse::json(
+                reqwest::StatusCode::ACCEPTED,
+                json!({ "nextExpectedRanges": ["8-11"] }),
+            ),
+            ScriptedRestResponse::json(reqwest::StatusCode::OK, json!({ "id": "drive-item-1" })),
+        ]);
+
+        let item = upload_chunks(
+            &client,
+            SESSION_URL,
+            Bytes::from_static(b"0123456789AB"),
+            5,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("the upload completes");
+        assert_eq!(item, "drive-item-1");
+
+        let requests = client.take_aux_requests();
+        assert_eq!(requests.len(), 3);
+        let ranges: Vec<&str> = requests
+            .iter()
+            .map(|request| request.header("Content-Range").expect("Content-Range"))
+            .collect();
+        assert_eq!(
+            ranges,
+            vec!["bytes 0-4/12", "bytes 3-7/12", "bytes 8-11/12"],
+            "the second chunk resumes at the server's offset, not at 5"
+        );
+        let bodies: Vec<Bytes> = requests
+            .iter()
+            .map(|request| request.body.clone())
+            .collect();
+        assert_eq!(
+            bodies,
+            vec![
+                Bytes::from_static(b"01234"),
+                Bytes::from_static(b"34567"),
+                Bytes::from_static(b"89AB"),
+            ]
+        );
+        for request in &requests {
+            assert_eq!(request.method, "PUT");
+            assert_eq!(request.url, SESSION_URL);
+            assert!(
+                !request.bearer,
+                "the pre-authed session URL must never carry the Graph bearer"
+            );
+        }
+    }
+
+    /// A 202 whose resume offset does not advance would spin the upload
+    /// loop forever against a server that keeps answering the same thing.
+    /// It is treated as a protocol violation instead.
+    #[tokio::test]
+    async fn a_non_advancing_202_offset_is_rejected_instead_of_looping() {
+        let client = GraphClient::new("token");
+        client.script_aux([ScriptedRestResponse::json(
+            reqwest::StatusCode::ACCEPTED,
+            json!({ "nextExpectedRanges": ["0-11"] }),
+        )]);
+
+        let error = upload_chunks(
+            &client,
+            SESSION_URL,
+            Bytes::from_static(b"0123456789AB"),
+            5,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect_err("a non-advancing offset fails");
+        let advanced = matches!(
+            &error,
+            GraphError::Json { message, .. } if message.contains("did not advance")
+        );
+        assert!(advanced, "{error:?}");
+        // Exactly one PUT: the loop did not spin.
+        assert_eq!(client.take_aux_requests().len(), 1);
+    }
+
+    /// A cancelled account shutdown aborts the upload between chunks
+    /// instead of finishing it, and the abort is `Unsent`-state so the
+    /// recovery mapping reads it as a client-side abort rather than a
+    /// server failure.
+    #[tokio::test]
+    async fn a_shutdown_aborts_the_upload_before_the_next_chunk() {
+        let client = GraphClient::new("token");
+        // Armed and EMPTY: any PUT at all panics at the seam, so "aborted
+        // before sending" is proven rather than assumed.
+        client.script_aux(std::iter::empty::<ScriptedRestResponse>());
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+
+        let error = upload_chunks(
+            &client,
+            SESSION_URL,
+            Bytes::from_static(b"0123456789AB"),
+            5,
+            &shutdown,
+        )
+        .await
+        .expect_err("a cancelled upload fails");
+        assert!(client.take_aux_requests().is_empty());
+        assert!(
+            matches!(
+                &error,
+                GraphError::Net(bifrost_net::Error::Network {
+                    transmission_state: bifrost_types::TransmissionState::Unsent,
+                    ..
+                })
+            ),
+            "{error:?}"
+        );
+    }
+
+    /// The whole hosting call: `createUploadSession` (bearer, JSON, the
+    /// de-branded folder and `rename` conflict behavior), the chunk PUT
+    /// against the URL the session handed back (no bearer), then
+    /// `createLink` for the requested scope. The two REST legs and the one
+    /// aux leg are scripted separately, so a leg landing on the wrong
+    /// transport shows up as an exhaustion panic rather than a pass.
+    #[tokio::test]
+    async fn hosting_an_attachment_uploads_then_mints_a_link() {
+        let client = GraphClient::new("token");
+        client.script_rest([
+            ScriptedRestResponse::json(
+                reqwest::StatusCode::OK,
+                json!({ "uploadUrl": SESSION_URL, "expirationDateTime": "2099-01-01T00:00:00Z" }),
+            ),
+            ScriptedRestResponse::json(
+                reqwest::StatusCode::OK,
+                json!({ "link": { "webUrl": "https://1drv.ms/x/abc" } }),
+            ),
+        ]);
+        client.script_aux([ScriptedRestResponse::json(
+            reqwest::StatusCode::CREATED,
+            json!({ "id": "drive-item-1" }),
+        )]);
+        let account = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
+        let payload = Bytes::from_static(b"hello world");
+
+        let hosted = host_attachment(
+            account,
+            payload.clone(),
+            CloudUploadMeta::new(
+                "report #1.pdf",
+                "application/pdf",
+                payload.len() as u64,
+                ShareScope::Organization,
+            ),
+        )
+        .await
+        .expect("hosting succeeds");
+        assert_eq!(hosted.share_url, "https://1drv.ms/x/abc");
+        assert_eq!(hosted.provider_file_id, "drive-item-1");
+
+        let rest = client.take_rest_requests();
+        assert_eq!(rest.len(), 2);
+        assert_eq!(rest[0].method, "POST");
+        assert!(
+            rest[0]
+                .url
+                .ends_with("/me/drive/root:/Attachments/report %231.pdf:/createUploadSession"),
+            "{}",
+            rest[0].url
+        );
+        let session_body = rest[0].body.as_ref().expect("session body");
+        assert_eq!(
+            session_body["@microsoft.graph.conflictBehavior"].as_str(),
+            Some("rename"),
+            "hosting must never overwrite an existing drive item"
+        );
+        assert_eq!(session_body["item"]["name"].as_str(), Some("report #1.pdf"));
+        assert!(
+            rest[1]
+                .url
+                .contains("/me/drive/items/drive-item-1/createLink")
+        );
+        assert_eq!(
+            rest[1].body.as_ref().expect("link body")["scope"].as_str(),
+            Some("organization")
+        );
+
+        let aux = client.take_aux_requests();
+        assert_eq!(aux.len(), 1);
+        assert_eq!(aux[0].url, SESSION_URL);
+        assert!(!aux[0].bearer);
+        assert_eq!(aux[0].header("Content-Range"), Some("bytes 0-10/11"));
+        assert_eq!(aux[0].body, payload);
+    }
 
     #[test]
     fn onedrive_chunk_aligned() {

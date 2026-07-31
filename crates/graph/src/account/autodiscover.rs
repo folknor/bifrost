@@ -19,7 +19,7 @@ use reqwest::header::HeaderMap;
 use super::GraphAccount;
 use super::cursor::PublicFolderRouting;
 use super::graph_error::{GraphErrorContext, into_account_error, response_to_account_error_pub};
-use crate::error::{GraphError, GraphResponseError};
+use crate::error::GraphResponseError;
 use crate::ews::push_general_ref;
 
 /// The POX (`autodiscover.xml`) Autodiscover endpoint under a given Outlook
@@ -236,28 +236,17 @@ impl GraphAccount {
         body: String,
     ) -> Result<String, AccountError> {
         let ctx = GraphErrorContext::graph(AccountOperation::Discover);
-        let account_net = self.client.account_net().ok_or_else(|| {
-            into_account_error(
-                GraphError::Net(bifrost_net::Error::Network {
-                    message: "Graph client is not attached to an account".to_string(),
-                    transmission_state: bifrost_types::TransmissionState::Unsent,
-                    source: None,
-                }),
-                ctx.clone(),
-            )
-        })?;
-
-        let mut req = account_net.post(url).header("Content-Type", content_type);
+        let mut headers = vec![("Content-Type", content_type)];
         if let Some((name, value)) = extra_header {
-            req = req.header(name, value);
+            headers.push((name, value));
         }
-        let resp = req
-            .body(bytes::Bytes::from(body))
-            .send()
+        let resp = self
+            .client
+            .execute_aux("POST", url, &headers, true, bytes::Bytes::from(body))
             .await
-            .map_err(|error| into_account_error(GraphError::Net(error), ctx.clone()))?;
+            .map_err(|error| into_account_error(error, ctx.clone()))?;
 
-        let status = resp.status();
+        let status = resp.status;
         if !status.is_success() {
             let response = GraphResponseError::from_response(
                 status,
@@ -506,6 +495,223 @@ fn push_text(e: &quick_xml::events::BytesText<'_>, buf: &mut String) {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::account::PushMode;
+    use crate::client::{GraphClient, ScriptedRestResponse};
+
+    fn test_account(client: GraphClient) -> GraphAccount {
+        GraphAccount::new_for_tests(client, PushMode::GraphSubscriptions)
+    }
+
+    fn user_settings_xml(name: &str, value: &str) -> String {
+        format!(
+            r#"<?xml version="1.0" encoding="utf-8"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"
+            xmlns:a="http://schemas.microsoft.com/exchange/2010/Autodiscover">
+  <s:Body>
+    <a:GetUserSettingsResponseMessage>
+      <a:Response>
+        <a:ErrorCode>NoError</a:ErrorCode>
+        <a:UserResponses>
+          <a:UserResponse>
+            <a:UserSettings>
+              <a:UserSetting>
+                <a:Name>{name}</a:Name>
+                <a:Value>{value}</a:Value>
+              </a:UserSetting>
+            </a:UserSettings>
+          </a:UserResponse>
+        </a:UserResponses>
+      </a:Response>
+    </a:GetUserSettingsResponseMessage>
+  </s:Body>
+</s:Envelope>"#
+        )
+    }
+
+    fn redirect_xml(target: &str) -> String {
+        format!(
+            r#"<?xml version="1.0" encoding="utf-8"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"
+            xmlns:a="http://schemas.microsoft.com/exchange/2010/Autodiscover">
+  <s:Body>
+    <a:GetUserSettingsResponseMessage>
+      <a:Response>
+        <a:ErrorCode>RedirectAddress</a:ErrorCode>
+        <a:RedirectTarget>{target}</a:RedirectTarget>
+      </a:Response>
+    </a:GetUserSettingsResponseMessage>
+  </s:Body>
+</s:Envelope>"#
+        )
+    }
+
+    /// The Autodiscover POST itself, which is not a Graph REST call: it
+    /// goes to the Autodiscover origin (NOT the Graph host), posts XML, and
+    /// carries the bearer. The delegate-discovery variant hits
+    /// `/autodiscover/autodiscover.xml` with no `SOAPAction`, and the
+    /// request body must name the mailbox and the response schema the
+    /// parser expects.
+    #[tokio::test]
+    async fn delegate_discovery_posts_autodiscover_xml_and_parses_the_mailboxes() {
+        let client = GraphClient::new("token");
+        client.script_aux([ScriptedRestResponse::text(
+            reqwest::StatusCode::OK,
+            r#"<?xml version="1.0" encoding="utf-8"?>
+<Autodiscover>
+  <Response>
+    <Account>
+      <AlternativeMailbox>
+        <Type>Delegate</Type>
+        <DisplayName>Sales Team</DisplayName>
+        <SmtpAddress>sales@contoso.com</SmtpAddress>
+      </AlternativeMailbox>
+    </Account>
+  </Response>
+</Autodiscover>"#,
+        )]);
+        let account = test_account(client.clone());
+
+        let mailboxes = account
+            .discover_shared_mailboxes("user@contoso.com")
+            .await
+            .expect("discovery succeeds");
+        assert_eq!(mailboxes.len(), 1);
+        assert_eq!(mailboxes[0].smtp_address, "sales@contoso.com");
+
+        let requests = client.take_aux_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, "POST");
+        assert_eq!(
+            requests[0].url,
+            format!(
+                "{}/autodiscover/autodiscover.xml",
+                crate::client::OUTLOOK_BASE
+            )
+        );
+        assert_eq!(requests[0].header("Content-Type"), Some("text/xml"));
+        assert_eq!(requests[0].header("SOAPAction"), None);
+        assert!(
+            requests[0].bearer,
+            "Autodiscover is authenticated with the Graph bearer"
+        );
+        let body = String::from_utf8(requests[0].body.to_vec()).expect("UTF-8 request body");
+        assert!(
+            body.contains("<EMailAddress>user@contoso.com</EMailAddress>"),
+            "{body}"
+        );
+        assert!(body.contains("responseschema/2006a"), "{body}");
+    }
+
+    /// A hybrid tenant answers `GetUserSettings` with an in-body
+    /// `RedirectAddress` inside an HTTP 200 - bifrost-net never sees a 3xx,
+    /// so nothing below this crate follows it. The walk must reissue the
+    /// SOAP call for the NEW mailbox against the SAME endpoint, and a
+    /// `RedirectTarget` that is a URL must move the endpoint instead.
+    #[tokio::test]
+    async fn a_soap_redirect_chain_reissues_against_the_new_mailbox_then_endpoint() {
+        let client = GraphClient::new("token");
+        client.script_aux([
+            ScriptedRestResponse::text(
+                reqwest::StatusCode::OK,
+                &redirect_xml("replica@contoso.mail.onmicrosoft.com"),
+            ),
+            ScriptedRestResponse::text(
+                reqwest::StatusCode::OK,
+                &redirect_xml("https://autodiscover.contoso.com/autodiscover/autodiscover.svc"),
+            ),
+            ScriptedRestResponse::text(
+                reqwest::StatusCode::OK,
+                &user_settings_xml("AutoDiscoverSMTPAddress", "content@contoso.com"),
+            ),
+        ]);
+        let account = test_account(client.clone());
+
+        let mailbox = account
+            .discover_content_mailbox("replica@contoso.com")
+            .await
+            .expect("the redirect chain resolves");
+        assert_eq!(mailbox, "content@contoso.com");
+
+        let requests = client.take_aux_requests();
+        assert_eq!(requests.len(), 3);
+        let soap_url = format!(
+            "{}/autodiscover/autodiscover.svc",
+            crate::client::OUTLOOK_BASE
+        );
+        assert_eq!(requests[0].url, soap_url);
+        // The address redirect keeps the endpoint and changes the mailbox.
+        assert_eq!(requests[1].url, soap_url);
+        // The URL redirect moves the endpoint and keeps the mailbox.
+        assert_eq!(
+            requests[2].url,
+            "https://autodiscover.contoso.com/autodiscover/autodiscover.svc"
+        );
+        let mailboxes: Vec<String> = requests
+            .iter()
+            .map(|request| {
+                let body = String::from_utf8(request.body.to_vec()).expect("UTF-8 body");
+                let start =
+                    body.find("<a:Mailbox>").expect("mailbox element") + "<a:Mailbox>".len();
+                let end = body.find("</a:Mailbox>").expect("mailbox element end");
+                body[start..end].to_string()
+            })
+            .collect();
+        assert_eq!(
+            mailboxes,
+            vec![
+                "replica@contoso.com".to_string(),
+                "replica@contoso.mail.onmicrosoft.com".to_string(),
+                "replica@contoso.mail.onmicrosoft.com".to_string(),
+            ]
+        );
+        for request in &requests {
+            assert_eq!(
+                request.header("Content-Type"),
+                Some("text/xml; charset=utf-8")
+            );
+            assert!(
+                request
+                    .header("SOAPAction")
+                    .is_some_and(|action| action.contains("GetUserSettings")),
+                "the SOAP endpoint requires the action header"
+            );
+        }
+    }
+
+    /// An in-body `ErrorCode` other than `NoError` is a real failure, not
+    /// an empty settings vec: without this the caller reports "response
+    /// missing PublicFolderInformation" for what is actually an invalid
+    /// user, and the Autodiscover error text is lost.
+    #[tokio::test]
+    async fn an_in_body_error_code_fails_the_lookup_with_its_text() {
+        let client = GraphClient::new("token");
+        client.script_aux([ScriptedRestResponse::text(
+            reqwest::StatusCode::OK,
+            r#"<?xml version="1.0" encoding="utf-8"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"
+            xmlns:a="http://schemas.microsoft.com/exchange/2010/Autodiscover">
+  <s:Body>
+    <a:GetUserSettingsResponseMessage>
+      <a:Response>
+        <a:ErrorCode>InvalidUser</a:ErrorCode>
+        <a:ErrorMessage>The user could not be found.</a:ErrorMessage>
+      </a:Response>
+    </a:GetUserSettingsResponseMessage>
+  </s:Body>
+</s:Envelope>"#,
+        )]);
+        let account = test_account(client.clone());
+
+        let error = account
+            .discover_public_folder_routing("ghost@contoso.com")
+            .await
+            .expect_err("an in-body error fails the lookup");
+        assert!(matches!(
+            error.kind(),
+            bifrost_types::AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed)
+        ));
+        assert_eq!(client.take_aux_requests().len(), 1);
+    }
 
     #[test]
     fn parse_single_alternative_mailbox() {

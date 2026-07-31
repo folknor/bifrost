@@ -157,10 +157,30 @@ account-wide request legitimately goes to the primary (`delete_thread`'s
 `/$batch` POST), the primary is armed with EXACTLY that one response, so a
 misrouted lookup consumes it and the next primary request panics.
 
-Still outside the funnel, and so still unseamed: blob byte streams
-(`download_stream`), the OneDrive resumable chunk PUT (pre-authed, no bearer),
-and the Autodiscover POST. EWS has its own `EwsExecute` seam. The remaining
-coverage gaps behind both seams are tracked in `TODO.md` as graph-T1.
+Two smaller funnels sit beside the REST one, for the wire paths that are not
+Graph REST JSON calls, each with its own script queue and its own exhaustion
+panic on the same `GraphClient`:
+
+- `GraphClient::download_stream` - blob and raw-RFC822 byte streams. Tests
+  script the chunk sequence (`ScriptedDownload::Chunks`), an open failure
+  (`Failed`, which is how a 405 "not a byte stream" and every 4xx arrive:
+  bifrost-net resolves the status before yielding a body), or a mid-stream
+  transport failure (`ChunksThenError`, the only failure the status check
+  cannot pre-empt). The recorded request carries the URL and the caller's
+  `ByteRange`.
+- `GraphClient::execute_aux` - the pre-authenticated OneDrive chunk PUT and
+  the Autodiscover POST. Deliberately NOT folded into `execute_wire`: that
+  funnel always sends a bearer and takes the client's concurrency permit,
+  and a chunked upload holding a Graph permit per chunk would be different
+  production behavior from the one this path has always had. The recorded
+  request keeps the header list verbatim (`Content-Range`, `SOAPAction`) plus
+  whether a bearer was attached, so "the pre-authed session URL never carries
+  the Graph token" is an assertion rather than a comment.
+
+EWS has its own `EwsExecute` seam. What remains unreachable behind all of
+them is anything whose behavior depends on bifrost-net's own retry, backoff,
+or redirect walk: every seam answers at the funnel, and none of that runs
+below it. Tracked in `TODO.md` as graph-T1.
 
 Calendar/contact primitives live in `calendar.rs` and `contacts.rs`. Graph
 calendar `color` is a provider token (not projected); reads request `Prefer:

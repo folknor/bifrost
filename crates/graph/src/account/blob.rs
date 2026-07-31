@@ -394,14 +394,7 @@ async fn fetch_raw_stream(
         "{}{prefix}/messages/{enc_message_id}/$value",
         client.api_base()
     );
-    let account_net = client.account_net().ok_or_else(|| {
-        Box::new(crate::error::GraphError::Net(bifrost_net::Error::Network {
-            message: "Graph client is not attached to an account".to_string(),
-            transmission_state: bifrost_types::TransmissionState::Unsent,
-            source: None,
-        }))
-    })?;
-    account_net
+    client
         .download_stream(&url, None)
         .await
         .map_err(|error| Box::new(crate::error::GraphError::Net(error)))
@@ -428,16 +421,7 @@ async fn fetch_blob_stream(
         "{}{prefix}/messages/{enc_message_id}/attachments/{enc_attachment_id}/$value",
         client.api_base()
     );
-    let account_net = client.account_net().ok_or_else(|| {
-        BlobFetchError::Failed(Box::new(crate::error::GraphError::Net(
-            bifrost_net::Error::Network {
-                message: "Graph client is not attached to an account".to_string(),
-                transmission_state: bifrost_types::TransmissionState::Unsent,
-                source: None,
-            },
-        )))
-    })?;
-    account_net
+    client
         .download_stream(&url, range)
         .await
         .map_err(BlobFetchError::from)
@@ -572,6 +556,184 @@ mod tests {
         .expect("handle expected");
         assert!(handle.capabilities.supports_range);
         assert_eq!(handle.size, Some(42));
+    }
+
+    /// Collect a blob/raw stream to completion. Every one of these streams
+    /// ends with exactly one `Done`, so a test that never sees it is
+    /// looking at a stream that hung or ended early.
+    async fn drain(mut stream: AccountStream<SyncEvent<Bytes>>) -> Vec<SyncEvent<Bytes>> {
+        let mut events = Vec::new();
+        while let Some(event) = stream.next().await {
+            events.push(event);
+        }
+        events
+    }
+
+    fn file_handle(message: &ObjectId, attachment: &str) -> BlobHandle {
+        blob_handle_from_graph_attachment(
+            message,
+            &json!({
+                "id": attachment,
+                "@odata.type": "#microsoft.graph.fileAttachment",
+                "size": 5
+            }),
+        )
+        .expect("file attachment handle")
+    }
+
+    /// The byte-stream leg, end to end through the download seam: the
+    /// requested window reaches the transport as the caller's `ByteRange`
+    /// (not re-derived, not dropped), the `$value` URL is the attachment's,
+    /// and every chunk the transport frames is forwarded as its own
+    /// `Batch` rather than being coalesced.
+    #[tokio::test]
+    async fn a_ranged_blob_read_forwards_every_transport_chunk() {
+        let client = GraphClient::new("token");
+        client.script_downloads([crate::client::ScriptedDownload::Chunks(vec![
+            Bytes::from_static(b"abc"),
+            Bytes::from_static(b"de"),
+        ])]);
+        let account = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
+        let message = ObjectId("AAMkmsg".to_string());
+        let handle = file_handle(&message, "att1");
+        let range = ByteRange {
+            start: 2,
+            length: Some(5),
+        };
+
+        let events = drain(open_blob_range_stream(account, handle, range)).await;
+        let chunks: Vec<Bytes> = events
+            .iter()
+            .filter_map(|event| match event {
+                SyncEvent::Batch(batch) => Some(batch.items[0].clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            chunks,
+            vec![Bytes::from_static(b"abc"), Bytes::from_static(b"de")]
+        );
+        assert!(matches!(events.last(), Some(SyncEvent::Done(None))));
+
+        let requests = client.take_download_requests();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests[0]
+                .url
+                .ends_with("/me/messages/AAMkmsg/attachments/att1/$value"),
+            "{}",
+            requests[0].url
+        );
+        assert_eq!(requests[0].range, Some(range));
+    }
+
+    /// Graph answers `405 Method Not Allowed` for an attachment that has no
+    /// `$value` byte stream at all. That is not a failure of the account -
+    /// it is "this blob is not a byte stream" - so the stream warns and
+    /// completes instead of terminating, which is what keeps a whole
+    /// hydration from dying on one unstreamable attachment.
+    #[tokio::test]
+    async fn a_405_on_the_value_endpoint_warns_instead_of_terminating() {
+        let client = GraphClient::new("token");
+        client.script_downloads([crate::client::ScriptedDownload::Failed(
+            bifrost_net::Error::Status {
+                code: reqwest::StatusCode::METHOD_NOT_ALLOWED,
+                body: Bytes::new(),
+                headers: reqwest::header::HeaderMap::new(),
+            },
+        )]);
+        let account = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
+        let message = ObjectId("AAMkmsg".to_string());
+        let handle = file_handle(&message, "att1");
+
+        let events = drain(open_blob_stream(account, handle)).await;
+        assert!(
+            matches!(events.first(), Some(SyncEvent::Warning(_))),
+            "{events:?}"
+        );
+        assert!(matches!(events.last(), Some(SyncEvent::Done(None))));
+        assert_eq!(client.take_download_requests().len(), 1);
+        // A "not a byte stream" answer is never an account failure.
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, SyncEvent::Terminated(_)))
+        );
+    }
+
+    /// A transport failure that arrives AFTER the stream opened is the one
+    /// blob failure mode the status check cannot pre-empt. The chunks that
+    /// did arrive stay delivered, and the tail is classified
+    /// `Protocol(PartialResponse)` - the caller must not mistake a
+    /// truncated blob for a complete one.
+    #[tokio::test]
+    async fn a_mid_stream_failure_keeps_delivered_chunks_and_terminates_partial() {
+        let client = GraphClient::new("token");
+        client.script_downloads([crate::client::ScriptedDownload::ChunksThenError(
+            vec![Bytes::from_static(b"head")],
+            bifrost_net::Error::Network {
+                message: "connection reset mid-body".to_string(),
+                transmission_state: bifrost_types::TransmissionState::Acknowledged,
+                source: None,
+            },
+        )]);
+        let account = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
+        let handle = file_handle(&ObjectId("AAMkmsg".to_string()), "att1");
+
+        let events = drain(open_blob_stream(account, handle)).await;
+        assert!(matches!(&events[0], SyncEvent::Batch(batch) if batch.items[0] == "head"));
+        match &events[1] {
+            SyncEvent::Terminated(error) => assert_eq!(
+                *error.kind(),
+                AccountErrorKind::Protocol(ProtocolErrorKind::PartialResponse)
+            ),
+            other => panic!("expected a partial-response termination, got {other:?}"),
+        }
+        assert!(matches!(events.last(), Some(SyncEvent::Done(None))));
+    }
+
+    /// `open_raw_rfc822` for a foreign-encoded message must open its
+    /// `$value` against the OWNER's mailbox. The primary is armed with an
+    /// EMPTY download script, so a fetch that fell back to `/me` panics on
+    /// exhaustion instead of passing quietly - the URL alone would not
+    /// prove routing here, since both clients share nothing else.
+    #[tokio::test]
+    async fn raw_rfc822_of_a_foreign_message_streams_from_the_owner_mailbox() {
+        let primary = GraphClient::new("token");
+        primary.script_downloads(std::iter::empty::<crate::client::ScriptedDownload>());
+        let shared_root = GraphClient::new("token");
+        shared_root.script_downloads([crate::client::ScriptedDownload::Chunks(vec![
+            Bytes::from_static(b"From: a@b\r\n"),
+        ])]);
+        let mailbox = "shared@contoso.com";
+        let account = GraphAccount::new_for_tests_with_shared_clients(
+            primary.clone(),
+            PushMode::GraphSubscriptions,
+            std::collections::HashMap::from([(
+                mailbox.to_string(),
+                shared_root.for_shared_mailbox(mailbox),
+            )]),
+        );
+        let scope = CursorScope::FolderType {
+            folder: super::super::foreign::encode_foreign(mailbox, "AAMkfolder"),
+            ty: bifrost_types::ObjectType::Email,
+        };
+        let foreign = super::super::foreign::encode_message_id(&scope, "AAMkmsg");
+
+        let events = drain(open_raw_rfc822(account, foreign)).await;
+        assert!(matches!(&events[0], SyncEvent::Batch(batch) if batch.items[0] == "From: a@b\r\n"));
+        assert!(matches!(events.last(), Some(SyncEvent::Done(None))));
+        assert!(primary.take_download_requests().is_empty());
+        let requests = shared_root.take_download_requests();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests[0]
+                .url
+                .ends_with("/users/shared%40contoso.com/messages/AAMkmsg/$value"),
+            "{}",
+            requests[0].url
+        );
+        assert_eq!(requests[0].range, None);
     }
 
     #[test]
