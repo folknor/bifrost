@@ -334,9 +334,10 @@ the two legs of `move_thread` / `delete_thread`) applies the same owner check
 `bulk_move` does, for the same reason: the account layer routes by the
 TARGET's owner but takes the container id as given, so a bare container id on
 a foreign route resolves in the share's namespace. Owners disagreeing is
-`Request(Malformed)` raised before `resolve_target` runs. A thread's owner is
-the primary account (threads are never foreign-routed - see nc-7); other
-target shapes are left to `resolve_target`'s `Unsupported`.
+`Request(Malformed)` raised before `resolve_target` runs. A thread's owner
+is decoded from its owner-qualified id, exactly like a message's (the
+thread-routing section below); other target shapes are left to
+`resolve_target`'s `Unsupported`.
 
 `attachment_upload` stores bytes through the upload URL, returns an opaque blob handle. `draft_create`/`update`/`discard` use `Email/set` against Drafts. `send_message` creates the draft `Email` + `EmailSubmission` in one result-referenced request, then `onSuccessUpdateEmail` to Sent (or `onSuccessDestroyEmail` when `save_to_sent == Some(false)`). `draft_send` submits an existing draft and moves it to Sent, resolving Sent and Drafts from a single `Mailbox/get` via `role_mailboxes`. A `SendRequest::send_as` routes both sets to a successfully seeded foreign account that advertises Submission, resolves a concrete foreign `Identity/get` identity, and forces its `identityId`; `As` forces From to that identity and `OnBehalfOf` adds the authenticated user's Sender when known. Scheduled foreign sends are rejected because their bare submission handles cannot be safely routed through cancel/reschedule.
 
