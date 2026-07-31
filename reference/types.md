@@ -206,7 +206,27 @@ a category.
 `Projection` controls bulk `get_stream` hydration. Typed
 `HydrationProjection` drives single-message hydration.
 `HydratedObject`, `Message`, and `ThreadHydration` keep parsed content
-separate from inventory and change signals.
+separate from inventory and change signals. `HydratedObject::blobs` remains
+the engine-side `BlobHandle` shape. User-facing `Message::attachments` uses
+`MessageAttachment`: `AttachmentSource::Blob` is an on-demand provider
+handle, `AttachmentSource::Inline` is decoded RFC 5322 content already
+carried by a hydration response, and `AttachmentSource::None` is metadata
+from a provider with no redeemable attachment handle. `Message::incomplete`
+marks a parser-limited body or attachment so consumers do not present a
+prefix as a complete message.
+
+Three unrelated "attachment" families live in this crate and only the naming
+suggests kinship:
+
+- `compose::AttachmentHandle` / `compose::AttachmentInline` - OUTBOUND, what a
+  caller hands the serializer to send.
+- `hydration::MessageAttachment` / `AttachmentSource::Inline` - INBOUND, what a
+  hydrated `Message` carries to a consumer.
+- `mime::DecodedAttachment` - the PARSER's intermediate, produced by
+  `select_body` and mapped onto `MessageAttachment` by each protocol crate. It
+  knows nothing about blobs.
+
+`AttachmentInline` and `AttachmentSource::Inline` are not related.
 
 Blob methods return byte streams. `open_blob_range` is only usable when
 advertised by `blob_range`; `open_raw_rfc822` returns verbatim
@@ -236,7 +256,8 @@ crates/types/src/
   directory.rs        directory search and groups
   calendar.rs         calendars and events
   cloud.rs            hosted attachment vocabulary
-  mime.rs             MIME-facing shared values
+  mime/               outgoing renderer plus inbound RFC 5322/MIME parser,
+                      header decoding, transfer decoding, and selection
   ids.rs              typed identifiers
   page.rs             Page envelope + SkippedScope skip lane
   error/              structured error, recovery, batch, warning model

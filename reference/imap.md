@@ -287,12 +287,18 @@ Containers use native mailbox paths as primitive/provenance ids. `containers_lis
 - Ids whose UIDVALIDITY no longer matches the selected mailbox are `Failed(Request(Malformed))` and are published *before* the hydration FETCH is issued. They are known truth already; buffering them behind a fallible command would relabel them uncertain whenever that command fails. The per-folder error path in turn only downgrades ids that still lack a published outcome (`run_folder_get` prunes the caller's unresolved set as it publishes), so a FETCH failure after the stale batch cannot put one id in two lanes.
 - A requested UID the server never returns is `Failed(NotFound(Message))` rather than being silently dropped.
 - FETCH responses are merged per UID before conversion. A server may follow the solicited response with unsolicited FLAGS-only FETCHes for the same UID; the merge adopts later `FLAGS` / `MODSEQ` and fills gaps, but never blanks a data item or body section the earlier response carried, so a trailing partial response cannot turn a complete hydration into an empty one.
-- `Projection::Preview` asks for headers plus a partial `BODY.PEEK[TEXT]`; the raw-MIME bytes concatenate the HEADER section and the TEXT section rather than keeping whichever arrived first.
-- Full hydration into `Message::body_text` still carries raw wire source; see `TODO.md` types-G2 (no shared inbound MIME parser).
+- `Projection::Preview` asks for headers plus a bounded prefix of `BODY.PEEK[]` (whole message, not the TEXT section); merged FETCH responses concatenate body-section bytes rather than keeping whichever arrived first.
+- Full and preview hydration parse the fetched RFC 5322 source through
+  `bifrost-types::mime`. Full exposes text and HTML plus attachment metadata;
+  `FullWithBlobs` carries decoded attachment bytes inline because IMAP has no
+  redeemable per-part handle. Preview fetches a whole-message prefix (at least
+  64 KiB, or the requested limit when larger) rather than `BODY[TEXT]`, so
+  multipart framing is not shown as prose. RFC 2047 and RFC 2231 decoding now
+  lives in `bifrost-types::mime`, shared with this parser.
 
 ### Blob openers
 
-`AccountCapabilities::blob_range` is `BlobRangeSupport::No` and `open_blob` / `open_blob_range` return `Unsupported`. IMAP can fetch a `BODY[]` section by range, but nothing in inventory or hydration mints a `BlobHandle` for a MIME part, so there is no handle a caller could hand back to an opener. `blob.rs` therefore serves only `open_raw_rfc822`, which streams the whole message via `BODY.PEEK[]`. Building the real capability (BODYSTRUCTURE traversal, a stable part-handle encoding, a consumer-facing projection that attaches handles) is filed as `TODO.md` imap-G1.
+`AccountCapabilities::blob_range` is `BlobRangeSupport::No` and `open_blob` / `open_blob_range` return `Unsupported`. IMAP can fetch a `BODY[]` section by range, but nothing in inventory or hydration mints a `BlobHandle` for a MIME part, so there is no handle a caller could hand back to an opener. `blob.rs` therefore serves only `open_raw_rfc822`, which streams the whole message via `BODY.PEEK[]`. Decoded attachment bytes nevertheless reach `FullWithBlobs` inline; that is not a resumable blob lane. Building the real capability (BODYSTRUCTURE traversal, a stable part-handle encoding, a consumer-facing projection that attaches handles) is filed as `TODO.md` imap-G1.
 
 ### Bandwidth metering
 

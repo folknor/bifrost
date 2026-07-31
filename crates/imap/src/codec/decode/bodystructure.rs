@@ -1,12 +1,12 @@
 //! BODYSTRUCTURE parser (RFC 3501 Section 7.4.2 / RFC 9051 Section 7.5.2).
 
-use super::encoded_words::decode_rfc2047;
+use super::decode_rfc2047;
 use super::envelope_fetch::envelope;
 #[allow(clippy::wildcard_imports)]
 use super::primitives::*;
 #[allow(clippy::wildcard_imports)]
 use super::*;
-use crate::types::rfc2231::decode_rfc2231_params;
+use bifrost_types::mime::decode_rfc2231_params;
 
 /// Maximum nesting depth for BODYSTRUCTURE parsing (defense-in-depth).
 ///

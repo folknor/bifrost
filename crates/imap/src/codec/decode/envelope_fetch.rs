@@ -1,7 +1,7 @@
 //! ENVELOPE + FETCH response parsing (RFC 3501 Section 7.4.2 / RFC 9051 Section 7.5.2).
 
 use super::bodystructure::body_structure;
-use super::encoded_words::decode_rfc2047;
+use super::decode_rfc2047;
 use super::flags_caps::flag_list;
 #[allow(clippy::wildcard_imports)]
 use super::primitives::*;

@@ -103,8 +103,9 @@ re-auditors don't re-raise them.)
   UIDVALIDITY, UID, part path, transfer encoding), and a consumer-facing
   projection that attaches those handles to hydrated MIME parts so
   `InventoryEntry::blob_id` and attachment metadata are populated.
-  Coordinate with **types-G2** so decoded MIME structure is shared
-  rather than recreated in the IMAP account. What was done instead:
+  `bifrost-types::mime` now ships the decoded MIME part tree
+  (`ParsedMessage` / `MimePart`) that any such traversal should reuse
+  rather than recreating. What was done instead:
   the capability now reports `BlobRangeSupport::No` and both openers
   return `Unsupported`, with the private blob id codec and its openers
   deleted; `open_raw_rfc822` (whole-message `BODY.PEEK[]`) is unchanged
@@ -130,10 +131,11 @@ re-auditors don't re-raise them.)
   bug-hunt ledger.)
 - **imap-T4.** (deferred, codec sweep leftovers) Cheap-to-large test
   candidates the codec sweep named but did not build:
-  `decode_rfc2231_params` (`types/rfc2231.rs`) is fed attacker-controlled
-  `Content-Type` parameters and does continuation reassembly - the classic
-  quadratic / unbounded-allocation shape - and was never read closely;
-  `parse_encoded_word_inner` decodes arbitrary charset labels via
+  `decode_rfc2231_params` (now `bifrost-types::mime::params`, moved out
+  of the IMAP crate; its quadratic group-lookup and rescan were rewritten
+  to O(1) as part of the move) still needs a structure-aware BODYSTRUCTURE
+  fuzz pass, unbuilt here; `parse_encoded_word_inner` (now
+  `bifrost-types::mime::words`) decodes arbitrary charset labels via
   `encoding_rs` (linear and well-audited, but a 100 KB base64 payload in a
   legacy multi-byte charset expands several-fold and nothing caps the
   resulting subject length); the `skip_tagged_ext_simple` terminator
@@ -410,29 +412,6 @@ Surfaced while authoring `reference/error-model.md` (a read of
   cause may match perfectly; the actual fault is the throttle scope.
   Add a dedicated `ThrottleScopeNotApplicable` build-error variant so
   the producer is pointed at the right thing.
-- **types-G2.** (gap, cross-crate prerequisite) `bifrost-types::mime`
-  has no inbound MIME parser: it serializes outgoing RFC 5322 messages
-  only. Every account crate that hydrates a full message therefore has
-  no shared way to turn fetched octets into decoded text, HTML, and
-  attachments. Symptom in bifrost-imap (`account/pim.rs`,
-  `attrs_for_hydration` / `fetch_to_message`): full hydration fetches
-  `BODY[]` and stores the entire raw wire message, lossy-UTF-8 decoded,
-  in `Message::body_text`; `body_html` is always `None` and attachments
-  are always empty, so multipart, base64, and quoted-printable messages
-  surface wire source instead of content. What bifrost-types would need
-  to ship: a parser over raw RFC 5322 octets producing the header set,
-  a decoded part tree (content-type, charset, disposition, filename,
-  cid), transfer-decoding for base64 and quoted-printable, charset
-  decoding to UTF-8, and a text/HTML body selection rule - the inbound
-  mirror of the existing outbound serializer, so IMAP, JMAP, Graph, and
-  Google all decode identically. What was done locally: nothing beyond
-  documenting the defect; the bug is pinned by the bifrost-imap test
-  `full_hydration_puts_the_whole_raw_message_in_body_text`. What remains
-  wrong: full hydration still returns raw source. A narrower
-  `BODY[TEXT]` change would only drop the headers and stay wrong for
-  multipart and transfer encodings, so it was deliberately not taken.
-  Do not build the parser as a side effect of an IMAP fix; it is a
-  shared-crate design item.
 - **types-N3.** (nit) `RequestCause::InvalidArgument` has no distinct
   `AccountErrorKind`: `kind_matches_cause` maps it onto
   `Request(Malformed)`, and message-key / recovery treat it

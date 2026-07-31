@@ -3,11 +3,12 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bifrost_types::{
-    AccountError, AccountFuture, AccountOperation, AccountStream, BlobCapabilities, BlobEncoding,
-    BlobHandle, BlobId, Container, ContainerId, ContainerKind, ContainerList, ContainerNamespace,
-    ContainerRights, FolderRole, HydrationProjection, Importance, LabelId, Message, MutationTarget,
-    ObjectId, Page, Provenance, QuotaInfo, SearchFilter, SearchRequest, SkippedScope,
-    ThreadHydration, ThreadId, VacationConfig,
+    AccountError, AccountFuture, AccountOperation, AccountStream, AttachmentSource,
+    BlobCapabilities, BlobEncoding, BlobHandle, BlobId, Container, ContainerId, ContainerKind,
+    ContainerList, ContainerNamespace, ContainerRights, FolderRole, HydrationProjection,
+    Importance, LabelId, Message, MessageAttachment, MutationTarget, ObjectId, Page, Provenance,
+    QuotaInfo, SearchFilter, SearchRequest, SkippedScope, ThreadHydration, ThreadId,
+    VacationConfig,
 };
 /// Convert a crate-internal error to `AccountError` with the correct
 /// `AccountOperation` for this call site. Every call site in this
@@ -1237,7 +1238,7 @@ fn qualify_foreign_message_ids(
     id: &mut ObjectId,
     thread_id: Option<&mut ThreadId>,
     containers: &mut [ContainerId],
-    attachments: &mut [BlobHandle],
+    attachments: &mut [MessageAttachment],
     account: &str,
 ) {
     id.0 = super::foreign::encode_object(account, &id.0);
@@ -1251,7 +1252,9 @@ fn qualify_foreign_message_ids(
         *container = ContainerId(super::foreign::encode_foreign(account, &container.0).0);
     }
     for attachment in attachments {
-        attachment.id = BlobId(super::foreign::encode_object(account, &attachment.id.0));
+        if let AttachmentSource::Blob(blob) = &mut attachment.source {
+            blob.id = BlobId(super::foreign::encode_object(account, &blob.id.0));
+        }
     }
 }
 
@@ -2806,6 +2809,8 @@ fn body_properties() -> Vec<BodyProperty> {
         BodyProperty::Size,
         BodyProperty::Name,
         BodyProperty::Type,
+        BodyProperty::Cid,
+        BodyProperty::Disposition,
     ]
 }
 
@@ -2893,11 +2898,12 @@ fn email_to_message(email: Email, projection: HydrationProjection) -> Message {
             .attachments()
             .unwrap_or_default()
             .iter()
-            .filter_map(blob_handle_from_part)
+            .filter_map(attachment_from_part)
             .collect(),
         size_bytes: u64::try_from(email.size()).ok(),
         in_reply_to: email.in_reply_to().and_then(|ids| ids.first().cloned()),
         references: email.references().map(<[_]>::to_vec).unwrap_or_default(),
+        incomplete: false,
     }
 }
 
@@ -2917,19 +2923,29 @@ fn collect_body_values(parts: Option<&[EmailBodyPart]>, email: &Email) -> Option
     }
 }
 
-fn blob_handle_from_part(part: &EmailBodyPart) -> Option<BlobHandle> {
+fn attachment_from_part(part: &EmailBodyPart) -> Option<MessageAttachment> {
     let id = part.blob_id()?.to_string();
-    Some(BlobHandle {
-        id: BlobId(id),
-        size: u64::try_from(part.size()).ok(),
-        content_type: part.content_type().map(str::to_string),
-        digest: None,
-        capabilities: BlobCapabilities {
-            supports_range: false,
-            supports_parallel: false,
-            digest_available_pre_download: false,
-            encoding: BlobEncoding::Raw8Bit,
-        },
+    let size = u64::try_from(part.size()).ok();
+    let content_type = part.content_type().map(str::to_string);
+    Some(MessageAttachment {
+        filename: part.name().map(str::to_string),
+        content_type: content_type.clone(),
+        content_id: part.content_id().map(str::to_string),
+        inline: part.content_disposition() == Some("inline"),
+        size,
+        source: AttachmentSource::Blob(BlobHandle {
+            id: BlobId(id),
+            size,
+            content_type,
+            digest: None,
+            capabilities: BlobCapabilities {
+                supports_range: false,
+                supports_parallel: false,
+                digest_available_pre_download: false,
+                encoding: BlobEncoding::Raw8Bit,
+            },
+        }),
+        truncated: false,
     })
 }
 
@@ -2969,22 +2985,41 @@ mod tests {
     // the foreign inventory minted, or the consumer's follow-up blob read
     // and container join both address the primary account.
     #[test]
-    fn foreign_hydration_requalifies_message_container_and_blob_ids() {
+    fn rebase_foreign_requalifies_message_container_and_blob_ids() {
         let mut id = ObjectId("M1".to_string());
         let mut thread_id = ThreadId("T1".to_string());
         let mut containers = vec![ContainerId("inbox".to_string())];
-        let mut attachments = vec![BlobHandle {
-            id: BlobId("B1".to_string()),
-            size: None,
-            content_type: None,
-            digest: None,
-            capabilities: BlobCapabilities {
-                supports_range: false,
-                supports_parallel: false,
-                digest_available_pre_download: false,
-                encoding: BlobEncoding::Raw8Bit,
+        let mut attachments = vec![
+            MessageAttachment {
+                filename: None,
+                content_type: None,
+                content_id: None,
+                inline: false,
+                size: None,
+                source: AttachmentSource::Blob(BlobHandle {
+                    id: BlobId("B1".to_string()),
+                    size: None,
+                    content_type: None,
+                    digest: None,
+                    capabilities: BlobCapabilities {
+                        supports_range: false,
+                        supports_parallel: false,
+                        digest_available_pre_download: false,
+                        encoding: BlobEncoding::Raw8Bit,
+                    },
+                }),
+                truncated: false,
             },
-        }];
+            MessageAttachment {
+                filename: None,
+                content_type: None,
+                content_id: None,
+                inline: false,
+                size: Some(6),
+                source: AttachmentSource::Inline(Bytes::from_static(b"inline")),
+                truncated: false,
+            },
+        ];
 
         qualify_foreign_message_ids(
             &mut id,
@@ -3005,9 +3040,16 @@ mod tests {
             super::super::foreign::encode_object("acct-9", "T1")
         );
         assert_eq!(
-            attachments[0].id.0,
+            match &attachments[0].source {
+                AttachmentSource::Blob(blob) => blob.id.0.as_str(),
+                _ => panic!("blob attachment must stay blob-backed"),
+            },
             super::super::foreign::encode_object("acct-9", "B1")
         );
+        assert!(matches!(
+            &attachments[1].source,
+            AttachmentSource::Inline(bytes) if bytes == &Bytes::from_static(b"inline")
+        ));
         // A container id is a mailbox id, so it rides the FOLDER namespace
         // `containers_list` and the qualified memberships key on -
         // byte-identical, or the join fails.
@@ -3015,6 +3057,36 @@ mod tests {
             containers[0].0,
             super::super::foreign::encode_foreign("acct-9", "inbox").0
         );
+    }
+
+    #[test]
+    fn attachment_from_part_fills_cid_and_disposition() {
+        let part: EmailBodyPart = serde_json::from_value(serde_json::json!({
+            "blobId": "blob-1",
+            "size": 42,
+            "name": "logo.png",
+            "type": "image/png",
+            "cid": "logo@example.test",
+            "disposition": "inline"
+        }))
+        .expect("attachment body part deserializes");
+
+        let attachment = attachment_from_part(&part).expect("blob-backed attachment");
+        assert_eq!(attachment.filename.as_deref(), Some("logo.png"));
+        assert_eq!(attachment.content_type.as_deref(), Some("image/png"));
+        assert_eq!(attachment.content_id.as_deref(), Some("logo@example.test"));
+        assert!(attachment.inline);
+        assert_eq!(attachment.size, Some(42));
+        assert!(!attachment.truncated);
+        assert!(matches!(
+            attachment.source,
+            AttachmentSource::Blob(BlobHandle { id, size: Some(42), content_type: Some(content_type), .. })
+                if id.0 == "blob-1" && content_type == "image/png"
+        ));
+
+        let requested = body_properties();
+        assert!(requested.contains(&BodyProperty::Cid));
+        assert!(requested.contains(&BodyProperty::Disposition));
     }
 
     /// The routing decision behind every thread-keyed door.

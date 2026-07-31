@@ -41,7 +41,6 @@ use crate::types::response::{
 use crate::types::validated::MailboxName;
 
 mod bodystructure;
-mod encoded_words;
 mod envelope_fetch;
 mod extensions;
 mod flags_caps;
@@ -56,14 +55,12 @@ mod search_response;
 mod tests;
 
 // Re-export pub(crate) items that were visible from the original module.
-pub(crate) use encoded_words::decode_rfc2047;
+pub(crate) use bifrost_types::mime::decode_encoded_words as decode_rfc2047;
 
 // Re-export sub-module items so they are visible within this module's namespace
 // (required for tests and cross-module function calls via `use super::*`).
 #[allow(unused_imports)]
 pub(super) use bodystructure::*;
-#[allow(unused_imports)]
-pub(super) use encoded_words::*;
 #[allow(unused_imports)]
 pub(super) use envelope_fetch::*;
 #[allow(unused_imports)]

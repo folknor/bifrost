@@ -898,8 +898,11 @@ async fn message_from_gmail(
         }
         _ => body_parts(message.payload.as_ref()),
     };
-    let attachments = if matches!(projection, HydrationProjection::FullWithBlobs) {
-        blobs::blob_handles_for_message(message)
+    let attachments = if matches!(
+        projection,
+        HydrationProjection::Full | HydrationProjection::FullWithBlobs
+    ) {
+        blobs::attachments_for_message(message)
     } else {
         Vec::new()
     };
@@ -926,6 +929,7 @@ async fn message_from_gmail(
         body_text,
         body_html,
         attachments,
+        incomplete: false,
         size_bytes: message.size_estimate.and_then(non_negative_i64),
         in_reply_to: header_from(headers, "In-Reply-To"),
         references: references_from_header(header_from(headers, "References").as_deref()),
@@ -1363,6 +1367,48 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    fn gmail_message(value: serde_json::Value) -> GmailMessage {
+        serde_json::from_value(value).expect("message fixture deserializes")
+    }
+
+    #[tokio::test]
+    async fn hydrate_full_reports_attachment_metadata_without_bytes() {
+        let message = gmail_message(serde_json::json!({
+            "id": "m1",
+            "threadId": "t1",
+            "payload": {
+                "mimeType": "multipart/mixed",
+                "headers": [],
+                "parts": [{
+                    "mimeType": "image/png",
+                    "filename": "chart.png",
+                    "headers": [
+                        { "name": "Content-ID", "value": "<chart-image>" },
+                        { "name": "Content-Disposition", "value": "inline; filename=chart.png" }
+                    ],
+                    "body": { "attachmentId": "att-1", "size": 42 }
+                }]
+            }
+        }));
+
+        let hydrated = message_from_gmail(&[], &message, HydrationProjection::Full)
+            .await
+            .expect("full hydration maps the parsed Gmail payload");
+
+        assert_eq!(hydrated.attachments.len(), 1);
+        let attachment = &hydrated.attachments[0];
+        assert_eq!(attachment.filename.as_deref(), Some("chart.png"));
+        assert_eq!(attachment.content_type.as_deref(), Some("image/png"));
+        assert_eq!(attachment.content_id.as_deref(), Some("chart-image"));
+        assert!(attachment.inline);
+        assert_eq!(attachment.size, Some(42));
+        assert!(!attachment.truncated);
+        assert!(matches!(
+            &attachment.source,
+            bifrost_types::AttachmentSource::Blob(_)
+        ));
+    }
 
     #[test]
     fn scheduled_send_request_is_unsupported() {

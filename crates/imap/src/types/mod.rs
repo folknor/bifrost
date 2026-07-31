@@ -22,7 +22,6 @@ pub(crate) mod mailbox;
 pub(crate) mod notify;
 mod profile;
 pub(crate) mod response;
-pub(crate) mod rfc2231;
 pub(crate) mod search;
 mod secret;
 mod sync;

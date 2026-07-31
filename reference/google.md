@@ -636,9 +636,14 @@ is false - the builder always sets it false for Gmail blobs. The
 range-supporting branch (slicing the decoded buffer) exists for trait
 symmetry but is unreachable.
 
-`blob_handles_for_message` walks the MIME tree, surfacing any part
-whose `body.attachment_id` is set. Inline bodies (no attachment id)
-are not surfaced.
+`attachments_for_message` walks the MIME tree, surfacing any part
+whose `body.attachment_id` is set as a `MessageAttachment` with
+`source: AttachmentSource::Blob(handle)`. Inline bodies (no attachment
+id) are not surfaced. `message_from_gmail` calls it under `Full` and
+`FullWithBlobs`, matching the cross-provider rule that `Full` reports
+attachment metadata without bytes and only `FullWithBlobs` implies
+fetchable content. `blob_handles_for_message` remains as the
+`Vec<BlobHandle>`-only helper `open_blob`'s tests build against.
 
 ## Error translation
 

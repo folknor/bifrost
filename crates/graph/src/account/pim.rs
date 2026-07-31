@@ -4,11 +4,11 @@ use std::time::SystemTime;
 use base64::Engine;
 use bifrost_types::{
     AccessErrorKind, AccountError, AccountErrorKind, AccountOperation, Address, AttachmentInline,
-    Container, ContainerContentClass, ContainerId, ContainerKind, ContainerList,
+    AttachmentSource, Container, ContainerContentClass, ContainerId, ContainerKind, ContainerList,
     ContainerNamespace, ContainerRights, DraftHandle, DraftPatch, ErrorScope, FolderId, FolderRole,
     HydrationProjection, Identity, IdentityId, Importance, LabelId, MailboxId, Message,
-    MutationTarget, ObjectId, Page, ProtocolErrorKind, ProtocolKind, Provenance, SearchFilter,
-    SearchRequest, SendAs, SkippedScope, ThreadHydration, ThreadId, VacationConfig,
+    MessageAttachment, MutationTarget, ObjectId, Page, ProtocolErrorKind, ProtocolKind, Provenance,
+    SearchFilter, SearchRequest, SendAs, SkippedScope, ThreadHydration, ThreadId, VacationConfig,
 };
 use chrono::TimeZone;
 use serde::{Deserialize, Serialize};
@@ -1024,8 +1024,12 @@ pub(crate) async fn message_hydrate(
     if let Some(folder) = ews_read_folder(&message) {
         return public_message_hydrate(&account, &message, &folder, projection).await;
     }
-    let value =
-        fetch_message_value(&account, &message, hydrate_select(expand_blobs(projection))).await?;
+    let value = fetch_message_value(
+        &account,
+        &message,
+        hydrate_select(includes_attachment_metadata(projection)),
+    )
+    .await?;
     let owner = super::foreign::parse_message_id(&message)
         .owner()
         .map(str::to_string);
@@ -1091,9 +1095,10 @@ async fn public_message_hydrate(
 ///
 /// EWS returns a parsed body, not MIME octets, so `body_html` carries the
 /// HTML part and `body_text` the `BodyPreview` text. Attachments ride out as
-/// EWS blob handles (`GetAttachment` fetches the bytes), and the containing
-/// public folder is the item's one membership. Pure over the already-fetched
-/// item so the projection is unit-pinnable without a live EWS server.
+/// metadata plus EWS blob handles (`GetAttachment` fetches the bytes), and
+/// the containing public folder is the item's one membership. Pure over the
+/// already-fetched item so the projection is unit-pinnable without a live EWS
+/// server.
 fn message_from_ews_item(
     id: ObjectId,
     item: &crate::ews::EwsItem,
@@ -1110,10 +1115,10 @@ fn message_from_ews_item(
         ),
         _ => (item.body_preview.clone(), item.body_html.clone()),
     };
-    let attachments = if expand_blobs(projection) {
+    let attachments = if includes_attachment_metadata(projection) {
         item.attachments
             .iter()
-            .map(|attachment| super::blob::blob_handle_from_ews_attachment(&id, attachment))
+            .map(|attachment| message_attachment_from_ews_attachment(&id, attachment))
             .collect()
     } else {
         Vec::new()
@@ -1149,6 +1154,7 @@ fn message_from_ews_item(
         body_text,
         body_html,
         attachments,
+        incomplete: false,
         size_bytes: None,
         in_reply_to: None,
         references: Vec::new(),
@@ -2401,16 +2407,19 @@ fn select_query(select: &str) -> String {
     }
 }
 
-fn hydrate_select(expand_attachments: bool) -> &'static str {
-    if expand_attachments {
+fn hydrate_select(include_attachments: bool) -> &'static str {
+    if include_attachments {
         "$select=id,conversationId,subject,bodyPreview,body,uniqueBody,from,toRecipients,ccRecipients,bccRecipients,replyTo,receivedDateTime,sentDateTime,parentFolderId,isRead,importance,categories,flag,internetMessageHeaders,internetMessageId,hasAttachments,changeKey&$expand=attachments"
     } else {
         "id,conversationId,subject,bodyPreview,body,uniqueBody,from,toRecipients,ccRecipients,bccRecipients,replyTo,receivedDateTime,sentDateTime,parentFolderId,isRead,importance,categories,flag,internetMessageHeaders,internetMessageId,hasAttachments,changeKey"
     }
 }
 
-fn expand_blobs(projection: HydrationProjection) -> bool {
-    matches!(projection, HydrationProjection::FullWithBlobs)
+fn includes_attachment_metadata(projection: HydrationProjection) -> bool {
+    matches!(
+        projection,
+        HydrationProjection::Full | HydrationProjection::FullWithBlobs
+    )
 }
 
 fn message_from_value(
@@ -2446,14 +2455,16 @@ fn message_from_value(
                 .map(str::to_string)
         });
     }
-    let attachments = if expand_blobs(projection) {
+    let attachments = if includes_attachment_metadata(projection) {
         value
             .get("attachments")
             .and_then(Value::as_array)
             .map(|attachments| {
                 attachments
                     .iter()
-                    .filter_map(|attachment| blob_handle_from_graph_attachment(&id, attachment))
+                    .filter_map(|attachment| {
+                        message_attachment_from_graph_attachment(&id, attachment)
+                    })
                     .collect()
             })
             .unwrap_or_default()
@@ -2496,12 +2507,67 @@ fn message_from_value(
         body_text,
         body_html,
         attachments,
+        incomplete: false,
         size_bytes: value.get("size").and_then(Value::as_u64),
         in_reply_to: internet_header(value, "In-Reply-To"),
         references: internet_header(value, "References")
             .map(|header| header.split_whitespace().map(str::to_string).collect())
             .unwrap_or_default(),
     })
+}
+
+/// Map Graph's attachment descriptor onto the user-facing attachment shape.
+///
+/// Graph exposes attachment bytes through `open_blob`, so both full hydration
+/// projections retain the handle instead of inlining potentially large files.
+/// Metadata is carried separately because `BlobHandle` deliberately describes
+/// only the byte-fetch capability, not a rendered attachment.
+fn message_attachment_from_graph_attachment(
+    message_id: &ObjectId,
+    attachment: &Value,
+) -> Option<MessageAttachment> {
+    let handle = blob_handle_from_graph_attachment(message_id, attachment)?;
+    Some(MessageAttachment {
+        filename: attachment
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        content_type: attachment
+            .get("contentType")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        content_id: attachment
+            .get("contentId")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        inline: attachment
+            .get("isInline")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        size: attachment.get("size").and_then(Value::as_u64),
+        source: AttachmentSource::Blob(handle),
+        truncated: false,
+    })
+}
+
+/// Map an EWS public-folder attachment descriptor onto the shared attachment
+/// shape. EWS exposes the same filename, media type, inline flag, and size as
+/// Graph REST, but its `GetItem` descriptor has no Content-ID field.
+fn message_attachment_from_ews_attachment(
+    message_id: &ObjectId,
+    attachment: &crate::ews::EwsAttachment,
+) -> MessageAttachment {
+    MessageAttachment {
+        filename: attachment.name.clone(),
+        content_type: attachment.content_type.clone(),
+        content_id: None,
+        inline: attachment.is_inline,
+        size: attachment.size,
+        source: AttachmentSource::Blob(super::blob::blob_handle_from_ews_attachment(
+            message_id, attachment,
+        )),
+        truncated: false,
+    }
 }
 
 /// Map Graph's single-valued `importance` wire field
@@ -3026,6 +3092,68 @@ mod tests {
         );
         assert!(message.body_text.is_none());
         assert!(message.body_html.is_none());
+    }
+
+    #[test]
+    fn ews_full_hydration_reports_attachment_metadata_with_blob_source() {
+        let folder = FolderId("AAMkPF=".to_string());
+        let id = encode_public_item_id(&folder, "notice-1");
+        let mut item = ews_item();
+        item.attachments.push(crate::ews::EwsAttachment {
+            attachment_id: "att-1".to_string(),
+            name: Some("notice.pdf".to_string()),
+            content_type: Some("application/pdf".to_string()),
+            size: Some(2048),
+            is_inline: true,
+            is_item: false,
+        });
+
+        let message = message_from_ews_item(id, &item, &folder, HydrationProjection::Full);
+        assert_eq!(message.attachments.len(), 1);
+        let attachment = &message.attachments[0];
+        assert_eq!(attachment.filename.as_deref(), Some("notice.pdf"));
+        assert_eq!(attachment.content_type.as_deref(), Some("application/pdf"));
+        assert_eq!(attachment.content_id, None);
+        assert!(attachment.inline);
+        assert_eq!(attachment.size, Some(2048));
+        assert!(matches!(&attachment.source, AttachmentSource::Blob(_)));
+        assert!(!attachment.truncated);
+    }
+
+    #[test]
+    fn graph_full_hydration_reports_attachment_metadata_with_blob_source() {
+        let value = json!({
+            "id": "message-1",
+            "attachments": [{
+                "id": "attachment-1",
+                "@odata.type": "#microsoft.graph.fileAttachment",
+                "name": "logo.png",
+                "contentType": "image/png",
+                "contentId": "logo@contoso.com",
+                "isInline": true,
+                "size": 512
+            }]
+        });
+
+        for projection in [
+            HydrationProjection::Full,
+            HydrationProjection::FullWithBlobs,
+        ] {
+            let message = message_from_value(&value, projection, None).expect("message projects");
+            assert_eq!(message.attachments.len(), 1);
+            let attachment = &message.attachments[0];
+            assert_eq!(attachment.filename.as_deref(), Some("logo.png"));
+            assert_eq!(attachment.content_type.as_deref(), Some("image/png"));
+            assert_eq!(attachment.content_id.as_deref(), Some("logo@contoso.com"));
+            assert!(attachment.inline);
+            assert_eq!(attachment.size, Some(512));
+            assert!(matches!(&attachment.source, AttachmentSource::Blob(_)));
+            assert!(!attachment.truncated);
+        }
+
+        let headers = message_from_value(&value, HydrationProjection::Headers, None)
+            .expect("headers project");
+        assert!(headers.attachments.is_empty());
     }
 
     fn shared_account() -> GraphAccount {

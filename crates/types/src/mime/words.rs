@@ -4,7 +4,7 @@
 ///
 /// Handles `=?charset?encoding?text?=` sequences. Non-UTF-8 charsets are
 /// lossy-converted to UTF-8 via `encoding_rs`.
-pub(crate) fn decode_rfc2047(input: &[u8]) -> String {
+pub fn decode_encoded_words(input: &[u8]) -> String {
     let s = String::from_utf8_lossy(input);
     decode_rfc2047_str(&s)
 }
@@ -19,7 +19,7 @@ fn decode_rfc2047_str(input: &str) -> String {
         let before = &remaining[..start];
 
         // RFC 2047 Section 6.2: whitespace between adjacent encoded words
-        // is ignored  -  but ONLY when both adjacent tokens are valid encoded
+        // is ignored - but ONLY when both adjacent tokens are valid encoded
         // words.  We must defer the decision to drop whitespace until after
         // we know whether the upcoming `=?...?=` token decodes successfully.
         // RFC 2047 Section 6.3: unrecognized encoded words are displayed as
@@ -52,7 +52,7 @@ fn decode_rfc2047_str(input: &str) -> String {
         }
         remaining = saved_after_prefix;
 
-        // Not a valid encoded word  -  restore deferred whitespace before
+        // Not a valid encoded word - restore deferred whitespace before
         // emitting the literal `=?` prefix (RFC 2047 Section 6.3).
         if ws_deferred {
             result.push_str(before);
@@ -145,15 +145,7 @@ fn parse_encoded_word_inner(remaining: &mut &str) -> Option<String> {
     if charset_upper == "UTF-8" || charset_upper == "US-ASCII" || charset_upper == "ASCII" {
         Some(String::from_utf8_lossy(&raw_bytes).into_owned())
     } else {
-        // Use encoding_rs for other charsets
-        let encoding = encoding_rs::Encoding::for_label(charset.as_bytes())?;
-        // Use decode_without_bom_handling to preserve a leading U+FEFF if
-        // it is genuinely part of the value rather than a BOM artefact.
-        // RFC 2047 encoded words are header text fragments (Section 2),
-        // not standalone documents, so stripping a leading FEFF would
-        // corrupt legitimate content.
-        let (cow, _) = encoding.decode_without_bom_handling(&raw_bytes);
-        Some(cow.into_owned())
+        super::charset::decode_charset_opt(charset, &raw_bytes)
     }
 }
 
@@ -173,7 +165,7 @@ const ENCODED_WORD_SCAN_LIMIT: usize = 998;
 /// cannot cross whitespace, controls, DEL, or UTF-8, and bytes outside
 /// `33..=126` are never inside a multi-byte `char`, so both bounds land on a
 /// `char` boundary.
-pub(super) fn encoded_word_window(input: &str) -> &str {
+fn encoded_word_window(input: &str) -> &str {
     let len = input
         .bytes()
         .take(ENCODED_WORD_SCAN_LIMIT)
@@ -185,10 +177,10 @@ pub(super) fn encoded_word_window(input: &str) -> &str {
 /// Decode Q-encoding per RFC 2047 Section 4.2.
 ///
 /// Handles `=XX` hex-encoded bytes, `_` as space. Also strips `=\r\n` / `=\n`
-/// sequences as a Postel's-law leniency  -  RFC 2047 Section 4.2 Q-encoding does
+/// sequences as a Postel's-law leniency - RFC 2047 Section 4.2 Q-encoding does
 /// NOT define soft line breaks (that is a Quoted-Printable concept from
 /// RFC 2045 Section 6.7).
-pub(super) fn decode_q_encoding(input: &str) -> Vec<u8> {
+fn decode_q_encoding(input: &str) -> Vec<u8> {
     let mut result = Vec::new();
     let bytes = input.as_bytes();
     let mut i = 0;
@@ -205,8 +197,10 @@ pub(super) fn decode_q_encoding(input: &str) -> Vec<u8> {
                     i += 2;
                 } else if i + 2 < bytes.len() {
                     // Hex-encoded byte
-                    if let (Some(hi), Some(lo)) = (hex_digit(bytes[i + 1]), hex_digit(bytes[i + 2]))
-                    {
+                    if let (Some(hi), Some(lo)) = (
+                        super::charset::hex_digit(bytes[i + 1]),
+                        super::charset::hex_digit(bytes[i + 2]),
+                    ) {
                         result.push(hi << 4 | lo);
                         i += 3;
                     } else {
@@ -214,7 +208,7 @@ pub(super) fn decode_q_encoding(input: &str) -> Vec<u8> {
                         i += 1;
                     }
                 } else {
-                    // Trailing '=' with only one char left  -  emit literally
+                    // Trailing '=' with only one char left - emit literally
                     result.push(b'=');
                     i += 1;
                 }
@@ -233,12 +227,6 @@ pub(super) fn decode_q_encoding(input: &str) -> Vec<u8> {
     result
 }
 
-/// Decode a single hex digit (RFC 2047 Section 4.2 Q-encoding).
-pub(super) fn hex_digit(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        _ => None,
-    }
-}
+#[cfg(test)]
+#[path = "words_tests.rs"]
+mod tests;

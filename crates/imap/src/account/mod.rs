@@ -382,6 +382,9 @@ impl Account for ImapAccount {
     }
 
     // IMAP does not yet mint BlobHandles from BODYSTRUCTURE part metadata.
+    // Decoded attachment BYTES do reach the consumer under FullWithBlobs, as
+    // AttachmentSource::Inline on the parsed message; a resumable per-part
+    // HANDLE is the separate capability that stays unsupported.
     fn open_blob(&self, _handle: BlobHandle) -> AccountStream<SyncEvent<bytes::Bytes>> {
         unsupported_stream(AccountOperation::OpenBlob)
     }

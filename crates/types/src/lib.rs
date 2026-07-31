@@ -80,7 +80,10 @@ pub use compose::{
 
 // Shared RFC 5322 / MIME assembler.
 pub use mime::{
-    ComposedMessage, RenderedMessage, SubmissionEnvelope, render_rfc5322, send_request_to_rfc5322,
+    ComposedMessage, DecodedAttachment, DecodedBody, Defect, MimeLimits, MimePart, ParsedMessage,
+    PartBody, RenderedMessage, SelectOptions, SubmissionEnvelope, TransferEncoding,
+    decode_encoded_words, parse_message, render_rfc5322, select_body, select_body_with,
+    send_request_to_rfc5322,
 };
 
 // Container / label / mutation-target types.
@@ -135,7 +138,9 @@ pub use events::{
 };
 
 // Threading + hydration types.
-pub use hydration::{HydrationProjection, Importance, Message, ThreadHydration};
+pub use hydration::{
+    AttachmentSource, HydrationProjection, Importance, Message, MessageAttachment, ThreadHydration,
+};
 
 // Newtype ids.
 pub use ids::{

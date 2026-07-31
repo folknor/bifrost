@@ -11,8 +11,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use bifrost_types::{
-    AccountError, AccountOperation, AccountStream, Batch, BlobCapabilities, BlobEncoding,
-    BlobHandle, BlobId, ByteRange, ObjectId, PageBoundary, SyncEvent,
+    AccountError, AccountOperation, AccountStream, AttachmentSource, Batch, BlobCapabilities,
+    BlobEncoding, BlobHandle, BlobId, ByteRange, MessageAttachment, ObjectId, PageBoundary,
+    SyncEvent,
 };
 use bytes::Bytes;
 use futures::{StreamExt, stream};
@@ -124,20 +125,36 @@ fn finish_blob_event(event: SyncEvent<Bytes>) -> impl futures::Stream<Item = Syn
     stream::iter(events)
 }
 
-pub(crate) fn blob_handles_for_message(message: &GmailMessage) -> Vec<BlobHandle> {
-    let mut handles = Vec::new();
+pub(crate) fn attachments_for_message(message: &GmailMessage) -> Vec<MessageAttachment> {
+    let mut attachments = Vec::new();
     if let Some(payload) = &message.payload {
-        collect_blob_handles(&message.id, payload, &mut handles);
+        collect_attachments(&message.id, payload, &mut attachments);
     }
-    handles
+    attachments
 }
 
-fn collect_blob_handles(message_id: &str, part: &GmailPayload, handles: &mut Vec<BlobHandle>) {
+/// The engine's `HydratedObject` still carries its binary blob shape.
+/// User-facing `Message` hydration uses `attachments_for_message` instead.
+pub(crate) fn blob_handles_for_message(message: &GmailMessage) -> Vec<BlobHandle> {
+    attachments_for_message(message)
+        .into_iter()
+        .filter_map(|attachment| match attachment.source {
+            AttachmentSource::Blob(handle) => Some(handle),
+            _ => None,
+        })
+        .collect()
+}
+
+fn collect_attachments(
+    message_id: &str,
+    part: &GmailPayload,
+    attachments: &mut Vec<MessageAttachment>,
+) {
     if let Some(body) = &part.body
         && let Some(attachment_id) = &body.attachment_id
     {
         let size = u64::try_from(body.size).ok();
-        handles.push(BlobHandle {
+        let handle = BlobHandle {
             id: encode_blob_id(message_id, attachment_id),
             size,
             content_type: Some(part.mime_type.clone()),
@@ -148,11 +165,40 @@ fn collect_blob_handles(message_id: &str, part: &GmailPayload, handles: &mut Vec
                 digest_available_pre_download: false,
                 encoding: BlobEncoding::Base64Url,
             },
+        };
+        attachments.push(MessageAttachment {
+            filename: (!part.filename.is_empty()).then(|| part.filename.clone()),
+            content_type: Some(part.mime_type.to_ascii_lowercase()),
+            content_id: content_id_value(&part.headers),
+            inline: content_disposition_inline(&part.headers),
+            size,
+            source: AttachmentSource::Blob(handle),
+            truncated: false,
         });
     }
     for child in &part.parts {
-        collect_blob_handles(message_id, child, handles);
+        collect_attachments(message_id, child, attachments);
     }
+}
+
+fn content_id_value(headers: &[crate::types::GmailHeader]) -> Option<String> {
+    headers
+        .iter()
+        .find(|header| header.name.eq_ignore_ascii_case("Content-ID"))
+        .map(|header| {
+            header
+                .value
+                .trim()
+                .trim_matches(|character| character == '<' || character == '>')
+                .to_string()
+        })
+}
+
+fn content_disposition_inline(headers: &[crate::types::GmailHeader]) -> bool {
+    headers
+        .iter()
+        .find(|header| header.name.eq_ignore_ascii_case("Content-Disposition"))
+        .is_some_and(|header| header.value.to_ascii_lowercase().contains("inline"))
 }
 
 fn encode_blob_id(message_id: &str, attachment_id: &str) -> BlobId {
@@ -212,16 +258,16 @@ mod tests {
     }
 
     #[test]
-    fn a_message_without_a_payload_has_no_blobs() {
+    fn a_message_without_a_payload_has_no_attachments() {
         let msg = message(json!({ "id": "m1", "threadId": "t1" }));
-        assert!(blob_handles_for_message(&msg).is_empty());
+        assert!(attachments_for_message(&msg).is_empty());
     }
 
-    /// Only parts carrying an `attachmentId` become blob handles.
+    /// Only parts carrying an `attachmentId` become attachments.
     /// Inline bodies (Gmail returns their bytes in `body.data`) are
-    /// deliberately not surfaced as blobs.
+    /// deliberately not surfaced as attachments.
     #[test]
-    fn inline_bodies_without_an_attachment_id_are_not_blobs() {
+    fn inline_bodies_without_an_attachment_id_are_not_attachments() {
         let msg = message(json!({
             "id": "m2",
             "threadId": "t2",
@@ -230,11 +276,11 @@ mod tests {
                 "body": { "size": 12, "data": "aGVsbG8" },
             },
         }));
-        assert!(blob_handles_for_message(&msg).is_empty());
+        assert!(attachments_for_message(&msg).is_empty());
     }
 
     #[test]
-    fn attachment_parts_become_handles_with_gmail_blob_capabilities() {
+    fn attachments_for_message_preserves_metadata_and_gmail_blob_capabilities() {
         let msg = message(json!({
             "id": "m3",
             "threadId": "t3",
@@ -248,15 +294,28 @@ mod tests {
                     {
                         "mimeType": "application/pdf",
                         "filename": "report.pdf",
+                        "headers": [
+                            { "name": "Content-ID", "value": "<report-1>" },
+                            { "name": "Content-Disposition", "value": "inline; filename=report.pdf" }
+                        ],
                         "body": { "attachmentId": "att-1", "size": 2048 },
                     },
                 ],
             },
         }));
 
-        let handles = blob_handles_for_message(&msg);
-        assert_eq!(handles.len(), 1);
-        let handle = &handles[0];
+        let attachments = attachments_for_message(&msg);
+        assert_eq!(attachments.len(), 1);
+        let attachment = &attachments[0];
+        assert_eq!(attachment.filename.as_deref(), Some("report.pdf"));
+        assert_eq!(attachment.content_type.as_deref(), Some("application/pdf"));
+        assert_eq!(attachment.content_id.as_deref(), Some("report-1"));
+        assert!(attachment.inline);
+        assert_eq!(attachment.size, Some(2048));
+        assert!(!attachment.truncated);
+        let AttachmentSource::Blob(handle) = &attachment.source else {
+            panic!("Gmail attachments must retain an openable blob handle");
+        };
         assert_eq!(handle.size, Some(2048));
         assert_eq!(handle.content_type.as_deref(), Some("application/pdf"));
         assert!(
@@ -294,9 +353,9 @@ mod tests {
                 }],
             },
         }));
-        let handles = blob_handles_for_message(&msg);
-        assert_eq!(handles.len(), 1);
-        assert_eq!(handles[0].size, Some(99));
+        let attachments = attachments_for_message(&msg);
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].size, Some(99));
     }
 
     /// A negative `size` (Gmail should never send one, but the DTO is
@@ -311,7 +370,7 @@ mod tests {
                 "body": { "attachmentId": "att-neg", "size": -1 },
             },
         }));
-        assert_eq!(blob_handles_for_message(&msg)[0].size, None);
+        assert_eq!(attachments_for_message(&msg)[0].size, None);
     }
 
     /// The blob id is an opaque JSON envelope pairing the message with

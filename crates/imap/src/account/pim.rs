@@ -9,8 +9,11 @@ use bifrost_types::container::{
     Container, ContainerId, ContainerKind, ContainerList, ContainerNamespace, ContainerRights,
     FolderRole, MutationTarget, Provenance,
 };
-use bifrost_types::hydration::{HydrationProjection, Importance, Message, ThreadHydration};
+use bifrost_types::hydration::{
+    AttachmentSource, HydrationProjection, Importance, Message, MessageAttachment, ThreadHydration,
+};
 use bifrost_types::ids::{ObjectId, ThreadId};
+use bifrost_types::mime::{Defect, MimeLimits, SelectOptions, parse_message, select_body_with};
 use bifrost_types::page::Page;
 use bifrost_types::search::{SearchFilter, SearchRequest};
 use bifrost_types::settings::{Identity, IdentityPatch, QuotaInfo, VacationConfig};
@@ -47,6 +50,9 @@ fn op_err(op: AccountOperation) -> impl Fn(Error) -> AccountError + Copy {
 /// included) while keeping the `FetchLimit` guard engaged, so a corrupt or
 /// adversarial server cannot make us buffer an unbounded literal.
 const DRAFT_FETCH_BUDGET: usize = 64 * 1024 * 1024;
+
+/// A preview fetch needs enough source to reach past MIME framing in ordinary mail.
+const PREVIEW_FETCH_BYTES: u64 = 64 * 1024;
 
 pub(crate) fn add_to_container(
     account: ImapAccount,
@@ -1968,8 +1974,13 @@ fn attrs_for_hydration(projection: HydrationProjection) -> Vec<FetchAttr> {
         HydrationProjection::Headers => {}
         HydrationProjection::Preview(limit) => attrs.push(FetchAttr::BodySection {
             peek: true,
-            section: Some("TEXT".into()),
-            partial: Some((0, u64::try_from(limit).unwrap_or(u64::MAX))),
+            section: None,
+            partial: Some((
+                0,
+                u64::try_from(limit)
+                    .unwrap_or(u64::MAX)
+                    .max(PREVIEW_FETCH_BYTES),
+            )),
         }),
         HydrationProjection::Full | HydrationProjection::FullWithBlobs => {
             attrs.push(FetchAttr::BodySection {
@@ -1978,6 +1989,10 @@ fn attrs_for_hydration(projection: HydrationProjection) -> Vec<FetchAttr> {
                 partial: None,
             });
         }
+        // Not dead code: `HydrationProjection` is `#[non_exhaustive]` and that
+        // attribute is scoped per crate, so a match in bifrost-imap on an enum
+        // defined in bifrost-types needs a wildcard even when the named arms
+        // are exhaustive in practice.
         _ => {}
     }
     attrs
@@ -1991,11 +2006,31 @@ fn fetch_to_message(
 ) -> Option<Message> {
     let uid = fetch.uid?;
     let envelope = fetch.envelope.clone();
-    let body = fetch
+    let raw_body = fetch
         .body_sections
         .iter()
         .find_map(|section| section.data.as_ref())
-        .map(|bytes| String::from_utf8_lossy(bytes).into_owned());
+        .map(Vec::as_slice);
+    let parsed = raw_body.map(parse_message);
+    let decoded = parsed.as_ref().map(|message| {
+        select_body_with(
+            message,
+            SelectOptions {
+                include_attachment_bytes: matches!(projection, HydrationProjection::FullWithBlobs),
+                max_body_bytes: match projection {
+                    HydrationProjection::Preview(limit) => Some(limit),
+                    _ => None,
+                },
+                limits: MimeLimits::default(),
+            },
+        )
+    });
+    let incomplete = parsed
+        .as_ref()
+        .is_some_and(|message| message.defects.iter().any(is_incomplete_defect))
+        || decoded
+            .as_ref()
+            .is_some_and(|body| body.defects.iter().any(is_incomplete_defect));
     let flags = super::inventory::flags_set(fetch.flags.as_deref().unwrap_or(&[]));
     let importance = if flags.contains("$important") {
         Importance::High
@@ -2029,22 +2064,62 @@ fn fetch_to_message(
             .map(|env| addresses(&env.reply_to))
             .unwrap_or_default(),
         subject: envelope.as_ref().and_then(|env| env.subject.clone()),
-        date: None,
+        date: parsed
+            .as_ref()
+            .and_then(|message| message.headers.date("Date")),
         containers: vec![ContainerId(folder.as_str().to_owned())],
         importance,
         flags,
-        body_text: match projection {
-            HydrationProjection::Headers => None,
-            _ => body.clone(),
+        body_text: decoded.as_ref().and_then(|body| body.text.clone()),
+        body_html: decoded.as_ref().and_then(|body| body.html.clone()),
+        attachments: match projection {
+            HydrationProjection::Full | HydrationProjection::FullWithBlobs => decoded
+                .as_ref()
+                .map(|body| {
+                    body.attachments
+                        .iter()
+                        .map(|attachment| MessageAttachment {
+                            filename: attachment.filename.clone(),
+                            content_type: Some(attachment.content_type.clone()),
+                            content_id: attachment.content_id.clone(),
+                            inline: attachment.inline,
+                            size: Some(attachment.size),
+                            source: attachment
+                                .data
+                                .clone()
+                                .map(AttachmentSource::Inline)
+                                .unwrap_or(AttachmentSource::None),
+                            truncated: attachment.truncated,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            // `Headers` and `Preview` carry no attachment list, and the
+            // wildcard is required because the enum is `#[non_exhaustive]`
+            // outside its defining crate.
+            _ => Vec::new(),
         },
-        body_html: None,
-        attachments: Vec::new(),
         size_bytes: fetch.rfc822_size,
         in_reply_to: envelope
             .as_ref()
             .and_then(|env| env.first_in_reply_to().map(str::to_owned)),
-        references: Vec::new(),
+        references: parsed
+            .as_ref()
+            .map(|message| message.headers.message_ids("References"))
+            .unwrap_or_default(),
+        incomplete,
     })
+}
+
+fn is_incomplete_defect(defect: &Defect) -> bool {
+    matches!(
+        defect,
+        Defect::Truncated
+            | Defect::TextTruncated
+            | Defect::DepthExceeded
+            | Defect::PartCountExceeded
+            | Defect::HeaderBlockTooLarge
+    )
 }
 
 fn addresses(addresses: &[crate::types::EnvelopeAddress]) -> Vec<Address> {
@@ -2920,9 +2995,9 @@ body text\r\n";
             attr,
             FetchAttr::BodySection {
                 peek: true,
-                section: Some(s),
-                partial: Some((0, 64)),
-            } if s == "TEXT"
+                section: None,
+                partial: Some((0, PREVIEW_FETCH_BYTES)),
+            }
         )));
 
         let full = attrs_for_hydration(HydrationProjection::Full);
@@ -2962,32 +3037,73 @@ body text\r\n";
         assert_eq!(message.importance, Importance::Normal);
     }
 
-    // NOTE: this pins CURRENT behavior, which is believed WRONG. A `Full`
-    // hydration fetches `BODY.PEEK[]` - the ENTIRE RFC 5322 message - and
-    // assigns the lossy-UTF-8 string of it to `Message::body_text`, so the
-    // consumer receives headers and MIME boundaries in a field documented
-    // as the text body.
     #[test]
-    fn full_hydration_puts_the_whole_raw_message_in_body_text() {
+    fn full_hydration_decodes_multipart_into_text_html_and_attachments() {
         let fetch = crate::types::FetchResponse {
             uid: Some(2),
             body_sections: vec![crate::types::fetch::BodySection {
                 section: String::new(),
                 origin: None,
-                data: Some(b"Subject: hi\r\n\r\nthe body".to_vec()),
+                data: Some(b"Subject: hi\r\nDate: Fri, 21 Nov 1997 09:55:06 -0600\r\nReferences: <a@test> <b@test>\r\nContent-Type: multipart/mixed; boundary=mix\r\n\r\n--mix\r\nContent-Type: multipart/alternative; boundary=alt\r\n\r\n--alt\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\ncaf=C3=A9\r\n--alt\r\nContent-Type: text/html\r\nContent-Transfer-Encoding: base64\r\n\r\nPGI+aHRtbDwvYj4=\r\n--alt--\r\n--mix\r\nContent-Type: application/pdf\r\nContent-Disposition: attachment; filename*=utf-8''report%20%C3%A6.pdf\r\nContent-Transfer-Encoding: base64\r\n\r\nJVBERi0=\r\n--mix--\r\n".to_vec()),
             }],
             ..Default::default()
         };
         let folder = MailboxName::new("INBOX").expect("valid mailbox");
-        let message =
-            fetch_to_message(&folder, 9, fetch, HydrationProjection::Full).expect("uid present");
-        let body = message.body_text.expect("full projection carries a body");
+        let message = fetch_to_message(&folder, 9, fetch, HydrationProjection::FullWithBlobs)
+            .expect("uid present");
+        assert_eq!(message.body_text.as_deref(), Some("café"));
+        assert_eq!(message.body_html.as_deref(), Some("<b>html</b>"));
+        assert_eq!(message.references, ["a@test", "b@test"]);
+        assert!(message.date.is_some());
+        assert_eq!(message.attachments.len(), 1);
+        let attachment = &message.attachments[0];
+        assert_eq!(attachment.filename.as_deref(), Some("report æ.pdf"));
+        assert_eq!(attachment.content_type.as_deref(), Some("application/pdf"));
         assert!(
-            body.starts_with("Subject: hi"),
-            "documents the un-parsed raw message; not an endorsement",
+            matches!(&attachment.source, AttachmentSource::Inline(bytes) if bytes.as_ref() == b"%PDF-")
         );
-        assert!(message.body_html.is_none());
+    }
+
+    #[test]
+    fn preview_projection_extracts_text_from_a_multipart_prefix() {
+        let fetch = crate::types::FetchResponse { uid: Some(2), body_sections: vec![crate::types::fetch::BodySection { section: String::new(), origin: None, data: Some(b"Content-Type: multipart/alternative; boundary=x\r\n\r\n--x\r\nContent-Type: text/plain\r\n\r\npreview prose\r\n--x--\r\n".to_vec()) }], ..Default::default() };
+        let folder = MailboxName::new("INBOX").expect("valid mailbox");
+        let message = fetch_to_message(&folder, 9, fetch, HydrationProjection::Preview(200))
+            .expect("uid present");
+        assert_eq!(message.body_text.as_deref(), Some("preview prose"));
+        assert!(
+            message
+                .body_text
+                .as_deref()
+                .is_none_or(|body| !body.contains("--x"))
+        );
         assert!(message.attachments.is_empty());
+    }
+
+    #[test]
+    fn preview_projection_requests_at_least_the_caller_limit() {
+        assert!(
+            attrs_for_hydration(HydrationProjection::Preview(256 * 1024))
+                .iter()
+                .any(|attr| matches!(
+                    attr,
+                    FetchAttr::BodySection {
+                        partial: Some((0, 262_144)),
+                        ..
+                    }
+                ))
+        );
+    }
+
+    #[test]
+    fn truncated_fetch_marks_the_message_incomplete() {
+        let fetch = crate::types::FetchResponse { uid: Some(2), body_sections: vec![crate::types::fetch::BodySection { section: String::new(), origin: None, data: Some(b"Content-Type: multipart/mixed; boundary=x\r\n\r\n--x\r\nContent-Type: application/octet-stream\r\n\r\nprefix".to_vec()) }], ..Default::default() };
+        let folder = MailboxName::new("INBOX").expect("valid mailbox");
+        let message = fetch_to_message(&folder, 9, fetch, HydrationProjection::FullWithBlobs)
+            .expect("uid present");
+        assert!(message.incomplete);
+        assert_eq!(message.attachments.len(), 1);
+        assert!(message.attachments[0].truncated);
     }
 
     #[test]
