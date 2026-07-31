@@ -212,6 +212,24 @@ impl<E: SmtpExecutor> Pool<E> {
 }
 
 impl<E: Executor> Pool<E> {
+    /// Park an already-established connection so a test can exercise checkout
+    /// and recycle without dialing anything.
+    #[cfg(test)]
+    pub(crate) async fn park_for_test(&self, conn: AsyncSmtpConnection) {
+        self.connections
+            .lock()
+            .await
+            .as_mut()
+            .expect("pool is not shut down")
+            .push(ParkedConnection::park(conn));
+    }
+
+    /// Number of connections currently parked as idle.
+    #[cfg(test)]
+    pub(crate) async fn idle_count_for_test(&self) -> usize {
+        self.connections.lock().await.as_ref().map_or(0, Vec::len)
+    }
+
     async fn recycle(&self, mut conn: AsyncSmtpConnection) {
         // A connection that has served an LMTP final-status drain is retired
         // rather than recycled: a surplus final status below the read buffer

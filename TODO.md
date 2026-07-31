@@ -132,17 +132,21 @@ any item; some may already be obsolete.
   chars) in an address header can still have its RFC 2047 folds flattened
   by the address-header path; the encoded-word fix fully handles Subject.
   Names are near-universally short, so low impact.
-- **smtp-T1.** (coverage) Test-seam gaps from the closed smtp ledger:
-  transport-level batch entry points (`send_raw_batch_with_options`
-  through the pool) are undriven, as is broader RCPT-option sequencing;
-  the `Transcript` harness does not model a peer that half-answers a
-  reply line, closes mid-response, or interleaves writes with pending
-  replies (`expect_coalesced` models adjacent-reply coalescing only);
-  the pool's retirement of a drained LMTP connection is pinned only at
-  the connection level (`should_retire()`), not end to end; TLS/network
-  modules, mailbox parsers, and direct async transport tests remain
-  uncovered, and `starttls` upgrade past the capability check has no
-  transcript (no TLS handshake in the harness).
+- **smtp-T1.** (coverage) Residual test-seam gaps. The batch entry
+  points through the pool (sync and async), pool retirement / reuse end
+  to end, RCPT-option sequencing on the wire, mailbox list parsing, a
+  peer that closes mid-response, and `starttls` up to the handshake
+  boundary are now pinned. What is left is deliberately out of scope or
+  needs a production seam: a real TLS handshake and the socket-dialing
+  paths in `client/net.rs` / `client/async_net.rs` cannot be exercised
+  without a listener; a peer that pushes an unsolicited reply while no
+  reply is owed is only observable through the coalesced-segment path,
+  because SMTP has no surplus-reply detection outside the LMTP
+  final-status drain (see the desync test in `connection.rs`); and the
+  socket-listener tests still living in `transport.rs`,
+  `async_transport.rs`, and `test_support.rs` (plaintext-auth refusal,
+  the LMTP delivery servers) predate the `Transcript` harness and could
+  be migrated onto it.
 
 ## bifrost-caldav / bifrost-carddav
 

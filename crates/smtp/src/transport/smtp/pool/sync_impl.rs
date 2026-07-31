@@ -143,6 +143,28 @@ impl Pool {
         pool
     }
 
+    /// Park an already-established connection so a test can exercise checkout
+    /// and recycle without dialing anything.
+    #[cfg(test)]
+    pub(crate) fn park_for_test(&self, conn: SmtpConnection) {
+        self.connections
+            .lock()
+            .expect("connection pool lock")
+            .as_mut()
+            .expect("pool is not shut down")
+            .push(ParkedConnection::park(conn));
+    }
+
+    /// Number of connections currently parked as idle.
+    #[cfg(test)]
+    pub(crate) fn idle_count_for_test(&self) -> usize {
+        self.connections
+            .lock()
+            .expect("connection pool lock")
+            .as_ref()
+            .map_or(0, Vec::len)
+    }
+
     pub(crate) fn shutdown(&self) {
         let connections = { self.connections.lock().unwrap().take() };
         if let Some(connections) = connections {

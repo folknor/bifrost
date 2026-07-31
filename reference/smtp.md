@@ -184,10 +184,25 @@ hermetic nor deterministic. A transcript is a greeting plus an ordered list of
   same surplus-detection path production has. The harness has no visibility
   below the buffer that a real transport lacks.
 
+- `expect_then_close(...)` models a peer that answers with the given bytes and
+  then hangs up. The bytes may be a truncated reply line, so this is the
+  close-mid-response case: reads report EOF once the scripted bytes are gone
+  and any later client write fails the way a write to a closed socket does.
+  A truncated reply must surface as an `incomplete response` parse error,
+  never a hang.
+
 `expect_then_stall` and `Transcript::silent()` model a peer that accepts and
 then never answers; reads park with no waker, so only the caller's own timeout
 or cancellation resumes the task. That is what the async timeout, setup-deadline
 and cancellation tests observe, under `start_paused` tokio time.
+
+Pool-level tests park a transcript-backed connection directly
+(`Pool::park_for_test`) and drive the public batch entry points through it, so
+the LMTP retirement rule and SMTP connection reuse are pinned end to end
+without dialing anything. A real TLS handshake stays out of scope: the
+`starttls` transcripts follow the upgrade to the handshake boundary (command
+written, positive reply read) and stop there, since the in-process stream is
+not a TCP socket.
 
 ## Example validation
 

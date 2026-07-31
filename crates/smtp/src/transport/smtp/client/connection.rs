@@ -110,8 +110,10 @@ impl SmtpConnection {
         )
     }
 
+    // Widened so the pool and transport tests can drive a scripted peer
+    // through the public entry points instead of a socket.
     #[cfg(test)]
-    fn from_transcript(
+    pub(in crate::transport::smtp) fn from_transcript(
         transcript: crate::transport::smtp::test_support::Transcript,
         hello_name: &ClientId,
         protocol: Protocol,
@@ -2594,6 +2596,264 @@ mod transcript_tests {
         connection
             .command(crate::transport::smtp::commands::Noop)
             .unwrap();
+        transcript.assert_exhausted();
+    }
+
+    /// The capability is advertised, so the driver must actually issue
+    /// `STARTTLS` and only then attempt the upgrade. The transcript stream is
+    /// not a TCP socket, so the upgrade stops at the handshake boundary: that
+    /// is exactly as far as a hermetic test can follow, and it still pins the
+    /// wire step and its ordering.
+    #[test]
+    fn advertised_starttls_writes_the_command_before_the_handshake() {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250-smtp.example\r\n250 STARTTLS\r\n")
+            .expect("STARTTLS\r\n", "220 ready to start tls\r\n");
+        let mut connection =
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp).unwrap();
+
+        assert!(connection.can_starttls());
+        let tls = super::TlsParameters::new("smtp.example".to_owned()).unwrap();
+        let error = connection
+            .starttls(&tls, &hello)
+            .expect_err("the in-process transcript stream cannot complete a TLS handshake");
+        assert!(
+            error.to_string().contains("only supported on TCP"),
+            "expected the upgrade to fail at the handshake boundary, got: {error}"
+        );
+        // The STARTTLS step was consumed, and no post-upgrade EHLO was sent.
+        transcript.assert_exhausted();
+    }
+
+    /// A server that advertises STARTTLS may still refuse it. The refusal must
+    /// surface as the server's reply, and no upgrade may be attempted.
+    #[test]
+    fn refused_starttls_reply_does_not_upgrade_the_stream() {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250-smtp.example\r\n250 STARTTLS\r\n")
+            .expect("STARTTLS\r\n", "454 TLS temporarily unavailable\r\n");
+        let mut connection =
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp).unwrap();
+
+        let tls = super::TlsParameters::new("smtp.example".to_owned()).unwrap();
+        let error = connection
+            .starttls(&tls, &hello)
+            .expect_err("a refused STARTTLS must not be treated as an upgrade");
+        assert!(
+            error
+                .smtp_response()
+                .is_some_and(|response| response.has_code(454)),
+            "expected the 454 reply to survive, got: {error}"
+        );
+        assert!(!connection.is_encrypted());
+        transcript.assert_exhausted();
+    }
+
+    /// A peer that hangs up in the middle of a multiline reply must produce a
+    /// parse failure, not a hang and not a half-parsed capability set.
+    #[test]
+    fn peer_closing_mid_reply_line_is_a_parse_failure() {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect_then_close(HELLO, "250-smtp.example\r\n250 PIPELI");
+
+        let Err(error) = SmtpConnection::from_transcript(transcript, &hello, Protocol::Smtp) else {
+            panic!("a truncated EHLO reply cannot yield a usable connection");
+        };
+        assert!(
+            error.to_string().contains("incomplete response"),
+            "expected an incomplete-response parse error, got: {error}"
+        );
+    }
+
+    /// The peer closes right after accepting `DATA`. The body write fails, so
+    /// the message may or may not have been seen: every recipient must land in
+    /// the `uncertain` lane, never `succeeded`.
+    #[test]
+    fn peer_closing_after_the_data_command_leaves_recipients_uncertain() {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250 smtp.example\r\n")
+            .expect("MAIL FROM:<sender@example.com>\r\n", "250 sender ok\r\n")
+            .expect("RCPT TO:<first@example.com>\r\n", "250 first ok\r\n")
+            .expect_then_close("DATA\r\n", "354 send body\r\n");
+        let batch = vec![SmtpBatchRecipient {
+            id: BatchItemId("item-0".to_owned()),
+            address: "first@example.com".parse().unwrap(),
+        }];
+
+        let mut connection =
+            SmtpConnection::from_transcript(transcript, &hello, Protocol::Smtp).unwrap();
+        let outcome = connection
+            .send_smtp_batch(
+                Some("sender@example.com".parse().unwrap()),
+                batch,
+                b"body",
+                &SendOptions::default(),
+            )
+            .expect("a mid-body drop is a per-recipient outcome, not a batch-level error")
+            .resolve();
+
+        assert!(outcome.succeeded().is_empty());
+        assert_eq!(outcome.uncertain().len(), 1);
+        assert_eq!(outcome.uncertain()[0].item.0, "item-0");
+        assert!(connection.has_broken());
+    }
+
+    /// A peer that pushes an unsolicited reply alongside the one the client
+    /// asked for leaves the stream one reply ahead. SMTP has no surplus check
+    /// outside the LMTP final-status drain, so the drift surfaces on the *next*
+    /// command, which reads the stale reply. Pinned so the exposure is visible:
+    /// the failure is loud (the stale status is reported), not a silent
+    /// mis-attribution of a later success.
+    #[test]
+    fn unsolicited_reply_coalesced_with_an_answer_desynchronizes_the_next_command() {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250 smtp.example\r\n")
+            .expect_coalesced("NOOP\r\n", "250 noop ok\r\n421 service closing\r\n")
+            .expect("RSET\r\n", "250 reset ok\r\n");
+        let mut connection =
+            SmtpConnection::from_transcript(transcript, &hello, Protocol::Smtp).unwrap();
+
+        connection
+            .command(crate::transport::smtp::commands::Noop)
+            .expect("the NOOP reply itself is well formed");
+        let error = connection
+            .command(crate::transport::smtp::commands::Rset)
+            .expect_err("the buffered 421 is consumed as the RSET reply");
+        assert!(
+            error
+                .smtp_response()
+                .is_some_and(|response| response.has_code(421)),
+            "expected the stale 421 to surface, got: {error}"
+        );
+    }
+
+    /// DSN RCPT parameters are refused before `MAIL FROM` when the server did
+    /// not advertise DSN. The refusal must be local: no envelope byte may hit
+    /// the wire, so the transaction can be retried on the same connection.
+    #[test]
+    fn dsn_rcpt_parameters_are_refused_before_any_envelope_byte() {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250 smtp.example\r\n")
+            .expect("NOOP\r\n", "250 noop ok\r\n");
+        let envelope = Envelope::new(
+            Some("sender@example.com".parse().unwrap()),
+            vec!["first@example.com".parse().unwrap()],
+        )
+        .unwrap();
+        let options = SendOptions::new().notify([DsnNotify::Failure]).unwrap();
+
+        let mut connection =
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp).unwrap();
+        let error = connection
+            .send_with_options(&envelope, b"body", &options)
+            .expect_err("DSN parameters must not be emitted to a server without DSN");
+        assert!(
+            error.to_string().contains("require server DSN support"),
+            "expected a local DSN refusal, got: {error}"
+        );
+
+        // Nothing was written: the next scripted step is still NOOP.
+        connection
+            .command(crate::transport::smtp::commands::Noop)
+            .unwrap();
+        transcript.assert_exhausted();
+    }
+
+    /// Recipient-specific parameters are keyed by address. A parameter naming
+    /// an address that is not in the batch is a caller bug and must be caught
+    /// before `MAIL FROM`, never silently dropped.
+    #[test]
+    fn batch_rcpt_parameters_for_an_unknown_recipient_fail_before_mail_from() {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250-smtp.example\r\n250 DSN\r\n")
+            .expect("NOOP\r\n", "250 noop ok\r\n");
+        let options = SendOptions::new()
+            .recipient_notify("stranger@example.com".parse().unwrap(), [DsnNotify::Never])
+            .unwrap();
+        let batch = vec![SmtpBatchRecipient {
+            id: BatchItemId("item-0".to_owned()),
+            address: "first@example.com".parse().unwrap(),
+        }];
+
+        let mut connection =
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp).unwrap();
+        let (error, progress) = connection
+            .send_smtp_batch(
+                Some("sender@example.com".parse().unwrap()),
+                batch,
+                b"body",
+                &options,
+            )
+            .expect_err("unmatched recipient parameters are a pre-wire input error");
+        assert!(
+            error.to_string().contains("do not match a batch recipient"),
+            "expected an unmatched-recipient refusal, got: {error}"
+        );
+        let outcome = progress.resolve();
+        assert!(outcome.succeeded().is_empty());
+
+        connection
+            .command(crate::transport::smtp::commands::Noop)
+            .unwrap();
+        transcript.assert_exhausted();
+    }
+
+    /// Per-recipient DSN parameters override the uniform ones on the matching
+    /// RCPT line only, and the batch path emits the same wire shape as the
+    /// envelope path. Sequential (non-PIPELINING) peer, so each RCPT line is
+    /// pinned as its own write.
+    #[test]
+    fn batch_rcpt_options_are_emitted_per_recipient_in_order() {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250-smtp.example\r\n250 DSN\r\n")
+            .expect("MAIL FROM:<sender@example.com>\r\n", "250 sender ok\r\n")
+            .expect(
+                "RCPT TO:<first@example.com> NOTIFY=NEVER ORCPT=rfc822;alias+3Dfirst@example.com\r\n",
+                "250 first ok\r\n",
+            )
+            .expect(
+                "RCPT TO:<second@example.com> NOTIFY=FAILURE,DELAY\r\n",
+                "250 second ok\r\n",
+            )
+            .expect("DATA\r\n", "354 send body\r\n")
+            .expect("body", "")
+            .expect("\r\n.\r\n", "250 queued\r\n");
+        let first: crate::address::Address = "first@example.com".parse().unwrap();
+        let options = SendOptions::new()
+            .notify([DsnNotify::Failure, DsnNotify::Delay])
+            .unwrap()
+            .recipient_never_notify(first.clone())
+            .recipient_original_recipient(first.clone(), "rfc822", "alias=first@example.com");
+        let batch = ["first@example.com", "second@example.com"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, address)| SmtpBatchRecipient {
+                id: BatchItemId(format!("item-{index}")),
+                address: address.parse().unwrap(),
+            })
+            .collect();
+
+        let mut connection =
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp).unwrap();
+        let outcome = connection
+            .send_smtp_batch(
+                Some("sender@example.com".parse().unwrap()),
+                batch,
+                b"body",
+                &options,
+            )
+            .expect("the transaction completes")
+            .resolve();
+
+        assert_eq!(outcome.succeeded().len(), 2);
         transcript.assert_exhausted();
     }
 }

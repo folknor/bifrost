@@ -23,6 +23,10 @@ struct TranscriptState {
     /// The pending server bytes arrived as one TCP segment, so a single read
     /// hands out all of them rather than one reply line.
     coalesced: bool,
+    /// The peer closed the connection once the scripted bytes were handed out.
+    /// Reads then report EOF and writes fail the way a real closed socket
+    /// does, so a driver cannot keep talking to a hung-up peer.
+    closed: bool,
 }
 
 #[derive(Debug)]
@@ -31,6 +35,7 @@ struct TranscriptStep {
     server: Vec<u8>,
     stall: bool,
     coalesced: bool,
+    close: bool,
 }
 
 impl Transcript {
@@ -51,12 +56,28 @@ impl Transcript {
                 steps: VecDeque::new(),
                 stalled,
                 coalesced: false,
+                closed: false,
             })),
         }
     }
 
     pub(super) fn expect(self, client: impl AsRef<[u8]>, server: impl AsRef<[u8]>) -> Self {
-        self.push(client, server, false, false)
+        self.push(client, server, false, false, false)
+    }
+
+    /// A peer that answers with `server` and then hangs up.
+    ///
+    /// `server` may be a half-written reply line (or empty): the scripted
+    /// bytes are handed out, then reads report EOF and any further client
+    /// write fails the way a write to a closed socket does. That is the
+    /// difference from `expect_then_stall`, where the peer stays
+    /// connected and simply never answers.
+    pub(super) fn expect_then_close(
+        self,
+        client: impl AsRef<[u8]>,
+        server: impl AsRef<[u8]>,
+    ) -> Self {
+        self.push(client, server, false, false, true)
     }
 
     /// A step whose reply bytes arrive as one segment, the way a real peer's
@@ -68,13 +89,13 @@ impl Transcript {
         client: impl AsRef<[u8]>,
         server: impl AsRef<[u8]>,
     ) -> Self {
-        self.push(client, server, false, true)
+        self.push(client, server, false, true, false)
     }
 
     /// Accept the client bytes, then never answer.
     #[cfg(feature = "tokio")]
     pub(super) fn expect_then_stall(self, client: impl AsRef<[u8]>) -> Self {
-        self.push(client, b"", true, false)
+        self.push(client, b"", true, false, false)
     }
 
     fn push(
@@ -83,6 +104,7 @@ impl Transcript {
         server: impl AsRef<[u8]>,
         stall: bool,
         coalesced: bool,
+        close: bool,
     ) -> Self {
         self.shared
             .lock()
@@ -93,6 +115,7 @@ impl Transcript {
                 server: server.as_ref().to_vec(),
                 stall,
                 coalesced,
+                close,
             });
         self
     }
@@ -136,6 +159,11 @@ impl std::io::Read for TranscriptStream {
             .lock()
             .map_err(|_| std::io::Error::other("SMTP transcript lock poisoned"))?;
         if state.pending_server_bytes.is_empty() {
+            if state.closed {
+                // A closed peer reports EOF, never a stall: the driver must
+                // classify the truncated response instead of waiting.
+                return Ok(0);
+            }
             if state.stalled {
                 return Err(std::io::ErrorKind::WouldBlock.into());
             }
@@ -173,6 +201,9 @@ impl std::io::Write for TranscriptStream {
             .shared
             .lock()
             .map_err(|_| std::io::Error::other("SMTP transcript lock poisoned"))?;
+        if state.closed {
+            return Err(std::io::ErrorKind::BrokenPipe.into());
+        }
         if !state.pending_server_bytes.is_empty() {
             return Err(std::io::Error::other(
                 "SMTP client wrote before draining the scripted server replies",
@@ -193,6 +224,7 @@ impl std::io::Write for TranscriptStream {
         state.pending_server_bytes.extend(step.server);
         state.stalled = step.stall;
         state.coalesced = step.coalesced;
+        state.closed = step.close;
         Ok(buf.len())
     }
 

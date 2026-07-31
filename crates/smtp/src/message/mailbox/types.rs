@@ -467,7 +467,7 @@ fn write_quoted_string_char(f: &mut Formatter<'_>, c: char) -> FmtResult {
 #[cfg(test)]
 mod test {
 
-    use super::Mailbox;
+    use super::{Mailbox, Mailboxes};
 
     #[test]
     fn mailbox_format_address_only() {
@@ -629,6 +629,61 @@ mod test {
             ("K.".to_owned(), "kayo@example.com".to_owned()).try_into(),
             Ok(Mailbox::new(
                 Some("K.".into()),
+                "kayo@example.com".parse().unwrap()
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_mailbox_list_mixes_named_and_bare_addresses() {
+        let mailboxes: Mailboxes =
+            "K. <kayo@example.com>, other@example.com, \"Last, First\" <last@example.com>"
+                .parse()
+                .unwrap();
+        let parsed: Vec<Mailbox> = mailboxes.into_iter().collect();
+
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed[0].name.as_deref(), Some("K."));
+        assert_eq!(parsed[1].name, None);
+        assert_eq!(parsed[1].email.to_string(), "other@example.com");
+        // The comma inside the quoted phrase must not split the list.
+        assert_eq!(parsed[2].name.as_deref(), Some("Last, First"));
+    }
+
+    #[test]
+    fn mailbox_list_round_trips_through_display() {
+        let source = "K. <kayo@example.com>, other@example.com";
+        let mailboxes: Mailboxes = source.parse().unwrap();
+        let rendered = mailboxes.to_string();
+        let reparsed: Mailboxes = rendered.parse().unwrap();
+
+        assert_eq!(mailboxes, reparsed);
+    }
+
+    #[test]
+    fn parse_mailbox_rejects_input_without_a_domain() {
+        assert!("kayo".parse::<Mailbox>().is_err());
+        assert!("kayo@".parse::<Mailbox>().is_err());
+        assert!("<kayo@example.com".parse::<Mailbox>().is_err());
+    }
+
+    /// The list parser must consume its whole input: a trailing fragment that
+    /// is not a mailbox is a parse failure, not a silently truncated list.
+    #[test]
+    fn parse_mailbox_list_rejects_trailing_garbage() {
+        assert!(
+            "kayo@example.com, not-an-address"
+                .parse::<Mailboxes>()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn parse_display_name_with_escaped_quote() {
+        assert_eq!(
+            r#""Laşt, \"First\"" <kayo@example.com>"#.parse(),
+            Ok(Mailbox::new(
+                Some(r#"Laşt, "First""#.into()),
                 "kayo@example.com".parse().unwrap()
             ))
         );

@@ -1184,4 +1184,207 @@ mod tests {
         assert!(auth.starts_with("AUTH PLAIN "), "got {auth:?}");
         handle.join().unwrap();
     }
+
+    mod pooled_batch {
+        use std::sync::Arc;
+
+        use bifrost_types::error::{AccountErrorKind, BatchItem, BatchItemId, RequestErrorKind};
+
+        use crate::transport::smtp::test_support::Transcript;
+
+        use super::super::{
+            ClientId, LmtpTransport, Pool, PoolConfig, Protocol, SendOptions, SmtpClient,
+            SmtpConnection, SmtpInfo, SmtpTransport,
+        };
+
+        fn hello() -> ClientId {
+            ClientId::Domain("client.example".to_owned())
+        }
+
+        /// A pool that will never dial: the only connection it can ever hand
+        /// out is the scripted one parked here.
+        fn pool_with(conn: SmtpConnection, protocol: Protocol) -> Arc<Pool> {
+            let pool = Pool::new(
+                // The checkout probe would need its own scripted NOOP step;
+                // the probe itself is pinned at the connection level.
+                PoolConfig::new().test_on_checkout(false),
+                SmtpClient {
+                    info: SmtpInfo::new("transcript.invalid", protocol),
+                },
+            );
+            pool.park_for_test(conn);
+            pool
+        }
+
+        fn batch(addresses: &[&str]) -> Vec<BatchItem<crate::address::Address>> {
+            addresses
+                .iter()
+                .enumerate()
+                .map(|(index, address)| {
+                    BatchItem::new(
+                        BatchItemId(format!("item-{index}")),
+                        address.parse().unwrap(),
+                    )
+                })
+                .collect()
+        }
+
+        /// End-to-end counterpart to the connection-level `should_retire()`
+        /// pin: a completed LMTP delivery must leave the pool empty, so the
+        /// next transaction cannot inherit a stream that may still hold an
+        /// unread final status.
+        #[test]
+        fn lmtp_batch_send_leaves_no_pooled_connection_behind() {
+            let transcript = Transcript::new("220 lmtp.example\r\n")
+                .expect("LHLO client.example\r\n", "250 lmtp.example\r\n")
+                .expect("MAIL FROM:<sender@example.com>\r\n", "250 sender ok\r\n")
+                .expect("RCPT TO:<first@example.com>\r\n", "250 first ok\r\n")
+                .expect("RCPT TO:<second@example.com>\r\n", "250 second ok\r\n")
+                .expect("DATA\r\n", "354 send body\r\n")
+                .expect("body", "")
+                .expect(
+                    "\r\n.\r\n",
+                    "250 first delivered\r\n550 second rejected\r\n",
+                );
+            let conn =
+                SmtpConnection::from_transcript(transcript.clone(), &hello(), Protocol::Lmtp)
+                    .unwrap();
+            let pool = pool_with(conn, Protocol::Lmtp);
+            let transport = LmtpTransport {
+                inner: Arc::clone(&pool),
+            };
+
+            let outcome = transport
+                .send_raw_batch_with_options(
+                    Some("sender@example.com".parse().unwrap()),
+                    batch(&["first@example.com", "second@example.com"]),
+                    b"body",
+                    &SendOptions::default(),
+                )
+                .expect("the delivery completes with per-recipient outcomes");
+
+            assert_eq!(outcome.succeeded().len(), 1);
+            assert_eq!(outcome.failed().len(), 1);
+            assert_eq!(
+                pool.idle_count_for_test(),
+                0,
+                "a drained LMTP connection must be retired, not parked"
+            );
+            transcript.assert_exhausted();
+        }
+
+        /// SMTP is the contrast case: the same entry point on a healthy SMTP
+        /// connection returns it to the pool, and the next batch reuses it
+        /// without a reconnect.
+        #[test]
+        fn smtp_batch_send_recycles_and_reuses_its_pooled_connection() {
+            let transcript = Transcript::new("220 smtp.example\r\n")
+                .expect("EHLO client.example\r\n", "250 smtp.example\r\n")
+                .expect("MAIL FROM:<sender@example.com>\r\n", "250 sender ok\r\n")
+                .expect("RCPT TO:<first@example.com>\r\n", "250 first ok\r\n")
+                .expect("DATA\r\n", "354 send body\r\n")
+                .expect("body", "")
+                .expect("\r\n.\r\n", "250 queued\r\n")
+                // Second transaction: no greeting, no EHLO. Any reconnect
+                // would have to write EHLO here and fail the transcript.
+                .expect("MAIL FROM:<sender@example.com>\r\n", "250 sender ok\r\n")
+                .expect("RCPT TO:<second@example.com>\r\n", "250 second ok\r\n")
+                .expect("DATA\r\n", "354 send body\r\n")
+                .expect("body", "")
+                .expect("\r\n.\r\n", "250 queued\r\n");
+            let conn =
+                SmtpConnection::from_transcript(transcript.clone(), &hello(), Protocol::Smtp)
+                    .unwrap();
+            let pool = pool_with(conn, Protocol::Smtp);
+            let transport = SmtpTransport {
+                inner: Arc::clone(&pool),
+            };
+
+            let first = transport
+                .send_raw_batch_with_options(
+                    Some("sender@example.com".parse().unwrap()),
+                    batch(&["first@example.com"]),
+                    b"body",
+                    &SendOptions::default(),
+                )
+                .unwrap();
+            assert_eq!(first.succeeded().len(), 1);
+            assert_eq!(
+                pool.idle_count_for_test(),
+                1,
+                "a healthy SMTP connection must be recycled"
+            );
+
+            let second = transport
+                .send_raw_batch_with_options(
+                    Some("sender@example.com".parse().unwrap()),
+                    batch(&["second@example.com"]),
+                    b"body",
+                    &SendOptions::default(),
+                )
+                .unwrap();
+            assert_eq!(second.succeeded().len(), 1);
+            assert_eq!(pool.idle_count_for_test(), 1);
+            transcript.assert_exhausted();
+        }
+
+        /// A batch whose recipient ids are unusable must be rejected before
+        /// checkout. The pool is shut down first, so reaching checkout would
+        /// yield a transport-shutdown error instead - and dial nothing either
+        /// way.
+        #[test]
+        fn invalid_batch_input_is_rejected_before_pool_checkout() {
+            let pool = Pool::new(
+                PoolConfig::new(),
+                SmtpClient {
+                    info: SmtpInfo::new("transcript.invalid", Protocol::Smtp),
+                },
+            );
+            pool.shutdown();
+            let transport = SmtpTransport {
+                inner: Arc::clone(&pool),
+            };
+
+            let duplicated = vec![
+                BatchItem::new(
+                    BatchItemId("dup".to_owned()),
+                    "first@example.com".parse().unwrap(),
+                ),
+                BatchItem::new(
+                    BatchItemId("dup".to_owned()),
+                    "second@example.com".parse().unwrap(),
+                ),
+            ];
+            let error = transport
+                .send_raw_batch_with_options(
+                    Some("sender@example.com".parse().unwrap()),
+                    duplicated,
+                    b"body",
+                    &SendOptions::default(),
+                )
+                .expect_err("duplicate batch ids are refused");
+            assert!(
+                matches!(
+                    error.kind(),
+                    AccountErrorKind::Request(RequestErrorKind::BatchInputInvalid)
+                ),
+                "expected BatchInputInvalid before checkout, got {:?}",
+                error.kind()
+            );
+
+            let empty: Vec<BatchItem<crate::address::Address>> = Vec::new();
+            let error = transport
+                .send_raw_batch_with_options(
+                    Some("sender@example.com".parse().unwrap()),
+                    empty,
+                    b"body",
+                    &SendOptions::default(),
+                )
+                .expect_err("an empty batch is refused");
+            assert!(matches!(
+                error.kind(),
+                AccountErrorKind::Request(RequestErrorKind::BatchInputInvalid)
+            ));
+        }
+    }
 }

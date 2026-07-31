@@ -1145,4 +1145,167 @@ mod tests {
         assert_eq!(after_ehlo, "");
         handle.join().unwrap();
     }
+
+    mod pooled_batch {
+        use std::{marker::PhantomData, sync::Arc};
+
+        use bifrost_types::error::{BatchItem, BatchItemId};
+
+        use crate::transport::smtp::test_support::Transcript;
+
+        use super::super::{
+            AsyncLmtpTransport, AsyncSmtpClient, AsyncSmtpConnection, AsyncSmtpTransport, ClientId,
+            Pool, PoolConfig, Protocol, SendOptions, SmtpInfo, TokioExecutor,
+        };
+
+        fn hello() -> ClientId {
+            ClientId::Domain("client.example".to_owned())
+        }
+
+        /// A pool that will never dial: the only connection it can ever hand
+        /// out is the scripted one parked here.
+        async fn pool_with(
+            conn: AsyncSmtpConnection,
+            protocol: Protocol,
+        ) -> Arc<Pool<TokioExecutor>> {
+            let pool = Pool::new(
+                // The checkout probe would need its own scripted NOOP step;
+                // the probe itself is pinned at the connection level.
+                PoolConfig::new().test_on_checkout(false),
+                AsyncSmtpClient::<TokioExecutor> {
+                    info: SmtpInfo::new("transcript.invalid", protocol),
+                    marker_: PhantomData,
+                },
+            );
+            pool.park_for_test(conn).await;
+            pool
+        }
+
+        fn batch(addresses: &[&str]) -> Vec<BatchItem<crate::address::Address>> {
+            addresses
+                .iter()
+                .enumerate()
+                .map(|(index, address)| {
+                    BatchItem::new(
+                        BatchItemId(format!("item-{index}")),
+                        address.parse().unwrap(),
+                    )
+                })
+                .collect()
+        }
+
+        /// Async recycling runs in a spawned task, so drain the executor
+        /// before observing the pool. `yield_now` is enough on the
+        /// current-thread test runtime and keeps the test off the clock.
+        async fn settle() {
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+        }
+
+        /// End-to-end counterpart to the connection-level `should_retire()`
+        /// pin, on the async path: a completed LMTP delivery must leave the
+        /// pool empty.
+        #[tokio::test(crate = "tokio")]
+        async fn tokio_lmtp_batch_send_leaves_no_pooled_connection_behind() {
+            let transcript = Transcript::new("220 lmtp.example\r\n")
+                .expect("LHLO client.example\r\n", "250 lmtp.example\r\n")
+                .expect("MAIL FROM:<sender@example.com>\r\n", "250 sender ok\r\n")
+                .expect("RCPT TO:<first@example.com>\r\n", "250 first ok\r\n")
+                .expect("RCPT TO:<second@example.com>\r\n", "250 second ok\r\n")
+                .expect("DATA\r\n", "354 send body\r\n")
+                .expect("body", "")
+                .expect(
+                    "\r\n.\r\n",
+                    "250 first delivered\r\n550 second rejected\r\n",
+                );
+            let conn =
+                AsyncSmtpConnection::from_transcript(transcript.clone(), &hello(), Protocol::Lmtp)
+                    .await
+                    .unwrap();
+            let pool = pool_with(conn, Protocol::Lmtp).await;
+            let transport = AsyncLmtpTransport::<TokioExecutor> {
+                inner: Arc::clone(&pool),
+            };
+
+            let outcome = transport
+                .send_raw_batch_with_options(
+                    Some("sender@example.com".parse().unwrap()),
+                    batch(&["first@example.com", "second@example.com"]),
+                    b"body",
+                    &SendOptions::default(),
+                )
+                .await
+                .expect("the delivery completes with per-recipient outcomes");
+            settle().await;
+
+            assert_eq!(outcome.succeeded().len(), 1);
+            assert_eq!(outcome.failed().len(), 1);
+            assert_eq!(
+                pool.idle_count_for_test().await,
+                0,
+                "a drained LMTP connection must be retired, not parked"
+            );
+            transcript.assert_exhausted();
+        }
+
+        /// The SMTP contrast case on the async path: the connection goes back
+        /// to the pool and the next batch reuses it without a reconnect.
+        #[tokio::test(crate = "tokio")]
+        async fn tokio_smtp_batch_send_recycles_and_reuses_its_pooled_connection() {
+            let transcript = Transcript::new("220 smtp.example\r\n")
+                .expect("EHLO client.example\r\n", "250 smtp.example\r\n")
+                .expect("MAIL FROM:<sender@example.com>\r\n", "250 sender ok\r\n")
+                .expect("RCPT TO:<first@example.com>\r\n", "250 first ok\r\n")
+                .expect("DATA\r\n", "354 send body\r\n")
+                .expect("body", "")
+                .expect("\r\n.\r\n", "250 queued\r\n")
+                // Second transaction: no greeting, no EHLO. A reconnect would
+                // have to write EHLO here and fail the transcript.
+                .expect("MAIL FROM:<sender@example.com>\r\n", "250 sender ok\r\n")
+                .expect("RCPT TO:<second@example.com>\r\n", "250 second ok\r\n")
+                .expect("DATA\r\n", "354 send body\r\n")
+                .expect("body", "")
+                .expect("\r\n.\r\n", "250 queued\r\n");
+            let conn =
+                AsyncSmtpConnection::from_transcript(transcript.clone(), &hello(), Protocol::Smtp)
+                    .await
+                    .unwrap();
+            let pool = pool_with(conn, Protocol::Smtp).await;
+            let transport = AsyncSmtpTransport::<TokioExecutor> {
+                inner: Arc::clone(&pool),
+            };
+
+            let first = transport
+                .send_raw_batch_with_options(
+                    Some("sender@example.com".parse().unwrap()),
+                    batch(&["first@example.com"]),
+                    b"body",
+                    &SendOptions::default(),
+                )
+                .await
+                .unwrap();
+            settle().await;
+            assert_eq!(first.succeeded().len(), 1);
+            assert_eq!(
+                pool.idle_count_for_test().await,
+                1,
+                "a healthy SMTP connection must be recycled"
+            );
+
+            let second = transport
+                .send_raw_batch_with_options(
+                    Some("sender@example.com".parse().unwrap()),
+                    batch(&["second@example.com"]),
+                    b"body",
+                    &SendOptions::default(),
+                )
+                .await
+                .unwrap();
+            settle().await;
+            assert_eq!(second.succeeded().len(), 1);
+            assert_eq!(pool.idle_count_for_test().await, 1);
+            transcript.assert_exhausted();
+        }
+    }
 }

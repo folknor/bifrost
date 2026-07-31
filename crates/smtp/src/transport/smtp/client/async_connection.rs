@@ -241,8 +241,10 @@ impl AsyncSmtpConnection {
         Ok(conn)
     }
 
+    // Widened so the pool and transport tests can drive a scripted peer
+    // through the public entry points instead of a socket.
     #[cfg(test)]
-    async fn from_transcript(
+    pub(in crate::transport::smtp) async fn from_transcript(
         transcript: crate::transport::smtp::test_support::Transcript,
         hello_name: &ClientId,
         protocol: Protocol,
