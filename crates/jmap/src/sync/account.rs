@@ -192,32 +192,7 @@ impl JmapAccount {
     }
 
     pub(crate) fn cursor_scopes(&self) -> Vec<CursorScope> {
-        let ordered = [
-            CursorScope::Type(bifrost_types::ObjectType::Email),
-            CursorScope::Type(bifrost_types::ObjectType::Mailbox),
-        ];
-
-        let mut scopes: Vec<CursorScope> = ordered
-            .into_iter()
-            .filter(|scope| self.seed_states.contains_key(scope))
-            .collect();
-
-        // Each foreign (shared/delegate) account surfaces as ONE seeded
-        // account-level `Folder` scope (the foreign accountId rides in
-        // the FolderId; the mailbox part is empty). Preserve a
-        // deterministic order so discovery is stable.
-        let mut foreign: Vec<CursorScope> = self
-            .seed_states
-            .keys()
-            .filter(|scope| matches!(scope, CursorScope::Folder(_)))
-            .cloned()
-            .collect();
-        foreign.sort_by(|a, b| match (a, b) {
-            (CursorScope::Folder(x), CursorScope::Folder(y)) => x.0.cmp(&y.0),
-            _ => std::cmp::Ordering::Equal,
-        });
-        scopes.extend(foreign);
-        scopes
+        cursor_scopes_from_seeds(self.seed_states.keys())
     }
 
     /// The owner-tag memberships every foreign account contributes:
@@ -231,6 +206,99 @@ impl JmapAccount {
         let next = self.subscription_seq.fetch_add(1, Ordering::AcqRel);
         SubscriptionHandle(format!("jmap-ws-{next}"))
     }
+}
+
+// The three functions below, like `route_object_id`, exist as free
+// functions purely so they can be exercised: `JmapAccount` pins
+// `MailAccount = Account<ReqwestTransport>`, so the trait methods that
+// wrap them cannot be driven without a live transport. Each is pure
+// given its inputs, so lifting the decision out is enough - the trait
+// methods stay one-line delegations to keep the pin meaningful.
+
+/// Discovery order for the seeded cursor scopes.
+///
+/// The two `Type` scopes come first in a FIXED order (Email, then
+/// Mailbox) and only when seeded; the foreign account-level `Folder`
+/// scopes follow, sorted by their encoded `FolderId`. The sort is not
+/// cosmetic: `seed_states` is a `HashMap`, so without it discovery order
+/// would vary run to run and the engine's scope set would churn.
+fn cursor_scopes_from_seeds<'a>(
+    seeded: impl IntoIterator<Item = &'a CursorScope>,
+) -> Vec<CursorScope> {
+    let seeded: Vec<&CursorScope> = seeded.into_iter().collect();
+
+    let ordered = [
+        CursorScope::Type(bifrost_types::ObjectType::Email),
+        CursorScope::Type(bifrost_types::ObjectType::Mailbox),
+    ];
+    let mut scopes: Vec<CursorScope> = ordered
+        .into_iter()
+        .filter(|scope| seeded.contains(&scope))
+        .collect();
+
+    // Each foreign (shared/delegate) account surfaces as ONE seeded
+    // account-level `Folder` scope (the foreign accountId rides in the
+    // FolderId; the mailbox part is empty).
+    let mut foreign: Vec<CursorScope> = seeded
+        .into_iter()
+        .filter(|scope| matches!(scope, CursorScope::Folder(_)))
+        .cloned()
+        .collect();
+    foreign.sort_by(|a, b| match (a, b) {
+        (CursorScope::Folder(x), CursorScope::Folder(y)) => x.0.cmp(&y.0),
+        _ => std::cmp::Ordering::Equal,
+    });
+    scopes.extend(foreign);
+    scopes
+}
+
+/// How backfill may partition a scope's inventory.
+///
+/// Only `Email` is partitionable: its inventory paginates `Email/query`,
+/// so a page window is meaningful. Every other scope (Mailbox, and the
+/// foreign account-level `Folder` scopes) enumerates in one pass and
+/// reports `Full` - a partitioned walk there would re-enumerate the same
+/// set per partition. `page_size` is the server's own
+/// `maxObjectsInGet`; a value that does not fit `u32` yields `None`
+/// (unbounded page) rather than a truncated cap.
+fn partitioning_for_scope(scope: &CursorScope, max_objects_in_get: usize) -> InventoryPartitioning {
+    match scope {
+        CursorScope::Type(bifrost_types::ObjectType::Email) => InventoryPartitioning::PageCount {
+            total: None,
+            page_size: u32::try_from(max_objects_in_get).ok(),
+        },
+        _ => InventoryPartitioning::Full,
+    }
+}
+
+/// Turn a scope's `open()`-time seed into a cursor establishment.
+///
+/// JMAP seeds every scope it can drive at `open`, so a scope with no
+/// seed is one this account cannot sync at all - reported `Unsupported`
+/// rather than established with an empty state, which would present as a
+/// working cursor that returns nothing.
+///
+/// Routed through the shared `unsupported_error` helper so every
+/// `Unsupported` in this crate has one construction path; the inline
+/// builder that used to live here had drifted from the helper's
+/// invariants (no scope attached, no diagnostic text).
+fn establishment_for_seed(
+    scope: CursorScope,
+    seed: Option<bifrost_types::OpaqueChangeState>,
+) -> Result<CursorEstablishment, AccountError> {
+    let Some(server_state) = seed else {
+        return Err(super::error::unsupported_error(
+            AccountOperation::EstablishCursor,
+            Some(ErrorScope::Cursor(scope)),
+            "JMAP did not seed a cursor for this scope",
+        ));
+    };
+    Ok(CursorEstablishment::Ready(ChangeCursor {
+        scope,
+        server_state,
+        advanced_through: None,
+        envelope_version: state::OUTER_CURSOR_ENVELOPE_VERSION,
+    }))
 }
 
 fn foreign_account_id_for_object<F>(id: &ObjectId, is_registered: F) -> Option<String>
@@ -351,28 +419,7 @@ impl Account for JmapAccount {
         scope: CursorScope,
     ) -> AccountFuture<Result<CursorEstablishment, AccountError>> {
         let seed = self.seed_states.get(&scope).cloned();
-        let scope_for_err = scope.clone();
-        Box::pin(async move {
-            let server_state = seed.ok_or_else(|| {
-                // Go through the shared `unsupported_error` helper so
-                // every `Unsupported` AccountError in this crate flows
-                // through a single construction path. The inline
-                // `AccountErrorBuilder::new(...)` that used to live
-                // here drifted from the helper's invariants (no scope
-                // attached, no diagnostic text).
-                super::error::unsupported_error(
-                    AccountOperation::EstablishCursor,
-                    Some(ErrorScope::Cursor(scope_for_err)),
-                    "JMAP did not seed a cursor for this scope",
-                )
-            })?;
-            Ok(CursorEstablishment::Ready(ChangeCursor {
-                scope,
-                server_state,
-                advanced_through: None,
-                envelope_version: state::OUTER_CURSOR_ENVELOPE_VERSION,
-            }))
-        })
+        Box::pin(async move { establishment_for_seed(scope, seed) })
     }
 
     fn inventory_stream(&self, scope: CursorScope) -> AccountStream<SyncEvent<InventoryEntry>> {
@@ -387,15 +434,7 @@ impl Account for JmapAccount {
     }
 
     fn inventory_partitioning(&self, scope: &CursorScope) -> InventoryPartitioning {
-        match scope {
-            CursorScope::Type(bifrost_types::ObjectType::Email) => {
-                InventoryPartitioning::PageCount {
-                    total: None,
-                    page_size: u32::try_from(self.core_limits.max_objects_in_get).ok(),
-                }
-            }
-            _ => InventoryPartitioning::Full,
-        }
+        partitioning_for_scope(scope, self.core_limits.max_objects_in_get)
     }
 
     fn inventory_partition_stream(
@@ -1346,11 +1385,157 @@ mod tests {
 
     use super::super::{foreign, state};
     use super::{
-        describe_cursor_support, foreign_account_id_for_object,
-        foreign_owner_memberships_from_scopes, is_unregistered_foreign, resolve_foreign_account_id,
+        cursor_scopes_from_seeds, describe_cursor_support, establishment_for_seed,
+        foreign_account_id_for_object, foreign_owner_memberships_from_scopes,
+        is_unregistered_foreign, partitioning_for_scope, resolve_foreign_account_id,
         route_mutation_target, route_object_id, route_send_as,
     };
     use bifrost_types::{ChangeCursor, CostClass, MutationTarget, SyncStrategy, ThreadId};
+
+    fn folder_scope(account_id: &str) -> CursorScope {
+        CursorScope::Folder(foreign::encode_foreign_account(account_id))
+    }
+
+    /// Discovery order. The `Type` scopes lead in a fixed order and only
+    /// when seeded; foreign `Folder` scopes follow, sorted.
+    #[test]
+    fn cursor_scopes_lead_with_seeded_type_scopes_then_sorted_foreign() {
+        let seeded = [
+            folder_scope("zeta"),
+            CursorScope::Type(ObjectType::Mailbox),
+            folder_scope("alpha"),
+            CursorScope::Type(ObjectType::Email),
+        ];
+
+        assert_eq!(
+            cursor_scopes_from_seeds(seeded.iter()),
+            vec![
+                CursorScope::Type(ObjectType::Email),
+                CursorScope::Type(ObjectType::Mailbox),
+                folder_scope("alpha"),
+                folder_scope("zeta"),
+            ]
+        );
+    }
+
+    /// `seed_states` is a `HashMap`, so an unsorted foreign lane would
+    /// hand the engine a different scope ORDER on every run. Feeding the
+    /// same set in the opposite sequence must produce the same answer.
+    #[test]
+    fn cursor_scope_order_does_not_depend_on_seed_iteration_order() {
+        let forward = vec![folder_scope("a"), folder_scope("b"), folder_scope("c")];
+        let mut reversed = forward.clone();
+        reversed.reverse();
+
+        assert_eq!(
+            cursor_scopes_from_seeds(forward.iter()),
+            cursor_scopes_from_seeds(reversed.iter())
+        );
+    }
+
+    /// An unseeded `Type` scope must not appear. Emitting it would have
+    /// the engine drive a scope whose `establish_initial_cursor` then
+    /// reports `Unsupported`.
+    #[test]
+    fn an_unseeded_type_scope_is_not_discovered() {
+        let seeded = [CursorScope::Type(ObjectType::Email)];
+
+        assert_eq!(
+            cursor_scopes_from_seeds(seeded.iter()),
+            vec![CursorScope::Type(ObjectType::Email)],
+            "Mailbox was never seeded, so it must not be discovered"
+        );
+        assert!(cursor_scopes_from_seeds(std::iter::empty()).is_empty());
+    }
+
+    /// Only `Email` paginates. Partitioning anything else would have each
+    /// partition re-enumerate the identical set.
+    #[test]
+    fn only_the_email_scope_is_partitionable() {
+        assert!(matches!(
+            partitioning_for_scope(&CursorScope::Type(ObjectType::Email), 42),
+            bifrost_types::InventoryPartitioning::PageCount {
+                total: None,
+                page_size: Some(42)
+            }
+        ));
+        for scope in [
+            CursorScope::Type(ObjectType::Mailbox),
+            folder_scope("shared"),
+            CursorScope::Account,
+        ] {
+            assert!(
+                matches!(
+                    partitioning_for_scope(&scope, 42),
+                    bifrost_types::InventoryPartitioning::Full
+                ),
+                "{scope:?} enumerates in one pass"
+            );
+        }
+    }
+
+    /// A `maxObjectsInGet` that does not fit `u32` must degrade to an
+    /// unbounded page, never to a truncated one - a wrapped cap would
+    /// silently shrink every backfill page.
+    #[test]
+    fn an_oversized_page_limit_degrades_to_unbounded() {
+        assert!(matches!(
+            partitioning_for_scope(
+                &CursorScope::Type(ObjectType::Email),
+                usize::try_from(u64::from(u32::MAX) + 1).unwrap_or(usize::MAX),
+            ),
+            bifrost_types::InventoryPartitioning::PageCount {
+                page_size: None,
+                ..
+            }
+        ));
+    }
+
+    /// A seeded scope establishes ready, carrying the seed state and the
+    /// current envelope version.
+    #[test]
+    fn a_seeded_scope_establishes_ready_from_its_seed() {
+        let scope = CursorScope::Type(ObjectType::Email);
+        let seed = bifrost_types::OpaqueChangeState {
+            protocol: bifrost_types::ProtocolKind::Jmap,
+            envelope_version: state::PAYLOAD_ENVELOPE_VERSION,
+            bytes: b"seed-state".to_vec(),
+        };
+
+        let established = establishment_for_seed(scope.clone(), Some(seed.clone()))
+            .expect("a seeded scope establishes");
+        let bifrost_types::CursorEstablishment::Ready(cursor) = established else {
+            panic!("a seeded scope is Ready");
+        };
+        assert_eq!(cursor.scope, scope);
+        assert_eq!(cursor.server_state.bytes, seed.bytes);
+        assert_eq!(cursor.advanced_through, None);
+        assert_eq!(
+            cursor.envelope_version,
+            state::OUTER_CURSOR_ENVELOPE_VERSION
+        );
+    }
+
+    /// An unseeded scope is `Unsupported`, NOT a cursor over an empty
+    /// state - the latter would present as a working cursor that returns
+    /// nothing forever. The error must carry the cursor scope so the
+    /// engine can route it.
+    #[test]
+    fn an_unseeded_scope_is_unsupported_and_names_its_scope() {
+        let scope = CursorScope::Type(ObjectType::Mailbox);
+
+        let error = establishment_for_seed(scope.clone(), None)
+            .expect_err("an unseeded scope cannot establish");
+        assert!(matches!(
+            error.kind(),
+            AccountErrorKind::Unsupported(AccountOperation::EstablishCursor)
+        ));
+        assert_eq!(
+            error.scope(),
+            Some(&bifrost_types::ErrorScope::Cursor(scope)),
+            "the engine routes the failure by cursor scope"
+        );
+    }
 
     /// The handle-selection boundary every thread- and message-keyed
     /// door delegates to. `JmapAccount` hardwires `ReqwestTransport`,

@@ -255,7 +255,7 @@ Validation rules in `state::decode`:
 - Any decode failure (unknown state tag, unknown scope tag, truncated payload, trailing bytes, non-UTF-8 string) returns `Error::SchemaIncompatible`.
 - `decode_cursor` additionally rejects a payload whose embedded scope does not match the `ChangeCursor.scope`, returning `Error::Other`.
 
-`establish_initial_cursor(scope)` returns `CursorEstablishment::Ready` with a cursor built from the seed state captured at `open()` (including the account-level foreign `Folder` seeds). Unseeded scopes return `Error::Unsupported`. `describe_cursor` reports `Cheap`/`ServerCursor` only for decodable cursors on scopes the change stream drives (Email, Mailbox, foreign `Folder`); legacy Thread/Query cursors still decode but terminate unsupported, so they - like undecodable cursors - report `Expensive`/`None` rather than promising a strategy that dies on its first poll.
+`establish_initial_cursor(scope)` returns `CursorEstablishment::Ready` with a cursor built from the seed state captured at `open()` (including the account-level foreign `Folder` seeds). Unseeded scopes return `Error::Unsupported` - deliberately, rather than a cursor over an empty state, which would present as a working cursor that returns nothing forever. `describe_cursor` reports `Cheap`/`ServerCursor` only for decodable cursors on scopes the change stream drives (Email, Mailbox, foreign `Folder`); legacy Thread/Query cursors still decode but terminate unsupported, so they - like undecodable cursors - report `Expensive`/`None` rather than promising a strategy that dies on its first poll.
 
 ### Per-scope inventory, changes, hydration
 
@@ -495,7 +495,21 @@ boundary itself (`route_object_id` / `route_mutation_target`) is
 transport-generic and pinned over string handles, because `JmapAccount`
 hardwires `ReqwestTransport` (xc-3) and the account door cannot be driven
 scripted; the account methods are one-line delegations to keep that pin
-meaningful. A thread id qualified for an account this session no longer
+meaningful.
+
+Three more decisions are lifted out for the same reason (jmap-O2), each
+pure given its inputs, each with its trait method reduced to a one-line
+delegation: `cursor_scopes_from_seeds` (discovery order - seeded `Type`
+scopes in a fixed order, then foreign `Folder` scopes SORTED, because
+`seed_states` is a `HashMap` and an unsorted lane would hand the engine a
+different scope order every run), `partitioning_for_scope` (only `Email`
+paginates; an oversized `maxObjectsInGet` degrades to an unbounded page
+rather than a truncated one), and `establishment_for_seed` (seeded ->
+`Ready`, unseeded -> `Unsupported` carrying the cursor scope). Prefer this
+pattern over threading the transport generic through the sync layer: it
+costs one function and no API surface.
+
+A thread id qualified for an account this session no longer
 holds stays LITERAL on the primary route - same rule as message ids - so
 the server reports the miss instead of a collision-prone local strip.
 

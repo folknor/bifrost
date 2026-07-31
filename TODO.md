@@ -11,18 +11,27 @@ any item; some may already be obsolete.
 - **jmap-D4.** Generic JMAP `Provider`. Wire `Provider::Fastmail` (and
   any other JMAP host the factory needs) when documented. Continue
   setting `Provider: None` until then.
-- **jmap-O2.** The jmap sync layer hardwires `ReqwestTransport`
-  (`sync/account.rs` pins `type MailAccount = Account<ReqwestTransport>`),
-  so `JmapAccount`'s own `Account` impl surface - `capabilities()`,
-  `describe_cursor`, `discover_cursor_scopes`, `establish_initial_cursor`,
-  `inventory_partitioning`, the mutation doors - cannot be driven
-  hermetically. Closing jmap-T1 covered everything below that boundary;
-  the three named casualties are `cursor_scopes()` (seed-filtered
-  ordering + foreign sort), the `inventory_partitioning` scope table,
-  and `establish_initial_cursor`'s unseeded-scope `Unsupported`. All
-  three are pure given their inputs; unblocking needs either the
-  transport generic threaded through (the xc-3 discussion) or the
-  free-function extraction pattern `route_object_id` already uses.
+- **jmap-O2.** DONE (2026-07-31). The three named casualties are now
+  pinned via the free-function extraction pattern `route_object_id`
+  already used, rather than by threading the transport generic through the
+  sync layer: `cursor_scopes_from_seeds`, `partitioning_for_scope`, and
+  `establishment_for_seed`, each pure given its inputs, each with its
+  trait method reduced to a one-line delegation. The extraction was
+  behavior-preserving (the crate's 482 tests passed unchanged before any
+  new test was added); the 7 tests added on top cover discovery order and
+  its `HashMap` iteration-order independence, unseeded `Type` scopes not
+  being discovered, `Email` as the only partitionable scope, the oversized
+  `maxObjectsInGet` degrading to unbounded rather than truncated, and the
+  seeded/unseeded establishment split including the cursor scope on the
+  error. Verified sensitive by removing the foreign sort and confirming
+  two tests fail.
+
+  `JmapAccount` still hardwires `ReqwestTransport`, so the remaining
+  surface (`capabilities()`, `describe_cursor`, the mutation doors as
+  whole calls) is still undrivable hermetically. That is now a bounded,
+  known residual rather than a blocker: the pattern for anything pure is
+  established, and anything genuinely needing a scripted transport belongs
+  with the xc-3 discussion.
 - **jmap-S1-residual.** (nit; the confusable version-const pair it was
   filed for is fixed - the two are now `PAYLOAD_ENVELOPE_VERSION` and
   `OUTER_CURSOR_ENVELOPE_VERSION`, each documenting its axis)
