@@ -286,7 +286,7 @@ async fn start_renewer(
                     }
                 }
                 Err(err) => {
-                    // gmail-D3: classify every error through the
+                    // Classify every error through the
                     // central translator and route on
                     // `is_terminal()`. Terminal classes (auth lost,
                     // policy, scope, account disabled, schema break)

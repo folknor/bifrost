@@ -202,20 +202,6 @@ re-auditors don't re-raise them.)
 
 ## bifrost-gmail
 
-- **gmail-N1.** `inventory.rs:196`: clone `id` before move into
-  `hydrate_one`; preserve it in the error scope.
-- **gmail-N2.** `recovery.rs:153-160`: attach blob `id` as
-  `ErrorScope::Message { id }` (parent message scope) and as a
-  diagnostic native code.
-- **gmail-N3.** `client.rs:159` unreachable branch: replace with
-  `unreachable!()`.
-- **gmail-N4.** `terminates_mutation_stream`: fix the comment/code
-  mismatch.
-- **gmail-N5.** Drop the `shallow_clone` helper; call
-  `into_account_error(error, ...)` directly.
-- **gmail-N6.** Hoist `dailyLimitExceeded` classification into a single
-  helper.
-- **gmail-N7.** Rename `account/recovery.rs` to `account/error.rs`.
 - **gmail-A1.** (audit boundary, not a defect) The 2026-07 google+net
   bug sweep did not line-audit: Gmail MIME rendering, draft patching,
   search translation, identity and vacation mapping in
@@ -352,17 +338,11 @@ re-auditors don't re-raise them.)
   routing membership (the engine covering rule would not cover a
   `Mailbox(owner)` tag against a folder cursor). Only worth it if change
   events must carry the owner tag for some future consumer.
-- **sync-N2.** `MutationBucket::BlockedByEngine` vs `FailedTerminal`:
-  split into distinct counter fields.
-- **sync-N3.** `wait_for_real_subscriber` 25ms hot-poll: switch to
-  `Notify`.
 - **sync-N4.** `broadcast_warning` scope default: pass directive target
   scope when present; account-default only for genuinely account-wide
   warnings.
 - **sync-N5.** `EstablishCursorTerminated` variant: keep; wire to
   `plan_recovery`.
-- **sync-N6.** Terminal-arm logging: emit `TelemetryView` structured
-  fields rather than `?debug` format.
 - **sync-N7.** `ReopenRequest` keeps `#[non_exhaustive]` (it is `pub`,
   re-exported from `lib.rs:85`). Listed as "leave alone" -
   re-auditor reminder.

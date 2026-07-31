@@ -80,7 +80,7 @@ pub(crate) struct GmailErrorContext {
     /// this signal to route to `SyncState(CursorInvalid)` rather than
     /// `NotFound` or a generic provider refusal.
     pub(crate) history_endpoint: bool,
-    /// gmail-N2: optional secondary diagnostic identifier (currently
+    /// Optional secondary diagnostic identifier (currently
     /// the Gmail attachment / blob id) that the central error model
     /// does not represent as an `ErrorScope`. Surfaced as
     /// `DiagnosticText::support_only` so support exports retain it.
@@ -165,7 +165,7 @@ impl GmailErrorContext {
         // Blob lives below a message in Gmail. Anchor diagnostics on
         // the parent message scope so consumer routing can find the
         // owning message; the blob id itself is preserved as a
-        // diagnostic note (gmail-N2).
+        // diagnostic note.
         ctx.scope = Some(ErrorScope::Message { id: id.clone() });
         ctx.diagnostic_id = Some(id);
         ctx
@@ -625,7 +625,7 @@ fn translate_response(resp: GmailResponseError, ctx: &GmailErrorContext) -> Acco
 
     builder = builder.push_cause(Cause::Wire(WireCause::Gmail(signal.clone())));
 
-    // gmail-D1: the response was acknowledged. Push the attempt
+    // the response was acknowledged. Push the attempt
     // evidence so non-idempotent ops with a `Server(Error)` cause
     // route to `Retry::SameRequest` (commit-rejection) rather than
     // `Reconcile(TransportDropAfterSend)`.
@@ -717,7 +717,7 @@ fn classify_response(
                 Cause::State(StateCause::CursorInvalid),
             );
         }
-        // gmail-D6: outside the history endpoint a `failedPrecondition`
+        // outside the history endpoint a `failedPrecondition`
         // signals an etag/version mismatch on the targeted resource,
         // not a malformed client request.
         GmailSignal::FailedPrecondition => {
@@ -867,14 +867,14 @@ fn classify_by_status(
     }
 }
 
-/// gmail-N6: `dailyLimitExceeded` lives under `GmailSignal::Unknown`
+/// `dailyLimitExceeded` lives under `GmailSignal::Unknown`
 /// (it's not in the typed signal enum). Classify the code in one place
 /// so both `classify_response` and `throttle_scope_for` agree.
 fn is_daily_limit_signal_code(code: &str) -> bool {
     code == "dailyLimitExceeded"
 }
 
-/// gmail-D5: pick the OAuth scope `needed` for an `InsufficientScope`
+/// pick the OAuth scope `needed` for an `InsufficientScope`
 /// `AccessCause` based on which operation tripped it. Returns the
 /// shortest scope that grants the operation according to Google's
 /// documented scope matrix.
@@ -962,7 +962,7 @@ fn malformed_kind_cause(detail: String) -> (AccountErrorKind, Cause) {
 }
 
 fn not_found_kind_cause(ctx: &GmailErrorContext) -> (AccountErrorKind, Cause) {
-    // gmail-D2: every typed `GmailResource` now maps to a real
+    // every typed `GmailResource` now maps to a real
     // `ResourceKind` (Blob -> Message because a missing blob means
     // the parent message can't be opened, PubSubWatch ->
     // PushSubscription, Account, etc.). The fallback to `Message` only
@@ -1041,7 +1041,7 @@ fn parse_failed(
     if let Some(scope) = ctx.scope.clone() {
         builder = builder.scope(scope);
     }
-    // gmail-D1: post-200 decode failures (`JsonDecode`, `Base64`) get
+    // post-200 decode failures (`JsonDecode`, `Base64`) get
     // `Acknowledged` because the response was received before the
     // decode failed.
     if let Some(state) = attempt {
@@ -1777,7 +1777,7 @@ mod tests {
     // Phase 5C decision coverage
     // ---------------------------------------------------------------
 
-    /// gmail-D1: every HTTP `Response` carries an
+    /// every HTTP `Response` carries an
     /// `AttemptCause(Acknowledged)` so the central recovery mapping
     /// can distinguish acknowledged-vs-unsent for non-idempotent ops.
     #[test]
@@ -1795,7 +1795,7 @@ mod tests {
         assert_eq!(attempt, bifrost_types::TransmissionState::Acknowledged);
     }
 
-    /// gmail-D1: post-200 decode failures classify as Acknowledged.
+    /// post-200 decode failures classify as Acknowledged.
     #[test]
     fn json_decode_pushes_acknowledged_attempt_cause() {
         let source = serde_json::from_slice::<serde_json::Value>(b"not json").expect_err("decode");
@@ -1815,7 +1815,7 @@ mod tests {
         assert_eq!(attempt, bifrost_types::TransmissionState::Acknowledged);
     }
 
-    /// gmail-D2: drafts route to `NotFound(Draft)`, not `Message`.
+    /// drafts route to `NotFound(Draft)`, not `Message`.
     #[test]
     fn not_found_draft_uses_draft_resource() {
         let err = gmail_response(404, &body_with_reason("notFound"));
@@ -1826,7 +1826,7 @@ mod tests {
         ));
     }
 
-    /// gmail-D2: identities route to `NotFound(Identity)`.
+    /// identities route to `NotFound(Identity)`.
     #[test]
     fn not_found_identity_uses_identity_resource() {
         let err = gmail_response(404, &body_with_reason("notFound"));
@@ -1837,7 +1837,7 @@ mod tests {
         ));
     }
 
-    /// gmail-D2: vacation responder routes to `NotFound(Vacation)`.
+    /// vacation responder routes to `NotFound(Vacation)`.
     #[test]
     fn not_found_vacation_uses_vacation_resource() {
         let err = gmail_response(404, &body_with_reason("notFound"));
@@ -1848,7 +1848,7 @@ mod tests {
         ));
     }
 
-    /// gmail-D2: Pub/Sub watch routes to `NotFound(PushSubscription)`.
+    /// Pub/Sub watch routes to `NotFound(PushSubscription)`.
     #[test]
     fn not_found_pubsub_uses_push_subscription_resource() {
         let err = gmail_response(404, &body_with_reason("notFound"));
@@ -1903,7 +1903,7 @@ mod tests {
         }));
     }
 
-    /// gmail-D5: `InsufficientScope::needed` reflects the operation.
+    /// `InsufficientScope::needed` reflects the operation.
     #[test]
     fn insufficient_scope_needed_for_send_is_gmail_send() {
         let err = gmail_response(403, &body_with_reason("insufficientPermissions"));
@@ -1946,7 +1946,7 @@ mod tests {
         }
     }
 
-    /// gmail-D6: `failedPrecondition` outside the history endpoint
+    /// `failedPrecondition` outside the history endpoint
     /// routes to `ConcurrencyConflict`, not `Request(Malformed)`.
     #[test]
     fn non_history_failed_precondition_maps_to_concurrency_conflict() {
@@ -1963,7 +1963,7 @@ mod tests {
         assert_eq!(advice.reason, RetryReason::ConcurrencyConflict);
     }
 
-    /// gmail-D4: `Retry-After` flows structurally through `ServerCause`
+    /// `Retry-After` flows structurally through `ServerCause`
     /// and surfaces as `RetryAdvice::retry_hint`.
     #[test]
     fn retry_after_propagates_to_retry_hint() {
@@ -1994,7 +1994,7 @@ mod tests {
         );
     }
 
-    /// gmail-D3: a 401 from Pub/Sub watch translates as terminal so
+    /// a 401 from Pub/Sub watch translates as terminal so
     /// the renewer can emit `WatchEvent::Terminated(AccountError)`
     /// rather than swallowing the failure into `Disconnected`.
     #[test]
@@ -2005,7 +2005,7 @@ mod tests {
         assert!(matches!(acc.recovery(), RecoveryClass::AuthLost));
     }
 
-    /// gmail-D3: a 500 from Pub/Sub watch is transient (Retry) so the
+    /// a 500 from Pub/Sub watch is transient (Retry) so the
     /// renewer keeps trying and emits `Disconnected` instead of
     /// `Terminated`.
     #[test]
@@ -2015,7 +2015,7 @@ mod tests {
         assert!(acc.recovery().is_retryable());
     }
 
-    /// gmail-D5: scope helper maps each gmail operation to a scope.
+    /// scope helper maps each gmail operation to a scope.
     #[test]
     fn gmail_scope_for_covers_canonical_operations() {
         assert_eq!(gmail_scope_for(AccountOperation::Send), "gmail.send");

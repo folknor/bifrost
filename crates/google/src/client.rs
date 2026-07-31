@@ -224,12 +224,11 @@ impl GmailClient {
             "PUT" => self.account_net().put(url),
             "PATCH" => self.account_net().patch(url),
             "DELETE" => self.account_net().delete(url),
-            // gmail-N3: every internal caller routes through the typed
+            // Every internal caller routes through the typed
             // `get` / `post` / `put` / `patch` / `delete` wrappers, so
-            // this branch is unreachable. Previously we synthesized a
-            // `Discover`-flavored placeholder error; replace with the
-            // panic so a future caller that adds a new method gets a
-            // hard failure instead of misclassified telemetry.
+            // this branch is unreachable; the panic gives a future
+            // caller that adds a new method a hard failure instead of
+            // misclassified telemetry.
             other => unreachable!("GmailClient::execute called with unsupported method {other}"),
         };
 

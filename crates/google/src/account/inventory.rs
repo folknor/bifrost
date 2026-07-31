@@ -218,12 +218,11 @@ pub(crate) fn get_stream(
         let started = Instant::now();
         let mut items: Vec<ItemOutcome<HydratedObject>> = Vec::with_capacity(ids.len());
         for id in ids {
-            // gmail-N1: clone the id so a failing hydrate can attach
+            // Clone the id so a failing hydrate can attach
             // `ErrorScope::Message { id }` to the resulting
             // `AccountError` (and so the per-item lane carries it as
-            // a `BatchItemId`). Previously the id was moved into
-            // `hydrate_one` and the error scope was emitted with an
-            // empty string.
+            // a `BatchItemId`); moved into `hydrate_one`, the error
+            // scope would carry an empty string.
             let id_for_error = id.0.clone();
             match hydrate_one(&state.client, &labels, id, state.projection).await {
                 Ok(hydrated) => {

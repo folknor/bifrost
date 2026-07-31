@@ -281,7 +281,7 @@ async fn apply_destroy(
     match post_empty_json(client, "/messages/batchDelete", &body, key).await {
         Ok(()) => MutationApply::Batch(applied_outcomes(ids)),
         Err(error) if is_batch_delete_scope_failure(&error) => {
-            // gmail-N5: translate the primary failure once and consume
+            // Translate the primary failure once and consume
             // it. The original `Error` is not used after this point;
             // the fallback diagnostic attaches the primary's outermost
             // cause via `merge_delete_fallback_error`.
