@@ -923,7 +923,11 @@ scope (per-scope re-establishment) or for the account
 flips the boundary to `Pause` so workers park. Consumers subscribe
 to the per-account `AccountControl` broadcast via
 `SyncEngine::account_control_stream` and flip back via
-`SyncEngine::resume_account`.
+`SyncEngine::resume_account`. The account-wide shape is pinned
+end-to-end by
+`tests/attach_schema_recovery.rs::three_failed_reopens_terminate_and_pause_the_account`,
+which runs under paused time so the recorded per-attempt open instants
+expose the 1s / 2s backoff schedule exactly.
 
 `EngineDirective::OperatorOverrideRequired { reason }` auto-pauses
 the account with `PauseReason::OperatorOverrideRequired` and emits

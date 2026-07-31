@@ -281,13 +281,6 @@ any item; some may already be obsolete.
 
 ## bifrost-sync
 
-- **sync-F1.** Three-failed-reopen behavior test deferred. The wiring
-  is correct (exponential backoff, then `SyncEvent::Terminated` plus
-  `AccountControl::Pause(RetryBudgetExhausted)`) but not pinned by a
-  focused test because the necessary `Account` / `AccountFactory` stub
-  is ~400 lines. Either add the test alongside protocol-level reopen
-  exercises, or extract the backoff helper into a sync-internal module
-  that can be tested in isolation.
 - **sync-F3.** `Reconcile` items requesting `DedupeByClientId` only
   (no `CheckTarget`) still queue `PendingReadback`. Counters surface
   the case and a `Warning::OperatorAttentionNeeded` fires, but the
@@ -315,9 +308,16 @@ any item; some may already be obsolete.
   provider identity at attach - the same identity-channel shape as (a).
   (d) No hermetic worker-level test proves a recorded deadline defers
   `changes_stream` or that two attached slots share a provider
-  deadline - blocked on the same `Account`/`AccountFactory` stub
-  sync-F1 wants; the bucket mechanics are unit-pinned in
-  `recovery.rs`.
+  deadline; the bucket mechanics are unit-pinned in `recovery.rs`.
+  No longer blocked on a stub (the `Account`/`AccountFactory` stub in
+  `tests/attach_schema_recovery.rs` covers it), but blocked on a clock
+  mismatch: `ThrottleBucket` deadlines are `SystemTime`, while the poll
+  loop sleeps them off on tokio time. Under `start_paused` the sleep
+  returns without `SystemTime::now()` having moved, so the re-check
+  loop in `spawn_scope_poll` re-derives the full wait and spins - a
+  virtual-time test of the deferral cannot terminate, and a real-time
+  one would need a wall-clock `Retry-After`. Pinning this wants the
+  bucket to carry a monotonic deadline (or an injectable clock) first.
 - **sync-N1.** (partially addressed) `directive_target_scope` and other
   `_ => None` after-exhaustive arms route a new scope-bearing
   `EngineDirective` variant account-wide instead of failing to compile.
