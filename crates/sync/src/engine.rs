@@ -3714,9 +3714,17 @@ async fn handle_engine_directive(
             restart_account(ctx).await;
         }
         EngineDirective::DowngradeStrategy(downgrade) => {
+            // Route the warning to the scope the downgrade is actually
+            // about: the originating error's cursor scope when it names
+            // one (the same signal the immediate re-establish below
+            // keys on), else the worker's suggestion, else account.
+            let warning_scope = match error.scope() {
+                Some(ErrorScope::Cursor(scoped)) => Some(scoped.clone()),
+                _ => fallback_scope.clone(),
+            };
             broadcast_warning(
                 ctx.changes_tx,
-                fallback_scope.clone(),
+                warning_scope,
                 bifrost_types::Warning::user_safe(
                     bifrost_types::WarningKind::StrategyDowngraded,
                     format!("downgraded sync strategy: {downgrade:?}"),
@@ -3740,9 +3748,13 @@ async fn handle_engine_directive(
             // The reason is bounded (`PauseReason::OperatorOverrideRequired`);
             // free-form reason text rides through the warning only.
             // (sync-D9)
+            // Deliberately account-scoped, not the worker's fallback:
+            // the directive pauses the WHOLE account, and a consumer
+            // routing the warning to one folder's scope would misfile
+            // an account-wide condition.
             broadcast_warning(
                 ctx.changes_tx,
-                fallback_scope.clone(),
+                None,
                 bifrost_types::Warning::user_safe(
                     bifrost_types::WarningKind::OperatorAttentionNeeded,
                     reason.clone(),
@@ -3915,7 +3927,27 @@ async fn re_establish_scope_with_backoff(ctx: &RecoveryContext<'_>, scope: Curso
                     message_key = err.message_key(),
                     "scope re-establishment failed"
                 );
-                last_account_error = Some(err);
+                // Dispatch the classified error through `plan_recovery`
+                // instead of blind-retrying every class three times: a
+                // scope-quarantine directive names its own action, and
+                // a terminal class cannot be repaired by another
+                // attempt - breaking out lands in the exhaustion tail
+                // below, which broadcasts `Terminated` plus the
+                // operator warning exactly as a spent budget would.
+                use crate::recovery::{RecoveryPlan, plan_recovery};
+                match plan_recovery(err.clone()) {
+                    RecoveryPlan::Engine(EngineDirective::DisableScope(quarantined)) => {
+                        disable_scope(ctx, quarantined).await;
+                        return;
+                    }
+                    RecoveryPlan::Terminal(_) => {
+                        last_account_error = Some(err);
+                        break;
+                    }
+                    _ => {
+                        last_account_error = Some(err);
+                    }
+                }
             }
             Err(err) => {
                 tracing::warn!(

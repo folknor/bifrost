@@ -308,11 +308,6 @@ re-auditors don't re-raise them.)
   routing membership (the engine covering rule would not cover a
   `Mailbox(owner)` tag against a folder cursor). Only worth it if change
   events must carry the owner tag for some future consumer.
-- **sync-N4.** `broadcast_warning` scope default: pass directive target
-  scope when present; account-default only for genuinely account-wide
-  warnings.
-- **sync-N5.** `EstablishCursorTerminated` variant: keep; wire to
-  `plan_recovery`.
 - **sync-N7.** `ReopenRequest` keeps `#[non_exhaustive]` (it is `pub`,
   re-exported from `lib.rs:85`). Listed as "leave alone" -
   re-auditor reminder.

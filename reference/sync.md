@@ -909,7 +909,13 @@ restart and schema recovery behind a delay after which no operation was
 actually retried.
 
 Reopens use exponential backoff with ±20% jitter (1s initial, 5min
-cap) and a three-attempt budget. After three failures the engine
+cap) and a three-attempt budget. Per-scope re-establishment
+dispatches each failure through `plan_recovery` rather than
+blind-retrying every class: a `DisableScope` establish failure
+quarantines the scope immediately (same rule attach applies), and a
+terminal class skips the remaining budget straight into the
+exhaustion tail - another attempt cannot repair it. After the budget
+is spent (or short-circuited terminal) the engine
 broadcasts `SyncEvent::Terminated(last_error)` for the affected
 scope (per-scope re-establishment) or for the account
 (`RestartAccount`), then publishes
