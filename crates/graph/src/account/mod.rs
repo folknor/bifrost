@@ -316,15 +316,30 @@ impl GraphAccount {
         account
     }
 
-    /// Seed a public-folder routing entry for tests. Mirrors what
-    /// Autodiscover discovery does at runtime.
+    /// Seed a public-folder routing entry for tests, with placeholder
+    /// metadata alongside it.
+    ///
+    /// Discovery (`seed_and_scope`) writes BOTH maps unconditionally, so a
+    /// routing entry without a metadata entry is a state production cannot
+    /// reach. This seeder therefore writes both too, even though its callers
+    /// only exercise routing: seeding one map alone would let a test drive
+    /// `public_folder_containers` down degradation branches that production
+    /// never takes. Use `seed_public_folder_meta_for_tests` when the metadata
+    /// values themselves matter.
     #[cfg(test)]
     pub(crate) async fn seed_public_folder_for_tests(
         &self,
         folder: bifrost_types::FolderId,
         routing: cursor::PublicFolderRouting,
     ) {
-        self.routing_map.write().await.insert(folder, routing);
+        let meta = public_folder::PublicFolderMeta {
+            display_name: folder.0.clone(),
+            folder_class: None,
+            parent: None,
+            effective_rights: crate::ews::EwsEffectiveRights::default(),
+        };
+        self.seed_public_folder_meta_for_tests(folder, routing, meta)
+            .await;
     }
 
     /// Seed a public folder's projection metadata for tests, alongside its

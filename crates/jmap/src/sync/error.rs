@@ -12,6 +12,13 @@
 //! central recovery mapping in `bifrost_types::error::recovery` derives
 //! recovery from `(kind, scope, operation, primary_cause)` at builder
 //! `build()` time.
+//!
+//! The crate root sets `#![allow(dead_code)]`, which is load-bearing for the
+//! per-RFC method modules (full `get`/`set`/`query` surfaces that consumers
+//! call and the crate itself does not). It is the wrong default HERE: an
+//! unreachable arm of this boundary is a silent hole in the contract above,
+//! not unused API. This module opts back in so the compiler reports one.
+#![warn(dead_code)]
 
 use std::time::Duration;
 
@@ -67,11 +74,19 @@ impl JmapErrorContext {
         Self::new(operation).with_scope(ErrorScope::Message { id: id.into() })
     }
 
+    /// Unused convenience wrappers: both scopes ARE produced (see
+    /// `pim.rs` / `factory.rs`), but producers reach for `with_scope`
+    /// directly. Kept because they are the readable spelling, and harmless
+    /// because the scope readers below (`resource_from_scope`,
+    /// `id_from_scope`) accept both shapes - the failure mode to avoid is a
+    /// reader that handles only what a dead constructor produces.
+    #[allow(dead_code)]
     #[must_use]
     pub(crate) fn mailbox(operation: AccountOperation, id: impl Into<String>) -> Self {
         Self::new(operation).with_scope(ErrorScope::Mailbox { id: id.into() })
     }
 
+    #[allow(dead_code)]
     #[must_use]
     pub(crate) fn thread(operation: AccountOperation, id: impl Into<String>) -> Self {
         Self::new(operation).with_scope(ErrorScope::Thread { id: id.into() })

@@ -689,11 +689,17 @@ fn server_error(status: u16) -> (AccountErrorKind, Cause) {
 }
 
 /// Boundary translation: map a message-builder `crate::error::Error` into the
-/// shared `AccountError` shape. Account-oriented callers that construct a
-/// `Message` (downstream send pipelines, drafts, future `Account` impls) feed
-/// validation failures through this function so the single-translation-
-/// boundary rule holds. Every variant of `MessageError` is exhaustively
-/// matched - adding a variant to `MessageError` forces a refresh here.
+/// shared `AccountError` shape. Every variant of `MessageError` is
+/// exhaustively matched - adding a variant to `MessageError` forces a refresh
+/// here.
+///
+/// No production caller today: nothing inside the workspace builds a `Message`
+/// (IMAP submission takes raw RFC822 bytes), and the live boundary
+/// `into_account_error` dispatches on `SmtpError::kind`, which never carries
+/// `MessageError` variants. This exists so that an account-oriented caller
+/// that DOES construct a `Message` - a draft pipeline, a future `Account`
+/// impl - has one translation point rather than inventing a second mapping.
+/// Kept deliberately; see the `dead_code` allowance below.
 #[allow(dead_code)]
 pub(crate) fn message_error_to_account_error(
     error: MessageError,

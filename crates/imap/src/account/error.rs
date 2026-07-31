@@ -14,6 +14,17 @@
 //! bytes ever crossed the side-effect boundary. That evidence has to
 //! survive into the chain or the engine will silently retry
 //! non-idempotent operations across `InFlight` transport drops.
+//!
+//! The crate root sets `#![allow(dead_code)]`, which is load-bearing for the
+//! protocol surface (command builders and response types that consumers use
+//! but the crate itself does not). It is actively harmful HERE: a guard in
+//! this module that nothing arms is a silent hole in the contract above, and
+//! `Translation::skip_attempt_cause` was exactly that - documented as
+//! suppressing a `try_build` invariant violation, never assigned `true`, so
+//! the guarantee was upheld by comment only. This module opts back in so the
+//! compiler reports an unreachable translation rather than a human catching
+//! it on the next audit.
+#![warn(dead_code)]
 
 use bifrost_types::{
     AccessCause, AccountError, AccountErrorBuilder, AccountErrorKind, AccountOperation,
@@ -65,6 +76,10 @@ impl ImapErrorContext {
         self
     }
 
+    /// Unused: every producer reaches for a scope-shaped helper below
+    /// (`with_cursor_scope` / `with_folder_scope` / `with_message_id`)
+    /// rather than naming an `ErrorScope` directly.
+    #[allow(dead_code)]
     #[must_use]
     pub(crate) fn with_scope(mut self, scope: ErrorScope) -> Self {
         self.scope = Some(scope);
@@ -77,6 +92,13 @@ impl ImapErrorContext {
         self
     }
 
+    /// Production-dead: every folder producer migrated to
+    /// `with_folder_scope` (`ErrorScope::Cursor(Folder(_))`). Tests still
+    /// use it, so the scope READERS must keep accepting `Mailbox { id }` -
+    /// see `id_from_scope` / `mailbox_throttle`, where assuming otherwise
+    /// made `ThrottleScope::Mailbox` unreachable in production while its
+    /// test kept passing.
+    #[allow(dead_code)]
     #[must_use]
     pub(crate) fn with_mailbox(mut self, mailbox: &MailboxName) -> Self {
         self.scope = Some(ErrorScope::Mailbox {
@@ -108,12 +130,21 @@ impl ImapErrorContext {
         self
     }
 
+    /// Unused: the driver stamps transmission state on the `Error` itself
+    /// (`error.attempt()`), which `into_account_error` prefers over the
+    /// context. So `ctx.transmission_state` is always `None` today.
+    #[allow(dead_code)]
     #[must_use]
     pub(crate) fn with_transmission_state(mut self, state: TransmissionState) -> Self {
         self.transmission_state = Some(state);
         self
     }
 
+    /// Unused by design: IMAP lets `derive` recompute idempotency from the
+    /// operation via the central `AccountOperation::is_idempotent` table
+    /// rather than overriding per error. The consequence, and the one case
+    /// where it would bite, is worked through at `pim::restamp`.
+    #[allow(dead_code)]
     #[must_use]
     pub(crate) fn with_idempotency_override(mut self, idempotent: bool) -> Self {
         self.idempotency_override = Some(idempotent);
@@ -266,6 +297,15 @@ pub(crate) fn modseq_reset(
 
 /// Build a fatal-stream error for a terminal QRESYNC/CONDSTORE strategy
 /// downgrade that cannot be served on the current connection.
+///
+/// Unreachable today, and structurally so: a downgrade always has somewhere
+/// to land (QRESYNC -> CONDSTORE -> Basic, and Basic is plain FETCH, which
+/// every server serves), so the sync lanes report one as a non-fatal
+/// `WarningKind::StrategyDowngraded` and continue on the weaker strategy
+/// instead of failing the stream. Kept because "no terminal downgrade" is a
+/// property of the current strategy ladder rather than of the error model:
+/// a future strategy with no weaker peer would need exactly this.
+#[allow(dead_code)]
 pub(crate) fn strategy_failure(folder: &MailboxName, downgrade: StrategyDowngrade) -> AccountError {
     AccountErrorBuilder::new(
         AccountErrorKind::SyncState(SyncStateErrorKind::StrategyFailure),

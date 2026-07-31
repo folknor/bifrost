@@ -95,6 +95,12 @@ any item; some may already be obsolete.
   `with_mailbox` is production-dead. Both are reasonable API surface; the
   scope readers now handle what they produce, so neither is a trap.
 
+  Followed up by sweep-1 (2026-07-31): `#![warn(dead_code)]` on
+  `account/error.rs` now enforces this residual rather than recording it,
+  and turned up three more unreachable items the audit had missed
+  (`with_scope`, `with_idempotency_override`, `strategy_failure`). All are
+  annotated in place with the reason they are dead.
+
   The one finding NOT fixed is filed as imap-S1 below.
 
 - **imap-S1.** DONE (2026-07-31). ManageSieve response codes (RFC 5804 1.3)
@@ -910,6 +916,67 @@ blocking; each is a real defect or a real decision, not a cleanup.
   Not scheduled, no blast radius bound yet - sizing is part of the job.
   Deliverable is a findings list triaged bug / gap / smell / nit, not a
   fix wave; fixes get scheduled per finding.
+
+  TELLS 1, 3, AND 4 ARE DONE (2026-07-31). Result: 0 bugs, 1 smell, 1 nit,
+  both fixed in the same commit. Tell 2 remains, and is now the only part
+  worth spending on.
+
+  Why the yield was so much lower than the four calibration finds, since
+  that is the reusable lesson: **drift needs movement.** All four earlier
+  defects lived in code that had MOVED - a producer changed shape, a seam
+  was promoted, a contract was restated across a layer boundary. Tell 1
+  greps (`mirrors`, `same shape as`, `equivalent to`) mostly surface copies
+  of FROZEN specs, which cannot rot. `types::mime::is_atom_phrase` and
+  `smtp::is_valid_phrase` are byte-comparable encodings of RFC 5322 `atext`
+  and were verified identical; the RFC has not moved since 2008. The string
+  marks intent-to-copy, which is only weakly correlated with drift.
+
+  Tell 3 (test-only helpers) was likewise near-empty: the suspicious ones
+  (`autodiscover::parse_user_settings`, `decode::parse_response`) are honest
+  thin wrappers that delegate to the real function, and their docs say so.
+
+  What DID pay was tell 4, in a form worth reusing: **arm the compiler
+  instead of reading.** `bifrost-imap` and `bifrost-jmap` both set a
+  crate-wide `#![allow(dead_code)]`, which switches off exactly the signal
+  that would have caught `skip_attempt_cause`. Measured before acting: 105
+  warnings in imap, 195 in jmap, overwhelmingly legitimate unused PROTOCOL
+  surface (command builders, response types, per-RFC method modules that
+  consumers call and the crate does not). So removing the blanket allow is
+  NOT a cheap win and was not done.
+
+  The bounded version was: re-arm the lint on the ERROR-TRANSLATION
+  boundaries only, where a dead item is a hole in a contract rather than
+  unused API. `#![warn(dead_code)]` now sits on
+  `crates/imap/src/account/error.rs` and `crates/jmap/src/sync/error.rs`;
+  `bifrost-smtp` needed nothing (no blanket allow, so already armed). It
+  found five unreachable items in imap and two in jmap on the first run,
+  three of which were not previously recorded anywhere. All seven proved
+  dead-but-intentional and are now annotated with the REASON they are
+  unreachable, so the next reader gets the ruling instead of re-deriving it.
+  Verified the guard bites by adding a dead function and confirming the
+  build fails.
+
+  The one with teeth for the future: `imap::account::error::strategy_failure`
+  is unreachable because the strategy ladder always has somewhere to land
+  (QRESYNC -> CONDSTORE -> Basic, and Basic is plain FETCH), so downgrades
+  report as `WarningKind::StrategyDowngraded` and continue. That is a
+  property of the CURRENT ladder, not of the error model - a future strategy
+  with no weaker peer needs it.
+
+  - **sweep-1a (graph, smell) FIXED.** `public_folder_containers`
+    (`account/pim.rs`) degrades four ways when a folder has no
+    `public_folder_meta`: display name falls back to the raw EWS folder id,
+    content class / parent / rights go `None`. Production cannot reach it -
+    `seed_and_scope` writes BOTH maps unconditionally - but the test-only
+    `seed_public_folder_for_tests` wrote routing alone, so a test could
+    drive branches production never takes. The seeder now writes both.
+  - **sweep-1b (smtp, nit) FIXED.** `message_error_to_account_error` has no
+    production caller (nothing in the workspace builds an SMTP `Message`;
+    IMAP submission takes raw RFC822 bytes, and the live boundary
+    `into_account_error` dispatches on `SmtpError::kind`). Its doc asserted
+    as present fact that send pipelines "feed validation failures through
+    this function so the single-translation-boundary rule holds". Reworded
+    to say what is true and why it is kept.
 
 ## Rules for agents working bug-hunt items
 
