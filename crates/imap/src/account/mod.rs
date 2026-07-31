@@ -891,9 +891,8 @@ pub(crate) fn account_error_with(err: Error, ctx: error::ImapErrorContext) -> Ac
 /// Wrap a fatal stream cause as `SyncEvent::Terminated`. Accepts any
 /// `Into<TerminatedCause>`: a structured `AccountError` (already built
 /// at the account boundary) or an `(Error, ImapErrorContext)` pair to
-/// classify on the way out. Replaces the previous twin helpers
-/// `fatal_event` / `terminated_event` so call sites do not have to
-/// pick which lane to dispatch through.
+/// classify on the way out - the single helper the former twin
+/// `fatal_event` / `terminated_event` pair collapsed into.
 pub(crate) fn terminated_event<T, E: Into<TerminatedCause>>(cause: E) -> SyncEvent<T> {
     SyncEvent::Terminated(cause.into().into_account_error())
 }
@@ -925,14 +924,6 @@ impl From<(Error, error::ImapErrorContext)> for TerminatedCause {
     fn from((err, ctx): (Error, error::ImapErrorContext)) -> Self {
         Self::Classify(err, ctx)
     }
-}
-
-/// Legacy alias for the classify-on-build helper. Same body as
-/// `terminated_event::<T, _>((err, ctx))` but reads naturally at
-/// call sites that still phrase the action as "fatal-event this
-/// `(Error, ImapErrorContext)`."
-pub(crate) fn fatal_event<T>(err: Error, ctx: error::ImapErrorContext) -> SyncEvent<T> {
-    terminated_event((err, ctx))
 }
 
 pub(crate) fn boxed_receiver_stream<T: Send + 'static>(

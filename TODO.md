@@ -76,10 +76,6 @@ re-auditors don't re-raise them.)
 - **imap-N3.** `concurrency_conflict_error` / `store_failed_error`:
   take an `AccountOperation` parameter; thread from the caller's
   `MutationKind`.
-- **imap-N4.** Delete `MAILBOX_UNAVAILABLE_KINDS` const,
-  `let _ = &mut t;`, and the unused `with_thread_id` constructor.
-- **imap-N5.** Consolidate `terminated_event` / `fatal_event` into a
-  single helper taking `impl Into<AccountError>`.
 - **imap-G1.** (gap, feature-sized) Expose IMAP MIME-part downloads as
   real `BlobHandle`s. Symptom: the account used to advertise
   `BlobRangeSupport::Yes` and accept any `BlobHandle` in `open_blob` /

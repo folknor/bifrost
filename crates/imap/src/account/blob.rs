@@ -7,8 +7,7 @@ use bytes::Bytes;
 use crate::types::{FetchAttr, MailboxName};
 
 use super::{
-    ImapAccount, batch, boxed_receiver_stream, decode_object_id, fatal_event, terminated_event,
-    uid_set_from_u32,
+    ImapAccount, batch, boxed_receiver_stream, decode_object_id, terminated_event, uid_set_from_u32,
 };
 
 enum BlobError {
@@ -51,11 +50,11 @@ pub(crate) fn open_raw_rfc822(
             }
             Err(BlobError::Imap(err)) => {
                 let _ = tx
-                    .send(fatal_event(
+                    .send(terminated_event((
                         err,
                         super::error::ImapErrorContext::operation(AccountOperation::OpenRawRfc822)
                             .with_message_id(scope_id),
-                    ))
+                    )))
                     .await;
             }
         }

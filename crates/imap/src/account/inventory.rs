@@ -10,8 +10,8 @@ use crate::types::{FetchAttr, FetchResponse, MailboxName, UidSet};
 
 use super::{
     BATCH_ITEMS, CompactUidSet, ImapAccount, ScopeHandler, batch, boxed_receiver_stream,
-    encode_cursor, encode_object_id, fatal_event, folder_from_scope, folder_scope,
-    membership_scope, route_scope,
+    encode_cursor, encode_object_id, folder_from_scope, folder_scope, membership_scope,
+    route_scope, terminated_event,
 };
 
 pub(crate) fn establish_initial_cursor(
@@ -55,13 +55,13 @@ pub(crate) fn inventory_stream(
             Ok(()) | Err(InventoryError::ChannelDropped) => {}
             Err(InventoryError::Imap(err)) => {
                 let _ = tx
-                    .send(fatal_event(
+                    .send(terminated_event((
                         err,
                         super::error::ImapErrorContext::operation(
                             bifrost_types::AccountOperation::SyncInventory,
                         )
                         .with_cursor_scope(scope),
-                    ))
+                    )))
                     .await;
             }
             Err(InventoryError::Account(err)) => {
@@ -78,7 +78,7 @@ pub(crate) fn inventory_stream(
 /// a dropped consumer is not an error to escalate: the streaming task
 /// just returns. We model it as a separate variant so the spawn handler
 /// can distinguish "consumer left" (silent return) from "wire failed"
-/// (`fatal_event`).
+/// (`terminated_event`).
 struct ChannelDropped;
 
 enum InventoryError {

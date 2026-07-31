@@ -12,8 +12,8 @@ use crate::types::{FetchAttr, MailboxName, SelectedMailbox, UidSet};
 use super::folder_registry::expand_range;
 use super::{
     BATCH_ITEMS, CompactUidSet, FolderCursor, ImapAccount, ScopeHandler, batch,
-    boxed_receiver_stream, decode_cursor, encode_cursor, encode_object_id, fatal_event,
-    folder_from_scope, folder_scope, membership_scope, route_scope, terminated_event,
+    boxed_receiver_stream, decode_cursor, encode_cursor, encode_object_id, folder_from_scope,
+    folder_scope, membership_scope, route_scope, terminated_event,
 };
 
 pub(crate) fn describe_cursor(account: &ImapAccount, cursor: &ChangeCursor) -> CursorDescriptor {
@@ -91,13 +91,13 @@ pub(crate) fn changes_stream(
             }
             Err(ChangeError::Imap(err)) => {
                 let _ = tx
-                    .send(fatal_event(
+                    .send(terminated_event((
                         err,
                         super::error::ImapErrorContext::operation(
                             bifrost_types::AccountOperation::SyncChanges,
                         )
                         .with_cursor_scope(scope_for_ctx),
-                    ))
+                    )))
                     .await;
             }
             Err(ChangeError::UidValidityChanged {
