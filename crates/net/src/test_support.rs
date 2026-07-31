@@ -62,6 +62,41 @@ pub enum Canned {
         /// Body bytes.
         body: Bytes,
     },
+    /// A 200 whose body arrives as the given chunks, in order, each one
+    /// framed as its own chunk on the wire.
+    ///
+    /// For the streaming download path, where what matters is how the
+    /// body is FRAMED rather than what it totals. A `Response` with the
+    /// concatenated bytes would let the transport frame them however it
+    /// liked, so a test could not tell a stream that forwards its chunks
+    /// from one that coalesces or re-splits them.
+    Stream {
+        /// Status line. Streaming callers care about 200 vs 206.
+        status: StatusCode,
+        /// Response headers - `Content-Range` for a ranged read.
+        headers: HeaderMap,
+        /// Body chunks, delivered in order and framed individually.
+        chunks: Vec<Bytes>,
+    },
+    /// A response whose body fails partway through, after delivering the
+    /// given chunks.
+    ///
+    /// The one failure a status check cannot pre-empt: the status and
+    /// headers are already good, so the caller has a stream in hand
+    /// before anything goes wrong. Surfaces to the caller as
+    /// `Error::Network`, which is what a real socket failure mid-body
+    /// produces - the specific error given here is what the transport
+    /// reports having seen, not what the caller receives verbatim.
+    StreamThenError {
+        /// Status line.
+        status: StatusCode,
+        /// Response headers.
+        headers: HeaderMap,
+        /// Chunks delivered before the failure.
+        chunks: Vec<Bytes>,
+        /// Message carried into the resulting `Error::Network`.
+        message: String,
+    },
     /// A transport-level failure, before any response exists. Drives
     /// the network-retry lane rather than the status lane.
     Error(Error),
@@ -174,18 +209,54 @@ impl Dispatch for ScriptedDispatch {
                     status,
                     headers,
                     body,
+                } => Ok(canned_response(status, &headers, body)),
+                Canned::Stream {
+                    status,
+                    headers,
+                    chunks,
                 } => {
-                    let mut response = http::Response::builder().status(status);
-                    for (name, value) in &headers {
-                        response = response.header(name, value);
-                    }
-                    Ok(response.body(body).expect("valid canned response").into())
+                    let body = reqwest::Body::wrap_stream(futures::stream::iter(
+                        chunks.into_iter().map(Ok::<Bytes, std::io::Error>),
+                    ));
+                    Ok(canned_response(status, &headers, body))
+                }
+                Canned::StreamThenError {
+                    status,
+                    headers,
+                    chunks,
+                    message,
+                } => {
+                    let failure = std::io::Error::other(message);
+                    let body = reqwest::Body::wrap_stream(futures::stream::iter(
+                        chunks
+                            .into_iter()
+                            .map(Ok)
+                            .chain(std::iter::once(Err(failure))),
+                    ));
+                    Ok(canned_response(status, &headers, body))
                 }
                 Canned::Error(error) => Err(error),
                 Canned::Pending => futures::future::pending().await,
             }
         })
     }
+}
+
+/// Assemble a `reqwest::Response` from a canned status, headers, and
+/// any body reqwest accepts (buffered `Bytes` or a wrapped stream).
+fn canned_response<B: Into<reqwest::Body>>(
+    status: StatusCode,
+    headers: &HeaderMap,
+    body: B,
+) -> reqwest::Response {
+    let mut response = http::Response::builder().status(status);
+    for (name, value) in headers {
+        response = response.header(name, value);
+    }
+    response
+        .body(body.into())
+        .expect("valid canned response")
+        .into()
 }
 
 /// A canned response with the given status and body and no headers.

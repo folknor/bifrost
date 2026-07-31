@@ -169,19 +169,24 @@ account-wide request legitimately goes to the primary (`delete_thread`'s
 misrouted lookup consumes it and the next primary request panics.
 
 Two smaller funnels sit beside the REST one, for the wire paths that are not
-Graph REST JSON calls. `execute_aux` shares the REST dispatcher (above);
-`download_stream` keeps a Graph-local queue, because chunk boundaries and a
-mid-stream failure are not expressible as a canned response body - and, unlike
-the REST queue, it restates nothing about bifrost-net's status contract, so it
-was never part of the xc-3 defect:
+Graph REST JSON calls. Both now share the REST dispatcher:
 
 - `GraphClient::download_stream` - blob and raw-RFC822 byte streams. Tests
-  script the chunk sequence (`ScriptedDownload::Chunks`), an open failure
-  (`Failed`, which is how a 405 "not a byte stream" and every 4xx arrive:
-  bifrost-net resolves the status before yielding a body), or a mid-stream
-  transport failure (`ChunksThenError`, the only failure the status check
-  cannot pre-empt). The recorded request carries the URL and the caller's
+  script the chunk sequence (`ScriptedDownload::Chunks`, framed individually
+  by `Canned::Stream` so "the blob stream forwards every transport chunk"
+  is checkable), a ranged read (`PartialChunks`, a 206 plus the
+  `Content-Range` it answers with), an open failure (`FailedStatus`, which is
+  how a 405 "not a byte stream" and every 4xx arrive: bifrost-net resolves the
+  status before yielding a body), or a mid-body failure (`ChunksThenError`,
+  the only failure the status check cannot pre-empt, surfacing as
+  `Error::Network`). The recorded request carries the URL and the caller's
   `ByteRange`.
+
+  `PartialChunks` exists because bifrost-net refuses a ranged read that does
+  not return 206 with a `Content-Range` matching the requested window. The
+  old Graph-local queue handed back chunks regardless of range, so a ranged
+  test could record a `ByteRange` the account never actually put on the wire.
+  The scripted header is now checked against the real request.
 - `GraphClient::execute_aux` - the pre-authenticated OneDrive chunk PUT and
   the Autodiscover POST. Deliberately NOT folded into `execute_wire`: that
   funnel always sends a bearer and takes the client's concurrency permit,
@@ -191,15 +196,18 @@ was never part of the xc-3 defect:
   whether a bearer was attached, so "the pre-authed session URL never carries
   the Graph token" is an assertion rather than a comment.
 
-EWS has its own `EwsExecute` seam, which answers at the EWS funnel and so
-still sits above the transport.
+The REST, aux, and download surfaces no longer have the graph-T1 limitation:
+because they script at the wire, retry, backoff, the rate-limit permit, the
+redirect walk, and the ranged-read contract all run below the script and are
+observable (`a_transient_5xx_is_retried_below_the_graph_funnel` pins one
+funnel call against two wire attempts).
 
-The REST and aux surfaces no longer have the graph-T1 limitation: because
-they script at the wire, retry, backoff, the rate-limit permit, and the
-redirect walk all run below the script and are observable
-(`a_transient_5xx_is_retried_below_the_graph_funnel` pins one funnel call
-against two wire attempts). What is still out of reach is the same behavior
-on the EWS and download paths, whose seams remain funnel-level.
+EWS keeps its own `EwsExecute` seam, which answers at the EWS funnel and so
+still sits above the transport - the one place graph-T1's gap remains.
+`EwsClient::execute` does post through `AccountNet`, so it COULD be scripted
+at the wire; it is not, because the trait double replaced three failed
+review-only rounds and immediately caught four defects, and the marginal gain
+(observing retry on SOAP posts) does not justify rebuilding a working seam.
 
 Calendar/contact primitives live in `calendar.rs` and `contacts.rs`. Graph
 calendar `color` is a provider token (not projected); reads request `Prefer:

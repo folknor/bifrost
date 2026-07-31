@@ -612,10 +612,14 @@ mod tests {
     #[tokio::test]
     async fn a_ranged_blob_read_forwards_every_transport_chunk() {
         let client = GraphClient::new("token");
-        client.script_downloads([crate::client::ScriptedDownload::Chunks(vec![
-            Bytes::from_static(b"abc"),
-            Bytes::from_static(b"de"),
-        ])]);
+        // A 206 whose `Content-Range` matches the window requested below.
+        // bifrost-net checks the two against each other, so this also
+        // pins that the account sent `bytes=2-6` rather than merely
+        // recording a range it never put on the wire.
+        client.script_downloads([crate::client::ScriptedDownload::PartialChunks {
+            content_range: "bytes 2-6/11",
+            chunks: vec![Bytes::from_static(b"abc"), Bytes::from_static(b"de")],
+        }]);
         let account = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
         let message = ObjectId("AAMkmsg".to_string());
         let handle = file_handle(&message, "att1");
@@ -658,12 +662,11 @@ mod tests {
     #[tokio::test]
     async fn a_405_on_the_value_endpoint_warns_instead_of_terminating() {
         let client = GraphClient::new("token");
-        client.script_downloads([crate::client::ScriptedDownload::Failed(
-            bifrost_net::Error::Status {
-                code: reqwest::StatusCode::METHOD_NOT_ALLOWED,
-                body: Bytes::new(),
-                headers: reqwest::header::HeaderMap::new(),
-            },
+        // The 405 is what the server answers; the typed `Error::Status`
+        // the account then classifies is produced by the transport, not
+        // hand-built here.
+        client.script_downloads([crate::client::ScriptedDownload::FailedStatus(
+            reqwest::StatusCode::METHOD_NOT_ALLOWED,
         )]);
         let account = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
         let message = ObjectId("AAMkmsg".to_string());
@@ -694,11 +697,7 @@ mod tests {
         let client = GraphClient::new("token");
         client.script_downloads([crate::client::ScriptedDownload::ChunksThenError(
             vec![Bytes::from_static(b"head")],
-            bifrost_net::Error::Network {
-                message: "connection reset mid-body".to_string(),
-                transmission_state: bifrost_types::TransmissionState::Acknowledged,
-                source: None,
-            },
+            "connection reset mid-body".to_string(),
         )]);
         let account = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
         let handle = file_handle(&ObjectId("AAMkmsg".to_string()), "att1");

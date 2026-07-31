@@ -1,5 +1,3 @@
-#[cfg(test)]
-use std::collections::VecDeque;
 use std::sync::{Arc, RwLock};
 
 use bifrost_net::{
@@ -216,8 +214,6 @@ struct ScriptedRest {
     wire_net: Option<AccountNet>,
     requests: Vec<RestRequest>,
     aux_requests: Vec<AuxRequest>,
-    download_armed: bool,
-    downloads: VecDeque<ScriptedDownload>,
     download_requests: Vec<DownloadRequest>,
 }
 
@@ -257,20 +253,85 @@ pub(crate) struct DownloadRequest {
     pub(crate) range: Option<bifrost_types::ByteRange>,
 }
 
-/// A scripted answer to `GraphClient::download_stream`.
+/// A scripted answer to `GraphClient::download_stream`, in terms of what
+/// the SERVER produced. What the caller then sees is bifrost-net's to
+/// decide, the same way it is for the REST surface.
 ///
-/// `bifrost-net` resolves the status BEFORE handing back a stream (a 4xx is
-/// an `Err`, never a body), so the two shapes here are the two the caller
-/// can actually see: an accepted stream, or a failure at open. `Chunks`
-/// carries the chunk boundaries verbatim so a test can pin that the blob
-/// stream forwards them rather than re-framing.
+/// `bifrost-net` resolves the status before handing back a stream (a 4xx
+/// is an `Err`, never a body), so a failing status is a failure at open;
+/// only a body that dies partway through reaches the caller as a stream
+/// that then errors.
 #[cfg(test)]
 pub(crate) enum ScriptedDownload {
+    /// A 200 whose body arrives as these chunks, framed individually so a
+    /// test can pin that the blob stream forwards them rather than
+    /// re-framing.
     Chunks(Vec<Bytes>),
-    /// Chunks that arrive before the transport fails mid-stream - the one
-    /// failure mode that is NOT resolved at open.
-    ChunksThenError(Vec<Bytes>, bifrost_net::Error),
-    Failed(bifrost_net::Error),
+    /// A `206 Partial Content` answering a RANGED read, carrying the
+    /// given `Content-Range`.
+    ///
+    /// bifrost-net refuses a ranged read that does not come back 206 with
+    /// a `Content-Range` matching the requested window - assembling
+    /// mismatched bytes into a blob would corrupt it silently. So the
+    /// header stated here is checked against the `Range` the account
+    /// actually sent, which makes a ranged test prove the request as well
+    /// as the response.
+    PartialChunks {
+        /// The `Content-Range` the server answers with, e.g.
+        /// `bytes 2-6/11`.
+        content_range: &'static str,
+        /// Body chunks, framed individually.
+        chunks: Vec<Bytes>,
+    },
+    /// Chunks that arrive before the body fails - the one failure mode
+    /// that is NOT resolved at open. Surfaces as `Error::Network`, which
+    /// is what a real socket failure mid-body produces.
+    ChunksThenError(Vec<Bytes>, String),
+    /// A failing status at open. The typed error the caller sees is
+    /// produced by the transport from this status, not stated here.
+    FailedStatus(reqwest::StatusCode),
+}
+
+#[cfg(test)]
+impl ScriptedDownload {
+    fn into_canned(self) -> bifrost_net::test_support::Canned {
+        use bifrost_net::test_support::Canned;
+        use reqwest::header::HeaderMap;
+
+        match self {
+            Self::Chunks(chunks) => Canned::Stream {
+                status: reqwest::StatusCode::OK,
+                headers: HeaderMap::new(),
+                chunks,
+            },
+            Self::PartialChunks {
+                content_range,
+                chunks,
+            } => {
+                let mut headers = HeaderMap::new();
+                headers.insert(
+                    reqwest::header::CONTENT_RANGE,
+                    reqwest::header::HeaderValue::from_static(content_range),
+                );
+                Canned::Stream {
+                    status: reqwest::StatusCode::PARTIAL_CONTENT,
+                    headers,
+                    chunks,
+                }
+            }
+            Self::ChunksThenError(chunks, message) => Canned::StreamThenError {
+                status: reqwest::StatusCode::OK,
+                headers: HeaderMap::new(),
+                chunks,
+                message,
+            },
+            Self::FailedStatus(status) => Canned::Response {
+                status,
+                headers: HeaderMap::new(),
+                body: Bytes::new(),
+            },
+        }
+    }
 }
 
 impl GraphClient {
@@ -802,10 +863,8 @@ impl GraphClient {
         range: Option<bifrost_types::ByteRange>,
     ) -> Result<bifrost_net::ByteStream, bifrost_net::Error> {
         #[cfg(test)]
-        if let Some(outcome) = self.scripted_download(url, range) {
-            return outcome;
-        }
-        let account_net = self.account_net().ok_or(bifrost_net::Error::Network {
+        self.record_download(url, range);
+        let account_net = self.wire_net().ok_or(bifrost_net::Error::Network {
             message: "Graph client is not attached to an account".to_string(),
             transmission_state: TransmissionState::Unsent,
             source: None,
@@ -850,42 +909,23 @@ impl GraphClient {
     }
 
     #[cfg(test)]
-    fn scripted_download(
-        &self,
-        url: &str,
-        range: Option<bifrost_types::ByteRange>,
-    ) -> Option<Result<bifrost_net::ByteStream, bifrost_net::Error>> {
-        use futures::StreamExt;
-
+    fn record_download(&self, url: &str, range: Option<bifrost_types::ByteRange>) {
         let mut scripted = self.inner.scripted.lock().expect("REST script lock");
-        if !scripted.download_armed {
-            return None;
+        if scripted.wire.is_none() {
+            return;
         }
-        let Some(scripted_download) = scripted.downloads.pop_front() else {
-            panic!("Graph download script exhausted by request: {url}");
-        };
         scripted.download_requests.push(DownloadRequest {
             url: url.to_string(),
             range,
         });
-        Some(match scripted_download {
-            ScriptedDownload::Chunks(chunks) => {
-                Ok(futures::stream::iter(chunks.into_iter().map(Ok)).boxed())
-            }
-            ScriptedDownload::ChunksThenError(chunks, error) => Ok(futures::stream::iter(
-                chunks
-                    .into_iter()
-                    .map(Ok)
-                    .chain(std::iter::once(Err(error))),
-            )
-            .boxed()),
-            ScriptedDownload::Failed(error) => Err(error),
-        })
     }
 
     #[cfg(test)]
     pub(crate) fn script_aux(&self, responses: impl IntoIterator<Item = ScriptedRestResponse>) {
-        self.script_wire(responses, RetryPolicy::disabled());
+        self.script_wire(
+            responses.into_iter().map(ScriptedRestResponse::into_canned),
+            RetryPolicy::disabled(),
+        );
     }
 
     #[cfg(test)]
@@ -902,9 +942,10 @@ impl GraphClient {
 
     #[cfg(test)]
     pub(crate) fn script_downloads(&self, downloads: impl IntoIterator<Item = ScriptedDownload>) {
-        let mut scripted = self.inner.scripted.lock().expect("REST script lock");
-        scripted.download_armed = true;
-        scripted.downloads.extend(downloads);
+        self.script_wire(
+            downloads.into_iter().map(ScriptedDownload::into_canned),
+            RetryPolicy::disabled(),
+        );
     }
 
     #[cfg(test)]
@@ -967,12 +1008,11 @@ impl GraphClient {
     #[cfg(test)]
     fn script_wire(
         &self,
-        responses: impl IntoIterator<Item = ScriptedRestResponse>,
+        canned: impl IntoIterator<Item = bifrost_net::test_support::Canned>,
         retry: RetryPolicy,
     ) {
         use bifrost_net::test_support::ScriptedDispatch;
 
-        let canned = responses.into_iter().map(ScriptedRestResponse::into_canned);
         let mut scripted = self.inner.scripted.lock().expect("REST script lock");
         if let Some(wire) = scripted.wire.as_ref() {
             wire.extend(canned);
@@ -1004,7 +1044,10 @@ impl GraphClient {
         &self,
         responses: impl IntoIterator<Item = ScriptedRestResponse>,
     ) {
-        self.script_wire(responses, RetryPolicy::default());
+        self.script_wire(
+            responses.into_iter().map(ScriptedRestResponse::into_canned),
+            RetryPolicy::default(),
+        );
     }
 
     /// How many requests the scripted transport has actually seen on the
@@ -1040,7 +1083,10 @@ impl GraphClient {
 
     #[cfg(test)]
     pub(crate) fn script_rest(&self, responses: impl IntoIterator<Item = ScriptedRestResponse>) {
-        self.script_wire(responses, RetryPolicy::disabled());
+        self.script_wire(
+            responses.into_iter().map(ScriptedRestResponse::into_canned),
+            RetryPolicy::disabled(),
+        );
     }
 
     #[cfg(test)]

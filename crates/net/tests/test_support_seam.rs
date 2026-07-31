@@ -144,6 +144,72 @@ async fn a_transport_failure_is_scriptable_without_a_socket() {
     assert_eq!(script.requests().len(), 2);
 }
 
+/// The framing guarantee the streaming variants exist for. A consumer
+/// pinning "the blob stream forwards every transport chunk rather than
+/// coalescing or re-splitting" needs the chunks it scripted to arrive as
+/// the chunks it scripted.
+#[tokio::test(flavor = "current_thread")]
+async fn a_streamed_body_preserves_its_chunk_boundaries() {
+    use futures::StreamExt;
+
+    let script = ScriptedDispatch::new([Canned::Stream {
+        status: StatusCode::OK,
+        headers: HeaderMap::new(),
+        chunks: vec![
+            bytes::Bytes::from_static(b"abc"),
+            bytes::Bytes::from_static(b"de"),
+            bytes::Bytes::from_static(b"fghi"),
+        ],
+    }]);
+
+    let stream = account(&script, no_retry())
+        .download_stream("https://consumer.test/blob", None)
+        .await
+        .expect("the stream opens");
+    let chunks: Vec<bytes::Bytes> = stream.map(|chunk| chunk.expect("chunk")).collect().await;
+
+    assert_eq!(
+        chunks,
+        vec![
+            bytes::Bytes::from_static(b"abc"),
+            bytes::Bytes::from_static(b"de"),
+            bytes::Bytes::from_static(b"fghi"),
+        ]
+    );
+}
+
+/// A body that fails partway through is the one failure the status check
+/// cannot pre-empt: the caller already holds a stream. The delivered
+/// chunks survive and the failure arrives as `Error::Network`, which is
+/// what a real socket failure mid-body produces.
+#[tokio::test(flavor = "current_thread")]
+async fn a_mid_body_failure_arrives_after_the_delivered_chunks() {
+    use futures::StreamExt;
+
+    let script = ScriptedDispatch::new([Canned::StreamThenError {
+        status: StatusCode::OK,
+        headers: HeaderMap::new(),
+        chunks: vec![bytes::Bytes::from_static(b"head")],
+        message: "connection reset mid-body".to_string(),
+    }]);
+
+    let stream = account(&script, no_retry())
+        .download_stream("https://consumer.test/blob", None)
+        .await
+        .expect("the stream opens: the status was already good");
+    let outcomes: Vec<Result<bytes::Bytes, Error>> = stream.collect().await;
+
+    assert_eq!(outcomes.len(), 2);
+    assert_eq!(
+        outcomes[0].as_ref().expect("first chunk delivered"),
+        &bytes::Bytes::from_static(b"head")
+    );
+    match outcomes[1].as_ref() {
+        Err(Error::Network { .. }) => {}
+        other => panic!("expected a mid-body Error::Network, got {other:?}"),
+    }
+}
+
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn the_transport_injects_authorization_below_the_consumer() {
     let script = ScriptedDispatch::new([canned(StatusCode::OK, b"ok")]);

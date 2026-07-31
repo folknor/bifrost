@@ -196,18 +196,24 @@ any item; some may already be obsolete.
   non-mail classes A5b-3 added. Fixing it needs a modification signal
   (e.g. `LastModifiedTime`) or a different watermark model entirely - a
   known poll-model limitation, not a regression.
-- **graph-T1.** (coverage; mostly closed by xc-3a on 2026-07-31) The REST
-  and aux surfaces now script at the wire via `bifrost_net::test_support`,
-  so retry, backoff, the rate-limit permit, and the redirect walk all run
-  below the script and are observable - `script_rest_with_retries` plus
-  `wire_attempts()` pin attempt counts, and
-  `a_transient_5xx_is_retried_below_the_graph_funnel` pins one funnel call
-  against two wire attempts. What REMAINS is the same gap on the two seams
-  that still answer at a funnel: EWS (`EwsExecute`) and
-  `GraphClient::download_stream`. Moving downloads would need the net seam
-  to grow a streaming canned body (chunk boundaries and a mid-stream
-  failure are not expressible as a `Bytes` body); moving EWS would need
-  its funnel to sit on an `AccountNet` the way REST now does.
+- **graph-T1.** (coverage; largely closed by xc-3a on 2026-07-31) The REST,
+  aux, and download surfaces now script at the wire via
+  `bifrost_net::test_support`, so retry, backoff, the rate-limit permit, the
+  redirect walk, and the ranged-read contract all run below the script and
+  are observable - `script_rest_with_retries` plus `wire_attempts()` pin
+  attempt counts, and `a_transient_5xx_is_retried_below_the_graph_funnel`
+  pins one funnel call against two wire attempts. Downloads moved once
+  `Canned` grew streaming bodies (`Stream` / `StreamThenError`), which
+  preserve chunk framing; that also surfaced that the old queue answered
+  ranged reads without a 206 or a `Content-Range`, so ranged tests recorded
+  a window the account never had to actually send.
+
+  What REMAINS is EWS, the one seam still answering at a funnel
+  (`EwsExecute`). `EwsClient::execute` does post through `AccountNet`, so it
+  is migratable; it was deliberately left, because that double replaced
+  three failed review-only rounds and caught four defects, and observing
+  retry on SOAP posts does not justify rebuilding a working seam. Revisit
+  if an EWS defect is ever traced to retry, backoff, or a redirect.
   (The blob byte streams, the pre-authed OneDrive chunk PUT, the
   Autodiscover POST including its in-body redirect chain, the renewal
   worker's SUCCESS leg across ticks, and the three-mailbox search walk
