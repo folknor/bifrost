@@ -14,6 +14,13 @@ doctest = false
 [lints]
 workspace = true
 
+[features]
+# Publishes the in-process wire seam (`test_support`) so crates riding
+# this transport can stage canned responses below the retry, redirect,
+# and rate-limit pipeline instead of hand-rolling a double that has to
+# re-derive this crate's status contract. Dev-dependency only.
+test-support = ["dep:http"]
+
 [dependencies]
 bifrost-types = { path = "../types" }
 reqwest = { workspace = true, features = ["native-tls", "stream", "json", "http2"] }
@@ -30,6 +37,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 zeroize = { workspace = true }
 uuid = { workspace = true }
+# Only used to assemble canned responses in `test_support`.
+http = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["sync", "time", "macros", "rt", "rt-multi-thread", "test-util"] }

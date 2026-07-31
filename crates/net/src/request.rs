@@ -794,7 +794,7 @@ fn build_reqwest(
     req
 }
 
-fn send_error_to_error(e: reqwest::Error) -> Error {
+pub(crate) fn send_error_to_error(e: reqwest::Error) -> Error {
     let message = format!("{e}");
     if e.is_builder() {
         // Builder failures become `InvalidRequest`; the retry loop's
@@ -963,132 +963,27 @@ mod tests {
     use super::*;
     use crate::auth::StaticTokenSource;
     use crate::config::NetConfig;
-    use crate::net::{AccountSpec, Net};
     use crate::rate::{RateLimit, RateLimitGovernor};
     use crate::redirect::FollowRedirects;
-    use bifrost_types::AccountId;
+    use crate::test_support::{Canned, ScriptedDispatch, canned, canned_with_headers};
     use reqwest::header::LOCATION;
-    use std::collections::VecDeque;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
-    enum Canned {
-        Response {
-            status: StatusCode,
-            headers: HeaderMap,
-            body: Bytes,
-        },
-        Error(Error),
-        Pending,
-    }
-
-    #[derive(Clone)]
-    struct RequestSnapshot {
-        method: reqwest::Method,
-        url: reqwest::Url,
-        headers: HeaderMap,
-        body: Option<Bytes>,
-    }
-
-    struct ScriptedDispatch {
-        steps: Mutex<VecDeque<Canned>>,
-        requests: Mutex<Vec<RequestSnapshot>>,
-    }
-
-    impl ScriptedDispatch {
-        fn new(steps: impl IntoIterator<Item = Canned>) -> Arc<Self> {
-            Arc::new(Self {
-                steps: Mutex::new(steps.into_iter().collect()),
-                requests: Mutex::new(Vec::new()),
-            })
-        }
-
-        fn requests(&self) -> Vec<RequestSnapshot> {
-            self.requests
-                .lock()
-                .expect("scripted request lock poisoned")
-                .clone()
-        }
-    }
-
-    impl Dispatch for ScriptedDispatch {
-        fn send(
-            &self,
-            request: reqwest::RequestBuilder,
-        ) -> AccountFuture<Result<reqwest::Response, Error>> {
-            let request = match request.build() {
-                Ok(request) => request,
-                Err(error) => return Box::pin(async move { Err(send_error_to_error(error)) }),
-            };
-            let body = request
-                .body()
-                .and_then(reqwest::Body::as_bytes)
-                .map(Bytes::copy_from_slice);
-            self.requests
-                .lock()
-                .expect("scripted request lock poisoned")
-                .push(RequestSnapshot {
-                    method: request.method().clone(),
-                    url: request.url().clone(),
-                    headers: request.headers().clone(),
-                    body,
-                });
-            let step = self
-                .steps
-                .lock()
-                .expect("scripted step lock poisoned")
-                .pop_front()
-                .expect("scripted dispatch exhausted");
-            Box::pin(async move {
-                match step {
-                    Canned::Response {
-                        status,
-                        headers,
-                        body,
-                    } => {
-                        let mut response = http::Response::builder().status(status);
-                        for (name, value) in &headers {
-                            response = response.header(name, value);
-                        }
-                        Ok(response.body(body).expect("valid canned response").into())
-                    }
-                    Canned::Error(error) => Err(error),
-                    Canned::Pending => futures::future::pending().await,
-                }
-            })
-        }
-    }
-
-    fn canned(status: StatusCode, body: &'static [u8]) -> Canned {
-        Canned::Response {
-            status,
-            headers: HeaderMap::new(),
-            body: Bytes::from_static(body),
-        }
-    }
-
-    fn canned_with_headers(status: StatusCode, headers: HeaderMap, body: &'static [u8]) -> Canned {
-        Canned::Response {
-            status,
-            headers,
-            body: Bytes::from_static(body),
-        }
-    }
-
+    // The scripted double these tests drive is the published one in
+    // `crate::test_support`, not a private copy - so a downstream crate
+    // scripting a status gets the same wire contract this crate pins.
     fn scripted_account(
         script: &Arc<ScriptedDispatch>,
         config: NetConfig,
         hosts: Vec<RateLimit>,
         retry: RetryPolicy,
     ) -> crate::net::AccountNet {
-        let net = Net::new_with_dispatch(config, Arc::clone(script) as Arc<dyn Dispatch>)
-            .expect("scripted net builds");
-        net.attach_account(
-            AccountId("scripted".to_string()),
-            AccountSpec {
-                hosts,
-                token_source: Arc::new(StaticTokenSource::new("token", None)),
-                default_retry: retry,
-            },
+        crate::test_support::scripted_account(
+            script,
+            config,
+            hosts,
+            Arc::new(StaticTokenSource::new("token", None)),
+            retry,
         )
     }
 

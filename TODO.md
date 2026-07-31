@@ -406,12 +406,38 @@ blocking; each is a real defect or a real decision, not a cleanup.
   deletion in `close`. The open question is whether the shared contract should
   keep placing that burden on the consumer at all.
 
-- **xc-3 (net + graph, related in jmap)** `bifrost-net` exposes no in-process
-  seam for staging a canned HTTP response, so account crates that ride it
-  cannot hermetically test any path whose behavior depends on what the server
-  returned. `bifrost_net::Response` is `#[non_exhaustive]` with no public
-  constructor, and the crate's `Dispatch` / `ScriptedDispatch` are
-  crate-private and test-only. Concretely this is why several `bifrost-graph`
+- **xc-3 (net + graph, related in jmap)** RESOLVED on the net side
+  (2026-07-31). `bifrost-net` now publishes the wire seam under a
+  `test-support` feature: `bifrost_net::test_support` exports `Canned`,
+  `ScriptedDispatch`, `RequestSnapshot`, `canned` / `canned_with_headers`,
+  and `scripted_net` / `scripted_account`. The `Dispatch` trait stays
+  crate-private - its signature is in reqwest types, and keeping reqwest
+  out of the public API is why the request wrapper exists - so what is
+  published is the double, not the trait. `request.rs`'s own unit tests
+  were migrated onto the published double so there is one definition
+  rather than a private copy plus a downstream copy, and
+  `tests/test_support_seam.rs` exercises it as a separate crate (which is
+  what catches a private-type leak or a mis-gated item that in-crate tests
+  would not). It also pins the two contract facts each hand-rolled double
+  had been re-deriving: a 4xx never surfaces as `Ok(Response)`, and an
+  exhausted script panics instead of reaching the network.
+
+  What remains is consumer migration, which is per-crate and optional:
+
+  - **xc-3a (graph)** Migrate the `#[cfg(test)]` `ScriptedRest` queue on
+    `ClientInner` onto the published seam. It intercepts above
+    `AccountNet`, so everything graph-T1 names (attempt counts, backoff
+    waits, rate-limit permits, which host a 3xx chain ended on) is still
+    unreachable from it. Not urgent - the existing queue is correct for
+    what it pins - but it is ~30 `#[cfg(test)]` sites in `client.rs` and
+    its recorded-request type (`RestRequest`, with parsed JSON bodies and
+    lifted `If-Match` / `Prefer`) is richer than `RequestSnapshot`, so the
+    port needs either an adapter or per-test rewrites. Sized as its own
+    slice.
+  - **xc-3b (graph)** Closing xc-3a is the prerequisite for graph-T1,
+    which stays open until then.
+
+  Original statement, for context on why several `bifrost-graph`
   paths are pinned only at the level of extracted pure decision functions,
   with the surrounding request/response sequencing left unpinned and named as
   such at the time: partial webhook-creation rollback, the
@@ -420,12 +446,13 @@ blocking; each is a real defect or a real decision, not a cleanup.
   `due_renewals`. `bifrost-jmap` hit the same wall and solved it locally by
   introducing a two-method `PushTransport` trait over the transport it owns,
   which worked precisely because jmap owns that transport - Graph does not.
-  The choice is between a Graph-local `GraphTransport` trait (or a
-  `#[cfg(test)]` response queue on `ClientInner`), and promoting net's
-  existing `Dispatch` seam to a supported test surface that every net-riding
-  crate can use. The second is the smaller total amount of code and the larger
-  API commitment. Related: `jmap-O2`, the jmap sync layer hardwiring
-  `ReqwestTransport`, which is the same testability problem one crate over.
+  That choice - a Graph-local transport trait versus promoting net's seam -
+  is settled: net's seam was promoted, per the resolution above. Related:
+  `jmap-O2`, the jmap sync layer hardwiring `ReqwestTransport`, which is the
+  same testability problem one crate over and is NOT closed by this: jmap
+  pins its own `ReqwestTransport` in a type alias rather than riding an
+  `AccountNet`, so it needs the transport generic threaded through (or the
+  free-function extraction), not a net-side seam.
 
 - **xc-4 (sync, maybe app)** Nothing schedules share-rediscovery reopens
   automatically. `AccountCapabilities::reopen_discovers_foreign_namespaces`

@@ -32,6 +32,11 @@ pub mod rate;
 pub mod redirect;
 pub mod request;
 pub mod retry;
+// Compiled for this crate's own unit tests as well, so the scripted
+// double has exactly one definition rather than a private copy here
+// and a published copy for downstream.
+#[cfg(any(feature = "test-support", test))]
+pub mod test_support;
 pub(crate) mod trace;
 pub mod url;
 

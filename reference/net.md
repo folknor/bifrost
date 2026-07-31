@@ -80,11 +80,48 @@ fresh wire request: governor debit + outbound metering + body send
 drains the body through the same metering reader.
 
 The loop sends through a crate-private `Dispatch` seam. Production
-dispatch delegates to reqwest. Unit tests install a scripted dispatcher
+dispatch delegates to reqwest. Tests install a scripted dispatcher
 that accepts real reqwest request builders and returns in-process
 responses or typed transport errors. This covers retry,
 authentication, redirect, range, metering, and cancellation behavior
 without sockets or listeners.
+
+### The `test-support` feature
+
+The scripted dispatcher is published to downstream crates under the
+`test-support` feature, as `bifrost_net::test_support`: `Canned`
+(a `Response` / `Error` / `Pending` wire outcome), `ScriptedDispatch`
+(answers a script in order, records every `RequestSnapshot`), the
+`canned` / `canned_with_headers` constructors, and the `scripted_net`
+/ `scripted_account` builders. Consumers enable it as a
+dev-dependency.
+
+The `Dispatch` trait itself stays crate-private, deliberately. Its
+signature is in terms of `reqwest::RequestBuilder` and
+`reqwest::Response`, and keeping reqwest out of the public API is why
+the `RequestBuilder` wrapper exists at all. What is published is the
+double, not the trait.
+
+Why it exists: account crates cannot construct a `Response`
+(`#[non_exhaustive]`, no public constructor), so each one grew a
+private double *above* `AccountNet` - which meant each re-derived
+this crate's status contract, and a mis-derivation is invisible until
+it hides a live defect. Scripting at the wire boundary instead puts
+the production retry budget, `Retry-After` honor, rate-limit permit,
+redirect walk, and bandwidth meter between the script and the
+assertion, which is exactly the layer no consumer-side seam can
+reach.
+
+Two contract facts a consumer scripting statuses must know, both
+pinned in `tests/test_support_seam.rs`:
+
+- The retry loop turns every 4xx and 5xx into `Err` before a response
+  surfaces. Only a 2xx and a passed-through 3xx reach a caller as
+  `Ok(Response)`. A branch that matches a 4xx off an `Ok` is dead on
+  the production path.
+- An exhausted script panics rather than falling through to the
+  network, so an under-scripted test fails loudly instead of dialing
+  a real socket.
 
 `AccountNet` exposes `get`, `post`, `put`, `patch`, `delete` - one
 constructor per HTTP method routing into the same `RequestBuilder`.
