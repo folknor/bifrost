@@ -71,23 +71,10 @@ impl Pool {
         };
         let member = match member {
             Some(member) => member,
-            None => {
-                let (conn, _auth) = self
-                    .inner
-                    .config
-                    .imap
-                    .connect_authenticated_metered(
-                        &self.inner.config.credentials,
-                        &self.inner.config.auth_policy,
-                        self.inner.meter.clone(),
-                        Some(Arc::clone(&self.inner.bandwidth_cap)),
-                    )
-                    .await?;
-                PoolMember {
-                    conn,
-                    selected: None,
-                }
-            }
+            None => PoolMember {
+                conn: self.inner.dial().await?,
+                selected: None,
+            },
         };
         Ok(PooledConn {
             member: Some(member),
@@ -115,23 +102,10 @@ impl Pool {
         };
         let member = match member {
             Some(member) => member,
-            None => {
-                let (conn, _auth) = self
-                    .inner
-                    .config
-                    .imap
-                    .connect_authenticated_metered(
-                        &self.inner.config.credentials,
-                        &self.inner.config.auth_policy,
-                        self.inner.meter.clone(),
-                        Some(Arc::clone(&self.inner.bandwidth_cap)),
-                    )
-                    .await?;
-                PoolMember {
-                    conn,
-                    selected: None,
-                }
-            }
+            None => PoolMember {
+                conn: self.inner.dial().await?,
+                selected: None,
+            },
         };
         Ok(PooledConn {
             member: Some(member),
@@ -146,18 +120,7 @@ impl Pool {
         if self.inner.closed.load(std::sync::atomic::Ordering::Acquire) {
             return Err(Error::closed());
         }
-        let (conn, _auth) = self
-            .inner
-            .config
-            .imap
-            .connect_authenticated_metered(
-                &self.inner.config.credentials,
-                &self.inner.config.auth_policy,
-                self.inner.meter.clone(),
-                Some(Arc::clone(&self.inner.bandwidth_cap)),
-            )
-            .await?;
-        Ok(conn)
+        self.inner.dial().await
     }
 
     pub(crate) async fn close(&self) {
@@ -168,9 +131,37 @@ impl Pool {
             let mut idle = self.inner.idle.lock().expect("pool lock poisoned");
             std::mem::take(&mut *idle)
         };
-        for member in members {
-            let _ = member.conn.logout().await;
+        if members.is_empty() {
+            return;
         }
+        // LOGOUT is best effort and the pool is already gated shut, so the
+        // drain must not be able to hold `Account::close` open. Members go
+        // out concurrently (a silent peer must not make the others wait its
+        // turn) under one `command_timeout` for the whole drain, which is
+        // the bound every other command in the account layer already has.
+        let drain = futures::future::join_all(members.into_iter().map(|member| async move {
+            let _ = member.conn.logout().await;
+        }));
+        let _ = tokio::time::timeout(self.inner.config.imap.command_timeout, drain).await;
+    }
+}
+
+impl PoolInner {
+    /// Dial and authenticate one fresh connection under the pool's meter and
+    /// bandwidth cap. The single place a pool connection is minted, so a
+    /// future change to how connections are metered or capped lands once.
+    async fn dial(&self) -> Result<ImapConnection, Error> {
+        let (conn, _auth) = self
+            .config
+            .imap
+            .connect_authenticated_metered(
+                &self.config.credentials,
+                &self.config.auth_policy,
+                self.meter.clone(),
+                Some(Arc::clone(&self.bandwidth_cap)),
+            )
+            .await?;
+        Ok(conn)
     }
 }
 
@@ -509,6 +500,35 @@ mod tests {
         ));
         assert!(matches!(pool.dial_idle().await, Err(Error::Closed { .. })));
         assert_eq!(idle_len(&pool), 0, "close drains the parked members");
+    }
+
+    /// A peer that accepts the LOGOUT and then says nothing must not hold
+    /// `close` open. The server ends stay alive and unresponsive here, so
+    /// each `logout()` would wait forever on its tagged reply; the drain's
+    /// `command_timeout` is the only thing that can end it. Two members pin
+    /// the concurrency too: serial logouts would need two timeouts to
+    /// finish, and the assertion below allows only one.
+    #[tokio::test(start_paused = true)]
+    async fn close_does_not_wait_forever_on_a_silent_peer() {
+        let (primed, _primed_server) = marked("ACL").await;
+        let (extra, _extra_server) = marked("BINARY").await;
+        let pool = pool_of(primed, 2);
+        park(&pool, extra, None);
+        let budget = pool.inner.config.imap.command_timeout;
+
+        let started = tokio::time::Instant::now();
+        pool.close().await;
+
+        assert!(
+            started.elapsed() <= budget,
+            "close drained two silent peers in {:?}, past the {budget:?} budget",
+            started.elapsed(),
+        );
+        assert_eq!(idle_len(&pool), 0, "close drains the parked members");
+        assert!(matches!(
+            pool.checkout_any().await,
+            Err(Error::Closed { .. })
+        ));
     }
 
     /// A checkout in flight when `close` runs is outside the idle list, so

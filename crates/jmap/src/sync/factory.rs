@@ -1162,7 +1162,7 @@ mod tests {
             scope: scope.clone(),
             server_state: encoded,
             advanced_through: None,
-            envelope_version: state::CHANGE_CURSOR_ENVELOPE_VERSION,
+            envelope_version: state::OUTER_CURSOR_ENVELOPE_VERSION,
         };
         let (_, seeded_state) = state::decode_cursor(&cursor).expect("seed decodes");
         assert_eq!(

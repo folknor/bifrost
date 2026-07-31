@@ -14,7 +14,6 @@ use bifrost_types::{AccountError, AccountOperation};
 use quick_xml::Reader;
 use quick_xml::escape::unescape;
 use quick_xml::events::Event;
-use reqwest::header::HeaderMap;
 
 use super::GraphAccount;
 use super::cursor::PublicFolderRouting;
@@ -248,11 +247,10 @@ impl GraphAccount {
 
         let status = resp.status;
         if !status.is_success() {
-            let response = GraphResponseError::from_response(
-                status,
-                HeaderMap::new(),
-                cap_status_body(resp.body),
-            );
+            // The real response headers, not an empty map: `Retry-After` and
+            // `WWW-Authenticate` are part of the classification input.
+            let response =
+                GraphResponseError::from_response(status, resp.headers, cap_status_body(resp.body));
             return Err(response_to_account_error_pub(response, &ctx));
         }
         Ok(String::from_utf8_lossy(resp.body.as_ref()).into_owned())
@@ -600,6 +598,31 @@ mod tests {
             "{body}"
         );
         assert!(body.contains("responseschema/2006a"), "{body}");
+    }
+
+    /// bifrost-net returns `Err` for every 4xx/5xx before a response
+    /// surfaces, so the only status that can reach `autodiscover_post`'s
+    /// non-2xx branch is a passed-through 3xx - and when one does, the
+    /// response's OWN headers are the classification and telemetry input.
+    /// They used to be replaced with an empty map here, which discarded
+    /// `Retry-After`, `WWW-Authenticate`, and the request id support reads.
+    #[tokio::test]
+    async fn a_passed_through_redirect_classifies_with_the_response_headers() {
+        let client = GraphClient::new("token");
+        client.script_aux([ScriptedRestResponse::text(reqwest::StatusCode::FOUND, "")
+            .with_header("Retry-After", "30")
+            .with_header("request-id", "req-77")
+            .with_header("client-request-id", "crid-77")]);
+        let account = test_account(client);
+
+        let error = account
+            .discover_shared_mailboxes("user@contoso.com")
+            .await
+            .expect_err("a redirect is not a discovery result");
+
+        let telemetry = error.telemetry_fields();
+        assert_eq!(telemetry.request_id, Some("req-77"));
+        assert_eq!(telemetry.trace_id, Some("crid-77"));
     }
 
     /// A hybrid tenant answers `GetUserSettings` with an in-body

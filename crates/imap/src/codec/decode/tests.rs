@@ -14210,10 +14210,11 @@ fn skip_tagged_ext_simple_nil_form_across_terminator_sets() {
     // values never sit inside a parenthesized list.
     assert_skip_ext(b"NIL)", Some(""), Some(")"));
 
-    // The mirror image: CR terminates only for ESEARCH. For STATUS the atom
-    // fallback runs past the response-terminating CRLF, because CR is not in
-    // its terminator set. See the boundary test below.
-    assert_skip_ext(b"NIL\r\n", Some("\r\n"), Some(""));
+    // The mirror image: CR is a declared terminator only for ESEARCH, so the
+    // STATUS NIL arm's boundary check fails and the atom fallback runs. It
+    // stops at the CR anyway - CR/LF end the atom scan for every caller - so
+    // both sets leave the response-terminating CRLF in place.
+    assert_skip_ext(b"NIL\r\n", Some("\r\n"), Some("\r\n"));
 
     // An atom that merely starts with NIL must not be partially consumed
     // (the boundary check exists for exactly this).
@@ -14233,10 +14234,8 @@ fn skip_tagged_ext_simple_literal_form_across_terminator_sets() {
     assert_skip_ext(b"~{2}\r\nxy)", Some(")"), Some(")"));
     assert_skip_ext(b"{2+}\r\nxy)", Some(")"), Some(")"));
     // A literal whose body is shorter than its count is not a literal at all;
-    // the atom fallback takes over and the terminator set decides where the
-    // scan stops - `{9}` for ESEARCH (stops at CR), `{9}\r\nab` for STATUS
-    // (runs to the `)`).
-    assert_skip_ext(b"{9}\r\nab)", Some("\r\nab)"), Some(")"));
+    // the atom fallback takes over and stops at the CR for both callers.
+    assert_skip_ext(b"{9}\r\nab)", Some("\r\nab)"), Some("\r\nab)"));
 }
 
 #[test]
@@ -14259,36 +14258,37 @@ fn skip_tagged_ext_simple_atom_form_across_terminator_sets() {
     assert_skip_ext(b"1:*,5 )", Some(" )"), Some(" )"));
     // Numbers and sequence sets butted against the caller's own closer.
     assert_skip_ext(b"42)", Some(""), Some(")"));
-    assert_skip_ext(b"42\r\n", Some("\r\n"), Some(""));
+    assert_skip_ext(b"42\r\n", Some("\r\n"), Some("\r\n"));
 
     // Nothing to consume: `take_while1` needs at least one non-terminator
-    // byte, so a value position that opens with a terminator is an error.
+    // byte, so a value position that opens with a terminator - or with the
+    // CR/LF that ends the response line - is an error for both callers.
     assert_skip_ext(b"", None, None);
     assert_skip_ext(b" x", None, None);
     assert_skip_ext(b")x", Some(""), None);
-    assert_skip_ext(b"\r\n", None, Some(""));
+    assert_skip_ext(b"\r\n", None, None);
 }
 
-/// SMELL (not fixed here - imap-T4 is test-only): with the STATUS terminator
-/// set, CR is not a terminator, so the atom fallback consumes straight through
-/// the response-terminating CRLF and into whatever is buffered behind it. The
-/// STATUS caller then fails to find its `)` and the whole response errors out,
-/// so this is a parse failure rather than a mis-parse - but the scan crossing
-/// the response boundary at all is the kind of thing every other skip helper
-/// in this module (`skip_balanced_parens`, `skip_paren_group`) explicitly
-/// guards against with a CR/LF arm.
+/// The atom fallback must not scan past the response-terminating CRLF, whatever
+/// the caller's terminator set says. The STATUS set (SP/`)`) does not name CR,
+/// so before the CR/LF guard in `skip_tagged_ext_simple` this input consumed the
+/// CRLF and the following response's `* ` - a parse failure rather than a
+/// mis-parse, since STATUS then never found its `)`, but a scan across a
+/// response boundary all the same. Every sibling helper (`skip_balanced_parens`,
+/// `skip_paren_group`, `skip_fetch_value`) guards this way.
 #[test]
-fn skip_tagged_ext_simple_status_atom_scans_past_the_response_boundary() {
+fn skip_tagged_ext_simple_atom_stops_at_the_response_boundary() {
     let input = b"badvalue\r\n* OK next\r\n";
-    let (rest, ()) = skip_tagged_ext_simple(status_terminator)(input).unwrap();
-    assert_eq!(
-        rest, b" OK next\r\n",
-        "the atom fallback consumed the CRLF and the next response's `* `"
-    );
-
-    // The ESEARCH terminator set stops at the CR, as the other skip helpers do.
-    let (rest, ()) = skip_tagged_ext_simple(esearch_terminator)(input).unwrap();
-    assert_eq!(rest, b"\r\n* OK next\r\n");
+    for (label, rest) in [
+        ("STATUS", skip_tagged_ext_simple(status_terminator)(input)),
+        ("ESEARCH", skip_tagged_ext_simple(esearch_terminator)(input)),
+    ] {
+        let (rest, ()) = rest.unwrap();
+        assert_eq!(
+            rest, b"\r\n* OK next\r\n",
+            "{label} terminator set left the CRLF for the response parser"
+        );
+    }
 }
 
 // ===== Structure-aware BODYSTRUCTURE generative pass (imap-T4) =====

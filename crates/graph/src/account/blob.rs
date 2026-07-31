@@ -38,6 +38,22 @@ struct GraphBlobLocator {
     kind: GraphBlobKind,
 }
 
+/// One streamed byte chunk as a `Batch`.
+///
+/// `bytes_in` carries the chunk's real length: the engine meters download
+/// volume off it, and reporting 0 here made every REST byte stream invisible
+/// to metering while the EWS attachment path reported the truth.
+fn byte_chunk_batch(bytes: Bytes, page_boundary: PageBoundary) -> Batch<Bytes> {
+    let bytes_in = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    Batch {
+        items: vec![bytes],
+        page_boundary,
+        server_latency: std::time::Duration::default(),
+        bytes_in,
+        checkpoint: None::<Checkpoint>,
+    }
+}
+
 pub(crate) fn open_blob_stream(
     account: GraphAccount,
     handle: BlobHandle,
@@ -174,16 +190,9 @@ fn open_ews_blob_stream(
     Box::pin(async_stream::stream! {
         match fetch_ews_attachment(&account, &locator).await {
             Ok(bytes) => {
-                let bytes_in = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-                yield SyncEvent::Batch(Batch {
-                    // GetAttachment returns the whole attachment in one
-                    // SOAP body, so this is always a single final page.
-                    items: vec![bytes],
-                    page_boundary: PageBoundary::Final,
-                    server_latency: std::time::Duration::default(),
-                    bytes_in,
-                    checkpoint: None::<Checkpoint>,
-                });
+                // GetAttachment returns the whole attachment in one SOAP
+                // body, so this is always a single final page.
+                yield SyncEvent::Batch(byte_chunk_batch(bytes, PageBoundary::Final));
             }
             Err(EwsAttachmentError::NotPublic) => {
                 yield SyncEvent::Warning(warning_blob_not_byte_stream(
@@ -289,16 +298,21 @@ fn open_blob_inner_stream(
             }
         };
 
+        // One chunk of lookahead so the last chunk of a complete stream can be
+        // `Final`. A stream that errors mid-way has no final page: its pending
+        // chunk flushes as `Page` before the terminal error.
+        let mut pending: Option<Bytes> = None;
         while let Some(chunk) = stream.next().await {
             match chunk {
-                Ok(bytes) => yield SyncEvent::Batch(Batch {
-                    items: vec![bytes],
-                    page_boundary: PageBoundary::Page,
-                    server_latency: std::time::Duration::default(),
-                    bytes_in: 0,
-                    checkpoint: None::<Checkpoint>,
-                }),
+                Ok(bytes) => {
+                    if let Some(prev) = pending.replace(bytes) {
+                        yield SyncEvent::Batch(byte_chunk_batch(prev, PageBoundary::Page));
+                    }
+                }
                 Err(error) => {
+                    if let Some(prev) = pending.take() {
+                        yield SyncEvent::Batch(byte_chunk_batch(prev, PageBoundary::Page));
+                    }
                     let account_error = AccountErrorBuilder::new(
                         AccountErrorKind::Protocol(ProtocolErrorKind::PartialResponse),
                         Cause::Wire(WireCause::MalformedResponse {
@@ -318,6 +332,9 @@ fn open_blob_inner_stream(
                     break;
                 }
             }
+        }
+        if let Some(last) = pending {
+            yield SyncEvent::Batch(byte_chunk_batch(last, PageBoundary::Final));
         }
         yield SyncEvent::Done(None);
     })
@@ -345,16 +362,19 @@ pub(crate) fn open_raw_rfc822(
             }
         };
 
+        // Same one-chunk lookahead as `open_blob_inner_stream`.
+        let mut pending: Option<Bytes> = None;
         while let Some(chunk) = stream.next().await {
             match chunk {
-                Ok(bytes) => yield SyncEvent::Batch(Batch {
-                    items: vec![bytes],
-                    page_boundary: PageBoundary::Page,
-                    server_latency: std::time::Duration::default(),
-                    bytes_in: 0,
-                    checkpoint: None::<Checkpoint>,
-                }),
+                Ok(bytes) => {
+                    if let Some(prev) = pending.replace(bytes) {
+                        yield SyncEvent::Batch(byte_chunk_batch(prev, PageBoundary::Page));
+                    }
+                }
                 Err(error) => {
+                    if let Some(prev) = pending.take() {
+                        yield SyncEvent::Batch(byte_chunk_batch(prev, PageBoundary::Page));
+                    }
                     let account_error = AccountErrorBuilder::new(
                         AccountErrorKind::Protocol(ProtocolErrorKind::PartialResponse),
                         Cause::Wire(WireCause::MalformedResponse {
@@ -374,6 +394,9 @@ pub(crate) fn open_raw_rfc822(
                     break;
                 }
             }
+        }
+        if let Some(last) = pending {
+            yield SyncEvent::Batch(byte_chunk_batch(last, PageBoundary::Final));
         }
         yield SyncEvent::Done(None);
     })

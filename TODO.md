@@ -30,12 +30,9 @@ any item; some may already be obsolete.
   three are pure given their inputs; unblocking needs either the
   transport generic threaded through (the xc-3 discussion) or the
   free-function extraction pattern `route_object_id` already uses.
-- **jmap-S1.** (smell, found while closing jmap-T1) `sync/state.rs`
-  holds two near-identically named version consts on different axes:
-  `CHANGE_CURSOR_ENVELOPE_VERSION = 1` (outer `ChangeCursor` envelope)
-  two lines from `ENVELOPE_VERSION_V2 = 2` (inner payload envelope);
-  every call site must know which is which. A rename
-  (`OUTER_`/`PAYLOAD_`) would remove the footgun. Related nit:
+- **jmap-S1-residual.** (nit; the confusable version-const pair it was
+  filed for is fixed - the two are now `PAYLOAD_ENVELOPE_VERSION` and
+  `OUTER_CURSOR_ENVELOPE_VERSION`, each documenting its axis)
   `JmapScopeRepr::from_cursor_scope` happily encodes `Type(Thread)` and
   `Query(_)` cursors that `changes::stream` then terminates
   `Unsupported` - a legal-but-dead codec path.
@@ -68,16 +65,6 @@ any item; some may already be obsolete.
   consumers that want per-attachment streaming from IMAP still cannot
   have it - they now get an honest `Unsupported` instead of a handle
   shape they could not obtain.
-- **imap-S2.** (smell, found while closing imap-T1) `Pool::close()`
-  awaits `logout()` serially per member with no timeout, and `close.rs`
-  adds none, so a hung or silent server blocks `Account::close` for the
-  whole pool. Everything else in the account layer goes through
-  `command_timeout()`. Candidate: a bounded logout or `join_all` +
-  timeout. Related nit: `checkout_for_folder`, `checkout_any`, and
-  `dial_idle` carry three byte-identical dial blocks; a private
-  `async fn dial(&self)` would collapse them - the duplication is
-  exactly where a future meter/cap wiring change gets applied twice and
-  forgotten once.
 - **imap-T3.** (audit) `account/error.rs`, crate `error.rs`, and their
   recovery-mapping tests still merit a dedicated audit against
   `reference/error-model.md`. ManageSieve and submission were checked only
@@ -93,15 +80,6 @@ any item; some may already be obsolete.
   halfwidth katakana beats base64's 4:3 contraction). The decoder
   inherits whatever cap the caller puts on the raw header. Pinned by
   `chained_encoded_words_expand_past_the_input_with_no_output_cap`.
-- **imap-S1.** (smell, found while closing imap-T4) With the STATUS
-  terminator set, `skip_tagged_ext_simple`'s atom fallback
-  (`codec/decode/envelope_fetch.rs`) does not treat CR as a terminator,
-  so it scans through the response-terminating CRLF into the next
-  buffered response. Degrades to a parse failure, not a mis-parse, but
-  every sibling helper (`skip_balanced_parens`, `skip_paren_group`,
-  `skip_fetch_value`) has an explicit CR/LF guard; candidate one-line
-  fix is a CR/LF exclusion in the atom arm. Pinned by
-  `skip_tagged_ext_simple_status_atom_scans_past_the_response_boundary`.
 - **imap-T5.** (deferred, connection sweep rulings - revisit triggers,
   not work items) Hermetic STARTTLS needs a fake TLS handshake
   (`ImapStream::into_tcp` returns `None` for `Memory`, deliberately);
@@ -237,22 +215,12 @@ any item; some may already be obsolete.
   worker's SUCCESS leg across ticks, and the three-mailbox search walk
   with a shared mailbox's own `nextLink` are covered as of the
   download/aux seams.)
-- **graph-B1.** (bug/smell, found while closing graph-T1) Byte-stream
-  `Batch`es in `account/blob.rs` set `bytes_in: 0`, so blob and
-  raw-RFC822 downloads report zero bytes to the engine's metering while
-  the EWS attachment path reports the real length - inconsistent
-  accounting on the same event type. Related nit: every streamed chunk
-  is `PageBoundary::Page`; no chunk is ever `Final`, so a consumer
-  keying off the boundary never sees a terminal page for a blob (only
-  the trailing `Done`).
-- **graph-S2.** (smell, found while closing graph-T1) Two near-dead
-  non-2xx branches: the chunk-PUT `_ =>` arm in `account/cloud.rs` and
-  the `!status.is_success()` branch in `account/autodiscover.rs` can
-  only be reached by a passed-through 3xx, because bifrost-net returns
-  `Err` for every 4xx/5xx before the response surfaces. The
-  autodiscover one additionally passes `HeaderMap::new()` into
-  `GraphResponseError::from_response`, discarding the real response
-  headers (`Retry-After`, `WWW-Authenticate`) from classification.
+- **graph-S2-residual.** (smell; the autodiscover half is fixed - it now
+  classifies with the real response headers and a scripted 3xx pins it)
+  The chunk-PUT `_ =>` arm in `account/cloud.rs` is still reachable only
+  by a passed-through 3xx, because bifrost-net returns `Err` for every
+  4xx/5xx before the response surfaces. Unpinned, but it does classify
+  with the real headers already.
 
 ## bifrost-sync
 

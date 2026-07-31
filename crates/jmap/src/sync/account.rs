@@ -370,7 +370,7 @@ impl Account for JmapAccount {
                 scope,
                 server_state,
                 advanced_through: None,
-                envelope_version: state::CHANGE_CURSOR_ENVELOPE_VERSION,
+                envelope_version: state::OUTER_CURSOR_ENVELOPE_VERSION,
             }))
         })
     }

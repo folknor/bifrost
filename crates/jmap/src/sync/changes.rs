@@ -393,7 +393,7 @@ mod tests {
             assert_eq!(cursor.scope, scope);
             assert_eq!(
                 cursor.envelope_version,
-                state::CHANGE_CURSOR_ENVELOPE_VERSION
+                state::OUTER_CURSOR_ENVELOPE_VERSION
             );
             let (_, state_string) =
                 state::decode_cursor(&cursor).expect("a checkpoint must decode again");
@@ -714,7 +714,7 @@ mod tests {
     /// from a newer build.
     #[tokio::test]
     async fn an_unreadable_cursor_envelope_clears_the_schema() {
-        for version in [1, state::ENVELOPE_VERSION_V2 + 1] {
+        for version in [1, state::PAYLOAD_ENVELOPE_VERSION + 1] {
             let scope = CursorScope::Type(bifrost_types::ObjectType::Email);
             let mut cursor =
                 state::cursor_for_scope(scope.clone(), "state-1").expect("scope encodes");
@@ -758,18 +758,18 @@ mod tests {
             scope: scope.clone(),
             server_state: bifrost_types::OpaqueChangeState {
                 protocol: bifrost_types::ProtocolKind::Gmail,
-                envelope_version: state::ENVELOPE_VERSION_V2,
+                envelope_version: state::PAYLOAD_ENVELOPE_VERSION,
                 bytes: good.server_state.bytes.clone(),
             },
             advanced_through: None,
-            envelope_version: state::CHANGE_CURSOR_ENVELOPE_VERSION,
+            envelope_version: state::OUTER_CURSOR_ENVELOPE_VERSION,
         };
         // Same payload, but the row is filed under a different scope.
         let crossed = ChangeCursor {
             scope: CursorScope::Type(bifrost_types::ObjectType::Mailbox),
             server_state: good.server_state.clone(),
             advanced_through: None,
-            envelope_version: state::CHANGE_CURSOR_ENVELOPE_VERSION,
+            envelope_version: state::OUTER_CURSOR_ENVELOPE_VERSION,
         };
 
         for (label, cursor) in [

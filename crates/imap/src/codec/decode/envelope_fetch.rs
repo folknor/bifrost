@@ -814,7 +814,11 @@ pub(super) fn binary_section_with_origin(input: &[u8]) -> IResult<&[u8], (Vec<u3
 /// - Atom/number (any run of non-delimiter bytes)
 ///
 /// The `terminator` predicate identifies bytes that mark the end of the atom
-/// fallback (e.g. SP and CR for ESEARCH, SP and `)` for STATUS).
+/// fallback (e.g. SP and CR for ESEARCH, SP and `)` for STATUS). CR and LF end
+/// the atom scan regardless of what the caller's predicate says: they close the
+/// response line, so a scan that crossed them would read into whatever response
+/// is buffered behind this one. Every sibling skip helper here guards the same
+/// way.
 ///
 /// Parenthesized groups are NOT handled here  -  callers must check for `(`
 /// before invoking this function.
@@ -843,7 +847,11 @@ where
             // Quoted string: "..." (RFC 9051 Section 4)
             map(quoted_string, |_| ()),
             // Atom / number / sequence-set  -  consume until a terminator byte
-            map(take_while1(move |b: u8| !terminator(b)), |_| ()),
+            // or the end of the response line.
+            map(
+                take_while1(move |b: u8| !terminator(b) && b != b'\r' && b != b'\n'),
+                |_| (),
+            ),
         ))
         .parse(input)
     }
