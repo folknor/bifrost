@@ -107,6 +107,19 @@ impl ScriptedDispatch {
         })
     }
 
+    /// Append further outcomes to the end of the script.
+    ///
+    /// For consumers whose scripting API is called more than once per
+    /// test (one call per wire surface, say) and which need all of them
+    /// answered by the single dispatcher their client is attached to.
+    /// Appending keeps one total order, which is what the wire has.
+    pub fn extend(&self, steps: impl IntoIterator<Item = Canned>) {
+        self.steps
+            .lock()
+            .expect("scripted step lock poisoned")
+            .extend(steps);
+    }
+
     /// Every request the dispatcher has seen, in order.
     #[must_use]
     pub fn requests(&self) -> Vec<RequestSnapshot> {

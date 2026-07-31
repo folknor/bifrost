@@ -107,33 +107,44 @@ arrived with cursor envelope v2, which forces a reseed.
 
 `GraphClient` owns the REST test seam. Every REST helper - raw MIME import
 included - funnels through one private `execute_wire`, which adapts the
-production `bifrost_net::Response` into a Graph-local wire response; test
-builds enqueue scripted status, headers, and bodies there and inspect the
-recorded method, URL, conditional/prefer headers, content type, and JSON or
-raw body. This keeps Graph account tests hermetic without exposing or
-changing bifrost-net's private dispatch seam. The production path is
-unchanged: it still goes through `AccountNet` for bearer auth, retry, rate
-limits, and metering. JSON bodies are serialized by the funnel rather than by
-`RequestBuilder::json` (identical bytes and content type, plus the same
-`EncodeBody` failure) so the funnel is non-generic and the one non-JSON body
-can share it; `post_mime` previously built its own request on `AccountNet` and
-was the one wire path the seam could not see.
+production `bifrost_net::Response` into a Graph-local wire response. JSON
+bodies are serialized by the funnel rather than by `RequestBuilder::json`
+(identical bytes and content type, plus the same `EncodeBody` failure) so the
+funnel is non-generic and the one non-JSON body can share it; `post_mime`
+previously built its own request on `AccountNet` and was the one wire path the
+seam could not see.
 
-Two rules make the seam an equivalence rather than an approximation:
+Responses are scripted at the WIRE, not at the funnel.
+`script_rest` / `script_aux` install a `bifrost_net::test_support::
+ScriptedDispatch` and bind an `AccountNet` to it, so a scripted status travels
+the production retry loop, rate-limit permit, redirect walk, and bandwidth
+meter before the funnel sees anything. Only the request RECORDING stays local
+(`record_wire` / `record_aux`), because this crate's recorded shape is richer
+than the transport's `RequestSnapshot`: the JSON body arrives parsed and
+`If-Match` / `Prefer` are lifted out of the header bag.
 
-- A scripted status takes the shape `bifrost-net` would have produced.
-  Its retry loop returns `Ok(Response)` for 2xx and a passed-through 3xx
-  ONLY: a terminal 4xx becomes `Error::Status`, a 401 surviving the forced
-  refresh `Error::AuthLost`, and the retryable set (429 plus 5xx) becomes
-  `Error::RateLimited` / `Error::RetryBudgetExhausted` once the budget is
-  gone. The retry set is read off `RetryPolicy::default()` - the policy
-  `attach_account` installs - not restated. Backoff, attempt count, and the
-  concurrency permit are not simulated; they change how long production
-  takes to reach an outcome, not which outcome it reaches.
-- An ARMED script that runs out panics at the offending request. Falling
-  through to `AccountNet` would let an unexpected request reach the network
-  and would leave it out of the recorded list, so a test asserting "exactly
-  N requests" could not detect the N+1th. Mirrors the EWS double.
+This replaced a Graph-local response queue that restated bifrost-net's status
+contract in an `into_net_outcome` helper. That restatement is what xc-3 was
+filed against: a copy of a contract can agree with itself while disagreeing
+with the transport, and this one did - it answered a 401 with `AuthLost`
+directly, hiding the fact that bifrost-net forces a token refresh and reissues
+the request on a budget separate from `max_attempts` first. A Graph path
+meeting a transient 401 recovers without surfacing an error at all.
+
+Consequences worth knowing when writing a test:
+
+- REST and aux share ONE dispatcher, because in production they share one
+  wire. A test scripting both lists its responses in wire order, and that
+  ordering is itself an assertion (see `hosting_an_attachment_uploads_then_
+  mints_a_link`, whose order is session, chunk, link).
+- The default policy is `RetryPolicy::disabled()`, so one scripted response
+  answers one request. `script_rest_with_retries` opts into the production
+  policy for a test that wants to pin the retry loop itself;
+  `wire_attempts()` reports the transport's own request count, which is where
+  a retried attempt is visible - it is not a second funnel call.
+- A script that runs out panics inside bifrost-net's dispatcher rather than
+  reaching the network. Same guarantee as before, now enforced once for every
+  crate riding the transport instead of per crate.
 
 The script is shared with every client derived from the one a test holds
 (`for_shared_mailbox`, `with_outlook_base`), the way the semaphore and
@@ -158,8 +169,11 @@ account-wide request legitimately goes to the primary (`delete_thread`'s
 misrouted lookup consumes it and the next primary request panics.
 
 Two smaller funnels sit beside the REST one, for the wire paths that are not
-Graph REST JSON calls, each with its own script queue and its own exhaustion
-panic on the same `GraphClient`:
+Graph REST JSON calls. `execute_aux` shares the REST dispatcher (above);
+`download_stream` keeps a Graph-local queue, because chunk boundaries and a
+mid-stream failure are not expressible as a canned response body - and, unlike
+the REST queue, it restates nothing about bifrost-net's status contract, so it
+was never part of the xc-3 defect:
 
 - `GraphClient::download_stream` - blob and raw-RFC822 byte streams. Tests
   script the chunk sequence (`ScriptedDownload::Chunks`), an open failure
@@ -177,10 +191,15 @@ panic on the same `GraphClient`:
   whether a bearer was attached, so "the pre-authed session URL never carries
   the Graph token" is an assertion rather than a comment.
 
-EWS has its own `EwsExecute` seam. What remains unreachable behind all of
-them is anything whose behavior depends on bifrost-net's own retry, backoff,
-or redirect walk: every seam answers at the funnel, and none of that runs
-below it. Tracked in `TODO.md` as graph-T1.
+EWS has its own `EwsExecute` seam, which answers at the EWS funnel and so
+still sits above the transport.
+
+The REST and aux surfaces no longer have the graph-T1 limitation: because
+they script at the wire, retry, backoff, the rate-limit permit, and the
+redirect walk all run below the script and are observable
+(`a_transient_5xx_is_retried_below_the_graph_funnel` pins one funnel call
+against two wire attempts). What is still out of reach is the same behavior
+on the EWS and download paths, whose seams remain funnel-level.
 
 Calendar/contact primitives live in `calendar.rs` and `contacts.rs`. Graph
 calendar `color` is a provider token (not projected); reads request `Prefer:

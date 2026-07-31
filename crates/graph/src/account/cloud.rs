@@ -513,9 +513,15 @@ mod tests {
     /// The whole hosting call: `createUploadSession` (bearer, JSON, the
     /// de-branded folder and `rename` conflict behavior), the chunk PUT
     /// against the URL the session handed back (no bearer), then
-    /// `createLink` for the requested scope. The two REST legs and the one
-    /// aux leg are scripted separately, so a leg landing on the wrong
-    /// transport shows up as an exhaustion panic rather than a pass.
+    /// `createLink` for the requested scope.
+    ///
+    /// The REST and aux legs share one scripted transport, because in
+    /// production they share one wire. The script is therefore in wire
+    /// order - session, chunk, link - and that ordering is itself an
+    /// assertion: a leg that went out in a different order, or an extra
+    /// leg, gets the wrong response or exhausts the script rather than
+    /// passing. The two surfaces still record their requests separately
+    /// below, since their recorded shapes differ.
     #[tokio::test]
     async fn hosting_an_attachment_uploads_then_mints_a_link() {
         let client = GraphClient::new("token");
@@ -525,14 +531,14 @@ mod tests {
                 json!({ "uploadUrl": SESSION_URL, "expirationDateTime": "2099-01-01T00:00:00Z" }),
             ),
             ScriptedRestResponse::json(
+                reqwest::StatusCode::CREATED,
+                json!({ "id": "drive-item-1" }),
+            ),
+            ScriptedRestResponse::json(
                 reqwest::StatusCode::OK,
                 json!({ "link": { "webUrl": "https://1drv.ms/x/abc" } }),
             ),
         ]);
-        client.script_aux([ScriptedRestResponse::json(
-            reqwest::StatusCode::CREATED,
-            json!({ "id": "drive-item-1" }),
-        )]);
         let account = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
         let payload = Bytes::from_static(b"hello world");
 

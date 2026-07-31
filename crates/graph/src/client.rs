@@ -56,9 +56,10 @@ struct ClientInner {
     scripted: Arc<std::sync::Mutex<ScriptedRest>>,
 }
 
-/// Graph-owned response shape at the one REST funnel.  Keeping this small
-/// adapter local lets tests script Graph responses without reaching into
-/// bifrost-net's private dispatch seam.
+/// Graph-owned response shape at the one REST funnel. Adapts the
+/// production `bifrost_net::Response` (which is `#[non_exhaustive]`) into
+/// a shape this crate owns, so the helpers above the funnel destructure
+/// it freely.
 pub(crate) struct RestResponse {
     pub(crate) status: reqwest::StatusCode,
     pub(crate) headers: reqwest::header::HeaderMap,
@@ -152,6 +153,18 @@ impl ScriptedRestResponse {
         }
     }
 
+    /// Hand this response to bifrost-net's scripted wire dispatch as the
+    /// bytes a server produced. What the caller then sees - `Ok`, a typed
+    /// `Error::Status`, `AuthLost`, `RateLimited`, a retry - is decided by
+    /// the production retry loop, not restated here.
+    fn into_canned(self) -> bifrost_net::test_support::Canned {
+        bifrost_net::test_support::Canned::Response {
+            status: self.status,
+            headers: self.headers,
+            body: self.body,
+        }
+    }
+
     /// A non-JSON body: the Autodiscover surfaces answer XML, not JSON.
     pub(crate) fn text(status: reqwest::StatusCode, body: &str) -> Self {
         Self {
@@ -176,91 +189,32 @@ impl ScriptedRestResponse {
         );
         self
     }
-
-    /// Reproduce what `bifrost-net` actually hands back for this status.
-    ///
-    /// The retry loop NEVER returns `Ok(Response)` for a 4xx or 5xx: a 4xx
-    /// outside the retry set becomes `Error::Status`, a 401 that survives a
-    /// forced token refresh becomes `Error::AuthLost`, and the retryable set
-    /// (429 plus the 5xx family) becomes `Error::RateLimited` /
-    /// `Error::RetryBudgetExhausted` once the budget is gone. Only 2xx and a
-    /// passed-through 3xx arrive as a response. A seam that handed a scripted
-    /// 500 back as a successful response would put every test built on it on
-    /// a code path production cannot reach, and the divergence would show up
-    /// as tests passing rather than as a failure.
-    ///
-    /// The retry set is read off `RetryPolicy::default()` - the policy
-    /// `attach_account` installs - rather than restated here, so a change to
-    /// the policy cannot leave the seam behind. Backoff, the attempt count,
-    /// and the client's own concurrency permit are deliberately not
-    /// simulated: they change how long production takes to reach an outcome,
-    /// not which outcome it reaches. A 3xx passes through as a response
-    /// because that is what the transport does with one it cannot follow.
-    fn into_net_outcome(self) -> Result<RestResponse, GraphError> {
-        use reqwest::StatusCode;
-
-        let Self {
-            status,
-            headers,
-            body,
-        } = self;
-        if status.is_success() || status.is_redirection() {
-            return Ok(RestResponse {
-                status,
-                headers,
-                body,
-            });
-        }
-
-        let policy = RetryPolicy::default();
-        let retry_after = bifrost_net::parse_retry_after(headers.get(reqwest::header::RETRY_AFTER))
-            .map(|hint| hint.min(policy.honor_retry_after_cap));
-        let final_response = bifrost_net::FinalResponse {
-            status,
-            headers: headers.clone(),
-            body: bifrost_net::error::cap_status_body(body.clone()),
-        };
-
-        let error = if status == StatusCode::UNAUTHORIZED {
-            bifrost_net::Error::AuthLost {
-                transmission_state: Some(TransmissionState::Acknowledged),
-                final_response: Some(final_response),
-            }
-        } else if status == StatusCode::TOO_MANY_REQUESTS {
-            bifrost_net::Error::RateLimited {
-                retry_after,
-                final_response,
-            }
-        } else if status.is_server_error() || policy.statuses.contains(&status) {
-            bifrost_net::Error::RetryBudgetExhausted {
-                final_response: Some(final_response),
-                retry_after_history: retry_after.into_iter().collect(),
-            }
-        } else {
-            bifrost_net::Error::Status {
-                code: status,
-                body: bifrost_net::error::cap_status_body(body),
-                headers,
-            }
-        };
-        Err(GraphError::Net(error))
-    }
 }
 
+/// Test-only scripting state, shared by every client derived from a
+/// scripted one (`for_shared_mailbox`, `with_outlook_base`) so a
+/// derivative issues its requests down the same scripted transport its
+/// parent was given - which is what production does with the real one.
+///
+/// Responses are NOT queued here. The REST and aux surfaces answer from
+/// a `bifrost_net` scripted wire dispatch installed as `wire_net`, so a
+/// scripted status travels the production retry loop and this crate does
+/// not restate what bifrost-net does with it. Only the recorded request
+/// shapes stay local, because they are richer than the transport's
+/// (parsed JSON bodies, lifted `If-Match` / `Prefer`).
 #[cfg(test)]
 #[derive(Default)]
 struct ScriptedRest {
-    /// Set by the first `script_rest` call and never cleared. While it is
-    /// set the client is a closed system: an unscripted request is a test
-    /// bug, not a reason to reach for the network.
-    armed: bool,
-    responses: VecDeque<ScriptedRestResponse>,
+    /// Installed by the first `script_rest` / `script_aux` call. Its
+    /// presence is what makes the client a closed system: once set, every
+    /// REST and aux request answers from the script, and an exhausted
+    /// script panics rather than reaching the network.
+    wire: Option<Arc<bifrost_net::test_support::ScriptedDispatch>>,
+    /// The `AccountNet` bound to `wire`. Preferred over the client's own
+    /// `account_net` slot while scripting is active, so a client derived
+    /// AFTER the script was installed still answers from it.
+    wire_net: Option<AccountNet>,
     requests: Vec<RestRequest>,
-    /// Armed independently of the REST script: a test that only scripts
-    /// REST must not have its unrelated aux paths silently answered, and a
-    /// test that only scripts an aux path must not have to arm REST.
-    aux_armed: bool,
-    aux_responses: VecDeque<ScriptedRestResponse>,
     aux_requests: Vec<AuxRequest>,
     download_armed: bool,
     downloads: VecDeque<ScriptedDownload>,
@@ -732,10 +686,11 @@ impl GraphClient {
         prefer: Option<&str>,
         body: Option<WireBody>,
     ) -> Result<RestResponse, GraphError> {
+        // Records the request in this crate's richer shape and does not
+        // answer it: the response comes back from the scripted transport
+        // below, through the production retry loop.
         #[cfg(test)]
-        if let Some(outcome) = self.scripted_wire(method, url, if_match, prefer, body.as_ref()) {
-            return outcome;
-        }
+        self.record_wire(method, url, if_match, prefer, body.as_ref());
         let _permit = self.inner.semaphore.acquire().await.map_err(|_| {
             GraphError::Net(bifrost_net::Error::Network {
                 message: "Graph request semaphore closed".to_string(),
@@ -743,7 +698,7 @@ impl GraphClient {
                 source: None,
             })
         })?;
-        let account_net = self.account_net().ok_or_else(|| {
+        let account_net = self.wire_net().ok_or_else(|| {
             GraphError::Net(bifrost_net::Error::Network {
                 message: "Graph client is not attached to an account".to_string(),
                 transmission_state: TransmissionState::Unsent,
@@ -808,10 +763,8 @@ impl GraphClient {
         body: Bytes,
     ) -> Result<RestResponse, GraphError> {
         #[cfg(test)]
-        if let Some(outcome) = self.scripted_aux(method, url, headers, bearer, &body) {
-            return outcome;
-        }
-        let account_net = self.account_net().ok_or_else(|| {
+        self.record_aux(method, url, headers, bearer, &body);
+        let account_net = self.wire_net().ok_or_else(|| {
             GraphError::Net(bifrost_net::Error::Network {
                 message: "Graph client is not attached to an account".to_string(),
                 transmission_state: TransmissionState::Unsent,
@@ -860,22 +813,30 @@ impl GraphClient {
         account_net.download_stream(url, range).await
     }
 
+    /// The transport a wire call should use: the scripted one under test
+    /// when a script is installed, otherwise this client's own attached
+    /// `AccountNet`. In production this is always the latter.
+    fn wire_net(&self) -> Option<AccountNet> {
+        #[cfg(test)]
+        if let Some(scripted) = self.scripted_net() {
+            return Some(scripted);
+        }
+        self.account_net()
+    }
+
     #[cfg(test)]
-    fn scripted_aux(
+    fn record_aux(
         &self,
         method: &str,
         url: &str,
         headers: &[(&str, &str)],
         bearer: bool,
         body: &Bytes,
-    ) -> Option<Result<RestResponse, GraphError>> {
+    ) {
         let mut scripted = self.inner.scripted.lock().expect("REST script lock");
-        if !scripted.aux_armed {
-            return None;
+        if scripted.wire.is_none() {
+            return;
         }
-        let Some(response) = scripted.aux_responses.pop_front() else {
-            panic!("Graph aux script exhausted by request: {method} {url}");
-        };
         scripted.aux_requests.push(AuxRequest {
             method: method.to_string(),
             url: url.to_string(),
@@ -886,7 +847,6 @@ impl GraphClient {
             bearer,
             body: body.clone(),
         });
-        Some(response.into_net_outcome())
     }
 
     #[cfg(test)]
@@ -925,9 +885,7 @@ impl GraphClient {
 
     #[cfg(test)]
     pub(crate) fn script_aux(&self, responses: impl IntoIterator<Item = ScriptedRestResponse>) {
-        let mut scripted = self.inner.scripted.lock().expect("REST script lock");
-        scripted.aux_armed = true;
-        scripted.aux_responses.extend(responses);
+        self.script_wire(responses, RetryPolicy::disabled());
     }
 
     #[cfg(test)]
@@ -961,32 +919,28 @@ impl GraphClient {
         )
     }
 
-    /// Answer a request from the installed script, or `None` when this
-    /// client was never scripted (production, and the many unit tests that
-    /// never issue a request at all).
+    /// Record a REST request in this crate's shape, which is richer than
+    /// the transport's `RequestSnapshot`: the JSON body arrives parsed,
+    /// and `If-Match` / `Prefer` are lifted out of the header bag.
     ///
-    /// An ARMED client that runs out of responses panics rather than
-    /// falling through to `AccountNet`: falling through would let an
-    /// unexpected extra request reach the network, which breaks
-    /// hermeticity outright, and would leave it out of the recorded
-    /// requests, so a test asserting "exactly N requests" could not detect
-    /// the N+1th. Mirrors the EWS double's exhaustion panic.
+    /// This does not answer the request. The response comes from the
+    /// scripted transport, so an exhausted script panics inside
+    /// bifrost-net rather than reaching the network - the same
+    /// hermeticity guarantee the local queue used to provide, now
+    /// enforced one layer down for every net-riding crate.
     #[cfg(test)]
-    fn scripted_wire(
+    fn record_wire(
         &self,
         method: &str,
         url: &str,
         if_match: Option<&str>,
         prefer: Option<&str>,
         body: Option<&WireBody>,
-    ) -> Option<Result<RestResponse, GraphError>> {
+    ) {
         let mut scripted = self.inner.scripted.lock().expect("REST script lock");
-        if !scripted.armed {
-            return None;
+        if scripted.wire.is_none() {
+            return;
         }
-        let Some(response) = scripted.responses.pop_front() else {
-            panic!("Graph REST script exhausted by request: {method} {url}");
-        };
         let is_json = body.is_none_or(|body| body.content_type == JSON_CONTENT_TYPE);
         scripted.requests.push(RestRequest {
             method: method.to_string(),
@@ -1001,14 +955,92 @@ impl GraphClient {
             }),
             raw_body: body.filter(|_| !is_json).map(|body| body.bytes.clone()),
         });
-        Some(response.into_net_outcome())
+    }
+
+    /// Install (or extend) the scripted wire transport backing this
+    /// client's REST and aux surfaces.
+    ///
+    /// Both surfaces share one dispatcher because they share one wire:
+    /// appending keeps a single total order, which is the order the
+    /// server would see. A test scripting both must therefore list its
+    /// responses in the order the requests actually go out.
+    #[cfg(test)]
+    fn script_wire(
+        &self,
+        responses: impl IntoIterator<Item = ScriptedRestResponse>,
+        retry: RetryPolicy,
+    ) {
+        use bifrost_net::test_support::ScriptedDispatch;
+
+        let canned = responses.into_iter().map(ScriptedRestResponse::into_canned);
+        let mut scripted = self.inner.scripted.lock().expect("REST script lock");
+        if let Some(wire) = scripted.wire.as_ref() {
+            wire.extend(canned);
+            return;
+        }
+        let wire = ScriptedDispatch::new(canned);
+        let account_net = bifrost_net::test_support::scripted_account(
+            &wire,
+            bifrost_net::NetConfig::default(),
+            Vec::new(),
+            Arc::clone(&self.inner.token_source),
+            retry,
+        );
+        scripted.wire = Some(wire);
+        scripted.wire_net = Some(account_net);
+    }
+
+    /// Script with the retry policy production installs, for a test that
+    /// wants to pin the retry loop itself - how many attempts a status
+    /// costs, and whether a transient failure is recovered from without
+    /// the caller ever seeing it.
+    ///
+    /// The default (`script_rest` / `script_aux`) disables retries so that
+    /// one scripted response answers one request, which is what a test
+    /// pinning WHICH outcome a status produces wants. Retrying by default
+    /// would silently consume a later leg's response.
+    #[cfg(test)]
+    pub(crate) fn script_rest_with_retries(
+        &self,
+        responses: impl IntoIterator<Item = ScriptedRestResponse>,
+    ) {
+        self.script_wire(responses, RetryPolicy::default());
+    }
+
+    /// How many requests the scripted transport has actually seen on the
+    /// wire, across every surface.
+    ///
+    /// This is the transport's own count, not the funnel's: a retried
+    /// attempt is a wire request but not a new funnel call, so this is the
+    /// only place the retry loop's behavior is observable from this crate.
+    #[cfg(test)]
+    pub(crate) fn wire_attempts(&self) -> usize {
+        self.inner
+            .scripted
+            .lock()
+            .expect("REST script lock")
+            .wire
+            .as_ref()
+            .map_or(0, |wire| wire.requests().len())
+    }
+
+    /// The scripted transport, when one is installed. Resolved through the
+    /// SHARED scripting state rather than this client's own `account_net`
+    /// slot, so a client derived after the script was installed still
+    /// answers from it.
+    #[cfg(test)]
+    fn scripted_net(&self) -> Option<AccountNet> {
+        self.inner
+            .scripted
+            .lock()
+            .expect("REST script lock")
+            .wire_net
+            .clone()
     }
 
     #[cfg(test)]
     pub(crate) fn script_rest(&self, responses: impl IntoIterator<Item = ScriptedRestResponse>) {
-        let mut scripted = self.inner.scripted.lock().expect("REST script lock");
-        scripted.armed = true;
-        scripted.responses.extend(responses);
+        self.script_wire(responses, RetryPolicy::disabled());
     }
 
     #[cfg(test)]
@@ -1352,38 +1384,57 @@ mod tests {
         assert_eq!(response.headers["retry-after"], "5");
     }
 
-    /// The seam is only worth building if it answers the way the transport
-    /// answers. `bifrost-net` returns `Ok(Response)` for 2xx and a
-    /// passed-through 3xx ONLY; every other status leaves its retry loop as
-    /// a typed `Error`. A seam that returned a scripted 500 as a response
-    /// would send every test built on it down a branch production cannot
-    /// reach, and nothing would fail to say so.
-    #[test]
-    fn a_scripted_status_takes_the_shape_bifrost_net_would_have_produced() {
+    /// Issue one GET against a scripted status and return what the
+    /// caller actually sees. Every response here travels the production
+    /// retry loop, so these outcomes are the transport's, not a local
+    /// restatement of them.
+    async fn outcome_for(
+        responses: impl IntoIterator<Item = ScriptedRestResponse>,
+    ) -> Result<RestResponse, GraphError> {
+        let client = GraphClient::new("token");
+        client.script_rest(responses);
+        client
+            .execute_wire(
+                "https://graph.microsoft.com/v1.0/me",
+                "GET",
+                None,
+                None,
+                None,
+            )
+            .await
+    }
+
+    /// `bifrost-net` returns `Ok(Response)` for 2xx and a passed-through
+    /// 3xx ONLY; every other status leaves its retry loop as a typed
+    /// `Error`. This used to assert against a local reimplementation of
+    /// that rule, which could agree with itself while disagreeing with
+    /// the transport. It now drives the transport.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_scripted_status_takes_the_shape_bifrost_net_produces() {
         use reqwest::StatusCode;
 
         assert!(
-            ScriptedRestResponse::empty(StatusCode::OK)
-                .into_net_outcome()
+            outcome_for([ScriptedRestResponse::empty(StatusCode::OK)])
+                .await
                 .is_ok()
         );
         // A 304 on a conditional read is passed through as a response.
         assert!(
-            ScriptedRestResponse::empty(StatusCode::NOT_MODIFIED)
-                .into_net_outcome()
+            outcome_for([ScriptedRestResponse::empty(StatusCode::NOT_MODIFIED)])
+                .await
                 .is_ok()
         );
 
-        match ScriptedRestResponse::empty(StatusCode::NOT_FOUND).into_net_outcome() {
+        match outcome_for([ScriptedRestResponse::empty(StatusCode::NOT_FOUND)]).await {
             Err(GraphError::Net(bifrost_net::Error::Status { code, .. })) => {
                 assert_eq!(code, StatusCode::NOT_FOUND);
             }
             _ => panic!("a terminal 4xx is Error::Status"),
         }
 
-        match ScriptedRestResponse::empty(StatusCode::TOO_MANY_REQUESTS)
-            .with_header("Retry-After", "5")
-            .into_net_outcome()
+        match outcome_for([ScriptedRestResponse::empty(StatusCode::TOO_MANY_REQUESTS)
+            .with_header("Retry-After", "5")])
+        .await
         {
             Err(GraphError::Net(bifrost_net::Error::RateLimited {
                 retry_after,
@@ -1395,15 +1446,44 @@ mod tests {
             _ => panic!("429 past the budget is Error::RateLimited"),
         }
 
-        match ScriptedRestResponse::empty(StatusCode::INTERNAL_SERVER_ERROR).into_net_outcome() {
+        match outcome_for([ScriptedRestResponse::empty(
+            StatusCode::INTERNAL_SERVER_ERROR,
+        )])
+        .await
+        {
             Err(GraphError::Net(bifrost_net::Error::RetryBudgetExhausted {
                 final_response: Some(final_response),
                 ..
             })) => assert_eq!(final_response.status, StatusCode::INTERNAL_SERVER_ERROR),
             _ => panic!("5xx past the budget is Error::RetryBudgetExhausted"),
         }
+    }
 
-        match ScriptedRestResponse::empty(StatusCode::UNAUTHORIZED).into_net_outcome() {
+    /// A fact the local simulation could not have told anyone, because it
+    /// answered every request from a single scripted entry: a 401 does not
+    /// become `AuthLost` on its own. bifrost-net forces a token refresh and
+    /// reissues the request on a budget SEPARATE from `max_attempts`, so
+    /// the caller sees `AuthLost` only when the second attempt is also
+    /// rejected - and a Graph path that meets a transient 401 recovers
+    /// without ever surfacing an error.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_401_is_retried_after_a_forced_refresh_before_it_becomes_auth_lost() {
+        use reqwest::StatusCode;
+
+        let recovered = outcome_for([
+            ScriptedRestResponse::empty(StatusCode::UNAUTHORIZED),
+            ScriptedRestResponse::json(StatusCode::OK, serde_json::json!({"ok": true})),
+        ])
+        .await
+        .expect("the refreshed retry succeeds");
+        assert_eq!(recovered.status, StatusCode::OK);
+
+        match outcome_for([
+            ScriptedRestResponse::empty(StatusCode::UNAUTHORIZED),
+            ScriptedRestResponse::empty(StatusCode::UNAUTHORIZED),
+        ])
+        .await
+        {
             Err(GraphError::Net(bifrost_net::Error::AuthLost {
                 transmission_state,
                 final_response: Some(_),
@@ -1412,12 +1492,57 @@ mod tests {
         }
     }
 
-    /// An armed script that runs out must fail the test at the request that
-    /// exceeded it. Falling through to `AccountNet` would put a real socket
-    /// behind an unexpected request and leave it out of the recorded list,
-    /// so a test asserting "exactly N requests" could not see the N+1th.
+    /// What no Graph-local seam could reach, and what graph-T1 was filed
+    /// for: the retry loop runs BELOW this crate's funnel, so a seam that
+    /// answered at the funnel could pin which outcome a status produced
+    /// but never how many attempts it cost. Scripting at the wire makes
+    /// the attempt count observable - one funnel call, two wire requests,
+    /// and a transient 503 the caller never sees.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_transient_5xx_is_retried_below_the_graph_funnel() {
+        use reqwest::StatusCode;
+
+        let client = GraphClient::new("token");
+        client.script_rest_with_retries([
+            ScriptedRestResponse::empty(StatusCode::SERVICE_UNAVAILABLE)
+                .with_header("Retry-After", "0"),
+            ScriptedRestResponse::json(StatusCode::OK, serde_json::json!({"ok": true})),
+        ]);
+
+        let response = client
+            .execute_wire(
+                "https://graph.microsoft.com/v1.0/me",
+                "GET",
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("the retried 503 succeeds on the second attempt");
+
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(
+            client.wire_attempts(),
+            2,
+            "the transport made two wire attempts"
+        );
+        assert_eq!(
+            client.take_rest_requests().len(),
+            1,
+            "the retry is invisible at the Graph funnel - it issued one request"
+        );
+    }
+
+    /// A script that runs out must fail the test at the request that
+    /// exceeded it. Falling through would put a real socket behind an
+    /// unexpected request and leave it out of the recorded list, so a test
+    /// asserting "exactly N requests" could not see the N+1th.
+    ///
+    /// The panic now comes from bifrost-net's dispatcher rather than a
+    /// Graph-local queue, which is the point of the consolidation: the
+    /// guarantee is enforced once, for every crate riding the transport.
     #[tokio::test]
-    #[should_panic(expected = "Graph REST script exhausted")]
+    #[should_panic(expected = "scripted dispatch exhausted")]
     async fn an_exhausted_script_fails_loudly_instead_of_reaching_the_network() {
         let client = GraphClient::new("token");
         client.script_rest([ScriptedRestResponse::json(

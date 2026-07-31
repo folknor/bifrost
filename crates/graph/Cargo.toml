@@ -35,5 +35,9 @@ tokio-util = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+# The scripted wire dispatch the REST and aux seams answer from, so a
+# scripted status travels the production retry loop instead of this
+# crate restating what bifrost-net does with one.
+bifrost-net = { path = "../net", features = ["test-support"] }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }

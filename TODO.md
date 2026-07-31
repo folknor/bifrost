@@ -196,14 +196,18 @@ any item; some may already be obsolete.
   non-mail classes A5b-3 added. Fixing it needs a modification signal
   (e.g. `LastModifiedTime`) or a different watermark model entirely - a
   known poll-model limitation, not a regression.
-- **graph-T1.** (coverage) What the REST/EWS/download/aux test seams
-  still do not reach (see `reference/graph.md` for the seams themselves):
-  anything whose behavior depends on bifrost-net's own retry, backoff,
-  rate-limit permit, or redirect walk. Every seam answers at the funnel,
-  below which none of that runs, so a test written on one of them can
-  pin WHICH outcome a status produces but never how many attempts,
-  how long they waited, or which host a 3xx chain ended on. Closing it
-  needs a seam inside bifrost-net, not another one in bifrost-graph.
+- **graph-T1.** (coverage; mostly closed by xc-3a on 2026-07-31) The REST
+  and aux surfaces now script at the wire via `bifrost_net::test_support`,
+  so retry, backoff, the rate-limit permit, and the redirect walk all run
+  below the script and are observable - `script_rest_with_retries` plus
+  `wire_attempts()` pin attempt counts, and
+  `a_transient_5xx_is_retried_below_the_graph_funnel` pins one funnel call
+  against two wire attempts. What REMAINS is the same gap on the two seams
+  that still answer at a funnel: EWS (`EwsExecute`) and
+  `GraphClient::download_stream`. Moving downloads would need the net seam
+  to grow a streaming canned body (chunk boundaries and a mid-stream
+  failure are not expressible as a `Bytes` body); moving EWS would need
+  its funnel to sit on an `AccountNet` the way REST now does.
   (The blob byte streams, the pre-authed OneDrive chunk PUT, the
   Autodiscover POST including its in-body redirect chain, the renewal
   worker's SUCCESS leg across ticks, and the three-mailbox search walk
@@ -422,20 +426,20 @@ blocking; each is a real defect or a real decision, not a cleanup.
   had been re-deriving: a 4xx never surfaces as `Ok(Response)`, and an
   exhausted script panics instead of reaching the network.
 
-  What remains is consumer migration, which is per-crate and optional:
+  **xc-3a (graph)** is DONE (2026-07-31). Graph's REST and aux surfaces now
+  script at the wire: `script_rest` / `script_aux` install a
+  `ScriptedDispatch` and bind an `AccountNet` to it, so responses travel the
+  production retry loop. `into_net_outcome` - the local restatement of
+  bifrost-net's status contract - is deleted. Only request RECORDING stayed
+  local, since Graph's recorded shape (parsed JSON body, lifted `If-Match` /
+  `Prefer`) is richer than `RequestSnapshot`; that kept all 62 scripting call
+  sites working unchanged. Deleting the restatement immediately paid: the old
+  helper answered a 401 with `AuthLost` directly, hiding that bifrost-net
+  forces a refresh and reissues on a separate budget first, so a Graph path
+  meeting a transient 401 recovers with no error at all. Now pinned.
 
-  - **xc-3a (graph)** Migrate the `#[cfg(test)]` `ScriptedRest` queue on
-    `ClientInner` onto the published seam. It intercepts above
-    `AccountNet`, so everything graph-T1 names (attempt counts, backoff
-    waits, rate-limit permits, which host a 3xx chain ended on) is still
-    unreachable from it. Not urgent - the existing queue is correct for
-    what it pins - but it is ~30 `#[cfg(test)]` sites in `client.rs` and
-    its recorded-request type (`RestRequest`, with parsed JSON bodies and
-    lifted `If-Match` / `Prefer`) is richer than `RequestSnapshot`, so the
-    port needs either an adapter or per-test rewrites. Sized as its own
-    slice.
-  - **xc-3b (graph)** Closing xc-3a is the prerequisite for graph-T1,
-    which stays open until then.
+  Consumer migration elsewhere remains optional and unscheduled; no other
+  crate has a comparable restatement.
 
   Original statement, for context on why several `bifrost-graph`
   paths are pinned only at the level of extracted pure decision functions,
