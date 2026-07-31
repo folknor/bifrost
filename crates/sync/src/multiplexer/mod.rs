@@ -73,6 +73,11 @@ pub struct MultiplexerEvent {
 /// carry `None`. Workers must not paper over an account-wide directive
 /// with the worker's own scope - passing `Some(arbitrary_scope)` would
 /// mask the directive's account-wide intent.
+///
+/// `#[non_exhaustive]` is deliberate and stays: the enum is `pub` and
+/// re-exported from `lib.rs`, so new request kinds must not break
+/// downstream matches. Adjudicated during the error-model close-out -
+/// do not re-raise.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum ReopenRequest {

@@ -6,22 +6,6 @@ cleanups the audit surfaced and the decisions doc marked "fix per
 spec" without scheduling. Verify against current code before working
 any item; some may already be obsolete.
 
-## bifrost-net
-
-- **net-N1.** `RequestCause::Malformed.detail` is synthetic. Leave the
-  body in support-text; accepted as-is.
-- **net-N2.** `refresh_failed` loses the underlying body via `Display`.
-  Accepted: the non-recursion rule on `source()` is binding.
-- **net-N3.** Retry-then-classify ordering. Accepted: final
-  classification is correct even if the intermediate shape isn't
-  pretty.
-- **net-N4.** `throttle_scope` per-provider coverage. Extend as
-  providers document their throttle vocabulary; `None` is honest for
-  unknowns.
-
-(All four are "accepted, no action" calls. Listed for completeness so
-re-auditors don't re-raise them.)
-
 ## bifrost-jmap
 
 - **jmap-D4.** Generic JMAP `Provider`. Wire `Provider::Fastmail` (and
@@ -52,9 +36,6 @@ re-auditors don't re-raise them.)
   `Request(Malformed) -> ClientBug` so recovery class is op-independent
   but operation telemetry is degraded. Thread the operation when other
   pim/envelope refactoring happens.
-- **imap-N1.** AUTH leg of `factory::open`: keep
-  `AccountOperation::Discover`. AUTH is protocol-level idempotent.
-  (Listed as "leave alone" - re-auditor reminder.)
 - **imap-G1.** (gap, feature-sized) Expose IMAP MIME-part downloads as
   real `BlobHandle`s. Symptom: the account used to advertise
   `BlobRangeSupport::Yes` and accept any `BlobHandle` in `open_blob` /
@@ -297,15 +278,6 @@ re-auditors don't re-raise them.)
   than the directive asks), `DirectiveKey::Other` bounds dedupe
   coarseness to the old behavior, and `handle_engine_directive`'s
   required fallback logs the unhandled variant.
-- **sync-N8.** (likely WONTFIX - re-auditor reminder) Widening
-  `ScopeChange.membership` to `Vec<MembershipScope>` would touch
-  types+jmap+graph+engine, but the single `Folder(id)` is the correct
-  routing membership (the engine covering rule would not cover a
-  `Mailbox(owner)` tag against a folder cursor). Only worth it if change
-  events must carry the owner tag for some future consumer.
-- **sync-N7.** `ReopenRequest` keeps `#[non_exhaustive]` (it is `pub`,
-  re-exported from `lib.rs:85`). Listed as "leave alone" -
-  re-auditor reminder.
 
 ## bifrost-types
 

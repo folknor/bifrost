@@ -364,6 +364,12 @@ pub(crate) struct InternalStreaming {
 /// rewritten state. Each redirect step counts as zero retries (it is
 /// a fresh logical request) but counts as one hop against
 /// `RedirectPolicy::max_hops`.
+///
+/// Ordering note (accepted): retries run before `AccountError`
+/// classification, so intermediate attempts surface only as raw
+/// `Error` values and the classified shape reflects the final attempt.
+/// The final classification is correct even if the intermediate shape
+/// is not pretty - do not re-raise.
 pub(crate) async fn send_streaming_inner(
     builder: RequestBuilder,
 ) -> Result<InternalStreaming, Error> {

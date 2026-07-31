@@ -204,6 +204,11 @@ fn auth_lost(
     finish(builder, ctx)
 }
 
+/// `format!("{source}")` goes through `Display`, so any HTTP body the
+/// underlying refresh error carried is lost here. Accepted: the error
+/// contract's non-recursion rule on `source()` is binding, and the
+/// support-only summary plus `support_cause_from_source` below are the
+/// agreed fidelity - do not re-raise.
 fn refresh_failed(
     ctx: &NetErrorContext,
     retry_after: Option<SystemTime>,
@@ -567,6 +572,10 @@ fn body_diagnostic(body: &Bytes) -> Option<DiagnosticText> {
     )))
 }
 
+/// The detail is deliberately synthetic: the response body is not
+/// summarized into `RequestCause::Malformed.detail`. The body reaches
+/// support-text via `response_diagnostics` at the call site, and that
+/// is the accepted home for it - do not re-raise.
 fn status_detail(code: u16, _body: &Bytes) -> DiagnosticText {
     DiagnosticText::support_only(format!("HTTP {code} malformed request"))
 }
@@ -617,6 +626,10 @@ fn id_from_scope(scope: Option<&ErrorScope>) -> Option<String> {
     }
 }
 
+/// Per-provider throttle-scope coverage is intentionally sparse:
+/// extend the match as providers document their throttle vocabulary.
+/// `None` is the honest answer for providers whose throttling scope is
+/// undocumented - do not invent one.
 fn throttle_scope(ctx: &NetErrorContext) -> Option<ThrottleScope> {
     if ctx.protocol == Protocol::Graph || ctx.provider == Some(Provider::Microsoft) {
         Some(ThrottleScope::Tenant)
