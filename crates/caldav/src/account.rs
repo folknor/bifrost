@@ -8,10 +8,12 @@ use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime, TimeZon
 use futures::{StreamExt, stream};
 
 use crate::capabilities::{caldav_capabilities, scheduling_available};
-use crate::client::{CalDavClient, PutCondition, event_scope, unsupported_error};
+use crate::client::{
+    CalDavClient, PutCondition, event_scope, missing_event_error, unsupported_error,
+};
 use crate::ical::{
-    create_to_ical, event_from_ical, events_from_ical, new_uid, patch_to_ical, rsvp_patch,
-    rsvp_reply_ical,
+    EventProjectionError, create_to_ical, event_from_ical, events_from_ical, new_uid,
+    patch_to_ical, rsvp_patch, rsvp_reply_ical,
 };
 use crate::parse::CalendarCollection;
 use crate::{CalDavConfig, CalDavCredentials};
@@ -51,7 +53,7 @@ impl CalDavAccount {
         let collections = client.list_calendars(&calendar_home).await?;
         let default_calendar_url = collections
             .first()
-            .map(|collection| client.resolve_url(&collection.href))
+            .map(|collection| collection.href.clone())
             .unwrap_or_else(|| client.resolve_url(&calendar_home));
         Ok(Self {
             client: Arc::new(client),
@@ -74,8 +76,8 @@ impl CalDavAccount {
         default_calendar_url.to_string()
     }
 
-    fn map_calendar(client: &CalDavClient, collection: CalendarCollection) -> Calendar {
-        let native = client.resolve_url(&collection.href);
+    fn map_calendar(collection: CalendarCollection) -> Calendar {
+        let native = collection.href;
         let name = collection
             .display_name
             .filter(|name| !name.trim().is_empty())
@@ -121,8 +123,11 @@ impl CalDavAccount {
             fetched.etag,
             &fetched.data,
         )
-        .map_err(|_| {
-            crate::client::local_error(operation, "CalDAV resource is not valid iCalendar")
+        .map_err(|error| match error {
+            EventProjectionError::NoVevent => missing_event_error(operation, event.0),
+            EventProjectionError::Parse(_) => {
+                crate::client::local_error(operation, "CalDAV resource is not valid iCalendar")
+            }
         })
     }
 
@@ -137,25 +142,21 @@ impl CalDavAccount {
                 .list_calendars_for_operation(home, operation)
                 .await?
                 .into_iter()
-                .find(|collection| same_url(&client.resolve_url(&collection.href), calendar))
+                .find(|collection| same_url(&collection.href, calendar))
                 .and_then(|collection| collection.sync_token),
-            None => None,
+            None => client.collection_sync_token(calendar, operation).await?,
         };
         let listing = client.list_events_listing(calendar, operation).await?;
         let mut entries = listing
             .entries
             .into_iter()
             .map(|entry| EventSnapshotEntry {
-                uri: client.resolve_url(&entry.uri),
+                uri: entry.uri,
                 etag: entry.etag,
             })
             .collect::<Vec<_>>();
         entries.sort_by(|left, right| left.uri.cmp(&right.uri));
-        let failed_hrefs = listing
-            .failed_hrefs
-            .into_iter()
-            .map(|href| client.resolve_url(&href))
-            .collect();
+        let failed_hrefs = listing.failed_hrefs;
         Ok(EventSnapshot {
             calendar_url: calendar.to_string(),
             sync_token,
@@ -685,7 +686,7 @@ impl Account for CalDavAccount {
             let collections = client.list_calendars(&home).await?;
             let mut calendars = collections
                 .into_iter()
-                .map(|collection| Self::map_calendar(&client, collection))
+                .map(Self::map_calendar)
                 .collect::<Vec<_>>();
             // A calendar-home that enumerates zero calendar collections
             // surfaces as an empty list, not a fabricated placeholder. The
@@ -722,14 +723,10 @@ impl Account for CalDavAccount {
             // the consumer: a resource the server refused inside the 207
             // (non-2xx propstat), and one that came back 200 but would not
             // tokenize. Neither aborts the rest of the pull.
-            let mut failed = fetched
-                .failed_hrefs()
-                .into_iter()
-                .map(|href| client.resolve_url(&href))
-                .collect::<Vec<_>>();
+            let mut failed = fetched.failed_hrefs();
             let mut materialized = HashSet::new();
             for event in fetched.events {
-                let uri = client.resolve_url(&event.uri);
+                let uri = event.uri;
                 match events_from_ical(
                     uri.clone(),
                     CalendarId(calendar_url.clone()),
@@ -938,11 +935,7 @@ impl Account for CalDavAccount {
             // Search dedups across the four per-property REPORTs, so the
             // failed hrefs need the same treatment before they become
             // `failed_ids`.
-            let mut failed = fetched
-                .failed_hrefs()
-                .into_iter()
-                .map(|href| client.resolve_url(&href))
-                .collect::<Vec<_>>();
+            let mut failed = fetched.failed_hrefs();
             failed.sort_unstable();
             failed.dedup();
             let mut events = Vec::new();
@@ -952,7 +945,7 @@ impl Account for CalDavAccount {
                 .into_iter()
                 .filter(|event| seen.insert(event.uri.clone()))
             {
-                let uri = client.resolve_url(&event.uri);
+                let uri = event.uri;
                 match events_from_ical(
                     uri.clone(),
                     CalendarId(calendar_url.clone()),
@@ -1189,7 +1182,7 @@ async fn changes_from_cursor(
             .await?;
         let mut current = previous.clone();
         current.sync_token = report.sync_token.or_else(|| previous.sync_token.clone());
-        let changes = apply_sync_report(client, &mut current, report.entries);
+        let changes = apply_sync_report(&mut current, report.entries);
         return Ok((current, changes));
     }
     let current = CalDavAccount::event_snapshot(
@@ -1204,13 +1197,12 @@ async fn changes_from_cursor(
 }
 
 fn apply_sync_report(
-    client: &CalDavClient,
     current: &mut EventSnapshot,
     entries: Vec<crate::parse::CalDavSyncEntry>,
 ) -> Vec<Change> {
     let mut changes = Vec::new();
     for entry in entries {
-        let uri = client.resolve_url(&entry.uri);
+        let uri = entry.uri;
         if matches!(entry.status, Some(404 | 410)) {
             // Only emit a Destroyed event for an href the prior snapshot
             // actually held. A 404/410 sync-report entry for an unknown
@@ -1916,11 +1908,6 @@ mod tests {
 
     #[test]
     fn sync_report_updates_snapshot_and_classifies_changes() {
-        let client = CalDavClient::new(&CalDavConfig {
-            base_url: "https://dav.example.test".to_string(),
-            credentials: CalDavCredentials::bearer("token"),
-        })
-        .expect("client");
         let mut snapshot = EventSnapshot {
             calendar_url: "https://dav.example.test/cal/".to_string(),
             sync_token: Some("token-1".to_string()),
@@ -1938,21 +1925,20 @@ mod tests {
         };
 
         let changes = apply_sync_report(
-            &client,
             &mut snapshot,
             vec![
                 crate::parse::CalDavSyncEntry {
-                    uri: "/cal/one.ics".to_string(),
+                    uri: "https://dav.example.test/cal/one.ics".to_string(),
                     etag: Some("new".to_string()),
                     status: Some(200),
                 },
                 crate::parse::CalDavSyncEntry {
-                    uri: "/cal/two.ics".to_string(),
+                    uri: "https://dav.example.test/cal/two.ics".to_string(),
                     etag: None,
                     status: Some(404),
                 },
                 crate::parse::CalDavSyncEntry {
-                    uri: "/cal/three.ics".to_string(),
+                    uri: "https://dav.example.test/cal/three.ics".to_string(),
                     etag: Some("created".to_string()),
                     status: Some(200),
                 },
@@ -1988,11 +1974,6 @@ mod tests {
 
     #[test]
     fn sync_report_404_for_unknown_href_emits_no_destroyed() {
-        let client = CalDavClient::new(&CalDavConfig {
-            base_url: "https://dav.example.test".to_string(),
-            credentials: CalDavCredentials::bearer("token"),
-        })
-        .expect("client");
         let mut snapshot = EventSnapshot {
             calendar_url: "https://dav.example.test/cal/".to_string(),
             sync_token: Some("token-1".to_string()),
@@ -2006,10 +1987,9 @@ mod tests {
         // A 404/410 entry for an href the snapshot never held (created and
         // deleted between polls) must not surface a phantom Destroyed.
         let changes = apply_sync_report(
-            &client,
             &mut snapshot,
             vec![crate::parse::CalDavSyncEntry {
-                uri: "/cal/ghost.ics".to_string(),
+                uri: "https://dav.example.test/cal/ghost.ics".to_string(),
                 etag: None,
                 status: Some(404),
             }],

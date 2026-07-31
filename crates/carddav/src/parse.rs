@@ -1,6 +1,7 @@
 use quick_xml::Reader;
 use quick_xml::escape::unescape;
 use quick_xml::events::Event;
+use reqwest::Url;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CardDavContactEntry {
@@ -84,6 +85,55 @@ pub(crate) struct AddressBookCollection {
     pub(crate) href: String,
     pub(crate) display_name: Option<String>,
     pub(crate) ctag: Option<String>,
+}
+
+impl AddressBookCollection {
+    pub(crate) fn resolve_href(&mut self, base_url: &str) {
+        self.href = resolve_href(base_url, &self.href);
+    }
+}
+
+impl CardDavContactListing {
+    pub(crate) fn resolve_hrefs(&mut self, base_url: &str) {
+        for entry in &mut self.entries {
+            entry.uri = resolve_href(base_url, &entry.uri);
+        }
+        for href in &mut self.failed_hrefs {
+            *href = resolve_href(base_url, href);
+        }
+    }
+}
+
+impl CardDavMultigetReport {
+    pub(crate) fn resolve_hrefs(&mut self, base_url: &str) {
+        for card in &mut self.cards {
+            card.uri = resolve_href(base_url, &card.uri);
+        }
+        for failed in &mut self.failed {
+            failed.href = resolve_href(base_url, &failed.href);
+        }
+        for href in &mut self.missing_data {
+            *href = resolve_href(base_url, href);
+        }
+    }
+}
+
+/// Rebase a DAV response href at the XML decoding boundary. Client callers
+/// never expose parsed relative hrefs to the account layer.
+pub(crate) fn resolve_href(base_url: &str, href: &str) -> String {
+    if href.starts_with("http://") || href.starts_with("https://") {
+        return href.to_string();
+    }
+    if let Ok(base) = Url::parse(base_url)
+        && let Ok(resolved) = base.join(href)
+    {
+        return resolved.to_string();
+    }
+    if base_url.ends_with('/') || href.starts_with('/') {
+        format!("{base_url}{href}")
+    } else {
+        format!("{base_url}/{href}")
+    }
 }
 
 pub(crate) fn parse_addressbook_collections(

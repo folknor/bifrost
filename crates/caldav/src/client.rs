@@ -1,12 +1,14 @@
+use std::fmt;
+use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine;
 use bifrost_types::{
-    AccountError, AccountErrorBuilder, AccountErrorKind, AccountOperation, Cause, CursorScope,
-    DiagnosticText, ErrorScope, ObjectType, Protocol, ProtocolErrorKind, RecoveryClass,
-    RequestCause, RequestErrorKind, ResourceKind, ServerCause, ServerErrorKind, StateCause,
-    SyncStateErrorKind, TransmissionState, TransportCause, TransportErrorKind, TransportKind,
-    WireCause,
+    AccountError, AccountErrorBuilder, AccountErrorKind, AccountFuture, AccountOperation, Cause,
+    CursorScope, DiagnosticText, ErrorScope, ObjectType, Protocol, ProtocolErrorKind,
+    RecoveryClass, RequestCause, RequestErrorKind, ResourceKind, ServerCause, ServerErrorKind,
+    StateCause, SyncStateErrorKind, TransmissionState, TransportCause, TransportErrorKind,
+    TransportKind, WireCause,
 };
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use reqwest::{Method, StatusCode, Url};
@@ -14,7 +16,7 @@ use reqwest::{Method, StatusCode, Url};
 use crate::parse::{
     CalDavFetchedEvent, CalDavMultigetReport, CalDavSyncReport, CalendarCollection,
     MultigetOutcome, extract_href_properties, extract_href_property, parse_calendar_collections,
-    parse_multiget_report, parse_propfind_events, parse_sync_collection_report,
+    parse_multiget_report, parse_propfind_events, parse_sync_collection_report, resolve_href,
 };
 use crate::{CalDavConfig, CalDavCredentials};
 
@@ -28,11 +30,53 @@ pub(crate) enum PutCondition<'a> {
     None,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct CalDavClient {
     http: reqwest::Client,
+    transport: Arc<dyn DavTransport>,
     base_url: String,
     credentials: CalDavCredentials,
+}
+
+impl fmt::Debug for CalDavClient {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CalDavClient")
+            .field("base_url", &self.base_url)
+            .field("credentials", &self.credentials)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DavResponse {
+    status: StatusCode,
+    headers: HeaderMap,
+    body: String,
+}
+
+/// Local DAV transport boundary. `bifrost-net`'s dispatcher is intentionally
+/// crate-private, while DAV keeps Basic auth and its own redirect policy, so
+/// the seam belongs here until these clients move onto `AccountNet`.
+trait DavTransport: Send + Sync {
+    fn send(&self, request: reqwest::RequestBuilder) -> AccountFuture<Result<DavResponse, String>>;
+}
+
+struct ReqwestDavTransport;
+
+impl DavTransport for ReqwestDavTransport {
+    fn send(&self, request: reqwest::RequestBuilder) -> AccountFuture<Result<DavResponse, String>> {
+        Box::pin(async move {
+            let response = request.send().await.map_err(|error| error.to_string())?;
+            let status = response.status();
+            let headers = response.headers().clone();
+            let body = response.text().await.map_err(|error| error.to_string())?;
+            Ok(DavResponse {
+                status,
+                headers,
+                body,
+            })
+        })
+    }
 }
 
 impl CalDavClient {
@@ -45,9 +89,25 @@ impl CalDavClient {
 
         Ok(Self {
             http,
+            transport: Arc::new(ReqwestDavTransport),
             base_url: config.base_url.trim_end_matches('/').to_string(),
             credentials: config.credentials.clone(),
         })
+    }
+
+    #[cfg(test)]
+    fn with_transport(base_url: &str, transport: Arc<dyn DavTransport>) -> Self {
+        Self {
+            http: reqwest::Client::new(),
+            transport,
+            base_url: base_url.trim_end_matches('/').to_string(),
+            credentials: CalDavCredentials::bearer("token"),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_base_url(base_url: &str) -> Self {
+        Self::with_transport(base_url, Arc::new(ReqwestDavTransport))
     }
 
     pub(crate) async fn discover_calendar_home(&self) -> Result<String, AccountError> {
@@ -102,7 +162,7 @@ impl CalDavClient {
             .await?;
         extract_href_property(&body, "calendar-home-set")
             .map_err(|error| parse_error(AccountOperation::Discover, error))?
-            .map(|href| self.resolve_url(&href))
+            .map(|href| resolve_href(&self.base_url, &href))
             .ok_or_else(|| parse_error(AccountOperation::Discover, "missing calendar-home-set"))
     }
 
@@ -136,7 +196,7 @@ impl CalDavClient {
             .await?;
         extract_href_property(&body, "schedule-outbox-URL")
             .map_err(|error| parse_error(AccountOperation::Discover, error))
-            .map(|href| href.map(|href| self.resolve_url(&href)))
+            .map(|href| href.map(|href| resolve_href(&self.base_url, &href)))
     }
 
     async fn discover_principal(&self, root: &str) -> Result<String, AccountError> {
@@ -145,7 +205,7 @@ impl CalDavClient {
             .await?;
         extract_href_property(&body, "current-user-principal")
             .map_err(|error| parse_error(AccountOperation::Discover, error))?
-            .map(|href| self.resolve_url(&href))
+            .map(|href| resolve_href(&self.base_url, &href))
             .ok_or_else(|| {
                 parse_error(AccountOperation::Discover, "missing current-user-principal")
             })
@@ -167,8 +227,12 @@ impl CalDavClient {
         let body = self
             .propfind_raw(home_url, "1", PROPFIND_CALENDARS, operation)
             .await?;
-        parse_calendar_collections(&body)
-            .map_err(|error| parse_error(operation, format!("calendar list: {error}")))
+        let mut collections = parse_calendar_collections(&body)
+            .map_err(|error| parse_error(operation, format!("calendar list: {error}")))?;
+        for collection in &mut collections {
+            collection.resolve_href(&self.base_url);
+        }
+        Ok(collections)
     }
 
     /// Depth-1 event PROPFIND returning both the committed entries and
@@ -183,7 +247,24 @@ impl CalDavClient {
         let body = self
             .propfind_raw(calendar_url, "1", PROPFIND_EVENTS, operation)
             .await?;
-        parse_propfind_events(&body).map_err(|error| parse_error(operation, error))
+        let mut listing =
+            parse_propfind_events(&body).map_err(|error| parse_error(operation, error))?;
+        listing.resolve_hrefs(&self.base_url);
+        Ok(listing)
+    }
+
+    /// Cheap depth-0 PROPFIND used by snapshot polling to refresh the
+    /// collection sync token without re-listing every calendar collection.
+    pub(crate) async fn collection_sync_token(
+        &self,
+        calendar_url: &str,
+        operation: AccountOperation,
+    ) -> Result<Option<String>, AccountError> {
+        let body = self
+            .propfind_raw(calendar_url, "0", PROPFIND_SYNC_TOKEN, operation)
+            .await?;
+        crate::parse::parse_collection_sync_token(&body)
+            .map_err(|error| parse_error(operation, format!("collection sync token: {error}")))
     }
 
     pub(crate) async fn query_events_in_range(
@@ -196,9 +277,10 @@ impl CalDavClient {
         let response = self
             .report_raw(calendar_url, &body, AccountOperation::EventsInRange)
             .await?;
-        let parsed = parse_multiget_report(&response).map_err(|error| {
+        let mut parsed = parse_multiget_report(&response).map_err(|error| {
             parse_error(AccountOperation::EventsInRange, format!("query: {error}"))
         })?;
+        parsed.resolve_hrefs(&self.base_url);
         multiget_failure(&parsed, AccountOperation::EventsInRange).map_or(Ok(parsed), Err)
     }
 
@@ -214,9 +296,10 @@ impl CalDavClient {
             let response = self
                 .report_raw(calendar_url, &body, AccountOperation::EventSearch)
                 .await?;
-            let parsed = parse_multiget_report(&response).map_err(|error| {
+            let mut parsed = parse_multiget_report(&response).map_err(|error| {
                 parse_error(AccountOperation::EventSearch, format!("query: {error}"))
             })?;
+            parsed.resolve_hrefs(&self.base_url);
             if let Some(error) = multiget_failure(&parsed, AccountOperation::EventSearch) {
                 degraded = worse_recovery(degraded, error);
             }
@@ -251,8 +334,9 @@ impl CalDavClient {
 {href_elements}</C:calendar-multiget>"
             );
             let response = self.report_raw(calendar_url, &body, operation).await?;
-            let parsed = parse_multiget_report(&response)
+            let mut parsed = parse_multiget_report(&response)
                 .map_err(|error| parse_error(operation, format!("multiget: {error}")))?;
+            parsed.resolve_hrefs(&self.base_url);
             if let Some(error) = multiget_failure(&parsed, operation) {
                 degraded = worse_recovery(degraded, error);
             }
@@ -268,34 +352,25 @@ impl CalDavClient {
     ) -> Result<CalDavSyncReport, AccountError> {
         let body = sync_collection_body(sync_token);
         let operation = AccountOperation::SyncChanges;
-        let method = Method::from_bytes(b"REPORT")
-            .map_err(|error| local_error(operation, error.to_string()))?;
         let response = self
-            .http
-            .request(method, calendar_url)
-            .header(CONTENT_TYPE, "application/xml; charset=utf-8")
-            .header("Depth", "0")
-            .headers(self.auth_headers(operation).await?)
-            .body(body)
-            .send()
-            .await
-            .map_err(|error| transport_error(operation, error.to_string()))?;
-        let status = response.status();
-        let response = response
-            .text()
-            .await
-            .map_err(|error| transport_error(operation, error.to_string()))?;
+            .report_raw_with_depth(calendar_url, "0", &body, operation)
+            .await?;
+        let status = response.status;
+        let body = response.body;
         if status == StatusCode::GONE
             || (status == StatusCode::FORBIDDEN
-                && response.to_ascii_lowercase().contains("valid-sync-token"))
+                && body.to_ascii_lowercase().contains("valid-sync-token"))
         {
-            return Err(cursor_invalid_error(status, response));
+            return Err(cursor_invalid_error(status, body));
         }
-        if !status.is_success() && status != StatusCode::MULTI_STATUS {
-            return Err(status_error(operation, status, response));
+        if !status.is_success() {
+            return Err(status_error(operation, status, body));
         }
-        parse_sync_collection_report(&response)
-            .map_err(|error| parse_error(AccountOperation::SyncChanges, format!("sync: {error}")))
+        let mut report = parse_sync_collection_report(&body).map_err(|error| {
+            parse_error(AccountOperation::SyncChanges, format!("sync: {error}"))
+        })?;
+        report.resolve_hrefs(&self.base_url);
+        Ok(report)
     }
 
     pub(crate) async fn get_event(
@@ -307,16 +382,10 @@ impl CalDavClient {
             .http
             .request(Method::GET, url)
             .headers(self.auth_headers(operation).await?);
-        let response = request
-            .send()
-            .await
-            .map_err(|error| transport_error(operation, error.to_string()))?;
-        let status = response.status();
-        let etag = response_etag(response.headers());
-        let body = response
-            .text()
-            .await
-            .map_err(|error| transport_error(operation, error.to_string()))?;
+        let response = self.send_raw_request(request, operation).await?;
+        let status = response.status;
+        let etag = response_etag(&response.headers);
+        let body = response.body;
         if status.is_success() {
             Ok(CalDavFetchedEvent {
                 uri: url.to_string(),
@@ -352,16 +421,10 @@ impl CalDavClient {
             }
             PutCondition::None => {}
         }
-        let response = request
-            .send()
-            .await
-            .map_err(|error| transport_error(operation, error.to_string()))?;
-        let status = response.status();
-        let etag = response_etag(response.headers());
-        let body = response
-            .text()
-            .await
-            .map_err(|error| transport_error(operation, error.to_string()))?;
+        let response = self.send_raw_request(request, operation).await?;
+        let status = response.status;
+        let etag = response_etag(&response.headers);
+        let body = response.body;
         if status.is_success() {
             Ok(etag)
         } else {
@@ -448,16 +511,36 @@ impl CalDavClient {
         body: &str,
         operation: AccountOperation,
     ) -> Result<String, AccountError> {
+        // Ordinary REPORTs get the same status classification as any other
+        // body request; only `sync_events` takes the raw-response path,
+        // because it has to inspect 403/410 before they become errors.
+        let response = self
+            .report_raw_with_depth(url, "1", body, operation)
+            .await?;
+        if response.status.is_success() {
+            Ok(response.body)
+        } else {
+            Err(status_error(operation, response.status, response.body))
+        }
+    }
+
+    async fn report_raw_with_depth(
+        &self,
+        url: &str,
+        depth: &str,
+        body: &str,
+        operation: AccountOperation,
+    ) -> Result<DavResponse, AccountError> {
         let method = Method::from_bytes(b"REPORT")
             .map_err(|error| local_error(operation, error.to_string()))?;
         let request = self
             .http
             .request(method, url)
             .header(CONTENT_TYPE, "application/xml; charset=utf-8")
-            .header("Depth", "1")
+            .header("Depth", depth)
             .headers(self.auth_headers(operation).await?)
             .body(body.to_string());
-        self.send_body_request(request, operation).await
+        self.send_raw_request(request, operation).await
     }
 
     async fn send_body_request(
@@ -465,19 +548,11 @@ impl CalDavClient {
         request: reqwest::RequestBuilder,
         operation: AccountOperation,
     ) -> Result<String, AccountError> {
-        let response = request
-            .send()
-            .await
-            .map_err(|error| transport_error(operation, error.to_string()))?;
-        let status = response.status();
-        let body = response
-            .text()
-            .await
-            .map_err(|error| transport_error(operation, error.to_string()))?;
-        if status.is_success() || status == StatusCode::MULTI_STATUS {
-            Ok(body)
+        let response = self.send_raw_request(request, operation).await?;
+        if response.status.is_success() {
+            Ok(response.body)
         } else {
-            Err(status_error(operation, status, body))
+            Err(status_error(operation, response.status, response.body))
         }
     }
 
@@ -486,20 +561,23 @@ impl CalDavClient {
         request: reqwest::RequestBuilder,
         operation: AccountOperation,
     ) -> Result<(), AccountError> {
-        let response = request
-            .send()
-            .await
-            .map_err(|error| transport_error(operation, error.to_string()))?;
-        let status = response.status();
-        let body = response
-            .text()
-            .await
-            .map_err(|error| transport_error(operation, error.to_string()))?;
-        if status.is_success() {
+        let response = self.send_raw_request(request, operation).await?;
+        if response.status.is_success() {
             Ok(())
         } else {
-            Err(status_error(operation, status, body))
+            Err(status_error(operation, response.status, response.body))
         }
+    }
+
+    async fn send_raw_request(
+        &self,
+        request: reqwest::RequestBuilder,
+        operation: AccountOperation,
+    ) -> Result<DavResponse, AccountError> {
+        self.transport
+            .send(request)
+            .await
+            .map_err(|error| transport_error(operation, error))
     }
 
     /// Build the per-request auth headers. The bearer token is read from
@@ -802,6 +880,20 @@ pub(crate) fn unsupported_error(operation: AccountOperation) -> AccountError {
     .expect("valid account error classification")
 }
 
+pub(crate) fn missing_event_error(operation: AccountOperation, id: String) -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::NotFound(ResourceKind::Calendar),
+        Cause::Request(RequestCause::NotFound {
+            what: ResourceKind::Calendar,
+            id: Some(id),
+        }),
+    )
+    .protocol(Protocol::CalDav)
+    .operation(operation)
+    .try_build()
+    .expect("valid account error classification")
+}
+
 pub(crate) fn local_error(operation: AccountOperation, message: impl Into<String>) -> AccountError {
     AccountErrorBuilder::new(
         AccountErrorKind::Request(RequestErrorKind::Malformed),
@@ -970,9 +1062,150 @@ const PROPFIND_EVENTS: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
   </D:prop>\n\
 </D:propfind>";
 
+const PROPFIND_SYNC_TOKEN: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
+<D:propfind xmlns:D=\"DAV:\">\n\
+  <D:prop>\n\
+    <D:sync-token/>\n\
+  </D:prop>\n\
+</D:propfind>";
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    #[derive(Debug, Clone)]
+    struct RequestTranscript {
+        method: Method,
+        url: String,
+        headers: HeaderMap,
+    }
+
+    struct ScriptedDavTransport {
+        responses: Mutex<VecDeque<DavResponse>>,
+        requests: Mutex<Vec<RequestTranscript>>,
+    }
+
+    impl ScriptedDavTransport {
+        fn new(responses: impl IntoIterator<Item = DavResponse>) -> Arc<Self> {
+            Arc::new(Self {
+                responses: Mutex::new(responses.into_iter().collect()),
+                requests: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn requests(&self) -> Vec<RequestTranscript> {
+            self.requests
+                .lock()
+                .expect("scripted DAV request lock poisoned")
+                .clone()
+        }
+    }
+
+    impl DavTransport for ScriptedDavTransport {
+        fn send(
+            &self,
+            request: reqwest::RequestBuilder,
+        ) -> AccountFuture<Result<DavResponse, String>> {
+            let request = match request.build() {
+                Ok(request) => request,
+                Err(error) => return Box::pin(async move { Err(error.to_string()) }),
+            };
+            self.requests
+                .lock()
+                .expect("scripted DAV request lock poisoned")
+                .push(RequestTranscript {
+                    method: request.method().clone(),
+                    url: request.url().to_string(),
+                    headers: request.headers().clone(),
+                });
+            let response = self
+                .responses
+                .lock()
+                .expect("scripted DAV response lock poisoned")
+                .pop_front()
+                .expect("scripted DAV transport exhausted");
+            Box::pin(async move { Ok(response) })
+        }
+    }
+
+    #[tokio::test]
+    async fn sync_events_uses_depth_zero_report_transcript() {
+        let script = ScriptedDavTransport::new([DavResponse {
+            status: StatusCode::MULTI_STATUS,
+            headers: HeaderMap::new(),
+            body:
+                "<D:multistatus xmlns:D=\"DAV:\"><D:sync-token>next</D:sync-token><D:response><D:href>/calendar/one.ics</D:href><D:status>HTTP/1.1 200 OK</D:status></D:response></D:multistatus>"
+                    .to_string(),
+        }]);
+        let concrete_transport = Arc::clone(&script);
+        let transport: Arc<dyn DavTransport> = concrete_transport;
+        let client = CalDavClient::with_transport("https://dav.example.test", transport);
+
+        let report = client
+            .sync_events("https://dav.example.test/calendar/", "previous")
+            .await
+            .expect("scripted sync succeeds");
+
+        assert_eq!(report.sync_token.as_deref(), Some("next"));
+        assert_eq!(
+            report.entries[0].uri,
+            "https://dav.example.test/calendar/one.ics"
+        );
+        let requests = script.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].method,
+            Method::from_bytes(b"REPORT").expect("REPORT method")
+        );
+        assert_eq!(requests[0].url, "https://dav.example.test/calendar/");
+        assert_eq!(
+            requests[0]
+                .headers
+                .get("depth")
+                .and_then(|value| value.to_str().ok()),
+            Some("0")
+        );
+        assert_eq!(
+            requests[0]
+                .headers
+                .get(AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer token")
+        );
+    }
+
+    /// A 401 on an ordinary REPORT must classify as reauthorization. Without
+    /// the status check in `report_raw` the empty/HTML error body either parses
+    /// as an authoritative empty multiget or degrades into a parse failure, and
+    /// a consumer treats "no events" as truth.
+    #[tokio::test]
+    async fn unauthorized_report_classifies_as_reauthorization() {
+        let script = ScriptedDavTransport::new([DavResponse {
+            status: StatusCode::UNAUTHORIZED,
+            headers: HeaderMap::new(),
+            body: "<html><body>401 Unauthorized</body></html>".to_string(),
+        }]);
+        let concrete_transport = Arc::clone(&script);
+        let transport: Arc<dyn DavTransport> = concrete_transport;
+        let client = CalDavClient::with_transport("https://dav.example.test", transport);
+
+        let error = client
+            .query_events_in_range(
+                "https://dav.example.test/calendar/",
+                Some("20260101T000000Z"),
+                Some("20260201T000000Z"),
+            )
+            .await
+            .expect_err("401 REPORT must not be reported as an empty result");
+
+        assert!(matches!(
+            error.kind(),
+            AccountErrorKind::Authentication(bifrost_types::AuthErrorKind::ReauthorizationRequired)
+        ));
+        assert_eq!(*error.recovery(), RecoveryClass::AuthLost);
+    }
 
     #[test]
     fn status_error_maps_write_conflicts() {
@@ -1021,11 +1254,7 @@ mod tests {
 
     #[test]
     fn resolve_url_fallback_preserves_separator() {
-        let client = CalDavClient {
-            http: reqwest::Client::new(),
-            base_url: "not a url".to_string(),
-            credentials: CalDavCredentials::bearer("token"),
-        };
+        let client = CalDavClient::for_base_url("not a url");
 
         assert_eq!(
             client.resolve_url("calendar/one.ics"),

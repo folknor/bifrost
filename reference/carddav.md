@@ -25,8 +25,13 @@ contact primitives.
 
 - `lib.rs` - public config / credentials / factory.
 - `account.rs` - crate-private contact-only `Account` impl.
-- `client.rs` - crate-private reqwest CardDAV client: discovery,
-  `PROPFIND`, `REPORT`, `PUT`, and `DELETE`.
+- `client.rs` - crate-private CardDAV client: discovery, `PROPFIND`,
+  `REPORT`, `PUT`, and `DELETE`. A local `DavTransport` seam keeps reqwest
+  dispatch in production while scripted request transcripts exercise DAV
+  flows without a listener. `bifrost-net`'s dispatcher is crate-private, and
+  DAV still owns Basic auth and its redirect policy. Every request path
+  classifies a non-2xx status before the body is parsed, so an error page
+  can never decode as an authoritative empty report.
 - `parse.rs` - XML response parsers for addressbook discovery,
   contact listing, multiget hydration, depth-0 `getctag`, and nested href
   properties. Addressbook/listing/multiget properties are staged per
@@ -37,7 +42,9 @@ contact primitives.
   transiently-failed resource instead of destroying it. Response parsers
   use element-stack parent checks so nested same-name properties do not
   overwrite response-level hrefs. Every text-bearing parser accepts both
-  XML text and CDATA.
+  XML text and CDATA. Response hrefs are rebased to absolute native URLs at
+  the decode boundary, before the account layer can consume success or
+  failure lanes.
 - `vcard.rs` - small vCard projection between DAV resources and
   `bifrost-types` contact cards. **Parse-in** uses caldata's `LineReader`
   for RFC 6350 line unfolding (deletes exactly one leading WSP, not the

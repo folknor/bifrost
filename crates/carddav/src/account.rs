@@ -53,7 +53,7 @@ impl CardDavAccount {
         let collections = client.list_addressbooks(&addressbook_home).await?;
         let default_addressbook_url = collections
             .first()
-            .map(|collection| client.resolve_url(&collection.href))
+            .map(|collection| collection.href.clone())
             .unwrap_or_else(|| client.resolve_url(&addressbook_home));
         Ok(Self {
             client: Arc::new(client),
@@ -74,8 +74,8 @@ impl CardDavAccount {
         default_addressbook_url.to_string()
     }
 
-    fn map_addressbook(client: &CardDavClient, collection: AddressBookCollection) -> AddressBook {
-        let native = client.resolve_url(&collection.href);
+    fn map_addressbook(collection: AddressBookCollection) -> AddressBook {
+        let native = collection.href;
         let name = collection
             .display_name
             .filter(|name| !name.trim().is_empty())
@@ -132,14 +132,14 @@ impl CardDavAccount {
         if report
             .missing_data
             .iter()
-            .any(|href| client.resolve_url(href) == client.resolve_url(&contact.0))
+            .any(|href| href == &client.resolve_url(&contact.0))
         {
             return Err(parse_error(
                 operation,
                 "CardDAV multiget response omitted address-data",
             ));
         }
-        let (cards, _) = resolved_report(client, report);
+        let (cards, _) = resolved_report(report);
         cards
             .into_iter()
             .next()
@@ -160,7 +160,7 @@ impl CardDavAccount {
             .collect::<Vec<_>>();
         let fetch = client.fetch_vcards(&addressbook, &uris, operation).await?;
         let skipped_scopes = skipped_addressbook_scope(fetch.degraded);
-        let (fetched, mut failed_ids) = resolved_report(client, fetch.report);
+        let (fetched, mut failed_ids) = resolved_report(fetch.report);
         let (cards, projection_failures) = partition_hydrated_vcards(&addressbook, fetched);
         failed_ids.extend(projection_failures);
         one_outcome_per_id(&mut failed_ids, &cards);
@@ -181,7 +181,7 @@ impl CardDavAccount {
         let mut seen = HashSet::new();
         let fetch = client.query_vcards_text(&addressbook, query).await?;
         let skipped_scopes = skipped_addressbook_scope(fetch.degraded);
-        let (fetched, mut failed_ids) = resolved_report(client, fetch.report);
+        let (fetched, mut failed_ids) = resolved_report(fetch.report);
         let fetched = fetched
             .into_iter()
             .filter(|card| seen.insert(card.uri.clone()))
@@ -215,7 +215,7 @@ impl CardDavAccount {
             .collect::<Vec<_>>();
         let fetch = client.fetch_vcards(&addressbook, &uris, operation).await?;
         let skipped_scopes = skipped_addressbook_scope(fetch.degraded);
-        let (fetched, mut failed_ids) = resolved_report(client, fetch.report);
+        let (fetched, mut failed_ids) = resolved_report(fetch.report);
         let (cards, projection_failures) = partition_hydrated_vcards(&addressbook, fetched);
         failed_ids.extend(projection_failures);
         one_outcome_per_id(&mut failed_ids, &cards);
@@ -240,25 +240,19 @@ impl CardDavAccount {
             .await?;
         let ctag = collections
             .into_iter()
-            .find(|collection| {
-                same_collection_url(&client.resolve_url(&collection.href), addressbook)
-            })
+            .find(|collection| same_collection_url(&collection.href, addressbook))
             .and_then(|collection| collection.ctag);
         let listing = client.list_contacts_listing(addressbook, operation).await?;
         let mut entries = listing
             .entries
             .into_iter()
             .map(|entry| ContactSnapshotEntry {
-                uri: client.resolve_url(&entry.uri),
+                uri: entry.uri,
                 etag: entry.etag,
             })
             .collect::<Vec<_>>();
         entries.sort_by(|left, right| left.uri.cmp(&right.uri));
-        let failed_hrefs = listing
-            .failed_hrefs
-            .into_iter()
-            .map(|href| client.resolve_url(&href))
-            .collect();
+        let failed_hrefs = listing.failed_hrefs;
         Ok(ContactSnapshot {
             addressbook_url: addressbook.to_string(),
             ctag,
@@ -764,7 +758,7 @@ impl Account for CardDavAccount {
             let collections = client.list_addressbooks(&home).await?;
             let mut books = collections
                 .into_iter()
-                .map(|collection| Self::map_addressbook(&client, collection))
+                .map(Self::map_addressbook)
                 .collect::<Vec<_>>();
             if books.is_empty() {
                 let native = client.resolve_url(&home);
@@ -1454,32 +1448,16 @@ fn estimated_total(total: usize) -> u64 {
 /// from a real remote deletion and preserve the row instead of
 /// destroying it. The captured id is the same `uri` a successful card
 /// would carry as its native id.
-/// Rebase a multiget report onto the account's native-id namespace.
-///
-/// A server writes multiget response hrefs however it likes - usually
-/// path-only, sometimes absolute. Every id this account hands out
-/// (snapshot entries, inventory, changes) is the resolved absolute URL, so
-/// a raw href would give the hydration lane a second, incompatible id
-/// namespace: the same contact would look created-then-destroyed to a
-/// consumer that indexes on `native_id`.
-fn resolved_report(
-    client: &CardDavClient,
-    report: CardDavMultigetReport,
-) -> (Vec<CardDavFetchedVCard>, Vec<String>) {
-    let cards = report
-        .cards
-        .into_iter()
-        .map(|card| CardDavFetchedVCard {
-            uri: client.resolve_url(&card.uri),
-            ..card
-        })
-        .collect();
+/// Parsed multiget reports already use the absolute native-id namespace.
+/// DAV response hrefs are rebased at the XML decoding boundary, before this
+/// account layer can place them in success or failure lanes.
+fn resolved_report(report: CardDavMultigetReport) -> (Vec<CardDavFetchedVCard>, Vec<String>) {
+    let cards = report.cards;
     let failed = report
         .failed
         .into_iter()
         .map(|failure| failure.href)
         .chain(report.missing_data)
-        .map(|href| client.resolve_url(&href))
         .collect();
     (cards, failed)
 }
@@ -1618,11 +1596,9 @@ mod tests {
 
     #[test]
     fn multiget_hrefs_are_rebased_onto_the_snapshot_id_namespace() {
-        // The snapshot lane resolves listing hrefs to absolute URLs, so the
-        // hydration lane must too: a path-only multiget href would give the
-        // same contact two native ids.
-        let client = CardDavClient::for_base_url("https://dav.example.test/");
-        let report = CardDavMultigetReport {
+        // XML decoding rebases every response href before the account layer
+        // sees it, so hydration cannot split native ids from the snapshot.
+        let mut report = CardDavMultigetReport {
             cards: vec![CardDavFetchedVCard {
                 uri: "/contacts/one.vcf".to_string(),
                 etag: Some("e1".to_string()),
@@ -1635,7 +1611,8 @@ mod tests {
             missing_data: vec!["/contacts/empty.vcf".to_string()],
         };
 
-        let (cards, failed) = resolved_report(&client, report);
+        report.resolve_hrefs("https://dav.example.test/");
+        let (cards, failed) = resolved_report(report);
 
         assert_eq!(cards[0].uri, "https://dav.example.test/contacts/one.vcf");
         assert_eq!(

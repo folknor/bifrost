@@ -1,6 +1,7 @@
 use quick_xml::Reader;
 use quick_xml::escape::unescape;
 use quick_xml::events::Event;
+use reqwest::Url;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CalendarCollection {
@@ -148,6 +149,63 @@ pub(crate) struct CalDavSyncEntry {
     pub(crate) uri: String,
     pub(crate) etag: Option<String>,
     pub(crate) status: Option<u16>,
+}
+
+impl CalendarCollection {
+    pub(crate) fn resolve_href(&mut self, base_url: &str) {
+        self.href = resolve_href(base_url, &self.href);
+    }
+}
+
+impl CalDavEventListing {
+    pub(crate) fn resolve_hrefs(&mut self, base_url: &str) {
+        for entry in &mut self.entries {
+            entry.uri = resolve_href(base_url, &entry.uri);
+        }
+        for href in &mut self.failed_hrefs {
+            *href = resolve_href(base_url, href);
+        }
+    }
+}
+
+impl CalDavMultigetReport {
+    pub(crate) fn resolve_hrefs(&mut self, base_url: &str) {
+        for event in &mut self.events {
+            event.uri = resolve_href(base_url, &event.uri);
+        }
+        for failed in &mut self.failed {
+            failed.href = resolve_href(base_url, &failed.href);
+        }
+        for href in &mut self.missing_data {
+            *href = resolve_href(base_url, href);
+        }
+    }
+}
+
+impl CalDavSyncReport {
+    pub(crate) fn resolve_hrefs(&mut self, base_url: &str) {
+        for entry in &mut self.entries {
+            entry.uri = resolve_href(base_url, &entry.uri);
+        }
+    }
+}
+
+/// Rebase a DAV response href at the XML decoding boundary. Client callers
+/// never expose parsed relative hrefs to the account layer.
+pub(crate) fn resolve_href(base_url: &str, href: &str) -> String {
+    if href.starts_with("http://") || href.starts_with("https://") {
+        return href.to_string();
+    }
+    if let Ok(base) = Url::parse(base_url)
+        && let Ok(resolved) = base.join(href)
+    {
+        return resolved.to_string();
+    }
+    if base_url.ends_with('/') || href.starts_with('/') {
+        format!("{base_url}{href}")
+    } else {
+        format!("{base_url}/{href}")
+    }
 }
 
 pub(crate) fn parse_calendar_collections(xml: &str) -> Result<Vec<CalendarCollection>, String> {
@@ -498,6 +556,63 @@ pub(crate) fn parse_sync_collection_report(xml: &str) -> Result<CalDavSyncReport
     }
 
     Ok(report)
+}
+
+/// Extract a collection sync token from a depth-0 PROPFIND. The token is
+/// committed only from a successful propstat so a stale value in a refused
+/// property cannot revive an invalid cursor.
+pub(crate) fn parse_collection_sync_token(xml: &str) -> Result<Option<String>, String> {
+    let mut reader = Reader::from_str(xml);
+    let mut stack: Vec<String> = Vec::new();
+    let mut text = String::new();
+    let mut propstat_token = None;
+    let mut propstat_success = None;
+    let mut committed = None;
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(element)) => {
+                let name = local_name(element.name().as_ref());
+                if name == "propstat" {
+                    propstat_token = None;
+                    propstat_success = None;
+                }
+                stack.push(name);
+                text.clear();
+            }
+            Ok(Event::Text(value)) => push_text(&mut text, value.as_ref())?,
+            Ok(Event::CData(value)) => {
+                let value = value.decode().map_err(|error| error.to_string())?;
+                text.push_str(&value);
+            }
+            Ok(Event::End(element)) => {
+                let name = local_name(element.name().as_ref());
+                let parent = stack.iter().rev().nth(1).map(String::as_str);
+                match (parent, name.as_str()) {
+                    (Some("prop"), "sync-token") => propstat_token = trimmed(&text),
+                    (Some("propstat"), "status") => {
+                        propstat_success = Some(
+                            status_code(&text).is_some_and(|status| (200..=299).contains(&status)),
+                        );
+                    }
+                    _ => {}
+                }
+                if name == "propstat"
+                    && propstat_success.unwrap_or(true)
+                    && propstat_token.is_some()
+                {
+                    committed = propstat_token.take();
+                }
+                stack.pop();
+                text.clear();
+            }
+            Ok(Event::Eof) => break,
+            Ok(_) => {}
+            Err(error) => return Err(format!("XML parse error: {error}")),
+        }
+    }
+
+    Ok(committed)
 }
 
 pub(crate) fn extract_href_property(

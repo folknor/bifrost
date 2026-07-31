@@ -26,8 +26,15 @@ calendar primitives.
 
 - `lib.rs` - public config / credentials / factory.
 - `account.rs` - crate-private calendar-only `Account` impl.
-- `client.rs` - crate-private reqwest CalDAV client: discovery,
-  `PROPFIND`, `REPORT`, `GET`, `PUT`, and `DELETE`.
+- `client.rs` - crate-private CalDAV client: discovery, `PROPFIND`,
+  `REPORT`, `GET`, `PUT`, and `DELETE`. A local `DavTransport` seam keeps
+  reqwest dispatch in production while scripted request transcripts exercise
+  DAV flows without a listener. `bifrost-net`'s dispatcher is crate-private,
+  and DAV still owns Basic auth and its redirect policy. Every request path
+  except `sync_events` classifies a non-2xx status before the body is
+  parsed, so an error page can never decode as an authoritative empty
+  report; `sync_events` alone reads the raw response, because it must see
+  403 `valid-sync-token` and 410 as cursor invalidation rather than failure.
 - `parse.rs` - XML response parsers for calendar discovery, event
   listing, multiget hydration, and nested href properties. Calendar
   collection metadata is staged per `propstat` and committed only for
@@ -39,7 +46,9 @@ calendar primitives.
   nested same-name properties do not overwrite response-level hrefs or
   propstat status. Every text-bearing parser accepts both XML text and
   CDATA. Scheduling address-set extraction returns every nested href;
-  single-valued discovery properties use the first.
+  single-valued discovery properties use the first. Response hrefs are
+  rebased to absolute native URLs at the decode boundary, before the account
+  layer can consume success or failure lanes.
 - `ical.rs` - iCalendar projection between DAV resources and
   `bifrost-types` calendar events. Parsing-in uses `caldata`'s streaming
   `ContentLineParser` (RFC 5545 unfolding that strips exactly one fold WSP,
@@ -71,9 +80,9 @@ calendar primitives.
   preserved verbatim rather than sliced at fixed byte offsets. `DTSTART`
   plus `DURATION` projects an end when `DTEND` is absent; an explicit end
   patch removes DURATION before emitting DTEND. A resource with no VEVENT
-  (a VTODO or VJOURNAL sharing the collection) projects to a
-  `event_get`/`event_update` error and to *no* events in the listing lanes,
-  never to a fabricated empty event.
+  (a VTODO or VJOURNAL sharing the collection) maps to
+  `NotFound(Calendar)` for `event_get`/`event_update` and to *no* events in
+  the listing lanes, never to a fabricated empty event.
   Serialization-out (create/patch/RSVP) stays
   hand-rolled and verbatim-preserving: patches splice on *physical* lines,
   folding only newly emitted lines, so long preserved/unmodeled values
@@ -238,7 +247,9 @@ An expired token reported as 403 with `DAV:valid-sync-token`, or as 410,
 becomes scoped `SyncState(CursorInvalid)`, which directs the engine to
 restart the calendar-event cursor. Cursor entry counts are payload-bounded
 before allocation. Range, search, inventory, changes, and their failed-id
-lanes all use resolved absolute resource URLs as native ids.
+lanes all use resolved absolute resource URLs as native ids. Snapshot-poll
+fallback refreshes a collection token with a depth-0 `sync-token` PROPFIND,
+rather than repeating the calendar-home depth-1 listing.
 
 All mail, contact, filter, blob, push, and settings methods return
 `AccountErrorKind::Unsupported` stamped with `Protocol::CalDav`.

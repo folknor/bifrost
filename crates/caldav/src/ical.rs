@@ -14,6 +14,14 @@ use uuid::Uuid;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct IcalParseError(pub(crate) String);
 
+/// Direct-resource projection can distinguish an invalid iCalendar body from
+/// a valid resource that simply does not contain an event component.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum EventProjectionError {
+    Parse(IcalParseError),
+    NoVevent,
+}
+
 /// Project the master (first) VEVENT of a resource. Used by the direct
 /// `event_get` / `event_update` paths, which operate on the master.
 pub(crate) fn event_from_ical(
@@ -21,11 +29,12 @@ pub(crate) fn event_from_ical(
     calendar_id: CalendarId,
     etag: Option<String>,
     data: &str,
-) -> Result<CalendarEvent, IcalParseError> {
-    let block = parse_vevents(data)?
+) -> Result<CalendarEvent, EventProjectionError> {
+    let block = parse_vevents(data)
+        .map_err(EventProjectionError::Parse)?
         .into_iter()
         .next()
-        .ok_or_else(|| IcalParseError("iCalendar resource contains no VEVENT".to_string()))?;
+        .ok_or(EventProjectionError::NoVevent)?;
     Ok(project_event(
         EventId(uri.clone()),
         uri,
@@ -109,11 +118,9 @@ fn project_event(
     let end = dtend
         .map(event_time_from_property)
         .or_else(|| {
-            dtstart.and_then(|start| {
-                props
-                    .first("DURATION")
-                    .and_then(|duration| event_end_from_duration(start, duration))
-            })
+            props
+                .first("DURATION")
+                .and_then(|duration| event_end_from_duration(&start, duration))
         })
         .unwrap_or_else(default_time);
     let is_all_day =
@@ -719,9 +726,8 @@ fn ical_offset_suffix(value: &str) -> String {
     String::new()
 }
 
-fn event_end_from_duration(start: &Prop, duration: &str) -> Option<EventTime> {
+fn event_end_from_duration(start: &EventTime, duration: &str) -> Option<EventTime> {
     let duration = caldata::types::parse_duration(duration).ok()?;
-    let start = event_time_from_property(start);
     let value = if let Ok(value) = DateTime::parse_from_rfc3339(&start.value) {
         let end = value.checked_add_signed(duration)?;
         end.to_rfc3339_opts(SecondsFormat::Secs, start.value.ends_with('Z'))
@@ -742,7 +748,7 @@ fn event_end_from_duration(start: &Prop, duration: &str) -> Option<EventTime> {
     };
     Some(EventTime {
         value,
-        timezone: start.timezone,
+        timezone: start.timezone.clone(),
     })
 }
 
@@ -2414,8 +2420,8 @@ mod tests {
         );
 
         assert_eq!(
-            result.expect_err("VTODO-only resource is not an event").0,
-            "iCalendar resource contains no VEVENT"
+            result.expect_err("VTODO-only resource is not an event"),
+            EventProjectionError::NoVevent
         );
     }
 

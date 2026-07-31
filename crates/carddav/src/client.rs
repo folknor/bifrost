@@ -1,11 +1,13 @@
+use std::fmt;
+use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine;
 use bifrost_types::{
-    AccountError, AccountErrorBuilder, AccountErrorKind, AccountOperation, Cause, DiagnosticText,
-    ErrorScope, Protocol, ProtocolErrorKind, RecoveryClass, RequestCause, RequestErrorKind,
-    ResourceKind, ServerCause, ServerErrorKind, StateCause, TransmissionState, TransportCause,
-    TransportErrorKind, TransportKind, WireCause,
+    AccountError, AccountErrorBuilder, AccountErrorKind, AccountFuture, AccountOperation, Cause,
+    DiagnosticText, ErrorScope, Protocol, ProtocolErrorKind, RecoveryClass, RequestCause,
+    RequestErrorKind, ResourceKind, ServerCause, ServerErrorKind, StateCause, TransmissionState,
+    TransportCause, TransportErrorKind, TransportKind, WireCause,
 };
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, ETAG, HeaderMap, HeaderValue};
 use reqwest::{Method, StatusCode, Url};
@@ -13,7 +15,7 @@ use reqwest::{Method, StatusCode, Url};
 use crate::parse::{
     AddressBookCollection, CardDavContactEntry, CardDavContactListing, CardDavMultigetReport,
     MultigetOutcome, extract_href_property, parse_addressbook_collections, parse_multiget_report,
-    parse_propfind_contacts,
+    parse_propfind_contacts, resolve_href,
 };
 use crate::{CardDavConfig, CardDavCredentials};
 
@@ -27,11 +29,52 @@ pub(crate) enum PutCondition<'a> {
     None,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct CardDavClient {
     http: reqwest::Client,
+    transport: Arc<dyn DavTransport>,
     base_url: String,
     credentials: CardDavCredentials,
+}
+
+impl fmt::Debug for CardDavClient {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CardDavClient")
+            .field("base_url", &self.base_url)
+            .field("credentials", &self.credentials)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DavResponse {
+    status: StatusCode,
+    headers: HeaderMap,
+    body: String,
+}
+
+/// Local DAV transport boundary. `bifrost-net` keeps its dispatcher private,
+/// while this client still owns Basic auth and DAV redirect policy.
+trait DavTransport: Send + Sync {
+    fn send(&self, request: reqwest::RequestBuilder) -> AccountFuture<Result<DavResponse, String>>;
+}
+
+struct ReqwestDavTransport;
+
+impl DavTransport for ReqwestDavTransport {
+    fn send(&self, request: reqwest::RequestBuilder) -> AccountFuture<Result<DavResponse, String>> {
+        Box::pin(async move {
+            let response = request.send().await.map_err(|error| error.to_string())?;
+            let status = response.status();
+            let headers = response.headers().clone();
+            let body = response.text().await.map_err(|error| error.to_string())?;
+            Ok(DavResponse {
+                status,
+                headers,
+                body,
+            })
+        })
+    }
 }
 
 impl CardDavClient {
@@ -44,6 +87,7 @@ impl CardDavClient {
 
         Ok(Self {
             http,
+            transport: Arc::new(ReqwestDavTransport),
             base_url: config.base_url.trim_end_matches('/').to_string(),
             credentials: config.credentials.clone(),
         })
@@ -62,7 +106,7 @@ impl CardDavClient {
         {
             Ok(body) => match extract_href_property(&body, "current-user-principal")
                 .map_err(|error| parse_error(AccountOperation::Discover, error))?
-                .map(|href| self.resolve_url(&href))
+                .map(|href| resolve_href(&self.base_url, &href))
             {
                 Some(principal) => {
                     return self.addressbook_home_for_principal(principal).await;
@@ -83,7 +127,7 @@ impl CardDavClient {
             .await?;
         let principal = extract_href_property(&body, "current-user-principal")
             .map_err(|error| parse_error(AccountOperation::Discover, error))?
-            .map(|href| self.resolve_url(&href))
+            .map(|href| resolve_href(&self.base_url, &href))
             .ok_or_else(|| {
                 parse_error(AccountOperation::Discover, "missing current-user-principal")
             })?;
@@ -105,7 +149,7 @@ impl CardDavClient {
             .await?;
         extract_href_property(&body, "addressbook-home-set")
             .map_err(|error| parse_error(AccountOperation::Discover, error))?
-            .map(|href| self.resolve_url(&href))
+            .map(|href| resolve_href(&self.base_url, &href))
             .ok_or_else(|| parse_error(AccountOperation::Discover, "missing addressbook-home-set"))
     }
 
@@ -125,8 +169,12 @@ impl CardDavClient {
         let body = self
             .propfind_raw(home_url, "1", PROPFIND_ADDRESSBOOKS, operation)
             .await?;
-        parse_addressbook_collections(&body)
-            .map_err(|error| parse_error(operation, format!("addressbook list: {error}")))
+        let mut collections = parse_addressbook_collections(&body)
+            .map_err(|error| parse_error(operation, format!("addressbook list: {error}")))?;
+        for collection in &mut collections {
+            collection.resolve_href(&self.base_url);
+        }
+        Ok(collections)
     }
 
     pub(crate) async fn list_contacts(
@@ -175,8 +223,10 @@ impl CardDavClient {
         let body = self
             .propfind_raw(addressbook_url, "1", PROPFIND_CONTACTS, operation)
             .await?;
-        parse_propfind_contacts(&body)
-            .map_err(|error| parse_error(operation, format!("contact list: {error}")))
+        let mut listing = parse_propfind_contacts(&body)
+            .map_err(|error| parse_error(operation, format!("contact list: {error}")))?;
+        listing.resolve_hrefs(&self.base_url);
+        Ok(listing)
     }
 
     pub(crate) async fn fetch_vcards(
@@ -205,8 +255,9 @@ impl CardDavClient {
 {href_elements}</C:addressbook-multiget>"
             );
             let response = self.report_raw(addressbook_url, &body, operation).await?;
-            let parsed = parse_multiget_report(&response)
+            let mut parsed = parse_multiget_report(&response)
                 .map_err(|error| parse_error(operation, format!("multiget: {error}")))?;
+            parsed.resolve_hrefs(&self.base_url);
             if let Some(error) = multiget_failure(&parsed, operation) {
                 degraded = worse_recovery(degraded, error);
             }
@@ -227,9 +278,10 @@ impl CardDavClient {
             let response = self
                 .report_raw(addressbook_url, &body, AccountOperation::ContactSearch)
                 .await?;
-            let parsed = parse_multiget_report(&response).map_err(|error| {
+            let mut parsed = parse_multiget_report(&response).map_err(|error| {
                 parse_error(AccountOperation::ContactSearch, format!("query: {error}"))
             })?;
+            parsed.resolve_hrefs(&self.base_url);
             if let Some(error) = multiget_failure(&parsed, AccountOperation::ContactSearch) {
                 degraded = worse_recovery(degraded, error);
             }
@@ -281,9 +333,15 @@ impl CardDavClient {
     /// href resolution without touching the network.
     #[cfg(test)]
     pub(crate) fn for_base_url(base_url: &str) -> Self {
+        Self::with_transport(base_url, Arc::new(ReqwestDavTransport))
+    }
+
+    #[cfg(test)]
+    fn with_transport(base_url: &str, transport: Arc<dyn DavTransport>) -> Self {
         Self {
             http: reqwest::Client::new(),
-            base_url: base_url.to_string(),
+            transport,
+            base_url: base_url.trim_end_matches('/').to_string(),
             credentials: CardDavCredentials::bearer("token"),
         }
     }
@@ -346,19 +404,11 @@ impl CardDavClient {
         request: reqwest::RequestBuilder,
         operation: AccountOperation,
     ) -> Result<String, AccountError> {
-        let response = request
-            .send()
-            .await
-            .map_err(|error| transport_error(operation, error.to_string()))?;
-        let status = response.status();
-        let body = response
-            .text()
-            .await
-            .map_err(|error| transport_error(operation, error.to_string()))?;
-        if status.is_success() || status == StatusCode::MULTI_STATUS {
-            Ok(body)
+        let response = self.send_raw_request(request, operation).await?;
+        if response.status.is_success() {
+            Ok(response.body)
         } else {
-            Err(status_error(operation, status, body))
+            Err(status_error(operation, response.status, response.body))
         }
     }
 
@@ -367,25 +417,28 @@ impl CardDavClient {
         request: reqwest::RequestBuilder,
         operation: AccountOperation,
     ) -> Result<Option<String>, AccountError> {
-        let response = request
-            .send()
-            .await
-            .map_err(|error| transport_error(operation, error.to_string()))?;
-        let status = response.status();
+        let response = self.send_raw_request(request, operation).await?;
         let etag = response
-            .headers()
+            .headers
             .get(ETAG)
             .and_then(|value| value.to_str().ok())
             .map(normalize_http_etag);
-        let body = response
-            .text()
-            .await
-            .map_err(|error| transport_error(operation, error.to_string()))?;
-        if status.is_success() {
+        if response.status.is_success() {
             Ok(etag)
         } else {
-            Err(status_error(operation, status, body))
+            Err(status_error(operation, response.status, response.body))
         }
+    }
+
+    async fn send_raw_request(
+        &self,
+        request: reqwest::RequestBuilder,
+        operation: AccountOperation,
+    ) -> Result<DavResponse, AccountError> {
+        self.transport
+            .send(request)
+            .await
+            .map_err(|error| transport_error(operation, error))
     }
 
     /// Build the per-request auth headers. The bearer token is read from
@@ -756,6 +809,143 @@ const PROPFIND_CONTACTS: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    #[derive(Debug, Clone)]
+    struct RequestTranscript {
+        method: Method,
+        url: String,
+        headers: HeaderMap,
+    }
+
+    struct ScriptedDavTransport {
+        responses: Mutex<VecDeque<DavResponse>>,
+        requests: Mutex<Vec<RequestTranscript>>,
+    }
+
+    impl ScriptedDavTransport {
+        fn new(responses: impl IntoIterator<Item = DavResponse>) -> Arc<Self> {
+            Arc::new(Self {
+                responses: Mutex::new(responses.into_iter().collect()),
+                requests: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn requests(&self) -> Vec<RequestTranscript> {
+            self.requests
+                .lock()
+                .expect("scripted DAV request lock poisoned")
+                .clone()
+        }
+    }
+
+    impl DavTransport for ScriptedDavTransport {
+        fn send(
+            &self,
+            request: reqwest::RequestBuilder,
+        ) -> AccountFuture<Result<DavResponse, String>> {
+            let request = match request.build() {
+                Ok(request) => request,
+                Err(error) => return Box::pin(async move { Err(error.to_string()) }),
+            };
+            self.requests
+                .lock()
+                .expect("scripted DAV request lock poisoned")
+                .push(RequestTranscript {
+                    method: request.method().clone(),
+                    url: request.url().to_string(),
+                    headers: request.headers().clone(),
+                });
+            let response = self
+                .responses
+                .lock()
+                .expect("scripted DAV response lock poisoned")
+                .pop_front()
+                .expect("scripted DAV transport exhausted");
+            Box::pin(async move { Ok(response) })
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_vcards_uses_scripted_report_transcript() {
+        let script = ScriptedDavTransport::new([DavResponse {
+            status: StatusCode::MULTI_STATUS,
+            headers: HeaderMap::new(),
+            body: "<D:multistatus xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:carddav\"><D:response><D:href>/book/one.vcf</D:href><D:propstat><D:prop><C:address-data>BEGIN:VCARD\nVERSION:4.0\nFN:One\nEND:VCARD</C:address-data></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response></D:multistatus>".to_string(),
+        }]);
+        let concrete_transport = Arc::clone(&script);
+        let transport: Arc<dyn DavTransport> = concrete_transport;
+        let client = CardDavClient::with_transport("https://dav.example.test", transport);
+
+        let fetched = client
+            .fetch_vcards(
+                "https://dav.example.test/book/",
+                &["https://dav.example.test/book/one.vcf".to_string()],
+                AccountOperation::ContactsList,
+            )
+            .await
+            .expect("scripted multiget succeeds");
+
+        assert_eq!(
+            fetched.report.cards[0].uri,
+            "https://dav.example.test/book/one.vcf"
+        );
+        let requests = script.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].method,
+            Method::from_bytes(b"REPORT").expect("REPORT method")
+        );
+        assert_eq!(requests[0].url, "https://dav.example.test/book/");
+        assert_eq!(
+            requests[0]
+                .headers
+                .get("depth")
+                .and_then(|value| value.to_str().ok()),
+            Some("1")
+        );
+        assert_eq!(
+            requests[0]
+                .headers
+                .get(AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer token")
+        );
+    }
+
+    /// Shared-shape guard against the CalDAV regression: a non-2xx REPORT must
+    /// classify, never decode into an authoritative empty multiget. An empty
+    /// result treated as truth is a downstream deletion.
+    #[tokio::test]
+    async fn unauthorized_report_classifies_as_reauthorization() {
+        let script = ScriptedDavTransport::new([DavResponse {
+            status: StatusCode::UNAUTHORIZED,
+            headers: HeaderMap::new(),
+            body: "<html><body>401 Unauthorized</body></html>".to_string(),
+        }]);
+        let concrete_transport = Arc::clone(&script);
+        let transport: Arc<dyn DavTransport> = concrete_transport;
+        let client = CardDavClient::with_transport("https://dav.example.test", transport);
+
+        let Err(error) = client
+            .fetch_vcards(
+                "https://dav.example.test/book/",
+                &["https://dav.example.test/book/one.vcf".to_string()],
+                AccountOperation::ContactsList,
+            )
+            .await
+        else {
+            panic!("401 REPORT must not be reported as an empty result");
+        };
+
+        assert_eq!(
+            error.kind(),
+            &AccountErrorKind::Authentication(
+                bifrost_types::AuthErrorKind::ReauthorizationRequired
+            )
+        );
+    }
 
     #[test]
     fn status_error_maps_write_conflicts() {
@@ -804,11 +994,7 @@ mod tests {
 
     #[test]
     fn resolve_url_fallback_preserves_separator() {
-        let client = CardDavClient {
-            http: reqwest::Client::new(),
-            base_url: "not a url".to_string(),
-            credentials: CardDavCredentials::bearer("token"),
-        };
+        let client = CardDavClient::for_base_url("not a url");
 
         assert_eq!(
             client.resolve_url("addressbook/one.vcf"),
