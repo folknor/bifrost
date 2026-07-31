@@ -1,3 +1,4 @@
+use bifrost_net::{status_line_code, status_line_is_success};
 use quick_xml::Reader;
 use quick_xml::escape::unescape;
 use quick_xml::events::Event;
@@ -286,8 +287,7 @@ pub(crate) fn parse_calendar_collections(xml: &str) -> Result<Vec<CalendarCollec
                             current.propstat_sync_token = trimmed(&text);
                         }
                         (Some("propstat"), "status") => {
-                            current.propstat_success =
-                                status_code(&text).map(|code| matches!(code, 200..=299));
+                            current.propstat_success = Some(status_line_is_success(&text));
                         }
                         _ => {}
                     }
@@ -363,8 +363,7 @@ pub(crate) fn parse_propfind_events(xml: &str) -> Result<CalDavEventListing, Str
                         (Some("prop"), "getetag") => current.etag = normalize_etag(&text),
                         (Some("prop"), "getcontenttype") => current.content_type = trimmed(&text),
                         (Some("propstat"), "status") => {
-                            current.propstat_success =
-                                status_code(&text).map(|code| matches!(code, 200..=299));
+                            current.propstat_success = Some(status_line_is_success(&text));
                         }
                         _ => {}
                     }
@@ -463,8 +462,7 @@ pub(crate) fn parse_multiget_report(xml: &str) -> Result<CalDavMultigetReport, S
                         }
                         (Some("propstat"), "status") => {
                             current.propstat_status = trimmed(&text);
-                            current.propstat_success =
-                                status_code(&text).map(|code| matches!(code, 200..=299));
+                            current.propstat_success = Some(status_line_is_success(&text));
                         }
                         (Some("response"), "status") => current.status = trimmed(&text),
                         _ => {}
@@ -591,9 +589,7 @@ pub(crate) fn parse_collection_sync_token(xml: &str) -> Result<Option<String>, S
                 match (parent, name.as_str()) {
                     (Some("prop"), "sync-token") => propstat_token = trimmed(&text),
                     (Some("propstat"), "status") => {
-                        propstat_success = Some(
-                            status_code(&text).is_some_and(|status| (200..=299).contains(&status)),
-                        );
+                        propstat_success = Some(status_line_is_success(&text));
                     }
                     _ => {}
                 }
@@ -798,7 +794,7 @@ impl ResponseParts {
     fn commit_propstat(&mut self) {
         if self.propstat_success == Some(false) {
             self.saw_failed_propstat = true;
-            if let Some(code) = self.propstat_status.as_deref().and_then(status_code) {
+            if let Some(code) = self.propstat_status.as_deref().and_then(status_line_code) {
                 self.failed_statuses.push(code);
             }
         }
@@ -903,7 +899,7 @@ impl ResponseParts {
         let status = self.failed_statuses.first().copied().or_else(|| {
             self.status
                 .as_deref()
-                .and_then(status_code)
+                .and_then(status_line_code)
                 .filter(|status| !(200..=299).contains(status))
         })?;
         Some(CalDavFailedResource {
@@ -930,16 +926,10 @@ impl ResponseParts {
             status: self
                 .status
                 .as_deref()
-                .and_then(status_code)
-                .or_else(|| self.propstat_status.as_deref().and_then(status_code)),
+                .and_then(status_line_code)
+                .or_else(|| self.propstat_status.as_deref().and_then(status_line_code)),
         })
     }
-}
-
-fn status_code(status: &str) -> Option<u16> {
-    status
-        .split_whitespace()
-        .find_map(|part| part.parse::<u16>().ok())
 }
 
 #[cfg(test)]
@@ -1392,6 +1382,47 @@ END:VCALENDAR</C:calendar-data></D:prop>
         assert_eq!(
             report.classify(),
             MultigetOutcome::CompleteFailure { status: Some(401) }
+        );
+    }
+
+    /// A `<D:status>` that is PRESENT but unreadable must not commit the
+    /// properties beside it.
+    ///
+    /// `propstat_success.unwrap_or(true)` treats `None` as success, which
+    /// is right for an ABSENT status (RFC 4918 s14.22 requires one, and a
+    /// server omitting it is describing a success). It is wrong for a
+    /// status that is there and cannot be parsed: that is not evidence
+    /// the property was returned, so committing it accepts a value the
+    /// server may have refused.
+    ///
+    /// This crate previously mapped unparseable to `None` (success) while
+    /// bifrost-carddav mapped it to failure - a divergence that survived
+    /// precisely because each crate spelled the check itself. Both now
+    /// fail closed through `bifrost_net::status_line_is_success`.
+    #[test]
+    fn a_present_but_unparseable_propstat_status_does_not_commit() {
+        // Real calendar-data, so the old behaviour genuinely committed an
+        // event here - the assertion would pass vacuously against an
+        // empty prop.
+        let xml = r#"
+<D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+  <D:response>
+    <D:href>/cal/one.ics</D:href>
+    <D:propstat>
+      <D:prop>
+        <D:getetag>"abc"</D:getetag>
+        <C:calendar-data>BEGIN:VCALENDAR
+END:VCALENDAR</C:calendar-data>
+      </D:prop>
+      <D:status>HTTP/1.1 OK</D:status>
+    </D:propstat>
+  </D:response>
+</D:multistatus>"#;
+
+        let report = parse_multiget_report(xml).expect("valid 207");
+        assert!(
+            report.events.is_empty(),
+            "an unreadable status must not commit the property beside it"
         );
     }
 

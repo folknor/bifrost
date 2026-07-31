@@ -157,6 +157,28 @@ any item; some may already be obsolete.
   now pinned by `long_non_ascii_display_names_fold_on_every_address_path`.
   Open only as a decision: encode over-long allowed tokens when the header
   already carries encoded words, at the cost of changing that pinned test.
+
+  RFC standing checked 2026-07-31, because the item cites the wrong
+  document for the question it asks. Nothing here is superseded, and
+  nothing is new:
+
+  - RFC 2047 (1996, encoded-words) is current, but applies only to
+    NON-ASCII text. The case at issue is an all-ASCII token, which 2047
+    does not cover at all - so "2047-encoding an all-ASCII word" would be
+    using the mechanism outside its remit to force a fold, not applying
+    it.
+  - The binding constraint is RFC 5322 (2008): line length SHOULD be <= 78
+    and MUST be <= 998. Current. The existing behaviour misses the SHOULD
+    and stays well inside the MUST, which is what makes this a preference
+    rather than a conformance bug.
+  - RFC 6532 (UTF-8 headers) over RFC 6531 (SMTPUTF8) is the modern escape
+    from encoded-words, but it removes the need to ENCODE non-ASCII; it
+    does nothing for folding an unbreakable ASCII atom. No RFC supersedes
+    the folding problem.
+
+  So the decision stands as filed, but it is a 5322 SHOULD-compliance
+  judgement, and the argument for leaving it alone is stronger than the
+  original wording suggests.
 - **smtp-T1.** (coverage) Residual test-seam gaps. The batch entry
   points through the pool (sync and async), pool retirement / reuse end
   to end, RCPT-option sequencing on the wire, mailbox list parsing, a
@@ -184,6 +206,42 @@ any item; some may already be obsolete.
   DAV clients still own Basic auth and their own redirect policy - a
   shared seam would have to grow those first. Revisit when these clients
   move onto `AccountNet`.
+
+  Re-scoped 2026-07-31: this is TWO items fused, and only one of them is
+  blocked. The `AccountNet` gating is about the TRANSPORT seam
+  (`DavTransport` / `DavResponse`). It does not gate the PARSER, which
+  could be lifted today with no transport work at all.
+
+  And the parser half is a live instance of the sweep-1 pattern, not a
+  tidiness preference. `carddav/src/parse.rs:502` carries the comment
+  "Matches CalDAV's `status_code` + `200..=299` check" - an explicit
+  annotation that it is a copy - and the two `status_code` functions are
+  byte-identical (`split_whitespace().find_map(parse::<u16>())`). A
+  comment is the only thing keeping them in step. That is the same shape
+  as the four defects the 2026-07 slices found (xc-3, xc-3a, imap-T3,
+  imap-S1), three of which were live.
+
+  Suggested split: parser unification is unblocked and should be judged on
+  its own; the duplicated transport seam keeps the `AccountNet` trigger.
+
+  PARSER HALF DONE (2026-07-31). `bifrost_net::status_line` now owns
+  `status_line_code` / `status_line_is_success`; both DAV crates call it
+  and their local copies are gone, including caldav's two different
+  in-line spellings of the 2xx test (`matches!(code, 200..=299)` three
+  times, `(200..=299).contains(&code)` once) and carddav's named wrapper.
+  Three spellings became one.
+
+  Consolidating immediately surfaced a real divergence the comment had
+  denied: for a `<D:status>` that is PRESENT but unparseable, carddav
+  failed closed while caldav mapped it to `None`, which
+  `propstat_success.unwrap_or(true)` read as SUCCESS - so caldav would
+  commit a property whose status it could not read. Both now fail closed,
+  pinned by `a_present_but_unparseable_propstat_status_does_not_commit`.
+  An ABSENT status is still success, which is the RFC 4918 s14.22 reading
+  and unchanged.
+
+  TRANSPORT HALF still open: the duplicated `DavTransport` / `DavResponse`
+  seam keeps the `AccountNet` trigger described above.
 - **caldav-F1.** VTODO / VJOURNAL resources still occupy the event
   cursor. The snapshot and changes lanes key on the PROPFIND href
   listing, which does not carry the component type, so a task resource in
@@ -204,6 +262,26 @@ any item; some may already be obsolete.
   build it when a consumer (ratatoskr) needs the audit surface. Lives in
   `bifrost-imap` / `bifrost-smtp` (the public auth surfaces), not the private
   `bifrost-sasl` crate.
+
+  Re-scoped 2026-07-31 against the question "shouldn't the error model
+  already give us this?". Partly yes, and the item is smaller than filed:
+
+  - FAILURE half, largely redundant. `crates/imap/src/error.rs` already
+    carries `AuthPolicyFailure` with the offered mechanism list and
+    per-mechanism `AuthMechanismRejection { mechanism, reason }`, which
+    reaches `AccountError` as support-only diagnostic text. So "which
+    mechanisms were rejected and why" is already available on the
+    local-policy path. Verify what the SERVER-rejection paths carry, then
+    close this half rather than building a parallel typed surface beside
+    the error model.
+  - SUCCESS half, genuinely unreachable that way. The error model only
+    speaks when something fails; there is no error object to hang
+    "authenticated with SCRAM-SHA-256 plus tls-exporter channel binding"
+    on. No amount of improving error plumbing produces a success record.
+
+  So the real remaining item is the success-path outcome record, and it
+  should not be designed as a mirror of the failure surface that already
+  exists. Still waiting on ratatoskr to need the audit trail.
 
 ## bifrost-gmail
 
@@ -291,6 +369,48 @@ any item; some may already be obsolete.
   read-back guard runs anyway. Per sync-D4 plumbing is correct; revisit
   when a consumer (ratatoskr) starts using
   `MutationCounters::dedupe_by_client_id` to suppress the read-back.
+
+  UNRULED as of 2026-07-31, but the premise above is WRONG and the item
+  is much narrower than it reads. Verified against the code:
+
+  - The described engine behaviour is real. At `engine.rs:1238-1281`
+    (mirrored at 1580) the loop over `advice.guidance.actions` sets only
+    `wants_dedupe`; the following `for id in &remaining` loop inserts
+    `PendingReadback` unconditionally. `wants_dedupe` drives the counter
+    and the warning, nothing else.
+  - But `DedupeByClientId` WITHOUT `CheckTarget` cannot be produced.
+    `RecoveryClass` is never set by producers - `try_build` always derives
+    it through `recovery::derive` - and there are exactly two paths that
+    yield a `Reconcile`: `transient_retry_or_reconcile` gives
+    `TransportDropAfterSend` with `actions: [CheckTarget]`, and
+    `derive_protocol`'s `PartialResponse` + non-idempotent arm gives
+    `PartialCompletionSignal` with `actions: [CheckTarget,
+    DedupeByClientId]` (`crates/types/src/error/recovery.rs:721-729`).
+    Nothing outside `recovery.rs` constructs a `ReconcileAdvice`, and the
+    builder exposes no way to inject one.
+  - So `CheckTarget` is present in EVERY producible reconcile advice, and
+    in the one case that also carries `DedupeByClientId` the read-back
+    queue is exactly right rather than an over-reach. The division of
+    labour already holds: `CheckTarget` is the engine's job (the read-back
+    guard IS the target probe), dedupe-by-client-id is the consumer's, and
+    the warning at `engine.rs:1272` says so.
+
+  There is therefore no behaviour change to consider, and nothing to
+  suppress. What is left is bookkeeping:
+
+  1. Close as resolved-by-analysis, recording that the feared shape is
+     unproducible and the reachable shape is correct.
+  2. Close, plus a test pinning the reachable case - a `[CheckTarget,
+     DedupeByClientId]` advice queues read-back AND warns - so the
+     reasoning is enforced rather than only written down. LIKELY CHOICE,
+     not yet ruled.
+  3. Keep open as a guard against a future `ReconcileAction` variant.
+
+  On 3: `ReconcileAction` is `#[non_exhaustive]` and the match at
+  `engine.rs:1244` ends in `_ => {}`, so a new variant is silently ignored
+  here. That is a real concern but it is the same shape as sync-N1
+  (after-exhaustive wildcards in cross-crate matches) and belongs there,
+  not in this item.
 - **sync-F6.** (residuals of the closed F4+F5 throttle wiring) What
   bounds the now-wired `ThrottleBucket`:
   (a) `ThrottleScope::Tenant` degrades to the `Account` key because the
@@ -432,6 +552,24 @@ container projection itself.
   mailbox, so shared-mailbox containers fall back to display-name matching and
   their Inbox / Sent carry no `FolderRole`. A correct fix costs about six extra
   round-trips per shared mailbox; decide whether the roles are worth it.
+
+  Re-framed 2026-07-31 after asking what an end user actually loses. Not
+  cosmetic. `FolderRole` (`Inbox | Sent | Drafts | Archive | Trash |
+  Spam`, `crates/types/src/container.rs:87`) is documented as the canonical
+  role a container plays in ratatoskr's UI, so without it on a shared
+  mailbox the app holds names and no routing: Send does not know where to
+  file the copy, Delete does not know which folder is Trash, Save-draft
+  does not know Drafts, Not-spam has no target, and icons plus ordering
+  fall back to alphabetical.
+
+  The decisive part is the FALLBACK. Display-name matching is
+  locale-dependent - a German tenant's shared mailbox is `Gesendete
+  Elemente`, not `Sent` - so shared mailboxes work by accident on English
+  tenants and degrade silently everywhere else. The real question is
+  therefore not "are icons worth six round-trips" but "is correct
+  destructive-action routing on non-English tenants worth six round-trips
+  per shared mailbox AT OPEN" (not per operation). Framed that way it
+  looks like a yes, but it is still unruled.
 - **nc-8 (jmap)** `pim::containers_list` reports `Container::rights` for the
   primary account from `Mailbox/myRights`, but a foreign account's mailboxes go
   through the same `container_from_mailbox`, so a share whose `Mailbox/get`
@@ -586,11 +724,60 @@ blocking; each is a real defect or a real decision, not a cleanup.
   tells a consumer that a share granted after open surfaces only through a
   reopen, and `SyncEngine::reopen` is the public staged-reattach entry that
   performs the rediscovery - but no component ever calls it on a cadence.
-  The ruling for now is that cadence is consumer policy (nightly, on
-  opening the folder list, on user action), so ratatoskr must drive it.
-  The open question is whether `bifrost-sync` should grow an optional
-  rediscovery interval (`EngineConfig`) that calls `reopen` for accounts
-  advertising the flag, so every consumer does not reimplement the timer.
+
+  RULED 2026-07-31: cadence stays CONSUMER POLICY. The engine will not
+  grow a rediscovery timer. Not yet implemented - this is a decision, and
+  the documentation and rename below are the remaining work.
+
+  Why, so the ruling is not re-litigated from scratch: the right interval
+  depends on things the engine cannot see (app foregrounded, metered
+  connection, whether shares are common in the deployment), a `reopen` is
+  a full staged reattach with real wire cost, and ratatoskr is the only
+  consumer - a `tokio::time::interval` on its side is ~10 lines. Rejected
+  alternatives were an optional `EngineConfig::rediscovery_interval`
+  (default-off would go unused, default-on would be wrong for most
+  deployments) and an `accounts_awaiting_rediscovery()` accessor that
+  exposes the candidate set without owning the clock. The second is the
+  one to revisit first if consumer footwork turns out to be the problem.
+
+  Verified while ruling: nothing in `crates/sync/src` reads the flag -
+  every occurrence there is a test stub setting it `false` - and no
+  internal caller of `reopen` exists. Also relevant to the shape of the
+  fix: `EngineConfig` has NO interval-shaped field today (every knob is a
+  cap, a count, or a timeout; `PushConfig` is an empty struct), so adding
+  one would have introduced the first engine-owned wall clock rather than
+  extending an existing pattern.
+
+  Remaining work:
+
+  1. Document the pairing so the flag does not read as a promise the
+     engine keeps. `reference/sync.md` should say plainly that the flag is
+     advisory TO THE CONSUMER and that the engine never schedules on it;
+     a consumer reads the flag and drives the call itself.
+  2. Rename `SyncEngine::reopen`. The name undersells the operation and
+     actively hides it from the consumer this ruling puts in charge:
+     someone told "drive share rediscovery yourself" will search for
+     something named `rediscover*` and find nothing. The method does a
+     full staged reattach - re-runs scope and membership discovery,
+     establishes newly-appeared scopes, drops vanished cursors, recreates
+     push subscriptions, refreshes the capability snapshot, then swaps the
+     handle. Candidate names: `rediscover_and_reattach` (most literal),
+     `reattach`, `reopen_and_rediscover`. Not settled.
+
+     Sizing, because it is bigger than it looks: `reopen` appears 105
+     times in `sync/src/engine.rs` and 35 times in `reference/sync.md`,
+     and most of those are the reopen LANE (`reopen_tx`, `reopen_lock`,
+     `ReopenRequest`, the reopen listener), not the public method - a
+     blind rename would churn the internal vocabulary too. Decide whether
+     the lane keeps its name.
+
+     The sharper consequence: the capability flag
+     `reopen_discovers_foreign_namespaces` NAMES the method. Renaming the
+     method either drags the flag with it - a `bifrost-types` public API
+     change touching all seven account crates plus every test stub - or
+     leaves the flag naming a method that no longer exists. That coupling
+     is the real cost of the rename and should be decided before starting,
+     not discovered midway.
 
   UPDATE (commit 6829767): the EWS half is solved Graph-locally. Every EWS
   request goes through one funnel, `EwsClient::execute`, so a crate-private

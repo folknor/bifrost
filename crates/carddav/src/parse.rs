@@ -1,3 +1,4 @@
+use bifrost_net::{status_line_code, status_line_is_success};
 use quick_xml::Reader;
 use quick_xml::escape::unescape;
 use quick_xml::events::Event;
@@ -188,7 +189,7 @@ pub(crate) fn parse_addressbook_collections(
                             current.staged.ctag = trimmed(&text);
                         }
                         (Some("propstat"), "status") => {
-                            current.staged.success = Some(is_success_status(&text));
+                            current.staged.success = Some(status_line_is_success(&text));
                         }
                         _ => {}
                     }
@@ -253,7 +254,7 @@ pub(crate) fn parse_propfind_contacts(xml: &str) -> Result<CardDavContactListing
                             current.staged.content_type = trimmed(&text);
                         }
                         (Some("propstat"), "status") => {
-                            current.staged.success = Some(is_success_status(&text));
+                            current.staged.success = Some(status_line_is_success(&text));
                         }
                         _ => {}
                     }
@@ -336,7 +337,7 @@ pub(crate) fn parse_multiget_report(xml: &str) -> Result<CardDavMultigetReport, 
                         }
                         (Some("propstat"), "status") => {
                             current.staged.status = trimmed(&text);
-                            current.staged.success = Some(is_success_status(&text));
+                            current.staged.success = Some(status_line_is_success(&text));
                         }
                         (Some("response"), "status") => current.status = trimmed(&text),
                         _ => {}
@@ -406,7 +407,7 @@ pub(crate) fn parse_collection_ctag(xml: &str) -> Result<Option<String>, String>
                 match (parent, name.as_str()) {
                     (Some("prop"), "getctag") => propstat_ctag = trimmed(&text),
                     (Some("propstat"), "status") => {
-                        propstat_success = Some(is_success_status(&text));
+                        propstat_success = Some(status_line_is_success(&text));
                     }
                     _ => {}
                 }
@@ -497,22 +498,6 @@ fn trimmed(text: &str) -> Option<String> {
     } else {
         Some(value.to_string())
     }
-}
-
-fn is_success_status(value: &str) -> bool {
-    // Parse the first whitespace-delimited token that is a 3-digit-ish
-    // numeric code and test the 2xx range, rather than positionally
-    // assuming the leading `HTTP/x` token is present. A status line that
-    // omits the protocol token (`200 OK`) would otherwise have its code
-    // read as the word `OK` and be misclassified as a failed propstat.
-    // Matches CalDAV's `status_code` + `200..=299` check.
-    status_code(value).is_some_and(|code| matches!(code, 200..=299))
-}
-
-fn status_code(value: &str) -> Option<u16> {
-    value
-        .split_whitespace()
-        .find_map(|part| part.parse::<u16>().ok())
 }
 
 fn normalize_etag(text: &str) -> Option<String> {
@@ -611,7 +596,7 @@ impl ResponseParts {
 
         if staged.success == Some(false) {
             self.saw_failed_propstat = true;
-            if let Some(code) = staged.status.as_deref().and_then(status_code) {
+            if let Some(code) = staged.status.as_deref().and_then(status_line_code) {
                 self.failed_statuses.push(code);
             }
         }
@@ -687,7 +672,7 @@ impl ResponseParts {
         let status = self.failed_statuses.first().copied().or_else(|| {
             self.status
                 .as_deref()
-                .and_then(status_code)
+                .and_then(status_line_code)
                 .filter(|status| !(200..=299).contains(status))
         })?;
         Some(CardDavFailedResource {
@@ -910,16 +895,9 @@ END:VCARD</C:address-data>
         assert_eq!(ctag.as_deref(), Some("ctag-7"));
     }
 
-    #[test]
-    fn is_success_status_parses_code_without_protocol_token() {
-        // A status line missing the leading `HTTP/x` token must still
-        // classify on the numeric code, not positionally read the second
-        // whitespace token (which would be `OK`).
-        assert!(is_success_status("200 OK"));
-        assert!(is_success_status("HTTP/1.1 207 Multi-Status"));
-        assert!(!is_success_status("404 Not Found"));
-        assert!(!is_success_status("HTTP/1.1 404 Not Found"));
-    }
+    // The status-line parsing this used to pin now lives in
+    // `bifrost_net::status_line`, tested there against both DAV crates'
+    // cases. A copy here would be the drift this consolidation removed.
 
     #[test]
     fn parse_collection_ctag_ignores_failed_propstat() {

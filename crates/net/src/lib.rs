@@ -32,6 +32,7 @@ pub mod rate;
 pub mod redirect;
 pub mod request;
 pub mod retry;
+pub mod status_line;
 // Compiled for this crate's own unit tests as well, so the scripted
 // double has exactly one definition rather than a private copy here
 // and a published copy for downstream.
@@ -55,3 +56,4 @@ pub use rate::{RateLimit, RateLimitGovernor, RequestCost};
 pub use redirect::{FollowRedirects, RedirectAction, RedirectPolicy, RedirectStep};
 pub use request::{ByteStream, RequestBuilder, Response, StreamingResponse, parse_retry_after};
 pub use retry::RetryPolicy;
+pub use status_line::{status_line_code, status_line_is_success};

@@ -550,6 +550,38 @@ exists, preserves request / trace ids and capped body text from
 `Status`, `RateLimited`, and status-backed `RetryBudgetExhausted`,
 and leaves provider JSON interpretation to JMAP, Gmail, and Graph.
 
+## Status-line helpers
+
+`status_line::status_line_code(&str) -> Option<u16>` and
+`status_line_is_success(&str) -> bool` parse an HTTP status line
+(`HTTP-version SP status-code SP reason-phrase`, RFC 9112). They live
+here rather than in a DAV crate because that grammar is HTTP's, not
+WebDAV's; DAV merely carries status lines as element text.
+
+Both DAV clients need them: RFC 4918 puts an HTTP status line inside
+each `<D:propstat>`'s `<D:status>`, so a 207 Multi-Status body is only
+meaningful once each is read. They were previously spelled out once per
+crate, and the drift that produced is the reason for consolidating (see
+dav-F5).
+
+Two behaviours worth not regressing:
+
+- The code is the first whitespace-delimited token that parses as a
+  number, NOT the token at position 1. Servers do emit the
+  protocol-less form (`200 OK`) inside `<D:status>`, where a positional
+  read takes `OK` as the code and classifies a good propstat as failed.
+  `HTTP/1.1` contains no bare numeric token, so the version cannot be
+  mistaken for the code.
+- A line with no parseable code is NOT success. An unreadable status is
+  not evidence the property was returned, so treating it as success
+  commits a value the server may have refused. This is the one place
+  the two DAV crates had silently diverged: carddav failed closed here,
+  caldav mapped unparseable to `None`, which its
+  `propstat_success.unwrap_or(true)` then read as success. An ABSENT
+  status remains success (RFC 4918 s14.22 requires one, so a server
+  omitting it is describing a success) - only the present-but-unreadable
+  case changed.
+
 ## URL helpers
 
 `url::encode_path_component(value)` and
