@@ -77,6 +77,8 @@ If the server advertises `SIZE=<bytes>`, message size is checked client-side bef
 
 For DATA the declared size is `message.len() + 2`. Every DATA writer terminates with `\r\n.\r\n` unconditionally, so the CRLF before the terminating dot is always an extra octet pair on the wire - a message that already ends in CRLF gains a trailing empty line rather than reusing its own CRLF as the terminator's line break. Declaring the bare buffer length would under-report by two octets for every well-formed message. BDAT declares the raw chunk length because it has no terminator or transparency layer.
 
+A consequence: `Message::formatted()` is not byte-identical to DATA delivery - delivered content gains that one trailing empty line. `body_raw()` applies the same terminator before DKIM canonicalization, so signing and delivery agree. Changing this is wire-compatible only after a dedicated API decision.
+
 ## Auth
 
 `Credentials` is enum: `Password { username, password: Zeroizing<String> }` and `OAuth2 { identity, token_source: Arc<dyn TokenSource> }` (bifrost-net's trait). The OAuth token is read live from the shared source at each connect, so a token rotated on the source is presented on reconnect without rebuilding the transport. `Credentials` is `Clone` only - no `PartialEq`/`Eq`/serde derives (a live token source is neither comparable nor serializable; rotation material is the consumer's to persist). The `AUTH` command struct (`Auth`) likewise dropped those derives. The async transport reads the token via `oauth2_token().await`; the blocking transport via `oauth2_token_blocking()`, a single-poll of `current()` (a `StaticTokenSource` or already-fresh `OAuthRefresher` resolves immediately; a source needing a network refresh is rejected - live refresh requires the async transport).
@@ -124,7 +126,7 @@ Display-name encoding emits RFC 5322 phrase text when the name is atom-shaped, R
 
 `MultiPart` kinds: `Mixed`, `Alternative`, `Related`, `Signed`, `Encrypted`, `Report { report_type }`. `Mixed` is the default for `MultiPart::builder().build()`.
 
-Multipart builders ensure a `boundary` is present even when a caller supplies a boundary-less multipart `Content-Type`. `try_boundary`, `try_encrypted`, and `try_signed` are fallible validation entry points; default boundaries use OS randomness, and a caller-supplied boundary is regenerated if it appears at a MIME delimiter position in an added part.
+Multipart builders ensure a `boundary` is present even when a caller supplies a boundary-less multipart `Content-Type`. `try_boundary`, `try_encrypted`, and `try_signed` are the fallible validation entry points; the infallible `boundary`, `MultiPart::encrypted`, and `MultiPart::signed` keep their signatures and panic on values that would break out of the MIME parameter (a deliberate runtime behavior change for callers passing unvalidated strings); default boundaries use OS randomness, and a caller-supplied boundary is regenerated if it appears at a MIME delimiter position in an added part.
 
 `SinglePartBuilder::body(String)` and `MessageBuilder::body(String)` infer `Content-Type: text/plain; charset=utf-8` when no content type is set.
 

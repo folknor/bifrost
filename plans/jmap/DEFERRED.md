@@ -72,7 +72,7 @@ drive the same `PushRouting` snapshot from an EventSource stream
 (`closeafter=no`, `ping` keepalives, Last-Event-ID reconnect resume)
 and advertise `push: InProcess` for that case too. This is deliberately
 NOT bundled into a bug-hunt pass: it is feature-sized, it lives in the
-push-reconciler territory `plans/bugs-jmap-core-sync.md` settled, and
+push-reconciler territory the 2026-07 core/sync bug sweep settled, and
 it deserves its own review cycle.
 
 **Revisit when:** the next planned change touches `sync/push.rs`, or a

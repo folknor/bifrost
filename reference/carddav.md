@@ -117,7 +117,10 @@ Supported contact primitives:
   changes, and writes the replacement vCard with `If-Match` when a strong
   etag was present. Weak ETags retain their `W/` marker for snapshot
   comparison but make the PUT unconditional because If-Match requires
-  strong comparison. Inline `ContactPatch.photo` replaces or clears vCard
+  strong comparison (RFC 7232), so a weak validator has no conforming
+  conditional form. Against a server that only ever emits weak ETags this
+  means `contact_update` has no lost-update protection at all; a consumer
+  that needs the guarantee needs an application-level revision check. Inline `ContactPatch.photo` replaces or clears vCard
   PHOTO data. Changing `address_book_id` is rejected; CardDAV moves are
   not implemented.
 - `contact_delete` - deletes the DAV resource.

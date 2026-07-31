@@ -134,7 +134,9 @@ Supported calendar primitives:
   recurrence-aware: a recurring master whose own interval sits outside the
   window is retained when its RRULE can still yield an in-window occurrence
   (dropped only when it starts after the window, or an RRULE `UNTIL` ends it
-  before the window). Per-resource failures are not swallowed - the failed
+  before the window). COUNT-bounded recurrences trust the server's
+  expansion: fully defending against a hostile server would require
+  recurrence expansion that does not exist in this crate. Per-resource failures are not swallowed - the failed
   hrefs surface on `Page::failed_ids` so a consumer can tell a transient
   failure apart from a real remote deletion. Two kinds land there and they
   are equivalent to the consumer: a resource the server refused inside the
@@ -195,7 +197,11 @@ Supported calendar primitives:
   `EventPatch`, and writes the replacement resource with `If-Match`
   when a strong etag was present. Weak ETags retain their `W/` marker for
   snapshot comparison but deliberately make the PUT unconditional because
-  If-Match requires strong comparison. When the current resource carried raw
+  If-Match requires strong comparison (RFC 7232), so a weak validator has
+  no conforming conditional form. Against a server that only ever emits
+  weak ETags this means `event_update` has no lost-update protection at
+  all; no better option exists inside HTTP, and a consumer that needs the
+  guarantee needs an application-level revision check. When the current resource carried raw
   iCalendar data, updates rewrite each VEVENT property the patch carries -
   summary, description, location, start/end, status, transparency
   (TRANSP), class (CLASS), recurrence, and attendees - while preserving
@@ -254,6 +260,14 @@ before allocation. Range, search, inventory, changes, and their failed-id
 lanes all use resolved absolute resource URLs as native ids. Snapshot-poll
 fallback refreshes a collection token with a depth-0 `sync-token` PROPFIND,
 rather than repeating the calendar-home depth-1 listing.
+
+Known cursor limitation: VTODO / VJOURNAL resources sharing the collection
+still occupy the event cursor. Both change lanes key on the PROPFIND href
+listing, which does not carry the component type, so a task resource is
+emitted as a created/updated event change whose hydration yields no events
+(the `.ics`-without-VEVENT rule above). Filtering it out needs either a
+component-type PROPFIND or a first-fetch classification cache (tracked in
+`TODO.md` as caldav-F1).
 
 All mail, contact, filter, blob, push, and settings methods return
 `AccountErrorKind::Unsupported` stamped with `Protocol::CalDav`.

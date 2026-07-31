@@ -37,6 +37,17 @@ re-auditors don't re-raise them.)
   coverage.
 - **jmap-N4.** `capabilities.rs` "core limits zero" path: reclassify
   as `Protocol(ContractViolation)`.
+- **jmap-T2.** (coverage) `client_ws.rs` frame handling beyond the
+  subprotocol check: the close / error / binary arms live inside the
+  `async_stream::stream!` and need a stub WebSocket transport of the same
+  shape as the stub `HttpTransport` / `SseTransport` doubles the blob and
+  EventSource tests use. (Carried from the closed jmap objects ledger,
+  which also deliberately left the thin query filter/comparator enums -
+  `principal/availability.rs`, `principal/query.rs`,
+  `share_notification/query.rs`, `sieve/query.rs`,
+  `calendar_event_notification/query.rs`, `quota/query.rs` - untested:
+  they are structurally identical to the pinned `email_query_wire`
+  tables and a second copy of the same table was judged lower value.)
 - **jmap-T1.** Account-layer conformance tests (cursor envelope
   round-trip, capability shape, error classification, scope-to-method
   wiring) were deferred during Phase 3 behind in-flight sync-engine
@@ -87,6 +98,42 @@ re-auditors don't re-raise them.)
   `crates/imap/src/account/` modules are still outstanding (the
   reference doc and code landed in P3-A2; the focused tests did not).
   (Carried from the deleted `plans/orchestration.md` P3-A2.)
+- **imap-T2.** (coverage) The scripted account harness
+  (`account/scripted_tests.rs`, a real `ImapAccount` over
+  `connection::test_support::driver_pair` with canned transcripts) covers
+  pool-permit discipline and the selected-mailbox deselect fallback, but
+  not the sync half: QRESYNC / CONDSTORE / Basic strategy dispatch,
+  VANISHED/FETCH deduplication, the downgrade paths, and checkpoint
+  emission. (Carried from the closed imap bug-hunt ledger.)
+- **imap-T3.** (audit) `account/error.rs`, crate `error.rs`, and their
+  recovery-mapping tests still merit a dedicated audit against
+  `reference/error-model.md`. ManageSieve and submission were checked only
+  for unsafe text ingress, not full logic. (Carried from the closed imap
+  bug-hunt ledger.)
+- **imap-T4.** (deferred, codec sweep leftovers) Cheap-to-large test
+  candidates the codec sweep named but did not build:
+  `decode_rfc2231_params` (`types/rfc2231.rs`) is fed attacker-controlled
+  `Content-Type` parameters and does continuation reassembly - the classic
+  quadratic / unbounded-allocation shape - and was never read closely;
+  `parse_encoded_word_inner` decodes arbitrary charset labels via
+  `encoding_rs` (linear and well-audited, but a 100 KB base64 payload in a
+  legacy multi-byte charset expands several-fold and nothing caps the
+  resulting subject length); the `skip_tagged_ext_simple` terminator
+  matrix (NIL / literal / quoted / atom against both caller terminator
+  sets) is a mechanical test matrix; a structure-aware BODYSTRUCTURE
+  fuzz generator (well-formed trees, then targeted mutations) is about a
+  day of generator work.
+- **imap-T5.** (deferred, connection sweep rulings - revisit triggers,
+  not work items) Hermetic STARTTLS needs a fake TLS handshake
+  (`ImapStream::into_tcp` returns `None` for `Memory`, deliberately);
+  ruled heavier machinery than the risk it retires. The B7 compile-level
+  guarantee (a result oneshot that cannot answer without publishing
+  state) was ruled not worth it while all completion arms live in one
+  match in `driver_task`; revisit if a new state-changing driver command
+  lane is added. Strongest proptest candidate if coverage is wanted:
+  `buffer_may_contain_complete_response` against generated well-formed
+  response streams, asserting the generator never lands on the fatal
+  lane.
 
 ## bifrost-smtp
 
@@ -101,6 +148,39 @@ re-auditors don't re-raise them.)
   document that bandwidth caps apply only to HTTP- and IMAP-shaped
   accounts. (Carried from the deleted `plans/unification.md` decision
   point 8, which was never stamped resolved.)
+- **smtp-N2.** (minor) A pathological non-ASCII display *name* (~500+
+  chars) in an address header can still have its RFC 2047 folds flattened
+  by the address-header path; the encoded-word fix fully handles Subject.
+  Names are near-universally short, so low impact.
+- **smtp-T1.** (coverage) Test-seam gaps from the closed smtp ledger:
+  transport-level batch entry points (`send_raw_batch_with_options`
+  through the pool) are undriven, as is broader RCPT-option sequencing;
+  the `Transcript` harness does not model a peer that half-answers a
+  reply line, closes mid-response, or interleaves writes with pending
+  replies (`expect_coalesced` models adjacent-reply coalescing only);
+  the pool's retirement of a drained LMTP connection is pinned only at
+  the connection level (`should_retire()`), not end to end; TLS/network
+  modules, mailbox parsers, and direct async transport tests remain
+  uncovered, and `starttls` upgrade past the capability check has no
+  transcript (no TLS handshake in the harness).
+
+## bifrost-caldav / bifrost-carddav
+
+- **dav-F5.** Shared DAV propstat/status parser. `is_success_status` and
+  the propstat-success gating are robust in place but duplicated across
+  both DAV crates; a shared parser module would remove the drift risk.
+  Related accepted cost: the `DavTransport` / `DavResponse` test seam is
+  duplicated in `caldav` and `carddav` rather than shared via
+  `bifrost-net`, because net keeps its dispatcher crate-private and both
+  DAV clients still own Basic auth and their own redirect policy - a
+  shared seam would have to grow those first. Revisit when these clients
+  move onto `AccountNet`.
+- **caldav-F1.** VTODO / VJOURNAL resources still occupy the event
+  cursor. The snapshot and changes lanes key on the PROPFIND href
+  listing, which does not carry the component type, so a task resource in
+  a shared calendar collection is emitted as a created/updated event
+  change whose hydration yields no events. Filtering needs either a
+  component-type PROPFIND or a first-fetch classification cache.
 
 ## bifrost-sasl
 
@@ -132,6 +212,15 @@ re-auditors don't re-raise them.)
 - **gmail-N6.** Hoist `dailyLimitExceeded` classification into a single
   helper.
 - **gmail-N7.** Rename `account/recovery.rs` to `account/error.rs`.
+- **gmail-A1.** (audit boundary, not a defect) The 2026-07 google+net
+  bug sweep did not line-audit: Gmail MIME rendering, draft patching,
+  search translation, identity and vacation mapping in
+  `crates/google/src/account/pim.rs`; the already test-dense contacts,
+  calendar, account-error, filters, and cloud modules;
+  `crates/net/src/account_error.rs` beyond its integration suite and
+  `trace.rs` beyond construction-level invariants; and bifrost-graph
+  beyond its `attach_account` reattach path. Listed so a future auditor
+  knows where coverage stops.
 
 ## bifrost-graph
 
@@ -180,6 +269,20 @@ re-auditors don't re-raise them.)
   non-mail classes A5b-3 added. Fixing it needs a modification signal
   (e.g. `LastModifiedTime`) or a different watermark model entirely - a
   known poll-model limitation, not a regression.
+- **graph-T1.** (coverage) What the REST/EWS test seams still do not
+  reach (see `reference/graph.md` for the seams themselves): blob byte
+  streams (`download_stream`), the OneDrive resumable chunk PUT
+  (pre-authed, no bearer, its own builder), the Autodiscover POST, the
+  renewal worker's plain SUCCESS leg driven as a loop across ticks
+  (`due_renewals` / `install_replacement` are pinned pure and the
+  recreate leg is driven through a tick), and anything whose behavior
+  depends on bifrost-net's own retry, backoff, or redirect walk - the
+  seam answers at the funnel, below which none of that runs. On the
+  SEARCH surface specifically: no test walks a shared mailbox's OWN
+  `nextLink` continuation (only primary search pagination is exercised;
+  the delta walks do pin a shared continuation), and no test PAGES
+  through three mailboxes (the quarantine test routes across three, but
+  only two return result pages).
 
 ## bifrost-sync
 
@@ -225,7 +328,17 @@ re-auditors don't re-raise them.)
   without dropping `#[non_exhaustive]` from the `pub`, re-exported enum -
   a broader API-stability change out of A5c scope. Until then a future
   scope-bearing variant still defaults account-wide here and needs a human
-  to add its arm.
+  to add its arm. Close-pass ruling (2026-07): the flag is sufficient -
+  the account-wide default is the conservative direction (never narrower
+  than the directive asks), `DirectiveKey::Other` bounds dedupe
+  coarseness to the old behavior, and `handle_engine_directive`'s
+  required fallback logs the unhandled variant.
+- **sync-N8.** (likely WONTFIX - re-auditor reminder) Widening
+  `ScopeChange.membership` to `Vec<MembershipScope>` would touch
+  types+jmap+graph+engine, but the single `Folder(id)` is the correct
+  routing membership (the engine covering rule would not cover a
+  `Mailbox(owner)` tag against a folder cursor). Only worth it if change
+  events must carry the owner tag for some future consumer.
 - **sync-N2.** `MutationBucket::BlockedByEngine` vs `FailedTerminal`:
   split into distinct counter fields.
 - **sync-N3.** `wait_for_real_subscriber` 25ms hot-poll: switch to
@@ -444,7 +557,8 @@ container projection itself.
 
 ## Cross-crate items from the bug-hunt loop (2026-07-29)
 
-Surfaced while working the `plans/bugs-*.md` files crate by crate. Each of
+Surfaced while working the per-crate bug-hunt ledgers (the since-deleted
+`plans/bugs-*.md` files) crate by crate. Each of
 these was found from inside one crate but cannot be resolved there: the fix,
 or the decision, belongs to a shared contract or to a second crate's API.
 They are collected here rather than in the per-crate sections above so they
@@ -483,7 +597,7 @@ blocking; each is a real defect or a real decision, not a cleanup.
   crate-private and test-only. Concretely this is why several `bifrost-graph`
   paths are pinned only at the level of extracted pure decision functions,
   with the surrounding request/response sequencing left unpinned and named as
-  such in `plans/bugs-graph.md`: partial webhook-creation rollback, the
+  such at the time: partial webhook-creation rollback, the
   inventory neither-link branch, the unsubscribe DELETE loop as a loop, a
   mixed reaction batch actually reaching `$batch`, and the renewal leg past
   `due_renewals`. `bifrost-jmap` hit the same wall and solved it locally by
@@ -556,6 +670,23 @@ blocking; each is a real defect or a real decision, not a cleanup.
   consumer surface as open skips, or at least a counter/warning), or whether
   "page lanes are the app's job" stays the documented ruling. A decision,
   not a bug: nothing is dropped silently at the crate boundary today.
+
+## Rules for agents working bug-hunt items
+
+These earned their keep during the 2026 fix slices - keep applying them
+to any item in this file:
+
+1. Contract docs (`reference/*.md`, above all `error-model.md` /
+   `sync.md`) and existing tests are authoritative; a finding that
+   contradicts them loses. Don't rewrite a contract or a passing test to
+   match a finding.
+2. Confirm against the contract, not the finding's own rationale.
+3. Fix only what is named and confirmed; don't generalize one case into
+   a sweeping rule.
+4. An existing test you must modify is a red flag - justify it
+   explicitly.
+5. A shared-crate change (`types`/`net`/`sasl`/`sync`) is pinned by
+   downstream tests; run the full-workspace `brokkr check`, never `-p`.
 
 ## Notes
 

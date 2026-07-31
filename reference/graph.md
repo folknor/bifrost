@@ -135,9 +135,32 @@ Two rules make the seam an equivalence rather than an approximation:
   and would leave it out of the recorded list, so a test asserting "exactly
   N requests" could not detect the N+1th. Mirrors the EWS double.
 
+The script is shared with every client derived from the one a test holds
+(`for_shared_mailbox`, `with_outlook_base`), the way the semaphore and
+`AccountNet` already are, so a foreign-mailbox request - issued by a client
+minted inside `GraphAccount::new` - is scripted and recorded alongside the
+primary's. That sharing silently weakens any test written past it: a derived
+client answers from the primary's queue and records into the primary's log,
+so the seam alone cannot say WHICH client issued a request. Asserting the URL
+does not recover it either on the delta paths - `initial_delta_url` builds
+its `/users/{mailbox}` prefix off `client_for_scope` independently of which
+client then sends it, and a `nextLink` / `deltaLink` is whatever Graph
+minted - so a walk that fell back to the primary would produce byte-identical
+requests. (The per-message write paths do not have that problem: there the
+URL is built from the selected client's own prefix, so the URL IS the routing
+evidence.) Where the distinction matters, a test roots the shared client in
+its own `GraphClient` (`new_for_tests_with_shared_clients`) and arms the
+primary with an EMPTY script, so a fallback hits the exhaustion panic instead
+of passing quietly - the pattern the foreign delta walks, the thread-keyed
+doors, and the mailbox-aware search cursor tests all use. When a test's
+account-wide request legitimately goes to the primary (`delete_thread`'s
+`/$batch` POST), the primary is armed with EXACTLY that one response, so a
+misrouted lookup consumes it and the next primary request panics.
+
 Still outside the funnel, and so still unseamed: blob byte streams
 (`download_stream`), the OneDrive resumable chunk PUT (pre-authed, no bearer),
-and the Autodiscover POST. EWS has its own `EwsExecute` seam.
+and the Autodiscover POST. EWS has its own `EwsExecute` seam. The remaining
+coverage gaps behind both seams are tracked in `TODO.md` as graph-T1.
 
 Calendar/contact primitives live in `calendar.rs` and `contacts.rs`. Graph
 calendar `color` is a provider token (not projected); reads request `Prefer:
