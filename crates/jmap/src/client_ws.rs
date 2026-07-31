@@ -177,60 +177,11 @@ impl Client {
             .await
             .map_err(crate::Error::WebSocketHandshake)?;
         validate_ws_subprotocol(&response)?;
-        let (tx, mut rx) = stream.split();
+        let (tx, rx) = stream.split();
 
         *self.ws.lock().await = WsStream { tx, req_id: 0 }.into();
 
-        Ok(Box::pin(async_stream::stream! {
-            let mut saw_close = false;
-
-            while let Some(message) = rx.next().await {
-                match message {
-                    Ok(message) if message.is_text() => {
-                        let payload = message.into_payload();
-                        match serde_json::from_slice::<WebSocketMessage_>(payload.as_ref()) {
-                            Ok(message) => match message {
-                                WebSocketMessage_::Response(response) => {
-                                    // Deserialize the raw method responses into a Response
-                                    let json = serde_json::json!({
-                                        "methodResponses": response.method_responses,
-                                        "createdIds": response.created_ids,
-                                        "sessionState": response.session_state,
-                                    });
-                                    match serde_json::from_value::<Response>(json) {
-                                        Ok(resp) => yield Ok(WebSocketMessage::Response(resp)),
-                                        Err(e) => yield Err(crate::Error::ResponseDecode(e)),
-                                    }
-                                }
-                                WebSocketMessage_::StateChange { changed } => {
-                                    yield Ok(WebSocketMessage::PushNotification(PushObject::StateChange { changed }))
-                                }
-                                #[cfg(feature = "calendars")]
-                                WebSocketMessage_::CalendarAlert(alert) => {
-                                    yield Ok(WebSocketMessage::PushNotification(PushObject::CalendarAlert(alert)))
-                                }
-                                WebSocketMessage_::RequestError(err) => yield Err(ProblemDetails::from(err).into()),
-                            },
-                            Err(err) => yield Err(err.into()),
-                        }
-                    }
-                    Ok(message) if message.is_binary() => {
-                        yield Err(crate::Error::NotParsable("binary WebSocket message".to_string()));
-                    }
-                    Ok(message) if message.is_close() => {
-                        saw_close = true;
-                    }
-                    Ok(_) => (),
-                    // Post-handshake runtime drop. Classification is
-                    // `Protocol(PartialResponse) + Attempt(Acknowledged)`.
-                    Err(err) => yield Err(crate::Error::WebSocketRuntime(err)),
-                }
-            }
-
-            if saw_close {
-                yield Err(crate::Error::WebSocketClosed);
-            }
-        }))
+        Ok(Box::pin(frame_stream(rx)))
     }
 
     pub(crate) async fn send_ws(&self, request: Request<'_>) -> crate::Result<String> {
@@ -309,6 +260,68 @@ impl Client {
             .send(Message::ping(Bytes::new()))
             .await
             .map_err(crate::Error::WebSocketRuntime)
+    }
+}
+
+/// Frame-level decoding of an established JMAP WebSocket read half.
+///
+/// Split out from `connect_ws` so the close / error / binary arms can be
+/// driven from an in-memory stream of `Message`s without a socket: the
+/// transport half is the only part of `connect_ws` that needs a real
+/// connection.
+fn frame_stream<S>(mut rx: S) -> impl Stream<Item = crate::Result<WebSocketMessage>> + use<S>
+where
+    S: Stream<Item = Result<Message, tokio_websockets::Error>> + Unpin,
+{
+    async_stream::stream! {
+        let mut saw_close = false;
+
+        while let Some(message) = rx.next().await {
+            match message {
+                Ok(message) if message.is_text() => {
+                    let payload = message.into_payload();
+                    match serde_json::from_slice::<WebSocketMessage_>(payload.as_ref()) {
+                        Ok(message) => match message {
+                            WebSocketMessage_::Response(response) => {
+                                // Deserialize the raw method responses into a Response
+                                let json = serde_json::json!({
+                                    "methodResponses": response.method_responses,
+                                    "createdIds": response.created_ids,
+                                    "sessionState": response.session_state,
+                                });
+                                match serde_json::from_value::<Response>(json) {
+                                    Ok(resp) => yield Ok(WebSocketMessage::Response(resp)),
+                                    Err(e) => yield Err(crate::Error::ResponseDecode(e)),
+                                }
+                            }
+                            WebSocketMessage_::StateChange { changed } => {
+                                yield Ok(WebSocketMessage::PushNotification(PushObject::StateChange { changed }))
+                            }
+                            #[cfg(feature = "calendars")]
+                            WebSocketMessage_::CalendarAlert(alert) => {
+                                yield Ok(WebSocketMessage::PushNotification(PushObject::CalendarAlert(alert)))
+                            }
+                            WebSocketMessage_::RequestError(err) => yield Err(ProblemDetails::from(err).into()),
+                        },
+                        Err(err) => yield Err(err.into()),
+                    }
+                }
+                Ok(message) if message.is_binary() => {
+                    yield Err(crate::Error::NotParsable("binary WebSocket message".to_string()));
+                }
+                Ok(message) if message.is_close() => {
+                    saw_close = true;
+                }
+                Ok(_) => (),
+                // Post-handshake runtime drop. Classification is
+                // `Protocol(PartialResponse) + Attempt(Acknowledged)`.
+                Err(err) => yield Err(crate::Error::WebSocketRuntime(err)),
+            }
+        }
+
+        if saw_close {
+            yield Err(crate::Error::WebSocketClosed);
+        }
     }
 }
 
@@ -403,5 +416,166 @@ mod tests {
         let by_type = changed.get("u1138").expect("account entry present");
         assert_eq!(by_type.len(), 1);
         assert_eq!(by_type.values().next().map(String::as_str), Some("f9a8d3"));
+    }
+
+    /// Stub read half of a JMAP WebSocket. Same shape as the stub
+    /// `HttpTransport` / `SseTransport` doubles the blob and EventSource
+    /// tests use: a canned transcript replayed in order, no socket.
+    struct StubWsTransport {
+        frames: Vec<Result<Message, tokio_websockets::Error>>,
+    }
+
+    impl StubWsTransport {
+        fn new(frames: Vec<Result<Message, tokio_websockets::Error>>) -> Self {
+            Self { frames }
+        }
+
+        fn open_ws(self) -> impl Stream<Item = Result<Message, tokio_websockets::Error>> + Unpin {
+            futures::stream::iter(self.frames)
+        }
+    }
+
+    fn io_error() -> tokio_websockets::Error {
+        tokio_websockets::Error::Io(std::io::Error::other("peer reset"))
+    }
+
+    async fn decode(
+        frames: Vec<Result<Message, tokio_websockets::Error>>,
+    ) -> Vec<crate::Result<WebSocketMessage>> {
+        frame_stream(StubWsTransport::new(frames).open_ws())
+            .collect::<Vec<_>>()
+            .await
+    }
+
+    #[tokio::test]
+    async fn binary_frame_is_rejected_as_not_parsable() {
+        let out = decode(vec![Ok(Message::binary(Bytes::from_static(b"\x00\x01")))]).await;
+
+        assert_eq!(out.len(), 1);
+        let Err(crate::Error::NotParsable(what)) = &out[0] else {
+            panic!("expected NotParsable, got {:?}", out[0]);
+        };
+        assert_eq!(what, "binary WebSocket message");
+    }
+
+    #[tokio::test]
+    async fn close_frame_yields_closed_only_after_the_stream_ends() {
+        let out = decode(vec![
+            Ok(Message::close(None, "")),
+            Ok(Message::text(
+                r#"{"@type":"StateChange","changed":{"u1":{"Mailbox":"s1"}}}"#.to_string(),
+            )),
+        ])
+        .await;
+
+        // The close arm only records; frames queued behind it are still
+        // decoded, and `WebSocketClosed` is emitted last.
+        assert_eq!(out.len(), 2);
+        assert!(matches!(
+            out[0],
+            Ok(WebSocketMessage::PushNotification(
+                PushObject::StateChange { .. }
+            ))
+        ));
+        assert!(matches!(out[1], Err(crate::Error::WebSocketClosed)));
+    }
+
+    #[tokio::test]
+    async fn stream_end_without_close_frame_is_silent() {
+        let out = decode(vec![Ok(Message::ping(Bytes::new()))]).await;
+
+        // Ping / pong fall through the `Ok(_)` arm, and an EOF that was
+        // not preceded by a close frame yields nothing at all.
+        assert!(out.is_empty(), "expected no items, got {out:?}");
+    }
+
+    #[tokio::test]
+    async fn runtime_error_is_yielded_and_the_stream_keeps_reading() {
+        let out = decode(vec![
+            Err(io_error()),
+            Ok(Message::text(
+                r#"{"@type":"StateChange","changed":{"u1":{"Mailbox":"s1"}}}"#.to_string(),
+            )),
+        ])
+        .await;
+
+        assert_eq!(out.len(), 2);
+        assert!(matches!(out[0], Err(crate::Error::WebSocketRuntime(_))));
+        assert!(matches!(
+            out[1],
+            Ok(WebSocketMessage::PushNotification(
+                PushObject::StateChange { .. }
+            ))
+        ));
+    }
+
+    #[tokio::test]
+    async fn malformed_text_frame_is_a_response_decode_error() {
+        let out = decode(vec![Ok(Message::text("not json".to_string()))]).await;
+
+        assert_eq!(out.len(), 1);
+        assert!(matches!(out[0], Err(crate::Error::ResponseDecode(_))));
+    }
+
+    #[tokio::test]
+    async fn request_error_frame_becomes_problem_details() {
+        let frame = r#"{"@type":"RequestError","requestId":"7","type":"urn:ietf:params:jmap:error:limit","status":400,"limit":"maxSizeRequest"}"#;
+
+        let out = decode(vec![Ok(Message::text(frame.to_string()))]).await;
+
+        assert_eq!(out.len(), 1);
+        let Err(crate::Error::Problem { details, transport }) = &out[0] else {
+            panic!("expected Problem, got {:?}", out[0]);
+        };
+        assert!(transport.is_none());
+        assert_eq!(details.status(), Some(400));
+        assert_eq!(details.limit(), Some("maxSizeRequest"));
+        assert_eq!(details.request_id(), Some("7"));
+    }
+
+    #[tokio::test]
+    async fn response_frame_is_rebuilt_into_a_response() {
+        let frame = r#"{"@type":"Response","methodResponses":[["Core/echo",{"hello":true},"c0"]],"createdIds":{"k":"v"},"sessionState":"s-1"}"#;
+
+        let out = decode(vec![Ok(Message::text(frame.to_string()))]).await;
+
+        assert_eq!(out.len(), 1);
+        let Ok(WebSocketMessage::Response(response)) = &out[0] else {
+            panic!("expected Response, got {:?}", out[0]);
+        };
+        assert_eq!(response.session_state(), "s-1");
+        assert_eq!(
+            response.created_ids().and_then(|ids| ids.get("k")),
+            Some(&"v".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn response_frame_with_malformed_method_responses_decodes_to_an_error() {
+        // The outer frame parses (methodResponses is a JSON array), but
+        // the rebuilt envelope is not a valid `Response`: this pins the
+        // inner `from_value` failure arm distinctly from the outer one.
+        let frame = r#"{"@type":"Response","methodResponses":[[1,2]],"sessionState":"s-1"}"#;
+
+        let out = decode(vec![Ok(Message::text(frame.to_string()))]).await;
+
+        assert_eq!(out.len(), 1);
+        assert!(matches!(out[0], Err(crate::Error::ResponseDecode(_))));
+    }
+
+    #[cfg(feature = "calendars")]
+    #[tokio::test]
+    async fn calendar_alert_frame_becomes_a_push_notification() {
+        let frame = r#"{"@type":"CalendarAlert","accountId":"a1","calendarEventId":"e1","uid":"u1","alertId":"al1"}"#;
+
+        let out = decode(vec![Ok(Message::text(frame.to_string()))]).await;
+
+        assert_eq!(out.len(), 1);
+        let Ok(WebSocketMessage::PushNotification(PushObject::CalendarAlert(alert))) = &out[0]
+        else {
+            panic!("expected CalendarAlert, got {:?}", out[0]);
+        };
+        assert_eq!(alert.alert_id, "al1");
+        assert_eq!(alert.recurrence_id, None);
     }
 }

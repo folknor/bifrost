@@ -11,12 +11,8 @@ any item; some may already be obsolete.
 - **jmap-D4.** Generic JMAP `Provider`. Wire `Provider::Fastmail` (and
   any other JMAP host the factory needs) when documented. Continue
   setting `Provider: None` until then.
-- **jmap-T2.** (coverage) `client_ws.rs` frame handling beyond the
-  subprotocol check: the close / error / binary arms live inside the
-  `async_stream::stream!` and need a stub WebSocket transport of the same
-  shape as the stub `HttpTransport` / `SseTransport` doubles the blob and
-  EventSource tests use. (Carried from the closed jmap objects ledger,
-  which also deliberately left the thin query filter/comparator enums -
+- **jmap-T2-residual.** (carried context from the closed jmap objects
+  ledger, which deliberately left the thin query filter/comparator enums -
   `principal/availability.rs`, `principal/query.rs`,
   `share_notification/query.rs`, `sieve/query.rs`,
   `calendar_event_notification/query.rs`, `quota/query.rs` - untested:
@@ -61,13 +57,31 @@ any item; some may already be obsolete.
   `crates/imap/src/account/` modules are still outstanding (the
   reference doc and code landed in P3-A2; the focused tests did not).
   (Carried from the deleted `plans/orchestration.md` P3-A2.)
-- **imap-T2.** (coverage) The scripted account harness
-  (`account/scripted_tests.rs`, a real `ImapAccount` over
-  `connection::test_support::driver_pair` with canned transcripts) covers
-  pool-permit discipline and the selected-mailbox deselect fallback, but
-  not the sync half: QRESYNC / CONDSTORE / Basic strategy dispatch,
-  VANISHED/FETCH deduplication, the downgrade paths, and checkpoint
-  emission. (Carried from the closed imap bug-hunt ledger.)
+- **imap-B1.** (bug, found while closing imap-T2) `run_qresync`'s
+  downgrade retries (`account/changes.rs:271`, `:450`) call
+  `run_condstore_with_baseline(...).await` as a tail expression while
+  the local `PooledConn` (and its semaphore permit) is still alive; the
+  retry's `checkout_for_folder` re-acquires from the same semaphore. At
+  `data_cap == 1` that deadlocks; above it, it needlessly dials a second
+  connection while holding a usable one (the `MissingCapability` branch
+  does not `discard()`). An explicit `drop(conn)` before the retry fixes
+  both. This is also why those two downgrade paths could not be pinned
+  hermetically in the scripted harness.
+- **imap-B2.** (gap, found while closing imap-T2)
+  `should_disable_qresync`'s `MissingCapability` arm is unreachable at
+  its call site: the only producer of
+  `MissingCapability("QRESYNC (not ENABLEd)")` is
+  `uid_fetch_vanished_stream`, called behind `?` at
+  `account/changes.rs:351-356`, before the loop whose `fallback_error`
+  handling performs the downgrade. A server that ACKs `ENABLE QRESYNC`
+  without echoing `* ENABLED QRESYNC` terminates the changes stream
+  instead of downgrading to CONDSTORE. `select_for_sync` can also return
+  `MissingCapability("ENABLE")` (QRESYNC advertised, ENABLE not,
+  non-rev2), which `mentions_qresync_capability` does not match, so that
+  also terminates. Related nit: `changes.rs:450` passes the original
+  `known_uids_complete` alongside `fallback_known_uids`, which is
+  complete by construction - the two arguments no longer describe the
+  same set.
 - **imap-T3.** (audit) `account/error.rs`, crate `error.rs`, and their
   recovery-mapping tests still merit a dedicated audit against
   `reference/error-model.md`. ManageSieve and submission were checked only

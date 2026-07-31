@@ -26,6 +26,20 @@ use super::{ImapAccount, ImapAccountParts, Pool};
 /// which the duplex transport cannot do, so any nested acquire shows up
 /// as a hang rather than silently passing.
 fn scripted_account(conn: crate::ImapConnection, pool_cap: usize) -> ImapAccount {
+    scripted_sync_account(conn, pool_cap, false, None, FolderRegistry::default())
+}
+
+/// `scripted_account` with the two knobs the sync half needs: whether
+/// QRESYNC survived negotiation, and a registry pre-seeded with the folder
+/// the transcript selects (an unregistered folder makes every cursor and
+/// MODSEQ cache write a silent no-op).
+fn scripted_sync_account(
+    conn: crate::ImapConnection,
+    pool_cap: usize,
+    qresync_enabled: bool,
+    qresync_negotiation_warning: Option<String>,
+    folders: FolderRegistry,
+) -> ImapAccount {
     let config = Arc::new(ImapAccountConfig {
         pool_cap,
         ..ImapAccountConfig::new(
@@ -46,9 +60,9 @@ fn scripted_account(conn: crate::ImapConnection, pool_cap: usize) -> ImapAccount
         config,
         capabilities: super::test_support::stub_capabilities(),
         pool,
-        folders: Arc::new(FolderRegistry::default()),
-        qresync_enabled: false,
-        qresync_negotiation_warning: None,
+        folders: Arc::new(folders),
+        qresync_enabled,
+        qresync_negotiation_warning,
         bandwidth_cap,
         contacts: None,
         calendars: None,
@@ -120,7 +134,7 @@ async fn container_create_completes_under_a_single_permit_pool() {
 /// would terminally fail it and simultaneously queue it for read-back.
 #[tokio::test]
 async fn folder_get_failure_does_not_relabel_published_stale_ids() {
-    use bifrost_types::{ItemOutcome, Projection, SyncEvent};
+    use bifrost_types::{ItemOutcome, Projection};
 
     let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1")).await;
     let account = scripted_account(conn, 1);
@@ -349,4 +363,838 @@ async fn deselect_fallback_releases_the_old_connection_before_redialing() {
         .await
         .expect("LOGOUT must precede the replacement dial")
         .unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Sync half: strategy dispatch, VANISHED/FETCH dedup, downgrades, checkpoints.
+//
+// Every test below drives the real `changes_stream` over a canned transcript,
+// so the strategy a cursor variant selects is proven by the bytes that reach
+// the server, not by reading the dispatch match.
+// ---------------------------------------------------------------------------
+
+use bifrost_types::{
+    Change, ChangeCursor, Checkpoint, DiagnosticText, ObjectChange, ObjectChangeKind, PageBoundary,
+    ScopeChange, ScopeChangeKind, SyncEvent, SyncStrategy, Warning, WarningKind,
+};
+
+use crate::types::MailboxInfo;
+
+use super::{CompactUidSet, FolderCursor};
+
+fn inbox() -> crate::types::MailboxName {
+    crate::types::MailboxName::new("INBOX").unwrap()
+}
+
+/// A registry holding just INBOX, so cursor and MODSEQ cache writes land.
+/// An unregistered folder makes every registry write a silent no-op.
+fn inbox_registry() -> FolderRegistry {
+    FolderRegistry::from_list(vec![MailboxInfo {
+        name: inbox(),
+        ..MailboxInfo::default()
+    }])
+}
+
+/// The mandatory SELECT/EXAMINE preamble (RFC 3501 Sections 6.3.1-6.3.2).
+///
+/// `SelectConsumer` validates FLAGS + EXISTS + RECENT before it reads a
+/// single response code, so a transcript that omits them fails the command
+/// with `Error::Protocol` and the whole changes stream terminates before
+/// any strategy work runs. Every select transcript below starts here.
+const SELECT_PREAMBLE: &str =
+    "* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)\r\n* 0 RECENT\r\n";
+
+fn cursor_for(cursor: &FolderCursor) -> ChangeCursor {
+    super::encode_cursor(super::folder_scope(&inbox()), cursor)
+}
+
+/// Drive `changes_stream` to completion, bounded so a regression that stalls
+/// the pipeline fails fast instead of hanging the suite.
+async fn collect_changes(account: ImapAccount, cursor: ChangeCursor) -> Vec<SyncEvent<Change>> {
+    use futures::StreamExt;
+
+    let mut stream = super::changes::changes_stream(account, cursor);
+    let mut events = Vec::new();
+    loop {
+        let next = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("changes stream must make progress");
+        let Some(event) = next else { break };
+        let terminal = matches!(event, SyncEvent::Done(_) | SyncEvent::Terminated(_));
+        events.push(event);
+        if terminal {
+            break;
+        }
+    }
+    events
+}
+
+/// The change lanes flattened in emission order: `(object id, lane)`.
+fn change_labels(events: &[SyncEvent<Change>]) -> Vec<(String, &'static str)> {
+    let mut out = Vec::new();
+    for event in events {
+        let SyncEvent::Batch(batch) = event else {
+            continue;
+        };
+        for change in &batch.items {
+            match change {
+                Change::ScopeChange(ScopeChange {
+                    id,
+                    kind: ScopeChangeKind::Added,
+                    ..
+                }) => out.push((id.0.clone(), "added")),
+                Change::ScopeChange(ScopeChange {
+                    id,
+                    kind: ScopeChangeKind::Removed,
+                    ..
+                }) => out.push((id.0.clone(), "removed")),
+                Change::ObjectChange(ObjectChange {
+                    id,
+                    kind: ObjectChangeKind::Updated,
+                }) => out.push((id.0.clone(), "updated")),
+                other => panic!("unexpected change: {other:?}"),
+            }
+        }
+    }
+    out
+}
+
+fn warnings_of(events: &[SyncEvent<Change>]) -> Vec<&Warning> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            SyncEvent::Warning(warning) => Some(warning),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The cursor carried by the terminal `Done`, decoded back to a `FolderCursor`.
+fn done_cursor(events: &[SyncEvent<Change>]) -> FolderCursor {
+    let last = events.last().expect("stream emits a terminal event");
+    let SyncEvent::Done(checkpoint) = last else {
+        panic!("expected Done, got {last:?}");
+    };
+    let Some(Checkpoint::Change(cursor)) = checkpoint else {
+        panic!("changes must checkpoint a change cursor");
+    };
+    super::decode_cursor(cursor).expect("emitted checkpoint must decode")
+}
+
+fn id(uidvalidity: u32, uid: u32) -> String {
+    super::encode_object_id(&inbox(), uidvalidity, uid).0
+}
+
+fn downgrade_detail(from: SyncStrategy, to: SyncStrategy) -> String {
+    format!("{from:?}->{to:?}")
+}
+
+/// QRESYNC happy path.
+///
+/// Pins four things at once: the QRESYNC cursor variant puts the QRESYNC
+/// parameter (with the known-UID baseline) on the SELECT line; the same UID
+/// reported by SELECT-side VANISHED and then by the CHANGEDSINCE FETCH
+/// collapses into a single `Updated` instead of surfacing in both the expunge
+/// and the update lane; a UID repeated across FETCH responses is emitted once;
+/// and the final checkpoint carries the server's new HIGHESTMODSEQ plus the
+/// recomputed live UID set.
+#[tokio::test]
+async fn qresync_dedupes_vanished_against_fetch_and_checkpoints_the_live_set() {
+    let (conn, mut server) =
+        driver_pair(&preauth_greeting("IMAP4rev1 ENABLE CONDSTORE QRESYNC")).await;
+    let account = scripted_sync_account(conn, 1, true, None, inbox_registry());
+
+    let script = tokio::spawn(async move {
+        let enable = read_line(&mut server).await;
+        assert!(
+            enable.contains("ENABLE QRESYNC"),
+            "QRESYNC must be ENABLEd before the SELECT that uses it, got {enable}"
+        );
+        respond(
+            &mut server,
+            &format!(
+                "* ENABLED QRESYNC\r\n{} OK ENABLE done\r\n",
+                tag_of(&enable)
+            ),
+        )
+        .await;
+
+        let select = read_line(&mut server).await;
+        assert!(
+            select.contains("EXAMINE") && select.contains("QRESYNC (5 100 1:3)"),
+            "a QRESYNC cursor must select with its uidvalidity/modseq/known-uid \
+             baseline, got {select}"
+        );
+        respond(
+            &mut server,
+            &format!(
+                "{SELECT_PREAMBLE}\
+                 * 2 EXISTS\r\n\
+                 * OK [UIDVALIDITY 5] ok\r\n\
+                 * OK [UIDNEXT 9] ok\r\n\
+                 * OK [HIGHESTMODSEQ 200] ok\r\n\
+                 * VANISHED (EARLIER) 2\r\n\
+                 * 1 FETCH (UID 3 FLAGS (\\Seen) MODSEQ (150))\r\n\
+                 {} OK [READ-ONLY] EXAMINE done\r\n",
+                tag_of(&select)
+            ),
+        )
+        .await;
+
+        let fetch = read_line(&mut server).await;
+        assert!(
+            fetch.contains("CHANGEDSINCE 100") && fetch.contains("VANISHED"),
+            "QRESYNC diffs with CHANGEDSINCE ... VANISHED, got {fetch}"
+        );
+        respond(
+            &mut server,
+            &format!(
+                "* 1 FETCH (UID 2 FLAGS (\\Deleted) MODSEQ (180))\r\n\
+                 * 2 FETCH (UID 3 FLAGS (\\Seen) MODSEQ (150))\r\n\
+                 * VANISHED (EARLIER) 1\r\n\
+                 {} OK UID FETCH done\r\n",
+                tag_of(&fetch)
+            ),
+        )
+        .await;
+        server
+    });
+
+    let events = collect_changes(
+        account,
+        cursor_for(&FolderCursor::QResync {
+            uidvalidity: 5,
+            modseq: 100,
+            known_uids: CompactUidSet::from_uids([1, 2, 3]),
+            known_uids_complete: true,
+        }),
+    )
+    .await;
+
+    assert!(
+        warnings_of(&events).is_empty(),
+        "a clean QRESYNC round must not warn: {:?}",
+        warnings_of(&events)
+    );
+    assert_eq!(
+        change_labels(&events),
+        vec![
+            (id(5, 3), "updated"),
+            (id(5, 2), "updated"),
+            (id(5, 1), "removed"),
+        ],
+        "UID 2 was VANISHED then re-FETCHed, so it must land in one lane only, \
+         and the twice-FETCHed UID 3 must be emitted once"
+    );
+
+    match done_cursor(&events) {
+        FolderCursor::QResync {
+            uidvalidity,
+            modseq,
+            known_uids,
+            known_uids_complete,
+        } => {
+            assert_eq!((uidvalidity, modseq), (5, 200));
+            assert_eq!(known_uids.to_uids(), vec![2, 3]);
+            assert!(known_uids_complete);
+        }
+        other => panic!("QRESYNC must checkpoint a QRESYNC cursor, got {other:?}"),
+    }
+    let _server = script.await.unwrap();
+}
+
+/// A QRESYNC cursor on a session where QRESYNC did not survive negotiation
+/// runs CONDSTORE instead, and says so with the specific negotiation reason
+/// rather than the generic fallback text. The cursor also lacks a complete UID
+/// baseline, so the CONDSTORE run seeds from `UID SEARCH ALL` *before* the
+/// CHANGEDSINCE FETCH and then reuses that snapshot as the live set: one
+/// SEARCH, not two, and no spurious added/removed churn on the seeding round.
+#[tokio::test]
+async fn qresync_cursor_without_negotiation_downgrades_to_condstore_and_seeds_the_baseline() {
+    let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1 CONDSTORE")).await;
+    let account = scripted_sync_account(
+        conn,
+        1,
+        false,
+        Some("server did not echo ENABLED QRESYNC".to_owned()),
+        inbox_registry(),
+    );
+
+    let script = tokio::spawn(async move {
+        let select = read_line(&mut server).await;
+        assert!(
+            select.contains("EXAMINE") && !select.contains("QRESYNC"),
+            "a downgraded session must not put QRESYNC on the wire, got {select}"
+        );
+        respond(
+            &mut server,
+            &format!(
+                "{SELECT_PREAMBLE}\
+                 * 3 EXISTS\r\n\
+                 * OK [UIDVALIDITY 5] ok\r\n\
+                 * OK [UIDNEXT 9] ok\r\n\
+                 * OK [HIGHESTMODSEQ 200] ok\r\n\
+                 {} OK [READ-ONLY] EXAMINE done\r\n",
+                tag_of(&select)
+            ),
+        )
+        .await;
+
+        let search = read_line(&mut server).await;
+        assert!(
+            search.contains("UID SEARCH ALL"),
+            "the partial baseline is seeded before the diff, got {search}"
+        );
+        respond(
+            &mut server,
+            &format!(
+                "* SEARCH 2 3 4\r\n{} OK UID SEARCH done\r\n",
+                tag_of(&search)
+            ),
+        )
+        .await;
+
+        let fetch = read_line(&mut server).await;
+        assert!(
+            fetch.contains("CHANGEDSINCE 100") && !fetch.contains("VANISHED"),
+            "CONDSTORE diffs with CHANGEDSINCE and no VANISHED modifier, got {fetch}"
+        );
+        respond(
+            &mut server,
+            &format!(
+                "* 3 FETCH (UID 4 FLAGS (\\Seen) MODSEQ (190))\r\n\
+                 {} OK UID FETCH done\r\n",
+                tag_of(&fetch)
+            ),
+        )
+        .await;
+        server
+    });
+
+    let events = collect_changes(
+        account,
+        cursor_for(&FolderCursor::QResync {
+            uidvalidity: 5,
+            modseq: 100,
+            known_uids: CompactUidSet::from_uids([1, 2]),
+            known_uids_complete: false,
+        }),
+    )
+    .await;
+
+    let warnings = warnings_of(&events);
+    assert_eq!(
+        warnings.len(),
+        2,
+        "expected downgrade + seeding, got {warnings:?}"
+    );
+    assert_eq!(warnings[0].kind, WarningKind::StrategyDowngraded);
+    assert_eq!(
+        warnings[0].message.as_str(),
+        "server did not echo ENABLED QRESYNC",
+        "the downgrade must name the actual negotiation failure, not the generic fallback"
+    );
+    assert_eq!(
+        warnings[0]
+            .protocol_detail
+            .as_ref()
+            .map(DiagnosticText::as_str),
+        Some(downgrade_detail(SyncStrategy::QResync, SyncStrategy::Condstore).as_str())
+    );
+    assert_eq!(warnings[1].kind, WarningKind::Other);
+
+    assert_eq!(
+        change_labels(&events),
+        vec![(id(5, 4), "updated")],
+        "the seeded snapshot is the baseline, so it must not diff against the stale known set"
+    );
+    match done_cursor(&events) {
+        FolderCursor::Condstore {
+            uidvalidity,
+            modseq,
+            known_uids,
+        } => {
+            assert_eq!((uidvalidity, modseq), (5, 200));
+            assert_eq!(known_uids.to_uids(), vec![2, 3, 4]);
+        }
+        other => panic!("a CONDSTORE run must checkpoint a CONDSTORE cursor, got {other:?}"),
+    }
+    let _server = script.await.unwrap();
+}
+
+/// CONDSTORE with a complete baseline: flags come from CHANGEDSINCE, expunges
+/// and arrivals from diffing `UID SEARCH ALL` against the cursor's UID set.
+/// The SEARCH follows the FETCH here (unlike the seeding round above), which
+/// is what makes the checkpointed UID snapshot current.
+#[tokio::test]
+async fn condstore_cursor_diffs_changedsince_flags_against_a_uid_search_snapshot() {
+    let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1 CONDSTORE")).await;
+    let account = scripted_sync_account(conn, 1, false, None, inbox_registry());
+
+    let script = tokio::spawn(async move {
+        let select = read_line(&mut server).await;
+        assert!(
+            select.contains("EXAMINE") && select.contains("CONDSTORE"),
+            "a CONDSTORE cursor selects with the CONDSTORE parameter, got {select}"
+        );
+        respond(
+            &mut server,
+            &format!(
+                "{SELECT_PREAMBLE}\
+                 * 3 EXISTS\r\n\
+                 * OK [UIDVALIDITY 7] ok\r\n\
+                 * OK [UIDNEXT 12] ok\r\n\
+                 * OK [HIGHESTMODSEQ 60] ok\r\n\
+                 {} OK [READ-ONLY] EXAMINE done\r\n",
+                tag_of(&select)
+            ),
+        )
+        .await;
+
+        let fetch = read_line(&mut server).await;
+        assert!(
+            fetch.contains("CHANGEDSINCE 50"),
+            "expected CHANGEDSINCE against the cursor modseq, got {fetch}"
+        );
+        respond(
+            &mut server,
+            &format!(
+                "* 1 FETCH (UID 2 FLAGS (\\Seen) MODSEQ (55))\r\n\
+                 {} OK UID FETCH done\r\n",
+                tag_of(&fetch)
+            ),
+        )
+        .await;
+
+        let search = read_line(&mut server).await;
+        assert!(
+            search.contains("UID SEARCH ALL"),
+            "CONDSTORE detects expunges by UID-list diff, got {search}"
+        );
+        respond(
+            &mut server,
+            &format!(
+                "* SEARCH 2 3 4\r\n{} OK UID SEARCH done\r\n",
+                tag_of(&search)
+            ),
+        )
+        .await;
+        server
+    });
+
+    let events = collect_changes(
+        account,
+        cursor_for(&FolderCursor::Condstore {
+            uidvalidity: 7,
+            modseq: 50,
+            known_uids: CompactUidSet::from_uids([1, 2, 3]),
+        }),
+    )
+    .await;
+
+    assert!(
+        warnings_of(&events).is_empty(),
+        "{:?}",
+        warnings_of(&events)
+    );
+    assert_eq!(
+        change_labels(&events),
+        vec![
+            (id(7, 2), "updated"),
+            (id(7, 4), "added"),
+            (id(7, 1), "removed"),
+        ]
+    );
+    match done_cursor(&events) {
+        FolderCursor::Condstore {
+            uidvalidity,
+            modseq,
+            known_uids,
+        } => {
+            assert_eq!((uidvalidity, modseq), (7, 60));
+            assert_eq!(known_uids.to_uids(), vec![2, 3, 4]);
+        }
+        other => panic!("expected a CONDSTORE checkpoint, got {other:?}"),
+    }
+    let _server = script.await.unwrap();
+}
+
+/// A Basic cursor on a server with neither extension: no CONDSTORE parameter,
+/// no CHANGEDSINCE, both lanes derived from the UID-list diff, and the
+/// checkpoint carrying UIDNEXT rather than a mod-sequence.
+#[tokio::test]
+async fn basic_cursor_derives_both_lanes_from_a_uid_search_diff() {
+    let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1")).await;
+    let account = scripted_sync_account(conn, 1, false, None, inbox_registry());
+
+    let script = tokio::spawn(async move {
+        let select = read_line(&mut server).await;
+        assert!(
+            select.contains("EXAMINE")
+                && !select.contains("CONDSTORE")
+                && !select.contains("QRESYNC"),
+            "a server advertising neither extension gets a bare EXAMINE, got {select}"
+        );
+        respond(
+            &mut server,
+            &format!(
+                "{SELECT_PREAMBLE}\
+                 * 2 EXISTS\r\n\
+                 * OK [UIDVALIDITY 3] ok\r\n\
+                 * OK [UIDNEXT 11] ok\r\n\
+                 {} OK [READ-ONLY] EXAMINE done\r\n",
+                tag_of(&select)
+            ),
+        )
+        .await;
+
+        let search = read_line(&mut server).await;
+        assert!(
+            search.contains("UID SEARCH ALL") && !search.contains("CHANGEDSINCE"),
+            "expected the plain UID SEARCH ALL diff, got {search}"
+        );
+        respond(
+            &mut server,
+            &format!("* SEARCH 2 5\r\n{} OK UID SEARCH done\r\n", tag_of(&search)),
+        )
+        .await;
+        server
+    });
+
+    let events = collect_changes(
+        account,
+        cursor_for(&FolderCursor::Basic {
+            uidvalidity: 3,
+            uidnext: 10,
+            known_uids: CompactUidSet::from_uids([1, 2]),
+        }),
+    )
+    .await;
+
+    assert!(
+        warnings_of(&events).is_empty(),
+        "{:?}",
+        warnings_of(&events)
+    );
+    assert_eq!(
+        change_labels(&events),
+        vec![(id(3, 5), "added"), (id(3, 1), "removed")]
+    );
+    match done_cursor(&events) {
+        FolderCursor::Basic {
+            uidvalidity,
+            uidnext,
+            known_uids,
+        } => {
+            assert_eq!((uidvalidity, uidnext), (3, 11));
+            assert_eq!(known_uids.to_uids(), vec![2, 5]);
+        }
+        other => panic!("expected a Basic checkpoint, got {other:?}"),
+    }
+    let _server = script.await.unwrap();
+}
+
+/// A mailbox that answers the CONDSTORE select with `[NOMODSEQ]` downgrades to
+/// Basic on the connection it already holds - two commands total, no second
+/// checkout - and checkpoints a Basic cursor so the next round does not ask
+/// for mod-sequences again.
+#[tokio::test]
+async fn nomodseq_mailbox_downgrades_condstore_to_basic_on_the_selected_connection() {
+    let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1 CONDSTORE")).await;
+    let account = scripted_sync_account(conn, 1, false, None, inbox_registry());
+
+    let script = tokio::spawn(async move {
+        let select = read_line(&mut server).await;
+        assert!(select.contains("EXAMINE"), "expected EXAMINE, got {select}");
+        respond(
+            &mut server,
+            &format!(
+                "{SELECT_PREAMBLE}\
+                 * 2 EXISTS\r\n\
+                 * OK [UIDVALIDITY 9] ok\r\n\
+                 * OK [UIDNEXT 7] ok\r\n\
+                 * OK [NOMODSEQ] no mod-sequences\r\n\
+                 {} OK [READ-ONLY] EXAMINE done\r\n",
+                tag_of(&select)
+            ),
+        )
+        .await;
+
+        let search = read_line(&mut server).await;
+        assert!(
+            search.contains("UID SEARCH ALL"),
+            "the Basic fallback must reuse the already selected connection, got {search}"
+        );
+        respond(
+            &mut server,
+            &format!("* SEARCH 1 2\r\n{} OK UID SEARCH done\r\n", tag_of(&search)),
+        )
+        .await;
+        server
+    });
+
+    let events = collect_changes(
+        account,
+        cursor_for(&FolderCursor::Condstore {
+            uidvalidity: 9,
+            modseq: 40,
+            known_uids: CompactUidSet::from_uids([1, 2]),
+        }),
+    )
+    .await;
+
+    let warnings = warnings_of(&events);
+    assert_eq!(
+        warnings.len(),
+        1,
+        "expected one downgrade warning: {warnings:?}"
+    );
+    assert_eq!(warnings[0].kind, WarningKind::StrategyDowngraded);
+    assert_eq!(
+        warnings[0]
+            .protocol_detail
+            .as_ref()
+            .map(DiagnosticText::as_str),
+        Some(downgrade_detail(SyncStrategy::Condstore, SyncStrategy::Basic).as_str())
+    );
+    assert!(
+        !events.iter().any(|e| matches!(e, SyncEvent::Batch(_))),
+        "nothing moved, so the downgrade must not manufacture a batch"
+    );
+    match done_cursor(&events) {
+        FolderCursor::Basic {
+            uidvalidity,
+            uidnext,
+            known_uids,
+        } => {
+            assert_eq!((uidvalidity, uidnext), (9, 7));
+            assert_eq!(known_uids.to_uids(), vec![1, 2]);
+        }
+        other => panic!("a NOMODSEQ mailbox must checkpoint Basic, got {other:?}"),
+    }
+    let _server = script.await.unwrap();
+}
+
+/// A UIDVALIDITY change is terminal for the scope, not a diff: the stream
+/// stops after the SELECT with a `RestartScope` directive and publishes no
+/// batch, because every id minted under the old epoch is now stale.
+#[tokio::test]
+async fn uidvalidity_change_terminates_the_stream_without_publishing_a_diff() {
+    let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1 CONDSTORE")).await;
+    let account = scripted_sync_account(conn, 1, false, None, inbox_registry());
+
+    let script = tokio::spawn(async move {
+        let select = read_line(&mut server).await;
+        assert!(select.contains("EXAMINE"), "expected EXAMINE, got {select}");
+        respond(
+            &mut server,
+            &format!(
+                "{SELECT_PREAMBLE}\
+                 * 1 EXISTS\r\n\
+                 * OK [UIDVALIDITY 8] rebuilt\r\n\
+                 * OK [UIDNEXT 2] ok\r\n\
+                 * OK [HIGHESTMODSEQ 3] ok\r\n\
+                 {} OK [READ-ONLY] EXAMINE done\r\n",
+                tag_of(&select)
+            ),
+        )
+        .await;
+        server
+    });
+
+    let events = collect_changes(
+        account,
+        cursor_for(&FolderCursor::Condstore {
+            uidvalidity: 7,
+            modseq: 50,
+            known_uids: CompactUidSet::from_uids([1]),
+        }),
+    )
+    .await;
+
+    let last = events.last().expect("terminal event");
+    let SyncEvent::Terminated(error) = last else {
+        panic!("a UIDVALIDITY change must terminate the stream, got {last:?}");
+    };
+    assert!(
+        matches!(
+            error.recovery(),
+            bifrost_types::RecoveryClass::Engine(bifrost_types::EngineDirective::RestartScope(
+                bifrost_types::CursorScope::Folder(_)
+            ))
+        ),
+        "expected RestartScope, got {:?}",
+        error.recovery()
+    );
+    assert!(
+        !events.iter().any(|e| matches!(e, SyncEvent::Batch(_))),
+        "no diff may be published across a UIDVALIDITY epoch break"
+    );
+    let _server = script.await.unwrap();
+}
+
+/// `describe_cursor` is the engine's scheduling hint, so it must agree with
+/// what `changes_stream` will actually do. The load-bearing case is the
+/// QRESYNC cursor on a session where QRESYNC was disabled: the run downgrades
+/// to CONDSTORE, and the descriptor has to say Condstore/Medium rather than
+/// promising the cheap QRESYNC round.
+#[tokio::test]
+async fn describe_cursor_reports_the_strategy_the_run_will_actually_use() {
+    use bifrost_types::CostClass;
+
+    let qresync_cursor = cursor_for(&FolderCursor::QResync {
+        uidvalidity: 1,
+        modseq: 1,
+        known_uids: CompactUidSet::default(),
+        known_uids_complete: true,
+    });
+    let condstore_cursor = cursor_for(&FolderCursor::Condstore {
+        uidvalidity: 1,
+        modseq: 1,
+        known_uids: CompactUidSet::default(),
+    });
+    let basic_cursor = cursor_for(&FolderCursor::Basic {
+        uidvalidity: 1,
+        uidnext: 1,
+        known_uids: CompactUidSet::default(),
+    });
+
+    let (conn, _server) =
+        driver_pair(&preauth_greeting("IMAP4rev1 ENABLE CONDSTORE QRESYNC")).await;
+    let enabled = scripted_sync_account(conn, 1, true, None, inbox_registry());
+    let described = super::changes::describe_cursor(&enabled, &qresync_cursor);
+    assert_eq!(described.strategy, SyncStrategy::QResync);
+    assert_eq!(described.cost_class, CostClass::Cheap);
+
+    let (conn, _server) = driver_pair(&preauth_greeting("IMAP4rev1 CONDSTORE")).await;
+    let disabled = scripted_sync_account(conn, 1, false, None, inbox_registry());
+    let described = super::changes::describe_cursor(&disabled, &qresync_cursor);
+    assert_eq!(
+        described.strategy,
+        SyncStrategy::Condstore,
+        "a QRESYNC cursor on a downgraded session must be described as CONDSTORE"
+    );
+    assert_eq!(described.cost_class, CostClass::Medium);
+
+    let described = super::changes::describe_cursor(&disabled, &condstore_cursor);
+    assert_eq!(described.strategy, SyncStrategy::Condstore);
+    assert_eq!(described.cost_class, CostClass::Medium);
+
+    let described = super::changes::describe_cursor(&disabled, &basic_cursor);
+    assert_eq!(described.strategy, SyncStrategy::Basic);
+    assert_eq!(described.cost_class, CostClass::Expensive);
+}
+
+/// EXISTS disagreeing with the derived live UID set is a server-consistency
+/// signal, not a fatal: the round still checkpoints, but it carries a warning
+/// naming both counts so the drift is visible to the engine.
+#[tokio::test]
+async fn uid_count_disagreeing_with_exists_warns_but_still_checkpoints() {
+    let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1")).await;
+    let account = scripted_sync_account(conn, 1, false, None, inbox_registry());
+
+    let script = tokio::spawn(async move {
+        let select = read_line(&mut server).await;
+        respond(
+            &mut server,
+            &format!(
+                "{SELECT_PREAMBLE}\
+                 * 9 EXISTS\r\n\
+                 * OK [UIDVALIDITY 3] ok\r\n\
+                 * OK [UIDNEXT 4] ok\r\n\
+                 {} OK [READ-ONLY] EXAMINE done\r\n",
+                tag_of(&select)
+            ),
+        )
+        .await;
+        let search = read_line(&mut server).await;
+        respond(
+            &mut server,
+            &format!("* SEARCH 1 2\r\n{} OK UID SEARCH done\r\n", tag_of(&search)),
+        )
+        .await;
+        server
+    });
+
+    let events = collect_changes(
+        account,
+        cursor_for(&FolderCursor::Basic {
+            uidvalidity: 3,
+            uidnext: 3,
+            known_uids: CompactUidSet::from_uids([1, 2]),
+        }),
+    )
+    .await;
+
+    let warnings = warnings_of(&events);
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert_eq!(warnings[0].kind, WarningKind::Other);
+    assert!(
+        warnings[0].message.as_str().contains("SELECT EXISTS 9"),
+        "the warning must carry both counts: {}",
+        warnings[0].message.as_str()
+    );
+    assert!(matches!(done_cursor(&events), FolderCursor::Basic { .. }));
+    let _server = script.await.unwrap();
+}
+
+/// `PageBoundary::Final` plus the checkpoint on the last batch, and the same
+/// checkpoint repeated on `Done`. A consumer that commits on either one must
+/// land on the identical cursor.
+#[tokio::test]
+async fn the_final_batch_and_done_carry_the_same_checkpoint() {
+    let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1")).await;
+    let account = scripted_sync_account(conn, 1, false, None, inbox_registry());
+
+    let script = tokio::spawn(async move {
+        let select = read_line(&mut server).await;
+        respond(
+            &mut server,
+            &format!(
+                "{SELECT_PREAMBLE}\
+                 * 1 EXISTS\r\n\
+                 * OK [UIDVALIDITY 3] ok\r\n\
+                 * OK [UIDNEXT 6] ok\r\n\
+                 {} OK [READ-ONLY] EXAMINE done\r\n",
+                tag_of(&select)
+            ),
+        )
+        .await;
+        let search = read_line(&mut server).await;
+        respond(
+            &mut server,
+            &format!("* SEARCH 5\r\n{} OK UID SEARCH done\r\n", tag_of(&search)),
+        )
+        .await;
+        server
+    });
+
+    let events = collect_changes(
+        account,
+        cursor_for(&FolderCursor::Basic {
+            uidvalidity: 3,
+            uidnext: 5,
+            known_uids: CompactUidSet::default(),
+        }),
+    )
+    .await;
+
+    let batch = events
+        .iter()
+        .find_map(|event| match event {
+            SyncEvent::Batch(batch) => Some(batch),
+            _ => None,
+        })
+        .expect("one batch");
+    assert!(matches!(batch.page_boundary, PageBoundary::Final));
+    let Some(Checkpoint::Change(batch_cursor)) = batch.checkpoint.as_ref() else {
+        panic!("the final batch must carry the checkpoint");
+    };
+    let batch_cursor = super::decode_cursor(batch_cursor).expect("decodes");
+    assert_eq!(
+        batch_cursor,
+        done_cursor(&events),
+        "committing on the final batch and committing on Done must agree"
+    );
+    let _server = script.await.unwrap();
 }
