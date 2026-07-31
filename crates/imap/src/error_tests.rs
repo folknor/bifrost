@@ -385,6 +385,7 @@ fn all_variants_are_distinguishable() {
             Error::Io { .. } => "io",
             Error::Auth { .. } => "auth",
             Error::No { .. } => "no",
+            Error::Sieve { .. } => "sieve",
             Error::Bad { .. } => "bad",
             Error::Bye { .. } => "bye",
             Error::Protocol(_) => "protocol",

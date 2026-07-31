@@ -105,6 +105,13 @@ pub enum ResourceKind {
     /// service principals, etc.). Distinct from `Message` so consumers
     /// route an account-level `NotFound` away from the message UX.
     Account,
+    /// Server-side mail filter / rule. Covers a ManageSieve script
+    /// (RFC 5804 `NONEXISTENT`), a Gmail filter, and a JMAP SieveScript.
+    /// The operation vocabulary already treats filters as first class
+    /// (`FiltersList` / `FilterCreate` / `FilterUpdate` / `FilterDelete`
+    /// / `FilterValidate`), so a missing one has its own resource rather
+    /// than borrowing an unrelated variant.
+    Filter,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]

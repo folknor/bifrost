@@ -424,6 +424,7 @@ fn classify(error: &Error, ctx: &ImapErrorContext) -> Translation {
         Error::Bye { text, code, .. } => {
             classify_status(text, code.as_ref(), StatusFallback::Bye, ctx)
         }
+        Error::Sieve { code, message } => classify_sieve(code.as_ref(), message, ctx),
         Error::Protocol(msg) => Translation::new(
             AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
             Cause::Wire(WireCause::MalformedResponse {
@@ -504,6 +505,94 @@ fn classify(error: &Error, ctx: &ImapErrorContext) -> Translation {
             }),
         ),
     }
+}
+
+/// Map a ManageSieve rejection (RFC 5804 1.3) onto the shared taxonomy.
+///
+/// An unrecognized or absent code falls through to the same
+/// `Server(Error { status: None })` this crate produced for every sieve
+/// rejection before the codes were parsed - terminal `ProviderRefused`,
+/// which is the right default for "the server refused and did not say
+/// why". The point of the table is the codes where that default is
+/// actively wrong.
+fn classify_sieve(
+    code: Option<&crate::account::sieve::SieveResponseCode>,
+    message: &str,
+    ctx: &ImapErrorContext,
+) -> Translation {
+    use crate::account::sieve::SieveResponseCode as Sc;
+
+    let mut t = match code {
+        // Explicitly transient: the server asked to be retried. Deriving
+        // this terminal was the imap-S1 defect.
+        Some(Sc::TryLater) => Translation::new(
+            AccountErrorKind::Server(ServerErrorKind::Unavailable),
+            Cause::Server(ServerCause::Unavailable { retry_hint: None }),
+        ),
+        Some(Sc::Quota) => {
+            let mut t = Translation::new(
+                AccountErrorKind::Server(ServerErrorKind::QuotaExhausted),
+                Cause::Server(ServerCause::QuotaExhausted { retry_hint: None }),
+            );
+            // Sieve quotas (script count, script size) are per-account.
+            t.throttle_scope = Some(ThrottleScope::Account);
+            t
+        }
+        Some(Sc::NonExistent) => Translation::new(
+            AccountErrorKind::NotFound(ResourceKind::Filter),
+            Cause::Request(RequestCause::NotFound {
+                what: ResourceKind::Filter,
+                id: None,
+            }),
+        ),
+        Some(Sc::AlreadyExists) => Translation::new(
+            AccountErrorKind::ConcurrencyConflict,
+            Cause::State(StateCause::ConcurrencyConflict),
+        ),
+        // Deleting or overwriting the active script. A precondition the
+        // caller must satisfy (deactivate first), not a server fault.
+        Some(Sc::Active) => Translation::new(
+            AccountErrorKind::Request(RequestErrorKind::Malformed),
+            Cause::Request(RequestCause::Malformed {
+                detail: DiagnosticText::support_only(
+                    "ManageSieve refused the operation on the ACTIVE script",
+                ),
+            }),
+        ),
+        // Mechanism / channel strength refusals during AUTHENTICATE.
+        Some(Sc::AuthTooWeak | Sc::EncryptNeeded) => Translation::new(
+            AccountErrorKind::Authorization(bifrost_types::AccessErrorKind::PolicyBlocked),
+            Cause::Access(AccessCause::PolicyBlocked),
+        ),
+        Some(Sc::TransitionNeeded | Sc::Sasl) => Translation::new(
+            AccountErrorKind::Authentication(AuthErrorKind::ReauthorizationRequired),
+            Cause::Auth(AuthCause::ReauthorizationRequired),
+        ),
+        Some(Sc::Referral) => {
+            let operation = ctx.operation;
+            Translation::new(
+                AccountErrorKind::Unsupported(operation),
+                Cause::Request(RequestCause::Unsupported { operation }),
+            )
+        }
+        // `WARNINGS` and `TAG` are advisory and ride on `OK` too, so on a
+        // rejection they say nothing about why. Unknown extension codes
+        // likewise. Both take the status-level default.
+        Some(Sc::Warnings | Sc::Tag | Sc::Other(_)) | None => Translation::new(
+            AccountErrorKind::Server(ServerErrorKind::Error { status: None }),
+            Cause::Server(ServerCause::Error { status: None }),
+        ),
+    };
+
+    if let Some(code) = code {
+        t.native_code = Some(code.code().to_owned());
+    }
+    if !message.is_empty() {
+        t.diagnostic_text = Some(DiagnosticText::support_only(message.to_owned()));
+    }
+    // A tagged ManageSieve response is server-acknowledged.
+    t.attempt = Some(TransmissionState::Acknowledged);
+    t
 }
 
 fn classify_auth(text: &str, code: Option<&ResponseCode>) -> Translation {

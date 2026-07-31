@@ -88,28 +88,19 @@ any item; some may already be obsolete.
 
   The one finding NOT fixed is filed as imap-S1 below.
 
-- **imap-S1.** (bug, feature-sized; found by the imap-T3 audit) ManageSieve
-  response codes are never parsed, so every `NO` misclassifies as terminal.
-  `SieveStatus::parse` hands the whole remainder to `status_message`, which
-  keeps it as one opaque string, and `ensure_ok` then builds
-  `Error::no_with_code(message, None)` - always a `None` code. That falls
-  through to `fallback_status(No)` -> `Server(Error { status: None })` with
-  an `Acknowledged` attempt, which derives `ProviderRefused`: terminal.
-
-  RFC 5804 defines the codes this discards. The damaging one is
-  `[TRYLATER]`, which explicitly means "transient, retry later" and is
-  currently permanent, so the engine never retries it. Also lost:
-  `[QUOTA/MAXSCRIPTS]` and `[QUOTA/MAXSIZE]` (should be
-  `Server(QuotaExhausted)` with a throttle scope), `[NONEXISTENT]` (should
-  be `NotFound`), `[ALREADYEXISTS]` (should be `ConcurrencyConflict`).
-  `check_script` has the same root cause with a worse symptom: it maps any
-  `NO` to a `FilterValidation` diagnostic, so a `[TRYLATER]` tells the user
-  their Sieve script is invalid when the server was merely busy.
-
-  Fix: parse the parenthesized response code off the status line and map it
-  the way `classify_response_code` maps IMAP codes. Feature-sized rather
-  than an audit correction (a parser plus a mapping table plus tests),
-  which is why it was not folded into the T3 fix.
+- **imap-S1.** DONE (2026-07-31). ManageSieve response codes (RFC 5804 1.3)
+  are now parsed and mapped. `SieveResponseCode` + `split_response_code`
+  lift the parenthesized code off the status line ahead of the message;
+  `Error::Sieve { code, message }` carries it to the boundary and
+  `classify_sieve` maps it. `TRYLATER` is retryable instead of terminal
+  (the headline defect), `QUOTA[/*]` is `QuotaExhausted` + account
+  throttle, `NONEXISTENT` is `NotFound(Filter)`, `ALREADYEXISTS` is
+  `ConcurrencyConflict`, and the auth-refusal codes split policy-block
+  from reauthorization. An absent, advisory, or unmodelled code keeps the
+  old terminal default. `check_script` no longer reports a transient
+  refusal as a validation verdict. Required one shared-crate addition,
+  `ResourceKind::Filter` (`notfound.filter`), justified by the operation
+  enum already treating filters as first class.
 - **imap-T5.** (deferred, connection sweep rulings - revisit triggers,
   not work items) Hermetic STARTTLS needs a fake TLS handshake
   (`ImapStream::into_tcp` returns `None` for `Memory`, deliberately);

@@ -16,6 +16,7 @@ use bifrost_types::{
 
 use super::{ImapErrorContext, into_account_error, shared_folder_error, strategy_failure};
 use crate::Error;
+use crate::account::sieve::SieveResponseCode;
 use crate::types::{MailboxName, ResponseCode};
 
 fn mailbox(name: &str) -> MailboxName {
@@ -124,6 +125,122 @@ fn closed_inflight_carries_attempt_cause() {
         c,
         Cause::Attempt(a) if a.transmission_state == TransmissionState::InFlight
     )));
+}
+
+// --- ManageSieve response codes (RFC 5804 1.3, imap-S1) ---
+
+fn sieve_error(
+    code: Option<SieveResponseCode>,
+    op: AccountOperation,
+) -> bifrost_types::AccountError {
+    into_account_error(
+        Error::Sieve {
+            code,
+            message: "sieve says no".into(),
+        },
+        ImapErrorContext::operation(op),
+    )
+}
+
+/// The imap-S1 defect. `TRYLATER` explicitly means "transient, retry
+/// later"; unparsed it fell through to `Server(Error { status: None })`
+/// with an `Acknowledged` attempt, which derives terminal
+/// `ProviderRefused` - so the engine never retried a server that asked
+/// to be retried.
+#[test]
+fn sieve_trylater_is_retryable_not_terminal() {
+    let account = sieve_error(
+        Some(SieveResponseCode::TryLater),
+        AccountOperation::FilterCreate,
+    );
+
+    assert!(matches!(
+        account.kind(),
+        AccountErrorKind::Server(ServerErrorKind::Unavailable)
+    ));
+    assert!(
+        account.recovery().is_retryable(),
+        "TRYLATER asks to be retried"
+    );
+    assert_eq!(account.telemetry_fields().native_code, Some("TRYLATER"));
+}
+
+#[test]
+fn sieve_quota_is_quota_exhausted_and_throttles_the_account() {
+    let account = sieve_error(
+        Some(SieveResponseCode::Quota),
+        AccountOperation::FilterCreate,
+    );
+
+    assert!(matches!(
+        account.kind(),
+        AccountErrorKind::Server(ServerErrorKind::QuotaExhausted)
+    ));
+    if let RecoveryClass::Retry(advice) = account.recovery() {
+        assert_eq!(advice.throttle_scope, Some(ThrottleScope::Account));
+    } else {
+        panic!("expected Retry");
+    }
+}
+
+#[test]
+fn sieve_nonexistent_is_a_missing_filter() {
+    let account = sieve_error(
+        Some(SieveResponseCode::NonExistent),
+        AccountOperation::FilterDelete,
+    );
+
+    assert!(matches!(
+        account.kind(),
+        AccountErrorKind::NotFound(ResourceKind::Filter)
+    ));
+    assert_eq!(account.message_key(), "notfound.filter");
+}
+
+#[test]
+fn sieve_alreadyexists_is_a_concurrency_conflict() {
+    let account = sieve_error(
+        Some(SieveResponseCode::AlreadyExists),
+        AccountOperation::FilterCreate,
+    );
+
+    assert!(matches!(
+        account.kind(),
+        AccountErrorKind::ConcurrencyConflict
+    ));
+    assert!(account.recovery().is_retryable());
+}
+
+/// An unmodelled extension code, and a rejection with no code at all,
+/// both keep the pre-existing behavior: the server refused and did not
+/// say why, which is terminal. The table only overrides the codes where
+/// that default is actively wrong.
+#[test]
+fn an_unmodelled_or_absent_sieve_code_stays_provider_refused() {
+    for code in [None, Some(SieveResponseCode::Other("FROBNICATE".into()))] {
+        let account = sieve_error(code, AccountOperation::FilterUpdate);
+        assert!(matches!(
+            account.kind(),
+            AccountErrorKind::Server(ServerErrorKind::Error { status: None })
+        ));
+        assert!(account.recovery().is_terminal());
+    }
+}
+
+/// A too-weak mechanism is a policy block, not a credential problem -
+/// re-entering a password cannot fix it, so it must not derive the
+/// reauthorization path.
+#[test]
+fn sieve_auth_too_weak_is_a_policy_block() {
+    let account = sieve_error(
+        Some(SieveResponseCode::AuthTooWeak),
+        AccountOperation::Discover,
+    );
+
+    assert!(matches!(
+        account.kind(),
+        AccountErrorKind::Authorization(AccessErrorKind::PolicyBlocked)
+    ));
 }
 
 #[test]

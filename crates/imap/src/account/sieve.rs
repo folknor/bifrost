@@ -419,9 +419,27 @@ impl ManageSieveClient {
         let command = literal_command("CHECKSCRIPT", None, body)?;
         write_command(&mut self.stream, self.timeout, &command).await?;
         let response = read_response(&mut self.stream, self.timeout).await?;
-        match response.status {
-            SieveStatus::Ok => Ok(FilterValidation::default()),
-            SieveStatus::No(message) | SieveStatus::Bye(message) => Ok(validation_error(message)),
+        validation_outcome(response.status)
+    }
+}
+
+/// Decide whether a CHECKSCRIPT reply is a validation verdict or a
+/// failure to reach one.
+///
+/// A `NO` normally IS the verdict - the server compiled the script and
+/// rejected it - so it becomes diagnostics rather than an error. But a
+/// transient code means the server never judged the script at all.
+/// Reporting that as "your script is invalid" tells the user something
+/// false about their input AND discards the retryable classification, so
+/// it stays an error.
+fn validation_outcome(status: SieveStatus) -> Result<FilterValidation, Error> {
+    match status {
+        SieveStatus::Ok => Ok(FilterValidation::default()),
+        SieveStatus::No { code, message } | SieveStatus::Bye { code, message } => {
+            if code.as_ref().is_some_and(SieveResponseCode::is_transient) {
+                return Err(Error::Sieve { code, message });
+            }
+            Ok(validation_error(message))
         }
     }
 }
@@ -506,11 +524,28 @@ async fn authenticate(
     write_command(stream, timeout, command.as_bytes()).await?;
     match read_response(stream, timeout).await?.status {
         SieveStatus::Ok => Ok(()),
-        SieveStatus::No(message) => Err(Error::Auth {
-            text: message,
-            code: None,
+        // The four RFC 5804 codes that say WHY authentication was refused
+        // classify better than a bare auth failure: a too-weak mechanism
+        // or a missing TLS layer is a policy block the user cannot fix by
+        // re-entering a password. Anything else (including no code at all)
+        // stays a plain auth failure rather than falling through to the
+        // sieve table's server-refused default.
+        SieveStatus::No { code, message } => Err(match code {
+            Some(
+                code @ (SieveResponseCode::AuthTooWeak
+                | SieveResponseCode::EncryptNeeded
+                | SieveResponseCode::TransitionNeeded
+                | SieveResponseCode::Sasl),
+            ) => Error::Sieve {
+                code: Some(code),
+                message,
+            },
+            _ => Error::Auth {
+                text: message,
+                code: None,
+            },
         }),
-        SieveStatus::Bye(message) => Err(Error::bye_with_code(message, None)),
+        SieveStatus::Bye { code, message } => Err(Error::Sieve { code, message }),
     }
 }
 
@@ -690,8 +725,13 @@ impl SieveResponse {
     fn ensure_ok(self) -> Result<Self, Error> {
         match self.status {
             SieveStatus::Ok => Ok(self),
-            SieveStatus::No(message) => Err(Error::no_with_code(message, None)),
-            SieveStatus::Bye(message) => Err(Error::bye_with_code(message, None)),
+            // Both carry the ManageSieve code so the account boundary can
+            // classify it; a `BYE` additionally means the server is
+            // closing the connection, but the rejection reason is what
+            // decides recovery.
+            SieveStatus::No { code, message } | SieveStatus::Bye { code, message } => {
+                Err(Error::Sieve { code, message })
+            }
         }
     }
 
@@ -720,25 +760,143 @@ enum SieveResponseItem {
     Literal(Vec<u8>),
 }
 
+#[derive(Debug)]
 enum SieveStatus {
     Ok,
-    No(String),
-    Bye(String),
+    No {
+        code: Option<SieveResponseCode>,
+        message: String,
+    },
+    Bye {
+        code: Option<SieveResponseCode>,
+        message: String,
+    },
 }
 
 impl SieveStatus {
     fn parse(line: &str) -> Option<Self> {
         let (token, rest) = split_token(line);
+        // RFC 5804 1.3:
+        //   response-oknobye = ("OK"/"NO"/"BYE") [SP "(" resp-code ")"]
+        //                      [SP string] CRLF
+        // The parenthesized code comes BEFORE the human-readable string,
+        // so it has to be lifted off first or it lands inside the message
+        // as opaque text and its semantics are lost.
+        let (code, rest) = split_response_code(rest);
         if token.eq_ignore_ascii_case("OK") {
             Some(Self::Ok)
         } else if token.eq_ignore_ascii_case("NO") {
-            Some(Self::No(status_message(rest)))
+            Some(Self::No {
+                code,
+                message: status_message(rest),
+            })
         } else if token.eq_ignore_ascii_case("BYE") {
-            Some(Self::Bye(status_message(rest)))
+            Some(Self::Bye {
+                code,
+                message: status_message(rest),
+            })
         } else {
             None
         }
     }
+}
+
+/// A ManageSieve response code (RFC 5804 1.3).
+///
+/// Its own vocabulary, deliberately not folded into the IMAP
+/// `ResponseCode`: these arrive on a different protocol and recording an
+/// IMAP code the server never sent would corrupt the wire evidence a
+/// support export exists to preserve.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SieveResponseCode {
+    AuthTooWeak,
+    EncryptNeeded,
+    /// `QUOTA`, `QUOTA/MAXSCRIPTS`, `QUOTA/MAXSIZE`. The sub-kind rides
+    /// in the diagnostic text; all three are the same classification.
+    Quota,
+    Referral,
+    Sasl,
+    TransitionNeeded,
+    /// The one that matters most: an explicitly TRANSIENT failure. Left
+    /// unparsed it derived terminal `ProviderRefused`, so the engine
+    /// never retried a server that asked to be retried.
+    TryLater,
+    /// The named script is the active one (e.g. DELETESCRIPT on it).
+    Active,
+    NonExistent,
+    AlreadyExists,
+    /// Script compiled with warnings. Advisory - it rides on `OK` too.
+    Warnings,
+    Tag,
+    /// An extension code this client does not model. Preserved verbatim
+    /// for diagnostics; classification falls back to the status.
+    Other(String),
+}
+
+impl SieveResponseCode {
+    fn parse(raw: &str) -> Self {
+        // `QUOTA/MAXSCRIPTS` and `SASL "..."` / `REFERRAL "..."` carry a
+        // payload after the code atom; key off the atom alone.
+        let atom = raw
+            .split(|c: char| c == '/' || c.is_whitespace())
+            .next()
+            .unwrap_or(raw);
+        match atom.to_ascii_uppercase().as_str() {
+            "AUTH-TOO-WEAK" => Self::AuthTooWeak,
+            "ENCRYPT-NEEDED" => Self::EncryptNeeded,
+            "QUOTA" => Self::Quota,
+            "REFERRAL" => Self::Referral,
+            "SASL" => Self::Sasl,
+            "TRANSITION-NEEDED" => Self::TransitionNeeded,
+            "TRYLATER" => Self::TryLater,
+            "ACTIVE" => Self::Active,
+            "NONEXISTENT" => Self::NonExistent,
+            "ALREADYEXISTS" => Self::AlreadyExists,
+            "WARNINGS" => Self::Warnings,
+            "TAG" => Self::Tag,
+            _ => Self::Other(raw.trim().to_owned()),
+        }
+    }
+
+    /// The on-wire spelling, for `native_code` telemetry.
+    pub(crate) fn code(&self) -> &str {
+        match self {
+            Self::AuthTooWeak => "AUTH-TOO-WEAK",
+            Self::EncryptNeeded => "ENCRYPT-NEEDED",
+            Self::Quota => "QUOTA",
+            Self::Referral => "REFERRAL",
+            Self::Sasl => "SASL",
+            Self::TransitionNeeded => "TRANSITION-NEEDED",
+            Self::TryLater => "TRYLATER",
+            Self::Active => "ACTIVE",
+            Self::NonExistent => "NONEXISTENT",
+            Self::AlreadyExists => "ALREADYEXISTS",
+            Self::Warnings => "WARNINGS",
+            Self::Tag => "TAG",
+            Self::Other(raw) => raw,
+        }
+    }
+
+    /// Whether a `NO` carrying this code is a transient condition the
+    /// caller should retry rather than a verdict about the request.
+    fn is_transient(&self) -> bool {
+        matches!(self, Self::TryLater)
+    }
+}
+
+/// Split a leading `"(" resp-code ")"` off a status line remainder.
+/// Returns the remainder unchanged when no code is present.
+fn split_response_code(rest: &str) -> (Option<SieveResponseCode>, &str) {
+    let Some(after_paren) = rest.strip_prefix('(') else {
+        return (None, rest);
+    };
+    let Some(close) = after_paren.find(')') else {
+        // Unbalanced - treat the whole thing as message text rather than
+        // inventing a code.
+        return (None, rest);
+    };
+    let (raw, tail) = after_paren.split_at(close);
+    (Some(SieveResponseCode::parse(raw)), tail[1..].trim_start())
 }
 
 #[derive(Default)]
@@ -855,6 +1013,88 @@ fn literal_command(command: &str, name: Option<&str>, body: &str) -> Result<Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn no_status(line: &str) -> (Option<SieveResponseCode>, String) {
+        match SieveStatus::parse(line).expect("status parses") {
+            SieveStatus::No { code, message } => (code, message),
+            other => panic!("expected NO, got {other:?}"),
+        }
+    }
+
+    /// RFC 5804 puts the parenthesized code BEFORE the human string, so a
+    /// parser that reads the message first swallows the code as opaque
+    /// text - which is how `[TRYLATER]` came to derive terminal.
+    #[test]
+    fn a_response_code_is_lifted_off_ahead_of_the_message() {
+        let (code, message) = no_status(r#"NO (TRYLATER) "Server busy, try again""#);
+        assert_eq!(code, Some(SieveResponseCode::TryLater));
+        assert_eq!(message, "Server busy, try again");
+    }
+
+    /// `QUOTA/MAXSCRIPTS` and `QUOTA/MAXSIZE` are the same classification;
+    /// the sub-kind is diagnostic only.
+    #[test]
+    fn a_quota_subkind_parses_as_quota() {
+        let (code, _) = no_status(r#"NO (QUOTA/MAXSCRIPTS) "Too many scripts""#);
+        assert_eq!(code, Some(SieveResponseCode::Quota));
+        let (code, _) = no_status(r#"NO (QUOTA/MAXSIZE) "Script too large""#);
+        assert_eq!(code, Some(SieveResponseCode::Quota));
+    }
+
+    /// An unmodelled extension code must be preserved verbatim rather
+    /// than dropped, and must not be mistaken for one we do model.
+    #[test]
+    fn an_unknown_response_code_is_preserved_verbatim() {
+        let (code, message) = no_status(r#"NO (FROBNICATE) "nope""#);
+        assert_eq!(code, Some(SieveResponseCode::Other("FROBNICATE".into())));
+        assert_eq!(message, "nope");
+    }
+
+    #[test]
+    fn a_status_line_without_a_code_still_parses_its_message() {
+        let (code, message) = no_status(r#"NO "plain refusal""#);
+        assert_eq!(code, None);
+        assert_eq!(message, "plain refusal");
+    }
+
+    /// An unbalanced parenthesis must not be read as a code - inventing
+    /// one would classify off text the server never framed as a code.
+    #[test]
+    fn an_unbalanced_paren_is_treated_as_message_text() {
+        let (code, _) = no_status("NO (TRYLATER oops");
+        assert_eq!(code, None);
+    }
+
+    /// A real compile failure is the verdict, and stays diagnostics.
+    #[test]
+    fn checkscript_rejection_without_a_transient_code_is_a_verdict() {
+        let outcome = validation_outcome(SieveStatus::No {
+            code: None,
+            message: "line 3: unknown command".into(),
+        })
+        .expect("a compile failure is a validation result, not an error");
+        assert_eq!(outcome.diagnostics.len(), 1);
+        assert_eq!(outcome.diagnostics[0].message, "line 3: unknown command");
+    }
+
+    /// But a busy server never judged the script. Reporting that as a
+    /// validation failure tells the user their script is broken when it
+    /// may be fine, and throws away the retryable classification.
+    #[test]
+    fn checkscript_trylater_is_an_error_not_a_validation_verdict() {
+        let error = validation_outcome(SieveStatus::No {
+            code: Some(SieveResponseCode::TryLater),
+            message: "server busy".into(),
+        })
+        .expect_err("a transient refusal is not a verdict about the script");
+        assert!(matches!(
+            error,
+            Error::Sieve {
+                code: Some(SieveResponseCode::TryLater),
+                ..
+            }
+        ));
+    }
 
     #[test]
     fn parse_capabilities_extracts_starttls_and_sasl() {

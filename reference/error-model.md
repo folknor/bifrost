@@ -98,7 +98,10 @@ top-level taxonomy with per-family subkind enums:
 - `ConcurrencyConflict` (flat).
 - `Request(RequestErrorKind)` - `Malformed` / `BatchInputInvalid`.
 - `NotFound(ResourceKind)` - message, mailbox, thread, calendar,
-  contact, draft, identity, vacation, push-subscription, account.
+  contact, draft, identity, vacation, push-subscription, account,
+  filter (a server-side mail rule: ManageSieve script, Gmail filter,
+  JMAP SieveScript - the operation enum already treats filters as first
+  class, so a missing one does not borrow an unrelated resource).
 - `Unsupported(AccountOperation)`.
 - `Protocol(ProtocolErrorKind)` - parse-failed, missing-field,
   contract-violation, partial-response, unknown.

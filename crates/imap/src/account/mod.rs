@@ -46,7 +46,7 @@ mod scopes;
 #[cfg(test)]
 #[path = "scripted_tests.rs"]
 mod scripted_tests;
-mod sieve;
+pub(crate) mod sieve;
 mod submission;
 #[cfg(test)]
 mod test_support;
