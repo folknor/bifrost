@@ -317,12 +317,6 @@ re-auditors don't re-raise them.)
 Surfaced while authoring `reference/error-model.md` (a read of
 `crates/types/src/error/`). All pre-existing, none blocking.
 
-- **types-N1.** (smell) `AccountErrorBuildError::EmptyChain` is
-  effectively unreachable: `AccountErrorBuilder::new` mandates a
-  `primary_cause` and `try_build` always pushes it first, so the chain
-  is never empty at build. Defensive variant for an invariant the type
-  system already guarantees; the "never escapes" framing slightly
-  oversells a check that cannot fire. Keep or drop deliberately.
 - **types-N2.** (smell) `Transport + Acknowledged` is rejected three
   ways: `try_build` returns `TransportAcknowledged`, and
   `recovery::derive` *additionally* re-checks it with a `debug_assert!`
@@ -332,12 +326,6 @@ Surfaced while authoring `reference/error-model.md` (a read of
   flow (reachable only by calling `pub(crate) derive` directly, as the
   tests do). Belt-and-suspenders, but the debug-panic-vs-release-demote
   fork is a real behavior split worth being aware of.
-- **types-N3.** (nit) `RequestCause::InvalidArgument` has no distinct
-  `AccountErrorKind`: `kind_matches_cause` maps it onto
-  `Request(Malformed)`, and message-key / recovery treat it
-  identically. It is purely a richer cause payload - fine by design,
-  but a reader expecting 1:1 cause-to-kind correspondence is briefly
-  surprised. Document or accept.
 
 ## Stage 3/4 (contacts + calendar) review
 
@@ -364,25 +352,6 @@ Nits:
   `open` (4+ PROPFIND round-trips, errors swallowed), even for
   accounts that never RSVP. Lazy discovery needs interior mutability
   and touches the open happy path; skipped during the fix wave.
-- **s34-N2 (caldav)** `account.rs` (`event_rsvp`) - the
-  organizer-email guard is unreachable on the success path because
-  `rsvp_reply_ical` already errors when the organizer is absent.
-  Redundant, harmless.
-- **s34-N5 (types)** `error/scope.rs` - `EventRsvp` is classified
-  non-idempotent; setting a fixed RSVP status is semantically
-  idempotent. Consistent with the patch-setter convention, so a
-  convention call, not a defect.
-- **s34-N6 (types)** `account.rs` - the `Account` trait is not
-  `#[non_exhaustive]` despite the (now-deleted) unification plan
-  stating it is. Practical impact low (the attribute on traits only
-  restricts external impls).
-- **s34-N7 (imap)** `mod.rs` - new delegation code uses imported
-  `AccountOperation::` while 8 pre-existing sites stay fully qualified
-  `bifrost_types::AccountOperation::`. Cosmetic.
-- **s34-N8 (jmap)** `calendar_ops.rs` - `jmap_visibility` and
-  `rsvp_value` retain the explicit-arm-then-identical-wildcard shape
-  cleaned out of the other three mappers; left because the explicit
-  arms read as intentional documentation.
 
 ## A9 (directory search) follow-ups
 

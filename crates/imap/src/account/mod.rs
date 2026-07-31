@@ -466,7 +466,7 @@ impl Account for ImapAccount {
         _label: ContainerId,
         _value: bool,
     ) -> AccountFuture<Result<(), AccountError>> {
-        pim::unsupported_unit(bifrost_types::AccountOperation::SetLabelMembership)
+        pim::unsupported_unit(AccountOperation::SetLabelMembership)
     }
 
     fn set_category(
@@ -475,7 +475,7 @@ impl Account for ImapAccount {
         _category: String,
         _value: bool,
     ) -> AccountFuture<Result<(), AccountError>> {
-        pim::unsupported_unit(bifrost_types::AccountOperation::SetCategory)
+        pim::unsupported_unit(AccountOperation::SetCategory)
     }
 
     fn set_extended_property(
@@ -484,7 +484,7 @@ impl Account for ImapAccount {
         _property_id: String,
         _value: Option<String>,
     ) -> AccountFuture<Result<(), AccountError>> {
-        pim::unsupported_unit(bifrost_types::AccountOperation::SetExtendedProperty)
+        pim::unsupported_unit(AccountOperation::SetExtendedProperty)
     }
 
     fn set_is_read(
@@ -520,7 +520,7 @@ impl Account for ImapAccount {
         _bytes: AccountStream<Result<bytes::Bytes, AccountError>>,
         _mime: String,
     ) -> AccountFuture<Result<AttachmentHandle, AccountError>> {
-        pim::unsupported_attachment(bifrost_types::AccountOperation::AttachmentUpload)
+        pim::unsupported_attachment(AccountOperation::AttachmentUpload)
     }
 
     fn host_attachment(
@@ -540,7 +540,7 @@ impl Account for ImapAccount {
         _draft: DraftHandle,
         _patch: DraftPatch,
     ) -> AccountFuture<Result<(), AccountError>> {
-        pim::unsupported_unit(bifrost_types::AccountOperation::DraftUpdate)
+        pim::unsupported_unit(AccountOperation::DraftUpdate)
     }
 
     fn draft_discard(&self, draft: DraftHandle) -> AccountFuture<Result<(), AccountError>> {
@@ -554,7 +554,7 @@ impl Account for ImapAccount {
     fn cancel_scheduled_send(&self, _handle: ObjectId) -> AccountFuture<Result<(), AccountError>> {
         // SMTP FUTURERELEASE is fire-and-submit: RFC 4865 has no verb to
         // recall an accepted HOLDUNTIL submission. Honest provider limit.
-        pim::unsupported_unit(bifrost_types::AccountOperation::CancelScheduledSend)
+        pim::unsupported_unit(AccountOperation::CancelScheduledSend)
     }
 
     fn reschedule_send(
@@ -562,7 +562,7 @@ impl Account for ImapAccount {
         _handle: ObjectId,
         _scheduled: std::time::SystemTime,
     ) -> AccountFuture<Result<ObjectId, AccountError>> {
-        pim::unsupported_object(bifrost_types::AccountOperation::RescheduleSend)
+        pim::unsupported_object(AccountOperation::RescheduleSend)
     }
 
     fn search(

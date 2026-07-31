@@ -383,6 +383,12 @@ pub enum RequestCause {
     Unsupported {
         operation: AccountOperation,
     },
+    /// Deliberately has NO distinct `AccountErrorKind`:
+    /// `kind_matches_cause` maps it onto `Request(Malformed)`, and
+    /// message-key / recovery treat the two identically. It exists as a
+    /// richer cause payload (the offending field, a message) for
+    /// diagnostics, not as a separate classification - do not expect a
+    /// 1:1 cause-to-kind correspondence here.
     InvalidArgument {
         field: Option<&'static str>,
         message: Option<DiagnosticText>,

@@ -865,6 +865,11 @@ impl Account for CalDavAccount {
             };
             let reply = rsvp_reply_ical(&current, status, &rsvp_email)
                 .map_err(|_| unsupported_error(AccountOperation::EventRsvp))?;
+            // Defensive on the success path: `rsvp_reply_ical` above
+            // already fails when the event names no organizer, so this
+            // guard cannot fire after it succeeded. Kept anyway - the
+            // alternative is an `expect` that panics if that coupling
+            // ever loosens, and an error is the better failure mode.
             let organizer_email = current
                 .organizer
                 .as_ref()

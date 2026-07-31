@@ -18,7 +18,12 @@ use super::scope::{AccountOperation, ErrorScope, Protocol, Provider};
 #[non_exhaustive]
 pub enum AccountErrorBuildError {
     /// The chain was empty. Every `AccountError` must carry at least
-    /// one `Cause` (the primary).
+    /// one `Cause` (the primary). Unreachable through the current
+    /// builder - `new` demands a primary and `try_build` always pushes
+    /// it first - and kept DELIBERATELY anyway: the invariant belongs
+    /// to the error, not to the one construction path that currently
+    /// guarantees it, and a future builder entry point must fail here
+    /// rather than freeze a causeless error.
     EmptyChain,
     /// The outermost `Cause` does not match the declared
     /// `AccountErrorKind`. Producers must classify both halves
