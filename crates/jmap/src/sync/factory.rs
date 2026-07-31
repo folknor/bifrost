@@ -647,7 +647,20 @@ mod tests {
         replies: Mutex<VecDeque<ScriptedReply>>,
     }
 
-    enum ScriptedReply {
+    struct ScriptedReply {
+        kind: ScriptedReplyKind,
+        /// Opt-in routing guard. The transport answers positionally and
+        /// never checks WHOM a request addresses, so a test that does
+        /// not explicitly assert the recorded request can pass while
+        /// the code under test talked to the wrong account. When set,
+        /// every `methodCall` in the request this reply answers must
+        /// carry exactly this `accountId`; a mismatch panics at the
+        /// offending request instead of handing back a plausible
+        /// answer.
+        expect_account: Option<String>,
+    }
+
+    enum ScriptedReplyKind {
         /// A server response, classified on delivery.
         Response {
             status: reqwest::StatusCode,
@@ -664,20 +677,37 @@ mod tests {
         }
 
         fn status(status: reqwest::StatusCode, body: impl Into<Bytes>) -> Self {
-            Self::Response {
-                status,
-                body: body.into(),
-                headers: reqwest::header::HeaderMap::new(),
+            Self {
+                kind: ScriptedReplyKind::Response {
+                    status,
+                    body: body.into(),
+                    headers: reqwest::header::HeaderMap::new(),
+                },
+                expect_account: None,
+            }
+        }
+
+        fn error(error: TransportError) -> Self {
+            Self {
+                kind: ScriptedReplyKind::Error(error),
+                expect_account: None,
             }
         }
 
         fn header(mut self, name: &'static str, value: &str) -> Self {
-            if let Self::Response { headers, .. } = &mut self {
+            if let ScriptedReplyKind::Response { headers, .. } = &mut self.kind {
                 headers.insert(
                     name,
                     reqwest::header::HeaderValue::from_str(value).expect("test header value"),
                 );
             }
+            self
+        }
+
+        /// Arm the routing guard: the request this reply answers must
+        /// address `account_id` in every method call.
+        fn for_account(mut self, account_id: &str) -> Self {
+            self.expect_account = Some(account_id.to_string());
             self
         }
 
@@ -704,9 +734,9 @@ mod tests {
         /// So a `Status` fixture for a retryable code is not something a
         /// test author can write by accident.
         fn into_transport_result(self) -> Result<Bytes, TransportError> {
-            let (status, body, headers) = match self {
-                Self::Error(error) => return Err(error),
-                Self::Response {
+            let (status, body, headers) = match self.kind {
+                ScriptedReplyKind::Error(error) => return Err(error),
+                ScriptedReplyKind::Response {
                     status,
                     body,
                     headers,
@@ -792,6 +822,28 @@ mod tests {
                         "scripted JMAP transport exhausted at API request #{request_number}"
                     ))
                 })?;
+            if let Some(expected) = &reply.expect_account {
+                let requests = self
+                    .requests
+                    .lock()
+                    .map_err(|_| TransportError::new("script requests lock poisoned"))?;
+                let request = &requests[request_number - 1];
+                let calls = request["methodCalls"]
+                    .as_array()
+                    .unwrap_or_else(|| panic!("request #{request_number} has no methodCalls"));
+                for call in calls {
+                    // Panic rather than return an error: a routing
+                    // mismatch answered with a TransportError could be
+                    // swallowed by an error-tolerant code path, and the
+                    // whole point of the guard is a loud failure.
+                    assert_eq!(
+                        call[1]["accountId"].as_str(),
+                        Some(expected.as_str()),
+                        "scripted reply #{request_number} is armed for account \
+                         {expected:?} but the request addressed: {call}"
+                    );
+                }
+            }
             reply.into_transport_result()
         }
     }
@@ -1031,6 +1083,20 @@ mod tests {
             vec!["delegate".to_string()],
             "the new grant, and only the new grant, is discovered"
         );
+    }
+
+    /// The routing guard's own bite: a reply armed for one account must
+    /// panic when the request addresses another, because a positional
+    /// answer to a misrouted request is exactly how a routing
+    /// regression passes quietly.
+    #[tokio::test]
+    #[should_panic(expected = "armed for account \"shared\"")]
+    async fn an_armed_reply_panics_when_the_request_addresses_another_account() {
+        let client = scripted_client([open_reply("primary", "p").for_account("shared")]);
+        let primary = client
+            .primary_account::<capability::Mail>()
+            .expect("primary mail account");
+        let _ = seed_account_state(&primary).await;
     }
 
     #[tokio::test]
@@ -1746,7 +1812,7 @@ mod tests {
 
     #[tokio::test]
     async fn scripted_typed_error_reaches_the_sync_request_unchanged() {
-        let client = scripted_client([ScriptedReply::Error(TransportError::new(
+        let client = scripted_client([ScriptedReply::error(TransportError::new(
             "scripted connection reset",
         ))]);
         let primary = client
@@ -2346,8 +2412,9 @@ mod tests {
                     {"id": "shared-trash", "name": "Trash", "role": "trash"}
                 ], "notFound": []},
                 "s0"
-            ])]),
-            thread_get_reply("shared", "T9", &["M9"]),
+            ])])
+            .for_account("shared"),
+            thread_get_reply("shared", "T9", &["M9"]).for_account("shared"),
             method_reply(vec![json!([
                 "Email/set",
                 {
@@ -2358,7 +2425,8 @@ mod tests {
                     "notDestroyed": {}
                 },
                 "s0"
-            ])]),
+            ])])
+            .for_account("shared"),
         ]);
         let shared = JmapMailAccount::new(client.clone(), JmapAccountId::new("shared"));
 

@@ -27,12 +27,6 @@ re-auditors don't re-raise them.)
 - **jmap-D4.** Generic JMAP `Provider`. Wire `Provider::Fastmail` (and
   any other JMAP host the factory needs) when documented. Continue
   setting `Provider: None` until then.
-- **jmap-N7.** (test smell, surfaced during the nc-7 fix)
-  `ScriptedTransport` replies purely positionally: it never checks that
-  a request's `accountId` or `ids` match the canned answer, so any test
-  that does not explicitly assert the recorded request can pass while
-  the code addressed the wrong account. An opt-in expectation on the
-  reply (match this accountId or panic) would harden the whole suite.
 - **jmap-T2.** (coverage) `client_ws.rs` frame handling beyond the
   subprotocol check: the close / error / binary arms live inside the
   `async_stream::stream!` and need a stub WebSocket transport of the same
