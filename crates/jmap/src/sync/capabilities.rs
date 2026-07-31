@@ -286,7 +286,7 @@ mod tests {
         assert_eq!(limits.max_objects_in_set, 700);
     }
 
-    /// jmap-N4: "core limits zero" is a `Protocol(ContractViolation)`,
+    /// "Core limits zero" is a `Protocol(ContractViolation)`,
     /// not a `SyncState(CapabilityChanged)`. The server claimed
     /// conformance to the core capability and then advertised
     /// zero-valued limits, which the spec prohibits.

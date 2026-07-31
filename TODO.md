@@ -27,16 +27,6 @@ re-auditors don't re-raise them.)
 - **jmap-D4.** Generic JMAP `Provider`. Wire `Provider::Fastmail` (and
   any other JMAP host the factory needs) when documented. Continue
   setting `Provider: None` until then.
-- **jmap-N1.** `terminated_unsupported(op, scope, msg)` should take the
-  caller's `AccountOperation`. Pagination overflows reclassify as
-  `Protocol(ContractViolation)`, not `Unsupported(Discover)`.
-- **jmap-N2.** `SetErrorType::Other(String)` should mirror
-  `MethodErrorType::Other(String)`. Stop synthesizing `"other"`.
-- **jmap-N3.** `resource_from_scope` / `id_from_scope`: drop the
-  `_ => None` catch-alls so `ErrorScope`'s `#[non_exhaustive]` enforces
-  coverage.
-- **jmap-N4.** `capabilities.rs` "core limits zero" path: reclassify
-  as `Protocol(ContractViolation)`.
 - **jmap-N7.** (test smell, surfaced during the nc-7 fix)
   `ScriptedTransport` replies purely positionally: it never checks that
   a request's `accountId` or `ids` match the canned answer, so any test
@@ -141,9 +131,6 @@ re-auditors don't re-raise them.)
 
 ## bifrost-smtp
 
-- **smtp-N1.** Per-recipient address: attach as
-  `DiagnosticText::support_only` on each failed/uncertain lane
-  explicitly, not only as shared response text.
 - **smtp-M1.** SMTP raw-socket bandwidth metering is unwired. IMAP
   drives `bifrost_net::MeterSink` + a `bandwidth_cap` through
   `account/{factory,pool}.rs` and `connection/wire.rs`; SMTP has no
@@ -214,17 +201,6 @@ re-auditors don't re-raise them.)
 
 ## bifrost-graph
 
-- **graph-N2.** `wire_or_specific` and trailing `_ => {}` arms: delete
-  them; let `#[non_exhaustive]` enforce coverage.
-- **graph-N3.** `parse_retry_after_header`: add HTTP-date support.
-- **graph-N4.** `ews_stream::scope_for_folder`: switch `try_read` to
-  `.read().await`.
-- **graph-N5.** `client.rs::execute` unreachable branch:
-  `unreachable!()`.
-- **graph-N6.** `GraphResponseError::from_response` empty-string
-  `Unknown { code: "" }`: emit `WireCause::MalformedResponse`.
-- **graph-N8.** Confirm `AccountNet` auto-injects the bearer for
-  `execute` and `fetch_blob_stream`; if not, attach explicitly.
 - **graph-S1.** `GraphClient` carries a local per-client `Semaphore`
   for request concurrency. If a per-account concurrency limiter ever
   lands in `bifrost-net` or `bifrost-sync`, delete the local one.
