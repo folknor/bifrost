@@ -477,12 +477,6 @@ container projection itself.
   omits `myRights` silently projects as unreported rather than as a
   degradation. The `ContainerList::skipped_scopes` lane (which closed nc-1)
   could now carry it, but nothing classifies the omission today.
-- **nc-9 (graph)** `GraphClient::with_account_net` hardcodes
-  `rate_limit_host = GRAPH_HOST` instead of deriving it from the supplied
-  api-base, unlike every other constructor. A consumer injecting its own
-  `AccountNet` against a redirected base therefore meters under the production
-  Graph host bucket. Cosmetic today (the injected net owns its own limits) but
-  it is an inconsistency waiting to mislead.
 
 ## Cross-crate items from the bug-hunt loop (2026-07-29)
 

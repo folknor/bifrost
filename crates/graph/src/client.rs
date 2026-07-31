@@ -295,13 +295,18 @@ impl GraphClient {
     ) -> Self {
         let api_base = trim_base(api_base.into());
         let outlook_base = derive_outlook_base(&api_base);
+        // Derived from the supplied base like every other constructor,
+        // not hardcoded: an injected net against a redirected base must
+        // meter under its own host bucket, not the production Graph
+        // host's.
+        let rate_limit_host = host_from_api_base(&api_base);
         Self {
             inner: Arc::new(ClientInner {
                 net: None,
                 account_net: RwLock::new(Some(net)),
                 api_base,
                 outlook_base,
-                rate_limit_host: GRAPH_HOST.to_string(),
+                rate_limit_host,
                 token_source,
                 mailbox_id: None,
                 semaphore: Arc::new(Semaphore::new(CONCURRENCY_LIMIT)),
@@ -989,6 +994,23 @@ mod tests {
         );
         // An unparseable base falls back to production rather than panicking.
         assert_eq!(host_from_api_base("not a url"), GRAPH_HOST);
+    }
+
+    /// nc-9's shape: `with_account_net` was the one constructor that
+    /// hardcoded `rate_limit_host` to the production Graph host, so an
+    /// injected net against a redirected base metered under the wrong
+    /// bucket. It must derive from the supplied base like the others.
+    #[test]
+    fn with_account_net_derives_the_rate_limit_host_from_its_base() {
+        let donor = GraphClient::new("token");
+        donor.attach_account(AccountId("with-account-net-host-probe".to_string()));
+        let net = donor.account_net().expect("account net attached");
+        let client = GraphClient::with_account_net(
+            net,
+            "http://127.0.0.1:8181/v1.0",
+            Arc::new(StaticTokenSource::new("token", None)),
+        );
+        assert_eq!(client.inner.rate_limit_host, "127.0.0.1");
     }
 
     #[test]
