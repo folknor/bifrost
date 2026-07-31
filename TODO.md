@@ -55,11 +55,6 @@ re-auditors don't re-raise them.)
 - **imap-N1.** AUTH leg of `factory::open`: keep
   `AccountOperation::Discover`. AUTH is protocol-level idempotent.
   (Listed as "leave alone" - re-auditor reminder.)
-- **imap-N2.** Boundary builders that attach scope: thread
-  `Mailbox(folder)` / `Cursor(scope)` per the IMAP plan's table.
-- **imap-N3.** `concurrency_conflict_error` / `store_failed_error`:
-  take an `AccountOperation` parameter; thread from the caller's
-  `MutationKind`.
 - **imap-G1.** (gap, feature-sized) Expose IMAP MIME-part downloads as
   real `BlobHandle`s. Symptom: the account used to advertise
   `BlobRangeSupport::Yes` and accept any `BlobHandle` in `open_blob` /

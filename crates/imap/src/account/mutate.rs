@@ -1049,7 +1049,7 @@ mod tests {
 
     #[test]
     fn concurrency_conflict_error_reports_callers_operation() {
-        // imap-N3: concurrency_conflict_error / store_failed_error /
+        // concurrency_conflict_error / store_failed_error /
         // uidvalidity_changed_error must surface the caller's op so
         // recovery routes correctly for non-idempotent paths.
         let folder = MailboxName::new("INBOX").expect("valid mailbox");
@@ -1060,7 +1060,7 @@ mod tests {
         ] {
             let err = concurrency_conflict_error(op, &folder);
             assert_eq!(err.operation(), Some(op));
-            // Mailbox scope must thread too (imap-N2).
+            // Mailbox scope must thread too.
             assert!(matches!(
                 err.scope(),
                 Some(bifrost_types::ErrorScope::Mailbox { .. })
