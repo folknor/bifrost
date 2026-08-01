@@ -1,27 +1,4 @@
-# CLAUDE.md
-
-## Agent rules
-
-- Always launch subagents in the **foreground** (never use `run_in_background`). Background agents cannot get tool approvals.
-
-### Multi-Agent Orchestration
-
-**Do NOT use worktree isolation for parallel agents.** Worktrees create merge conflicts that silently drop agent work. Instead, launch agents in the same tree with strict file ownership - zero overlap.
-
-**Why no worktrees:** Worktrees let agents work on diverged snapshots. When merging back, `git checkout --ours/--theirs` drops code, conflict markers get missed, and features end up "existing but not wired" - types/functions created but never connected to bytecode dispatch, the standard library, or call sites. This has happened in long sessions and was only caught by a rigorous 3-pass audit.
-
-**Agent coordination rules:**
-
-- Each agent gets exclusive ownership of specific files. No two agents touch the same file.
-- Agents must read their target file FIRST. Do not replace existing code with placeholders or stub it out.
-- Agents must NOT run `brokkr check`, `brokkr test`, `cargo`, or `./diff_test.sh`. The orchestrator validates between agents.
-- Include `CLAUDE.md` (and any other top-level docs they'll need, e.g. `LLM.md`) in every agent's required reading.
-
-**Audit protocol:**
-
-- Do not trust agent claims of completion. Verify existence + wiring + behavior.
-- Use the 3-pass audit structure: domain-specific verification, then cross-cutting reconciliation (does the new instruction actually dispatch? is the new builtin actually installed by `open_libs`?), then editorial normalization.
-- Any discrepancies doc should contain only current gaps, not historical records. Remove resolved items entirely.
+# bifrost
 
 ## Project
 
@@ -59,15 +36,6 @@ CalDAV composes into IMAP-shaped accounts when configured.
 - Never read or write from `/tmp`. All data lives in the project.
 - Never run raw `cargo`, `curl`, `pkill`. Use `brokkr`.
 
-### git commit rules
-
-- Always run `brokkr fmt` before a commit.
-- Never commit markdown changes alone. Bundle them with upcoming code commits.
-- When committing other changes: always tag along markdown files if dirty.
-- Write substantive engineering-focused commit messages.
-- Has `Cargo.lock` changed? Commit it.
-- Never `git push` unless the user explicitly asks. Stop after the commit.
-
 ### Testing rules
 
 The line is hermeticity, not size. A test belongs here if it is deterministic and runs entirely in-process.
@@ -104,12 +72,12 @@ Workspace-wide conventions. Per-crate conventions live in `reference/<crate>.md`
 - Async-only (no maybe_async, no blocking).
 - `#[non_exhaustive]` on all public enums.
 - Clippy lints in workspace root `Cargo.toml` `[workspace.lints.clippy]`.
-- Don't commit ad-hoc reference docs outside `plans/` or `reference/`.
-- Code comments must never point to documents in `plans/`. Plans move, get renamed, and get deleted; source comments that name a plan path rot silently and require cross-tree edits when the doc moves. Explain the "why" in the comment itself, or point at a stable doc under `reference/`.
+- Don't commit ad-hoc reference docs outside `notes/` or `reference/`.
+- Code comments must never point to documents in `notes/`. Notes move, get renamed, and get deleted; source comments that name a note path rot silently and require cross-tree edits when the doc moves. Explain the "why" in the comment itself, or point at a stable doc under `reference/`.
 
 ## Reference
 
-Per-crate architecture and conventions. Single source of truth for current code state; in-flight design lives in `plans/`.
+Per-crate architecture and conventions. Single source of truth for current code state; in-flight design lives in `notes/`.
 
 **Before working in a crate, read its `reference/<crate>.md` first.** These docs are kept in sync with the code and exist precisely so agents do not have to rediscover module layout, trait surfaces, or invariants from scratch. Skipping the read is how mistakes that the reference would have flagged get made.
 
@@ -124,3 +92,37 @@ Per-crate architecture and conventions. Single source of truth for current code 
 - `reference/net.md` - bifrost-net shared HTTP transport: retry, rate-limiting, observability.
 - `reference/sasl.md` - bifrost-sasl private SASL/SCRAM computation crate: `Secret`, `SaslError`, `ScramHash`, the pure SCRAM/CRAM functions, and the error-mapping contract with the protocol crates.
 - `reference/sync.md` - bifrost-sync engine: scheduler, multiplexer, partitioned backfill, push reconciler, mutation pipeline, checkpoint envelope versioning, scope lifecycle.
+
+## Document folders
+
+The standing layout, across every project. Three live folders plus one retired,
+split by durability first, subject second.
+
+| Folder | Contents | Rule |
+|---|---|---|
+| `reference/` | Durable in-repo reference for anyone working on or with the code - how the thing is built and why: `architecture.md`, `technical-implementation-spec.md`, `performance.md` (the durable record of measured numbers over time), invariants, protocol contracts | Citable from source as a source of truth. What it says must be true. |
+| `docs/` | Durable in-repo documentation of how the thing is used - guides, CLI reference, the consumer-facing API surface. Sometimes exposed as a hand-edited VitePress gh-pages site | Same must-be-true rule. |
+| `notes/` | Transient - work items (`todo.md`), future plans, hypotheticals, bug reports, research, analysis. Things that will die | No truth guarantee. Nothing durable cites it. |
+| `plans/` | Retired | Plan documents are transient: they go in `notes/`. |
+
+`reference/` and `docs/` are both durable and both binding. The difference is
+subject, not audience: `reference/` covers how the thing is built and why - what
+you need in order to change it safely - while `docs/` covers how it is used. A
+developer or library consumer reads both. Where a project publishes a site,
+`docs/` is what gets published; the folder means the same thing either way.
+`notes/` is neither durable nor binding, which is the whole point of keeping it
+separate: a document that may be wrong must not sit where a document that must
+be right is expected.
+
+The dependency direction is therefore one-way. `notes/` may cite `docs/` and
+`reference/`; nothing durable may cite `notes/` - not a code comment, not
+`docs/`, not `reference/`. A code comment must carry its full context, because
+it outlives the note.
+
+**Root-level convention files are exempt.** `AGENTS.md`, `CLAUDE.md`,
+`README.md`, `LICENSE`, `CHANGELOG.md` and their kin are found by tooling and by
+convention at the repository root, and stay there. These folders govern
+documents we chose where to put, not files whose location is dictated.
+
+In `notes/`, `docs/` and `reference/` alike, avoid citing source line numbers -
+they drift fast.
