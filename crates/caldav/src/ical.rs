@@ -4,7 +4,8 @@ use bifrost_types::{
     EventTime, EventVisibility, ProtocolKind, ReminderRelativeTo, ReminderTrigger, RsvpStatus,
 };
 use caldata::{ContentLineParser, LineReader};
-use chrono::{DateTime, NaiveDate, NaiveDateTime, SecondsFormat, Utc};
+use jiff::tz::{AmbiguousOffset, Offset, TimeZone};
+use jiff::{SignedDuration, Timestamp, civil};
 use uuid::Uuid;
 
 /// Projection failed because the resource body could not be tokenized into
@@ -362,7 +363,12 @@ pub(crate) fn rsvp_reply_ical(
         "METHOD:REPLY".to_string(),
         "BEGIN:VEVENT".to_string(),
         format!("UID:{}", escape_text(uid)),
-        format!("DTSTAMP:{}", chrono::Utc::now().format("%Y%m%dT%H%M%SZ")),
+        format!(
+            "DTSTAMP:{}",
+            Offset::UTC
+                .to_datetime(Timestamp::now())
+                .strftime("%Y%m%dT%H%M%SZ")
+        ),
     ];
     push_time(&mut lines, "DTSTART", &current.start, current.is_all_day);
     push_time(&mut lines, "DTEND", &current.end, current.is_all_day);
@@ -694,9 +700,9 @@ fn format_ical_time(value: &str, is_date: bool, has_tzid: bool) -> String {
             return formatted;
         }
         if !suffix.is_empty() {
-            if let Ok(time) = DateTime::parse_from_rfc3339(&formatted) {
-                formatted = time.to_rfc3339();
-            }
+            // Offset-bearing and already in canonical second-precision RFC
+            // 3339 form; parsing only confirms the reassembled value is well
+            // formed, so it is emitted verbatim.
             return formatted;
         }
         // A TZID-bearing local time is a wall-clock value, not UTC: leave it
@@ -727,21 +733,30 @@ fn ical_offset_suffix(value: &str) -> String {
 }
 
 fn event_end_from_duration(start: &EventTime, duration: &str) -> Option<EventTime> {
-    let duration = caldata::types::parse_duration(duration).ok()?;
-    let value = if let Ok(value) = DateTime::parse_from_rfc3339(&start.value) {
-        let end = value.checked_add_signed(duration)?;
-        end.to_rfc3339_opts(SecondsFormat::Secs, start.value.ends_with('Z'))
-    } else if let Ok(value) = NaiveDateTime::parse_from_str(&start.value, "%Y-%m-%dT%H:%M:%S") {
+    // `caldata` still speaks chrono, so cross the boundary as a plain
+    // second count rather than naming its duration type.
+    let duration =
+        SignedDuration::from_secs(caldata::types::parse_duration(duration).ok()?.num_seconds());
+    let value = if let Ok(value) = start.value.parse::<Timestamp>() {
+        let end = Offset::UTC.to_datetime(value.checked_add(duration).ok()?);
+        if start.value.ends_with('Z') {
+            end.strftime("%Y-%m-%dT%H:%M:%SZ").to_string()
+        } else {
+            end.strftime("%Y-%m-%dT%H:%M:%S+00:00").to_string()
+        }
+    } else if let Ok(value) = civil::DateTime::strptime("%Y-%m-%dT%H:%M:%S", &start.value) {
         value
-            .checked_add_signed(duration)?
-            .format("%Y-%m-%dT%H:%M:%S")
+            .checked_add(duration)
+            .ok()?
+            .strftime("%Y-%m-%dT%H:%M:%S")
             .to_string()
-    } else if let Ok(value) = NaiveDate::parse_from_str(&start.value, "%Y-%m-%d") {
+    } else if let Ok(value) = civil::Date::strptime("%Y-%m-%d", &start.value) {
         value
-            .and_hms_opt(0, 0, 0)?
-            .checked_add_signed(duration)?
+            .to_datetime(civil::Time::MIN)
+            .checked_add(duration)
+            .ok()?
             .date()
-            .format("%Y-%m-%d")
+            .strftime("%Y-%m-%d")
             .to_string()
     } else {
         return None;
@@ -758,13 +773,19 @@ fn ical_time_from_event_time(time: &EventTime, is_all_day: bool) -> String {
         // exclusive DTEND, so the date serializes verbatim - no +1 day.
         return time.value.replace('-', "");
     }
-    if let Ok(parsed) = DateTime::parse_from_rfc3339(&time.value) {
+    if let Ok(instant) = time.value.parse::<Timestamp>() {
         if time.timezone.is_some() {
-            return parsed.format("%Y%m%dT%H%M%S").to_string();
+            // Under a TZID the wall clock is what belongs on the wire, so
+            // render in the value's own offset rather than normalizing.
+            let wall = time
+                .value
+                .parse::<civil::DateTime>()
+                .unwrap_or_else(|_| Offset::UTC.to_datetime(instant));
+            return wall.strftime("%Y%m%dT%H%M%S").to_string();
         }
-        return parsed
-            .with_timezone(&Utc)
-            .format("%Y%m%dT%H%M%SZ")
+        return Offset::UTC
+            .to_datetime(instant)
+            .strftime("%Y%m%dT%H%M%SZ")
             .to_string();
     }
     let mut value = time.value.replace(['-', ':'], "");
@@ -916,7 +937,7 @@ fn push_vtimezones(lines: &mut Vec<String>, event: &EventCreate) {
 
         // Resolve the real UTC offset for the event's instant. `canonical_tzid`
         // folds Windows/Exchange names ("W. Europe Standard Time") to IANA so
-        // the name parses to a `chrono_tz::Tz`. An unknown zone, or a value we
+        // the name resolves against the tzdb. An unknown zone, or a value we
         // cannot parse to a naive wall-clock, falls through to `None`.
         let offset = tzid_offset_for_naive(&tzid, anchor);
 
@@ -948,93 +969,42 @@ fn push_vtimezones(lines: &mut Vec<String>, event: &EventCreate) {
 /// Derive the wall-clock `NaiveDateTime` an event time names. With a TZID the
 /// stored value is a local wall-clock instant (mirrors `push_time`, which
 /// strips the trailing `Z` and emits the date/time verbatim under the zone).
-fn event_naive_local(time: &EventTime) -> Option<chrono::NaiveDateTime> {
-    if let Ok(parsed) = DateTime::parse_from_rfc3339(&time.value) {
-        return Some(parsed.naive_local());
+fn event_naive_local(time: &EventTime) -> Option<civil::DateTime> {
+    if let Ok(parsed) = time.value.parse::<civil::DateTime>() {
+        return Some(parsed);
     }
     // Fall back to parsing a bare iCalendar-style `YYYYMMDDTHHMMSS[Z]` value.
+    // This also covers a `Z`-suffixed RFC 3339 value, which the civil parser
+    // rejects because Temporal reads `Z` as an unknown offset.
     let raw = time.value.replace(['-', ':'], "");
     let raw = raw.trim_end_matches('Z');
-    chrono::NaiveDateTime::parse_from_str(raw, "%Y%m%dT%H%M%S").ok()
+    civil::DateTime::strptime("%Y%m%dT%H%M%S", raw).ok()
 }
 
 /// Resolve the iCalendar UTC-offset string (`+HHMM` / `-HHMM`) for `tzid` at
 /// the given wall-clock instant, or `None` if the zone is unknown.
 ///
-/// LocalResult discipline mirrors ratatoskr's `resolve_local_to_timestamp`:
-/// `Single` is used directly; `Ambiguous` (fall-back) picks the earlier
-/// instant (matches Outlook/Google/Apple); `None` (spring-forward gap) walks
-/// past the gap and uses the post-gap offset.
-fn tzid_offset_for_naive(tzid: &str, naive: Option<chrono::NaiveDateTime>) -> Option<String> {
-    use chrono::{LocalResult, Offset, TimeZone};
-
-    let tz: chrono_tz::Tz = canonical_tzid(tzid).parse().ok()?;
+/// Ambiguity discipline mirrors ratatoskr's `resolve_local_to_timestamp`:
+/// an unambiguous wall clock is used directly; a fall-back fold picks the
+/// earlier instant (matches Outlook/Google/Apple); a spring-forward gap uses
+/// the post-gap offset.
+fn tzid_offset_for_naive(tzid: &str, naive: Option<civil::DateTime>) -> Option<String> {
+    let tz = TimeZone::get(&canonical_tzid(tzid)).ok()?;
     // With no usable anchor, fall back to the Unix epoch so we still emit the
     // zone's standard-time offset rather than nothing.
-    let naive = naive.unwrap_or_else(|| {
-        chrono::DateTime::from_timestamp(0, 0)
-            .expect("epoch is representable")
-            .naive_utc()
-    });
+    let naive = naive.unwrap_or_else(|| Offset::UTC.to_datetime(Timestamp::UNIX_EPOCH));
 
-    let offset = match tz.from_local_datetime(&naive) {
-        LocalResult::Single(dt) => dt.offset().fix(),
-        LocalResult::Ambiguous(early, _late) => early.offset().fix(),
-        LocalResult::None => resolve_offset_through_gap(tz, naive)?,
+    let offset = match tz.to_ambiguous_timestamp(naive).offset() {
+        AmbiguousOffset::Unambiguous { offset } => offset,
+        AmbiguousOffset::Fold { before, .. } => before,
+        AmbiguousOffset::Gap { after, .. } => after,
     };
     Some(format_utc_offset(offset))
 }
 
-/// Spring-forward gap: walk back to the last valid wall clock and forward to
-/// the first, shift `naive` past the gap by the gap width, and take the
-/// resulting (post-gap) offset. Mirrors ratatoskr's `resolve_through_gap`.
-fn resolve_offset_through_gap(
-    tz: chrono_tz::Tz,
-    naive: chrono::NaiveDateTime,
-) -> Option<chrono::FixedOffset> {
-    use chrono::{Duration, LocalResult, Offset, TimeZone};
-
-    const MAX_PROBE_MINUTES: i64 = 60 * 48;
-
-    let mut backward = 0i64;
-    let gap_start = loop {
-        backward += 1;
-        if backward > MAX_PROBE_MINUTES {
-            return None;
-        }
-        if !matches!(
-            tz.from_local_datetime(&(naive - Duration::minutes(backward))),
-            LocalResult::None
-        ) {
-            break backward;
-        }
-    };
-    let mut forward = 0i64;
-    let gap_end = loop {
-        forward += 1;
-        if forward > MAX_PROBE_MINUTES {
-            return None;
-        }
-        if !matches!(
-            tz.from_local_datetime(&(naive + Duration::minutes(forward))),
-            LocalResult::None
-        ) {
-            break forward;
-        }
-    };
-
-    let gap_width = gap_start + gap_end - 1;
-    let shifted = naive.checked_add_signed(Duration::minutes(gap_width))?;
-    match tz.from_local_datetime(&shifted) {
-        LocalResult::Single(dt) => Some(dt.offset().fix()),
-        LocalResult::Ambiguous(_early, late) => Some(late.offset().fix()),
-        LocalResult::None => None,
-    }
-}
-
-/// Format a `FixedOffset` as the iCalendar UTC-offset form `+HHMM` / `-HHMM`.
-fn format_utc_offset(offset: chrono::FixedOffset) -> String {
-    let total = offset.local_minus_utc();
+/// Format an offset as the iCalendar UTC-offset form `+HHMM` / `-HHMM`.
+fn format_utc_offset(offset: Offset) -> String {
+    let total = offset.seconds();
     let sign = if total < 0 { '-' } else { '+' };
     let abs = total.abs();
     format!("{sign}{:02}{:02}", abs / 3600, (abs % 3600) / 60)
@@ -1377,7 +1347,6 @@ fn escape_param(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::NaiveDate;
 
     /// Test shim: the production projector is fallible (malformed bodies
     /// degrade to a per-resource skip); these tests feed well-formed input
@@ -1926,12 +1895,8 @@ mod tests {
 
     #[test]
     fn tzid_offset_resolves_known_zone_and_instant() {
-        let summer = NaiveDate::from_ymd_opt(2026, 6, 2)
-            .and_then(|d| d.and_hms_opt(12, 0, 0))
-            .expect("valid");
-        let winter = NaiveDate::from_ymd_opt(2026, 1, 15)
-            .and_then(|d| d.and_hms_opt(12, 0, 0))
-            .expect("valid");
+        let summer = civil::date(2026, 6, 2).at(12, 0, 0, 0);
+        let winter = civil::date(2026, 1, 15).at(12, 0, 0, 0);
         assert_eq!(
             tzid_offset_for_naive("Europe/Oslo", Some(summer)).as_deref(),
             Some("+0200")

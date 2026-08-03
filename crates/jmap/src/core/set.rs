@@ -1,5 +1,5 @@
 use crate::Error;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::{self, Display, Formatter};
@@ -488,16 +488,16 @@ impl Display for SetErrorType {
     }
 }
 
-pub(crate) fn from_timestamp(timestamp: i64) -> DateTime<Utc> {
-    DateTime::from_timestamp(timestamp, 0).unwrap_or_default()
+pub(crate) fn from_timestamp(timestamp: i64) -> Timestamp {
+    Timestamp::from_second(timestamp).unwrap_or(Timestamp::UNIX_EPOCH)
 }
 
 pub(crate) fn skip_if_empty_str(string: &Option<String>) -> bool {
     matches!(string, Some(string) if string.is_empty())
 }
 
-pub(crate) fn skip_if_zero_date(date: &Option<DateTime<Utc>>) -> bool {
-    matches!(date, Some(date) if date.timestamp() == 0)
+pub(crate) fn skip_if_zero_date(date: &Option<Timestamp>) -> bool {
+    matches!(date, Some(date) if date.as_second() == 0)
 }
 
 pub(crate) fn skip_if_empty_list<O>(list: &Option<Vec<O>>) -> bool {

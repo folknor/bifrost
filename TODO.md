@@ -248,6 +248,29 @@ any item; some may already be obsolete.
 
   TRANSPORT HALF still open: the duplicated `DavTransport` / `DavResponse`
   seam keeps the `AccountNet` trigger described above.
+- **caldav-J1.** (residual of the chrono -> jiff migration) chrono and
+  chrono-tz are still in the dependency tree, reached only through
+  `caldata` 0.16, which depends on both. No bifrost code names either
+  crate any more, so the migration bought one time library in our own
+  source, not a smaller tree. The one place the boundary is crossed is
+  `event_end_from_duration` in `caldav/src/ical.rs`, which takes
+  `caldata::types::parse_duration`'s chrono duration and converts via
+  `.num_seconds()` rather than naming the type - deliberate, so caldav
+  needs no chrono dependency, but it is a shim that would go quiet if
+  caldata ever changed that return type to something else with a
+  `num_seconds`. Close this if caldata drops chrono or is replaced;
+  until then there is nothing to fix, only a fact to know.
+- **caldav-J2.** (opportunity opened by the jiff migration, not a defect)
+  Generated VTIMEZONE components still emit a single STANDARD block
+  carrying the offset for the event's instant, which is approximate for a
+  recurring event spanning a DST transition - off by the DST delta on the
+  far side. That limit was accepted when the offset had to be resolved by
+  hand-walking `LocalResult`; jiff exposes zone transitions directly, so
+  emitting real STANDARD/DAYLIGHT transition rules is now substantially
+  cheaper than it was. Still not obviously worth it - most servers
+  re-resolve the TZID by name and ignore the supplied component - so this
+  is a re-evaluation, not scheduled work. The accepted limit is documented
+  in `reference/caldav.md`.
 - **caldav-F1.** VTODO / VJOURNAL resources still occupy the event
   cursor. The snapshot and changes lanes key on the PROPFIND href
   listing, which does not carry the component type, so a task resource in

@@ -54,7 +54,7 @@ nom = "8"
 caldata = "0.16"
 
 # Time
-chrono = { version = "0.4", features = ["serde"] }
+jiff = { version = "0.2", features = ["serde"] }
 
 # Bytes
 bytes = "1"

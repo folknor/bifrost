@@ -25,7 +25,7 @@ tracing = { workspace = true, features = ["std"] }
 thiserror = { workspace = true }
 dashmap = { workspace = true }
 uuid = { workspace = true }
-chrono = { workspace = true }
+jiff = { workspace = true }
 arc-swap = { workspace = true }
 
 # Protocol-crate dev-dependencies so `cross_crate_conformance.rs` can

@@ -21,7 +21,8 @@ use bifrost_types::{
     AccountError, AccountErrorBuilder, AccountErrorKind, AccountFuture, AccountOperation, Cause,
     DiagnosticText, LabelId, Protocol, ProtocolKind, RequestCause, RequestErrorKind,
 };
-use chrono::{DateTime, Datelike, Utc};
+use jiff::Timestamp;
+use jiff::tz::Offset;
 
 use crate::types::{
     AclRight, FetchAttr, Flag, MailboxAttribute, MailboxName, MailboxRights, SearchCriteria,
@@ -1640,7 +1641,9 @@ fn empty_to_all(criteria: &str) -> String {
 }
 
 fn imap_date(time: SystemTime) -> String {
-    let datetime: DateTime<Utc> = time.into();
+    let datetime = Offset::UTC
+        .to_datetime(Timestamp::try_from(time).unwrap_or(Timestamp::UNIX_EPOCH))
+        .date();
     let month = match datetime.month() {
         1 => "Jan",
         2 => "Feb",

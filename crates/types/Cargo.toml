@@ -17,7 +17,7 @@ workspace = true
 [dependencies]
 base64 = { workspace = true }
 encoding_rs = { workspace = true }
-chrono = { workspace = true }
+jiff = { workspace = true }
 futures = { workspace = true }
 bytes = { workspace = true }
 thiserror = { workspace = true }

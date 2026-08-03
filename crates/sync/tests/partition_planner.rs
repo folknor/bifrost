@@ -9,10 +9,15 @@ use bifrost_sync::backfill::partitioner::PartitionBounds;
 use bifrost_sync::backfill::{
     BackfillPolicy, BackfillStrategy, default_time_boundaries, partitioner,
 };
-use chrono::{TimeZone, Utc};
+use jiff::Timestamp;
+use jiff::civil::date;
 
-fn fixed_now() -> chrono::DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 5, 21, 12, 0, 0).unwrap()
+fn fixed_now() -> Timestamp {
+    date(2026, 5, 21)
+        .at(12, 0, 0, 0)
+        .in_tz("UTC")
+        .unwrap()
+        .timestamp()
 }
 
 #[test]
@@ -84,7 +89,7 @@ fn clock_skew_shifts_time_partitions_forward() {
     let with_skew = partitioner::plan(&policy_skew, fixed_now(), 0);
     // Each `to` boundary in the skewed plan should be exactly one
     // hour ahead of the non-skewed plan's matching boundary.
-    let expected_delta = chrono::Duration::hours(1);
+    let expected_delta = jiff::SignedDuration::from_hours(1);
     for (lhs, rhs) in no_skew.partitions.iter().zip(with_skew.partitions.iter()) {
         match (lhs, rhs) {
             (
@@ -92,9 +97,9 @@ fn clock_skew_shifts_time_partitions_forward() {
                 PartitionBounds::Time { from: f1, to: t1 },
             ) => {
                 // Both ends shift by the skew.
-                assert_eq!(*t1 - *t0, expected_delta);
-                if *f0 != chrono::DateTime::<Utc>::MIN_UTC {
-                    assert_eq!(*f1 - *f0, expected_delta);
+                assert_eq!(t1.duration_since(*t0), expected_delta);
+                if *f0 != Timestamp::MIN {
+                    assert_eq!(f1.duration_since(*f0), expected_delta);
                 }
             }
             _ => panic!("expected time partitions"),

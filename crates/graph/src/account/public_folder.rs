@@ -258,10 +258,8 @@ pub(crate) fn advance_watermark(prior: Option<String>, items: &[EwsItem]) -> Opt
 /// Parse an EWS `DateTimeReceived` (RFC-3339 / ISO-8601 UTC) into a
 /// comparable instant. Returns `None` for an unparseable value so the
 /// caller can fall back conservatively rather than mis-order.
-fn parse_received(raw: &str) -> Option<chrono::DateTime<chrono::Utc>> {
-    chrono::DateTime::parse_from_rfc3339(raw)
-        .ok()
-        .map(|dt| dt.with_timezone(&chrono::Utc))
+fn parse_received(raw: &str) -> Option<jiff::Timestamp> {
+    raw.parse::<jiff::Timestamp>().ok()
 }
 
 /// Collect the ids of items whose `received_at` equals `watermark`.

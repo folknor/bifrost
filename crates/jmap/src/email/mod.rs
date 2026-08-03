@@ -10,7 +10,7 @@ pub(crate) mod query;
 pub(crate) mod search_snippet;
 pub(crate) mod set;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{
     Deserialize, Serialize,
     de::{IgnoredAny, MapAccess, Visitor},
@@ -62,7 +62,7 @@ pub(crate) struct Email {
 
     #[serde(rename = "receivedAt")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) received_at: Option<DateTime<Utc>>,
+    pub(super) received_at: Option<Timestamp>,
 
     #[serde(alias = "header:Message-ID:asMessageIds")]
     #[serde(rename = "messageId")]
@@ -117,7 +117,7 @@ pub(crate) struct Email {
     #[serde(rename = "sentAt")]
     #[serde(alias = "header:Date:asDate")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) sent_at: Option<DateTime<Utc>>,
+    pub(super) sent_at: Option<Timestamp>,
 
     #[serde(rename = "bodyStructure")]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -211,7 +211,7 @@ pub(crate) struct EmailCreate {
 
     #[serde(rename = "receivedAt")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) received_at: Option<DateTime<Utc>>,
+    pub(super) received_at: Option<Timestamp>,
 
     #[serde(rename = "messageId")]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -255,7 +255,7 @@ pub(crate) struct EmailCreate {
 
     #[serde(rename = "sentAt")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) sent_at: Option<DateTime<Utc>>,
+    pub(super) sent_at: Option<Timestamp>,
 
     #[serde(rename = "bodyStructure")]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -431,8 +431,8 @@ pub(crate) enum HeaderValue {
     AsAddressesAll(Vec<Vec<EmailAddress>>),
     AsAddresses(Vec<EmailAddress>),
     AsTextListAll(Vec<Vec<String>>),
-    AsDateAll(Vec<DateTime<Utc>>),
-    AsDate(DateTime<Utc>),
+    AsDateAll(Vec<Timestamp>),
+    AsDate(Timestamp),
     AsTextAll(Vec<String>),
     AsText(String),
 }
@@ -1060,7 +1060,7 @@ pub(crate) struct TestEmail {
 
     #[serde(rename = "receivedAt")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) received_at: Option<DateTime<Utc>>,
+    pub(crate) received_at: Option<Timestamp>,
 
     #[serde(rename = "messageId")]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1097,7 +1097,7 @@ pub(crate) struct TestEmail {
 
     #[serde(rename = "sentAt")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) sent_at: Option<DateTime<Utc>>,
+    pub(crate) sent_at: Option<Timestamp>,
 
     #[serde(rename = "bodyStructure")]
     #[serde(skip_serializing_if = "Option::is_none")]

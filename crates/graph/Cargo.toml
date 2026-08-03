@@ -23,7 +23,7 @@ base64 = { workspace = true }
 bifrost-net = { path = "../net" }
 bifrost-types = { path = "../types" }
 bytes = { workspace = true }
-chrono = { workspace = true }
+jiff = { workspace = true }
 futures = { workspace = true }
 getrandom = { workspace = true }
 quick-xml = "0.41.0"

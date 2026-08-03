@@ -11,7 +11,7 @@ use std::fmt::Display;
 use crate::core::field::Field;
 use crate::core::set::skip_if_empty_str;
 use crate::core::set::skip_if_zero_date;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 mod marker {
@@ -32,11 +32,11 @@ pub(crate) struct VacationResponse {
 
     #[serde(rename = "fromDate")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) from_date: Option<DateTime<Utc>>,
+    pub(super) from_date: Option<Timestamp>,
 
     #[serde(rename = "toDate")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) to_date: Option<DateTime<Utc>>,
+    pub(super) to_date: Option<Timestamp>,
 
     #[serde(rename = "subject")]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -62,11 +62,11 @@ pub(crate) struct VacationResponseCreate {
 
     #[serde(rename = "fromDate")]
     #[serde(skip_serializing_if = "skip_if_zero_date")]
-    pub(super) from_date: Option<DateTime<Utc>>,
+    pub(super) from_date: Option<Timestamp>,
 
     #[serde(rename = "toDate")]
     #[serde(skip_serializing_if = "skip_if_zero_date")]
-    pub(super) to_date: Option<DateTime<Utc>>,
+    pub(super) to_date: Option<Timestamp>,
 
     #[serde(rename = "subject")]
     #[serde(skip_serializing_if = "skip_if_empty_str")]
@@ -89,11 +89,11 @@ pub(crate) struct VacationResponsePatch {
 
     #[serde(rename = "fromDate")]
     #[serde(skip_serializing_if = "Field::is_omitted")]
-    pub(super) from_date: Field<DateTime<Utc>>,
+    pub(super) from_date: Field<Timestamp>,
 
     #[serde(rename = "toDate")]
     #[serde(skip_serializing_if = "Field::is_omitted")]
-    pub(super) to_date: Field<DateTime<Utc>>,
+    pub(super) to_date: Field<Timestamp>,
 
     #[serde(rename = "subject")]
     #[serde(skip_serializing_if = "Field::is_omitted")]

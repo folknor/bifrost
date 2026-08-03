@@ -7,7 +7,7 @@ pub(crate) mod get;
 pub(crate) mod query;
 pub(crate) mod set;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::Display;
@@ -60,7 +60,7 @@ pub(crate) struct EmailSubmission {
 
     #[serde(rename = "sendAt")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) send_at: Option<DateTime<Utc>>,
+    pub(super) send_at: Option<Timestamp>,
 
     #[serde(rename = "undoStatus")]
     #[serde(skip_serializing_if = "Option::is_none")]

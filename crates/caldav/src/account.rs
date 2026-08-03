@@ -4,8 +4,9 @@ use std::time::Instant;
 
 use bifrost_types::*;
 use bytes::Bytes;
-use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
 use futures::{StreamExt, stream};
+use jiff::tz::Offset;
+use jiff::{Timestamp, civil};
 
 use crate::capabilities::{caldav_capabilities, scheduling_available};
 use crate::client::{
@@ -1433,7 +1434,7 @@ fn event_in_range(event: &CalendarEvent, start: &EventTime, end: &EventTime) -> 
 
 /// Parse the instant named by an RRULE `UNTIL=` part, if present. Handles
 /// both `YYYYMMDD` (date) and `YYYYMMDDTHHMMSS[Z]` (date-time) forms.
-fn rrule_until(rrule: &str) -> Option<DateTime<FixedOffset>> {
+fn rrule_until(rrule: &str) -> Option<Timestamp> {
     let value = rrule.split(';').find_map(|part| {
         let (key, value) = part.split_once('=')?;
         key.eq_ignore_ascii_case("UNTIL").then_some(value)
@@ -1441,52 +1442,53 @@ fn rrule_until(rrule: &str) -> Option<DateTime<FixedOffset>> {
     parse_ical_instant(value.trim())
 }
 
-fn parse_ical_instant(value: &str) -> Option<DateTime<FixedOffset>> {
-    let zero = FixedOffset::east_opt(0)?;
+fn parse_ical_instant(value: &str) -> Option<Timestamp> {
     if value.len() == 8 {
-        let date = NaiveDate::parse_from_str(value, "%Y%m%d").ok()?;
-        return zero
-            .from_local_datetime(&date.and_time(NaiveTime::MIN))
-            .single();
+        let date = civil::Date::strptime("%Y%m%d", value).ok()?;
+        return Offset::UTC
+            .to_timestamp(date.to_datetime(civil::Time::MIN))
+            .ok();
     }
     let core = value.trim_end_matches('Z');
-    let naive = NaiveDateTime::parse_from_str(core, "%Y%m%dT%H%M%S").ok()?;
-    zero.from_local_datetime(&naive).single()
+    let naive = civil::DateTime::strptime("%Y%m%dT%H%M%S", core).ok()?;
+    Offset::UTC.to_timestamp(naive).ok()
 }
 
 fn time_interval(
     start: &EventTime,
     end: &EventTime,
     is_all_day: bool,
-) -> Option<(DateTime<FixedOffset>, DateTime<FixedOffset>)> {
+) -> Option<(Timestamp, Timestamp)> {
     let start = comparable_time(start, is_all_day)?;
     let end = comparable_time(end, is_all_day).unwrap_or(start);
     Some((start, end))
 }
 
-fn comparable_time(time: &EventTime, is_all_day: bool) -> Option<DateTime<FixedOffset>> {
+fn comparable_time(time: &EventTime, is_all_day: bool) -> Option<Timestamp> {
     if is_all_day || time.value.len() == 10 {
-        let date = NaiveDate::parse_from_str(&time.value, "%Y-%m-%d").ok()?;
-        let naive = date.and_time(NaiveTime::MIN);
-        return FixedOffset::east_opt(0)?
-            .from_local_datetime(&naive)
-            .single();
+        let date = civil::Date::strptime("%Y-%m-%d", &time.value).ok()?;
+        return Offset::UTC
+            .to_timestamp(date.to_datetime(civil::Time::MIN))
+            .ok();
     }
-    DateTime::parse_from_rfc3339(&time.value).ok()
+    time.value.parse::<Timestamp>().ok()
 }
 
 fn caldav_query_time(time: &EventTime) -> Option<String> {
-    if time.value.len() == 10 {
-        let date = NaiveDate::parse_from_str(&time.value, "%Y-%m-%d").ok()?;
-        let naive = date.and_time(NaiveTime::MIN);
-        let utc = Utc.from_local_datetime(&naive).single()?;
-        return Some(utc.format("%Y%m%dT%H%M%SZ").to_string());
-    }
-    DateTime::parse_from_rfc3339(&time.value).ok().map(|time| {
-        time.with_timezone(&Utc)
-            .format("%Y%m%dT%H%M%SZ")
-            .to_string()
-    })
+    let instant = if time.value.len() == 10 {
+        let date = civil::Date::strptime("%Y-%m-%d", &time.value).ok()?;
+        Offset::UTC
+            .to_timestamp(date.to_datetime(civil::Time::MIN))
+            .ok()?
+    } else {
+        time.value.parse::<Timestamp>().ok()?
+    };
+    Some(
+        Offset::UTC
+            .to_datetime(instant)
+            .strftime("%Y%m%dT%H%M%SZ")
+            .to_string(),
+    )
 }
 
 fn event_matches(event: &CalendarEvent, needle: &str) -> bool {
@@ -1721,13 +1723,13 @@ mod tests {
         // UNTIL comes in both date and date-time forms, and RRULE part
         // names are case-insensitive per RFC 5545.
         let until = rrule_until("FREQ=WEEKLY;until=20260525").expect("date-form UNTIL");
-        assert_eq!(until.to_rfc3339(), "2026-05-25T00:00:00+00:00");
+        assert_eq!(until.to_string(), "2026-05-25T00:00:00Z");
 
         let until = rrule_until("FREQ=DAILY;UNTIL=20260525T120000").expect("datetime UNTIL");
-        assert_eq!(until.to_rfc3339(), "2026-05-25T12:00:00+00:00");
+        assert_eq!(until.to_string(), "2026-05-25T12:00:00Z");
 
         let until = rrule_until("FREQ=DAILY;UNTIL=20260525T120000Z").expect("UTC UNTIL");
-        assert_eq!(until.to_rfc3339(), "2026-05-25T12:00:00+00:00");
+        assert_eq!(until.to_string(), "2026-05-25T12:00:00Z");
 
         assert!(rrule_until("FREQ=DAILY").is_none());
         assert!(rrule_until("FREQ=DAILY;UNTIL=garbage").is_none());

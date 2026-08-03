@@ -319,7 +319,9 @@ fn build_send_options(hold: Option<std::time::SystemTime>) -> SendOptions {
 /// Format an absolute instant as RFC 3339 for the SMTP FUTURERELEASE
 /// `HOLDUNTIL` parameter.
 fn hold_until_rfc3339(at: std::time::SystemTime) -> String {
-    chrono::DateTime::<chrono::Utc>::from(at).to_rfc3339()
+    jiff::Timestamp::try_from(at)
+        .map(|ts| ts.to_string())
+        .unwrap_or_default()
 }
 
 /// Convert a `bifrost_types::Address` into an SMTP envelope address.

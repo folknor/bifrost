@@ -37,7 +37,7 @@ impl EmailSubmission {
     }
 
     pub(crate) fn send_at(&self) -> Option<i64> {
-        self.send_at.as_ref().map(chrono::DateTime::timestamp)
+        self.send_at.map(jiff::Timestamp::as_second)
     }
 
     pub(crate) fn undo_status(&self) -> Option<&UndoStatus> {

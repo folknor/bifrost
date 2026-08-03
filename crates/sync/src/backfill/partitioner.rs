@@ -13,7 +13,7 @@
 use std::time::Duration;
 
 use bifrost_types::{InventoryPartition, Partition};
-use chrono::{DateTime, Utc};
+use jiff::{SignedDuration, Timestamp};
 
 /// Account-level backfill policy.
 #[derive(Debug, Clone)]
@@ -78,10 +78,7 @@ pub struct PartitionPlan {
 #[non_exhaustive]
 pub enum PartitionBounds {
     /// `[from, to)` inclusive-exclusive time window.
-    Time {
-        from: DateTime<Utc>,
-        to: DateTime<Utc>,
-    },
+    Time { from: Timestamp, to: Timestamp },
     /// `[from, to]` inclusive UID range.
     Uid { from: u32, to: u32 },
     /// `[from, to)` page-count range.
@@ -94,12 +91,12 @@ pub enum PartitionBounds {
 pub fn inventory_partition_for(bounds: &PartitionBounds) -> InventoryPartition {
     match bounds {
         PartitionBounds::Time { from, to } => InventoryPartition::Time {
-            from_unix_seconds: if *from == DateTime::<Utc>::MIN_UTC {
+            from_unix_seconds: if *from == Timestamp::MIN {
                 None
             } else {
-                Some(from.timestamp())
+                Some(from.as_second())
             },
-            to_unix_seconds: Some(to.timestamp()),
+            to_unix_seconds: Some(to.as_second()),
         },
         PartitionBounds::Uid { from, to } => InventoryPartition::Uid {
             from: *from,
@@ -177,11 +174,7 @@ pub fn is_completion_partition(partition: &Partition) -> bool {
 /// `total_for_uid_or_page` parameter is the upper bound for `UidRange`
 /// (total UIDs in folder) and `PageCount` (total items in query).
 #[must_use]
-pub fn plan(
-    policy: &BackfillPolicy,
-    now: DateTime<Utc>,
-    total_for_uid_or_page: u32,
-) -> PartitionPlan {
+pub fn plan(policy: &BackfillPolicy, now: Timestamp, total_for_uid_or_page: u32) -> PartitionPlan {
     match &policy.strategy {
         BackfillStrategy::TimeWindowed { boundaries } => {
             plan_time(boundaries, now, policy.clock_skew)
@@ -193,22 +186,29 @@ pub fn plan(
     }
 }
 
-fn plan_time(boundaries: &[Duration], now: DateTime<Utc>, skew: Duration) -> PartitionPlan {
-    let now_skewed =
-        now + chrono::Duration::from_std(skew).unwrap_or_else(|_| chrono::Duration::zero());
+fn plan_time(boundaries: &[Duration], now: Timestamp, skew: Duration) -> PartitionPlan {
+    let now_skewed = SignedDuration::try_from(skew)
+        .ok()
+        .and_then(|d| now.checked_add(d).ok())
+        .unwrap_or(now);
     let mut partitions = Vec::with_capacity(boundaries.len() + 1);
     let mut prev_to = now_skewed;
     for boundary in boundaries {
-        let from = now_skewed
-            - chrono::Duration::from_std(*boundary).unwrap_or_else(|_| chrono::Duration::zero());
+        // A boundary that runs off the start of the representable range
+        // saturates to the same sentinel the final open-ended partition
+        // uses, keeping partition identity stable across runs.
+        let from = SignedDuration::try_from(*boundary)
+            .ok()
+            .and_then(|d| now_skewed.checked_sub(d).ok())
+            .unwrap_or(Timestamp::MIN);
         partitions.push(PartitionBounds::Time { from, to: prev_to });
         prev_to = from;
     }
-    // Final open-ended partition: from year 1 (or DateTime::MIN_UTC) to
-    // the oldest boundary. Encoded as a fixed sentinel so partition
+    // Final open-ended partition: from the minimum representable instant
+    // to the oldest boundary. Encoded as a fixed sentinel so partition
     // identity is stable across runs.
     partitions.push(PartitionBounds::Time {
-        from: DateTime::<Utc>::MIN_UTC,
+        from: Timestamp::MIN,
         to: prev_to,
     });
     PartitionPlan { partitions }
@@ -249,10 +249,14 @@ fn plan_page(chunk: u32, total: u32) -> PartitionPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
+    use jiff::civil::date;
 
-    fn now() -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(2026, 5, 21, 12, 0, 0).unwrap()
+    fn now() -> Timestamp {
+        date(2026, 5, 21)
+            .at(12, 0, 0, 0)
+            .in_tz("UTC")
+            .unwrap()
+            .timestamp()
     }
 
     #[test]
@@ -320,8 +324,16 @@ mod tests {
     #[test]
     fn bounds_convert_to_account_partitions() {
         let time = PartitionBounds::Time {
-            from: Utc.with_ymd_and_hms(2026, 5, 1, 0, 0, 0).unwrap(),
-            to: Utc.with_ymd_and_hms(2026, 5, 2, 0, 0, 0).unwrap(),
+            from: date(2026, 5, 1)
+                .at(0, 0, 0, 0)
+                .in_tz("UTC")
+                .unwrap()
+                .timestamp(),
+            to: date(2026, 5, 2)
+                .at(0, 0, 0, 0)
+                .in_tz("UTC")
+                .unwrap()
+                .timestamp(),
         };
         assert_eq!(
             inventory_partition_for(&time),

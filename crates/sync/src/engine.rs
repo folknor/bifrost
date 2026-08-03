@@ -3339,7 +3339,7 @@ fn backfill_plan_for(
         InventoryPartitioning::Full => BackfillPlan::Fixed(vec![InventoryPartition::Full]),
         InventoryPartitioning::TimeWindowed => {
             let policy = BackfillPolicy::default();
-            let plan = crate::backfill::partitioner::plan(&policy, chrono::Utc::now(), 0);
+            let plan = crate::backfill::partitioner::plan(&policy, jiff::Timestamp::now(), 0);
             BackfillPlan::Fixed(
                 plan.partitions
                     .iter()
@@ -3356,7 +3356,7 @@ fn backfill_plan_for(
                 },
                 clock_skew: std::time::Duration::ZERO,
             };
-            let plan = crate::backfill::partitioner::plan(&policy, chrono::Utc::now(), max_uid);
+            let plan = crate::backfill::partitioner::plan(&policy, jiff::Timestamp::now(), max_uid);
             BackfillPlan::Fixed(
                 plan.partitions
                     .iter()
@@ -3382,7 +3382,7 @@ fn backfill_plan_for(
                 },
                 clock_skew: std::time::Duration::ZERO,
             };
-            let plan = crate::backfill::partitioner::plan(&policy, chrono::Utc::now(), total);
+            let plan = crate::backfill::partitioner::plan(&policy, jiff::Timestamp::now(), total);
             BackfillPlan::Fixed(
                 plan.partitions
                     .iter()

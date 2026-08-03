@@ -260,6 +260,20 @@ pub(crate) fn removed_id(value: &Value) -> Option<ObjectId> {
         .map(|id| ObjectId(id.to_string()))
 }
 
+/// A `calendarView` window bound, `days` from `now`, in the second-precision
+/// UTC form Graph expects. A bound that runs off the representable range
+/// falls back to `now` rather than widening the window unpredictably.
+fn calendar_view_bound(now: jiff::Timestamp, days: i64) -> String {
+    let at = jiff::Span::new()
+        .try_days(days)
+        .and_then(|span| now.checked_add(span))
+        .unwrap_or(now);
+    jiff::tz::Offset::UTC
+        .to_datetime(at)
+        .strftime("%Y-%m-%dT%H:%M:%SZ")
+        .to_string()
+}
+
 pub(crate) fn page_marker(next_link: String, last_seen_id: Option<String>) -> GraphPageMarker {
     GraphPageMarker {
         next_link,
@@ -288,10 +302,9 @@ pub(crate) fn initial_delta_url(
                     "{prefix}/mailFolders/{encoded}/messages/delta?$select={MESSAGE_SELECT}&$top=50"
                 )),
                 ObjectType::Event | ObjectType::CalendarEvent => {
-                    let start = (chrono::Utc::now() - chrono::Duration::days(90))
-                        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-                    let end = (chrono::Utc::now() + chrono::Duration::days(365))
-                        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+                    let now = jiff::Timestamp::now();
+                    let start = calendar_view_bound(now, -90);
+                    let end = calendar_view_bound(now, 365);
                     Ok(format!(
                         "{prefix}/calendars/{encoded}/calendarView/delta?startDateTime={start}&endDateTime={end}&$select={EVENT_SELECT}"
                     ))

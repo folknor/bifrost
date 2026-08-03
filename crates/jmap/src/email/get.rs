@@ -55,7 +55,7 @@ impl Email {
     }
 
     pub(crate) fn received_at(&self) -> Option<i64> {
-        self.received_at.as_ref().map(chrono::DateTime::timestamp)
+        self.received_at.map(jiff::Timestamp::as_second)
     }
 
     pub(crate) fn message_id(&self) -> Option<&[String]> {
@@ -127,7 +127,7 @@ impl Email {
     }
 
     pub(crate) fn sent_at(&self) -> Option<i64> {
-        self.sent_at.as_ref().map(chrono::DateTime::timestamp)
+        self.sent_at.map(jiff::Timestamp::as_second)
     }
 
     pub(crate) fn body_structure(&self) -> Option<&EmailBodyPart> {

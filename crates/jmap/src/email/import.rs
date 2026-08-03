@@ -7,7 +7,7 @@ use crate::{
     },
     mailbox::MailboxId,
 };
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -47,7 +47,7 @@ pub(crate) struct EmailImport {
 
     #[serde(rename = "receivedAt")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    received_at: Option<DateTime<Utc>>,
+    received_at: Option<Timestamp>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

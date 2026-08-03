@@ -5,7 +5,8 @@ use bifrost_types::{
     EventSearchRequest, EventStatus, EventTime, EventVisibility, Page, ProtocolKind,
     ReminderRelativeTo, ReminderTrigger, RsvpStatus,
 };
-use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime, TimeZone};
+use jiff::tz::Offset;
+use jiff::{SignedDuration, Span, Timestamp, civil};
 use serde_json::{Map, Value, json};
 
 use crate::account::Account as JmapProtoAccount;
@@ -937,23 +938,23 @@ fn duration(start: &str, end: &str) -> String {
     if start.len() == 10
         && end.len() == 10
         && let (Ok(start), Ok(end)) = (
-            NaiveDate::parse_from_str(start, "%Y-%m-%d"),
-            NaiveDate::parse_from_str(end, "%Y-%m-%d"),
+            civil::Date::strptime("%Y-%m-%d", start),
+            civil::Date::strptime("%Y-%m-%d", end),
         )
     {
         // `EventTime`'s all-day end is exclusive, so the JSCalendar
         // duration is exactly end - start days (a single all-day event,
         // start D / end D+1, is P1D).
-        let days = end.signed_duration_since(start).num_days().max(0);
+        let days = (end - start).get_days().max(0);
         return format!("P{days}D");
     }
-    let Ok(start) = DateTime::parse_from_rfc3339(start) else {
+    let Ok(start) = start.parse::<Timestamp>() else {
         return "PT0S".to_string();
     };
-    let Ok(end) = DateTime::parse_from_rfc3339(end) else {
+    let Ok(end) = end.parse::<Timestamp>() else {
         return "PT0S".to_string();
     };
-    let seconds = end.signed_duration_since(start).num_seconds().max(0);
+    let seconds = end.duration_since(start).as_secs().max(0);
     format!("PT{seconds}S")
 }
 
@@ -961,11 +962,11 @@ fn shared_time_from_jmap(value: &str, is_all_day: bool) -> String {
     if is_all_day || value.len() == 10 {
         return value.to_string();
     }
-    if DateTime::parse_from_rfc3339(value).is_ok() {
+    if value.parse::<Timestamp>().is_ok() {
         return value.to_string();
     }
     if let Some(time) = local_datetime(value) {
-        return time.to_rfc3339();
+        return shared_rfc3339(time);
     }
     value.to_string()
 }
@@ -974,8 +975,19 @@ fn jmap_time_from_shared(time: &EventTime, is_all_day: bool) -> String {
     if is_all_day || time.value.len() == 10 {
         return time.value.clone();
     }
-    if let Ok(parsed) = DateTime::parse_from_rfc3339(&time.value) {
-        return parsed.format("%Y-%m-%dT%H:%M:%S").to_string();
+    // Rendered in the value's own offset, not normalized to UTC: the
+    // JSCalendar `timeZone` property carries the zone separately, so the
+    // wall clock is what belongs in the LocalDateTime.
+    // A numeric offset yields the wall clock directly. A `Z` suffix is
+    // rejected by the civil parser (Temporal reads it as an unknown
+    // offset), so route that through the instant and read it back at UTC.
+    let wall = time
+        .value
+        .parse::<civil::DateTime>()
+        .ok()
+        .or_else(|| Some(Offset::UTC.to_datetime(time.value.parse::<Timestamp>().ok()?)));
+    if let Some(wall) = wall {
+        return wall.strftime("%Y-%m-%dT%H:%M:%S").to_string();
     }
     time.value.clone()
 }
@@ -988,10 +1000,10 @@ fn jmap_time_from_shared(time: &EventTime, is_all_day: bool) -> String {
 // UTC and rendered bare, matching that Etc/UTC default. Date-only or
 // unparseable values pass through untouched.
 fn jmap_utc_filter_time(time: &EventTime) -> String {
-    if let Ok(parsed) = DateTime::parse_from_rfc3339(&time.value) {
-        return parsed
-            .with_timezone(&chrono::Utc)
-            .format("%Y-%m-%dT%H:%M:%S")
+    if let Ok(parsed) = time.value.parse::<Timestamp>() {
+        return Offset::UTC
+            .to_datetime(parsed)
+            .strftime("%Y-%m-%dT%H:%M:%S")
             .to_string();
     }
     time.value.clone()
@@ -1015,52 +1027,66 @@ fn time_interval(
     start: &EventTime,
     end: &EventTime,
     is_all_day: bool,
-) -> Option<(DateTime<FixedOffset>, DateTime<FixedOffset>)> {
+) -> Option<(Timestamp, Timestamp)> {
     let start = comparable_time(start, is_all_day)?;
     let end = comparable_time(end, is_all_day).unwrap_or(start);
     Some((start, end))
 }
 
-fn comparable_time(time: &EventTime, is_all_day: bool) -> Option<DateTime<FixedOffset>> {
+fn comparable_time(time: &EventTime, is_all_day: bool) -> Option<Timestamp> {
     if is_all_day || time.value.len() == 10 {
-        let date = NaiveDate::parse_from_str(&time.value, "%Y-%m-%d").ok()?;
-        let naive = date.and_time(NaiveTime::MIN);
-        return FixedOffset::east_opt(0)?
-            .from_local_datetime(&naive)
-            .single();
+        let date = civil::Date::strptime("%Y-%m-%d", &time.value).ok()?;
+        return Offset::UTC
+            .to_timestamp(date.to_datetime(civil::Time::MIN))
+            .ok();
     }
-    DateTime::parse_from_rfc3339(&time.value)
+    time.value
+        .parse::<Timestamp>()
         .ok()
         .or_else(|| local_datetime(&time.value))
 }
 
-fn local_datetime(value: &str) -> Option<DateTime<FixedOffset>> {
-    let naive = NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S").ok()?;
-    FixedOffset::east_opt(0)?
-        .from_local_datetime(&naive)
-        .single()
+/// Render an instant for the shared `EventTime` layer, which spells the
+/// UTC offset out as `+00:00` rather than `Z`.
+fn shared_rfc3339(at: Timestamp) -> String {
+    Offset::UTC
+        .to_datetime(at)
+        .strftime("%Y-%m-%dT%H:%M:%S+00:00")
+        .to_string()
+}
+
+/// A zoneless JSCalendar LocalDateTime, anchored at UTC so two of them
+/// compare against each other and against offset-bearing values on one
+/// consistent scale.
+fn local_datetime(value: &str) -> Option<Timestamp> {
+    let naive = civil::DateTime::strptime("%Y-%m-%dT%H:%M:%S", value).ok()?;
+    Offset::UTC.to_timestamp(naive).ok()
 }
 
 fn end_from_start_duration(start: &str, duration: &str, is_all_day: bool) -> String {
     let seconds = parse_duration_seconds(duration).unwrap_or(0);
     if (is_all_day || start.len() == 10)
-        && let Ok(date) = NaiveDate::parse_from_str(start, "%Y-%m-%d")
+        && let Ok(date) = civil::Date::strptime("%Y-%m-%d", start)
     {
         // `EventTime`'s all-day end is exclusive: end = start + duration
         // days (a P1D JSCalendar all-day event, start D, ends D+1).
         let days = seconds.div_ceil(86_400);
-        let end = date
-            .checked_add_days(chrono::Days::new(days))
+        let end = Span::new()
+            .try_days(i64::try_from(days).unwrap_or(i64::MAX))
+            .and_then(|span| date.checked_add(span))
             .unwrap_or(date);
-        return end.format("%Y-%m-%d").to_string();
+        return end.strftime("%Y-%m-%d").to_string();
     }
-    if let Ok(start) = DateTime::parse_from_rfc3339(start) {
-        return (start + chrono::Duration::seconds(i64::try_from(seconds).unwrap_or(i64::MAX)))
-            .to_rfc3339();
+    let offset = SignedDuration::from_secs(i64::try_from(seconds).unwrap_or(i64::MAX));
+    if let Ok(start) = start.parse::<Timestamp>() {
+        return shared_rfc3339(start.checked_add(offset).unwrap_or(start));
     }
     if let Some(start) = local_datetime(start) {
-        let end = start + chrono::Duration::seconds(i64::try_from(seconds).unwrap_or(i64::MAX));
-        return end.naive_local().format("%Y-%m-%dT%H:%M:%S").to_string();
+        let end = start.checked_add(offset).unwrap_or(start);
+        return Offset::UTC
+            .to_datetime(end)
+            .strftime("%Y-%m-%dT%H:%M:%S")
+            .to_string();
     }
     start.to_string()
 }

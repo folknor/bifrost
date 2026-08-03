@@ -10,7 +10,8 @@ use bifrost_types::{
     MessageAttachment, MutationTarget, ObjectId, Page, ProtocolErrorKind, ProtocolKind, Provenance,
     SearchFilter, SearchRequest, SendAs, SkippedScope, ThreadHydration, ThreadId, VacationConfig,
 };
-use chrono::TimeZone;
+use jiff::tz::Offset;
+use jiff::{Timestamp, civil};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
@@ -493,9 +494,7 @@ fn deferred_send_time_body(at: std::time::SystemTime) -> Value {
 /// `singleValueExtendedProperty` value (matches Graph's PT_SYSTIME wire
 /// shape, e.g. `2026-06-16T10:00:00Z`).
 fn graph_iso8601_utc(at: std::time::SystemTime) -> String {
-    chrono::DateTime::<chrono::Utc>::from(at)
-        .format("%Y-%m-%dT%H:%M:%SZ")
-        .to_string()
+    utc_civil(at).strftime("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
 pub(crate) async fn cancel_scheduled_send(
@@ -2322,8 +2321,7 @@ fn kql_quoted(value: &str) -> String {
 
 /// KQL date literal (`YYYY-MM-DD`) for the `received` range predicates.
 fn system_time_date(value: SystemTime) -> String {
-    let dt: chrono::DateTime<chrono::Utc> = value.into();
-    dt.format("%Y-%m-%d").to_string()
+    utc_civil(value).strftime("%Y-%m-%d").to_string()
 }
 
 fn odata_filter(filter: &SearchFilter) -> Result<String, AccountError> {
@@ -2888,22 +2886,26 @@ fn graph_datetime_to_system_time(value: &DateTimeTimeZone) -> Option<SystemTime>
 }
 
 fn parse_graph_datetime(value: &str) -> Option<SystemTime> {
-    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(value) {
-        return Some(dt.with_timezone(&chrono::Utc).into());
+    if let Ok(ts) = value.parse::<Timestamp>() {
+        return Some(ts.into());
     }
-    chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S%.f")
-        .ok()
-        .map(|dt| chrono::Utc.from_utc_datetime(&dt).into())
+    // Graph also emits zoneless date-times; those are UTC by contract.
+    let naive = civil::DateTime::strptime("%Y-%m-%dT%H:%M:%S%.f", value).ok()?;
+    Offset::UTC.to_timestamp(naive).ok().map(SystemTime::from)
+}
+
+/// A `SystemTime` as the UTC wall clock it names. Instants outside the
+/// representable range clamp to the epoch rather than failing the caller.
+fn utc_civil(value: SystemTime) -> civil::DateTime {
+    Offset::UTC.to_datetime(Timestamp::try_from(value).unwrap_or(Timestamp::UNIX_EPOCH))
 }
 
 fn system_time_rfc3339(value: SystemTime) -> String {
-    let dt: chrono::DateTime<chrono::Utc> = value.into();
-    dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    utc_civil(value).strftime("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
 fn system_time_naive_utc(value: SystemTime) -> String {
-    let dt: chrono::DateTime<chrono::Utc> = value.into();
-    dt.format("%Y-%m-%dT%H:%M:%S").to_string()
+    utc_civil(value).strftime("%Y-%m-%dT%H:%M:%S").to_string()
 }
 
 #[cfg(test)]

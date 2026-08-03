@@ -2602,7 +2602,9 @@ fn submission_address_from_compose(address: &bifrost_types::Address) -> Submissi
 /// Format an absolute instant as RFC 3339 / ISO 8601 UTC for the SMTP
 /// FUTURERELEASE `holduntil` envelope parameter.
 fn rfc3339(at: SystemTime) -> String {
-    chrono::DateTime::<chrono::Utc>::from(at).to_rfc3339()
+    jiff::Timestamp::try_from(at)
+        .map(|ts| ts.to_string())
+        .unwrap_or_default()
 }
 
 /// A scheduled JMAP send needs an envelope mailFrom (explicit `from` +

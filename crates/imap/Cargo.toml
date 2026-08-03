@@ -30,7 +30,7 @@ bifrost-carddav = { path = "../carddav" }
 bifrost-sasl = { path = "../sasl" }
 bifrost-smtp = { path = "../smtp", features = ["tokio"] }
 bytes = { workspace = true }
-chrono = { workspace = true }
+jiff = { workspace = true }
 flate2 = "1"
 futures = { workspace = true }
 getrandom = { workspace = true }

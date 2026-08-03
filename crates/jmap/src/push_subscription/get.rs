@@ -1,3 +1,5 @@
+use jiff::Timestamp;
+
 use crate::DataType;
 
 use super::{Keys, PushSubscription, PushSubscriptionId};
@@ -30,7 +32,7 @@ impl PushSubscription {
     }
 
     pub(crate) fn expires(&self) -> Option<i64> {
-        self.expires.map(|v| v.timestamp())
+        self.expires.map(Timestamp::as_second)
     }
 
     pub(crate) fn types(&self) -> Option<&[DataType]> {

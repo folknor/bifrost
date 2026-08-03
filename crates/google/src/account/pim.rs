@@ -10,7 +10,8 @@ use bifrost_types::{
     SearchRequest, SendRequest, ThreadHydration, ThreadId, VacationConfig,
 };
 use bytes::Bytes;
-use chrono::{DateTime, Datelike, Utc};
+use jiff::Timestamp;
+use jiff::tz::Offset;
 use serde_json::json;
 
 use crate::client::GmailClient;
@@ -803,7 +804,9 @@ fn container_query(id: &str) -> String {
 }
 
 fn gmail_date(time: SystemTime) -> String {
-    let dt: DateTime<Utc> = time.into();
+    let dt = Offset::UTC
+        .to_datetime(Timestamp::try_from(time).unwrap_or(Timestamp::UNIX_EPOCH))
+        .date();
     format!("{:04}/{:02}/{:02}", dt.year(), dt.month(), dt.day())
 }
 

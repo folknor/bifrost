@@ -8,7 +8,7 @@ pub(crate) mod set;
 
 use std::fmt::Display;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use crate::DataType;
@@ -45,7 +45,7 @@ pub(crate) struct PushSubscription {
 
     #[serde(rename = "expires")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) expires: Option<DateTime<Utc>>,
+    pub(super) expires: Option<Timestamp>,
 
     #[serde(rename = "types")]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -75,7 +75,7 @@ pub(crate) struct PushSubscriptionCreate {
 
     #[serde(rename = "expires")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) expires: Option<DateTime<Utc>>,
+    pub(super) expires: Option<Timestamp>,
 
     #[serde(rename = "types")]
     #[serde(skip_serializing_if = "skip_if_empty_list")]
@@ -90,7 +90,7 @@ pub(crate) struct PushSubscriptionPatch {
 
     #[serde(rename = "expires")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) expires: Option<DateTime<Utc>>,
+    pub(super) expires: Option<Timestamp>,
 
     #[serde(rename = "types")]
     #[serde(skip_serializing_if = "Field::is_omitted")]

@@ -23,7 +23,7 @@ base64 = { workspace = true }
 bifrost-net = { path = "../net" }
 bifrost-types = { path = "../types", optional = true }
 bytes = { workspace = true }
-chrono = { workspace = true }
+jiff = { workspace = true }
 futures = { workspace = true }
 http = { workspace = true, optional = true }
 native-tls = { workspace = true, optional = true }

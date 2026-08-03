@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::Serialize;
 
 use crate::core::{
@@ -24,11 +24,11 @@ pub(crate) enum Filter {
     },
     Before {
         #[serde(rename = "before")]
-        value: DateTime<Utc>,
+        value: Timestamp,
     },
     After {
         #[serde(rename = "after")]
-        value: DateTime<Utc>,
+        value: Timestamp,
     },
     MinSize {
         #[serde(rename = "minSize")]
@@ -102,11 +102,11 @@ pub(crate) enum Filter {
     },
     SentBefore {
         #[serde(rename = "sentBefore")]
-        value: DateTime<Utc>,
+        value: Timestamp,
     },
     SentAfter {
         #[serde(rename = "sentAfter")]
-        value: DateTime<Utc>,
+        value: Timestamp,
     },
     InThread {
         #[serde(rename = "inThread")]

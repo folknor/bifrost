@@ -105,9 +105,9 @@ calendar primitives.
   the two are indistinguishable on the wire. VTIMEZONE
   generation emits a single STANDARD
   block carrying the real UTC offset for the event's instant (the TZID is
-  parsed to a `chrono_tz::Tz` after Windows/Exchange-alias folding, and the
-  offset is resolved from the DTSTART wall-clock with the same
-  ambiguous-picks-earlier / gap-walks-forward `LocalResult` discipline as
+  resolved against the jiff tzdb after Windows/Exchange-alias folding, and
+  the offset is resolved from the DTSTART wall-clock with the same
+  fold-picks-earlier / gap-takes-post-gap-offset discipline as
   ratatoskr's resolver), not the old `+0000` stub. A single block is
   approximate for a recurring event crossing a DST boundary (off by the DST
   delta on the far side) but strictly correct for the master instant. An
@@ -191,7 +191,7 @@ Supported calendar primitives:
   present, ORGANIZER from the shared organizer field, and VTIMEZONE
   components for TZID-bearing start/end times. Each generated VTIMEZONE
   carries the real UTC offset for the event's instant in a single STANDARD
-  block (resolved via `chrono-tz`), not full timezone transition-rule
+  block (resolved via jiff's bundled tzdb), not full timezone transition-rule
   definitions; an unknown zone emits the bare VTIMEZONE with no offset block.
 - `event_update` - fetches the current event, applies the shared
   `EventPatch`, and writes the replacement resource with `If-Match`

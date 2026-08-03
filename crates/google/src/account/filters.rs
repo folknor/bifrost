@@ -6,7 +6,8 @@ use bifrost_types::{
     FilterDiagnostic, FilterDiagnosticSeverity, FilterRule, FilterRuleCreate, FilterValidation,
     Provider, ServerFilter, ServerFilterCreate, ServerFilterId,
 };
-use chrono::{DateTime, Datelike, Utc};
+use jiff::Timestamp;
+use jiff::tz::Offset;
 
 use crate::client::GmailClient;
 use crate::types::{
@@ -536,7 +537,9 @@ fn container_query(id: &str) -> String {
 }
 
 fn gmail_date(time: SystemTime) -> String {
-    let dt: DateTime<Utc> = time.into();
+    let dt = Offset::UTC
+        .to_datetime(Timestamp::try_from(time).unwrap_or(Timestamp::UNIX_EPOCH))
+        .date();
     format!("{:04}/{:02}/{:02}", dt.year(), dt.month(), dt.day())
 }
 

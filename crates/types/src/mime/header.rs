@@ -1,6 +1,7 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use chrono::{FixedOffset, NaiveDate, NaiveTime, TimeZone};
+use jiff::civil;
+use jiff::tz::Offset;
 
 use crate::compose::Address;
 
@@ -232,8 +233,8 @@ fn parse_date(value: &str) -> Option<SystemTime> {
     {
         words.next();
     }
-    let day: u32 = words.next()?.parse().ok()?;
-    let month = match words.next()?.to_ascii_lowercase().as_str() {
+    let day: i8 = words.next()?.parse().ok()?;
+    let month: i8 = match words.next()?.to_ascii_lowercase().as_str() {
         "jan" => 1,
         "feb" => 2,
         "mar" => 3,
@@ -248,7 +249,7 @@ fn parse_date(value: &str) -> Option<SystemTime> {
         "dec" => 12,
         _ => return None,
     };
-    let raw_year: i32 = words.next()?.parse().ok()?;
+    let raw_year: i16 = words.next()?.parse().ok()?;
     let year = if raw_year < 50 {
         raw_year + 2000
     } else if raw_year < 100 {
@@ -258,15 +259,18 @@ fn parse_date(value: &str) -> Option<SystemTime> {
     };
     let time = words.next()?;
     let zone = words.next().unwrap_or("-0000");
-    let time = NaiveTime::parse_from_str(time, "%H:%M:%S")
-        .or_else(|_| NaiveTime::parse_from_str(time, "%H:%M"))
+    let time = civil::Time::strptime("%H:%M:%S", time)
+        .or_else(|_| civil::Time::strptime("%H:%M", time))
         .ok()?;
     let offset = parse_zone(zone)?;
-    let local = NaiveDate::from_ymd_opt(year, month, day)?.and_time(time);
-    let timestamp = FixedOffset::east_opt(offset)?
-        .from_local_datetime(&local)
-        .single()?
-        .timestamp();
+    let local = civil::Date::new(year, month, day).ok()?.to_datetime(time);
+    // RFC 5322 zones are fixed offsets, so the local time is unambiguous:
+    // there is no DST gap or fold to disambiguate.
+    let timestamp = Offset::from_seconds(offset)
+        .ok()?
+        .to_timestamp(local)
+        .ok()?
+        .as_second();
     if timestamp >= 0 {
         UNIX_EPOCH.checked_add(Duration::from_secs(timestamp.unsigned_abs()))
     } else {

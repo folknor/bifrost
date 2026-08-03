@@ -23,8 +23,7 @@ bifrost-net = { path = "../net" }
 bifrost-types = { path = "../types" }
 bytes = { workspace = true }
 caldata = { workspace = true }
-chrono = { workspace = true }
-chrono-tz = "0.10.4"
+jiff = { workspace = true }
 futures = { workspace = true }
 quick-xml = "0.41.0"
 reqwest = { workspace = true, features = ["native-tls"] }

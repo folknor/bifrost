@@ -10,11 +10,11 @@ impl VacationResponse {
     }
 
     pub(crate) fn from_date(&self) -> Option<i64> {
-        self.from_date.as_ref().map(chrono::DateTime::timestamp)
+        self.from_date.map(jiff::Timestamp::as_second)
     }
 
     pub(crate) fn to_date(&self) -> Option<i64> {
-        self.to_date.as_ref().map(chrono::DateTime::timestamp)
+        self.to_date.map(jiff::Timestamp::as_second)
     }
 
     pub(crate) fn subject(&self) -> Option<&str> {
