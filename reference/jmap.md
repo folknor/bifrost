@@ -60,7 +60,7 @@ returns `Error::Method` for JMAP method-level errors.
   mandatory RFC 8620 session property, unlike the RFC 8887 WebSocket
   extension `sync/` push relies on. Wiring EventSource in as the sync-layer
   push fallback for servers without WebSocket push is tracked in
-  `plans/jmap/DEFERRED.md`.
+  `reference/jmap/DEFERRED.md`.
 - `ReqwestTransport` - default implementation with a pooled reqwest::Client.
 - `Client::with_transport(transport, session, session_url)` - crate-internal custom transport injection. The session URL is required and rejected when empty: a client built without one could never re-fetch its session, so `refresh_session` was a silent no-op against the wrong (empty) URL.
 - WebSocket remains reqwest-specific (documented).
@@ -545,7 +545,7 @@ a whole new share still waits for reopen.
   `open_raw_rfc822`, bulk mutation, and single-message PIM mutation route to
   the foreign account via the qualified object-id codec. Foreign submission is
   supported, but scheduled foreign submission is not.
-- Raw-MIME projections unsupported; only `FlagsOnly` and `Metadata` work. Sync-layer push is WebSocket-subprotocol only; against a server without RFC 8887 the engine falls back to polling. The client-level EventSource API exists but is not wired in as a push fallback (deliberate; see `plans/jmap/DEFERRED.md`).
+- Raw-MIME projections unsupported; only `FlagsOnly` and `Metadata` work. Sync-layer push is WebSocket-subprotocol only; against a server without RFC 8887 the engine falls back to polling. The client-level EventSource API exists but is not wired in as a push fallback (deliberate; see `reference/jmap/DEFERRED.md`).
 - `BlobRangeSupport::No`; `open_blob_range` fatals `Error::Unsupported` even when the handle advertises range support (no transport `Range` hook).
 - `MutationReplaySafety::None`; `IdempotencyKey` is a wire no-op (read-back guard is the only lost-update protection).
 - `bulk_move` only `MembershipScope::Mailbox`; `inventory_partitioning` only `Page { from, to }` for `Email`.

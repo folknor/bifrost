@@ -329,7 +329,7 @@ any item; some may already be obsolete.
 - **graph-S1.** `GraphClient` carries a local per-client `Semaphore`
   for request concurrency. If a per-account concurrency limiter ever
   lands in `bifrost-net` or `bifrost-sync`, delete the local one.
-  (Carried from the deleted `plans/unification.md`
+  (Carried from the deleted unification plan's
   captured-but-not-decisions block.)
 - **graph-A5b-1.** Public-folder deletion reconcile is side-table-free:
   the live-id baseline rides in the cursor (`PublicFolderCursor.live_ids`)
@@ -534,7 +534,7 @@ Surfaced while authoring `reference/error-model.md` (a read of
 ## Stage 3/4 (contacts + calendar) review
 
 Open findings from the contacts/calendar review wave, carried from the
-deleted `plans/stage-3-4-review.md`. The fix wave there closed all six
+deleted stage 3/4 review. The fix wave there closed all six
 bugs and the tractable gaps; these survive. Labels: **gap** (silent
 intent loss or pending design decision), **smell**, **nit**. The
 deliberate "accepted fidelity limits" from that doc are documented in
@@ -633,8 +633,8 @@ container projection itself.
 
 ## Cross-crate items from the bug-hunt loop (2026-07-29)
 
-Surfaced while working the per-crate bug-hunt ledgers (the since-deleted
-`plans/bugs-*.md` files) crate by crate. Each of
+Surfaced while working the per-crate bug-hunt ledgers of that wave (since
+deleted; unrelated to the current `notes/bugs-*.md`) crate by crate. Each of
 these was found from inside one crate but cannot be resolved there: the fix,
 or the decision, belongs to a shared contract or to a second crate's API.
 They are collected here rather than in the per-crate sections above so they
@@ -1062,12 +1062,12 @@ to any item in this file:
 
 ## Notes
 
-- The error-model design docs (`plans/error-model-*.md`) and the
+- The error-model design docs and the
   phase 4 audit / decisions docs were deleted at the end of phase 5.
   The contract lives in code; this file holds the residual cleanup
   tail.
-- `plans/orchestration.md`, `plans/unification.md`, and
-  `plans/stage-3-4-review.md` were deleted once their phases/stages
+- The orchestration, unification, and stage 3/4 review plans were
+  deleted once their phases/stages
   fully merged - same convention as the error-model and Phase 0 plans.
   Their "what" lives in code + `reference/*.md`; their resolved-decision
   "why" lives in git history. Open items they still carried were folded

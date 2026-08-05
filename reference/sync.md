@@ -1025,8 +1025,7 @@ toward the `Account` key rather than dropping the deadline - the
 throttle applies to at least this account, so recording the subset
 beats an unrecorded truth. `Tenant` ALWAYS degrades today: the
 error contract carries no tenant identity string, so cross-account
-tenant pausing is blocked on that types-level channel (tracked in
-`TODO.md`). Reading: the poll loop (before each drive), the
+tenant pausing is blocked on that types-level channel. Reading: the poll loop (before each drive), the
 reconciler (before each hinted scope), and the mutation campaigns
 (before each attempt) call `recovery::account_throttle_wait` - the
 longest pending wait across the account's own key and its shared
@@ -1047,7 +1046,7 @@ enrollment needs a provider identity channel the contract does not
 carry. `Mailbox` keys are recorded but deliberately excluded from
 the account-wide wait: a per-mailbox throttle must not pause the
 whole account, and the engine has no scope-to-mailbox mapping to
-pause anything narrower with (both in `TODO.md`).
+pause anything narrower with. Both remain open.
 
 Cursor envelope schema mismatches at `get_change_cursor` are
 translated through `crate::recovery::cursor_decode_failure` into an

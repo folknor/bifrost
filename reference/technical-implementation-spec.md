@@ -57,7 +57,7 @@ the same artifact.
     `AccountError` contract - ALWAYS required reading regardless of what the
     spec targets, because every `Account` method returns
     `Result<_, AccountError>` and any change is bound by it; the document the
-    spec was spawned from (the TODO source naming the item - e.g. a `TODO.md`
+    spec was spawned from (the TODO source naming the item - e.g. a todo-list
     entry); AND the `reference/<crate>.md` for every crate the spec targets -
     the single source of truth for that crate's module layout, trait surfaces,
     and invariants. A spec citing these references must direct its reviewers

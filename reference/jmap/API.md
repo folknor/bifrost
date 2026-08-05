@@ -212,5 +212,5 @@ extract, but not blocking.
 ## See also
 
 - `reference/jmap.md` - current architecture, single source of truth.
-- `plans/jmap/DEFERRED.md` - accepted micro-optimizations and the
+- `reference/jmap/DEFERRED.md` - accepted micro-optimizations and the
   one open API-cleanup item.

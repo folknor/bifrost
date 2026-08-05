@@ -154,4 +154,4 @@ PLAIN-over-TLS. The selection function lives per-protocol (IMAP
 - GSSAPI / Kerberos. Different stack, no demand.
 - A typed public auth-outcome surface (which mechanism + binding were used, or a
   typed failure reason) is not built; the protocol crates map into their
-  existing error types. Tracked in `TODO.md`.
+  existing error types. Not scheduled.

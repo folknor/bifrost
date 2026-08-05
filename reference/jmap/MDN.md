@@ -75,7 +75,7 @@ Include `Disposition-Notification-To` header in outgoing email pointing to the a
 
 ## Relevance to Ratatoskr
 
-- "Read receipts (outgoing)" is already in TODO.md - this is the JMAP-native implementation
+- "Read receipts (outgoing)" is already a tracked todo item - this is the JMAP-native implementation
 - Send side: add `Disposition-Notification-To` header in compose when user enables read receipt
 - Receive side: detect MDN messages, offer "Send read receipt?" prompt
 - Parse side: show "Read by X at Y" status on sent messages that received MDNs

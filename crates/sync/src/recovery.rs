@@ -252,7 +252,7 @@ impl ThrottleBucket {
     /// key it is enrolled in. `Mailbox` keys are deliberately excluded -
     /// a per-mailbox throttle must not pause the whole account, and the
     /// engine has no scope-to-mailbox mapping to pause anything
-    /// narrower with (see `TODO.md`).
+    /// narrower with.
     #[must_use]
     pub fn wait_for_account(&self, account: &AccountId, now: SystemTime) -> Option<Duration> {
         let own = self.wait_for(&ThrottleKey::Account(account.clone()), now);
@@ -297,7 +297,7 @@ impl ThrottleBucket {
 /// - `Tenant` ALWAYS degrades to `Account` today: the error contract
 ///   carries no tenant identity, so there is nothing to key a
 ///   cross-account tenant bucket on. Cross-account tenant pausing is
-///   blocked on that types-level identity channel (see `TODO.md`).
+///   blocked on that types-level identity channel.
 /// - `Provider` uses `AccountError::provider()`, degrading to
 ///   `Account` when absent.
 #[must_use]
@@ -571,7 +571,7 @@ mod tests {
         // account's own error stream names the identity - so the very
         // first provider-wide deadline is invisible to a sibling that
         // has never failed. Attach-time enrollment needs a provider
-        // identity channel that does not exist yet (see `TODO.md`).
+        // identity channel that does not exist yet.
         let mut bucket = ThrottleBucket::new();
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
         let a = AccountId("acc-1".into());

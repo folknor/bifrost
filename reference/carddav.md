@@ -138,7 +138,7 @@ Supported contact primitives:
   match-all behavior. This is the *personal* corpus only;
   `directory_search` (org directory / GAL) returns
   `Unsupported(DirectorySearch)` with the capability flag `false`. An RFC
-  6352 directory-gateway leg is a named follow-up (see `TODO.md`): the
+  6352 directory-gateway leg is a named follow-up: the
   port evidence has no CardDAV directory impl, and gateway discovery is a
   substantial provider-specific unknown.
 

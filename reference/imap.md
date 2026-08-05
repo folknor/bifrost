@@ -298,7 +298,7 @@ Containers use native mailbox paths as primitive/provenance ids. `containers_lis
 
 ### Blob openers
 
-`AccountCapabilities::blob_range` is `BlobRangeSupport::No` and `open_blob` / `open_blob_range` return `Unsupported`. IMAP can fetch a `BODY[]` section by range, but nothing in inventory or hydration mints a `BlobHandle` for a MIME part, so there is no handle a caller could hand back to an opener. `blob.rs` therefore serves only `open_raw_rfc822`, which streams the whole message via `BODY.PEEK[]`. Decoded attachment bytes nevertheless reach `FullWithBlobs` inline; that is not a resumable blob lane. Building the real capability (BODYSTRUCTURE traversal, a stable part-handle encoding, a consumer-facing projection that attaches handles) is filed as `TODO.md` imap-G1.
+`AccountCapabilities::blob_range` is `BlobRangeSupport::No` and `open_blob` / `open_blob_range` return `Unsupported`. IMAP can fetch a `BODY[]` section by range, but nothing in inventory or hydration mints a `BlobHandle` for a MIME part, so there is no handle a caller could hand back to an opener. `blob.rs` therefore serves only `open_raw_rfc822`, which streams the whole message via `BODY.PEEK[]`. Decoded attachment bytes nevertheless reach `FullWithBlobs` inline; that is not a resumable blob lane. Building the real capability (BODYSTRUCTURE traversal, a stable part-handle encoding, a consumer-facing projection that attaches handles) is filed as imap-G1.
 
 ### Bandwidth metering
 

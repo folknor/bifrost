@@ -266,8 +266,8 @@ still occupy the event cursor. Both change lanes key on the PROPFIND href
 listing, which does not carry the component type, so a task resource is
 emitted as a created/updated event change whose hydration yields no events
 (the `.ics`-without-VEVENT rule above). Filtering it out needs either a
-component-type PROPFIND or a first-fetch classification cache (tracked in
-`TODO.md` as caldav-F1).
+component-type PROPFIND or a first-fetch classification cache (tracked as
+caldav-F1).
 
 All mail, contact, filter, blob, push, and settings methods return
 `AccountErrorKind::Unsupported` stamped with `Protocol::CalDav`.

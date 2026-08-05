@@ -1,6 +1,6 @@
 # Ratatoskr -> bifrost port map
 
-Companion to `plans/ratatoskr-adoption.md`. That plan lays the bricks; this doc
+Companion to `notes/ratatoskr-adoption.md`. That plan lays the bricks; this doc
 records, per brick, what already exists in the cloned ratatoskr tree
 (`research/ratatoskr/`) and how it ports. It is the evidence base for sizing and
 sequencing each brick's spec. The adoption plan stays the source-of-record; this
