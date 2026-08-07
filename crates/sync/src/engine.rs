@@ -59,10 +59,23 @@ pub struct SyncEngine {
     /// Per-account ack senders; consumers call `ack_checkpoint` to
     /// durably persist a cursor for a specific scope.
     ack_senders: DashMap<AccountId, mpsc::Sender<AckRequest>>,
-    /// Per-account in-flight attach guard. Prevents two concurrent
-    /// `attach` calls for the same account from spawning duplicate
-    /// workers between the existence check and the final insert.
-    attaching: Arc<AsyncMutex<std::collections::HashSet<AccountId>>>,
+    /// Per-account in-flight lifecycle guard, held for the whole of
+    /// `attach` AND the whole of `detach`.
+    ///
+    /// Attach needs it because the existence check, `factory.open`, and
+    /// the final slot insert span several awaits, so two concurrent
+    /// attaches would otherwise both spawn workers. Detach needs it for
+    /// the mirror-image reason: it removes the slot first but does its
+    /// registry cleanup last, after awaiting workers (up to
+    /// `detach_timeout`) and `Account::close()`. An attach landing in
+    /// that window sees no slot and no in-flight entry, installs fresh
+    /// registrations, and then the still-running detach unregisters the
+    /// NEW incarnation from the invalidation sink, the budget gate, the
+    /// backfill registry, the throttle memberships, and the bandwidth
+    /// meter. The result is an account that looks attached but silently
+    /// drops every out-of-process push. Serializing the two is what
+    /// makes the teardown's identity assumption true.
+    lifecycle_inflight: Arc<AsyncMutex<std::collections::HashSet<AccountId>>>,
     /// Engine-wide throttle bucket, shared by every attached account
     /// so `Tenant` / `Provider` deadlines recorded by one account can
     /// pause its siblings. Recovery paths record; the per-scope poll
@@ -146,7 +159,7 @@ impl SyncEngineBuilder {
             root_cancel: CancellationToken::new(),
             bandwidth_meter: self.bandwidth_meter,
             ack_senders: DashMap::new(),
-            attaching: Arc::new(AsyncMutex::new(std::collections::HashSet::new())),
+            lifecycle_inflight: Arc::new(AsyncMutex::new(std::collections::HashSet::new())),
             throttles: Arc::new(std::sync::Mutex::new(crate::recovery::ThrottleBucket::new())),
         })
     }
@@ -207,12 +220,16 @@ impl SyncEngine {
         account_id: AccountId,
         factory: Arc<dyn AccountFactory>,
     ) -> Result<SyncControl, Error> {
-        // Take a per-account in-flight guard to close the duplicate-
+        // Take the per-account lifecycle guard to close the duplicate-
         // attach race (existence check + factory.open + spawn workers
         // is a multi-await window between the early bail and the
-        // final insert).
+        // final insert). A detach still tearing this id down also holds
+        // the guard, so this reports `AccountAlreadyAttached` - which is
+        // literally true, the incarnation is attached and draining -
+        // rather than installing a slot the detach would then strip of
+        // its sink, budget, and throttle registrations.
         {
-            let mut guard = self.attaching.lock().await;
+            let mut guard = self.lifecycle_inflight.lock().await;
             if guard.contains(&account_id) || self.accounts.contains_key(&account_id) {
                 return Err(Error::AccountAlreadyAttached(account_id));
             }
@@ -221,7 +238,7 @@ impl SyncEngine {
         let result = self.attach_inner(account_id.clone(), factory).await;
         // Always release the in-flight guard, success or failure.
         {
-            let mut guard = self.attaching.lock().await;
+            let mut guard = self.lifecycle_inflight.lock().await;
             guard.remove(&account_id);
         }
         result
@@ -855,6 +872,32 @@ impl SyncEngine {
     /// that wants events to queue while it is down is a legitimate
     /// pattern that unconditional teardown would break silently.
     pub async fn detach(&self, account_id: &AccountId) -> Result<(), Error> {
+        // Claim the lifecycle guard and remove the slot under the same
+        // lock, so an `attach` cannot slip into the teardown window
+        // below and have its brand-new registrations unregistered by
+        // this call's tail. A concurrent attach or detach already owns
+        // the transition: for an in-flight attach the slot is not
+        // installed yet, and for an in-flight detach it is already
+        // gone, so `AccountNotAttached` is the honest answer either way.
+        {
+            let mut guard = self.lifecycle_inflight.lock().await;
+            if guard.contains(account_id) || !self.accounts.contains_key(account_id) {
+                return Err(Error::AccountNotAttached(account_id.clone()));
+            }
+            guard.insert(account_id.clone());
+        }
+        let result = self.detach_inner(account_id).await;
+        {
+            let mut guard = self.lifecycle_inflight.lock().await;
+            guard.remove(account_id);
+        }
+        result
+    }
+
+    /// Teardown body. Runs under the lifecycle guard taken by
+    /// [`Self::detach`]; every registry cleanup at the tail assumes no
+    /// other incarnation of this id can exist while it runs.
+    async fn detach_inner(&self, account_id: &AccountId) -> Result<(), Error> {
         let Some((_, slot)) = self.accounts.remove(account_id) else {
             return Err(Error::AccountNotAttached(account_id.clone()));
         };

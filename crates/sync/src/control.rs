@@ -326,6 +326,28 @@ fn pending_key(checkpoint: &Checkpoint) -> Option<(u8, CursorScope)> {
     }
 }
 
+/// Restores the boundary request `checkpoint_now` displaced, whichever
+/// way the wait ends: the checkpoint landing, the watch channel
+/// closing, or the caller dropping the future mid-await.
+///
+/// `previous` is `None` only when `request_checkpoint` refused to
+/// install over a `Stop`, in which case there is nothing to restore.
+/// The restore is still conditional on the boundary reading
+/// `CheckpointNow`, so an interleaved pause, stop, or resume wins.
+struct CheckpointLatchGuard<'a> {
+    boundary: &'a Boundary,
+    previous: Option<BoundaryRequest>,
+}
+
+impl Drop for CheckpointLatchGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(previous) = self.previous {
+            self.boundary
+                .restore_if_current(BoundaryRequest::CheckpointNow, previous);
+        }
+    }
+}
+
 pub(crate) struct SyncActivityGuard {
     control: SyncControl,
 }
@@ -364,17 +386,20 @@ impl Control for SyncControl {
             let gen_id = self.inner.generation.fetch_add(1, Ordering::SeqCst) + 1;
             // Read-and-install is one atomic step, so a `Pause` landing
             // between the two is never displaced by this request.
-            let previous = self.inner.boundary.request_checkpoint();
+            // The guard restores on EVERY exit from the wait, not just
+            // the success one. A `?` here instead would leave
+            // `CheckpointNow` latched whenever the watch channel closed
+            // under the waiter, and dropping the future would do the
+            // same - and a latched `CheckpointNow` reads as not-running
+            // to `wait_until_running`, so backfill, deferred inventory,
+            // and `restart_account` all park until some unrelated write
+            // moves the boundary.
+            let _latch = CheckpointLatchGuard {
+                boundary: &self.inner.boundary,
+                previous: self.inner.boundary.request_checkpoint(),
+            };
             self.publish_quiescence(gen_id);
-            let cp = self.wait_for_checkpoint_at_or_after(gen_id).await?;
-            // Restore only if no concurrent control or engine action
-            // changed the boundary while this request was waiting.
-            if let Some(previous) = previous {
-                self.inner
-                    .boundary
-                    .restore_if_current(BoundaryRequest::CheckpointNow, previous);
-            }
-            Ok(cp)
+            self.wait_for_checkpoint_at_or_after(gen_id).await
         })
     }
 
@@ -560,6 +585,34 @@ mod tests {
         control.retire_checkpoint(&undelivered);
 
         assert_eq!(control.pause().await.expect("pause"), None);
+    }
+
+    /// A `checkpoint_now` that does not run to completion must still
+    /// unlatch. `wait_until_running` reads `CheckpointNow` as
+    /// not-running, so a leaked latch parks backfill, deferred
+    /// inventory, and `restart_account` until some unrelated write
+    /// moves the boundary - the account goes quiet with nothing in the
+    /// logs to say why.
+    #[tokio::test(start_paused = true)]
+    async fn an_abandoned_checkpoint_request_unlatches_the_boundary() {
+        let control = control();
+        let _activity = control.begin_activity().expect("running activity");
+
+        let abandoned = tokio::time::timeout(
+            std::time::Duration::from_millis(10),
+            Control::checkpoint_now(&control),
+        )
+        .await;
+        assert!(
+            abandoned.is_err(),
+            "the wait cannot finish while activity is outstanding"
+        );
+
+        assert_eq!(control.inner.boundary.snapshot(), BoundaryRequest::Run);
+        assert!(
+            control.wait_until_running(&CancellationToken::new()).await,
+            "a dropped checkpoint request must not park the engine's workers"
+        );
     }
 
     #[tokio::test]

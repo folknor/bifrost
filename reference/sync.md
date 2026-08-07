@@ -65,12 +65,14 @@ engine.shutdown().await?; // explicit cleanup; preferred over Drop
 ```
 
 `attach`:
-1. Take the per-account in-flight guard
-   (`AsyncMutex<HashSet<AccountId>>` on `engine.attaching`) and
-   reject duplicate / racing attaches with
+1. Take the per-account lifecycle guard
+   (`AsyncMutex<HashSet<AccountId>>` on `engine.lifecycle_inflight`)
+   and reject duplicate / racing attaches with
    `Error::AccountAlreadyAttached`. The guard is released on both
    success and failure paths so a failed `attach_inner` does not
-   strand the slot.
+   strand the slot. `detach` holds the same guard for its whole
+   teardown (see below), so an attach racing a detach of the same id is
+   refused rather than admitted into that window.
 2. `factory.open(account_id).await` -> `OpenedAccount { account,
    skipped_scopes }`. The engine threads its own `AccountId` through
    so the protocol crate can register against `bifrost-net` /
@@ -124,6 +126,22 @@ shutdown token, calls `Account::close()`, awaits all workers
 with `EngineConfig::detach_timeout` (default 5s) and aborts
 stragglers, removes the slot, unregisters the sink and ack
 sender.
+
+The whole teardown runs under the same `lifecycle_inflight` guard
+`attach` takes, claimed together with the slot removal under one lock
+acquisition. The slot leaves `engine.accounts` at the top while the
+registry cleanup (invalidation sink, budget gate, backfill registry,
+throttle memberships, bandwidth meter) happens at the very bottom,
+after up to `detach_timeout` of worker awaits plus `Account::close()`.
+Without the guard an attach landing in that window saw no slot, no
+in-flight entry, succeeded, and then had its brand-new registrations
+unregistered by the detach's tail - leaving an account that reported
+itself attached while silently dropping every out-of-process push
+(`push` returns early on a missing sender), with nothing logged. A
+racing attach now gets `AccountAlreadyAttached`, which is literally
+true: the incarnation is attached and draining. A racing detach, and an
+attach still in flight, both yield `AccountNotAttached`. Pinned by
+`tests/attach_schema_recovery.rs::attach_cannot_land_inside_an_in_flight_detach`.
 
 `shutdown(self)` enumerates attached accounts, calls `detach`
 for each (logging but not failing on per-account errors), then
@@ -296,7 +314,16 @@ successful `Done`.
 
 Per-scope cancellation tokens live in
 `Multiplexer::scope_tokens` so a `ScopeLifecycle::Deleted` stops
-the matching poll task without disturbing siblings.
+the matching poll task without disturbing siblings. Each entry is a
+`ScopeToken { generation, token }` and an exiting task retires its
+registration by generation match (`retire_scope_token`), never by key.
+Removing by key lets a departing task evict a successor's entry: task A
+exits while its scope is momentarily absent from the registry
+(mid-`restart_scope`), the 1s scan spawns B under the same key, A's
+cleanup deletes B's entry, and the next scan - seeing no token - spawns
+C. B and C then poll one scope forever, which is both doubled wire
+traffic and two concurrent producers on a lane+scope that the
+checkpoint supersession rule in `control.rs` assumes has exactly one.
 
 Output is a `broadcast::Sender<MultiplexerEvent>`. The event
 carries `{ scope, event: Arc<SyncEvent<Change>>, checkpoint }`.
@@ -786,9 +813,17 @@ one of them:
   `Result`. Leaving it pending instead would wedge every later
   `pause` / `checkpoint_now` on the account for the process lifetime.
 - Supersession: a newer broadcast on the same lane + scope replaces
-  the older one. Broadcasts within a lane+scope come from a single
-  sequential task, so acking the newest proves the earlier ones are
-  durable too. This bounds the set by the account's scope count
+  the older one. This rests on a single sequential producer per
+  lane+scope, so that acking the newest proves the earlier ones are
+  durable too. Poll-vs-poll is enforced (`ScopeToken` generation
+  matching, above). Poll-vs-push-reconcile is NOT: the push reconciler
+  and the scope's poll task both call `drive_changes_stream` for the
+  same `CursorScope` with no per-scope lease between them, so an
+  invalidation arriving mid-drive gives two producers on one key and
+  the second `expect_checkpoint` evicts the first's still-outstanding
+  entry. `pause()` / `checkpoint_now()` can then report a safe boundary
+  while a broadcast batch is genuinely unacked. Open; the fix is a
+  per-scope lease or a producer-keyed pending set. This bounds the set by the account's scope count
   instead of by how many batches a consumer left unacked, and lets a
   consumer that acks coarsely (persist N batches, ack the last
   checkpoint) still reach a boundary. `record_checkpoint` removes by
@@ -817,7 +852,13 @@ writes:
   restores that value only if the boundary still reads `CheckpointNow`
   (`Boundary::restore_if_current`). An interleaved pause, stop, or
   resume wins in both halves - neither the install nor the restore can
-  clobber it.
+  clobber it. The restore runs from a drop guard, so it fires on every
+  exit from the wait: the checkpoint landing, the watch channel closing
+  under the waiter, and the caller dropping the future mid-await. A
+  latch left installed is not cosmetic - `wait_until_running` reads
+  `CheckpointNow` as not-running, so backfill, deferred inventory, and
+  `restart_account` would park until some unrelated write moved the
+  boundary.
 - `Stop` is terminal for consumer-driven writes
   (`Boundary::set_unless_stopped`, used by `pause` / `resume`, and
   refused outright by `request_checkpoint`). A pause written over a
@@ -830,11 +871,17 @@ writes:
 `OpaqueChangeState` carries `protocol`, `envelope_version`, and
 `bytes`. `decode_envelope` returns:
 
-- `Error::SchemaIncompatible` if `envelope_version <
-  MIN_MIGRATABLE`.
-- `Error::Other("cursor envelope: version N exceeds engine
-  version M")` if `envelope_version > ENGINE_VERSION`.
+- `Error::SchemaIncompatible` for a header version outside
+  `[MIN_MIGRATABLE, ENGINE_VERSION]`, in either direction.
 - Otherwise decoded `Checkpoint::Change` / `Checkpoint::Backfill`.
+
+Both out-of-range directions are the same classification on purpose:
+both describe a durable row this revision cannot read, and
+`SchemaIncompatible` is the only signal the two healing paths key on.
+An over-version row classified as `Error::Other` instead would
+propagate as an ordinary establish failure - three burnt reopen
+attempts, a broadcast `Terminated`, and the undecodable row still on
+disk for the next attach to trip over identically.
 
 Encoding an `ObjectType` or `ProtocolKind` variant the codec does not
 know panics, the same rule `encode_scope` already applied to unknown
@@ -863,7 +910,20 @@ attach would fail identically.
 variants.)
 
 `ChangeCursor` carries its own `envelope_version` separately from
-`OpaqueChangeState.envelope_version` (outer vs inner versioning).
+`OpaqueChangeState.envelope_version` (outer vs inner versioning). The
+outer one is engine-owned and `pack_envelope` stamps `ENGINE_VERSION`
+into the header rather than reading the field off the checkpoint. The
+field is authored by whichever protocol crate minted the cursor, and
+IMAP, CalDAV, CardDAV, and Gmail all fill it from the same constant
+that versions their own opaque payload; trusting it means the first
+protocol-side bump - which is exactly what that constant is for -
+stamps a header the engine then refuses to read, turning a payload
+format change into permanently unreadable rows for every account on
+that protocol. JMAP and Graph keep the two apart explicitly
+(`OUTER_CURSOR_ENVELOPE_VERSION` vs `PAYLOAD_ENVELOPE_VERSION`). The
+inner version rides inside the payload, where a bump invalidates only
+that protocol's own bytes. Pinned by
+`tests/envelope_roundtrip.rs::a_protocol_authored_outer_version_does_not_reach_the_header`.
 
 ## Checkpoint store
 

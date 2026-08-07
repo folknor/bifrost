@@ -18,6 +18,7 @@ pub mod poll;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use arc_swap::ArcSwap;
@@ -130,6 +131,43 @@ fn lifecycle_termination(error: &AccountError) -> LifecycleTermination {
     }
 }
 
+/// A per-scope poll task's cancellation token, tagged with the
+/// identity of the task that owns it.
+///
+/// The generation is what makes cleanup safe. A task removing its
+/// entry by key alone can evict a SUCCESSOR's token: task A exits
+/// naturally while its scope is momentarily absent from the registry
+/// (mid-`restart_scope`), the 1s scan in `Multiplexer::run` sees a
+/// re-established cursor with no live token and spawns task B, and
+/// A's cleanup then deletes B's entry. The next scan sees no token and
+/// spawns C, leaving B and C polling the same scope forever - doubled
+/// wire traffic, doubled broadcasts, and two concurrent producers on
+/// one lane+scope, which is exactly what `SyncControl`'s checkpoint
+/// supersession assumes cannot happen.
+#[derive(Debug, Clone)]
+pub struct ScopeToken {
+    generation: u64,
+    token: CancellationToken,
+}
+
+impl ScopeToken {
+    fn is_cancelled(&self) -> bool {
+        self.token.is_cancelled()
+    }
+
+    fn cancel(&self) {
+        self.token.cancel();
+    }
+}
+
+/// Per-scope poll tokens, keyed by the scope the task polls.
+pub type ScopeTokens = Arc<StdMutex<HashMap<CursorScope, ScopeToken>>>;
+
+/// Monotonic source of `ScopeToken::generation`. Process-wide rather
+/// than per-multiplexer: the value only has to be unique, and threading
+/// another `Arc` through the poll-spawn argument list buys nothing.
+static SCOPE_TOKEN_GENERATION: AtomicU64 = AtomicU64::new(0);
+
 /// Multiplexer task state. Constructed in `engine::attach` and run on
 /// a `tokio::spawn`.
 pub struct Multiplexer {
@@ -146,7 +184,7 @@ pub struct Multiplexer {
     pub ack_tx: Option<mpsc::Sender<AckRequest>>,
     /// Per-scope cancellation tokens keyed by membership-id so
     /// `ScopeLifecycle::Deleted` can stop the matching poll task.
-    pub scope_tokens: Arc<StdMutex<HashMap<CursorScope, CancellationToken>>>,
+    pub scope_tokens: ScopeTokens,
     /// Engine-wide throttle bucket. Poll tasks consult it before each
     /// drive so a tenant- or account-wide `Retry-After` recorded by one
     /// scope (or a sibling account) pauses the others; the Retry arm
@@ -456,7 +494,7 @@ impl Multiplexer {
 
         // Cancel every tracked scope token so per-scope polls exit
         // cleanly. Tokens are dropped as part of the map clear.
-        let drained: Vec<CancellationToken> = {
+        let drained: Vec<ScopeToken> = {
             let mut g = scope_tokens.lock().expect("poisoned");
             g.drain().map(|(_, t)| t).collect()
         };
@@ -512,18 +550,21 @@ fn spawn_and_track_scope_poll(
     shutdown: CancellationToken,
     reopen_tx: mpsc::Sender<ReopenRequest>,
     ack_tx: Option<mpsc::Sender<AckRequest>>,
-    scope_tokens: Arc<StdMutex<HashMap<CursorScope, CancellationToken>>>,
+    scope_tokens: ScopeTokens,
     throttles: Arc<StdMutex<crate::recovery::ThrottleBucket>>,
     scope: CursorScope,
 ) {
     let scope_cancel = shutdown.child_token();
-    scope_tokens
-        .lock()
-        .expect("poisoned")
-        .insert(scope.clone(), scope_cancel.clone());
+    let generation = SCOPE_TOKEN_GENERATION.fetch_add(1, Ordering::Relaxed);
+    scope_tokens.lock().expect("poisoned").insert(
+        scope.clone(),
+        ScopeToken {
+            generation,
+            token: scope_cancel.clone(),
+        },
+    );
     let cleanup_tokens = Arc::clone(&scope_tokens);
     let cleanup_scope = scope.clone();
-    let cleanup_cancel = scope_cancel.clone();
     tokio::spawn(async move {
         spawn_scope_poll_inner(
             account_id,
@@ -541,13 +582,23 @@ fn spawn_and_track_scope_poll(
             scope,
         )
         .await;
-        let mut g = cleanup_tokens.lock().expect("poisoned");
-        let should_remove = !cleanup_cancel.is_cancelled()
-            || matches!(g.get(&cleanup_scope), Some(token) if token.is_cancelled());
-        if should_remove {
-            g.remove(&cleanup_scope);
-        }
+        retire_scope_token(&cleanup_tokens, &cleanup_scope, generation);
     });
+}
+
+/// Drop an exiting poll task's registration, by identity.
+///
+/// Removing by key alone is what produces the duplicate-poll
+/// interleaving described on [`ScopeToken`]: the entry under this scope
+/// may already belong to a successor spawned by the 1s scan while this
+/// task was on its way out, and evicting it leaves that successor
+/// untracked, so the next scan spawns a second live poll for the same
+/// scope.
+fn retire_scope_token(tokens: &ScopeTokens, scope: &CursorScope, generation: u64) {
+    let mut g = tokens.lock().expect("poisoned");
+    if matches!(g.get(scope), Some(entry) if entry.generation == generation) {
+        g.remove(scope);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -562,7 +613,7 @@ fn spawn_missing_scope_polls(
     shutdown: CancellationToken,
     reopen_tx: mpsc::Sender<ReopenRequest>,
     ack_tx: Option<mpsc::Sender<AckRequest>>,
-    scope_tokens: Arc<StdMutex<HashMap<CursorScope, CancellationToken>>>,
+    scope_tokens: ScopeTokens,
     throttles: Arc<StdMutex<crate::recovery::ThrottleBucket>>,
 ) {
     for scope in cursors.all_scopes() {
@@ -941,6 +992,86 @@ mod tests {
 
     fn ms(n: u64) -> Duration {
         Duration::from_millis(n)
+    }
+
+    fn scope_tokens() -> ScopeTokens {
+        Arc::new(StdMutex::new(HashMap::new()))
+    }
+
+    fn track(tokens: &ScopeTokens, scope: &CursorScope) -> u64 {
+        let generation = SCOPE_TOKEN_GENERATION.fetch_add(1, Ordering::Relaxed);
+        tokens.lock().expect("poisoned").insert(
+            scope.clone(),
+            ScopeToken {
+                generation,
+                token: CancellationToken::new(),
+            },
+        );
+        generation
+    }
+
+    /// The ordinary case: a task that is still the registered owner
+    /// clears its own entry, so the 1s scan can respawn the scope.
+    #[test]
+    fn an_exiting_poll_task_retires_its_own_token() {
+        let tokens = scope_tokens();
+        let scope = CursorScope::Account;
+        let generation = track(&tokens, &scope);
+
+        retire_scope_token(&tokens, &scope, generation);
+
+        assert!(tokens.lock().expect("poisoned").is_empty());
+    }
+
+    /// The interleaving that produced duplicate poll tasks: task A
+    /// exits while its scope is momentarily absent from the cursor
+    /// registry, the scan spawns B under the same key, and A's cleanup
+    /// then lands. Removing by key would evict B, leaving it untracked
+    /// and the next scan free to spawn a third live poll for one
+    /// scope - two concurrent producers on a lane+scope the checkpoint
+    /// supersession rule assumes has exactly one.
+    #[test]
+    fn an_exiting_poll_task_does_not_retire_its_successors_token() {
+        let tokens = scope_tokens();
+        let scope = CursorScope::Account;
+        let departing = track(&tokens, &scope);
+        let successor = track(&tokens, &scope);
+        assert_ne!(departing, successor);
+
+        retire_scope_token(&tokens, &scope, departing);
+
+        let guard = tokens.lock().expect("poisoned");
+        let entry = guard.get(&scope).expect("the successor stays tracked");
+        assert_eq!(entry.generation, successor);
+    }
+
+    /// A cancelled entry left behind by a `ScopeLifecycle::Deleted` or
+    /// a `restart_scope` is still the successor's to own; the departing
+    /// task must not remove it on the strength of the cancel flag
+    /// alone.
+    #[test]
+    fn retirement_ignores_the_cancellation_flag() {
+        let tokens = scope_tokens();
+        let scope = CursorScope::Folder(bifrost_types::FolderId("Inbox".into()));
+        let departing = track(&tokens, &scope);
+        let successor = track(&tokens, &scope);
+        tokens
+            .lock()
+            .expect("poisoned")
+            .get(&scope)
+            .expect("successor")
+            .cancel();
+
+        retire_scope_token(&tokens, &scope, departing);
+
+        let guard = tokens.lock().expect("poisoned");
+        assert_eq!(
+            guard
+                .get(&scope)
+                .expect("successor still tracked")
+                .generation,
+            successor
+        );
     }
 
     #[test]

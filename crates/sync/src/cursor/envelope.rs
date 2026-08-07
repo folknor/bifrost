@@ -99,16 +99,31 @@ pub fn encode_envelope(checkpoint: &Checkpoint) -> Vec<u8> {
 fn encode_change(c: &ChangeCursor) -> Vec<u8> {
     let scope = encode_scope(&c.scope);
     let payload = encode_change_payload(c);
-    pack_envelope(c.envelope_version, EnvelopeKind::Change, &scope, &payload)
+    pack_envelope(EnvelopeKind::Change, &scope, &payload)
 }
 
 fn encode_backfill(b: &BackfillCheckpoint) -> Vec<u8> {
     let scope = encode_scope(&b.scope);
     let payload = encode_backfill_payload(b);
-    pack_envelope(b.envelope_version, EnvelopeKind::Backfill, &scope, &payload)
+    pack_envelope(EnvelopeKind::Backfill, &scope, &payload)
 }
 
-fn pack_envelope(version: u32, kind: EnvelopeKind, scope: &[u8], payload: &[u8]) -> Vec<u8> {
+/// The header version is always `ENGINE_VERSION`, never the
+/// `envelope_version` field carried on the in-memory checkpoint.
+///
+/// That field is the OUTER version and belongs to this codec, but the
+/// value reaching us was authored by whichever protocol crate minted
+/// the cursor, and several of them fill it from the same constant they
+/// use to version their own opaque payload (`ENVELOPE_VERSION` in
+/// `crates/imap/src/account/envelope.rs`, and the CalDAV / CardDAV /
+/// Gmail equivalents). Trusting it means the first protocol-side bump
+/// stamps a header this engine then refuses to read, poisoning every
+/// persisted row for that protocol. The engine stamps its own layout
+/// version; the protocol's payload version rides in
+/// `OpaqueChangeState::envelope_version` inside the payload, where a
+/// bump only invalidates that protocol's own bytes.
+fn pack_envelope(kind: EnvelopeKind, scope: &[u8], payload: &[u8]) -> Vec<u8> {
+    let version = ENGINE_VERSION;
     let mut out = Vec::with_capacity(13 + scope.len() + payload.len());
     out.push(MAGIC);
     out.extend_from_slice(&[0u8, 0, 0]);
@@ -131,18 +146,23 @@ fn pack_envelope(version: u32, kind: EnvelopeKind, scope: &[u8], payload: &[u8])
 ///
 /// Errors:
 /// - `Error::Other` for malformed bytes (missing magic, truncated
-///   header, version > `ENGINE_VERSION`).
-/// - `Error::SchemaIncompatible` if version < `MIN_MIGRATABLE`.
+///   header).
+/// - `Error::SchemaIncompatible` for a version outside
+///   `[MIN_MIGRATABLE, ENGINE_VERSION]`.
+///
+/// Both out-of-range directions are `SchemaIncompatible` because both
+/// describe the same situation: a durable row this revision cannot
+/// read. That is the only classification the healing paths key on -
+/// `establish_one` deletes the row and re-establishes the scope,
+/// `run_establish` raises `Engine(SchemaIncompatible)` for the
+/// account-wide schema-clear loop. An `Error::Other` here instead would
+/// propagate as an ordinary establish failure, burn the reopen budget,
+/// broadcast `Terminated`, and leave the unreadable row on disk for
+/// every subsequent attach to trip over identically.
 pub fn decode_envelope(bytes: &[u8]) -> Result<Checkpoint, Error> {
     let env = parse_envelope(bytes)?;
-    if env.version < MIN_MIGRATABLE {
+    if env.version < MIN_MIGRATABLE || env.version > ENGINE_VERSION {
         return Err(Error::SchemaIncompatible);
-    }
-    if env.version > ENGINE_VERSION {
-        return Err(Error::Other(format!(
-            "cursor envelope: version {} exceeds engine version {}",
-            env.version, ENGINE_VERSION
-        )));
     }
     let scope = decode_scope(&env.scope_repr)?;
     match env.kind {

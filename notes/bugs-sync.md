@@ -4,6 +4,11 @@ Hunter: Claude Opus, single pass, 2026-08-05. Scope: `crates/sync/` (engine, con
 multiplexer, backfill, push, mutation, cursor, recovery, scheduler, types). Findings are
 unverified work material.
 
+2026-08-07: four findings verified against the code and fixed, each with a regression test -
+the cursor envelope outer version, the detach/re-attach teardown race, the scope-token cleanup
+identity bug, and the latched `CheckpointNow`. Their sections are removed below; the behaviour
+now lives in `reference/sync.md`. Everything still listed is unverified.
+
 ## Two producers drive the same scope concurrently, falsifying the checkpoint supersession invariant
 
 `crates/sync/src/multiplexer/mod.rs::spawn_scope_poll_inner` and
@@ -29,67 +34,6 @@ Consequences, in increasing order of seriousness:
 Either serialize per scope (a per-scope async mutex in `scope_tokens`, so push reconcile and poll
 take turns), or make the pending set producer-keyed. Serializing is also what makes the
 cursor-clobber go away.
-
-## detach racing a re-attach of the same id tears down the new incarnation
-
-`engine.rs::detach` removes the slot from `self.accounts` at the very top, but does its registry
-cleanup at the very bottom, after awaiting workers (up to `detach_timeout`, 5s) and awaiting
-`Account::close()`. `attach`'s duplicate guard only checks `attaching` and
-`accounts.contains_key`, both of which are already clear. So an `attach` that lands in that
-window succeeds and installs new registrations, and then the still-running `detach` executes:
-
-```
-self.sink.unregister(account_id);
-self.scheduler.budget().forget(account_id);
-self.backfill_registry.forget_account(account_id);
-throttles.forget_account(account_id);
-meter.forget_account(account_id);
-```
-
-against the new incarnation. Result: a freshly attached account whose `InvalidationSink`
-registration is gone (all out-of-process push silently dropped, since `push` returns early on a
-missing sender), whose budget semaphores are gone, and whose throttle memberships are gone.
-Nothing logs it. Every one of these should be identity-checked (compare the slot `Arc` or a
-per-incarnation epoch), or the whole teardown should hold the attach guard for the account id.
-
-## Multiplexer scope-token cleanup removes by key, not identity, producing duplicate poll tasks
-
-`multiplexer/mod.rs::spawn_and_track_scope_poll`, cleanup block: on exit the task does
-`g.remove(&cleanup_scope)` whenever `!cleanup_cancel.is_cancelled()`, without checking that the
-map still holds its own token. Interleaving:
-
-1. Task A exits (cursor momentarily absent from the registry, e.g. mid-`restart_scope`).
-2. The 1s scan in `Multiplexer::run` sees the re-established cursor with no live token and
-   spawns task B, inserting token B under the same scope key.
-3. A's cleanup runs and removes token B's entry.
-4. The next scan sees no token and spawns task C.
-
-B and C now both poll the same scope forever: doubled wire traffic, doubled broadcasts, and the
-cursor/checkpoint races above between two poll tasks rather than poll-vs-push. Fix by storing
-`(generation, token)` and removing only on a generation match.
-
-## Cursor envelope: outer version authored by protocol crates, and an over-version row never heals
-
-`cursor/envelope.rs::pack_envelope` writes `c.envelope_version`, a field the protocol crate fills
-in, into the envelope header, and `decode_envelope` rejects `version > ENGINE_VERSION` with
-`Error::Other`, not `Error::SchemaIncompatible`. `Error::Other` is not routed to the schema-clear
-loop: `run_establish` propagates it, `re_establish_scope_with_backoff` burns three attempts,
-broadcasts `Terminated`, and the undecodable row stays on disk. Every subsequent attach repeats
-that.
-
-Today this is latent because everyone uses 1, but `crates/imap/src/account/envelope.rs::encode_cursor`
-sets `ChangeCursor::envelope_version` and `OpaqueChangeState::envelope_version` from the same
-protocol constant `ENVELOPE_VERSION`; CalDAV, CardDAV, and Gmail do the same. The first time IMAP
-bumps its constant to invalidate its own payload format (which is what that constant is for, see
-`decode_cursor`'s version check), every persisted IMAP cursor row becomes permanently unreadable
-and unhealable. JMAP and Graph got this right (`OUTER_CURSOR_ENVELOPE_VERSION` vs
-`PAYLOAD_ENVELOPE_VERSION`), which shows the trap is already live.
-
-Two fixes, both worth doing: the engine should stamp `ENGINE_VERSION` itself at encode time rather
-than trusting the field, and decode of `version > ENGINE_VERSION` should return
-`SchemaIncompatible` so it heals like every other unreadable row. `reference/sync.md` documents
-the current behaviour as intentional ("outer vs inner versioning") without noting that no code
-enforces the outer one.
 
 ## reopen_lock held across an unbounded pause wait, so unsubscribe_push can hang forever
 
@@ -131,14 +75,6 @@ reaching zero, the activity guard is held for the whole drive, and `detach` burn
 timeout before aborting. `reference/sync.md`'s "worker reacts at the next safe boundary" is only
 true for checkpoint-bearing streams; that qualifier is not stated anywhere and is not enforced on
 the `Account` contract.
-
-## A failed checkpoint_now leaves the boundary latched at CheckpointNow, parking every worker
-
-`control.rs::checkpoint_now` does `let cp = self.wait_for_checkpoint_at_or_after(gen_id).await?;`
-The `?` returns before `restore_if_current`, so `CheckpointNow` stays installed.
-`wait_until_running` treats `CheckpointNow` as not-running, so backfill, deferred inventory, and
-`restart_account` all park until something else writes the boundary. The error path is narrow
-(watch channel closed) but the restore belongs in a guard, not after a `?`.
 
 ## CursorRegistry::replace_from is not atomic, and reattach can roll cursors back
 
@@ -244,8 +180,9 @@ aspirationally; the code does not match it.
 
 ## Cross-cutting, outside this scope
 
-`reference/sync.md` is 1139 lines and reads as a design essay rather than a reference. Several of
-its strongest claims (single sequential producer per lane+scope; orchestrator excludes fused
-scopes; pause halts all engine-driven work; `replace_from` atomicity) are invariants the code does
-not enforce. A doc that must be true is more useful when its invariants are also test-pinned;
-three of the four above have no test.
+`reference/sync.md` reads as a design essay rather than a reference. Several of its strongest
+claims are invariants the code does not enforce: single sequential producer per lane+scope (half
+fixed - poll-vs-poll is now enforced by generation-matched scope tokens, poll-vs-push-reconcile
+is not, and the doc now says so); orchestrator excludes fused scopes; pause halts all
+engine-driven work; `replace_from` atomicity. A doc that must be true is more useful when its
+invariants are also test-pinned, and the remaining three have no test.

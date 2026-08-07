@@ -227,6 +227,20 @@ struct HealAccount {
     /// lanes populated. Off by default so the stub stays neutral for
     /// every test that does not care.
     degraded_contacts: bool,
+    /// When set, `close()` announces that it has been entered and then
+    /// parks until released, holding `detach` open inside its teardown
+    /// window. `None` for every test that does not stage that window.
+    close_gate: Arc<Mutex<Option<CloseGate>>>,
+}
+
+/// Test handle for pinning `detach` inside `Account::close()`.
+struct CloseGate {
+    entered: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
+}
+
+fn no_close_gate() -> Arc<Mutex<Option<CloseGate>>> {
+    Arc::new(Mutex::new(None))
 }
 
 struct HealFactory {
@@ -234,6 +248,9 @@ struct HealFactory {
     established: Arc<Mutex<Vec<CursorScope>>>,
     closed: Arc<AtomicUsize>,
     degraded_contacts: bool,
+    /// Handed to every account this factory opens; the first `close()`
+    /// consumes it.
+    close_gate: Arc<Mutex<Option<CloseGate>>>,
 }
 
 impl HealFactory {
@@ -247,6 +264,21 @@ impl HealFactory {
             established,
             closed,
             degraded_contacts: false,
+            close_gate: no_close_gate(),
+        }
+    }
+
+    /// Opens accounts whose first `close()` parks until the test
+    /// releases it, holding `detach` inside its teardown window.
+    fn with_close_gate(
+        scopes: Vec<CursorScope>,
+        established: Arc<Mutex<Vec<CursorScope>>>,
+        closed: Arc<AtomicUsize>,
+        gate: CloseGate,
+    ) -> Self {
+        Self {
+            close_gate: Arc::new(Mutex::new(Some(gate))),
+            ..Self::new(scopes, established, closed)
         }
     }
 
@@ -273,6 +305,7 @@ impl AccountFactory for HealFactory {
         let established = Arc::clone(&self.established);
         let closed = Arc::clone(&self.closed);
         let degraded_contacts = self.degraded_contacts;
+        let close_gate = Arc::clone(&self.close_gate);
         Box::pin(async move {
             let account: Arc<dyn Account> = Arc::new(HealAccount {
                 caps: caps(),
@@ -287,6 +320,7 @@ impl AccountFactory for HealFactory {
                 lifecycle_calls: Arc::new(Mutex::new(Vec::new())),
                 lifecycle_script: Arc::new(Mutex::new(VecDeque::new())),
                 degraded_contacts,
+                close_gate: Arc::clone(&close_gate),
             });
             Ok(bifrost_types::OpenedAccount::complete(account))
         })
@@ -344,6 +378,7 @@ impl AccountFactory for RotatingFactory {
                 lifecycle_calls,
                 lifecycle_script: Arc::new(Mutex::new(VecDeque::new())),
                 degraded_contacts: false,
+                close_gate: no_close_gate(),
             });
             Ok(bifrost_types::OpenedAccount::complete(account))
         })
@@ -525,7 +560,14 @@ impl Account for HealAccount {
             .lock()
             .expect("closed generations lock")
             .push(self.generation);
-        Box::pin(async { Ok(()) })
+        let gate = self.close_gate.lock().expect("close gate lock").take();
+        Box::pin(async move {
+            if let Some(gate) = gate {
+                let _ = gate.entered.send(());
+                let _ = gate.release.await;
+            }
+            Ok(())
+        })
     }
 
     fn add_to_container(
@@ -1133,6 +1175,90 @@ async fn one_undecodable_scope_does_not_disturb_its_siblings() {
     assert_eq!(closed.load(Ordering::SeqCst), 1);
 }
 
+/// `detach` removes the slot up front but does its registry cleanup at
+/// the very tail - after awaiting workers (up to `detach_timeout`) and
+/// `Account::close()`. An `attach` landing inside that window used to
+/// see no slot and no in-flight entry, so it succeeded and installed
+/// fresh registrations; the still-running detach then unregistered the
+/// NEW incarnation from the invalidation sink, the budget gate, the
+/// backfill registry, the throttle memberships, and the bandwidth
+/// meter. The consumer got an account that reported itself attached and
+/// silently dropped every out-of-process push, with nothing logged.
+///
+/// Rejecting the racing attach is the fix: the id is genuinely still
+/// attached and draining, and a caller that gets an error can retry.
+#[tokio::test]
+async fn attach_cannot_land_inside_an_in_flight_detach() {
+    let account_id = AccountId("detach-reattach-race".to_owned());
+    let established = Arc::new(Mutex::new(Vec::new()));
+    let closed = Arc::new(AtomicUsize::new(0));
+    let engine = Arc::new(
+        SyncEngine::builder()
+            .build()
+            .expect("default engine config is valid"),
+    );
+
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let gated: Arc<dyn AccountFactory> = Arc::new(HealFactory::with_close_gate(
+        vec![CursorScope::Account],
+        Arc::clone(&established),
+        Arc::clone(&closed),
+        CloseGate {
+            entered: entered_tx,
+            release: release_rx,
+        },
+    ));
+    engine
+        .attach(account_id.clone(), Arc::clone(&gated))
+        .await
+        .expect("attach succeeds");
+
+    // Park the detach inside `Account::close()`, which sits after the
+    // slot removal and before every registry cleanup.
+    let detaching = {
+        let engine = Arc::clone(&engine);
+        let account_id = account_id.clone();
+        tokio::spawn(async move { engine.detach(&account_id).await })
+    };
+    entered_rx.await.expect("detach reaches Account::close");
+    assert!(
+        !engine.attached_account_ids().contains(&account_id),
+        "the slot is already gone; only the lifecycle guard stands between \
+         a racing attach and the teardown tail"
+    );
+
+    let racing: Arc<dyn AccountFactory> = Arc::new(HealFactory::new(
+        vec![CursorScope::Account],
+        Arc::clone(&established),
+        Arc::clone(&closed),
+    ));
+    let raced = engine.attach(account_id.clone(), racing).await;
+    assert!(
+        matches!(raced, Err(Error::AccountAlreadyAttached(ref id)) if id == &account_id),
+        "an attach inside the teardown window must be refused, not \
+         installed and then stripped of its registrations"
+    );
+
+    release_tx.send(()).expect("release the gated close");
+    detaching
+        .await
+        .expect("detach task")
+        .expect("detach succeeds");
+
+    // The guard releases with the teardown, so the id is reusable.
+    let fresh: Arc<dyn AccountFactory> = Arc::new(HealFactory::new(
+        vec![CursorScope::Account],
+        established,
+        Arc::clone(&closed),
+    ));
+    engine
+        .attach(account_id.clone(), fresh)
+        .await
+        .expect("re-attach after the detach completes");
+    engine.detach(&account_id).await.expect("detach succeeds");
+}
+
 #[tokio::test]
 async fn failed_attach_closes_the_opened_account() {
     let account_id = AccountId("attach-failure-close".to_owned());
@@ -1478,6 +1604,7 @@ impl AccountFactory for GatingFactory {
                 lifecycle_calls: Arc::new(Mutex::new(Vec::new())),
                 lifecycle_script: Arc::new(Mutex::new(VecDeque::new())),
                 degraded_contacts: false,
+                close_gate: no_close_gate(),
             });
             Ok(bifrost_types::OpenedAccount::complete(account))
         })
@@ -1655,6 +1782,7 @@ impl AccountFactory for SkippingFactory {
                 lifecycle_calls: Arc::new(Mutex::new(Vec::new())),
                 lifecycle_script: Arc::new(Mutex::new(VecDeque::new())),
                 degraded_contacts: false,
+                close_gate: no_close_gate(),
             });
             Ok(bifrost_types::OpenedAccount {
                 account,
@@ -1759,6 +1887,7 @@ impl AccountFactory for ParkedReopenFactory {
                 lifecycle_calls,
                 lifecycle_script,
                 degraded_contacts: false,
+                close_gate: no_close_gate(),
             });
             Ok(bifrost_types::OpenedAccount::complete(account))
         })
@@ -1869,6 +1998,7 @@ impl AccountFactory for ExhaustingFactory {
                 lifecycle_calls: Arc::new(Mutex::new(Vec::new())),
                 lifecycle_script,
                 degraded_contacts: false,
+                close_gate: no_close_gate(),
             });
             Ok(bifrost_types::OpenedAccount::complete(account))
         })

@@ -123,17 +123,66 @@ fn truncated_header_is_rejected() {
     assert!(decode_envelope(truncated).is_err());
 }
 
+/// An over-version row is as unreadable as an under-version one, and
+/// `SchemaIncompatible` is the only classification the two healing
+/// paths key on. Classified as anything else the row never heals: the
+/// error propagates as an ordinary establish failure, the reopen budget
+/// burns, and the next attach trips over the same bytes.
 #[test]
-fn version_above_engine_is_rejected() {
+fn version_above_engine_is_schema_incompatible() {
     let mut bytes = encode_envelope(&Checkpoint::Change(sample_change_cursor()));
     let bumped = ENGINE_VERSION + 1;
     bytes[4..8].copy_from_slice(&bumped.to_le_bytes());
     let err = decode_envelope(&bytes).expect_err("version above engine should fail");
     let msg = format!("{err}");
     assert!(
-        msg.contains("exceeds engine version"),
+        msg.contains("envelope schema is incompatible"),
         "unexpected error: {msg}"
     );
+}
+
+/// The header version is engine-owned. Protocol crates fill
+/// `ChangeCursor::envelope_version` from the same constant that
+/// versions their own opaque payload, so the first protocol-side bump
+/// would otherwise stamp a header this engine refuses to read - turning
+/// a payload-format change into permanently unreadable rows for every
+/// account on that protocol.
+#[test]
+fn a_protocol_authored_outer_version_does_not_reach_the_header() {
+    let mut cursor = sample_change_cursor();
+    cursor.envelope_version = ENGINE_VERSION + 41;
+    let bytes = encode_envelope(&Checkpoint::Change(cursor.clone()));
+
+    assert_eq!(
+        u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
+        ENGINE_VERSION,
+        "the engine stamps its own layout version"
+    );
+    let Checkpoint::Change(decoded) = decode_envelope(&bytes).expect("decode succeeds") else {
+        panic!("expected Change variant");
+    };
+    assert_eq!(decoded.envelope_version, ENGINE_VERSION);
+    assert_eq!(
+        decoded.server_state.envelope_version, cursor.server_state.envelope_version,
+        "the protocol's own payload version rides inside the payload, untouched"
+    );
+}
+
+/// Same rule on the backfill lane, which packs through the same helper.
+#[test]
+fn a_protocol_authored_backfill_version_does_not_reach_the_header() {
+    let mut bf = sample_backfill_checkpoint();
+    bf.envelope_version = ENGINE_VERSION + 41;
+    let bytes = encode_envelope(&Checkpoint::Backfill(bf));
+
+    assert_eq!(
+        u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
+        ENGINE_VERSION
+    );
+    let Checkpoint::Backfill(decoded) = decode_envelope(&bytes).expect("decode succeeds") else {
+        panic!("expected Backfill variant");
+    };
+    assert_eq!(decoded.envelope_version, ENGINE_VERSION);
 }
 
 #[test]
