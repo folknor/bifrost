@@ -126,7 +126,9 @@ pinned in `tests/test_support_seam.rs`:
 `AccountNet` exposes `get`, `post`, `put`, `patch`, `delete` - one
 constructor per HTTP method routing into the same `RequestBuilder`.
 Builder setters of note beyond the example: `body(Bytes)` for raw
-payloads (used when `json()` is not the right encoding) and
+payloads (used when `json()` is not the right encoding),
+`idempotent(bool)` to override the method-derived replay-safety
+default (see "Replay safety" below), and
 `without_bearer_auth()` for the pre-authenticated-URL and
 Basic-auth flows (Gmail upload URLs, JMAP Basic), which still want
 the shared retry / rate-limit / metering pipeline. The token-source
@@ -163,12 +165,54 @@ feeds the per-account meter and the bandwidth-cap throttle.
   cannot influence the wait.
 - 429 -> same retry path; `Retry-After` honored.
 - Network / timeout / decode errors -> retry if
-  `policy.network_errors && attempt < max_attempts`.
+  `policy.network_errors && attempt < max_attempts` **and the failure
+  is replayable**. See "Replay safety" below.
 - Past `max_attempts` -> `Error::RetryBudgetExhausted` (or
   `Error::RateLimited` on 429). The exhausted-attempt branch parses
   the *final* response's `Retry-After` and pushes it onto
   `retry_after_history` before surfacing, so consumers see the
   server's last hint.
+
+### Replay safety
+
+The transport-failure retry branch consults idempotency;
+`transport_error_is_replayable` allows a retry when EITHER nothing was
+transmitted (`TransmissionState::Unsent`) OR replaying cannot change
+server state. Past `Unsent` on a non-idempotent request the side effect
+may already have landed, and `send_error_to_error` classifies every
+non-connect, non-timeout reqwest failure as `Network { InFlight }` -
+exactly that evidence. Retrying regardless is how one Gmail
+`/messages/send` becomes two delivered messages and one JMAP
+`Email/set` create becomes two drafts, and it happened three times
+before `into_account_error` ever ran, so the `Reconcile` classification
+only ever described the final attempt.
+
+Idempotency defaults to `reqwest::Method::is_idempotent()`: safe
+methods plus PUT and DELETE are replayable, POST / PATCH / extension
+methods are not. `RequestBuilder::idempotent(bool)` overrides it. The
+override exists for two real shapes: a read carried over POST (JMAP's
+single `/jmap/api` endpoint, when the payload's method calls are all
+`*/get` or `*/query`) opts back in, and a GET a provider treats as an
+action opts out. The JMAP transport does not set it today - its `send`
+sees only method, URL, and opaque body bytes - so JMAP POSTs are
+conservatively non-replayable at this layer.
+
+This is not a net loss of resilience. The refused replay surfaces to
+`into_account_error`, which holds the caller's real `AccountOperation`
+and routes `InFlight` + idempotent to `Retry(SameRequest)` and
+`InFlight` + non-idempotent to
+`Reconcile(TransportDropAfterSend, [CheckTarget])`. The retry decision
+moves up to the layer that knows what the request meant, instead of
+being taken three times by the layer that only knows it is holding
+bytes.
+
+Status-driven retry (5xx, 429, `policy.statuses`) is deliberately NOT
+gated on idempotency. A complete response is `Acknowledged` evidence
+that the server is reporting it did not do the work, and
+`recovery::derive`'s `transient_retry_or_reconcile` already treats
+`Acknowledged` as replayable for any operation. Gating it here would
+contradict the shared error model and turn every 503 on a POST into an
+immediate failure.
 
 Token-source failures returned from `current()` are passed through
 to the caller unchanged: `Error::AuthLost` for true auth failures,
@@ -203,6 +247,16 @@ transient-vs-permanent: `Network`/`Timeout` survive as themselves;
 true auth failures (token-endpoint 401/403) map to `AuthLost`.
 OAuth 429/503 `Retry-After` hints are projected to the wrapper's
 absolute deadline.
+
+A waiter whose driver drops the sender without answering - task
+cancelled, panicked, or the runtime shutting down - also gets
+`RefreshFailed`, with `Error::Cancelled` as the preserved source. That
+event says nothing about the credential, so classifying it as
+`AuthLost` (which `auth_lost` maps unconditionally to
+`Authentication(ReauthorizationRequired)` and thence to the terminal
+`RecoveryClass::AuthLost`) told the engine a shutdown race meant the
+user must re-authorize. `RefreshTransient` into
+`Retry(AfterAuthRefresh)` is what a lost driver warrants.
 
 When a proactive refresh displaces a cached token with a known expiry,
 `Refreshing` retains that token as a fallback. A transient refresh
@@ -415,6 +469,15 @@ response through `classify_redirect`:
   stays a hard `MalformedRedirect`; only the missing header passes
   through.
 
+`same_origin` - the `keep_auth` / cross-host decision - compares all
+three RFC 6454 origin components: scheme, host (case-insensitively, per
+RFC 3986 §3.2.2), and `port_or_known_default`. Scheme was previously
+uncompared on the reasoning that the pipeline only issues `https`;
+nothing enforced that, and an `https` -> `http` downgrade was
+classified cross-origin only because the default ports happen to differ
+(443 vs 80), so a downgrade spelled `http://h:443/` would have carried
+the bearer onto a cleartext hop.
+
 `RedirectPolicy::trusted_hosts` is an allowlist for cross-host hops:
 empty means every host is acceptable; populated means only matching
 hosts are admitted (case-insensitive host comparison per RFC 3986
@@ -506,7 +569,9 @@ variants:
   refresh failure preserving the original. OAuth `Retry-After`
   deadlines are stored on the wrapper for the account-error
   conversion.
-- `Cancelled` - request cancelled before completion.
+- `Cancelled` - request cancelled before completion. Produced by
+  `wait_for_refresh` as the preserved `RefreshFailed` source when the
+  single-flight refresh driver drops its sender without answering.
 - `CostExceedsBurst { cost, burst }` - rate-limit configuration
   bug.
 - `EncodeBody { message, source }` - `RequestBuilder::json`
@@ -567,11 +632,16 @@ dav-F5).
 Two behaviours worth not regressing:
 
 - The code is the first whitespace-delimited token that parses as a
-  number, NOT the token at position 1. Servers do emit the
-  protocol-less form (`200 OK`) inside `<D:status>`, where a positional
-  read takes `OK` as the code and classifies a good propstat as failed.
-  `HTTP/1.1` contains no bare numeric token, so the version cannot be
-  mistaken for the code.
+  number **in RFC 9110's `100..=599` range**, NOT the token at position
+  1. Servers do emit the protocol-less form (`200 OK`) inside
+  `<D:status>`, where a positional read takes `OK` as the code and
+  classifies a good propstat as failed. `HTTP/1.1` contains no bare
+  numeric token, so the version cannot be mistaken for the code. The
+  range constraint is what stops a server's prose (`Error 42 occurred`,
+  a `<D:status>` a proxy filled with free text) from parsing as status
+  42; an out-of-range number is not a status, so the line lands in the
+  unreadable bucket that `status_line_is_success` already fails closed
+  on.
 - A line with no parseable code is NOT success. An unreadable status is
   not evidence the property was returned, so treating it as success
   commits a value the server may have refused. This is the one place

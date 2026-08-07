@@ -448,12 +448,21 @@ async fn wait_for_refresh(
     match rx.await {
         Ok(Ok(t)) => Ok(t),
         Ok(Err(e)) => Err(arc_err_to_error(e)),
-        // The driver task dropped without sending. Treat as a terminal
-        // refresh failure; the state will already have been reset only
-        // if the driver reached `drive_refresh`.
-        Err(_) => Err(Error::AuthLost {
-            transmission_state: None,
-            final_response: None,
+        // The driver dropped its sender without answering: its task was
+        // cancelled, it panicked, or the runtime is shutting down.
+        //
+        // This says nothing about the credential. Reporting `AuthLost`
+        // here - which `account_error.rs::auth_lost` maps
+        // unconditionally to `Authentication(ReauthorizationRequired)`
+        // and thence to the terminal `RecoveryClass::AuthLost` - told
+        // the engine the user must re-authorize because a task went
+        // away. `RefreshFailed` carries it as
+        // `Authentication(RefreshTransient)` into
+        // `Retry(AfterAuthRefresh)`, which is what a lost driver
+        // actually warrants: ask again.
+        Err(_) => Err(Error::RefreshFailed {
+            retry_after: None,
+            source: Arc::new(Error::Cancelled),
         }),
     }
 }
@@ -641,6 +650,32 @@ mod tests {
                     source: None,
                 })
             })
+        }
+    }
+
+    /// A waiter whose driver went away - cancelled task, panic, runtime
+    /// shutdown - learns nothing about the credential. Reporting
+    /// `AuthLost` turned that into
+    /// `Authentication(ReauthorizationRequired)` and a terminal
+    /// `RecoveryClass::AuthLost`, so a shutdown race told the engine the
+    /// user had to re-authorize.
+    #[tokio::test]
+    async fn a_dropped_refresh_driver_is_transient_not_terminal_auth_loss() {
+        let (tx, rx) = oneshot::channel::<Result<AccessToken, Arc<Error>>>();
+        drop(tx);
+
+        let Err(error) = wait_for_refresh(rx).await else {
+            panic!("a driver that never answered is a failure");
+        };
+
+        match error {
+            Error::RefreshFailed { source, .. } => {
+                assert!(
+                    matches!(*source, Error::Cancelled),
+                    "the preserved source names why the driver went away"
+                );
+            }
+            other => panic!("expected a transient RefreshFailed, got {other:?}"),
         }
     }
 

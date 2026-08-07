@@ -127,6 +127,13 @@ impl<T> BatchOutcomeBuilder<T> {
         self,
         expected: &[BatchItemId],
     ) -> Result<BatchOutcome<T>, BatchInvariantError> {
+        // Index `expected` once. The membership test used to be a
+        // linear `expected.iter().any(..)` of `String` comparisons
+        // inside the per-item loop, i.e. O(n*m) on a hot mutation path:
+        // a 1000-item Gmail batch cost roughly a million string
+        // compares to prove an invariant that is almost always
+        // satisfied.
+        let known: HashSet<&BatchItemId> = expected.iter().collect();
         let mut seen: HashSet<&BatchItemId> = HashSet::with_capacity(expected.len());
         let mut duplicates: Vec<BatchItemId> = Vec::new();
         let mut unknown: Vec<BatchItemId> = Vec::new();
@@ -138,7 +145,7 @@ impl<T> BatchOutcomeBuilder<T> {
             .chain(self.failed.iter().map(|f| &f.item))
             .chain(self.uncertain.iter().map(|u| &u.item))
         {
-            if !expected.iter().any(|expected_id| expected_id == id) {
+            if !known.contains(id) {
                 unknown.push(id.clone());
                 continue;
             }
@@ -367,6 +374,22 @@ mod tests {
         assert_eq!(err.missing, ids(&["b"]));
         assert_eq!(err.duplicates, ids(&["a"]));
         assert_eq!(err.unknown, ids(&["z"]));
+    }
+
+    /// `finalize` indexes `expected` into a `HashSet` rather than
+    /// rescanning it per item. A caller that submitted a duplicate id
+    /// must reach the same verdict it did under the linear scan: the id
+    /// is known, so it is not `unknown`, and one lane entry satisfies
+    /// both copies of the expectation rather than reporting `missing`.
+    #[test]
+    fn a_duplicated_expectation_does_not_change_the_verdict() {
+        let mut builder = BatchOutcomeBuilder::<()>::new();
+        builder.push_succeeded(BatchItemId("a".to_string()), ());
+
+        let outcome = builder
+            .finalize(&ids(&["a", "a"]))
+            .expect("a known id is accounted for");
+        assert_eq!(outcome.succeeded.len(), 1);
     }
 
     #[test]

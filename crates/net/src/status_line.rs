@@ -22,12 +22,22 @@
 /// `OK` as the code there and classify a perfectly good propstat as
 /// failed.
 ///
-/// Returns `None` when no token parses as a number.
+/// A token only counts when it parses as a `u16` in RFC 9110's
+/// `100..=599` status range. Without the range constraint any bare
+/// number anywhere in the line was accepted, so a server's prose
+/// (`"Error 42 occurred"`, a `<D:status>` a proxy filled with free
+/// text) parsed as status 42 and the caller classified it against a
+/// code the server never sent. An out-of-range number is not a status,
+/// and reporting `None` puts the line in the unreadable bucket, which
+/// `status_line_is_success` already fails closed on.
+///
+/// Returns `None` when no token parses as an in-range status code.
 #[must_use]
 pub fn status_line_code(status: &str) -> Option<u16> {
     status
         .split_whitespace()
         .find_map(|part| part.parse::<u16>().ok())
+        .filter(|code| (100..=599).contains(code))
 }
 
 /// True when an HTTP status line carries a 2xx code.
@@ -89,5 +99,25 @@ mod tests {
     #[test]
     fn the_http_version_is_not_read_as_the_code() {
         assert_eq!(status_line_code("HTTP/1.1 500 Server Error"), Some(500));
+    }
+
+    /// A bare number in prose is not a status code. Without the range
+    /// constraint this parsed as status 42 and the caller classified a
+    /// `<D:status>` against a code the server never sent.
+    #[test]
+    fn a_number_outside_the_status_range_is_not_a_code() {
+        assert_eq!(status_line_code("Error 42 occurred"), None);
+        assert!(!status_line_is_success("Error 42 occurred"));
+        assert_eq!(status_line_code("HTTP/1.1 600 Nonsense"), None);
+        assert_eq!(status_line_code("HTTP/1.1 0 Nonsense"), None);
+        assert_eq!(status_line_code("99 Too Low"), None);
+    }
+
+    /// The range ends are inclusive, so a legitimate 1xx or 5xx line
+    /// still reads.
+    #[test]
+    fn the_status_range_ends_are_inclusive() {
+        assert_eq!(status_line_code("HTTP/1.1 100 Continue"), Some(100));
+        assert_eq!(status_line_code("HTTP/1.1 599 Whatever"), Some(599));
     }
 }

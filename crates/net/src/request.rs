@@ -109,6 +109,9 @@ struct RequestBuilderInner {
     retry: Option<RetryPolicy>,
     /// Optional per-request timeout override.
     timeout: Option<Duration>,
+    /// Caller's override of whether replaying this request can change
+    /// server state. `None` derives it from the HTTP method.
+    idempotent: Option<bool>,
     /// Whether the transport should inject `Authorization: Bearer`.
     /// Some protocol flows use a pre-authenticated upload URL or an
     /// explicit Basic authorization header, but still need the shared
@@ -139,6 +142,7 @@ impl RequestBuilder {
                 cost: None,
                 retry: None,
                 timeout: None,
+                idempotent: None,
                 bearer_auth: true,
                 pending_error: None,
             },
@@ -236,6 +240,33 @@ impl RequestBuilder {
     #[must_use]
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.inner.timeout = Some(timeout);
+        self
+    }
+
+    /// Declare whether replaying this request can change server state,
+    /// overriding the method-derived default.
+    ///
+    /// The default is `reqwest::Method::is_idempotent()`, so POST,
+    /// PATCH, and extension methods are treated as unsafe to replay and
+    /// the transport will not retry them once bytes have gone out. Two
+    /// shapes want the override:
+    ///
+    /// - `idempotent(true)` for a read carried over POST. JMAP's single
+    ///   `/jmap/api` endpoint is the standing example: a request whose
+    ///   method calls are all `*/get` or `*/query` is safe to replay,
+    ///   and saying so restores transport-level retry for it.
+    /// - `idempotent(false)` for a GET or PUT the caller knows the
+    ///   provider treats as an action rather than a read or an
+    ///   absolute-state write.
+    ///
+    /// This does not affect retries driven by a status RESPONSE (5xx,
+    /// 429). A complete response is `Acknowledged` evidence that the
+    /// server is reporting it did not do the work, which the shared
+    /// error model already treats as replayable regardless of
+    /// idempotency. Only the transport-failure path consults this.
+    #[must_use]
+    pub fn idempotent(mut self, idempotent: bool) -> Self {
+        self.inner.idempotent = Some(idempotent);
         self
     }
 
@@ -382,6 +413,7 @@ pub(crate) async fn send_streaming_inner(
         cost,
         retry,
         timeout,
+        idempotent,
         bearer_auth,
         pending_error,
     } = builder.inner;
@@ -424,6 +456,11 @@ pub(crate) async fn send_streaming_inner(
 
     'outer: loop {
         attempt = attempt.saturating_add(1);
+        // Resolved per attempt rather than once, because a redirect hop
+        // can rewrite the method: RFC 7231 §6.4 turns a 301/302/303 on a
+        // POST into a GET, and the GET that results is replayable even
+        // though the request the caller wrote was not.
+        let replayable = idempotent.unwrap_or_else(|| method.is_idempotent());
         // Acquire a rate-limit slot. No-op if no host is configured.
         // Surfaces `Error::CostExceedsBurst` if the caller asked for
         // more units than the host's bucket can ever hold; that is a
@@ -493,10 +530,7 @@ pub(crate) async fn send_streaming_inner(
             Err(e) => {
                 if policy.network_errors
                     && attempt < policy.max_attempts
-                    && matches!(
-                        e,
-                        Error::Network { .. } | Error::Timeout { .. } | Error::Tls { .. }
-                    )
+                    && transport_error_is_replayable(&e, replayable)
                 {
                     let delay = backoff_for(&policy, attempt);
                     tokio::time::sleep(delay).await;
@@ -794,6 +828,42 @@ fn build_reqwest(
     req
 }
 
+/// Whether a transport failure may be replayed on the wire.
+///
+/// Two conditions make a replay safe, and either suffices: nothing was
+/// transmitted, or transmitting it again cannot change server state.
+/// Past `Unsent` on a non-idempotent request the side effect may
+/// already have landed - `send_error_to_error` classifies every
+/// non-connect, non-timeout reqwest failure as
+/// `Network { InFlight }`, which is precisely the "may have landed"
+/// evidence - and a blind replay is how one Gmail `messages/send`
+/// becomes two delivered messages, or one JMAP `Email/set` create
+/// becomes two drafts.
+///
+/// Refusing the replay is not the end of the retry story. The error
+/// surfaces to `into_account_error`, which has the caller's real
+/// `AccountOperation` and routes `InFlight` + non-idempotent to
+/// `Reconcile(TransportDropAfterSend)` and `InFlight` + idempotent to
+/// `Retry(SameRequest)`. The decision moves up to the layer that knows
+/// what the request meant, instead of being taken three times by a
+/// layer that only knows it is holding bytes.
+///
+/// A variant carrying no transmission evidence is not replayable here:
+/// `InvalidRequest` and the rest are local failures a retry cannot fix.
+fn transport_error_is_replayable(error: &Error, idempotent: bool) -> bool {
+    let state = match error {
+        Error::Network {
+            transmission_state, ..
+        }
+        | Error::Tls {
+            transmission_state, ..
+        }
+        | Error::Timeout { transmission_state } => transmission_state,
+        _ => return false,
+    };
+    idempotent || *state == TransmissionState::Unsent
+}
+
 pub(crate) fn send_error_to_error(e: reqwest::Error) -> Error {
     let message = format!("{e}");
     if e.is_builder() {
@@ -1063,6 +1133,164 @@ mod tests {
             .send()
             .await
             .expect("network retry succeeds");
+
+        assert_eq!(response.body, Bytes::from_static(b"recovered"));
+        assert_eq!(script.requests().len(), 2);
+    }
+
+    fn in_flight_reset() -> Canned {
+        Canned::Error(Error::Network {
+            message: "connection reset mid-body".to_string(),
+            transmission_state: TransmissionState::InFlight,
+            source: None,
+        })
+    }
+
+    fn two_attempts() -> RetryPolicy {
+        RetryPolicy {
+            max_attempts: 2,
+            initial_backoff: Duration::ZERO,
+            max_backoff: Duration::ZERO,
+            ..RetryPolicy::default()
+        }
+    }
+
+    /// The duplicate-send bug. `send_error_to_error` classifies every
+    /// non-connect, non-timeout reqwest failure as
+    /// `Network { InFlight }` - the side effect may already have landed
+    /// - and the loop used to replay it anyway, three times, before
+    /// `into_account_error` ever ran. Against Gmail's
+    /// `/messages/send` that is a duplicate delivered message; against
+    /// JMAP's `Email/set` it is a duplicate create.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn an_in_flight_failure_on_a_post_is_not_replayed() {
+        let script = ScriptedDispatch::new([in_flight_reset(), canned(StatusCode::OK, b"second")]);
+        let account = scripted_account(&script, NetConfig::default(), Vec::new(), two_attempts());
+
+        let Err(error) = account
+            .post("https://send.test/messages/send")
+            .body(Bytes::from_static(b"payload"))
+            .send()
+            .await
+        else {
+            panic!("a POST that may have landed must not be replayed");
+        };
+
+        assert!(matches!(
+            error,
+            Error::Network {
+                transmission_state: TransmissionState::InFlight,
+                ..
+            }
+        ));
+        assert_eq!(
+            script.requests().len(),
+            1,
+            "exactly one wire attempt; the reconcile decision belongs to the caller"
+        );
+    }
+
+    /// `Unsent` is the other half of the rule: nothing reached the
+    /// server, so replaying a POST cannot duplicate anything.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn an_unsent_failure_on_a_post_still_retries() {
+        let script = ScriptedDispatch::new([
+            Canned::Error(Error::Network {
+                message: "connect refused".to_string(),
+                transmission_state: TransmissionState::Unsent,
+                source: None,
+            }),
+            canned(StatusCode::OK, b"recovered"),
+        ]);
+        let account = scripted_account(&script, NetConfig::default(), Vec::new(), two_attempts());
+
+        let response = account
+            .post("https://send.test/messages/send")
+            .body(Bytes::from_static(b"payload"))
+            .send()
+            .await
+            .expect("nothing was transmitted, so the replay is safe");
+
+        assert_eq!(response.body, Bytes::from_static(b"recovered"));
+        assert_eq!(script.requests().len(), 2);
+    }
+
+    /// An idempotent method is replayable at any transmission state:
+    /// sending the same GET twice cannot change server state.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn an_in_flight_failure_on_a_get_still_retries() {
+        let script =
+            ScriptedDispatch::new([in_flight_reset(), canned(StatusCode::OK, b"recovered")]);
+        let account = scripted_account(&script, NetConfig::default(), Vec::new(), two_attempts());
+
+        let response = account
+            .get("https://read.test/resource")
+            .send()
+            .await
+            .expect("an idempotent request is replayable in any state");
+
+        assert_eq!(response.body, Bytes::from_static(b"recovered"));
+        assert_eq!(script.requests().len(), 2);
+    }
+
+    /// The escape hatch for a read carried over POST, which is JMAP's
+    /// whole API shape.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn an_explicitly_idempotent_post_retries_in_flight() {
+        let script =
+            ScriptedDispatch::new([in_flight_reset(), canned(StatusCode::OK, b"recovered")]);
+        let account = scripted_account(&script, NetConfig::default(), Vec::new(), two_attempts());
+
+        let response = account
+            .post("https://jmap.test/jmap/api")
+            .idempotent(true)
+            .body(Bytes::from_static(b"{\"methodCalls\":[]}"))
+            .send()
+            .await
+            .expect("a caller that knows the payload is read-only opts back in");
+
+        assert_eq!(response.body, Bytes::from_static(b"recovered"));
+        assert_eq!(script.requests().len(), 2);
+    }
+
+    /// And the inverse: a caller that knows a GET is really an action.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn an_explicitly_non_idempotent_get_is_not_replayed() {
+        let script = ScriptedDispatch::new([in_flight_reset(), canned(StatusCode::OK, b"second")]);
+        let account = scripted_account(&script, NetConfig::default(), Vec::new(), two_attempts());
+
+        let Err(error) = account
+            .get("https://legacy.test/trigger-action")
+            .idempotent(false)
+            .send()
+            .await
+        else {
+            panic!("the override wins over the method default");
+        };
+
+        assert!(matches!(error, Error::Network { .. }));
+        assert_eq!(script.requests().len(), 1);
+    }
+
+    /// A status RESPONSE is `Acknowledged` evidence that the server is
+    /// reporting it did not do the work, which the shared error model
+    /// treats as replayable regardless of idempotency. Idempotency must
+    /// not leak into that branch and turn every 503 on a POST into an
+    /// immediate failure.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_503_on_a_post_still_retries() {
+        let script = ScriptedDispatch::new([
+            canned(StatusCode::SERVICE_UNAVAILABLE, b"try again"),
+            canned(StatusCode::OK, b"recovered"),
+        ]);
+        let account = scripted_account(&script, NetConfig::default(), Vec::new(), two_attempts());
+
+        let response = account
+            .post("https://send.test/messages/send")
+            .body(Bytes::from_static(b"payload"))
+            .send()
+            .await
+            .expect("status-driven retry is unchanged by the idempotency rule");
 
         assert_eq!(response.body, Bytes::from_static(b"recovered"));
         assert_eq!(script.requests().len(), 2);

@@ -4,26 +4,12 @@ Hunter: Claude Opus, single pass, 2026-08-05. Scope: `crates/net/` and `crates/t
 foundation. Read-only review. Findings are unverified work material. Line numbers are as of the hunt
 and will drift.
 
-## The retry loop re-sends non-idempotent requests
-
-`crates/net/src/request.rs`, `send_streaming_inner`. The loop retries on (a)
-`Error::Network{..} | Timeout{..} | Tls{..}` whenever `policy.network_errors`, and (b) any 5xx or
-`policy.statuses` member, with no idempotency input of any kind. `RetryPolicy` has no operation, no
-idempotency flag, no client-request-id. Meanwhile `send_error_to_error` classifies any non-connect,
-non-timeout reqwest failure as `Network { transmission_state: InFlight }`, precisely the state the
-error model treats as "the side effect may have landed, do NOT blind-retry"
-(`transient_retry_or_reconcile` into `Reconcile(TransportDropAfterSend)`). The transport retries
-three times before `into_account_error` ever runs, so the reconcile classification only describes the
-final attempt.
-
-Confirmed live: `crates/google/src/api.rs` sends mail via `self.post("/messages/send", &body)` on the
-account's default `RetryPolicy` (3 attempts, retries 500/502/503/504 and in-flight resets). No
-protocol crate passes `RetryPolicy::disabled()` in production; the only three call sites are
-`#[cfg(test)]` in `crates/graph/src/client.rs`. A 503 from Gmail's send endpoint after it accepted the
-message produces a duplicate email; same shape for JMAP `Email/set` creates and Graph `POST`
-mutations. Fix: `RequestBuilder` must take the `AccountOperation` (or an explicit `idempotent: bool`),
-and the retry loop must refuse to retry a non-idempotent request once transmission state is past
-`Unsent`, surfacing the error for the reconcile path instead.
+2026-08-07: five findings verified and fixed, each with a regression test - the non-idempotent
+retry replay, `same_origin` ignoring scheme, `status_line_code`'s missing range constraint,
+`finalize`'s O(n*m) membership scan, and the dropped refresh driver reported as terminal auth
+loss. `Error::Cancelled` now has a producer (the dropped-driver source), closing that item too.
+Their entries are removed below; the behaviour lives in `reference/net.md`. Everything still
+listed is unverified.
 
 ## Google and Graph requests have no deadline at all
 
@@ -53,14 +39,6 @@ Drop cannot detach the replacement", implying a `Drop` that does not exist. Goog
 `NetInner::account_hosts` and the meter map grow by one entry per JMAP account open for the process
 lifetime. Either add `Drop for AccountNetInner` calling `detach_registration`, or make the leak
 impossible by construction.
-
-## A dropped refresh driver is reported as terminal auth loss
-
-`auth.rs`, `wait_for_refresh`: `Err(_)` from the oneshot (driver task cancelled, panicked, or runtime
-shutting down) yields `Error::AuthLost`, which `account_error.rs::auth_lost` maps unconditionally to
-`Authentication(ReauthorizationRequired)` into `RecoveryClass::AuthLost`, terminal. A
-runtime-shutdown race therefore tells the engine the user must re-authorize. This should be a
-transient `RefreshFailed`.
 
 ## No backoff on the token-endpoint failure path that has no fallback token
 
@@ -123,17 +101,6 @@ flagging it as the thing most likely to be the next structural cost.
   nits: the parser accepts any `u16` token anywhere in the line, so `"Error 42 occurred"` parses as
   42, and it accepts codes outside 100-599. Constraining to the first token in `100..=599` would cost
   nothing.
-- **`redirect::same_origin` ignores scheme.** An `https://h/` to `http://h/` hop is only classified
-  cross-origin because `port_or_known_default` happens to differ (443 vs 80). The comment
-  acknowledges scheme is uncompared and justifies it with "the pipeline only ever issues `https`",
-  which nothing enforces. Compare schemes explicitly; the credential-stripping decision should not
-  rest on a port coincidence.
-- **`Error::Cancelled` is dead.** Never constructed anywhere in the workspace (only matched in
-  `account_error.rs` and one test). Cancellation is drop-based. `reference/net.md` documents it as a
-  live variant. Either produce it or delete it.
-- **`BatchOutcomeBuilder::finalize` is O(n*m).** `expected.iter().any(...)` inside the per-item loop,
-  with `String` comparisons. For a 1000-item Gmail batch that is ~10^6 string compares on a hot
-  mutation path. Build one `HashSet<&BatchItemId>` from `expected` first.
 - **Rate governor has no fairness.** Waiters race after each `notify_one`, with a 250 ms poll floor.
   Under sustained contention a waiter can starve; the code's own comment concedes "if a caller adds
   higher-volume refund paths, reconsider", and the retry loop now refunds on every retried failure (a
@@ -141,6 +108,5 @@ flagging it as the thing most likely to be the next structural cost.
 - **Outbound metering is counted before dispatch** (`request.rs`), so bytes are recorded for attempts
   that fail `Unsent` (DNS/connect) and never touched the wire. Headers are excluded by design. Minor
   accounting skew, documented only in a code comment.
-- **Doc drift in `reference/net.md`**: the Drop claim, the `Cancelled` variant, and the
-  `MeterSinkHandle` "wiring lands in S1-W2" note, which reads as stale planning text in a durable
-  reference doc.
+- **Doc drift in `reference/net.md`**: the Drop claim and the `MeterSinkHandle` "wiring lands in
+  S1-W2" note, which reads as stale planning text in a durable reference doc.

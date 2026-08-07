@@ -300,10 +300,21 @@ fn location_to_str(value: &HeaderValue) -> Result<String, Error> {
 /// the port (`host:443` -> `host:8443`) IS cross-origin and must strip
 /// credentials. `port_or_known_default` collapses the scheme's implicit
 /// port (e.g. `https` -> 443) so `https://h/` and `https://h:443/`
-/// compare equal. Scheme itself is not compared here because the
-/// pipeline only ever issues `https`; a scheme downgrade is a separate
-/// concern not reachable through this loop.
+/// compare equal.
+///
+/// Scheme is the third component of an RFC 6454 origin and is compared
+/// explicitly. It previously was not, on the reasoning that the
+/// pipeline only ever issues `https` - but nothing enforces that, and
+/// an `https://h/` to `http://h/` downgrade was classified cross-origin
+/// only because `port_or_known_default` happens to answer 443 and 80.
+/// A server that spells the downgrade `http://h:443/` would have had
+/// the hop treated as same-origin and the bearer token carried onto it
+/// in cleartext. A credential-stripping decision must not rest on a
+/// port coincidence.
 fn same_origin(a: &reqwest::Url, b: &reqwest::Url) -> bool {
+    if a.scheme() != b.scheme() {
+        return false;
+    }
     let host_eq = match (a.host_str(), b.host_str()) {
         (Some(ha), Some(hb)) => ha.eq_ignore_ascii_case(hb),
         (None, None) => true,
@@ -568,6 +579,39 @@ mod tests {
             step.keep_auth,
             "explicit :443 equals implicit https default port"
         );
+    }
+
+    /// Scheme is part of an RFC 6454 origin. The plain downgrade was
+    /// already classified cross-origin, but only as a side effect of
+    /// `port_or_known_default` answering 443 for https and 80 for http.
+    /// A downgrade that names 443 explicitly defeated that coincidence
+    /// and would have carried the bearer token onto a cleartext hop.
+    #[test]
+    fn a_scheme_downgrade_is_cross_origin_and_strips_auth() {
+        let policy = RedirectPolicy::default();
+        for location in [
+            "http://a.example/next",
+            "http://a.example:443/next",
+            "http://a.example:80/next",
+        ] {
+            let h = header(LOCATION, location);
+            let action = classify_redirect(
+                &policy,
+                &Method::POST,
+                &url("https://a.example/"),
+                StatusCode::TEMPORARY_REDIRECT,
+                &h,
+            )
+            .expect("scheme-downgrade 307 should classify");
+            let step = match action {
+                RedirectAction::Follow(s) => s,
+                RedirectAction::PassThrough => panic!("expected follow"),
+            };
+            assert!(
+                !step.keep_auth,
+                "{location} downgrades the scheme; credentials must not follow"
+            );
+        }
     }
 
     #[test]
