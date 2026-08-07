@@ -280,18 +280,8 @@ impl RequestBuilder {
 
     /// Drive the request to completion with the configured retry
     /// budget, returning the buffered response.
-    pub async fn send(mut self) -> Result<Response, Error> {
-        let config = self.inner.account.net().config().clone();
-        // Apply the buffered path's default deadline. Only here, not in
-        // `send_streaming_inner`: this is the JSON-API path, where a
-        // whole-request ceiling is right, while the streaming path
-        // carries blob downloads that legitimately run long and are
-        // bounded by `NetConfig::read_timeout` instead. An explicit
-        // `.timeout()` from the caller always wins.
-        if self.inner.timeout.is_none() {
-            self.inner.timeout = config.default_request_timeout;
-        }
-        let limit = config.max_buffered_response;
+    pub async fn send(self) -> Result<Response, Error> {
+        let limit = self.inner.account.net().config().max_buffered_response;
         let internal = send_streaming_inner(self).await?;
         // Drain the body into a single `Bytes`. The retry loop has
         // already validated status; everything from here is a
@@ -1378,21 +1368,26 @@ mod tests {
         assert_eq!(response.body.len(), 4096);
     }
 
-    /// Only JMAP set a per-request timeout, so every Gmail and Graph
-    /// call went out with no deadline at all. `send` now supplies the
-    /// configured default when the caller set none, and an explicit
-    /// `.timeout()` still wins.
+    /// The pipeline supplies no total deadline of its own - the only
+    /// per-request timeout on the wire is one the caller asked for.
+    ///
+    /// `NetConfig::read_timeout` is what bounds a stalled request, and
+    /// it is an inactivity bound precisely because it cannot be
+    /// overridden: consumers program against `Account` and never reach
+    /// the transport config, so a total deadline here would be able to
+    /// fail a slow-but-healthy large fetch with no recourse.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn the_buffered_path_supplies_a_default_deadline() {
+    async fn the_only_request_deadline_is_one_the_caller_set() {
         let script = ScriptedDispatch::new([
             canned(StatusCode::OK, b"one"),
             canned(StatusCode::OK, b"two"),
         ]);
-        let config = NetConfig {
-            default_request_timeout: Some(Duration::from_secs(7)),
-            ..NetConfig::default()
-        };
-        let account = scripted_account(&script, config, Vec::new(), RetryPolicy::disabled());
+        let account = scripted_account(
+            &script,
+            NetConfig::default(),
+            Vec::new(),
+            RetryPolicy::disabled(),
+        );
 
         account
             .get("https://deadline.test/a")
@@ -1409,38 +1404,14 @@ mod tests {
         let requests = script.requests();
         assert_eq!(requests.len(), 2);
         assert_eq!(
-            requests[0].timeout,
-            Some(Duration::from_secs(7)),
-            "a caller that set no timeout gets the configured default"
+            requests[0].timeout, None,
+            "the pipeline must not invent a total deadline"
         );
         assert_eq!(
             requests[1].timeout,
             Some(Duration::from_secs(90)),
-            "an explicit timeout wins over the default"
+            "a caller-set timeout reaches the wire"
         );
-    }
-
-    /// The streaming path is deliberately exempt: it carries blob
-    /// downloads that legitimately run for minutes, and a total
-    /// deadline would fail them on size rather than on health.
-    /// `NetConfig::read_timeout` is what bounds a stalled stream.
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn the_streaming_path_takes_no_default_deadline() {
-        let script = ScriptedDispatch::new([canned(StatusCode::OK, b"blob")]);
-        let account = scripted_account(
-            &script,
-            NetConfig::default(),
-            Vec::new(),
-            RetryPolicy::disabled(),
-        );
-
-        account
-            .get("https://blob.test/attachment")
-            .send_streaming()
-            .await
-            .expect("streaming request succeeds");
-
-        assert_eq!(script.requests()[0].timeout, None);
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]

@@ -118,10 +118,11 @@ pub struct RequestSnapshot {
     pub headers: HeaderMap,
     /// Request body, if the request carried one in memory.
     pub body: Option<Bytes>,
-    /// Total request deadline as sent: the caller's `.timeout()`, else
-    /// `NetConfig::default_request_timeout` on the buffered path, else
-    /// `None`. Exposed so a test can assert a request actually went out
-    /// with a deadline rather than trusting the config.
+    /// Total request deadline as sent. `None` unless the caller set
+    /// one: the pipeline supplies no deadline of its own, bounding a
+    /// stalled request with `NetConfig::read_timeout` instead. Exposed
+    /// so a test can assert what actually reached the wire rather than
+    /// trusting the builder.
     pub timeout: Option<std::time::Duration>,
 }
 

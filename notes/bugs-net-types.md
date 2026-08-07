@@ -5,7 +5,9 @@ foundation. Read-only review. Findings are unverified work material. Line number
 and will drift.
 
 2026-08-07 (second pass): three more fixed - the missing request deadline (as
-`NetConfig::read_timeout` plus a buffered-only `default_request_timeout`), uncapped buffered
+`NetConfig::read_timeout`, an inactivity bound; a TOTAL default deadline was tried and then
+dropped, because consumers program against `Account` and cannot override it, so it could have
+failed a slow-but-healthy large fetch with no recourse), uncapped buffered
 response bodies in both `send()` and the two DAV transports, and the `AccountNet` registration
 leak (a registration-keyed `Drop`, which also forced same-id `retag` to stop minting a second
 owner of one token).
@@ -44,6 +46,18 @@ This wants a split: `NetConfig` keeps only what the shared client owns (pool, ke
 and everything per-account (timeouts, UA, redirect policy, token max-age) moves onto
 `AccountSpec`/`AccountNet`. A breaking change worth taking pre-1.0; it is the single change that
 would make the crate deliver what it advertises.
+
+2026-08-07 amendment: the second sentence of the motivation above is wrong and should not drive
+the design. Consumers program against `Account` / `AccountFactory`; `bifrost-net` is an internal
+shared layer like `bifrost-sasl`, so google/graph being unable to configure TLS roots or timeouts
+is not a defect - it is the abstraction working. Where a per-deployment value is genuinely needed
+it belongs on the protocol crate's own config struct, which is already the pattern.
+
+The rest of the finding stands and is the reason to keep it: JMAP minting one `Net` per account
+means one reqwest client, connection pool, governor, and meter per account, which is a real
+resource and correctness problem and does make `reference/net.md`'s "multi-account quota
+coordination out of the box" false. The split is still the fix; the goal is sharing the client,
+not exposing configuration.
 
 ## The DAV bypass: Dispatch's privacy is not what is blocking them
 

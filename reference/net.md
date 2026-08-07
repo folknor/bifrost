@@ -97,7 +97,7 @@ drains the body through the same metering reader.
 
 ### Deadlines and the buffered ceiling
 
-Three bounds, at deliberately different layers:
+Two bounds:
 
 - `NetConfig::connect_timeout` (10s) covers reaching the server.
 - `NetConfig::read_timeout` (30s) is an inactivity deadline between
@@ -106,14 +106,32 @@ Three bounds, at deliberately different layers:
   connects and then stalls mid-body produces no error at all: the retry
   loop never fires, and the sync scope blocks indefinitely. Only JMAP
   set a per-request timeout, so every Gmail and Graph call previously
-  had no deadline of any kind. An inactivity bound rather than a total
-  one, so it cannot fail a legitimately slow large download.
-- `NetConfig::default_request_timeout` (120s) is a TOTAL deadline
-  `RequestBuilder::send` supplies when the caller set no explicit
-  `.timeout()`. Buffered-only: `send` is the JSON-API path where a
-  whole-request ceiling is right, while `send_streaming` carries blob
-  downloads that legitimately run for minutes and would fail on size
-  rather than on health. Streaming is bounded by `read_timeout` alone.
+  had no deadline of any kind.
+
+The pipeline supplies no TOTAL request deadline. `RequestBuilder::timeout`
+exists for callers that want one (JMAP sets it), and nothing is applied
+when they do not.
+
+That is a consequence of the crate's position, not an oversight.
+Consumers program against `Account` / `AccountFactory` and never reach
+`NetConfig`; `bifrost-net` is an internal shared layer the same way
+`bifrost-sasl` is. So a value chosen here is the contract, not a default
+someone can override when it turns out wrong for their deployment - and
+that rules out any bound capable of failing a request that is making
+slow but genuine progress. A total deadline is exactly such a bound: a
+large `Email/get` with full bodies over a poor link is healthy and slow,
+and indistinguishable from a hang by wall-clock alone. An inactivity
+bound is not, because silence is unambiguous. `read_timeout` closes the
+reported hole (connect-then-stall) without the failure mode.
+
+The same reasoning is why the knobs below are not exposed upward. If a
+per-deployment value is genuinely needed, it belongs on the protocol
+crate's own config struct - where JMAP's `timeout` /
+`accept_invalid_certs` / trusted-hosts already live, and where CalDAV
+and CardDAV take theirs - not on a transport config handed to
+consumers. (`GraphClient::with_account_net` is `pub` and takes an
+`AccountNet`, which does force a caller using it to depend on this
+crate directly. That predates the rule above and is a hole in it.)
 
 `NetConfig::max_buffered_response` (`DEFAULT_MAX_BUFFERED_RESPONSE`,
 64 MiB) caps what `send` will accumulate, failing with

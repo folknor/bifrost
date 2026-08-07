@@ -36,19 +36,16 @@ pub struct NetConfig {
     /// that connects and then stalls mid-body produces no error at all,
     /// so the retry loop never fires and the caller waits forever - and
     /// only JMAP was setting a per-request timeout, leaving every Gmail
-    /// and Graph call with no deadline of any kind. This is an
-    /// inactivity timeout rather than a total one, so it bounds the
-    /// stall without capping a legitimately long blob download.
-    pub read_timeout: Option<Duration>,
-    /// Total deadline applied by `RequestBuilder::send` when the caller
-    /// set no explicit `timeout`.
+    /// and Graph call with no deadline of any kind.
     ///
-    /// Buffered-only, deliberately. `send` is the JSON-API path, where
-    /// a whole-request ceiling is right; `send_streaming` is the blob
-    /// path, where a multi-minute attachment download is normal and a
-    /// total deadline would fail it on size rather than on health.
-    /// Streaming is bounded by `read_timeout` instead.
-    pub default_request_timeout: Option<Duration>,
+    /// Deliberately an inactivity bound and not a total one. Consumers
+    /// program against `Account` and never reach this config, so a
+    /// value here is the contract rather than a default they can
+    /// override - which rules out any bound that can fail a request
+    /// making slow but genuine progress. Silence is unambiguous; slow
+    /// is not. A large `Email/get` over a poor link keeps working, and
+    /// a stalled stream still dies.
+    pub read_timeout: Option<Duration>,
     /// Ceiling on a buffered response body, enforced by
     /// `RequestBuilder::send`.
     ///
@@ -93,7 +90,6 @@ impl Default for NetConfig {
             tcp_keepalive: Duration::from_secs(60),
             connect_timeout: Duration::from_secs(10),
             read_timeout: Some(Duration::from_secs(30)),
-            default_request_timeout: Some(Duration::from_secs(120)),
             max_buffered_response: Some(DEFAULT_MAX_BUFFERED_RESPONSE),
             user_agent: format!("bifrost-net/{}", env!("CARGO_PKG_VERSION")),
             root_certs: Vec::new(),
