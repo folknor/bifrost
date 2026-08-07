@@ -101,6 +101,14 @@ impl Net {
             .user_agent(&config.user_agent)
             .danger_accept_invalid_certs(config.dangerous_accept_invalid_certs);
 
+        // Inactivity deadline on the response body. `connect_timeout`
+        // only covers reaching the server, so without this a request
+        // that connects and then stalls mid-body never errors, the
+        // retry loop never fires, and the sync scope blocks forever.
+        if let Some(read_timeout) = config.read_timeout {
+            builder = builder.read_timeout(read_timeout);
+        }
+
         // bifrost-net owns the redirect loop unconditionally. Reqwest's
         // default policy follows 3xx but without RFC 7231 method
         // rewriting or a trusted-host allowlist; our loop in
@@ -316,6 +324,28 @@ pub(crate) struct AccountNetInner {
     /// Engine-controlled bandwidth cap in bytes per second.
     /// `BANDWIDTH_CAP_NONE` (sentinel `u64::MAX`) means unlimited.
     pub(crate) bandwidth_cap: AtomicU64,
+}
+
+/// Release the registration when the last clone of the handle goes.
+///
+/// Google and Graph call `detach()` explicitly; the JMAP reqwest
+/// transport attaches and never does, so `NetInner::account_hosts` and
+/// the meter map grew by one entry per JMAP account open for the
+/// process lifetime. Making the release automatic closes the leak for
+/// every caller instead of relying on each one to remember, and leaves
+/// the explicit `detach()` as the way to release early.
+///
+/// The teardown is keyed on this handle's exact `registration_id`,
+/// which is what makes the reference doc's "a stale Drop cannot detach
+/// the replacement" true rather than aspirational. `detach_registration`
+/// returns before touching the meter or the governor when that token is
+/// no longer present, so a Drop after an explicit `detach()`, or after
+/// `retag()` moved the token to another id, is a complete no-op.
+impl Drop for AccountNetInner {
+    fn drop(&mut self) {
+        self.net
+            .detach_registration(&self.account, Some(self.registration_id));
+    }
 }
 
 impl AccountNet {
@@ -568,9 +598,22 @@ impl AccountNet {
     ///   one engine code should propagate forward.
     #[must_use]
     pub fn retag(&self, new_id: AccountId) -> AccountNet {
+        // Same-id retag returns THIS handle, not a second
+        // `AccountNetInner` carrying the same `registration_id` under
+        // the same account. Two inners sharing one token is ambiguous
+        // ownership: whichever dropped first would release a
+        // registration the other still depends on. Cross-id retag is
+        // unambiguous because the token moves - the old inner's Drop
+        // finds nothing under the old id and no-ops - but the same-id
+        // path moves nothing, so the only safe rebuild is no rebuild.
+        // The documented contract is unchanged: "a cheap rebuild with
+        // no registration-count change".
+        if new_id == self.inner.account {
+            return self.clone();
+        }
         let net_inner = &self.inner.net.inner;
         let mut moved = false;
-        if new_id != self.inner.account {
+        {
             let mut map = net_inner
                 .account_hosts
                 .lock()
@@ -593,9 +636,7 @@ impl AccountNet {
                 .meter
                 .retag_account(&self.inner.account, new_id.clone());
         }
-        let account_meter = if new_id == self.inner.account {
-            self.inner.meter.clone()
-        } else if moved {
+        let account_meter = if moved {
             net_inner.meter.account(new_id.clone())
         } else {
             BandwidthMeter::inert_account(new_id.clone())
@@ -1110,6 +1151,116 @@ mod tests {
             .expect("net account_hosts lock poisoned");
         map.get(id)
             .and_then(|registrations| registrations.values().next().cloned())
+    }
+
+    /// The leak: the JMAP reqwest transport attaches and never calls
+    /// `detach()`, so `account_hosts` and the meter map grew by one
+    /// entry per account open for the process lifetime. Release is now
+    /// automatic on the last clone.
+    #[test]
+    fn dropping_the_last_handle_releases_the_registration() {
+        let net = build_net();
+        let id = AccountId("dropped".to_string());
+        let account = net.attach_account(id.clone(), build_spec("drop.example"));
+        let clone = account.clone();
+        assert!(account_hosts_snapshot(&net, &id).is_some());
+
+        drop(account);
+        assert!(
+            account_hosts_snapshot(&net, &id).is_some(),
+            "a surviving clone still owns the registration"
+        );
+
+        drop(clone);
+        assert!(
+            account_hosts_snapshot(&net, &id).is_none(),
+            "the last clone going away must release the registration"
+        );
+    }
+
+    /// Drop is keyed on the exact attachment token, which is what makes
+    /// "a stale Drop cannot detach the replacement" true rather than
+    /// aspirational. Two live handles under one `AccountId` must not
+    /// interfere.
+    #[test]
+    fn a_dropped_handle_does_not_detach_a_sibling_under_the_same_id() {
+        let net = build_net();
+        let id = AccountId("duplicate".to_string());
+        let first = net.attach_account(id.clone(), build_spec("dup.example"));
+        let second = net.attach_account(id.clone(), build_spec("dup.example"));
+
+        drop(first);
+        assert!(
+            account_hosts_snapshot(&net, &id).is_some(),
+            "the second attachment's registration must survive"
+        );
+
+        drop(second);
+        assert!(account_hosts_snapshot(&net, &id).is_none());
+    }
+
+    /// An explicit `detach()` followed by the handle going out of scope
+    /// must not double-release: `detach_registration` returns before
+    /// touching the meter or the governor once the token is gone.
+    #[test]
+    fn an_explicit_detach_then_drop_is_not_a_double_release() {
+        let net = build_net();
+        let id = AccountId("explicit".to_string());
+        let survivor = net.attach_account(id.clone(), build_spec("shared.example"));
+        let early = net.attach_account(id.clone(), build_spec("shared.example"));
+
+        early.detach();
+        drop(early);
+
+        assert!(
+            account_hosts_snapshot(&net, &id).is_some(),
+            "the double release would have taken the survivor's registration too"
+        );
+        drop(survivor);
+        assert!(account_hosts_snapshot(&net, &id).is_none());
+    }
+
+    /// A cross-id retag moves the token, so the old handle's Drop finds
+    /// nothing under the old id and must leave the renamed registration
+    /// alone.
+    #[test]
+    fn dropping_a_retagged_handles_predecessor_does_not_release_the_new_id() {
+        let net = build_net();
+        let old = AccountId("before".to_string());
+        let new = AccountId("after".to_string());
+        let original = net.attach_account(old.clone(), build_spec("retagdrop.example"));
+        let renamed = original.retag(new.clone());
+
+        drop(original);
+        assert!(
+            account_hosts_snapshot(&net, &new).is_some(),
+            "the moved registration belongs to the renamed handle"
+        );
+
+        drop(renamed);
+        assert!(account_hosts_snapshot(&net, &new).is_none());
+    }
+
+    /// Same-id retag returns the same handle rather than a second inner
+    /// sharing one `registration_id`. Two inners on one token is
+    /// ambiguous ownership - whichever dropped first would release a
+    /// registration the other still depends on.
+    #[test]
+    fn a_same_id_retag_does_not_mint_a_second_owner_of_one_token() {
+        let net = build_net();
+        let id = AccountId("stable".to_string());
+        let original = net.attach_account(id.clone(), build_spec("same.example"));
+        let rebuilt = original.retag(id.clone());
+        assert_eq!(rebuilt.account(), &id);
+
+        drop(original);
+        assert!(
+            account_hosts_snapshot(&net, &id).is_some(),
+            "the rebuilt handle must still own a live registration"
+        );
+
+        drop(rebuilt);
+        assert!(account_hosts_snapshot(&net, &id).is_none());
     }
 
     #[test]

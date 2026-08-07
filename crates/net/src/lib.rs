@@ -49,7 +49,7 @@ pub use bandwidth::{AccountMeter, BandwidthMeter, MeterSink, MeterSinkHandle};
 // crate all speak the same language. Re-exported here for ergonomic
 // imports from downstream code.
 pub use bifrost_types::{AccountFuture, AccountId, ByteRange, Priority};
-pub use config::NetConfig;
+pub use config::{DEFAULT_MAX_BUFFERED_RESPONSE, NetConfig};
 pub use error::{Error, FinalResponse, MalformedRedirectKind, RangeFailureKind, STATUS_BODY_CAP};
 pub use net::{AccountNet, AccountSpec, Net};
 pub use rate::{RateLimit, RateLimitGovernor, RequestCost};

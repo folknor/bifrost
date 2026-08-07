@@ -118,6 +118,11 @@ pub struct RequestSnapshot {
     pub headers: HeaderMap,
     /// Request body, if the request carried one in memory.
     pub body: Option<Bytes>,
+    /// Total request deadline as sent: the caller's `.timeout()`, else
+    /// `NetConfig::default_request_timeout` on the buffered path, else
+    /// `None`. Exposed so a test can assert a request actually went out
+    /// with a deadline rather than trusting the config.
+    pub timeout: Option<std::time::Duration>,
 }
 
 /// A wire dispatcher that answers from a fixed script and records
@@ -196,6 +201,7 @@ impl Dispatch for ScriptedDispatch {
                 url: request.url().clone(),
                 headers: request.headers().clone(),
                 body,
+                timeout: request.timeout().copied(),
             });
         let step = self
             .steps

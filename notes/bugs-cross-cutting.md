@@ -19,7 +19,8 @@ mandatory even for Basic auth. Both writeups are retained in full in their own d
 
 **Uncapped response buffering.** `bugs-net-types.md` reports `send()` buffering response bodies with
 no ceiling, and separately notes `ReqwestDavTransport::send` calling `response.text()` with the same
-exposure. The DAV report does not raise it.
+exposure. The DAV report does not raise it. (Fixed 2026-08-07 in all three places, against one
+shared `DEFAULT_MAX_BUFFERED_RESPONSE`.)
 
 ## The same defect shape in three or more scopes
 

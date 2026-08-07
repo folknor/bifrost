@@ -5,6 +5,12 @@ use std::time::Duration;
 use crate::auth::DEFAULT_TOKEN_MAX_AGE;
 use crate::redirect::{FollowRedirects, RedirectPolicy};
 
+/// Default ceiling on a buffered response body: 64 MiB. Chosen to be
+/// far above any JSON envelope the protocol crates exchange (the
+/// largest realistic one is a JMAP `Email/get` batch with full bodies)
+/// and far below a size that threatens the process.
+pub const DEFAULT_MAX_BUFFERED_RESPONSE: usize = 64 * 1024 * 1024;
+
 /// Tunable parameters for the underlying reqwest client. Hidden behind
 /// an explicit config struct so future migrations off reqwest can
 /// remap fields without breaking the public surface.
@@ -23,6 +29,36 @@ pub struct NetConfig {
     pub tcp_keepalive: Duration,
     /// Connection establishment timeout.
     pub connect_timeout: Duration,
+    /// Inactivity deadline between response body chunks, applied to
+    /// every request.
+    ///
+    /// `connect_timeout` only covers reaching the server. A request
+    /// that connects and then stalls mid-body produces no error at all,
+    /// so the retry loop never fires and the caller waits forever - and
+    /// only JMAP was setting a per-request timeout, leaving every Gmail
+    /// and Graph call with no deadline of any kind. This is an
+    /// inactivity timeout rather than a total one, so it bounds the
+    /// stall without capping a legitimately long blob download.
+    pub read_timeout: Option<Duration>,
+    /// Total deadline applied by `RequestBuilder::send` when the caller
+    /// set no explicit `timeout`.
+    ///
+    /// Buffered-only, deliberately. `send` is the JSON-API path, where
+    /// a whole-request ceiling is right; `send_streaming` is the blob
+    /// path, where a multi-minute attachment download is normal and a
+    /// total deadline would fail it on size rather than on health.
+    /// Streaming is bounded by `read_timeout` instead.
+    pub default_request_timeout: Option<Duration>,
+    /// Ceiling on a buffered response body, enforced by
+    /// `RequestBuilder::send`.
+    ///
+    /// `send` accumulates the whole body into memory, and every JSON
+    /// API call in google / graph / jmap takes that path. Without a
+    /// ceiling a provider outage page, a mis-routed blob URL, or a
+    /// hostile response can OOM the process. The error path already had
+    /// a 4 KB cap (`read_capped_response_body`); this is the success
+    /// path's. `None` disables the check.
+    pub max_buffered_response: Option<usize>,
     /// User-Agent header set on every outbound request.
     pub user_agent: String,
     /// Extra trusted root certificates injected into the native-tls
@@ -56,6 +92,9 @@ impl Default for NetConfig {
             http2_keep_alive_timeout: Duration::from_secs(10),
             tcp_keepalive: Duration::from_secs(60),
             connect_timeout: Duration::from_secs(10),
+            read_timeout: Some(Duration::from_secs(30)),
+            default_request_timeout: Some(Duration::from_secs(120)),
+            max_buffered_response: Some(DEFAULT_MAX_BUFFERED_RESPONSE),
             user_agent: format!("bifrost-net/{}", env!("CARGO_PKG_VERSION")),
             root_certs: Vec::new(),
             dangerous_accept_invalid_certs: false,

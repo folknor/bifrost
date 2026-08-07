@@ -280,7 +280,18 @@ impl RequestBuilder {
 
     /// Drive the request to completion with the configured retry
     /// budget, returning the buffered response.
-    pub async fn send(self) -> Result<Response, Error> {
+    pub async fn send(mut self) -> Result<Response, Error> {
+        let config = self.inner.account.net().config().clone();
+        // Apply the buffered path's default deadline. Only here, not in
+        // `send_streaming_inner`: this is the JSON-API path, where a
+        // whole-request ceiling is right, while the streaming path
+        // carries blob downloads that legitimately run long and are
+        // bounded by `NetConfig::read_timeout` instead. An explicit
+        // `.timeout()` from the caller always wins.
+        if self.inner.timeout.is_none() {
+            self.inner.timeout = config.default_request_timeout;
+        }
+        let limit = config.max_buffered_response;
         let internal = send_streaming_inner(self).await?;
         // Drain the body into a single `Bytes`. The retry loop has
         // already validated status; everything from here is a
@@ -292,6 +303,15 @@ impl RequestBuilder {
         use futures::StreamExt;
         while let Some(chunk) = body_stream.next().await {
             let chunk = chunk?;
+            // Checked before the extend, so the ceiling bounds what is
+            // actually held rather than being noticed one chunk after
+            // the allocation that mattered. The stream drops here, so a
+            // provider streaming gigabytes stops being read.
+            if let Some(limit) = limit
+                && accum.len() + chunk.len() > limit
+            {
+                return Err(Error::ResponseTooLarge { limit });
+            }
             accum.extend_from_slice(&chunk);
         }
         Ok(Response {
@@ -1294,6 +1314,133 @@ mod tests {
 
         assert_eq!(response.body, Bytes::from_static(b"recovered"));
         assert_eq!(script.requests().len(), 2);
+    }
+
+    /// `send` buffers the whole body, and every JSON API call in
+    /// google / graph / jmap takes that path. Without a ceiling a
+    /// provider outage page, a mis-routed blob URL, or a hostile
+    /// response OOMs the process. The error path already had a 4 KB
+    /// cap; this is the success path's.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_buffered_body_past_the_ceiling_is_refused() {
+        let script = ScriptedDispatch::new([canned(StatusCode::OK, &[b'x'; 4096])]);
+        let config = NetConfig {
+            max_buffered_response: Some(1024),
+            ..NetConfig::default()
+        };
+        let account = scripted_account(&script, config, Vec::new(), RetryPolicy::disabled());
+
+        let Err(error) = account.get("https://big.test/resource").send().await else {
+            panic!("a 4 KiB body must not pass a 1 KiB ceiling");
+        };
+
+        assert!(
+            matches!(error, Error::ResponseTooLarge { limit: 1024 }),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    /// The ceiling must not fire on ordinary traffic, and `None`
+    /// disables it entirely.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_body_within_the_ceiling_is_returned_intact() {
+        let script = ScriptedDispatch::new([
+            canned(StatusCode::OK, b"small"),
+            canned(StatusCode::OK, &[b'x'; 4096]),
+        ]);
+        let account = scripted_account(
+            &script,
+            NetConfig::default(),
+            Vec::new(),
+            RetryPolicy::disabled(),
+        );
+        let response = account
+            .get("https://ok.test/resource")
+            .send()
+            .await
+            .expect("a small body is well under the default ceiling");
+        assert_eq!(response.body, Bytes::from_static(b"small"));
+
+        let unbounded = scripted_account(
+            &script,
+            NetConfig {
+                max_buffered_response: None,
+                ..NetConfig::default()
+            },
+            Vec::new(),
+            RetryPolicy::disabled(),
+        );
+        let response = unbounded
+            .get("https://ok.test/resource")
+            .send()
+            .await
+            .expect("None disables the check");
+        assert_eq!(response.body.len(), 4096);
+    }
+
+    /// Only JMAP set a per-request timeout, so every Gmail and Graph
+    /// call went out with no deadline at all. `send` now supplies the
+    /// configured default when the caller set none, and an explicit
+    /// `.timeout()` still wins.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn the_buffered_path_supplies_a_default_deadline() {
+        let script = ScriptedDispatch::new([
+            canned(StatusCode::OK, b"one"),
+            canned(StatusCode::OK, b"two"),
+        ]);
+        let config = NetConfig {
+            default_request_timeout: Some(Duration::from_secs(7)),
+            ..NetConfig::default()
+        };
+        let account = scripted_account(&script, config, Vec::new(), RetryPolicy::disabled());
+
+        account
+            .get("https://deadline.test/a")
+            .send()
+            .await
+            .expect("first request succeeds");
+        account
+            .get("https://deadline.test/b")
+            .timeout(Duration::from_secs(90))
+            .send()
+            .await
+            .expect("second request succeeds");
+
+        let requests = script.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0].timeout,
+            Some(Duration::from_secs(7)),
+            "a caller that set no timeout gets the configured default"
+        );
+        assert_eq!(
+            requests[1].timeout,
+            Some(Duration::from_secs(90)),
+            "an explicit timeout wins over the default"
+        );
+    }
+
+    /// The streaming path is deliberately exempt: it carries blob
+    /// downloads that legitimately run for minutes, and a total
+    /// deadline would fail them on size rather than on health.
+    /// `NetConfig::read_timeout` is what bounds a stalled stream.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn the_streaming_path_takes_no_default_deadline() {
+        let script = ScriptedDispatch::new([canned(StatusCode::OK, b"blob")]);
+        let account = scripted_account(
+            &script,
+            NetConfig::default(),
+            Vec::new(),
+            RetryPolicy::disabled(),
+        );
+
+        account
+            .get("https://blob.test/attachment")
+            .send_streaming()
+            .await
+            .expect("streaming request succeeds");
+
+        assert_eq!(script.requests()[0].timeout, None);
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]

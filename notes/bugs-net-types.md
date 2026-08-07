@@ -4,41 +4,18 @@ Hunter: Claude Opus, single pass, 2026-08-05. Scope: `crates/net/` and `crates/t
 foundation. Read-only review. Findings are unverified work material. Line numbers are as of the hunt
 and will drift.
 
+2026-08-07 (second pass): three more fixed - the missing request deadline (as
+`NetConfig::read_timeout` plus a buffered-only `default_request_timeout`), uncapped buffered
+response bodies in both `send()` and the two DAV transports, and the `AccountNet` registration
+leak (a registration-keyed `Drop`, which also forced same-id `retag` to stop minting a second
+owner of one token).
+
 2026-08-07: five findings verified and fixed, each with a regression test - the non-idempotent
 retry replay, `same_origin` ignoring scheme, `status_line_code`'s missing range constraint,
 `finalize`'s O(n*m) membership scan, and the dropped refresh driver reported as terminal auth
 loss. `Error::Cancelled` now has a producer (the dropped-driver source), closing that item too.
 Their entries are removed below; the behaviour lives in `reference/net.md`. Everything still
 listed is unverified.
-
-## Google and Graph requests have no deadline at all
-
-`NetConfig` carries only `connect_timeout`; reqwest's client has no default overall timeout; and
-`RequestBuilder::timeout` is optional and set only by JMAP
-(`crates/jmap/src/transport_reqwest.rs`, `crates/jmap/src/sync/factory.rs`). A Gmail or Graph request
-that connects and then stalls mid-body hangs forever: the retry loop never fires because no error is
-produced, and the sync scope blocks indefinitely. `NetConfig` should carry a
-`default_request_timeout` that `build_reqwest` applies when the builder did not set one.
-
-## send() buffers response bodies with no cap
-
-`request.rs` accumulates the entire body into a `Vec<u8>` with no ceiling. Every JSON API call in
-google/graph/jmap uses this path. A provider (or a MITM-able error page, or a mis-routed blob URL)
-returning a multi-GB body OOMs the process. `read_capped_response_body` already exists for the error
-path (4 KB); the success path has nothing. Add a configurable `max_buffered_response` and fail with a
-`Protocol(ContractViolation)` past it.
-
-Second instance of the same exposure: `ReqwestDavTransport::send` in the DAV crates calls
-`response.text()` with no cap.
-
-## AccountNet has no Drop, and JMAP never detaches, so registrations leak
-
-There is exactly one `impl Drop` in both crates (`RateDebit`). `reference/net.md` asserts "a stale
-Drop cannot detach the replacement", implying a `Drop` that does not exist. Google and Graph call
-`detach()` explicitly; `crates/jmap/src/transport_reqwest.rs` attaches and never detaches, so
-`NetInner::account_hosts` and the meter map grow by one entry per JMAP account open for the process
-lifetime. Either add `Drop for AccountNetInner` calling `detach_registration`, or make the leak
-impossible by construction.
 
 ## No backoff on the token-endpoint failure path that has no fallback token
 

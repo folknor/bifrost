@@ -67,7 +67,7 @@ impl DavTransport for ReqwestDavTransport {
             let response = request.send().await.map_err(|error| error.to_string())?;
             let status = response.status();
             let headers = response.headers().clone();
-            let body = response.text().await.map_err(|error| error.to_string())?;
+            let body = read_capped_body(response).await?;
             Ok(DavResponse {
                 status,
                 headers,
@@ -75,6 +75,39 @@ impl DavTransport for ReqwestDavTransport {
             })
         })
     }
+}
+
+/// Read a DAV response body with a ceiling.
+///
+/// `response.text()` buffers without one, so a provider returning a
+/// runaway 207, an error page, or a mis-routed blob URL OOMs the
+/// process. A Multi-Status body for a large address book is
+/// legitimately big, hence a ceiling generous enough that only a
+/// pathological response reaches it, matching the buffered ceiling
+/// `bifrost-net` applies on its own `send` path.
+async fn read_capped_body(response: reqwest::Response) -> Result<String, String> {
+    use futures::StreamExt;
+
+    let limit = bifrost_net::DEFAULT_MAX_BUFFERED_RESPONSE;
+    let mut stream = response.bytes_stream();
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| error.to_string())?;
+        if buf.len() + chunk.len() > limit {
+            return Err(format!(
+                "DAV response body exceeded the {limit}-byte ceiling"
+            ));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    // `.text()` decodes per the `charset` Content-Type parameter and
+    // falls back to lossy UTF-8. This decodes lossily unconditionally,
+    // which narrows behaviour for a server that declares a non-UTF-8
+    // charset - RFC 4918 bodies are XML, whose declared default is
+    // UTF-8, so that case was already outside what the parsers here
+    // handle. Lossy rather than strict keeps a malformed byte behaving
+    // as it did before (a replacement character, not a failed request).
+    Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
 impl CardDavClient {

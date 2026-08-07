@@ -164,6 +164,19 @@ pub enum Error {
     #[error("request cancelled")]
     Cancelled,
 
+    /// A buffered response body exceeded
+    /// `NetConfig::max_buffered_response`.
+    ///
+    /// A contract violation rather than a transport failure: the server
+    /// answered, and what it answered with is not something this client
+    /// agreed to hold in memory. Retrying cannot help, so it must not
+    /// classify as transient.
+    #[error("response body exceeded the {limit}-byte buffered ceiling")]
+    ResponseTooLarge {
+        /// The configured ceiling, in bytes.
+        limit: usize,
+    },
+
     /// Caller asked the per-host governor to debit a cost that exceeds
     /// the bucket's burst capacity. The bucket can never fill that high,
     /// so the request would block forever; we surface a typed error

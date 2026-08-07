@@ -38,8 +38,24 @@ Every `attach_account` receives a monotone registration token carried
 by its `AccountNet`. `AccountNet::detach()` removes that exact
 registration, decrements the meter's per-id attach count, and
 decrements the governor for only the hosts that attachment
-successfully registered. This remains safe when two live handles have
-the same `AccountId`: a stale Drop cannot detach the replacement.
+successfully registered. Release is also automatic: `AccountNetInner`
+has a `Drop` that runs the same registration-keyed teardown when the
+last clone of a handle goes. Google and Graph call `detach()`
+explicitly, the JMAP reqwest transport never did, and
+`NetInner::account_hosts` plus the meter map therefore grew by one
+entry per JMAP account open for the process lifetime; making the
+release automatic closes that for every caller rather than relying on
+each to remember, and leaves `detach()` as the way to release early.
+
+Keying on the exact token is what makes this safe when two live handles
+share an `AccountId`: a stale Drop cannot detach the replacement.
+`detach_registration` returns before touching the meter or the governor
+once its token is absent, so a Drop after an explicit `detach()`, or
+after a cross-id `retag()` moved the token, is a complete no-op. A
+SAME-id `retag` returns the receiver itself rather than minting a
+second `AccountNetInner` over one token - two owners of one
+registration is ambiguous, and whichever dropped first would release
+what the other still depends on.
 `Net::detach_account(id)` remains the ID-only compatibility entry point
 and removes one registration. Host buckets and meter counters are
 reclaimed only after their final matching detach.
@@ -78,6 +94,39 @@ fresh wire request: governor debit + outbound metering + body send
 + inbound metering. Buffered (`send`) and streaming
 (`send_streaming`) share `send_streaming_inner`; the buffered path
 drains the body through the same metering reader.
+
+### Deadlines and the buffered ceiling
+
+Three bounds, at deliberately different layers:
+
+- `NetConfig::connect_timeout` (10s) covers reaching the server.
+- `NetConfig::read_timeout` (30s) is an inactivity deadline between
+  response body chunks, installed on the shared client so it applies to
+  every request, buffered and streaming. Without it a request that
+  connects and then stalls mid-body produces no error at all: the retry
+  loop never fires, and the sync scope blocks indefinitely. Only JMAP
+  set a per-request timeout, so every Gmail and Graph call previously
+  had no deadline of any kind. An inactivity bound rather than a total
+  one, so it cannot fail a legitimately slow large download.
+- `NetConfig::default_request_timeout` (120s) is a TOTAL deadline
+  `RequestBuilder::send` supplies when the caller set no explicit
+  `.timeout()`. Buffered-only: `send` is the JSON-API path where a
+  whole-request ceiling is right, while `send_streaming` carries blob
+  downloads that legitimately run for minutes and would fail on size
+  rather than on health. Streaming is bounded by `read_timeout` alone.
+
+`NetConfig::max_buffered_response` (`DEFAULT_MAX_BUFFERED_RESPONSE`,
+64 MiB) caps what `send` will accumulate, failing with
+`Error::ResponseTooLarge` before the allocation that would exceed it
+and dropping the stream. Every JSON API call in google / graph / jmap
+takes this path, so without a ceiling a provider outage page, a
+mis-routed blob URL, or a hostile response OOMs the process; the error
+path already had a 4 KB cap in `read_capped_response_body` and the
+success path had nothing. `None` disables the check.
+`send_streaming` is uncapped by design - the caller owns backpressure
+there. The CalDAV and CardDAV clients, which run their own transport,
+apply the same constant in their `read_capped_body` rather than
+`reqwest::Response::text()`.
 
 The loop sends through a crate-private `Dispatch` seam. Production
 dispatch delegates to reqwest. Tests install a scripted dispatcher
@@ -569,6 +618,10 @@ variants:
   refresh failure preserving the original. OAuth `Retry-After`
   deadlines are stored on the wrapper for the account-error
   conversion.
+- `ResponseTooLarge { limit }` - a buffered body exceeded
+  `NetConfig::max_buffered_response`. Maps to
+  `Protocol(ContractViolation)`, not a transport class: the server
+  answered, and the same answer comes back on a retry.
 - `Cancelled` - request cancelled before completion. Produced by
   `wait_for_refresh` as the preserved `RefreshFailed` source when the
   single-flight refresh driver drops its sender without answering.

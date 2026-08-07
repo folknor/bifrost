@@ -149,6 +149,14 @@ pub fn into_account_error(error: Error, ctx: NetErrorContext) -> AccountError {
             format!("redirect chain exceeded configured maximum after {hops} hops"),
             TransmissionState::Acknowledged,
         ),
+        // The server answered; what it answered with is not something
+        // this client agreed to hold in memory. Terminal, not
+        // transient - the same response comes back on a retry.
+        Error::ResponseTooLarge { limit } => contract_violation(
+            &ctx,
+            format!("response body exceeded the {limit}-byte buffered ceiling"),
+            TransmissionState::Acknowledged,
+        ),
     }
 }
 
@@ -696,7 +704,8 @@ fn support_cause_from_source(error: &Error) -> Option<Cause> {
         | Error::RangeNotHonored { .. }
         | Error::RedirectRejected { .. }
         | Error::MalformedRedirect { .. }
-        | Error::RedirectLoop { .. } => None,
+        | Error::RedirectLoop { .. }
+        | Error::ResponseTooLarge { .. } => None,
     }
 }
 
