@@ -8,7 +8,6 @@ use super::client::GraphClient;
 
 const DEFAULT_EXPIRATION_MINUTES: u32 = 1440;
 const MAX_EXPIRATION_MINUTES: u32 = 4230;
-const CLIENT_STATE_BYTES: usize = 16;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -17,7 +16,7 @@ struct GraphSubscription {
     notification_url: String,
     resource: String,
     expiration_date_time: String,
-    client_state: Option<String>,
+    client_state: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -37,7 +36,7 @@ pub(crate) async fn create_subscription(
     client: &GraphClient,
     resource: &str,
     notification_url: &str,
-    client_state: Option<&str>,
+    client_state: &str,
     expiration_minutes: Option<u32>,
 ) -> Result<SubscriptionResponse, GraphError> {
     let minutes = expiration_minutes
@@ -49,10 +48,7 @@ pub(crate) async fn create_subscription(
         notification_url: notification_url.to_string(),
         resource: resource.to_string(),
         expiration_date_time: compute_expiry_iso8601(minutes),
-        client_state: Some(match client_state {
-            Some(client_state) => client_state.to_string(),
-            None => generate_client_state()?,
-        }),
+        client_state: client_state.to_string(),
     };
 
     let response: SubscriptionResponse = client.post("/subscriptions", &body).await?;
@@ -122,32 +118,6 @@ pub(crate) async fn delete_subscription(
     Ok(())
 }
 
-fn generate_client_state() -> Result<String, GraphError> {
-    let mut buf = [0u8; CLIENT_STATE_BYTES];
-    getrandom::fill(&mut buf).map_err(|error| {
-        // RNG failure is a host-environment problem, not a Graph
-        // contract violation. Surface it as a transport "Network"
-        // failure with `transmission_state: Unsent` so the recovery
-        // mapping classifies it as a retryable client-side issue
-        // (engine reopens the account); we never sent a byte.
-        GraphError::Net(bifrost_net::Error::Network {
-            message: format!("RNG failed: {error}"),
-            transmission_state: bifrost_types::TransmissionState::Unsent,
-            source: None,
-        })
-    })?;
-    Ok(hex_encode(&buf))
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        use std::fmt::Write;
-        let _ = write!(s, "{byte:02x}");
-    }
-    s
-}
-
 fn compute_expiry_iso8601(minutes: u32) -> String {
     let now = jiff::Timestamp::now();
     let at = jiff::Span::new()
@@ -211,7 +181,7 @@ mod tests {
             notification_url: "https://example.com/notify".to_string(),
             resource: "/me/messages".to_string(),
             expiration_date_time: "2024-06-15T12:00:00Z".to_string(),
-            client_state: Some("abc123".to_string()),
+            client_state: "abc123".to_string(),
         };
 
         let json = serde_json::to_string(&sub).expect("should serialize");
@@ -238,11 +208,6 @@ mod tests {
     fn iso_roundtrip_parse() {
         let iso = unix_to_iso8601(1_718_450_400);
         assert_eq!(parse_iso8601_to_unix(&iso), Some(1_718_450_400));
-    }
-
-    #[test]
-    fn hex_encode_lowercase() {
-        assert_eq!(hex_encode(&[0x0a, 0xff]), "0aff");
     }
 
     #[test]
@@ -336,10 +301,6 @@ mod tests {
         assert!(default_remaining < want);
     }
 
-    /// The legacy endpoint constructor still mints a random fallback when a
-    /// caller does not opt into a receiver-owned account-wide clientState.
-    /// The configured path is exercised by account construction; this pins
-    /// only the fallback's entropy and encoding.
     /// `subscription_is_gone` is the gate on the renewal worker's
     /// recreate path: only a subscription Graph no longer has may be
     /// replaced by a fresh create. A throttle or an auth failure must
@@ -407,11 +368,23 @@ mod tests {
         assert!(subscription_is_gone(&gone(reqwest::StatusCode::GONE)));
     }
 
+    /// `clientState` is the only thing an out-of-process receiver can
+    /// authenticate a notification with, so it comes from the caller and is
+    /// sent verbatim. Nothing in this module mints one: a locally generated
+    /// secret is a secret nobody holds.
     #[test]
-    fn each_client_state_is_a_distinct_unexported_secret() {
-        let first = generate_client_state().expect("rng");
-        let second = generate_client_state().expect("rng");
-        assert_eq!(first.len(), CLIENT_STATE_BYTES * 2);
-        assert_ne!(first, second);
+    fn the_callers_client_state_is_sent_verbatim() {
+        let sub = GraphSubscription {
+            change_type: "created".to_string(),
+            notification_url: "https://example.com/notify".to_string(),
+            resource: "/me/messages".to_string(),
+            expiration_date_time: "2099-01-01T00:00:00Z".to_string(),
+            client_state: "receiver-owned".to_string(),
+        };
+        let json = serde_json::to_string(&sub).expect("should serialize");
+        assert!(
+            json.contains("\"clientState\":\"receiver-owned\""),
+            "{json}"
+        );
     }
 }

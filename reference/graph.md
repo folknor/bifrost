@@ -251,11 +251,14 @@ retagged instead, which moves its token rather than minting a new one.
 `GraphAccountFactory` carries a `GraphClient`, a `PushMode`, an optional
 `PushEndpoint`, a `shared_mailboxes: Vec<String>`, and
 `public_folders: Option<PublicFolderScope>`.
-`with_push_endpoint(url)` selects `GraphSubscriptions` with the historical
-random `clientState` fallback. New webhook consumers should use
-`with_push_endpoint_client_state(url, secret)`: it reuses the caller-owned
-account-wide secret for every resource so the out-of-process receiver can
-validate Graph notifications. `with_ews_streaming()` selects `EwsStreaming`
+`with_push_endpoint_client_state(url, secret)` is the ONLY webhook-mode
+constructor: it selects `GraphSubscriptions` and sends the caller-owned
+account-wide secret on every resource so the out-of-process receiver can
+validate Graph notifications. `PushEndpoint::client_state` is a `String`, not
+an `Option`. The removed `with_push_endpoint(url)` let `create_subscription`
+mint a random per-resource value and drop it on the floor, producing
+subscriptions no receiver could authenticate; nothing in the crate generates a
+`clientState` any more. `with_ews_streaming()` selects `EwsStreaming`
 and clears the endpoint; default webhook-mode without an endpoint makes
 `push_subscribe` return `Error::MissingCoreCapability`.
 `with_shared_mailbox(id)` registers a delegate/shared mailbox by its
@@ -815,19 +818,23 @@ is no hand-rolled civil-date arithmetic in the crate; `jiff` does it in both
 `clientState` validation is available through
 `GraphAccountFactory::with_push_endpoint_client_state(url, secret)`, which
 sends the caller-owned account-wide secret on every resource's subscription
-so the out-of-process receiver can compare it. The older
-`with_push_endpoint(url)` keeps the legacy behavior: `create_subscription`
-mints a fresh random `clientState` per resource, sends it, and discards it,
-and nothing on `GraphAccount`, `GraphSubscriptionGroup`, or the returned
-`SubscriptionHandle` exposes the value - a receiver behind that constructor
-still has no secret to check and must authenticate forged invalidations by
-other means.
+so the out-of-process receiver can compare it. There is no other webhook
+constructor and no locally generated fallback: a `clientState` this crate mints
+and discards is a secret nobody holds, which left the receiver with nothing to
+check while the field made the subscription look validated.
 
 #### Renewal worker
 
 The worker wakes every 10 min, renews everything inside the 30 min
 threshold, and emits `Disconnected` / `Reconnected` / `Terminated`
-accordingly. Three rules make the renewal path safe:
+accordingly. `GraphSubscriptionState` retains the `CursorScope`s its resource
+covers, and `due_renewals` carries them through, so a terminal failure's
+`Terminated` names what lost coverage: `ErrorScope::Cursor(scope)` when the
+resource covers exactly one scope, which is every ordinary case now that each
+resource string is built from one folder or calendar id. `subscribe_graph` used
+to discard the scopes it grouped, leaving the engine with a terminal push
+failure it could not attribute to anything. Three further rules make the
+renewal path safe:
 
 - A renewal that 404/410s (`subscription_is_gone`) is not retryable - Graph
   retains no deleted subscription to PATCH - so the worker creates a

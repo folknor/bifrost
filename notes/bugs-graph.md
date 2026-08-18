@@ -8,8 +8,10 @@ subscriptions colliding on `/me/events`, `push_stream` swallowing broadcast
 `Lagged`, the infallible `expirationDateTime` parser (and the hand-rolled
 civil-date arithmetic beside it), and the empty flag PATCH reported as
 `Applied`, `close()` stranding server-side subscriptions in both push modes,
-and the `decode_cursor` progress asymmetry. `reference/graph.md` now states
-each new rule.
+the `decode_cursor` progress asymmetry, the missing scope attribution on a
+terminal renewal failure, and the `with_push_endpoint` constructor whose
+`clientState` no receiver could validate. `reference/graph.md` now states each
+new rule.
 
 ## EWS streaming push is not actually streaming: it delivers in ~30-minute batches
 
@@ -104,11 +106,6 @@ already has a reseed path for anything it cannot honor.
 
 ## Smaller observations
 
-- **`subscribe_graph` discards the scopes it grouped** (`push.rs`, `for (resource, _) in grouped`).
-  A `GraphSubscriptionGroup` knows its server ids and resources but not which `CursorScope`s it
-  covers, so a terminal renewal failure emits `Terminated` with no scope attribution: the engine
-  cannot tell which scopes lost coverage. Given how carefully every other error path in this crate
-  carries `ErrorScope`, this one is conspicuous.
 - **Move sends `If-Match` on `POST /messages/{id}/move`** (`mutate.rs`). Graph likely does not honor
   a precondition on the move action; if so, the `Move` etag preflight (`refresh_missing_etags`, one
   GET per uncached id) is buying nothing while `mutation.concurrency: StateBased` implies it is.
@@ -119,8 +116,3 @@ already has a reseed path for anything it cannot honor.
   multi-item surface is filed per item and the rest proceeds, but here `push_subscribe` answers per
   request, so the design is at least self-consistent. Still, the practical effect is that one
   deleted folder in the engine's scope list disables push entirely.
-- **`generate_client_state()` is minted per resource and immediately discarded** (`webhooks.rs`)
-  under the legacy `with_push_endpoint`. The reference doc is honest about it, but it means that
-  constructor produces subscriptions no receiver can authenticate. Pre-1.0: delete
-  `with_push_endpoint` and make the secret mandatory rather than keeping a constructor whose
-  documented behavior is "your webhook receiver cannot validate anything".

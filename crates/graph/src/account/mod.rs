@@ -502,19 +502,16 @@ impl GraphAccountFactory {
         self
     }
 
-    // pub: webhook-mode consumers provide the public Graph subscription callback URL here.
-    pub fn with_push_endpoint(mut self, webhook_url: impl Into<String>) -> Self {
-        self.push_endpoint = Some(PushEndpoint {
-            webhook_url: webhook_url.into(),
-            client_state: None,
-        });
-        self.push_mode = PushMode::GraphSubscriptions;
-        self
-    }
-
     /// Configure Graph webhook delivery with an account-wide `clientState`
     /// secret. Use the same value in the consumer's webhook receiver to
     /// reject notifications not minted for this account.
+    ///
+    /// This is the only webhook-mode constructor. The secret is not optional:
+    /// the removed `with_push_endpoint(url)` let `create_subscription` mint a
+    /// random per-resource value and immediately discard it, so its
+    /// subscriptions carried a `clientState` no receiver could ever compare
+    /// against - a documented "your webhook receiver cannot validate
+    /// anything" mode.
     #[must_use]
     pub fn with_push_endpoint_client_state(
         mut self,
@@ -523,7 +520,7 @@ impl GraphAccountFactory {
     ) -> Self {
         self.push_endpoint = Some(PushEndpoint {
             webhook_url: webhook_url.into(),
-            client_state: Some(client_state.into()),
+            client_state: client_state.into(),
         });
         self.push_mode = PushMode::GraphSubscriptions;
         self
@@ -1409,11 +1406,19 @@ mod tests {
                     server_id: "one".to_string(),
                     expires_at: "2099-01-01T00:00:00Z".to_string(),
                     resource: "/me/mailFolders/inbox/messages".to_string(),
+                    scopes: vec![CursorScope::FolderType {
+                        folder: FolderId("inbox".to_string()),
+                        ty: ObjectType::Email,
+                    }],
                 },
                 push::GraphSubscriptionState {
                     server_id: "two".to_string(),
                     expires_at: "2099-01-01T00:00:00Z".to_string(),
                     resource: "/me/calendars/cal/events".to_string(),
+                    scopes: vec![CursorScope::FolderType {
+                        folder: FolderId("cal".to_string()),
+                        ty: ObjectType::Event,
+                    }],
                 },
             ]),
         );

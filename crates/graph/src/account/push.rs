@@ -28,7 +28,12 @@ pub(crate) struct PushEndpoint {
     pub(crate) webhook_url: String,
     /// A consumer-owned account-wide secret carried in every Graph webhook
     /// subscription so its out-of-process receiver can validate clientState.
-    pub(crate) client_state: Option<String>,
+    ///
+    /// Mandatory. The alternative was a per-resource random value minted
+    /// inside `create_subscription` and dropped on the floor, which produced
+    /// subscriptions no receiver could authenticate - a secret nobody holds
+    /// is not a secret, it is an unvalidated webhook with a field filled in.
+    pub(crate) client_state: String,
 }
 
 #[derive(Debug, Clone)]
@@ -67,6 +72,15 @@ pub(crate) struct GraphSubscriptionState {
     pub(crate) server_id: String,
     pub(crate) expires_at: String,
     pub(crate) resource: String,
+    /// The cursor scopes this one subscription covers.
+    ///
+    /// Retained so a terminal renewal failure can name what lost coverage.
+    /// `subscribe_graph` groups by resource string and used to discard the
+    /// scopes it grouped, leaving `Terminated` with no scope attribution at
+    /// all - the engine could see that push broke without being able to tell
+    /// which scopes to fall back to polling. Every other error path in this
+    /// crate carries an `ErrorScope`.
+    pub(crate) scopes: Vec<CursorScope>,
 }
 
 #[derive(Debug, Clone)]
@@ -223,12 +237,12 @@ async fn subscribe_graph(
     let handle = new_handle()?;
 
     let mut subscriptions = Vec::new();
-    for (resource, _) in grouped {
+    for (resource, covered) in grouped {
         match create_subscription(
             &account.client,
             &resource,
             &endpoint.webhook_url,
-            endpoint.client_state.as_deref(),
+            &endpoint.client_state,
             None,
         )
         .await
@@ -237,6 +251,7 @@ async fn subscribe_graph(
                 server_id: response.id,
                 expires_at: response.expiration_date_time,
                 resource,
+                scopes: covered,
             }),
             Err(error) => {
                 // The handle is never registered on the account and never
@@ -423,7 +438,13 @@ async fn run_graph_subscription_worker(account: GraphAccount) {
         };
 
         let mut had_error = false;
-        for (handle, server_id, resource) in due {
+        for DueRenewal {
+            handle,
+            server_id,
+            resource,
+            scopes,
+        } in due
+        {
             match renew_subscription(&account.client, &server_id, None).await {
                 Ok(new_expiry) => {
                     let mut groups = account.graph_subscriptions.write().await;
@@ -448,7 +469,7 @@ async fn run_graph_subscription_worker(account: GraphAccount) {
                     let (phase, error) = match account.push_endpoint.as_ref() {
                         Some(endpoint) if subscription_is_gone(&error) => {
                             match replace_gone_subscription(
-                                &account, endpoint, &handle, &server_id, &resource,
+                                &account, endpoint, &handle, &server_id, &resource, &scopes,
                             )
                             .await
                             {
@@ -479,10 +500,19 @@ async fn run_graph_subscription_worker(account: GraphAccount) {
                         }
                         _ => ("renew", error),
                     };
-                    let account_error = into_account_error(
-                        error,
-                        GraphErrorContext::graph(AccountOperation::PushSubscribe),
-                    );
+                    // Name what lost coverage. A resource covers exactly one
+                    // scope in every ordinary case (each resource string is
+                    // built from one folder or calendar id), so the common
+                    // path gets precise attribution; the ambiguous case -
+                    // `Event` and `CalendarEvent` scopes over one calendar -
+                    // stays account-scoped rather than picking a scope
+                    // arbitrarily, and the covered list is logged either way.
+                    let context = GraphErrorContext::graph(AccountOperation::PushSubscribe);
+                    let context = match scopes.as_slice() {
+                        [only] => context.with_scope(ErrorScope::Cursor(only.clone())),
+                        _ => context,
+                    };
+                    let account_error = into_account_error(error, context);
                     // Terminal recovery classes (AuthLost,
                     // NeedsPolicyChange, NoPermission, etc.) cannot
                     // be recovered without engine intervention.
@@ -501,6 +531,7 @@ async fn run_graph_subscription_worker(account: GraphAccount) {
                             recovery = telemetry.recovery_discriminant,
                             server_id = %server_id,
                             phase = phase,
+                            scopes = ?scopes,
                             "Graph webhook renewal failed"
                         );
                     }
@@ -547,27 +578,36 @@ async fn retire_graph_worker_slot(account: &GraphAccount) {
     drop(account.graph_worker.lock().await.take());
 }
 
-/// The `(handle, server_id, resource)` triples inside the renewal threshold.
+/// One subscription inside the renewal threshold, with everything the worker
+/// needs to renew it, recreate it, or report what it covered.
+#[derive(Debug, Clone)]
+struct DueRenewal {
+    handle: SubscriptionHandle,
+    server_id: String,
+    resource: String,
+    scopes: Vec<CursorScope>,
+}
+
+/// The subscriptions inside the renewal threshold.
 ///
 /// A condemned (`tearing_down`) group contributes nothing. Renewing its
 /// subscriptions would extend the life of exactly what the caller asked to
 /// delete, and recreating a vanished one would hand teardown a server id its
 /// snapshot cannot contain. Their rows stay registered only so that a failed
 /// DELETE can be retried against them.
-fn due_renewals(
-    groups: &HashMap<SubscriptionHandle, GraphSubscriptionGroup>,
-) -> Vec<(SubscriptionHandle, String, String)> {
+fn due_renewals(groups: &HashMap<SubscriptionHandle, GraphSubscriptionGroup>) -> Vec<DueRenewal> {
     groups
         .iter()
         .filter(|(_, group)| !group.tearing_down)
         .flat_map(|(handle, group)| {
             group.subscriptions.iter().filter_map(move |state| {
                 if is_expiring_soon(&state.expires_at, RENEWAL_THRESHOLD_MINUTES) {
-                    Some((
-                        handle.clone(),
-                        state.server_id.clone(),
-                        state.resource.clone(),
-                    ))
+                    Some(DueRenewal {
+                        handle: handle.clone(),
+                        server_id: state.server_id.clone(),
+                        resource: state.resource.clone(),
+                        scopes: state.scopes.clone(),
+                    })
                 } else {
                     None
                 }
@@ -598,12 +638,13 @@ async fn replace_gone_subscription(
     handle: &SubscriptionHandle,
     stale_server_id: &str,
     resource: &str,
+    scopes: &[CursorScope],
 ) -> Result<Replacement, crate::error::GraphError> {
     let response = create_subscription(
         &account.client,
         resource,
         &endpoint.webhook_url,
-        endpoint.client_state.as_deref(),
+        &endpoint.client_state,
         None,
     )
     .await?;
@@ -611,6 +652,7 @@ async fn replace_gone_subscription(
         server_id: response.id,
         expires_at: response.expiration_date_time,
         resource: resource.to_string(),
+        scopes: scopes.to_vec(),
     };
     let created_id = replacement.server_id.clone();
 
@@ -1112,7 +1154,7 @@ mod tests {
             GraphAccount::new_for_tests(GraphClient::new("token"), PushMode::GraphSubscriptions);
         account.push_endpoint = Some(PushEndpoint {
             webhook_url: "https://example.test/webhook".to_string(),
-            client_state: None,
+            client_state: "secret".to_string(),
         });
         // CursorScope::Account is not a `FolderType` and so cannot
         // be mapped to a Graph subscription resource. This must
@@ -1143,7 +1185,7 @@ mod tests {
         let mut account = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
         account.push_endpoint = Some(PushEndpoint {
             webhook_url: "https://example.test/hook".to_string(),
-            client_state: Some("secret".to_string()),
+            client_state: "secret".to_string(),
         });
         let scopes = vec![
             CursorScope::FolderType {
@@ -1426,6 +1468,10 @@ mod tests {
             server_id: server_id.to_string(),
             expires_at: "2099-01-01T00:00:00Z".to_string(),
             resource: resource.to_string(),
+            scopes: vec![CursorScope::FolderType {
+                folder: FolderId(resource.to_string()),
+                ty: ObjectType::Email,
+            }],
         }
     }
 
@@ -1436,6 +1482,10 @@ mod tests {
             server_id: server_id.to_string(),
             expires_at: "2000-01-01T00:00:00Z".to_string(),
             resource: resource.to_string(),
+            scopes: vec![CursorScope::FolderType {
+                folder: FolderId(resource.to_string()),
+                ty: ObjectType::Email,
+            }],
         }
     }
 
@@ -1666,9 +1716,12 @@ mod tests {
 
         let due = due_renewals(&groups);
         assert_eq!(due.len(), 1, "only the live group is due");
-        assert_eq!(due[0].0, live);
-        assert_eq!(due[0].1, "live-sub");
-        assert_eq!(due[0].2, "/me/events");
+        assert_eq!(due[0].handle, live);
+        assert_eq!(due[0].server_id, "live-sub");
+        assert_eq!(due[0].resource, "/me/events");
+        // The scopes ride along so a terminal failure can name what lost
+        // coverage rather than reporting an unattributed `Terminated`.
+        assert!(!due[0].scopes.is_empty());
 
         // And an expiry outside the threshold is not due at all.
         groups.get_mut(&live).expect("live group").subscriptions[0].expires_at =
@@ -1762,7 +1815,7 @@ mod tests {
         let mut account = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
         account.push_endpoint = Some(PushEndpoint {
             webhook_url: "https://example.test/hook".to_string(),
-            client_state: Some("secret".to_string()),
+            client_state: "secret".to_string(),
         });
         let mut events = account.push_tx.subscribe();
         let handle = SubscriptionHandle("h".to_string());
@@ -1895,6 +1948,63 @@ mod tests {
             events.try_recv().is_err(),
             "a healthy renewal is silent on the push channel"
         );
+
+        account.shutdown.cancel();
+    }
+
+    /// A terminal renewal failure must name the scope that lost push
+    /// coverage. `subscribe_graph` groups by resource string and used to
+    /// discard the scopes it grouped, so `Terminated` arrived with no
+    /// attribution at all and the engine could not tell which scopes to fall
+    /// back to polling.
+    #[tokio::test(start_paused = true)]
+    async fn a_terminal_renewal_failure_names_the_scope_that_lost_coverage() {
+        let client = GraphClient::new("token");
+        client.script_rest([ScriptedRestResponse::json(
+            reqwest::StatusCode::FORBIDDEN,
+            serde_json::json!({"error":{"code":"ErrorAccessDenied","message":"no"}}),
+        )]);
+        let account = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
+        let mut events = account.push_tx.subscribe();
+        let scope = CursorScope::FolderType {
+            folder: FolderId("inbox".to_string()),
+            ty: ObjectType::Email,
+        };
+        let mut state = expiring("sub", "/me/mailFolders/inbox/messages");
+        state.scopes = vec![scope.clone()];
+        account.graph_subscriptions.write().await.insert(
+            SubscriptionHandle("h".to_string()),
+            GraphSubscriptionGroup::live(vec![state]),
+        );
+
+        ensure_graph_worker(account.clone()).await;
+        // A terminal failure retires the local state, so the group emptying
+        // is the signal the tick has run.
+        for _ in 0..64 {
+            let retired = account
+                .graph_subscriptions
+                .read()
+                .await
+                .values()
+                .all(|group| group.subscriptions.is_empty());
+            if retired {
+                break;
+            }
+            tokio::time::advance(RENEWAL_CHECK_INTERVAL + Duration::from_secs(1)).await;
+            tokio::task::yield_now().await;
+        }
+        tokio::task::yield_now().await;
+
+        let mut terminated = None;
+        while let Ok(event) = events.try_recv() {
+            match event {
+                WatchEvent::Terminated(error) => terminated = Some(error),
+                WatchEvent::Disconnected => {}
+                other => panic!("unexpected push event {other:?}"),
+            }
+        }
+        let terminated = terminated.expect("a terminal failure is reported");
+        assert_eq!(terminated.scope(), Some(&ErrorScope::Cursor(scope)));
 
         account.shutdown.cancel();
     }
