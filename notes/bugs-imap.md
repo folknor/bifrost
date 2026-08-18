@@ -10,18 +10,13 @@ returning to the pool, `get.rs` preview/text-only hydration, `CompactUidSet`
 expanding on every `diff`, and the flat push-reconnect sleep. The reference doc
 now states each new rule.
 
-## Push watches exactly one folder, silently
+## Push still watches one folder on a server without NOTIFY
 
-`crates/imap/src/account/push.rs::choose_idle_folder` / `subscribed_idle_folder`.
-
-Subscriptions are collected from all handles, sorted by name, and `.next()` is taken. An account
-that subscribes ten folder scopes gets IDLE on `Archive` and no push at all for the other nine:
-no warning, no capability signal, nothing in the reference doc. The doc only claims the choice
-is deterministic, which hides the fact that everything else is dropped. The crate already models
-NOTIFY (RFC 5465) end to end in the connection layer (`NotifySet`, `NotifyFlags`, STATUS/LIST
-routing) and it is unused by the account layer. The right move is a rewrite of `idle_loop` to
-use `NOTIFY SET` with the subscribed mailbox set when advertised, and one IDLE connection per
-hot folder (bounded) otherwise, not a tweak.
+`NOTIFY SET` now covers every subscribed folder on one connection when the server advertises
+NOTIFY (2026-08-18), and the no-NOTIFY case logs a warning instead of going silent. What is
+still missing is coverage on servers without NOTIFY: the remaining option is one IDLE connection
+per hot folder (bounded), which costs connections and wants a deliberate decision about the
+budget.
 
 ## Two parallel hydration implementations
 

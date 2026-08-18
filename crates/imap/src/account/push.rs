@@ -234,6 +234,15 @@ async fn idle_loop(account: ImapAccount, cancel: CancellationToken) {
         // A round-trip landed: the next failure starts a fresh backoff ramp.
         backoff = INITIAL_REDIAL_BACKOFF;
         let uidvalidity = selected.uid_validity;
+        let watched = {
+            let scopes = account
+                .push
+                .scopes
+                .lock()
+                .expect("push scopes lock poisoned");
+            subscribed_idle_folders(&scopes)
+        };
+        register_notify(&conn, &folder, &watched, account.command_timeout()).await;
         if was_disconnected {
             let _ = account.push.tx.send(WatchEvent::Reconnected);
             was_disconnected = false;
@@ -339,6 +348,15 @@ fn choose_idle_folder(account: &ImapAccount) -> Option<crate::types::MailboxName
 fn subscribed_idle_folder(
     scopes: &HashMap<String, HashSet<CursorScope>>,
 ) -> Option<crate::types::MailboxName> {
+    subscribed_idle_folders(scopes).into_iter().next()
+}
+
+/// Every subscribed folder scope, sorted and deduplicated. One of these is
+/// SELECTed for IDLE; the rest are covered by NOTIFY when the server has
+/// it (see `register_notify`).
+fn subscribed_idle_folders(
+    scopes: &HashMap<String, HashSet<CursorScope>>,
+) -> Vec<crate::types::MailboxName> {
     let mut folders = scopes
         .values()
         .flat_map(|scopes| scopes.iter())
@@ -348,7 +366,93 @@ fn subscribed_idle_folder(
         })
         .collect::<Vec<_>>();
     folders.sort_by(|left, right| left.as_str().cmp(right.as_str()));
-    folders.into_iter().next()
+    folders.dedup_by(|left, right| left.as_str() == right.as_str());
+    folders
+}
+
+/// Extend this IDLE session's coverage from the one SELECTed mailbox to
+/// every subscribed folder, via `NOTIFY SET` (RFC 5465 Section 3).
+///
+/// IDLE alone reports only the selected mailbox, so an account subscribing
+/// ten folder scopes would get push for one of them and silence for the
+/// other nine. NOTIFY fixes that on one connection: message events on the
+/// selected mailbox keep arriving as EXISTS/EXPUNGE/FETCH, and the same
+/// events on the other watched mailboxes arrive as STATUS responses
+/// (RFC 5465 Section 4), which `map_idle_event` already turns into a
+/// per-folder invalidation.
+///
+/// `status` is left off deliberately: the initial STATUS snapshot would
+/// invalidate every watched scope immediately after subscribe, right when
+/// discovery and inventory have just run.
+///
+/// Returns whether every watched folder is covered. A server without
+/// NOTIFY, or one that rejects the registration, leaves the loop watching
+/// only the selected mailbox - the pre-NOTIFY behaviour - and that is worth
+/// a log line, because the silence is otherwise invisible.
+/// The `NOTIFY SET` registration for one IDLE round: message events on the
+/// selected mailbox, the same events on the other watched mailboxes.
+///
+/// RFC 5465 Section 5.1: `FlagChange` is only legal alongside `MessageNew`
+/// and `MessageExpunge`. Fetch attributes are legal only on the `selected`
+/// filter (Section 5.2) and we ask for none - the account layer refetches
+/// through the changes stream, so a payload here would be wasted bandwidth
+/// on every flag flip.
+fn notify_params(others: Vec<String>) -> crate::types::NotifySetParams {
+    let events = || {
+        vec![
+            crate::types::NotifyEvent::MessageNew {
+                fetch_attrs: Vec::new(),
+            },
+            crate::types::NotifyEvent::MessageExpunge,
+            crate::types::NotifyEvent::FlagChange,
+        ]
+    };
+    crate::types::NotifySetParams::new(
+        vec![
+            crate::types::NotifyEventGroup::new(crate::types::MailboxFilter::Selected, events()),
+            crate::types::NotifyEventGroup::new(
+                crate::types::MailboxFilter::Mailboxes(others),
+                events(),
+            ),
+        ],
+        false,
+    )
+}
+
+async fn register_notify(
+    conn: &crate::connection::ImapConnection,
+    selected: &crate::types::MailboxName,
+    watched: &[crate::types::MailboxName],
+    timeout: std::time::Duration,
+) -> bool {
+    let others: Vec<String> = watched
+        .iter()
+        .filter(|folder| folder.as_str() != selected.as_str())
+        .map(|folder| folder.as_str().to_owned())
+        .collect();
+    if others.is_empty() {
+        return true;
+    }
+    if !conn.server_profile().supports_notify() {
+        tracing::warn!(
+            watched = others.len(),
+            selected = selected.as_str(),
+            "server does not advertise NOTIFY (RFC 5465); IDLE push covers only the \
+             selected mailbox and the other subscribed folders will not be pushed"
+        );
+        return false;
+    }
+    match conn.notify_set(notify_params(others), timeout).await {
+        Ok(()) => true,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                selected = selected.as_str(),
+                "NOTIFY SET rejected; IDLE push covers only the selected mailbox"
+            );
+            false
+        }
+    }
 }
 
 /// Cover the events a resubscribe-cancelled IDLE round may have swallowed.
@@ -500,5 +604,77 @@ mod tests {
                 .as_str(),
             "Archive"
         );
+    }
+
+    // The SELECTed mailbox is one of these; the rest ride on NOTIFY. Two
+    // handles subscribing the same folder must not register it twice.
+    #[test]
+    fn every_subscribed_folder_is_watched_once_in_a_stable_order() {
+        let mut scopes = HashMap::new();
+        scopes.insert(
+            "later".to_owned(),
+            HashSet::from([
+                CursorScope::Folder(bifrost_types::FolderId("Zebra".to_owned())),
+                CursorScope::Folder(bifrost_types::FolderId("Archive".to_owned())),
+            ]),
+        );
+        scopes.insert(
+            "first".to_owned(),
+            HashSet::from([
+                CursorScope::Folder(bifrost_types::FolderId("Archive".to_owned())),
+                CursorScope::Account,
+            ]),
+        );
+
+        let watched: Vec<String> = subscribed_idle_folders(&scopes)
+            .iter()
+            .map(|folder| folder.as_str().to_owned())
+            .collect();
+        assert_eq!(watched, vec!["Archive".to_owned(), "Zebra".to_owned()]);
+    }
+
+    // RFC 5465 Section 5.1 makes FlagChange illegal without MessageNew and
+    // MessageExpunge, and Section 5.2 makes fetch attributes illegal off
+    // the `selected` filter. A registration that breaks either is rejected
+    // with [BADEVENT] and the account silently loses push for every folder
+    // but one.
+    #[test]
+    fn notify_registration_is_legal_for_both_filters() {
+        let params = notify_params(vec!["Archive".to_owned(), "Zebra".to_owned()]);
+        assert!(
+            !params.status,
+            "the initial STATUS snapshot would invalidate every scope right after subscribe",
+        );
+        assert_eq!(params.event_groups.len(), 2);
+        assert_eq!(
+            params.event_groups[0].filter,
+            crate::types::MailboxFilter::Selected
+        );
+        assert_eq!(
+            params.event_groups[1].filter,
+            crate::types::MailboxFilter::Mailboxes(vec!["Archive".to_owned(), "Zebra".to_owned()])
+        );
+        for group in &params.event_groups {
+            assert!(
+                group
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, crate::types::NotifyEvent::MessageNew { .. }))
+            );
+            assert!(
+                group
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, crate::types::NotifyEvent::MessageExpunge)),
+                "FlagChange requires MessageExpunge alongside it",
+            );
+            assert!(
+                group.events.iter().all(|event| !matches!(
+                    event,
+                    crate::types::NotifyEvent::MessageNew { fetch_attrs } if !fetch_attrs.is_empty()
+                )),
+                "fetch attributes are only legal on the selected filter, and we want none",
+            );
+        }
     }
 }

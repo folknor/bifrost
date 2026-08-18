@@ -42,7 +42,7 @@ pub(crate) use ids::{ModSeq, SeqSet, Uid, UidSet, UidValidity};
 pub(crate) use mailbox::{
     MailboxAttribute, MailboxInfo, SelectedMailbox, StatusItem, StatusResult,
 };
-pub(crate) use notify::{MailboxFilter, NotifyEvent, NotifySetParams};
+pub(crate) use notify::{MailboxFilter, NotifyEvent, NotifyEventGroup, NotifySetParams};
 pub(crate) use profile::ServerProfile;
 pub(crate) use response::{
     AclEntry, Capability, CopyResult, EsearchResponse, ExpungeResult, ListRightsResponse,
