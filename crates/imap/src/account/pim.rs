@@ -1216,8 +1216,7 @@ async fn delete_messages(
             )
             .await
             .map_err(err)?;
-        conn.connection()
-            .uid_expunge(uid_set.as_sequence_set(), account.command_timeout())
+        super::mutate::expunge_uids_or_fall_back(account, &conn, uid_set.as_sequence_set(), &uids)
             .await
             .map_err(err)?;
         account.folders.clear_modseqs(&folder, uidvalidity, &uids);

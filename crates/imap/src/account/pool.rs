@@ -25,6 +25,13 @@ struct PoolInner {
     meter: Option<bifrost_net::MeterSinkHandle>,
     bandwidth_cap: Arc<AtomicU64>,
     closed: std::sync::atomic::AtomicBool,
+    /// The push loop's dedicated IDLE connection, if one is currently
+    /// dialed. Held weakly: the loop owns it, and a redial replaces the
+    /// registration. Without this `close()` has no way to reach it - it is
+    /// never in `idle`, so the drain would return with the IDLE session
+    /// still logged in, and `Account::close()` returning would not mean the
+    /// sessions are gone.
+    idle_conn: Mutex<Option<std::sync::Weak<ImapConnection>>>,
 }
 
 impl Pool {
@@ -46,6 +53,7 @@ impl Pool {
                 meter,
                 bandwidth_cap,
                 closed: std::sync::atomic::AtomicBool::new(false),
+                idle_conn: Mutex::new(None),
             }),
         }
     }
@@ -116,11 +124,17 @@ impl Pool {
 
     /// Dial the dedicated connection used exclusively by the long-lived IDLE
     /// loop. Ordinary account operations must use a checkout method instead.
-    pub(crate) async fn dial_idle(&self) -> Result<ImapConnection, Error> {
+    pub(crate) async fn dial_idle(&self) -> Result<Arc<ImapConnection>, Error> {
         if self.inner.closed.load(std::sync::atomic::Ordering::Acquire) {
             return Err(Error::closed());
         }
-        self.inner.dial().await
+        let conn = Arc::new(self.inner.dial().await?);
+        *self
+            .inner
+            .idle_conn
+            .lock()
+            .expect("pool idle-conn lock poisoned") = Some(Arc::downgrade(&conn));
+        Ok(conn)
     }
 
     pub(crate) async fn close(&self) {
@@ -131,6 +145,20 @@ impl Pool {
             let mut idle = self.inner.idle.lock().expect("pool lock poisoned");
             std::mem::take(&mut *idle)
         };
+        let idle_conn = self
+            .inner
+            .idle_conn
+            .lock()
+            .expect("pool idle-conn lock poisoned")
+            .take()
+            .and_then(|weak| weak.upgrade());
+        if let Some(conn) = idle_conn {
+            // Best effort under the same drain budget as the parked
+            // members: the push loop may be parked in `idle()`, and the
+            // LOGOUT is what tells the server this session is over.
+            let _ =
+                tokio::time::timeout(self.inner.config.imap.command_timeout, conn.logout()).await;
+        }
         if members.is_empty() {
             return;
         }

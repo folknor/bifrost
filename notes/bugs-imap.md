@@ -32,19 +32,17 @@ whole-message-prefix fix landed in `pim.rs` first and had to be applied to
 `get.rs` separately (done 2026-08-18). They want unifying behind a single
 attribute-selection + decode function.
 
-## Unbounded memory, two places
+## Unbounded memory: the buffered target sets
 
-- `FolderEntry::modseq_by_uid` (`folder_registry.rs`) is a `HashMap<u32, u64>` that grows one
-  entry per UID seen by inventory/get/changes/IDLE and is only ever pruned by expunge/VANISHED or
-  a UIDVALIDITY change. A 500k-message mailbox holds a permanent multi-MB map per folder for an
-  opportunistic cache. It wants an LRU bound or to be dropped for UIDs outside the current
-  mutation working set.
-- `mutation_stream` and `get_stream` both fully drain their input `AccountStream<ObjectId>` into
-  a `HashMap` before issuing a single command. Nothing is emitted until the producer finishes,
-  and the whole target set is resident. `Projection::Full` in `get.rs` additionally uses the
-  buffered `uid_fetch` (not `uid_fetch_limited`), so a hydration batch of large messages is
-  materialised in full with no byte budget, while the reference explicitly notes that
-  `uid_fetch_full_messages` requires one.
+`mutation_stream` and `get_stream` both fully drain their input
+`AccountStream<ObjectId>` into a `HashMap` before issuing a single command.
+Nothing is emitted until the producer finishes, and the whole target set is
+resident. Streaming per folder as ids arrive would fix both, but changes
+batching and ordering, so it wants a deliberate design pass rather than a
+patch.
+
+(The MODSEQ cache is bounded and body-bearing hydration has a byte budget as
+of 2026-08-18.)
 
 ## CompactUidSet is range-compressed in name only
 
@@ -67,11 +65,11 @@ mailbox, dominant on a real one.
   `short_circuit_on_bye` guard was clearly added to paper over exactly this. One loop
   parameterised by "how do I send" and "what do I do with a `+`" would remove the class of bug
   the guard defends against.
-- `bulk_destroy` has no non-UIDPLUS path. It always issues `UID EXPUNGE`; on a server without
-  UIDPLUS the batch is left flagged `\Deleted` and every item fails. `draft_discard` is
-  capability-gated on UID EXPUNGE, but the sync-side destroy is not.
-- `Pool::close` cannot log out an outstanding checkout or the IDLE connection. Both are outside
-  the idle list; the checkout's `Drop` correctly refuses to re-park it, but nothing LOGOUTs it.
-  It relies on the driver task's `logout_best_effort` after the handle drops, which is fine but
-  means `Account::close()` returning does not mean the sessions are gone.
-- `map_idle_event`'s `IdleEvent::Bye` arm is dead code; `event_closes_connection` breaks first.
+- `Pool::close` cannot log out an outstanding checkout. It is outside the idle list; the
+  checkout's `Drop` correctly refuses to re-park it, but nothing LOGOUTs it. It relies on the
+  driver task's `logout_best_effort` after the handle drops, which is fine but means
+  `Account::close()` returning does not mean that session is gone. (The IDLE connection is
+  registered with the pool as of 2026-08-18 and is drained by `close()`.)
+- `map_idle_event`'s `IdleEvent::Bye` arm is unreachable in the push loop; `event_closes_connection`
+  breaks first. Kept deliberately: the mapping is total over a `#[non_exhaustive]` enum, and the
+  arm costs nothing.

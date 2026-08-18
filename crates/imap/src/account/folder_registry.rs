@@ -187,10 +187,40 @@ pub(crate) struct FolderListing {
     pub(crate) attributes: Vec<MailboxAttribute>,
 }
 
+/// Per-folder ceiling on the opportunistic MODSEQ cache. Inventory walks
+/// every UID in a mailbox, so without a bound a 500k-message folder holds a
+/// permanent multi-MB map per folder for a cache that only ever saves a
+/// round trip on `STORE UNCHANGEDSINCE`.
+const MODSEQ_CACHE_CAPACITY: usize = 50_000;
+/// What a prune leaves behind, so the eviction sort is amortised over many
+/// inserts rather than running on every one past the ceiling.
+const MODSEQ_CACHE_TARGET: usize = 40_000;
+
 #[derive(Debug, Default, Clone)]
 struct ModSeqCache {
     uidvalidity: Option<u32>,
     by_uid: HashMap<u32, u64>,
+}
+
+impl ModSeqCache {
+    /// Evict down to `MODSEQ_CACHE_TARGET`, keeping the highest UIDs.
+    ///
+    /// UID order is arrival order in IMAP, and mutations overwhelmingly
+    /// target recent mail, so "highest UID" is the cheap stand-in for
+    /// "most likely to be asked for" - no access-order bookkeeping on a
+    /// cache whose whole point is being free to maintain. A miss costs an
+    /// unprotected STORE, which is the documented cold-cache behaviour.
+    fn prune(&mut self) {
+        if self.by_uid.len() <= MODSEQ_CACHE_CAPACITY {
+            return;
+        }
+        let mut uids: Vec<u32> = self.by_uid.keys().copied().collect();
+        let evict = uids.len() - MODSEQ_CACHE_TARGET;
+        uids.select_nth_unstable(evict);
+        for uid in &uids[..evict] {
+            self.by_uid.remove(uid);
+        }
+    }
 }
 
 fn listing_from_info(
@@ -323,6 +353,7 @@ impl FolderEntry {
             modseqs.by_uid.clear();
         }
         modseqs.by_uid.insert(uid, modseq);
+        modseqs.prune();
         Ok(())
     }
 
@@ -714,6 +745,34 @@ mod tests {
         let diff = disjoint.diff(&some);
         assert_eq!(diff.added, vec![4, 5, 9]);
         assert_eq!(diff.removed, vec![1, 6, 7]);
+    }
+
+    // The cache is opportunistic, so the bound must hold without an
+    // access-order structure: a full-mailbox inventory sweep leaves the
+    // highest UIDs cached and nothing unbounded behind it.
+    #[test]
+    fn modseq_cache_prunes_to_the_target_keeping_the_newest_uids() {
+        let info = MailboxInfo {
+            name: MailboxName::new("INBOX").expect("valid mailbox"),
+            ..Default::default()
+        };
+        let entry = FolderEntry::from_mailbox(info);
+        let total = u32::try_from(MODSEQ_CACHE_CAPACITY).expect("fits") + 1;
+        for uid in 1..=total {
+            entry
+                .record_modseq(11, uid, u64::from(uid))
+                .expect("valid modseq");
+        }
+        assert_eq!(entry.modseq(11, total), Some(u64::from(total)));
+        assert_eq!(
+            entry.modseq(11, 1),
+            None,
+            "the oldest UID is the first evicted",
+        );
+        let survivors = (1..=total)
+            .filter(|uid| entry.modseq(11, *uid).is_some())
+            .count();
+        assert_eq!(survivors, MODSEQ_CACHE_TARGET);
     }
 
     #[test]

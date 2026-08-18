@@ -17,6 +17,16 @@ use super::{
     uid_set_from_u32,
 };
 
+/// Memory ceiling for one body-bearing hydration FETCH.
+///
+/// The engine sizes hydration batches, so this is not a per-message limit
+/// but a guard on the batch as a whole: it exists so a corrupt or
+/// adversarial server cannot make us buffer an unbounded literal, not to
+/// second-guess a legitimate batch of large mail. Crossing it surfaces as
+/// `Error::FetchLimit` after the tagged completion, with the IMAP stream
+/// still synchronized.
+const HYDRATION_FETCH_BUDGET: usize = 256 * 1024 * 1024;
+
 pub(crate) fn get_stream(
     account: ImapAccount,
     mut ids: AccountStream<bifrost_types::ObjectId>,
@@ -248,14 +258,29 @@ async fn run_folder_get(
         return Ok(());
     };
     let include_modseq = selected.mailbox.highest_mod_seq.is_some() && !selected.mailbox.no_mod_seq;
-    let fetches = conn
-        .connection()
-        .uid_fetch(
-            uid_set.as_sequence_set(),
-            &attrs_for_projection(projection, include_modseq),
-            account.command_timeout(),
-        )
-        .await?;
+    let attrs = attrs_for_projection(projection, include_modseq);
+    // A body-bearing projection buffers whole messages, so it runs under an
+    // explicit byte budget: `uid_fetch` has none, and a hydration batch of
+    // large messages (or a server answering with more than it was asked
+    // for) would otherwise be materialised in full. Metadata and flag
+    // projections are bounded by their own response shape.
+    let fetches = if attrs
+        .iter()
+        .any(|attr| matches!(attr, FetchAttr::BodySection { .. }))
+    {
+        conn.connection()
+            .uid_fetch_limited(
+                &uid_set,
+                &attrs,
+                HYDRATION_FETCH_BUDGET,
+                account.command_timeout(),
+            )
+            .await?
+    } else {
+        conn.connection()
+            .uid_fetch(uid_set.as_sequence_set(), &attrs, account.command_timeout())
+            .await?
+    };
     // A server may emit several FETCH responses for one UID: the solicited
     // one plus unsolicited FLAGS updates that carry none of the requested
     // data items. Merge them per UID before conversion so a trailing partial

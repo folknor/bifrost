@@ -327,10 +327,13 @@ async fn run_destroy_mutation_groups(
             .folders
             .clear_modseqs(folder, uidvalidity, &expunge_uids);
         if let Some(expunge_set) = uid_set_from_u32(&expunge_uids)
-            && let Err(err) = conn
-                .connection()
-                .uid_expunge(expunge_set.as_sequence_set(), account.command_timeout())
-                .await
+            && let Err(err) = expunge_uids_or_fall_back(
+                account,
+                conn,
+                expunge_set.as_sequence_set(),
+                &expunge_uids,
+            )
+            .await
         {
             let (expunging_ids, remaining_ids) = split_ids_by_uid(ids, &expunge_uids);
             results.extend(failed_all(
@@ -878,6 +881,40 @@ fn store_failed_error(operation: AccountOperation, folder: &MailboxName) -> Acco
     })
     .try_build()
     .expect("valid account error classification")
+}
+
+/// Remove the just-marked messages, with a bounded fallback for servers
+/// that have neither UIDPLUS nor IMAP4rev2.
+///
+/// `UID EXPUNGE` (RFC 4315 Section 2) is the only command that names the
+/// messages to remove. Plain `EXPUNGE` (RFC 3501 Section 6.4.3) removes
+/// *every* `\Deleted` message in the mailbox, including ones another
+/// client marked and has not committed to removing - so it is only run
+/// when `UID SEARCH DELETED` shows the mailbox's `\Deleted` set is
+/// exactly the set this batch marked. When a foreign `\Deleted` message
+/// is present the original `MissingCapability` is returned and the batch
+/// fails with its messages left flagged, which is the honest outcome:
+/// better a reported failure than silently expunging someone else's mail.
+pub(super) async fn expunge_uids_or_fall_back(
+    account: &ImapAccount,
+    conn: &super::PooledConn,
+    expunge_set: &crate::types::SequenceSet,
+    expunge_uids: &[u32],
+) -> Result<(), crate::Error> {
+    let timeout = account.command_timeout();
+    match conn.connection().uid_expunge(expunge_set, timeout).await {
+        Ok(_) => return Ok(()),
+        Err(crate::Error::MissingCapability(_)) => {}
+        Err(err) => return Err(err),
+    }
+    let deleted = conn.connection().uid_search("DELETED", timeout).await?;
+    let marked: std::collections::BTreeSet<u32> = expunge_uids.iter().copied().collect();
+    let found: std::collections::BTreeSet<u32> = deleted.ids.into_iter().collect();
+    if !found.is_subset(&marked) {
+        return Err(crate::Error::MissingCapability("UIDPLUS".into()));
+    }
+    conn.connection().expunge(timeout).await?;
+    Ok(())
 }
 
 /// The STORE half of IMAP deletion is already acknowledged before this
