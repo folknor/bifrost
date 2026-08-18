@@ -78,7 +78,6 @@ impl IdempotencyVendor {
 
 /// Default salt factory that returns the empty-string variant per
 /// protocol. Engine-internal bookkeeping; never travels on the wire.
-#[must_use]
 pub fn default_salt_factory() -> Box<dyn Fn(ProtocolKind) -> ProtocolSalt + Send + Sync> {
     Box::new(|protocol| match protocol {
         ProtocolKind::Jmap => ProtocolSalt::Jmap(String::new()),

@@ -77,6 +77,7 @@ async fn make_driver_test_pair() -> (ImapConnection, tokio::io::DuplexStream) {
         driver_handle: tokio::sync::Mutex::new(Some(handle)),
         prebuilt_tag_counter: std::sync::atomic::AtomicU32::new(0),
         tls_active: std::sync::atomic::AtomicBool::new(false),
+        abandoned: std::sync::atomic::AtomicBool::new(false),
         host: "test".into(),
     };
 
@@ -1201,6 +1202,7 @@ async fn idle_returns_the_first_event_and_completes_the_done_handshake() {
     let event = conn
         .idle(
             Duration::from_secs(5),
+            Duration::from_secs(5),
             tokio_util::sync::CancellationToken::new(),
         )
         .await
@@ -1232,6 +1234,7 @@ async fn idle_surfaces_a_server_terminated_session_without_done() {
     let event = conn
         .idle(
             Duration::from_secs(5),
+            Duration::from_secs(5),
             tokio_util::sync::CancellationToken::new(),
         )
         .await
@@ -1241,4 +1244,35 @@ async fn idle_surfaces_a_server_terminated_session_without_done() {
         "got {event:?}"
     );
     let _server = script.await.unwrap();
+}
+
+// A peer whose TCP is alive but which never answers the tagged OK for IDLE
+// used to park the caller in `result_rx.await` forever: past the cancel
+// token, past account shutdown, past `close()`. The DONE handshake carries
+// the same bound as every other command.
+#[tokio::test]
+async fn idle_done_handshake_is_bounded_when_the_server_never_completes() {
+    let (conn, mut server) =
+        crate::connection::test_support::driver_pair(&preauth_greeting("IMAP4rev1 IDLE")).await;
+
+    let script = tokio::spawn(async move {
+        let _idle = read_line(&mut server).await;
+        respond(&mut server, "+ idling\r\n").await;
+        respond(&mut server, "* 3 EXISTS\r\n").await;
+        assert_eq!(read_line(&mut server).await, "DONE\r\n");
+        // No tagged completion, ever. The socket stays open.
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        server
+    });
+
+    let err = conn
+        .idle(
+            Duration::from_secs(5),
+            Duration::from_millis(100),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .expect_err("an unanswered DONE must not park the caller");
+    assert!(matches!(err, crate::Error::Timeout { .. }), "got {err:?}");
+    script.abort();
 }

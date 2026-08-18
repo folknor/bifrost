@@ -120,8 +120,13 @@ async fn run_inventory(
         .await
         .map_err(|_| ChannelDropped)?;
     }
+    // `folder_from_scope` already returns a classified `AccountError`
+    // (`Unsupported` for a non-folder scope, `Request(Malformed)` for an
+    // unsendable name). Stringifying it into `Error::Protocol` would
+    // re-derive it as a provider contract violation at the boundary, which
+    // is exactly what the producer-preserves-classification rule forbids.
     let folder = folder_from_scope(&scope, bifrost_types::AccountOperation::SyncInventory)
-        .map_err(|e| crate::Error::Protocol(e.to_string()))?;
+        .map_err(InventoryError::Account)?;
     let shared_owner = account
         .folders
         .get(&folder)
@@ -188,8 +193,17 @@ async fn run_inventory(
                     }
                     Some(Err(err)) => return Err(err.into()),
                     None => {
-                        if let Some(result) = fetch_result.take() {
-                            result?;
+                        // The driver drops the item sender before it answers
+                        // the oneshot, so a failed FETCH closes `fetch_rx`
+                        // first and this arm can win the race against
+                        // `fetch_fut`. Awaiting the future here (rather than
+                        // reading whatever `select!` happened to store) is
+                        // what makes the failure unconditional: without it a
+                        // tagged NO, a read error, or a timeout would break on
+                        // the success path and checkpoint a truncated mailbox.
+                        match fetch_result.take() {
+                            Some(result) => result?,
+                            None => (&mut fetch_fut).await?,
                         }
                         break;
                     }

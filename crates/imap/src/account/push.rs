@@ -154,6 +154,29 @@ fn ensure_idle_task(account: ImapAccount) -> Result<(), crate::Error> {
     Ok(())
 }
 
+/// First wait after a failed dial or SELECT in the push loop.
+const INITIAL_REDIAL_BACKOFF: std::time::Duration = std::time::Duration::from_secs(5);
+/// Ceiling for the doubling ramp. A server that is down for an hour must not
+/// be dialed 720 times by every account watching it.
+const MAX_REDIAL_BACKOFF: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Wait out the current backoff, then double it. Returns `false` if the loop
+/// was cancelled or the account shut down while waiting - a flat sleep here
+/// would hold shutdown hostage for the whole (now up to five minute) delay.
+async fn sleep_backoff(
+    account: &ImapAccount,
+    cancel: &CancellationToken,
+    backoff: &mut std::time::Duration,
+) -> bool {
+    let wait = *backoff;
+    *backoff = (*backoff * 2).min(MAX_REDIAL_BACKOFF);
+    tokio::select! {
+        () = cancel.cancelled() => false,
+        () = account.shutdown.cancelled() => false,
+        () = tokio::time::sleep(wait) => true,
+    }
+}
+
 async fn idle_loop(account: ImapAccount, cancel: CancellationToken) {
     // Track whether the consumer has seen a `Disconnected` since the last
     // `Reconnected`. The very first successful connect must NOT emit
@@ -161,6 +184,7 @@ async fn idle_loop(account: ImapAccount, cancel: CancellationToken) {
     // `Reconnected` as a full account-wide `Unknown` reconcile, which is
     // spurious right after subscribe when discovery/inventory just ran.
     let mut was_disconnected = false;
+    let mut backoff = INITIAL_REDIAL_BACKOFF;
     let resubscribe = std::sync::Arc::clone(&account.push.resubscribe);
     loop {
         if cancel.is_cancelled() || account.shutdown.is_cancelled() {
@@ -181,9 +205,13 @@ async fn idle_loop(account: ImapAccount, cancel: CancellationToken) {
         let conn = match account.pool.dial_idle().await {
             Ok(conn) => conn,
             Err(_) => {
-                let _ = account.push.tx.send(WatchEvent::Disconnected);
+                if !was_disconnected {
+                    let _ = account.push.tx.send(WatchEvent::Disconnected);
+                }
                 was_disconnected = true;
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                if !sleep_backoff(&account, &cancel, &mut backoff).await {
+                    break;
+                }
                 continue;
             }
         };
@@ -193,12 +221,18 @@ async fn idle_loop(account: ImapAccount, cancel: CancellationToken) {
         {
             Ok(selected) => selected,
             Err(_) => {
-                let _ = account.push.tx.send(WatchEvent::Disconnected);
+                if !was_disconnected {
+                    let _ = account.push.tx.send(WatchEvent::Disconnected);
+                }
                 was_disconnected = true;
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                if !sleep_backoff(&account, &cancel, &mut backoff).await {
+                    break;
+                }
                 continue;
             }
         };
+        // A round-trip landed: the next failure starts a fresh backoff ramp.
+        backoff = INITIAL_REDIAL_BACKOFF;
         let uidvalidity = selected.uid_validity;
         if was_disconnected {
             let _ = account.push.tx.send(WatchEvent::Reconnected);
@@ -224,7 +258,11 @@ async fn idle_loop(account: ImapAccount, cancel: CancellationToken) {
                 }
             });
             let idle_result = conn
-                .idle(account.config.idle_timeout, round_cancel.clone())
+                .idle(
+                    account.config.idle_timeout,
+                    account.command_timeout(),
+                    round_cancel.clone(),
+                )
                 .await;
             let interrupted_by_resubscribe = round_cancel.is_cancelled() && !cancel.is_cancelled();
             nudge.abort();

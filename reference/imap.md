@@ -34,6 +34,16 @@ dead parked members during checkout and never returns a dead checked-out
 member to the idle list. Tagged NO/BAD responses and local validation or
 capability errors leave the connection reusable.
 
+A timed-out or cancelled command is a third case: the driver is
+cancellation-safe and keeps executing the command after the caller's
+`tokio::time::timeout` fires, so the connection is neither dead nor idle.
+Every submit helper holds an `InFlightGuard` that marks the connection
+`abandoned` when its future is dropped before the driver's result arrives,
+and `PooledConn::drop` parks only a member that `is_reusable()` (alive AND
+not abandoned). Without this, the next checkout queues behind the still
+running command and times out in turn, so one slow command cascades into a
+run of spurious timeouts on the same connection.
+
 An untagged `* BYE` is fatal in every driver read loop - regular command,
 prebuilt command, pipeline batch, IDLE (and its drain), literal
 continuation wait, and best-effort LOGOUT - through one shared guard
@@ -101,6 +111,17 @@ Three entry points:
 - `uid_fetch_limited(budget, ...)` - hard client-side byte budget enforced inside the driver consumer; returns `Error::FetchLimit` when crossed. Driver keeps reading until tagged OK, so parser/TCP buffers may continue past the limit.
 
 **Early consumer stop.** When a callback returns an error (or the caller's own sender is gone), the shared drain helper *drops* the bounded receiver rather than closing and draining it. The distinction is load-bearing: with an `OwnedPermit` outstanding, `recv()` on a merely closed receiver stays pending forever, so a server that stalls mid-response would outlive the command timeout and hang the joined future. Dropping makes the driver's next `reserve_owned` fail; it marks the pipe drained and keeps reading through the tagged completion so IMAP framing stays synchronized. Items already buffered when the consumer stopped are discarded, and the callback's error is the returned error.
+
+**Termination is decided by the future, never by the channel.** A caller
+driving a `(fetch_rx, fetch_fut)` pair through `tokio::select!` sees the
+item receiver close *before* the future resolves - the driver drops the
+consumer synchronously and only then answers the oneshot - so the two
+branches are both ready and the choice between them is random. Every such
+loop (`run_inventory`, `run_qresync`) therefore awaits `fetch_fut` on the
+`recv() -> None` arm and propagates its result unconditionally. Reading
+whatever `select!` happened to have stored would let a tagged NO, a read
+error, or a timeout break on the success path and checkpoint a truncated
+mailbox as complete.
 
 Buffered `uid_fetch()` uses the driver buffer path directly, not the streaming channel. `uid_fetch_full_messages(budget, ...)` requires an explicit budget and routes through the limited path.
 
@@ -181,7 +202,7 @@ Submodules:
 `FolderCursor` has three variants and `changes_stream()` dispatches diff strategy by variant:
 
 - `QResync { uidvalidity, modseq, known_uids, known_uids_complete }`: change diff via `UID FETCH ... CHANGEDSINCE ... VANISHED` against the cached MODSEQ, plus SELECT-side VANISHED and changed-FETCH data.
-- `Condstore { uidvalidity, modseq, known_uids }`: flag diff via `CHANGEDSINCE`; expunge detection via UID-list diff against `known_uids`.
+- `Condstore { uidvalidity, modseq, known_uids }`: flag diff via `CHANGEDSINCE`; expunge detection via UID-list diff against `known_uids`. `CHANGEDSINCE` returns arrivals as well as updates, so a UID absent from `known_uids` is not emitted as `Updated` - the baseline diff reports it as `Added`, once. The QRESYNC path guards the same hazard through `record_fetch_change` / `fetch_change_seen`.
 - `Basic { uidvalidity, uidnext, known_uids }`: neither extension; UID-list diff for both flags and expunges.
 
 Negotiation in `factory.rs`:
@@ -287,13 +308,14 @@ Containers use native mailbox paths as primitive/provenance ids. `containers_lis
 - Ids whose UIDVALIDITY no longer matches the selected mailbox are `Failed(Request(Malformed))` and are published *before* the hydration FETCH is issued. They are known truth already; buffering them behind a fallible command would relabel them uncertain whenever that command fails. The per-folder error path in turn only downgrades ids that still lack a published outcome (`run_folder_get` prunes the caller's unresolved set as it publishes), so a FETCH failure after the stale batch cannot put one id in two lanes.
 - A requested UID the server never returns is `Failed(NotFound(Message))` rather than being silently dropped.
 - FETCH responses are merged per UID before conversion. A server may follow the solicited response with unsolicited FLAGS-only FETCHes for the same UID; the merge adopts later `FLAGS` / `MODSEQ` and fills gaps, but never blanks a data item or body section the earlier response carried, so a trailing partial response cannot turn a complete hydration into an empty one.
-- `Projection::Preview` asks for headers plus a bounded prefix of `BODY.PEEK[]` (whole message, not the TEXT section); merged FETCH responses concatenate body-section bytes rather than keeping whichever arrived first.
+- `Projection::Preview` and `Projection::TextOnly` both ask for `BODY.PEEK[]` (whole message, not the TEXT section) - preview bounded to a prefix, text-only unbounded. `BODY[TEXT]` is never requested by either: the hydrated value is raw MIME the consumer parses, and the TEXT section of a multipart message is boundaries and base64 with no headers to decode them by. `get.rs` and `pim.rs` use the same 64 KiB preview floor (`PREVIEW_FETCH_BYTES`), raised to the caller's limit when that is larger.
 - Full and preview hydration parse the fetched RFC 5322 source through
   `bifrost-types::mime`. Full exposes text and HTML plus attachment metadata;
   `FullWithBlobs` carries decoded attachment bytes inline because IMAP has no
   redeemable per-part handle. Preview fetches a whole-message prefix (at least
   64 KiB, or the requested limit when larger) rather than `BODY[TEXT]`, so
-  multipart framing is not shown as prose. RFC 2047 and RFC 2231 decoding now
+  multipart framing is not shown as prose - in `pim.rs` and `get.rs` alike.
+  RFC 2047 and RFC 2231 decoding now
   lives in `bifrost-types::mime`, shared with this parser.
 
 ### Blob openers
@@ -368,7 +390,11 @@ A `Transport(_)` kind must never carry an `Acknowledged` attempt - `try_build` r
 
 The IDLE task is account-owned, not subscription-owned: `ensure_idle_task` spawns one for the account's lifetime, and `push_unsubscribe` never cancels it. With no subscribed scopes the loop parks on the `resubscribe` `Notify` (plus the cancel/shutdown tokens) instead of sleeping or exiting, so a subscribe/unsubscribe pair cannot race a cancelling task into two IDLE loops or none. `choose_idle_folder` sorts subscribed folder scopes by name before picking, so a `HashMap`/`HashSet` iteration order never decides which mailbox is watched, then falls back to INBOX.
 
-A scope-set change cancels the in-flight IDLE round through a child token so the folder choice can be re-evaluated. `ImapConnection::idle` gives cancellation strict priority over queued server events and the DONE handshake discards the rest, so any event that landed in that window is unrecoverable - the loop therefore absorbs whatever `idle()` did return and then emits a coarse `HintPayload::Unknown` invalidation (`signal_idle_interrupt_loss`). Reconfiguring subscriptions degrades to a broader reconcile, never to silent push loss for the scopes that stayed.
+A scope-set change cancels the in-flight IDLE round through a child token so the folder choice can be re-evaluated. `ImapConnection::idle` gives cancellation strict priority over queued server events, so the round returns `Cancelled` while events may still be queued. The DONE drain itself does not throw those away - `drain_idle_responses` emits them to the event sink and they survive into the next `idle()` round - but the loop breaks to re-choose a folder and redials, which is where they are lost. It therefore absorbs whatever `idle()` did return and then emits a coarse `HintPayload::Unknown` invalidation (`signal_idle_interrupt_loss`). Reconfiguring subscriptions degrades to a broader reconcile, never to silent push loss for the scopes that stayed.
+
+The DONE handshake carries the account's `command_timeout`, the same bound every other command has. A peer whose TCP is alive but which never answers the tagged OK for IDLE would otherwise park the push loop past cancellation, past `account.shutdown`, and past `close()` - the IDLE connection is dialed via `dial_idle` and sits outside the pool's idle list, so `Pool::close`'s bounded drain never reaches it. The bound turns that into an `Error::Timeout`, a `Disconnected` event, and a redial.
+
+A failed dial or SELECT backs off from 5s, doubling to a 300s ceiling, and resets on the first successful SELECT. The wait races the cancel and shutdown tokens rather than sleeping through them, and `Disconnected` is emitted once per disconnection rather than once per failed attempt.
 
 ### Concurrency conflicts and UNCHANGEDSINCE
 

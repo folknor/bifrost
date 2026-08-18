@@ -230,6 +230,7 @@ impl ImapConnection {
             tls_active: std::sync::atomic::AtomicBool::new(
                 tls_mode.uses_implicit_tls() || tls_mode.uses_starttls(),
             ),
+            abandoned: std::sync::atomic::AtomicBool::new(false),
         })
     }
 

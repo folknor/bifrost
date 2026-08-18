@@ -57,6 +57,7 @@ pub(crate) fn detached(
         prebuilt_tag_counter: std::sync::atomic::AtomicU32::new(0),
         host: "test.invalid".to_owned(),
         tls_active: std::sync::atomic::AtomicBool::new(false),
+        abandoned: std::sync::atomic::AtomicBool::new(false),
     }
 }
 
@@ -104,6 +105,7 @@ pub(crate) async fn driver_pair(greeting: &[u8]) -> (ImapConnection, tokio::io::
         prebuilt_tag_counter: std::sync::atomic::AtomicU32::new(0),
         host: "test.invalid".to_owned(),
         tls_active: std::sync::atomic::AtomicBool::new(false),
+        abandoned: std::sync::atomic::AtomicBool::new(false),
     };
 
     (conn, server)

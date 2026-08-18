@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
@@ -76,13 +76,67 @@ impl CompactUidSet {
         self.ranges.is_empty()
     }
 
+    /// Membership test over the compact ranges. `from_uids` leaves them
+    /// sorted and disjoint, so this is a binary search rather than an
+    /// expansion of the whole baseline.
+    pub(crate) fn contains(&self, uid: u32) -> bool {
+        self.ranges
+            .binary_search_by(|range| {
+                let end = range.end.unwrap_or(range.start);
+                if end < uid {
+                    std::cmp::Ordering::Less
+                } else if range.start > uid {
+                    std::cmp::Ordering::Greater
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
+            .is_ok()
+    }
+
+    /// Ascending UIDs, produced lazily from the ranges. Callers that only
+    /// walk the set in order must use this rather than `to_uids`, which
+    /// materialises one `u32` per UID.
+    fn iter(&self) -> impl Iterator<Item = u32> + '_ {
+        self.ranges
+            .iter()
+            .flat_map(|range| range.start..=range.end.unwrap_or(range.start))
+    }
+
+    /// Linear merge of two sorted range lists. A CONDSTORE cycle diffs the
+    /// baseline against the live set once per run on mailboxes that can hold
+    /// hundreds of thousands of UIDs, so neither side is expanded into a
+    /// `BTreeSet` here.
     pub(crate) fn diff(&self, newer: &Self) -> UidSetDiff {
-        let old: BTreeSet<u32> = self.to_uids().into_iter().collect();
-        let new: BTreeSet<u32> = newer.to_uids().into_iter().collect();
-        UidSetDiff {
-            added: new.difference(&old).copied().collect(),
-            removed: old.difference(&new).copied().collect(),
+        let mut old = self.iter().peekable();
+        let mut new = newer.iter().peekable();
+        let mut diff = UidSetDiff::default();
+        loop {
+            match (old.peek().copied(), new.peek().copied()) {
+                (Some(o), Some(n)) if o == n => {
+                    old.next();
+                    new.next();
+                }
+                (Some(o), Some(n)) if o < n => {
+                    diff.removed.push(o);
+                    old.next();
+                }
+                (Some(_), Some(n)) => {
+                    diff.added.push(n);
+                    new.next();
+                }
+                (Some(o), None) => {
+                    diff.removed.push(o);
+                    old.next();
+                }
+                (None, Some(n)) => {
+                    diff.added.push(n);
+                    new.next();
+                }
+                (None, None) => break,
+            }
         }
+        diff
     }
 }
 
@@ -635,6 +689,43 @@ mod tests {
         assert_eq!(diff.added, vec![4]);
         assert_eq!(diff.removed, vec![1, 7, 10]);
         assert_eq!(set.uid_count(), 6);
+    }
+
+    // The merge walks both range lists in order, so the edges worth pinning
+    // are the ones where one side runs out before the other.
+    #[test]
+    fn compact_uid_set_diff_handles_exhausted_sides() {
+        let empty = CompactUidSet::default();
+        let some = CompactUidSet::from_uids([4, 5, 9]);
+
+        let from_empty = empty.diff(&some);
+        assert_eq!(from_empty.added, vec![4, 5, 9]);
+        assert!(from_empty.removed.is_empty());
+
+        let to_empty = some.diff(&empty);
+        assert!(to_empty.added.is_empty());
+        assert_eq!(to_empty.removed, vec![4, 5, 9]);
+
+        assert_eq!(some.diff(&some), UidSetDiff::default());
+
+        // Disjoint sets: every UID on each side must appear exactly once,
+        // interleaved rather than concatenated.
+        let disjoint = CompactUidSet::from_uids([1, 6, 7]);
+        let diff = disjoint.diff(&some);
+        assert_eq!(diff.added, vec![4, 5, 9]);
+        assert_eq!(diff.removed, vec![1, 6, 7]);
+    }
+
+    #[test]
+    fn compact_uid_set_contains_probes_the_ranges() {
+        let set = CompactUidSet::from_uids([1, 2, 3, 7, 9, 10]);
+        for uid in set.to_uids() {
+            assert!(set.contains(uid), "{uid} is in the set");
+        }
+        for uid in [0, 4, 5, 6, 8, 11, u32::MAX] {
+            assert!(!set.contains(uid), "{uid} is not in the set");
+        }
+        assert!(!CompactUidSet::default().contains(1));
     }
 
     #[test]

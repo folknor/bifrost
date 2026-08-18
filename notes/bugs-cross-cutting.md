@@ -31,8 +31,9 @@ Both reports note the crate already has the right instinct nearby and scoped the
 
 **`close()` / teardown that is unbounded, uncancellable, or does not actually tear down.** jmap
 (`close()` awaits an unbounded WebSocket write, and the detached reader `JoinHandle` is dropped so
-`close()` returning proves nothing), imap (`idle()`'s DONE handshake has no deadline and the IDLE
-connection is outside the pool's drain; `Pool::close` cannot log out an outstanding checkout), graph
+`close()` returning proves nothing), imap (`idle()`'s DONE handshake has no deadline - fixed
+2026-08-18 - and the IDLE connection is outside the pool's drain; `Pool::close` cannot log out an
+outstanding checkout), graph
 (`close()` aborts the EWS worker rather than letting it release, and never deletes webhook
 subscriptions).
 
@@ -43,7 +44,7 @@ reports independently propose synthesizing a full-reconcile signal instead.
 
 **Reference-doc invariants that the code does not enforce.** Reported in sync (four named claims,
 three with no test), imap (the `get.rs` preview fix the doc describes landed only in `pim.rs`; the
-IDLE drain "discards" claim), jmap (`close()` "awaits teardown"), google (`open_blob_range`'s
+IDLE drain "discards" claim - both corrected 2026-08-18), jmap (`close()` "awaits teardown"), google (`open_blob_range`'s
 "range-supporting branch" does not exist), graph, dav (the CardDAV phantom collection that the
 CalDAV doc explains was removed as a bug), net (a `Drop` the doc asserts and the code does not have;
 a `Cancelled` variant nothing constructs; a stale "lands in S1-W2" planning note).

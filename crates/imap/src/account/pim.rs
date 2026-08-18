@@ -53,7 +53,7 @@ fn op_err(op: AccountOperation) -> impl Fn(Error) -> AccountError + Copy {
 const DRAFT_FETCH_BUDGET: usize = 64 * 1024 * 1024;
 
 /// A preview fetch needs enough source to reach past MIME framing in ordinary mail.
-const PREVIEW_FETCH_BYTES: u64 = 64 * 1024;
+pub(crate) const PREVIEW_FETCH_BYTES: u64 = 64 * 1024;
 
 pub(crate) fn add_to_container(
     account: ImapAccount,

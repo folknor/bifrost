@@ -62,15 +62,20 @@ impl ImapConnection {
     /// # Arguments
     ///
     /// * `timeout`  -  maximum time to wait for an event.
+    /// * `done_timeout`  -  bound on the DONE handshake once the wait ends:
+    ///   how long the driver gets to send DONE, drain, and confirm the
+    ///   tagged OK. Use the same `command_timeout` every other command has.
     /// * `cancel`  -  cancellation token; firing this exits IDLE early.
     ///
     /// # Errors
     ///
     /// Returns [`Error::DriverGone`] if the driver task has exited,
-    /// or any I/O or protocol error from the IDLE session.
+    /// [`Error::Timeout`] if the DONE handshake does not complete within
+    /// `done_timeout`, or any I/O or protocol error from the IDLE session.
     pub async fn idle(
         &self,
         timeout: Duration,
+        done_timeout: Duration,
         cancel: CancellationToken,
     ) -> Result<IdleEvent, Error> {
         // Submit IDLE to the driver task.
@@ -151,12 +156,18 @@ impl ImapConnection {
         let _ = done_tx.send(());
         trace!("idle handle: sent DONE signal");
 
-        // Wait for the driver to send DONE on the wire, drain
-        // remaining responses, and confirm the tagged OK.
-        match result_rx.await {
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) => return Err(e),
-            Err(_) => return Err(self.observe_driver_panic().await),
+        // Wait for the driver to send DONE on the wire, drain remaining
+        // responses, and confirm the tagged OK - under the same bound every
+        // other command carries. The driver's drain is a bare read loop, so
+        // a peer whose TCP is alive but which never answers the tagged OK
+        // would otherwise park this future forever, past cancellation, past
+        // account shutdown, and past `close()` (the IDLE connection is
+        // dialed outside the pool, so the pool's drain never sees it).
+        match tokio::time::timeout(done_timeout, result_rx).await {
+            Ok(Ok(Ok(_))) => {}
+            Ok(Ok(Err(e))) => return Err(e),
+            Ok(Err(_)) => return Err(self.observe_driver_panic().await),
+            Err(_) => return Err(Error::timeout_inflight()),
         }
 
         Ok(idle_event)

@@ -826,10 +826,14 @@ impl ImapConnection {
             ),
             result_tx,
         };
+        let guard = self.in_flight();
         if self.cmd_tx.send(dcmd).await.is_err() {
+            guard.completed();
             return Err(self.observe_driver_panic().await);
         }
-        let result = match result_rx.await {
+        let received = result_rx.await;
+        guard.completed();
+        let result = match received {
             Ok(inner) => inner?,
             Err(_) => return Err(self.observe_driver_panic().await),
         };
@@ -857,10 +861,14 @@ impl ImapConnection {
             ),
             result_tx,
         };
+        let guard = self.in_flight();
         if self.cmd_tx.send(dcmd).await.is_err() {
+            guard.completed();
             return Err(self.observe_driver_panic().await);
         }
-        let result = match result_rx.await {
+        let received = result_rx.await;
+        guard.completed();
+        let result = match received {
             Ok(inner) => inner?,
             Err(_) => return Err(self.observe_driver_panic().await),
         };
@@ -893,10 +901,14 @@ impl ImapConnection {
             ),
             result_tx,
         };
+        let guard = self.in_flight();
         if self.cmd_tx.send(dcmd).await.is_err() {
+            guard.completed();
             return Err(self.observe_driver_panic().await);
         }
-        let result = match result_rx.await {
+        let received = result_rx.await;
+        guard.completed();
+        let result = match received {
             Ok(inner) => inner?,
             Err(_) => return Err(self.observe_driver_panic().await),
         };
@@ -936,10 +948,14 @@ impl ImapConnection {
             ),
             result_tx,
         };
+        let guard = self.in_flight();
         if self.cmd_tx.send(dcmd).await.is_err() {
+            guard.completed();
             return Err(self.observe_driver_panic().await);
         }
-        let result = match result_rx.await {
+        let received = result_rx.await;
+        guard.completed();
+        let result = match received {
             Ok(inner) => inner?,
             Err(_) => return Err(self.observe_driver_panic().await),
         };
@@ -960,10 +976,14 @@ impl ImapConnection {
     ) -> Result<(), Error> {
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
         let dcmd = driver::DriverCommand::Upgrade { payload, result_tx };
+        let guard = self.in_flight();
         if self.cmd_tx.send(dcmd).await.is_err() {
+            guard.completed();
             return Err(self.observe_driver_panic().await);
         }
-        match result_rx.await {
+        let received = result_rx.await;
+        guard.completed();
+        match received {
             Ok(inner) => {
                 inner?;
                 Ok(())

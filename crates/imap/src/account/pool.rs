@@ -273,7 +273,7 @@ impl Drop for PooledConn {
                 member.conn.session_state(),
                 crate::connection::SessionState::Logout
             )
-            && member.conn.is_alive()
+            && member.conn.is_reusable()
             && !self.pool.closed.load(std::sync::atomic::Ordering::Acquire)
         {
             self.pool

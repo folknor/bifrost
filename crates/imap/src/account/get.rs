@@ -11,6 +11,7 @@ use futures::StreamExt;
 use crate::types::{FetchAttr, FetchResponse, MailboxName};
 
 use super::inventory::{fetch_to_inventory, flags_set};
+use super::pim::PREVIEW_FETCH_BYTES;
 use super::{
     BATCH_ITEMS, DecodedObjectId, ImapAccount, batch, boxed_receiver_stream, decode_object_id,
     uid_set_from_u32,
@@ -345,20 +346,33 @@ fn attrs_for_projection(projection: Projection, include_modseq: bool) -> Vec<Fet
             attrs
         }
         Projection::Headers => vec![FetchAttr::Uid, FetchAttr::Rfc822Header],
+        // A whole-message prefix, not `BODY[TEXT]`: the hydrated value is
+        // raw MIME that the consumer parses, and `BODY[TEXT]` of a
+        // multipart message is boundaries and base64 with no headers to
+        // decode them by. The floor is what makes the prefix reach past
+        // the framing of ordinary mail. This is the same shape `pim.rs`
+        // uses for its preview hydration.
         Projection::Preview(count) => vec![
             FetchAttr::Uid,
-            FetchAttr::Rfc822Header,
             FetchAttr::BodySection {
                 peek: true,
-                section: Some("TEXT".into()),
-                partial: Some((0, count as u64)),
+                section: None,
+                partial: Some((
+                    0,
+                    u64::try_from(count)
+                        .unwrap_or(u64::MAX)
+                        .max(PREVIEW_FETCH_BYTES),
+                )),
             },
         ],
+        // Likewise whole-message: text extraction needs Content-Type and
+        // Content-Transfer-Encoding, which live in the headers that
+        // `BODY[TEXT]` omits.
         Projection::TextOnly => vec![
             FetchAttr::Uid,
             FetchAttr::BodySection {
                 peek: true,
-                section: Some("TEXT".into()),
+                section: None,
                 partial: None,
             },
         ],
@@ -394,10 +408,7 @@ fn fetch_to_hydrated(
             fetch,
             shared_owner,
         )),
-        _ => HydratedObjectKind::RawMime(bytes::Bytes::from(raw_mime_bytes(
-            fetch.body_sections,
-            projection,
-        ))),
+        _ => HydratedObjectKind::RawMime(bytes::Bytes::from(raw_mime_bytes(fetch.body_sections))),
     };
     Some(HydratedObject {
         id,
@@ -457,24 +468,7 @@ fn merge_fetch_response(existing: &mut FetchResponse, later: FetchResponse) {
     }
 }
 
-fn raw_mime_bytes(
-    sections: Vec<crate::types::fetch::BodySection>,
-    projection: Projection,
-) -> Vec<u8> {
-    if matches!(projection, Projection::Preview(_)) {
-        let mut header = None;
-        let mut text = None;
-        for section in sections {
-            if section.section.eq_ignore_ascii_case("HEADER") {
-                header = section.data;
-            } else if section.section.eq_ignore_ascii_case("TEXT") {
-                text = section.data;
-            }
-        }
-        let mut bytes = header.unwrap_or_default();
-        bytes.extend(text.unwrap_or_default());
-        return bytes;
-    }
+fn raw_mime_bytes(sections: Vec<crate::types::fetch::BodySection>) -> Vec<u8> {
     sections
         .into_iter()
         .find_map(|section| section.data)
@@ -652,35 +646,76 @@ mod tests {
         }
     }
 
+    // A preview is a prefix of the whole message, so what comes back is a
+    // single unnamed section that already carries its own headers.
     #[test]
-    fn preview_hydration_combines_headers_and_preview_text() {
+    fn preview_hydration_returns_the_whole_message_prefix() {
         let fetch = FetchResponse {
             uid: Some(3),
-            body_sections: vec![
-                crate::types::fetch::BodySection {
-                    section: "HEADER".to_owned(),
-                    origin: None,
-                    data: Some(b"Subject: hi\r\n\r\n".to_vec()),
-                },
-                crate::types::fetch::BodySection {
-                    section: "TEXT".to_owned(),
-                    origin: Some(0),
-                    data: Some(b"preview body".to_vec()),
-                },
-            ],
+            body_sections: vec![crate::types::fetch::BodySection {
+                section: String::new(),
+                origin: Some(0),
+                data: Some(b"Subject: hi\r\n\r\npreview body".to_vec()),
+            }],
             ..Default::default()
         };
         let object = fetch_to_hydrated(&folder(), 9, fetch, Projection::Preview(16), None)
             .expect("uid present");
         match object.kind {
             HydratedObjectKind::RawMime(bytes) => {
-                assert!(
-                    bytes.as_ref().ends_with(b"Subject: hi\r\n\r\npreview body"),
-                    "preview MIME must retain the requested text after its headers",
-                );
+                assert_eq!(bytes.as_ref(), &b"Subject: hi\r\n\r\npreview body"[..]);
             }
             other => panic!("expected RawMime, got {other:?}"),
         }
+    }
+
+    // `BODY[TEXT]` of a multipart message is boundaries and base64 with no
+    // headers to decode it by, which is exactly what a consumer must not be
+    // handed as "preview text". Both body-prefix projections ask for the
+    // whole message; only the byte budget differs.
+    #[test]
+    fn preview_and_text_only_fetch_a_whole_message_not_body_text() {
+        for projection in [Projection::Preview(16), Projection::TextOnly] {
+            let sections: Vec<_> = attrs_for_projection(projection, false)
+                .into_iter()
+                .filter_map(|attr| match attr {
+                    FetchAttr::BodySection {
+                        section, partial, ..
+                    } => Some((section, partial)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(sections.len(), 1, "{projection:?} fetches one section");
+            assert!(
+                sections[0].0.is_none(),
+                "{projection:?} must fetch the whole message, not a named section",
+            );
+        }
+
+        // The floor is what makes the prefix reach past MIME framing: a
+        // caller asking for 16 bytes still gets a usable message.
+        let partial = attrs_for_projection(Projection::Preview(16), false)
+            .into_iter()
+            .find_map(|attr| match attr {
+                FetchAttr::BodySection { partial, .. } => partial,
+                _ => None,
+            })
+            .expect("preview fetches a partial section");
+        assert_eq!(partial, (0, PREVIEW_FETCH_BYTES));
+
+        let large = usize::try_from(PREVIEW_FETCH_BYTES).expect("fits") * 4;
+        let partial = attrs_for_projection(Projection::Preview(large), false)
+            .into_iter()
+            .find_map(|attr| match attr {
+                FetchAttr::BodySection { partial, .. } => partial,
+                _ => None,
+            })
+            .expect("preview fetches a partial section");
+        assert_eq!(
+            partial,
+            (0, PREVIEW_FETCH_BYTES * 4),
+            "a request larger than the floor is honoured in full",
+        );
     }
 
     #[test]
@@ -757,13 +792,13 @@ mod tests {
         }
     }
 
-    // The preview projection spans two sections; a trailing partial response
-    // may add a section but must not overwrite one that already has data.
+    // A trailing partial response may add a section the first lacked, but
+    // must never overwrite one that already carries data.
     #[test]
     fn merging_fetches_fills_gaps_without_overwriting_returned_sections() {
         let mut first = FetchResponse {
             uid: Some(7),
-            body_sections: vec![body_section("HEADER", b"Subject: hi\r\n\r\n")],
+            body_sections: vec![body_section("", b"Subject: hi\r\n\r\npreview body")],
             ..Default::default()
         };
         merge_fetch_response(
@@ -771,11 +806,16 @@ mod tests {
             FetchResponse {
                 uid: Some(7),
                 body_sections: vec![
-                    body_section("HEADER", b"Subject: WRONG\r\n\r\n"),
-                    body_section("TEXT", b"preview body"),
+                    body_section("", b"Subject: WRONG\r\n\r\n"),
+                    body_section("HEADER", b"Subject: hi\r\n\r\n"),
                 ],
                 ..Default::default()
             },
+        );
+        assert_eq!(
+            first.body_sections.len(),
+            2,
+            "the section the first response lacked is adopted",
         );
         let object = fetch_to_hydrated(&folder(), 9, first, Projection::Preview(16), None)
             .expect("uid present");

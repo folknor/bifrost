@@ -327,6 +327,35 @@ pub(crate) struct ImapConnection {
     host: String,
     /// Whether the current transport is encrypted.
     tls_active: std::sync::atomic::AtomicBool,
+    /// Set when a submitted command's future is dropped before its result
+    /// arrives - the caller's `tokio::time::timeout` fired, or it was
+    /// cancelled. The driver is still executing that command, so the next
+    /// command submitted on this connection queues behind it and is very
+    /// likely to time out in turn. The flag makes the checkout unreusable
+    /// so the cascade stops at one connection.
+    abandoned: std::sync::atomic::AtomicBool,
+}
+
+/// Guard around one submitted command. Marks the connection abandoned
+/// unless [`completed`](Self::completed) is called, which happens only on
+/// the path where the driver's result has actually been received.
+pub(super) struct InFlightGuard<'a> {
+    flag: &'a std::sync::atomic::AtomicBool,
+    completed: bool,
+}
+
+impl InFlightGuard<'_> {
+    pub(super) fn completed(mut self) {
+        self.completed = true;
+    }
+}
+
+impl Drop for InFlightGuard<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.flag.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
 }
 
 /// Per-type NOTIFY flags (RFC 5465 Sections 5.1-5.8).
@@ -362,6 +391,24 @@ impl ImapConnection {
     /// pool reuse must consult the command-channel liveness separately.
     pub(crate) fn is_alive(&self) -> bool {
         !self.cmd_tx.is_closed()
+    }
+
+    /// Whether this connection may be returned to the pool.
+    ///
+    /// Liveness is necessary but not sufficient: a connection whose caller
+    /// walked away from an in-flight command still has the driver busy on
+    /// the wire, and parking it hands the next caller a queue it will
+    /// almost certainly time out behind.
+    pub(crate) fn is_reusable(&self) -> bool {
+        self.is_alive() && !self.abandoned.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Open an in-flight guard for one submitted command.
+    pub(super) fn in_flight(&self) -> InFlightGuard<'_> {
+        InFlightGuard {
+            flag: &self.abandoned,
+            completed: false,
+        }
     }
 
     /// Generate the next tag for a pre-built command (APPEND/MULTIAPPEND).

@@ -420,7 +420,21 @@ async fn run_qresync(
                                 break;
                             }
                             None => {
-                                if let Some(Err(err)) = fetch_result.take() {
+                                // The driver drops the item sender before it
+                                // answers the oneshot, so a failed FETCH
+                                // closes `fetch_rx` first and this arm can win
+                                // the race against `fetch_fut`. Await the
+                                // future rather than reading whatever
+                                // `select!` happened to store: otherwise a
+                                // tagged NO, a read error, or a timeout breaks
+                                // on the success path and checkpoints a cursor
+                                // at HIGHESTMODSEQ having processed only part
+                                // of the CHANGEDSINCE/VANISHED stream.
+                                let result = match fetch_result.take() {
+                                    Some(result) => result,
+                                    None => (&mut fetch_fut).await,
+                                };
+                                if let Err(err) = result {
                                     fallback_error = Some(err);
                                 }
                                 break;
@@ -563,7 +577,15 @@ async fn run_condstore_with_baseline(
                     .folders
                     .record_modseq(&folder, uidvalidity, uid, modseq)?;
             }
-            changes.push(updated_change(&folder, uidvalidity, uid));
+            // CHANGEDSINCE returns everything with modseq > cursor, which
+            // includes messages that arrived after it. Those are not updates
+            // to anything the consumer knows about - the baseline diff below
+            // reports them as `Added`. Emitting both would announce every new
+            // message twice, `Updated` before it exists. The QRESYNC path
+            // guards the same hazard through `record_fetch_change`.
+            if known_uids.contains(uid) {
+                changes.push(updated_change(&folder, uidvalidity, uid));
+            }
         }
     }
     // The first complete baseline has no prior snapshot to diff against. It
