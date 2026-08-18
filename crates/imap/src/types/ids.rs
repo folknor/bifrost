@@ -3,7 +3,7 @@
 use std::fmt;
 use std::num::NonZeroU32;
 
-use super::{SequenceSet, ValidationError};
+use super::{SequenceSet, UidRange, ValidationError};
 
 macro_rules! nonzero_u32_id {
     ($name:ident, $doc:literal) => {
@@ -139,6 +139,45 @@ impl UidSet {
         values.dedup();
         Some(Self(
             SequenceSet::new(coalesce_numbers(&values)).expect("coalesced UID set is valid"),
+        ))
+    }
+
+    /// Build a UID set from already-coalesced ascending ranges.
+    ///
+    /// The counterpart to [`from_uids`](Self::from_uids) for callers that
+    /// already hold range-compressed UIDs - a QRESYNC known-UID baseline,
+    /// for one, which can name hundreds of thousands of messages. Expanding
+    /// those into individual `Uid`s only to re-coalesce them is the whole
+    /// cost of the call.
+    ///
+    /// Ranges are emitted in the order given; `0` is not a legal UID, so a
+    /// range starting at zero is skipped. Empty input (or input that is
+    /// entirely skipped) returns `None`.
+    pub fn from_ranges<'a>(ranges: impl IntoIterator<Item = &'a UidRange>) -> Option<Self> {
+        let mut set = String::new();
+        for range in ranges {
+            if range.start == 0 {
+                continue;
+            }
+            if !set.is_empty() {
+                set.push(',');
+            }
+            match range.end {
+                Some(end) if end > range.start => {
+                    use std::fmt::Write as _;
+                    let _ = write!(set, "{}:{end}", range.start);
+                }
+                _ => {
+                    use std::fmt::Write as _;
+                    let _ = write!(set, "{}", range.start);
+                }
+            }
+        }
+        if set.is_empty() {
+            return None;
+        }
+        Some(Self(
+            SequenceSet::new(set).expect("coalesced UID ranges are a valid sequence set"),
         ))
     }
 

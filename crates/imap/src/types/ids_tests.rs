@@ -21,6 +21,38 @@ fn uid_set_coalesces_numbers() {
     assert_eq!(set.to_string(), "1:2,4:5");
 }
 
+// The QRESYNC baseline arrives range-compressed and must reach the wire
+// without a detour through one `Uid` per message.
+#[test]
+fn uid_set_from_ranges_emits_the_wire_form_directly() {
+    let set = UidSet::from_ranges(&[
+        UidRange::range(1, 3),
+        UidRange::single(7),
+        UidRange::range(9, 10),
+    ])
+    .unwrap();
+    assert_eq!(set.to_string(), "1:3,7,9:10");
+
+    assert!(UidSet::from_ranges(&[]).is_none());
+    // 0 is not a legal UID. `UidRange::single` refuses to build one, so the
+    // skip in `from_ranges` only ever sees a hand-built struct - keep it,
+    // but the reachable contract is "empty in, None out".
+    assert!(
+        UidSet::from_ranges(&[UidRange {
+            start: 0,
+            end: None
+        }])
+        .is_none()
+    );
+    // A degenerate range (end == start) is a single UID, not "4:4".
+    assert_eq!(
+        UidSet::from_ranges(&[UidRange::range(4, 4)])
+            .unwrap()
+            .to_string(),
+        "4",
+    );
+}
+
 #[test]
 fn uid_set_static_sets_are_valid() {
     assert_eq!(UidSet::all().to_string(), "1:*");

@@ -202,12 +202,12 @@ impl ImapAccount {
             }) = cursor
             && let Some(validity) = UidValidity::new(*uidvalidity)
         {
+            // Straight from the compact ranges: the baseline is already
+            // sorted and coalesced, and on a large mailbox expanding it into
+            // individual UIDs only to re-coalesce them is the entire cost of
+            // building the QRESYNC operand.
             let known_uids = if *known_uids_complete {
-                let uids = known_uids
-                    .to_uids()
-                    .into_iter()
-                    .filter_map(crate::types::Uid::new);
-                crate::types::UidSet::from_uids(uids)
+                crate::types::UidSet::from_ranges(known_uids.ranges())
             } else {
                 None
             };

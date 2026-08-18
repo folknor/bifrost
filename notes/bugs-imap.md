@@ -41,19 +41,23 @@ of 2026-08-18.)
 
 ## CompactUidSet is range-compressed in name only
 
-`diff` is now a linear merge and `contains` a binary search over the ranges
-(2026-08-18), but `to_uids` callers still expand: `run_qresync`'s `live_uids`
-`BTreeSet`, `run_condstore_with_baseline`'s seeded-baseline path, and
-`select_options`' QRESYNC known-UID list. A CONDSTORE cycle on a large mailbox
-still materialises the baseline and re-coalesces it. Invisible on a test
-mailbox, dominant on a real one.
+`diff` is a linear merge, `contains` a binary search, and the QRESYNC
+known-UID operand is built straight from the ranges via `UidSet::from_ranges`
+(2026-08-18). What still expands: `run_qresync`'s `live_uids` `BTreeSet` and
+`run_condstore_with_baseline`'s seeded-baseline path. Both want a
+range-native mutable set (insert / remove / contains over the range list)
+before they can drop the expansion, which is a bigger change than the two
+call sites suggest.
 
 ## Smaller / lower-confidence
 
 - `*` sentinel collides with a legal UID. `codec/decode/flags_caps.rs::seq_number` maps `*` to
   `u32::MAX`, and `connection/mod.rs::expand_uid_ranges` treats any `u32::MAX` endpoint as `*`
-  and returns `Error::SearchResultTruncated`. UID 4294967295 is a legal `nz-number`. Vanishingly
-  rare, but the sentinel should be a distinct variant rather than an in-band value.
+  and returns `Error::SearchResultTruncated`. UID 4294967295 is a legal `nz-number`. Assessed
+  2026-08-18 and deliberately left: the collision fails safe (a refused expansion, never a wrong
+  one), it needs a mailbox that has reached the last UID of its UIDVALIDITY epoch to trigger, and
+  moving the sentinel out of band means changing `UidRange` itself, which every codec, encoder,
+  and cursor path touches.
 - Duplicated dispatch loop. `run_one_command` and `run_prebuilt_command` in `driver/mod.rs` are
   ~70 near-identical lines (the classification/BYE/continuation loop); `pipeline.rs` and
   `idle.rs` carry third and fourth copies of the untagged-response handling. The
