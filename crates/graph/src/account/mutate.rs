@@ -122,7 +122,13 @@ async fn submit_batch(
     // request would become `{}` and falsely report Applied on a 2xx. A
     // read-modify-write implementation can replace this rejection later,
     // but it must never silently claim the incremental category change.
-    if matches!(kind, MutationKind::SetFlags(op) if flag_op_requires_category_rmw(op)) {
+    //
+    // The same reasoning covers every flag Graph does not model at all
+    // (`\answered`, `\draft`, arbitrary keywords): the built body is empty,
+    // Graph answers 200 to it, and the caller would be told a flag change
+    // landed that was never expressed on the wire. So the test is on the
+    // body, not on the token namespace.
+    if matches!(kind, MutationKind::SetFlags(op) if flag_op_is_unexpressible(op)) {
         let error = unsupported_account_error(AccountOperation::UpdateFlags);
         return Ok(vec![SyncEvent::Batch(Batch {
             items: ids
@@ -578,6 +584,19 @@ fn categories_from_flags(flags: &HashSet<String>) -> Vec<String> {
         .collect();
     categories.sort();
     categories
+}
+
+/// A flag op that Graph cannot express as a PATCH: either it needs the
+/// category read-modify-write Graph has no member operation for, or it
+/// names only flags Graph does not model, leaving an empty body that
+/// would 200 and be filed `Applied`.
+fn flag_op_is_unexpressible(op: &FlagOp) -> bool {
+    if flag_op_requires_category_rmw(op) {
+        return true;
+    }
+    patch_for_flags(op)
+        .as_object()
+        .is_none_or(serde_json::Map::is_empty)
 }
 
 fn flag_op_requires_category_rmw(op: &FlagOp) -> bool {
@@ -1041,6 +1060,57 @@ mod tests {
         };
         let ItemOutcome::Failed(failure) = &batch.items[0] else {
             panic!("category operation must not be applied");
+        };
+        assert!(matches!(
+            failure.error.kind(),
+            bifrost_types::AccountErrorKind::Unsupported(AccountOperation::UpdateFlags)
+        ));
+    }
+
+    /// Graph models only `isRead` and `flag.flagStatus`. An incremental op
+    /// naming any other flag builds `{}`, which Graph answers 200 to, so it
+    /// has to be refused before the wire rather than filed `Applied`.
+    #[test]
+    fn flags_graph_does_not_model_are_unexpressible() {
+        for token in ["\\Answered", "\\Draft", "$Junk", "arbitrary-keyword"] {
+            assert!(
+                flag_op_is_unexpressible(&FlagOp::Add(flag_set(&[token]))),
+                "add {token} built a non-empty patch"
+            );
+            assert!(
+                flag_op_is_unexpressible(&FlagOp::Remove(flag_set(&[token]))),
+                "remove {token} built a non-empty patch"
+            );
+        }
+        assert!(flag_op_is_unexpressible(&FlagOp::Patch {
+            add: flag_set(&["\\Answered"]),
+            remove: flag_set(&["\\Draft"]),
+        }));
+        // A mixed op still carries an expressible half, so it proceeds.
+        assert!(!flag_op_is_unexpressible(&FlagOp::Add(flag_set(&[
+            "\\Answered",
+            "\\Seen"
+        ]))));
+        // `Set` is full-replace and always writes all three owned fields.
+        assert!(!flag_op_is_unexpressible(&FlagOp::Set(HashSet::new())));
+    }
+
+    #[tokio::test]
+    async fn unmodelled_flag_ops_fail_rather_than_report_applied() {
+        let account = shared_account();
+        let id = ObjectId("AAMkmsg".to_string());
+        let events = submit_batch(
+            &account,
+            std::slice::from_ref(&id),
+            &MutationKind::SetFlags(FlagOp::Add(flag_set(&["\\Answered"]))),
+        )
+        .await
+        .expect("preflight rejection is local");
+        let SyncEvent::Batch(batch) = &events[0] else {
+            panic!("expected a batch outcome");
+        };
+        let ItemOutcome::Failed(failure) = &batch.items[0] else {
+            panic!("an empty patch must not be reported as applied");
         };
         assert!(matches!(
             failure.error.kind(),

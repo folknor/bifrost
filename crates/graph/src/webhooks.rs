@@ -149,78 +149,53 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 fn compute_expiry_iso8601(minutes: u32) -> String {
-    let secs = now_unix() + i64::from(minutes) * 60;
-    unix_to_iso8601(secs)
+    let now = jiff::Timestamp::now();
+    let at = jiff::Span::new()
+        .try_minutes(i64::from(minutes))
+        .and_then(|span| now.checked_add(span))
+        .unwrap_or(now);
+    unix_to_iso8601(at.as_second())
 }
 
 fn now_unix() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-        .cast_signed()
+    jiff::Timestamp::now().as_second()
 }
 
+/// Second-precision UTC, the form Graph accepts on `expirationDateTime`.
 fn unix_to_iso8601(secs: i64) -> String {
-    const SECS_PER_DAY: i64 = 86400;
-    let days = secs.div_euclid(SECS_PER_DAY);
-    let day_secs = secs.rem_euclid(SECS_PER_DAY);
-
-    let hours = day_secs / 3600;
-    let minutes = (day_secs % 3600) / 60;
-    let seconds = day_secs % 60;
-
-    let z = days + 719468;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = z - era * 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-
-    format!("{y:04}-{m:02}-{d:02}T{hours:02}:{minutes:02}:{seconds:02}Z")
+    let at = jiff::Timestamp::from_second(secs).unwrap_or(jiff::Timestamp::UNIX_EPOCH);
+    jiff::tz::Offset::UTC
+        .to_datetime(at)
+        .strftime("%Y-%m-%dT%H:%M:%SZ")
+        .to_string()
 }
 
-fn parse_iso8601_to_unix(s: &str) -> i64 {
-    let Some(s) = s.strip_suffix('Z') else {
-        return 0;
-    };
-    let s = if let Some(dot_pos) = s.rfind('.') {
-        &s[..dot_pos]
-    } else {
-        s
-    };
-
-    let parts: Vec<&str> = s.split('T').collect();
-    if parts.len() != 2 {
-        return 0;
-    }
-
-    let date_parts: Vec<i64> = parts[0].split('-').filter_map(|p| p.parse().ok()).collect();
-    let time_parts: Vec<i64> = parts[1].split(':').filter_map(|p| p.parse().ok()).collect();
-
-    if date_parts.len() != 3 || time_parts.len() != 3 {
-        return 0;
-    }
-
-    let (y, m, d) = (date_parts[0], date_parts[1], date_parts[2]);
-    let (hh, mm, ss) = (time_parts[0], time_parts[1], time_parts[2]);
-    let y_adj = if m <= 2 { y - 1 } else { y };
-    let era = if y_adj >= 0 { y_adj } else { y_adj - 399 } / 400;
-    let yoe = y_adj - era * 400;
-    let m_adj = if m > 2 { m - 3 } else { m + 9 };
-    let doy = (153 * m_adj + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146097 + doe - 719468;
-
-    days * 86400 + hh * 3600 + mm * 60 + ss
+/// `None` when the value is not a timestamp this client understands.
+///
+/// This drives a control loop (the 10-minute renewal tick), so it must have
+/// an error channel: an infallible parser that coerces to the epoch reports
+/// every unreadable value as long-expired and PATCHes it forever. `jiff`
+/// accepts every RFC 3339 form Graph might emit, offsets included, so the
+/// `None` lane means genuinely unparseable rather than merely unexpected.
+fn parse_iso8601_to_unix(s: &str) -> Option<i64> {
+    s.parse::<jiff::Timestamp>()
+        .ok()
+        .map(jiff::Timestamp::as_second)
 }
 
 pub(crate) fn is_expiring_soon(expiration_iso: &str, threshold_minutes: i64) -> bool {
-    let expiry = parse_iso8601_to_unix(expiration_iso);
+    let Some(expiry) = parse_iso8601_to_unix(expiration_iso) else {
+        // Renewing is the safe direction (the alternative is a
+        // subscription that silently dies at its real expiry), but the
+        // value itself is a defect worth seeing: a successful renewal
+        // replaces it with `compute_expiry_iso8601`'s own output, so this
+        // should be logged once per subscription, not once per tick.
+        tracing::warn!(
+            expiration = expiration_iso,
+            "[Graph webhooks] Unparseable subscription expiry; treating as due for renewal"
+        );
+        return true;
+    };
     let remaining = expiry - now_unix();
     remaining < threshold_minutes * 60
 }
@@ -262,7 +237,7 @@ mod tests {
     #[test]
     fn iso_roundtrip_parse() {
         let iso = unix_to_iso8601(1_718_450_400);
-        assert_eq!(parse_iso8601_to_unix(&iso), 1_718_450_400);
+        assert_eq!(parse_iso8601_to_unix(&iso), Some(1_718_450_400));
     }
 
     #[test]
@@ -294,26 +269,37 @@ mod tests {
         assert!(!is_expiring_soon("2099-01-01T00:00:00.0000000Z", 30));
     }
 
-    /// Documents current behavior, not an endorsement.
-    /// `parse_iso8601_to_unix` has no error channel: a value it cannot read
-    /// collapses to epoch 0, which `is_expiring_soon` then reports as "long
-    /// expired". That direction is safe (renew), but it renews on every
-    /// tick forever rather than reporting the bad value once.
+    /// An unreadable expiry is reported as such rather than coerced to the
+    /// epoch. `is_expiring_soon` still answers "renew" - that is the safe
+    /// direction, and one successful renewal replaces the value with this
+    /// module's own output - but the parse now has a lane to log from.
     #[test]
-    fn unreadable_expiry_reads_as_epoch_zero_and_forces_renewal() {
+    fn unreadable_expiry_is_a_parse_failure_and_still_forces_renewal() {
         for bad in ["", "2099-01-01", "not-a-timestamp", "2099-01-01T00:00"] {
-            assert_eq!(parse_iso8601_to_unix(bad), 0, "{bad}");
+            assert_eq!(parse_iso8601_to_unix(bad), None, "{bad}");
             assert!(is_expiring_soon(bad, 30), "{bad}");
         }
     }
 
+    /// The hand-rolled parser this replaced only accepted a `Z` suffix, so a
+    /// Graph format change to the offset form would have read as epoch 0 and
+    /// driven a PATCH per subscription per tick. Offsets now resolve to the
+    /// instant they denote.
     #[test]
-    fn numeric_utc_offsets_are_rejected_instead_of_silently_misread() {
-        let utc = parse_iso8601_to_unix("2026-01-01T10:00:00Z");
-        assert_ne!(utc, 0);
-        assert_eq!(parse_iso8601_to_unix("2026-01-01T10:00:00+00:00"), 0);
-        assert_eq!(parse_iso8601_to_unix("2026-01-01T10:00:00+05:00"), 0);
-        assert_eq!(parse_iso8601_to_unix("2026-01-01T10:00:00-05:00"), 0);
+    fn numeric_utc_offsets_resolve_to_the_instant_they_denote() {
+        let utc = parse_iso8601_to_unix("2026-01-01T10:00:00Z").expect("utc form");
+        assert_eq!(
+            parse_iso8601_to_unix("2026-01-01T10:00:00+00:00"),
+            Some(utc)
+        );
+        assert_eq!(
+            parse_iso8601_to_unix("2026-01-01T05:00:00-05:00"),
+            Some(utc)
+        );
+        assert_eq!(
+            parse_iso8601_to_unix("2026-01-01T15:00:00+05:00"),
+            Some(utc)
+        );
     }
 
     #[test]
@@ -324,7 +310,8 @@ mod tests {
             "2026-12-31T23:59:59Z",
             "2027-01-01T00:00:00Z",
         ] {
-            assert_eq!(unix_to_iso8601(parse_iso8601_to_unix(iso)), iso);
+            let secs = parse_iso8601_to_unix(iso).expect(iso);
+            assert_eq!(unix_to_iso8601(secs), iso);
         }
     }
 
@@ -333,8 +320,9 @@ mod tests {
         // `create_subscription` / `renew_subscription` clamp their argument
         // to `MAX_EXPIRATION_MINUTES` before calling this, so pinning the
         // offset arithmetic pins the clamp's effect too.
-        let remaining =
-            parse_iso8601_to_unix(&compute_expiry_iso8601(MAX_EXPIRATION_MINUTES)) - now_unix();
+        let remaining = parse_iso8601_to_unix(&compute_expiry_iso8601(MAX_EXPIRATION_MINUTES))
+            .expect("own output parses")
+            - now_unix();
         let want = i64::from(MAX_EXPIRATION_MINUTES) * 60;
         assert!(
             (remaining - want).abs() <= 2,
@@ -342,7 +330,9 @@ mod tests {
         );
 
         let default_remaining =
-            parse_iso8601_to_unix(&compute_expiry_iso8601(DEFAULT_EXPIRATION_MINUTES)) - now_unix();
+            parse_iso8601_to_unix(&compute_expiry_iso8601(DEFAULT_EXPIRATION_MINUTES))
+                .expect("own output parses")
+                - now_unix();
         assert!(default_remaining < want);
     }
 

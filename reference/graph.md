@@ -359,6 +359,13 @@ token source's current value. `close()` cancels the shutdown token and aborts
 the EWS worker; `push_stream` wraps the broadcast receiver in a `stream::unfold`
 selecting against the same token.
 
+A broadcast `Lagged` on that receiver yields a synthesized
+`Invalidated { source: Coalesced, payload: Unknown }`, not a `continue`. The
+dropped events are the only record that those scopes changed and are never
+replayed, so swallowing the overflow converts a recoverable burst into
+indefinite staleness for the affected folders; a coalesced whole-account
+invalidation is exactly what `PushSource::Coalesced` exists for.
+
 ## Capabilities
 
 `build_capabilities(push_mode)` in `capabilities.rs`:
@@ -761,6 +768,23 @@ on every path. The webhook receiver is not in this crate: consumers mount an HTT
 endpoint at `PushEndpoint::webhook_url` and feed invalidations into the
 engine `InvalidationSink`; `push_stream` carries health only.
 
+`resource_for_scope` builds one resource per scope, and for calendars that
+means `{prefix}/calendars/{native}/events` - the same calendar id
+`inventory.rs` builds `calendarView/delta` from. A bare `{prefix}/events` is
+the DEFAULT calendar: it both mis-targets every secondary calendar (whose
+notifications would never arrive while the engine believed the scope
+push-covered) and, because `subscribe_graph` groups on the resource string,
+collapses every calendar scope into one subscription.
+
+Subscription expiry is parsed with `jiff` and `parse_iso8601_to_unix` is
+FALLIBLE. It drives the renewal tick, so an infallible parser that coerced an
+unreadable value to the epoch reported it as long-expired and PATCHed it on
+every tick indefinitely. `is_expiring_soon` still answers "renew" on a parse
+failure - that is the safe direction, and one successful renewal replaces the
+stored string with this module's own output - but it logs the bad value. There
+is no hand-rolled civil-date arithmetic in the crate; `jiff` does it in both
+`webhooks.rs` and `inventory.rs`.
+
 `clientState` validation is available through
 `GraphAccountFactory::with_push_endpoint_client_state(url, secret)`, which
 sends the caller-owned account-wide secret on every resource's subscription
@@ -937,8 +961,19 @@ until a bulk destroy hit it. If step (2) leaves nothing routable, no
 outcomes.
 
 `bulk_set_flags` translates `FlagOp` to a PATCH body (`isRead`,
-`flag.flagStatus`, sorted `categories`); unrecognized flags ignored; `Set`
+`flag.flagStatus`, sorted `categories`); `Set`
 rewrites the `categories` array, `Add`/`Remove`/`Patch` touch named fields.
+
+An op Graph cannot express is refused before the wire as
+`Failed(Unsupported(UpdateFlags))`, never sent. `flag_op_is_unexpressible`
+tests the BUILT BODY, not the token namespace: an incremental category op
+(Graph's PATCH surface has no add/remove member operation for `categories`,
+so the partial patch would drop the other tokens) and an op naming only flags
+Graph does not model at all (`\answered`, `\draft`, arbitrary keywords) both
+produce `{}`. Graph answers 200 to an empty PATCH, so filing it would tell the
+caller a flag change landed that never reached the wire. A mixed op keeping an
+expressible half still proceeds, and `Set` is full-replace so it always writes
+all three owned fields.
 `bulk_move` requires `MembershipScope::Folder` (else fatal pre-request).
 `IdempotencyKey` is accepted but not sent (`MutationReplaySafety::None`).
 

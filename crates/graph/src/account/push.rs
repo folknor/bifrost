@@ -907,7 +907,19 @@ fn resource_for_scope(
                 let encoded = bifrost_net::url::encode_path_component(&native);
                 Ok(Some(format!("{prefix}/mailFolders/{encoded}/messages")))
             }
-            ObjectType::Event | ObjectType::CalendarEvent => Ok(Some(format!("{prefix}/events"))),
+            ObjectType::Event | ObjectType::CalendarEvent => {
+                // The scope's folder is the calendar id - the same id
+                // `inventory.rs` builds `/calendars/{id}/calendarView/delta`
+                // from. Discarding it and subscribing to `{prefix}/events`
+                // subscribes to the *default* calendar for every calendar
+                // scope: secondary calendars would never see a notification
+                // while the engine believed them push-covered, and the
+                // grouping in `subscribe_graph` (keyed on this string) would
+                // collapse every calendar scope into one entry.
+                let native = super::foreign::parse_folder(folder).native_id().to_string();
+                let encoded = bifrost_net::url::encode_path_component(&native);
+                Ok(Some(format!("{prefix}/calendars/{encoded}/events")))
+            }
             ObjectType::Contact => {
                 let native = super::foreign::parse_folder(folder).native_id().to_string();
                 let encoded = bifrost_net::url::encode_path_component(&native);
@@ -1002,20 +1014,33 @@ mod tests {
         );
     }
 
+    /// Each calendar scope must subscribe to its own calendar. `{prefix}/events`
+    /// is the default calendar, so a shared resource string both mis-targets
+    /// secondary calendars and collapses them together in `subscribe_graph`'s
+    /// resource-keyed grouping.
     #[test]
-    fn graph_event_subscription_is_account_wide() {
+    fn graph_event_subscription_names_the_scope_calendar() {
         let account =
             GraphAccount::new_for_tests(GraphClient::new("token"), PushMode::GraphSubscriptions);
-        let scope = CursorScope::FolderType {
-            folder: FolderId("calendar-id".to_string()),
+        let scope = |id: &str| CursorScope::FolderType {
+            folder: FolderId(id.to_string()),
             ty: ObjectType::Event,
         };
         assert_eq!(
-            resource_for_scope(&account, &scope)
+            resource_for_scope(&account, &scope("calendar-id"))
                 .expect("primary")
                 .as_deref(),
-            Some("/me/events")
+            Some("/me/calendars/calendar-id/events")
         );
+        assert_ne!(
+            resource_for_scope(&account, &scope("secondary")).expect("primary"),
+            resource_for_scope(&account, &scope("calendar-id")).expect("primary"),
+        );
+        let opaque = resource_for_scope(&account, &scope("AAMk/GI2="))
+            .expect("primary")
+            .expect("subscribable");
+        assert!(!opaque.contains("AAMk/GI2="), "{opaque}");
+        assert!(opaque.ends_with("/events"), "{opaque}");
     }
 
     #[test]

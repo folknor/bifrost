@@ -26,7 +26,8 @@ shared `DEFAULT_MAX_BUFFERED_RESPONSE`.)
 
 **A no-op or downgraded mutation reported as `Applied`.** google (`bulk_destroy` falls back to a
 TRASH label patch and returns `MutationSuccess::Applied` for messages that still exist), graph (a
-`FlagOp` with no Graph-recognized flag builds an empty PATCH, gets a 200, and files `Applied`).
+`FlagOp` with no Graph-recognized flag builds an empty PATCH, gets a 200, and files `Applied` -
+fixed 2026-08-18 by testing the built body rather than the token namespace).
 Both reports note the crate already has the right instinct nearby and scoped the guard too narrowly.
 
 **`close()` / teardown that is unbounded, uncancellable, or does not actually tear down.** jmap
@@ -39,8 +40,9 @@ subscriptions).
 
 **Broadcast `Lagged` treated as nothing.** sync (the engine never detects lag on the changes
 channel, and the in-memory cursor has already advanced past the dropped batches), graph
-(`push_stream` does `Err(RecvError::Lagged(_)) => continue`, losing invalidations permanently). Both
-reports independently propose synthesizing a full-reconcile signal instead.
+(`push_stream` did `Err(RecvError::Lagged(_)) => continue`, losing invalidations permanently -
+fixed 2026-08-18: it now yields a `PushSource::Coalesced` invalidation). Both
+reports independently propose synthesizing a full-reconcile signal instead; the sync half stands.
 
 **Reference-doc invariants that the code does not enforce.** Reported in sync (four named claims,
 three with no test), imap (the `get.rs` preview fix the doc describes landed only in `pim.rs`; the

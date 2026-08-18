@@ -3,6 +3,12 @@
 Hunter: Claude Opus, single pass, 2026-08-05. Scope: `crates/graph/`. Findings are unverified work
 material. Line numbers are as of the hunt and will drift.
 
+Fixed 2026-08-18 and removed from this document: the calendar webhook
+subscriptions colliding on `/me/events`, `push_stream` swallowing broadcast
+`Lagged`, the infallible `expirationDateTime` parser (and the hand-rolled
+civil-date arithmetic beside it), and the empty flag PATCH reported as
+`Applied`. `reference/graph.md` now states each new rule.
+
 ## EWS streaming push is not actually streaming: it delivers in ~30-minute batches
 
 `crates/graph/src/ews/client.rs` - `EwsClient::execute` does `req.send().await`, then reads
@@ -53,25 +59,6 @@ There is no mechanism in the crate to age out a cursor. Options: store the windo
 cursor as stale past a threshold. Either way the cursor payload needs to carry the window it was
 minted against, which is an envelope bump.
 
-## Calendar webhook subscriptions ignore the calendar and collide on one resource
-
-`crates/graph/src/account/push.rs`:
-
-```rust
-ObjectType::Event | ObjectType::CalendarEvent => Ok(Some(format!("{prefix}/events"))),
-```
-
-The `folder` (calendar id) is discarded. Two consequences:
-
-- `subscribe_graph` groups scopes by resource string, so every calendar scope in a
-  `push_subscribe` call collapses into one `GraphSubscriptionGroup` entry for `/me/events`.
-- `/me/events` is the default calendar. A scope for a secondary calendar gets a subscription on the
-  wrong calendar: notifications for it never arrive, and the engine believes that scope is
-  push-covered.
-
-The Email and Contact arms three lines above both decode the native folder id into the path. Graph
-supports `/me/calendars/{id}/events` as a subscription resource; that is what this should build.
-
 ## Nothing retires server-side subscriptions on close() / reopen
 
 `crates/graph/src/account/mod.rs` - `close()` cancels the shutdown token and aborts the EWS worker.
@@ -93,52 +80,12 @@ timeout) is the shape this wants. Webhook teardown needs `close()` to walk `grap
 DELETE, or an explicit statement in the reference that the engine guarantees `push_unsubscribe`
 before `close()`. The hunter could not find such a guarantee.
 
-## push_stream silently swallows Lagged, losing invalidations with no compensation
+## FlagOp::Patch naming one flag in both sets has no rejection
 
-`crates/graph/src/account/push_stream.rs`: `Err(RecvError::Lagged(_)) => continue`.
-
-The broadcast channel is 256. A consumer that falls behind, plausible during a notification burst
-after a `Reconnected` full reconcile, loses `Invalidated` events permanently. Those hints are the
-only signal that a scope changed; the dropped ones are never replayed, so the affected folders wait
-for the ordinary poll.
-
-`Lagged` is precisely the condition that should synthesize `WatchEvent::Reconnected`, since the
-crate already documents `Reconnected` as "the engine's full-reconcile trigger". Silently continuing
-converts a recoverable overflow into indefinite staleness.
-
-## Unparseable expirationDateTime makes a subscription renew on every 10-minute tick forever
-
-`crates/graph/src/webhooks.rs`. `parse_iso8601_to_unix` returns `0` for anything it does not
-recognize (no `Z` suffix, offset form `+00:00`, a non-numeric component). `is_expiring_soon` then
-computes `0 - now < threshold`, which is unconditionally true.
-
-Graph currently answers with `...Z` and the fractional-second strip handles `.0000000Z`, so this is
-latent rather than live, but it is a parser that cannot fail, on a value that drives a control loop.
-One format change on Microsoft's side turns into a PATCH per subscription per 10 minutes,
-indefinitely, against a throttled endpoint. A parse failure should be surfaced, or at minimum
-treated as "not due", not silently coerced to the epoch.
-
-Related convention divergence: this file hand-rolls civil-date arithmetic (`unix_to_iso8601`, the
-era/`doe`/`yoe` math) while the workspace just migrated to `jiff` (commit 93a0885) and
-`inventory.rs` already uses `jiff` for exactly this job. Two implementations of Gregorian date math
-in one crate, one of them infallible-by-truncation. Delete the hand-rolled pair.
-
-## FlagOp with no Graph-recognized flag sends an empty PATCH and reports Applied
-
-`crates/graph/src/account/mutate.rs`. `apply_flag_adds` / `apply_flag_removes` only ever write
-`isRead` and `flag.flagStatus`. Any other flag (`\answered`, `\draft`, an arbitrary keyword)
-contributes nothing, so `patch_for_flags` returns `{}`. That empty PATCH gets a 200 from Graph and
-`mutation_item_outcome` files it `Succeeded(MutationSuccess::Applied)`: the caller is told a flag
-change landed that was never expressed on the wire.
-
-The code has the right instinct one function up: `flag_op_requires_category_rmw` refuses category
-ops rather than lie about them, with a comment saying exactly this ("a category-only request would
-become `{}` and falsely report Applied on a 2xx"). The guard was just scoped to `category:` instead
-of to "the patch body is empty". The check should be on the built body: if `patch_for_flags`
-produces an empty object, file the id `Failed(Unsupported(UpdateFlags))` rather than send it.
-
-Secondary, smaller: `FlagOp::Patch { add, remove }` naming the same flag in both sets resolves by
-evaluation order (remove wins) with no rejection.
+`crates/graph/src/account/mutate.rs`. The empty-patch half of this finding is fixed; what remains is
+that `FlagOp::Patch { add, remove }` naming the same flag in both sets resolves by evaluation order
+(`apply_flag_removes` runs last, so remove wins) rather than being refused as a contradictory
+request. Deterministic and pinned by a test, so this is a design question, not a live defect.
 
 ## unsubscribe_ews never retires the EWS worker; the two push modes have divergent worker lifecycles
 
