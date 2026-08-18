@@ -7,7 +7,9 @@ Fixed 2026-08-18 and removed from this document: the calendar webhook
 subscriptions colliding on `/me/events`, `push_stream` swallowing broadcast
 `Lagged`, the infallible `expirationDateTime` parser (and the hand-rolled
 civil-date arithmetic beside it), and the empty flag PATCH reported as
-`Applied`. `reference/graph.md` now states each new rule.
+`Applied`, `close()` stranding server-side subscriptions in both push modes,
+and the `decode_cursor` progress asymmetry. `reference/graph.md` now states
+each new rule.
 
 ## EWS streaming push is not actually streaming: it delivers in ~30-minute batches
 
@@ -59,27 +61,6 @@ There is no mechanism in the crate to age out a cursor. Options: store the windo
 cursor as stale past a threshold. Either way the cursor payload needs to carry the window it was
 minted against, which is an envelope bump.
 
-## Nothing retires server-side subscriptions on close() / reopen
-
-`crates/graph/src/account/mod.rs` - `close()` cancels the shutdown token and aborts the EWS worker.
-It does not delete any Graph webhook subscription still in `graph_subscriptions`, and does not send
-an EWS `Unsubscribe` for the live streaming subscription.
-
-For webhook mode, since reopen constructs a fresh `GraphAccount` and the engine resubscribes, each
-reopen strands one live server subscription per resource for up to its ~24h expiry, still POSTing
-to the consumer's HTTPS receiver. For EWS mode this is exactly the per-mailbox
-streaming-subscription quota leak the code already goes out of its way to avoid on the
-topology-handoff path (`release_subscription`), but the shutdown path drops it on the floor.
-`StreamLoopExit::Shutdown` and `StreamLoopExit::Terminated` both return without
-`release_subscription`, and `close()`'s `worker.abort()` means even a release placed there would not
-run.
-
-The abort-based teardown is the structural problem: a cancellation-token-driven graceful exit
-(worker observes `shutdown`, releases, then returns; `close()` joins rather than aborts, with a
-timeout) is the shape this wants. Webhook teardown needs `close()` to walk `graph_subscriptions` and
-DELETE, or an explicit statement in the reference that the engine guarantees `push_unsubscribe`
-before `close()`. The hunter could not find such a guarantee.
-
 ## FlagOp::Patch naming one flag in both sets has no rejection
 
 `crates/graph/src/account/mutate.rs`. The empty-patch half of this finding is fixed; what remains is
@@ -92,6 +73,8 @@ request. Deterministic and pinned by a test, so this is a design question, not a
 `push.rs` removes the state and bumps topology. The worker then exits its `GetStreamingEvents` loop
 as `Resubscribe`, releases the subscription, finds an empty scope map, and parks forever on
 `topology.changed()`: one live task per account, for the account's whole lifetime, doing nothing.
+(`close()` now joins that worker rather than aborting it, so the task does end with the account -
+what remains is the idle-worker asymmetry between an `unsubscribe_ews` and an `unsubscribe_graph`.)
 
 The webhook mode built a careful protocol for exactly this (`has_live_graph_subscription_group`,
 `retire_graph_worker_slot`, the subscriptions-then-worker lock order, the "clear the slot before
@@ -121,11 +104,6 @@ already has a reseed path for anything it cannot honor.
 
 ## Smaller observations
 
-- **`decode_cursor` asymmetry** (`cursor.rs`): the outer `ChangeCursor::advanced_through`, when
-  present, overwrites the payload's own; when absent, the payload's survives. Two sources of truth
-  for one field with a silent precedence rule. Since `encode_cursor` always writes both from the
-  same value they cannot disagree today, but nothing enforces that, and the resume URL is chosen off
-  whichever won.
 - **`subscribe_graph` discards the scopes it grouped** (`push.rs`, `for (resource, _) in grouped`).
   A `GraphSubscriptionGroup` knows its server ids and resources but not which `CursorScope`s it
   covers, so a terminal renewal failure emits `Terminated` with no scope attribution: the engine

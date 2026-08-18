@@ -355,9 +355,28 @@ mailboxes always install.
 Reopen is engine-delegated: on drop or after `close()`, the engine calls
 `GraphAccountFactory::open` again for a fresh `GraphAccount` (empty caches, fresh
 shutdown token); the factory holds the client, so the new account reads the
-token source's current value. `close()` cancels the shutdown token and aborts
-the EWS worker; `push_stream` wraps the broadcast receiver in a `stream::unfold`
-selecting against the same token.
+token source's current value. `push_stream` wraps the broadcast receiver in a
+`stream::unfold` selecting against the same token.
+
+`close()` retires SERVER-side state before it cancels anything, because
+cancelling stops the very workers that would otherwise retire it, and neither
+kind of subscription dies because this process did. In order: it walks
+`graph_subscriptions` and runs `unsubscribe_graph` per handle
+(`retire_all_graph_subscriptions`, best-effort - a DELETE failure is logged,
+never returned, since `close()` must still complete and the engine has no
+recovery for "the server kept a subscription"); cancels the shutdown token;
+JOINS the EWS worker under `CLOSE_WORKER_JOIN_TIMEOUT` rather than aborting it,
+so the worker's own `Shutdown` arm gets to send its EWS `Unsubscribe` (aborting
+preempted exactly that, and Exchange caps streaming subscriptions per mailbox,
+so every reopen burned one until it timed out); and only then aborts the
+renewal worker, which by that point holds no server-side state of its own.
+Without the walk, each reopen stranded one live webhook subscription per
+resource still POSTing to the consumer's receiver.
+
+`run_worker`'s `Shutdown` and `Terminated` exits both call
+`release_subscription`, like the `Resubscribe` / `Disconnected` exits.
+Leaking on a terminal exit is worse than leaking on a reconnect: nothing in
+that worker's remaining lifetime comes back for it.
 
 A broadcast `Lagged` on that receiver yields a synthesized
 `Invalidated { source: Coalesced, payload: Unknown }`, not a `continue`. The
@@ -427,7 +446,15 @@ and not reconstructable from the stored bytes, so reseeding is the migration.
 `ChangeCursor::advanced_through`).
 
 `decode_cursor` rejects wrong protocol, incompatible envelopes, and malformed
-JSON. `changes_stream` cross-checks that payload kind projects back to
+JSON. The OUTER `ChangeCursor::advanced_through` is the single source of truth
+for page progress in both directions: it overrides the payload's copy when
+present (the engine persists it separately and may have acked a later page than
+the bytes recorded) and CLEARS it when absent (it may equally have acked no page
+at all, and a marker the engine never acknowledged must not pick the resume
+URL). Overriding on presence but deferring on absence gave one field two
+sources with a silent precedence; `encode_cursor` writes both from the same
+value, so honoring the outer unconditionally loses nothing.
+`changes_stream` cross-checks that payload kind projects back to
 `cursor.scope`; mismatches terminate with `SyncState(SchemaIncompatible)`.
 `establish_initial_cursor` accepts delta-eligible `FolderType` scopes (email,
 event/calendar event, contact) plus any `CursorScope::Folder` in the

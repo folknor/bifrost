@@ -54,7 +54,7 @@ pub(crate) struct GraphSubscriptionGroup {
 
 impl GraphSubscriptionGroup {
     /// A freshly registered group, not yet being torn down.
-    fn live(subscriptions: Vec<GraphSubscriptionState>) -> Self {
+    pub(crate) fn live(subscriptions: Vec<GraphSubscriptionState>) -> Self {
         Self {
             subscriptions,
             tearing_down: false,
@@ -311,6 +311,40 @@ async fn unsubscribe_graph(
     }
     drop(groups);
     Ok(())
+}
+
+/// Best-effort DELETE of every webhook subscription still registered, for
+/// `close()`.
+///
+/// A Graph subscription lives on the server for up to its ~24h expiry and
+/// keeps POSTing to the consumer's HTTPS receiver whether or not this process
+/// still exists. Reopen builds a FRESH `GraphAccount` and the engine
+/// resubscribes, so a `close()` that dropped the local map stranded one live
+/// subscription per resource per reopen. Nothing in the `Account` contract
+/// promises `push_unsubscribe` before `close()`, so `close()` has to do it.
+///
+/// Failures are logged, not returned: `close()` must still cancel the
+/// shutdown token and retire its workers, and the engine has no useful
+/// recovery for "the server kept a subscription we asked it to drop".
+pub(crate) async fn retire_all_graph_subscriptions(account: &GraphAccount) {
+    let handles: Vec<SubscriptionHandle> = account
+        .graph_subscriptions
+        .read()
+        .await
+        .keys()
+        .cloned()
+        .collect();
+    for handle in handles {
+        if let Err(error) = unsubscribe_graph(account.clone(), handle).await {
+            let telemetry = error.telemetry_fields();
+            tracing::warn!(
+                target: "bifrost_graph::push",
+                message_key = telemetry.message_key,
+                recovery = telemetry.recovery_discriminant,
+                "close() could not retire a Graph webhook subscription"
+            );
+        }
+    }
 }
 
 async fn begin_graph_teardown(

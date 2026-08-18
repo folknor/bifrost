@@ -132,11 +132,23 @@ async fn run_worker<E: EwsExecute>(account: GraphAccount, ews: E) {
                         disconnected = true;
                         release_subscription(&ews, &subscription_id).await;
                     }
+                    // Exchange holds streaming subscriptions against a
+                    // per-mailbox quota and does not retire one because the
+                    // client went away, so the terminal exits owe the same
+                    // Unsubscribe the reconnect exits do. Leaking here is
+                    // worse than leaking on a reconnect: nothing in this
+                    // worker's lifetime will ever come back for it. `close()`
+                    // joins rather than aborts precisely so the `Shutdown`
+                    // release below gets to run.
                     StreamLoopExit::Terminated(error) => {
+                        release_subscription(&ews, &subscription_id).await;
                         let _ = account.push_tx.send(WatchEvent::Terminated(error));
                         return;
                     }
-                    StreamLoopExit::Shutdown => return,
+                    StreamLoopExit::Shutdown => {
+                        release_subscription(&ews, &subscription_id).await;
+                        return;
+                    }
                 }
             }
             Err(error) => {
@@ -1118,6 +1130,7 @@ mod tests {
         let (scripted, mut requests) = scripted(vec![
             ScriptStep::Respond(subscribe_response_xml("sub-1")),
             ScriptStep::Hang,
+            ScriptStep::Respond(unsubscribe_response_xml()),
         ]);
         let worker = tokio::spawn(run_worker(account.clone(), scripted));
 
@@ -1135,9 +1148,17 @@ mod tests {
 
         account.shutdown.cancel();
         worker.await.expect("worker joins");
+        // Shutdown releases the subscription: Exchange holds streaming
+        // subscriptions against a per-mailbox quota and does not retire one
+        // because the client stopped polling.
+        let unsubscribe = requests.recv().await.expect("unsubscribe on shutdown");
+        assert!(
+            unsubscribe.contains("<m:SubscriptionId>sub-1</m:SubscriptionId>"),
+            "{unsubscribe}"
+        );
         assert!(
             requests.try_recv().is_err(),
-            "one Subscribe and one long poll are the whole conversation"
+            "one Subscribe, one long poll, one release are the whole conversation"
         );
     }
 
@@ -1160,6 +1181,7 @@ mod tests {
             ScriptStep::Respond(unsubscribe_response_xml()),
             ScriptStep::Respond(subscribe_response_xml("sub-2")),
             ScriptStep::Hang,
+            ScriptStep::Respond(unsubscribe_response_xml()),
         ]);
         let worker = tokio::spawn(run_worker(account.clone(), scripted));
 
@@ -1214,6 +1236,11 @@ mod tests {
 
         account.shutdown.cancel();
         worker.await.expect("worker joins");
+        let released = requests.recv().await.expect("unsubscribe on shutdown");
+        assert!(
+            released.contains("<m:SubscriptionId>sub-2</m:SubscriptionId>"),
+            "{released}"
+        );
     }
 
     /// End-to-end dispatch: a streamed notification for a subscribed folder
@@ -1229,6 +1256,7 @@ mod tests {
             ScriptStep::Respond(subscribe_response_xml("sub-1")),
             ScriptStep::Respond(NOTIFICATION_XML.to_string()),
             ScriptStep::Hang,
+            ScriptStep::Respond(unsubscribe_response_xml()),
         ]);
         let worker = tokio::spawn(run_worker(account.clone(), scripted));
 

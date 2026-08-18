@@ -35,8 +35,9 @@ Both reports note the crate already has the right instinct nearby and scoped the
 `close()` returning proves nothing), imap (`idle()`'s DONE handshake has no deadline - fixed
 2026-08-18 - and the IDLE connection is outside the pool's drain; `Pool::close` cannot log out an
 outstanding checkout), graph
-(`close()` aborts the EWS worker rather than letting it release, and never deletes webhook
-subscriptions).
+(`close()` aborted the EWS worker rather than letting it release, and never deleted webhook
+subscriptions - both fixed 2026-08-18: `close()` retires webhook subscriptions first, then joins
+the EWS worker under a bounded timeout so its `Shutdown` arm can Unsubscribe).
 
 **Broadcast `Lagged` treated as nothing.** sync (the engine never detects lag on the changes
 channel, and the in-memory cursor has already advanced past the dropped batches), graph

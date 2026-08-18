@@ -140,6 +140,12 @@ pub(crate) struct GraphAccount {
 /// cache, so keep only a fixed working set.
 pub(crate) const ETAG_INDEX_MAX_ENTRIES: usize = 10_000;
 
+/// How long `close()` waits for the EWS worker to release its streaming
+/// subscription before aborting it. Long enough for one round trip to a
+/// healthy Exchange, short enough that an unresponsive one cannot make
+/// `close()` hang.
+const CLOSE_WORKER_JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// A change key plus the recency ticket that orders it in `EtagIndex::order`.
 struct EtagEntry {
     etag: String,
@@ -1298,8 +1304,39 @@ impl Account for GraphAccount {
     fn close(&self) -> AccountFuture<Result<(), AccountError>> {
         let account = self.clone();
         Box::pin(async move {
+            // Server-side state first, while the account is still usable:
+            // cancelling the token stops the workers that would otherwise be
+            // the ones retiring it, and both webhook subscriptions and EWS
+            // streaming subscriptions outlive this process if nobody asks the
+            // server to drop them.
+            push::retire_all_graph_subscriptions(&account).await;
             account.shutdown.cancel();
             if let Some(worker) = account.ews_worker.lock().await.take() {
+                // Join rather than abort: the worker observes the cancelled
+                // token, then sends an EWS `Unsubscribe` for whatever
+                // streaming subscription it is holding. An abort here would
+                // preempt exactly that, and Exchange caps streaming
+                // subscriptions per mailbox, so each reopen would burn one
+                // until it timed out on its own. The join is bounded because
+                // the release is a network round trip and `close()` must not
+                // be able to hang on an unresponsive server.
+                let mut worker = worker;
+                if tokio::time::timeout(CLOSE_WORKER_JOIN_TIMEOUT, &mut worker)
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!(
+                        target: "bifrost_graph::ews",
+                        "EWS worker did not release its subscription within \
+                         the close() budget; aborting"
+                    );
+                    worker.abort();
+                }
+            }
+            // The renewal worker holds no server-side state of its own (the
+            // subscriptions it renews are already deleted above), so aborting
+            // is honest here.
+            if let Some(worker) = account.graph_worker.lock().await.take() {
                 worker.abort();
             }
             Ok(())
@@ -1350,6 +1387,45 @@ mod tests {
 
     fn account() -> GraphAccount {
         GraphAccount::new_for_tests(GraphClient::new("token"), PushMode::GraphSubscriptions)
+    }
+
+    /// A Graph subscription outlives this process: it keeps POSTing to the
+    /// consumer's receiver for up to its ~24h expiry, and reopen builds a
+    /// fresh account whose resubscribe adds another. Nothing in the `Account`
+    /// contract promises `push_unsubscribe` before `close()`, so `close()`
+    /// must retire them itself.
+    #[tokio::test]
+    async fn close_deletes_every_registered_webhook_subscription() {
+        let client = GraphClient::new("token");
+        client.script_rest([
+            crate::client::ScriptedRestResponse::empty(reqwest::StatusCode::NO_CONTENT),
+            crate::client::ScriptedRestResponse::empty(reqwest::StatusCode::NO_CONTENT),
+        ]);
+        let account = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
+        account.graph_subscriptions.write().await.insert(
+            bifrost_types::SubscriptionHandle("h".to_string()),
+            push::GraphSubscriptionGroup::live(vec![
+                push::GraphSubscriptionState {
+                    server_id: "one".to_string(),
+                    expires_at: "2099-01-01T00:00:00Z".to_string(),
+                    resource: "/me/mailFolders/inbox/messages".to_string(),
+                },
+                push::GraphSubscriptionState {
+                    server_id: "two".to_string(),
+                    expires_at: "2099-01-01T00:00:00Z".to_string(),
+                    resource: "/me/calendars/cal/events".to_string(),
+                },
+            ]),
+        );
+
+        Account::close(&account).await.expect("close succeeds");
+
+        assert!(account.graph_subscriptions.read().await.is_empty());
+        let requests = client.take_rest_requests();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].url.ends_with("/subscriptions/one"));
+        assert!(requests[1].url.ends_with("/subscriptions/two"));
+        assert!(account.shutdown.is_cancelled());
     }
 
     fn public_folder_routing() -> PublicFolderRouting {

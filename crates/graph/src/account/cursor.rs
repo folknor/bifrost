@@ -316,9 +316,21 @@ pub(crate) fn decode_cursor(cursor: &ChangeCursor) -> Result<GraphCursorPayload,
 
     let mut payload: GraphCursorPayload = serde_json::from_slice(&cursor.server_state.bytes)
         .map_err(|error| CursorError::Encode(error.to_string()))?;
-    if let Some(progress) = cursor.advanced_through.as_ref() {
-        payload.advanced_through = Some(decode_page_marker(progress)?);
-    }
+    // The outer `ChangeCursor::advanced_through` is the single source of
+    // truth for page progress, in BOTH directions: the engine persists it
+    // separately from the opaque payload bytes and may have acked a later
+    // page than the bytes recorded, so it overrides; and it may equally have
+    // acked no page at all, so its absence must clear the payload's copy
+    // rather than let a marker the engine never acknowledged pick the resume
+    // URL. Overriding on presence but deferring on absence made one field
+    // have two sources with a silent precedence rule; `encode_cursor` writes
+    // both from the same value, so honoring the outer unconditionally loses
+    // nothing.
+    payload.advanced_through = cursor
+        .advanced_through
+        .as_ref()
+        .map(decode_page_marker)
+        .transpose()?;
     Ok(payload)
 }
 
@@ -582,6 +594,33 @@ mod tests {
         let decoded = decode_cursor(&cursor).expect("decode");
         assert_eq!(decoded.advanced_through, Some(acked));
         assert_eq!(decoded.resume_url(), "https://graph.example/page-9");
+    }
+
+    /// The other half of the same rule: the outer progress is authoritative
+    /// when ABSENT too. A payload marker the engine never acknowledged must
+    /// not survive to pick the resume URL, or the field has two sources with
+    /// a silent precedence between them.
+    #[test]
+    fn an_absent_outer_progress_clears_the_payload_marker() {
+        let scope = CursorScope::FolderType {
+            folder: FolderId("inbox".to_string()),
+            ty: ObjectType::Email,
+        };
+        let unacked = GraphPageMarker {
+            next_link: "https://graph.example/page-1".to_string(),
+            last_seen_id: Some("m1".to_string()),
+        };
+        let payload = GraphCursorPayload::new(
+            kind_for_scope(&scope).expect("scope should map"),
+            "https://graph.example/delta".to_string(),
+            Some(unacked),
+        );
+        let mut cursor = encode_cursor(scope, payload).expect("encode");
+        cursor.advanced_through = None;
+
+        let decoded = decode_cursor(&cursor).expect("decode");
+        assert_eq!(decoded.advanced_through, None);
+        assert_eq!(decoded.resume_url(), "https://graph.example/delta");
     }
 
     #[test]
