@@ -10,7 +10,9 @@ use futures::StreamExt;
 
 use crate::types::{FetchAttr, FetchResponse, MailboxName};
 
+use super::hydration::{BodySelection, FetchSelection, decode_body};
 use super::inventory::{fetch_to_inventory, flags_set};
+#[cfg(test)]
 use super::pim::PREVIEW_FETCH_BYTES;
 use super::{
     BATCH_ITEMS, DecodedObjectId, ImapAccount, batch, boxed_receiver_stream, decode_object_id,
@@ -258,16 +260,14 @@ async fn run_folder_get(
         return Ok(());
     };
     let include_modseq = selected.mailbox.highest_mod_seq.is_some() && !selected.mailbox.no_mod_seq;
-    let attrs = attrs_for_projection(projection, include_modseq);
+    let selection = selection_for_projection(projection, include_modseq);
+    let attrs = selection.attributes();
     // A body-bearing projection buffers whole messages, so it runs under an
     // explicit byte budget: `uid_fetch` has none, and a hydration batch of
     // large messages (or a server answering with more than it was asked
     // for) would otherwise be materialised in full. Metadata and flag
     // projections are bounded by their own response shape.
-    let fetches = if attrs
-        .iter()
-        .any(|attr| matches!(attr, FetchAttr::BodySection { .. }))
-    {
+    let fetches = if selection.needs_body_budget() {
         conn.connection()
             .uid_fetch_limited(
                 &uid_set,
@@ -350,74 +350,67 @@ async fn run_folder_get(
 }
 
 fn attrs_for_projection(projection: Projection, include_modseq: bool) -> Vec<FetchAttr> {
+    selection_for_projection(projection, include_modseq).attributes()
+}
+
+fn selection_for_projection(projection: Projection, include_modseq: bool) -> FetchSelection {
     match projection {
-        Projection::FlagsOnly => {
-            let mut attrs = vec![FetchAttr::Uid, FetchAttr::Flags];
-            if include_modseq {
-                attrs.push(FetchAttr::ModSeq);
-            }
-            attrs
-        }
-        Projection::Metadata => {
-            let mut attrs = vec![
-                FetchAttr::Uid,
-                FetchAttr::Flags,
-                FetchAttr::Envelope,
-                FetchAttr::Rfc822Size,
-            ];
-            if include_modseq {
-                attrs.push(FetchAttr::ModSeq);
-            }
-            attrs
-        }
-        Projection::Headers => vec![FetchAttr::Uid, FetchAttr::Rfc822Header],
-        // A whole-message prefix, not `BODY[TEXT]`: the hydrated value is
-        // raw MIME that the consumer parses, and `BODY[TEXT]` of a
-        // multipart message is boundaries and base64 with no headers to
-        // decode them by. The floor is what makes the prefix reach past
-        // the framing of ordinary mail. This is the same shape `pim.rs`
-        // uses for its preview hydration.
-        Projection::Preview(count) => vec![
-            FetchAttr::Uid,
-            FetchAttr::BodySection {
-                peek: true,
-                section: None,
-                partial: Some((
-                    0,
-                    u64::try_from(count)
-                        .unwrap_or(u64::MAX)
-                        .max(PREVIEW_FETCH_BYTES),
-                )),
-            },
-        ],
-        // Likewise whole-message: text extraction needs Content-Type and
-        // Content-Transfer-Encoding, which live in the headers that
-        // `BODY[TEXT]` omits.
-        Projection::TextOnly => vec![
-            FetchAttr::Uid,
-            FetchAttr::BodySection {
-                peek: true,
-                section: None,
-                partial: None,
-            },
-        ],
-        Projection::Full | Projection::FullWithBlobs => vec![
-            FetchAttr::Uid,
-            FetchAttr::Rfc822Size,
-            FetchAttr::BodySection {
-                peek: true,
-                section: None,
-                partial: None,
-            },
-        ],
-        _ => vec![FetchAttr::Uid, FetchAttr::Flags],
+        Projection::FlagsOnly => FetchSelection {
+            flags: true,
+            envelope: false,
+            size: false,
+            modseq: include_modseq,
+            body: BodySelection::None,
+        },
+        Projection::Metadata => FetchSelection {
+            flags: true,
+            envelope: true,
+            size: true,
+            modseq: include_modseq,
+            body: BodySelection::None,
+        },
+        Projection::Headers => FetchSelection {
+            flags: false,
+            envelope: false,
+            size: false,
+            modseq: false,
+            body: BodySelection::Headers,
+        },
+        Projection::Preview(count) => FetchSelection {
+            flags: false,
+            envelope: false,
+            size: false,
+            modseq: false,
+            body: BodySelection::Preview(count),
+        },
+        Projection::TextOnly => FetchSelection {
+            flags: false,
+            envelope: false,
+            size: false,
+            modseq: false,
+            body: BodySelection::Whole,
+        },
+        Projection::Full | Projection::FullWithBlobs => FetchSelection {
+            flags: false,
+            envelope: false,
+            size: true,
+            modseq: false,
+            body: BodySelection::Whole,
+        },
+        _ => FetchSelection {
+            flags: true,
+            envelope: false,
+            size: false,
+            modseq: false,
+            body: BodySelection::None,
+        },
     }
 }
 
 fn fetch_to_hydrated(
     folder: &MailboxName,
     uidvalidity: u32,
-    fetch: FetchResponse,
+    mut fetch: FetchResponse,
     projection: Projection,
     shared_owner: Option<&bifrost_types::MailboxId>,
 ) -> Option<HydratedObject> {
@@ -433,7 +426,9 @@ fn fetch_to_hydrated(
             fetch,
             shared_owner,
         )),
-        _ => HydratedObjectKind::RawMime(bytes::Bytes::from(raw_mime_bytes(fetch.body_sections))),
+        _ => HydratedObjectKind::RawMime(bytes::Bytes::from(
+            decode_body(&mut fetch).unwrap_or_default(),
+        )),
     };
     Some(HydratedObject {
         id,
@@ -491,13 +486,6 @@ fn merge_fetch_response(existing: &mut FetchResponse, later: FetchResponse) {
         }
         existing.binary_sections.push(section);
     }
-}
-
-fn raw_mime_bytes(sections: Vec<crate::types::fetch::BodySection>) -> Vec<u8> {
-    sections
-        .into_iter()
-        .find_map(|section| section.data)
-        .unwrap_or_default()
 }
 
 #[cfg(test)]

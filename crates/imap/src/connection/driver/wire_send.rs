@@ -185,9 +185,7 @@ pub(super) async fn wait_for_continuation(
                 // (I13): emit alert/notification overflow before
                 // BYE handling to ensure ALERT codes on BYE responses
                 // are not lost.
-                let code_emitted = super::emit_untagged_response_code_events(&u, event_sink);
-
-                super::short_circuit_on_bye(digest, &u)?;
+                let code_emitted = super::process_untagged_prefix(digest, &u, event_sink)?;
                 if !code_emitted {
                     let _ = event_sink.emit((*u).into());
                 }

@@ -29,25 +29,25 @@ impl CompactUidSet {
             if uid == end.saturating_add(1) {
                 end = uid;
             } else {
-                ranges.push(if start == end {
-                    UidRange::single(start)
-                } else {
-                    UidRange::range(start, end)
-                });
+                ranges.push(normalized_range(start, end));
                 start = uid;
                 end = uid;
             }
         }
-        ranges.push(if start == end {
-            UidRange::single(start)
-        } else {
-            UidRange::range(start, end)
-        });
+        ranges.push(normalized_range(start, end));
         Self { ranges }
     }
 
     pub(crate) fn from_ranges(ranges: Vec<UidRange>) -> Self {
-        Self::from_uids(ranges.into_iter().flat_map(expand_range))
+        let mut set = Self::default();
+        for range in ranges {
+            let start = range.start;
+            let end = range.end.unwrap_or(start);
+            if start != 0 && end >= start {
+                set.insert_range(start, end);
+            }
+        }
+        set
     }
 
     pub(crate) fn ranges(&self) -> &[UidRange] {
@@ -92,6 +92,64 @@ impl CompactUidSet {
                 }
             })
             .is_ok()
+    }
+
+    /// Insert one UID while retaining sorted, disjoint, maximally merged ranges.
+    /// Returns whether the UID was absent before the insertion.
+    pub(crate) fn insert(&mut self, uid: u32) -> bool {
+        if uid == 0 || self.contains(uid) {
+            return false;
+        }
+        self.insert_range(uid, uid);
+        true
+    }
+
+    /// Remove one UID while retaining sorted, disjoint ranges.
+    /// Returns whether the UID was present before the removal.
+    pub(crate) fn remove(&mut self, uid: u32) -> bool {
+        let Ok(index) = self.ranges.binary_search_by(|range| {
+            let end = range.end.unwrap_or(range.start);
+            if end < uid {
+                std::cmp::Ordering::Less
+            } else if range.start > uid {
+                std::cmp::Ordering::Greater
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        }) else {
+            return false;
+        };
+        let range = self.ranges[index];
+        let end = range.end.unwrap_or(range.start);
+        match (uid == range.start, uid == end) {
+            (true, true) => {
+                self.ranges.remove(index);
+            }
+            (true, false) => {
+                self.ranges[index] = normalized_range(uid + 1, end);
+            }
+            (false, true) => {
+                self.ranges[index] = normalized_range(range.start, uid - 1);
+            }
+            (false, false) => {
+                self.ranges[index] = normalized_range(range.start, uid - 1);
+                self.ranges
+                    .insert(index + 1, normalized_range(uid + 1, end));
+            }
+        }
+        true
+    }
+
+    fn insert_range(&mut self, mut start: u32, mut end: u32) {
+        let index = self
+            .ranges
+            .partition_point(|range| range.end.unwrap_or(range.start).saturating_add(1) < start);
+        while index < self.ranges.len() && self.ranges[index].start <= end.saturating_add(1) {
+            let range = self.ranges.remove(index);
+            start = start.min(range.start);
+            end = end.max(range.end.unwrap_or(range.start));
+        }
+        self.ranges.insert(index, normalized_range(start, end));
     }
 
     /// Ascending UIDs, produced lazily from the ranges. Callers that only
@@ -144,6 +202,21 @@ impl CompactUidSet {
 pub(crate) struct UidSetDiff {
     pub(crate) added: Vec<u32>,
     pub(crate) removed: Vec<u32>,
+}
+
+/// The one canonical spelling for an inclusive run of UIDs.
+///
+/// `UidRange::range(n, n)` and `UidRange::single(n)` are distinct values that
+/// both denote a single UID, and `CompactUidSet` derives `PartialEq` over its
+/// range vector. Every construction and mutation path must therefore agree on
+/// which one it emits, or two sets holding identical UIDs compare unequal and
+/// encode to different cursor payloads.
+fn normalized_range(start: u32, end: u32) -> UidRange {
+    if start == end {
+        UidRange::single(start)
+    } else {
+        UidRange::range(start, end)
+    }
 }
 
 pub(crate) fn expand_range(range: UidRange) -> Vec<u32> {
@@ -720,6 +793,166 @@ mod tests {
         assert_eq!(diff.added, vec![4]);
         assert_eq!(diff.removed, vec![1, 7, 10]);
         assert_eq!(set.uid_count(), 6);
+    }
+
+    #[test]
+    fn compact_uid_set_mutation_splits_and_merges_ranges() {
+        let mut set = CompactUidSet::from_ranges(vec![UidRange::range(1, 500_000)]);
+        assert!(set.remove(250_000));
+        assert!(!set.contains(250_000));
+        assert_eq!(set.ranges().len(), 2);
+        assert!(!set.remove(250_000));
+
+        assert!(set.insert(250_000));
+        assert_eq!(set.ranges(), &[UidRange::range(1, 500_000)]);
+        assert!(!set.insert(250_000));
+
+        assert!(set.remove(1));
+        assert!(set.remove(500_000));
+        assert_eq!(set.ranges(), &[UidRange::range(2, 499_999)]);
+    }
+
+    // `UidRange::range(n, n)` and `UidRange::single(n)` are deliberately NOT
+    // equal (see `types::uid_range`), and `from_uids` / `insert_range` both
+    // normalise a one-element run to `single`. `remove` must land on the same
+    // spelling: `CompactUidSet` derives `PartialEq` over the range vector, and
+    // a mutated live set from `run_qresync` is what gets encoded into the
+    // persisted CONDSTORE cursor. A `2:2` residue there would make the same
+    // UID set compare unequal to - and serialise differently from - the set
+    // rebuilt from the wire.
+    #[test]
+    fn compact_uid_set_remove_normalises_one_element_residue() {
+        // Trimming the low end down to a single survivor.
+        let mut set = CompactUidSet::from_uids([1, 2]);
+        assert!(set.remove(1));
+        assert_eq!(set, CompactUidSet::from_uids([2]));
+        assert_eq!(set.ranges(), &[UidRange::single(2)]);
+
+        // Trimming the high end down to a single survivor.
+        let mut set = CompactUidSet::from_uids([1, 2]);
+        assert!(set.remove(2));
+        assert_eq!(set, CompactUidSet::from_uids([1]));
+        assert_eq!(set.ranges(), &[UidRange::single(1)]);
+
+        // Splitting from the middle, leaving a single survivor on each side.
+        let mut set = CompactUidSet::from_uids([1, 2, 3]);
+        assert!(set.remove(2));
+        assert_eq!(set, CompactUidSet::from_uids([1, 3]));
+        assert_eq!(set.ranges(), &[UidRange::single(1), UidRange::single(3)]);
+
+        // Splitting with a multi-UID remainder on one side only.
+        let mut set = CompactUidSet::from_uids([1, 2, 3, 4]);
+        assert!(set.remove(2));
+        assert_eq!(set, CompactUidSet::from_uids([1, 3, 4]));
+        assert_eq!(set.ranges(), &[UidRange::single(1), UidRange::range(3, 4)]);
+    }
+
+    #[test]
+    fn compact_uid_set_mutation_handles_empty_and_single_element_sets() {
+        let mut set = CompactUidSet::default();
+        assert!(!set.remove(1), "removing from an empty set reports absent");
+        assert!(set.is_empty());
+
+        assert!(set.insert(5));
+        assert_eq!(set.ranges(), &[UidRange::single(5)]);
+        assert!(!set.insert(5), "re-inserting reports already present");
+
+        assert!(set.remove(5));
+        assert!(set.is_empty(), "removing the only UID empties the set");
+        assert_eq!(set.ranges(), &[]);
+
+        // UID 0 is not an `nz-number` and must never enter the set.
+        assert!(!set.insert(0));
+        assert!(set.is_empty());
+        assert!(!set.remove(0));
+    }
+
+    #[test]
+    fn compact_uid_set_insert_merges_across_range_boundaries() {
+        let mut set = CompactUidSet::from_uids([1, 2, 4, 5]);
+        assert_eq!(
+            set.ranges(),
+            &[UidRange::range(1, 2), UidRange::range(4, 5)]
+        );
+
+        // The gap UID bridges two neighbours into one range.
+        assert!(set.insert(3));
+        assert_eq!(set.ranges(), &[UidRange::range(1, 5)]);
+        assert_eq!(set.uid_count(), 5);
+
+        // Extending past each endpoint keeps a single merged range.
+        assert!(set.insert(6));
+        assert_eq!(set.ranges(), &[UidRange::range(1, 6)]);
+        assert!(set.insert(7));
+        assert_eq!(set.ranges(), &[UidRange::range(1, 7)]);
+
+        // A UID two past the end is disjoint, not adjacent.
+        assert!(set.insert(9));
+        assert_eq!(set.ranges(), &[UidRange::range(1, 7), UidRange::single(9)]);
+        // ...and filling the hole merges it back in.
+        assert!(set.insert(8));
+        assert_eq!(set.ranges(), &[UidRange::range(1, 9)]);
+
+        // A single UID adjacent below the first range extends it downward.
+        let mut set = CompactUidSet::from_uids([5, 6]);
+        assert!(set.insert(4));
+        assert_eq!(set.ranges(), &[UidRange::range(4, 6)]);
+        assert!(set.insert(1));
+        assert_eq!(set.ranges(), &[UidRange::single(1), UidRange::range(4, 6)]);
+    }
+
+    // Every mutation path must leave the set indistinguishable from the same
+    // UIDs fed through `from_uids`, since that is what membership, diffing and
+    // cursor encoding all assume.
+    #[test]
+    fn compact_uid_set_mutations_agree_with_a_reference_set() {
+        let mut set = CompactUidSet::default();
+        let mut reference = std::collections::BTreeSet::new();
+
+        // A deterministic walk that hits adjacency, splitting and re-merging.
+        let script: [(bool, u32); 18] = [
+            (true, 10),
+            (true, 11),
+            (true, 12),
+            (true, 14),
+            (true, 13),
+            (false, 12),
+            (true, 1),
+            (true, 2),
+            (false, 1),
+            (false, 2),
+            (true, 20),
+            (false, 20),
+            (true, 12),
+            (false, 14),
+            (false, 10),
+            (true, 10),
+            (false, 11),
+            (false, 13),
+        ];
+        for (insert, uid) in script {
+            if insert {
+                assert_eq!(set.insert(uid), reference.insert(uid), "insert {uid}");
+            } else {
+                assert_eq!(set.remove(uid), reference.remove(&uid), "remove {uid}");
+            }
+            let expected = CompactUidSet::from_uids(reference.iter().copied());
+            assert_eq!(
+                set,
+                expected,
+                "after {}{uid}",
+                if insert { '+' } else { '-' }
+            );
+            assert_eq!(set.uid_count(), reference.len());
+            assert_eq!(set.to_uids(), reference.iter().copied().collect::<Vec<_>>());
+            for uid in 1..25 {
+                assert_eq!(
+                    set.contains(uid),
+                    reference.contains(&uid),
+                    "contains {uid}"
+                );
+            }
+        }
     }
 
     // The merge walks both range lists in order, so the edges worth pinning

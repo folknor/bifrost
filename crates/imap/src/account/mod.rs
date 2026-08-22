@@ -37,6 +37,7 @@ pub(crate) mod error;
 mod factory;
 mod folder_registry;
 mod get;
+mod hydration;
 mod inventory;
 mod mutate;
 mod pim;

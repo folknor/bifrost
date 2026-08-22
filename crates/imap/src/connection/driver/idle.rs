@@ -76,8 +76,7 @@ pub(super) async fn run_idle(
                         super::emit_tagged_response_code_events(&t, event_sink);
                     }
                     crate::types::Response::Untagged(u) => {
-                        let code_emitted = super::emit_untagged_response_code_events(&u, event_sink);
-                        super::short_circuit_on_bye(digest, &u)?;
+                        let code_emitted = super::process_untagged_prefix(digest, &u, event_sink)?;
                         if !code_emitted {
                             let _ = event_sink.emit((*u).into());
                         }
@@ -132,8 +131,7 @@ async fn drain_idle_responses(
                 super::emit_tagged_response_code_events(&t, event_sink);
             }
             crate::types::Response::Untagged(u) => {
-                let code_emitted = super::emit_untagged_response_code_events(&u, event_sink);
-                super::short_circuit_on_bye(digest, &u)?;
+                let code_emitted = super::process_untagged_prefix(digest, &u, event_sink)?;
                 if !code_emitted {
                     let _ = event_sink.emit((*u).into());
                 }

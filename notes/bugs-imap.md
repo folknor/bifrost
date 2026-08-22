@@ -18,15 +18,6 @@ still missing is coverage on servers without NOTIFY: the remaining option is one
 per hot folder (bounded), which costs connections and wants a deliberate decision about the
 budget.
 
-## Two parallel hydration implementations
-
-`Projection` in `get.rs` and `HydrationProjection` in `pim.rs` are two
-attribute-selection paths over the same FETCH surface, one parsing through
-`bifrost-types::mime` and one returning raw bytes. They drift: the preview
-whole-message-prefix fix landed in `pim.rs` first and had to be applied to
-`get.rs` separately (done 2026-08-18). They want unifying behind a single
-attribute-selection + decode function.
-
 ## Unbounded memory: the buffered target sets
 
 `mutation_stream` and `get_stream` both fully drain their input
@@ -39,16 +30,6 @@ patch.
 (The MODSEQ cache is bounded and body-bearing hydration has a byte budget as
 of 2026-08-18.)
 
-## CompactUidSet is range-compressed in name only
-
-`diff` is a linear merge, `contains` a binary search, and the QRESYNC
-known-UID operand is built straight from the ranges via `UidSet::from_ranges`
-(2026-08-18). What still expands: `run_qresync`'s `live_uids` `BTreeSet` and
-`run_condstore_with_baseline`'s seeded-baseline path. Both want a
-range-native mutable set (insert / remove / contains over the range list)
-before they can drop the expansion, which is a bigger change than the two
-call sites suggest.
-
 ## Smaller / lower-confidence
 
 - `*` sentinel collides with a legal UID. `codec/decode/flags_caps.rs::seq_number` maps `*` to
@@ -58,12 +39,6 @@ call sites suggest.
   one), it needs a mailbox that has reached the last UID of its UIDVALIDITY epoch to trigger, and
   moving the sentinel out of band means changing `UidRange` itself, which every codec, encoder,
   and cursor path touches.
-- Duplicated dispatch loop. `run_one_command` and `run_prebuilt_command` in `driver/mod.rs` are
-  ~70 near-identical lines (the classification/BYE/continuation loop); `pipeline.rs` and
-  `idle.rs` carry third and fourth copies of the untagged-response handling. The
-  `short_circuit_on_bye` guard was clearly added to paper over exactly this. One loop
-  parameterised by "how do I send" and "what do I do with a `+`" would remove the class of bug
-  the guard defends against.
 - `Pool::close` cannot log out an outstanding checkout. It is outside the idle list; the
   checkout's `Drop` correctly refuses to re-park it, but nothing LOGOUTs it. It relies on the
   driver task's `logout_best_effort` after the handle drops, which is fine but means

@@ -1966,54 +1966,37 @@ async fn refresh_folders(
 }
 
 fn attrs_for_hydration(projection: HydrationProjection) -> Vec<FetchAttr> {
-    let mut attrs = vec![
-        FetchAttr::Uid,
-        FetchAttr::Flags,
-        FetchAttr::Envelope,
-        FetchAttr::Rfc822Size,
-    ];
-    match projection {
-        HydrationProjection::Headers => {}
-        HydrationProjection::Preview(limit) => attrs.push(FetchAttr::BodySection {
-            peek: true,
-            section: None,
-            partial: Some((
-                0,
-                u64::try_from(limit)
-                    .unwrap_or(u64::MAX)
-                    .max(PREVIEW_FETCH_BYTES),
-            )),
-        }),
-        HydrationProjection::Full | HydrationProjection::FullWithBlobs => {
-            attrs.push(FetchAttr::BodySection {
-                peek: true,
-                section: None,
-                partial: None,
-            });
-        }
+    use super::hydration::{BodySelection, FetchSelection};
+    let body = match projection {
+        HydrationProjection::Headers => BodySelection::None,
+        HydrationProjection::Preview(limit) => BodySelection::Preview(limit),
+        HydrationProjection::Full | HydrationProjection::FullWithBlobs => BodySelection::Whole,
         // Not dead code: `HydrationProjection` is `#[non_exhaustive]` and that
         // attribute is scoped per crate, so a match in bifrost-imap on an enum
         // defined in bifrost-types needs a wildcard even when the named arms
         // are exhaustive in practice.
-        _ => {}
+        _ => BodySelection::None,
+    };
+    FetchSelection {
+        flags: true,
+        envelope: true,
+        size: true,
+        modseq: false,
+        body,
     }
-    attrs
+    .attributes()
 }
 
 fn fetch_to_message(
     folder: &MailboxName,
     uidvalidity: u32,
-    fetch: crate::types::FetchResponse,
+    mut fetch: crate::types::FetchResponse,
     projection: HydrationProjection,
 ) -> Option<Message> {
     let uid = fetch.uid?;
     let envelope = fetch.envelope.clone();
-    let raw_body = fetch
-        .body_sections
-        .iter()
-        .find_map(|section| section.data.as_ref())
-        .map(Vec::as_slice);
-    let parsed = raw_body.map(parse_message);
+    let raw_body = super::hydration::decode_body(&mut fetch);
+    let parsed = raw_body.as_deref().map(parse_message);
     let decoded = parsed.as_ref().map(|message| {
         select_body_with(
             message,

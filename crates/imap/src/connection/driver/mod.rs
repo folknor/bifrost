@@ -553,7 +553,7 @@ pub(in crate::connection) async fn run_one_command(
     tag_gen: &mut super::tag::TagGenerator,
     event_sink: &mut event_sink::DriverEventSink,
     cmd: Command,
-    mut consumer: DriverConsumer,
+    consumer: DriverConsumer,
 ) -> Result<Box<dyn std::any::Any + Send>, Error> {
     let cmd_kind = cmd.kind();
     let cmd_target: Option<MailboxName> = cmd.mailbox_target().cloned();
@@ -611,6 +611,36 @@ pub(in crate::connection) async fn run_one_command(
     // decoration; send_command_on_wire owns the pre-send phase.
     let tag = send_command_on_wire(wire_reader, state, tag_gen, event_sink, &cmd).await?;
 
+    dispatch_response_loop(
+        wire_reader,
+        state,
+        event_sink,
+        &tag,
+        cmd_kind,
+        cmd_target,
+        consumer,
+        ContinuationPolicy::Consumer,
+    )
+    .await
+}
+
+#[derive(Clone, Copy)]
+enum ContinuationPolicy {
+    Consumer,
+    RejectAfterSend,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_response_loop(
+    wire_reader: &mut super::wire::WireReader,
+    state: &mut super::state::ProtocolState,
+    event_sink: &mut event_sink::DriverEventSink,
+    tag: &str,
+    cmd_kind: crate::types::CommandKind,
+    cmd_target: Option<MailboxName>,
+    mut consumer: DriverConsumer,
+    continuation: ContinuationPolicy,
+) -> Result<Box<dyn std::any::Any + Send>, Error> {
     // After a successful send, any transport failure is InFlight: the
     // command bytes crossed the side-effect boundary.
     loop {
@@ -631,7 +661,7 @@ pub(in crate::connection) async fn run_one_command(
                 // (I13): emit alert/notification overflow from
                 // tagged response codes before finalization.
                 emit_tagged_response_code_events(&t, event_sink);
-                let ctx = build_consumer_context(state, cmd_target.as_ref(), &tag);
+                let ctx = build_consumer_context(state, cmd_target.as_ref(), tag);
                 // Tagged response received: the server acknowledged the
                 // command. Errors from finalization (NO/BAD status) carry
                 // Acknowledged so recovery can distinguish them from
@@ -660,8 +690,7 @@ pub(in crate::connection) async fn run_one_command(
                 // (I13): emit alert/notification overflow before
                 // classification so they reach the event queue even
                 // when the response is routed to a consumer.
-                let code_emitted = emit_untagged_response_code_events(&u, event_sink);
-                short_circuit_on_bye(digest, &u)?;
+                let code_emitted = process_untagged_prefix(digest, &u, event_sink)?;
 
                 let class_ctx = ClassificationContext {
                     notify: notify_before,
@@ -670,7 +699,7 @@ pub(in crate::connection) async fn run_one_command(
                 let rule = classification::classify(cmd_kind, &u, &class_ctx);
                 match rule {
                     SolicitationRule::OnlySolicited | SolicitationRule::Either => {
-                        let ctx = build_consumer_context(state, cmd_target.as_ref(), &tag);
+                        let ctx = build_consumer_context(state, cmd_target.as_ref(), tag);
                         consumer.on_response(*u, notify_before, &ctx);
                     }
                     SolicitationRule::OnlyUnsolicited | SolicitationRule::Impossible => {
@@ -683,16 +712,21 @@ pub(in crate::connection) async fn run_one_command(
                     }
                 }
             }
-            crate::types::Response::Continuation(c) => {
-                // Route to the consumer's continuation handler if
-                // supported (RFC 3501 Section7.5). Regular consumers error.
-                let ctx = build_consumer_context(state, cmd_target.as_ref(), &tag);
-                let ContinuationReply::Write(bytes) = consumer.on_continuation(c, &ctx)?;
-                wire_reader
-                    .write_all(&bytes)
-                    .await
-                    .map_err(|e| e.with_attempt(TransmissionState::InFlight))?;
-            }
+            crate::types::Response::Continuation(c) => match continuation {
+                ContinuationPolicy::Consumer => {
+                    let ctx = build_consumer_context(state, cmd_target.as_ref(), tag);
+                    let ContinuationReply::Write(bytes) = consumer.on_continuation(c, &ctx)?;
+                    wire_reader
+                        .write_all(&bytes)
+                        .await
+                        .map_err(|e| e.with_attempt(TransmissionState::InFlight))?;
+                }
+                ContinuationPolicy::RejectAfterSend => {
+                    return Err(Error::Protocol(
+                        "unexpected continuation after pre-built command fully sent".into(),
+                    ));
+                }
+            },
             crate::types::Response::Greeting(_) => {
                 return Err(Error::Protocol("unexpected greeting mid-command".into()));
             }
@@ -723,7 +757,7 @@ pub(in crate::connection) async fn run_prebuilt_command(
     tag: &str,
     cmd_kind: crate::types::CommandKind,
     cmd_target: Option<MailboxName>,
-    mut consumer: DriverConsumer,
+    consumer: DriverConsumer,
 ) -> Result<Box<dyn std::any::Any + Send>, Error> {
     trace!(tag, ?cmd_kind, "driver: sending pre-built command");
 
@@ -733,73 +767,17 @@ pub(in crate::connection) async fn run_prebuilt_command(
     // them without decoration. After send, responses are InFlight.
     send_with_literal_sync(wire_reader, state, event_sink, &wire_bytes).await?;
 
-    // Response classification loop  -  identical to run_one_command.
-    loop {
-        let notify_before = state.notify();
-        let utf8 = utf8_mode(state);
-        consumer
-            .prepare_to_read()
-            .await
-            .map_err(|e| e.with_attempt(TransmissionState::InFlight))?;
-        let resp = wire_reader
-            .read_one(utf8)
-            .await
-            .map_err(|e| e.with_attempt(TransmissionState::InFlight))?;
-        let digest = state.apply_side_effects(&resp);
-
-        match resp {
-            crate::types::Response::Tagged(t) if t.tag == tag => {
-                emit_tagged_response_code_events(&t, event_sink);
-                let ctx = build_consumer_context(state, cmd_target.as_ref(), tag);
-                let finalized = consumer
-                    .finalize_erased(t, &ctx)
-                    .map_err(|e| e.with_attempt(TransmissionState::Acknowledged))?;
-                for resp in finalized.reclassified_as_events {
-                    if !has_critical_response_code(&resp) {
-                        let _ = event_sink.emit(resp.into());
-                    }
-                }
-                return Ok(finalized.output);
-            }
-            crate::types::Response::Tagged(t) => {
-                return Err(Error::Protocol(format!(
-                    "unexpected tag {:?} (expected {:?})",
-                    t.tag, tag,
-                )));
-            }
-            crate::types::Response::Untagged(u) => {
-                let code_emitted = emit_untagged_response_code_events(&u, event_sink);
-                short_circuit_on_bye(digest, &u)?;
-
-                let class_ctx = ClassificationContext {
-                    notify: notify_before,
-                    command_target: cmd_target.as_ref(),
-                };
-                let rule = classification::classify(cmd_kind, &u, &class_ctx);
-                match rule {
-                    SolicitationRule::OnlySolicited | SolicitationRule::Either => {
-                        let ctx = build_consumer_context(state, cmd_target.as_ref(), tag);
-                        consumer.on_response(*u, notify_before, &ctx);
-                    }
-                    SolicitationRule::OnlyUnsolicited | SolicitationRule::Impossible => {
-                        if !code_emitted {
-                            let _ = event_sink.emit((*u).into());
-                        }
-                    }
-                }
-            }
-            crate::types::Response::Continuation(_) => {
-                // APPEND/MULTIAPPEND should not receive continuations
-                // after all bytes have been sent. Error per RFC 3501 Section7.5.
-                return Err(Error::Protocol(
-                    "unexpected continuation after pre-built command fully sent".into(),
-                ));
-            }
-            crate::types::Response::Greeting(_) => {
-                return Err(Error::Protocol("unexpected greeting mid-command".into()));
-            }
-        }
-    }
+    dispatch_response_loop(
+        wire_reader,
+        state,
+        event_sink,
+        tag,
+        cmd_kind,
+        cmd_target,
+        consumer,
+        ContinuationPolicy::RejectAfterSend,
+    )
+    .await
 }
 
 /// Publish the state snapshot before waking the command caller.
@@ -814,9 +792,13 @@ fn publish_then_answer<T>(publish: impl FnOnce(), result_tx: oneshot::Sender<T>,
 /// Turn a side-effect digest for an untagged response into the fatal BYE
 /// result every active driver read loop must honor.
 ///
-/// Call this after response-code events are emitted so an ALERT carried by
-/// BYE reaches the event queue before the command exits.
-pub(super) fn short_circuit_on_bye(
+/// Private on purpose: the ordering constraint below (response-code events
+/// first, so an ALERT carried by BYE reaches the event queue before the
+/// command exits) is only safe if every read loop applies it the same way.
+/// `process_untagged_prefix` is that single application point, and keeping
+/// this unexported is what stops a fifth hand-rolled copy of the pair from
+/// drifting out of order again.
+fn short_circuit_on_bye(
     digest: super::state::SideEffectDigest,
     response: &UntaggedResponse,
 ) -> Result<(), Error> {
@@ -832,6 +814,20 @@ pub(super) fn short_circuit_on_bye(
     };
     debug_assert!(matches!(status, UntaggedStatus::Bye));
     Err(Error::bye_with_code(text.clone(), code.clone()))
+}
+
+/// The shared prologue every driver read loop runs on an untagged response:
+/// emit response-code events, then fail the command if the response was a BYE.
+/// Returns whether a code event was emitted, which the caller uses to decide
+/// whether the response still needs a plain event of its own.
+pub(super) fn process_untagged_prefix(
+    digest: super::state::SideEffectDigest,
+    response: &UntaggedResponse,
+    event_sink: &mut event_sink::DriverEventSink,
+) -> Result<bool, Error> {
+    let code_emitted = emit_untagged_response_code_events(response, event_sink);
+    short_circuit_on_bye(digest, response)?;
+    Ok(code_emitted)
 }
 
 // ---------------------------------------------------------------------------

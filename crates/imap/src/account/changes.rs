@@ -313,7 +313,7 @@ async fn run_qresync(
             .await;
     }
     validate_modseq_not_reset(&folder, modseq, selected.mailbox.highest_mod_seq)?;
-    let mut live_uids = known_uids.to_uids().into_iter().collect::<BTreeSet<_>>();
+    let mut live_uids = known_uids.clone();
     let mut fallback_known_uids = live_uids.clone();
     let mut fetch_change_seen = BTreeSet::new();
     let mut removed_seen = BTreeSet::new();
@@ -469,7 +469,7 @@ async fn run_qresync(
             let cursor = FolderCursor::Condstore {
                 uidvalidity,
                 modseq,
-                known_uids: CompactUidSet::from_uids(fallback_known_uids),
+                known_uids: fallback_known_uids,
             };
             // Any buffered QRESYNC changes are intentionally discarded:
             // the CONDSTORE retry re-derives them from the same modseq
@@ -486,7 +486,7 @@ async fn run_qresync(
         return Err(err.into());
     }
 
-    let live_set = CompactUidSet::from_uids(live_uids);
+    let live_set = live_uids;
     warn_if_uid_count_mismatch(&tx, &folder, selected.mailbox.exists, live_set.uid_count()).await?;
     let next = account.cursor_from_select(&selected.mailbox, Some(live_set))?;
     account.folders.set_cursor(&folder, next.clone());
@@ -591,12 +591,11 @@ async fn run_condstore_with_baseline(
     // The first complete baseline has no prior snapshot to diff against. It
     // is also the current UID snapshot, so issuing a second immediate SEARCH
     // would only repeat the same work before we checkpoint it.
-    let live = if seeded_baseline {
-        known_uids.to_uids()
+    let live_set = if seeded_baseline {
+        known_uids.clone()
     } else {
-        search_all(&account, conn.connection()).await?
+        CompactUidSet::from_uids(search_all(&account, conn.connection()).await?)
     };
-    let live_set = CompactUidSet::from_uids(live);
     warn_if_uid_count_mismatch(&tx, &folder, selected.mailbox.exists, live_set.uid_count()).await?;
     let diff = known_uids.diff(&live_set);
     for uid in diff.added {
@@ -721,7 +720,7 @@ fn record_fetch_change(
     folder: &MailboxName,
     uidvalidity: u32,
     uid: Option<u32>,
-    live_uids: &mut BTreeSet<u32>,
+    live_uids: &mut CompactUidSet,
     fetch_change_seen: &mut BTreeSet<u32>,
     removed_seen: &mut BTreeSet<u32>,
     changes: &mut Vec<Change>,
@@ -777,11 +776,11 @@ fn record_removed_change(
     folder: &MailboxName,
     uidvalidity: u32,
     uid: u32,
-    live_uids: &mut BTreeSet<u32>,
+    live_uids: &mut CompactUidSet,
     removed_seen: &mut BTreeSet<u32>,
     changes: &mut Vec<Change>,
 ) {
-    live_uids.remove(&uid);
+    live_uids.remove(uid);
     if removed_seen.insert(uid) {
         changes.push(removed_change(folder, uidvalidity, uid));
     }
@@ -991,7 +990,7 @@ mod tests {
     #[test]
     fn qresync_record_helpers_deduplicate_select_and_fetch_data() {
         let folder = MailboxName::new("INBOX").expect("valid mailbox");
-        let mut live_uids = BTreeSet::from([1, 2]);
+        let mut live_uids = CompactUidSet::from_uids([1, 2]);
         let mut fetch_seen = BTreeSet::new();
         let mut removed_seen = BTreeSet::new();
         let mut changes = Vec::new();
@@ -1055,7 +1054,7 @@ mod tests {
                 ..
             })
         ));
-        assert_eq!(live_uids, BTreeSet::from([1, 2, 3]));
+        assert_eq!(live_uids, CompactUidSet::from_uids([1, 2, 3]));
     }
 
     // A HIGHESTMODSEQ that merely stayed put is not a reset; only a
@@ -1114,7 +1113,7 @@ mod tests {
     #[test]
     fn a_fetch_after_an_already_flushed_removal_reports_added() {
         let folder = MailboxName::new("INBOX").expect("valid mailbox");
-        let mut live_uids = BTreeSet::from([1, 2]);
+        let mut live_uids = CompactUidSet::from_uids([1, 2]);
         let mut fetch_seen = BTreeSet::new();
         let mut removed_seen = BTreeSet::new();
         let mut changes = Vec::new();
@@ -1151,7 +1150,7 @@ mod tests {
             ),
             "a flushed removal cannot be retracted, so the UID re-Adds",
         );
-        assert!(live_uids.contains(&2), "the UID is live again");
+        assert!(live_uids.contains(2), "the UID is live again");
     }
 
     // VANISHED and FETCH may name the same UID on a non-conformant
@@ -1160,7 +1159,7 @@ mod tests {
     #[test]
     fn a_buffered_removal_is_retracted_into_an_update() {
         let folder = MailboxName::new("INBOX").expect("valid mailbox");
-        let mut live_uids = BTreeSet::from([1, 2]);
+        let mut live_uids = CompactUidSet::from_uids([1, 2]);
         let mut fetch_seen = BTreeSet::new();
         let mut removed_seen = BTreeSet::new();
         let mut changes = Vec::new();
@@ -1196,7 +1195,7 @@ mod tests {
     #[test]
     fn a_fetch_without_a_uid_is_ignored() {
         let folder = MailboxName::new("INBOX").expect("valid mailbox");
-        let mut live_uids = BTreeSet::new();
+        let mut live_uids = CompactUidSet::default();
         let mut fetch_seen = BTreeSet::new();
         let mut removed_seen = BTreeSet::new();
         let mut changes = Vec::new();

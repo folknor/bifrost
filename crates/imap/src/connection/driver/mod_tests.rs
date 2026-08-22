@@ -226,3 +226,93 @@ fn command_answer_follows_state_publication() {
         "the caller is answered after publication"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Shared untagged prologue
+// ---------------------------------------------------------------------------
+//
+// `process_untagged_prefix` is the single application point every driver read
+// loop (command dispatch, pre-built command dispatch, pipeline, IDLE, literal
+// sync, upgrade) now shares. The ordering it enforces is load-bearing: an
+// ALERT carried on a `* BYE` must reach the event queue BEFORE the BYE error
+// unwinds the command, or the user-visible reason for the disconnect is lost.
+// These pin that contract at the helper, so the six call sites cannot each
+// re-derive it.
+
+use crate::connection::typed_event::TypedEvent;
+use crate::types::response::{ResponseCode, UntaggedResponse, UntaggedStatus};
+
+fn prefix_sink() -> (
+    event_sink::DriverEventSink,
+    tokio::sync::mpsc::Receiver<TypedEvent>,
+) {
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    (event_sink::DriverEventSink::new(tx, Some(64)), rx)
+}
+
+/// Run the prologue exactly as a read loop does: apply side effects to real
+/// protocol state first, then hand the resulting digest to the helper.
+fn run_prefix(response: UntaggedResponse) -> (Result<bool, crate::error::Error>, Vec<TypedEvent>) {
+    let (mut sink, mut rx) = prefix_sink();
+    let mut state = super::super::state::ProtocolState::new();
+    let wrapped = crate::types::Response::Untagged(Box::new(response.clone()));
+    let digest = state.apply_side_effects(&wrapped);
+    let result = process_untagged_prefix(digest, &response, &mut sink);
+    let mut events = Vec::new();
+    while let Ok(ev) = rx.try_recv() {
+        events.push(ev);
+    }
+    (result, events)
+}
+
+#[test]
+fn untagged_prologue_emits_the_alert_carried_by_a_fatal_bye() {
+    let (result, events) = run_prefix(UntaggedResponse::Status {
+        status: UntaggedStatus::Bye,
+        text: "server shutting down for maintenance".to_owned(),
+        code: Some(ResponseCode::Alert),
+    });
+
+    assert!(
+        matches!(result, Err(crate::error::Error::Bye { .. })),
+        "a BYE must fail the in-flight command, got {result:?}"
+    );
+    assert!(
+        matches!(
+            events.as_slice(),
+            [TypedEvent::Alert(text)] if text == "server shutting down for maintenance"
+        ),
+        "the ALERT is emitted before the BYE error unwinds the command, got {events:?}"
+    );
+}
+
+#[test]
+fn untagged_prologue_reports_whether_a_code_event_was_emitted() {
+    // A code that produces its own typed event: the caller must NOT also
+    // emit the raw response, so the prologue reports `true`.
+    let (result, events) = run_prefix(UntaggedResponse::Status {
+        status: UntaggedStatus::Ok,
+        text: "mailbox is over quota".to_owned(),
+        code: Some(ResponseCode::Alert),
+    });
+    assert!(result.unwrap(), "an ALERT code was turned into an event");
+    assert!(
+        matches!(
+            events.as_slice(),
+            [TypedEvent::Alert(text)] if text == "mailbox is over quota"
+        ),
+        "got {events:?}"
+    );
+
+    // A plain untagged response emits nothing here and reports `false`, so
+    // the caller still forwards it as an event of its own.
+    let (result, events) = run_prefix(UntaggedResponse::Exists(42));
+    assert!(
+        !result.unwrap(),
+        "no code event, so the caller must forward the response itself"
+    );
+    assert!(
+        events.is_empty(),
+        "the prologue does not forward plain responses; its caller does"
+    );
+}

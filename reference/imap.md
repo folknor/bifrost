@@ -46,8 +46,15 @@ run of spurious timeouts on the same connection.
 
 An untagged `* BYE` is fatal in every driver read loop - regular command,
 prebuilt command, pipeline batch, IDLE (and its drain), literal
-continuation wait, and best-effort LOGOUT - through one shared guard
-(`short_circuit_on_bye`) fed by `ProtocolState::apply_side_effects`'s
+continuation wait, and best-effort LOGOUT. Regular and prebuilt commands use
+one response loop parameterized by continuation policy. All six loops route
+every untagged response through one prologue, `process_untagged_prefix`, which
+emits critical response-code events and only then applies the BYE guard - that
+order is what keeps an `ALERT` carried on a `* BYE` from being lost when the
+error unwinds the command. `short_circuit_on_bye` is private to the driver
+module and reachable only through that prologue, so no read loop can re-derive
+the ordering and get it wrong. The guard is fed by
+`ProtocolState::apply_side_effects`'s
 `SideEffectDigest`. The digest is `#[must_use]` and its `had_bye` field is
 private, so a new loop cannot silently ignore it. BYE is recognized from
 the status tag alone, independently of the response code it carries, so
@@ -167,6 +174,16 @@ Newtypes with explicit `::new` constructors. No `From<u32>`/`From<u64>` to preve
 
 `UidSet` and `SeqSet` wrap the validated sequence-set encoder (`from_uids`, `from_seqs`, `all()`, `saved_search()` (`$`), or range constructors). `parse(&str)` is an escape hatch bypassing the typed discipline.
 
+Account cursors use `CompactUidSet`, a sorted, disjoint range list with
+range-native construction, membership, insertion, removal, and linear diff.
+QRESYNC mutates its live and fallback snapshots in that representation, and a
+seeded CONDSTORE cycle reuses the searched compact snapshot without expanding
+one allocation per UID. Because `UidRange::range(n, n)` and
+`UidRange::single(n)` are distinct values and `CompactUidSet` compares by its
+range vector, every construction and mutation path normalizes a one-element run
+to `single`. Two sets holding the same UIDs must compare equal and encode to
+the same cursor payload no matter which path built them.
+
 ## Configuration and connect
 
 `ImapConfig` centralizes TLS mode (Implicit / StartTls / Plaintext), connect/command timeouts, keepalive, and optional native-tls connector. Ports default per mode (993 / 143 / 143). Public constructors are `tls`, `starttls`, `plaintext`; builders cover port, timeouts, keepalive disablement, and custom TLS connectors. The raw `connect` / `connect_authenticated` entry points were deleted in S1-W3.
@@ -229,6 +246,12 @@ Runtime downgrades:
 Capabilities advertise `MutationConcurrency::None`: the MODSEQ cache is opportunistic (cold cache = unprotected STORE), so `StateBased` would let the engine assume UNCHANGEDSINCE is always wired. The engine's read-back-after-retry path is the lost-update safety net.
 
 ### PIM primitives
+
+Generic `Projection` hydration and PIM `HydrationProjection` share
+`account/hydration.rs` for FETCH attribute selection and body-byte decoding.
+Their outer results intentionally differ: generic hydration can return raw MIME
+and has flags-only/metadata/text-only modes, while PIM hydration always carries
+message metadata and parses selected bytes through `bifrost-types::mime`.
 
 `capabilities.rs` fills `AccountCapabilities::pim_methods` and `conveniences` at open time, and sets `AccountCapabilities::reopen_discovers_foreign_namespaces` from the open-time NAMESPACE response (`namespaces_advertise_foreign`, pure, `factory.rs`): true iff any `other`/`shared` descriptor carries a non-empty prefix, independent of whether any folders are currently shared. IMAP emits no scope-lifecycle events and discovers foreign folders only at open, so consumers read this flag to decide whether a periodic reopen/reattach (the only way a post-open ACL grant becomes visible) can ever surface anything on this server. IMAP advertises real support for:
 
