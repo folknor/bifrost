@@ -84,6 +84,36 @@ by the `tokio` feature no longer existing. An out-of-workspace caller that
 passed `features = ["tokio"]` will now fail to resolve that feature; the fix on
 their side is to drop it.
 
+## bifrost-smtp now delivers different bytes for every message, and consumers need telling
+
+**Symptom (discovered in bifrost-smtp).** Every DATA writer terminated with
+`\r\n.\r\n` unconditionally, so a message that already ended in CRLF - which is
+every well-formed message - gained a trailing empty line the sender never wrote.
+RFC 5321 section 4.1.1.4 defines the terminator as `<CRLF>.<CRLF>` where the
+leading CRLF *is* the message's final CRLF. `Message::formatted()` was therefore
+not what the recipient received, and `smtp_data_size` had to declare
+`len() + 2` to keep the RFC 1870 `SIZE` honest about the inflated body.
+
+**What an external consumer would have to ship.** Nothing, in the ordinary case:
+the new bytes are the correct ones and the old trailing blank line was the
+defect. But anything downstream that pinned the old shape needs revisiting -
+golden-file tests of delivered content, stored message digests computed over the
+old terminated form, or a caller that deliberately omitted a final CRLF knowing
+one would be supplied (still supplied, so unaffected).
+
+**What was done here instead.** Fixed, not disclosed. The writer reuses an
+existing final CRLF and adds one only when the buffer does not end in CRLF; the
+chunked writers track the last two bytes across iterator boundaries so a
+straddling CRLF is recognized. `smtp_data_size` matches the transmitted data
+section in every case. DKIM is unaffected: `body_raw()` still appends an
+unconditional CRLF, and RFC 6376 simple and relaxed body canonicalization both
+strip trailing empty lines, so signing and delivery continue to agree.
+
+**What remains wrong.** Nothing in the code. This is a pre-1.0 observable wire
+change and belongs in release notes next to the blocking-transport removal and
+the `tokio` feature removal already recorded above - a consumer reading the
+changelog should not have to infer it from a `SIZE` arithmetic change.
+
 ## An inventory partition that yields zero entries is the engine's exhaustion signal, and nothing enforces it
 
 **Symptom (discovered in bifrost-jmap).** `bifrost-sync`'s `BackfillPlan::OpenPages`

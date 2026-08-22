@@ -4,36 +4,33 @@ Hunter: Claude Opus, single pass, 2026-08-05. Scope: `crates/smtp/` and `crates/
 together because sasl exists to serve the auth paths. Read-only review; no build or test was run.
 Findings are unverified work material. Line numbers are as of the hunt and will drift.
 
-## bifrost-smtp
+All hunt findings are resolved and landed. What follows is the one gap the arc could not close,
+recorded rather than dropped so the document is not falsely empty.
 
-### Channel binding is resolved per-mechanism although it does not vary by mechanism
+## Remaining: the connection-level channel-binding gate is unpinnable in a hermetic suite
 
-`client/connection.rs` and the mirror in `async_connection.rs`. The loop calls
-`resolve_scram_binding()` once for `ScramSha256Plus` and again for `ScramSha1Plus`, each time cloning
-the peer certificate DER out of the TLS stream and re-running a SHA-2 over the whole certificate, and
-stores two identical values in a `HashMap` keyed by mechanism. `tls-server-end-point` is a property
-of the certificate, not of the SCRAM hash. This should be one `Option<ScramChannelBinding>` computed
-once; the `HashMap` also allocates on every authenticated connect. It reads like the type was chosen
-to fit `first_attemptable`'s `Fn(Mechanism) -> bool` closure rather than the other way round.
+`AsyncSmtpConnection::auth_password` decides whether to resolve a channel binding at all by asking
+whether any *allowed* PLUS mechanism is also *advertised* (`plus_candidate`), then passes
+`binding.is_some()` to `password_mechanism`. If that gate were ever wrong in the `false` direction,
+a PLUS-advertising server would be answered with PLAIN - the exact silent downgrade this arc spent
+four rounds refusing - and nothing would notice.
 
-### first_attemptable consumes only the head of a fully-computed ladder
+Nothing tests it. Neutering `plus_candidate` to a constant `false` leaves the whole crate suite
+green. This is not a regression from the round-4 collapse: the previous per-mechanism `HashMap` loop
+was gated the same way and was equally untested. The cause is structural. The transcript harness is
+an in-memory duplex with no TLS, so no test in this crate can produce a peer certificate, and
+`peer_certificate_der()` is unconditionally `None` under test. Per the project testing rules a real
+socket or a live certificate is out of scope here.
 
-`password_mechanism_order` builds an ordered `Vec` of every acceptable mechanism, and the only
-consumer takes the first non-skipped element and discards the rest; there is no retry down the ladder
-on wire rejection (deliberate, and documented). The ordered-list abstraction therefore earns nothing
-over a function that returns the single chosen mechanism. Either collapse it, or make it load-bearing
-by actually retrying the next rung on a 535 (which is what most clients do, and what makes an ordered
-ladder worth having).
+What *is* pinned: the pure seam `resolve_scram_binding` (absent certificate -> `Ok(None)` skip;
+present-but-unusable -> hard error, never a fall-through) by
+`scram_binding_only_treats_absent_certificate_as_unavailable`, and the whole selection function
+including RFC 5802 Section 6 by `password_mechanism_selection`,
+`scram_binding_skip_falls_through` and
+`unbound_scram_is_never_selected_when_its_plus_variant_is_advertised`. The untested residue is
+exactly the few lines of connection plumbing between the two.
 
-### The DATA writer appends an unconditional extra CRLF, altering every delivered message
-
-`client/mod.rs` and the DATA writers. `smtp_data_size` is `message.len() + 2` because the terminator
-is always written as `\r\n.\r\n` regardless of whether the buffer already ends in CRLF. RFC 5321
-section 4.1.1.4 specifies the terminator as `<CRLF>.<CRLF>` where the leading CRLF is the final CRLF
-of the message body, so every well-formed message bifrost sends gains a trailing empty line that the
-sender did not write, and `Message::formatted()` is not what the recipient receives.
-`reference/smtp.md` documents this at length and calls changing it "wire-compatible only after a
-dedicated API decision", but the change is a two-line conditional
-(`if !buf.ends_with(b"\r\n") { write CRLF }`) plus the matching `smtp_data_size` adjustment, and it
-makes `formatted()` honest. The hunter's read is that the doc is rationalizing an inherited lettre
-bug and it is worth fixing rather than documenting.
+Closing it properly needs a seam that lets a test inject the peer-certificate DER into an
+`AsyncSmtpConnection` built from a transcript - i.e. making `peer_certificate_der` overridable in
+test builds. That is a real, small, hermetic change; it was left out of round 4 because the round
+was scoped to three named findings and inventing a new test seam was not one of them.

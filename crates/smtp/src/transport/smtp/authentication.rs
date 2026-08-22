@@ -397,9 +397,7 @@ impl From<bifrost_sasl::SaslError> for Error {
     }
 }
 
-/// Fixed SCRAM-aware preference order, strongest first. Intersected with both
-/// the caller's `allowed` set and the server's advertised set by
-/// [`password_mechanism_order`].
+/// Fixed SCRAM-aware preference order, strongest first.
 const MECHANISM_PREFERENCE: &[Mechanism] = &[
     Mechanism::ScramSha256Plus,
     Mechanism::ScramSha1Plus,
@@ -409,22 +407,23 @@ const MECHANISM_PREFERENCE: &[Mechanism] = &[
     Mechanism::Login,
 ];
 
-/// Ordered SCRAM-aware password mechanism selection over the
-/// server-advertised set, with RFC 5802 Section 6 downgrade protection.
+/// Select the strongest attemptable password mechanism, with RFC 5802 Section
+/// 6 downgrade protection.
 ///
 /// `allowed` is the configured/default preference set (the existing
 /// `authentication` Vec). `advertised` is the server's EHLO `AUTH` set.
-/// Returns the mechanisms to try, strongest first, with the unbound
-/// `SCRAM-SHA-N` rung dropped when `SCRAM-SHA-N-PLUS` is advertised (the
-/// downgrade skip is keyed on the advertised set, matching IMAP and the RFC).
-pub(crate) fn password_mechanism_order(
+/// A rejected authentication is final. This function does not return a retry
+/// ladder because walking from PLUS to an unbound mechanism or PLAIN after a
+/// 535 would be a silent security downgrade.
+pub(crate) fn password_mechanism(
     allowed: &[Mechanism],
     advertised: &ServerInfo,
-) -> Vec<Mechanism> {
+    binding_available: bool,
+) -> Result<Mechanism, Error> {
     let offers_sha256_plus = advertised.supports_auth_mechanism(Mechanism::ScramSha256Plus);
     let offers_sha1_plus = advertised.supports_auth_mechanism(Mechanism::ScramSha1Plus);
 
-    let mut order = Vec::new();
+    let mut skipped_plus_for_binding = false;
     for &mechanism in MECHANISM_PREFERENCE {
         if !allowed.contains(&mechanism) {
             continue;
@@ -440,9 +439,22 @@ pub(crate) fn password_mechanism_order(
         if downgrade_forbidden {
             continue;
         }
-        order.push(mechanism);
+        let is_plus = matches!(
+            mechanism,
+            Mechanism::ScramSha1Plus | Mechanism::ScramSha256Plus
+        );
+        if is_plus && !binding_available {
+            skipped_plus_for_binding = true;
+            continue;
+        }
+        return Ok(mechanism);
     }
-    order
+    let message = if skipped_plus_for_binding {
+        "channel binding required but unavailable"
+    } else {
+        "no compatible authentication mechanism"
+    };
+    Err(error::invalid_input(message).with_phase(SmtpCommandPhase::Auth))
 }
 
 /// First advertised OAuth mechanism in the caller's order, or `None`.
@@ -450,7 +462,7 @@ pub(crate) fn password_mechanism_order(
 /// OAuth credentials never flow through the SCRAM/password ladder; they pick
 /// the first advertised `OAUTHBEARER` / `XOAUTH2` rung in caller order and run
 /// the legacy stateless encoder. Returns `None` for password credentials so
-/// the caller falls through to [`password_mechanism_order`].
+/// the caller falls through to [`password_mechanism`].
 pub(crate) fn oauth_mechanism(
     mechanisms: &[Mechanism],
     advertised: &ServerInfo,
@@ -463,44 +475,6 @@ pub(crate) fn oauth_mechanism(
         matches!(m, Mechanism::OAuthBearer | Mechanism::Xoauth2)
             && advertised.supports_auth_mechanism(m)
     })
-}
-
-/// Walk `order` and return the first attemptable mechanism, skipping PLUS
-/// rungs whose channel binding is unavailable (`binding_available(mech) ==
-/// false`).
-///
-/// Only PLUS rungs consult `binding_available`; non-PLUS mechanisms are always
-/// attemptable. Per RFC 5802 Section 6, a skipped PLUS rung never falls back
-/// to its own unbound hash, but the *other* PLUS hash and PLAIN remain
-/// attemptable. Errors with an `Auth`-phase `invalid_input` when every
-/// candidate is a binding-unavailable PLUS rung (or `order` is empty).
-pub(crate) fn first_attemptable(
-    order: &[Mechanism],
-    binding_available: impl Fn(Mechanism) -> bool,
-) -> Result<Mechanism, Error> {
-    let mut skipped_plus_for_binding = false;
-    for &mechanism in order {
-        let is_plus = matches!(
-            mechanism,
-            Mechanism::ScramSha1Plus | Mechanism::ScramSha256Plus
-        );
-        if is_plus && !binding_available(mechanism) {
-            skipped_plus_for_binding = true;
-            continue;
-        }
-        return Ok(mechanism);
-    }
-    // Two distinct exhaustion shapes share this routing (InvalidInput + Auth ->
-    // PolicyBlocked) but warrant different diagnostics: every candidate was a
-    // binding-unavailable PLUS rung, versus the empty order / no-compatible-
-    // mechanism case (the default-set-vs-`AUTH LOGIN`-only outcome documented
-    // in `reference/smtp.md`).
-    let message = if skipped_plus_for_binding {
-        "channel binding required but unavailable"
-    } else {
-        "no compatible authentication mechanism"
-    };
-    Err(error::invalid_input(message).with_phase(SmtpCommandPhase::Auth))
 }
 
 /// Resolve cached peer-certificate DER into SCRAM channel binding. Absence is
@@ -728,9 +702,60 @@ mod test {
         );
     }
 
+    /// RFC 5802 Section 6. The single-selection API can only express this drop
+    /// when channel binding is *unavailable*: with binding available the PLUS
+    /// rung outranks its unbound twin regardless, so every assertion here uses
+    /// `binding_available: false`. That is exactly the MITM shape the rule
+    /// exists for - a peer that strips the certificate must not be handed the
+    /// unbound SCRAM rung as a consolation prize.
     #[test]
-    fn password_mechanism_order() {
-        use super::{PASSWORD_MECHANISMS, password_mechanism_order};
+    fn unbound_scram_is_never_selected_when_its_plus_variant_is_advertised() {
+        use super::{PASSWORD_MECHANISMS, password_mechanism};
+        use crate::transport::smtp::extension::ServerInfo;
+
+        // Both PLUS rungs advertised, binding unavailable: neither unbound
+        // SCRAM rung is reachable, so selection lands on PLAIN.
+        let advertised = ServerInfo::with_auth_mechanisms(&[
+            Mechanism::ScramSha256Plus,
+            Mechanism::ScramSha1Plus,
+            Mechanism::ScramSha256,
+            Mechanism::ScramSha1,
+            Mechanism::Plain,
+        ]);
+        assert_eq!(
+            password_mechanism(PASSWORD_MECHANISMS, &advertised, false).unwrap(),
+            Mechanism::Plain
+        );
+
+        // Only SHA-256-PLUS advertised: SHA-256 is dropped, but SHA-1 has no
+        // advertised PLUS variant and stays selectable.
+        let advertised = ServerInfo::with_auth_mechanisms(&[
+            Mechanism::ScramSha256Plus,
+            Mechanism::ScramSha256,
+            Mechanism::ScramSha1,
+            Mechanism::Plain,
+        ]);
+        assert_eq!(
+            password_mechanism(PASSWORD_MECHANISMS, &advertised, false).unwrap(),
+            Mechanism::ScramSha1
+        );
+
+        // SHA-256-PLUS + SHA-256 only, binding unavailable: the unbound rung is
+        // forbidden and there is nothing weaker, so this is a hard failure
+        // diagnosed as a channel-binding problem - never an unbound success.
+        let advertised =
+            ServerInfo::with_auth_mechanisms(&[Mechanism::ScramSha256Plus, Mechanism::ScramSha256]);
+        let err = password_mechanism(PASSWORD_MECHANISMS, &advertised, false).unwrap_err();
+        assert!(err.is_invalid_input());
+        assert_eq!(
+            err.to_string(),
+            "invalid SMTP input: channel binding required but unavailable"
+        );
+    }
+
+    #[test]
+    fn password_mechanism_selection() {
+        use super::{PASSWORD_MECHANISMS, password_mechanism};
         use crate::transport::smtp::extension::ServerInfo;
 
         // All SCRAM + PLAIN advertised and allowed.
@@ -741,24 +766,20 @@ mod test {
             Mechanism::ScramSha1,
             Mechanism::Plain,
         ]);
-        // With the PLUS rungs advertised, the matching non-PLUS rungs are
-        // dropped (RFC 5802 Section 6).
+        // Strongest advertised rung wins. (This case cannot pin the RFC 5802
+        // drop on its own - the PLUS rung outranks the unbound one anyway; see
+        // `unbound_scram_is_never_selected_when_its_plus_variant_is_advertised`.)
         assert_eq!(
-            password_mechanism_order(PASSWORD_MECHANISMS, &advertised),
-            vec![
-                Mechanism::ScramSha256Plus,
-                Mechanism::ScramSha1Plus,
-                Mechanism::Plain,
-            ]
+            password_mechanism(PASSWORD_MECHANISMS, &advertised, true).unwrap(),
+            Mechanism::ScramSha256Plus
         );
 
-        // SHA-256-PLUS + SHA-256 advertised: SHA-256 dropped, SHA-256-PLUS
-        // first.
+        // SHA-256-PLUS + SHA-256 advertised: SHA-256-PLUS first.
         let advertised =
             ServerInfo::with_auth_mechanisms(&[Mechanism::ScramSha256Plus, Mechanism::ScramSha256]);
         assert_eq!(
-            password_mechanism_order(PASSWORD_MECHANISMS, &advertised),
-            vec![Mechanism::ScramSha256Plus]
+            password_mechanism(PASSWORD_MECHANISMS, &advertised, true).unwrap(),
+            Mechanism::ScramSha256Plus
         );
 
         // No PLUS advertised: non-PLUS SCRAM kept.
@@ -768,26 +789,22 @@ mod test {
             Mechanism::Plain,
         ]);
         assert_eq!(
-            password_mechanism_order(PASSWORD_MECHANISMS, &advertised),
-            vec![
-                Mechanism::ScramSha256,
-                Mechanism::ScramSha1,
-                Mechanism::Plain
-            ]
+            password_mechanism(PASSWORD_MECHANISMS, &advertised, false).unwrap(),
+            Mechanism::ScramSha256
         );
 
         // LOGIN only appears when in `allowed`, and always last.
         let allowed = [Mechanism::Plain, Mechanism::Login];
         let advertised = ServerInfo::with_auth_mechanisms(&[Mechanism::Login, Mechanism::Plain]);
         assert_eq!(
-            password_mechanism_order(&allowed, &advertised),
-            vec![Mechanism::Plain, Mechanism::Login]
+            password_mechanism(&allowed, &advertised, false).unwrap(),
+            Mechanism::Plain
         );
 
         // LOGIN-only server under the default `PASSWORD_MECHANISMS` (LOGIN not
         // allowed): empty order. Pins the migration-note regression.
         let advertised = ServerInfo::with_auth_mechanisms(&[Mechanism::Login]);
-        assert!(password_mechanism_order(PASSWORD_MECHANISMS, &advertised).is_empty());
+        assert!(password_mechanism(PASSWORD_MECHANISMS, &advertised, false).is_err());
     }
 
     #[test]
@@ -811,23 +828,26 @@ mod test {
 
     #[test]
     fn scram_binding_skip_falls_through() {
-        use super::first_attemptable;
+        use super::password_mechanism;
         use crate::transport::smtp::error::SmtpCommandPhase;
+        use crate::transport::smtp::extension::ServerInfo;
 
         // PLUS rungs first, but binding unavailable -> fall through to PLAIN.
-        let order = [
+        let allowed = [
             Mechanism::ScramSha256Plus,
             Mechanism::ScramSha1Plus,
             Mechanism::Plain,
         ];
         assert_eq!(
-            first_attemptable(&order, |_| false).unwrap(),
+            password_mechanism(&allowed, &ServerInfo::with_auth_mechanisms(&allowed), false,)
+                .unwrap(),
             Mechanism::Plain
         );
 
         // A PLUS rung whose binding *is* available is chosen.
         assert_eq!(
-            first_attemptable(&order, |_| true).unwrap(),
+            password_mechanism(&allowed, &ServerInfo::with_auth_mechanisms(&allowed), true,)
+                .unwrap(),
             Mechanism::ScramSha256Plus
         );
 
@@ -835,7 +855,12 @@ mod test {
         // diagnosed as a channel-binding failure (every candidate was a
         // binding-unavailable PLUS rung).
         let all_plus = [Mechanism::ScramSha256Plus, Mechanism::ScramSha1Plus];
-        let err = first_attemptable(&all_plus, |_| false).unwrap_err();
+        let err = password_mechanism(
+            &all_plus,
+            &ServerInfo::with_auth_mechanisms(&all_plus),
+            false,
+        )
+        .unwrap_err();
         assert!(err.is_invalid_input());
         assert_eq!(err.phase(), Some(SmtpCommandPhase::Auth));
         assert_eq!(
@@ -846,7 +871,7 @@ mod test {
         // Empty order -> same routing (Auth-phase invalid_input) but the
         // no-compatible-mechanism diagnostic, not the channel-binding one (no
         // PLUS rung was skipped).
-        let err = first_attemptable(&[], |_| true).unwrap_err();
+        let err = password_mechanism(&[], &ServerInfo::default(), true).unwrap_err();
         assert!(err.is_invalid_input());
         assert_eq!(err.phase(), Some(SmtpCommandPhase::Auth));
         assert_eq!(

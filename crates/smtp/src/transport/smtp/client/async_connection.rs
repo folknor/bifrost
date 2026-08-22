@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::net::IpAddr;
 #[cfg(unix)]
 use std::path::Path;
@@ -18,7 +17,8 @@ use super::escape_crlf;
 use super::metering::WireMetering;
 use super::{
     ClientCodec, ConnectionState, MAX_RESPONSE_BYTES, MAX_RESPONSE_LINE_BYTES,
-    PIPELINING_RECIPIENT_WINDOW, TlsParameters, async_net::AsyncNetworkStream, smtp_data_size,
+    PIPELINING_RECIPIENT_WINDOW, TlsParameters, async_net::AsyncNetworkStream, data_terminator,
+    smtp_data_size,
 };
 use crate::{
     Envelope,
@@ -27,8 +27,8 @@ use crate::{
         Protocol,
         authentication::{
             Credentials, Mechanism, ScramExchange, ScramStep, decode_auth_challenge,
-            decode_scram_payload, first_attemptable, oauth_mechanism, password_mechanism_order,
-            resolve_scram_binding, scram_hash,
+            decode_scram_payload, oauth_mechanism, password_mechanism, resolve_scram_binding,
+            scram_hash,
         },
         batch::{RecipientProgress, SendProgress, SmtpBatchRecipient},
         commands::{
@@ -1111,7 +1111,7 @@ impl AsyncSmtpConnection {
         let mut out_buf = Vec::with_capacity(email.len());
         codec.encode(email, &mut out_buf);
         self.write(out_buf.as_slice()).await?;
-        self.write(b"\r\n.\r\n").await
+        self.write(data_terminator(email.ends_with(b"\r\n"))).await
     }
 
     /// Compute RCPT TO parameters for a single recipient and the given options.
@@ -1615,24 +1615,21 @@ impl AsyncSmtpConnection {
             return self.auth_legacy(mechanism, credentials).await;
         }
 
-        let order = password_mechanism_order(mechanisms, &self.server_info);
-
-        let mut bindings: HashMap<Mechanism, ScramChannelBinding> = HashMap::new();
-        for &mechanism in &order {
-            if matches!(
+        let plus_candidate = mechanisms.iter().any(|mechanism| {
+            matches!(
                 mechanism,
                 Mechanism::ScramSha1Plus | Mechanism::ScramSha256Plus
-            ) && let Some(binding) = self.resolve_scram_binding()?
-            {
-                bindings.insert(mechanism, binding);
-            }
-        }
-        let chosen = first_attemptable(&order, |mechanism| bindings.contains_key(&mechanism))?;
+            ) && self.server_info.supports_auth_mechanism(*mechanism)
+        });
+        let binding = if plus_candidate {
+            self.resolve_scram_binding()?
+        } else {
+            None
+        };
+        let chosen = password_mechanism(mechanisms, &self.server_info, binding.is_some())?;
         match chosen {
             Mechanism::ScramSha1Plus | Mechanism::ScramSha256Plus => {
-                let binding = bindings
-                    .remove(&chosen)
-                    .expect("PLUS binding resolved above");
+                let binding = binding.expect("PLUS binding resolved above");
                 self.auth_scram(chosen, binding, credentials).await
             }
             Mechanism::ScramSha1 | Mechanism::ScramSha256 => {
@@ -1882,13 +1879,24 @@ impl AsyncSmtpConnection {
         B: AsRef<[u8]>,
     {
         let mut codec = ClientCodec::new();
+        let mut last_two = [0_u8; 2];
+        let mut seen = 0_usize;
         for message_part in message {
             let message_part = message_part.as_ref();
+            if message_part.len() >= 2 {
+                last_two.copy_from_slice(&message_part[message_part.len() - 2..]);
+                seen = 2;
+            } else if let Some(&byte) = message_part.first() {
+                last_two[0] = last_two[1];
+                last_two[1] = byte;
+                seen = (seen + 1).min(2);
+            }
             let mut out_buf = Vec::with_capacity(message_part.len());
             codec.encode(message_part, &mut out_buf);
             self.write(out_buf.as_slice()).await?;
         }
-        self.write(b"\r\n.\r\n").await?;
+        self.write(data_terminator(seen >= 2 && last_two == *b"\r\n"))
+            .await?;
 
         self.read_response().await
     }
@@ -1904,13 +1912,24 @@ impl AsyncSmtpConnection {
         B: AsRef<[u8]>,
     {
         let mut codec = ClientCodec::new();
+        let mut last_two = [0_u8; 2];
+        let mut seen = 0_usize;
         for message_part in message {
             let message_part = message_part.as_ref();
+            if message_part.len() >= 2 {
+                last_two.copy_from_slice(&message_part[message_part.len() - 2..]);
+                seen = 2;
+            } else if let Some(&byte) = message_part.first() {
+                last_two[0] = last_two[1];
+                last_two[1] = byte;
+                seen = (seen + 1).min(2);
+            }
             let mut out_buf = Vec::with_capacity(message_part.len());
             codec.encode(message_part, &mut out_buf);
             self.write(out_buf.as_slice()).await?;
         }
-        self.write(b"\r\n.\r\n").await?;
+        self.write(data_terminator(seen >= 2 && last_two == *b"\r\n"))
+            .await?;
 
         // A dropped LMTP send cannot safely reuse the stream until every
         // accepted recipient status has been consumed.
@@ -2156,6 +2175,49 @@ mod transcript_tests {
     use super::{AsyncSmtpConnection, SendOptions};
 
     const HELLO: &str = "EHLO client.example\r\n";
+
+    #[tokio::test(crate = "tokio")]
+    async fn data_terminator_preserves_exact_message_bytes() {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let cases: &[(&[u8], &[u8])] = &[
+            (b"body\r\n", b".\r\n"),
+            (b"body", b"\r\n.\r\n"),
+            (b"", b"\r\n.\r\n"),
+            (b"body\r", b"\r\n.\r\n"),
+            (b"body\n", b"\r\n.\r\n"),
+        ];
+
+        for &(body, terminator) in cases {
+            let mut transcript =
+                Transcript::new("220 smtp.example\r\n").expect(HELLO, "250 smtp.example\r\n");
+            if !body.is_empty() {
+                transcript = transcript.expect(body, "");
+            }
+            transcript = transcript.expect(terminator, "250 queued\r\n");
+            let mut connection =
+                AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp)
+                    .await
+                    .unwrap();
+
+            connection.message(body).await.unwrap();
+            transcript.assert_exhausted();
+        }
+
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250 smtp.example\r\n")
+            .expect("body\r", "")
+            .expect("\n", "")
+            .expect(".\r\n", "250 queued\r\n");
+        let mut connection =
+            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp)
+                .await
+                .unwrap();
+        connection
+            .message_iter([b"body\r".as_slice(), b"\n".as_slice()].into_iter())
+            .await
+            .unwrap();
+        transcript.assert_exhausted();
+    }
 
     #[tokio::test(crate = "tokio")]
     async fn pipelining_drains_each_recipient_window_before_writing_the_next() {

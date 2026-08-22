@@ -175,9 +175,12 @@ when OAuth credentials are configured the SCRAM ladder does not apply. RFC 5802
 Section 6 downgrade protection drops the unbound `SCRAM-SHA-N` rung whenever
 `SCRAM-SHA-N-PLUS` is advertised. A PLUS rung is skipped only when TLS has no
 peer certificate. A present certificate whose binding computation fails is a
-hard protocol error and cannot fall through to PLAIN. The selection function lives per-protocol (IMAP
-`password_mechanism_ladder`, SMTP `password_mechanism_order`); see
-`reference/imap.md` / `reference/smtp.md`.
+hard protocol error and cannot fall through to PLAIN. The selection function lives per-protocol and
+the two shapes deliberately differ: IMAP's `password_mechanism_ladder` returns an ordered
+`Attempt`/`Reject` list because its driver walks past locally rejected rungs, while SMTP's
+`password_mechanism` returns exactly one mechanism because SMTP never retries after a wire
+rejection - descending to an unbound mechanism or PLAIN on a 535 would be the very downgrade the
+Section 6 rule exists to prevent. See `reference/imap.md` / `reference/smtp.md`.
 
 ## Non-goals
 
