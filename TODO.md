@@ -4,32 +4,25 @@ Cross-crate work items surfaced by per-crate work but not fixable inside one
 crate. Each entry stands alone: symptom on the discovering side, what the other
 side would have to ship, what was done locally instead, and what remains wrong.
 
-## bifrost-sync removed public configuration that never controlled runtime work
+## bifrost-sync mutation retry storage is unbounded
 
-**Symptom (discovered in bifrost-sync).** `SchedulerConfig`,
-`ConcurrencyBudget`, `MutationConfig::{fanout_buffer, retry_queue_cap}`, and
-`BackfillConfig::clock_skew_warn` were public configuration surfaces documented
-as runtime tuning, but no production path consulted them. In particular,
-`retry_queue_cap` read as a bound on mutation retries while the campaign retains
-retry candidates in an unbounded `Vec<ObjectId>`.
+**Symptom (discovered in bifrost-sync).** A bulk mutation campaign retains its
+retry candidates in an unbounded `Vec<ObjectId>`, so campaign memory grows with
+the number of unresolved targets in a single run.
+`MutationConfig::retry_queue_cap` reads as a bound on that memory but is inert:
+no production path consults it.
 
-**What an external consumer would have to ship.** Consumers constructing
-`EngineConfig` must remove these fields and stop calling
-`SyncEngineBuilder::budget`. A consumer that depended on a retry-memory bound
-must bound the target list before starting each campaign; the engine does not
-currently provide that guarantee.
+**What an external consumer would have to ship.** A consumer that needs a
+retry-memory bound must bound the target list before starting each campaign.
+`retry_queue_cap` must not be relied on for it; the engine provides no such
+guarantee today.
 
-**What was done here instead.** The unwired scheduler and budget gate, their
-public exports and tests, the unused mutation fanout helper, the unused
-checkpoint writer, and the three inert configuration fields were deleted. The
-durable sync reference now describes only running machinery.
+**What was done here instead.** Nothing beyond disclosure. The field stays, and
+the durable sync reference states plainly that it does not bound the vector.
 
-**What remains wrong.** Mutation retry storage is still unbounded and grows
-with the number of unresolved targets in one campaign. This is disclosed rather
-than disguised as a working cap. Reintroducing a bound requires defined overflow
+**What remains wrong.** Reintroducing a real bound requires defined overflow
 semantics that preserve every target's outcome; silently dropping retry ids
-would turn memory protection into mutation-accounting loss. These removals are
-pre-1.0 breaking API changes and belong in the next release notes.
+would turn memory protection into mutation-accounting loss.
 
 ## bifrost-smtp's `account-error` feature gates nothing and cannot be turned off
 

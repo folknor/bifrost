@@ -9,13 +9,15 @@
 //! `TimeWindowed` with exponentially-widening windows per
 //! `bifrost-sync.md` -> Default partition policy.
 
+pub mod checkpoint;
 pub mod partitioner;
 pub mod runner;
 
 use bifrost_types::{AccountId, CursorScope};
 
+pub use checkpoint::BackfillCheckpointWriter;
 pub use partitioner::{BackfillPolicy, BackfillStrategy, PartitionPlan, default_time_boundaries};
-pub use runner::{BackfillPartitionOutcome, BackfillRunner};
+pub use runner::{BackfillPartitionOutcome, BackfillRunner, LiveSupersedes};
 
 /// Backfill registry: tracks which account scopes are pending, running,
 /// or complete. Durable resume state lives in the checkpoint store.

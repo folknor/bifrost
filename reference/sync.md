@@ -2,7 +2,7 @@
 
 Current architecture of the sync engine.
 
-Scope: multiplexer, backfill orchestrator, push
+Scope: scheduler, multiplexer, backfill orchestrator, push
 reconciler, mutation pipeline, checkpoint envelope versioning,
 observability. Depends only on `bifrost-types` (plus
 `bifrost-net` for the bandwidth meter); opaque to every protocol
@@ -26,6 +26,8 @@ SyncEngine
     Reopen listener         -> ReopenRequest -> handle_recovery
     Mutation campaigns      -> bulk_set_flags retry loop
   Shared:
+    Scheduler (four-lane: Foreground / Normal / Background / Bulk)
+    BudgetGate (global + per-account semaphores)
     CursorRegistry (scope -> cursor; membership index)
     CheckpointStore (consumer-provided; InMemoryCheckpointStore for tests)
     InvalidationSinkInner (DashMap<AccountId, mpsc::Sender<WatchEvent>>)
@@ -40,13 +42,15 @@ visible to spawned tasks immediately: every iteration calls
 
 `SyncEngineBuilder` is the entry point. Methods:
 
+- `budget(ConcurrencyBudget)` - sets `EngineConfig::budget`.
 - `config(EngineConfig)` - replaces the whole config.
 - `checkpoints(Arc<DynCheckpointStore>)` - consumer-provided
   store; defaults to `InMemoryCheckpointStore` when omitted.
 - `with_bandwidth_meter(Arc<bifrost_net::BandwidthMeter>)` -
   wires the meter; when unset, `Control::bandwidth_observed`
   returns 0 for every account.
-- `build()` - constructs and returns `SyncEngine`.
+- `build()` - validates the budget, constructs the scheduler
+  with the configured lane capacity, returns `SyncEngine`.
 
 `SyncEngine::builder()` is the canonical constructor; no public
 `SyncEngine::new()`.
@@ -498,10 +502,64 @@ ack writer: it calls `SyncControl::record_checkpoint` after the
 consumer-acked `put_backfill` lands, so waiters wake on a durable,
 consumer-acknowledged boundary - identical to the change-cursor path.
 
-Backfill forwards every inventory entry. It does not suppress an entry
-merely because a live `Created` was broadcast: broadcast is not proof
-that a consumer received the event, and consumers already have to
-tolerate repeated `Created` events when a crash re-walks a partition.
+`LiveSupersedes` is the ring-evicting `(VecDeque + HashSet)` set
+`BackfillRunner::run_partition` filters each inventory page through,
+via `filter_supersedes`. Default cap
+`LIVE_SUPERSEDES_DEFAULT_CAP = 100_000`; overflow drops the oldest
+insertion.
+
+**Nothing populates it, and that is deliberate.** No production
+path calls `add`, so the filter is a no-op and every inventory
+entry is forwarded. Cold-start can therefore re-emit a `Created`
+for an object the live stream already announced. That duplicate is
+accepted: consumers must already tolerate a repeated `Created`,
+because a crash mid-plan re-walks every partition and re-emits
+consumer-acked pages.
+
+Populating it from `drive_changes_stream` looks obvious and is
+wrong, for two independent reasons:
+
+- **Broadcasting is not receiving.** The per-account channel is a
+  `tokio::broadcast`. The slot's sentinel receiver makes `send`
+  report success with no consumer attached, a subscriber that
+  attaches later starts at the ring's tail, and a lagging
+  subscriber has values overwritten out from under it. `ChangesReceiver`
+  surfaces the skipped count but the crate still cannot replay those
+  entries. Recording on `send`
+  records ids the consumer will never see, and suppressing the
+  inventory copy of one of those loses that object for the session,
+  since the in-memory cursor has already advanced.
+- **Selection and publication are separate operations.** The runner
+  decides to keep an entry and broadcasts it later; the live feed
+  records and broadcasts separately. These are distinct spawned
+  tasks on a multi-threaded runtime, so they run genuinely in
+  parallel - the absence of an await between the runner's `take` and
+  its `send` does not close the window. A mutex makes each `add` and
+  `take` atomic but does nothing for the compound take-then-publish,
+  which is what the guarantee needs.
+
+The only sound record trigger the engine has is the consumer ack:
+`ack_checkpoint` is what this crate already treats as proof of
+receipt, precisely because broadcast delivery is not. A correct
+design buffers ids as pending keyed by their batch's checkpoint and
+promotes them only on ack, with a policy for batches carrying no
+checkpoint and a bound on the pending buffer. It would also need
+take-and-publish to be one indivisible decision on both sides, and
+a test-only seam to prove it - the window has no scheduling point,
+so no mock server can stage the interleaving black-box.
+
+`take` is O(1): it removes from the membership set only and leaves
+a tombstone slot in the eviction ring, so a future sound producer
+does not make cold-start quadratic. A tombstone cannot cause a
+wrong suppression - suppression reads the membership set, which
+only `add` writes - and eviction reclaims tombstone slots as they
+reach the front, so membership reconverges on `cap` with no scan.
+
+`BackfillCheckpointWriter` (in `backfill/checkpoint.rs`) is a
+thin wrapper over `CheckpointStore::put_backfill`. The runner no
+longer persists (the ack writer does), so the wrapper is unused on
+the hot path today; it remains as a typed helper for consumer-side
+store wiring.
 
 ## Push
 
@@ -647,8 +705,8 @@ method and final read-back guard. Campaign flow:
    rather than replayed), and an engine-blocked id is waiting on a
    directive.
 3. Sleep for the effective delay from `advice.retry_hint`
-   (`RetryHint::min_delay(now)` or `RetryHint::not_before(now)`) and
-   resubmit with the **same**
+   (`RetryHint::min_delay(now)` or `RetryHint::not_before(now)` per
+   the caller's scheduler shape) and resubmit with the **same**
    `IdempotencyKey`
    (engine bookkeeping; no protocol today emits it on the wire).
    Repeat up to `EngineConfig::mutation_max_retries`.
@@ -716,11 +774,20 @@ settled; any retry then parks before resubmission. Detach cancellation
 interrupts retry delays, throttle waits, mutation streams, and read-back
 and returns `Error::ShuttingDown` instead of parking.
 
-The retry candidate list is an unbounded `Vec<ObjectId>`. There is no
-engine configuration field that caps it; consumers must bound campaign
-input if retaining every unresolved id is too costly.
+The retry candidate list is an unbounded `Vec<ObjectId>`. No engine
+configuration field caps it - `MutationConfig::retry_queue_cap` is inert
+and does not bound this vector - so consumers must bound campaign input
+if retaining every unresolved id is too costly.
 
-`PushConfig` is currently empty (reserved for future push-only knobs; the
+`mutation::fanout::partition_by_account` is a cross-account
+fanout helper: given an input stream of `(AccountId, T)` and a
+prebuilt `HashMap<AccountId, mpsc::Sender<T>>`, it spawns a task
+that routes each item to the matching sender, dropping items
+addressed to unattached accounts.
+
+`MutationConfig` (`fanout_buffer = 256`, `retry_queue_cap =
+4096`) lives on `EngineConfig::mutation`. `PushConfig` is
+currently empty (reserved for future push-only knobs; the
 per-account `WatchEvent` mpsc capacity lives on
 `MultiplexerConfig::watch_capacity`).
 
@@ -770,8 +837,9 @@ Two deliberate properties:
   write surface and the reopen-snapshot discipline, so the engine does
   not - it forwards the read methods explicitly instead.
 
-Consumer-driven hydration and engine-driven backfill share the same
-underlying client, where
+These calls do not pass through the `Scheduler` / `BudgetGate` (neither
+does any production path today; see below). Consumer-driven hydration
+and engine-driven backfill share the same underlying client, where
 `bifrost-net` is the rate-limit chokepoint.
 
 Alongside the read-only hydration cluster, the engine forwards sibling
@@ -795,6 +863,42 @@ returns the engine `Error` (the trait's `AccountError` folds in through
 These are single-op conveniences and reads, so - like the container /
 compose clusters - they deliberately bypass the idempotency / read-back /
 recovery pipeline that guards the volume mutations.
+
+## Scheduler + budget
+
+`Scheduler` is a strict-priority gate (not an executor) with four
+lanes: `Foreground` / `Normal` / `Background` / `Bulk`. Starvation
+guard forces a lower-lane pull after a configurable threshold of
+consecutive higher-lane pulls (`SchedulerConfig::starvation_floor`,
+default 64).
+
+`LaneQueue` is bounded (default 1024 items, configurable via
+`EngineConfig::lane_capacity`). Production construction always uses
+`LaneShedPolicy::DropOldest`, which evicts the head, increments a shed
+counter, and emits a `warn!`. `DropNewest` remains an internal policy
+variant for direct queue construction and tests; `EngineConfig` does
+not expose a selector.
+
+`BudgetGate` exposes two semaphores per account (sync + mutation)
+plus global caps. Acquisition takes the per-account permit first and
+the global permit second, so a waiter parked on a busy account cannot
+consume global capacity needed by another account. Lazy-creation uses
+`DashMap::entry().or_insert_with(...)` to close the original
+data race. `ConcurrencyBudget::validate` requires `per_account >= 2`
+and a mutation share that leaves at least one real sync permit; the
+gate no longer masks a zero split by granting an extra permit. Its public
+constructor still floors the global semaphore at one permit, because direct
+construction bypasses builder validation and must not create a permanently
+blocked gate from `global: 0`.
+
+**Status (v1):** the scheduler and budget gate are intentionally
+NOT WIRED into the engine's production work paths. Multiplexer,
+backfill, and mutation tasks acquire from `Account::*_stream`
+directly. The scheduler exists as infrastructure for a follow-up
+pass that threads every protocol call through
+`Scheduler::submit` and `BudgetGate::acquire`; `Scheduler` and
+`BudgetGate` are deliberately absent from `lib.rs` re-exports
+until then. See `scheduler/mod.rs` module docs.
 
 ## Control
 
@@ -981,8 +1085,10 @@ sled / sqlite default; storage is consumer-owned.
 `get_backfill` selects the greatest `items_done`. Equal-progress rows
 use the greatest parsed page upper bound, then lexicographically
 greatest opaque partition bytes, so equal-sized page windows resume
-deterministically from the furthest one. Page checkpoint `items_done`
-counts inventory entries observed.
+deterministically from the furthest one. Page checkpoint
+`items_done` counts entries observed before `LiveSupersedes` filtering;
+filtering therefore cannot make a full inventory window look short and
+falsely signal exhaustion.
 
 `Partition` is `Hash + Eq` (additive change to `bifrost-types`)
 because the in-memory store keys on it.
@@ -1145,8 +1251,8 @@ crates/sync/src/
   control.rs              // SyncControl + record_checkpoint hook
   error.rs                // engine Error wrapping AccountError + Warning
   types.rs                // EngineConfig, MultiplexerConfig,
-                          // BackfillConfig, PushConfig, AccountSlot,
-                          // WorkerTask
+                          // BackfillConfig, MutationConfig, PushConfig,
+                          // SchedulerConfig, AccountSlot, WorkerTask
   recovery.rs             // plan_recovery + RecoveryPlan dispatch;
                           // ThrottleBucket (engine-wide) +
                           // resolve_throttle_key / record_throttle /
@@ -1164,8 +1270,11 @@ crates/sync/src/
   backfill/
     mod.rs                // account-keyed BackfillRegistry,
                           // BackfillPolicy / Strategy
-    runner.rs             // BackfillRunner::run_partition
+    runner.rs             // BackfillRunner::run_partition,
+                          // LiveSupersedes (ring-evicting, default
+                          // cap LIVE_SUPERSEDES_DEFAULT_CAP)
     partitioner.rs        // plan() for TimeWindowed / UidRange / PageCount
+    checkpoint.rs         // BackfillCheckpointWriter wrapper
   push/
     mod.rs                // InvalidationSinkInner
                           // (DashMap<AccountId, mpsc>) + coalesced_event
@@ -1173,7 +1282,8 @@ crates/sync/src/
                           // warning_event on Disconnected/Reconnected
     subscription.rs       // SubscriptionRegistry (per-engine DashMap)
   mutation/
-    mod.rs                // MutationCounters
+    mod.rs                // MutationCounters,
+                          // fanout::partition_by_account
     idempotency.rs        // IdempotencyKey vending
     readback.rs           // Projection::FlagsOnly read-back guard
   cursor/
@@ -1181,6 +1291,11 @@ crates/sync/src/
     envelope.rs           // MIN_MIGRATABLE / ENGINE_VERSION + migrations
     store.rs              // CheckpointStore trait (6 methods) +
                           // InMemoryCheckpointStore
+  scheduler/
+    mod.rs                // four-lane Scheduler (NOT WIRED into work paths)
+    lanes.rs              // bounded LaneQueue + LaneShedPolicy
+                          // (DropOldest default / DropNewest)
+    budget.rs             // BudgetGate (DashMap entry/or_insert_with)
   cancel/
     mod.rs boundary.rs    // safe-boundary mechanism
 
@@ -1189,4 +1304,11 @@ crates/sync/tests/
   envelope_roundtrip.rs       // cursor envelope encode/decode tests
   partition_planner.rs        // backfill partitioner unit tests
   readback_guard.rs           // mutation readback reconciliation
+  scheduler_priority.rs       // lane ordering and starvation guard
 ```
+
+## Open follow-ups (post-Phase-2 hardening)
+
+- Scheduler / `BudgetGate` not yet wired into multiplexer,
+  backfill, or mutation acquisition paths; tracked in
+  `scheduler/mod.rs` module docs.

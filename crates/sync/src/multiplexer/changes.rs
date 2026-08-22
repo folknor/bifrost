@@ -73,6 +73,10 @@ pub enum ChangesEvent {
 /// `SyncEngine::ack_checkpoint`, not here. See module docs for the
 /// rationale.
 ///
+/// This driver deliberately does NOT feed `LiveSupersedes`. Having
+/// broadcast a change is not evidence the consumer received it, so it
+/// is not a sound basis for suppressing the object's inventory copy;
+/// see the `LiveSupersedes` type docs for the full argument.
 #[allow(clippy::too_many_arguments)]
 pub async fn drive_changes_stream(
     account: &dyn Account,

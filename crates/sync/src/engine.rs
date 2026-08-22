@@ -27,6 +27,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::backfill::{
     BackfillPolicy, BackfillRegistry, BackfillRunner, BackfillState, BackfillStrategy,
+    LiveSupersedes,
 };
 use crate::cancel::{Boundary, BoundaryRequest};
 use crate::control::{SyncActivityGuard, SyncControl};
@@ -37,6 +38,7 @@ use crate::multiplexer::{
     AckRequest, Multiplexer, MultiplexerEvent, MultiplexerHandle, ReopenRequest,
 };
 use crate::push::{InvalidationSinkInner, RegisteredSubscription, SubscriptionRegistry};
+use crate::scheduler::{BudgetGate, ConcurrencyBudget, Scheduler};
 use crate::types::{AccountSlot, BackfillConfig, EngineConfig, WorkerTask};
 
 /// Top-level engine.
@@ -47,6 +49,7 @@ pub struct SyncEngine {
     backfill_registry: Arc<BackfillRegistry>,
     sink: Arc<InvalidationSinkInner>,
     subscriptions: Arc<SubscriptionRegistry>,
+    scheduler: Scheduler,
     root_cancel: CancellationToken,
     /// Optional bandwidth meter wired through `bifrost-net`. When
     /// present, `attach` spawns a periodic bandwidth-feed task per
@@ -88,7 +91,7 @@ impl std::fmt::Debug for SyncEngine {
 }
 
 /// Builder for `SyncEngine`. Lets the consumer pre-configure the
-/// checkpoint store and tuning knobs before any
+/// concurrency budget, checkpoint store, and tuning knobs before any
 /// account is attached.
 pub struct SyncEngineBuilder {
     config: EngineConfig,
@@ -104,6 +107,12 @@ impl SyncEngineBuilder {
             checkpoints: None,
             bandwidth_meter: None,
         }
+    }
+
+    #[must_use]
+    pub fn budget(mut self, budget: ConcurrencyBudget) -> Self {
+        self.config.budget = budget;
+        self
     }
 
     #[must_use]
@@ -128,9 +137,16 @@ impl SyncEngineBuilder {
     }
 
     pub fn build(self) -> Result<SyncEngine, Error> {
+        self.config.budget.validate()?;
         let checkpoints = self
             .checkpoints
             .unwrap_or_else(|| Arc::new(InMemoryCheckpointStore::new()));
+        let budget_gate = BudgetGate::new(self.config.budget);
+        let scheduler = Scheduler::with_lane_capacity(
+            self.config.scheduler,
+            budget_gate,
+            self.config.lane_capacity,
+        );
         Ok(SyncEngine {
             config: self.config,
             checkpoints,
@@ -138,6 +154,7 @@ impl SyncEngineBuilder {
             backfill_registry: Arc::new(BackfillRegistry::new()),
             sink: Arc::new(InvalidationSinkInner::new()),
             subscriptions: Arc::new(SubscriptionRegistry::new()),
+            scheduler,
             root_cancel: CancellationToken::new(),
             bandwidth_meter: self.bandwidth_meter,
             ack_senders: DashMap::new(),
@@ -378,6 +395,7 @@ impl SyncEngine {
         self.ack_senders.insert(account_id.clone(), ack_tx.clone());
 
         // Register per-account budget semaphores.
+        self.scheduler.budget().register(account_id.clone());
         if let Some(meter) = &self.bandwidth_meter {
             meter.register_account(account_id.clone());
         }
@@ -613,10 +631,17 @@ impl SyncEngine {
         // scopes and runs one `BackfillRunner::run_partition` per
         // scope under a default policy. Items + checkpoints flow onto
         // the same per-account broadcast.
+        // The de-dup set the partition runner filters against. Nothing
+        // populates it - see the `LiveSupersedes` type docs for why
+        // broadcasting a live change is not evidence the consumer got
+        // it, and therefore not a sound basis for suppressing that
+        // object's inventory copy.
+        let live_supersedes = Arc::new(LiveSupersedes::new());
         let backfill_registry_handle = Arc::clone(&self.backfill_registry);
         let bf_account = Arc::clone(&current);
         let bf_account_id = account_id.clone();
         let bf_cursors = Arc::clone(&cursors);
+        let bf_live = Arc::clone(&live_supersedes);
         let bf_store = Arc::clone(&self.checkpoints);
         let bf_shutdown = shutdown.clone();
         let bf_changes = changes_tx.clone();
@@ -633,6 +658,7 @@ impl SyncEngine {
                 bf_account,
                 bf_account_id,
                 bf_cursors,
+                bf_live,
                 bf_store,
                 backfill_registry_handle,
                 bf_shutdown,
@@ -963,6 +989,7 @@ impl SyncEngine {
             );
         }
         self.sink.unregister(account_id);
+        self.scheduler.budget().forget(account_id);
         self.backfill_registry.forget_account(account_id);
         if let Ok(mut throttles) = self.throttles.lock() {
             throttles.forget_account(account_id);
@@ -2559,6 +2586,12 @@ impl SyncEngine {
             .map_err(|_| Error::Other("capabilities lock poisoned".into()))
     }
 
+    /// Scheduler handle for advanced consumers (tests, instrumentation).
+    #[must_use]
+    pub fn scheduler(&self) -> Scheduler {
+        self.scheduler.clone()
+    }
+
     /// Backfill registry handle.
     #[must_use]
     pub fn backfill_registry(&self) -> Arc<BackfillRegistry> {
@@ -2758,6 +2791,10 @@ async fn await_worker_until(deadline: tokio::time::Instant, worker: WorkerTask) 
 /// Backfill orchestrator. Walks the registered cursor scopes and runs
 /// one partition pass per scope via `BackfillRunner::run_partition`.
 ///
+/// The runner uses the slot's shared `LiveSupersedes` set so live
+/// `Created` events from the multiplexer skip over inventory entries
+/// the user has already seen.
+///
 /// Resume: the in-memory `BackfillRegistry` is wiped on detach, so the
 /// only durable record of backfill progress is the consumer-acked
 /// `BackfillCheckpoint` in the `CheckpointStore`. Before walking an
@@ -2771,6 +2808,7 @@ async fn run_backfill_orchestrator(
     account: Arc<ArcSwap<Arc<dyn Account>>>,
     account_id: AccountId,
     cursors: Arc<CursorRegistry>,
+    live: Arc<LiveSupersedes>,
     store: Arc<DynCheckpointStore>,
     registry: Arc<BackfillRegistry>,
     shutdown: CancellationToken,
@@ -2861,6 +2899,7 @@ async fn run_backfill_orchestrator(
                             &account_id,
                             scope.clone(),
                             partition,
+                            &live,
                             changes_tx.clone(),
                             &control,
                             &shutdown,
@@ -2958,6 +2997,7 @@ async fn run_backfill_orchestrator(
                             &account_id,
                             scope.clone(),
                             partition,
+                            &live,
                             changes_tx.clone(),
                             &control,
                             &shutdown,
@@ -3125,6 +3165,7 @@ async fn run_backfill_partition_at_boundary(
     account_id: &AccountId,
     scope: CursorScope,
     partition: InventoryPartition,
+    live: &Arc<LiveSupersedes>,
     changes_tx: Option<broadcast::Sender<MultiplexerEvent>>,
     control: &SyncControl,
     shutdown: &CancellationToken,
@@ -3163,6 +3204,7 @@ async fn run_backfill_partition_at_boundary(
             current.as_ref().as_ref(),
             scope.clone(),
             partition.clone(),
+            live.as_ref(),
             changes_tx.clone(),
             crate::cursor::ENGINE_VERSION,
             Some(control),
