@@ -58,20 +58,42 @@ And the split deleted three tests that pinned `NetConfig` defaults which had
 merely MOVED to `AccountSpec`, leaving those defaults unpinned; they are
 re-pinned on their new home.
 
-**This document has no close pass.** Both rounds ran the full loop - fix pass,
-cold review, then a fix-and-commit stage - but the arc-level review that the
-`bugs-graph` and `bugs-imap` arcs each received was not run here, because the
-agent budget for it was gone. That matters more than it sounds: in both arcs that
-did get one, the close pass found real defects, and in both cases they were in
-the half of the fix-and-commit stage that no cold review ever sees. Round 2's
-fix-and-commit ran in the main session, so the same blind spot applies to it -
-specifically the `Net::shared_for_tls` selector, the two rewritten terminal-status
-drains, the `Canned::StreamThenStall` seam variant, and the four tests added
-around them. None of that has been read by anything but its author.
+2026-08-22 (close pass): the arc-level review both earlier rounds lacked was
+run. The never-cold-reviewed half of round 2's fix-and-commit stage was read in
+full - `Net::shared_for_tls`, both rewritten terminal-status drains, the
+`Canned::StreamThenStall` seam variant, and the tests around them - and found
+sound; the stall test is deterministic under paused time because the drain's
+read-timeout is the only pending timer. `crates/net/src/rate.rs`, which round 1
+lost and reconstructed from context, was re-read as new code: the generation
+check holds at all four sites, only a ticket's owner can remove it from the
+queue (so the front cannot change between the is_front check and the debit),
+and `Notify`'s stored-permit semantics cover the wake-before-park race. The
+FIFO admission and permanent-strand properties hold, and the governor tests
+observe them with uneven costs. auth.rs backoff escalation, terminal shortcut,
+fallback restore and reset-on-success were verified against the prose, and the
+escalation counter is shared across refresher handle clones. The consumer
+sharing claim was checked crate by crate: google and graph attach to
+`Net::shared_default`, JMAP routes through `shared_for_tls`; caldav and carddav
+still run `ReqwestDavTransport` and are documented as outside the claim rather
+than silently inside it. `reference/types.md`'s 94-method count was re-counted
+against the trait and is exact. Three doc-only drifts in `reference/net.md`
+were fixed by the close pass: the sharing paragraph named `shared_default`
+where JMAP actually uses `shared_for_tls`, the retry-decision bullet still said
+reqwest follows redirects (contradicting the `Policy::none()` design stated
+later in the same document), and the file map omitted `status_line.rs` and
+`test_support.rs`. No code defect was found.
 
-`crates/net/src/rate.rs` deserves a second look for a separate reason: it was
-accidentally reverted during round 1 and reconstructed from context by the agent
-that lost it. It was read critically afterwards and looks intact - the generation
-scoping is present at all four sites and the validate-and-enqueue-under-one-lock
-fix carries its reasoning - but a file rebuilt from memory is not the same as a
-file that was never lost, and a green check does not distinguish them.
+Accepted residuals, on the record:
+
+- **No concurrency governor in bifrost-net.** `TODO.md` carries the full
+  cross-crate writeup (symptom in JMAP's foreign probing, clamped `[1, 8]` at
+  the single overlapping call site, no cross-account global bound). The close
+  pass ruled it stays a recorded deferral: it is a new permit-pool feature with
+  its own API and test-bite obligations, not a defect in these two commits.
+- **The DAV crates have not migrated onto `AccountNet`.** Round 1 shipped the
+  enablers (`request(Method, ..)`, optional token source) deliberately without
+  the migration; `reference/net.md` now scopes the sharing claim accordingly.
+- `read_capped_response_body` applies the read timeout per chunk, so a server
+  trickling one byte per interval can stretch a terminal-status drain to
+  roughly `STATUS_BODY_CAP` intervals. Bounded by the 4 KB cap; noted, not
+  worth a second deadline.

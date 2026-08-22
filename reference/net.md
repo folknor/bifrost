@@ -39,8 +39,12 @@ let account = net.attach_account(account_id, spec);     // per-account
 and TLS trust. `AccountSpec` contains request behavior: header and body
 timeouts, optional total timeout, User-Agent, buffered-body ceiling, redirect
 policy, token max-age, retry policy, token source, and rate declarations.
-JMAP attaches every independently opened account to `shared_default`, so its
-accounts now share the client, governor, and meter as advertised.
+JMAP attaches every independently opened account to the shared transport
+selected by `Net::shared_for_tls` (see the TLS section), so its accounts share
+the client, governor, and meter within each trust class as advertised. The
+CalDAV and CardDAV clients still run their own reqwest transport and are not
+covered by this claim; `AccountNet::request(Method, ..)` and the optional token
+source exist so they can migrate.
 
 Every `attach_account` receives a monotone registration token carried
 by its `AccountNet`. `AccountNet::detach()` removes that exact
@@ -216,11 +220,12 @@ feeds the per-account meter and the bandwidth-cap throttle.
 
 ### Retry decision (RetryPolicy)
 
-- 2xx -> return. 3xx is passed through unchanged (reqwest follows
-  redirects up to 10 hops by default; a surfacing 3xx means the
-  caller disabled the policy, hit the limit, or got a terminal 3xx
-  like 304). Conditional-request callers rely on the headers being
-  exposed.
+- 2xx -> return. 3xx is classified by the in-crate redirect loop
+  (reqwest itself never follows: `Policy::none()` is installed at
+  client construction). A surfacing 3xx means the caller disabled
+  `FollowRedirects`, the classifier passed it through (304/305/306,
+  or a followed status with no `Location`), or the hop limit errored.
+  Conditional-request callers rely on the headers being exposed.
 - 4xx not in `policy.statuses`, not 401 -> terminal
   `Error::Status`.
 - 401 -> force refresh once; second 401 -> `Error::AuthLost` with
@@ -814,6 +819,8 @@ crates/net/src/
                   // StaticTokenSource
   retry.rs        // RetryPolicy
   rate.rs         // RateLimitGovernor + HostBucket
+  status_line.rs  // HTTP status-line parsing shared by the DAV crates
+  test_support.rs // scripted wire dispatcher (feature "test-support")
   bandwidth.rs    // BandwidthMeter + AccountMeter + MeterSink +
                   // MeterSinkHandle
   error.rs        // Error + cap_status_body

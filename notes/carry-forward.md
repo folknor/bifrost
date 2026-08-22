@@ -427,12 +427,13 @@ notes.
   unreviewed. The close pass looks hardest there, and in both arcs that had a
   close pass it found real defects in exactly that half.
 
-- **Which arcs have had a close pass, and which have not.** `bugs-graph`,
-  `bugs-imap`, `bugs-jmap`, and `bugs-smtp-sasl` were closed properly.
-  `bugs-net-types` was NOT: both rounds ran,
-  but the arc-level review never did. Anything later that leans on
-  `bifrost-net` machinery from that arc should treat it as reviewed once, not
-  twice. The gap is recorded in the document itself.
+- **Which arcs have had a close pass.** `bugs-graph`, `bugs-imap`,
+  `bugs-jmap`, `bugs-smtp-sasl`, and `bugs-net-types` (close pass run
+  2026-08-22, after its two rounds) are all closed properly. The
+  `bugs-net-types` close pass re-read the reconstructed `rate.rs` as new code
+  and the un-cold-reviewed half of round 2, found no code defect, and fixed
+  three doc-only drifts in `reference/net.md`; its residuals are recorded in
+  `notes/bugs-net-types.md`.
 
 - **The recurring defect shape is a fix that opens a new hole one layer up.**
   Check what a fix does to its consumer, not only to the unit test in front of it.
