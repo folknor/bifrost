@@ -625,19 +625,17 @@ pub(crate) fn extract_href_properties(
     property_name: &str,
 ) -> Result<Vec<String>, String> {
     let mut reader = Reader::from_str(xml);
-    let mut in_property = false;
-    let mut current_tag = String::new();
+    let mut stack = Vec::new();
     let mut text = String::new();
     let mut hrefs = Vec::new();
+    let mut propstat_hrefs = Vec::new();
+    let mut propstat_success = None;
 
     loop {
         match reader.read_event() {
             Ok(Event::Start(element)) => {
                 let name = local_name(element.name().as_ref());
-                if name == property_name {
-                    in_property = true;
-                }
-                current_tag = name;
+                stack.push(name);
                 text.clear();
             }
             Ok(Event::Text(value)) => push_text(&mut text, value.as_ref())?,
@@ -647,16 +645,32 @@ pub(crate) fn extract_href_properties(
             }
             Ok(Event::End(element)) => {
                 let name = local_name(element.name().as_ref());
-                if in_property
-                    && current_tag == "href"
+                if name == "href"
+                    && stack.iter().any(|tag| tag == property_name)
                     && let Some(href) = trimmed(&text)
                 {
-                    hrefs.push(href);
+                    if stack.iter().any(|tag| tag == "propstat") {
+                        propstat_hrefs.push(href);
+                    } else {
+                        hrefs.push(href);
+                    }
                 }
-                if name == property_name {
-                    in_property = false;
+                if name == "status" && stack.iter().any(|tag| tag == "propstat") {
+                    propstat_success = Some(
+                        trimmed(&text)
+                            .as_deref()
+                            .is_some_and(status_line_is_success),
+                    );
                 }
-                current_tag.clear();
+                if name == "propstat" {
+                    if propstat_success.unwrap_or(true) {
+                        hrefs.append(&mut propstat_hrefs);
+                    } else {
+                        propstat_hrefs.clear();
+                    }
+                    propstat_success = None;
+                }
+                stack.pop();
                 text.clear();
             }
             Ok(Event::Eof) => break,
@@ -1611,6 +1625,17 @@ END:VCALENDAR</C:calendar-data>
                 "Mailto:Ada@example.test".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn href_extractors_ignore_failed_propstats() {
+        let hrefs = extract_href_properties(
+            r#"<D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav"><D:response><D:propstat><D:prop><C:calendar-user-address-set><D:href>mailto:wrong@example.test</D:href></C:calendar-user-address-set></D:prop><D:status>HTTP/1.1 404 Not Found</D:status></D:propstat><D:propstat><D:prop><C:calendar-user-address-set><D:href>mailto:right@example.test</D:href></C:calendar-user-address-set></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response></D:multistatus>"#,
+            "calendar-user-address-set",
+        )
+        .expect("valid XML");
+
+        assert_eq!(hrefs, vec!["mailto:right@example.test".to_string()]);
     }
 
     #[test]

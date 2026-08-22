@@ -35,10 +35,22 @@ calendar primitives.
   parsed, so an error page can never decode as an authoritative empty
   report; `sync_events` alone reads the raw response, because it must see
   403 `valid-sync-token` and 410 as cursor invalidation rather than failure.
+  Credential-bearing requests are limited to the configured base origin plus
+  calendar-home and scheduling origins delegated by an authenticated principal
+  on that origin. Resource hrefs, consumer-provided native ids, and a
+  cross-origin principal href cannot extend that internal origin set. A
+  delegated origin may never weaken the transport guarantee the configured base
+  URL established: when the base URL is `https`, a discovered `http` home is
+  refused admission, so discovery cannot become a downgrade channel for the
+  account credential. A cross-origin `https` home is admitted, because a
+  principal and a calendar home on different hosts of one service is a real
+  deployment shape.
 - `parse.rs` - XML response parsers for calendar discovery, event
   listing, multiget hydration, and nested href properties. Calendar
-  collection metadata is staged per `propstat` and committed only for
-  successful 2xx propstat statuses. `parse_propfind_events` returns a
+  collection metadata and href-valued discovery properties are staged per
+  `propstat` and committed only for successful 2xx statuses or a missing
+  status, which RFC 4918 requires but the parser tolerates as success.
+  `parse_propfind_events` returns a
   `CalDavEventListing`: committed `entries` plus `failed_hrefs` (`.ics`
   resources whose only propstat failed within the 207), so the snapshot
   diff preserves a transiently-failed resource instead of destroying it.
@@ -130,7 +142,9 @@ Supported calendar primitives:
   spec-correct server 404s.
 - `events_in_range` - `calendar-query` `REPORT` with a CalDAV
   `time-range` filter and calendar-data hydration, followed by local
-  overlap filtering as a defensive guard. The local guard is
+  overlap filtering as a defensive guard. Invalid time bounds fail locally
+  before a REPORT is sent, and the encoder preserves legal one-sided ranges.
+  The local guard is
   recurrence-aware: a recurring master whose own interval sits outside the
   window is retained when its RRULE can still yield an in-window occurrence
   (dropped only when it starts after the window, or an RRULE `UNTIL` ends it
@@ -184,7 +198,9 @@ Supported calendar primitives:
   retries instead of returning an empty page that a consumer would
   record as a completed walk - which would drop those resources
   permanently.
-- `event_get` - direct `GET` of the event resource.
+- `event_get` - direct `GET` of the event resource. Calendar id and calendar
+  provenance are derived from the resource URL rather than stamped with the
+  account's default calendar.
 - `event_create` - creates a VEVENT resource with a UUID-backed
   `.ics` path using `PUT`, including STATUS from shared lifecycle status,
   TRANSP from shared availability, CLASS from shared visibility when

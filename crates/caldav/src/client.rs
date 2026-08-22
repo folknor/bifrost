@@ -1,5 +1,6 @@
 use std::fmt;
 use std::sync::Arc;
+use std::sync::RwLock;
 use std::time::Duration;
 
 use base64::Engine;
@@ -36,6 +37,7 @@ pub(crate) struct CalDavClient {
     transport: Arc<dyn DavTransport>,
     base_url: String,
     credentials: CalDavCredentials,
+    trusted_origins: Arc<RwLock<Vec<String>>>,
 }
 
 impl fmt::Debug for CalDavClient {
@@ -120,10 +122,12 @@ impl CalDavClient {
             .build()
             .map_err(|error| local_error(AccountOperation::Discover, error.to_string()))?;
 
+        let base_url = config.base_url.trim_end_matches('/').to_string();
         Ok(Self {
             http,
             transport: Arc::new(ReqwestDavTransport),
-            base_url: config.base_url.trim_end_matches('/').to_string(),
+            trusted_origins: Arc::new(RwLock::new(url_origin(&base_url).into_iter().collect())),
+            base_url,
             credentials: config.credentials.clone(),
         })
     }
@@ -135,6 +139,7 @@ impl CalDavClient {
             transport,
             base_url: base_url.trim_end_matches('/').to_string(),
             credentials: CalDavCredentials::bearer("token"),
+            trusted_origins: Arc::new(RwLock::new(url_origin(base_url).into_iter().collect())),
         }
     }
 
@@ -196,6 +201,7 @@ impl CalDavClient {
         extract_href_property(&body, "calendar-home-set")
             .map_err(|error| parse_error(AccountOperation::Discover, error))?
             .map(|href| resolve_href(&self.base_url, &href))
+            .inspect(|home| self.trust_discovered_url(home))
             .ok_or_else(|| parse_error(AccountOperation::Discover, "missing calendar-home-set"))
     }
 
@@ -230,6 +236,11 @@ impl CalDavClient {
         extract_href_property(&body, "schedule-outbox-URL")
             .map_err(|error| parse_error(AccountOperation::Discover, error))
             .map(|href| href.map(|href| resolve_href(&self.base_url, &href)))
+            .inspect(|outbox| {
+                if let Some(outbox) = outbox {
+                    self.trust_discovered_url(outbox);
+                }
+            })
     }
 
     async fn discover_principal(&self, root: &str) -> Result<String, AccountError> {
@@ -414,7 +425,7 @@ impl CalDavClient {
         let request = self
             .http
             .request(Method::GET, url)
-            .headers(self.auth_headers(operation).await?);
+            .headers(self.auth_headers(url, operation).await?);
         let response = self.send_raw_request(request, operation).await?;
         let status = response.status;
         let etag = response_etag(&response.headers);
@@ -441,7 +452,7 @@ impl CalDavClient {
             .http
             .request(Method::PUT, url)
             .header(CONTENT_TYPE, "text/calendar; charset=utf-8")
-            .headers(self.auth_headers(operation).await?)
+            .headers(self.auth_headers(url, operation).await?)
             .body(body);
         match condition {
             PutCondition::IfNoneMatch => {
@@ -473,7 +484,7 @@ impl CalDavClient {
         let request = self
             .http
             .request(Method::DELETE, url)
-            .headers(self.auth_headers(operation).await?);
+            .headers(self.auth_headers(url, operation).await?);
         self.send_status_request(request, operation).await
     }
 
@@ -491,7 +502,10 @@ impl CalDavClient {
             .http
             .request(Method::POST, outbox_url)
             .header(CONTENT_TYPE, "text/calendar; charset=utf-8")
-            .headers(self.auth_headers(AccountOperation::EventRsvp).await?);
+            .headers(
+                self.auth_headers(outbox_url, AccountOperation::EventRsvp)
+                    .await?,
+            );
         if let Ok(value) = HeaderValue::from_str(&schedule_address(originator)) {
             request = request.header("Originator", value);
         }
@@ -533,7 +547,7 @@ impl CalDavClient {
             .request(method, url)
             .header(CONTENT_TYPE, "application/xml; charset=utf-8")
             .header("Depth", depth)
-            .headers(self.auth_headers(operation).await?)
+            .headers(self.auth_headers(url, operation).await?)
             .body(body.to_string());
         self.send_body_request(request, operation).await
     }
@@ -571,7 +585,7 @@ impl CalDavClient {
             .request(method, url)
             .header(CONTENT_TYPE, "application/xml; charset=utf-8")
             .header("Depth", depth)
-            .headers(self.auth_headers(operation).await?)
+            .headers(self.auth_headers(url, operation).await?)
             .body(body.to_string());
         self.send_raw_request(request, operation).await
     }
@@ -616,7 +630,17 @@ impl CalDavClient {
     /// Build the per-request auth headers. The bearer token is read from
     /// the shared source on every call, so a token rotated mid-sync is
     /// honored on the next DAV request without reopening the account.
-    async fn auth_headers(&self, operation: AccountOperation) -> Result<HeaderMap, AccountError> {
+    async fn auth_headers(
+        &self,
+        url: &str,
+        operation: AccountOperation,
+    ) -> Result<HeaderMap, AccountError> {
+        if !self.is_trusted_url(url) {
+            return Err(local_error(
+                operation,
+                format!("refusing to send DAV credentials to untrusted URL: {url}"),
+            ));
+        }
         let mut headers = HeaderMap::new();
         match &self.credentials {
             CalDavCredentials::Basic { username, password } => {
@@ -640,6 +664,59 @@ impl CalDavClient {
         }
         Ok(headers)
     }
+
+    /// Admit a discovered DAV home to the credential-bearing origin set.
+    ///
+    /// Discovery is server-steered: the calendar home and scheduling outbox
+    /// come out of the principal's own PROPFIND response, so a compromised or
+    /// hostile server picks these origins. Two rules bound what it can pick.
+    /// A discovered origin must parse, and it must never weaken the transport
+    /// guarantee the configured base URL already established - an
+    /// HTTPS-configured account never trusts a plaintext discovered home,
+    /// because that would turn discovery into a downgrade channel for the
+    /// account credential. A cross-origin HTTPS home is still admitted; that
+    /// is a real deployment shape, where the principal and the calendar home
+    /// live on different hosts of the same service.
+    fn trust_discovered_url(&self, url: &str) {
+        let Some(origin) = url_origin(url) else {
+            return;
+        };
+        if origin_is_secure(&self.base_url) && !origin_is_secure(url) {
+            return;
+        }
+        let mut origins = self.trusted_origins.write().expect("trusted origins lock");
+        if !origins.contains(&origin) {
+            origins.push(origin);
+        }
+    }
+
+    fn is_trusted_url(&self, url: &str) -> bool {
+        url_origin(url).is_some_and(|origin| {
+            self.trusted_origins
+                .read()
+                .expect("trusted origins lock")
+                .contains(&origin)
+        })
+    }
+}
+
+/// Whether a URL's scheme carries an authenticated, encrypted transport.
+///
+/// Only `https` qualifies; an unparseable URL is treated as insecure so the
+/// downgrade check fails closed.
+fn origin_is_secure(value: &str) -> bool {
+    Url::parse(value).is_ok_and(|url| url.scheme().eq_ignore_ascii_case("https"))
+}
+
+fn url_origin(value: &str) -> Option<String> {
+    let url = Url::parse(value).ok()?;
+    let host = url.host_str()?.to_ascii_lowercase();
+    Some(format!(
+        "{}://{}:{}",
+        url.scheme().to_ascii_lowercase(),
+        host,
+        url.port_or_known_default()?
+    ))
 }
 
 /// Hardened redirect policy for the DAV `reqwest::Client`, sourced from
@@ -695,7 +772,9 @@ fn calendar_query_body(start: Option<&str>, end: Option<&str>) -> String {
             escape_xml(start),
             escape_xml(end)
         ),
-        _ => String::new(),
+        (Some(start), None) => format!("      <C:time-range start=\"{}\"/>\n", escape_xml(start)),
+        (None, Some(end)) => format!("      <C:time-range end=\"{}\"/>\n", escape_xml(end)),
+        (None, None) => String::new(),
     };
     format!(
         "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
@@ -1164,6 +1243,124 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn credentials_never_reach_a_resource_href_origin() {
+        // Two canned responses, so a neutered guard reaches the transport and
+        // fails on the destination assertion below rather than on a starved
+        // script - the failure has to name the credential leak.
+        let event = || DavResponse {
+            status: StatusCode::OK,
+            headers: HeaderMap::new(),
+            body: "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:one\nEND:VEVENT\nEND:VCALENDAR".to_string(),
+        };
+        let script = ScriptedDavTransport::new([event(), event()]);
+        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
+        let client = CalDavClient::with_transport("https://dav.example.test", transport);
+
+        client
+            .get_event(
+                "https://dav.example.test/calendar/one.ics",
+                AccountOperation::EventGet,
+            )
+            .await
+            .expect("trusted request succeeds");
+        client
+            .get_event("https://evil.test/stolen.ics", AccountOperation::EventGet)
+            .await
+            .expect_err("foreign resource origin is rejected");
+
+        let requests = script.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].url, "https://dav.example.test/calendar/one.ics");
+        assert_eq!(
+            requests[0]
+                .headers
+                .get(AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer token")
+        );
+    }
+
+    fn discovery_script(home_href: &str) -> Arc<ScriptedDavTransport> {
+        let response = |body: String| DavResponse {
+            status: StatusCode::MULTI_STATUS,
+            headers: HeaderMap::new(),
+            body,
+        };
+        ScriptedDavTransport::new([
+            response(
+                "<D:current-user-principal xmlns:D=\"DAV:\"><D:href>/principals/ada/</D:href></D:current-user-principal>"
+                    .to_string(),
+            ),
+            response(format!(
+                "<C:calendar-home-set xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\"><D:href>{home_href}</D:href></C:calendar-home-set>"
+            )),
+            response("<D:multistatus xmlns:D=\"DAV:\"/>".to_string()),
+        ])
+    }
+
+    /// The legitimate deployment the origin allowlist must not break: the
+    /// calendar home lives on a different host than the principal. It is
+    /// discovered over HTTPS, so it is credential-bearing.
+    #[tokio::test]
+    async fn discovered_cross_origin_https_home_receives_credentials() {
+        let script = discovery_script("https://cal.example.test/homes/ada/");
+        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
+        let client = CalDavClient::with_transport("https://dav.example.test", transport);
+
+        let home = client
+            .discover_calendar_home()
+            .await
+            .expect("cross-origin home is discovered");
+        assert_eq!(home, "https://cal.example.test/homes/ada/");
+        client
+            .list_calendars(&home)
+            .await
+            .expect("cross-origin home is credential-bearing");
+
+        let requests = script.requests();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[2].url, "https://cal.example.test/homes/ada/");
+        assert_eq!(
+            requests[2]
+                .headers
+                .get(AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer token")
+        );
+    }
+
+    /// Discovery is server-steered, so a discovered home must never weaken the
+    /// transport guarantee the configured HTTPS base URL established. The
+    /// assertion that matters is the destination: no request at all reaches the
+    /// plaintext origin, credential-bearing or otherwise.
+    #[tokio::test]
+    async fn discovered_plaintext_home_never_receives_credentials() {
+        let script = discovery_script("http://cal.example.test/homes/ada/");
+        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
+        let client = CalDavClient::with_transport("https://dav.example.test", transport);
+
+        let home = client
+            .discover_calendar_home()
+            .await
+            .expect("home href is still reported");
+        assert_eq!(home, "http://cal.example.test/homes/ada/");
+        client
+            .list_calendars(&home)
+            .await
+            .expect_err("a downgraded discovered origin is refused");
+
+        let requests = script.requests();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.url.starts_with("https://dav.example.test/")),
+            "no request reached the plaintext origin: {:?}",
+            requests.iter().map(|r| &r.url).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
     async fn sync_events_uses_depth_zero_report_transcript() {
         let script = ScriptedDavTransport::new([DavResponse {
             status: StatusCode::MULTI_STATUS,
@@ -1332,6 +1529,15 @@ mod tests {
         let body = calendar_query_body(Some("20260602T000000Z"), Some("bad\"&value"));
 
         assert!(body.contains("end=\"bad&quot;&amp;value\""));
+    }
+
+    #[test]
+    fn calendar_query_body_preserves_one_sided_ranges() {
+        let start_only = calendar_query_body(Some("20260602T000000Z"), None);
+        let end_only = calendar_query_body(None, Some("20260603T000000Z"));
+
+        assert!(start_only.contains("<C:time-range start=\"20260602T000000Z\"/>"));
+        assert!(end_only.contains("<C:time-range end=\"20260603T000000Z\"/>"));
     }
 
     #[test]

@@ -108,8 +108,11 @@ impl CalDavAccount {
         event: EventId,
         operation: AccountOperation,
     ) -> Result<CalendarEvent, AccountError> {
-        let calendar_url = Self::calendar_url(&client, &default_calendar_url, calendar);
         let url = client.resolve_url(&event.0);
+        let calendar_url = calendar.map_or_else(
+            || event_calendar_url(&url).unwrap_or(default_calendar_url),
+            |calendar| client.resolve_url(&calendar.0),
+        );
         let fetched = client.get_event(&url, operation).await.map_err(|error| {
             error
                 .clone()
@@ -712,10 +715,9 @@ impl Account for CalDavAccount {
         let client = Arc::clone(&self.client);
         Box::pin(async move {
             let calendar_url = client.resolve_url(&range.calendar_id.0);
-            let range_start = caldav_query_time(&range.start);
-            let range_end = caldav_query_time(&range.end);
+            let (range_start, range_end) = caldav_query_range(&range.start, &range.end)?;
             let fetched = client
-                .query_events_in_range(&calendar_url, range_start.as_deref(), range_end.as_deref())
+                .query_events_in_range(&calendar_url, Some(&range_start), Some(&range_end))
                 .await?;
             let mut events = Vec::new();
             // Per-resource failures are surfaced (not swallowed) so a
@@ -1033,6 +1035,27 @@ fn append_path(base: &str, path: &str) -> String {
     } else {
         format!("{base}/{path}")
     }
+}
+
+/// Derive the parent collection URL of an event resource URL.
+///
+/// This must go through a real URL parse. A final-slash search over the whole
+/// string picks up a slash living in the query or fragment - for
+/// `https://dav.test/cal/one.ics?redirect=/foo` it yields
+/// `https://dav.test/cal/one.ics?redirect=/`, which is not a collection URL at
+/// all, and which then travels onward as `calendar_id` and `calendar_native`.
+/// Query and fragment are dropped before the final path segment is removed.
+fn event_calendar_url(event_url: &str) -> Option<String> {
+    let mut url = reqwest::Url::parse(event_url).ok()?;
+    url.set_query(None);
+    url.set_fragment(None);
+    {
+        let mut segments = url.path_segments_mut().ok()?;
+        segments.pop_if_empty();
+        segments.pop();
+        segments.push("");
+    }
+    Some(url.to_string())
 }
 
 /// Reduce the failure lane to one outcome per resource id.
@@ -1491,6 +1514,25 @@ fn caldav_query_time(time: &EventTime) -> Option<String> {
     )
 }
 
+fn caldav_query_range(
+    start: &EventTime,
+    end: &EventTime,
+) -> Result<(String, String), AccountError> {
+    let start = caldav_query_time(start).ok_or_else(|| {
+        crate::client::local_error(
+            AccountOperation::EventsInRange,
+            format!("invalid event range start: {}", start.value),
+        )
+    })?;
+    let end = caldav_query_time(end).ok_or_else(|| {
+        crate::client::local_error(
+            AccountOperation::EventsInRange,
+            format!("invalid event range end: {}", end.value),
+        )
+    })?;
+    Ok((start, end))
+}
+
 fn event_matches(event: &CalendarEvent, needle: &str) -> bool {
     if needle.is_empty() {
         return true;
@@ -1750,6 +1792,38 @@ mod tests {
             caldav_query_time(&time("2026-06-02")).as_deref(),
             Some("20260602T000000Z")
         );
+    }
+
+    #[test]
+    fn event_calendar_url_is_the_resource_parent() {
+        assert_eq!(
+            event_calendar_url("https://dav.example.test/calendars/work/one.ics").as_deref(),
+            Some("https://dav.example.test/calendars/work/")
+        );
+        // A slash in the query or fragment is not a path separator; a raw
+        // final-slash search over the string returns a query fragment here.
+        assert_eq!(
+            event_calendar_url("https://dav.example.test/calendars/work/one.ics?redirect=/foo")
+                .as_deref(),
+            Some("https://dav.example.test/calendars/work/")
+        );
+        assert_eq!(
+            event_calendar_url("https://dav.example.test/calendars/work/one.ics#a/b").as_deref(),
+            Some("https://dav.example.test/calendars/work/")
+        );
+        assert_eq!(event_calendar_url("not-a-url"), None);
+    }
+
+    #[test]
+    fn invalid_query_range_is_rejected_before_report_construction() {
+        let error = caldav_query_range(&time("not-a-time"), &time("2026-06-03T00:00:00Z"))
+            .expect_err("invalid start is rejected");
+
+        assert_eq!(
+            error.kind(),
+            &AccountErrorKind::Request(RequestErrorKind::Malformed)
+        );
+        assert_eq!(error.operation(), Some(AccountOperation::EventsInRange));
     }
 
     #[test]

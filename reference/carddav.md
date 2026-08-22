@@ -19,7 +19,9 @@ addressbook home, caches the default address book URL, and returns an
 `Arc<dyn Account>` inside an `OpenedAccount` whose skip lane is always
 empty (single-principal surface). The raw DAV client and parser modules stay
 crate-private; consumers use only the factory and the shared `Account`
-contact primitives.
+contact primitives. Discovery tries `.well-known/carddav` first and falls
+back to the configured base URL both when that request is not found and when
+its successful body does not identify a current-user principal.
 
 ## Module layout
 
@@ -32,10 +34,22 @@ contact primitives.
   DAV still owns Basic auth and its redirect policy. Every request path
   classifies a non-2xx status before the body is parsed, so an error page
   can never decode as an authoritative empty report.
+  Credential-bearing requests are limited to the configured base origin plus
+  an addressbook-home origin delegated by an authenticated principal on that
+  origin. Resource hrefs, consumer-provided native ids, and a cross-origin
+  principal href cannot extend that internal origin set. A delegated origin
+  may never weaken the transport guarantee the configured base URL
+  established: when the base URL is `https`, a discovered `http` home is
+  refused admission, so discovery cannot become a downgrade channel for the
+  account credential. A cross-origin `https` home is admitted, because a
+  principal and an address book home on different hosts of one service is a
+  real deployment shape.
 - `parse.rs` - XML response parsers for addressbook discovery,
   contact listing, multiget hydration, depth-0 `getctag`, and nested href
-  properties. Addressbook/listing/multiget properties are staged per
-  `propstat` and committed only for successful 2xx propstat statuses.
+  properties. Addressbook/listing/multiget and href-valued discovery
+  properties are staged per `propstat` and committed only for successful 2xx
+  statuses or a missing status, which RFC 4918 requires but the parser
+  tolerates as success.
   `parse_propfind_contacts` returns a `CardDavContactListing`: committed
   `entries` plus `failed_hrefs` (vcard resources whose only propstat
   failed within the 207), so the snapshot diff can preserve a

@@ -1,5 +1,6 @@
 use std::fmt;
 use std::sync::Arc;
+use std::sync::RwLock;
 use std::time::Duration;
 
 use base64::Engine;
@@ -35,6 +36,7 @@ pub(crate) struct CardDavClient {
     transport: Arc<dyn DavTransport>,
     base_url: String,
     credentials: CardDavCredentials,
+    trusted_origins: Arc<RwLock<Vec<String>>>,
 }
 
 impl fmt::Debug for CardDavClient {
@@ -118,10 +120,12 @@ impl CardDavClient {
             .build()
             .map_err(|error| local_error(AccountOperation::Discover, error.to_string()))?;
 
+        let base_url = config.base_url.trim_end_matches('/').to_string();
         Ok(Self {
             http,
             transport: Arc::new(ReqwestDavTransport),
-            base_url: config.base_url.trim_end_matches('/').to_string(),
+            trusted_origins: Arc::new(RwLock::new(url_origin(&base_url).into_iter().collect())),
+            base_url,
             credentials: config.credentials.clone(),
         })
     }
@@ -144,7 +148,7 @@ impl CardDavClient {
                 Some(principal) => {
                     return self.addressbook_home_for_principal(principal).await;
                 }
-                None => well_known_url,
+                None => self.base_url.clone(),
             },
             Err(error) if should_fallback_discovery(&error) => self.base_url.clone(),
             Err(error) => return Err(error),
@@ -164,7 +168,6 @@ impl CardDavClient {
             .ok_or_else(|| {
                 parse_error(AccountOperation::Discover, "missing current-user-principal")
             })?;
-
         self.addressbook_home_for_principal(principal).await
     }
 
@@ -183,6 +186,7 @@ impl CardDavClient {
         extract_href_property(&body, "addressbook-home-set")
             .map_err(|error| parse_error(AccountOperation::Discover, error))?
             .map(|href| resolve_href(&self.base_url, &href))
+            .inspect(|home| self.trust_discovered_url(home))
             .ok_or_else(|| parse_error(AccountOperation::Discover, "missing addressbook-home-set"))
     }
 
@@ -334,7 +338,7 @@ impl CardDavClient {
             .http
             .request(Method::PUT, url)
             .header(CONTENT_TYPE, "text/vcard; charset=utf-8")
-            .headers(self.auth_headers(operation).await?)
+            .headers(self.auth_headers(url, operation).await?)
             .body(body);
         match condition {
             PutCondition::IfNoneMatch => {
@@ -358,7 +362,7 @@ impl CardDavClient {
         let request = self
             .http
             .request(Method::DELETE, url)
-            .headers(self.auth_headers(operation).await?);
+            .headers(self.auth_headers(url, operation).await?);
         self.send_status_request(request, operation).await
     }
 
@@ -376,6 +380,7 @@ impl CardDavClient {
             transport,
             base_url: base_url.trim_end_matches('/').to_string(),
             credentials: CardDavCredentials::bearer("token"),
+            trusted_origins: Arc::new(RwLock::new(url_origin(base_url).into_iter().collect())),
         }
     }
 
@@ -409,7 +414,7 @@ impl CardDavClient {
             .request(method, url)
             .header(CONTENT_TYPE, "application/xml; charset=utf-8")
             .header("Depth", depth)
-            .headers(self.auth_headers(operation).await?)
+            .headers(self.auth_headers(url, operation).await?)
             .body(body.to_string());
         self.send_body_request(request, operation).await
     }
@@ -427,7 +432,7 @@ impl CardDavClient {
             .request(method, url)
             .header(CONTENT_TYPE, "application/xml; charset=utf-8")
             .header("Depth", "1")
-            .headers(self.auth_headers(operation).await?)
+            .headers(self.auth_headers(url, operation).await?)
             .body(body.to_string());
         self.send_body_request(request, operation).await
     }
@@ -477,7 +482,17 @@ impl CardDavClient {
     /// Build the per-request auth headers. The bearer token is read from
     /// the shared source on every call, so a token rotated mid-sync is
     /// honored on the next DAV request without reopening the account.
-    async fn auth_headers(&self, operation: AccountOperation) -> Result<HeaderMap, AccountError> {
+    async fn auth_headers(
+        &self,
+        url: &str,
+        operation: AccountOperation,
+    ) -> Result<HeaderMap, AccountError> {
+        if !self.is_trusted_url(url) {
+            return Err(local_error(
+                operation,
+                format!("refusing to send DAV credentials to untrusted URL: {url}"),
+            ));
+        }
         let mut headers = HeaderMap::new();
         match &self.credentials {
             CardDavCredentials::Basic { username, password } => {
@@ -501,6 +516,59 @@ impl CardDavClient {
         }
         Ok(headers)
     }
+
+    /// Admit a discovered DAV home to the credential-bearing origin set.
+    ///
+    /// Discovery is server-steered: the address book home comes out of the
+    /// principal's own PROPFIND response, so a compromised or hostile server
+    /// picks the origin. Two rules bound what it can pick. A discovered
+    /// origin must parse, and it must never weaken the transport guarantee
+    /// the configured base URL already established - an HTTPS-configured
+    /// account never trusts a plaintext discovered home, because that would
+    /// turn discovery into a downgrade channel for the account credential. A
+    /// cross-origin HTTPS home is still admitted; that is a real deployment
+    /// shape, where the principal and the address book home live on different
+    /// hosts of the same service.
+    fn trust_discovered_url(&self, url: &str) {
+        let Some(origin) = url_origin(url) else {
+            return;
+        };
+        if origin_is_secure(&self.base_url) && !origin_is_secure(url) {
+            return;
+        }
+        let mut origins = self.trusted_origins.write().expect("trusted origins lock");
+        if !origins.contains(&origin) {
+            origins.push(origin);
+        }
+    }
+
+    fn is_trusted_url(&self, url: &str) -> bool {
+        url_origin(url).is_some_and(|origin| {
+            self.trusted_origins
+                .read()
+                .expect("trusted origins lock")
+                .contains(&origin)
+        })
+    }
+}
+
+/// Whether a URL's scheme carries an authenticated, encrypted transport.
+///
+/// Only `https` qualifies; an unparseable URL is treated as insecure so the
+/// downgrade check fails closed.
+fn origin_is_secure(value: &str) -> bool {
+    Url::parse(value).is_ok_and(|url| url.scheme().eq_ignore_ascii_case("https"))
+}
+
+fn url_origin(value: &str) -> Option<String> {
+    let url = Url::parse(value).ok()?;
+    let host = url.host_str()?.to_ascii_lowercase();
+    Some(format!(
+        "{}://{}:{}",
+        url.scheme().to_ascii_lowercase(),
+        host,
+        url.port_or_known_default()?
+    ))
 }
 
 /// Hardened redirect policy for the DAV `reqwest::Client`, sourced from
@@ -898,6 +966,167 @@ mod tests {
                 .expect("scripted DAV transport exhausted");
             Box::pin(async move { Ok(response) })
         }
+    }
+
+    #[tokio::test]
+    async fn credentials_never_reach_a_resource_href_origin() {
+        // Two canned responses, so a neutered guard reaches the transport and
+        // fails on the destination assertion below rather than on a starved
+        // script - the failure has to name the credential leak.
+        let deleted = || DavResponse {
+            status: StatusCode::NO_CONTENT,
+            headers: HeaderMap::new(),
+            body: String::new(),
+        };
+        let script = ScriptedDavTransport::new([deleted(), deleted()]);
+        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
+        let client = CardDavClient::with_transport("https://dav.example.test", transport);
+
+        client
+            .delete_vcard(
+                "https://dav.example.test/book/one.vcf",
+                AccountOperation::ContactDelete,
+            )
+            .await
+            .expect("trusted request succeeds");
+        client
+            .delete_vcard(
+                "https://evil.test/stolen.vcf",
+                AccountOperation::ContactDelete,
+            )
+            .await
+            .expect_err("foreign resource origin is rejected");
+
+        let requests = script.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].url, "https://dav.example.test/book/one.vcf");
+        assert_eq!(
+            requests[0]
+                .headers
+                .get(AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer token")
+        );
+    }
+
+    #[tokio::test]
+    async fn discovery_falls_back_to_base_after_empty_well_known_response() {
+        let response = |body: &str| DavResponse {
+            status: StatusCode::MULTI_STATUS,
+            headers: HeaderMap::new(),
+            body: body.to_string(),
+        };
+        let script = ScriptedDavTransport::new([
+            response("<D:multistatus xmlns:D=\"DAV:\"/>"),
+            response(
+                "<D:current-user-principal xmlns:D=\"DAV:\"><D:href>/principals/ada/</D:href></D:current-user-principal>",
+            ),
+            response(
+                "<C:addressbook-home-set xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:carddav\"><D:href>/books/ada/</D:href></C:addressbook-home-set>",
+            ),
+        ]);
+        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
+        let client = CardDavClient::with_transport("https://dav.example.test", transport);
+
+        let home = client
+            .discover_addressbook_home()
+            .await
+            .expect("base fallback discovers home");
+
+        assert_eq!(home, "https://dav.example.test/books/ada/");
+        let urls = script
+            .requests()
+            .into_iter()
+            .map(|request| request.url)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            urls,
+            vec![
+                "https://dav.example.test/.well-known/carddav".to_string(),
+                "https://dav.example.test/".to_string(),
+                "https://dav.example.test/principals/ada/".to_string(),
+            ]
+        );
+    }
+
+    fn discovery_script(home_href: &str) -> Arc<ScriptedDavTransport> {
+        let response = |body: String| DavResponse {
+            status: StatusCode::MULTI_STATUS,
+            headers: HeaderMap::new(),
+            body,
+        };
+        ScriptedDavTransport::new([
+            response(
+                "<D:current-user-principal xmlns:D=\"DAV:\"><D:href>/principals/ada/</D:href></D:current-user-principal>"
+                    .to_string(),
+            ),
+            response(format!(
+                "<C:addressbook-home-set xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:carddav\"><D:href>{home_href}</D:href></C:addressbook-home-set>"
+            )),
+            response("<D:multistatus xmlns:D=\"DAV:\"/>".to_string()),
+        ])
+    }
+
+    /// The legitimate deployment the origin allowlist must not break: the
+    /// address book home lives on a different host than the principal. It is
+    /// discovered over HTTPS, so it is credential-bearing.
+    #[tokio::test]
+    async fn discovered_cross_origin_https_home_receives_credentials() {
+        let script = discovery_script("https://books.example.test/homes/ada/");
+        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
+        let client = CardDavClient::with_transport("https://dav.example.test", transport);
+
+        let home = client
+            .discover_addressbook_home()
+            .await
+            .expect("cross-origin home is discovered");
+        assert_eq!(home, "https://books.example.test/homes/ada/");
+        client
+            .list_addressbooks(&home)
+            .await
+            .expect("cross-origin home is credential-bearing");
+
+        let requests = script.requests();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[2].url, "https://books.example.test/homes/ada/");
+        assert_eq!(
+            requests[2]
+                .headers
+                .get(AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer token")
+        );
+    }
+
+    /// Discovery is server-steered, so a discovered home must never weaken the
+    /// transport guarantee the configured HTTPS base URL established. The
+    /// assertion that matters is the destination: no request at all reaches the
+    /// plaintext origin, credential-bearing or otherwise.
+    #[tokio::test]
+    async fn discovered_plaintext_home_never_receives_credentials() {
+        let script = discovery_script("http://books.example.test/homes/ada/");
+        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
+        let client = CardDavClient::with_transport("https://dav.example.test", transport);
+
+        let home = client
+            .discover_addressbook_home()
+            .await
+            .expect("home href is still reported");
+        assert_eq!(home, "http://books.example.test/homes/ada/");
+        client
+            .list_addressbooks(&home)
+            .await
+            .expect_err("a downgraded discovered origin is refused");
+
+        let requests = script.requests();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.url.starts_with("https://dav.example.test/")),
+            "no request reached the plaintext origin: {:?}",
+            requests.iter().map(|r| &r.url).collect::<Vec<_>>()
+        );
     }
 
     #[tokio::test]
