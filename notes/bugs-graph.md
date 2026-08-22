@@ -3,6 +3,18 @@
 Hunter: Claude Opus, single pass, 2026-08-05. Scope: `crates/graph/`. Findings are unverified work
 material. Line numbers are as of the hunt and will drift.
 
+## How to read this document (triage pass 2026-08-23)
+
+This is an unverified hunt ledger, not a work queue. Most of it is a record of fixed work; the only
+live section is the one filed from the round-1 audit at the bottom. Categories used across the
+`bugs-*.md` set: **C1 live defect**, **C2 latent defect**, **C3 refactor opinion**, **C4 product
+decision** (owner's call, never the loop's), **STALE** (no longer reproduces). **PUBLISHED SURFACE**
+is an orthogonal marker for any remedy that would remove, rename, or reshape a published item.
+
+Result for this document: **no C1, no C2, no C4, and no published-surface finding.** Both remaining
+open entries are C3-or-less, and one of them is now stale. There is nothing here for the loop to
+work. That is the honest state, not a gap in the triage.
+
 Fixed 2026-08-18 and removed from this document: the calendar webhook
 subscriptions colliding on `/me/events`, `push_stream` swallowing broadcast
 `Lagged`, the infallible `expirationDateTime` parser (and the hand-rolled
@@ -56,12 +68,24 @@ These were flagged by the agent that fixed round 1, noticed while auditing the
 consumers of its own changes. They are recorded here rather than fixed in place
 so the next round adjudicates them deliberately.
 
-- **The EWS frame decoder rescans its buffer from index 0 on every chunk**
+- **[C3, not a defect - and the entry says so itself]** Verified 2026-08-23: `StreamingFrameDecoder::push`
+  does loop from the buffer start, but every path either drains the consumed prefix or truncates the
+  buffer to a bounded tail, so the quadratic case needs a single frame larger than the whole
+  transfer. Filed correctly as a known bound. No action.
+
+  **The EWS frame decoder rescans its buffer from index 0 on every chunk**
   (`account/ews_stream.rs`). Buffers drain per frame, so this is fine in
   practice; it is quadratic only in a pathological single-huge-frame case. Filed
   as a known bound, not a defect.
 
-- **`fusion.rs`'s `delivered <= 1` retire-checkpoint heuristic is correct** - it
+- **[STALE - the one thing it asked for has landed]** The entry's only suggestion was "a comment
+  naming the shared idiom". As of 2026-08-23 the bare `delivered <= 1` comparison is gone from
+  `crates/sync/src/multiplexer/fusion.rs`: both sites now call the named shared helper
+  `super::delivered_to_real_subscriber(delivered)`, which is a stronger version of the remedy than
+  the comment. Nothing remains to do. Also note the entry is filed in the wrong document - the code
+  it describes lives in `bifrost-sync`, not `bifrost-graph`.
+
+  **`fusion.rs`'s `delivered <= 1` retire-checkpoint heuristic is correct** - it
   mirrors the idiom in `multiplexer/changes.rs` exactly. Recorded only because it
   reads like a bug on first encounter and will again to the next reader; if
   anything here is worth doing, it is a comment naming the shared idiom, not a

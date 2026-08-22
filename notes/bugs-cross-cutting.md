@@ -4,6 +4,29 @@ Orchestrator notes on the eight-scope hunt filed in `notes/bugs-*.md`. This docu
 findings that belong to no single scope, and repetitions across scopes. It states what the reports
 say; it does not rank or verify them.
 
+## How to read this document (triage pass 2026-08-23)
+
+**This document holds no findings of its own and must never be run as a work queue.** It is an
+index over the eight per-scope ledgers: every item below is a restatement of a finding that lives,
+in full, in another `bugs-*.md`, and the fix belongs there. Working an entry from here means
+working a summary rather than the finding, with the owning document's context stripped off - which
+is precisely how a proposal gets mistaken for a defect.
+
+Categories used across the `bugs-*.md` set, for reference when following a link out of here:
+**C1 live defect**, **C2 latent defect**, **C3 refactor opinion**, **C4 product decision** (the
+owner's call, never the loop's), **STALE**. **PUBLISHED SURFACE** marks any remedy that would
+remove, rename, or reshape a published item.
+
+One warning about the last section, "Large hand-mirrored duplication proposed for collapse":
+**every entry in it is C3 or C4, and two of the six have already been acted on and reverted.** The
+smtp entry ("~5000 lines of blocking transport mirroring the async half, with no in-workspace
+consumer, recommending deletion") is the exact text that produced `d20816c`, restored in
+`e632ab9`; the sync entry's "~1000 lines of unwired machinery" is the reasoning behind `603d146`,
+restored in `7e7184d`. That section reads as a list of tasks and is a list of opinions, and its
+"no in-workspace consumer" premise is meaningless for library crates whose consumers are outside
+this workspace by definition. See the standing-lessons section of `notes/carry-forward.md`. Nothing
+in that section may be acted on without the repository owner.
+
 Reports: `bugs-jmap.md`, `bugs-imap.md`, `bugs-sync.md`, `bugs-google.md`, `bugs-graph.md`,
 `bugs-dav.md`, `bugs-smtp-sasl.md`, `bugs-net-types.md`. All eight scopes returned findings.
 
@@ -54,7 +77,8 @@ true 2026-08-22 rather than corrected), google (`open_blob_range`'s
 CalDAV doc explains was removed as a bug), net (a `Drop` the doc asserts and the code does not have;
 a `Cancelled` variant nothing constructs; a stale "lands in S1-W2" planning note).
 
-**Large hand-mirrored duplication proposed for collapse.** dav (~1500 lines across the two crates,
+**Large hand-mirrored duplication proposed for collapse. [C3/C4 throughout - see the warning at
+the top of this document. Do not act on any of this here.]** dav (~1500 lines across the two crates,
 with four already-drifted copies identified, recommending a shared `bifrost-dav`), smtp (~5000 lines
 of blocking transport mirroring the async half, with no in-workspace consumer, recommending
 deletion), sync (a 230-line verbatim copy of the mutation campaign loop, plus ~1000 lines of unwired

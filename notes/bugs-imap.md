@@ -3,6 +3,19 @@
 Hunter: Claude Opus, single pass, 2026-08-05. Scope: `crates/imap/` including
 `crates/imap/src/account/`. Findings are unverified work material.
 
+## How to read this document (triage pass 2026-08-23)
+
+This is an unverified hunt ledger, not a work queue. Categories used across the `bugs-*.md` set:
+**C1 live defect**, **C2 latent defect**, **C3 refactor opinion**, **C4 product decision** (owner's
+call, never the loop's), **STALE** (no longer reproduces). **PUBLISHED SURFACE** is an orthogonal
+marker for any remedy that would remove, rename, or reshape a published item.
+
+Result for this document: **zero open findings in any category, and no published-surface item.**
+The two entries under "Settled decisions" are adjudicated non-defects with the reasoning recorded,
+which is the correct terminal state for a finding that was never a bug - not a weaker one. The loop
+has nothing to run here; running it anyway is how a settled decision gets relitigated into a
+change.
+
 Fixed 2026-08-18 and removed from this document: the streaming-FETCH
 termination race, the CONDSTORE double-report, the laundered `AccountError` in
 `inventory.rs`, the unbounded IDLE DONE handshake, the timed-out command
@@ -42,6 +55,9 @@ misreport residual is accepted as documented.
 No open findings remain. What follows are decisions, not defects.
 
 ## Settled decisions
+
+Both entries are **C2-shaped observations already adjudicated and deliberately kept**. Neither is
+open. Reopening either needs new evidence, not a fresh reading.
 
 - `*` sentinel collides with a legal UID. `codec/decode/flags_caps.rs::seq_number` maps `*` to
   `u32::MAX`, and `connection/mod.rs::expand_uid_ranges` treats any `u32::MAX` endpoint as `*`
