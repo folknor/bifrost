@@ -28,15 +28,41 @@ malformed-XML reconnect loop. A fourth was found while auditing the consumers:
 the reopen path `run_establish` put a stored mid-inventory cursor straight into
 the registry, where `changes_stream` would have walked an empty delta link.
 
-## Smaller observations
+Fixed 2026-08-22 in round 2 and removed from this document: `push_subscribe`
+failing the whole request when one requested scope was refused. It is now a
+per-scope `PushSubscription` over the shared three-lane `BatchOutcome`, and
+bifrost-sync records and recreates only the accepted scopes. Round 2's own fix
+pass shipped that contract but left the all-or-nothing bails that ran BEFORE
+translation - the poll-only public-folder check in `push_subscribe`, the
+unsubscribable-shape check in `subscribe_ews`, and the unresolvable-resource
+check in `subscribe_graph` - so the user-visible symptom survived on every path
+that mattered; all three now route through the same lane. The same pass added
+`Account::is_inventory_cursor` but wrote it to check only
+`inventory_in_progress` where `inventory_resume_stream` also requires
+`scope_matches_payload`, which would have stranded a scope/payload-mismatched
+cursor with no live cursor and no recovery path; both now read one
+`resumable_inventory_payload` condition.
 
-- **Move sends `If-Match` on `POST /messages/{id}/move`** (`mutate.rs`). Graph likely does not honor
-  a precondition on the move action; if so, the `Move` etag preflight (`refresh_missing_etags`, one
-  GET per uncached id) is buying nothing while `mutation.concurrency: StateBased` implies it is.
-  Worth verifying against the live service; hunter was not certain either way.
-- **`translate_ews_scopes` fails the whole subscription on one refused id** (`push.rs`).
-  `reconcile_translated_ews_scopes` collects into `Result`, so a single stale folder id kills
-  `push_subscribe` for every other folder. Everywhere else in this crate a per-item failure on a
-  multi-item surface is filed per item and the rest proceeds, but here `push_subscribe` answers per
-  request, so the design is at least self-consistent. Still, the practical effect is that one
-  deleted folder in the engine's scope list disables push entirely.
+Recorded, not fixed: round 2's Finding B (the Graph flag alias table) was not a
+defect. The projection helpers and `canonical_flag_name` already recognised the
+same alias set, so the unification into `graph_flag_field` changes no behavior
+and its alias-pair test passes against the pre-unification code - verified by
+reverting. The refactor and the test are worth keeping as a drift guard; they
+should not be described as fixing anything.
+
+## Filed 2026-08-22 from the round-1 fix-and-commit audit
+
+These were flagged by the agent that fixed round 1, noticed while auditing the
+consumers of its own changes. They are recorded here rather than fixed in place
+so the next round adjudicates them deliberately.
+
+- **The EWS frame decoder rescans its buffer from index 0 on every chunk**
+  (`account/ews_stream.rs`). Buffers drain per frame, so this is fine in
+  practice; it is quadratic only in a pathological single-huge-frame case. Filed
+  as a known bound, not a defect.
+
+- **`fusion.rs`'s `delivered <= 1` retire-checkpoint heuristic is correct** - it
+  mirrors the idiom in `multiplexer/changes.rs` exactly. Recorded only because it
+  reads like a bug on first encounter and will again to the next reader; if
+  anything here is worth doing, it is a comment naming the shared idiom, not a
+  change.

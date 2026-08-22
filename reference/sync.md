@@ -263,11 +263,17 @@ cursor-establishment pass progresses. A provider may attach a page checkpoint
 before its terminal cursor exists; that checkpoint persists only after the
 consumer ack, and BOTH cursor-establishment paths - `establish_initial_cursor`
 at attach and `run_establish` on reopen - ask the account's
-`inventory_resume_stream` hook whether it owns and can resume the saved
-inventory state before putting a stored cursor into the registry. A stored
-page position must never reach `changes_stream`, which has no delta link to
-walk; the hook is also the classifier, so building its stream must be free of
-I/O and side effects. The terminal `Done` still installs the ordinary live
+`is_inventory_cursor` predicate whether the saved state is a resumable
+inventory position before putting it into the registry. A stored page position
+must never reach `changes_stream`, which has no delta link to walk. Only after
+classification does `inventory_resume_stream` build the stream. The predicate
+and the hook must accept exactly the same cursors, and an account implementing
+one implements both from a single condition: a cursor the predicate accepts but
+the hook refuses reaches the deferred inventory worker, which gets `None`,
+reports `NoCursor`, and leaves the scope with neither a live cursor nor a
+recovery path - whereas that same cursor reaching `changes_stream` would be
+classified schema-incompatible and restarted. The terminal
+`Done` still installs the ordinary live
 change cursor in the registry.
 
 `ChangesEvent` is the per-batch outcome returned by the driver:
@@ -543,7 +549,10 @@ iteration.
 
 `SubscriptionRegistry` (per-engine `DashMap<AccountId,
 Vec<RegisteredSubscription>>`) stashes each returned handle together
-with its requested cursor scopes. That scope snapshot lets account
+with only the scopes in `PushSubscription.outcomes`' succeeded lane. Failed
+scopes remain polling-only and are never recorded as covered. The validated
+three-lane outcome accounts for every requested scope, and an all-rejected
+request returns no handle. That accepted-scope snapshot lets account
 reopen recreate subscriptions against the replacement topology.
 The consumer can later call
 `SyncEngine::unsubscribe_push(account)` to walk the handles back
@@ -551,8 +560,10 @@ through `Account::push_unsubscribe`. A failed teardown is returned to
 the caller and its registry record is retained, while successful records
 are retired; a later call retries only the failed handles. This composes
 with Graph's retained server ids after a failed DELETE.
-`SyncEngine::subscribe_push` is the engine-side entry that records the
-handle on success. Both entries serialize on the slot's reopen lock:
+`SyncEngine::subscribe_push` is the engine-side entry that returns the
+per-scope result and records its handle only when at least one scope succeeded.
+Reopen likewise recreates and records only accepted scopes. Both entries
+serialize on the slot's reopen lock:
 reattach snapshots the registry, tears old handles down, and installs
 the replacement set wholesale, so a registration or teardown landing
 inside that window would either be silently erased - orphaning a

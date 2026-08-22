@@ -471,7 +471,7 @@ impl Account for CardDavAccount {
     fn push_subscribe(
         &self,
         _scopes: &[CursorScope],
-    ) -> AccountFuture<Result<SubscriptionHandle, AccountError>> {
+    ) -> AccountFuture<Result<bifrost_types::PushSubscription, AccountError>> {
         unsupported_future(AccountOperation::PushSubscribe)
     }
 

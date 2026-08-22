@@ -465,13 +465,18 @@ impl Account for HealAccount {
     fn push_subscribe(
         &self,
         scopes: &[CursorScope],
-    ) -> AccountFuture<Result<SubscriptionHandle, AccountError>> {
+    ) -> AccountFuture<Result<bifrost_types::PushSubscription, AccountError>> {
         self.subscribed
             .lock()
             .expect("subscribed lock")
             .push((self.generation, scopes.to_vec()));
         let handle = SubscriptionHandle(format!("generation-{}", self.generation));
-        Box::pin(async move { Ok(handle) })
+        let scopes = scopes.to_vec();
+        Box::pin(async move {
+            Ok(bifrost_types::PushSubscription::all_succeeded(
+                handle, &scopes,
+            ))
+        })
     }
 
     fn push_unsubscribe(

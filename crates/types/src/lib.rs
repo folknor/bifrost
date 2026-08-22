@@ -39,7 +39,7 @@ pub mod settings;
 // Account trait + factory + erased return aliases.
 pub use account::{
     Account, AccountFactory, AccountFuture, AccountStream, CategoryDefinition,
-    MessageReactionState, OpenedAccount,
+    MessageReactionState, OpenedAccount, PushSubscription,
 };
 
 // Blob types.

@@ -533,11 +533,15 @@ fn patch_for_flags(op: &FlagOp) -> Value {
             // owned field.
             body.insert(
                 "isRead".to_string(),
-                json!(has_flag(flags, "\\seen") || has_flag(flags, "read")),
+                json!(
+                    flags
+                        .iter()
+                        .any(|flag| graph_flag_field(flag) == Some(GraphFlagField::Read))
+                ),
             );
-            let flagged = has_flag(flags, "\\flagged")
-                || has_flag(flags, "flagged")
-                || has_flag(flags, "starred");
+            let flagged = flags
+                .iter()
+                .any(|flag| graph_flag_field(flag) == Some(GraphFlagField::Flagged));
             body.insert(
                 "flag".to_string(),
                 json!({ "flagStatus": if flagged { "flagged" } else { "notFlagged" } }),
@@ -557,25 +561,33 @@ fn patch_for_flags(op: &FlagOp) -> Value {
 }
 
 fn apply_flag_adds(body: &mut serde_json::Map<String, Value>, flags: &HashSet<String>) {
-    if has_flag(flags, "\\seen") || has_flag(flags, "read") {
+    if flags
+        .iter()
+        .any(|flag| graph_flag_field(flag) == Some(GraphFlagField::Read))
+    {
         body.insert("isRead".to_string(), json!(true));
     }
-    if has_flag(flags, "\\flagged") || has_flag(flags, "flagged") || has_flag(flags, "starred") {
+    if flags
+        .iter()
+        .any(|flag| graph_flag_field(flag) == Some(GraphFlagField::Flagged))
+    {
         body.insert("flag".to_string(), json!({ "flagStatus": "flagged" }));
     }
 }
 
 fn apply_flag_removes(body: &mut serde_json::Map<String, Value>, flags: &HashSet<String>) {
-    if has_flag(flags, "\\seen") || has_flag(flags, "read") {
+    if flags
+        .iter()
+        .any(|flag| graph_flag_field(flag) == Some(GraphFlagField::Read))
+    {
         body.insert("isRead".to_string(), json!(false));
     }
-    if has_flag(flags, "\\flagged") || has_flag(flags, "flagged") || has_flag(flags, "starred") {
+    if flags
+        .iter()
+        .any(|flag| graph_flag_field(flag) == Some(GraphFlagField::Flagged))
+    {
         body.insert("flag".to_string(), json!({ "flagStatus": "notFlagged" }));
     }
-}
-
-fn has_flag(flags: &HashSet<String>, wanted: &str) -> bool {
-    flags.iter().any(|flag| flag.eq_ignore_ascii_case(wanted))
 }
 
 fn categories_from_flags(flags: &HashSet<String>) -> Vec<String> {
@@ -627,10 +639,30 @@ fn invalid_flag_op_error(op: &FlagOp) -> Option<bifrost_types::AccountError> {
 
 fn canonical_flag_name(flag: &str) -> String {
     let normalized = flag.to_ascii_lowercase();
-    match normalized.as_str() {
-        "\\seen" | "read" => "\\seen".to_string(),
-        "\\flagged" | "flagged" | "starred" => "\\flagged".to_string(),
-        _ => normalized,
+    match graph_flag_field(&normalized) {
+        Some(GraphFlagField::Read) => "\\seen".to_string(),
+        Some(GraphFlagField::Flagged) => "\\flagged".to_string(),
+        None => normalized,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GraphFlagField {
+    Read,
+    Flagged,
+}
+
+/// The single alias table for both PATCH projection and contradiction checks.
+fn graph_flag_field(flag: &str) -> Option<GraphFlagField> {
+    if flag.eq_ignore_ascii_case("\\seen") || flag.eq_ignore_ascii_case("read") {
+        Some(GraphFlagField::Read)
+    } else if flag.eq_ignore_ascii_case("\\flagged")
+        || flag.eq_ignore_ascii_case("flagged")
+        || flag.eq_ignore_ascii_case("starred")
+    {
+        Some(GraphFlagField::Flagged)
+    } else {
+        None
     }
 }
 
@@ -1027,6 +1059,27 @@ mod tests {
             })
             .is_some()
         );
+    }
+
+    #[test]
+    fn every_graph_field_alias_is_a_patch_contradiction() {
+        for aliases in [
+            &["\\Seen", "read"][..],
+            &["\\Flagged", "flagged", "starred"][..],
+        ] {
+            for added in aliases {
+                for removed in aliases {
+                    assert!(
+                        invalid_flag_op_error(&FlagOp::Patch {
+                            add: flag_set(&[added]),
+                            remove: flag_set(&[removed]),
+                        })
+                        .is_some(),
+                        "{added} and {removed} project to one Graph field"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

@@ -364,8 +364,14 @@ impl Account for ImapAccount {
     fn push_subscribe(
         &self,
         scopes: &[CursorScope],
-    ) -> AccountFuture<Result<SubscriptionHandle, AccountError>> {
-        push::push_subscribe(self.clone(), scopes.to_vec())
+    ) -> AccountFuture<Result<bifrost_types::PushSubscription, AccountError>> {
+        let scopes = scopes.to_vec();
+        let future = push::push_subscribe(self.clone(), scopes.clone());
+        Box::pin(async move {
+            future
+                .await
+                .map(|handle| bifrost_types::PushSubscription::all_succeeded(handle, &scopes))
+        })
     }
 
     // Account: unsubscribes the synthetic in-process push handle; direct users call notify_none().

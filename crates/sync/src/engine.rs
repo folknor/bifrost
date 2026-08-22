@@ -18,8 +18,7 @@ use bifrost_types::{
     Checkpoint, CursorEstablishment, CursorScope, DiagnosticText, EngineDirective, ErrorScope,
     InvalidationSink, InventoryPartition, InventoryPartitioning, ItemOutcome, MembershipScope,
     MutationSuccess, OpenedAccount, PageBoundary, PauseReason, Priority, ReconcileAction,
-    ReconcileAdvice, RecoveryClass, RetryAdvice, SkippedScope, SubscriptionHandle, SyncEvent,
-    WatchEvent,
+    ReconcileAdvice, RecoveryClass, RetryAdvice, SkippedScope, SyncEvent, WatchEvent,
 };
 use dashmap::DashMap;
 use futures::stream::StreamExt;
@@ -1177,7 +1176,7 @@ impl SyncEngine {
         &self,
         account_id: &AccountId,
         scopes: &[CursorScope],
-    ) -> Result<SubscriptionHandle, Error> {
+    ) -> Result<bifrost_types::PushSubscription, Error> {
         let slot = self
             .accounts
             .get(account_id)
@@ -1190,10 +1189,20 @@ impl SyncEngine {
         // closed - kept delivering with nothing left able to tear it down.
         let _reopen_guard = slot.reopen_lock.lock().await;
         let account = slot.current.load_full();
-        let handle = account.push_subscribe(scopes).await?;
-        self.subscriptions
-            .record(account_id.clone(), handle.clone(), scopes.to_vec());
-        Ok(handle)
+        let result = account.push_subscribe(scopes).await?;
+        let covered = accepted_push_scopes(&result);
+        for failure in result.outcomes.failed() {
+            tracing::warn!(
+                target: "bifrost.sync.reconcile",
+                error = ?failure.error,
+                "push scope rejected; retaining polling coverage"
+            );
+        }
+        if let Some(handle) = &result.handle {
+            self.subscriptions
+                .record(account_id.clone(), handle.clone(), covered);
+        }
+        Ok(result)
     }
 
     /// Drive a single-account bulk-flag campaign against an attached
@@ -2785,7 +2794,7 @@ impl SyncEngine {
         // the one cursor that cannot be read. (sync-D10)
         match self.checkpoints.get_change_cursor(account_id, &scope).await {
             Ok(Some(existing)) => {
-                if account.inventory_resume_stream(existing.clone()).is_some() {
+                if account.is_inventory_cursor(&existing) {
                     return Ok(InitialScope::DeferredInventory(DeferredInventory::Resume(
                         existing,
                     )));
@@ -4332,12 +4341,15 @@ async fn reattach_account(
                 continue;
             }
             match next.push_subscribe(&scopes).await {
-                Ok(handle) => {
-                    replacement_subscriptions.push(RegisteredSubscription {
-                        handle,
-                        scopes,
-                        teardown_unconfirmed: false,
-                    });
+                Ok(result) => {
+                    let covered = accepted_push_scopes(&result);
+                    if let Some(handle) = result.handle {
+                        replacement_subscriptions.push(RegisteredSubscription {
+                            handle,
+                            scopes: covered,
+                            teardown_unconfirmed: false,
+                        });
+                    }
                 }
                 Err(error) => {
                     unwind_replacement_subscriptions(
@@ -4442,6 +4454,15 @@ async fn reattach_account(
         );
     }
     result
+}
+
+fn accepted_push_scopes(result: &bifrost_types::PushSubscription) -> Vec<CursorScope> {
+    result
+        .outcomes
+        .succeeded()
+        .iter()
+        .map(|success| success.output.clone())
+        .collect()
 }
 
 async fn restart_account(ctx: &RecoveryContext<'_>) {
@@ -4620,7 +4641,7 @@ async fn run_establish(
             // would hand it straight to `changes_stream`, which has no
             // delta link to walk. Finish the inventory instead - the same
             // decision `establish_initial_cursor` makes at open.
-            if account.inventory_resume_stream(existing.clone()).is_some() {
+            if account.is_inventory_cursor(&existing) {
                 let fusion = crate::multiplexer::InventoryFusion {
                     account_id: account_id.clone(),
                     cursors: Arc::clone(&cursors),
@@ -4969,10 +4990,40 @@ fn counters_from_outcomes(
 #[cfg(test)]
 mod tests {
     use super::{
-        MutationBucket, classify_item_outcome, queue_unresolved_for_retry, scope_covers_membership,
-        should_forward_engine_recovery, unresolved_readback_ids,
+        MutationBucket, accepted_push_scopes, classify_item_outcome, queue_unresolved_for_retry,
+        scope_covers_membership, should_forward_engine_recovery, unresolved_readback_ids,
     };
     use bifrost_types::{CursorScope, EngineDirective, FolderId, MembershipScope, ObjectType};
+
+    #[test]
+    fn rejected_push_scopes_are_not_treated_as_covered() {
+        let accepted = CursorScope::Folder(FolderId("accepted".into()));
+        let rejected = CursorScope::Folder(FolderId("rejected".into()));
+        let expected = vec![
+            bifrost_types::BatchItemId("0".into()),
+            bifrost_types::BatchItemId("1".into()),
+        ];
+        let mut builder = bifrost_types::BatchOutcomeBuilder::new();
+        builder.push_succeeded(expected[0].clone(), accepted.clone());
+        let operation = bifrost_types::AccountOperation::PushSubscribe;
+        let error = bifrost_types::AccountErrorBuilder::new(
+            bifrost_types::AccountErrorKind::Unsupported(operation),
+            bifrost_types::Cause::Request(bifrost_types::RequestCause::Unsupported { operation }),
+        )
+        .operation(operation)
+        .scope(bifrost_types::ErrorScope::Cursor(rejected))
+        .try_build()
+        .expect("valid unsupported push error");
+        builder.push_failed(expected[1].clone(), error);
+        let result = bifrost_types::PushSubscription::new(
+            Some(bifrost_types::SubscriptionHandle("handle".into())),
+            builder
+                .finalize(&expected)
+                .expect("complete scope accounting"),
+        );
+
+        assert_eq!(accepted_push_scopes(&result), vec![accepted]);
+    }
 
     #[test]
     fn jittered_stays_within_plus_minus_20_percent() {

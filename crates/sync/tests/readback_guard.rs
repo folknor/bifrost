@@ -162,7 +162,7 @@ impl Account for FlagsAccount {
     fn push_subscribe(
         &self,
         _scopes: &[CursorScope],
-    ) -> AccountFuture<Result<SubscriptionHandle, AccountError>> {
+    ) -> AccountFuture<Result<bifrost_types::PushSubscription, AccountError>> {
         Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::PushSubscribe)) })
     }
 

@@ -498,15 +498,21 @@ impl Account for JmapAccount {
     fn push_subscribe(
         &self,
         scopes: &[CursorScope],
-    ) -> AccountFuture<Result<SubscriptionHandle, AccountError>> {
-        push::subscribe(
+    ) -> AccountFuture<Result<bifrost_types::PushSubscription, AccountError>> {
+        let scopes = scopes.to_vec();
+        let future = push::subscribe(
             self.client.clone(),
             self.caps.push,
             self.next_subscription_handle(),
-            scopes.to_vec(),
+            scopes.clone(),
             Arc::clone(&self.subscriptions),
             Arc::clone(&self.ws.enabled),
-        )
+        );
+        Box::pin(async move {
+            future
+                .await
+                .map(|handle| bifrost_types::PushSubscription::all_succeeded(handle, &scopes))
+        })
     }
 
     fn push_unsubscribe(

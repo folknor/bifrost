@@ -61,6 +61,46 @@ use crate::page::{Page, SkippedScope};
 use crate::search::SearchRequest;
 use crate::settings::{Identity, IdentityPatch, QuotaInfo, VacationConfig};
 
+/// Result of creating a server-side push subscription.
+///
+/// Only scopes in `outcomes`' succeeded lane are covered by `handle`.
+/// Failed scopes remain available to the consumer's polling path. The handle
+/// is absent when no requested scope was accepted.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct PushSubscription {
+    pub handle: Option<SubscriptionHandle>,
+    pub outcomes: crate::error::BatchOutcome<CursorScope>,
+}
+
+impl PushSubscription {
+    #[must_use]
+    pub fn new(
+        handle: Option<SubscriptionHandle>,
+        outcomes: crate::error::BatchOutcome<CursorScope>,
+    ) -> Self {
+        Self { handle, outcomes }
+    }
+
+    /// Build the common result where one handle covers every requested scope.
+    #[must_use]
+    pub fn all_succeeded(handle: SubscriptionHandle, scopes: &[CursorScope]) -> Self {
+        let expected: Vec<_> = (0..scopes.len())
+            .map(|index| crate::error::BatchItemId(index.to_string()))
+            .collect();
+        let mut builder = crate::error::BatchOutcomeBuilder::new();
+        for (item, scope) in expected.iter().cloned().zip(scopes.iter().cloned()) {
+            builder.push_succeeded(item, scope);
+        }
+        Self {
+            handle: Some(handle),
+            outcomes: builder
+                .finalize(&expected)
+                .expect("all push scopes are accounted for exactly once"),
+        }
+    }
+}
+
 /// A provider category definition. Color is the protocol token, not a UI color.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CategoryDefinition {
@@ -184,6 +224,22 @@ pub trait Account: Send + Sync {
         None
     }
 
+    /// Whether `cursor` is an in-progress inventory position accepted by
+    /// `inventory_resume_stream`. This method performs pure classification.
+    ///
+    /// It must accept EXACTLY what `inventory_resume_stream` accepts, and an
+    /// implementor overriding one must override the other. The engine uses
+    /// this to route a stored cursor to the deferred inventory worker, which
+    /// then calls the hook: a cursor this accepts but the hook refuses leaves
+    /// that worker reporting `NoCursor`, and the scope ends up with neither a
+    /// live cursor nor a recovery path - where the same cursor reaching
+    /// `changes_stream` would have been classified and restarted. Implement
+    /// the condition once and have both entry points read it, rather than
+    /// having two bodies agree by inspection.
+    fn is_inventory_cursor(&self, _cursor: &ChangeCursor) -> bool {
+        false
+    }
+
     /// Which inventory partition shape this account can serve for
     /// `scope`. Implementations that do not override this keep the
     /// original full-pass behavior.
@@ -240,7 +296,7 @@ pub trait Account: Send + Sync {
     fn push_subscribe(
         &self,
         scopes: &[CursorScope],
-    ) -> AccountFuture<Result<SubscriptionHandle, AccountError>>;
+    ) -> AccountFuture<Result<PushSubscription, AccountError>>;
 
     /// Server-side push subscription CRUD: destroy.
     fn push_unsubscribe(

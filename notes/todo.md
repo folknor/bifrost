@@ -1,5 +1,16 @@
 # TODO
 
+- **graph move concurrency verification.** `bulk_move` refreshes every missing
+  message etag with a GET and sends `If-Match` on
+  `POST /messages/{id}/move`, while Graph advertises
+  `mutation.concurrency: StateBased`. Microsoft does not document `If-Match`
+  for the move action, but that silence does not establish that the service
+  ignores it. Verify against a live Graph mailbox by moving a message with a
+  deliberately stale etag and observing whether the action rejects with a
+  precondition failure before changing either the concurrency capability or
+  removing the etag preflight. Until that experiment is recorded, the code
+  retains the header and the capability is an explicitly unverified promise.
+
 Open work surviving the close-out of the error-model project. Items
 here were either explicitly deferred during phase 5 or are tail
 cleanups the audit surfaced and the decisions doc marked "fix per

@@ -143,7 +143,7 @@ const TRANSLATE_EXCHANGE_IDS_MAX_INPUTS: usize = 1_000;
 pub(crate) async fn push_subscribe(
     account: GraphAccount,
     scopes: Vec<CursorScope>,
-) -> Result<SubscriptionHandle, AccountError> {
+) -> Result<bifrost_types::PushSubscription, AccountError> {
     // A subscription covering nothing is not a subscription. Registering it
     // anyway minted a handle over an empty group: teardown had no server id
     // to walk, so the group was never retired and the renewal worker it
@@ -155,20 +155,59 @@ pub(crate) async fn push_subscribe(
             "push_subscribe requires at least one scope",
         ));
     }
-    // Public folders are poll-only in v1: a bare `CursorScope::Folder`
-    // has no push surface (EWS streaming notifications do not cover the
-    // public-folder hierarchy mailbox). Reject before dispatch so both
-    // push modes are consistent.
-    if scopes
-        .iter()
-        .any(|scope| matches!(scope, CursorScope::Folder(_)))
-    {
+    let expected = push_item_ids(scopes.len());
+    let mut outcomes = bifrost_types::BatchOutcomeBuilder::new();
+    let mut eligible = Vec::with_capacity(scopes.len());
+    for (item, scope) in expected.iter().cloned().zip(scopes) {
+        // Public folders are poll-only in v1: a bare `CursorScope::Folder`
+        // has no push surface (EWS streaming notifications do not cover the
+        // public-folder hierarchy mailbox). It is refused per scope, not per
+        // request: one stale or poll-only scope in a mixed list must not
+        // disable push for every valid sibling, which is what bailing out
+        // before dispatch did.
+        if matches!(scope, CursorScope::Folder(_)) {
+            outcomes.push_failed(item, unsupported_push_scope_error(scope));
+            continue;
+        }
+        eligible.push((item, scope));
+    }
+    // Nothing in the request was ever subscribable. There is no partial
+    // success to report and no handle to hold, so this stays a whole-request
+    // refusal the caller can act on rather than an empty success.
+    if eligible.is_empty() {
         return Err(unsupported_push_error());
     }
-    match account.push_mode {
-        PushMode::GraphSubscriptions => subscribe_graph(account, scopes).await,
-        PushMode::EwsStreaming => subscribe_ews(account, scopes).await,
-    }
+    let handle = match account.push_mode {
+        PushMode::GraphSubscriptions => subscribe_graph(account, eligible, &mut outcomes).await?,
+        PushMode::EwsStreaming => subscribe_ews(account, eligible, &mut outcomes).await?,
+    };
+    Ok(bifrost_types::PushSubscription::new(
+        handle,
+        finalize_push_outcomes(outcomes, &expected)?,
+    ))
+}
+
+/// Positional ids for one `push_subscribe` request's scopes. The lanes are
+/// keyed on submission position because `CursorScope` is not an id and two
+/// requested scopes can legitimately name the same folder.
+fn push_item_ids(len: usize) -> Vec<bifrost_types::BatchItemId> {
+    (0..len)
+        .map(|index| bifrost_types::BatchItemId(index.to_string()))
+        .collect()
+}
+
+fn finalize_push_outcomes(
+    outcomes: bifrost_types::BatchOutcomeBuilder<CursorScope>,
+    expected: &[bifrost_types::BatchItemId],
+) -> Result<bifrost_types::BatchOutcome<CursorScope>, AccountError> {
+    outcomes.finalize(expected).map_err(|error| {
+        protocol_violation(
+            ProtocolErrorKind::ContractViolation,
+            AccountOperation::PushSubscribe,
+            None,
+            format!("push scope accounting invariant failed: {error}"),
+        )
+    })
 }
 
 pub(crate) async fn push_unsubscribe(
@@ -195,37 +234,60 @@ fn unsupported_push_error() -> AccountError {
     .expect("valid account error classification")
 }
 
+/// The same refusal, correlated to the scope that caused it. A per-scope lane
+/// entry the caller cannot attribute is not a report it can act on: it would
+/// know a scope was declined without knowing which registration to drop.
+fn unsupported_push_scope_error(scope: CursorScope) -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::Unsupported(AccountOperation::PushSubscribe),
+        Cause::Request(RequestCause::Unsupported {
+            operation: AccountOperation::PushSubscribe,
+        }),
+    )
+    .operation(AccountOperation::PushSubscribe)
+    .provider(Provider::Microsoft)
+    .protocol(Protocol::Graph)
+    .scope(ErrorScope::Cursor(scope))
+    .try_build()
+    .expect("valid account error classification")
+}
+
 async fn subscribe_graph(
     account: GraphAccount,
-    scopes: Vec<CursorScope>,
-) -> Result<SubscriptionHandle, AccountError> {
+    eligible: Vec<(bifrost_types::BatchItemId, CursorScope)>,
+    outcomes: &mut bifrost_types::BatchOutcomeBuilder<CursorScope>,
+) -> Result<Option<SubscriptionHandle>, AccountError> {
     let Some(endpoint) = account.push_endpoint.clone() else {
         return Err(unsupported_push_error());
     };
-    // Graph webhooks reject any subscription whose `resource` we
-    // cannot construct. Resolving partial subsets silently and
-    // returning success would mask consumer-side bugs where the
-    // engine asked for a scope we can never serve. Fail loudly.
-    let mut grouped: HashMap<String, Vec<CursorScope>> = HashMap::new();
-    for scope in scopes {
+    // Graph webhooks reject any subscription whose `resource` we cannot
+    // construct. A scope with no resource is refused into the failed lane,
+    // where the caller sees exactly which scope was declined and keeps
+    // polling coverage for it, while its subscribable siblings still get a
+    // live subscription.
+    let mut grouped: HashMap<String, Vec<(bifrost_types::BatchItemId, CursorScope)>> =
+        HashMap::new();
+    for (item, scope) in eligible {
         match resource_for_scope(&account, &scope) {
             Ok(Some(resource)) => {
-                grouped.entry(resource).or_default().push(scope);
+                grouped.entry(resource).or_default().push((item, scope));
             }
-            Ok(None) => return Err(unsupported_push_error()),
+            Ok(None) => outcomes.push_failed(item, unsupported_push_scope_error(scope)),
             Err(error) => {
                 // A stale shared mailbox has no subscribable resource.
-                // `push_subscribe` answers per REQUEST (one handle covers
-                // the whole scope list), so refusing the call is right -
-                // but the refusal must name the scope that caused it, or
-                // the caller cannot tell which registration to drop.
-                return Err(into_account_error(
-                    error,
-                    GraphErrorContext::graph(AccountOperation::PushSubscribe)
-                        .with_scope(ErrorScope::Cursor(scope)),
-                ));
+                outcomes.push_failed(
+                    item,
+                    into_account_error(
+                        error,
+                        GraphErrorContext::graph(AccountOperation::PushSubscribe)
+                            .with_scope(ErrorScope::Cursor(scope)),
+                    ),
+                );
             }
         }
+    }
+    if grouped.is_empty() {
+        return Ok(None);
     }
 
     // Mint the handle BEFORE the first create. `new_handle` is fallible
@@ -247,12 +309,17 @@ async fn subscribe_graph(
         )
         .await
         {
-            Ok(response) => subscriptions.push(GraphSubscriptionState {
-                server_id: response.id,
-                expires_at: response.expiration_date_time,
-                resource,
-                scopes: covered,
-            }),
+            Ok(response) => {
+                for (item, scope) in &covered {
+                    outcomes.push_succeeded(item.clone(), scope.clone());
+                }
+                subscriptions.push(GraphSubscriptionState {
+                    server_id: response.id,
+                    expires_at: response.expiration_date_time,
+                    resource,
+                    scopes: covered.into_iter().map(|(_, scope)| scope).collect(),
+                });
+            }
             Err(error) => {
                 // The handle is never registered on the account and never
                 // returned on this path, so nothing downstream could ever
@@ -286,7 +353,7 @@ async fn subscribe_graph(
         .insert(handle.clone(), GraphSubscriptionGroup::live(subscriptions));
     let _ = account.push_tx.send(WatchEvent::Reconnected);
     ensure_graph_worker(account).await;
-    Ok(handle)
+    Ok(Some(handle))
 }
 
 async fn unsubscribe_graph(
@@ -776,16 +843,27 @@ fn ews_subscribable_folder_id(scope: &CursorScope) -> Option<String> {
 
 async fn subscribe_ews(
     account: GraphAccount,
-    scopes: Vec<CursorScope>,
-) -> Result<SubscriptionHandle, AccountError> {
-    let mut pending = Vec::with_capacity(scopes.len());
-    for scope in scopes {
+    eligible: Vec<(bifrost_types::BatchItemId, CursorScope)>,
+    outcomes: &mut bifrost_types::BatchOutcomeBuilder<CursorScope>,
+) -> Result<Option<SubscriptionHandle>, AccountError> {
+    let mut pending = Vec::with_capacity(eligible.len());
+    for (item, scope) in eligible {
+        // An unsubscribable shape (non-`FolderType`, or a foreign mailbox
+        // this Subscribe cannot route to) is that scope's refusal, not the
+        // request's: its valid siblings still get a live subscription.
         let Some(source_id) = ews_subscribable_folder_id(&scope) else {
-            return Err(unsupported_push_error());
+            outcomes.push_failed(item, unsupported_push_scope_error(scope));
+            continue;
         };
-        pending.push((scope, source_id));
+        pending.push((item, scope, source_id));
     }
-    let scopes = translate_ews_scopes(&account, pending).await?;
+    if pending.is_empty() {
+        return Ok(None);
+    }
+    let scopes = translate_ews_scopes(&account, pending, outcomes).await?;
+    if scopes.is_empty() {
+        return Ok(None);
+    }
     let handle = new_handle()?;
     account
         .ews_subscriptions
@@ -799,7 +877,7 @@ async fn subscribe_ews(
         .ews_topology
         .send_modify(|generation| *generation = generation.wrapping_add(1));
     super::push_stream::ensure_ews_worker(account).await;
-    Ok(handle)
+    Ok(Some(handle))
 }
 
 /// The error context for the translation request itself.
@@ -825,7 +903,8 @@ fn translate_error_context() -> GraphErrorContext {
 /// rather than by position.
 async fn translate_ews_scopes(
     account: &GraphAccount,
-    pending: Vec<(CursorScope, String)>,
+    pending: Vec<PendingEwsScope>,
+    outcomes: &mut bifrost_types::BatchOutcomeBuilder<CursorScope>,
 ) -> Result<Vec<EwsSubscriptionScope>, AccountError> {
     let mut translated = Vec::new();
     for input_ids in translation_input_chunks(&pending) {
@@ -841,8 +920,14 @@ async fn translate_ews_scopes(
             .map_err(|error| into_account_error(error, translate_error_context()))?;
         translated.extend(response.value);
     }
-    reconcile_translated_ews_scopes(pending, translated)
+    Ok(reconcile_translated_ews_scopes(
+        pending, translated, outcomes,
+    ))
 }
+
+/// One scope that passed the shape checks, carried with its lane id and the
+/// REST folder id the translation request will submit for it.
+type PendingEwsScope = (bifrost_types::BatchItemId, CursorScope, String);
 
 /// The `inputIds` collections one subscription's translation needs.
 ///
@@ -854,10 +939,10 @@ async fn translate_ews_scopes(
 /// a genuinely large mailbox fans out instead of failing before EWS setup is
 /// even attempted. First-seen order is preserved so the chunk boundaries are
 /// deterministic and a failure names a stable set of ids.
-fn translation_input_chunks(pending: &[(CursorScope, String)]) -> Vec<Vec<String>> {
+fn translation_input_chunks(pending: &[PendingEwsScope]) -> Vec<Vec<String>> {
     let mut seen = HashSet::new();
     let mut unique = Vec::with_capacity(pending.len());
-    for (_, source_id) in pending {
+    for (_, _, source_id) in pending {
         if seen.insert(source_id.as_str()) {
             unique.push(source_id.clone());
         }
@@ -887,51 +972,58 @@ fn translation_input_chunks(pending: &[(CursorScope, String)]) -> Vec<Vec<String
 /// cannot parse it, so the Subscribe would fail as an opaque
 /// `SoapFaultCode::Unknown` instead of the diagnosable local error.
 fn reconcile_translated_ews_scopes(
-    pending: Vec<(CursorScope, String)>,
+    pending: Vec<PendingEwsScope>,
     translated: Vec<TranslatedExchangeId>,
-) -> Result<Vec<EwsSubscriptionScope>, AccountError> {
+    outcomes: &mut bifrost_types::BatchOutcomeBuilder<CursorScope>,
+) -> Vec<EwsSubscriptionScope> {
     let answers: HashMap<String, TranslatedExchangeId> = translated
         .into_iter()
         .map(|entry| (entry.source_id.clone(), entry))
         .collect();
-    pending
-        .into_iter()
-        .map(|(scope, source_id)| {
-            let error_scope = ErrorScope::Cursor(scope.clone());
-            let Some(answer) = answers.get(&source_id) else {
-                return Err(protocol_violation(
+    let mut subscribed = Vec::new();
+    for (item, scope, source_id) in pending {
+        let error_scope = ErrorScope::Cursor(scope.clone());
+        let Some(answer) = answers.get(&source_id) else {
+            outcomes.push_failed(
+                item,
+                protocol_violation(
                     ProtocolErrorKind::ContractViolation,
                     AccountOperation::PushSubscribe,
                     Some(error_scope),
                     "translateExchangeIds omitted a subscribed folder",
-                ));
-            };
-            if let Some(ews_folder_id) = answer
-                .target_id
-                .as_ref()
-                .filter(|target| !target.trim().is_empty())
-            {
-                return Ok(EwsSubscriptionScope {
-                    scope,
-                    ews_folder_id: ews_folder_id.clone(),
-                });
-            }
-            match answer.error_details.as_ref() {
-                Some(details) => Err(id_translation_refused(
-                    AccountOperation::PushSubscribe,
-                    error_scope,
-                    details.code.as_deref(),
-                    details.message.as_deref(),
-                )),
-                None => Err(protocol_violation(
-                    ProtocolErrorKind::ContractViolation,
-                    AccountOperation::PushSubscribe,
-                    Some(error_scope),
-                    "translateExchangeIds answered without a target id or error details",
-                )),
-            }
-        })
-        .collect()
+                ),
+            );
+            continue;
+        };
+        if let Some(ews_folder_id) = answer
+            .target_id
+            .as_ref()
+            .filter(|target| !target.trim().is_empty())
+        {
+            outcomes.push_succeeded(item, scope.clone());
+            subscribed.push(EwsSubscriptionScope {
+                scope,
+                ews_folder_id: ews_folder_id.clone(),
+            });
+            continue;
+        }
+        let error = match answer.error_details.as_ref() {
+            Some(details) => id_translation_refused(
+                AccountOperation::PushSubscribe,
+                error_scope,
+                details.code.as_deref(),
+                details.message.as_deref(),
+            ),
+            None => protocol_violation(
+                ProtocolErrorKind::ContractViolation,
+                AccountOperation::PushSubscribe,
+                Some(error_scope),
+                "translateExchangeIds answered without a target id or error details",
+            ),
+        };
+        outcomes.push_failed(item, error);
+    }
+    subscribed
 }
 
 async fn unsubscribe_ews(
@@ -1133,28 +1225,106 @@ mod tests {
         assert!(!resource.contains("%1F"));
     }
 
-    /// `subscribe_graph` must fail loudly when any requested scope
-    /// cannot resolve to a Graph resource. Silently subscribing to
-    /// the resolvable subset returns `Ok` while quietly losing
-    /// coverage of the unresolved scopes; tests pin
-    /// `Unsupported(PushSubscribe)` instead.
+    /// A scope that cannot resolve to a Graph resource must never be
+    /// silently dropped from an otherwise-successful subscription: the
+    /// caller would believe it has push coverage it does not have. It lands
+    /// in the failed lane, correlated to the scope, and the handle covers
+    /// only what actually subscribed.
     #[tokio::test]
-    async fn subscribe_partial_resolve_returns_unsupported() {
-        let mut account =
-            GraphAccount::new_for_tests(GraphClient::new("token"), PushMode::GraphSubscriptions);
+    async fn an_unresolvable_scope_is_reported_and_not_covered_by_the_handle() {
+        let client = GraphClient::new("token");
+        client.script_rest([ScriptedRestResponse::json(
+            reqwest::StatusCode::CREATED,
+            serde_json::json!({"id":"first","expirationDateTime":"2099-01-01T00:00:00Z"}),
+        )]);
+        let mut account = GraphAccount::new_for_tests(client, PushMode::GraphSubscriptions);
         account.push_endpoint = Some(PushEndpoint {
             webhook_url: "https://example.test/webhook".to_string(),
             client_state: "secret".to_string(),
         });
-        // CursorScope::Account is not a `FolderType` and so cannot
-        // be mapped to a Graph subscription resource. This must
-        // surface as Unsupported(PushSubscribe), not as an
-        // empty-success.
-        let result = subscribe_graph(account, vec![CursorScope::Account]).await;
-        let err = result.expect_err("expected Unsupported");
+        let inbox = CursorScope::FolderType {
+            folder: FolderId("inbox".to_string()),
+            ty: ObjectType::Email,
+        };
+        // `CursorScope::Account` is not a `FolderType`, so it maps to no
+        // Graph subscription resource.
+        let result = push_subscribe(account, vec![CursorScope::Account, inbox.clone()])
+            .await
+            .expect("an unresolvable scope does not sink its resolvable sibling");
+
+        assert!(result.handle.is_some(), "the inbox scope did subscribe");
+        assert_eq!(
+            result
+                .outcomes
+                .succeeded()
+                .iter()
+                .map(|success| success.output.clone())
+                .collect::<Vec<_>>(),
+            vec![inbox]
+        );
+        let failed = result.outcomes.failed();
+        assert_eq!(failed.len(), 1);
         assert!(matches!(
-            err.kind(),
+            failed[0].error.kind(),
             AccountErrorKind::Unsupported(AccountOperation::PushSubscribe)
+        ));
+        assert!(matches!(
+            failed[0].error.scope(),
+            Some(ErrorScope::Cursor(CursorScope::Account))
+        ));
+    }
+
+    /// Nothing in the request was ever subscribable, so there is no partial
+    /// coverage to report and no handle to hold. That stays a whole-request
+    /// refusal the caller can act on rather than an empty success.
+    #[tokio::test]
+    async fn an_all_poll_only_request_is_still_refused_outright() {
+        let account =
+            GraphAccount::new_for_tests(GraphClient::new("token"), PushMode::GraphSubscriptions);
+        let error = push_subscribe(
+            account,
+            vec![CursorScope::Folder(FolderId("public".to_string()))],
+        )
+        .await
+        .expect_err("a request of only poll-only scopes is refused");
+        assert!(matches!(
+            error.kind(),
+            AccountErrorKind::Unsupported(AccountOperation::PushSubscribe)
+        ));
+    }
+
+    /// The poll-only public-folder refusal is per scope, not per request.
+    /// One stale public folder in a mixed list used to disable push for
+    /// every valid sibling, which is precisely the symptom the per-scope
+    /// outcome contract exists to eliminate.
+    #[tokio::test]
+    async fn a_poll_only_public_folder_does_not_sink_its_valid_siblings() {
+        let client = GraphClient::new("token");
+        client.script_rest([ScriptedRestResponse::json(
+            reqwest::StatusCode::CREATED,
+            serde_json::json!({"id":"first","expirationDateTime":"2099-01-01T00:00:00Z"}),
+        )]);
+        let mut account = GraphAccount::new_for_tests(client, PushMode::GraphSubscriptions);
+        account.push_endpoint = Some(PushEndpoint {
+            webhook_url: "https://example.test/webhook".to_string(),
+            client_state: "secret".to_string(),
+        });
+        let public = CursorScope::Folder(FolderId("public".to_string()));
+        let inbox = CursorScope::FolderType {
+            folder: FolderId("inbox".to_string()),
+            ty: ObjectType::Email,
+        };
+        let result = push_subscribe(account, vec![public.clone(), inbox.clone()])
+            .await
+            .expect("a poll-only scope is a per-scope refusal");
+
+        assert!(result.handle.is_some());
+        assert_eq!(result.outcomes.succeeded().len(), 1);
+        assert_eq!(result.outcomes.succeeded()[0].output, inbox);
+        assert_eq!(result.outcomes.failed().len(), 1);
+        assert!(matches!(
+            result.outcomes.failed()[0].error.scope(),
+            Some(ErrorScope::Cursor(scope)) if *scope == public
         ));
     }
 
@@ -1187,7 +1357,7 @@ mod tests {
                 ty: ObjectType::Contact,
             },
         ];
-        assert!(subscribe_graph(account.clone(), scopes).await.is_err());
+        assert!(push_subscribe(account.clone(), scopes).await.is_err());
         assert!(account.graph_subscriptions.read().await.is_empty());
         let requests = client.take_rest_requests();
         assert_eq!(
@@ -1268,6 +1438,7 @@ mod tests {
         let pending: Vec<_> = (0..=TRANSLATE_EXCHANGE_IDS_MAX_INPUTS)
             .map(|index| {
                 (
+                    bifrost_types::BatchItemId(index.to_string()),
                     CursorScope::FolderType {
                         folder: FolderId(format!("f{index}")),
                         ty: ObjectType::Email,
@@ -1291,7 +1462,7 @@ mod tests {
             ),
         ]);
         let account = GraphAccount::new_for_tests(client.clone(), PushMode::EwsStreaming);
-        let translated = translate_ews_scopes(&account, pending)
+        let translated = translate_ews_scopes(&account, pending, &mut ledger())
             .await
             .expect("wire fan-out translates all folders");
         assert_eq!(translated.len(), TRANSLATE_EXCHANGE_IDS_MAX_INPUTS + 1);
@@ -1409,7 +1580,7 @@ mod tests {
             folder: FolderId("inbox".to_string()),
             ty: ObjectType::Email,
         };
-        let err = subscribe_graph(account, vec![scope])
+        let err = push_subscribe(account, vec![scope])
             .await
             .expect_err("expected Unsupported");
         assert!(matches!(
@@ -1420,19 +1591,14 @@ mod tests {
 
     #[tokio::test]
     async fn a_public_folder_scope_is_rejected_in_both_push_modes() {
-        // Rejected before mode dispatch, so neither mode can start a worker
-        // for a folder it can never observe.
+        // Refused before mode dispatch, so neither mode can start a worker
+        // for a folder it can never observe. A request made only of such
+        // scopes has no subscribable remainder, so it is refused outright.
         for mode in [PushMode::GraphSubscriptions, PushMode::EwsStreaming] {
             let account = GraphAccount::new_for_tests(GraphClient::new("token"), mode);
             let err = push_subscribe(
-                account,
-                vec![
-                    CursorScope::FolderType {
-                        folder: FolderId("inbox".to_string()),
-                        ty: ObjectType::Email,
-                    },
-                    CursorScope::Folder(FolderId("AAMkPF=".to_string())),
-                ],
+                account.clone(),
+                vec![CursorScope::Folder(FolderId("AAMkPF=".to_string()))],
             )
             .await
             .expect_err("public-folder push is unsupported");
@@ -1440,7 +1606,45 @@ mod tests {
                 err.kind(),
                 AccountErrorKind::Unsupported(AccountOperation::PushSubscribe)
             ));
+            assert!(account.graph_subscriptions.read().await.is_empty());
+            assert!(account.ews_subscriptions.read().await.is_empty());
         }
+    }
+
+    /// The EWS half of the per-scope contract. A foreign (shared-mailbox)
+    /// folder cannot be routed by this Subscribe, and used to refuse the
+    /// whole request; it must now fail alone while its primary-mailbox
+    /// sibling gets a live EWS subscription.
+    #[tokio::test]
+    async fn an_unsubscribable_ews_scope_does_not_sink_its_valid_siblings() {
+        let client = GraphClient::new("token");
+        client.script_rest([ScriptedRestResponse::json(
+            reqwest::StatusCode::OK,
+            serde_json::json!({"value":[{"sourceId":"rest-inbox","targetId":"ews-inbox"}]}),
+        )]);
+        let account = GraphAccount::new_for_tests(client, PushMode::EwsStreaming);
+        let inbox = email_scope("rest-inbox");
+        // `CursorScope::Account` contributes no folder id at all.
+        let result = push_subscribe(account.clone(), vec![CursorScope::Account, inbox.clone()])
+            .await
+            .expect("an unsubscribable scope is a per-scope refusal");
+
+        let handle = result.handle.expect("the primary folder did subscribe");
+        assert_eq!(
+            result.outcomes.succeeded().len(),
+            1,
+            "only the inbox scope is covered"
+        );
+        assert_eq!(result.outcomes.succeeded()[0].output, inbox);
+        assert_eq!(result.outcomes.failed().len(), 1);
+        assert!(matches!(
+            result.outcomes.failed()[0].error.scope(),
+            Some(ErrorScope::Cursor(CursorScope::Account))
+        ));
+        let registered = account.ews_subscriptions.read().await;
+        let state = registered.get(&handle).expect("the group is registered");
+        assert_eq!(state.scopes.len(), 1);
+        assert_eq!(state.scopes[0].ews_folder_id, "ews-inbox");
     }
 
     #[test]
@@ -2119,16 +2323,27 @@ mod tests {
 
     /// What `subscribe_ews` hands the translation phase: every scope already
     /// validated and paired with the native id it contributes.
-    fn pending(folders: &[&str]) -> Vec<(CursorScope, String)> {
+    fn pending(folders: &[&str]) -> Vec<PendingEwsScope> {
         folders
             .iter()
-            .map(|folder| {
+            .enumerate()
+            .map(|(index, folder)| {
                 let scope = email_scope(folder);
                 let source_id =
                     ews_subscribable_folder_id(&scope).expect("a primary folder scope is pending");
-                (scope, source_id)
+                (
+                    bifrost_types::BatchItemId(index.to_string()),
+                    scope,
+                    source_id,
+                )
             })
             .collect()
+    }
+
+    /// A fresh per-request ledger for a `reconcile_translated_ews_scopes`
+    /// call made outside `push_subscribe`.
+    fn ledger() -> bifrost_types::BatchOutcomeBuilder<CursorScope> {
+        bifrost_types::BatchOutcomeBuilder::new()
     }
 
     fn converted(source_id: &str, target_id: &str) -> TranslatedExchangeId {
@@ -2146,9 +2361,11 @@ mod tests {
             converted("rest-inbox", "ews-inbox"),
         ];
 
-        let resolved =
-            reconcile_translated_ews_scopes(pending(&["rest-inbox", "rest-archive"]), translated)
-                .expect("every subscribed folder was translated");
+        let resolved = reconcile_translated_ews_scopes(
+            pending(&["rest-inbox", "rest-archive"]),
+            translated,
+            &mut ledger(),
+        );
         assert_eq!(resolved[0].ews_folder_id, "ews-inbox");
         assert_eq!(resolved[1].ews_folder_id, "ews-archive");
     }
@@ -2159,8 +2376,17 @@ mod tests {
     /// container is not a diagnosable report.
     #[test]
     fn a_missing_ews_translation_rejects_the_subscription() {
-        let error = reconcile_translated_ews_scopes(pending(&["rest-inbox"]), Vec::new())
-            .expect_err("a REST id must never be sent to EWS as a fallback");
+        let mut outcomes = ledger();
+        let resolved =
+            reconcile_translated_ews_scopes(pending(&["rest-inbox"]), Vec::new(), &mut outcomes);
+        assert!(
+            resolved.is_empty(),
+            "an unanswered folder is not subscribed"
+        );
+        let outcomes = outcomes
+            .finalize(&push_item_ids(1))
+            .expect("every scope is accounted for");
+        let error = &outcomes.failed()[0].error;
         assert!(matches!(
             error.kind(),
             AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation)
@@ -2190,9 +2416,21 @@ mod tests {
             },
         ];
 
-        let error =
-            reconcile_translated_ews_scopes(pending(&["rest-inbox", "rest-stale"]), translated)
-                .expect_err("a folder with no EWS id cannot be subscribed");
+        let mut outcomes = ledger();
+        let resolved = reconcile_translated_ews_scopes(
+            pending(&["rest-inbox", "rest-stale"]),
+            translated,
+            &mut outcomes,
+        );
+        assert_eq!(resolved.len(), 1, "the accepted sibling still subscribes");
+        assert_eq!(resolved[0].scope, email_scope("rest-inbox"));
+        let outcomes = outcomes
+            .finalize(&push_item_ids(2))
+            .expect("every scope is accounted for");
+        assert_eq!(outcomes.succeeded().len(), 1);
+        assert_eq!(outcomes.succeeded()[0].output, email_scope("rest-inbox"));
+        assert_eq!(outcomes.failed().len(), 1);
+        let error = &outcomes.failed()[0].error;
         assert!(matches!(
             error.kind(),
             AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed)
@@ -2221,8 +2459,14 @@ mod tests {
             target_id: Some("   ".to_string()),
             error_details: None,
         }];
-        let error = reconcile_translated_ews_scopes(pending(&["rest-inbox"]), translated)
-            .expect_err("a blank target id is not a translation");
+        let mut outcomes = ledger();
+        let resolved =
+            reconcile_translated_ews_scopes(pending(&["rest-inbox"]), translated, &mut outcomes);
+        assert!(resolved.is_empty());
+        let outcomes = outcomes
+            .finalize(&push_item_ids(1))
+            .expect("every scope is accounted for");
+        let error = &outcomes.failed()[0].error;
         assert!(matches!(
             error.kind(),
             AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation)
@@ -2235,8 +2479,13 @@ mod tests {
     #[test]
     fn scopes_sharing_a_folder_translate_once_and_both_resolve() {
         let pending = vec![
-            (email_scope("rest-shared"), "rest-shared".to_string()),
             (
+                bifrost_types::BatchItemId("0".to_string()),
+                email_scope("rest-shared"),
+                "rest-shared".to_string(),
+            ),
+            (
+                bifrost_types::BatchItemId("1".to_string()),
                 CursorScope::FolderType {
                     folder: FolderId("rest-shared".to_string()),
                     ty: ObjectType::Contact,
@@ -2247,9 +2496,11 @@ mod tests {
         let chunks = translation_input_chunks(&pending);
         assert_eq!(chunks, vec![vec!["rest-shared".to_string()]]);
 
-        let resolved =
-            reconcile_translated_ews_scopes(pending, vec![converted("rest-shared", "ews-shared")])
-                .expect("one answer serves both scopes");
+        let resolved = reconcile_translated_ews_scopes(
+            pending,
+            vec![converted("rest-shared", "ews-shared")],
+            &mut ledger(),
+        );
         assert_eq!(resolved.len(), 2);
         assert!(resolved.iter().all(|s| s.ews_folder_id == "ews-shared"));
     }
@@ -2261,9 +2512,16 @@ mod tests {
     #[test]
     fn translation_requests_stay_inside_the_graph_input_id_cap() {
         let folders: Vec<String> = (0..2_500).map(|n| format!("rest-{n}")).collect();
-        let pending: Vec<(CursorScope, String)> = folders
+        let pending: Vec<PendingEwsScope> = folders
             .iter()
-            .map(|folder| (email_scope(folder), folder.clone()))
+            .enumerate()
+            .map(|(index, folder)| {
+                (
+                    bifrost_types::BatchItemId(index.to_string()),
+                    email_scope(folder),
+                    folder.clone(),
+                )
+            })
             .collect();
 
         let chunks = translation_input_chunks(&pending);

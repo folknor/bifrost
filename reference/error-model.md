@@ -293,6 +293,16 @@ empty/duplicate `BatchItemId`s surface as
 `Request(BatchInputInvalid)` before any byte crosses the side-effect
 boundary.
 
+The same three lanes carry `push_subscribe`, whose input is a scope list
+rather than a `Vec<BatchItem<_>>`. `PushSubscription { handle, outcomes }`
+puts a `BatchOutcome<CursorScope>` beside an optional handle: the handle
+covers exactly the succeeded lane, refused scopes carry their own
+scope-correlated `AccountError` in the failed lane, and the handle is absent
+when no scope was accepted. `BatchItemId`s are the scopes' submission
+positions, because a `CursorScope` is not an id and one request may legitimately
+name the same folder twice. No fourth lane and no parallel contract: an
+`Err(_)` from `push_subscribe` still means no scope was subscribed at all.
+
 `stream.rs`. `ItemOutcome<T>` is the streaming counterpart -
 `Succeeded(BatchSuccess<T>)` / `Failed(BatchFailure)` /
 `Uncertain(BatchUncertain)` - the same closed three-lane model, emitted

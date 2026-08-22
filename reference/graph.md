@@ -331,9 +331,18 @@ mailboxes always install.
     the wire. A top-level `Err` there would discard valid siblings, and on
     `message_reactions` would additionally claim nothing was transmitted
     while earlier chunks had already completed.
-  - **Per-request surfaces** (`push_subscribe`, the single-message `pim`
-    writes, blobs), per call: the call fails, carrying the scope of the
-    offending id.
+  - **Per-request surfaces** (single-message `pim` writes and blobs), per
+    call: the call fails, carrying the scope of the offending id.
+  - **Push subscription**, per scope in BOTH push modes:
+    `PushSubscription.outcomes` uses the shared three-lane batch contract, and
+    its optional handle covers only the succeeded scopes. Every per-scope
+    refusal routes through that lane - a poll-only public folder, a scope with
+    no Graph subscription resource, a foreign-mailbox or non-`FolderType` EWS
+    scope, and a refused or omitted id translation alike - so one bad scope
+    never disables push for its valid siblings. `Err(_)` is reserved for
+    whole-request faults: an empty scope list, a webhook mode with no endpoint,
+    a request in which no scope was subscribable at all, and a transport
+    failure during subscription creation (which rolls back what it created).
 - The built `AccountCapabilities`; the push mode plus optional endpoint; a
   `broadcast::Sender<WatchEvent>` feeding `push_stream`.
 - An `Arc<RwLock<CursorIndex>>` (scope list) and `Arc<RwLock<FolderTree>>`
@@ -499,8 +508,9 @@ scan diffed against `live_ids` emits `Destroyed` for vanished ids.
 it the snapshot empties and the folder degrades to additions-only with one
 scoped `Warning`. Dispatch: routing-map membership for `Folder` scopes
 (establish/inventory), cursor kind for changes; a bare non-public `Folder`
-keeps its reject-on-delta behavior. `push_subscribe` is
-`Unsupported(PushSubscribe)` for any `Folder` scope (poll-only v1). Lost rights
+keeps its reject-on-delta behavior. A `Folder` scope is refused
+per scope as `Unsupported(PushSubscribe)` in `push_subscribe`'s failed lane
+(poll-only v1); its subscribable siblings still get a handle. Lost rights
 surface as EWS `ErrorAccessDenied` and quarantine just that scope via
 `ews_shared_scope_error` -> `ScopeRevoked` -> `DisableScope`.
 
@@ -786,8 +796,8 @@ before mode dispatch, so in both modes (a subscription covering nothing
 registered a group teardown could never retire and started a renewal worker
 nothing could stop; the engine already skips empty lists at its own reattach
 boundary). It then groups by Graph
-subscription resource and
-rejects the request if any scope is not subscribable, creates one server
+subscription resource, files any scope with no subscribable resource into the
+failed lane, creates one server
 subscription per resource, and best-effort deletes any already-created
 subscriptions if a later create fails. The `SubscriptionHandle` is minted
 BEFORE the first create: `new_handle` is fallible and classifies its error
@@ -888,6 +898,10 @@ worker: it subscribes to the union of active folders, long-polls
 `GetStreamingEvents`, maps notifications to cursor scopes, and emits
 `Invalidated`. Failures use `ews_error_to_account_error`
 (terminal terminates; transient emits `Disconnected`, sleeps, reconnects).
+The REST-id translation response is reconciled per requested scope. A stale or
+refused folder enters the failed lane with its scope and Graph code while valid
+siblings are retained in the EWS subscription. An all-refused request has no
+handle, so bifrost-sync cannot record rejected scopes as push-covered.
 Scope registrations ride a `watch`-channel generation counter
 (`ews_topology`): the worker marks the generation seen immediately before
 every read of the subscription map, so a change can never fall between a
@@ -924,10 +938,12 @@ still-unfinished `JoinHandle`, declined to spawn, and was left with no
 worker once the old one returned - push silently dead. That bug appeared
 independently in each mode before the lifecycle was unified.
 
-`push_subscribe` rejects any `Folder` (public-folder) scope as
-`Unsupported(PushSubscribe)` in both modes. The EWS arm narrows further via
-`ews_subscribable_folder_id`: only a PRIMARY-mailbox `FolderType` scope is
-accepted. A non-folder scope contributes nothing to the Subscribe body's
+`push_subscribe` refuses any `Folder` (public-folder) scope as
+`Unsupported(PushSubscribe)` in both modes, per scope rather than per request:
+one stale public folder in a mixed list used to disable push for every valid
+sibling. The EWS arm narrows further via `ews_subscribable_folder_id`: only a
+PRIMARY-mailbox `FolderType` scope is accepted, and a scope failing that
+predicate likewise enters the failed lane alone. A non-folder scope contributes nothing to the Subscribe body's
 `FolderIds` (an empty element EWS rejects outright), and a foreign folder is
 addressable only with its mailbox's routing headers while Subscribe sends
 `EwsHeaders::default()`, so its native id would resolve against the primary

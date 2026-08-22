@@ -737,6 +737,10 @@ impl Account for GraphAccount {
         inventory::resume_inventory_stream(self.clone(), cursor)
     }
 
+    fn is_inventory_cursor(&self, cursor: &ChangeCursor) -> bool {
+        inventory::resumable_inventory_payload(cursor).is_some()
+    }
+
     fn get_stream(
         &self,
         ids: AccountStream<ObjectId>,
@@ -763,7 +767,7 @@ impl Account for GraphAccount {
     fn push_subscribe(
         &self,
         scopes: &[CursorScope],
-    ) -> AccountFuture<Result<SubscriptionHandle, AccountError>> {
+    ) -> AccountFuture<Result<bifrost_types::PushSubscription, AccountError>> {
         let account = self.clone();
         let scopes = scopes.to_vec();
         Box::pin(async move { push::push_subscribe(account, scopes).await })
@@ -1385,12 +1389,81 @@ mod tests {
     use bifrost_types::{AccountErrorKind, AccountOperation, FolderId, ObjectType};
 
     use super::cursor::{
-        GraphCursorPayload, PublicFolderCursor, PublicFolderRouting, encode_cursor, kind_for_scope,
+        GraphCursorKind, GraphCursorPayload, GraphPageMarker, PublicFolderCursor,
+        PublicFolderRouting, encode_cursor, kind_for_scope,
     };
     use super::*;
 
     fn account() -> GraphAccount {
         GraphAccount::new_for_tests(GraphClient::new("token"), PushMode::GraphSubscriptions)
+    }
+
+    #[test]
+    fn inventory_cursor_predicate_classifies_without_building_a_stream() {
+        let scope = CursorScope::FolderType {
+            folder: FolderId("inbox".into()),
+            ty: ObjectType::Email,
+        };
+        let cursor = encode_cursor(
+            scope,
+            GraphCursorPayload::inventory_page(
+                GraphCursorKind::Messages {
+                    folder_id: "inbox".into(),
+                },
+                GraphPageMarker {
+                    next_link: "next".into(),
+                    last_seen_id: Some("last".into()),
+                },
+                None,
+            ),
+        )
+        .expect("inventory cursor encodes");
+
+        assert!(Account::is_inventory_cursor(&account(), &cursor));
+    }
+
+    /// The predicate must mirror `inventory_resume_stream`'s COMPLETE
+    /// acceptance condition, not the `inventory_in_progress` half of it. A
+    /// cursor whose outer scope disagrees with its payload is refused by the
+    /// hook; if the predicate accepted it anyway, sync would route the scope
+    /// to the deferred inventory worker, the worker would get `None` back and
+    /// report `NoCursor`, and the scope would be left with no live cursor and
+    /// no recovery path. Refused by the predicate, it reaches `changes_stream`
+    /// instead, which classifies it as schema-incompatible and restarts.
+    #[test]
+    fn an_inventory_cursor_whose_scope_contradicts_its_payload_is_not_resumable() {
+        let mut cursor = encode_cursor(
+            CursorScope::FolderType {
+                folder: FolderId("inbox".into()),
+                ty: ObjectType::Email,
+            },
+            GraphCursorPayload::inventory_page(
+                GraphCursorKind::Messages {
+                    folder_id: "inbox".into(),
+                },
+                GraphPageMarker {
+                    next_link: "next".into(),
+                    last_seen_id: Some("last".into()),
+                },
+                None,
+            ),
+        )
+        .expect("inventory cursor encodes");
+        // Same payload, a scope that contradicts it.
+        cursor.scope = CursorScope::FolderType {
+            folder: FolderId("archive".into()),
+            ty: ObjectType::Email,
+        };
+
+        let account = account();
+        assert!(
+            Account::inventory_resume_stream(&account, cursor.clone()).is_none(),
+            "the resume hook refuses a scope/payload mismatch"
+        );
+        assert!(
+            !Account::is_inventory_cursor(&account, &cursor),
+            "the predicate must refuse exactly what the hook refuses"
+        );
     }
 
     /// A Graph subscription outlives this process: it keeps POSTing to the
