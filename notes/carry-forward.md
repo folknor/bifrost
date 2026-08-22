@@ -236,7 +236,14 @@ bind the whole workspace.
 
 - **The second half of a fix-and-commit stage is never cold-reviewed.** That
   stage fixes review findings and commits in one step, so its own work ships
-  unreviewed. The close pass looks hardest there.
+  unreviewed. The close pass looks hardest there, and in both arcs that had a
+  close pass it found real defects in exactly that half.
+
+- **Which arcs have had a close pass, and which have not.** `bugs-graph` and
+  `bugs-imap` were closed properly. `bugs-net-types` was NOT: both rounds ran,
+  but the arc-level review never did. Anything later that leans on
+  `bifrost-net` machinery from that arc should treat it as reviewed once, not
+  twice. The gap is recorded in the document itself.
 
 - **The recurring defect shape is a fix that opens a new hole one layer up.**
   Check what a fix does to its consumer, not only to the unit test in front of it.

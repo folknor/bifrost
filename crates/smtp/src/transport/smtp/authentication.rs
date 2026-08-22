@@ -341,6 +341,16 @@ impl Mechanism {
                 )),
                 None => {
                     let (username, password) = credentials.password_parts()?;
+                    // RFC 4616 forbids NUL inside authzid/authcid/passwd: NUL is
+                    // the field separator. A username carrying one splits into
+                    // an extra field, so `authzid\0authcid` in the username slot
+                    // is an authorization-identity injection, not merely a
+                    // malformed message. Refuse rather than format it.
+                    if username.contains('\u{0}') || password.contains('\u{0}') {
+                        return Err(error::invalid_input(
+                            "PLAIN credentials must not contain a NUL byte",
+                        ));
+                    }
                     Ok(format!("\u{0}{username}\u{0}{password}"))
                 }
             },
@@ -1088,6 +1098,28 @@ mod test {
         assert!(
             mechanism
                 .response_with_token(&credentials, Some("test"), None)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn plain_rejects_nul_in_credentials() {
+        let mechanism = Mechanism::Plain;
+
+        // authzid injection: the NUL would open a third PLAIN field.
+        let injected =
+            Credentials::password("admin\u{0}username".to_owned(), "password".to_owned());
+        assert!(
+            mechanism
+                .response_with_token(&injected, None, None)
+                .is_err()
+        );
+
+        let injected_password =
+            Credentials::password("username".to_owned(), "pass\u{0}word".to_owned());
+        assert!(
+            mechanism
+                .response_with_token(&injected_password, None, None)
                 .is_err()
         );
     }

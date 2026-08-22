@@ -13,6 +13,15 @@ use crate::secret::Secret;
 /// rounds is already seconds of work; anything beyond is treated as an attack.
 const MAX_SCRAM_ITERATIONS: u32 = 100_000_000;
 
+/// Lower bound on the SCRAM `i=` iteration count, from RFC 7677 section 4
+/// ("the iteration count SHOULD be at least 4096"). Enforced as a hard floor:
+/// the count is server-supplied, and a hostile or MITM'd peer answering `i=1`
+/// reduces `SaltedPassword` to a single PBKDF2 round, which makes the captured
+/// `p=` proof cheap to brute-force offline. Refusing is the same downgrade
+/// defence this module applies to `-PLUS` stripping and nonce non-extension:
+/// a peer that cannot meet the specified minimum does not get our proof.
+const MIN_SCRAM_ITERATIONS: u32 = 4096;
+
 /// The hash function backing a SCRAM mechanism.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -148,10 +157,10 @@ pub fn scram_client_final(
         })?
         .parse::<u32>()
         .map_err(|e| SaslError::Protocol(format!("invalid SCRAM iteration count: {e}")))?;
-    if iterations == 0 {
-        return Err(SaslError::Protocol(
-            "SCRAM iteration count must be greater than zero".into(),
-        ));
+    if iterations < MIN_SCRAM_ITERATIONS {
+        return Err(SaslError::Protocol(format!(
+            "SCRAM iteration count {iterations} is below the minimum of {MIN_SCRAM_ITERATIONS}"
+        )));
     }
     // RFC 7677 mandates a minimum of 4096 and notes the count should stay within
     // reason; an unbounded `i=` is a CPU DoS, since the value flows straight into
@@ -409,6 +418,9 @@ mod tests {
             "m=ext,r=abcdef,s=QSXCR+Q6sek8bf92,i=4096",
             // zero iterations
             "r=abcdef,s=QSXCR+Q6sek8bf92,i=0",
+            // below the RFC 7677 floor: an offline-brute-force downgrade
+            "r=abcdef,s=QSXCR+Q6sek8bf92,i=1",
+            "r=abcdef,s=QSXCR+Q6sek8bf92,i=4095",
             // salt is not base64
             "r=abcdef,s=!!!,i=4096",
             // iteration count is not numeric

@@ -18,16 +18,6 @@ as if the computation is complete. This is the most likely real-world interop bu
 minimum it needs to be a documented non-goal with a stringprep-shaped error for non-ASCII input;
 properly it needs `stringprep::saslprep`.
 
-### No minimum on the SCRAM iteration count
-
-`crates/sasl/src/scram.rs`. There is a ceiling (`MAX_SCRAM_ITERATIONS`) and an `i == 0` rejection,
-but nothing between. RFC 7677 section 4 sets a hard floor of 4096. A hostile or MITM'd server sends
-`i=1` and the client happily runs a single PBKDF2 round, making the salted password trivially
-brute-forceable offline from the captured `p=` proof. The ceiling is defended in a long comment as a
-DoS guard; the floor, which is the actually-specified requirement and the one with a
-credential-disclosure consequence, is absent. Same class of downgrade the crate carefully guards
-against elsewhere (`-PLUS` stripping, nonce non-extension).
-
 ### Key material is never zeroized
 
 `crates/sasl/src/scram.rs`. `salted` (`[u8; 20]`/`[u8; 32]`), `client_key`, `stored_key`,
@@ -75,19 +65,6 @@ mis-split. Cheap to tighten.
 
 ## bifrost-smtp
 
-### HeaderName::new_from_ascii permits CR and LF, so header injection
-
-`crates/smtp/src/message/header/mod.rs`. The check is
-`!empty && len <= 76 && is_ascii() && !contains([':', ' '])`. Control characters are not excluded.
-`HeaderName::new_from_ascii("X-Foo\r\nBcc".to_owned())` succeeds, and `Display for Headers` writes
-`name`, `": "`, value, `"\r\n"` verbatim with no re-validation. Any caller building a raw header from
-an untrusted name string injects arbitrary headers. This matters because the value side is carefully
-defended (`allowed_char` excludes 10 and 13, so CR/LF in a value get RFC 2047 encoded, and there is a
-test for it) while the name side, going through the same `Display`, is not. The const
-`new_from_ascii_str` has the same gap but is compile-time so it is only a footgun. Fix: reject every
-byte outside `!`..`~` (RFC 5322 `ftext` is `%d33-57 / %d59-126`, printable minus colon), which also
-subsumes the existing space/colon check.
-
 ### Cleartext credentials leave Secret at the SMTP boundary
 
 `crates/smtp/src/transport/smtp/authentication.rs` and `commands.rs`.
@@ -101,14 +78,6 @@ in sasl and in `Credentials` is defeated at this one boundary. `response_with_to
 `bifrost_sasl::Secret`, `Auth.response` should hold one, and `crate::base64::encode` needs a
 zeroizing variant. Also `Credentials::oauth2` does `token.to_string()` on the `Zeroizing<String>`,
 creating an un-zeroized copy to hand to `StaticTokenSource`.
-
-### PLAIN does not reject NUL in the username
-
-`authentication.rs`: `format!("\u{0}{username}\u{0}{password}")` with no validation. RFC 4616 forbids
-NUL in authcid/authzid/passwd. A username containing `\0` splits into an extra field, so a
-caller-supplied identity can inject an authzid (`authzid\0authcid\0passwd`): an
-authorization-identity injection, not just a malformed message. Same for the password. Should be a
-hard error, not silently formatted.
 
 ### LOGIN challenge matching is text equality against a fixed list, and the helper is misnamed
 
@@ -187,9 +156,7 @@ correctness landmine for any third `TokenSource` impl. Deleting the sync transpo
 
 ## Doc divergence
 
-`reference/sasl.md` presents the SCRAM computation as pinned-correct without noting the absent
-SASLprep or the absent iteration floor; its "Correctness pins" list should name both as gaps or
-non-goals. It also says binding failures are "a hard `Protocol` error rather than a guessed binding
+`reference/sasl.md` now names the iteration bounds as a pin and SASLprep as a known gap. It still says binding failures are "a hard `Protocol` error rather than a guessed binding
 hash", which is true inside the crate but not observable to the caller because the SMTP driver
 swallows it with `.ok()?`. Either the reference should say the consumer treats it as a skip signal,
 or the consumer should stop discarding it.

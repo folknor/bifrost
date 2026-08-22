@@ -57,3 +57,21 @@ rather than being silently dropped, preserving sharing within each trust class.
 And the split deleted three tests that pinned `NetConfig` defaults which had
 merely MOVED to `AccountSpec`, leaving those defaults unpinned; they are
 re-pinned on their new home.
+
+**This document has no close pass.** Both rounds ran the full loop - fix pass,
+cold review, then a fix-and-commit stage - but the arc-level review that the
+`bugs-graph` and `bugs-imap` arcs each received was not run here, because the
+agent budget for it was gone. That matters more than it sounds: in both arcs that
+did get one, the close pass found real defects, and in both cases they were in
+the half of the fix-and-commit stage that no cold review ever sees. Round 2's
+fix-and-commit ran in the main session, so the same blind spot applies to it -
+specifically the `Net::shared_for_tls` selector, the two rewritten terminal-status
+drains, the `Canned::StreamThenStall` seam variant, and the four tests added
+around them. None of that has been read by anything but its author.
+
+`crates/net/src/rate.rs` deserves a second look for a separate reason: it was
+accidentally reverted during round 1 and reconstructed from context by the agent
+that lost it. It was read critically afterwards and looks intact - the generation
+scoping is present at all four sites and the validate-and-enqueue-under-one-lock
+fix carries its reasoning - but a file rebuilt from memory is not the same as a
+file that was never lost, and a green check does not distinguish them.

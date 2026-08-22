@@ -178,11 +178,22 @@ impl Error for InvalidHeaderName {}
 // pub: users construct safe raw header names for HeaderValue.
 pub struct HeaderName(Cow<'static, str>);
 
+/// RFC 5322 `ftext`: `%d33-57 / %d59-126`, i.e. printable ASCII minus the
+/// colon. Excluding the control range is what keeps CR and LF out of a header
+/// name: `Display for Headers` writes the name verbatim ahead of `": "`, so a
+/// name carrying CRLF would terminate the field and let the rest of the string
+/// be read by the receiver as further headers - header injection from any
+/// caller that builds a name out of untrusted input. The value side already
+/// refuses 10 and 13 by RFC 2047 encoding them; this is the matching defence on
+/// the name side. Subsumes the older space/colon check.
+const fn is_ftext(byte: u8) -> bool {
+    matches!(byte, 33..=57 | 59..=126)
+}
+
 impl HeaderName {
     /// Creates a new header name
     pub fn new_from_ascii(ascii: String) -> Result<Self, InvalidHeaderName> {
-        if !ascii.is_empty() && ascii.len() <= 76 && ascii.is_ascii() && !ascii.contains([':', ' '])
-        {
+        if !ascii.is_empty() && ascii.len() <= 76 && ascii.bytes().all(is_ftext) {
             Ok(Self(Cow::Owned(ascii)))
         } else {
             Err(InvalidHeaderName)
@@ -193,13 +204,11 @@ impl HeaderName {
     pub const fn new_from_ascii_str(ascii: &'static str) -> Self {
         assert!(!ascii.is_empty());
         assert!(ascii.len() <= 76);
-        assert!(ascii.is_ascii());
 
         let bytes = ascii.as_bytes();
         let mut i = 0;
         while i < bytes.len() {
-            assert!(bytes[i] != b' ');
-            assert!(bytes[i] != b':');
+            assert!(is_ftext(bytes[i]));
 
             i += 1;
         }
@@ -410,6 +419,23 @@ mod tests {
     #[test]
     fn colons_in_headername() {
         assert!(HeaderName::new_from_ascii(String::from("From:")).is_err());
+    }
+
+    #[test]
+    fn control_characters_in_headername() {
+        // Header injection: the name is written verbatim by `Display`, so a
+        // CRLF here would open a second header field on the wire.
+        assert!(HeaderName::new_from_ascii(String::from("X-Foo\r\nBcc")).is_err());
+        assert!(HeaderName::new_from_ascii(String::from("X-Foo\n")).is_err());
+        assert!(HeaderName::new_from_ascii(String::from("X-Foo\r")).is_err());
+        assert!(HeaderName::new_from_ascii(String::from("X-Foo\t")).is_err());
+        assert!(HeaderName::new_from_ascii(String::from("X-\u{0}Foo")).is_err());
+    }
+
+    #[test]
+    #[should_panic]
+    fn const_control_characters_in_headername() {
+        let _ = HeaderName::new_from_ascii_str("X-Foo\r\nBcc");
     }
 
     #[test]

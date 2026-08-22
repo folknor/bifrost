@@ -104,6 +104,19 @@ correct:
   signatureAlgorithm OID; an SHA-1-signed cert upgrades to SHA-256; truncated,
   unrecognized-OID, and EdDSA certs are `Protocol` errors. The OID-to-family
   table is exercised directly so a mistyped OID byte fails a type-level test.
+- SCRAM `i=` bounds (`scram.rs`): the server-supplied iteration count is
+  rejected below the RFC 7677 floor of 4096 and above a DoS ceiling of
+  100,000,000. The floor is a downgrade defence, not hygiene - `i=1` reduces
+  `SaltedPassword` to one PBKDF2 round and makes the captured `p=` proof cheap
+  to brute-force offline.
+
+### Known gaps
+
+- No SASLprep (RFC 4013). `scram_client_final` feeds the password bytes into
+  PBKDF2 unnormalized and `escape_username` only applies the `=`/`,` saslname
+  escape, so a non-ASCII or non-NFKC password computes a different
+  `SaltedPassword` than a conforming server and SCRAM fails auth where PLAIN
+  would have worked. ASCII credentials are unaffected.
 
 ## Forward note
 
