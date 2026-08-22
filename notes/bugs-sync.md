@@ -9,43 +9,6 @@ the cursor envelope outer version, the detach/re-attach teardown race, the scope
 identity bug, and the latched `CheckpointNow`. Their sections are removed below; the behaviour
 now lives in `reference/sync.md`. Everything still listed is unverified.
 
-## Roughly a thousand lines of machinery that nothing calls
-
-- `scheduler/` (mod + lanes + budget, ~600 lines plus a test file), documented as deliberately
-  unwired, with no dated plan.
-- `LiveSupersedes` in `backfill/runner.rs`: ~160 lines of implementation and doc plus 8 unit tests
-  for a set that is, by an extensively argued decision, never populated. The argument for not
-  populating it is convincing; the conclusion should therefore be to delete the type, not to
-  maintain a no-op filter, a ring-with-tombstones eviction policy, and tests pinning the tombstone
-  semantics of dead code.
-- `BackfillCheckpointWriter`: the file itself says it is unused on the hot path.
-- `mutation::fanout::partition_by_account`: no caller.
-- `MutationConfig::{fanout_buffer, retry_queue_cap}` and `BackfillConfig::clock_skew_warn`: never
-  read anywhere, yet documented in `reference/sync.md` as if they tune something.
-  `retry_queue_cap` in particular reads as a bound on the mutation retry queue, which is an
-  unbounded `Vec`.
-
-Every one of these has doc comments and reference-doc paragraphs that a reader must process before
-discovering they describe nothing running.
-
-## bulk_set_flags is a verbatim copy of run_bulk_pipeline
-
-`engine.rs` carries the same ~230-line campaign loop twice: same retry structure, same throttle
-wait, same `classify_item_outcome` handling, same four `plan_recovery` arms, same counter
-rebalance, differing only in which `Account::bulk_*` method submits and which read-back guard
-runs. `BulkPipelineOp` already exists; `SetFlags(FlagOp)` should be a third variant and the
-duplicate deleted. As it stands, a fix to one arm (and there have clearly been several, judging by
-the sync-D5/retry-sweep comments) has to be mirrored by hand.
-
-## Mutation campaigns ignore pause, boundary, and shutdown
-
-Neither campaign consults `BoundaryView` or the slot's `shutdown` token. An account paused by
-`RetryBudgetExhausted` or `OperatorOverrideRequired`, i.e. one the engine has decided it should
-not be talking to, will still have a running `bulk_set_flags` campaign resubmitting batches to the
-wire on its retry schedule. Polls, push reconcile, backfill, and deferred inventory all park;
-mutations do not. `reference/sync.md` claims pause "halts all engine-driven work for the account",
-which is not true of the mutation pipeline.
-
 ## Structural: engine.rs is 5278 lines and mixes five unrelated concerns
 
 Lifecycle (attach/detach/reopen), recovery dispatch (~900 lines of free functions), the backfill

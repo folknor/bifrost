@@ -17,22 +17,15 @@ use crate::control::SyncControl;
 use crate::cursor::CursorRegistry;
 use crate::cursor::store::DynCheckpointStore;
 use crate::multiplexer::MultiplexerHandle;
-use crate::scheduler::budget::ConcurrencyBudget;
 
 /// Top-level engine configuration. Cloned into every `AccountSlot`.
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
-    pub budget: ConcurrencyBudget,
-    pub scheduler: SchedulerConfig,
     pub multiplexer: MultiplexerConfig,
     pub backfill: BackfillConfig,
     pub push: PushConfig,
-    pub mutation: MutationConfig,
     /// Detach / drop timeout for awaiting spawned workers (see `H1`).
     pub detach_timeout: Duration,
-    /// Per-lane cap on the scheduler's `VecDeque`. On overflow the
-    /// oldest item is shed and a counter incremented (see `H4`).
-    pub lane_capacity: usize,
     /// Mutation campaign retry cap. The campaign attempts up to this
     /// many resubmissions for ids whose per-item `ItemOutcome::Failed`
     /// carried a retryable `RecoveryClass`.
@@ -42,32 +35,11 @@ pub struct EngineConfig {
 impl Default for EngineConfig {
     fn default() -> Self {
         Self {
-            budget: ConcurrencyBudget::default(),
-            scheduler: SchedulerConfig::default(),
             multiplexer: MultiplexerConfig::default(),
             backfill: BackfillConfig::default(),
             push: PushConfig::default(),
-            mutation: MutationConfig::default(),
             detach_timeout: Duration::from_secs(5),
-            lane_capacity: 1024,
             mutation_max_retries: 5,
-        }
-    }
-}
-
-/// Scheduler tuning knobs.
-#[derive(Debug, Clone, Copy)]
-pub struct SchedulerConfig {
-    /// Number of consecutive higher-lane pulls before the starvation
-    /// floor forces one lower-lane pull. Default 64 per
-    /// `bifrost-sync.md` -> Starvation guards.
-    pub starvation_floor: u32,
-}
-
-impl Default for SchedulerConfig {
-    fn default() -> Self {
-        Self {
-            starvation_floor: 64,
         }
     }
 }
@@ -110,9 +82,6 @@ pub struct BackfillConfig {
     pub uid_range_chunk: u32,
     /// JMAP `PageCount` strategy page size.
     pub page_count_chunk: u32,
-    /// Clock-skew threshold above which a `Warning::ClockSkew` is
-    /// emitted.
-    pub clock_skew_warn: Duration,
 }
 
 impl Default for BackfillConfig {
@@ -120,7 +89,6 @@ impl Default for BackfillConfig {
         Self {
             uid_range_chunk: 5000,
             page_count_chunk: 1000,
-            clock_skew_warn: Duration::from_secs(5 * 60),
         }
     }
 }
@@ -132,24 +100,6 @@ impl Default for BackfillConfig {
 /// future push-only knobs.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PushConfig {}
-
-/// Mutation pipeline config.
-#[derive(Debug, Clone, Copy)]
-pub struct MutationConfig {
-    /// Default fan-out per-account sub-channel buffer.
-    pub fanout_buffer: usize,
-    /// Default per-campaign retry queue limit.
-    pub retry_queue_cap: usize,
-}
-
-impl Default for MutationConfig {
-    fn default() -> Self {
-        Self {
-            fanout_buffer: 256,
-            retry_queue_cap: 4096,
-        }
-    }
-}
 
 /// Engine-side per-account state. Held inside the engine's
 /// `DashMap<AccountId, Arc<AccountSlot>>`.

@@ -14,7 +14,7 @@
 //! - `bifrost-net` (sibling) - shared transport.
 //! - `bifrost-{jmap,imap,gmail,graph,smtp}` (sibling) - per-protocol
 //!   wire primitives.
-//! - `bifrost-sync` (this crate) - scheduler, multiplexer, backfill,
+//! - `bifrost-sync` (this crate) - multiplexer, backfill,
 //!   push reconciliation, mutation pipeline, checkpoint envelope,
 //!   cancellation, observability.
 //!
@@ -35,7 +35,6 @@ pub mod multiplexer;
 pub mod mutation;
 pub mod push;
 pub mod recovery;
-pub mod scheduler;
 pub mod types;
 
 // Engine entry types.
@@ -67,10 +66,7 @@ pub use cursor::{
 pub use backfill::{BackfillPolicy, BackfillStrategy};
 
 // Engine configuration knobs.
-pub use scheduler::{ConcurrencyBudget, WorkKind};
-pub use types::{
-    BackfillConfig, EngineConfig, MultiplexerConfig, MutationConfig, PushConfig, SchedulerConfig,
-};
+pub use types::{BackfillConfig, EngineConfig, MultiplexerConfig, PushConfig};
 
 // Engine-side control implementation, exposed so tests / consumers
 // pattern-match on the concrete type when convenient.

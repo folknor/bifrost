@@ -1,6 +1,6 @@
 [package]
 name = "bifrost-sync"
-description = "Sync engine that drives bifrost-types Account implementations: scheduler, backfill, push reconciliation, mutation pipeline."
+description = "Sync engine that drives bifrost-types Account implementations: backfill, push reconciliation, mutation pipeline."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

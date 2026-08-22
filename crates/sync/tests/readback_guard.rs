@@ -7,23 +7,25 @@
 use std::collections::HashSet;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-use bifrost_sync::run_readback_guard;
+use bifrost_sync::{Error, IdempotencyVendor, SyncEngine, run_readback_guard};
 use bifrost_types::{
     Account, AccountCapabilities, AccountError, AccountErrorBuilder, AccountErrorKind,
-    AccountFuture, AccountStream, AttachmentHandle, Batch, BatchingPolicy, BlobHandle,
-    BlobRangeSupport, ByteRange, Cause, Change, ChangeCursor, CloudUploadMeta, ContactCard,
-    ContactCreate, ContactId, ContactPatch, ContactSearchRequest, ContainerId, ContainerKind,
-    ConvenienceShape, CursorDescriptor, CursorEstablishment, CursorFreshness, CursorScope,
-    DraftHandle, DraftPatch, EventCreate, EventId, EventPatch, EventRange, EventSearchRequest,
-    FilterRuleShape, FilterValidation, FlagOp, HostedAttachment, HydratedObject,
-    HydratedObjectKind, HydrationProjection, IdempotencyKey, Identity, IdentityId, IdentityPatch,
-    Importance, InventoryEntry, ItemOutcome, MembershipScope, Message, MutationCapabilities,
-    MutationConcurrency, MutationReplaySafety, MutationSuccess, MutationTarget, ObjectId, Page,
-    PageBoundary, PimMethodSupport, Priority, Projection, PushCapability, QuotaInfo, QuotaSignal,
-    RateLimitClass, RequestCause, RsvpStatus, ScopeLifecycleEvent, SearchRequest, SendRequest,
-    ServerFilter, ServerFilterCreate, ServerFilterId, ServerFilterPatch, SubscriptionHandle,
-    SyncEvent, ThreadHydration, ThreadId, VacationConfig, WatchEvent,
+    AccountFactory, AccountFuture, AccountId, AccountStream, AttachmentHandle, Batch,
+    BatchingPolicy, BlobHandle, BlobRangeSupport, ByteRange, Cause, Change, ChangeCursor,
+    CloudUploadMeta, ContactCard, ContactCreate, ContactId, ContactPatch, ContactSearchRequest,
+    ContainerId, ContainerKind, Control, ConvenienceShape, CursorDescriptor, CursorEstablishment,
+    CursorFreshness, CursorScope, DraftHandle, DraftPatch, EventCreate, EventId, EventPatch,
+    EventRange, EventSearchRequest, FilterRuleShape, FilterValidation, FlagOp, HostedAttachment,
+    HydratedObject, HydratedObjectKind, HydrationProjection, IdempotencyKey, Identity, IdentityId,
+    IdentityPatch, Importance, InventoryEntry, ItemOutcome, MembershipScope, Message,
+    MutationCapabilities, MutationConcurrency, MutationReplaySafety, MutationSuccess,
+    MutationTarget, ObjectId, OpenedAccount, Page, PageBoundary, PimMethodSupport, Priority,
+    Projection, ProtocolKind, PushCapability, QuotaInfo, QuotaSignal, RateLimitClass, RequestCause,
+    RsvpStatus, ScopeLifecycleEvent, SearchRequest, SendRequest, ServerFilter, ServerFilterCreate,
+    ServerFilterId, ServerFilterPatch, SubscriptionHandle, SyncEvent, ThreadHydration, ThreadId,
+    VacationConfig, WatchEvent,
 };
 use bifrost_types::{AddressBook, AddressBookId};
 use bifrost_types::{Calendar, CalendarEvent};
@@ -49,6 +51,36 @@ fn unsupported(op: bifrost_types::AccountOperation) -> AccountError {
 struct FlagsAccount {
     caps: AccountCapabilities,
     flag_table: std::collections::HashMap<ObjectId, HashSet<String>>,
+    campaign: Option<Arc<CampaignState>>,
+}
+
+#[derive(Default)]
+struct CampaignState {
+    submissions: AtomicUsize,
+    submitted: tokio::sync::Notify,
+    keys: std::sync::Mutex<Vec<IdempotencyKey>>,
+}
+
+struct FlagsFactory(Arc<FlagsAccount>);
+
+impl AccountFactory for FlagsFactory {
+    fn open(&self, _account: AccountId) -> AccountFuture<Result<OpenedAccount, AccountError>> {
+        let concrete = Arc::clone(&self.0);
+        let account: Arc<dyn Account> = concrete;
+        Box::pin(async move { Ok(OpenedAccount::complete(account)) })
+    }
+}
+
+fn retryable_transport() -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::Transport(bifrost_types::TransportErrorKind::Network),
+        Cause::Transport(bifrost_types::TransportCause::new(
+            bifrost_types::TransportKind::Network,
+            None,
+        )),
+    )
+    .try_build()
+    .expect("valid retryable transport error")
 }
 
 fn caps() -> AccountCapabilities {
@@ -199,11 +231,37 @@ impl Account for FlagsAccount {
 
     fn bulk_set_flags(
         &self,
-        _targets: AccountStream<ObjectId>,
+        targets: AccountStream<ObjectId>,
         _op: FlagOp,
-        _key: IdempotencyKey,
+        key: IdempotencyKey,
     ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
-        Box::pin(stream::empty())
+        let Some(campaign) = &self.campaign else {
+            return Box::pin(stream::empty());
+        };
+        campaign.keys.lock().expect("keys lock").push(key);
+        let attempt = campaign.submissions.fetch_add(1, Ordering::SeqCst);
+        campaign.submitted.notify_one();
+        if attempt == 0 {
+            return Box::pin(stream::iter([SyncEvent::Terminated(retryable_transport())]));
+        }
+        Box::pin(stream::once(async move {
+            let items = targets
+                .map(|id| {
+                    ItemOutcome::Succeeded(bifrost_types::BatchSuccess::new(
+                        bifrost_types::BatchItemId(id.0),
+                        MutationSuccess::Applied,
+                    ))
+                })
+                .collect()
+                .await;
+            SyncEvent::Batch(Batch {
+                items,
+                page_boundary: PageBoundary::Final,
+                server_latency: std::time::Duration::ZERO,
+                bytes_in: 0,
+                checkpoint: None,
+            })
+        }))
     }
 
     /// Echoes the destination it was handed back as a single
@@ -657,6 +715,7 @@ async fn readback_guard_marks_applied_as_skipped() {
     let acc = FlagsAccount {
         caps: caps(),
         flag_table: table,
+        campaign: None,
     };
     let ids = vec![
         ObjectId("a".into()),
@@ -678,6 +737,7 @@ async fn readback_guard_handles_remove() {
     let acc = FlagsAccount {
         caps: caps(),
         flag_table: table,
+        campaign: None,
     };
     let ids = vec![ObjectId("a".into()), ObjectId("b".into())];
     let outcome = run_readback_guard(&acc, ids, &FlagOp::Remove(set(&["\\Seen"])))
@@ -695,6 +755,7 @@ async fn readback_guard_handles_set() {
     let acc = FlagsAccount {
         caps: caps(),
         flag_table: table,
+        campaign: None,
     };
     let ids = vec![ObjectId("a".into()), ObjectId("b".into())];
     let outcome = run_readback_guard(&acc, ids, &FlagOp::Set(set(&["\\Seen"])))
@@ -709,6 +770,7 @@ async fn readback_guard_with_no_ids_is_no_op() {
     let acc = FlagsAccount {
         caps: caps(),
         flag_table: std::collections::HashMap::new(),
+        campaign: None,
     };
     let outcome = run_readback_guard(&acc, vec![], &FlagOp::Add(set(&["\\Seen"])))
         .await
@@ -727,6 +789,7 @@ async fn bulk_move_from_defaults_to_bulk_move() {
     let acc = FlagsAccount {
         caps: caps(),
         flag_table: std::collections::HashMap::new(),
+        campaign: None,
     };
     let destination = MembershipScope::Label(bifrost_types::LabelId("Label_42".into()));
     let source = MembershipScope::Label(bifrost_types::LabelId("Label_7".into()));
@@ -770,6 +833,7 @@ async fn readback_guard_works_through_arc() {
     let acc: Arc<dyn Account> = Arc::new(FlagsAccount {
         caps: caps(),
         flag_table: table,
+        campaign: None,
     });
     let outcome = run_readback_guard(
         acc.as_ref(),
@@ -780,4 +844,103 @@ async fn readback_guard_works_through_arc() {
     .expect("guard ok");
     assert_eq!(outcome.skipped, 1);
     assert_eq!(outcome.still_failed, 0);
+}
+
+fn campaign_account(state: Arc<CampaignState>) -> Arc<FlagsAccount> {
+    Arc::new(FlagsAccount {
+        caps: caps(),
+        flag_table: std::collections::HashMap::new(),
+        campaign: Some(state),
+    })
+}
+
+fn vendor() -> IdempotencyVendor {
+    IdempotencyVendor::with_run_id(
+        bifrost_types::RunId("boundary-test".into()),
+        Box::new(|_| bifrost_types::ProtocolSalt::Imap),
+    )
+}
+
+#[tokio::test(start_paused = true)]
+async fn paused_campaign_resumes_once_without_losing_retry_accounting() {
+    let state = Arc::new(CampaignState::default());
+    let engine = Arc::new(SyncEngine::builder().build().expect("engine"));
+    let account_id = AccountId("mutation-boundary".into());
+    let control = engine
+        .attach(
+            account_id.clone(),
+            Arc::new(FlagsFactory(campaign_account(Arc::clone(&state)))),
+        )
+        .await
+        .expect("attach");
+    let campaign_engine = Arc::clone(&engine);
+    let campaign_id = account_id.clone();
+    let campaign = tokio::spawn(async move {
+        campaign_engine
+            .bulk_set_flags(
+                &campaign_id,
+                vec![ObjectId("one".into())],
+                FlagOp::Add(set(&["\\Seen"])),
+                &vendor(),
+                ProtocolKind::Imap,
+            )
+            .await
+    });
+
+    state.submitted.notified().await;
+    control.pause().await.expect("pause");
+    tokio::task::yield_now().await;
+    tokio::time::advance(std::time::Duration::from_secs(10)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(state.submissions.load(Ordering::SeqCst), 1);
+
+    control.resume();
+    let counters = campaign.await.expect("campaign task").expect("campaign");
+    assert_eq!(counters.applied, 1);
+    assert_eq!(counters.pending_retry, 0);
+    assert_eq!(state.submissions.load(Ordering::SeqCst), 2);
+    {
+        let keys = state.keys.lock().expect("keys lock");
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0].run_id, keys[1].run_id);
+        assert_eq!(keys[0].sequence, keys[1].sequence);
+        assert_eq!(keys[0].protocol_salt, keys[1].protocol_salt);
+    }
+    engine.detach(&account_id).await.expect("detach");
+}
+
+#[tokio::test(start_paused = true)]
+async fn detach_abandons_a_parked_campaign() {
+    let state = Arc::new(CampaignState::default());
+    let engine = Arc::new(SyncEngine::builder().build().expect("engine"));
+    let account_id = AccountId("mutation-shutdown".into());
+    let control = engine
+        .attach(
+            account_id.clone(),
+            Arc::new(FlagsFactory(campaign_account(Arc::clone(&state)))),
+        )
+        .await
+        .expect("attach");
+    let campaign_engine = Arc::clone(&engine);
+    let campaign_id = account_id.clone();
+    let campaign = tokio::spawn(async move {
+        campaign_engine
+            .bulk_set_flags(
+                &campaign_id,
+                vec![ObjectId("one".into())],
+                FlagOp::Add(set(&["\\Seen"])),
+                &vendor(),
+                ProtocolKind::Imap,
+            )
+            .await
+    });
+
+    state.submitted.notified().await;
+    control.pause().await.expect("pause");
+    engine.detach(&account_id).await.expect("detach");
+    assert!(matches!(
+        campaign.await.expect("campaign task"),
+        Err(Error::ShuttingDown)
+    ));
+    assert_eq!(state.submissions.load(Ordering::SeqCst), 1);
 }

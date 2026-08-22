@@ -27,7 +27,6 @@ use tokio_util::sync::CancellationToken;
 
 use crate::backfill::{
     BackfillPolicy, BackfillRegistry, BackfillRunner, BackfillState, BackfillStrategy,
-    LiveSupersedes,
 };
 use crate::cancel::{Boundary, BoundaryRequest};
 use crate::control::{SyncActivityGuard, SyncControl};
@@ -38,7 +37,6 @@ use crate::multiplexer::{
     AckRequest, Multiplexer, MultiplexerEvent, MultiplexerHandle, ReopenRequest,
 };
 use crate::push::{InvalidationSinkInner, RegisteredSubscription, SubscriptionRegistry};
-use crate::scheduler::{BudgetGate, ConcurrencyBudget, Scheduler};
 use crate::types::{AccountSlot, BackfillConfig, EngineConfig, WorkerTask};
 
 /// Top-level engine.
@@ -49,7 +47,6 @@ pub struct SyncEngine {
     backfill_registry: Arc<BackfillRegistry>,
     sink: Arc<InvalidationSinkInner>,
     subscriptions: Arc<SubscriptionRegistry>,
-    scheduler: Scheduler,
     root_cancel: CancellationToken,
     /// Optional bandwidth meter wired through `bifrost-net`. When
     /// present, `attach` spawns a periodic bandwidth-feed task per
@@ -91,7 +88,7 @@ impl std::fmt::Debug for SyncEngine {
 }
 
 /// Builder for `SyncEngine`. Lets the consumer pre-configure the
-/// concurrency budget, checkpoint store, and tuning knobs before any
+/// checkpoint store and tuning knobs before any
 /// account is attached.
 pub struct SyncEngineBuilder {
     config: EngineConfig,
@@ -107,12 +104,6 @@ impl SyncEngineBuilder {
             checkpoints: None,
             bandwidth_meter: None,
         }
-    }
-
-    #[must_use]
-    pub fn budget(mut self, budget: ConcurrencyBudget) -> Self {
-        self.config.budget = budget;
-        self
     }
 
     #[must_use]
@@ -137,16 +128,9 @@ impl SyncEngineBuilder {
     }
 
     pub fn build(self) -> Result<SyncEngine, Error> {
-        self.config.budget.validate()?;
         let checkpoints = self
             .checkpoints
             .unwrap_or_else(|| Arc::new(InMemoryCheckpointStore::new()));
-        let budget_gate = BudgetGate::new(self.config.budget);
-        let scheduler = Scheduler::with_lane_capacity(
-            self.config.scheduler,
-            budget_gate,
-            self.config.lane_capacity,
-        );
         Ok(SyncEngine {
             config: self.config,
             checkpoints,
@@ -154,7 +138,6 @@ impl SyncEngineBuilder {
             backfill_registry: Arc::new(BackfillRegistry::new()),
             sink: Arc::new(InvalidationSinkInner::new()),
             subscriptions: Arc::new(SubscriptionRegistry::new()),
-            scheduler,
             root_cancel: CancellationToken::new(),
             bandwidth_meter: self.bandwidth_meter,
             ack_senders: DashMap::new(),
@@ -395,7 +378,6 @@ impl SyncEngine {
         self.ack_senders.insert(account_id.clone(), ack_tx.clone());
 
         // Register per-account budget semaphores.
-        self.scheduler.budget().register(account_id.clone());
         if let Some(meter) = &self.bandwidth_meter {
             meter.register_account(account_id.clone());
         }
@@ -631,17 +613,10 @@ impl SyncEngine {
         // scopes and runs one `BackfillRunner::run_partition` per
         // scope under a default policy. Items + checkpoints flow onto
         // the same per-account broadcast.
-        // The de-dup set the partition runner filters against. Nothing
-        // populates it - see the `LiveSupersedes` type docs for why
-        // broadcasting a live change is not evidence the consumer got
-        // it, and therefore not a sound basis for suppressing that
-        // object's inventory copy.
-        let live_supersedes = Arc::new(LiveSupersedes::new());
         let backfill_registry_handle = Arc::clone(&self.backfill_registry);
         let bf_account = Arc::clone(&current);
         let bf_account_id = account_id.clone();
         let bf_cursors = Arc::clone(&cursors);
-        let bf_live = Arc::clone(&live_supersedes);
         let bf_store = Arc::clone(&self.checkpoints);
         let bf_shutdown = shutdown.clone();
         let bf_changes = changes_tx.clone();
@@ -658,7 +633,6 @@ impl SyncEngine {
                 bf_account,
                 bf_account_id,
                 bf_cursors,
-                bf_live,
                 bf_store,
                 backfill_registry_handle,
                 bf_shutdown,
@@ -989,7 +963,6 @@ impl SyncEngine {
             );
         }
         self.sink.unregister(account_id);
-        self.scheduler.budget().forget(account_id);
         self.backfill_registry.forget_account(account_id);
         if let Ok(mut throttles) = self.throttles.lock() {
             throttles.forget_account(account_id);
@@ -1247,238 +1220,14 @@ impl SyncEngine {
         vendor: &crate::mutation::IdempotencyVendor,
         protocol: bifrost_types::ProtocolKind,
     ) -> Result<crate::mutation::MutationCounters, Error> {
-        use crate::recovery::{RecoveryPlan, plan_recovery};
-        let slot = self
-            .accounts
-            .get(account_id)
-            .map(|r| Arc::clone(r.value()))
-            .ok_or_else(|| Error::AccountNotAttached(account_id.clone()))?;
-        let max_retries = self.config.mutation_max_retries;
-
-        let key = vendor.next(protocol);
-
-        let mut outcomes: HashMap<bifrost_types::ObjectId, MutationBucket> = HashMap::new();
-        let mut retry_ids: Vec<bifrost_types::ObjectId> = Vec::new();
-        let mut dedupe_count: u64 = 0;
-        let mut remaining: Vec<bifrost_types::ObjectId> = targets;
-        let mut attempt: u32 = 0;
-        let mut retry_advice: Option<RetryAdvice> = None;
-        let mut blocked_by_engine: bool = false;
-        let mut forwarded_directives: HashSet<DirectiveKey> = HashSet::new();
-
-        loop {
-            if let Some(advice) = retry_advice.take() {
-                let delay = crate::recovery::retry_delay(
-                    &advice,
-                    std::time::SystemTime::now(),
-                    Duration::from_secs(1),
-                );
-                tokio::time::sleep(delay).await;
-            }
-            // Honor any account-wide throttle deadline (recorded by
-            // this campaign's previous attempt, a poll, or a sibling
-            // account via a shared key) before submitting. Re-checked
-            // after waking: a longer deadline can land mid-sleep.
-            while let Some(wait) = crate::recovery::account_throttle_wait(
-                &slot.throttles,
-                account_id,
-                std::time::SystemTime::now(),
-            ) {
-                tokio::time::sleep(wait).await;
-            }
-
-            let account = slot.current.load_full();
-            let target_stream: AccountStream<bifrost_types::ObjectId> =
-                Box::pin(futures::stream::iter(remaining.clone()));
-            let mut stream = account.bulk_set_flags(target_stream, op.clone(), key.clone());
-            // Only the retry queue is per-attempt. Read-back membership
-            // is derived from `outcomes` after the campaign ends, so an
-            // id parked in the read-back lane survives an attempt that
-            // resubmits its siblings.
-            retry_ids.clear();
-            let mut stream_termination_advice: Option<RetryAdvice> = None;
-
-            while let Some(event) = stream.next().await {
-                match event {
-                    bifrost_types::SyncEvent::Batch(batch) => {
-                        for item in batch.items {
-                            if let Some((directive, error)) = classify_item_outcome(
-                                item,
-                                &mut outcomes,
-                                &mut retry_ids,
-                                &mut dedupe_count,
-                                &slot.throttles,
-                                account_id,
-                            ) {
-                                if should_forward_engine_recovery(
-                                    &mut forwarded_directives,
-                                    &directive,
-                                ) {
-                                    let scope = crate::recovery::directive_target_scope(&directive);
-                                    let _ = slot
-                                        .reopen_tx
-                                        .send(ReopenRequest::Recovery { scope, error })
-                                        .await;
-                                }
-                                blocked_by_engine = true;
-                            }
-                        }
-                    }
-                    bifrost_types::SyncEvent::Terminated(err) => {
-                        // Plan the recovery on the stream-level
-                        // terminating error and dispatch. Retry /
-                        // Reconcile let the campaign continue; Engine
-                        // routes through the reopen channel so the
-                        // engine performs the directive (restart,
-                        // downgrade, schema clear, etc.) and the
-                        // campaign returns the partial outcome. Clone
-                        // so the engine arm can forward the original
-                        // error through the reopen channel without
-                        // losing it to `plan_recovery`'s consume.
-                        let original = err.clone();
-                        match plan_recovery(err) {
-                            RecoveryPlan::Retry(advice) => {
-                                queue_unresolved_for_retry(&remaining, &outcomes, &mut retry_ids);
-                                // Share the throttle deadline before the
-                                // next attempt sleeps it off locally.
-                                crate::recovery::record_throttle(
-                                    &slot.throttles,
-                                    account_id,
-                                    &advice,
-                                    &original,
-                                );
-                                stream_termination_advice = Some(advice);
-                                break;
-                            }
-                            RecoveryPlan::Reconcile(advice) => {
-                                let mut wants_dedupe = false;
-                                for action in &advice.guidance.actions {
-                                    match action {
-                                        ReconcileAction::CheckTarget => {}
-                                        ReconcileAction::DedupeByClientId => wants_dedupe = true,
-                                        _ => {}
-                                    }
-                                }
-                                for id in &remaining {
-                                    if !matches!(
-                                        outcomes.get(id),
-                                        Some(
-                                            MutationBucket::Applied
-                                                | MutationBucket::Skipped
-                                                | MutationBucket::FailedTerminal
-                                        )
-                                    ) {
-                                        // PendingReadback both queues the id
-                                        // for the guard and makes
-                                        // `counters_from_outcomes` count it
-                                        // alongside other read-back-queued
-                                        // items. Without this insert the
-                                        // counter rebalance would underflow
-                                        // when read-back resolves these ids
-                                        // to skipped/still_failed.
-                                        outcomes
-                                            .insert(id.clone(), MutationBucket::PendingReadback);
-                                    }
-                                }
-                                if wants_dedupe {
-                                    dedupe_count = dedupe_count.saturating_add(1);
-                                    let warning = bifrost_types::Warning::user_safe(
-                                        bifrost_types::WarningKind::OperatorAttentionNeeded,
-                                        "reconcile requested dedupe-by-client-id; consumer must dedupe",
-                                    );
-                                    let me = MultiplexerEvent {
-                                        scope: CursorScope::Account,
-                                        event: Arc::new(SyncEvent::Warning(warning)),
-                                        checkpoint: None,
-                                    };
-                                    let _ = slot.multiplexer.changes_tx.send(me);
-                                }
-                                break;
-                            }
-                            RecoveryPlan::Engine(directive) => {
-                                let directive_scope =
-                                    crate::recovery::directive_target_scope(&directive);
-                                let _ = slot
-                                    .reopen_tx
-                                    .send(ReopenRequest::Recovery {
-                                        scope: directive_scope,
-                                        error: original,
-                                    })
-                                    .await;
-                                blocked_by_engine = true;
-                                // Every still-unresolved id is blocked
-                                // by the engine directive; record so
-                                // the partial outcome surfaces them.
-                                for id in &remaining {
-                                    if !matches!(
-                                        outcomes.get(id),
-                                        Some(
-                                            MutationBucket::Applied
-                                                | MutationBucket::Skipped
-                                                | MutationBucket::FailedTerminal
-                                        )
-                                    ) {
-                                        outcomes
-                                            .insert(id.clone(), MutationBucket::BlockedByEngine);
-                                    }
-                                }
-                                break;
-                            }
-                            RecoveryPlan::Terminal(fatal) => {
-                                return Err(Error::Account(fatal.into_inner()));
-                            }
-                        }
-                    }
-                    bifrost_types::SyncEvent::Done(_) => break,
-                    bifrost_types::SyncEvent::Progress(_)
-                    | bifrost_types::SyncEvent::Warning(_) => {}
-                    _ => {}
-                }
-            }
-
-            if blocked_by_engine {
-                break;
-            }
-
-            attempt = attempt.saturating_add(1);
-            let retry_set: HashSet<_> = retry_ids.iter().cloned().collect();
-            let mut next_remaining: Vec<bifrost_types::ObjectId> = remaining
-                .iter()
-                .filter(|id| retry_set.contains(*id))
-                .cloned()
-                .collect();
-            if attempt < max_retries && !next_remaining.is_empty() {
-                retry_advice = stream_termination_advice;
-                std::mem::swap(&mut remaining, &mut next_remaining);
-                continue;
-            }
-            // No more attempts. Anything still in `retry_ids` stays
-            // pending so the read-back guard can decide applied vs
-            // failed_terminal.
-            for id in &retry_set {
-                outcomes.insert(id.clone(), MutationBucket::PendingRetry);
-            }
-            break;
-        }
-
-        let mut totals = counters_from_outcomes(&outcomes);
-        for _ in 0..dedupe_count {
-            totals.record_dedupe_by_client_id();
-        }
-        let readback_ids = unresolved_readback_ids(&outcomes);
-        if !readback_ids.is_empty() {
-            let account = slot.current.load_full();
-            let outcome =
-                crate::mutation::run_readback_guard(account.as_ref().as_ref(), readback_ids, &op)
-                    .await?;
-            totals.pending_retry = totals
-                .pending_retry
-                .saturating_sub(outcome.skipped)
-                .saturating_sub(outcome.still_failed);
-            totals.skipped = totals.skipped.saturating_add(outcome.skipped);
-            totals.failed_terminal = totals.failed_terminal.saturating_add(outcome.still_failed);
-        }
-        Ok(totals)
+        self.run_bulk_pipeline(
+            account_id,
+            targets,
+            BulkPipelineOp::SetFlags(op),
+            vendor,
+            protocol,
+        )
+        .await
     }
 
     /// Drive a single-account bulk-move campaign against an attached
@@ -1609,24 +1358,42 @@ impl SyncEngine {
                     std::time::SystemTime::now(),
                     Duration::from_secs(1),
                 );
-                tokio::time::sleep(delay).await;
+                tokio::select! {
+                    () = slot.shutdown.cancelled() => return Err(Error::ShuttingDown),
+                    () = tokio::time::sleep(delay) => {}
+                }
             }
             // Honor any account-wide throttle deadline (recorded by
             // this campaign's previous attempt, a poll, or a sibling
             // account via a shared key) before submitting. Re-checked
             // after waking: a longer deadline can land mid-sleep.
-            while let Some(wait) = crate::recovery::account_throttle_wait(
-                &slot.throttles,
-                account_id,
-                std::time::SystemTime::now(),
-            ) {
-                tokio::time::sleep(wait).await;
-            }
+            let _activity = loop {
+                if !slot.control.wait_until_running(&slot.shutdown).await {
+                    return Err(Error::ShuttingDown);
+                }
+                if let Some(wait) = crate::recovery::account_throttle_wait(
+                    &slot.throttles,
+                    account_id,
+                    std::time::SystemTime::now(),
+                ) {
+                    tokio::select! {
+                        () = slot.shutdown.cancelled() => return Err(Error::ShuttingDown),
+                        () = tokio::time::sleep(wait) => {}
+                    }
+                    continue;
+                }
+                if let Some(activity) = slot.control.begin_activity() {
+                    break activity;
+                }
+            };
 
             let account = slot.current.load_full();
             let target_stream: AccountStream<bifrost_types::ObjectId> =
                 Box::pin(futures::stream::iter(remaining.clone()));
             let mut stream = match &op {
+                BulkPipelineOp::SetFlags(flag_op) => {
+                    account.bulk_set_flags(target_stream, flag_op.clone(), key.clone())
+                }
                 BulkPipelineOp::Move {
                     destination,
                     source,
@@ -1645,7 +1412,14 @@ impl SyncEngine {
             retry_ids.clear();
             let mut stream_termination_advice: Option<RetryAdvice> = None;
 
-            while let Some(event) = stream.next().await {
+            loop {
+                let event = tokio::select! {
+                    () = slot.shutdown.cancelled() => return Err(Error::ShuttingDown),
+                    event = stream.next() => event,
+                };
+                let Some(event) = event else {
+                    break;
+                };
                 match event {
                     bifrost_types::SyncEvent::Batch(batch) => {
                         for item in batch.items {
@@ -1790,23 +1564,45 @@ impl SyncEngine {
         }
         let readback_ids = unresolved_readback_ids(&outcomes);
         if !readback_ids.is_empty() {
+            let _activity = loop {
+                if !slot.control.wait_until_running(&slot.shutdown).await {
+                    return Err(Error::ShuttingDown);
+                }
+                if let Some(activity) = slot.control.begin_activity() {
+                    break activity;
+                }
+            };
             let account = slot.current.load_full();
-            let outcome = match &op {
-                BulkPipelineOp::Move { destination, .. } => {
-                    crate::mutation::run_move_readback_guard(
-                        account.as_ref().as_ref(),
-                        readback_ids,
-                        destination,
-                    )
-                    .await?
+            let readback = async {
+                match &op {
+                    BulkPipelineOp::SetFlags(flag_op) => {
+                        crate::mutation::run_readback_guard(
+                            account.as_ref().as_ref(),
+                            readback_ids,
+                            flag_op,
+                        )
+                        .await
+                    }
+                    BulkPipelineOp::Move { destination, .. } => {
+                        crate::mutation::run_move_readback_guard(
+                            account.as_ref().as_ref(),
+                            readback_ids,
+                            destination,
+                        )
+                        .await
+                    }
+                    BulkPipelineOp::Destroy => {
+                        crate::mutation::run_destroy_readback_guard(
+                            account.as_ref().as_ref(),
+                            readback_ids,
+                        )
+                        .await
+                    }
                 }
-                BulkPipelineOp::Destroy => {
-                    crate::mutation::run_destroy_readback_guard(
-                        account.as_ref().as_ref(),
-                        readback_ids,
-                    )
-                    .await?
-                }
+            };
+            let outcome = tokio::select! {
+                () = slot.shutdown.cancelled() => return Err(Error::ShuttingDown),
+                outcome = readback => outcome?,
             };
             totals.pending_retry = totals
                 .pending_retry
@@ -2763,12 +2559,6 @@ impl SyncEngine {
             .map_err(|_| Error::Other("capabilities lock poisoned".into()))
     }
 
-    /// Scheduler handle for advanced consumers (tests, instrumentation).
-    #[must_use]
-    pub fn scheduler(&self) -> Scheduler {
-        self.scheduler.clone()
-    }
-
     /// Backfill registry handle.
     #[must_use]
     pub fn backfill_registry(&self) -> Arc<BackfillRegistry> {
@@ -2968,10 +2758,6 @@ async fn await_worker_until(deadline: tokio::time::Instant, worker: WorkerTask) 
 /// Backfill orchestrator. Walks the registered cursor scopes and runs
 /// one partition pass per scope via `BackfillRunner::run_partition`.
 ///
-/// The runner uses the slot's shared `LiveSupersedes` set so live
-/// `Created` events from the multiplexer skip over inventory entries
-/// the user has already seen.
-///
 /// Resume: the in-memory `BackfillRegistry` is wiped on detach, so the
 /// only durable record of backfill progress is the consumer-acked
 /// `BackfillCheckpoint` in the `CheckpointStore`. Before walking an
@@ -2985,7 +2771,6 @@ async fn run_backfill_orchestrator(
     account: Arc<ArcSwap<Arc<dyn Account>>>,
     account_id: AccountId,
     cursors: Arc<CursorRegistry>,
-    live: Arc<LiveSupersedes>,
     store: Arc<DynCheckpointStore>,
     registry: Arc<BackfillRegistry>,
     shutdown: CancellationToken,
@@ -3076,7 +2861,6 @@ async fn run_backfill_orchestrator(
                             &account_id,
                             scope.clone(),
                             partition,
-                            &live,
                             changes_tx.clone(),
                             &control,
                             &shutdown,
@@ -3174,7 +2958,6 @@ async fn run_backfill_orchestrator(
                             &account_id,
                             scope.clone(),
                             partition,
-                            &live,
                             changes_tx.clone(),
                             &control,
                             &shutdown,
@@ -3342,7 +3125,6 @@ async fn run_backfill_partition_at_boundary(
     account_id: &AccountId,
     scope: CursorScope,
     partition: InventoryPartition,
-    live: &Arc<LiveSupersedes>,
     changes_tx: Option<broadcast::Sender<MultiplexerEvent>>,
     control: &SyncControl,
     shutdown: &CancellationToken,
@@ -3381,7 +3163,6 @@ async fn run_backfill_partition_at_boundary(
             current.as_ref().as_ref(),
             scope.clone(),
             partition.clone(),
-            live.as_ref(),
             changes_tx.clone(),
             crate::cursor::ENGINE_VERSION,
             Some(control),
@@ -4878,11 +4659,13 @@ impl Drop for SyncEngine {
 /// Which bulk mutation a [`SyncEngine::run_bulk_pipeline`] run drives.
 ///
 /// Selects the two op-specific seams in the shared pipeline: the wire
-/// submit call (`Account::bulk_move` vs `Account::bulk_destroy`) and the
+/// submit call and the
 /// matching read-back guard (membership vs absence). Everything else in
 /// the idempotency / retry / recovery loop is identical to
-/// `bulk_set_flags`.
+/// operation-specific read-back guard.
 enum BulkPipelineOp {
+    /// Apply `op` through `Account::bulk_set_flags`.
+    SetFlags(bifrost_types::FlagOp),
     /// Route every target into `destination` (and, when the consumer
     /// knows it, out of `source`) via `Account::bulk_move_from`.
     Move {
