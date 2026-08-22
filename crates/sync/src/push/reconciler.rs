@@ -202,6 +202,7 @@ impl Reconciler {
                     () = tokio::time::sleep(wait) => {}
                 }
             }
+            let drive = self.cursors.claim_drive(&scope).await;
             let Some(cursor) = self.cursors.snapshot(&scope) else {
                 continue;
             };
@@ -219,6 +220,7 @@ impl Reconciler {
                 self.boundary.clone(),
                 Some(self.control.clone()),
                 self.ack_tx.clone(),
+                Some(drive.registry_generation()),
             )
             .await?;
             match outcome {

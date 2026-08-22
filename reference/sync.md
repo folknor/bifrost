@@ -166,6 +166,17 @@ wire cost is worth paying) is consumer policy - the engine does not
 schedule speculative reopens on its own. A generation watch wakes
 the push and lifecycle readers even when their old streams never end.
 
+Cursor and membership topology live under one registry state lock, so
+reattach replaces both atomically. The same replacement increments a
+registry generation while holding that lock. Every live change drive
+captures the generation with its scope lease and conditionally publishes
+the batch and installs its cursor together under the state lock. The swap
+also overlays the final live cursor snapshot onto every retained scope.
+A batch from an old handle that finishes after cutover is therefore fenced
+out before broadcast or durable ack, instead of rolling either cursor copy
+backward. This fencing avoids waiting for an unbounded old stream during
+reopen.
+
 ## Page loss lanes
 
 `Page<T>` carries two lanes beside `items`: `failed_ids` (resources the
@@ -239,6 +250,13 @@ poll iteration starts from the freshly-yielded cursor. It does
 NOT write to `CheckpointStore`. Durable persistence is consumer-
 ack-driven:
 
+Polling and push reconciliation claim the same async drive lease for
+each `CursorScope` before snapshotting its cursor and hold it through
+the stream drive. This makes lane + scope a single-producer channel:
+the next producer starts from the cursor installed by the previous one,
+and checkpoint supersession cannot retire another producer's unacked
+batch.
+
 1. Consumer subscribes via `account_changes_stream`, receives a
    `MultiplexerEvent { scope, event, checkpoint }`.
 2. Consumer atomically persists `(items, checkpoint)` in their
@@ -278,6 +296,28 @@ change cursor in the registry.
 
 `ChangesEvent` is the per-batch outcome returned by the driver:
 `Advanced` / `Done` / `Stopped` / `Paused` / `Terminated(AccountError)`.
+
+`account_changes_stream` returns `ChangesReceiver`, which preserves the
+ordinary broadcast `recv` / `try_recv` shape but converts ring overflow
+into a synthetic account-scoped `OperatorAttentionNeeded` warning. The
+warning carries the overwritten batch count and directs the consumer to
+reconcile from its last acknowledged checkpoint; retained ring entries
+remain readable afterward. The engine cannot replay the overwritten
+batches in-session, but it never presents that loss as success.
+
+Observing a lag also abandons the account's outstanding checkpoint
+registrations (`SyncControl::abandon_pending_checkpoints`), and the
+warning's `next_action` reports how many. This is load-bearing, not
+tidy-up: `expect_checkpoint` runs before the send and an entry leaves
+only through a matching consumer ack, so a registration whose batch the
+ring destroyed can never be retired and would gate every later `pause` /
+`checkpoint_now` on the account forever. Surfacing lag without this
+would turn silent in-session loss into a permanent hang. The cost is
+bounded and disclosed: a registration whose batch is still in the ring
+is also abandoned, so a boundary wait taken between the lag and that
+batch's ack reports the previous durable checkpoint rather than the
+newer one. Nothing durable is invented - the snapshot is not advanced -
+and the accompanying warning is what tells the consumer to reconcile.
 
 ## Multiplexer
 
@@ -342,6 +382,11 @@ checkpoint supersession rule in `control.rs` assumes has exactly one.
 Output is a `broadcast::Sender<MultiplexerEvent>`. The event
 carries `{ scope, event: Arc<SyncEvent<Change>>, checkpoint }`.
 
+After publishing any complete stream item, `Pause` returns `Paused` and
+drops the activity guard even when that item carried no checkpoint.
+`CheckpointNow` still waits for a checkpoint-bearing item because its
+request is specifically for a durable cursor boundary.
+
 ## Backfill
 
 `BackfillRunner::run_partition` walks
@@ -357,8 +402,8 @@ broadcast and the consumer's write re-walks the partition on restart
 (the orchestrator always restarts a scope from its first partition),
 so no inventory page is lost. An eager engine-side write would let the
 store record progress the consumer never durably persisted, losing
-that page's objects permanently. The orchestrator spawns runners
-from `discover_cursor_scopes()` and plans partitions from
+that page's objects permanently. The orchestrator continuously rescans
+the cursor registry by scope incarnation and plans partitions from
 `Account::inventory_partitioning(scope)`. Before walking any scope the
 orchestrator parks on `wait_for_real_subscriber` (the same guard the
 deferred-inventory fusion path uses): cold-start pages broadcast onto
@@ -376,6 +421,24 @@ inventory page and the consumer ingests zero objects. The partitioner
 `UidRange` (newest-first chunking), and `PageCount` (page-size
 chunking). `Full` falls through as a single partition; JMAP
 Email currently advertises open-ended `PageCount`.
+
+The deferred-inventory set captured at attach is a structural exclusion:
+the first registry incarnation of each such scope belongs to
+`InventoryFusion` and is never walked again by backfill, regardless of
+which worker wins the subscriber wake. Newly-created scopes and later
+delete + re-establish incarnations are discovered by subsequent scans
+and receive their own pass.
+
+The rescan retires an incarnation only on a durable conclusion: the plan
+ran to completion, or the checkpoint store already carries its
+completion marker. A partition failure or a checkpoint-store read
+failure deliberately leaves the scope `Pending`, so those incarnations
+stay eligible and return on an exponential delay (5s doubling to a 5min
+ceiling) rather than being filtered out for the rest of the attachment -
+otherwise one transient request would cost that scope its whole backfill
+until the next attach. `CursorRegistry::all_scope_incarnations`
+enumerates live cursors and annotates each with its incarnation, so the
+rescan can never plan a walk for a scope the registry has dropped.
 
 Open-ended `PageCount` (`total: None`) drives `BackfillPlan::OpenPages`:
 the orchestrator walks `Page { from, to }` windows of width `chunk`,
@@ -460,8 +523,9 @@ wrong, for two independent reasons:
   `tokio::broadcast`. The slot's sentinel receiver makes `send`
   report success with no consumer attached, a subscriber that
   attaches later starts at the ring's tail, and a lagging
-  subscriber has values overwritten out from under it - this crate
-  has no `Lagged` handling and never replays. Recording on `send`
+  subscriber has values overwritten out from under it. `ChangesReceiver`
+  surfaces the skipped count but the crate still cannot replay those
+  entries. Recording on `send`
   records ids the consumer will never see, and suppressing the
   inventory copy of one of those loses that object for the session,
   since the in-memory cursor has already advanced.
@@ -573,8 +637,23 @@ the replacement set wholesale, so a registration or teardown landing
 inside that window would either be silently erased - orphaning a
 server-side subscription whose handle is connection-local state on
 Graph and IMAP - or resurrect records the consumer just tore down.
-The lock means both calls queue behind an in-flight reopen (including
-one queued behind a pause) rather than racing it.
+The lock means both calls queue behind an active open/swap attempt rather
+than racing it. A reopen queued behind `Pause` does not hold the lock
+while it waits for `Run`, so `unsubscribe_push` remains available for
+shutdown cleanup during an indefinitely paused account.
+
+That property is structural rather than remembered. `open_replacement`
+is the single acquisition site for an open/swap, taking the guard after
+its activity registration and returning it in its `Ok` tuple so it lives
+exactly as long as the open plus the `reattach_account` that consumes
+it. Callers wait for the boundary to read `Run` before calling in and
+hold nothing while they wait, so "hold the reopen lock across a pause"
+is not a shape a caller can write. `handle_engine_directive`'s other
+directives are bounded scope-local repairs that must not interleave with
+a swap, so `handle_account_error` still takes the lock around them - and
+skips it for `RestartAccount` precisely because that path reaches
+`open_replacement`; reintroducing it there deadlocks loudly instead of
+regressing quietly.
 
 Two entry points sit one layer apart and their names read as near
 anagrams of each other, so it is worth naming the difference:
@@ -836,17 +915,11 @@ one of them:
   `Result`. Leaving it pending instead would wedge every later
   `pause` / `checkpoint_now` on the account for the process lifetime.
 - Supersession: a newer broadcast on the same lane + scope replaces
-  the older one. This rests on a single sequential producer per
-  lane+scope, so that acking the newest proves the earlier ones are
-  durable too. Poll-vs-poll is enforced (`ScopeToken` generation
-  matching, above). Poll-vs-push-reconcile is NOT: the push reconciler
-  and the scope's poll task both call `drive_changes_stream` for the
-  same `CursorScope` with no per-scope lease between them, so an
-  invalidation arriving mid-drive gives two producers on one key and
-  the second `expect_checkpoint` evicts the first's still-outstanding
-  entry. `pause()` / `checkpoint_now()` can then report a safe boundary
-  while a broadcast batch is genuinely unacked. Open; the fix is a
-  per-scope lease or a producer-keyed pending set. This bounds the set by the account's scope count
+  the older one. The shared per-scope drive lease makes polling and
+  push reconciliation one sequential producer, while `ScopeToken`
+  generation matching prevents duplicate poll tasks. Acking the newest
+  checkpoint therefore proves the earlier ones from that producer are
+  durable too. This bounds the set by the account's scope count
   instead of by how many batches a consumer left unacked, and lets a
   consumer that acks coarsely (persist N batches, ack the last
   checkpoint) still reach a boundary. `record_checkpoint` removes by

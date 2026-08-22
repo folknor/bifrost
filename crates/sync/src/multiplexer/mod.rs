@@ -62,6 +62,89 @@ pub struct MultiplexerEvent {
     pub checkpoint: Option<Checkpoint>,
 }
 
+/// Consumer-facing receiver that turns broadcast ring overflow into an
+/// observable event. The overwritten batches cannot be replayed in-session,
+/// but loss is never presented as an ordinary successful receive.
+///
+/// The receiver also owns the recovery half of a lag. Batches destroyed by
+/// ring overflow had their checkpoints registered as expected before the
+/// send, and only a consumer ack retires such a registration - so a lag
+/// that merely warned would leave `pause` and `checkpoint_now` waiting for
+/// acks the consumer can no longer produce. Surfacing lag without doing
+/// this would convert in-session data loss into a permanent hang. The
+/// receiver therefore abandons the account's outstanding registrations at
+/// the moment it observes the gap, and reports the count in the warning.
+pub struct ChangesReceiver {
+    inner: broadcast::Receiver<MultiplexerEvent>,
+    control: Option<crate::control::SyncControl>,
+}
+
+/// Every account keeps this many internal receivers alive solely to keep the
+/// broadcast channel open. Publication sites use this helper instead of
+/// duplicating knowledge of that channel topology.
+const SENTINEL_RECEIVERS: usize = 1;
+
+pub(crate) fn delivered_to_real_subscriber(delivered: usize) -> bool {
+    delivered > SENTINEL_RECEIVERS
+}
+
+pub(crate) fn has_real_subscriber(tx: &broadcast::Sender<MultiplexerEvent>) -> bool {
+    tx.receiver_count() > SENTINEL_RECEIVERS
+}
+
+impl ChangesReceiver {
+    pub(crate) fn new(
+        inner: broadcast::Receiver<MultiplexerEvent>,
+        control: Option<crate::control::SyncControl>,
+    ) -> Self {
+        Self { inner, control }
+    }
+
+    pub async fn recv(&mut self) -> Result<MultiplexerEvent, broadcast::error::RecvError> {
+        match self.inner.recv().await {
+            Ok(event) => Ok(event),
+            Err(broadcast::error::RecvError::Lagged(skipped)) => Ok(self.on_lag(skipped)),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn try_recv(&mut self) -> Result<MultiplexerEvent, broadcast::error::TryRecvError> {
+        match self.inner.try_recv() {
+            Ok(event) => Ok(event),
+            Err(broadcast::error::TryRecvError::Lagged(skipped)) => Ok(self.on_lag(skipped)),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn on_lag(&self, skipped: u64) -> MultiplexerEvent {
+        let abandoned = self
+            .control
+            .as_ref()
+            .map_or(0, crate::control::SyncControl::abandon_pending_checkpoints);
+        lag_warning(skipped, abandoned)
+    }
+}
+
+fn lag_warning(skipped: u64, abandoned: usize) -> MultiplexerEvent {
+    let warning = bifrost_types::Warning::user_safe(
+        bifrost_types::WarningKind::OperatorAttentionNeeded,
+        format!(
+            "change stream lagged and lost {skipped} batches; reconcile from the last acknowledged checkpoint"
+        ),
+    )
+    .with_next_action(bifrost_types::DiagnosticText::user_safe(format!(
+        "{abandoned} outstanding checkpoint registrations were abandoned because their batches \
+         can no longer be delivered; re-read from the last durable checkpoint. Boundary waits \
+         (pause / checkpoint_now) stay usable, but the checkpoint they report may predate the \
+         batches that were lost."
+    )));
+    MultiplexerEvent {
+        scope: CursorScope::Account,
+        event: Arc::new(SyncEvent::Warning(warning)),
+        checkpoint: None,
+    }
+}
+
 /// Reopen request raised by per-scope drivers when a stream ends with
 /// an account-side failure. The engine listens on the receiver and
 /// dispatches according to the carried `AccountError`'s recovery.
@@ -715,6 +798,7 @@ async fn spawn_scope_poll_inner(
                 () = tokio::time::sleep(wait) => {}
             }
         }
+        let drive = cursors.claim_drive(&scope).await;
         let Some(cursor) = cursors.snapshot(&scope) else {
             // Scope was removed from the registry; exit cleanly.
             return;
@@ -732,6 +816,7 @@ async fn spawn_scope_poll_inner(
             boundary.clone(),
             Some(control.clone()),
             ack_tx.clone(),
+            Some(drive.registry_generation()),
         )
         .await;
         let recovered = handle_drive_outcome(
@@ -996,6 +1081,131 @@ mod tests {
 
     fn scope_tokens() -> ScopeTokens {
         Arc::new(StdMutex::new(HashMap::new()))
+    }
+
+    fn warning_event(message: &str) -> MultiplexerEvent {
+        MultiplexerEvent {
+            scope: CursorScope::Account,
+            event: Arc::new(SyncEvent::Warning(bifrost_types::Warning::user_safe(
+                bifrost_types::WarningKind::Other,
+                message,
+            ))),
+            checkpoint: None,
+        }
+    }
+
+    fn lag_test_control() -> crate::control::SyncControl {
+        let (boundary, _view) = crate::cancel::Boundary::new();
+        let (priority, _priority_view) =
+            tokio::sync::watch::channel(bifrost_types::Priority::Normal);
+        let (bandwidth, _bandwidth_view) = tokio::sync::watch::channel(None);
+        crate::control::SyncControl::new(
+            bifrost_types::AccountId("lag".into()),
+            boundary,
+            priority,
+            bandwidth,
+        )
+    }
+
+    fn account_change_checkpoint(state: &[u8]) -> Checkpoint {
+        Checkpoint::Change(bifrost_types::ChangeCursor {
+            scope: CursorScope::Account,
+            server_state: bifrost_types::OpaqueChangeState {
+                protocol: bifrost_types::ProtocolKind::Imap,
+                envelope_version: 1,
+                bytes: state.to_vec(),
+            },
+            advanced_through: None,
+            envelope_version: 1,
+        })
+    }
+
+    /// A lag destroys batches whose checkpoints are already registered
+    /// as expected. If the receiver only warned, those registrations
+    /// would gate `pause` / `checkpoint_now` forever: surfacing the loss
+    /// would have converted it into a permanent hang.
+    /// `try_recv` shares the lag path, so it must abandon too - a
+    /// polling consumer that never calls `recv` would otherwise wedge
+    /// the boundary exactly as the awaiting one used to.
+    #[tokio::test]
+    async fn try_recv_takes_the_same_lag_recovery_path() {
+        let (tx, sentinel) = broadcast::channel(1);
+        let control = lag_test_control();
+        let mut receiver = ChangesReceiver::new(tx.subscribe(), Some(control.clone()));
+        control.expect_checkpoint(account_change_checkpoint(b"lost"));
+        tx.send(warning_event("overwritten"))
+            .expect("receivers live");
+        tx.send(warning_event("retained")).expect("receivers live");
+
+        let lag = receiver.try_recv().expect("lag becomes an event");
+        assert!(matches!(
+            lag.event.as_ref(),
+            SyncEvent::Warning(warning)
+                if warning.kind == bifrost_types::WarningKind::OperatorAttentionNeeded
+        ));
+        assert!(
+            control.abandon_pending_checkpoints() == 0,
+            "try_recv's lag must already have abandoned the registration"
+        );
+        drop(sentinel);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn broadcast_lag_releases_boundary_waiters_that_can_never_be_acked() {
+        use bifrost_types::Control as _;
+
+        let (tx, sentinel) = broadcast::channel(1);
+        let control = lag_test_control();
+        let mut receiver = ChangesReceiver::new(tx.subscribe(), Some(control.clone()));
+        control.expect_checkpoint(account_change_checkpoint(b"lost"));
+        tx.send(warning_event("overwritten"))
+            .expect("receivers live");
+        tx.send(warning_event("retained")).expect("receivers live");
+
+        let pause = tokio::spawn({
+            let control = control.clone();
+            async move { control.pause().await }
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !pause.is_finished(),
+            "the outstanding registration must gate the boundary before the lag is observed"
+        );
+
+        let _lag = receiver.recv().await.expect("lag becomes an event");
+        // Bounded so the regression reports as a failure rather than a
+        // hung test: the defect this pins IS an unbounded wait.
+        let released = tokio::time::timeout(std::time::Duration::from_secs(5), pause)
+            .await
+            .expect("a lost batch's registration must stop gating the boundary");
+        assert_eq!(released.expect("pause task").expect("pause"), None);
+        drop(sentinel);
+    }
+
+    #[tokio::test]
+    async fn changes_receiver_surfaces_broadcast_lag_as_operator_warning() {
+        let (tx, sentinel) = broadcast::channel(1);
+        let mut receiver = ChangesReceiver::new(tx.subscribe(), None);
+        tx.send(warning_event("overwritten"))
+            .expect("receivers live");
+        tx.send(warning_event("retained")).expect("receivers live");
+
+        let lag = receiver.recv().await.expect("lag becomes an event");
+        assert!(matches!(
+            lag.event.as_ref(),
+            SyncEvent::Warning(warning)
+                if warning.kind == bifrost_types::WarningKind::OperatorAttentionNeeded
+        ));
+        let retained = receiver
+            .recv()
+            .await
+            .expect("retained event follows warning");
+        assert!(matches!(
+            retained.event.as_ref(),
+            SyncEvent::Warning(warning)
+                if warning.kind == bifrost_types::WarningKind::Other
+        ));
+        drop(sentinel);
     }
 
     fn track(tokens: &ScopeTokens, scope: &CursorScope) -> u64 {

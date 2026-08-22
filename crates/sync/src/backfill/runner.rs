@@ -305,7 +305,7 @@ impl BackfillRunner {
                             control.expect_checkpoint(expected.clone());
                         }
                         let delivered = tx.send(me).unwrap_or(0);
-                        if delivered <= 1
+                        if !crate::multiplexer::delivered_to_real_subscriber(delivered)
                             && let Some(control) = control
                         {
                             control.retire_checkpoint(&expected);

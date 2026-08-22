@@ -197,6 +197,55 @@ impl SyncControl {
         self.publish_quiescence(generation);
     }
 
+    /// The consumer's view of the broadcast stream lost batches: the
+    /// per-account ring overwrote entries before this subscriber read
+    /// them. Retire every outstanding broadcast registration.
+    ///
+    /// This is not a nicety. `expect_checkpoint` is called before the
+    /// send, and an entry only leaves through the matching consumer
+    /// ack. Batches destroyed by ring overflow are never delivered, so
+    /// their acks can never arrive, and every later `pause` /
+    /// `checkpoint_now` on this account would wait forever - trading
+    /// silent in-session data loss for a permanent hang, which is the
+    /// worse failure. After a lag the consumer's view is definitionally
+    /// incomplete, so no outstanding registration can be trusted to
+    /// produce an ack; the whole set goes.
+    ///
+    /// Retiring an entry whose batch is still in the ring is safe: the
+    /// consumer will still receive it and still ack it, and
+    /// `record_checkpoint` advances the durable snapshot for a
+    /// checkpoint it no longer tracks as pending. The cost is that a
+    /// `pause` between the lag and that ack reports the previous
+    /// durable checkpoint instead of the newer one - which is exactly
+    /// what the accompanying `OperatorAttentionNeeded` warning tells
+    /// the consumer to reconcile from. The durable snapshot is
+    /// deliberately not advanced here; nothing became durable.
+    ///
+    /// Returns how many registrations were abandoned, for the warning.
+    pub(crate) fn abandon_pending_checkpoints(&self) -> usize {
+        let abandoned = {
+            let mut pending = match self.inner.pending_checkpoints.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let abandoned = pending.len();
+            pending.clear();
+            abandoned
+        };
+        if abandoned > 0 {
+            tracing::warn!(
+                target: "bifrost.sync.control",
+                account = ?self.inner.account,
+                abandoned,
+                "change stream lagged; abandoning outstanding checkpoint registrations \
+                 that can no longer be acked"
+            );
+        }
+        let generation = self.inner.generation.load(Ordering::SeqCst);
+        self.publish_quiescence(generation);
+        abandoned
+    }
+
     /// Engine-side hook: bandwidth meter feeds observed throughput.
     pub fn observe_bandwidth(&self, bps: u64) {
         self.inner.bandwidth_observed.store(bps, Ordering::Relaxed);
@@ -612,6 +661,24 @@ mod tests {
         assert!(
             control.wait_until_running(&CancellationToken::new()).await,
             "a dropped checkpoint request must not park the engine's workers"
+        );
+    }
+
+    /// Ring overflow destroys batches whose acks were already
+    /// registered as expected. Without abandonment those registrations
+    /// gate every later boundary wait on this account forever.
+    #[tokio::test]
+    async fn abandoning_after_a_lag_unwedges_the_boundary() {
+        let control = control();
+        control.expect_checkpoint(checkpoint(b"lost-to-ring-overflow"));
+        control.expect_checkpoint(backfill_checkpoint(CursorScope::Account, b"page:0:500"));
+
+        assert_eq!(control.abandon_pending_checkpoints(), 2);
+        assert_eq!(pending_len(&control), 0);
+        assert_eq!(
+            control.pause().await.expect("pause"),
+            None,
+            "abandonment must not invent a durable checkpoint"
         );
     }
 

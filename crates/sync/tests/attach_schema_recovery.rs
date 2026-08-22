@@ -1505,6 +1505,18 @@ async fn reopen_waits_for_resume_without_opening_during_pause() {
         "reopen must not open or establish a replacement while paused"
     );
 
+    // The queued reopen must not retain the subscription-serialization
+    // lock while it waits for Run. This is the cleanup ordering consumers
+    // use before detach; if the lock is held, this future cannot complete
+    // until the resume below and the test deterministically takes the yield
+    // arm instead.
+    let mut unsubscribe = Box::pin(engine.unsubscribe_push(&account_id));
+    tokio::select! {
+        biased;
+        result = &mut unsubscribe => result.expect("paused reopen leaves push teardown available"),
+        () = tokio::task::yield_now() => panic!("push teardown blocked behind a paused reopen"),
+    }
+
     control.resume();
     reopen.await.expect("queued reopen completes after resume");
     assert_eq!(

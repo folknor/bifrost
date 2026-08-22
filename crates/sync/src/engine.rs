@@ -22,7 +22,7 @@ use bifrost_types::{
 };
 use dashmap::DashMap;
 use futures::stream::StreamExt;
-use tokio::sync::{Mutex as AsyncMutex, Notify, broadcast, mpsc, oneshot, watch};
+use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedMutexGuard, broadcast, mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::backfill::{
@@ -649,6 +649,10 @@ impl SyncEngine {
         let bf_config = self.config.backfill;
         let bf_control = control.clone();
         let bf_throttles = Arc::clone(&throttles);
+        let bf_excluded: HashSet<CursorScope> = deferred_inventory_scopes
+            .iter()
+            .map(|inventory| inventory.scope().clone())
+            .collect();
         spawn(tokio::spawn(async move {
             run_backfill_orchestrator(
                 bf_account,
@@ -663,6 +667,7 @@ impl SyncEngine {
                 bf_config,
                 bf_control,
                 bf_throttles,
+                bf_excluded,
             )
             .await;
         }));
@@ -1027,13 +1032,16 @@ impl SyncEngine {
             open_skips: &slot.open_skips,
             shutdown: &slot.shutdown,
         };
-        let _reopen_guard = slot.reopen_lock.lock().await;
         loop {
             if !slot.control.wait_until_running(&slot.shutdown).await {
                 return Err(Error::ShuttingDown);
             }
             match open_replacement(&ctx).await {
-                Ok((activity, next)) => return reattach_account(&ctx, activity, next).await,
+                Ok((reopen_guard, activity, next)) => {
+                    let result = reattach_account(&ctx, activity, next).await;
+                    drop(reopen_guard);
+                    return result;
+                }
                 // A pause won the race between the wait above and the activity
                 // registration, and nothing was opened. Keep this public
                 // request queued until the account runs again.
@@ -1074,7 +1082,7 @@ impl SyncEngine {
     pub fn account_changes_stream(
         &self,
         account_id: &AccountId,
-    ) -> Result<broadcast::Receiver<MultiplexerEvent>, Error> {
+    ) -> Result<crate::multiplexer::ChangesReceiver, Error> {
         let slot = self
             .accounts
             .get(account_id)
@@ -1083,7 +1091,10 @@ impl SyncEngine {
         // Wake any deferred-inventory workers parked on the Notify so
         // they observe the new subscriber without hot-polling.
         slot.subscriber_notify.notify_waiters();
-        Ok(rx)
+        Ok(crate::multiplexer::ChangesReceiver::new(
+            rx,
+            Some(slot.control.clone()),
+        ))
     }
 
     /// Subscribe to the per-account control stream. Engine publishes
@@ -2983,6 +2994,7 @@ async fn run_backfill_orchestrator(
     config: BackfillConfig,
     control: SyncControl,
     throttles: Arc<std::sync::Mutex<crate::recovery::ThrottleBucket>>,
+    fusion_owned_scopes: HashSet<CursorScope>,
 ) {
     // Cold-start backfill pages broadcast onto the per-account channel
     // during `attach`, but a consumer can only call
@@ -3003,224 +3015,324 @@ async fn run_backfill_orchestrator(
     {
         return;
     }
-    // Snapshot only Ready scopes. EstablishViaInventory scopes are
-    // owned by the concurrent fusion worker, which broadcasts their
-    // cold-start inventory while minting the cursor. Adding them to
-    // this already-running plan after fusion would double-walk and
-    // double-publish the same scope.
-    let scopes = cursors.all_scopes();
-    for scope in scopes {
-        if shutdown.is_cancelled() {
-            return;
-        }
-        let acc_arc = account.load_full();
-        let acc: &dyn Account = acc_arc.as_ref().as_ref();
-        match backfill_plan_for(acc, &scope, config) {
-            BackfillPlan::Fixed(partitions) => {
-                // Skip a scope whose backfill already completed on a prior
-                // run. A fixed plan has no positional "resume from here"
-                // (its partitions are a known, finite set, not an open page
-                // walk), so the durable signal is binary: the completion
-                // marker is present (skip the whole plan) or it is not
-                // (walk every partition; re-emitting acked pages is
-                // idempotent, so a crash mid-plan simply re-walks).
-                match store.get_backfill(&account_id, &scope).await {
-                    Ok(opt) => {
-                        if backfill_complete_recorded(opt.as_ref()) {
-                            registry.mark(
-                                account_id.clone(),
-                                scope.clone(),
-                                BackfillState::Completed,
-                            );
-                            continue;
-                        }
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            target: "bifrost.sync.backfill",
-                            scope = ?scope,
-                            error = %err,
-                            "backfill resume read failed; re-walking all partitions"
-                        );
-                    }
-                }
-                registry.mark(account_id.clone(), scope.clone(), BackfillState::Running);
-                let mut completed = true;
-                let mut total_seen = 0_u64;
-                for partition in partitions {
-                    if shutdown.is_cancelled() {
-                        return;
-                    }
-                    let Some(result) = run_backfill_partition_at_boundary(
-                        &account,
-                        &account_id,
-                        scope.clone(),
-                        partition,
-                        &live,
-                        changes_tx.clone(),
-                        &control,
-                        &shutdown,
-                        &throttles,
-                    )
-                    .await
-                    else {
-                        return;
-                    };
-                    match result {
-                        Ok(outcome) => {
-                            total_seen = total_seen.saturating_add(outcome.seen);
+    // Fusion-owned scopes are excluded by identity, not by whether the
+    // fusion worker happened to install their cursor before this scan.
+    // Keep scanning for new scope incarnations for the lifetime of the
+    // attach so lifecycle creation and explicit re-establishment receive
+    // their own cold-start pass.
+    let mut scan = BackfillScan::default();
+    loop {
+        let scopes = scan.select(
+            cursors.all_scope_incarnations(),
+            &fusion_owned_scopes,
+            tokio::time::Instant::now(),
+        );
+        for (scope, incarnation) in scopes {
+            if shutdown.is_cancelled() {
+                return;
+            }
+            let incarnation_key = (scope.clone(), incarnation);
+            let acc_arc = account.load_full();
+            let acc: &dyn Account = acc_arc.as_ref().as_ref();
+            match backfill_plan_for(acc, &scope, config) {
+                BackfillPlan::Fixed(partitions) => {
+                    // Skip a scope whose backfill already completed on a prior
+                    // run. A fixed plan has no positional "resume from here"
+                    // (its partitions are a known, finite set, not an open page
+                    // walk), so the durable signal is binary: the completion
+                    // marker is present (skip the whole plan) or it is not
+                    // (walk every partition; re-emitting acked pages is
+                    // idempotent, so a crash mid-plan simply re-walks).
+                    match store.get_backfill(&account_id, &scope).await {
+                        Ok(opt) => {
+                            if backfill_complete_recorded(opt.as_ref()) {
+                                registry.mark(
+                                    account_id.clone(),
+                                    scope.clone(),
+                                    BackfillState::Completed,
+                                );
+                                scan.settled(incarnation_key);
+                                continue;
+                            }
                         }
                         Err(err) => {
                             tracing::warn!(
                                 target: "bifrost.sync.backfill",
                                 scope = ?scope,
                                 error = %err,
-                                "backfill partition failed; leaving scope Pending"
+                                "backfill resume read failed; re-walking all partitions"
                             );
-                            completed = false;
-                            break;
                         }
                     }
-                }
-                // Persist a durable completion marker through the same
-                // consumer-ack path the page batches use. It is ordered
-                // behind every page, so a crash before its ack re-walks
-                // instead of recording a false completion.
-                if completed
-                    && !emit_backfill_complete(
-                        changes_tx.as_ref(),
-                        &scope,
-                        total_seen,
-                        &control,
-                        &shutdown,
-                    )
-                    .await
-                {
-                    return;
-                }
-                registry.mark(
-                    account_id.clone(),
-                    scope.clone(),
-                    if completed {
-                        BackfillState::Completed
-                    } else {
-                        BackfillState::Pending
-                    },
-                );
-            }
-            BackfillPlan::OpenPages { chunk } => {
-                // Resume from durable progress instead of page 0. The
-                // persisted checkpoint is consumer-acked, so anything it
-                // covers is safe to skip; we never skip a window the consumer
-                // has not durably persisted.
-                let mut from = 0_u32;
-                match store.get_backfill(&account_id, &scope).await {
-                    Ok(opt) => match open_pages_resume(opt.as_ref()) {
-                        OpenPagesResume::Skip => {
-                            registry.mark(
-                                account_id.clone(),
-                                scope.clone(),
-                                BackfillState::Completed,
-                            );
-                            continue;
+                    registry.mark(account_id.clone(), scope.clone(), BackfillState::Running);
+                    let mut completed = true;
+                    let mut total_seen = 0_u64;
+                    for partition in partitions {
+                        if shutdown.is_cancelled() {
+                            return;
                         }
-                        OpenPagesResume::ResumeFrom(position) => from = position,
-                    },
-                    Err(err) => {
-                        // A read failure is not authoritative; fall back to a
-                        // full walk rather than risk skipping unpersisted
-                        // pages.
-                        tracing::warn!(
-                            target: "bifrost.sync.backfill",
-                            scope = ?scope,
-                            error = %err,
-                            "backfill resume read failed; re-walking from page 0"
-                        );
-                    }
-                }
-                registry.mark(account_id.clone(), scope.clone(), BackfillState::Running);
-                let mut completed = true;
-                let mut total_seen = 0_u64;
-                loop {
-                    if shutdown.is_cancelled() {
-                        return;
-                    }
-                    let to = from.saturating_add(chunk);
-                    let partition = InventoryPartition::Page { from, to };
-                    let Some(result) = run_backfill_partition_at_boundary(
-                        &account,
-                        &account_id,
-                        scope.clone(),
-                        partition,
-                        &live,
-                        changes_tx.clone(),
-                        &control,
-                        &shutdown,
-                        &throttles,
-                    )
-                    .await
-                    else {
-                        return;
-                    };
-                    match result {
-                        Ok(outcome) => {
-                            // Terminate only on a genuinely empty page, never
-                            // on a merely short one. A partition stream whose
-                            // server caps a page below the requested `chunk`
-                            // (e.g. a JMAP Email/query cap below the window
-                            // width) returns fewer entries than asked for;
-                            // treating that as exhaustion silently drops every
-                            // later page. So the Page partition stream owes us a
-                            // stronger guarantee than "it filled the window":
-                            // it must yield zero entries ONLY when the scope has
-                            // no more results past `from`. A window whose ids all
-                            // vanished between listing and hydration is NOT
-                            // end-of-inventory, and a stream that stopped there
-                            // would truncate the backfill; implementations are
-                            // required to keep walking past the window until they
-                            // produce an entry or the listing runs dry. Given
-                            // that, `seen == 0` is unambiguous here.
-                            if outcome.seen == 0 {
+                        let Some(result) = run_backfill_partition_at_boundary(
+                            &account,
+                            &account_id,
+                            scope.clone(),
+                            partition,
+                            &live,
+                            changes_tx.clone(),
+                            &control,
+                            &shutdown,
+                            &throttles,
+                        )
+                        .await
+                        else {
+                            return;
+                        };
+                        match result {
+                            Ok(outcome) => {
+                                total_seen = total_seen.saturating_add(outcome.seen);
+                            }
+                            Err(err) => {
+                                tracing::warn!(
+                                    target: "bifrost.sync.backfill",
+                                    scope = ?scope,
+                                    error = %err,
+                                    "backfill partition failed; leaving scope Pending"
+                                );
+                                completed = false;
                                 break;
                             }
-                            total_seen = total_seen.saturating_add(outcome.seen);
-                            from = to;
                         }
+                    }
+                    // Persist a durable completion marker through the same
+                    // consumer-ack path the page batches use. It is ordered
+                    // behind every page, so a crash before its ack re-walks
+                    // instead of recording a false completion.
+                    if completed
+                        && !emit_backfill_complete(
+                            changes_tx.as_ref(),
+                            &scope,
+                            total_seen,
+                            &control,
+                            &shutdown,
+                        )
+                        .await
+                    {
+                        return;
+                    }
+                    registry.mark(
+                        account_id.clone(),
+                        scope.clone(),
+                        if completed {
+                            BackfillState::Completed
+                        } else {
+                            BackfillState::Pending
+                        },
+                    );
+                    scan.record_attempt(incarnation_key, completed);
+                }
+                BackfillPlan::OpenPages { chunk } => {
+                    // Resume from durable progress instead of page 0. The
+                    // persisted checkpoint is consumer-acked, so anything it
+                    // covers is safe to skip; we never skip a window the consumer
+                    // has not durably persisted.
+                    let mut from = 0_u32;
+                    match store.get_backfill(&account_id, &scope).await {
+                        Ok(opt) => match open_pages_resume(opt.as_ref()) {
+                            OpenPagesResume::Skip => {
+                                registry.mark(
+                                    account_id.clone(),
+                                    scope.clone(),
+                                    BackfillState::Completed,
+                                );
+                                scan.settled(incarnation_key);
+                                continue;
+                            }
+                            OpenPagesResume::ResumeFrom(position) => from = position,
+                        },
                         Err(err) => {
+                            // A read failure is not authoritative; fall back to a
+                            // full walk rather than risk skipping unpersisted
+                            // pages.
                             tracing::warn!(
                                 target: "bifrost.sync.backfill",
                                 scope = ?scope,
                                 error = %err,
-                                "backfill page partition failed; leaving scope Pending"
+                                "backfill resume read failed; re-walking from page 0"
                             );
-                            completed = false;
-                            break;
                         }
                     }
+                    registry.mark(account_id.clone(), scope.clone(), BackfillState::Running);
+                    let mut completed = true;
+                    let mut total_seen = 0_u64;
+                    loop {
+                        if shutdown.is_cancelled() {
+                            return;
+                        }
+                        let to = from.saturating_add(chunk);
+                        let partition = InventoryPartition::Page { from, to };
+                        let Some(result) = run_backfill_partition_at_boundary(
+                            &account,
+                            &account_id,
+                            scope.clone(),
+                            partition,
+                            &live,
+                            changes_tx.clone(),
+                            &control,
+                            &shutdown,
+                            &throttles,
+                        )
+                        .await
+                        else {
+                            return;
+                        };
+                        match result {
+                            Ok(outcome) => {
+                                // Terminate only on a genuinely empty page, never
+                                // on a merely short one. A partition stream whose
+                                // server caps a page below the requested `chunk`
+                                // (e.g. a JMAP Email/query cap below the window
+                                // width) returns fewer entries than asked for;
+                                // treating that as exhaustion silently drops every
+                                // later page. So the Page partition stream owes us a
+                                // stronger guarantee than "it filled the window":
+                                // it must yield zero entries ONLY when the scope has
+                                // no more results past `from`. A window whose ids all
+                                // vanished between listing and hydration is NOT
+                                // end-of-inventory, and a stream that stopped there
+                                // would truncate the backfill; implementations are
+                                // required to keep walking past the window until they
+                                // produce an entry or the listing runs dry. Given
+                                // that, `seen == 0` is unambiguous here.
+                                if outcome.seen == 0 {
+                                    break;
+                                }
+                                total_seen = total_seen.saturating_add(outcome.seen);
+                                from = to;
+                            }
+                            Err(err) => {
+                                tracing::warn!(
+                                    target: "bifrost.sync.backfill",
+                                    scope = ?scope,
+                                    error = %err,
+                                    "backfill page partition failed; leaving scope Pending"
+                                );
+                                completed = false;
+                                break;
+                            }
+                        }
+                    }
+                    if completed
+                        && !emit_backfill_complete(
+                            changes_tx.as_ref(),
+                            &scope,
+                            total_seen,
+                            &control,
+                            &shutdown,
+                        )
+                        .await
+                    {
+                        return;
+                    }
+                    registry.mark(
+                        account_id.clone(),
+                        scope.clone(),
+                        if completed {
+                            BackfillState::Completed
+                        } else {
+                            BackfillState::Pending
+                        },
+                    );
+                    scan.record_attempt(incarnation_key, completed);
                 }
-                if completed
-                    && !emit_backfill_complete(
-                        changes_tx.as_ref(),
-                        &scope,
-                        total_seen,
-                        &control,
-                        &shutdown,
-                    )
-                    .await
-                {
-                    return;
-                }
-                registry.mark(
-                    account_id.clone(),
-                    scope.clone(),
-                    if completed {
-                        BackfillState::Completed
-                    } else {
-                        BackfillState::Pending
-                    },
-                );
             }
         }
+        tokio::select! {
+            () = shutdown.cancelled() => return,
+            () = tokio::time::sleep(Duration::from_secs(1)) => {}
+        }
+    }
+}
+
+/// First retry delay for a scope incarnation whose backfill did not
+/// complete, and the ceiling the delay doubles towards.
+const BACKFILL_RETRY_INITIAL: Duration = Duration::from_secs(5);
+const BACKFILL_RETRY_CAP: Duration = Duration::from_secs(300);
+
+/// Which scope incarnations the orchestrator's rescan still owes a
+/// cold-start pass.
+///
+/// The distinction that matters here is settled versus attempted. An
+/// incarnation leaves the rescan permanently only when its backfill
+/// reached a durable conclusion: the plan ran to completion, or the
+/// checkpoint store already carries a completion marker. A partition
+/// failure or a checkpoint-store read failure is transient by
+/// construction - the scope is deliberately left `Pending` so it can be
+/// retried - so filtering it out for the rest of the attachment would
+/// mean one flaky request costs the scope its entire backfill until the
+/// account is reattached. Failed incarnations stay eligible and come
+/// back on an exponential delay, which is what keeps a permanently
+/// failing scope from re-walking on every rescan tick.
+#[derive(Default)]
+struct BackfillScan {
+    /// Incarnations that reached a durable conclusion. Never re-walked.
+    settled: HashSet<(CursorScope, u64)>,
+    /// Fusion-owned scopes whose cold-start incarnation the fusion
+    /// worker already published. Only the first sighting is fusion's;
+    /// a later incarnation of the same scope is a genuine
+    /// re-establishment and gets its own pass.
+    fusion_skipped: HashSet<CursorScope>,
+    /// Failure count plus earliest next attempt, per incarnation.
+    failed: HashMap<(CursorScope, u64), (u32, tokio::time::Instant)>,
+}
+
+impl BackfillScan {
+    fn select(
+        &mut self,
+        available: Vec<(CursorScope, u64)>,
+        fusion_owned: &HashSet<CursorScope>,
+        now: tokio::time::Instant,
+    ) -> Vec<(CursorScope, u64)> {
+        let mut pending = Vec::new();
+        for (scope, incarnation) in available {
+            let key = (scope, incarnation);
+            if self.settled.contains(&key) {
+                continue;
+            }
+            if fusion_owned.contains(&key.0)
+                && !self.failed.contains_key(&key)
+                && self.fusion_skipped.insert(key.0.clone())
+            {
+                // Fusion owns this incarnation's cold-start inventory;
+                // walking it here would double-publish the same scope.
+                self.settled.insert(key);
+                continue;
+            }
+            if self.failed.get(&key).is_some_and(|(_, at)| *at > now) {
+                continue;
+            }
+            pending.push(key);
+        }
+        pending
+    }
+
+    /// The incarnation reached a durable conclusion with no walk of our
+    /// own (completion marker already present, or fusion owns it).
+    fn settled(&mut self, key: (CursorScope, u64)) {
+        self.failed.remove(&key);
+        self.settled.insert(key);
+    }
+
+    /// Record the outcome of a walk we actually ran.
+    fn record_attempt(&mut self, key: (CursorScope, u64), completed: bool) {
+        if completed {
+            self.settled(key);
+            return;
+        }
+        let failures = self.failed.get(&key).map_or(0, |(count, _)| *count) + 1;
+        let delay = BACKFILL_RETRY_INITIAL
+            .saturating_mul(1_u32 << failures.min(6).saturating_sub(1))
+            .min(BACKFILL_RETRY_CAP);
+        self.failed
+            .insert(key, (failures, tokio::time::Instant::now() + delay));
     }
 }
 
@@ -3393,7 +3505,7 @@ async fn emit_backfill_complete(
         control.expect_checkpoint(expected.clone());
     }
     let delivered = tx.send(event).unwrap_or(0);
-    if delivered <= 1
+    if !crate::multiplexer::delivered_to_real_subscriber(delivered)
         && let Some(expected) = &expected
     {
         control.retire_checkpoint(expected);
@@ -3625,7 +3737,7 @@ async fn wait_for_real_subscriber(
     shutdown: &CancellationToken,
 ) -> bool {
     loop {
-        if changes_tx.receiver_count() > 1 {
+        if crate::multiplexer::has_real_subscriber(changes_tx) {
             return true;
         }
         tokio::select! {
@@ -3804,7 +3916,24 @@ pub(crate) async fn handle_account_error(
             log_reconcile_advice(ctx, scope.as_ref(), &error, &advice);
         }
         RecoveryPlan::Engine(directive) => {
-            let _reopen_guard = ctx.reopen_lock.lock().await;
+            // Every directive except `RestartAccount` is a bounded,
+            // scope-local repair that must not interleave with a
+            // connection swap, so it takes the serialization lock here.
+            //
+            // `RestartAccount` must NOT take it here. It waits for the
+            // boundary to read `Run` before each attempt, and that wait is
+            // unbounded: a consumer can pause and hold the account idle
+            // indefinitely. Holding the lock across it made
+            // `unsubscribe_push` - which needs the same lock - hang for
+            // the entire pause, so push teardown was unavailable exactly
+            // when a consumer was trying to detach cleanly. The lock it
+            // does need is taken inside `open_replacement`, spanning only
+            // the open and the swap. Reintroducing an acquisition here
+            // deadlocks against that one rather than silently regressing.
+            let _reopen_guard = match directive {
+                EngineDirective::RestartAccount => None,
+                _ => Some(ctx.reopen_lock.lock().await),
+            };
             handle_engine_directive(ctx, scope, directive, error).await;
         }
         RecoveryPlan::Terminal(fatal) => {
@@ -4035,6 +4164,15 @@ async fn restart_scope(ctx: &RecoveryContext<'_>, scope: CursorScope) {
             "RestartScope: delete_change_cursor failed"
         );
     }
+    if let Err(err) = ctx.store.delete_backfill(ctx.account_id, &scope).await {
+        tracing::warn!(
+            target: "bifrost.sync.changes",
+            account = ?ctx.account_id,
+            scope = ?scope,
+            error = %err,
+            "RestartScope: delete_backfill failed"
+        );
+    }
     re_establish_scope_with_backoff(ctx, scope).await;
 }
 
@@ -4235,15 +4373,25 @@ enum ReplacementOpen {
 /// background - the opposite of what the quiescence contract promises. The
 /// guard is returned so the caller can hand it to `reattach_account` and keep
 /// the whole reopen inside one activity registration.
+///
+/// This is also the ONLY place the reopen serialization lock is taken for
+/// an open/swap, and the guard leaves only inside the returned tuple. That
+/// is deliberate structure, not style: callers all wait for the boundary to
+/// read `Run` before they get here, and a caller that took the lock itself
+/// would hold it across that unbounded wait - which is exactly how
+/// `unsubscribe_push` came to hang for the whole duration of a pause. With
+/// acquisition owned here, holding the lock across a pause wait is not
+/// something a caller can express.
 async fn open_replacement(
     ctx: &RecoveryContext<'_>,
-) -> Result<(SyncActivityGuard, OpenedAccount), ReplacementOpen> {
+) -> Result<(OwnedMutexGuard<()>, SyncActivityGuard, OpenedAccount), ReplacementOpen> {
     let activity = ctx
         .control
         .begin_activity()
         .ok_or(ReplacementOpen::Paused)?;
+    let reopen_guard = Arc::clone(ctx.reopen_lock).lock_owned().await;
     match ctx.factory.open(ctx.account_id.clone()).await {
-        Ok(next) => Ok((activity, next)),
+        Ok(next) => Ok((reopen_guard, activity, next)),
         // Dropping `activity` here is the point: the failed open registered
         // no lasting work, so quiescence must not stay blocked on it.
         Err(error) => Err(ReplacementOpen::Failed(error)),
@@ -4301,15 +4449,6 @@ async fn reattach_account(
         }
 
         link_discovered_memberships(next.as_ref(), &staged).await?;
-
-        // Refresh existing cursor snapshots at the last possible
-        // moment so an in-flight old-handle poll cannot be lost merely
-        // because discovery and subscription setup took time.
-        for scope in &discovered {
-            if let Some(latest) = ctx.cursors.snapshot(scope) {
-                staged.put(latest);
-            }
-        }
 
         let discovered_set: HashSet<_> = discovered.iter().cloned().collect();
         for vanished in ctx
@@ -4411,8 +4550,12 @@ async fn reattach_account(
         }
         replacement_subscriptions.extend(carried_unconfirmed);
 
+        // Take the final old-handle snapshot immediately before cutover.
+        // replace_from advances the registry generation atomically with the
+        // topology swap, so an old stream that finishes later cannot write a
+        // cursor minted by the retired connection into this new topology.
         let previous = ctx.current.swap(Arc::new(Arc::clone(&next)));
-        ctx.cursors.replace_from(&staged);
+        ctx.cursors.replace_topology_preserving_cursors(&staged);
         {
             let mut capabilities = match ctx.capabilities.write() {
                 Ok(guard) => guard,
@@ -4491,35 +4634,37 @@ async fn restart_account(ctx: &RecoveryContext<'_>) {
             // registration, and nothing was opened. Loop back through the
             // boundary wait instead of spending an attempt on it.
             Err(ReplacementOpen::Paused) => continue,
-            Ok((activity, next)) => match reattach_account(ctx, activity, next).await {
-                Ok(()) => return,
-                Err(Error::Account(error) | Error::EstablishCursorTerminated(error)) => {
-                    tracing::warn!(
-                        target: "bifrost.sync.changes",
-                        account = ?ctx.account_id,
-                        attempt,
-                        kind = ?error.kind(),
-                        message_key = error.message_key(),
-                        "RestartAccount: replacement attach failed"
-                    );
-                    last_error = Some(error);
-                    attempt = attempt.saturating_add(1);
+            Ok((_reopen_guard, activity, next)) => {
+                match reattach_account(ctx, activity, next).await {
+                    Ok(()) => return,
+                    Err(Error::Account(error) | Error::EstablishCursorTerminated(error)) => {
+                        tracing::warn!(
+                            target: "bifrost.sync.changes",
+                            account = ?ctx.account_id,
+                            attempt,
+                            kind = ?error.kind(),
+                            message_key = error.message_key(),
+                            "RestartAccount: replacement attach failed"
+                        );
+                        last_error = Some(error);
+                        attempt = attempt.saturating_add(1);
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            target: "bifrost.sync.changes",
+                            account = ?ctx.account_id,
+                            attempt,
+                            error = %error,
+                            "RestartAccount: replacement attach failed"
+                        );
+                        last_error = Some(crate::recovery::establish_failure_error(
+                            CursorScope::Account,
+                            bifrost_types::AccountOperation::EstablishCursor,
+                        ));
+                        attempt = attempt.saturating_add(1);
+                    }
                 }
-                Err(error) => {
-                    tracing::warn!(
-                        target: "bifrost.sync.changes",
-                        account = ?ctx.account_id,
-                        attempt,
-                        error = %error,
-                        "RestartAccount: replacement attach failed"
-                    );
-                    last_error = Some(crate::recovery::establish_failure_error(
-                        CursorScope::Account,
-                        bifrost_types::AccountOperation::EstablishCursor,
-                    ));
-                    attempt = attempt.saturating_add(1);
-                }
-            },
+            }
             Err(ReplacementOpen::Failed(err)) => {
                 tracing::warn!(
                     target: "bifrost.sync.changes",
@@ -4995,10 +5140,84 @@ fn counters_from_outcomes(
 #[cfg(test)]
 mod tests {
     use super::{
-        MutationBucket, accepted_push_scopes, classify_item_outcome, queue_unresolved_for_retry,
-        scope_covers_membership, should_forward_engine_recovery, unresolved_readback_ids,
+        BackfillScan, MutationBucket, accepted_push_scopes, classify_item_outcome,
+        queue_unresolved_for_retry, scope_covers_membership, should_forward_engine_recovery,
+        unresolved_readback_ids,
     };
     use bifrost_types::{CursorScope, EngineDirective, FolderId, MembershipScope, ObjectType};
+    use std::collections::HashSet;
+
+    #[test]
+    fn backfill_skips_only_the_fusion_owned_incarnation_and_rescans_new_scopes() {
+        let fused = CursorScope::Type(ObjectType::Email);
+        let created = CursorScope::Folder(FolderId("created".into()));
+        let fusion_owned = HashSet::from([fused.clone()]);
+        let mut scan = BackfillScan::default();
+        let now = tokio::time::Instant::now();
+
+        let first = scan.select(vec![(fused.clone(), 1)], &fusion_owned, now);
+        assert!(
+            first.is_empty(),
+            "fusion's inventory must not be double-walked"
+        );
+
+        let later = scan.select(
+            vec![(fused.clone(), 2), (created.clone(), 3)],
+            &fusion_owned,
+            now,
+        );
+        assert_eq!(later, vec![(fused, 2), (created, 3)]);
+    }
+
+    /// A completed walk retires the incarnation; a failed one does not.
+    /// Filtering a failed incarnation out permanently would let a single
+    /// transient partition or checkpoint-store error cost that scope its
+    /// entire backfill for the rest of the attachment.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_backfill_incarnation_stays_eligible_for_retry() {
+        let scope = CursorScope::Type(ObjectType::Email);
+        let fusion_owned = HashSet::new();
+        let mut scan = BackfillScan::default();
+        let available = vec![(scope.clone(), 7)];
+
+        assert_eq!(
+            scan.select(
+                available.clone(),
+                &fusion_owned,
+                tokio::time::Instant::now()
+            ),
+            vec![(scope.clone(), 7)]
+        );
+        scan.record_attempt((scope.clone(), 7), false);
+        assert!(
+            scan.select(
+                available.clone(),
+                &fusion_owned,
+                tokio::time::Instant::now()
+            )
+            .is_empty(),
+            "a just-failed incarnation must back off rather than re-walk immediately"
+        );
+
+        tokio::time::advance(super::BACKFILL_RETRY_INITIAL * 2).await;
+        assert_eq!(
+            scan.select(
+                available.clone(),
+                &fusion_owned,
+                tokio::time::Instant::now()
+            ),
+            vec![(scope.clone(), 7)],
+            "a failed incarnation must come back once its backoff elapses"
+        );
+
+        scan.record_attempt((scope.clone(), 7), true);
+        tokio::time::advance(super::BACKFILL_RETRY_CAP * 2).await;
+        assert!(
+            scan.select(available, &fusion_owned, tokio::time::Instant::now())
+                .is_empty(),
+            "a completed incarnation is never re-walked"
+        );
+    }
 
     #[test]
     fn rejected_push_scopes_are_not_treated_as_covered() {

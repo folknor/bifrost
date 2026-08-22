@@ -124,7 +124,7 @@ impl InventoryFusion {
                             control.expect_checkpoint(cp.clone());
                         }
                         let delivered = tx.send(me).unwrap_or(0);
-                        if delivered <= 1
+                        if !super::delivered_to_real_subscriber(delivered)
                             && let Some(control) = &self.control
                         {
                             control.retire_checkpoint(&cp);
@@ -190,7 +190,7 @@ impl InventoryFusion {
             control.expect_checkpoint(checkpoint.clone());
         }
         let delivered = tx.send(me).unwrap_or(0);
-        if delivered <= 1
+        if !super::delivered_to_real_subscriber(delivered)
             && let (Some(control), Some(checkpoint)) = (&self.control, batch.checkpoint.as_ref())
         {
             control.retire_checkpoint(checkpoint);

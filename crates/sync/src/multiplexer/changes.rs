@@ -88,6 +88,7 @@ pub async fn drive_changes_stream(
     boundary: BoundaryView,
     control: Option<SyncControl>,
     _ack_tx: Option<mpsc::Sender<AckRequest>>,
+    registry_generation: Option<u64>,
 ) -> Result<ChangesEvent, Error> {
     let _activity = match &control {
         Some(control) => match control.begin_activity() {
@@ -126,34 +127,42 @@ pub async fn drive_changes_stream(
         // A consumer that receives, persists and acks between the send
         // and the registration would otherwise leave behind an entry
         // no ack can ever match, permanently wedging boundary waiters.
-        let expected = match (&control, &checkpoint) {
-            (Some(control), Some(checkpoint)) => {
-                control.expect_checkpoint(checkpoint.clone());
-                Some(checkpoint.clone())
-            }
+        let publish = || {
+            let expected = match (&control, &checkpoint) {
+                (Some(control), Some(checkpoint)) => {
+                    control.expect_checkpoint(checkpoint.clone());
+                    Some(checkpoint.clone())
+                }
+                _ => None,
+            };
+            (changes_tx.send(me.clone()).unwrap_or(0), expected)
+        };
+        let change_cursor = match &checkpoint {
+            Some(Checkpoint::Change(cursor)) => Some(cursor.clone()),
             _ => None,
         };
-        let delivered = changes_tx.send(me.clone()).unwrap_or(0);
-        if delivered <= 1
+        let published = match registry_generation {
+            Some(generation) => cursors.publish_if_generation(change_cursor, generation, publish),
+            None => {
+                let result = publish();
+                if let Some(cursor) = change_cursor {
+                    cursors.put(cursor);
+                }
+                Some(result)
+            }
+        };
+        let Some((delivered, expected)) = published else {
+            return Ok(ChangesEvent::Done);
+        };
+        if !super::delivered_to_real_subscriber(delivered)
             && let (Some(control), Some(expected)) = (&control, &expected)
         {
             // Only the slot's sentinel receiver saw this batch, so no
             // consumer ack is coming for it.
             control.retire_checkpoint(expected);
         }
-        if let Some(Checkpoint::Change(c)) = &checkpoint {
-            // Advance the in-memory registry so the next poll
-            // iteration starts from the freshly-yielded cursor. The
-            // durable write awaits the consumer ack.
-            cursors.put(c.clone());
-        }
-        if checkpoint.is_some() {
-            match boundary.peek() {
-                BoundaryRequest::Pause => return Ok(ChangesEvent::Paused),
-                BoundaryRequest::CheckpointNow => return Ok(ChangesEvent::Done),
-                BoundaryRequest::Stop => return Ok(ChangesEvent::Stopped),
-                BoundaryRequest::Run => {}
-            }
+        if let Some(outcome) = post_publish_boundary(boundary.peek(), checkpoint.is_some()) {
+            return Ok(outcome);
         }
         if is_done {
             return Ok(ChangesEvent::Done);
@@ -163,6 +172,20 @@ pub async fn drive_changes_stream(
         }
     }
     Ok(ChangesEvent::Done)
+}
+
+fn post_publish_boundary(request: BoundaryRequest, has_checkpoint: bool) -> Option<ChangesEvent> {
+    match request {
+        // Pause is a lifecycle boundary, not a request for a durable
+        // cursor. A checkpoint-free batch is still a completed stream
+        // item and must release the activity guard here, otherwise a
+        // valid checkpoint-free stream can keep the account non-quiescent
+        // forever.
+        BoundaryRequest::Pause => Some(ChangesEvent::Paused),
+        BoundaryRequest::Stop => Some(ChangesEvent::Stopped),
+        BoundaryRequest::CheckpointNow if has_checkpoint => Some(ChangesEvent::Done),
+        BoundaryRequest::CheckpointNow | BoundaryRequest::Run => None,
+    }
 }
 
 /// Ack request: scope + checkpoint the engine should durably persist.
@@ -198,5 +221,50 @@ fn checkpoint_for(event: &SyncEvent<Change>) -> Option<&Checkpoint> {
         SyncEvent::Batch(b) => b.checkpoint.as_ref(),
         SyncEvent::Done(c) => c.as_ref(),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ChangesEvent, post_publish_boundary};
+    use crate::cancel::BoundaryRequest;
+
+    /// The full boundary truth table for a published item. Pause and
+    /// Stop are lifecycle boundaries and must be honoured whether or
+    /// not the item carried a checkpoint - a checkpoint-free stream
+    /// that only checked at checkpoint boundaries never parks, and the
+    /// account never reaches quiescence. `CheckpointNow` is the one
+    /// request that genuinely needs a durable cursor to satisfy, so it
+    /// alone keeps running when the item produced none.
+    #[test]
+    fn lifecycle_boundaries_are_honoured_with_or_without_a_checkpoint() {
+        for has_checkpoint in [true, false] {
+            assert!(
+                matches!(
+                    post_publish_boundary(BoundaryRequest::Pause, has_checkpoint),
+                    Some(ChangesEvent::Paused)
+                ),
+                "pause must park (has_checkpoint={has_checkpoint})"
+            );
+            assert!(
+                matches!(
+                    post_publish_boundary(BoundaryRequest::Stop, has_checkpoint),
+                    Some(ChangesEvent::Stopped)
+                ),
+                "stop must stop (has_checkpoint={has_checkpoint})"
+            );
+            assert!(
+                post_publish_boundary(BoundaryRequest::Run, has_checkpoint).is_none(),
+                "run must keep going (has_checkpoint={has_checkpoint})"
+            );
+        }
+        assert!(matches!(
+            post_publish_boundary(BoundaryRequest::CheckpointNow, true),
+            Some(ChangesEvent::Done)
+        ));
+        assert!(
+            post_publish_boundary(BoundaryRequest::CheckpointNow, false).is_none(),
+            "a checkpoint request is not satisfied by a checkpoint-free item"
+        );
     }
 }
