@@ -1364,6 +1364,278 @@ mod tests {
         }
     }
 
+    /// A full primary walk must not confuse a server-capped short query
+    /// page with end-of-inventory. It continues from the consumed query
+    /// position, and primary ids remain bare rather than being qualified.
+    #[tokio::test]
+    async fn primary_inventory_continues_after_a_short_page_with_bare_ids() {
+        let client = scripted_client([
+            method_reply(vec![json!([
+                "Email/query",
+                {"accountId": "primary", "queryState": "q1", "position": 0, "ids": ["M1"]},
+                "s0"
+            ])]),
+            method_reply(vec![json!([
+                "Email/get",
+                {"accountId": "primary", "state": "email-s", "list": [
+                    {"id": "M1", "blobId": "B1", "threadId": "T1", "size": 10,
+                     "mailboxIds": {"inbox": true}, "keywords": {}}
+                ], "notFound": []},
+                "s0"
+            ])]),
+            method_reply(vec![json!([
+                "Email/query",
+                {"accountId": "primary", "queryState": "q1", "position": 1, "ids": ["M2"]},
+                "s0"
+            ])]),
+            method_reply(vec![json!([
+                "Email/get",
+                {"accountId": "primary", "state": "email-s", "list": [
+                    {"id": "M2", "blobId": "B2", "threadId": "T2", "size": 11,
+                     "mailboxIds": {"archive": true}, "keywords": {}}
+                ], "notFound": []},
+                "s0"
+            ])]),
+            method_reply(vec![json!([
+                "Email/query",
+                {"accountId": "primary", "queryState": "q1", "position": 2, "ids": []},
+                "s0"
+            ])]),
+        ]);
+        let primary = client
+            .primary_account::<capability::Mail>()
+            .expect("primary mail account");
+        let mut stream = crate::sync::inventory::stream(
+            primary,
+            super::capabilities::CoreLimits {
+                max_objects_in_get: 4,
+                max_objects_in_set: 4,
+            },
+            CursorScope::Type(ObjectType::Email),
+            None,
+        );
+
+        for expected in ["M1", "M2"] {
+            match stream.next().await {
+                Some(bifrost_types::SyncEvent::Batch(batch)) => {
+                    assert_eq!(batch.items.len(), 1);
+                    assert_eq!(batch.items[0].id.0, expected);
+                }
+                other => panic!("expected primary inventory batch, got {other:?}"),
+            }
+        }
+        assert!(matches!(
+            stream.next().await,
+            Some(bifrost_types::SyncEvent::Done(None))
+        ));
+        assert_eq!(client.transport().requests().len(), 5);
+    }
+
+    /// A bounded partition may receive short server pages, but it must
+    /// fill exactly its requested query window and stop without probing
+    /// the following position.
+    #[tokio::test]
+    async fn page_inventory_fills_then_stops_at_its_explicit_window() {
+        let client = scripted_client([
+            method_reply(vec![json!([
+                "Email/query",
+                {"accountId": "primary", "queryState": "q1", "position": 2, "ids": ["M3"]},
+                "s0"
+            ])]),
+            method_reply(vec![json!([
+                "Email/get",
+                {"accountId": "primary", "state": "email-s", "list": [
+                    {"id": "M3", "size": 10, "mailboxIds": {}, "keywords": {}}
+                ], "notFound": []},
+                "s0"
+            ])]),
+            method_reply(vec![json!([
+                "Email/query",
+                {"accountId": "primary", "queryState": "q1", "position": 3, "ids": ["M4", "M5"]},
+                "s0"
+            ])]),
+            method_reply(vec![json!([
+                "Email/get",
+                {"accountId": "primary", "state": "email-s", "list": [
+                    {"id": "M4", "size": 10, "mailboxIds": {}, "keywords": {}},
+                    {"id": "M5", "size": 10, "mailboxIds": {}, "keywords": {}}
+                ], "notFound": []},
+                "s0"
+            ])]),
+        ]);
+        let primary = client
+            .primary_account::<capability::Mail>()
+            .expect("primary mail account");
+        let mut stream = crate::sync::inventory::stream_partition(
+            primary,
+            super::capabilities::CoreLimits {
+                max_objects_in_get: 99,
+                max_objects_in_set: 4,
+            },
+            CursorScope::Type(ObjectType::Email),
+            bifrost_types::InventoryPartition::Page { from: 2, to: 5 },
+            None,
+        );
+
+        let mut ids = Vec::new();
+        while let Some(event) = stream.next().await {
+            match event {
+                bifrost_types::SyncEvent::Batch(batch) => {
+                    ids.extend(batch.items.into_iter().map(|entry| entry.id.0));
+                }
+                bifrost_types::SyncEvent::Done(None) => break,
+                other => panic!("unexpected page inventory event: {other:?}"),
+            }
+        }
+        assert_eq!(ids, ["M3", "M4", "M5"]);
+        assert_eq!(client.transport().requests().len(), 4);
+        let requests = client.transport().requests();
+        assert_eq!(requests[0]["methodCalls"][0][1]["limit"], 3);
+        assert_eq!(requests[2]["methodCalls"][0][1]["limit"], 2);
+    }
+
+    /// A bounded partition that yields zero entries is the engine's
+    /// end-of-inventory signal, so the stream must never produce zero
+    /// entries while the scope still has results. If every id in the
+    /// requested window is deleted between `Email/query` and `Email/get`,
+    /// stopping at the window boundary would hand the engine a silent
+    /// "exhausted" and drop every later message. The stream has to walk
+    /// past the window until it produces something or the query runs dry.
+    #[tokio::test]
+    async fn page_inventory_walks_past_a_fully_vanished_window_rather_than_reading_as_exhausted() {
+        let client = scripted_client([
+            method_reply(vec![json!([
+                "Email/query",
+                {"accountId": "primary", "queryState": "q1", "position": 0, "ids": ["M1", "M2"]},
+                "s0"
+            ])]),
+            // Both ids were deleted between the query and the get.
+            method_reply(vec![json!([
+                "Email/get",
+                {"accountId": "primary", "state": "email-s", "list": [],
+                 "notFound": ["M1", "M2"]},
+                "s0"
+            ])]),
+            method_reply(vec![json!([
+                "Email/query",
+                {"accountId": "primary", "queryState": "q1", "position": 2, "ids": ["M3"]},
+                "s0"
+            ])]),
+            method_reply(vec![json!([
+                "Email/get",
+                {"accountId": "primary", "state": "email-s", "list": [
+                    {"id": "M3", "size": 10, "mailboxIds": {}, "keywords": {}}
+                ], "notFound": []},
+                "s0"
+            ])]),
+        ]);
+        let primary = client
+            .primary_account::<capability::Mail>()
+            .expect("primary mail account");
+        let mut stream = crate::sync::inventory::stream_partition(
+            primary,
+            super::capabilities::CoreLimits {
+                max_objects_in_get: 99,
+                max_objects_in_set: 4,
+            },
+            CursorScope::Type(ObjectType::Email),
+            bifrost_types::InventoryPartition::Page { from: 0, to: 2 },
+            None,
+        );
+
+        let mut ids = Vec::new();
+        while let Some(event) = stream.next().await {
+            match event {
+                bifrost_types::SyncEvent::Batch(batch) => {
+                    ids.extend(batch.items.into_iter().map(|entry| entry.id.0));
+                }
+                bifrost_types::SyncEvent::Done(None) => break,
+                other => panic!("unexpected page inventory event: {other:?}"),
+            }
+        }
+        assert_eq!(
+            ids,
+            ["M3"],
+            "a window emptied by concurrent deletion must not end the partition"
+        );
+        assert_eq!(client.transport().requests().len(), 4);
+    }
+
+    /// The consolidated inventory loop must still qualify foreign ids,
+    /// blob ids, thread ids, and memberships with the owning account, and
+    /// must still route errors through the shared-scope mapping. This is
+    /// the positive half of the primary walk's bare-id assertion.
+    #[tokio::test]
+    async fn foreign_inventory_qualifies_every_id_through_the_shared_loop() {
+        let client = scripted_client([
+            method_reply(vec![json!([
+                "Email/query",
+                {"accountId": "shared", "queryState": "q1", "position": 0, "ids": ["F1"]},
+                "s0"
+            ])]),
+            method_reply(vec![json!([
+                "Email/get",
+                {"accountId": "shared", "state": "email-s", "list": [
+                    {"id": "F1", "blobId": "FB1", "threadId": "FT1", "size": 12,
+                     "mailboxIds": {"inbox": true}, "keywords": {}}
+                ], "notFound": []},
+                "s0"
+            ])]),
+            method_reply(vec![json!([
+                "Email/query",
+                {"accountId": "shared", "queryState": "q1", "position": 1, "ids": []},
+                "s0"
+            ])]),
+        ]);
+        let owner = bifrost_types::MailboxId("shared".to_string());
+        let mut stream = crate::sync::inventory::stream(
+            crate::account::Account::new(client.clone(), JmapAccountId::new("shared")),
+            super::capabilities::CoreLimits {
+                max_objects_in_get: 4,
+                max_objects_in_set: 4,
+            },
+            CursorScope::Folder(foreign::encode_foreign_account("shared")),
+            Some(owner.clone()),
+        );
+
+        let entry = match stream.next().await {
+            Some(bifrost_types::SyncEvent::Batch(mut batch)) => {
+                assert_eq!(batch.items.len(), 1);
+                batch.items.remove(0)
+            }
+            other => panic!("expected a foreign inventory batch, got {other:?}"),
+        };
+        assert_eq!(entry.id.0, foreign::encode_object("shared", "F1"));
+        assert_eq!(
+            entry.blob_id.as_ref().map(|blob| blob.0.clone()),
+            Some(foreign::encode_object("shared", "FB1"))
+        );
+        assert_eq!(
+            entry.thread_id.as_ref().map(|thread| thread.0.clone()),
+            Some(foreign::encode_object("shared", "FT1"))
+        );
+        assert!(
+            entry
+                .memberships
+                .contains(&bifrost_types::MembershipScope::Folder(
+                    foreign::encode_foreign("shared", "inbox")
+                )),
+            "native memberships are re-encoded into the foreign namespace: {:?}",
+            entry.memberships
+        );
+        assert!(
+            entry
+                .memberships
+                .contains(&bifrost_types::MembershipScope::Mailbox(owner)),
+            "the owner tag is appended: {:?}",
+            entry.memberships
+        );
+        assert!(matches!(
+            stream.next().await,
+            Some(bifrost_types::SyncEvent::Done(None))
+        ));
+    }
+
     /// An empty additive flag op is a local no-op, and it now rides the
     /// shared `mutation_stream` rather than a private batching loop. Two
     /// things have to stay true through that reuse, and neither is

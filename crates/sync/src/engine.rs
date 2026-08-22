@@ -3170,11 +3170,16 @@ async fn run_backfill_orchestrator(
                             // (e.g. a JMAP Email/query cap below the window
                             // width) returns fewer entries than asked for;
                             // treating that as exhaustion silently drops every
-                            // later page. The Page partition stream fills its
-                            // window by paging internally past any such cap, so
-                            // an empty window is the unambiguous end-of-inventory
-                            // boundary - a short window means the final partial
-                            // page, and the next pass returns empty.
+                            // later page. So the Page partition stream owes us a
+                            // stronger guarantee than "it filled the window":
+                            // it must yield zero entries ONLY when the scope has
+                            // no more results past `from`. A window whose ids all
+                            // vanished between listing and hydration is NOT
+                            // end-of-inventory, and a stream that stopped there
+                            // would truncate the backfill; implementations are
+                            // required to keep walking past the window until they
+                            // produce an entry or the listing runs dry. Given
+                            // that, `seen == 0` is unambiguous here.
                             if outcome.seen == 0 {
                                 break;
                             }

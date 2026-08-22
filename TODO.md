@@ -4,6 +4,48 @@ Cross-crate work items surfaced by per-crate work but not fixable inside one
 crate. Each entry stands alone: symptom on the discovering side, what the other
 side would have to ship, what was done locally instead, and what remains wrong.
 
+## An inventory partition that yields zero entries is the engine's exhaustion signal, and nothing enforces it
+
+**Symptom (discovered in bifrost-jmap).** `bifrost-sync`'s `BackfillPlan::OpenPages`
+walker asks an account for `InventoryPartition::Page { from, to }` windows and
+stops the whole scope the first time a partition reports `seen == 0`. That is
+the only termination signal it has: there is no separate "the listing is
+exhausted" flag on the partition result. The JMAP `Page` stream could produce a
+zero-entry partition while the account still had messages - `Email/query`
+returned a full window of ids, every one of them was deleted before the
+following `Email/get`, the loop filled its window with nothing, and the stream
+ended. A single concurrent deletion landing in the first window silently
+truncated the backfill and dropped every later message in the scope. The bug is
+data loss, not a stall, and nothing observable reports it: the scope is marked
+`Completed`.
+
+**What the other side would have to ship.** The partition result should carry
+exhaustion explicitly rather than inferring it from an entry count - either a
+`reached_end` flag on the partition outcome, or a `Done` payload that
+distinguishes "this window produced nothing" from "there is nothing past this
+window". Then the engine stops on the account's own statement instead of on a
+count that means two different things, and an implementation that gets it wrong
+is a type error rather than a silent truncation.
+
+**What was done here instead.** The fix is entirely on the JMAP side: the
+consolidated `email_inventory_loop` now tracks whether it has emitted any entry,
+and when a bounded window is filled without emitting anything it keeps walking
+past the window until it either produces an entry or `Email/query` returns an
+empty page. That makes zero entries mean only "no more results", which is what
+the engine already assumed. Overshooting re-reads positions the next partition
+also covers; inventory entries are idempotent, so duplication is the safe side
+of the trade. The engine comment that previously asserted an empty window was
+unambiguous has been corrected to state the requirement it actually relies on.
+
+**What remains wrong.** The requirement is prose in a comment, not a type. JMAP
+is currently the only crate that implements `InventoryPartition::Page` - every
+other account crate falls through to `Full` - so there is exactly one
+implementation to be right today, and the next one to implement bounded
+partitions gets no compiler help and no test that fails. The overshoot is also
+unbounded in principle: a scope in which a very large contiguous run of ids
+vanishes mid-walk makes one partition read far past its window. In practice the
+run ends at the first surviving message, but nothing caps it.
+
 ## bifrost-net has no concurrency governor, so per-protocol concurrency limits are unenforced
 
 **Symptom (discovered in bifrost-jmap).** JMAP servers advertise
