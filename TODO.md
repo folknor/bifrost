@@ -101,9 +101,9 @@ unconditional CRLF, and RFC 6376 simple and relaxed body canonicalization both
 strip trailing empty lines, so signing and delivery continue to agree.
 
 **What remains wrong.** Nothing in the code. This is a pre-1.0 observable wire
-change and belongs in release notes next to the blocking-transport removal and
-the `tokio` feature removal already recorded above - a consumer reading the
-changelog should not have to infer it from a `SIZE` arithmetic change.
+change and belongs in release notes - a consumer reading the changelog should
+not have to infer it from a `SIZE` arithmetic change. Note the blocking writers
+carry the same fix, so the change applies to both transports.
 
 ## An inventory partition that yields zero entries is the engine's exhaustion signal, and nothing enforces it
 

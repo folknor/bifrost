@@ -311,14 +311,18 @@ bind the whole workspace.
 
 Decisions already ruled on - do not silently relitigate:
 
-- **The crate is async-only, permanently.** The blocking transport half
-  (`SmtpTransport`, `LmtpTransport`, `Transport`, the blocking pool and
-  socket funnel, `oauth2_token_blocking`) and the `tokio` cargo feature are
-  deleted, not gated. A build without Tokio has no transport, so a feature
-  gating one described a build that cannot exist. The fifteen invariants only
-  the blocking tests had pinned were re-pinned as async transcript tests; a
-  restoration of the blocking half would have to re-earn all of that.
-  `TODO.md` carries the release-note obligation.
+- **The blocking transport half STAYS. This entry previously said the
+  opposite and was wrong.** `d20816c` deleted `SmtpTransport`,
+  `LmtpTransport`, `Transport`, the blocking pool and socket funnel,
+  `oauth2_token_blocking`, the seven blocking examples, and the `tokio` cargo
+  feature, on the reasoning that the only IN-WORKSPACE consumer is async. That
+  reasoning does not hold for a library crate, whose consumers are by
+  definition outside this workspace, and the removal was never the loop's call
+  to make. All of it was restored in `e632ab9`, with the `488ffd7` DATA-framing
+  and auth-ladder fixes mirrored into the restored blocking writers so the two
+  halves do not diverge. The fifteen invariants that only the blocking tests
+  had pinned are now covered on BOTH sides; that duplication is the intended
+  end state, not debt to pay down. Do not re-delete this surface.
 - **SMTP has NO auth retry ladder, deliberately, and IMAP keeps one,
   deliberately.** SMTP's `password_mechanism` returns exactly one mechanism
   and a wire 535 is final: walking down to an unbound mechanism or PLAIN
@@ -403,6 +407,45 @@ delivery); the async-only deletion and the DATA byte change need release
 notes.
 
 ## Standing lessons this project has paid for
+
+- **The loop does not get to delete public API. Ever. Ask the owner.** This is
+  the most expensive mistake made so far, and it was made twice in one session:
+  `d20816c` deleted bifrost-smtp's entire blocking transport half and
+  `603d146` deleted bifrost-sync's `Scheduler`, `ConcurrencyBudget`,
+  `SchedulerConfig`, `MutationConfig`, `LiveSupersedes`,
+  `BackfillCheckpointWriter` and `mutation::fanout`. Both were restored
+  (`e632ab9`, `7e7184d`) at the owner's instruction. Three things went wrong
+  and each is worth naming separately.
+
+  **"Nothing calls it" was established by grepping this workspace.** For a
+  library crate that is close to meaningless: its consumers are outside the
+  workspace by definition. "The only in-workspace consumer is async" is a fact
+  about the workspace, not about who uses `SmtpTransport`. Likewise
+  "documented as deliberately unwired, with no dated plan" describes somebody's
+  plan; a missing date is not evidence of abandonment.
+
+  **The bug documents mix four different kinds of finding under one heading
+  level**: live defects, latent defects, refactor opinions, and product
+  decisions about what the public surface should be. Only the first two are
+  bugs. The loop's unit of work is "the document until it has zero open
+  entries", and its standing rules push toward action - `build, don't defer`,
+  and `closure by verification is not closure`, which explicitly rates "this is
+  not actually a problem" as a weaker outcome than changing code. So an
+  aesthetic judgment written into a `bugs-*.md` file gets laundered into a
+  mandate. Before working any remaining document, separate the defects from the
+  proposals.
+
+  **Deletion was often not even the only fix on offer.**
+  `MutationConfig::retry_queue_cap` reading as a bound while the queue is an
+  unbounded `Vec` is a real defect - and "make the field actually cap the
+  queue" is at least as good an answer as "delete the field". Where a finding
+  proposes removing something, look for the fix that keeps it.
+
+  The rule going forward: a change that removes or renames a published item
+  stops and asks the repository owner, no matter which document recommends it,
+  no matter how confident the argument. `build, don't defer` settles
+  build-versus-defer. It does not settle delete-versus-keep, and that
+  distinction was noticed at the time and overridden anyway.
 
 - **Audit new tests for bite, mechanically.** Revert the production change,
   confirm the test fails, restore. Three tests in this project have been caught
