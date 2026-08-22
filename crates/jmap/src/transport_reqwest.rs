@@ -48,7 +48,7 @@ impl ReqwestTransport {
             account_id,
             AccountSpec {
                 hosts: Vec::<RateLimit>::new(),
-                token_source,
+                token_source: Some(token_source),
                 default_retry: RetryPolicy::default(),
             },
         );

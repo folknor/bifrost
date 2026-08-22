@@ -1447,6 +1447,53 @@ END:VCALENDAR</C:calendar-data>
         assert_eq!(report.classify(), MultigetOutcome::Usable);
     }
 
+    /// `status_line_code` reads the status POSITION, not the first
+    /// in-range number anywhere in the line. That moves inputs between
+    /// buckets here, so both directions are pinned: the protocol-less
+    /// form servers really emit inside `<D:status>` still classifies,
+    /// and free text a proxy dropped in no longer fabricates a code the
+    /// server never sent. The failure lane keeps its `href` either way -
+    /// this is about the reported status, not about losing the resource.
+    #[test]
+    fn a_prose_response_status_does_not_fabricate_a_resource_status_code() {
+        let xml = r#"
+<D:multistatus xmlns:D="DAV:">
+  <D:response>
+    <D:href>/cal/terse.ics</D:href>
+    <D:status>404 Not Found</D:status>
+  </D:response>
+  <D:response>
+    <D:href>/cal/prose.ics</D:href>
+    <D:propstat>
+      <D:prop><D:getetag>"p"</D:getetag></D:prop>
+      <D:status>Resource error 404 reported by upstream</D:status>
+    </D:propstat>
+  </D:response>
+</D:multistatus>"#;
+
+        let report = parse_multiget_report(xml).expect("valid 207");
+        assert!(report.events.is_empty());
+        let terse = report
+            .failed
+            .iter()
+            .find(|resource| resource.href == "/cal/terse.ics")
+            .expect("a protocol-less status line still classifies");
+        assert_eq!(terse.status, Some(404));
+        // The refusal is still honoured - no property is committed - but
+        // with no readable code the resource carries no status to report,
+        // so it surfaces in the absent-data lane rather than being
+        // labelled with a code the server never sent.
+        assert!(
+            !report
+                .failed
+                .iter()
+                .any(|resource| resource.href == "/cal/prose.ics"),
+            "prose must not be mined for a status the server never sent"
+        );
+        assert_eq!(report.missing_data, vec!["/cal/prose.ics"]);
+        assert_eq!(report.classify(), MultigetOutcome::Usable);
+    }
+
     #[test]
     fn absent_calendar_data_does_not_make_a_missing_resource_systemic() {
         // A 2xx propstat with no calendar-data is an absent-data outcome,

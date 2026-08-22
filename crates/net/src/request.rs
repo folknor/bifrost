@@ -500,7 +500,13 @@ pub(crate) async fn send_streaming_inner(
         // pattern-match for retry-vs-give-up decisions; collapsing
         // every variant into `AuthLost` would discard that signal.
         let token = if auth_for_next_hop {
-            match account.token_source().current().await {
+            let source = account
+                .token_source()
+                .ok_or_else(|| Error::InvalidRequest {
+                    field: "bearer_auth",
+                    detail: "bearer authentication requires an AccountSpec token source".to_owned(),
+                })?;
+            match source.current().await {
                 Ok(t) => Some(t),
                 Err(e) => return Err(e),
             }
@@ -578,7 +584,11 @@ pub(crate) async fn send_streaming_inner(
             if let Some(ref h) = host {
                 account.net().governor().refund(h, cost_units);
             }
-            account.token_source().refresh().await?;
+            account
+                .token_source()
+                .expect("bearer-authenticated request validated its token source")
+                .refresh()
+                .await?;
             // Undo the top-of-loop network-budget increment: 401 is
             // its own one-shot recovery path tracked by
             // `auth_retries`. `continue 'outer` re-enters the loop;

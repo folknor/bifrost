@@ -19,15 +19,15 @@ loss. `Error::Cancelled` now has a producer (the dropped-driver source), closing
 Their entries are removed below; the behaviour lives in `reference/net.md`. Everything still
 listed is unverified.
 
-## No backoff on the token-endpoint failure path that has no fallback token
-
-`drive_refresh`'s 30-second `refresh_not_before` deferral only applies when `can_fallback`, i.e. when
-there was a cached token with a known `expires_at` that is still valid. For the `Empty` state, or for
-opaque tokens with no `expires_at` (exactly the case `DEFAULT_TOKEN_MAX_AGE` exists to handle), a
-failure resets state to `Empty` and the very next request drives another refresh. Concurrent callers
-are single-flighted, but a serial request stream hammers the token endpoint at request rate during an
-issuer outage. The doc's claim that the deferral prevents "one refresh call per request" is only true
-for the narrow fallback case.
+2026-08-22 (round 1 of the bug-hunt arc): the remaining smaller findings fixed - the no-fallback
+token-refresh backoff (now escalating 1s -> 60s on transient failure, straight to 60s on an
+authoritative issuer refusal, reset by any success), FIFO admission in the rate governor,
+`status_line_code` reading the status POSITION rather than the first in-range number anywhere in
+the line, and the two DAV blockers (`AccountNet::request(Method, &str)`, optional
+`AccountSpec::token_source`). `Dispatch` stays private - assessed as correct. The FIFO change
+introduced and this round fixed a permanent-strand bug: a waiter woken by the final `unregister`
+could be recaptured by a bucket another account registered for the same host. Behaviour lives in
+`reference/net.md`. The two entries below remain unverified.
 
 ## NetConfig conflates process-wide and per-account settings, destroying the sharing the crate exists for
 
@@ -59,45 +59,8 @@ resource and correctness problem and does make `reference/net.md`'s "multi-accou
 coordination out of the box" false. The split is still the fix; the goal is sharing the client,
 not exposing configuration.
 
-## The DAV bypass: Dispatch's privacy is not what is blocking them
-
-The `test_support` feature already publishes `ScriptedDispatch` / `scripted_account`, which is the
-only thing consumers actually needed from that seam. Keeping the `Dispatch` trait itself private is
-buying real value (reqwest stays out of the public API), and the hunter would not change it. The
-actual blockers for CalDAV/CardDAV are two much smaller gaps:
-
-- `AccountNet` exposes only `get/post/put/patch/delete`. DAV needs `PROPFIND`, `REPORT`,
-  `MKCALENDAR` (`crates/caldav/src/client.rs` builds them via `Method::from_bytes`). There is no
-  `AccountNet::request(Method, &str)`.
-- `AccountSpec::token_source` is mandatory `Arc<dyn TokenSource>`, but DAV is commonly Basic-auth.
-  `without_bearer_auth()` exists on the builder, but the spec still demands a token source, so a
-  Basic account must fabricate a dummy `StaticTokenSource`.
-
-Fix those two and the DAV crates can drop `ReqwestDavTransport`, their own `reqwest::Client`, their
-`DavTransport` double, and their `String`-typed transport errors, and gain retry, rate limiting,
-bandwidth metering, traceparent, 401 refresh, and method-aware redirects (today they get follow/stop
-only, since `reqwest::redirect::Policy` cannot rewrite methods or strip headers).
-
 ## The 93-method Account trait
 
 Object-safe with default impls, so it does not force duplication mechanically, but every new lane on
 it is a workspace-wide edit. The hunter did not audit this deeply enough to propose a specific split;
 flagging it as the thing most likely to be the next structural cost.
-
-## Smaller / lower-confidence
-
-- **`status_line_code` (dav-F5) landed correctly.** Both DAV crates consume it, the caldav
-  `propstat_success.unwrap_or(true)` hole is closed (unparseable is now `Some(false)`, absent stays
-  `None` into success), and `commit_propstat`'s two branches are mutually exclusive. Two hardening
-  nits: the parser accepts any `u16` token anywhere in the line, so `"Error 42 occurred"` parses as
-  42, and it accepts codes outside 100-599. Constraining to the first token in `100..=599` would cost
-  nothing.
-- **Rate governor has no fairness.** Waiters race after each `notify_one`, with a 250 ms poll floor.
-  Under sustained contention a waiter can starve; the code's own comment concedes "if a caller adds
-  higher-volume refund paths, reconsider", and the retry loop now refunds on every retried failure (a
-  change since that comment), so that condition is arguably already met.
-- **Outbound metering is counted before dispatch** (`request.rs`), so bytes are recorded for attempts
-  that fail `Unsent` (DNS/connect) and never touched the wire. Headers are excluded by design. Minor
-  accounting skew, documented only in a code comment.
-- **Doc drift in `reference/net.md`**: the Drop claim and the `MeterSinkHandle` "wiring lands in
-  S1-W2" note, which reads as stale planning text in a durable reference doc.

@@ -12,6 +12,155 @@ use std::time::Duration;
 use bifrost_net::error::Error;
 use bifrost_net::rate::{RateLimit, RateLimitGovernor};
 
+/// Cancelling the head must hand the front to its successor, and the
+/// successor's own precedence must survive the handoff. The costs are
+/// deliberately uneven: with a queue, the expensive B blocks the cheap C
+/// until B is funded, so an out-of-order admission is observable. With
+/// waiters merely racing for tokens, C takes the first refunded unit and
+/// the assertion fires. Uniform costs made this test pass against a
+/// governor with no queue at all.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_cancelled_head_hands_the_front_over_without_letting_the_tail_overtake() {
+    let governor = std::sync::Arc::new(RateLimitGovernor::new());
+    governor.register(RateLimit {
+        host: "fifo.test".to_owned(),
+        quota_per_second: 0.001,
+        cost_default: 1,
+        burst: 3,
+    });
+    governor.acquire("fifo.test", 3).await.unwrap();
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut tasks = Vec::new();
+    for (id, cost) in [(0, 1), (1, 3), (2, 1)] {
+        let governor = std::sync::Arc::clone(&governor);
+        let tx = tx.clone();
+        tasks.push(tokio::spawn(async move {
+            governor.acquire("fifo.test", cost).await.unwrap();
+            tx.send(id).unwrap();
+        }));
+        tokio::task::yield_now().await;
+    }
+
+    // Cancel the head. B (cost 3) inherits the front; C (cost 1) must
+    // not be admitted by the refunds that are funding B.
+    tasks.remove(0).abort();
+    tokio::task::yield_now().await;
+
+    for _ in 0..2 {
+        governor.refund("fifo.test", 1);
+        tokio::task::yield_now().await;
+        assert!(
+            rx.try_recv().is_err(),
+            "a partially funded head must not let its successor overtake"
+        );
+    }
+    governor.refund("fifo.test", 1);
+    assert_eq!(
+        rx.recv().await,
+        Some(1),
+        "the cancelled head handed the front to B"
+    );
+    governor.refund("fifo.test", 1);
+    assert_eq!(rx.recv().await, Some(2));
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_cheaper_later_waiter_cannot_overtake_the_fifo_head() {
+    let governor = std::sync::Arc::new(RateLimitGovernor::new());
+    governor.register(RateLimit {
+        host: "cost-fifo.test".to_owned(),
+        quota_per_second: 0.001,
+        cost_default: 1,
+        burst: 2,
+    });
+    governor.acquire("cost-fifo.test", 2).await.unwrap();
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    for (id, cost) in [(0, 2), (1, 1)] {
+        let governor = std::sync::Arc::clone(&governor);
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            governor.acquire("cost-fifo.test", cost).await.unwrap();
+            tx.send(id).unwrap();
+        });
+        tokio::task::yield_now().await;
+    }
+
+    governor.refund("cost-fifo.test", 1);
+    tokio::task::yield_now().await;
+    assert!(rx.try_recv().is_err(), "the one-unit follower overtook");
+    governor.refund("cost-fifo.test", 1);
+    assert_eq!(rx.recv().await, Some(0));
+    governor.refund("cost-fifo.test", 1);
+    assert_eq!(rx.recv().await, Some(1));
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn unregister_releases_every_queued_waiter() {
+    let governor = std::sync::Arc::new(RateLimitGovernor::new());
+    governor.register(RateLimit {
+        host: "detach.test".to_owned(),
+        quota_per_second: 0.001,
+        cost_default: 1,
+        burst: 1,
+    });
+    governor.acquire("detach.test", 1).await.unwrap();
+
+    let mut tasks = Vec::new();
+    for _ in 0..2 {
+        let governor = std::sync::Arc::clone(&governor);
+        tasks.push(tokio::spawn(async move {
+            governor.acquire("detach.test", 1).await
+        }));
+        tokio::task::yield_now().await;
+    }
+
+    governor.unregister("detach.test");
+    for task in tasks {
+        task.await.unwrap().unwrap();
+    }
+}
+
+/// The final `unregister` wakes queued waiters, but a woken waiter does
+/// not resume instantly. If another account registers the SAME host in
+/// that window, the waiter finds a bucket under its host again. Matching
+/// only on the host name it concluded it was still queued and parked on
+/// a `Notify` that the new bucket has no handle to - stranded forever.
+/// Bucket generation is what distinguishes "still my queue" from "a
+/// different queue that reused my host name".
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_waiter_woken_by_unregister_is_not_recaptured_by_a_re_registered_host() {
+    let governor = std::sync::Arc::new(RateLimitGovernor::new());
+    let limit = || RateLimit {
+        host: "churn.test".to_owned(),
+        quota_per_second: 0.001,
+        cost_default: 1,
+        burst: 1,
+    };
+    governor.register(limit());
+    governor.acquire("churn.test", 1).await.unwrap();
+
+    let queued = {
+        let governor = std::sync::Arc::clone(&governor);
+        tokio::spawn(async move { governor.acquire("churn.test", 1).await })
+    };
+    tokio::task::yield_now().await;
+
+    // Detach wakes the waiter; the replacement lands before it is
+    // scheduled again. The new bucket is drained, so a waiter that
+    // mistakes it for its own queue can never reach the front.
+    governor.unregister("churn.test");
+    governor.register(limit());
+    governor.acquire("churn.test", 1).await.unwrap();
+
+    tokio::time::timeout(Duration::from_secs(30), queued)
+        .await
+        .expect("a waiter released by unregister must not be recaptured by the new bucket")
+        .unwrap()
+        .unwrap();
+}
+
 /// T3: register a host at 10 units/sec, burst 5; debit 5 immediately
 /// (drains the bucket), debit 1 (must wait); refund 1 (must wake the
 /// waiter). Asserts the timing intent rather than exact wall time -

@@ -308,7 +308,7 @@ fn default_account_net(
                     burst: PEOPLE_API_BURST,
                 },
             ],
-            token_source,
+            token_source: Some(token_source),
             default_retry: RetryPolicy::default(),
         },
     )

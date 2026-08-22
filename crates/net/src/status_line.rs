@@ -15,12 +15,9 @@
 
 /// Extract the numeric status from an HTTP status line.
 ///
-/// Takes the first whitespace-delimited token that parses as a number,
-/// rather than positionally assuming the leading `HTTP/x` token is
-/// present. Servers do emit the protocol-less form (`200 OK`) inside
-/// `<D:status>`, and reading position 1 unconditionally would take
-/// `OK` as the code there and classify a perfectly good propstat as
-/// failed.
+/// Reads the first token for the protocol-less form (`200 OK`), or the
+/// token immediately after an `HTTP/` version. It never scans prose for
+/// a later number.
 ///
 /// A token only counts when it parses as a `u16` in RFC 9110's
 /// `100..=599` status range. Without the range constraint any bare
@@ -31,12 +28,26 @@
 /// and reporting `None` puts the line in the unreadable bucket, which
 /// `status_line_is_success` already fails closed on.
 ///
-/// Returns `None` when no token parses as an in-range status code.
+/// Returns `None` when the status position does not contain an in-range code.
 #[must_use]
 pub fn status_line_code(status: &str) -> Option<u16> {
-    status
-        .split_whitespace()
-        .find_map(|part| part.parse::<u16>().ok())
+    let mut parts = status.split_whitespace();
+    let first = parts.next()?;
+    // The version token is matched case-insensitively. RFC 9112 spells
+    // it uppercase, but a lowercase `http/1.1` used to reach the code
+    // anyway (the version token simply failed to parse as a number),
+    // and tightening the parser must not turn a status line some server
+    // already emits into an unreadable one.
+    let code = if first
+        .get(..5)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("HTTP/"))
+    {
+        parts.next()?
+    } else {
+        first
+    };
+    code.parse::<u16>()
+        .ok()
         .filter(|code| (100..=599).contains(code))
 }
 
@@ -107,10 +118,34 @@ mod tests {
     #[test]
     fn a_number_outside_the_status_range_is_not_a_code() {
         assert_eq!(status_line_code("Error 42 occurred"), None);
+        assert_eq!(status_line_code("Error 404 occurred"), None);
         assert!(!status_line_is_success("Error 42 occurred"));
         assert_eq!(status_line_code("HTTP/1.1 600 Nonsense"), None);
         assert_eq!(status_line_code("HTTP/1.1 0 Nonsense"), None);
         assert_eq!(status_line_code("99 Too Low"), None);
+    }
+
+    /// Boundaries of the positional read itself. The version token is
+    /// matched case-insensitively because a lowercase `http/1.1` reached
+    /// the code under the old scan-for-a-number parser, and tightening
+    /// must not make a line that already worked unreadable.
+    #[test]
+    fn the_status_position_is_read_positionally_and_tolerates_version_case() {
+        assert_eq!(status_line_code("http/1.1 200 OK"), Some(200));
+        assert_eq!(status_line_code("HTTP/2 200 OK"), Some(200));
+        assert_eq!(status_line_code("   HTTP/1.1 204 No Content"), Some(204));
+        // Code with no reason phrase: the shortest legal shape either way.
+        assert_eq!(status_line_code("204"), Some(204));
+        assert_eq!(status_line_code("HTTP/1.1 204"), Some(204));
+        // Version present but truncated before the status position.
+        assert_eq!(status_line_code("HTTP/1.1"), None);
+        assert_eq!(status_line_code("HTTP/1.1 "), None);
+        // A first token whose fifth byte falls inside a multi-byte char
+        // must not panic on the prefix slice.
+        assert_eq!(status_line_code("1234\u{e9} 404"), None);
+        // Something that is not a version and not a code stays unreadable
+        // even when a valid-looking code follows it.
+        assert_eq!(status_line_code("Status: 404 Not Found"), None);
     }
 
     /// The range ends are inclusive, so a legitimate 1xx or 5xx line

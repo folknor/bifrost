@@ -324,7 +324,7 @@ pub fn scripted_account(
         AccountId("scripted".to_string()),
         AccountSpec {
             hosts,
-            token_source,
+            token_source: Some(token_source),
             default_retry,
         },
     )

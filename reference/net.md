@@ -190,8 +190,10 @@ pinned in `tests/test_support_seam.rs`:
   network, so an under-scripted test fails loudly instead of dialing
   a real socket.
 
-`AccountNet` exposes `get`, `post`, `put`, `patch`, `delete` - one
-constructor per HTTP method routing into the same `RequestBuilder`.
+`AccountNet` exposes `get`, `post`, `put`, `patch`, `delete`, plus
+`request(http::Method, url)` for extension methods such as WebDAV's
+`PROPFIND`, `REPORT`, and `MKCALENDAR`. All constructors route into the
+same `RequestBuilder`; the generic method does not expose reqwest.
 Builder setters of note beyond the example: `body(Bytes)` for raw
 payloads (used when `json()` is not the right encoding),
 `idempotent(bool)` to override the method-derived replay-safety
@@ -202,6 +204,12 @@ the shared retry / rate-limit / metering pipeline. The token-source
 short-circuit at `request.rs:375-390` skips `Authorization: Bearer`
 injection when `bearer_auth` is false; caller-provided headers go
 through unchanged.
+
+`AccountSpec::token_source` is optional. `Some` is wrapped in the
+single-flight refresher at attach time. `None` represents an account
+that does not use bearer authentication; its requests opt out with
+`without_bearer_auth()`. Leaving bearer auth enabled without a token
+source fails locally as `InvalidRequest` before dispatch.
 
 `Response` and `StreamingResponse` are `#[non_exhaustive]` structs
 with `status()` and `headers()` accessors; `StreamingResponse.body`
@@ -333,6 +341,26 @@ cause one refresh call per request. Token expiry overrides that delay.
 Forced refreshes after a target 401 and terminal token-endpoint
 authentication failures never use the fallback.
 
+A failure with no usable fallback enters an error backoff. Calls during
+the quiet interval return the shared typed failure without contacting
+the issuer; at the boundary one caller drives the next single-flight
+attempt, and any success resets the escalation.
+
+The interval depends on what failed. A transient failure starts at one
+second and doubles per consecutive failure to a sixty-second ceiling, so
+recovery from a blip costs at most one second of added latency while a
+long outage settles at one issuer call per minute per account rather
+than one per second. A failure the issuer answered authoritatively - a
+401 or 403 from the token endpoint, or an `AuthLost` the source raised
+itself - takes the sixty-second interval immediately: re-asking cannot
+help, and hammering an IdP that is refusing is how an account gets
+throttled or blocked there. Forced refreshes are subject to the same
+quiet interval; the state, not the caller, decides.
+
+Note what this does and does not promise. It bounds the issuer call
+RATE, not the number of failing requests: every request during the
+interval still fails, it just fails locally off the cached error.
+
 `AccessToken` wraps `Zeroizing<String>`; `Debug` redacts the bytes
 and surfaces only length + expiry.
 
@@ -371,12 +399,25 @@ swapped-in token.
 ## Rate-limit governor (`RateLimitGovernor`)
 
 Per-host token bucket behind `Arc<Mutex<HashMap<String,
-HostBucket>>>`. `acquire(host, cost)` returns a `Send + 'static`
-future that captures `Arc::clone(&self.buckets)`, refills tokens
-based on elapsed time, debits `cost` if available, otherwise awaits
-the bucket's `Notify` (with a 250 ms poll cap so refunds don't
-deadlock). Refill timestamps use `tokio::time::Instant`, so paused-time
-tests advance deterministically. `refund(host, cost)` wakes one waiter.
+HostBucket>>>`. `acquire(host, cost)` joins a FIFO ticket queue. Only
+the head may debit; admission wakes its successor, a refund wakes the
+head, and cancellation removes its ticket and hands off if necessary.
+Each waiter holds its own `Notify`, so every wake is addressed rather
+than broadcast.
+
+A ticket names a bucket INSTANCE, not a host: each bucket carries a
+`generation`, and `next_waiter_id` restarts at zero for a new one.
+Removing the final host registration drops the bucket and wakes every
+queued waiter; a waiter whose ticket generation no longer matches the
+bucket sitting under its host - or whose ticket is simply no longer in
+that queue - completes as unmetered. Host-name matching alone stranded
+a woken waiter permanently when another account re-registered the same
+host before it resumed, which is ordinary detach/open churn. The
+cancellation guard is generation-scoped for the same reason: it must
+never evict a recycled ticket id belonging to the replacement bucket.
+The head polls refill at no more than 250 ms intervals. Refill
+timestamps use `tokio::time::Instant`, so paused-time tests advance
+deterministically.
 
 `cost > burst` short-circuits to `Error::CostExceedsBurst` instead
 of hanging: the bucket can never fill that high. Configuration bug,
@@ -417,9 +458,14 @@ counter wraps a `RateWindow` (10 one-second buckets, ring buffer).
 `AccountMeter::observed_bps()` returns total bytes over the
 trailing 10 seconds.
 
-Outbound metering is wired in `send_streaming_inner` (records
-`body.len()` per attempt). Inbound metering is per-chunk on the
-response body reader, both buffered and streaming.
+Outbound metering records `body.len()` when each attempt is handed to
+reqwest. Headers are excluded by design. This is an attempted-payload
+estimate, not an on-wire byte counter: reqwest does not expose the
+point at which an in-memory body is written, so an `Unsent` DNS/connect
+failure can count bytes that never reached the wire. Moving the count
+after dispatch would instead miss in-flight failures and cancellation
+after a partial write. Inbound metering is per-chunk on the response
+body reader, both buffered and streaming.
 
 `AccountNet` caches its `AccountMeter` at attach or retag time, avoiding
 an account-id allocation and meter-map lookup on each request attempt.
@@ -439,7 +485,7 @@ site does not have to thread the id alongside every byte count.
 `MeterSinkHandle::new` accepts any `Arc<dyn MeterSink>` for test
 doubles. Both the direct HTTP meter and `MeterSink` are lookup-only:
 recording against an unknown or detached account is a no-op and never
-re-registers it. Wiring against IMAP / SMTP lands in S1-W2.
+re-registers it.
 
 ### Bandwidth cap
 
@@ -702,17 +748,11 @@ dav-F5).
 
 Two behaviours worth not regressing:
 
-- The code is the first whitespace-delimited token that parses as a
-  number **in RFC 9110's `100..=599` range**, NOT the token at position
-  1. Servers do emit the protocol-less form (`200 OK`) inside
-  `<D:status>`, where a positional read takes `OK` as the code and
-  classifies a good propstat as failed. `HTTP/1.1` contains no bare
-  numeric token, so the version cannot be mistaken for the code. The
-  range constraint is what stops a server's prose (`Error 42 occurred`,
-  a `<D:status>` a proxy filled with free text) from parsing as status
-  42; an out-of-range number is not a status, so the line lands in the
-  unreadable bucket that `status_line_is_success` already fails closed
-  on.
+- The code is the first token in the protocol-less form (`200 OK`), or
+  the token immediately after an `HTTP/` version. It must be in RFC
+  9110's `100..=599` range, and the parser never scans later prose for
+  a number. An invalid status position lands in the unreadable bucket
+  that `status_line_is_success` fails closed on.
 - A line with no parseable code is NOT success. An unreadable status is
   not evidence the property was returned, so treating it as success
   commits a value the server may have refused. This is the one place

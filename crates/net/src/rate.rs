@@ -4,10 +4,13 @@
 //! construction. The governor enforces it on every request. `Notify`
 //! is used rather than fixed sleeps so a 429 with a long
 //! `Retry-After` can refund the unused cost and wake other waiters
-//! immediately.
+//! immediately. Admission is FIFO: each `acquire` takes a ticket in
+//! its host's queue and only the head may debit, so a waiter cannot
+//! starve behind a stream of later arrivals.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -86,8 +89,18 @@ pub(crate) struct HostBucket {
     pub(crate) cost_default: u32,
     /// Wall-clock instant of the last refill calculation.
     pub(crate) last_refill: Instant,
-    /// Notify handle used by `acquire` waiters and the refund path.
-    pub(crate) notify: Arc<Notify>,
+    /// FIFO admission queue. Only its front entry may debit tokens.
+    waiters: VecDeque<RateWaiter>,
+    next_waiter_id: u64,
+    /// Identity of this bucket *instance*, distinct from the host name.
+    /// A host can be unregistered and registered again while a woken
+    /// waiter is still on its way back to the lock; without this the
+    /// waiter would find a bucket under its host, fail to recognise it
+    /// as a different queue, and park on its own `Notify` forever. It
+    /// also stops a cancelled waiter's `Drop` from evicting a
+    /// same-numbered ticket belonging to the replacement bucket, since
+    /// `next_waiter_id` restarts at zero for every new instance.
+    generation: u64,
     /// Per-host attach count. Each `register` increments; each
     /// `unregister` decrements; the bucket is dropped when the count
     /// reaches zero. Lets `Net::detach_account` shed unused host
@@ -163,7 +176,9 @@ impl RateLimitGovernor {
                         refill_rate: limit.quota_per_second,
                         cost_default: limit.cost_default,
                         last_refill: Instant::now(),
-                        notify: Arc::new(Notify::new()),
+                        waiters: VecDeque::new(),
+                        next_waiter_id: 0,
+                        generation: NEXT_BUCKET_GENERATION.fetch_add(1, Ordering::Relaxed),
                         attach_count: 1,
                     },
                 );
@@ -185,8 +200,13 @@ impl RateLimitGovernor {
             }
             None => false,
         };
-        if drop_it {
-            map.remove(host);
+        // Waking the queue is what makes detach safe: a parked waiter
+        // whose bucket just vanished must complete as unmetered rather
+        // than sit on a `Notify` nothing will ever fire again.
+        if drop_it && let Some(bucket) = map.remove(host) {
+            for waiter in bucket.waiters {
+                waiter.notify.notify_one();
+            }
         }
     }
 
@@ -244,13 +264,67 @@ impl RateLimitGovernor {
                     });
                 }
             }
+            let (ticket, waiter_notify) = {
+                let mut map = buckets.lock().expect("rate-governor lock poisoned");
+                let Some(bucket) = map.get_mut(&host) else {
+                    return Ok(());
+                };
+                let ticket = Ticket {
+                    generation: bucket.generation,
+                    id: bucket.next_waiter_id,
+                };
+                bucket.next_waiter_id = bucket.next_waiter_id.wrapping_add(1);
+                let notify = Arc::new(Notify::new());
+                bucket.waiters.push_back(RateWaiter {
+                    id: ticket.id,
+                    notify: Arc::clone(&notify),
+                });
+                (ticket, notify)
+            };
+            let mut guard = WaiterGuard {
+                buckets: Arc::clone(&buckets),
+                host: host.clone(),
+                ticket,
+                armed: true,
+            };
             loop {
-                // Snapshot the notify handle and wait duration inside
-                // the lock; the actual await happens outside.
-                let (notify, wait_for) = {
+                let is_front = {
+                    let map = buckets.lock().expect("rate-governor lock poisoned");
+                    // Three ways this ticket can have stopped being
+                    // metered, all of which must complete rather than
+                    // park: the host was unregistered outright, the
+                    // host was unregistered and registered again by
+                    // another account (a different bucket instance,
+                    // which never held this ticket), or the ticket was
+                    // otherwise drained from the queue we joined.
+                    // Completing unmetered matches the documented
+                    // detach behaviour; parking on a `Notify` nothing
+                    // holds any more would strand the request forever.
+                    let Some(bucket) = map.get(&host).filter(|bucket| {
+                        bucket.generation == ticket.generation
+                            && bucket.waiters.iter().any(|waiter| waiter.id == ticket.id)
+                    }) else {
+                        guard.armed = false;
+                        return Ok(());
+                    };
+                    bucket.waiters.front().map(|waiter| waiter.id) == Some(ticket.id)
+                };
+                if !is_front {
+                    waiter_notify.notified().await;
+                    continue;
+                }
+                // Snapshot the wait duration inside the lock; the
+                // actual await happens outside.
+                let wait_for = {
                     let mut map = buckets.lock().expect("rate-governor lock poisoned");
-                    let Some(bucket) = map.get_mut(&host) else {
-                        // Host has no declared quota; no-op.
+                    let Some(bucket) = map
+                        .get_mut(&host)
+                        .filter(|bucket| bucket.generation == ticket.generation)
+                    else {
+                        // Host has no declared quota, or the bucket we
+                        // queued on was replaced; either way this
+                        // request is now unmetered.
+                        guard.armed = false;
                         return Ok(());
                     };
                     let now = Instant::now();
@@ -260,6 +334,11 @@ impl RateLimitGovernor {
                     bucket.last_refill = now;
                     if bucket.tokens >= cost_f {
                         bucket.tokens -= cost_f;
+                        bucket.waiters.pop_front();
+                        if let Some(next) = bucket.waiters.front() {
+                            next.notify.notify_one();
+                        }
+                        guard.armed = false;
                         return Ok(());
                     }
                     // Not enough tokens. Compute the minimum wait until
@@ -272,13 +351,12 @@ impl RateLimitGovernor {
                     let deficit = cost_f - bucket.tokens;
                     let wait_secs = deficit / bucket.refill_rate;
                     let wait_capped = wait_secs.clamp(0.005, 0.25);
-                    let dur = Duration::from_secs_f64(wait_capped);
-                    (Arc::clone(&bucket.notify), dur)
+                    Duration::from_secs_f64(wait_capped)
                 };
-                // Either the notify fires (refund / quota-tier change)
-                // or the timer elapses (we recompute the refill).
+                // Either a refund wakes the FIFO head or its refill
+                // timer elapses.
                 tokio::select! {
-                    _ = notify.notified() => {}
+                    _ = waiter_notify.notified() => {}
                     _ = tokio::time::sleep(wait_for) => {}
                 }
             }
@@ -289,25 +367,73 @@ impl RateLimitGovernor {
     /// server returned 429 with a `Retry-After` and the request did
     /// not actually consume the slot.
     ///
-    /// **Thundering-herd note:** waiters are tokio `Notify`
-    /// listeners. We call `notify_one()` so a single refund wakes
-    /// only one waiter, which is the right semantics for token-bucket
-    /// fairness: refunding `cost = 1` should not wake N waiters who
-    /// each consume the same slot. However, a burst of refunds (e.g.
-    /// a chain of 503s from a host that just came back up) will wake
-    /// one waiter per refund in quick succession, and they will all
-    /// re-enter `acquire` and race to debit the bucket. This is
-    /// acceptable: refilled tokens are still scarce on the
-    /// just-recovered host, so racing acquirers self-throttle. If a
-    /// caller adds higher-volume refund paths (currently only the
-    /// retry loop refunds), reconsider.
+    /// **No thundering herd:** the wake goes to the head of the
+    /// admission queue and nobody else. Refunded tokens are offered to
+    /// exactly the waiter entitled to them, so a burst of refunds (a
+    /// chain of 503s from a host that just came back up) cannot wake N
+    /// waiters to race for one slot. A refund that arrives with the
+    /// queue empty simply raises the token count for the next arrival.
     pub fn refund(&self, host: &str, cost: u32) {
         let mut map = self.buckets.lock().expect("rate-governor lock poisoned");
         let Some(bucket) = map.get_mut(host) else {
             return;
         };
         bucket.tokens = (bucket.tokens + f64::from(cost)).min(bucket.burst);
-        bucket.notify.notify_one();
+        if let Some(waiter) = bucket.waiters.front() {
+            waiter.notify.notify_one();
+        }
+    }
+}
+
+/// Monotonic source of `HostBucket::generation`. Process-wide because
+/// bucket instances are compared only against tickets minted from the
+/// same instance; uniqueness across governors costs nothing and removes
+/// any question about governors that share a host name.
+static NEXT_BUCKET_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+struct RateWaiter {
+    id: u64,
+    notify: Arc<Notify>,
+}
+
+/// A waiter's place in one specific bucket instance. The `id` alone is
+/// ambiguous across an unregister/register cycle, since `next_waiter_id`
+/// restarts at zero with the new bucket.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Ticket {
+    generation: u64,
+    id: u64,
+}
+
+struct WaiterGuard {
+    buckets: Arc<Mutex<HashMap<String, HostBucket>>>,
+    host: String,
+    ticket: Ticket,
+    armed: bool,
+}
+
+impl Drop for WaiterGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut map = self.buckets.lock().expect("rate-governor lock poisoned");
+        // Only ever mutate the bucket instance this ticket was minted
+        // against. A cancelled waiter whose host was re-registered
+        // meanwhile would otherwise evict an unrelated waiter that
+        // happens to hold the same recycled id, and hand its wake to
+        // the wrong task.
+        let Some(bucket) = map
+            .get_mut(&self.host)
+            .filter(|bucket| bucket.generation == self.ticket.generation)
+        else {
+            return;
+        };
+        let was_front = bucket.waiters.front().map(|waiter| waiter.id) == Some(self.ticket.id);
+        bucket.waiters.retain(|waiter| waiter.id != self.ticket.id);
+        if was_front && let Some(next) = bucket.waiters.front() {
+            next.notify.notify_one();
+        }
     }
 }
 

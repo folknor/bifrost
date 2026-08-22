@@ -17,7 +17,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bifrost_net::test_support::{Canned, ScriptedDispatch, canned, canned_with_headers};
-use bifrost_net::{Error, NetConfig, RetryPolicy, StaticTokenSource};
+use bifrost_net::{
+    AccountId, AccountSpec, Error, Method, NetConfig, RetryPolicy, StaticTokenSource,
+};
 use reqwest::StatusCode;
 use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
 
@@ -33,6 +35,96 @@ fn account(script: &Arc<ScriptedDispatch>, retry: RetryPolicy) -> bifrost_net::A
 
 fn no_retry() -> RetryPolicy {
     RetryPolicy::disabled()
+}
+
+#[tokio::test]
+async fn extension_method_and_no_bearer_account_use_the_shared_pipeline() {
+    let script = ScriptedDispatch::new([canned(StatusCode::MULTI_STATUS, b"dav")]);
+    let net = bifrost_net::test_support::scripted_net(&script, NetConfig::default());
+    let account = net.attach_account(
+        AccountId("basic-dav".to_owned()),
+        AccountSpec {
+            hosts: Vec::new(),
+            token_source: None,
+            default_retry: no_retry(),
+        },
+    );
+    let method = Method::from_bytes(b"PROPFIND").unwrap();
+
+    account
+        .request(method.clone(), "https://dav.test/calendars")
+        .without_bearer_auth()
+        .send()
+        .await
+        .expect("Basic-auth shape needs no fabricated bearer source");
+
+    let sent = script.requests();
+    assert_eq!(sent[0].method, method);
+    assert!(
+        sent[0]
+            .headers
+            .get(reqwest::header::AUTHORIZATION)
+            .is_none()
+    );
+}
+
+/// The token source is optional, so bearer auth left enabled on an
+/// account that has none is a caller configuration error. It must be
+/// caught before dispatch: an unauthenticated request that reaches the
+/// server would either leak the resource's existence or come back as a
+/// 401 the retry path would try to recover from with a refresh that
+/// cannot exist.
+#[tokio::test]
+async fn bearer_auth_without_a_token_source_fails_locally_and_sends_nothing() {
+    let script = ScriptedDispatch::new([canned(StatusCode::OK, b"never reached")]);
+    let net = bifrost_net::test_support::scripted_net(&script, NetConfig::default());
+    let account = net.attach_account(
+        AccountId("no-source".to_owned()),
+        AccountSpec {
+            hosts: Vec::new(),
+            token_source: None,
+            default_retry: no_retry(),
+        },
+    );
+
+    let Err(error) = account.get("https://api.test/thing").send().await else {
+        panic!("bearer auth with no token source is a local configuration failure");
+    };
+
+    match &error {
+        Error::InvalidRequest { field, .. } => assert_eq!(*field, "bearer_auth"),
+        other => panic!("expected a local InvalidRequest, got {other:?}"),
+    }
+    assert!(
+        script.requests().is_empty(),
+        "no unauthenticated request may reach the transport"
+    );
+
+    let account_error = bifrost_net::into_account_error(
+        error,
+        bifrost_net::NetErrorContext {
+            provider: None,
+            protocol: bifrost_types::Protocol::CalDav,
+            operation: bifrost_types::AccountOperation::Discover,
+            scope: None,
+        },
+    );
+    assert!(
+        matches!(
+            account_error.kind(),
+            bifrost_types::AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed)
+        ),
+        "kind was {:?}",
+        account_error.kind()
+    );
+    assert!(
+        matches!(
+            account_error.recovery(),
+            bifrost_types::RecoveryClass::ClientBug
+        ),
+        "recovery was {:?}",
+        account_error.recovery()
+    );
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]

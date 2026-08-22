@@ -9,6 +9,7 @@
 use std::fmt;
 use std::sync::Arc;
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use bifrost_types::AccountFuture;
@@ -27,6 +28,37 @@ use crate::request::parse_retry_after;
 /// it.
 pub const DEFAULT_TOKEN_MAX_AGE: Duration = Duration::from_secs(55 * 60);
 const PROACTIVE_REFRESH_RETRY_DELAY: Duration = Duration::from_secs(30);
+/// First quiet interval after a refresh failure that left no usable
+/// cached token. Short on purpose: the common case is a blip, and the
+/// engine's recovery latency is bounded by how soon the next attempt
+/// may run.
+const FAILED_REFRESH_RETRY_DELAY: Duration = Duration::from_secs(1);
+/// Ceiling for the doubling applied to consecutive transient failures.
+/// An outage therefore costs at most one issuer call per minute per
+/// account instead of one per second for its whole duration.
+const MAX_FAILED_REFRESH_RETRY_DELAY: Duration = Duration::from_secs(60);
+/// Quiet interval after a failure the issuer answered authoritatively:
+/// a 401/403 from the token endpoint, or an `AuthLost` the source
+/// raised itself. Retrying at the transient cadence cannot help - the
+/// credential needs human repair - and can get the account throttled
+/// or blocked at the IdP, so these skip the escalation and start at
+/// the ceiling.
+const TERMINAL_REFRESH_RETRY_DELAY: Duration = MAX_FAILED_REFRESH_RETRY_DELAY;
+
+/// Quiet interval to impose after a refresh failure.
+///
+/// `consecutive` counts this failure, so the first is 1. Transient
+/// failures double from `FAILED_REFRESH_RETRY_DELAY` and clamp at
+/// `MAX_FAILED_REFRESH_RETRY_DELAY`; any success resets the count.
+fn failed_refresh_delay(consecutive: u32, terminal: bool) -> Duration {
+    if terminal {
+        return TERMINAL_REFRESH_RETRY_DELAY;
+    }
+    let shift = consecutive.saturating_sub(1).min(u32::BITS - 1);
+    FAILED_REFRESH_RETRY_DELAY
+        .saturating_mul(1_u32.checked_shl(shift).unwrap_or(u32::MAX))
+        .min(MAX_FAILED_REFRESH_RETRY_DELAY)
+}
 
 /// Source of OAuth bearer tokens. Implementations are responsible for
 /// holding the refresh token (or whatever provider-specific material
@@ -176,6 +208,11 @@ pub struct OAuthRefresher {
     /// waiting for a server 401. Defaults to `DEFAULT_TOKEN_MAX_AGE`
     /// (55 min) and is tunable via `with_max_age`.
     max_age: Duration,
+    /// Consecutive no-fallback refresh failures, shared by every handle
+    /// onto this refresher. Drives the escalating quiet interval; reset
+    /// to zero by any successful refresh so a recovered issuer is back
+    /// to the one-second floor immediately.
+    consecutive_failures: Arc<AtomicU32>,
 }
 
 impl OAuthRefresher {
@@ -194,6 +231,7 @@ impl OAuthRefresher {
             source,
             state: Arc::new(Mutex::new(RefreshState::Empty)),
             max_age: DEFAULT_TOKEN_MAX_AGE,
+            consecutive_failures: Arc::new(AtomicU32::new(0)),
         }
     }
 
@@ -284,6 +322,19 @@ impl OAuthRefresher {
                     };
                     DriverRole::Driver(rx)
                 }
+                RefreshState::Backoff { error, retry_at }
+                    if tokio::time::Instant::now() < *retry_at =>
+                {
+                    return Err(arc_err_to_error(Arc::clone(error)));
+                }
+                RefreshState::Backoff { .. } => {
+                    let (tx, rx) = oneshot::channel();
+                    *state = RefreshState::Refreshing {
+                        waiters: vec![tx],
+                        fallback: None,
+                    };
+                    DriverRole::Driver(rx)
+                }
                 RefreshState::Refreshing { waiters, .. } => {
                     let (tx, rx) = oneshot::channel();
                     waiters.push(tx);
@@ -324,6 +375,7 @@ impl OAuthRefresher {
 
         match result {
             Ok(token) => {
+                self.consecutive_failures.store(0, Ordering::Relaxed);
                 *state = RefreshState::Fresh {
                     token: token.clone(),
                     refreshed_at: Instant::now(),
@@ -336,7 +388,8 @@ impl OAuthRefresher {
                 Ok(token)
             }
             Err(err) => {
-                let can_fallback = !is_terminal_auth_error(&err)
+                let terminal = is_terminal_auth_error(&err);
+                let can_fallback = !terminal
                     && fallback
                         .as_ref()
                         .and_then(|(token, _)| token.expires_at())
@@ -354,11 +407,17 @@ impl OAuthRefresher {
                     }
                     return Ok(token);
                 }
-                // Leave state as `Empty` so the next caller drives a
-                // fresh attempt rather than parking on a dead
-                // `Refreshing` entry.
-                drop(state);
+                let consecutive = self
+                    .consecutive_failures
+                    .fetch_add(1, Ordering::Relaxed)
+                    .saturating_add(1);
                 let shared = Arc::new(err);
+                *state = RefreshState::Backoff {
+                    error: Arc::clone(&shared),
+                    retry_at: tokio::time::Instant::now()
+                        + failed_refresh_delay(consecutive, terminal),
+                };
+                drop(state);
                 for waiter in waiters {
                     let _ = waiter.send(Err(Arc::clone(&shared)));
                 }
@@ -380,6 +439,7 @@ impl OAuthRefresher {
             source: Arc::clone(&self.source),
             state: Arc::clone(&self.state),
             max_age: self.max_age,
+            consecutive_failures: Arc::clone(&self.consecutive_failures),
         }
     }
 
@@ -414,6 +474,7 @@ impl TokenSource for OAuthRefresher {
             source: Arc::clone(&self.source),
             state: Arc::clone(&self.state),
             max_age: self.max_age,
+            consecutive_failures: Arc::clone(&self.consecutive_failures),
         };
         Box::pin(async move { me.token().await })
     }
@@ -423,6 +484,7 @@ impl TokenSource for OAuthRefresher {
             source: Arc::clone(&self.source),
             state: Arc::clone(&self.state),
             max_age: self.max_age,
+            consecutive_failures: Arc::clone(&self.consecutive_failures),
         };
         Box::pin(async move { me.force_refresh().await })
     }
@@ -590,6 +652,15 @@ pub enum RefreshState {
     /// refreshing role implicitly claimed (`waiters` empty); it
     /// drives the network round-trip itself.
     Empty,
+    /// A refresh failed without a usable fallback. Calls fail fast
+    /// with the shared error until one short retry interval elapses,
+    /// after which exactly one caller becomes the next driver.
+    Backoff {
+        /// Failure returned to callers during the quiet interval.
+        error: Arc<Error>,
+        /// Earliest instant at which another issuer call may start.
+        retry_at: tokio::time::Instant,
+    },
     /// Steady state. The cached token is valid and outside the
     /// proactive-refresh window.
     Fresh {
@@ -630,10 +701,168 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use reqwest::header::{HeaderMap, HeaderValue, WWW_AUTHENTICATE};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     struct FailingRefreshSource {
         calls: AtomicUsize,
+    }
+
+    struct RecoveringRefreshSource {
+        calls: AtomicUsize,
+        healthy: AtomicBool,
+    }
+
+    impl TokenSource for RecoveringRefreshSource {
+        fn current(&self) -> AccountFuture<Result<AccessToken, Error>> {
+            self.refresh()
+        }
+
+        fn refresh(&self) -> AccountFuture<Result<AccessToken, Error>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let healthy = self.healthy.load(Ordering::SeqCst);
+            Box::pin(async move {
+                if healthy {
+                    Ok(AccessToken::new("recovered", None))
+                } else {
+                    Err(Error::Network {
+                        message: "issuer unavailable".to_owned(),
+                        transmission_state: bifrost_types::TransmissionState::Unsent,
+                        source: None,
+                    })
+                }
+            })
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_fallback_failure_is_throttled_and_retries_at_the_short_boundary() {
+        let source = Arc::new(RecoveringRefreshSource {
+            calls: AtomicUsize::new(0),
+            healthy: AtomicBool::new(false),
+        });
+        let refresher = OAuthRefresher::new(Arc::clone(&source) as Arc<dyn TokenSource>);
+
+        assert!(refresher.token().await.is_err());
+        assert!(refresher.token().await.is_err());
+        assert_eq!(source.calls.load(Ordering::SeqCst), 1);
+
+        source.healthy.store(true, Ordering::SeqCst);
+        tokio::time::advance(FAILED_REFRESH_RETRY_DELAY - Duration::from_millis(1)).await;
+        assert!(refresher.token().await.is_err());
+        assert_eq!(source.calls.load(Ordering::SeqCst), 1);
+
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert_eq!(refresher.token().await.unwrap().as_str(), "recovered");
+        assert_eq!(source.calls.load(Ordering::SeqCst), 2);
+    }
+
+    struct TerminalRefreshSource {
+        calls: AtomicUsize,
+    }
+
+    impl TokenSource for TerminalRefreshSource {
+        fn current(&self) -> AccountFuture<Result<AccessToken, Error>> {
+            self.refresh()
+        }
+
+        fn refresh(&self) -> AccountFuture<Result<AccessToken, Error>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {
+                Err(Error::Status {
+                    code: reqwest::StatusCode::UNAUTHORIZED,
+                    body: Bytes::from_static(br#"{"error":"invalid_grant"}"#),
+                    headers: HeaderMap::new(),
+                })
+            })
+        }
+    }
+
+    /// Boundary table for the quiet interval. The first failure keeps
+    /// the one-second floor so a blip costs almost no recovery latency;
+    /// consecutive failures double so a long outage cannot be answered
+    /// with one issuer call per second forever; the clamp is exact at
+    /// the transition, not merely "eventually 60s".
+    #[test]
+    fn the_quiet_interval_escalates_from_one_second_and_clamps_at_a_minute() {
+        assert_eq!(failed_refresh_delay(1, false), Duration::from_secs(1));
+        assert_eq!(failed_refresh_delay(2, false), Duration::from_secs(2));
+        assert_eq!(failed_refresh_delay(6, false), Duration::from_secs(32));
+        assert_eq!(failed_refresh_delay(7, false), Duration::from_secs(60));
+        assert_eq!(failed_refresh_delay(8, false), Duration::from_secs(60));
+        // No overflow panic at the far end of the shift domain.
+        assert_eq!(
+            failed_refresh_delay(u32::MAX, false),
+            Duration::from_secs(60)
+        );
+        // A refusal the issuer is authoritative about never gets the
+        // one-second treatment, not even on its first occurrence.
+        assert_eq!(failed_refresh_delay(1, true), Duration::from_secs(60));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn consecutive_transient_failures_escalate_and_a_success_resets_the_floor() {
+        let source = Arc::new(RecoveringRefreshSource {
+            calls: AtomicUsize::new(0),
+            healthy: AtomicBool::new(false),
+        });
+        let refresher = OAuthRefresher::new(Arc::clone(&source) as Arc<dyn TokenSource>);
+
+        // First failure: one second.
+        assert!(refresher.token().await.is_err());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(refresher.token().await.is_err());
+        assert_eq!(source.calls.load(Ordering::SeqCst), 2);
+
+        // Second failure: two seconds, so one second is not enough.
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(refresher.token().await.is_err());
+        assert_eq!(
+            source.calls.load(Ordering::SeqCst),
+            2,
+            "the second failure must not retry at the one-second floor"
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        source.healthy.store(true, Ordering::SeqCst);
+        assert_eq!(refresher.token().await.unwrap().as_str(), "recovered");
+        assert_eq!(source.calls.load(Ordering::SeqCst), 3);
+
+        // The success reset the count, so the next failure is back to
+        // one second rather than resuming the escalation.
+        source.healthy.store(false, Ordering::SeqCst);
+        assert!(refresher.force_refresh().await.is_err());
+        assert_eq!(source.calls.load(Ordering::SeqCst), 4);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        source.healthy.store(true, Ordering::SeqCst);
+        assert_eq!(refresher.token().await.unwrap().as_str(), "recovered");
+        assert_eq!(source.calls.load(Ordering::SeqCst), 5);
+    }
+
+    /// A token endpoint answering 401 `invalid_grant` is refusing
+    /// authoritatively. Calling it once a second for the life of the
+    /// outage helps nobody and is how an account gets throttled or
+    /// blocked at the IdP.
+    #[tokio::test(start_paused = true)]
+    async fn a_hard_issuer_refusal_does_not_retry_at_the_transient_cadence() {
+        let source = Arc::new(TerminalRefreshSource {
+            calls: AtomicUsize::new(0),
+        });
+        let refresher = OAuthRefresher::new(Arc::clone(&source) as Arc<dyn TokenSource>);
+
+        assert!(refresher.token().await.is_err());
+        assert_eq!(source.calls.load(Ordering::SeqCst), 1);
+
+        tokio::time::advance(TERMINAL_REFRESH_RETRY_DELAY - Duration::from_millis(1)).await;
+        assert!(refresher.token().await.is_err());
+        assert!(refresher.force_refresh().await.is_err());
+        assert_eq!(
+            source.calls.load(Ordering::SeqCst),
+            1,
+            "a hard refusal must not be re-asked before the long interval"
+        );
+
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(refresher.token().await.is_err());
+        assert_eq!(source.calls.load(Ordering::SeqCst), 2);
     }
 
     impl TokenSource for FailingRefreshSource {

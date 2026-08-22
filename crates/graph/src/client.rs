@@ -413,7 +413,7 @@ impl GraphClient {
                         cost_default: 1,
                         burst: 10,
                     }],
-                    token_source,
+                    token_source: Some(token_source),
                     default_retry: RetryPolicy::default(),
                 },
             );

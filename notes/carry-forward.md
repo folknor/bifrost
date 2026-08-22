@@ -120,6 +120,46 @@ These are cross-crate. They bind every protocol crate, not just `bifrost-graph`.
   `ObjectId` and `BatchOutcome` carries its own submission-order index. A
   consumer that starts depending on cross-window ordering breaks this.
 
+## From the bifrost-net arc (round 1, 2026-08-22)
+
+These bind every protocol crate, because `bifrost-net` sits under all of them.
+
+- **`AccountSpec::token_source` is optional.** `None` means the account
+  does not use bearer auth (Basic-auth DAV is the motivating case) and its
+  requests must opt out with `without_bearer_auth()`. Leaving bearer auth on
+  with no source fails LOCALLY, before dispatch, as `Error::InvalidRequest {
+  field: "bearer_auth" }` -> `Request(Malformed)` -> `RecoveryClass::ClientBug`.
+  No path may send an unauthenticated request in place of an authenticated
+  one; that is a configuration bug, not a transient condition.
+
+- **The refresh backoff bounds the issuer call RATE, not the failure count.**
+  A no-fallback refresh failure parks the refresher in `Backoff`, and every
+  call during the interval fails locally off the shared cached error.
+  Transient failures escalate 1s -> 60s by doubling; an authoritative issuer
+  refusal (401/403 from the token endpoint, or `AuthLost`) takes 60s
+  immediately; any success resets. Forced refreshes obey the same interval -
+  the state decides, not the caller. Do not re-document this as "prevents one
+  refresh call per request": that overclaim is what this round replaced.
+
+- **Rate-governor tickets name a bucket INSTANCE, not a host.** Admission is
+  FIFO, each waiter holds its own `Notify`, and every `HostBucket` carries a
+  `generation` while `next_waiter_id` restarts at zero per instance. A waiter
+  whose generation no longer matches the bucket under its host, or whose
+  ticket is gone from that queue, completes as UNMETERED; the cancellation
+  guard mutates only its own generation. Matching on the host name alone
+  stranded a waiter forever when another account re-registered the same host
+  in the window between the final `unregister` waking it and it resuming -
+  ordinary detach/open churn. Anything added to this queue must keep the
+  generation check, or the strand comes back.
+
+- **`status_line_code` reads the status POSITION.** The first token, or the
+  token after an `HTTP/` version (case-insensitive), and only in `100..=599`.
+  It never scans prose for a later number. Both DAV crates consume it, and
+  the caldav `propstat_success.unwrap_or(true)` hole stays closed because
+  unparseable is still `Some(false)` while ABSENT stays `None` into success.
+  Tightening the parser moves inputs into the unreadable bucket, never out of
+  it, so that hole cannot reopen from this direction.
+
 ## Standing lessons this project has paid for
 
 - **Audit new tests for bite, mechanically.** Revert the production change,
@@ -127,6 +167,18 @@ These are cross-crate. They bind every protocol crate, not just `bifrost-graph`.
   passing against the bug they were written for - most recently an entire
   "exhaustive" alias-pair suite that passed against the pre-fix code, which also
   proved the finding it came from was never a defect.
+
+  **Uniform inputs are how a concurrency test fails to bite.** A FIFO
+  admission test whose waiters all had cost 1 passed against a governor with
+  no queue at all, because single-threaded scheduling order alone reproduced
+  the answer. It only bit once the head was made expensive and the follower
+  cheap, so an overtake was observable. Same shape as the 500,000-element
+  test that never produced a single-element result.
+
+  **Check the name filter before believing a PASS.** `brokkr test -p X <NAME>`
+  is a substring match; a filter that matches none of the tests you meant
+  reports PASS. Two ablation runs in this arc were read as "the test does not
+  bite" when the test had simply not run.
 
 - **The second half of a fix-and-commit stage is never cold-reviewed.** That
   stage fixes review findings and commits in one step, so its own work ships

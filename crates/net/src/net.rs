@@ -198,10 +198,11 @@ impl Net {
                 account: id,
                 registration_id,
                 meter: account_meter,
-                token_source: Arc::new(
-                    OAuthRefresher::new(spec.token_source)
-                        .with_max_age(self.inner.config.token_max_age),
-                ),
+                token_source: spec.token_source.map(|source| {
+                    Arc::new(
+                        OAuthRefresher::new(source).with_max_age(self.inner.config.token_max_age),
+                    ) as Arc<dyn TokenSource>
+                }),
                 default_retry: spec.default_retry,
                 priority: AtomicU8::new(Priority::Foreground as u8),
                 bandwidth_cap: AtomicU64::new(BANDWIDTH_CAP_NONE),
@@ -313,7 +314,7 @@ pub(crate) struct AccountNetInner {
     /// meter map per attempt.
     pub(crate) meter: AccountMeter,
     /// Provider of OAuth bearer tokens for this account.
-    pub(crate) token_source: Arc<dyn TokenSource>,
+    pub(crate) token_source: Option<Arc<dyn TokenSource>>,
     /// Default retry policy applied to every request unless the
     /// caller overrides via `RequestBuilder::retry`.
     pub(crate) default_retry: RetryPolicy,
@@ -355,6 +356,14 @@ impl AccountNet {
     #[must_use]
     pub fn get(&self, url: &str) -> RequestBuilder {
         RequestBuilder::new(self.clone(), reqwest::Method::GET, url)
+    }
+
+    /// Start a request with any standard or extension HTTP method.
+    /// The public method type comes from `http`, so reqwest remains
+    /// absent from this crate's API.
+    #[must_use]
+    pub fn request(&self, method: http::Method, url: &str) -> RequestBuilder {
+        RequestBuilder::new(self.clone(), method, url)
     }
 
     /// Start a `POST` request.
@@ -564,8 +573,8 @@ impl AccountNet {
     /// Underlying token source. Exposed so the OAuth refresher in
     /// `auth.rs` can share the trait object across requests.
     #[must_use]
-    pub fn token_source(&self) -> &Arc<dyn TokenSource> {
-        &self.inner.token_source
+    pub fn token_source(&self) -> Option<&Arc<dyn TokenSource>> {
+        self.inner.token_source.as_ref()
     }
 
     /// Underlying shared `Net` handle. Crate-internal: used by the
@@ -647,7 +656,7 @@ impl AccountNet {
                 account: new_id,
                 registration_id: self.inner.registration_id,
                 meter: account_meter,
-                token_source: Arc::clone(&self.inner.token_source),
+                token_source: self.inner.token_source.clone(),
                 default_retry: self.inner.default_retry.clone(),
                 priority: AtomicU8::new(self.inner.priority.load(Ordering::Relaxed)),
                 bandwidth_cap: AtomicU64::new(self.inner.bandwidth_cap.load(Ordering::Relaxed)),
@@ -663,11 +672,12 @@ pub struct AccountSpec {
     /// Per-host rate-limit declarations. Empty means "no governor
     /// enforcement for this account", which is the default for JMAP.
     pub hosts: Vec<RateLimit>,
-    /// Raw OAuth token provider. `Net::attach_account` wraps this in
+    /// Optional raw OAuth token provider. `Net::attach_account` wraps this in
     /// an `OAuthRefresher` using `NetConfig::token_max_age`, so callers
     /// should pass the provider itself rather than pre-wrapping it in
     /// another refresher.
-    pub token_source: Arc<dyn TokenSource>,
+    /// `None` expresses an account that does not use bearer auth.
+    pub token_source: Option<Arc<dyn TokenSource>>,
     /// Default retry policy.
     pub default_retry: RetryPolicy,
 }
@@ -1138,7 +1148,7 @@ mod tests {
                 cost_default: 1,
                 burst: 1,
             }],
-            token_source: Arc::new(StaticTokenSource::new("test-token", None)),
+            token_source: Some(Arc::new(StaticTokenSource::new("test-token", None))),
             default_retry: RetryPolicy::default(),
         }
     }
@@ -1405,7 +1415,7 @@ mod tests {
                     cost_default: 1,
                     burst: 1,
                 }],
-                token_source: Arc::new(StaticTokenSource::new("test-token", None)),
+                token_source: Some(Arc::new(StaticTokenSource::new("test-token", None))),
                 default_retry: RetryPolicy::default(),
             },
         );

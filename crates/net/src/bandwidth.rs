@@ -371,8 +371,6 @@ pub trait MeterSink: Send + Sync + 'static {
 /// transport call site does not have to thread it. Cloneable; one
 /// per spawned task is the expected usage.
 ///
-/// `S1-W1 status`: the adapter is shipped for use; IMAP / SMTP
-/// wiring lands in S1-W2.
 #[derive(Clone)]
 pub struct MeterSinkHandle {
     sink: Arc<dyn MeterSink>,
