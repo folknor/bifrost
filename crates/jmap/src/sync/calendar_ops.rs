@@ -5,7 +5,7 @@ use bifrost_types::{
     EventSearchRequest, EventStatus, EventTime, EventVisibility, Page, ProtocolKind,
     ReminderRelativeTo, ReminderTrigger, RsvpStatus,
 };
-use jiff::tz::Offset;
+use jiff::tz::{Offset, TimeZone};
 use jiff::{SignedDuration, Span, Timestamp, civil};
 use serde_json::{Map, Value, json};
 
@@ -119,7 +119,13 @@ pub(crate) fn create<T: HttpTransport>(
 ) -> AccountFuture<Result<EventId, AccountError>> {
     Box::pin(async move {
         let calendars = require_calendars(calendars, AccountOperation::EventCreate)?;
-        validate_shared_recurrence(&event.recurrence, AccountOperation::EventCreate)?;
+        validate_shared_recurrence(
+            &event.recurrence,
+            Some(&event.start),
+            event.is_all_day,
+            AccountOperation::EventCreate,
+        )?;
+        validate_shared_attendees(&event.attendees, AccountOperation::EventCreate)?;
         let mut set = CalendarEventSet::new();
         let create_id = set.create_item(jmap_create_from_event(&event));
         let mut response = calendars
@@ -144,11 +150,31 @@ pub(crate) fn update<T: HttpTransport>(
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
         let calendars = require_calendars(calendars, AccountOperation::EventUpdate)?;
-        if let Some(recurrence) = &patch.recurrence {
-            validate_shared_recurrence(recurrence, AccountOperation::EventUpdate)?;
-        }
         let id = CalendarEventId::new(event.0);
-        let jmap_patch = jmap_patch_from_event_patch(&patch, AccountOperation::EventUpdate)?;
+        // A patch that changes only the recurrence rule carries neither the
+        // event start nor its all-day flag, yet `UNTIL` conversion and the
+        // start/duration write both need them. Read the current server state
+        // for exactly the fields the patch leaves unset rather than defaulting
+        // to a timed, floating event and mangling the value.
+        let context = if event_patch_needs_context(&patch) {
+            let raw = get_raw_event(&calendars, id.clone(), AccountOperation::EventUpdate).await?;
+            event_context_from_patch(&patch, Some(&raw))
+        } else {
+            event_context_from_patch(&patch, None)
+        };
+        if let Some(recurrence) = &patch.recurrence {
+            validate_shared_recurrence(
+                recurrence,
+                context.start.as_ref(),
+                context.is_all_day,
+                AccountOperation::EventUpdate,
+            )?;
+        }
+        if let Some(attendees) = &patch.attendees {
+            validate_shared_attendees(attendees, AccountOperation::EventUpdate)?;
+        }
+        let jmap_patch =
+            jmap_patch_from_event_patch(&patch, &context, AccountOperation::EventUpdate)?;
         let mut set = CalendarEventSet::new();
         set.update_item(id.clone(), jmap_patch);
         let mut response = calendars
@@ -262,11 +288,11 @@ async fn get_events<T: HttpTransport>(
         .call(CalendarEventGet::new().ids(ids))
         .await
         .map_err(to_acct_err(operation))?;
-    Ok(response
+    response
         .into_list()
         .into_iter()
-        .map(event_from_jmap)
-        .collect())
+        .map(|event| event_from_jmap(event, operation))
+        .collect()
 }
 
 async fn get_raw_event<T: HttpTransport>(
@@ -310,7 +336,10 @@ fn calendar_from_jmap(calendar: JmapCalendar) -> Calendar {
     }
 }
 
-fn event_from_jmap(event: JmapCalendarEvent) -> CalendarEvent {
+fn event_from_jmap(
+    event: JmapCalendarEvent,
+    operation: AccountOperation,
+) -> Result<CalendarEvent, AccountError> {
     let native = event
         .id()
         .map(CalendarEventId::into_string)
@@ -331,15 +360,20 @@ fn event_from_jmap(event: JmapCalendarEvent) -> CalendarEvent {
     };
     let end = EventTime {
         value: shared_time_from_jmap(&raw_end, is_all_day),
-        timezone,
+        timezone: timezone.clone(),
     };
-    let (rdate, mut exdate) = recurrence_dates_from_overrides(event.recurrence_overrides());
+    let (rdate, mut exdate) = recurrence_dates_from_overrides(event.recurrence_overrides())
+        .map_err(|message| unsupported(operation, message))?;
     if let Some(dates) = event.excluded_dates() {
         exdate.extend(dates.keys().cloned());
     }
     let alerts = event.alerts();
     let reminders = reminders_from_alerts(alerts.as_value().copied());
-    CalendarEvent {
+    let recurrence = recurrence_from_jmap(&event, raw_start, is_all_day, timezone.as_deref())
+        .map_err(|message| unsupported(operation, message))?;
+    let attendees =
+        attendees(event.participants()).map_err(|message| unsupported(operation, message))?;
+    Ok(CalendarEvent {
         id: EventId(native.clone()),
         calendar_id: calendar_id.clone(),
         native_id: native.clone(),
@@ -361,20 +395,48 @@ fn event_from_jmap(event: JmapCalendarEvent) -> CalendarEvent {
         visibility: visibility(event.privacy()),
         self_response: RsvpStatus::Unknown,
         organizer: organizer(event.participants()),
-        attendees: attendees(event.participants()),
+        attendees,
         reminders,
         recurrence: EventRecurrence {
-            rrule: event
-                .recurrence_rules()
-                .and_then(|rules| rules.first())
-                .and_then(rrule_from_jmap_recurrence_rule),
             rdate,
             exdate,
-            recurrence_id: event.recurrence_id().map(ToString::to_string),
+            ..recurrence
         },
         html_link: None,
         raw_ical: None,
+    })
+}
+
+fn recurrence_from_jmap(
+    event: &JmapCalendarEvent,
+    start: &str,
+    is_all_day: bool,
+    timezone: Option<&str>,
+) -> Result<EventRecurrence, &'static str> {
+    if event
+        .excluded_recurrence_rules()
+        .is_some_and(|rules| !rules.is_empty())
+    {
+        return Err(
+            "JMAP excludedRecurrenceRules cannot be represented by the shared recurrence model",
+        );
     }
+    let rules = event.recurrence_rules().map(Vec::as_slice).unwrap_or(&[]);
+    if rules.len() > 1 {
+        return Err(
+            "multiple JMAP recurrenceRules cannot be represented by the shared recurrence model",
+        );
+    }
+    let rrule = rules
+        .first()
+        .map(|rule| rrule_from_jmap_recurrence_rule(rule, start, is_all_day, timezone))
+        .transpose()?
+        .flatten();
+    Ok(EventRecurrence {
+        rrule,
+        recurrence_id: event.recurrence_id().map(ToString::to_string),
+        ..EventRecurrence::default()
+    })
 }
 
 fn jmap_create_from_event(event: &EventCreate) -> CalendarEventCreate {
@@ -383,8 +445,57 @@ fn jmap_create_from_event(event: &EventCreate) -> CalendarEventCreate {
     create
 }
 
+/// The event start and all-day flag that JSCalendar conversion needs but an
+/// `EventPatch` is not required to carry.
+#[derive(Debug, Default, Clone)]
+struct EventContext {
+    start: Option<EventTime>,
+    is_all_day: bool,
+}
+
+fn rrule_has_until(patch: &EventPatch) -> bool {
+    patch
+        .recurrence
+        .as_ref()
+        .and_then(|recurrence| recurrence.rrule.as_deref())
+        .is_some_and(|rrule| {
+            rrule.split(';').any(|part| {
+                part.split_once('=')
+                    .is_some_and(|(key, _)| key.eq_ignore_ascii_case("UNTIL"))
+            })
+        })
+}
+
+/// True when the patch cannot supply the conversion context itself. `UNTIL`
+/// needs the start's timezone; any start/end or `UNTIL` write needs to know
+/// whether the event is all-day, and a patch that does not restate
+/// `is_all_day` is not asserting that the event became timed.
+fn event_patch_needs_context(patch: &EventPatch) -> bool {
+    let until = rrule_has_until(patch);
+    (until && patch.start.is_none())
+        || (patch.is_all_day.is_none() && (until || patch.start.is_some() || patch.end.is_some()))
+}
+
+fn event_context_from_patch(
+    patch: &EventPatch,
+    current: Option<&JmapCalendarEvent>,
+) -> EventContext {
+    let is_all_day = patch
+        .is_all_day
+        .or_else(|| current.map(|event| event.show_without_time().unwrap_or(false)))
+        .unwrap_or(false);
+    let start = patch.start.clone().or_else(|| {
+        current.map(|event| EventTime {
+            value: shared_time_from_jmap(event.start().unwrap_or_default(), is_all_day),
+            timezone: event.time_zone().as_value().map(ToString::to_string),
+        })
+    });
+    EventContext { start, is_all_day }
+}
+
 fn jmap_patch_from_event_patch(
     patch: &EventPatch,
+    context: &EventContext,
     operation: AccountOperation,
 ) -> Result<CalendarEventPatch, AccountError> {
     let mut out = CalendarEventPatch::default();
@@ -428,7 +539,7 @@ fn jmap_patch_from_event_patch(
     // stale duration (start-only) or drop the change entirely (end-only).
     match (&patch.start, &patch.end) {
         (Some(start), Some(end)) => {
-            let all_day = patch.is_all_day.unwrap_or(false);
+            let all_day = context.is_all_day;
             out.start(jmap_time_from_shared(start, all_day));
             out.time_zone(start.timezone.clone());
             out.duration(duration(&start.value, &end.value));
@@ -457,11 +568,9 @@ fn jmap_patch_from_event_patch(
         out.participants(participants_from_attendees(attendees));
     }
     if let Some(recurrence) = &patch.recurrence {
-        if let Some(rule) = recurrence
-            .rrule
-            .as_deref()
-            .and_then(jmap_recurrence_rule_from_rrule)
-        {
+        if let Some(rule) = recurrence.rrule.as_deref().and_then(|rrule| {
+            jmap_recurrence_rule_from_rrule(rrule, context.start.as_ref(), context.is_all_day)
+        }) {
             out.recurrence_rules(vec![rule]);
         } else {
             out.set_property("recurrenceRules", Value::Null);
@@ -560,12 +669,9 @@ fn write_event_create(target: &mut CalendarEventCreate, event: &EventCreate) {
     if !participants.is_empty() {
         target.participants(participants);
     }
-    if let Some(rule) = event
-        .recurrence
-        .rrule
-        .as_deref()
-        .and_then(jmap_recurrence_rule_from_rrule)
-    {
+    if let Some(rule) = event.recurrence.rrule.as_deref().and_then(|rrule| {
+        jmap_recurrence_rule_from_rrule(rrule, Some(&event.start), event.is_all_day)
+    }) {
         target.recurrence_rules(vec![rule]);
     }
     let overrides = recurrence_overrides_from_shared(&event.recurrence);
@@ -587,33 +693,44 @@ fn recurrence_overrides_from_shared(recurrence: &EventRecurrence) -> Map<String,
 
 fn recurrence_dates_from_overrides(
     overrides: Option<&Map<String, Value>>,
-) -> (Vec<String>, Vec<String>) {
+) -> Result<(Vec<String>, Vec<String>), &'static str> {
     let mut rdate = Vec::new();
     let mut exdate = Vec::new();
     let Some(overrides) = overrides else {
-        return (rdate, exdate);
+        return Ok((rdate, exdate));
     };
     for (date, value) in overrides {
         let Some(object) = value.as_object() else {
-            continue;
+            return Err("JMAP recurrenceOverrides entry is not an object");
         };
+        // The shared model has only RDATE and EXDATE. An override that merely
+        // excludes an occurrence is an EXDATE and one that adds an unmodified
+        // occurrence is an RDATE; anything that patches the occurrence itself
+        // has no shared representation, and dropping it would hand back the
+        // master event as though the modified occurrence did not exist.
         match object.get("excluded").and_then(Value::as_bool) {
-            Some(true) if object.len() == 1 => exdate.push(date.clone()),
-            None if object.is_empty() => rdate.push(date.clone()),
-            _ => {}
+            Some(true) => exdate.push(date.clone()),
+            _ if object.keys().all(|key| key == "excluded") => rdate.push(date.clone()),
+            _ => {
+                return Err(
+                    "a modified JMAP recurrence override cannot be represented by the shared recurrence model",
+                );
+            }
         }
     }
-    (rdate, exdate)
+    Ok((rdate, exdate))
 }
 
 fn validate_shared_recurrence(
     recurrence: &EventRecurrence,
+    start: Option<&EventTime>,
+    is_all_day: bool,
     operation: AccountOperation,
 ) -> Result<(), AccountError> {
     if recurrence
         .rrule
         .as_deref()
-        .is_some_and(|rrule| jmap_recurrence_rule_from_rrule(rrule).is_none())
+        .is_some_and(|rrule| jmap_recurrence_rule_from_rrule(rrule, start, is_all_day).is_none())
     {
         return Err(unsupported(
             operation,
@@ -623,17 +740,26 @@ fn validate_shared_recurrence(
     Ok(())
 }
 
-fn jmap_recurrence_rule_from_rrule(rrule: &str) -> Option<Value> {
+fn jmap_recurrence_rule_from_rrule(
+    rrule: &str,
+    start: Option<&EventTime>,
+    is_all_day: bool,
+) -> Option<Value> {
     let mut object = Map::new();
     object.insert("@type".to_string(), json!("RecurrenceRule"));
     for part in rrule.split(';') {
         let (key, value) = part.split_once('=')?;
         match key.to_ascii_uppercase().as_str() {
             "FREQ" => {
-                object.insert(
-                    "frequency".to_string(),
-                    Value::String(value.to_ascii_lowercase()),
-                );
+                let frequency = value.to_ascii_lowercase();
+                if ![
+                    "yearly", "monthly", "weekly", "daily", "hourly", "minutely", "secondly",
+                ]
+                .contains(&frequency.as_str())
+                {
+                    return None;
+                }
+                object.insert("frequency".to_string(), Value::String(frequency));
             }
             "INTERVAL" => {
                 object.insert("interval".to_string(), json!(value.parse::<u64>().ok()?));
@@ -642,17 +768,10 @@ fn jmap_recurrence_rule_from_rrule(rrule: &str) -> Option<Value> {
                 object.insert("count".to_string(), json!(value.parse::<u64>().ok()?));
             }
             "UNTIL" => {
-                // JSCalendar `until` is a LocalDateTime: no `Z`, no offset.
-                // An RFC 5545 UTC `UNTIL=...Z` cannot be normalized to local
-                // time without the event's timeZone, which this mapper does
-                // not see, so reject it (caught by `validate_shared_recurrence`
-                // before payload construction) rather than emit a non-conformant
-                // `Z`-suffixed `until`. Floating (no-`Z`) and date-only forms
-                // pass through unchanged.
-                if value.ends_with('Z') || value.ends_with('z') {
-                    return None;
-                }
-                object.insert("until".to_string(), Value::String(value.to_string()));
+                object.insert(
+                    "until".to_string(),
+                    Value::String(jmap_until_from_ical(value, start, is_all_day)?),
+                );
             }
             "BYDAY" => {
                 object.insert("byDay".to_string(), Value::Array(jmap_by_day(value)?));
@@ -671,32 +790,144 @@ fn jmap_recurrence_rule_from_rrule(rrule: &str) -> Option<Value> {
         .then_some(Value::Object(object))
 }
 
-fn rrule_from_jmap_recurrence_rule(rule: &Value) -> Option<String> {
-    let object = rule.as_object()?;
+fn rrule_from_jmap_recurrence_rule(
+    rule: &Value,
+    start: &str,
+    is_all_day: bool,
+    timezone: Option<&str>,
+) -> Result<Option<String>, &'static str> {
+    let object = rule
+        .as_object()
+        .ok_or("JMAP recurrence rule is not an object")?;
+    const SUPPORTED: &[&str] = &[
+        "@type",
+        "frequency",
+        "interval",
+        "count",
+        "until",
+        "byDay",
+        "byMonth",
+        "byMonthDay",
+    ];
+    if object.keys().any(|key| !SUPPORTED.contains(&key.as_str())) {
+        return Err("JMAP recurrence rule contains an unsupported component");
+    }
     let mut parts = Vec::new();
-    parts.push(format!(
-        "FREQ={}",
-        object.get("frequency")?.as_str()?.to_ascii_uppercase()
-    ));
-    if let Some(interval) = object.get("interval").and_then(Value::as_u64) {
-        parts.push(format!("INTERVAL={interval}"));
+    let frequency = object
+        .get("frequency")
+        .and_then(Value::as_str)
+        .ok_or("JMAP recurrence frequency is missing or invalid")?;
+    if ![
+        "yearly", "monthly", "weekly", "daily", "hourly", "minutely", "secondly",
+    ]
+    .contains(&frequency)
+    {
+        return Err("JMAP recurrence frequency is unsupported");
     }
-    if let Some(count) = object.get("count").and_then(Value::as_u64) {
-        parts.push(format!("COUNT={count}"));
+    parts.push(format!("FREQ={}", frequency.to_ascii_uppercase()));
+    if let Some(interval) = object.get("interval") {
+        parts.push(format!(
+            "INTERVAL={}",
+            interval
+                .as_u64()
+                .ok_or("JMAP recurrence interval is invalid")?
+        ));
     }
-    if let Some(until) = object.get("until").and_then(Value::as_str) {
-        parts.push(format!("UNTIL={until}"));
+    if let Some(count) = object.get("count") {
+        parts.push(format!(
+            "COUNT={}",
+            count.as_u64().ok_or("JMAP recurrence count is invalid")?
+        ));
     }
-    if let Some(by_day) = object.get("byDay").and_then(rrule_by_day) {
-        parts.push(format!("BYDAY={by_day}"));
+    if object.contains_key("count") && object.contains_key("until") {
+        return Err("JMAP recurrence rule contains both count and until");
     }
-    if let Some(by_month) = object.get("byMonth").and_then(rrule_integer_list) {
-        parts.push(format!("BYMONTH={by_month}"));
+    if let Some(until) = object.get("until") {
+        parts.push(format!(
+            "UNTIL={}",
+            ical_until_from_jmap(
+                until
+                    .as_str()
+                    .ok_or("JMAP recurrence until is not a string")?,
+                start,
+                is_all_day,
+                timezone,
+            )?
+        ));
     }
-    if let Some(by_month_day) = object.get("byMonthDay").and_then(rrule_integer_list) {
-        parts.push(format!("BYMONTHDAY={by_month_day}"));
+    if let Some(by_day) = object.get("byDay") {
+        parts.push(format!(
+            "BYDAY={}",
+            rrule_by_day(by_day).ok_or("JMAP recurrence byDay is invalid")?
+        ));
     }
-    Some(parts.join(";"))
+    if let Some(by_month) = object.get("byMonth") {
+        parts.push(format!(
+            "BYMONTH={}",
+            rrule_integer_list(by_month).ok_or("JMAP recurrence byMonth is invalid")?
+        ));
+    }
+    if let Some(by_month_day) = object.get("byMonthDay") {
+        parts.push(format!(
+            "BYMONTHDAY={}",
+            rrule_integer_list(by_month_day).ok_or("JMAP recurrence byMonthDay is invalid")?
+        ));
+    }
+    Ok(Some(parts.join(";")))
+}
+
+fn jmap_until_from_ical(
+    value: &str,
+    start: Option<&EventTime>,
+    is_all_day: bool,
+) -> Option<String> {
+    if is_all_day {
+        let date = civil::Date::strptime("%Y%m%d", value).ok()?;
+        return Some(date.strftime("%Y-%m-%dT00:00:00").to_string());
+    }
+    let raw = value.trim_end_matches(['Z', 'z']);
+    let datetime = civil::DateTime::strptime("%Y%m%dT%H%M%S", raw).ok()?;
+    if value.ends_with(['Z', 'z']) {
+        let start = start?;
+        let timezone = TimeZone::get(start.timezone.as_deref()?).ok()?;
+        let instant = Offset::UTC.to_timestamp(datetime).ok()?;
+        return Some(
+            timezone
+                .to_datetime(instant)
+                .strftime("%Y-%m-%dT%H:%M:%S")
+                .to_string(),
+        );
+    }
+    start.filter(|start| start.timezone.is_none())?;
+    Some(datetime.strftime("%Y-%m-%dT%H:%M:%S").to_string())
+}
+
+fn ical_until_from_jmap(
+    value: &str,
+    start: &str,
+    is_all_day: bool,
+    timezone: Option<&str>,
+) -> Result<String, &'static str> {
+    let until = civil::DateTime::strptime("%Y-%m-%dT%H:%M:%S", value)
+        .map_err(|_| "JMAP recurrence until is not a LocalDateTime")?;
+    if is_all_day || start.len() == 10 {
+        if until.time() != civil::Time::MIN {
+            return Err("an all-day JMAP recurrence until must be midnight");
+        }
+        return Ok(until.date().strftime("%Y%m%d").to_string());
+    }
+    if let Some(timezone) = timezone {
+        let timezone = TimeZone::get(timezone)
+            .map_err(|_| "JMAP event timeZone is unknown; recurrence until cannot be normalized")?;
+        let instant = timezone
+            .to_timestamp(until)
+            .map_err(|_| "JMAP recurrence until is ambiguous or invalid in the event timeZone")?;
+        return Ok(Offset::UTC
+            .to_datetime(instant)
+            .strftime("%Y%m%dT%H%M%SZ")
+            .to_string());
+    }
+    Ok(until.strftime("%Y%m%dT%H%M%S").to_string())
 }
 
 fn jmap_by_day(value: &str) -> Option<Vec<Value>> {
@@ -717,11 +948,16 @@ fn jmap_by_day(value: &str) -> Option<Vec<Value>> {
 
 fn split_by_day(value: &str) -> Option<(Option<i64>, &str)> {
     if value.len() == 2 {
-        return Some((None, value));
+        return ["MO", "TU", "WE", "TH", "FR", "SA", "SU"]
+            .contains(&value.to_ascii_uppercase().as_str())
+            .then_some((None, value));
     }
     let split = value.len().checked_sub(2)?;
     let nth = value[..split].parse::<i64>().ok()?;
-    Some((Some(nth), &value[split..]))
+    let day = &value[split..];
+    ["MO", "TU", "WE", "TH", "FR", "SA", "SU"]
+        .contains(&day.to_ascii_uppercase().as_str())
+        .then_some((Some(nth), day))
 }
 
 fn integer_list(value: &str) -> Option<Vec<Value>> {
@@ -736,16 +972,20 @@ fn rrule_by_day(value: &Value) -> Option<String> {
     days.iter()
         .map(|day| {
             let object = day.as_object()?;
+            if object
+                .keys()
+                .any(|key| !["@type", "day", "nthOfPeriod"].contains(&key.as_str()))
+            {
+                return None;
+            }
+            let day = object.get("day")?.as_str()?;
+            split_by_day(day)?;
             let prefix = object
                 .get("nthOfPeriod")
                 .and_then(Value::as_i64)
                 .map(|nth| nth.to_string())
                 .unwrap_or_default();
-            Some(format!(
-                "{}{}",
-                prefix,
-                object.get("day")?.as_str()?.to_ascii_uppercase()
-            ))
+            Some(format!("{}{}", prefix, day.to_ascii_uppercase()))
         })
         .collect::<Option<Vec<_>>>()
         .map(|days| days.join(","))
@@ -775,6 +1015,7 @@ fn participants_from_attendees(attendees: &[EventAttendee]) -> Map<String, Value
                 "participationStatus".to_string(),
                 json!(rsvp_value(attendee.status)),
             );
+            value.insert("expectReply".to_string(), Value::Bool(true));
             if let Some(roles) = roles_from_attendee(attendee.role) {
                 value.insert("roles".to_string(), Value::Object(roles));
             }
@@ -812,40 +1053,56 @@ fn roles_from_attendee(role: AttendeeRole) -> Option<Map<String, Value>> {
     Some(roles)
 }
 
-fn attendees(participants: Option<&Map<String, Value>>) -> Vec<EventAttendee> {
+fn attendees(
+    participants: Option<&Map<String, Value>>,
+) -> Result<Vec<EventAttendee>, &'static str> {
     participants
         .into_iter()
         .flat_map(Map::values)
-        .filter_map(|value| {
-            let object = value.as_object()?;
-            Some(EventAttendee {
-                email: object.get("email")?.as_str()?.to_string(),
+        .filter_map(|value| value.as_object())
+        .filter(|object| object.get("email").is_some())
+        .map(|object| {
+            Ok(EventAttendee {
+                email: object
+                    .get("email")
+                    .and_then(Value::as_str)
+                    .ok_or("JMAP participant email is not a string")?
+                    .to_string(),
                 name: object
                     .get("name")
                     .and_then(Value::as_str)
                     .map(ToString::to_string),
-                role: attendee_role(object.get("roles")),
-                status: rsvp_status(object.get("participationStatus").and_then(Value::as_str)),
+                role: attendee_role(object.get("roles"))?,
+                status: rsvp_status(object.get("participationStatus").and_then(Value::as_str))?,
             })
         })
         .collect()
 }
 
-fn attendee_role(value: Option<&Value>) -> AttendeeRole {
+fn attendee_role(value: Option<&Value>) -> Result<AttendeeRole, &'static str> {
     let Some(roles) = value.and_then(Value::as_object) else {
-        return AttendeeRole::Unknown;
+        return Ok(AttendeeRole::Unknown);
     };
-    if role_enabled(roles, "chair") || role_enabled(roles, "owner") {
-        AttendeeRole::Chair
-    } else if role_enabled(roles, "optional") {
-        AttendeeRole::Optional
-    } else if role_enabled(roles, "resource") {
-        AttendeeRole::Resource
-    } else if role_enabled(roles, "attendee") {
-        AttendeeRole::Required
-    } else {
-        AttendeeRole::Unknown
+    let known = ["chair", "owner", "optional", "resource", "attendee"];
+    if roles
+        .iter()
+        .any(|(role, enabled)| enabled.as_bool() == Some(true) && !known.contains(&role.as_str()))
+    {
+        return Err("JMAP participant has an unsupported role");
     }
+    Ok(
+        if role_enabled(roles, "chair") || role_enabled(roles, "owner") {
+            AttendeeRole::Chair
+        } else if role_enabled(roles, "optional") {
+            AttendeeRole::Optional
+        } else if role_enabled(roles, "resource") {
+            AttendeeRole::Resource
+        } else if role_enabled(roles, "attendee") {
+            AttendeeRole::Required
+        } else {
+            AttendeeRole::Unknown
+        },
+    )
 }
 
 fn role_enabled(roles: &Map<String, Value>, role: &str) -> bool {
@@ -959,7 +1216,13 @@ fn duration(start: &str, end: &str) -> String {
 }
 
 fn shared_time_from_jmap(value: &str, is_all_day: bool) -> String {
-    if is_all_day || value.len() == 10 {
+    if is_all_day {
+        // The shared all-day contract is a bare date; JSCalendar carries
+        // midnight on that date. Keep only the date half so a server that
+        // stores the conformant LocalDateTime reads back correctly.
+        return value.split('T').next().unwrap_or(value).to_string();
+    }
+    if value.len() == 10 {
         return value.to_string();
     }
     if value.parse::<Timestamp>().is_ok() {
@@ -973,7 +1236,17 @@ fn shared_time_from_jmap(value: &str, is_all_day: bool) -> String {
 
 fn jmap_time_from_shared(time: &EventTime, is_all_day: bool) -> String {
     if is_all_day || time.value.len() == 10 {
-        return time.value.clone();
+        // JSCalendar has no DATE type: RFC 8984 `start` is always a
+        // LocalDateTime, and an all-day event is midnight on its date with
+        // `showWithoutTime` carrying the all-day sense. Writing the shared
+        // bare DATE straight through emits a value no conforming server
+        // accepts, and only reads back because our own read path truncates
+        // the same way.
+        return if time.value.len() == 10 {
+            format!("{}T00:00:00", time.value)
+        } else {
+            time.value.clone()
+        };
     }
     // Rendered in the value's own offset, not normalized to UTC: the
     // JSCalendar `timeZone` property carries the zone separately, so the
@@ -1020,7 +1293,10 @@ fn event_in_range(event: &CalendarEvent, start: &EventTime, end: &EventTime) -> 
     else {
         return true;
     };
-    event_start <= range_end && event_end >= range_start
+    // Both the query window and event interval use exclusive ends. An event
+    // ending exactly at the window start, or starting exactly at its end,
+    // does not overlap the window.
+    event_start < range_end && event_end > range_start
 }
 
 fn time_interval(
@@ -1066,7 +1342,8 @@ fn local_datetime(value: &str) -> Option<Timestamp> {
 fn end_from_start_duration(start: &str, duration: &str, is_all_day: bool) -> String {
     let seconds = parse_duration_seconds(duration).unwrap_or(0);
     if (is_all_day || start.len() == 10)
-        && let Ok(date) = civil::Date::strptime("%Y-%m-%d", start)
+        && let Ok(date) =
+            civil::Date::strptime("%Y-%m-%d", start.split('T').next().unwrap_or(start))
     {
         // `EventTime`'s all-day end is exclusive: end = start + duration
         // days (a P1D JSCalendar all-day event, start D, ends D+1).
@@ -1194,15 +1471,32 @@ fn rsvp_value(value: RsvpStatus) -> &'static str {
     }
 }
 
-fn rsvp_status(value: Option<&str>) -> RsvpStatus {
-    match value.unwrap_or_default() {
-        "accepted" => RsvpStatus::Accepted,
-        "declined" => RsvpStatus::Declined,
-        "tentative" => RsvpStatus::Tentative,
-        "delegated" => RsvpStatus::Delegated,
-        "needs-action" => RsvpStatus::NeedsAction,
-        _ => RsvpStatus::Unknown,
+fn rsvp_status(value: Option<&str>) -> Result<RsvpStatus, &'static str> {
+    match value {
+        Some("accepted") => Ok(RsvpStatus::Accepted),
+        Some("declined") => Ok(RsvpStatus::Declined),
+        Some("tentative") => Ok(RsvpStatus::Tentative),
+        Some("delegated") => Ok(RsvpStatus::Delegated),
+        Some("needs-action") => Ok(RsvpStatus::NeedsAction),
+        None => Ok(RsvpStatus::Unknown),
+        Some(_) => Err("JMAP participant has an unsupported participationStatus"),
     }
+}
+
+fn validate_shared_attendees(
+    attendees: &[EventAttendee],
+    operation: AccountOperation,
+) -> Result<(), AccountError> {
+    if attendees.iter().any(|attendee| {
+        matches!(attendee.role, AttendeeRole::Unknown)
+            || matches!(attendee.status, RsvpStatus::Unknown)
+    }) {
+        return Err(unsupported(
+            operation,
+            "JMAP cannot serialize an unknown attendee role or participation status",
+        ));
+    }
+    Ok(())
 }
 
 fn next_cursor(position: i32, count: usize, total: Option<usize>) -> Option<Vec<u8>> {
@@ -1284,6 +1578,16 @@ mod tests {
             value: value.to_string(),
             timezone: None,
         }
+    }
+
+    /// Builds the JMAP patch using only the context the `EventPatch` itself
+    /// carries, which is what `update` does when it does not need to read the
+    /// current event.
+    fn patch_with_patch_context(
+        patch: &EventPatch,
+        operation: AccountOperation,
+    ) -> Result<CalendarEventPatch, AccountError> {
+        jmap_patch_from_event_patch(patch, &event_context_from_patch(patch, None), operation)
     }
 
     fn event(start: &str, end: &str, is_all_day: bool) -> CalendarEvent {
@@ -1397,6 +1701,16 @@ mod tests {
     }
 
     #[test]
+    fn range_filter_excludes_events_touching_only_an_exclusive_boundary() {
+        let before = event("2026-06-01T23:00:00Z", "2026-06-02T00:00:00Z", false);
+        let after = event("2026-06-03T00:00:00Z", "2026-06-03T01:00:00Z", false);
+        let start = time("2026-06-02T00:00:00Z");
+        let end = time("2026-06-03T00:00:00Z");
+        assert!(!event_in_range(&before, &start, &end));
+        assert!(!event_in_range(&after, &start, &end));
+    }
+
+    #[test]
     fn range_query_filter_includes_calendar_and_time_bounds() {
         let value = serde_json::to_value(range_filter(&EventRange {
             calendar_id: CalendarId("cal".to_string()),
@@ -1484,7 +1798,7 @@ mod tests {
 
     #[test]
     fn event_patch_recomputes_duration_from_both_bounds() {
-        let patch = jmap_patch_from_event_patch(
+        let patch = patch_with_patch_context(
             &EventPatch {
                 start: Some(time("2026-06-02T12:00:00Z")),
                 end: Some(time("2026-06-02T13:30:00Z")),
@@ -1516,7 +1830,7 @@ mod tests {
                 ..EventPatch::default()
             },
         ] {
-            let error = jmap_patch_from_event_patch(&patch, AccountOperation::EventUpdate)
+            let error = patch_with_patch_context(&patch, AccountOperation::EventUpdate)
                 .expect_err("single-bound time patch should reject");
             assert!(matches!(
                 error.kind(),
@@ -1526,20 +1840,42 @@ mod tests {
     }
 
     #[test]
-    fn recurrence_rule_rejects_utc_until() {
-        assert!(jmap_recurrence_rule_from_rrule("FREQ=DAILY;UNTIL=20260101T000000Z").is_none());
-        // Floating and date-only UNTIL pass through unchanged.
-        let floating = jmap_recurrence_rule_from_rrule("FREQ=DAILY;UNTIL=20260101T000000")
-            .expect("floating until");
-        assert_eq!(floating["until"].as_str(), Some("20260101T000000"));
-        let date_only =
-            jmap_recurrence_rule_from_rrule("FREQ=DAILY;UNTIL=20260101").expect("date until");
-        assert_eq!(date_only["until"].as_str(), Some("20260101"));
+    fn recurrence_rule_normalizes_until_to_event_local_datetime() {
+        let zoned_start = EventTime {
+            value: "2025-01-01T09:00:00+01:00".to_string(),
+            timezone: Some("Europe/Oslo".to_string()),
+        };
+        let utc = jmap_recurrence_rule_from_rrule(
+            "FREQ=DAILY;UNTIL=20260601T070000Z",
+            Some(&zoned_start),
+            false,
+        )
+        .expect("UTC until");
+        assert_eq!(utc["until"].as_str(), Some("2026-06-01T09:00:00"));
+
+        let floating_start = EventTime {
+            value: "2025-01-01T09:00:00+00:00".to_string(),
+            timezone: None,
+        };
+        let floating = jmap_recurrence_rule_from_rrule(
+            "FREQ=DAILY;UNTIL=20260101T000000",
+            Some(&floating_start),
+            false,
+        )
+        .expect("floating until");
+        assert_eq!(floating["until"].as_str(), Some("2026-01-01T00:00:00"));
+        let date_only = jmap_recurrence_rule_from_rrule(
+            "FREQ=DAILY;UNTIL=20260101",
+            Some(&time("2025-01-01")),
+            true,
+        )
+        .expect("date until");
+        assert_eq!(date_only["until"].as_str(), Some("2026-01-01T00:00:00"));
     }
 
     #[test]
     fn event_patch_clears_nullable_fields_with_null() {
-        let patch = jmap_patch_from_event_patch(
+        let patch = patch_with_patch_context(
             &EventPatch {
                 title: Some(None),
                 description: Some(None),
@@ -1559,6 +1895,8 @@ mod tests {
     fn recurrence_rule_writes_jscalendar_object() {
         let rule = jmap_recurrence_rule_from_rrule(
             "FREQ=WEEKLY;INTERVAL=2;COUNT=5;BYDAY=MO,WE;BYMONTH=6;BYMONTHDAY=2",
+            None,
+            false,
         )
         .expect("rrule should convert");
 
@@ -1573,14 +1911,20 @@ mod tests {
 
     #[test]
     fn recurrence_rule_reads_jscalendar_object_as_rrule() {
-        let rrule = rrule_from_jmap_recurrence_rule(&json!({
-            "frequency": "monthly",
-            "interval": 1,
-            "count": 3,
-            "byDay": [{"day": "tu", "nthOfPeriod": 2}],
-            "byMonthDay": [14]
-        }))
-        .expect("jscalendar rule should convert");
+        let rrule = rrule_from_jmap_recurrence_rule(
+            &json!({
+                "frequency": "monthly",
+                "interval": 1,
+                "count": 3,
+                "byDay": [{"day": "tu", "nthOfPeriod": 2}],
+                "byMonthDay": [14]
+            }),
+            "2025-01-01T09:00:00",
+            false,
+            None,
+        )
+        .expect("jscalendar rule should convert")
+        .expect("rrule");
 
         assert_eq!(
             rrule,
@@ -1589,8 +1933,217 @@ mod tests {
     }
 
     #[test]
+    fn zoned_jscalendar_until_writes_inclusive_utc_ical_until() {
+        let rrule = rrule_from_jmap_recurrence_rule(
+            &json!({
+                "@type": "RecurrenceRule",
+                "frequency": "daily",
+                "until": "2026-06-01T09:00:00"
+            }),
+            "2025-01-01T09:00:00",
+            false,
+            Some("Europe/Oslo"),
+        )
+        .expect("supported rule")
+        .expect("rrule");
+        assert_eq!(rrule, "FREQ=DAILY;UNTIL=20260601T070000Z");
+    }
+
+    #[test]
+    fn unknown_jscalendar_recurrence_component_is_not_silently_dropped() {
+        let error = rrule_from_jmap_recurrence_rule(
+            &json!({
+                "@type": "RecurrenceRule",
+                "frequency": "daily",
+                "byHour": [9]
+            }),
+            "2025-01-01T09:00:00",
+            false,
+            None,
+        )
+        .expect_err("unknown recurrence component must reject");
+        assert_eq!(
+            error,
+            "JMAP recurrence rule contains an unsupported component"
+        );
+    }
+
+    #[test]
+    fn an_all_day_start_is_written_as_a_jscalendar_local_datetime() {
+        // Absolute wire values, not a round trip: both directions previously
+        // shared a bare-DATE assumption, so a round trip proved nothing.
+        assert_eq!(
+            jmap_time_from_shared(&time("2026-06-02"), true),
+            "2026-06-02T00:00:00"
+        );
+        // And a conformant server's midnight LocalDateTime reads back as the
+        // shared bare date.
+        assert_eq!(
+            shared_time_from_jmap("2026-06-02T00:00:00", true),
+            "2026-06-02"
+        );
+        // The exclusive all-day end still lands a day out from either form.
+        assert_eq!(
+            end_from_start_duration("2026-06-02T00:00:00", "P1D", true),
+            "2026-06-03"
+        );
+        assert_eq!(
+            end_from_start_duration("2026-06-02", "P1D", true),
+            "2026-06-03"
+        );
+    }
+
+    #[test]
+    fn recurrence_only_patch_with_until_demands_the_current_event() {
+        // A patch that touches nothing but the RRULE cannot supply the start
+        // timezone or the all-day flag, so `update` must read them back.
+        let recurrence_only = EventPatch {
+            recurrence: Some(EventRecurrence {
+                rrule: Some("FREQ=DAILY;UNTIL=20260601T070000Z".to_string()),
+                ..EventRecurrence::default()
+            }),
+            ..EventPatch::default()
+        };
+        assert!(event_patch_needs_context(&recurrence_only));
+        // Without that read the conversion cannot succeed, and the guard that
+        // `update` runs first turns it into Unsupported. (The payload builder
+        // treats a failed conversion as "clear the rule", so this validation
+        // is what stops a recurrence patch from erasing the recurrence.)
+        let error = validate_shared_recurrence(
+            recurrence_only.recurrence.as_ref().expect("recurrence"),
+            None,
+            false,
+            AccountOperation::EventUpdate,
+        )
+        .expect_err("no context, no conversion");
+        assert!(matches!(
+            error.kind(),
+            bifrost_types::AccountErrorKind::Unsupported(AccountOperation::EventUpdate)
+        ));
+
+        // A recurrence patch with no UNTIL needs nothing extra.
+        let countable = EventPatch {
+            recurrence: Some(EventRecurrence {
+                rrule: Some("FREQ=DAILY;COUNT=3".to_string()),
+                ..EventRecurrence::default()
+            }),
+            ..EventPatch::default()
+        };
+        assert!(!event_patch_needs_context(&countable));
+    }
+
+    #[test]
+    fn recurrence_context_falls_back_to_the_current_event() {
+        let current = JmapCalendarEvent {
+            properties: serde_json::from_value(json!({
+                "id": "e1",
+                "start": "2025-01-01T09:00:00",
+                "timeZone": "Europe/Oslo",
+                "showWithoutTime": false
+            }))
+            .expect("event"),
+        };
+        let patch = EventPatch {
+            recurrence: Some(EventRecurrence {
+                rrule: Some("FREQ=DAILY;UNTIL=20260601T070000Z".to_string()),
+                ..EventRecurrence::default()
+            }),
+            ..EventPatch::default()
+        };
+        let context = event_context_from_patch(&patch, Some(&current));
+        assert_eq!(
+            context
+                .start
+                .as_ref()
+                .and_then(|start| start.timezone.as_deref()),
+            Some("Europe/Oslo")
+        );
+        assert!(!context.is_all_day);
+
+        let built = jmap_patch_from_event_patch(&patch, &context, AccountOperation::EventUpdate)
+            .expect("patch");
+        // 07:00 UTC is 09:00 Oslo summer wall clock; the inclusive bound holds.
+        assert_eq!(
+            built.properties["recurrenceRules"][0]["until"].as_str(),
+            Some("2026-06-01T09:00:00")
+        );
+    }
+
+    #[test]
+    fn an_all_day_event_keeps_its_date_start_when_a_patch_omits_is_all_day() {
+        let current = JmapCalendarEvent {
+            properties: serde_json::from_value(json!({
+                "id": "e1",
+                "start": "2026-06-01T00:00:00",
+                "showWithoutTime": true
+            }))
+            .expect("event"),
+        };
+        let patch = EventPatch {
+            start: Some(time("2026-06-02")),
+            end: Some(time("2026-06-03")),
+            ..EventPatch::default()
+        };
+        assert!(event_patch_needs_context(&patch));
+        let context = event_context_from_patch(&patch, Some(&current));
+        assert!(context.is_all_day);
+
+        let built = jmap_patch_from_event_patch(&patch, &context, AccountOperation::EventUpdate)
+            .expect("patch");
+        assert_eq!(
+            built.properties["start"].as_str(),
+            Some("2026-06-02T00:00:00")
+        );
+        assert_eq!(built.properties["duration"].as_str(), Some("P1D"));
+    }
+
+    #[test]
+    fn a_modified_recurrence_override_is_not_silently_discarded() {
+        let overrides: Map<String, Value> = serde_json::from_value(json!({
+            "2026-06-03T12:00:00": {"title": "moved"}
+        }))
+        .expect("overrides");
+        assert_eq!(
+            recurrence_dates_from_overrides(Some(&overrides)),
+            Err(
+                "a modified JMAP recurrence override cannot be represented by the shared recurrence model"
+            )
+        );
+
+        // Pure exclusions and pure additions still project.
+        let plain: Map<String, Value> = serde_json::from_value(json!({
+            "2026-06-04T12:00:00": {"excluded": true},
+            "2026-06-05T12:00:00": {}
+        }))
+        .expect("overrides");
+        let (rdate, exdate) =
+            recurrence_dates_from_overrides(Some(&plain)).expect("representable overrides");
+        assert_eq!(rdate, vec!["2026-06-05T12:00:00".to_string()]);
+        assert_eq!(exdate, vec!["2026-06-04T12:00:00".to_string()]);
+    }
+
+    #[test]
+    fn a_modified_override_fails_event_hydration() {
+        let event = JmapCalendarEvent {
+            properties: serde_json::from_value(json!({
+                "id": "e1",
+                "start": "2026-06-01T09:00:00",
+                "duration": "PT1H",
+                "recurrenceOverrides": {"2026-06-03T09:00:00": {"title": "moved"}}
+            }))
+            .expect("event"),
+        };
+        let error = event_from_jmap(event, AccountOperation::EventGet)
+            .expect_err("modified override must reject");
+        assert!(matches!(
+            error.kind(),
+            bifrost_types::AccountErrorKind::Unsupported(AccountOperation::EventGet)
+        ));
+    }
+
+    #[test]
     fn recurrence_patch_clears_or_writes_recurrence_rules() {
-        let clear = jmap_patch_from_event_patch(
+        let clear = patch_with_patch_context(
             &EventPatch {
                 recurrence: Some(EventRecurrence::default()),
                 ..EventPatch::default()
@@ -1604,7 +2157,7 @@ mod tests {
             Some(&Value::Null)
         );
 
-        let write = jmap_patch_from_event_patch(
+        let write = patch_with_patch_context(
             &EventPatch {
                 recurrence: Some(EventRecurrence {
                     rrule: Some("FREQ=DAILY;COUNT=2".to_string()),
@@ -1641,15 +2194,17 @@ mod tests {
             recurrence_id: None,
         };
 
-        let create = validate_shared_recurrence(&recurrence, AccountOperation::EventCreate)
-            .expect_err("unsupported create recurrence should fail");
+        let create =
+            validate_shared_recurrence(&recurrence, None, false, AccountOperation::EventCreate)
+                .expect_err("unsupported create recurrence should fail");
         assert!(matches!(
             create.kind(),
             bifrost_types::AccountErrorKind::Unsupported(AccountOperation::EventCreate)
         ));
 
-        let update = validate_shared_recurrence(&recurrence, AccountOperation::EventUpdate)
-            .expect_err("unsupported update recurrence should fail");
+        let update =
+            validate_shared_recurrence(&recurrence, None, false, AccountOperation::EventUpdate)
+                .expect_err("unsupported update recurrence should fail");
         assert!(matches!(
             update.kind(),
             bifrost_types::AccountErrorKind::Unsupported(AccountOperation::EventUpdate)
@@ -1660,11 +2215,11 @@ mod tests {
     fn recurrence_overrides_read_simple_rdate_and_exdate() {
         let overrides = serde_json::from_value::<Map<String, Value>>(json!({
             "2026-06-03T12:00:00": {},
-            "2026-06-04T12:00:00": {"excluded": true},
-            "2026-06-05T12:00:00": {"title": "Moved"}
+            "2026-06-04T12:00:00": {"excluded": true}
         }))
         .expect("override map");
-        let (rdate, exdate) = recurrence_dates_from_overrides(Some(&overrides));
+        let (rdate, exdate) =
+            recurrence_dates_from_overrides(Some(&overrides)).expect("representable overrides");
 
         assert_eq!(rdate, vec!["2026-06-03T12:00:00"]);
         assert_eq!(exdate, vec!["2026-06-04T12:00:00"]);
@@ -1743,7 +2298,7 @@ mod tests {
         }))
         .expect("participants");
 
-        let attendees = attendees(Some(&participants));
+        let attendees = attendees(Some(&participants)).expect("supported participants");
 
         assert_eq!(attendees[0].role, AttendeeRole::Required);
         assert_eq!(attendees[1].role, AttendeeRole::Optional);
@@ -1777,6 +2332,21 @@ mod tests {
             participants["p1"]["roles"]["resource"].as_bool(),
             Some(true)
         );
+        assert_eq!(participants["p0"]["expectReply"].as_bool(), Some(true));
+        assert_eq!(participants["p1"]["expectReply"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn unknown_participation_vocabulary_is_not_presented_as_success() {
+        let participants = serde_json::from_value(json!({
+            "p0": {
+                "email": "future@example.test",
+                "roles": {"future-role": true},
+                "participationStatus": "future-status"
+            }
+        }))
+        .expect("participants");
+        assert!(attendees(Some(&participants)).is_err());
     }
 
     #[test]
@@ -1925,7 +2495,7 @@ mod tests {
         assert_eq!(visibility(Some("secret")), EventVisibility::Confidential);
         assert_eq!(jmap_visibility(EventVisibility::Confidential), "secret");
 
-        let patch = jmap_patch_from_event_patch(
+        let patch = patch_with_patch_context(
             &EventPatch {
                 visibility: Some(EventVisibility::Private),
                 status: Some(EventStatus::Cancelled),

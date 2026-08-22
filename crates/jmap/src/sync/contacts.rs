@@ -260,7 +260,8 @@ async fn get_cards<T: HttpTransport>(
         .await
         .map_err(to_acct_err(operation))?;
     let not_found = response.not_found().to_vec();
-    let (cards, unanswered) = reconcile_cards(requested, &not_found, response.into_list());
+    let (cards, unanswered) =
+        reconcile_cards(requested, &not_found, response.into_list(), operation)?;
     Ok(HydratedCards {
         cards,
         failed_ids: unanswered,
@@ -281,7 +282,8 @@ fn reconcile_cards(
     requested: Vec<String>,
     not_found: &[ContactCardId],
     list: Vec<JmapContactCard>,
-) -> (Vec<ContactCard>, Vec<String>) {
+    operation: AccountOperation,
+) -> Result<(Vec<ContactCard>, Vec<String>), AccountError> {
     let mut answered: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut failed_ids: Vec<String> = Vec::new();
     for missing in not_found {
@@ -296,7 +298,7 @@ fn reconcile_cards(
         if let Some(id) = card.id() {
             answered.insert(id.into_string());
         }
-        cards.push(contact_from_jmap(card));
+        cards.push(contact_from_jmap(card, operation)?);
     }
 
     for id in requested {
@@ -304,7 +306,7 @@ fn reconcile_cards(
             failed_ids.push(id);
         }
     }
-    (cards, failed_ids)
+    Ok((cards, failed_ids))
 }
 
 fn address_book_from_jmap(book: crate::address_book::AddressBook) -> AddressBook {
@@ -339,7 +341,10 @@ fn address_book_can_delete(rights: Option<&crate::address_book::AddressBookRight
     rights.and_then(|rights| rights.may_delete).unwrap_or(false)
 }
 
-fn contact_from_jmap(card: JmapContactCard) -> ContactCard {
+fn contact_from_jmap(
+    card: JmapContactCard,
+    operation: AccountOperation,
+) -> Result<ContactCard, AccountError> {
     let native = card
         .id()
         .map(ContactCardId::into_string)
@@ -348,7 +353,9 @@ fn contact_from_jmap(card: JmapContactCard) -> ContactCard {
         .address_book_ids()
         .and_then(|ids| ids.keys().next().cloned())
         .map(SharedAddressBookId);
-    ContactCard {
+    let addresses =
+        addresses(card.addresses()).map_err(|message| unsupported(operation, message))?;
+    Ok(ContactCard {
         id: ContactId(native.clone()),
         address_book_id: address_book_id.clone(),
         native_id: native.clone(),
@@ -363,12 +370,15 @@ fn contact_from_jmap(card: JmapContactCard) -> ContactCard {
         display_name: display_name(card.name()),
         emails: emails(card.emails()),
         phones: phones(card.phones()),
-        organizations: organizations(card.organizations()),
-        addresses: addresses(card.addresses()),
+        organizations: organizations(
+            card.organizations(),
+            card.property("titles").and_then(Value::as_object),
+        ),
+        addresses,
         notes: notes(card.notes()),
         photo_url: photo_url(card.media()),
         photo: None,
-    }
+    })
 }
 
 fn jmap_create_from_contact(contact: &ContactCreate) -> ContactCardCreate {
@@ -408,6 +418,7 @@ fn jmap_patch_from_contact_patch(
     }
     if let Some(orgs) = &patch.organizations {
         out.organizations(organization_object(orgs));
+        out.set_property("titles", Value::Object(titles_object(orgs)));
     }
     if let Some(addresses) = &patch.addresses {
         out.addresses(address_object(addresses));
@@ -461,6 +472,10 @@ fn write_contact_create(target: &mut Map<String, Value>, contact: &ContactCreate
         target.insert(
             "organizations".to_string(),
             Value::Object(organization_object(&contact.organizations)),
+        );
+        target.insert(
+            "titles".to_string(),
+            Value::Object(titles_object(&contact.organizations)),
         );
     }
     if !contact.addresses.is_empty() {
@@ -540,9 +555,27 @@ fn organization_object(orgs: &[ContactOrganization]) -> Map<String, Value> {
                 json!({
                     "@type": "Organization",
                     "name": org.name,
-                    "title": org.title,
                 }),
             )
+        })
+        .collect()
+}
+
+fn titles_object(orgs: &[ContactOrganization]) -> Map<String, Value> {
+    orgs.iter()
+        .enumerate()
+        .filter_map(|(idx, org)| {
+            org.title.as_ref().map(|title| {
+                (
+                    format!("t{idx}"),
+                    json!({
+                        "@type": "Title",
+                        "name": title,
+                        "kind": "title",
+                        "organizationId": format!("o{idx}"),
+                    }),
+                )
+            })
         })
         .collect()
 }
@@ -552,6 +585,26 @@ fn address_object(addresses: &[ContactAddress]) -> Map<String, Value> {
         .iter()
         .enumerate()
         .map(|(idx, address)| {
+            let mut components = Vec::new();
+            components.extend(
+                address.street.iter().map(
+                    |line| json!({ "@type": "AddressComponent", "kind": "name", "value": line }),
+                ),
+            );
+            for (kind, value) in [
+                ("locality", address.locality.as_ref()),
+                ("region", address.region.as_ref()),
+                ("postcode", address.postal_code.as_ref()),
+                ("country", address.country.as_ref()),
+            ] {
+                if let Some(value) = value {
+                    components.push(json!({
+                        "@type": "AddressComponent",
+                        "kind": kind,
+                        "value": value,
+                    }));
+                }
+            }
             (
                 format!("a{idx}"),
                 json!({
@@ -559,11 +612,8 @@ fn address_object(addresses: &[ContactAddress]) -> Map<String, Value> {
                     "contexts": context_object(address.kind.as_deref()),
                     "pref": address.is_primary.then_some(1),
                     "full": address.formatted.clone(),
-                    "street": address.street.join("\n"),
-                    "locality": address.locality.clone(),
-                    "region": address.region.clone(),
-                    "postcode": address.postal_code.clone(),
-                    "country": address.country.clone(),
+                    "components": components,
+                    "isOrdered": false,
                 }),
             )
         })
@@ -637,63 +687,105 @@ fn phones(values: Option<&Map<String, Value>>) -> Vec<ContactPhone> {
         .collect()
 }
 
-fn organizations(values: Option<&Map<String, Value>>) -> Vec<ContactOrganization> {
+fn organizations(
+    values: Option<&Map<String, Value>>,
+    titles: Option<&Map<String, Value>>,
+) -> Vec<ContactOrganization> {
     values
         .into_iter()
-        .flat_map(Map::values)
-        .filter_map(|value| {
+        .flat_map(Map::iter)
+        .filter_map(|(id, value)| {
             let object = value.as_object()?;
             Some(ContactOrganization {
                 name: object.get("name").and_then(Value::as_str)?.to_string(),
-                title: object
-                    .get("title")
-                    .and_then(Value::as_str)
-                    .map(ToString::to_string),
+                title: titles.into_iter().flat_map(Map::values).find_map(|title| {
+                    let title = title.as_object()?;
+                    (title.get("organizationId").and_then(Value::as_str) == Some(id.as_str()))
+                        .then(|| title.get("name").and_then(Value::as_str))
+                        .flatten()
+                        .map(ToString::to_string)
+                }),
             })
         })
         .collect()
 }
 
-fn addresses(values: Option<&Map<String, Value>>) -> Vec<ContactAddress> {
+/// RFC 9553 address-component kinds that make up a street line, in the order
+/// the shared `ContactAddress.street` lines preserve.
+const STREET_COMPONENTS: &[&str] = &[
+    "room",
+    "apartment",
+    "floor",
+    "building",
+    "number",
+    "name",
+    "block",
+    "direction",
+    "landmark",
+    "postOfficeBox",
+];
+
+/// RFC 9553 address-component kinds that map onto a dedicated shared scalar.
+const SCALAR_COMPONENTS: &[&str] = &["locality", "region", "postcode", "country"];
+
+fn addresses(values: Option<&Map<String, Value>>) -> Result<Vec<ContactAddress>, &'static str> {
     values
         .into_iter()
         .flat_map(Map::values)
-        .filter_map(|value| {
-            let object = value.as_object()?;
-            let street = object
-                .get("street")
-                .and_then(Value::as_str)
-                .map(|street| {
-                    street
-                        .lines()
-                        .filter(|line| !line.is_empty())
+        .filter_map(Value::as_object)
+        .map(|object| {
+            let components = object
+                .get("components")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_object)
+                .collect::<Vec<_>>();
+            // The accepted set is exactly the projected set. RFC 9553 defines
+            // further kinds (`district`, `subdistrict`, `separator`) that the
+            // shared `ContactAddress` has no field for and that folding into
+            // `street` would misplace, so they are rejected rather than
+            // accepted and dropped.
+            if components.iter().any(|component| {
+                component
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .is_none_or(|kind| {
+                        !STREET_COMPONENTS.contains(&kind) && !SCALAR_COMPONENTS.contains(&kind)
+                    })
+            }) {
+                return Err("JMAP address contains an unsupported address component");
+            }
+            let component = |kind: &str| {
+                components.iter().find_map(|component| {
+                    (component.get("kind").and_then(Value::as_str) == Some(kind))
+                        .then(|| component.get("value").and_then(Value::as_str))
+                        .flatten()
                         .map(ToString::to_string)
-                        .collect()
                 })
-                .unwrap_or_default();
-            Some(ContactAddress {
+            };
+            let street = components
+                .iter()
+                .filter_map(|component| {
+                    component
+                        .get("kind")
+                        .and_then(Value::as_str)
+                        .filter(|kind| STREET_COMPONENTS.contains(kind))
+                        .and_then(|_| component.get("value").and_then(Value::as_str))
+                        .map(ToString::to_string)
+                })
+                .collect();
+            Ok(ContactAddress {
                 kind: first_context(object.get("contexts")),
                 formatted: object
                     .get("full")
                     .and_then(Value::as_str)
                     .map(ToString::to_string),
                 street,
-                locality: object
-                    .get("locality")
-                    .and_then(Value::as_str)
-                    .map(ToString::to_string),
-                region: object
-                    .get("region")
-                    .and_then(Value::as_str)
-                    .map(ToString::to_string),
-                postal_code: object
-                    .get("postcode")
-                    .and_then(Value::as_str)
-                    .map(ToString::to_string),
-                country: object
-                    .get("country")
-                    .and_then(Value::as_str)
-                    .map(ToString::to_string),
+                locality: component("locality"),
+                region: component("region"),
+                postal_code: component("postcode"),
+                country: component("country"),
                 is_primary: object.get("pref").and_then(Value::as_i64).unwrap_or(0) == 1,
             })
         })
@@ -821,7 +913,9 @@ mod tests {
             // Empty is exactly what an omitted `notFound` decodes to.
             &[],
             vec![card("c1")],
-        );
+            AccountOperation::ContactsList,
+        )
+        .expect("supported cards");
 
         assert_eq!(cards.len(), 1);
         assert_eq!(cards[0].id.0, "c1");
@@ -839,7 +933,9 @@ mod tests {
             requested,
             &[ContactCardId::new("c0"), ContactCardId::new("c0")],
             vec![card("c1")],
-        );
+            AccountOperation::ContactsList,
+        )
+        .expect("supported cards");
 
         assert_eq!(cards.len(), 1);
         assert_eq!(failed_ids, vec!["c0".to_string(), "c2".to_string()]);
@@ -854,8 +950,16 @@ mod tests {
                 "name": {"full": "Ada Lovelace"},
                 "emails": {"e1": {"address": "ada@example.test", "contexts": {"work": true}, "pref": 1}},
                 "phones": {"p1": {"number": "+123", "features": {"mobile": true}}},
-                "addresses": {"a1": {"street": "1 Example St\nUnit 2", "locality": "London", "region": "England", "postcode": "N1", "country": "UK", "contexts": {"home": true}, "pref": 1}},
-                "organizations": {"o1": {"name": "Analytical Engines", "title": "Programmer"}},
+                "addresses": {"a1": {"components": [
+                    {"kind": "name", "value": "1 Example St"},
+                    {"kind": "apartment", "value": "Unit 2"},
+                    {"kind": "locality", "value": "London"},
+                    {"kind": "region", "value": "England"},
+                    {"kind": "postcode", "value": "N1"},
+                    {"kind": "country", "value": "UK"}
+                ], "contexts": {"home": true}, "pref": 1}},
+                "organizations": {"o1": {"name": "Analytical Engines"}},
+                "titles": {"t1": {"name": "Programmer", "kind": "title", "organizationId": "o1"}},
                 "notes": {"n1": {"note": "notes"}},
                 "media": {
                     "m1": {"kind": "logo", "uri": "https://example.test/logo.jpg"},
@@ -865,7 +969,8 @@ mod tests {
             .expect("object"),
         };
 
-        let contact = contact_from_jmap(card);
+        let contact =
+            contact_from_jmap(card, AccountOperation::ContactGet).expect("supported card");
         assert_eq!(contact.id.0, "c1");
         // JMAP has no auto-collected corpus; every card routes to Main.
         assert_eq!(contact.corpus, ContactCorpus::Main);
@@ -1015,9 +1120,85 @@ mod tests {
             .expect("addresses object");
 
         assert_eq!(addresses["a0"]["contexts"]["work"].as_bool(), Some(true));
-        assert_eq!(addresses["a0"]["street"].as_str(), Some("1 Analytical Way"));
-        assert_eq!(addresses["a0"]["postcode"].as_str(), Some("N1"));
+        assert_eq!(addresses["a0"]["components"][0]["kind"], "name");
+        assert_eq!(
+            addresses["a0"]["components"][0]["value"],
+            "1 Analytical Way"
+        );
+        assert_eq!(addresses["a0"]["components"][2]["kind"], "postcode");
+        assert_eq!(addresses["a0"]["components"][2]["value"], "N1");
+        assert!(addresses["a0"].get("street").is_none());
         assert_eq!(addresses["a0"]["pref"].as_i64(), Some(1));
+    }
+
+    #[test]
+    fn contact_create_writes_titles_separately_from_organizations() {
+        let create = jmap_create_from_contact(&ContactCreate {
+            organizations: vec![ContactOrganization {
+                name: "Analytical Engines".to_string(),
+                title: Some("Programmer".to_string()),
+            }],
+            ..ContactCreate::default()
+        });
+
+        assert_eq!(
+            create.properties["organizations"]["o0"],
+            json!({"@type": "Organization", "name": "Analytical Engines"})
+        );
+        assert!(
+            create.properties["organizations"]["o0"]
+                .get("title")
+                .is_none()
+        );
+        assert_eq!(
+            create.properties["titles"]["t0"],
+            json!({
+                "@type": "Title",
+                "name": "Programmer",
+                "kind": "title",
+                "organizationId": "o0"
+            })
+        );
+    }
+
+    #[test]
+    fn address_components_without_a_shared_field_reject_rather_than_vanish() {
+        // These are valid RFC 9553 kinds, so a "did we recognize it" check
+        // passes them; the shared ContactAddress still has nowhere to put
+        // them, and accepting them silently would hand back a lossy address.
+        for kind in ["district", "subdistrict", "separator"] {
+            let addresses: Map<String, Value> = serde_json::from_value(json!({
+                "a1": {"components": [
+                    {"kind": "name", "value": "1 Example St"},
+                    {"kind": kind, "value": "opaque"}
+                ]}
+            }))
+            .expect("addresses");
+            assert_eq!(
+                super::addresses(Some(&addresses)),
+                Err("JMAP address contains an unsupported address component"),
+                "{kind} must not be accepted and dropped"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_address_component_rejects_contact_hydration() {
+        let card = JmapContactCard {
+            properties: serde_json::from_value(json!({
+                "id": "c1",
+                "addresses": {"a1": {"components": [
+                    {"kind": "future-component", "value": "opaque"}
+                ]}}
+            }))
+            .expect("card"),
+        };
+        let error = contact_from_jmap(card, AccountOperation::ContactGet)
+            .expect_err("unknown component must reject");
+        assert!(matches!(
+            error.kind(),
+            bifrost_types::AccountErrorKind::Unsupported(AccountOperation::ContactGet)
+        ));
     }
 
     #[test]
