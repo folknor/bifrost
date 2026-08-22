@@ -24,7 +24,7 @@ use crate::{
         authentication::{
             Credentials, Mechanism, ScramExchange, ScramStep, decode_auth_challenge,
             decode_scram_payload, first_attemptable, oauth_mechanism, password_mechanism_order,
-            scram_hash,
+            resolve_scram_binding, scram_hash,
         },
         batch::{RecipientProgress, SendProgress, SmtpBatchRecipient},
         commands::{Auth, Bdat, Data, Ehlo, Expn, Lhlo, Mail, Noop, Rcpt, Rset, Starttls, Vrfy},
@@ -1490,19 +1490,17 @@ impl SmtpConnection {
 
         let order = password_mechanism_order(mechanisms, &self.server_info);
 
-        // Resolve each PLUS rung's binding eagerly (network-free; the DER is
-        // cached on the live TLS stream) so the selection stays socket-free and
-        // the chosen exchange does not re-fetch the DER.
         let mut bindings: HashMap<Mechanism, ScramChannelBinding> = HashMap::new();
-        for &mech in &order {
-            if matches!(mech, Mechanism::ScramSha1Plus | Mechanism::ScramSha256Plus)
-                && let Some(b) = self.resolve_scram_binding()
+        for &mechanism in &order {
+            if matches!(
+                mechanism,
+                Mechanism::ScramSha1Plus | Mechanism::ScramSha256Plus
+            ) && let Some(binding) = self.resolve_scram_binding()?
             {
-                bindings.insert(mech, b);
+                bindings.insert(mechanism, binding);
             }
         }
-
-        let chosen = first_attemptable(&order, |m| bindings.contains_key(&m))?;
+        let chosen = first_attemptable(&order, |mechanism| bindings.contains_key(&mechanism))?;
         match chosen {
             Mechanism::ScramSha1Plus | Mechanism::ScramSha256Plus => {
                 let binding = bindings
@@ -1521,12 +1519,12 @@ impl SmtpConnection {
     /// connection: fetch the peer certificate DER (already cached on the TLS
     /// stream, no wire I/O) and hash it. `None` when the DER is absent
     /// (plaintext) or [`bifrost_sasl::tls_server_end_point`] errors (`EdDSA`
-    /// leaf, unsupported signature algorithm, truncated cert) - that `None` is the binding-skip
-    /// signal the walk in `auth` consumes.
-    fn resolve_scram_binding(&self) -> Option<ScramChannelBinding> {
-        let der = self.peer_certificate_der()?;
-        let bytes = bifrost_sasl::tls_server_end_point(&der).ok()?;
-        Some(ScramChannelBinding::TlsServerEndPoint(bytes))
+    /// leaf. Absence means there is no TLS certificate; malformed or
+    /// unsupported certificate algorithms remain typed errors and cannot
+    /// silently downgrade authentication.
+    fn resolve_scram_binding(&self) -> Result<Option<ScramChannelBinding>, Error> {
+        let der = self.peer_certificate_der();
+        resolve_scram_binding(der.as_deref())
     }
 
     /// Run a SCRAM exchange (bound or unbound) as a no-IR `334` challenge walk.

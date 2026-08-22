@@ -3,6 +3,7 @@
 use std::fmt;
 use std::ops::Deref;
 
+use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 /// A string that zeroizes its allocation on drop and redacts under `Debug`.
@@ -65,16 +66,7 @@ impl AsRef<str> for Secret {
 
 impl PartialEq for Secret {
     fn eq(&self, other: &Self) -> bool {
-        let a = self.as_bytes();
-        let b = other.as_bytes();
-        let mut diff = a.len() ^ b.len();
-        let max_len = a.len().max(b.len());
-        for index in 0..max_len {
-            let lhs = a.get(index).copied().unwrap_or(0);
-            let rhs = b.get(index).copied().unwrap_or(0);
-            diff |= usize::from(lhs ^ rhs);
-        }
-        diff == 0
+        bool::from(self.as_bytes().ct_eq(other.as_bytes()))
     }
 }
 

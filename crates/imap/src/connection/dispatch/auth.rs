@@ -1,5 +1,5 @@
 use bifrost_sasl::{
-    ScramChannelBinding, ScramHash, cram_md5_response, decode_continuation, escape_username,
+    ScramChannelBinding, ScramHash, cram_md5_response, decode_continuation, prepare_scram_username,
     scram_client_final, verify_server_final,
 };
 
@@ -350,9 +350,9 @@ impl AuthenticateScramConsumer {
         nonce: String,
         sasl_ir_used: bool,
         binding: ScramChannelBinding,
-    ) -> Self {
-        let client_first_bare = format!("n={},r={nonce}", escape_username(&user));
-        Self {
+    ) -> Result<Self, Error> {
+        let client_first_bare = format!("n={},r={nonce}", prepare_scram_username(&user)?);
+        Ok(Self {
             mechanism,
             pass,
             client_nonce: nonce,
@@ -366,7 +366,7 @@ impl AuthenticateScramConsumer {
             expected_server_signature: None,
             caps_seen: false,
             buffered: Vec::new(),
-        }
+        })
     }
 
     pub(crate) fn initial_response(&self) -> SecretString {
@@ -488,7 +488,8 @@ mod tests {
             "nonce123".to_owned(),
             true,
             ScramChannelBinding::TlsServerEndPoint(vec![1, 2, 3, 4]),
-        );
+        )
+        .unwrap();
         let decoded = decode_initial(&consumer);
         assert!(
             decoded.starts_with("p=tls-server-end-point,,n="),
@@ -510,7 +511,8 @@ mod tests {
             "nonce123".to_owned(),
             true,
             ScramChannelBinding::None,
-        );
+        )
+        .unwrap();
         let decoded = decode_initial(&consumer);
         assert!(
             decoded.starts_with("n,,n=user,r=nonce123"),

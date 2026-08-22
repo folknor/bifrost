@@ -98,10 +98,12 @@ impl ImapConnection {
                             } else {
                                 bifrost_sasl::ScramHash::Sha1
                             };
-                            // One DER fetch + hash per PLUS candidate; a
-                            // failure here is a typed rejection, not a fall
+                            // One DER fetch + hash per PLUS candidate. No
+                            // certificate at all is a typed rejection recorded
+                            // on the ladder; a certificate we cannot bind to
+                            // aborts the ladder outright rather than falling
                             // through to unbound SCRAM (RFC 5802 Section 6).
-                            let Some(resolved) = self.resolve_scram_binding().await else {
+                            let Some(resolved) = self.resolve_scram_binding().await? else {
                                 rejected.push(AuthMechanismRejection::new(
                                     mechanism,
                                     AuthMechanismRejectionReason::ChannelBindingUnavailable,
@@ -585,7 +587,7 @@ impl ImapConnection {
         let scram_binding = match binding {
             ChannelBinding::TlsServerEndPoint => match resolved {
                 Some(resolved) => resolved,
-                None => self.resolve_scram_binding().await.ok_or_else(|| {
+                None => self.resolve_scram_binding().await?.ok_or_else(|| {
                     // `ScramHash` is `#[non_exhaustive]`; SHA-1 maps to its
                     // PLUS variant, SHA-256 (and any future hash) to the
                     // SHA-256 PLUS variant for the audit/display rejection.
@@ -620,7 +622,7 @@ impl ImapConnection {
             nonce,
             has_sasl_ir,
             scram_binding,
-        );
+        )?;
         let initial_response = has_sasl_ir.then(|| consumer.initial_response());
         let cmd = Command::Authenticate {
             // Single source of truth for the emitted token: the SASL crate.
@@ -640,14 +642,22 @@ impl ImapConnection {
     /// Resolve the `tls-server-end-point` channel binding for the live
     /// connection: fetch the peer certificate DER once and hash it.
     ///
-    /// Returns `None` when the DER is absent (plaintext, dead driver, or
-    /// native-tls produced no DER) or when `tls_server_end_point` errors
-    /// (unsupported signature algorithm, EdDSA leaf, truncated cert). The
-    /// caller turns `None` into a `ChannelBindingUnavailable` rejection.
-    async fn resolve_scram_binding(&self) -> Option<bifrost_sasl::ScramChannelBinding> {
-        let der = self.peer_certificate_der().await?;
-        let bytes = bifrost_sasl::tls_server_end_point(&der).ok()?;
-        Some(bifrost_sasl::ScramChannelBinding::TlsServerEndPoint(bytes))
+    /// Returns `Ok(None)` only when there is no peer certificate at all
+    /// (plaintext, dead driver, or native-tls produced no DER); that absence is
+    /// the sole binding-skip signal, and the caller turns it into a
+    /// `ChannelBindingUnavailable` rejection.
+    ///
+    /// A certificate that is present but whose binding cannot be computed
+    /// (unsupported signature algorithm, EdDSA leaf, malformed or truncated
+    /// DER) is an error, not a skip. Swallowing it would let an attacker who
+    /// can influence the presented leaf knock the client off the PLUS rung and
+    /// onto unbound SCRAM or PLAIN, which is the downgrade the `PLUS`
+    /// mechanisms exist to prevent (RFC 5802 Section 6). SMTP resolves this the
+    /// same way; the two crates must not differ here.
+    async fn resolve_scram_binding(
+        &self,
+    ) -> Result<Option<bifrost_sasl::ScramChannelBinding>, Error> {
+        scram_binding_from_der(self.peer_certificate_der().await.as_deref())
     }
 
     /// Finalize authentication: refresh capabilities if the server did
@@ -1123,6 +1133,47 @@ pub(super) fn is_rev2_from_snapshot(snap: &driver::ConnectionStateSnapshot) -> b
             .any(|e| e.eq_ignore_ascii_case("IMAP4rev2"))
     } else {
         has_rev2
+    }
+}
+
+/// Channel-binding policy for a peer certificate, split out from the live
+/// connection so the decision itself is testable and so it reads identically to
+/// `bifrost_smtp`'s `resolve_scram_binding`.
+///
+/// `Ok(None)` means "no certificate at all", the only condition under which the
+/// caller may record a `ChannelBindingUnavailable` rejection and move down the
+/// mechanism ladder. A certificate that is present but unusable is an `Err`:
+/// treating it as a skip would hand an attacker who can shape the presented
+/// leaf a way to force the client off SCRAM-*-PLUS onto an unbound mechanism.
+fn scram_binding_from_der(
+    der: Option<&[u8]>,
+) -> Result<Option<bifrost_sasl::ScramChannelBinding>, Error> {
+    let Some(der) = der else {
+        return Ok(None);
+    };
+    let bytes = bifrost_sasl::tls_server_end_point(der)?;
+    Ok(Some(bifrost_sasl::ScramChannelBinding::TlsServerEndPoint(
+        bytes,
+    )))
+}
+
+#[cfg(test)]
+mod binding_policy_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::scram_binding_from_der;
+    use crate::error::Error;
+
+    #[test]
+    fn absent_certificate_is_the_only_binding_skip() {
+        assert!(scram_binding_from_der(None).unwrap().is_none());
+    }
+
+    #[test]
+    fn unusable_certificate_is_an_error_not_a_downgrade() {
+        // A present but unparseable DER. If this came back as `Ok(None)` the
+        // ladder would silently continue to unbound SCRAM and then PLAIN.
+        let err = scram_binding_from_der(Some(&[0x30, 0x01, 0x00])).unwrap_err();
+        assert!(matches!(err, Error::Protocol(_)), "got {err:?}");
     }
 }
 

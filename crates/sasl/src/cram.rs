@@ -17,7 +17,8 @@ pub fn cram_md5_response(user: &str, pass: &str, challenge: &str) -> Result<Secr
     mac.update(&challenge);
     let digest = mac.finalize().into_bytes();
 
-    let mut response = String::with_capacity(user.len() + 1 + digest.len() * 2);
+    let mut response =
+        zeroize::Zeroizing::new(String::with_capacity(user.len() + 1 + digest.len() * 2));
     response.push_str(user);
     response.push(' ');
     for byte in digest {

@@ -5,6 +5,8 @@
 
 use crate::error::SaslError;
 use crate::secret::Secret;
+use subtle::ConstantTimeEq;
+use zeroize::Zeroizing;
 
 /// Upper bound on the SCRAM `i=` iteration count fed to PBKDF2. RFC 7677 sets
 /// the floor at 4096; this ceiling sits far above any legitimate deployment
@@ -114,8 +116,28 @@ pub fn decode_continuation(data: &str) -> Result<String, SaslError> {
 }
 
 /// Escape `=` and `,` in a SCRAM username (RFC 5802 saslname rule).
-pub fn escape_username(user: &str) -> String {
+///
+/// Crate-private on purpose. Escaping alone is only half of what RFC 5802
+/// requires of a `n=` value - the other half is RFC 4013 SASLprep, and a caller
+/// that reached for the escaper by name would silently skip it. Protocol crates
+/// get [`prepare_scram_username`], which does both. The GS2 identity in
+/// `oauth.rs` is the one in-crate caller that needs escaping without SASLprep,
+/// because OAuth identities are not SCRAM usernames.
+pub(crate) fn escape_username(user: &str) -> String {
     user.replace('=', "=3D").replace(',', "=2C")
+}
+
+/// Apply RFC 4013 SASLprep, then RFC 5802 saslname escaping to a SCRAM username.
+///
+/// SASLprep failure (a prohibited code point, an unassigned one, or a bidi
+/// violation) is a `Protocol` error rather than a pass-through: sending the raw
+/// bytes would make the client and the server derive `SaltedPassword` over
+/// different inputs, and would let visually equivalent identities reach the
+/// same account.
+pub fn prepare_scram_username(user: &str) -> Result<String, SaslError> {
+    let prepared = stringprep::saslprep(user)
+        .map_err(|e| SaslError::Protocol(format!("SCRAM username failed SASLprep: {e}")))?;
+    Ok(escape_username(&prepared))
 }
 
 /// Build the base64 client-final message and the expected server signature
@@ -130,12 +152,13 @@ pub fn scram_client_final(
 ) -> Result<(Secret, Vec<u8>), SaslError> {
     use base64::Engine;
 
-    if scram_field(server_first, 'm').is_some() {
+    validate_scram_attributes(server_first)?;
+    if scram_field(server_first, 'm')?.is_some() {
         return Err(SaslError::Protocol(
             "SCRAM mandatory extension field is not supported".into(),
         ));
     }
-    let server_nonce = scram_field(server_first, 'r')
+    let server_nonce = scram_field(server_first, 'r')?
         .ok_or_else(|| SaslError::Protocol("SCRAM server-first message missing nonce".into()))?;
     // RFC 5802: the server-nonce (`r=`) is the client nonce with server-supplied
     // bytes appended, so it must STRICTLY extend the client nonce. An equal
@@ -146,12 +169,12 @@ pub fn scram_client_final(
             "SCRAM server nonce does not extend client nonce".into(),
         ));
     }
-    let salt_b64 = scram_field(server_first, 's')
+    let salt_b64 = scram_field(server_first, 's')?
         .ok_or_else(|| SaslError::Protocol("SCRAM server-first message missing salt".into()))?;
     let salt = base64::engine::general_purpose::STANDARD
         .decode(salt_b64)
         .map_err(|e| SaslError::Protocol(format!("invalid SCRAM salt: {e}")))?;
-    let iterations = scram_field(server_first, 'i')
+    let iterations = scram_field(server_first, 'i')?
         .ok_or_else(|| {
             SaslError::Protocol("SCRAM server-first message missing iteration count".into())
         })?
@@ -186,6 +209,11 @@ pub fn scram_client_final(
     let c_value = base64::engine::general_purpose::STANDARD.encode(&cbind);
     let client_final_without_proof = format!("c={c_value},r={server_nonce}");
     let auth_message = format!("{client_first_bare},{server_first},{client_final_without_proof}");
+    let password = Zeroizing::new(
+        stringprep::saslprep(password)
+            .map_err(|e| SaslError::Protocol(format!("SCRAM password failed SASLprep: {e}")))?
+            .into_owned(),
+    );
     let (proof, server_signature) = scram_proof_and_server_signature(
         hash,
         password.as_bytes(),
@@ -208,12 +236,13 @@ pub fn scram_client_final(
 pub fn verify_server_final(server_final: &str, expected_signature: &[u8]) -> Result<(), SaslError> {
     use base64::Engine;
 
-    if let Some(error) = scram_field(server_final, 'e') {
+    validate_scram_attributes(server_final)?;
+    if let Some(error) = scram_field(server_final, 'e')? {
         return Err(SaslError::AuthFailed(format!(
             "SCRAM server error: {error}"
         )));
     }
-    let verifier = scram_field(server_final, 'v')
+    let verifier = scram_field(server_final, 'v')?
         .ok_or_else(|| SaslError::Protocol("SCRAM server-final message missing verifier".into()))?;
     let actual = base64::engine::general_purpose::STANDARD
         .decode(verifier)
@@ -221,7 +250,7 @@ pub fn verify_server_final(server_final: &str, expected_signature: &[u8]) -> Res
     // `actual` is the attacker-controllable `v=` field; compare in constant
     // time so a MITM cannot use a timing oracle to forge the server signature
     // and impersonate the server. Matches the proof compare in `secret.rs`.
-    if !constant_time_eq(&actual, expected_signature) {
+    if !bool::from(actual.ct_eq(expected_signature)) {
         return Err(SaslError::Protocol(
             "SCRAM server signature verification failed".into(),
         ));
@@ -229,29 +258,42 @@ pub fn verify_server_final(server_final: &str, expected_signature: &[u8]) -> Res
     Ok(())
 }
 
-/// Constant-time byte-slice equality. Folds the length difference and every
-/// byte XOR into one accumulator, so the comparison time does not depend on
-/// where (or whether) the slices first differ. Leaks `max(len)`, which is not
-/// secret here (the signature length is fixed by the hash).
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    let mut diff = a.len() ^ b.len();
-    let max_len = a.len().max(b.len());
-    for index in 0..max_len {
-        let lhs = a.get(index).copied().unwrap_or(0);
-        let rhs = b.get(index).copied().unwrap_or(0);
-        diff |= usize::from(lhs ^ rhs);
-    }
-    diff == 0
-}
-
-fn scram_field(message: &str, key: char) -> Option<&str> {
+fn scram_field(message: &str, key: char) -> Result<Option<&str>, SaslError> {
     // Match `<key>=` without rebuilding a `format!("{key}=")` String on every
     // call (4-5 lookups per message). Strip the single `key` char, then the `=`.
-    message.split(',').find_map(|field| {
+    let mut matches = message.split(',').filter_map(|field| {
         field
             .strip_prefix(key)
             .and_then(|rest| rest.strip_prefix('='))
-    })
+    });
+    let value = matches.next();
+    if matches.next().is_some() {
+        return Err(SaslError::Protocol(format!(
+            "SCRAM message contains duplicate {key}= attribute"
+        )));
+    }
+    Ok(value)
+}
+
+fn validate_scram_attributes(message: &str) -> Result<(), SaslError> {
+    let mut seen = [false; 128];
+    for field in message.split(',') {
+        let bytes = field.as_bytes();
+        if bytes.len() < 2 || !bytes[0].is_ascii_alphabetic() || bytes[1] != b'=' {
+            return Err(SaslError::Protocol(
+                "SCRAM message contains a malformed attribute".into(),
+            ));
+        }
+        let index = usize::from(bytes[0]);
+        if seen[index] {
+            return Err(SaslError::Protocol(format!(
+                "SCRAM message contains duplicate {}= attribute",
+                char::from(bytes[0])
+            )));
+        }
+        seen[index] = true;
+    }
+    Ok(())
 }
 
 fn scram_proof_and_server_signature(
@@ -260,7 +302,7 @@ fn scram_proof_and_server_signature(
     salt: &[u8],
     iterations: u32,
     auth_message: &str,
-) -> Result<(Vec<u8>, Vec<u8>), SaslError> {
+) -> Result<(Zeroizing<Vec<u8>>, Vec<u8>), SaslError> {
     match hash {
         ScramHash::Sha1 => scram_proof_sha1(password, salt, iterations, auth_message),
         ScramHash::Sha256 => scram_proof_sha256(password, salt, iterations, auth_message),
@@ -272,20 +314,20 @@ fn scram_proof_sha1(
     salt: &[u8],
     iterations: u32,
     auth_message: &str,
-) -> Result<(Vec<u8>, Vec<u8>), SaslError> {
+) -> Result<(Zeroizing<Vec<u8>>, Vec<u8>), SaslError> {
     use sha1::Digest;
 
-    let mut salted = [0u8; 20];
-    pbkdf2::pbkdf2_hmac::<sha1::Sha1>(password, salt, iterations, &mut salted);
-    let client_key = hmac_digest::<hmac::Hmac<sha1::Sha1>>(&salted, b"Client Key")?;
-    let stored_key = sha1::Sha1::digest(&client_key);
+    let mut salted = Zeroizing::new([0u8; 20]);
+    pbkdf2::pbkdf2_hmac::<sha1::Sha1>(password, salt, iterations, &mut salted[..]);
+    let client_key = hmac_digest::<hmac::Hmac<sha1::Sha1>>(&salted[..], b"Client Key")?;
+    let stored_key = Zeroizing::new(sha1::Sha1::digest(&client_key).to_vec());
     let client_signature =
         hmac_digest::<hmac::Hmac<sha1::Sha1>>(&stored_key, auth_message.as_bytes())?;
     let proof = xor_bytes(&client_key, &client_signature);
-    let server_key = hmac_digest::<hmac::Hmac<sha1::Sha1>>(&salted, b"Server Key")?;
+    let server_key = hmac_digest::<hmac::Hmac<sha1::Sha1>>(&salted[..], b"Server Key")?;
     let server_signature =
         hmac_digest::<hmac::Hmac<sha1::Sha1>>(&server_key, auth_message.as_bytes())?;
-    Ok((proof, server_signature))
+    Ok((proof, server_signature.to_vec()))
 }
 
 fn scram_proof_sha256(
@@ -293,34 +335,34 @@ fn scram_proof_sha256(
     salt: &[u8],
     iterations: u32,
     auth_message: &str,
-) -> Result<(Vec<u8>, Vec<u8>), SaslError> {
+) -> Result<(Zeroizing<Vec<u8>>, Vec<u8>), SaslError> {
     use sha2::Digest;
 
-    let mut salted = [0u8; 32];
-    pbkdf2::pbkdf2_hmac::<sha2::Sha256>(password, salt, iterations, &mut salted);
-    let client_key = hmac_digest::<hmac::Hmac<sha2::Sha256>>(&salted, b"Client Key")?;
-    let stored_key = sha2::Sha256::digest(&client_key);
+    let mut salted = Zeroizing::new([0u8; 32]);
+    pbkdf2::pbkdf2_hmac::<sha2::Sha256>(password, salt, iterations, &mut salted[..]);
+    let client_key = hmac_digest::<hmac::Hmac<sha2::Sha256>>(&salted[..], b"Client Key")?;
+    let stored_key = Zeroizing::new(sha2::Sha256::digest(&client_key).to_vec());
     let client_signature =
         hmac_digest::<hmac::Hmac<sha2::Sha256>>(&stored_key, auth_message.as_bytes())?;
     let proof = xor_bytes(&client_key, &client_signature);
-    let server_key = hmac_digest::<hmac::Hmac<sha2::Sha256>>(&salted, b"Server Key")?;
+    let server_key = hmac_digest::<hmac::Hmac<sha2::Sha256>>(&salted[..], b"Server Key")?;
     let server_signature =
         hmac_digest::<hmac::Hmac<sha2::Sha256>>(&server_key, auth_message.as_bytes())?;
-    Ok((proof, server_signature))
+    Ok((proof, server_signature.to_vec()))
 }
 
-fn hmac_digest<M>(key: &[u8], data: &[u8]) -> Result<Vec<u8>, SaslError>
+fn hmac_digest<M>(key: &[u8], data: &[u8]) -> Result<Zeroizing<Vec<u8>>, SaslError>
 where
     M: hmac::Mac + hmac::digest::KeyInit,
 {
     let mut mac = <M as hmac::digest::KeyInit>::new_from_slice(key)
         .map_err(|e| SaslError::Protocol(format!("invalid SCRAM HMAC key: {e}")))?;
     mac.update(data);
-    Ok(mac.finalize().into_bytes().to_vec())
+    Ok(Zeroizing::new(mac.finalize().into_bytes().to_vec()))
 }
 
-fn xor_bytes(a: &[u8], b: &[u8]) -> Vec<u8> {
-    a.iter().zip(b.iter()).map(|(a, b)| a ^ b).collect()
+fn xor_bytes(a: &[u8], b: &[u8]) -> Zeroizing<Vec<u8>> {
+    Zeroizing::new(a.iter().zip(b.iter()).map(|(a, b)| a ^ b).collect())
 }
 
 #[cfg(test)]
@@ -404,6 +446,75 @@ mod tests {
     }
 
     #[test]
+    fn scram_username_saslprep_matches_rfc_4013_examples() {
+        // The complete RFC 4013 Section 3 example table, in order. Each row
+        // exercises a different SASLprep clause, so pinning the whole table is
+        // what proves real SASLprep is wired rather than a mapping subset.
+
+        // #1 SOFT HYPHEN mapped to nothing.
+        assert_eq!(prepare_scram_username("I\u{ad}X").unwrap(), "IX");
+        // #2 and #3: no transformation, and case is NOT folded.
+        assert_eq!(prepare_scram_username("user").unwrap(), "user");
+        assert_eq!(prepare_scram_username("USER").unwrap(), "USER");
+        // #4 FEMININE ORDINAL INDICATOR: NFKC output is "a".
+        assert_eq!(prepare_scram_username("\u{aa}").unwrap(), "a");
+        // #5 ROMAN NUMERAL NINE: NFKC output is "IX".
+        assert_eq!(prepare_scram_username("\u{2168}").unwrap(), "IX");
+        // #6 prohibited character (BELL).
+        assert!(
+            matches!(prepare_scram_username("\u{7}"), Err(SaslError::Protocol(_))),
+            "prohibited code point must not pass SASLprep"
+        );
+        // #7 bidirectional check failure: a RandALCat code point followed by an
+        // LCat one. Without the bidi rule this string prepares cleanly.
+        assert!(
+            matches!(
+                prepare_scram_username("\u{627}\u{31}"),
+                Err(SaslError::Protocol(_))
+            ),
+            "RFC 3454 bidi rule violation must not pass SASLprep"
+        );
+
+        // Escaping still runs after preparation, on the prepared form.
+        assert_eq!(prepare_scram_username("a,b=c").unwrap(), "a=2Cb=3Dc");
+    }
+
+    #[test]
+    fn scram_password_saslprep_removes_rfc_4013_mapped_to_nothing() {
+        use base64::Engine;
+        let (client_final, _) = scram_client_final(
+            ScramHash::Sha1,
+            "pen\u{ad}cil",
+            "fyko+d2lbbFgONRv9qkxdawL",
+            "n=user,r=fyko+d2lbbFgONRv9qkxdawL",
+            "r=fyko+d2lbbFgONRv9qkxdawL3rfcNHYJY1ZVvWVs7j,s=QSXCR+Q6sek8bf92,i=4096",
+            &ScramChannelBinding::None,
+        )
+        .unwrap();
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(client_final.as_str())
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(decoded).unwrap(),
+            "c=biws,r=fyko+d2lbbFgONRv9qkxdawL3rfcNHYJY1ZVvWVs7j,p=v0X8v3Bz2T0CJGbJQyF0X+HI4Ts="
+        );
+    }
+
+    #[test]
+    fn scram_password_rejects_prohibited_saslprep_input() {
+        let err = scram_client_final(
+            ScramHash::Sha256,
+            "bad\u{7}",
+            "abc",
+            "n=user,r=abc",
+            "r=abcdef,s=QSXCR+Q6sek8bf92,i=4096",
+            &ScramChannelBinding::None,
+        )
+        .unwrap_err();
+        assert!(matches!(err, SaslError::Protocol(_)), "got {err:?}");
+    }
+
+    #[test]
     fn scram_rejects_malformed_server_first_messages() {
         let nonce = "abc";
         let bare = "n=user,r=abc";
@@ -442,6 +553,57 @@ mod tests {
                 "{server_first}: got {err:?}"
             );
         }
+    }
+
+    #[test]
+    fn scram_rejects_duplicate_attributes() {
+        let err = scram_client_final(
+            ScramHash::Sha256,
+            "pencil",
+            "abc",
+            "n=user,r=abc",
+            "r=abcdef,s=QSXCR+Q6sek8bf92,i=4096,x=one,x=two",
+            &ScramChannelBinding::None,
+        )
+        .unwrap_err();
+        assert!(matches!(err, SaslError::Protocol(_)), "got {err:?}");
+
+        // A duplicated attribute we DO consume. Taking the first occurrence
+        // would let a MITM append a second salt or iteration count that a
+        // differently-ordered peer honours instead.
+        let err = scram_client_final(
+            ScramHash::Sha256,
+            "pencil",
+            "abc",
+            "n=user,r=abc",
+            "r=abcdef,s=QSXCR+Q6sek8bf92,s=AAAAAAAAAAAAAAAA,i=4096",
+            &ScramChannelBinding::None,
+        )
+        .unwrap_err();
+        assert!(matches!(err, SaslError::Protocol(_)), "got {err:?}");
+
+        // A field with no `=` at all is not an attribute-value pair.
+        let err = verify_server_final("v=AAAA,junk", &[0; 32]).unwrap_err();
+        assert!(matches!(err, SaslError::Protocol(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn scram_rejects_duplicate_verifier_even_when_both_copies_are_correct() {
+        use base64::Engine;
+
+        // Both `v=` values are the signature we expect, so every check
+        // downstream of the duplicate guard passes. Without that guard this is
+        // an accepted server-final, which is precisely the ambiguity a
+        // duplicate attribute buys an attacker: one copy for us, another for
+        // whatever else parses the message.
+        let expected = [7u8; 32];
+        let encoded = base64::engine::general_purpose::STANDARD.encode(expected);
+        assert!(
+            verify_server_final(&format!("v={encoded}"), &expected).is_ok(),
+            "single correct verifier must still be accepted"
+        );
+        let err = verify_server_final(&format!("v={encoded},v={encoded}"), &expected).unwrap_err();
+        assert!(matches!(err, SaslError::Protocol(_)), "got {err:?}");
     }
 
     #[test]

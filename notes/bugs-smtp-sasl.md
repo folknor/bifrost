@@ -4,65 +4,6 @@ Hunter: Claude Opus, single pass, 2026-08-05. Scope: `crates/smtp/` and `crates/
 together because sasl exists to serve the auth paths. Read-only review; no build or test was run.
 Findings are unverified work material. Line numbers are as of the hunt and will drift.
 
-## bifrost-sasl
-
-### No SASLprep (RFC 4013) on the SCRAM password or username
-
-`crates/sasl/src/scram.rs`. RFC 5802 section 5.1 requires the password (and the `n=` saslname) to
-be normalized with SASLprep before PBKDF2. `scram_client_final` feeds `password.as_bytes()` straight
-in, and `escape_username` only does the `=`/`,` escape. Any non-ASCII password (accented characters,
-non-NFKC input, embedded non-ASCII space) produces a different `SaltedPassword` than a conforming
-server computes, so SCRAM silently fails auth against e.g. Cyrus/Dovecot while PLAIN would have
-worked. Neither `reference/sasl.md` nor its "Correctness pins" section mentions this; the docs read
-as if the computation is complete. This is the most likely real-world interop bug in the crate. At
-minimum it needs to be a documented non-goal with a stringprep-shaped error for non-ASCII input;
-properly it needs `stringprep::saslprep`.
-
-### Key material is never zeroized
-
-`crates/sasl/src/scram.rs`. `salted` (`[u8; 20]`/`[u8; 32]`), `client_key`, `stored_key`,
-`server_key`, and the `proof` `Vec` from `xor_bytes` are ordinary stack arrays and `Vec<u8>` that
-drop without wiping. `SaltedPassword` and `ClientKey` are password-equivalent (they authenticate
-forever without the password); `StoredKey` lets you impersonate the server. The crate goes to real
-trouble to wrap the base64 client-final in `Zeroizing` two lines later, so the intent is clearly
-there and the intermediates were missed. `hmac_digest` returning `Vec<u8>` is the shape that makes it
-easy to miss; it should return `Zeroizing<Vec<u8>>`, and `salted` should be a `Zeroizing<[u8; N]>`.
-
-### constant_time_eq is hand-rolled and duplicated
-
-`crates/sasl/src/scram.rs` and `crates/sasl/src/secret.rs`. Two byte-identical implementations.
-Neither uses `subtle` or `core::hint::black_box`, so nothing prevents LLVM from recognizing the
-accumulator pattern and short-circuiting; on the `verify_server_final` path that is a
-server-impersonation timing oracle, which is exactly the threat the comment names. This should be
-one `subtle::ConstantTimeEq` call site. Low likelihood of the optimizer actually breaking it today,
-but the code is carrying a correctness claim it cannot enforce.
-
-### RSASSA-PSS certificates get no channel binding
-
-`crates/sasl/src/channel_binding.rs`. The OID table covers PKCS#1 v1.5 RSA, ECDSA, bare digests, and
-EdDSA-as-error, but not `1.2.840.113549.1.1.10` (`id-RSASSA-PSS`). PSS leaf certs are issued in
-production today. The result is not a loud failure: `resolve_scram_binding` in the SMTP driver does
-`.ok()?`, so an unrecognized OID silently degrades to `None`, `first_attemptable` skips the PLUS
-rung, and the connection quietly falls through to PLAIN-over-TLS. So the "fail loud rather than
-guess" property the module docs claim is defeated one layer up: the typed error is discarded. Two
-things wanted: add PSS (its binding hash comes from the `parameters` field, not the OID, so it needs
-a small extra parse), and make the driver distinguish "no TLS" from "TLS but binding computation
-failed" so the latter is at least observable.
-
-### CRAM-MD5 response string is not zeroized
-
-`crates/sasl/src/cram.rs`. `response` is a plain `String` containing the HMAC digest; the base64 of
-it becomes a `Secret`, but the pre-encoded buffer leaks to the allocator. Minor relative to the
-SCRAM key material, same fix shape.
-
-### scram_field takes the first matching field
-
-`message.split(',').find_map(...)`. A server sending `v=<forged>,v=<real>` gets the first one
-verified. Not exploitable (the attacker controls both), but the parser is lenient where RFC 5802 is
-not: duplicate attributes are malformed and should be rejected, and the same leniency means an `e=`
-buried after other fields is found while a malformed message with a `,`-containing value could be
-mis-split. Cheap to tighten.
-
 ## bifrost-smtp
 
 ### Cleartext credentials leave Secret at the SMTP boundary
@@ -153,13 +94,6 @@ an arbitrary await point, once per connect attempt. It also means a perfectly fr
 async mutex returns `Pending` and is rejected with a misleading "requires a network refresh" message.
 It works today because the only sources are `StaticTokenSource` and `OAuthRefresher`; it is a
 correctness landmine for any third `TokenSource` impl. Deleting the sync transport deletes this.
-
-## Doc divergence
-
-`reference/sasl.md` now names the iteration bounds as a pin and SASLprep as a known gap. It still says binding failures are "a hard `Protocol` error rather than a guessed binding
-hash", which is true inside the crate but not observable to the caller because the SMTP driver
-swallows it with `.ok()?`. Either the reference should say the consumer treats it as a skip signal,
-or the consumer should stop discarding it.
 
 ## Uncertain, needs a pin
 

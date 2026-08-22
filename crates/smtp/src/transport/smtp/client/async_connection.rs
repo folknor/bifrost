@@ -27,7 +27,7 @@ use crate::{
         authentication::{
             Credentials, Mechanism, ScramExchange, ScramStep, decode_auth_challenge,
             decode_scram_payload, first_attemptable, oauth_mechanism, password_mechanism_order,
-            scram_hash,
+            resolve_scram_binding, scram_hash,
         },
         batch::{RecipientProgress, SendProgress, SmtpBatchRecipient},
         commands::{Auth, Bdat, Data, Ehlo, Expn, Lhlo, Mail, Noop, Rcpt, Rset, Starttls, Vrfy},
@@ -1651,18 +1651,17 @@ impl AsyncSmtpConnection {
 
         let order = password_mechanism_order(mechanisms, &self.server_info);
 
-        // The DER accessor is sync, so the PLUS binding resolution adds no
-        // round trips: selection stays network-free.
         let mut bindings: HashMap<Mechanism, ScramChannelBinding> = HashMap::new();
-        for &mech in &order {
-            if matches!(mech, Mechanism::ScramSha1Plus | Mechanism::ScramSha256Plus)
-                && let Some(b) = self.resolve_scram_binding()
+        for &mechanism in &order {
+            if matches!(
+                mechanism,
+                Mechanism::ScramSha1Plus | Mechanism::ScramSha256Plus
+            ) && let Some(binding) = self.resolve_scram_binding()?
             {
-                bindings.insert(mech, b);
+                bindings.insert(mechanism, binding);
             }
         }
-
-        let chosen = first_attemptable(&order, |m| bindings.contains_key(&m))?;
+        let chosen = first_attemptable(&order, |mechanism| bindings.contains_key(&mechanism))?;
         match chosen {
             Mechanism::ScramSha1Plus | Mechanism::ScramSha256Plus => {
                 let binding = bindings
@@ -1681,10 +1680,9 @@ impl AsyncSmtpConnection {
     /// Resolve the `tls-server-end-point` channel binding for the live
     /// connection. The DER accessor is sync (cached on the TLS stream), so this
     /// is non-awaiting and the binding-skip decision stays network-free.
-    fn resolve_scram_binding(&self) -> Option<ScramChannelBinding> {
-        let der = self.peer_certificate_der()?;
-        let bytes = bifrost_sasl::tls_server_end_point(&der).ok()?;
-        Some(ScramChannelBinding::TlsServerEndPoint(bytes))
+    fn resolve_scram_binding(&self) -> Result<Option<ScramChannelBinding>, Error> {
+        let der = self.peer_certificate_der();
+        resolve_scram_binding(der.as_deref())
     }
 
     /// Run a SCRAM exchange (bound or unbound) as a no-IR `334` challenge walk.

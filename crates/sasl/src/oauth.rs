@@ -47,7 +47,7 @@ pub fn xoauth2_payload(user: &str, access_token: &str) -> Secret {
 pub fn oauthbearer_payload(identity: &str, access_token: &str) -> Secret {
     // `escape_username` handles the GS2 `=`/`,` escapes but not `\x01`; strip the
     // frame delimiter from both fields so neither can inject extra attributes.
-    let identity = crate::escape_username(&strip_frame_delim(identity));
+    let identity = crate::scram::escape_username(&strip_frame_delim(identity));
     let access_token = strip_frame_delim(access_token);
     Secret::from(format!(
         "n,a={identity},\x01auth=Bearer {access_token}\x01\x01"

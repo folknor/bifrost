@@ -549,6 +549,18 @@ pub(crate) fn first_attemptable(
     Err(error::invalid_input(message).with_phase(SmtpCommandPhase::Auth))
 }
 
+/// Resolve cached peer-certificate DER into SCRAM channel binding. Absence is
+/// the only skip signal; a present but unusable certificate remains an error.
+pub(crate) fn resolve_scram_binding(
+    peer_certificate_der: Option<&[u8]>,
+) -> Result<Option<ScramChannelBinding>, Error> {
+    let Some(der) = peer_certificate_der else {
+        return Ok(None);
+    };
+    let bytes = bifrost_sasl::tls_server_end_point(der)?;
+    Ok(Some(ScramChannelBinding::TlsServerEndPoint(bytes)))
+}
+
 /// Next client line a [`ScramExchange::step`] produces.
 #[derive(Debug)]
 pub(crate) enum ScramStep {
@@ -594,7 +606,7 @@ impl ScramExchange {
         let client_nonce = generate_scram_nonce()?;
         let client_first_bare = format!(
             "n={},r={client_nonce}",
-            bifrost_sasl::escape_username(username)
+            bifrost_sasl::prepare_scram_username(username)?
         );
         Ok(ScramExchange {
             hash,
@@ -887,6 +899,15 @@ mod test {
             err.diagnostic_text().as_deref(),
             Some("no compatible authentication mechanism")
         );
+    }
+
+    #[test]
+    fn scram_binding_only_treats_absent_certificate_as_unavailable() {
+        use super::resolve_scram_binding;
+
+        assert!(resolve_scram_binding(None).unwrap().is_none());
+        let err = resolve_scram_binding(Some(&[0x30, 0x01, 0x00])).unwrap_err();
+        assert!(err.is_parse());
     }
 
     #[test]

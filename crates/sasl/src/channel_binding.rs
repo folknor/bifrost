@@ -28,8 +28,12 @@ use crate::error::SaslError;
 /// length, or a signature algorithm whose binding hash cannot be determined
 /// (unrecognized OID, or EdDSA - see [`HashFamily`] resolution).
 pub fn tls_server_end_point(cert_der: &[u8]) -> Result<Vec<u8>, SaslError> {
-    let oid = signature_algorithm_oid(cert_der)?;
-    let family = hash_family_for_oid(oid)?;
+    let (oid, parameters) = signature_algorithm(cert_der)?;
+    let family = if oid == OID_RSASSA_PSS {
+        hash_family_for_pss_parameters(parameters)?
+    } else {
+        hash_family_for_oid(oid)?
+    };
     Ok(family.digest(cert_der))
 }
 
@@ -69,6 +73,8 @@ const OID_SHA512_RSA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 
 const OID_SHA1_RSA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x05];
 // 1.2.840.113549.1.1.4   md5WithRSAEncryption
 const OID_MD5_RSA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x04];
+// 1.2.840.113549.1.1.10  id-RSASSA-PSS
+const OID_RSASSA_PSS: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0a];
 
 // 1.2.840.10045.4.3.2    ecdsa-with-SHA256
 const OID_ECDSA_SHA256: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02];
@@ -142,6 +148,78 @@ fn hash_family_for_oid(oid: &[u8]) -> Result<HashFamily, SaslError> {
     )))
 }
 
+/// Resolve the `hashAlgorithm` field of RFC 4055 `RSASSA-PSS-params`. An
+/// absent field carries the ASN.1 default `sha1`, which RFC 5929 Section 4.1
+/// upgrades to SHA-256.
+///
+/// The whole parameter SEQUENCE is parsed before a hash is returned, not just
+/// the prefix up to `[0]`. `RSASSA-PSS-params` is
+/// `SEQUENCE { [0] hashAlgorithm, [1] maskGenAlgorithm, [2] saltLength,
+/// [3] trailerField }`, all DEFAULTed and all explicitly tagged, so DER admits
+/// each context tag at most once and only in ascending order. Returning on the
+/// first `[0]` would accept a duplicated or misordered `[0]` and silently bind
+/// against whichever hash was encoded first - an ambiguity an attacker chooses.
+/// Since this module's policy is that anything it cannot read unambiguously is
+/// a hard error, the structure is validated in full first.
+fn hash_family_for_pss_parameters(parameters: &[u8]) -> Result<HashFamily, SaslError> {
+    // `parameters` is OPTIONAL in `AlgorithmIdentifier`; wholly absent means
+    // every PSS field takes its default, hash included.
+    if parameters.is_empty() {
+        return Ok(HashFamily::Sha256);
+    }
+    let (tag, body, rest) = read_tlv(parameters)?;
+    if tag != TAG_SEQUENCE || !rest.is_empty() {
+        return Err(SaslError::Protocol(
+            "RSASSA-PSS certificate parameters are not one DER SEQUENCE".into(),
+        ));
+    }
+
+    let mut hash: Option<HashFamily> = None;
+    let mut previous_tag: Option<u8> = None;
+    let mut fields = body;
+    while !fields.is_empty() {
+        let (field_tag, field_body, remaining) = read_tlv(fields)?;
+        if !(TAG_CONTEXT_0..=TAG_CONTEXT_3).contains(&field_tag) {
+            return Err(SaslError::Protocol(format!(
+                "RSASSA-PSS parameters contain an unexpected field tag {field_tag:#04x}"
+            )));
+        }
+        // DER: DEFAULTed SEQUENCE members appear at most once, in declaration
+        // order. Equal or descending tags mean a duplicate or a reordering.
+        if previous_tag.is_some_and(|previous| field_tag <= previous) {
+            return Err(SaslError::Protocol(format!(
+                "RSASSA-PSS parameters contain a duplicate or out-of-order field \
+                 tag {field_tag:#04x}"
+            )));
+        }
+        previous_tag = Some(field_tag);
+
+        if field_tag == TAG_CONTEXT_0 {
+            hash = Some(pss_hash_algorithm(field_body)?);
+        }
+        fields = remaining;
+    }
+    Ok(hash.unwrap_or(HashFamily::Sha256))
+}
+
+/// Read the `[0] hashAlgorithm` content: exactly one `AlgorithmIdentifier`
+/// whose first element is the hash OID.
+fn pss_hash_algorithm(field_body: &[u8]) -> Result<HashFamily, SaslError> {
+    let (alg_tag, alg_body, alg_rest) = read_tlv(field_body)?;
+    if alg_tag != TAG_SEQUENCE || !alg_rest.is_empty() {
+        return Err(SaslError::Protocol(
+            "RSASSA-PSS hashAlgorithm is not one AlgorithmIdentifier".into(),
+        ));
+    }
+    let (oid_tag, oid, _parameters) = read_tlv(alg_body)?;
+    if oid_tag != TAG_OID {
+        return Err(SaslError::Protocol(
+            "RSASSA-PSS hashAlgorithm.algorithm is not an OBJECT IDENTIFIER".into(),
+        ));
+    }
+    hash_family_for_oid(oid)
+}
+
 /// Walk the DER `Certificate` and return the `signatureAlgorithm` OID's
 /// content bytes (no tag, no length).
 ///
@@ -149,7 +227,7 @@ fn hash_family_for_oid(oid: &[u8]) -> Result<HashFamily, SaslError> {
 /// signatureValue }`. The `signatureAlgorithm` is the second element, an
 /// `AlgorithmIdentifier ::= SEQUENCE { algorithm OID, parameters OPTIONAL }`;
 /// its first element is the OID.
-fn signature_algorithm_oid(cert_der: &[u8]) -> Result<&[u8], SaslError> {
+fn signature_algorithm(cert_der: &[u8]) -> Result<(&[u8], &[u8]), SaslError> {
     // Outer Certificate SEQUENCE.
     let (outer_tag, outer_body, _rest) = read_tlv(cert_der)?;
     if outer_tag != TAG_SEQUENCE {
@@ -167,17 +245,19 @@ fn signature_algorithm_oid(cert_der: &[u8]) -> Result<&[u8], SaslError> {
         ));
     }
     // First element of signatureAlgorithm: the algorithm OID.
-    let (oid_tag, oid_body, _after_oid) = read_tlv(sigalg_body)?;
+    let (oid_tag, oid_body, after_oid) = read_tlv(sigalg_body)?;
     if oid_tag != TAG_OID {
         return Err(SaslError::Protocol(
             "certificate signatureAlgorithm.algorithm is not an OBJECT IDENTIFIER".into(),
         ));
     }
-    Ok(oid_body)
+    Ok((oid_body, after_oid))
 }
 
 const TAG_SEQUENCE: u8 = 0x30;
 const TAG_OID: u8 = 0x06;
+const TAG_CONTEXT_0: u8 = 0xa0;
+const TAG_CONTEXT_3: u8 = 0xa3;
 
 /// Read one definite-form DER TLV from the front of `buf`. Returns the tag
 /// byte, the content (value) slice, and the remainder past this element.
@@ -249,6 +329,10 @@ mod tests {
     /// the binding value is the hash of *these exact whole bytes*, so a minimal
     /// shape is a faithful fixture for both behaviors under test.
     fn build_cert(sig_oid_content: &[u8]) -> Vec<u8> {
+        build_cert_with_parameters(sig_oid_content, &[])
+    }
+
+    fn build_cert_with_parameters(sig_oid_content: &[u8], parameters: &[u8]) -> Vec<u8> {
         // All fixture bodies are well under 128 bytes, so DER short-form length
         // (a single byte) is always correct; `try_from` pins that invariant
         // rather than truncating silently.
@@ -257,8 +341,10 @@ mod tests {
         // signatureAlgorithm: SEQUENCE { OID }
         let mut oid = vec![TAG_OID, short_len(sig_oid_content.len())];
         oid.extend_from_slice(sig_oid_content);
-        let mut sigalg = vec![TAG_SEQUENCE, short_len(oid.len())];
+        let sigalg_len = oid.len() + parameters.len();
+        let mut sigalg = vec![TAG_SEQUENCE, short_len(sigalg_len)];
         sigalg.extend_from_slice(&oid);
+        sigalg.extend_from_slice(parameters);
 
         // tbsCertificate: empty SEQUENCE.
         let tbs = vec![TAG_SEQUENCE, 0x00];
@@ -274,6 +360,34 @@ mod tests {
         let mut cert = vec![TAG_SEQUENCE, short_len(body.len())];
         cert.extend_from_slice(&body);
         cert
+    }
+
+    fn pss_parameters(hash_oid: &[u8]) -> Vec<u8> {
+        let short_len = |n: usize| u8::try_from(n).unwrap();
+        let mut oid = vec![TAG_OID, short_len(hash_oid.len())];
+        oid.extend_from_slice(hash_oid);
+        let mut algorithm = vec![TAG_SEQUENCE, short_len(oid.len())];
+        algorithm.extend_from_slice(&oid);
+        let mut hash_algorithm = vec![TAG_CONTEXT_0, short_len(algorithm.len())];
+        hash_algorithm.extend_from_slice(&algorithm);
+        let mut parameters = vec![TAG_SEQUENCE, short_len(hash_algorithm.len())];
+        parameters.extend_from_slice(&hash_algorithm);
+        parameters
+    }
+
+    /// A `[0] hashAlgorithm` element (tag + AlgorithmIdentifier), without the
+    /// enclosing `RSASSA-PSS-params` SEQUENCE, so tests can assemble field
+    /// sequences the strict encoder would never produce.
+    fn pss_hash_field(hash_oid: &[u8]) -> Vec<u8> {
+        let inner = pss_parameters(hash_oid);
+        // Strip the outer SEQUENCE header that `pss_parameters` added.
+        inner[2..].to_vec()
+    }
+
+    fn pss_params_from_fields(fields: &[u8]) -> Vec<u8> {
+        let mut parameters = vec![TAG_SEQUENCE, u8::try_from(fields.len()).unwrap()];
+        parameters.extend_from_slice(fields);
+        parameters
     }
 
     #[test]
@@ -295,6 +409,94 @@ mod tests {
         // RFC 5929 Section 4.1: SHA-1 signature -> SHA-256 binding hash.
         assert_eq!(got.len(), 32);
         assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn tls_server_end_point_rsassa_pss_uses_parameter_hash() {
+        use sha2::Digest;
+        let parameters = pss_parameters(OID_SHA384_BARE);
+        let cert = build_cert_with_parameters(OID_RSASSA_PSS, &parameters);
+        let expected = sha2::Sha384::digest(&cert).to_vec();
+        let got = tls_server_end_point(&cert).unwrap();
+        assert_eq!(got.len(), 48);
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn tls_server_end_point_rsassa_pss_default_sha1_upgrades_to_sha256() {
+        use sha2::Digest;
+        let cert = build_cert_with_parameters(OID_RSASSA_PSS, &[TAG_SEQUENCE, 0]);
+        let expected = sha2::Sha256::digest(&cert).to_vec();
+        assert_eq!(tls_server_end_point(&cert).unwrap(), expected);
+    }
+
+    #[test]
+    fn tls_server_end_point_rsassa_pss_rejects_duplicate_hash_field() {
+        // Two `[0] hashAlgorithm` fields naming different hashes. Taking the
+        // first would bind against SHA-384 while the certificate is ambiguous;
+        // an ambiguous binding must be refused outright.
+        let mut fields = pss_hash_field(OID_SHA384_BARE);
+        fields.extend_from_slice(&pss_hash_field(OID_SHA512_BARE));
+        let cert = build_cert_with_parameters(OID_RSASSA_PSS, &pss_params_from_fields(&fields));
+        let err = tls_server_end_point(&cert).unwrap_err();
+        assert!(matches!(err, SaslError::Protocol(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn tls_server_end_point_rsassa_pss_rejects_out_of_order_hash_field() {
+        // `[1] maskGenAlgorithm` (contents irrelevant) placed before
+        // `[0] hashAlgorithm`. DER forbids the reordering; a prefix parser that
+        // stopped at the first `[0]` would never notice.
+        let mut fields = vec![TAG_CONTEXT_0 + 1, 0x00];
+        fields.extend_from_slice(&pss_hash_field(OID_SHA384_BARE));
+        let cert = build_cert_with_parameters(OID_RSASSA_PSS, &pss_params_from_fields(&fields));
+        let err = tls_server_end_point(&cert).unwrap_err();
+        assert!(matches!(err, SaslError::Protocol(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn tls_server_end_point_rsassa_pss_rejects_unknown_field_tag() {
+        // `[4]` is not a member of `RSASSA-PSS-params`. Unknown structure is a
+        // typed error, never a shrug that keeps the default hash.
+        let mut fields = pss_hash_field(OID_SHA384_BARE);
+        fields.extend_from_slice(&[TAG_CONTEXT_0 + 4, 0x00]);
+        let cert = build_cert_with_parameters(OID_RSASSA_PSS, &pss_params_from_fields(&fields));
+        let err = tls_server_end_point(&cert).unwrap_err();
+        assert!(matches!(err, SaslError::Protocol(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn tls_server_end_point_rsassa_pss_trailing_fields_are_validated() {
+        // A well-formed `[0]` followed by `[2] saltLength` and `[3]
+        // trailerField` still resolves to the `[0]` hash, proving full-sequence
+        // parsing did not break the conforming case.
+        use sha2::Digest;
+        let mut fields = pss_hash_field(OID_SHA384_BARE);
+        fields.extend_from_slice(&[TAG_CONTEXT_0 + 2, 0x00, TAG_CONTEXT_3, 0x00]);
+        let cert = build_cert_with_parameters(OID_RSASSA_PSS, &pss_params_from_fields(&fields));
+        let expected = sha2::Sha384::digest(&cert).to_vec();
+        assert_eq!(tls_server_end_point(&cert).unwrap(), expected);
+    }
+
+    #[test]
+    fn tls_server_end_point_rsassa_pss_absent_parameters_default_to_sha256() {
+        // `AlgorithmIdentifier.parameters` omitted entirely: every PSS field
+        // takes its default, so hashAlgorithm is sha1, upgraded to SHA-256.
+        use sha2::Digest;
+        let cert = build_cert_with_parameters(OID_RSASSA_PSS, &[]);
+        let expected = sha2::Sha256::digest(&cert).to_vec();
+        assert_eq!(tls_server_end_point(&cert).unwrap(), expected);
+    }
+
+    #[test]
+    fn tls_server_end_point_rsassa_pss_unknown_hash_oid_is_protocol_error() {
+        // The named hash is not one we recognize. Falling back to the sha1
+        // default here would compute a binding value the server never agrees
+        // with, so it has to be an error.
+        let parameters = pss_parameters(&[0x2a, 0x03, 0x04]);
+        let cert = build_cert_with_parameters(OID_RSASSA_PSS, &parameters);
+        let err = tls_server_end_point(&cert).unwrap_err();
+        assert!(matches!(err, SaslError::Protocol(_)), "got {err:?}");
     }
 
     #[test]
