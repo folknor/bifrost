@@ -76,7 +76,9 @@ These are cross-crate. They bind every protocol crate, not just `bifrost-graph`.
   legitimately partially fails, so it is the live test of the per-scope
   contract above: `Err` stays reserved for whole-request faults, a refusal
   never fails a sibling, and a subscribe that accepts nothing returns no
-  handle at all.
+  handle at all. Admission accepts exactly what worker assignment can watch:
+  a folder name `MailboxName::new` rejects goes to the failed lane, since the
+  assignment side (`subscribed_idle_folders`) silently drops such names.
 
   The coupling that makes this safe is that **bifrost-sync never suppresses
   polling on push coverage.** `Engine::subscribe_push` records only
@@ -105,7 +107,11 @@ These are cross-crate. They bind every protocol crate, not just `bifrost-graph`.
   workers and leaves the rest on a stale assignment, and `notify_waiters`
   stores nothing, so a worker between deciding it has no folder and awaiting
   the wake parks forever. Anything that fans out to several workers here needs
-  the same latching property.
+  the same latching property. The seen-mark lives at exactly ONE site, before
+  `choose_idle_folder` reads the scope set; a second mark later in the round
+  discards bumps latched during the dial/SELECT/`NOTIFY SET` awaits and leaves
+  the worker on a stale assignment for a full `idle_timeout` - the close pass
+  removed exactly such a mark.
 
 - **Get and mutation streams flush at `TARGET_BUFFER_ITEMS` (256) decoded
   targets.** Output ordering is therefore input-window order, then lexical

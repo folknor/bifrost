@@ -23,6 +23,22 @@ per dial forever - plus a lost-wakeup regression from waking several IDLE
 workers with a `Notify`. `reference/imap.md` states each new guarantee and
 `notes/carry-forward.md` carries the invariants forward.
 
+Close pass 2026-08-22: reviewed both rounds in full, with the never-cold-reviewed
+halves hardest. Found and fixed two defects in round 2's push worker machinery:
+the in-round `resubscribe.mark_unchanged()` discarded a generation bump landing
+during the dial/SELECT/`NOTIFY SET` awaits (a stale worker assignment for up to
+one `idle_timeout` - the same lost-wakeup class round 2 fixed elsewhere, and a
+direct contradiction of the discipline `reference/imap.md` documented), and
+admission accepted folder scopes whose names `MailboxName::new` rejects, so an
+unsendable name was reported as pushed and burned a budget slot while
+`subscribed_idle_folders` silently dropped it. Verified independently: the
+ordering weakening is tolerated (bifrost-sync keys mutation outcomes by
+`ObjectId`, and the read-back guard is order-insensitive counting), the
+subscription registry is teardown/reopen bookkeeping only with no scheduler
+path suppressing polling on push coverage, and the reopen replay handles
+partial acceptance via `accepted_push_scopes`. The NOTIFY-runtime-rejection
+misreport residual is accepted as documented.
+
 No open findings remain. What follows are decisions, not defects.
 
 ## Settled decisions

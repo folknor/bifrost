@@ -403,6 +403,50 @@ async fn non_notify_push_reports_the_folder_beyond_its_budget_as_poll_only() {
     account.close().await.unwrap();
 }
 
+/// Admission must accept exactly what worker assignment can watch. A folder
+/// name containing CR/LF fails `MailboxName::new`, so `subscribed_idle_folders`
+/// silently drops it and no IDLE worker can ever SELECT it. Admitting it
+/// anyway would report it as pushed (a misreport bifrost-sync trusts) and
+/// consume a budget slot that a valid folder later in the same request should
+/// have received.
+#[tokio::test]
+async fn a_folder_scope_with_an_unsendable_name_is_refused_not_misreported() {
+    use bifrost_types::{Account, CursorScope, FolderId};
+
+    let (conn, server) = driver_pair(&preauth_greeting("IMAP4rev1")).await;
+    let account = scripted_account(conn, 1);
+    let scopes = vec![
+        CursorScope::Folder(FolderId("bad\r\nname".to_owned())),
+        CursorScope::Folder(FolderId("Valid".to_owned())),
+    ];
+    let result = account
+        .push_subscribe(&scopes)
+        .await
+        .expect("an invalid folder name is a failed item, never a whole-request Err");
+    let succeeded: Vec<_> = result
+        .outcomes
+        .succeeded()
+        .iter()
+        .map(|item| item.item.0.clone())
+        .collect();
+    assert_eq!(
+        succeeded,
+        vec!["1"],
+        "the invalid name must not be reported as pushed, and must not block the valid sibling",
+    );
+    assert_eq!(result.outcomes.failed().len(), 1);
+    assert_eq!(result.outcomes.failed()[0].item.0, "0");
+    assert!(
+        result.outcomes.failed()[0]
+            .error
+            .user_safe_text()
+            .any(|text| text.contains("invalid mailbox name")),
+        "the refusal names the cause",
+    );
+    drop(server);
+    account.close().await.unwrap();
+}
+
 /// DELETE must not be sent on a pooled connection that still has its target
 /// selected. IMAP4rev2 provides UNSELECT, so this transcript proves the
 /// affinity-free checkout explicitly deselects before STATUS/DELETE rather

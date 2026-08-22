@@ -100,6 +100,15 @@ pub(crate) fn push_subscribe(
                     outcomes.push_failed(item, unsupported_push_scope_error());
                     continue;
                 };
+                // Admission must accept exactly what the worker assignment
+                // can watch: `subscribed_idle_folders` parses each stored
+                // scope through `MailboxName::new`, which rejects NUL/CR/LF.
+                // Admitting such a name would report it succeeded and burn a
+                // budget slot on a folder no worker can ever SELECT.
+                if crate::types::MailboxName::new(folder.0.clone()).is_err() {
+                    outcomes.push_failed(item, invalid_folder_name_error());
+                    continue;
+                }
                 // NOTIFY folds every folder onto one session, so the budget
                 // does not apply there. A folder already covered costs no
                 // new session either; only a new distinct folder consumes a
@@ -188,6 +197,14 @@ fn unsupported_push_scope_error() -> AccountError {
 /// the polling lane instead of believing it is pushed.
 fn idle_budget_error() -> AccountError {
     rejected_scope_error("IMAP IDLE connection budget exhausted; folder remains poll-only")
+}
+
+/// The scope names a folder that is not a sendable IMAP mailbox name
+/// (`MailboxName::new` rejects NUL, CR, and LF). No IDLE worker could ever
+/// SELECT it, so admitting it would misreport it as pushed while burning a
+/// budget slot on nothing.
+fn invalid_folder_name_error() -> AccountError {
+    rejected_scope_error("IMAP push scope names an invalid mailbox name")
 }
 
 pub(crate) fn push_unsubscribe(
@@ -387,11 +404,15 @@ async fn idle_loop(account: ImapAccount, cancel: CancellationToken, slot: usize)
             // waiting for this connection to break.
             let round_cancel = cancel.child_token();
             let notify_cancel = round_cancel.clone();
-            // Same latching discipline as the park above: the generation is
-            // marked seen on this task's own receiver before the round
-            // starts, so a change landing while the nudge task is being
-            // spawned still breaks the round.
-            resubscribe.mark_unchanged();
+            // The receiver was marked seen once, before `choose_idle_folder`
+            // read the scope set this round is built on. It must NOT be
+            // re-marked here: the dial, SELECT, and `NOTIFY SET` between the
+            // choice and this point all await the network, and a generation
+            // bump landing in that window is exactly what the latch exists
+            // to preserve. Clearing it would leave this worker on a stale
+            // assignment for a full `idle_timeout`. The clone keeps the
+            // original's seen version, so a latched bump cancels the very
+            // first round immediately and the outer loop re-chooses.
             let mut resubscribe_for_round = resubscribe.clone();
             let nudge = tokio::spawn(async move {
                 tokio::select! {
