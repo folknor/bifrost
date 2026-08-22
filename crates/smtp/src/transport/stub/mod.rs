@@ -1,22 +1,21 @@
 //! The stub transport logs message envelopes as well as contents. It can be useful for testing
 //! purposes.
 //!
-//! # Async stub transport
+//! # Stub Transport
 //!
 //! The stub transport logs message envelopes as well as contents. It can be useful for testing
 //! purposes.
 //!
 //! # Examples
 //!
-//! ```rust,ignore
+//! ```rust
 //! # //! # {
 //! use bifrost_smtp::{
-//!     AsyncTransport, Message, message::header::ContentType,
-//!     transport::stub::AsyncStubTransport,
+//!     Message, Transport, message::header::ContentType, transport::stub::StubTransport,
 //! };
 //!
 //! # use std::error::Error;
-//! # async fn try_main() -> Result<(), Box<dyn Error>> {
+//! # fn try_main() -> Result<(), Box<dyn Error>> {
 //! let email = Message::builder()
 //!     .from("NoBody <nobody@domain.tld>".parse()?)
 //!     .reply_to("Yuin <yuin@domain.tld>".parse()?)
@@ -25,16 +24,18 @@
 //!     .header(ContentType::TEXT_PLAIN)
 //!     .body(String::from("Be happy!"))?;
 //!
-//! let sender = AsyncStubTransport::new_ok();
-//! sender.send(&email).await?;
+//! let mut sender = StubTransport::new_ok();
+//! sender.send(&email)?;
 //! assert_eq!(
-//!     sender.messages().await,
+//!     sender.messages(),
 //!     vec![(
 //!         email.envelope().clone(),
 //!         String::from_utf8(email.formatted()).unwrap()
 //!     )],
 //! );
 //! # Ok(())
+//! # }
+//! # try_main().unwrap();
 //! # }
 //! ```
 
@@ -44,8 +45,9 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+#[cfg(feature = "tokio")]
 use crate::AsyncTransport;
-use crate::address::Envelope;
+use crate::{Transport, address::Envelope};
 
 /// An error returned by the stub transport
 #[non_exhaustive]
@@ -63,12 +65,57 @@ impl StdError for Error {}
 
 /// This transport logs messages and always returns the given response
 #[derive(Debug, Clone)]
+// pub: users can substitute a sync logging transport in tests.
+pub struct StubTransport {
+    response: Result<(), Error>,
+    message_log: Arc<Mutex<Vec<(Envelope, String)>>>,
+}
+
+/// This transport logs messages and always returns the given response
+#[derive(Debug, Clone)]
+#[cfg(feature = "tokio")]
+#[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
 // pub: users can substitute an async logging transport in tests.
 pub struct AsyncStubTransport {
     response: Result<(), Error>,
     message_log: Arc<Mutex<Vec<(Envelope, String)>>>,
 }
 
+impl StubTransport {
+    /// Creates a new transport that always returns the given Result
+    pub fn new(response: Result<(), Error>) -> Self {
+        Self {
+            response,
+            message_log: Arc::new(Mutex::new(vec![])),
+        }
+    }
+
+    /// Creates a new transport that always returns a success response
+    pub fn new_ok() -> Self {
+        Self {
+            response: Ok(()),
+            message_log: Arc::new(Mutex::new(vec![])),
+        }
+    }
+
+    /// Creates a new transport that always returns an error
+    pub fn new_error() -> Self {
+        Self {
+            response: Err(Error),
+            message_log: Arc::new(Mutex::new(vec![])),
+        }
+    }
+
+    /// Return all logged messages sent using [`Transport::send_raw`]
+    pub fn messages(&self) -> Vec<(Envelope, String)> {
+        self.message_log
+            .lock()
+            .expect("Couldn't acquire lock to write message log")
+            .clone()
+    }
+}
+
+#[cfg(feature = "tokio")]
 impl AsyncStubTransport {
     /// Creates a new transport that always returns the given Result
     pub fn new(response: Result<(), Error>) -> Self {
@@ -95,11 +142,24 @@ impl AsyncStubTransport {
     }
 
     /// Return all logged messages sent using [`AsyncTransport::send_raw`]
+    #[cfg(feature = "tokio")]
     pub async fn messages(&self) -> Vec<(Envelope, String)> {
         self.message_log.lock().unwrap().clone()
     }
 }
 
+impl Transport for StubTransport {
+    type Ok = ();
+    type Error = Error;
+
+    fn send_raw(&self, envelope: &Envelope, email: &[u8]) -> Result<Self::Ok, Self::Error> {
+        let mut messages = self.message_log.lock().map_err(|_| Error)?;
+        messages.push((envelope.clone(), String::from_utf8_lossy(email).into()));
+        self.response
+    }
+}
+
+#[cfg(feature = "tokio")]
 impl AsyncTransport for AsyncStubTransport {
     type Ok = ();
     type Error = Error;

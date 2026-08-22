@@ -1,11 +1,7 @@
 #[cfg(unix)]
 use std::path::Path;
 use std::sync::Arc;
-use std::{
-    fmt::{self, Debug},
-    marker::PhantomData,
-    time::Duration,
-};
+use std::{fmt::Debug, time::Duration};
 
 use bifrost_types::error::{AccountError, BatchItem, BatchOutcome};
 
@@ -14,34 +10,30 @@ use std::sync::atomic::AtomicU64;
 use bifrost_net::MeterSinkHandle;
 
 use super::PoolConfig;
-#[cfg(feature = "tokio")]
-use super::Tls;
 use super::WireMetering;
 use super::batch::{SmtpBatchRecipient, batch_input_invalid_error, batch_level_error};
-use super::pool::async_impl::Pool;
+use super::pool::sync_impl::Pool;
 use super::{
-    AsyncSmtpConnection, ClientId, Credentials, Error, Mechanism, Protocol, Response, SendOptions,
-    SmtpInfo,
+    ClientId, Credentials, Error, Mechanism, Protocol, Response, SendOptions, SmtpConnection,
+    SmtpInfo, error,
 };
-use crate::AsyncTransport;
-use crate::TokioExecutor;
+use super::{SUBMISSION_PORT, SUBMISSIONS_PORT, Tls, TlsParameters};
 use crate::address::Address;
-use crate::executor::SmtpExecutor;
 use crate::transport::smtp::account_error::SmtpErrorContext;
 use crate::transport::smtp::authentication::IntoSecretString;
-use crate::{Envelope, Executor};
+use crate::{Transport, address::Envelope};
 
-/// Asynchronously sends emails using the SMTP protocol
+/// Synchronously send emails using the SMTP protocol
 ///
-/// `AsyncSmtpTransport` is the primary way for communicating
+/// `SmtpTransport` is the primary way for communicating
 /// with SMTP relay servers to send email messages. It holds the
 /// client connect configuration and creates new connections
 /// as necessary.
 ///
 /// # Connection pool
 ///
-/// `AsyncSmtpTransport` maintains a connection pool to manage SMTP
-/// connections. The pool:
+/// `SmtpTransport` maintains a connection pool to manage SMTP connections. The
+/// pool:
 ///
 /// - Establishes a new connection when sending a message.
 /// - Recycles connections internally after a message is sent.
@@ -51,84 +43,94 @@ use crate::{Envelope, Executor};
 /// emails are sent concurrently, as SMTP does not support multiplexing within a
 /// single connection.
 ///
-/// However, **connection reuse is not possible** if the `SyncSmtpTransport` instance
+/// However, **connection reuse is not possible** if the `SmtpTransport` instance
 /// is dropped after every email send operation. You must reuse the instance
 /// of this struct for the connection pool to be of any use.
 ///
-/// To customize connection pool settings, use [`AsyncSmtpTransportBuilder::pool_config`].
-#[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
-pub struct AsyncSmtpTransport<E: Executor> {
-    inner: Arc<Pool<E>>,
+/// To customize connection pool settings, use [`SmtpTransportBuilder::pool_config`].
+#[derive(Clone)]
+pub struct SmtpTransport {
+    inner: Arc<Pool>,
 }
 
-/// Asynchronously sends emails using the LMTP protocol
+/// Synchronously send emails using the LMTP protocol
 ///
-/// `AsyncLmtpTransport` is the local-delivery counterpart to
-/// [`AsyncSmtpTransport`]. LMTP uses `LHLO` for capability discovery and
-/// returns one status per envelope recipient. Rejected recipients carry their
-/// `RCPT` response; accepted recipients carry their post-DATA delivery response.
+/// `LmtpTransport` is the local-delivery counterpart to [`SmtpTransport`].
+/// LMTP uses `LHLO` for capability discovery and returns one status per
+/// envelope recipient. Rejected recipients carry their `RCPT` response;
+/// accepted recipients carry their post-DATA delivery response.
 ///
 /// Direct sends return only the ordered statuses. Use
-/// [`AsyncLmtpTransport::send_raw_batch_with_options`] when callers need the
+/// [`LmtpTransport::send_raw_batch_with_options`] when callers need the
 /// RCPT-versus-final-status phase and per-recipient recovery classification.
-#[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
-pub struct AsyncLmtpTransport<E: Executor> {
-    inner: Arc<Pool<E>>,
+#[derive(Clone)]
+pub struct LmtpTransport {
+    inner: Arc<Pool>,
 }
 
-impl AsyncTransport for AsyncSmtpTransport<TokioExecutor> {
+impl Transport for SmtpTransport {
     type Ok = Response;
     type Error = Error;
 
     /// Sends an email
-    async fn send_raw(&self, envelope: &Envelope, email: &[u8]) -> Result<Self::Ok, Self::Error> {
-        let mut conn = self.inner.connection().await?;
+    fn send_raw(&self, envelope: &Envelope, email: &[u8]) -> Result<Self::Ok, Self::Error> {
+        let mut conn = self.inner.connection()?;
 
-        let result = conn.send(envelope, email).await?;
+        let result = conn.send(envelope, email)?;
 
         Ok(result)
     }
 
-    async fn shutdown(&self) {
-        self.inner.shutdown().await;
+    fn shutdown(&self) {
+        self.inner.shutdown();
     }
 }
 
-impl AsyncTransport for AsyncLmtpTransport<TokioExecutor> {
+impl Transport for LmtpTransport {
     type Ok = Vec<Response>;
     type Error = Error;
 
     /// Sends an email and returns one LMTP status per recipient.
     ///
     /// For per-recipient command-phase and recovery details, use
-    /// [`AsyncLmtpTransport::send_raw_batch_with_options`].
-    async fn send_raw(&self, envelope: &Envelope, email: &[u8]) -> Result<Self::Ok, Self::Error> {
-        let mut conn = self.inner.connection().await?;
+    /// [`LmtpTransport::send_raw_batch_with_options`].
+    fn send_raw(&self, envelope: &Envelope, email: &[u8]) -> Result<Self::Ok, Self::Error> {
+        let mut conn = self.inner.connection()?;
 
-        let result = conn.send_lmtp(envelope, email).await?;
+        let result = conn.send_lmtp(envelope, email)?;
 
         Ok(result)
     }
 
-    async fn shutdown(&self) {
-        self.inner.shutdown().await;
+    fn shutdown(&self) {
+        self.inner.shutdown();
     }
 }
 
-impl<E> AsyncSmtpTransport<E>
-where
-    E: Executor,
-{
+impl Debug for SmtpTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut builder = f.debug_struct("SmtpTransport");
+        builder.field("inner", &self.inner);
+        builder.finish()
+    }
+}
+
+impl Debug for LmtpTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut builder = f.debug_struct("LmtpTransport");
+        builder.field("inner", &self.inner);
+        builder.finish()
+    }
+}
+
+impl SmtpTransport {
     /// Simple and secure transport, using TLS connections to communicate with the SMTP server
     ///
     /// The right option for most SMTP servers.
     ///
     /// Creates an encrypted transport over submissions port, using the provided domain
     /// to validate TLS certificates.
-    #[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
-    pub fn relay(relay: &str) -> Result<AsyncSmtpTransportBuilder, Error> {
-        use super::{SUBMISSIONS_PORT, Tls, TlsParameters};
-
+    pub fn relay(relay: &str) -> Result<SmtpTransportBuilder, Error> {
         let tls_parameters = TlsParameters::new(relay.into())?;
 
         Ok(Self::builder_dangerous(relay)
@@ -138,7 +140,7 @@ where
 
     /// Simple and secure transport, using STARTTLS to obtain encrypted connections
     ///
-    /// Alternative to [`AsyncSmtpTransport::relay`](#method.relay), for SMTP servers
+    /// Alternative to [`SmtpTransport::relay`](#method.relay), for SMTP servers
     /// that don't take SMTPS connections.
     ///
     /// Creates an encrypted transport over submissions port, by first connecting using
@@ -147,10 +149,7 @@ where
     ///
     /// An error is returned if the connection can't be upgraded. No credentials
     /// or emails will be sent to the server, protecting from downgrade attacks.
-    #[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
-    pub fn starttls_relay(relay: &str) -> Result<AsyncSmtpTransportBuilder, Error> {
-        use super::{SUBMISSION_PORT, Tls, TlsParameters};
-
+    pub fn starttls_relay(relay: &str) -> Result<SmtpTransportBuilder, Error> {
         let tls_parameters = TlsParameters::new(relay.into())?;
 
         Ok(Self::builder_dangerous(relay)
@@ -161,11 +160,7 @@ where
     /// Creates a new local SMTP client to port 25
     ///
     /// Shortcut for local unencrypted relay (typical local email daemon that will handle relaying)
-    #[allow(private_bounds)]
-    pub fn unencrypted_localhost() -> AsyncSmtpTransport<E>
-    where
-        E: SmtpExecutor,
-    {
+    pub fn unencrypted_localhost() -> SmtpTransport {
         Self::builder_dangerous("localhost").build()
     }
 
@@ -178,14 +173,14 @@ where
     /// * A 10-second timeout for SMTP commands
     /// * Port 25
     ///
-    /// Consider using [`AsyncSmtpTransport::relay`](#method.relay) or
-    /// [`AsyncSmtpTransport::starttls_relay`](#method.starttls_relay) instead,
+    /// Consider using [`SmtpTransport::relay`](#method.relay) or
+    /// [`SmtpTransport::starttls_relay`](#method.starttls_relay) instead,
     /// if possible.
-    pub fn builder_dangerous<T: Into<String>>(server: T) -> AsyncSmtpTransportBuilder {
-        AsyncSmtpTransportBuilder::new(server)
+    pub fn builder_dangerous<T: Into<String>>(server: T) -> SmtpTransportBuilder {
+        SmtpTransportBuilder::new(server)
     }
 
-    /// Creates a `AsyncSmtpTransportBuilder` from a connection URL
+    /// Creates a `SmtpTransportBuilder` from a connection URL
     ///
     /// The protocol, credentials, host, port and EHLO name can be provided
     /// in a single URL. This may be simpler than having to configure SMTP
@@ -253,14 +248,16 @@ where
     /// ```
     ///
     /// The connection URL can then be used in the following way:
+    /// If a plaintext URL contains credentials, authentication is refused at
+    /// connection time unless
+    /// [`SmtpTransportBuilder::dangerous_allow_insecure_auth`] is enabled.
     ///
     /// ```rust,no_run
     /// use bifrost_smtp::{
-    ///     AsyncSmtpTransport, AsyncTransport, Message, TokioExecutor, message::header::ContentType,
+    ///     Message, SmtpTransport, Transport, message::header::ContentType,
     /// };
     ///
-    /// # #[tokio::main]
-    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let email = Message::builder()
     ///     .from("NoBody <nobody@domain.tld>".parse().unwrap())
     ///     .reply_to("Yuin <yuin@domain.tld>".parse().unwrap())
@@ -270,38 +267,25 @@ where
     ///     .body(String::from("Be happy!"))
     ///     .unwrap();
     ///
-    /// // Open a remote connection to gmail
-    /// let mailer: AsyncSmtpTransport<TokioExecutor> =
-    ///     AsyncSmtpTransport::<TokioExecutor>::from_url(
-    ///         "smtps://username:password@smtp.example.com:465",
-    ///     )?
-    ///     .build();
+    /// // Open a remote connection to example
+    /// let mailer = SmtpTransport::from_url("smtps://username:password@smtp.example.com")?.build();
     ///
     /// // Send the email
-    /// mailer.send(&email).await?;
+    /// mailer.send(&email)?;
     /// # Ok(())
     /// # }
     /// ```
-    ///
-    /// If a plaintext URL contains credentials, authentication is refused at
-    /// connection time unless
-    /// [`AsyncSmtpTransportBuilder::dangerous_allow_insecure_auth`] is
-    /// enabled.
-    pub fn from_url(connection_url: &str) -> Result<AsyncSmtpTransportBuilder, Error> {
+    pub fn from_url(connection_url: &str) -> Result<SmtpTransportBuilder, Error> {
         super::connection_url::from_connection_url(connection_url)
     }
 
     /// Tests the SMTP connection
     ///
     /// `test_connection()` tests the connection by using the SMTP NOOP command.
-    #[allow(private_bounds)]
-    pub async fn test_connection(&self) -> Result<bool, Error>
-    where
-        E: SmtpExecutor,
-    {
-        let mut conn = self.inner.connection().await?;
+    pub fn test_connection(&self) -> Result<bool, Error> {
+        let mut conn = self.inner.connection()?;
 
-        let is_connected = conn.test_connected().await;
+        let is_connected = conn.test_connected();
 
         Ok(is_connected)
     }
@@ -310,47 +294,35 @@ where
     ///
     /// Many servers disable `VRFY` for privacy. Negative SMTP replies are
     /// returned as [`Response`] values so callers can inspect the exact status.
-    #[allow(private_bounds)]
-    pub async fn verify(&self, argument: impl Into<String>) -> Result<Response, Error>
-    where
-        E: SmtpExecutor,
-    {
-        let mut conn = self.inner.connection().await?;
-        conn.verify(argument).await
+    pub fn verify(&self, argument: impl Into<String>) -> Result<Response, Error> {
+        let mut conn = self.inner.connection()?;
+        conn.verify(argument)
     }
 
     /// Sends `EXPN` and returns the server response.
     ///
     /// Many servers disable `EXPN` for privacy. Negative SMTP replies are
     /// returned as [`Response`] values so callers can inspect the exact status.
-    #[allow(private_bounds)]
-    pub async fn expand(&self, argument: impl Into<String>) -> Result<Response, Error>
-    where
-        E: SmtpExecutor,
-    {
-        let mut conn = self.inner.connection().await?;
-        conn.expand(argument).await
+    pub fn expand(&self, argument: impl Into<String>) -> Result<Response, Error> {
+        let mut conn = self.inner.connection()?;
+        conn.expand(argument)
     }
 
     /// Sends an email with per-message SMTP options.
     ///
-    /// This is the advanced counterpart to [`AsyncTransport::send_raw`]. It
-    /// keeps the core transport trait simple while still allowing
-    /// message-specific ESMTP parameters such as `REQUIRETLS`, `DELIVERBY`,
-    /// `FUTURERELEASE`, `MT-PRIORITY`, and DSN options.
-    #[allow(private_bounds)]
-    pub async fn send_raw_with_options(
+    /// This is the advanced counterpart to [`Transport::send_raw`]. It keeps
+    /// the core transport trait simple while still allowing message-specific
+    /// ESMTP parameters such as `REQUIRETLS`, `DELIVERBY`, `FUTURERELEASE`,
+    /// `MT-PRIORITY`, and DSN options.
+    pub fn send_raw_with_options(
         &self,
         envelope: &Envelope,
         email: &[u8],
         options: &SendOptions,
-    ) -> Result<Response, Error>
-    where
-        E: SmtpExecutor,
-    {
-        let mut conn = self.inner.connection().await?;
+    ) -> Result<Response, Error> {
+        let mut conn = self.inner.connection()?;
 
-        let result = conn.send_with_options(envelope, email, options).await?;
+        let result = conn.send_with_options(envelope, email, options)?;
 
         Ok(result)
     }
@@ -359,31 +331,20 @@ where
     ///
     /// The server must advertise `CHUNKING`. This path avoids DATA
     /// dot-stuffing and is the required path for `BODY=BINARYMIME`.
-    #[allow(private_bounds)]
-    pub async fn send_raw_bdat(&self, envelope: &Envelope, email: &[u8]) -> Result<Response, Error>
-    where
-        E: SmtpExecutor,
-    {
+    pub fn send_raw_bdat(&self, envelope: &Envelope, email: &[u8]) -> Result<Response, Error> {
         self.send_raw_bdat_with_options(envelope, email, &SendOptions::default())
-            .await
     }
 
     /// Sends an email with `BDAT ... LAST` and per-message SMTP options.
-    #[allow(private_bounds)]
-    pub async fn send_raw_bdat_with_options(
+    pub fn send_raw_bdat_with_options(
         &self,
         envelope: &Envelope,
         email: &[u8],
         options: &SendOptions,
-    ) -> Result<Response, Error>
-    where
-        E: SmtpExecutor,
-    {
-        let mut conn = self.inner.connection().await?;
+    ) -> Result<Response, Error> {
+        let mut conn = self.inner.connection()?;
 
-        let result = conn
-            .send_bdat_with_options(envelope, email, options)
-            .await?;
+        let result = conn.send_bdat_with_options(envelope, email, options)?;
 
         Ok(result)
     }
@@ -397,17 +358,13 @@ where
     /// Returns `Err(AccountError)` only for batch-level failures where no
     /// per-recipient outcome can be attributed: pool checkout failure, connection
     /// setup failure, MAIL FROM rejection, or a pre-MAIL transport drop.
-    #[allow(private_bounds)]
-    pub async fn send_raw_batch_with_options(
+    pub fn send_raw_batch_with_options(
         &self,
         from: Option<Address>,
         recipients: Vec<BatchItem<Address>>,
         email: &[u8],
         options: &SendOptions,
-    ) -> Result<BatchOutcome<()>, AccountError>
-    where
-        E: SmtpExecutor,
-    {
+    ) -> Result<BatchOutcome<()>, AccountError> {
         let ctx = SmtpErrorContext::send(Protocol::Smtp);
 
         if let Err(invalid) = bifrost_types::error::validate_batch_input(&recipients) {
@@ -422,40 +379,29 @@ where
         let mut conn = self
             .inner
             .connection()
-            .await
             .map_err(|e| batch_level_error(e, ctx.clone()))?;
 
-        match conn
-            .send_smtp_batch(from, batch_recipients, email, options)
-            .await
-        {
+        match conn.send_smtp_batch(from, batch_recipients, email, options) {
             Ok(progress) => Ok(progress.resolve()),
             Err((e, _progress)) => Err(batch_level_error(e, ctx)),
         }
     }
 }
 
-impl<E> AsyncLmtpTransport<E>
-where
-    E: Executor,
-{
+impl LmtpTransport {
     /// Creates a new local LMTP client to port 24.
     ///
     /// RFC 2033 does not assign an LMTP TCP port. Port 24 is the common TCP
     /// convention. Use [`Self::unix_socket`] for the more common local socket
     /// deployment shape.
-    #[allow(private_bounds)]
-    pub fn unencrypted_localhost() -> AsyncLmtpTransport<E>
-    where
-        E: SmtpExecutor,
-    {
+    pub fn unencrypted_localhost() -> LmtpTransport {
         Self::builder_dangerous("localhost").build()
     }
 
     /// Creates a new local LMTP client over a Unix-domain socket.
     #[cfg(unix)]
     #[cfg_attr(docsrs, doc(cfg(unix)))]
-    pub fn unix_socket(path: impl AsRef<Path>) -> AsyncLmtpTransportBuilder {
+    pub fn unix_socket(path: impl AsRef<Path>) -> LmtpTransportBuilder {
         Self::builder_dangerous("localhost").unix_socket(path)
     }
 
@@ -467,21 +413,17 @@ where
     /// * No TLS
     /// * A 10-second timeout for SMTP commands
     /// * Port 24, the common TCP LMTP convention
-    pub fn builder_dangerous<T: Into<String>>(server: T) -> AsyncLmtpTransportBuilder {
-        AsyncLmtpTransportBuilder::new(server)
+    pub fn builder_dangerous<T: Into<String>>(server: T) -> LmtpTransportBuilder {
+        LmtpTransportBuilder::new(server)
     }
 
     /// Tests the LMTP connection.
     ///
     /// `test_connection()` tests the connection by using the SMTP NOOP command.
-    #[allow(private_bounds)]
-    pub async fn test_connection(&self) -> Result<bool, Error>
-    where
-        E: SmtpExecutor,
-    {
-        let mut conn = self.inner.connection().await?;
+    pub fn test_connection(&self) -> Result<bool, Error> {
+        let mut conn = self.inner.connection()?;
 
-        let is_connected = conn.test_connected().await;
+        let is_connected = conn.test_connected();
 
         Ok(is_connected)
     }
@@ -490,47 +432,33 @@ where
     ///
     /// Negative replies are returned as [`Response`] values so callers can
     /// inspect the exact status.
-    #[allow(private_bounds)]
-    pub async fn verify(&self, argument: impl Into<String>) -> Result<Response, Error>
-    where
-        E: SmtpExecutor,
-    {
-        let mut conn = self.inner.connection().await?;
-        conn.verify(argument).await
+    pub fn verify(&self, argument: impl Into<String>) -> Result<Response, Error> {
+        let mut conn = self.inner.connection()?;
+        conn.verify(argument)
     }
 
     /// Sends `EXPN` over LMTP and returns the server response.
     ///
     /// Negative replies are returned as [`Response`] values so callers can
     /// inspect the exact status.
-    #[allow(private_bounds)]
-    pub async fn expand(&self, argument: impl Into<String>) -> Result<Response, Error>
-    where
-        E: SmtpExecutor,
-    {
-        let mut conn = self.inner.connection().await?;
-        conn.expand(argument).await
+    pub fn expand(&self, argument: impl Into<String>) -> Result<Response, Error> {
+        let mut conn = self.inner.connection()?;
+        conn.expand(argument)
     }
 
     /// Sends an email over LMTP with per-message SMTP options.
     ///
     /// For per-recipient command-phase and recovery details, use
     /// [`Self::send_raw_batch_with_options`].
-    #[allow(private_bounds)]
-    pub async fn send_raw_with_options(
+    pub fn send_raw_with_options(
         &self,
         envelope: &Envelope,
         email: &[u8],
         options: &SendOptions,
-    ) -> Result<Vec<Response>, Error>
-    where
-        E: SmtpExecutor,
-    {
-        let mut conn = self.inner.connection().await?;
+    ) -> Result<Vec<Response>, Error> {
+        let mut conn = self.inner.connection()?;
 
-        let result = conn
-            .send_lmtp_with_options(envelope, email, options)
-            .await?;
+        let result = conn.send_lmtp_with_options(envelope, email, options)?;
 
         Ok(result)
     }
@@ -539,35 +467,20 @@ where
     ///
     /// The server must advertise `CHUNKING`. Returned responses still preserve
     /// one status per input recipient.
-    #[allow(private_bounds)]
-    pub async fn send_raw_bdat(
-        &self,
-        envelope: &Envelope,
-        email: &[u8],
-    ) -> Result<Vec<Response>, Error>
-    where
-        E: SmtpExecutor,
-    {
+    pub fn send_raw_bdat(&self, envelope: &Envelope, email: &[u8]) -> Result<Vec<Response>, Error> {
         self.send_raw_bdat_with_options(envelope, email, &SendOptions::default())
-            .await
     }
 
     /// Sends an email over LMTP with `BDAT ... LAST` and per-message options.
-    #[allow(private_bounds)]
-    pub async fn send_raw_bdat_with_options(
+    pub fn send_raw_bdat_with_options(
         &self,
         envelope: &Envelope,
         email: &[u8],
         options: &SendOptions,
-    ) -> Result<Vec<Response>, Error>
-    where
-        E: SmtpExecutor,
-    {
-        let mut conn = self.inner.connection().await?;
+    ) -> Result<Vec<Response>, Error> {
+        let mut conn = self.inner.connection()?;
 
-        let result = conn
-            .send_lmtp_bdat_with_options(envelope, email, options)
-            .await?;
+        let result = conn.send_lmtp_bdat_with_options(envelope, email, options)?;
 
         Ok(result)
     }
@@ -581,17 +494,13 @@ where
     /// Returns `Err(AccountError)` only for batch-level failures where no
     /// per-recipient outcome can be attributed: pool checkout failure, connection
     /// setup failure, MAIL FROM rejection, or a pre-MAIL transport drop.
-    #[allow(private_bounds)]
-    pub async fn send_raw_batch_with_options(
+    pub fn send_raw_batch_with_options(
         &self,
         from: Option<Address>,
         recipients: Vec<BatchItem<Address>>,
         email: &[u8],
         options: &SendOptions,
-    ) -> Result<BatchOutcome<()>, AccountError>
-    where
-        E: SmtpExecutor,
-    {
+    ) -> Result<BatchOutcome<()>, AccountError> {
         let ctx = SmtpErrorContext::send(Protocol::Lmtp);
 
         if let Err(invalid) = bifrost_types::error::validate_batch_input(&recipients) {
@@ -606,80 +515,36 @@ where
         let mut conn = self
             .inner
             .connection()
-            .await
             .map_err(|e| batch_level_error(e, ctx.clone()))?;
 
-        match conn
-            .send_lmtp_batch(from, batch_recipients, email, options)
-            .await
-        {
+        match conn.send_lmtp_batch(from, batch_recipients, email, options) {
             Ok(progress) => Ok(progress.resolve()),
             Err((e, _progress)) => Err(batch_level_error(e, ctx)),
         }
     }
 }
 
-impl<E: Executor> Debug for AsyncSmtpTransport<E> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut builder = f.debug_struct("AsyncSmtpTransport");
-        builder.field("inner", &self.inner);
-        builder.finish()
-    }
-}
-
-impl<E: Executor> Debug for AsyncLmtpTransport<E> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut builder = f.debug_struct("AsyncLmtpTransport");
-        builder.field("inner", &self.inner);
-        builder.finish()
-    }
-}
-
-impl<E> Clone for AsyncSmtpTransport<E>
-where
-    E: Executor,
-{
-    fn clone(&self) -> Self {
-        Self {
-            inner: Arc::clone(&self.inner),
-        }
-    }
-}
-
-impl<E> Clone for AsyncLmtpTransport<E>
-where
-    E: Executor,
-{
-    fn clone(&self) -> Self {
-        Self {
-            inner: Arc::clone(&self.inner),
-        }
-    }
-}
-
 /// Contains client configuration.
-/// Instances of this struct can be created using functions of [`AsyncSmtpTransport`].
+/// Instances of this struct can be created using functions of [`SmtpTransport`].
 #[derive(Debug, Clone)]
-#[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
-pub struct AsyncSmtpTransportBuilder {
+pub struct SmtpTransportBuilder {
     info: SmtpInfo,
     pool_config: PoolConfig,
 }
 
 /// Contains LMTP client configuration.
-/// Instances of this struct can be created using functions of [`AsyncLmtpTransport`].
+/// Instances of this struct can be created using functions of [`LmtpTransport`].
 #[derive(Debug, Clone)]
-#[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
-pub struct AsyncLmtpTransportBuilder {
+pub struct LmtpTransportBuilder {
     info: SmtpInfo,
     pool_config: PoolConfig,
 }
 
-/// Builder for the SMTP `AsyncSmtpTransport`
-impl AsyncSmtpTransportBuilder {
+/// Builder for the SMTP `SmtpTransport`
+impl SmtpTransportBuilder {
     // Create new builder with default parameters
     pub(crate) fn new<T: Into<String>>(server: T) -> Self {
-        AsyncSmtpTransportBuilder {
+        Self {
             info: SmtpInfo::new(server, Protocol::Smtp),
             pool_config: PoolConfig::default(),
         }
@@ -722,9 +587,10 @@ impl AsyncSmtpTransportBuilder {
 
     /// Set OAuth 2.0 bearer-token credentials from a shared token source.
     ///
-    /// ratatoskr supplies one `Arc<dyn TokenSource>` it drives rotation
-    /// on; the token is read live at each connect, so a refreshed token
-    /// is presented on reconnect without rebuilding the transport.
+    /// The blocking transport reads the token by polling the source once;
+    /// a `StaticTokenSource` (or an already-fresh `OAuthRefresher`)
+    /// resolves immediately. A source needing a network refresh requires
+    /// the async transport.
     pub fn oauth2_source<I>(
         self,
         identity: I,
@@ -752,25 +618,6 @@ impl AsyncSmtpTransportBuilder {
         self
     }
 
-    /// Set the port to use
-    ///
-    /// # Warning
-    ///
-    /// You probably do not need to call this method.
-    ///
-    /// Bifrost SMTP usually picks the correct `port` when building
-    /// [`AsyncSmtpTransport`] using [`AsyncSmtpTransport::relay`] or
-    /// [`AsyncSmtpTransport::starttls_relay`].
-    ///
-    /// # Errors
-    ///
-    /// Using the incorrect `port` and [`Self::tls`] combination may
-    /// lead to hard to debug IO errors coming from the TLS library.
-    pub fn port(mut self, port: u16) -> Self {
-        self.info.port = port;
-        self
-    }
-
     /// Set the timeout duration
     pub fn timeout(mut self, timeout: Option<Duration>) -> Self {
         self.info.timeout = timeout;
@@ -780,16 +627,9 @@ impl AsyncSmtpTransportBuilder {
     /// Meter this transport's socket bytes, and optionally cap its
     /// throughput.
     ///
-    /// `sink` receives every byte read and written; `bandwidth_cap` is a
-    /// live bytes-per-second ceiling read fresh on each transfer, so a
-    /// consumer can retune or lift it without reconnecting.
-    /// `UNLIMITED_BANDWIDTH` (`u64::MAX`) in the atomic means no cap -
-    /// the same encoding `bifrost-imap` uses, so one value can drive
-    /// both halves of an IMAP-shaped account.
-    ///
-    /// Without this, an account that sets a bandwidth cap has it honoured
-    /// on its other protocols and silently ignored on submission, which
-    /// is the upstream-heavy path a cap usually exists to protect.
+    /// See `AsyncSmtpTransportBuilder::bandwidth_metering`. This blocking
+    /// transport honours the cap by sleeping the calling thread, which is
+    /// the semantic its caller accepted by choosing the blocking API.
     #[must_use]
     pub fn bandwidth_metering(
         mut self,
@@ -797,6 +637,25 @@ impl AsyncSmtpTransportBuilder {
         bandwidth_cap: Option<Arc<AtomicU64>>,
     ) -> Self {
         self.info.metering = WireMetering::new(sink, bandwidth_cap);
+        self
+    }
+
+    /// Set the port to use
+    ///
+    /// # Warning
+    ///
+    /// You probably do not need to call this method.
+    ///
+    /// Bifrost SMTP usually picks the correct `port` when building
+    /// [`SmtpTransport`] using [`SmtpTransport::relay`] or
+    /// [`SmtpTransport::starttls_relay`].
+    ///
+    /// # Errors
+    ///
+    /// Using the incorrect `port` and [`Self::tls`] combination may
+    /// lead to hard to debug IO errors coming from the TLS library.
+    pub fn port(mut self, port: u16) -> Self {
+        self.info.port = port;
         self
     }
 
@@ -811,15 +670,13 @@ impl AsyncSmtpTransportBuilder {
     /// You probably do not need to call this method.
     ///
     /// By default Bifrost SMTP chooses the correct `tls` configuration when
-    /// building [`AsyncSmtpTransport`] using [`AsyncSmtpTransport::relay`] or
-    /// [`AsyncSmtpTransport::starttls_relay`].
+    /// building [`SmtpTransport`] using [`SmtpTransport::relay`] or
+    /// [`SmtpTransport::starttls_relay`].
     ///
     /// # Errors
     ///
-    /// Using the incorrect [`Tls`] and [`Self::port`] combination may
+    /// Using the wrong [`Tls`] and [`Self::port`] combination may
     /// lead to hard to debug IO errors coming from the TLS library.
-    #[cfg(feature = "tokio")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
     pub fn tls(mut self, tls: Tls) -> Self {
         self.info.tls = tls;
         self.info.unix_socket = None;
@@ -835,27 +692,22 @@ impl AsyncSmtpTransportBuilder {
     }
 
     /// Build the transport
-    #[allow(private_bounds)]
-    pub fn build<E>(self) -> AsyncSmtpTransport<E>
-    where
-        E: SmtpExecutor,
-    {
-        let client = AsyncSmtpClient {
-            info: self.info,
-            marker_: PhantomData,
-        };
+    ///
+    /// Defaults can be found at [`PoolConfig`]
+    pub fn build(self) -> SmtpTransport {
+        let client = SmtpClient { info: self.info };
 
         let client = Pool::new(self.pool_config, client);
 
-        AsyncSmtpTransport { inner: client }
+        SmtpTransport { inner: client }
     }
 }
 
-/// Builder for the LMTP `AsyncLmtpTransport`
-impl AsyncLmtpTransportBuilder {
+/// Builder for the LMTP `LmtpTransport`
+impl LmtpTransportBuilder {
     // Create new builder with default parameters
     pub(crate) fn new<T: Into<String>>(server: T) -> Self {
-        AsyncLmtpTransportBuilder {
+        Self {
             info: SmtpInfo::new(server, Protocol::Lmtp),
             pool_config: PoolConfig::default(),
         }
@@ -898,9 +750,10 @@ impl AsyncLmtpTransportBuilder {
 
     /// Set OAuth 2.0 bearer-token credentials from a shared token source.
     ///
-    /// ratatoskr supplies one `Arc<dyn TokenSource>` it drives rotation
-    /// on; the token is read live at each connect, so a refreshed token
-    /// is presented on reconnect without rebuilding the transport.
+    /// The blocking transport reads the token by polling the source once;
+    /// a `StaticTokenSource` (or an already-fresh `OAuthRefresher`)
+    /// resolves immediately. A source needing a network refresh requires
+    /// the async transport.
     pub fn oauth2_source<I>(
         self,
         identity: I,
@@ -928,6 +781,28 @@ impl AsyncLmtpTransportBuilder {
         self
     }
 
+    /// Set the timeout duration
+    pub fn timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.info.timeout = timeout;
+        self
+    }
+
+    /// Meter this transport's socket bytes, and optionally cap its
+    /// throughput.
+    ///
+    /// See `AsyncSmtpTransportBuilder::bandwidth_metering`. This blocking
+    /// transport honours the cap by sleeping the calling thread, which is
+    /// the semantic its caller accepted by choosing the blocking API.
+    #[must_use]
+    pub fn bandwidth_metering(
+        mut self,
+        sink: Option<MeterSinkHandle>,
+        bandwidth_cap: Option<Arc<AtomicU64>>,
+    ) -> Self {
+        self.info.metering = WireMetering::new(sink, bandwidth_cap);
+        self
+    }
+
     /// Set the port to use
     pub fn port(mut self, port: u16) -> Self {
         self.info.port = port;
@@ -944,15 +819,7 @@ impl AsyncLmtpTransportBuilder {
         self
     }
 
-    /// Set the timeout duration
-    pub fn timeout(mut self, timeout: Option<Duration>) -> Self {
-        self.info.timeout = timeout;
-        self
-    }
-
     /// Set the TLS settings to use
-    #[cfg(feature = "tokio")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
     pub fn tls(mut self, tls: Tls) -> Self {
         self.info.tls = tls;
         self.info.unix_socket = None;
@@ -968,157 +835,258 @@ impl AsyncLmtpTransportBuilder {
     }
 
     /// Build the transport
-    #[allow(private_bounds)]
-    pub fn build<E>(self) -> AsyncLmtpTransport<E>
-    where
-        E: SmtpExecutor,
-    {
-        let client = AsyncSmtpClient {
-            info: self.info,
-            marker_: PhantomData,
-        };
+    ///
+    /// Defaults can be found at [`PoolConfig`]
+    pub fn build(self) -> LmtpTransport {
+        let client = SmtpClient { info: self.info };
 
         let client = Pool::new(self.pool_config, client);
 
-        AsyncLmtpTransport { inner: client }
+        LmtpTransport { inner: client }
     }
 }
 
 /// Build client
-pub(super) struct AsyncSmtpClient<E> {
+#[derive(Debug, Clone)]
+pub(super) struct SmtpClient {
     info: SmtpInfo,
-    marker_: PhantomData<E>,
 }
 
-impl<E> AsyncSmtpClient<E>
-where
-    E: SmtpExecutor,
-{
+impl SmtpClient {
     /// Creates a new connection directly usable to send emails
     ///
     /// Handles encryption and authentication
-    pub(super) async fn connection(&self) -> Result<AsyncSmtpConnection, Error> {
-        let mut conn = E::connect(
-            &self.info.server,
-            self.info.port,
-            self.info.unix_socket.as_deref(),
+    pub(super) fn connection(&self) -> Result<SmtpConnection, Error> {
+        if let Some(path) = &self.info.unix_socket {
+            #[cfg(unix)]
+            {
+                if self.info.uses_tls() {
+                    return Err(error::invalid_input(
+                        "TLS is not supported over Unix-domain LMTP sockets",
+                    ));
+                }
+                let mut conn = SmtpConnection::connect_unix_with_protocol(
+                    path,
+                    self.info.timeout,
+                    &self.info.hello_name,
+                    self.info.protocol,
+                    self.info.metering.clone(),
+                )?;
+
+                if let Some(credentials) = &self.info.credentials {
+                    self.info.ensure_can_authenticate(conn.is_encrypted())?;
+                    conn.auth(&self.info.authentication, credentials)?;
+                }
+                return Ok(conn);
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = path;
+                return Err(error::invalid_input(
+                    "Unix-domain LMTP sockets are only supported on Unix platforms",
+                ));
+            }
+        }
+
+        let tls_parameters = match &self.info.tls {
+            Tls::Wrapper(tls_parameters) => Some(tls_parameters),
+            _ => None,
+        };
+
+        let mut conn = SmtpConnection::connect_with_protocol::<(&str, u16)>(
+            (self.info.server.as_ref(), self.info.port),
             self.info.timeout,
             &self.info.hello_name,
-            &self.info.tls,
+            tls_parameters,
+            None,
             self.info.protocol,
             self.info.metering.clone(),
-        )
-        .await?;
+        )?;
+
+        match &self.info.tls {
+            Tls::Opportunistic(tls_parameters) if conn.can_starttls() => {
+                conn.starttls(tls_parameters, &self.info.hello_name)?;
+            }
+            Tls::Required(tls_parameters) => {
+                conn.starttls(tls_parameters, &self.info.hello_name)?;
+            }
+            _ => (),
+        }
 
         if let Some(credentials) = &self.info.credentials {
             self.info.ensure_can_authenticate(conn.is_encrypted())?;
-            conn.auth(&self.info.authentication, credentials).await?;
+            conn.auth(&self.info.authentication, credentials)?;
         }
         Ok(conn)
     }
 }
 
-impl<E> Debug for AsyncSmtpClient<E> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut builder = f.debug_struct("AsyncSmtpClient");
-        builder.field("info", &self.info);
-        builder.finish()
-    }
-}
-
 #[cfg(test)]
-#[cfg(feature = "tokio")]
 mod tests {
     use std::{
         io::{BufRead, BufReader, Write},
-        marker::PhantomData,
         net::TcpListener,
         sync::mpsc,
         thread,
         time::Duration,
     };
 
+    use crate::transport::smtp::Tls;
     #[cfg(unix)]
     use crate::transport::smtp::test_support::spawn_unix_lmtp_delivery_server;
     use crate::{
-        AsyncLmtpTransport, AsyncSmtpTransport, AsyncTransport, TokioExecutor,
+        LmtpTransport, SmtpTransport, Transport,
         address::Envelope,
         transport::smtp::{
             authentication::{
                 Credentials, DEFAULT_MECHANISMS, Mechanism, OAUTH2_MECHANISMS, PASSWORD_MECHANISMS,
             },
-            client::Tls,
             test_support::{assert_lmtp_delivery_commands, spawn_lmtp_delivery_server},
         },
     };
 
-    use super::{AsyncSmtpClient, Protocol};
+    use super::{Protocol, SmtpClient};
 
     #[test]
-    fn tokio_transport_from_plaintext_url() {
-        let builder =
-            AsyncSmtpTransport::<TokioExecutor>::from_url("smtp://127.0.0.1:2525").unwrap();
+    fn transport_from_plaintext_url() {
+        let builder = SmtpTransport::from_url("smtp://127.0.0.1:2525").unwrap();
 
         assert_eq!(builder.info.port, 2525);
         assert_eq!(builder.info.server, "127.0.0.1");
     }
 
     #[test]
-    fn tokio_lmtp_builder_uses_lmtp_defaults() {
-        let builder = AsyncLmtpTransport::<TokioExecutor>::builder_dangerous("localhost");
+    fn lmtp_builder_uses_lmtp_defaults() {
+        let builder = LmtpTransport::builder_dangerous("localhost");
 
         assert_eq!(builder.info.port, super::super::LMTP_PORT);
         assert_eq!(builder.info.protocol, Protocol::Lmtp);
     }
 
-    /// URL parsing decides the port, the TLS posture and the credentials, and
-    /// percent-decodes both halves of the userinfo. Getting any of those wrong
-    /// silently downgrades or misauthenticates the connection.
     #[test]
-    fn tokio_transport_from_tls_url() {
-        let builder = AsyncSmtpTransport::<TokioExecutor>::from_url("smtp://127.0.0.1:2525")
-            .expect("a plaintext URL parses");
+    fn lmtp_transport_returns_per_recipient_statuses() {
+        let server = spawn_lmtp_delivery_server();
+
+        let envelope = Envelope::new(
+            Some("sender@example.com".parse().unwrap()),
+            vec![
+                "first@example.com".parse().unwrap(),
+                "second@example.com".parse().unwrap(),
+                "third@example.com".parse().unwrap(),
+            ],
+        )
+        .unwrap();
+        let mailer = LmtpTransport::builder_dangerous("127.0.0.1")
+            .port(server.address.port())
+            .build();
+
+        let responses = mailer
+            .send_raw(&envelope, b"Subject: test\r\n\r\nHello")
+            .unwrap();
+
+        assert_eq!(responses.len(), 3);
+        assert!(responses[0].has_code(250));
+        assert!(responses[1].has_code(550));
+        assert!(!responses[1].is_positive());
+        assert!(responses[2].has_code(451));
+        assert!(!responses[2].is_positive());
+
+        let commands = server.commands();
+        assert_lmtp_delivery_commands(&commands);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn lmtp_transport_sends_over_unix_socket() {
+        let server = spawn_unix_lmtp_delivery_server();
+
+        let envelope = Envelope::new(
+            Some("sender@example.com".parse().unwrap()),
+            vec![
+                "first@example.com".parse().unwrap(),
+                "second@example.com".parse().unwrap(),
+                "third@example.com".parse().unwrap(),
+            ],
+        )
+        .unwrap();
+        let mailer = LmtpTransport::unix_socket(server.path.clone()).build();
+
+        let responses = mailer
+            .send_raw(&envelope, b"Subject: test\r\n\r\nHello")
+            .unwrap();
+
+        assert_eq!(responses.len(), 3);
+        assert!(responses[0].has_code(250));
+        assert!(responses[1].has_code(550));
+        assert!(responses[2].has_code(451));
+
+        let commands = server.commands();
+        assert_lmtp_delivery_commands(&commands);
+    }
+
+    #[test]
+    fn transport_from_tls_url() {
+        let builder = SmtpTransport::from_url("smtp://127.0.0.1:2525").unwrap();
+
         assert!(matches!(builder.info.tls, Tls::None));
 
-        let builder = AsyncSmtpTransport::<TokioExecutor>::from_url(
-            "smtps://username:password@smtp.example.com:465",
-        )
-        .expect("an implicit-TLS URL parses");
+        let builder =
+            SmtpTransport::from_url("smtps://username:password@smtp.example.com:465").unwrap();
+
         assert_eq!(builder.info.port, 465);
-        assert_eq!(builder.info.server, "smtp.example.com");
-        assert!(matches!(builder.info.tls, Tls::Wrapper(_)));
         assert!(matches!(
             builder.info.credentials,
             Some(Credentials::Password { ref username, ref password })
                 if username == "username" && password.as_str() == "password"
         ));
+        assert!(matches!(builder.info.tls, Tls::Wrapper(_)));
+        assert_eq!(builder.info.server, "smtp.example.com");
 
-        let builder = AsyncSmtpTransport::<TokioExecutor>::from_url(
+        let builder = SmtpTransport::from_url(
             "smtps://user%40example.com:pa$$word%3F%22!@smtp.example.com:465",
         )
-        .expect("percent-encoded userinfo parses");
-        assert!(matches!(builder.info.tls, Tls::Wrapper(_)));
+        .unwrap();
+
+        assert_eq!(builder.info.port, 465);
         assert!(matches!(
             builder.info.credentials,
             Some(Credentials::Password { ref username, ref password })
                 if username == "user@example.com" && password.as_str() == "pa$$word?\"!"
         ));
+        assert!(matches!(builder.info.tls, Tls::Wrapper(_)));
+        assert_eq!(builder.info.server, "smtp.example.com");
 
-        let builder = AsyncSmtpTransport::<TokioExecutor>::from_url(
-            "smtp://username:password@smtp.example.com:587?tls=required",
-        )
-        .expect("an explicit STARTTLS URL parses");
+        let builder =
+            SmtpTransport::from_url("smtp://username:password@smtp.example.com:587?tls=required")
+                .unwrap();
+
         assert_eq!(builder.info.port, 587);
+        assert!(matches!(
+            builder.info.credentials,
+            Some(Credentials::Password { ref username, ref password })
+                if username == "username" && password.as_str() == "password"
+        ));
         assert!(matches!(builder.info.tls, Tls::Required(_)));
+
+        let builder = SmtpTransport::from_url(
+            "smtp://username:password@smtp.example.com:587?tls=opportunistic",
+        )
+        .unwrap();
+
+        assert_eq!(builder.info.port, 587);
+        assert!(matches!(builder.info.tls, Tls::Opportunistic(_)));
+
+        let builder = SmtpTransport::from_url("smtps://smtp.example.com").unwrap();
+
+        assert_eq!(builder.info.port, 465);
+        assert!(builder.info.credentials.is_none());
+        assert!(matches!(builder.info.tls, Tls::Wrapper(_)));
     }
 
-    /// The `password` helper picks the password mechanism ladder, strongest
-    /// first. SCRAM is offered out of the box; LOGIN is opt-in only. A silent
-    /// reordering here is a downgrade.
     #[test]
-    fn tokio_password_helper_uses_password_mechanisms() {
-        let builder = AsyncSmtpTransport::<TokioExecutor>::builder_dangerous("smtp.example.com")
-            .password("username", "password");
+    fn password_helper_uses_password_mechanisms() {
+        let builder =
+            SmtpTransport::builder_dangerous("smtp.example.com").password("username", "password");
 
         assert!(matches!(
             builder.info.credentials,
@@ -1126,6 +1094,8 @@ mod tests {
                 if username == "username" && password.as_str() == "password"
         ));
         assert_eq!(builder.info.authentication, PASSWORD_MECHANISMS);
+        // Pin the grown default-construction surface explicitly: SCRAM is now
+        // offered out of the box (strongest first), LOGIN is opt-in only.
         assert_eq!(
             builder.info.authentication,
             vec![
@@ -1139,10 +1109,9 @@ mod tests {
         assert_eq!(DEFAULT_MECHANISMS, PASSWORD_MECHANISMS);
     }
 
-    /// OAUTHBEARER (RFC 7628) outranks the legacy XOAUTH2 draft.
     #[test]
-    fn tokio_oauth2_helper_prefers_standard_bearer_mechanism() {
-        let builder = AsyncSmtpTransport::<TokioExecutor>::builder_dangerous("smtp.example.com")
+    fn oauth2_helper_prefers_standard_bearer_mechanism() {
+        let builder = SmtpTransport::builder_dangerous("smtp.example.com")
             .oauth2("user@example.com", "token");
 
         assert!(matches!(
@@ -1157,141 +1126,23 @@ mod tests {
         );
     }
 
-    /// Setting credentials must not clobber an explicit mechanism list. A
-    /// caller who narrowed the ladder deliberately gets to keep it.
     #[test]
-    fn tokio_credentials_preserve_explicit_authentication_mechanisms() {
-        let builder = AsyncSmtpTransport::<TokioExecutor>::builder_dangerous("smtp.example.com")
+    fn credentials_preserve_explicit_authentication_mechanisms() {
+        let builder = SmtpTransport::builder_dangerous("smtp.example.com")
             .authentication(vec![Mechanism::Xoauth2])
             .oauth2("user@example.com", "token");
+
         assert_eq!(builder.info.authentication, [Mechanism::Xoauth2]);
 
-        let builder = AsyncSmtpTransport::<TokioExecutor>::builder_dangerous("smtp.example.com")
+        let builder = SmtpTransport::builder_dangerous("smtp.example.com")
             .authentication(vec![Mechanism::Plain])
             .password("username", "password");
+
         assert_eq!(builder.info.authentication, [Mechanism::Plain]);
     }
 
-    /// The insecure-auth escape hatch is a builder flag, and it is the only
-    /// thing that may relax the refusal. Both directions are pinned so the
-    /// flag cannot rot into a no-op (silently breaking local relays) or into
-    /// a default (silently sending credentials in the clear).
     #[test]
-    fn tokio_dangerous_allow_insecure_auth_is_the_only_plaintext_escape_hatch() {
-        let guarded = AsyncSmtpTransport::<TokioExecutor>::builder_dangerous("smtp.example.com")
-            .password("user", "pass");
-        assert!(!guarded.info.allow_insecure_auth);
-        let error = guarded
-            .info
-            .ensure_can_authenticate(false)
-            .expect_err("plaintext AUTH is refused by default");
-        assert!(
-            error
-                .to_string()
-                .contains("refusing to authenticate over an unencrypted SMTP connection"),
-            "expected a plaintext-auth policy refusal, got: {error}"
-        );
-        guarded
-            .info
-            .ensure_can_authenticate(true)
-            .expect("an encrypted connection may authenticate");
-
-        let opted_in = AsyncSmtpTransport::<TokioExecutor>::builder_dangerous("smtp.example.com")
-            .password("user", "pass")
-            .dangerous_allow_insecure_auth(true);
-        assert!(opted_in.info.allow_insecure_auth);
-        opted_in
-            .info
-            .ensure_can_authenticate(false)
-            .expect("the opt-in escape hatch permits plaintext AUTH");
-    }
-
-    /// LMTP names itself in the refusal, so an operator reading a log knows
-    /// which transport refused.
-    #[test]
-    fn tokio_plaintext_auth_refusal_names_the_lmtp_protocol() {
-        let builder = AsyncLmtpTransport::<TokioExecutor>::builder_dangerous("localhost")
-            .password("user", "pass");
-
-        let error = builder
-            .info
-            .ensure_can_authenticate(false)
-            .expect_err("plaintext AUTH is refused for LMTP too");
-        assert!(
-            error
-                .to_string()
-                .contains("refusing to authenticate over an unencrypted LMTP connection"),
-            "expected an LMTP-labelled refusal, got: {error}"
-        );
-    }
-
-    #[tokio::test(crate = "tokio")]
-    async fn tokio_lmtp_transport_returns_per_recipient_statuses() {
-        let server = spawn_lmtp_delivery_server();
-
-        let envelope = Envelope::new(
-            Some("sender@example.com".parse().unwrap()),
-            vec![
-                "first@example.com".parse().unwrap(),
-                "second@example.com".parse().unwrap(),
-                "third@example.com".parse().unwrap(),
-            ],
-        )
-        .unwrap();
-        let mailer: AsyncLmtpTransport<TokioExecutor> =
-            AsyncLmtpTransport::<TokioExecutor>::builder_dangerous("127.0.0.1")
-                .port(server.address.port())
-                .build();
-
-        let responses = mailer
-            .send_raw(&envelope, b"Subject: test\r\n\r\nHello")
-            .await
-            .unwrap();
-
-        assert_eq!(responses.len(), 3);
-        assert!(responses[0].has_code(250));
-        assert!(responses[1].has_code(550));
-        assert!(!responses[1].is_positive());
-        assert!(responses[2].has_code(451));
-        assert!(!responses[2].is_positive());
-
-        let commands = server.commands();
-        assert_lmtp_delivery_commands(&commands);
-    }
-
-    #[tokio::test(crate = "tokio")]
-    #[cfg(unix)]
-    async fn tokio_lmtp_transport_sends_over_unix_socket() {
-        let server = spawn_unix_lmtp_delivery_server();
-
-        let envelope = Envelope::new(
-            Some("sender@example.com".parse().unwrap()),
-            vec![
-                "first@example.com".parse().unwrap(),
-                "second@example.com".parse().unwrap(),
-                "third@example.com".parse().unwrap(),
-            ],
-        )
-        .unwrap();
-        let mailer: AsyncLmtpTransport<TokioExecutor> =
-            AsyncLmtpTransport::<TokioExecutor>::unix_socket(server.path.clone()).build();
-
-        let responses = mailer
-            .send_raw(&envelope, b"Subject: test\r\n\r\nHello")
-            .await
-            .unwrap();
-
-        assert_eq!(responses.len(), 3);
-        assert!(responses[0].has_code(250));
-        assert!(responses[1].has_code(550));
-        assert!(responses[2].has_code(451));
-
-        let commands = server.commands();
-        assert_lmtp_delivery_commands(&commands);
-    }
-
-    #[tokio::test(crate = "tokio")]
-    async fn tokio_plaintext_auth_is_refused_before_auth_command() {
+    fn plaintext_auth_is_refused_before_auth_command() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let (observed_tx, observed_rx) = mpsc::channel();
@@ -1315,14 +1166,11 @@ mod tests {
             observed_tx.send((read, after_ehlo)).unwrap();
         });
 
-        let builder = AsyncSmtpTransport::<TokioExecutor>::builder_dangerous("127.0.0.1")
+        let builder = SmtpTransport::builder_dangerous("127.0.0.1")
             .port(address.port())
             .password("user", "pass");
-        let client = AsyncSmtpClient::<TokioExecutor> {
-            info: builder.info,
-            marker_: PhantomData,
-        };
-        let Err(error) = client.connection().await else {
+        let client = SmtpClient { info: builder.info };
+        let Err(error) = client.connection() else {
             panic!("plaintext auth must be refused");
         };
 
@@ -1333,16 +1181,59 @@ mod tests {
         handle.join().unwrap();
     }
 
+    #[test]
+    fn dangerous_allow_insecure_auth_preserves_plaintext_auth_escape_hatch() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (auth_tx, auth_rx) = mpsc::channel();
+
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            stream.write_all(b"220 localhost\r\n").unwrap();
+
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut ehlo = String::new();
+            reader.read_line(&mut ehlo).unwrap();
+            stream
+                .write_all(b"250-localhost\r\n250 AUTH PLAIN\r\n")
+                .unwrap();
+
+            let mut auth = String::new();
+            reader.read_line(&mut auth).unwrap();
+            stream.write_all(b"235 authenticated\r\n").unwrap();
+
+            let mut post_auth_ehlo = String::new();
+            reader.read_line(&mut post_auth_ehlo).unwrap();
+            stream.write_all(b"250 localhost\r\n").unwrap();
+            auth_tx.send(auth).unwrap();
+        });
+
+        let builder = SmtpTransport::builder_dangerous("127.0.0.1")
+            .port(address.port())
+            .password("user", "pass")
+            .dangerous_allow_insecure_auth(true);
+        let client = SmtpClient { info: builder.info };
+        let mut connection = client.connection().unwrap();
+        connection.abort();
+
+        let auth = auth_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(auth.starts_with("AUTH PLAIN "), "got {auth:?}");
+        handle.join().unwrap();
+    }
+
     mod pooled_batch {
-        use std::{marker::PhantomData, sync::Arc};
+        use std::sync::Arc;
 
         use bifrost_types::error::{AccountErrorKind, BatchItem, BatchItemId, RequestErrorKind};
 
         use crate::transport::smtp::test_support::Transcript;
 
         use super::super::{
-            AsyncLmtpTransport, AsyncSmtpClient, AsyncSmtpConnection, AsyncSmtpTransport, ClientId,
-            Pool, PoolConfig, Protocol, SendOptions, SmtpInfo, TokioExecutor,
+            ClientId, LmtpTransport, Pool, PoolConfig, Protocol, SendOptions, SmtpClient,
+            SmtpConnection, SmtpInfo, SmtpTransport,
         };
 
         fn hello() -> ClientId {
@@ -1351,20 +1242,16 @@ mod tests {
 
         /// A pool that will never dial: the only connection it can ever hand
         /// out is the scripted one parked here.
-        async fn pool_with(
-            conn: AsyncSmtpConnection,
-            protocol: Protocol,
-        ) -> Arc<Pool<TokioExecutor>> {
+        fn pool_with(conn: SmtpConnection, protocol: Protocol) -> Arc<Pool> {
             let pool = Pool::new(
                 // The checkout probe would need its own scripted NOOP step;
                 // the probe itself is pinned at the connection level.
                 PoolConfig::new().test_on_checkout(false),
-                AsyncSmtpClient::<TokioExecutor> {
+                SmtpClient {
                     info: SmtpInfo::new("transcript.invalid", protocol),
-                    marker_: PhantomData,
                 },
             );
-            pool.park_for_test(conn).await;
+            pool.park_for_test(conn);
             pool
         }
 
@@ -1381,20 +1268,12 @@ mod tests {
                 .collect()
         }
 
-        /// Async recycling runs in a spawned task, so drain the executor
-        /// before observing the pool. `yield_now` is enough on the
-        /// current-thread test runtime and keeps the test off the clock.
-        async fn settle() {
-            for _ in 0..8 {
-                tokio::task::yield_now().await;
-            }
-        }
-
         /// End-to-end counterpart to the connection-level `should_retire()`
-        /// pin, on the async path: a completed LMTP delivery must leave the
-        /// pool empty.
-        #[tokio::test(crate = "tokio")]
-        async fn tokio_lmtp_batch_send_leaves_no_pooled_connection_behind() {
+        /// pin: a completed LMTP delivery must leave the pool empty, so the
+        /// next transaction cannot inherit a stream that may still hold an
+        /// unread final status.
+        #[test]
+        fn lmtp_batch_send_leaves_no_pooled_connection_behind() {
             let transcript = Transcript::new("220 lmtp.example\r\n")
                 .expect("LHLO client.example\r\n", "250 lmtp.example\r\n")
                 .expect("MAIL FROM:<sender@example.com>\r\n", "250 sender ok\r\n")
@@ -1407,11 +1286,10 @@ mod tests {
                     "250 first delivered\r\n550 second rejected\r\n",
                 );
             let conn =
-                AsyncSmtpConnection::from_transcript(transcript.clone(), &hello(), Protocol::Lmtp)
-                    .await
+                SmtpConnection::from_transcript(transcript.clone(), &hello(), Protocol::Lmtp)
                     .unwrap();
-            let pool = pool_with(conn, Protocol::Lmtp).await;
-            let transport = AsyncLmtpTransport::<TokioExecutor> {
+            let pool = pool_with(conn, Protocol::Lmtp);
+            let transport = LmtpTransport {
                 inner: Arc::clone(&pool),
             };
 
@@ -1422,117 +1300,23 @@ mod tests {
                     b"body",
                     &SendOptions::default(),
                 )
-                .await
                 .expect("the delivery completes with per-recipient outcomes");
-            settle().await;
 
             assert_eq!(outcome.succeeded().len(), 1);
             assert_eq!(outcome.failed().len(), 1);
             assert_eq!(
-                pool.idle_count_for_test().await,
+                pool.idle_count_for_test(),
                 0,
                 "a drained LMTP connection must be retired, not parked"
             );
             transcript.assert_exhausted();
         }
 
-        use std::sync::atomic::{AtomicU64, Ordering};
-
-        use super::super::WireMetering;
-
-        /// Records every byte the transport reads and writes, per account.
-        #[derive(Default)]
-        struct CountingSink {
-            bytes_in: AtomicU64,
-            bytes_out: AtomicU64,
-        }
-
-        impl bifrost_net::MeterSink for CountingSink {
-            fn record_bytes_in(&self, _account: &bifrost_net::AccountId, n: u64) {
-                self.bytes_in.fetch_add(n, Ordering::Relaxed);
-            }
-            fn record_bytes_out(&self, _account: &bifrost_net::AccountId, n: u64) {
-                self.bytes_out.fetch_add(n, Ordering::Relaxed);
-            }
-        }
-
-        /// smtp-M1. SMTP was the one protocol whose bytes reached the wire
-        /// unmetered, which made an account's bandwidth cap silently
-        /// PARTIAL: honoured on its other traffic, ignored on submission -
-        /// the upstream-heavy path a cap usually exists to protect.
-        ///
-        /// Drives a real send through the transport and asserts the sink
-        /// saw traffic in both directions, rather than asserting the
-        /// adapter was merely installed.
-        #[tokio::test(crate = "tokio")]
-        async fn a_metered_transport_reports_its_socket_bytes_to_the_sink() {
-            let transcript = Transcript::new("220 smtp.example\r\n")
-                .expect("EHLO client.example\r\n", "250 smtp.example\r\n")
-                .expect("MAIL FROM:<sender@example.com>\r\n", "250 sender ok\r\n")
-                .expect("RCPT TO:<first@example.com>\r\n", "250 first ok\r\n")
-                .expect("DATA\r\n", "354 send body\r\n")
-                .expect("body", "")
-                .expect("\r\n.\r\n", "250 queued\r\n");
-
-            let sink = Arc::new(CountingSink::default());
-            let erased: Arc<dyn bifrost_net::MeterSink> = Arc::<CountingSink>::clone(&sink);
-            let handle = bifrost_net::MeterSinkHandle::new(
-                erased,
-                bifrost_net::AccountId("metered".to_owned()),
-            );
-            let conn = AsyncSmtpConnection::from_transcript_metered(
-                transcript.clone(),
-                &hello(),
-                Protocol::Smtp,
-                WireMetering::new(Some(handle), None),
-            )
-            .await
-            .unwrap();
-            let pool = pool_with(conn, Protocol::Smtp).await;
-            let transport = AsyncSmtpTransport::<TokioExecutor> {
-                inner: Arc::clone(&pool),
-            };
-
-            let outcome = transport
-                .send_raw_batch_with_options(
-                    Some("sender@example.com".parse().unwrap()),
-                    batch(&["first@example.com"]),
-                    b"body",
-                    &SendOptions::default(),
-                )
-                .await
-                .unwrap();
-            settle().await;
-            assert_eq!(outcome.succeeded().len(), 1);
-
-            let sent = sink.bytes_out.load(Ordering::Relaxed);
-            let received = sink.bytes_in.load(Ordering::Relaxed);
-            assert!(
-                sent > 0,
-                "the commands and body the transport wrote must be metered"
-            );
-            assert!(
-                received > 0,
-                "the server's replies must be metered too - a cap that\
-                 counted only one direction would misreport usage"
-            );
-        }
-
-        /// The complement: an unmetered transport is the default, and must
-        /// stay free of any accounting overhead or behaviour change.
-        #[tokio::test(crate = "tokio")]
-        async fn an_unmetered_transport_is_the_default() {
-            let info = SmtpInfo::new("transcript.invalid", Protocol::Smtp);
-            assert!(
-                !info.metering.is_enabled(),
-                "metering is opt-in; a plain transport must not meter"
-            );
-        }
-
-        /// The SMTP contrast case on the async path: the connection goes back
-        /// to the pool and the next batch reuses it without a reconnect.
-        #[tokio::test(crate = "tokio")]
-        async fn tokio_smtp_batch_send_recycles_and_reuses_its_pooled_connection() {
+        /// SMTP is the contrast case: the same entry point on a healthy SMTP
+        /// connection returns it to the pool, and the next batch reuses it
+        /// without a reconnect.
+        #[test]
+        fn smtp_batch_send_recycles_and_reuses_its_pooled_connection() {
             let transcript = Transcript::new("220 smtp.example\r\n")
                 .expect("EHLO client.example\r\n", "250 smtp.example\r\n")
                 .expect("MAIL FROM:<sender@example.com>\r\n", "250 sender ok\r\n")
@@ -1540,19 +1324,18 @@ mod tests {
                 .expect("DATA\r\n", "354 send body\r\n")
                 .expect("body", "")
                 .expect("\r\n.\r\n", "250 queued\r\n")
-                // Second transaction: no greeting, no EHLO. A reconnect would
-                // have to write EHLO here and fail the transcript.
+                // Second transaction: no greeting, no EHLO. Any reconnect
+                // would have to write EHLO here and fail the transcript.
                 .expect("MAIL FROM:<sender@example.com>\r\n", "250 sender ok\r\n")
                 .expect("RCPT TO:<second@example.com>\r\n", "250 second ok\r\n")
                 .expect("DATA\r\n", "354 send body\r\n")
                 .expect("body", "")
                 .expect("\r\n.\r\n", "250 queued\r\n");
             let conn =
-                AsyncSmtpConnection::from_transcript(transcript.clone(), &hello(), Protocol::Smtp)
-                    .await
+                SmtpConnection::from_transcript(transcript.clone(), &hello(), Protocol::Smtp)
                     .unwrap();
-            let pool = pool_with(conn, Protocol::Smtp).await;
-            let transport = AsyncSmtpTransport::<TokioExecutor> {
+            let pool = pool_with(conn, Protocol::Smtp);
+            let transport = SmtpTransport {
                 inner: Arc::clone(&pool),
             };
 
@@ -1563,12 +1346,10 @@ mod tests {
                     b"body",
                     &SendOptions::default(),
                 )
-                .await
                 .unwrap();
-            settle().await;
             assert_eq!(first.succeeded().len(), 1);
             assert_eq!(
-                pool.idle_count_for_test().await,
+                pool.idle_count_for_test(),
                 1,
                 "a healthy SMTP connection must be recycled"
             );
@@ -1580,33 +1361,29 @@ mod tests {
                     b"body",
                     &SendOptions::default(),
                 )
-                .await
                 .unwrap();
-            settle().await;
             assert_eq!(second.succeeded().len(), 1);
-            assert_eq!(pool.idle_count_for_test().await, 1);
+            assert_eq!(pool.idle_count_for_test(), 1);
             transcript.assert_exhausted();
         }
 
-        /// Batch input is validated before a connection is taken out of the
-        /// pool. Duplicate ids would make the per-item outcome lanes
-        /// ambiguous, and discovering that after checkout would burn a
-        /// connection (or, worse, open a transaction) over a caller bug. The
-        /// pool here is shut down, so any checkout attempt fails loudly with
-        /// a different error than the one asserted.
-        #[tokio::test(crate = "tokio")]
-        async fn invalid_batch_input_is_rejected_before_pool_checkout() {
+        /// A batch whose recipient ids are unusable must be rejected before
+        /// checkout. The pool is shut down first, so reaching checkout would
+        /// yield a transport-shutdown error instead - and dial nothing either
+        /// way.
+        #[test]
+        fn invalid_batch_input_is_rejected_before_pool_checkout() {
             let pool = Pool::new(
                 PoolConfig::new(),
-                AsyncSmtpClient::<TokioExecutor> {
+                SmtpClient {
                     info: SmtpInfo::new("transcript.invalid", Protocol::Smtp),
-                    marker_: PhantomData,
                 },
             );
-            pool.shutdown().await;
-            let transport = AsyncSmtpTransport::<TokioExecutor> {
+            pool.shutdown();
+            let transport = SmtpTransport {
                 inner: Arc::clone(&pool),
             };
+
             let duplicated = vec![
                 BatchItem::new(
                     BatchItemId("dup".to_owned()),
@@ -1617,7 +1394,6 @@ mod tests {
                     "second@example.com".parse().unwrap(),
                 ),
             ];
-
             let error = transport
                 .send_raw_batch_with_options(
                     Some("sender@example.com".parse().unwrap()),
@@ -1625,9 +1401,7 @@ mod tests {
                     b"body",
                     &SendOptions::default(),
                 )
-                .await
                 .expect_err("duplicate batch ids are refused");
-
             assert!(
                 matches!(
                     error.kind(),
@@ -1636,6 +1410,20 @@ mod tests {
                 "expected BatchInputInvalid before checkout, got {:?}",
                 error.kind()
             );
+
+            let empty: Vec<BatchItem<crate::address::Address>> = Vec::new();
+            let error = transport
+                .send_raw_batch_with_options(
+                    Some("sender@example.com".parse().unwrap()),
+                    empty,
+                    b"body",
+                    &SendOptions::default(),
+                )
+                .expect_err("an empty batch is refused");
+            assert!(matches!(
+                error.kind(),
+                AccountErrorKind::Request(RequestErrorKind::BatchInputInvalid)
+            ));
         }
     }
 }

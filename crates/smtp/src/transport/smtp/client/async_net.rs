@@ -19,18 +19,9 @@ use tokio::time::Sleep;
 use tokio_native_tls::TlsStream as TokioTlsStream;
 
 use super::metering::WireMetering;
+use super::net::resolved_address_filter;
 use super::{ConnectionState, TlsParameters};
 use crate::transport::smtp::{Error, error};
-
-fn resolved_address_filter(resolved_addr: &SocketAddr, local_addr: Option<IpAddr>) -> bool {
-    match local_addr {
-        Some(local_addr) => match resolved_addr.ip() {
-            IpAddr::V4(_) => local_addr.is_ipv4(),
-            IpAddr::V6(_) => local_addr.is_ipv6(),
-        },
-        None => true,
-    }
-}
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct AsyncDeadline {
@@ -359,7 +350,9 @@ impl AsyncNetworkStream {
 
     /// DER of the peer (server) certificate when the connection is TLS.
     ///
-    /// The DER feeds RFC 5929 channel binding through the native-tls session.
+    /// See `NetworkStream::peer_certificate_der` for the contract; this is
+    /// the Tokio sibling reaching the same native-tls session through
+    /// `tokio_native_tls::TlsStream::get_ref`.
     // Plumbing for SCRAM-PLUS channel binding; the first consumer is the
     // SASL layer, so there is no in-crate caller yet.
     #[allow(dead_code)]

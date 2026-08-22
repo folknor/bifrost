@@ -29,9 +29,9 @@
 //! * Modern: unicode support for email contents and sender/recipient addresses when compatible
 //! * Fast: supports connection reuse and pooling
 //!
-//! [`AsyncLmtpTransport`] provides the same transport shape for local delivery
-//! over LMTP, returning one status per recipient. It supports both TCP LMTP
-//! and Unix-domain LMTP sockets on Unix platforms.
+//! [`LmtpTransport`] and [`AsyncLmtpTransport`] provide the same transport
+//! shape for local delivery over LMTP, returning one status per recipient.
+//! They support both TCP LMTP and Unix-domain LMTP sockets on Unix platforms.
 //!
 //! This client is designed to send emails to a relay server, and should *not* be used to send
 //! emails directly to the destination server.
@@ -44,9 +44,9 @@
 //! do the following:
 //!
 //! ```rust,no_run
-//! # async fn test() -> Result<(), Box<dyn std::error::Error>> {
+//! # fn test() -> Result<(), Box<dyn std::error::Error>> {
 //! use bifrost_smtp::{
-//!     AsyncSmtpTransport, AsyncTransport, Message, TokioExecutor,
+//!     Message, SmtpTransport, Transport,
 //!     message::header::ContentType,
 //!     transport::smtp::authentication::{Credentials, Mechanism},
 //! };
@@ -60,7 +60,7 @@
 //!     .body(String::from("Be happy!"))?;
 //!
 //! // Create the SMTPS transport
-//! let sender = AsyncSmtpTransport::<TokioExecutor>::relay("smtp.example.com")?
+//! let sender = SmtpTransport::relay("smtp.example.com")?
 //!     // Add credentials for authentication
 //!     .password("username", "password")
 //!     // Optionally configure expected authentication mechanism
@@ -68,7 +68,7 @@
 //!     .build();
 //!
 //! // Send the email via remote relay
-//! sender.send(&email).await?;
+//! sender.send(&email)?;
 //! # Ok(())
 //! # }
 //! ```
@@ -78,12 +78,12 @@
 //! It can be very repetitive to ask the user for every SMTP connection parameter.
 //! In some cases this can be simplified by using a connection URI instead.
 //!
-//! For more information take a look at [`AsyncSmtpTransport::from_url`].
+//! For more information take a look at [`SmtpTransport::from_url`] or [`AsyncSmtpTransport::from_url`].
 //!
 //! ```rust,no_run
-//! # async fn test() -> Result<(), Box<dyn std::error::Error>> {
+//! # fn test() -> Result<(), Box<dyn std::error::Error>> {
 //! use bifrost_smtp::{
-//!     AsyncSmtpTransport, AsyncTransport, Message, TokioExecutor,
+//!     Message, SmtpTransport, Transport,
 //!     message::header::ContentType,
 //!     transport::smtp::authentication::Mechanism,
 //! };
@@ -97,10 +97,10 @@
 //!     .body(String::from("Be happy!"))?;
 //!
 //! // Create the SMTPS transport
-//! let sender = AsyncSmtpTransport::<TokioExecutor>::from_url("smtps://username:password@smtp.example.com")?.build();
+//! let sender = SmtpTransport::from_url("smtps://username:password@smtp.example.com")?.build();
 //!
 //! // Send the email via remote relay
-//! sender.send(&email).await?;
+//! sender.send(&email)?;
 //! # Ok(())
 //! # }
 //! ```
@@ -108,11 +108,11 @@
 //! #### Advanced configuration with custom TLS settings
 //!
 //! ```rust,no_run
-//! # async fn test() -> Result<(), Box<dyn std::error::Error>> {
+//! # fn test() -> Result<(), Box<dyn std::error::Error>> {
 //! use std::fs;
 //!
 //! use bifrost_smtp::{
-//!     AsyncSmtpTransport, AsyncTransport, Message, TokioExecutor,
+//!     Message, SmtpTransport, Transport,
 //!     message::header::ContentType,
 //!     transport::smtp::{Certificate, Tls, TlsParameters},
 //! };
@@ -133,28 +133,28 @@
 //!     .build()?;
 //!
 //! // Create the SMTPS transport
-//! let sender = AsyncSmtpTransport::<TokioExecutor>::relay("smtp.example.com")?
+//! let sender = SmtpTransport::relay("smtp.example.com")?
 //!     .tls(Tls::Wrapper(tls))
 //!     .build();
 //!
 //! // Send the email via remote relay
-//! sender.send(&email).await?;
+//! sender.send(&email)?;
 //! # Ok(())
 //! # }
 //! ```
 //!
 //! #### Connection pooling
 //!
-//! [`AsyncSmtpTransport`] stores connections in
+//! [`SmtpTransport`] and [`AsyncSmtpTransport`] store connections in
 //! a connection pool by default. This avoids connecting and disconnecting
 //! from the relay server for every message the application tries to send. For the connection pool
 //! to work the instance of the transport **must** be reused.
 //! In a webserver context it may go about this:
 //!
 //! ```rust,no_run
-//! # async fn test() {
+//! # fn test() {
 //! use bifrost_smtp::{
-//!     AsyncSmtpTransport, AsyncTransport, Message, TokioExecutor,
+//!     Message, SmtpTransport, Transport,
 //!     message::header::ContentType,
 //! };
 //! #
@@ -163,18 +163,18 @@
 //! /// The global application state
 //! #[derive(Debug)]
 //! struct AppState {
-//!     smtp: AsyncSmtpTransport<TokioExecutor>,
+//!     smtp: SmtpTransport,
 //!     // ... other global application parameters
 //! }
 //!
 //! impl AppState {
 //!     pub fn new(smtp_url: &str) -> Result<Self> {
-//!         let smtp = AsyncSmtpTransport::<TokioExecutor>::from_url(smtp_url)?.build();
+//!         let smtp = SmtpTransport::from_url(smtp_url)?.build();
 //!         Ok(Self { smtp })
 //!     }
 //! }
 //!
-//! async fn handle_request(app_state: &AppState) -> Result<String> {
+//! fn handle_request(app_state: &AppState) -> Result<String> {
 //!     let email = Message::builder()
 //!         .from("NoBody <nobody@domain.tld>".parse()?)
 //!         .reply_to("Yuin <yuin@domain.tld>".parse()?)
@@ -184,7 +184,7 @@
 //!         .body(String::from("Be happy!"))?;
 //!
 //!     // Send the email via remote relay
-//!     app_state.smtp.send(&email).await?;
+//!     app_state.smtp.send(&email)?;
 //!
 //!     Ok("The email has successfully been sent!".to_owned())
 //! }
@@ -199,21 +199,25 @@ pub use self::client::UNLIMITED_BANDWIDTH;
 
 pub(crate) use bifrost_types::error::Protocol;
 
+#[cfg(feature = "tokio")]
 // pub: async SMTP and LMTP transports are the tokio user-facing API.
 pub use self::async_transport::{
     AsyncLmtpTransport, AsyncLmtpTransportBuilder, AsyncSmtpTransport, AsyncSmtpTransportBuilder,
 };
+#[cfg(feature = "tokio")]
 pub(crate) use self::client::AsyncSmtpConnection;
+pub(crate) use self::client::SmtpConnection;
 // pub: callers configure SMTP TLS roots and client identities explicitly.
 pub use self::client::{Certificate, Identity};
 // pub: callers choose SMTP TLS mode, SNI, and native-tls parameters.
 pub use self::client::{CertificateStore, Tls, TlsParameters, TlsParametersBuilder, TlsVersion};
 // pub: callers tune connection pooling on transport builders.
 pub use self::pool::PoolConfig;
-// pub: SMTP transports return rich protocol errors and send options.
+// pub: SMTP transports return rich protocol errors, send options, and builders.
 pub use self::{
     error::{Error, ErrorKind},
     extension::SendOptions,
+    transport::{LmtpTransport, LmtpTransportBuilder, SmtpTransport, SmtpTransportBuilder},
 };
 use crate::transport::smtp::{
     authentication::{Credentials, DEFAULT_MECHANISMS, Mechanism},
@@ -222,6 +226,7 @@ use crate::transport::smtp::{
 };
 
 mod account_error;
+#[cfg(feature = "tokio")]
 mod async_transport;
 // pub: users select credential kinds and explicit SASL mechanisms.
 pub mod authentication;
@@ -237,6 +242,7 @@ mod pool;
 pub mod response;
 #[cfg(test)]
 mod test_support;
+mod transport;
 pub(super) mod util;
 
 // Registered port numbers:
@@ -343,6 +349,10 @@ impl SmtpInfo {
     fn set_authentication(&mut self, mechanisms: Vec<Mechanism>) {
         self.authentication = mechanisms;
         self.authentication_configured = true;
+    }
+
+    fn uses_tls(&self) -> bool {
+        !matches!(self.tls, Tls::None)
     }
 
     fn ensure_can_authenticate(&self, encrypted: bool) -> Result<(), Error> {

@@ -64,6 +64,16 @@ impl SmtpErrorContext {
         }
     }
 
+    pub(crate) fn with_scope(mut self, scope: ErrorScope) -> Self {
+        self.scope = Some(scope);
+        self
+    }
+
+    pub(crate) fn with_attempt(mut self, state: SmtpTransmissionState) -> Self {
+        self.transmission_state = Some(state);
+        self
+    }
+
     pub(crate) fn with_phase(mut self, phase: SmtpCommandPhase) -> Self {
         self.phase = Some(phase);
         self

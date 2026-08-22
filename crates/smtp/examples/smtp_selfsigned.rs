@@ -1,0 +1,41 @@
+use std::fs;
+
+use bifrost_smtp::{
+    Message, SmtpTransport, Transport,
+    message::header::ContentType,
+    transport::smtp::{Certificate, Tls, TlsParameters},
+};
+
+fn main() {
+    tracing_subscriber::fmt::init();
+
+    let email = Message::builder()
+        .from("NoBody <nobody@domain.tld>".parse().unwrap())
+        .reply_to("Yuin <yuin@domain.tld>".parse().unwrap())
+        .to("Hei <hei@domain.tld>".parse().unwrap())
+        .subject("Happy new year")
+        .header(ContentType::TEXT_PLAIN)
+        .body(String::from("Be happy!"))
+        .unwrap();
+
+    // Use a custom certificate stored on disk to verify the server certificate.
+    let pem_cert = fs::read("certificate.pem").unwrap();
+    let cert = Certificate::from_pem(&pem_cert).unwrap();
+    let tls = TlsParameters::builder("smtp.server.com".to_owned())
+        .add_root_certificate(cert)
+        .build()
+        .unwrap();
+
+    // Open a TLS-wrapped connection to the SMTP server.
+    let mailer = SmtpTransport::builder_dangerous("smtp.server.com")
+        .port(465)
+        .tls(Tls::Wrapper(tls))
+        .password("user@example.com", "smtp_password")
+        .build();
+
+    // Send the email
+    match mailer.send(&email) {
+        Ok(_) => println!("Email sent successfully!"),
+        Err(e) => panic!("Could not send email: {e:?}"),
+    }
+}

@@ -2,11 +2,16 @@ use std::fmt::Debug;
 use std::path::Path;
 use std::time::Duration;
 
+#[cfg(feature = "tokio")]
 use crate::transport::smtp::AsyncSmtpConnection;
+#[cfg(feature = "tokio")]
 use crate::transport::smtp::Error;
+#[cfg(feature = "tokio")]
 use crate::transport::smtp::Protocol;
+#[cfg(feature = "tokio")]
 use crate::transport::smtp::Tls;
 use crate::transport::smtp::WireMetering;
+#[cfg(feature = "tokio")]
 use crate::transport::smtp::extension::ClientId;
 
 /// Async executor abstraction trait
@@ -15,6 +20,7 @@ use crate::transport::smtp::extension::ClientId;
 /// Tokio-backed abstraction.
 ///
 /// [`AsyncSmtpTransport`]: crate::AsyncSmtpTransport
+#[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
 pub trait Executor: Debug + Send + Sync + 'static + private::Sealed {
     #[allow(private_bounds)]
     type Handle: SpawnHandle;
@@ -63,9 +69,12 @@ pub(crate) trait SmtpExecutor: Executor {
 /// [`AsyncSmtpTransport`]: crate::AsyncSmtpTransport
 #[allow(missing_copy_implementations)]
 #[non_exhaustive]
+#[cfg(feature = "tokio")]
+#[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
 #[derive(Debug)]
 pub struct TokioExecutor;
 
+#[cfg(feature = "tokio")]
 impl Executor for TokioExecutor {
     type Handle = tokio::task::JoinHandle<()>;
     type Sleep = tokio::time::Sleep;
@@ -83,6 +92,7 @@ impl Executor for TokioExecutor {
     }
 }
 
+#[cfg(feature = "tokio")]
 impl SmtpExecutor for TokioExecutor {
     async fn connect(
         hostname: &str,
@@ -147,6 +157,7 @@ impl SmtpExecutor for TokioExecutor {
     }
 }
 
+#[cfg(feature = "tokio")]
 impl SpawnHandle for tokio::task::JoinHandle<()> {
     async fn shutdown(&self) {
         self.abort();
@@ -156,7 +167,9 @@ impl SpawnHandle for tokio::task::JoinHandle<()> {
 mod private {
     pub trait Sealed {}
 
+    #[cfg(feature = "tokio")]
     impl Sealed for super::TokioExecutor {}
 
+    #[cfg(feature = "tokio")]
     impl Sealed for tokio::task::JoinHandle<()> {}
 }

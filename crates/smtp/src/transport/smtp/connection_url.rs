@@ -2,8 +2,11 @@ use std::borrow::Cow;
 
 use url::Url;
 
+#[cfg(feature = "tokio")]
 use super::AsyncSmtpTransportBuilder;
-use super::{Error, SMTP_PORT, authentication::Credentials, error, extension::ClientId};
+use super::{
+    Error, SMTP_PORT, SmtpTransportBuilder, authentication::Credentials, error, extension::ClientId,
+};
 use super::{SUBMISSION_PORT, SUBMISSIONS_PORT};
 use super::{Tls, TlsParameters};
 
@@ -15,6 +18,29 @@ pub(crate) trait TransportBuilder {
     fn hello_name(self, name: ClientId) -> Self;
 }
 
+impl TransportBuilder for SmtpTransportBuilder {
+    fn new<T: Into<String>>(server: T) -> Self {
+        Self::new(server)
+    }
+
+    fn tls(self, tls: super::Tls) -> Self {
+        self.tls(tls)
+    }
+
+    fn port(self, port: u16) -> Self {
+        self.port(port)
+    }
+
+    fn credentials(self, credentials: Credentials) -> Self {
+        self.credentials(credentials)
+    }
+
+    fn hello_name(self, name: ClientId) -> Self {
+        self.hello_name(name)
+    }
+}
+
+#[cfg(feature = "tokio")]
 impl TransportBuilder for AsyncSmtpTransportBuilder {
     fn new<T: Into<String>>(server: T) -> Self {
         Self::new(server)
@@ -37,7 +63,7 @@ impl TransportBuilder for AsyncSmtpTransportBuilder {
     }
 }
 
-/// Create a new `AsyncSmtpTransportBuilder` from a connection URL.
+/// Create a new `SmtpTransportBuilder` or `AsyncSmtpTransportBuilder` from a connection URL
 pub(crate) fn from_connection_url<B: TransportBuilder>(connection_url: &str) -> Result<B, Error> {
     let connection_url = Url::parse(connection_url).map_err(error::connection)?;
     let tls: Option<String> = connection_url

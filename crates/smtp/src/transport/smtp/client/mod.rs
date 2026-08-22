@@ -1,19 +1,47 @@
-//! Async SMTP client internals.
+//! SMTP client
+//!
+//! `SmtpConnection` allows manually sending SMTP commands.
+//!
+//! ```rust,no_run
+//! # use std::error::Error;
+//!
+//! # //! # fn main() -> Result<(), Box<dyn Error>> {
+//! use bifrost_smtp::transport::smtp::{
+//!     SMTP_PORT, client::SmtpConnection, commands::*, extension::ClientId,
+//! };
+//!
+//! let hello = ClientId::Domain("my_hostname".to_owned());
+//! let mut client = SmtpConnection::connect(&("localhost", SMTP_PORT), None, &hello, None, None)?;
+//! client.command(Mail::new(Some("user@example.com".parse()?), vec![]))?;
+//! client.command(Rcpt::new("user@example.org".parse()?, vec![]))?;
+//! client.command(Data)?;
+//! client.message("Test email".as_bytes())?;
+//! client.command(Quit)?;
+//! # Ok(())
+//! # }
+//! ```
 
 #[cfg(feature = "serde")]
 use std::fmt::Debug;
 
 use crate::transport::smtp::{Error, error};
 
+#[cfg(feature = "tokio")]
 pub(crate) use self::async_connection::AsyncSmtpConnection;
+pub(crate) use self::connection::SmtpConnection;
+use self::net::NetworkStream;
 // pub: re-exported by smtp for caller-supplied native-tls credentials.
 pub use self::tls::{Certificate, Identity};
 // pub: re-exported by smtp for caller-supplied SMTP TLS configuration.
 pub use self::tls::{CertificateStore, Tls, TlsParameters, TlsParametersBuilder, TlsVersion};
 
+#[cfg(feature = "tokio")]
 mod async_connection;
+#[cfg(feature = "tokio")]
 mod async_net;
+mod connection;
 pub(crate) mod metering;
+mod net;
 mod tls;
 
 pub(crate) use self::metering::WireMetering;
