@@ -69,6 +69,8 @@ pub(crate) use pool::{Pool, PooledConn};
 
 const STREAM_CAPACITY: usize = 64;
 const BATCH_ITEMS: usize = 128;
+/// Maximum decoded target ids retained before a get or mutation stream flushes.
+const TARGET_BUFFER_ITEMS: usize = 256;
 const UNLIMITED_BANDWIDTH: u64 = u64::MAX;
 
 /// Open IMAP account handle. The handle owns the connection pool.
@@ -85,6 +87,7 @@ pub(crate) struct ImapAccountInner {
     pub(crate) qresync_enabled: AtomicBool,
     pub(crate) qresync_negotiation_warning: Option<String>,
     pub(crate) qresync_negotiation_warning_sent: AtomicBool,
+    pub(crate) supports_notify: bool,
     pub(crate) shutdown: CancellationToken,
     pub(crate) closed: AtomicBool,
     pub(crate) priority: AtomicU8,
@@ -107,6 +110,7 @@ pub(crate) struct ImapAccountParts {
     pub(crate) folders: Arc<FolderRegistry>,
     pub(crate) qresync_enabled: bool,
     pub(crate) qresync_negotiation_warning: Option<String>,
+    pub(crate) supports_notify: bool,
     pub(crate) bandwidth_cap: Arc<AtomicU64>,
     pub(crate) contacts: Option<Arc<dyn Account>>,
     pub(crate) calendars: Option<Arc<dyn Account>>,
@@ -116,6 +120,7 @@ pub(crate) struct ImapAccountParts {
 
 impl ImapAccount {
     pub(crate) fn new(parts: ImapAccountParts) -> Self {
+        let push = push::PushState::new(parts.supports_notify, parts.config.idle_connection_budget);
         Self {
             inner: Arc::new(ImapAccountInner {
                 config: parts.config,
@@ -125,11 +130,12 @@ impl ImapAccount {
                 qresync_enabled: AtomicBool::new(parts.qresync_enabled),
                 qresync_negotiation_warning: parts.qresync_negotiation_warning,
                 qresync_negotiation_warning_sent: AtomicBool::new(false),
+                supports_notify: parts.supports_notify,
                 shutdown: CancellationToken::new(),
                 closed: AtomicBool::new(false),
                 priority: AtomicU8::new(Priority::Normal as u8),
                 bandwidth_cap: parts.bandwidth_cap,
-                push: push::PushState::new(),
+                push,
                 contacts: parts.contacts,
                 calendars: parts.calendars,
                 submission: parts.submission,
@@ -366,13 +372,7 @@ impl Account for ImapAccount {
         &self,
         scopes: &[CursorScope],
     ) -> AccountFuture<Result<bifrost_types::PushSubscription, AccountError>> {
-        let scopes = scopes.to_vec();
-        let future = push::push_subscribe(self.clone(), scopes.clone());
-        Box::pin(async move {
-            future
-                .await
-                .map(|handle| bifrost_types::PushSubscription::all_succeeded(handle, &scopes))
-        })
+        push::push_subscribe(self.clone(), scopes.to_vec())
     }
 
     // Account: unsubscribes the synthetic in-process push handle; direct users call notify_none().

@@ -10,7 +10,7 @@ use crate::types::MailboxName;
 use super::factory::ImapAccountConfig;
 
 struct PoolMember {
-    conn: ImapConnection,
+    conn: Arc<ImapConnection>,
     selected: Option<MailboxName>,
 }
 
@@ -25,13 +25,17 @@ struct PoolInner {
     meter: Option<bifrost_net::MeterSinkHandle>,
     bandwidth_cap: Arc<AtomicU64>,
     closed: std::sync::atomic::AtomicBool,
-    /// The push loop's dedicated IDLE connection, if one is currently
-    /// dialed. Held weakly: the loop owns it, and a redial replaces the
-    /// registration. Without this `close()` has no way to reach it - it is
-    /// never in `idle`, so the drain would return with the IDLE session
-    /// still logged in, and `Account::close()` returning would not mean the
-    /// sessions are gone.
-    idle_conn: Mutex<Option<std::sync::Weak<ImapConnection>>>,
+    /// Every live session minted by this pool, including checked-out and
+    /// push sessions. Weak entries do not extend their lifetime, but let
+    /// close reach sessions which are outside the parked list.
+    ///
+    /// This mutex is also the linearization point for closure: `close`
+    /// stores `closed` before it drains here, and registration re-reads
+    /// `closed` while holding it. A dial that reaches the lock first is
+    /// therefore seen by the drain; one that reaches it after the drain
+    /// observes the flag and terminates itself. Nothing can land a live
+    /// session on the far side of a completed close.
+    sessions: Mutex<Vec<std::sync::Weak<ImapConnection>>>,
 }
 
 impl Pool {
@@ -42,6 +46,8 @@ impl Pool {
         meter: Option<bifrost_net::MeterSinkHandle>,
         bandwidth_cap: Arc<AtomicU64>,
     ) -> Self {
+        let primed = Arc::new(primed);
+        let primed_weak = Arc::downgrade(&primed);
         Self {
             inner: Arc::new(PoolInner {
                 permits: Arc::new(Semaphore::new(data_cap.max(1))),
@@ -53,7 +59,7 @@ impl Pool {
                 meter,
                 bandwidth_cap,
                 closed: std::sync::atomic::AtomicBool::new(false),
-                idle_conn: Mutex::new(None),
+                sessions: Mutex::new(vec![primed_weak]),
             }),
         }
     }
@@ -62,13 +68,7 @@ impl Pool {
         &self,
         folder: &MailboxName,
     ) -> Result<PooledConn, Error> {
-        if self.inner.closed.load(std::sync::atomic::Ordering::Acquire) {
-            return Err(Error::closed());
-        }
-        let permit = Arc::clone(&self.inner.permits)
-            .acquire_owned()
-            .await
-            .map_err(|_| Error::closed())?;
+        let permit = self.inner.permit().await?;
         let member = {
             let mut idle = self.inner.idle.lock().expect("pool lock poisoned");
             idle.retain(|member| member.conn.is_alive());
@@ -96,13 +96,7 @@ impl Pool {
     /// safely reuse any parked connection, including one left selected by a
     /// folder-scoped operation.
     pub(crate) async fn checkout_any(&self) -> Result<PooledConn, Error> {
-        if self.inner.closed.load(std::sync::atomic::Ordering::Acquire) {
-            return Err(Error::closed());
-        }
-        let permit = Arc::clone(&self.inner.permits)
-            .acquire_owned()
-            .await
-            .map_err(|_| Error::closed())?;
+        let permit = self.inner.permit().await?;
         let member = {
             let mut idle = self.inner.idle.lock().expect("pool lock poisoned");
             idle.retain(|member| member.conn.is_alive());
@@ -125,60 +119,84 @@ impl Pool {
     /// Dial the dedicated connection used exclusively by the long-lived IDLE
     /// loop. Ordinary account operations must use a checkout method instead.
     pub(crate) async fn dial_idle(&self) -> Result<Arc<ImapConnection>, Error> {
-        if self.inner.closed.load(std::sync::atomic::Ordering::Acquire) {
-            return Err(Error::closed());
-        }
-        let conn = Arc::new(self.inner.dial().await?);
-        *self
-            .inner
-            .idle_conn
-            .lock()
-            .expect("pool idle-conn lock poisoned") = Some(Arc::downgrade(&conn));
-        Ok(conn)
+        self.inner.dial().await
     }
 
     pub(crate) async fn close(&self) {
         self.inner
             .closed
             .store(true, std::sync::atomic::Ordering::Release);
+        // Wake every checkout blocked on a permit so none lingers past
+        // close waiting for a permit that will never be returned; the
+        // post-acquire re-check turns a permit that does arrive into
+        // `Error::closed` rather than a fresh session.
+        self.inner.permits.close();
         let members = {
             let mut idle = self.inner.idle.lock().expect("pool lock poisoned");
             std::mem::take(&mut *idle)
         };
-        let idle_conn = self
+        // Drain under the same mutex registration re-checks `closed` under.
+        // Everything already minted is here; anything mid-dial observes the
+        // flag when it arrives and terminates itself instead of registering.
+        let sessions: Vec<_> = self
             .inner
-            .idle_conn
+            .sessions
             .lock()
-            .expect("pool idle-conn lock poisoned")
-            .take()
-            .and_then(|weak| weak.upgrade());
-        if let Some(conn) = idle_conn {
-            // Best effort under the same drain budget as the parked
-            // members: the push loop may be parked in `idle()`, and the
-            // LOGOUT is what tells the server this session is over.
-            let _ =
-                tokio::time::timeout(self.inner.config.imap.command_timeout, conn.logout()).await;
-        }
-        if members.is_empty() {
-            return;
-        }
+            .expect("pool sessions lock poisoned")
+            .drain(..)
+            .filter_map(|weak| weak.upgrade())
+            .collect();
+        drop(members);
         // LOGOUT is best effort and the pool is already gated shut, so the
         // drain must not be able to hold `Account::close` open. Members go
         // out concurrently (a silent peer must not make the others wait its
         // turn) under one `command_timeout` for the whole drain, which is
         // the bound every other command in the account layer already has.
-        let drain = futures::future::join_all(members.into_iter().map(|member| async move {
-            let _ = member.conn.logout().await;
+        let drain = futures::future::join_all(sessions.iter().map(|conn| async move {
+            let _ = conn.logout().await;
         }));
         let _ = tokio::time::timeout(self.inner.config.imap.command_timeout, drain).await;
+        for conn in sessions {
+            conn.terminate().await;
+        }
     }
 }
 
 impl PoolInner {
+    fn is_closed(&self) -> bool {
+        self.closed.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Acquire one data-lane permit, refusing a closed pool on both sides of
+    /// the await. The pre-check is the cheap path; the post-check is the
+    /// load-bearing one, because `close` can land while this task is parked
+    /// on the semaphore and the permit it then receives must not become a
+    /// live session after the drain has already run.
+    async fn permit(&self) -> Result<OwnedSemaphorePermit, Error> {
+        if self.is_closed() {
+            return Err(Error::closed());
+        }
+        let permit = Arc::clone(&self.permits)
+            .acquire_owned()
+            .await
+            .map_err(|_| Error::closed())?;
+        if self.is_closed() {
+            return Err(Error::closed());
+        }
+        Ok(permit)
+    }
+
     /// Dial and authenticate one fresh connection under the pool's meter and
     /// bandwidth cap. The single place a pool connection is minted, so a
     /// future change to how connections are metered or capped lands once.
-    async fn dial(&self) -> Result<ImapConnection, Error> {
+    ///
+    /// A dial that started before `close` and completed after it is torn
+    /// down here rather than handed out: `Account::close()` promises no
+    /// session of this account is still connected when it returns.
+    async fn dial(&self) -> Result<Arc<ImapConnection>, Error> {
+        if self.is_closed() {
+            return Err(Error::closed());
+        }
         let (conn, _auth) = self
             .config
             .imap
@@ -189,7 +207,29 @@ impl PoolInner {
                 Some(Arc::clone(&self.bandwidth_cap)),
             )
             .await?;
+        let conn = Arc::new(conn);
+        if !self.register(&conn) {
+            let _ = conn.logout().await;
+            conn.terminate().await;
+            return Err(Error::closed());
+        }
         Ok(conn)
+    }
+
+    /// Record a freshly minted session, pruning entries whose connection has
+    /// already been dropped. Without the prune a long-lived account with
+    /// reconnecting IDLE workers grows this vector by one entry per dial for
+    /// as long as it stays open. Returns `false` when the pool closed before
+    /// this session could be registered, meaning the caller owns tearing it
+    /// down (the drain in `close` has already run and will not see it).
+    fn register(&self, conn: &Arc<ImapConnection>) -> bool {
+        let mut sessions = self.sessions.lock().expect("pool sessions lock poisoned");
+        if self.is_closed() {
+            return false;
+        }
+        sessions.retain(|weak| weak.strong_count() > 0);
+        sessions.push(Arc::downgrade(conn));
+        true
     }
 }
 
@@ -268,22 +308,8 @@ impl PooledConn {
         if let Some(old) = self.member.take() {
             let _ = old.conn.logout().await;
         }
-        if self.pool.closed.load(std::sync::atomic::Ordering::Acquire) {
-            return Err(Error::closed());
-        }
-        let (conn, _auth) = self
-            .pool
-            .config
-            .imap
-            .connect_authenticated_metered(
-                &self.pool.config.credentials,
-                &self.pool.config.auth_policy,
-                self.pool.meter.clone(),
-                Some(Arc::clone(&self.pool.bandwidth_cap)),
-            )
-            .await?;
         self.member = Some(PoolMember {
-            conn,
+            conn: self.pool.dial().await?,
             selected: None,
         });
         Ok(())
@@ -302,7 +328,7 @@ impl Drop for PooledConn {
                 crate::connection::SessionState::Logout
             )
             && member.conn.is_reusable()
-            && !self.pool.closed.load(std::sync::atomic::Ordering::Acquire)
+            && !self.pool.is_closed()
         {
             self.pool
                 .idle
@@ -323,7 +349,9 @@ mod tests {
 
     use super::super::factory::ImapAccountConfig;
     use super::{Pool, PoolMember};
-    use crate::connection::test_support::{driver_pair, preauth_greeting};
+    use crate::connection::test_support::{
+        driver_pair, preauth_greeting, read_line, respond, tag_of,
+    };
     use crate::error::Error;
     use crate::types::{AuthPolicy, Capability, Credentials, MailboxName};
 
@@ -366,6 +394,12 @@ mod tests {
     /// connection and the only other way in is a real dial, which no
     /// hermetic test may perform.
     fn park(pool: &Pool, conn: crate::ImapConnection, selected: Option<MailboxName>) {
+        let conn = Arc::new(conn);
+        pool.inner
+            .sessions
+            .lock()
+            .unwrap()
+            .push(Arc::downgrade(&conn));
         pool.inner
             .idle
             .lock()
@@ -559,26 +593,125 @@ mod tests {
         ));
     }
 
-    /// A checkout in flight when `close` runs is outside the idle list, so
-    /// `close` cannot log it out. Its drop must not resurrect the pool by
-    /// parking a live connection nobody will ever close.
+    /// Close reaches a checkout even while it is outside the parked list.
     #[tokio::test]
     async fn a_checkout_outstanding_at_close_is_not_parked_on_drop() {
-        let (primed, _primed_server) = marked("ACL").await;
+        let (primed, mut primed_server) = marked("ACL").await;
         let pool = pool_of(primed, 1);
 
         let conn = pool.checkout_for_folder(&folder("INBOX")).await.unwrap();
-        // The idle list is empty while the checkout is held, so close has
-        // nothing to log out and cannot block.
+        let server = tokio::spawn(async move {
+            let logout = read_line(&mut primed_server).await;
+            assert!(
+                logout.contains("LOGOUT"),
+                "close must reach the outstanding checkout: {logout}"
+            );
+            respond(
+                &mut primed_server,
+                &format!("* BYE closing\r\n{} OK done\r\n", tag_of(&logout)),
+            )
+            .await;
+        });
         tokio::time::timeout(Duration::from_secs(5), pool.close())
             .await
             .expect("close must not block");
+        server.await.unwrap();
         drop(conn);
 
         assert_eq!(
             idle_len(&pool),
             0,
             "a closed pool must not accept a returning checkout",
+        );
+    }
+
+    /// A checkout parked on the semaphore when `close` runs must not be
+    /// handed the permit and go on to dial. `close` drains `sessions` once;
+    /// a session minted after that drain is a live connection the consumer
+    /// has already been told is gone, which is exactly the guarantee this
+    /// pool now makes. The single permit is held for the whole test, so the
+    /// waiter can only ever be released by `close` itself.
+    #[tokio::test]
+    async fn a_checkout_blocked_on_a_permit_at_close_refuses_instead_of_dialing() {
+        let (primed, primed_server) = marked("ACL").await;
+        let pool = Arc::new(pool_of(primed, 1));
+        let held = pool.checkout_any().await.unwrap();
+        // No responder for the LOGOUT close issues; dropping the server end
+        // makes the drain fail fast instead of spending `command_timeout`.
+        drop(primed_server);
+
+        let waiting = tokio::spawn({
+            let pool = Arc::clone(&pool);
+            async move { pool.checkout_any().await.map(|_| ()) }
+        });
+        // Let the spawned checkout reach the semaphore before closing, so
+        // the post-acquire re-check is the thing under test rather than the
+        // cheap pre-check.
+        tokio::task::yield_now().await;
+        tokio::time::timeout(Duration::from_secs(5), pool.close())
+            .await
+            .expect("close must not block on the blocked waiter");
+
+        let outcome = tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("close must release a blocked checkout rather than strand it")
+            .unwrap();
+        assert!(
+            matches!(outcome, Err(Error::Closed { .. })),
+            "a checkout released by close must refuse, not mint a session: {outcome:?}",
+        );
+        drop(held);
+    }
+
+    /// The registration side of the same race. `dial` completing after the
+    /// drain must be refused rather than filed, because nothing would ever
+    /// tear it down: `close` has already run. This is `dial`'s decision
+    /// point, exercised directly - a hermetic test cannot make the real
+    /// handshake straddle `close`.
+    #[tokio::test]
+    async fn a_session_finished_after_close_is_refused_registration() {
+        let (primed, primed_server) = marked("ACL").await;
+        let (late, _late_server) = marked("BINARY").await;
+        let pool = pool_of(primed, 1);
+        drop(primed_server);
+
+        tokio::time::timeout(Duration::from_secs(5), pool.close())
+            .await
+            .expect("close must not block");
+
+        let late = Arc::new(late);
+        assert!(
+            !pool.inner.register(&late),
+            "a session that finished after the drain must not be filed as live",
+        );
+        assert!(
+            pool.inner.sessions.lock().unwrap().is_empty(),
+            "close leaves the registry drained",
+        );
+    }
+
+    /// The registry must not grow by one entry per dial for the life of the
+    /// account. A non-NOTIFY push worker redials on every network blip, so
+    /// an unpruned registry is an unbounded leak on exactly the path this
+    /// round added connections to. Registering many connections that are
+    /// each dropped immediately must leave the registry at live size.
+    #[tokio::test]
+    async fn registration_prunes_sessions_whose_connection_is_gone() {
+        let (primed, _primed_server) = marked("ACL").await;
+        let pool = pool_of(primed, 1);
+
+        for _ in 0..32 {
+            let (transient, transient_server) = marked("BINARY").await;
+            let transient = Arc::new(transient);
+            assert!(pool.inner.register(&transient));
+            drop(transient);
+            drop(transient_server);
+        }
+
+        let registered = pool.inner.sessions.lock().unwrap().len();
+        assert!(
+            registered <= 2,
+            "32 reconnects left {registered} registry entries; dead weak refs are retained",
         );
     }
 }

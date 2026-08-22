@@ -336,6 +336,16 @@ pub(crate) struct ImapConnection {
     abandoned: std::sync::atomic::AtomicBool,
 }
 
+impl ImapConnection {
+    /// Stop the driver task and drop its transport immediately.
+    pub(crate) async fn terminate(&self) {
+        if let Some(handle) = self.driver_handle.lock().await.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
+}
+
 /// Guard around one submitted command. Marks the connection abandoned
 /// unless [`completed`](Self::completed) is called, which happens only on
 /// the path where the driver's result has actually been received.

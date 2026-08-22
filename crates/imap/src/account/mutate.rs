@@ -40,7 +40,7 @@ pub(crate) fn bulk_destroy(
     mutation_stream(account, targets, MutationKind::Destroy)
 }
 
-enum MutationKind {
+pub(super) enum MutationKind {
     Flags(FlagOp),
     Move(MembershipScope),
     Destroy,
@@ -72,14 +72,36 @@ fn mutation_operation(kind: &MutationKind) -> AccountOperation {
     }
 }
 
-fn mutation_stream(
+pub(super) fn mutation_stream(
     account: ImapAccount,
     mut targets: AccountStream<bifrost_types::ObjectId>,
     kind: MutationKind,
 ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
     let (tx, rx) = tokio::sync::mpsc::channel(super::STREAM_CAPACITY);
     tokio::spawn(async move {
+        let move_destination = match validated_move_destination(&kind) {
+            Ok(destination) => destination,
+            Err(error) => {
+                while let Some(id) = targets.next().await {
+                    let item = BatchItemId(id.0);
+                    if tx
+                        .send(batch(
+                            vec![ItemOutcome::Failed(BatchFailure::new(item, error.clone()))],
+                            PageBoundary::Page,
+                            None,
+                        ))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                let _ = tx.send(SyncEvent::Done(None)).await;
+                return;
+            }
+        };
         let mut grouped: HashMap<String, (MailboxName, Vec<DecodedObjectId>)> = HashMap::new();
+        let mut buffered = 0usize;
         while let Some(id) = targets.next().await {
             match decode_object_id(&id) {
                 Ok(decoded) => {
@@ -88,93 +110,119 @@ fn mutation_stream(
                         .or_insert_with(|| (decoded.folder.clone(), Vec::new()))
                         .1
                         .push(decoded);
+                    buffered += 1;
                 }
                 Err(err) => {
                     let item_id = BatchItemId(id.0.clone());
-                    let _ = tx
+                    if tx
                         .send(batch(
                             vec![ItemOutcome::Failed(BatchFailure::new(item_id, err))],
                             PageBoundary::Page,
                             None,
                         ))
-                        .await;
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
                 }
             }
-        }
-
-        let move_destination = match validated_move_destination(&kind) {
-            Ok(destination) => destination,
-            Err(error) => {
-                let outcomes = grouped
-                    .into_values()
-                    .flat_map(|(_, ids)| failed_all(ids, error.clone()))
-                    .collect();
-                if tx
-                    .send(batch(outcomes, PageBoundary::Page, None))
-                    .await
-                    .is_err()
+            if buffered >= super::TARGET_BUFFER_ITEMS {
+                if flush_mutation_groups(
+                    &account,
+                    &mut grouped,
+                    &kind,
+                    move_destination.as_ref(),
+                    &tx,
+                )
+                .await
+                .is_err()
                 {
                     return;
                 }
-                let _ = tx.send(SyncEvent::Done(None)).await;
-                return;
+                buffered = 0;
             }
-        };
-
-        // Per-folder failure semantics:
-        // - A folder error after per-item emissions in any prior folder
-        //   must NOT collapse those items by emitting a global
-        //   `SyncEvent::Terminated`. The failing folder's items surface
-        //   as `ItemOutcome::Uncertain` carrying the classified error
-        //   (the engine cannot tell, post-hoc, whether the mutation
-        //   landed).
-        // - Stream-level `Terminated` is reserved for failures that
-        //   prevent any further folder attempts at all (auth lost,
-        //   schema break, capability shift). Those classify as
-        //   terminal or as an engine directive; we surface them with
-        //   `Terminated` and stop.
-        // - Anything else (transient transport, rate limit, per-folder
-        //   server error) emits per-item `Uncertain` for the failing
-        //   folder and continues to the next folder.
-        for (folder, ids) in sorted_mutation_groups(grouped) {
-            match run_folder_mutation(
-                &account,
-                &folder,
-                ids.clone(),
-                &kind,
-                move_destination.as_ref(),
-            )
-            .await
-            {
-                Ok(results) => {
-                    let _ = tx.send(batch(results, PageBoundary::Page, None)).await;
-                }
-                Err(err) => {
-                    let account_err = super::account_error_with(
-                        err,
-                        super::error::ImapErrorContext::operation(mutation_operation(&kind))
-                            .with_folder_scope(&folder),
-                    );
-                    if stream_terminating(&account_err) {
-                        let _ = tx.send(SyncEvent::Terminated(account_err)).await;
-                        return;
-                    }
-                    let uncertain = ids
-                        .into_iter()
-                        .map(|id| {
-                            let item = BatchItemId(
-                                super::encode_object_id(&id.folder, id.uidvalidity, id.uid).0,
-                            );
-                            ItemOutcome::Uncertain(BatchUncertain::new(item, account_err.clone()))
-                        })
-                        .collect();
-                    let _ = tx.send(batch(uncertain, PageBoundary::Page, None)).await;
-                }
-            }
+        }
+        if flush_mutation_groups(
+            &account,
+            &mut grouped,
+            &kind,
+            move_destination.as_ref(),
+            &tx,
+        )
+        .await
+        .is_err()
+        {
+            return;
         }
         let _ = tx.send(SyncEvent::Done(None)).await;
     });
     boxed_receiver_stream(rx)
+}
+
+async fn flush_mutation_groups(
+    account: &ImapAccount,
+    grouped: &mut HashMap<String, (MailboxName, Vec<DecodedObjectId>)>,
+    kind: &MutationKind,
+    move_destination: Option<&MailboxName>,
+    tx: &tokio::sync::mpsc::Sender<SyncEvent<ItemOutcome<MutationSuccess>>>,
+) -> Result<(), ()> {
+    // Per-folder failure semantics:
+    // - A folder error after per-item emissions in any prior folder
+    //   must NOT collapse those items by emitting a global
+    //   `SyncEvent::Terminated`. The failing folder's items surface
+    //   as `ItemOutcome::Uncertain` carrying the classified error
+    //   (the engine cannot tell, post-hoc, whether the mutation
+    //   landed).
+    // - Stream-level `Terminated` is reserved for failures that
+    //   prevent any further folder attempts at all (auth lost,
+    //   schema break, capability shift). Those classify as
+    //   terminal or as an engine directive; we surface them with
+    //   `Terminated` and stop.
+    // - Anything else (transient transport, rate limit, per-folder
+    //   server error) emits per-item `Uncertain` for the failing
+    //   folder and continues to the next folder.
+    for (folder, ids) in sorted_mutation_groups(std::mem::take(grouped)) {
+        match run_folder_mutation(account, &folder, ids.clone(), kind, move_destination).await {
+            Ok(results) => {
+                if tx
+                    .send(batch(results, PageBoundary::Page, None))
+                    .await
+                    .is_err()
+                {
+                    return Err(());
+                }
+            }
+            Err(err) => {
+                let account_err = super::account_error_with(
+                    err,
+                    super::error::ImapErrorContext::operation(mutation_operation(kind))
+                        .with_folder_scope(&folder),
+                );
+                if stream_terminating(&account_err) {
+                    let _ = tx.send(SyncEvent::Terminated(account_err)).await;
+                    return Err(());
+                }
+                let uncertain = ids
+                    .into_iter()
+                    .map(|id| {
+                        let item = BatchItemId(
+                            super::encode_object_id(&id.folder, id.uidvalidity, id.uid).0,
+                        );
+                        ItemOutcome::Uncertain(BatchUncertain::new(item, account_err.clone()))
+                    })
+                    .collect();
+                if tx
+                    .send(batch(uncertain, PageBoundary::Page, None))
+                    .await
+                    .is_err()
+                {
+                    return Err(());
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn sorted_mutation_groups(

@@ -3,8 +3,9 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bifrost_types::{
-    AccountError, AccountFuture, AccountOperation, AccountStream, CursorScope, HintPayload,
-    InvalidationHint, PushSource, SubscriptionHandle, WatchEvent,
+    AccountError, AccountErrorBuilder, AccountErrorKind, AccountFuture, AccountOperation,
+    AccountStream, BatchItemId, BatchOutcomeBuilder, Cause, CursorScope, HintPayload,
+    InvalidationHint, PushSource, RequestCause, SubscriptionHandle, WatchEvent,
 };
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
@@ -17,33 +18,50 @@ use super::{ImapAccount, account_error_with, boxed_receiver_stream, folder_scope
 pub(crate) struct PushState {
     tx: broadcast::Sender<WatchEvent>,
     scopes: Mutex<HashMap<String, HashSet<CursorScope>>>,
-    task_cancel: Mutex<Option<CancellationToken>>,
-    /// Wakes a parked IDLE loop when the subscribed scope set changes, so
-    /// a scope added after IDLE has already parked on one folder gets a
-    /// chance to be chosen instead of waiting for the current connection
-    /// to break. The loop re-evaluates `choose_idle_folder` on each wake.
-    resubscribe: std::sync::Arc<tokio::sync::Notify>,
+    pub(super) task_cancel: Mutex<Vec<CancellationToken>>,
+    supports_notify: bool,
+    idle_budget: usize,
+    /// Monotonic generation of the subscribed scope set. Every worker holds
+    /// a receiver and re-evaluates `choose_idle_folder` when it moves, so a
+    /// scope added after the workers parked is picked up without waiting for
+    /// a connection to break.
+    ///
+    /// A `Notify` cannot serve this with more than one worker. `notify_one`
+    /// wakes exactly one of them, which leaves the other slots parked on a
+    /// stale assignment; `notify_waiters` wakes all of them but stores
+    /// nothing, so a worker in the window between deciding it has no folder
+    /// and awaiting the notification misses the wake and parks forever. A
+    /// `watch` generation latches, so both readings are safe.
+    resubscribe: tokio::sync::watch::Sender<u64>,
     next_id: AtomicU64,
 }
 
 impl PushState {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(supports_notify: bool, idle_budget: usize) -> Self {
         let (tx, _rx) = broadcast::channel(128);
         Self {
             tx,
             scopes: Mutex::new(HashMap::new()),
-            task_cancel: Mutex::new(None),
-            resubscribe: std::sync::Arc::new(tokio::sync::Notify::new()),
+            task_cancel: Mutex::new(Vec::new()),
+            supports_notify,
+            idle_budget: idle_budget.max(1),
+            resubscribe: tokio::sync::watch::Sender::new(0),
             next_id: AtomicU64::new(1),
         }
     }
 
+    /// Publish that the subscribed scope set changed.
+    fn bump_generation(&self) {
+        self.resubscribe
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
+    }
+
     pub(crate) fn stop(&self) {
-        if let Some(cancel) = self
+        for cancel in self
             .task_cancel
             .lock()
             .expect("push task lock poisoned")
-            .take()
+            .drain(..)
         {
             cancel.cancel();
         }
@@ -53,28 +71,123 @@ impl PushState {
 pub(crate) fn push_subscribe(
     account: ImapAccount,
     scopes: Vec<CursorScope>,
-) -> AccountFuture<Result<SubscriptionHandle, AccountError>> {
+) -> AccountFuture<Result<bifrost_types::PushSubscription, AccountError>> {
     Box::pin(async move {
         let id = account.push.next_id.fetch_add(1, Ordering::AcqRel);
         let handle = SubscriptionHandle(format!("imap-idle-{id}"));
-        account
-            .push
-            .scopes
-            .lock()
-            .expect("push scopes lock poisoned")
-            .insert(handle.0.clone(), scopes.into_iter().collect());
-        ensure_idle_task(account.clone()).map_err(|e| {
-            account_error_with(
-                e,
+        // Batch item ids are submission positions, per the cross-crate
+        // contract in `reference/error-model.md`.
+        let expected: Vec<_> = (0..scopes.len())
+            .map(|index| BatchItemId(index.to_string()))
+            .collect();
+        let mut outcomes = BatchOutcomeBuilder::new();
+        let accepted = {
+            let mut subscriptions = account
+                .push
+                .scopes
+                .lock()
+                .expect("push scopes lock poisoned");
+            // Admission runs against the folders this account already
+            // pushes, under the same lock the insert takes, so two
+            // concurrent subscribes cannot both admit the last free slot.
+            let mut covered: HashSet<String> = subscribed_idle_folders(&subscriptions)
+                .into_iter()
+                .map(|folder| folder.as_str().to_owned())
+                .collect();
+            let mut accepted = HashSet::new();
+            for (item, scope) in expected.iter().cloned().zip(scopes.iter().cloned()) {
+                let CursorScope::Folder(folder) = &scope else {
+                    outcomes.push_failed(item, unsupported_push_scope_error());
+                    continue;
+                };
+                // NOTIFY folds every folder onto one session, so the budget
+                // does not apply there. A folder already covered costs no
+                // new session either; only a new distinct folder consumes a
+                // slot. A refusal is per scope and never fails a sibling.
+                let admitted = account.push.supports_notify
+                    || covered.contains(&folder.0)
+                    || covered.len() < account.push.idle_budget;
+                if admitted {
+                    covered.insert(folder.0.clone());
+                    accepted.insert(scope.clone());
+                    outcomes.push_succeeded(item, scope);
+                } else {
+                    outcomes.push_failed(item, idle_budget_error());
+                }
+            }
+            if !accepted.is_empty() {
+                subscriptions.insert(handle.0.clone(), accepted.clone());
+            }
+            accepted
+        };
+        if !accepted.is_empty()
+            && let Err(error) = ensure_idle_tasks(account.clone())
+        {
+            account
+                .push
+                .scopes
+                .lock()
+                .expect("push scopes lock poisoned")
+                .remove(&handle.0);
+            return Err(account_error_with(
+                error,
                 ImapErrorContext::operation(AccountOperation::PushSubscribe),
-            )
-        })?;
+            ));
+        }
         // Nudge an already-running IDLE loop so a scope added after it
         // parked on another folder is reconsidered without waiting for the
         // current IDLE connection to break.
-        account.push.resubscribe.notify_one();
-        Ok(handle)
+        account.push.bump_generation();
+        let outcomes = outcomes.finalize(&expected).map_err(|error| {
+            account_error_with(
+                crate::Error::Internal(error.to_string()),
+                ImapErrorContext::operation(AccountOperation::PushSubscribe),
+            )
+        })?;
+        // No handle when nothing was accepted: a handle bifrost-sync records
+        // would claim coverage this account is not providing, and there is
+        // nothing for the matching unsubscribe to tear down.
+        Ok(bifrost_types::PushSubscription::new(
+            (!accepted.is_empty()).then_some(handle),
+            outcomes,
+        ))
     })
+}
+
+/// One rejected scope in the `push_subscribe` failed lane.
+///
+/// Both refusals are `Unsupported(PushSubscribe)`: neither is a whole-request
+/// fault (`Err` stays reserved for that), neither is retryable as issued, and
+/// a rejected scope must not fail its siblings. They are distinguished by the
+/// diagnostic text, not the kind, because a capacity refusal and a
+/// scope-shape refusal need different operator action even though they carry
+/// the same recovery class - bifrost-sync keeps polling either way.
+fn rejected_scope_error(detail: &'static str) -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::Unsupported(AccountOperation::PushSubscribe),
+        Cause::Request(RequestCause::Unsupported {
+            operation: AccountOperation::PushSubscribe,
+        }),
+    )
+    .operation(AccountOperation::PushSubscribe)
+    .protocol(bifrost_types::Protocol::Imap)
+    .text(bifrost_types::DiagnosticText::user_safe(detail))
+    .try_build()
+    .expect("valid push scope error")
+}
+
+/// IMAP push is folder-granular: IDLE and `NOTIFY SET` both name mailboxes,
+/// so an account-wide or other non-folder scope has nothing to register.
+fn unsupported_push_scope_error() -> AccountError {
+    rejected_scope_error("IMAP push covers folder scopes only")
+}
+
+/// The account is at `idle_connection_budget` distinct pushed folders and the
+/// server has no NOTIFY to fold another one onto an existing session. The
+/// scope is refused rather than silently dropped, so bifrost-sync keeps it in
+/// the polling lane instead of believing it is pushed.
+fn idle_budget_error() -> AccountError {
+    rejected_scope_error("IMAP IDLE connection budget exhausted; folder remains poll-only")
 }
 
 pub(crate) fn push_unsubscribe(
@@ -95,7 +208,7 @@ pub(crate) fn push_unsubscribe(
             // alive while this account is open and waits when there are no
             // scopes, so an unsubscribe followed by a subscribe cannot race
             // a cancelling task into two IDLE loops (or no loop at all).
-            account.push.resubscribe.notify_one();
+            account.push.bump_generation();
         }
         Ok(())
     })
@@ -136,21 +249,28 @@ pub(crate) fn push_stream(account: ImapAccount) -> AccountStream<WatchEvent> {
     boxed_receiver_stream(out)
 }
 
-fn ensure_idle_task(account: ImapAccount) -> Result<(), crate::Error> {
+fn ensure_idle_tasks(account: ImapAccount) -> Result<(), crate::Error> {
     let mut guard = account
         .push
         .task_cancel
         .lock()
         .map_err(|_| crate::Error::Internal("push task lock poisoned".into()))?;
-    if guard.is_some() {
+    if !guard.is_empty() {
         return Ok(());
     }
-    let cancel = CancellationToken::new();
-    *guard = Some(cancel.clone());
-    drop(guard);
-    tokio::spawn(async move {
-        idle_loop(account, cancel).await;
-    });
+    let workers = if account.push.supports_notify {
+        1
+    } else {
+        account.push.idle_budget
+    };
+    for slot in 0..workers {
+        let cancel = CancellationToken::new();
+        guard.push(cancel.clone());
+        let worker_account = account.clone();
+        tokio::spawn(async move {
+            idle_loop(worker_account, cancel, slot).await;
+        });
+    }
     Ok(())
 }
 
@@ -177,7 +297,7 @@ async fn sleep_backoff(
     }
 }
 
-async fn idle_loop(account: ImapAccount, cancel: CancellationToken) {
+async fn idle_loop(account: ImapAccount, cancel: CancellationToken, slot: usize) {
     // Track whether the consumer has seen a `Disconnected` since the last
     // `Reconnected`. The very first successful connect must NOT emit
     // `Reconnected` (there was no prior disconnect): the reconciler treats
@@ -185,12 +305,16 @@ async fn idle_loop(account: ImapAccount, cancel: CancellationToken) {
     // spurious right after subscribe when discovery/inventory just ran.
     let mut was_disconnected = false;
     let mut backoff = INITIAL_REDIAL_BACKOFF;
-    let resubscribe = std::sync::Arc::clone(&account.push.resubscribe);
+    let mut resubscribe = account.push.resubscribe.subscribe();
     loop {
         if cancel.is_cancelled() || account.shutdown.is_cancelled() {
             break;
         }
-        let folder = choose_idle_folder(&account);
+        // Mark the current generation seen BEFORE choosing, so a scope set
+        // that changes between the choice and the park below latches and
+        // wakes this worker instead of being lost.
+        resubscribe.mark_unchanged();
+        let folder = choose_idle_folder(&account, slot);
         let Some(folder) = folder else {
             // Do not tear down the task merely because the last subscription
             // left. `ensure_idle_task` has one account-lifetime owner; a
@@ -198,7 +322,11 @@ async fn idle_loop(account: ImapAccount, cancel: CancellationToken) {
             tokio::select! {
                 () = cancel.cancelled() => break,
                 () = account.shutdown.cancelled() => break,
-                () = resubscribe.notified() => {}
+                changed = resubscribe.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                }
             }
             continue;
         };
@@ -259,10 +387,15 @@ async fn idle_loop(account: ImapAccount, cancel: CancellationToken) {
             // waiting for this connection to break.
             let round_cancel = cancel.child_token();
             let notify_cancel = round_cancel.clone();
-            let resubscribe_for_round = std::sync::Arc::clone(&resubscribe);
+            // Same latching discipline as the park above: the generation is
+            // marked seen on this task's own receiver before the round
+            // starts, so a change landing while the nudge task is being
+            // spawned still breaks the round.
+            resubscribe.mark_unchanged();
+            let mut resubscribe_for_round = resubscribe.clone();
             let nudge = tokio::spawn(async move {
                 tokio::select! {
-                    () = resubscribe_for_round.notified() => notify_cancel.cancel(),
+                    _ = resubscribe_for_round.changed() => notify_cancel.cancel(),
                     () = notify_cancel.cancelled() => {}
                 }
             });
@@ -320,7 +453,7 @@ async fn idle_loop(account: ImapAccount, cancel: CancellationToken) {
     }
 }
 
-fn choose_idle_folder(account: &ImapAccount) -> Option<crate::types::MailboxName> {
+fn choose_idle_folder(account: &ImapAccount, slot: usize) -> Option<crate::types::MailboxName> {
     let scopes = account
         .push
         .scopes
@@ -329,11 +462,17 @@ fn choose_idle_folder(account: &ImapAccount) -> Option<crate::types::MailboxName
     if scopes.is_empty() {
         return None;
     }
-    if let Some(folder) = subscribed_idle_folder(&scopes) {
+    if let Some(folder) = subscribed_idle_folders(&scopes).into_iter().nth(slot) {
         return Some(folder);
     }
     drop(scopes);
 
+    // The INBOX fallback belongs to one worker only. Every slot taking it
+    // would point the whole budget at the same mailbox and burn
+    // `idle_connection_budget` sessions to watch it once.
+    if slot != 0 {
+        return None;
+    }
     account
         .folders
         .entries()
@@ -342,18 +481,16 @@ fn choose_idle_folder(account: &ImapAccount) -> Option<crate::types::MailboxName
         .map(|entry| entry.name.clone())
 }
 
-/// Select a subscribed folder deterministically. A HashMap/HashSet backs
-/// subscriptions, so iteration order must not decide which mailbox IDLE
-/// monitors after a resubscription.
-fn subscribed_idle_folder(
-    scopes: &HashMap<String, HashSet<CursorScope>>,
-) -> Option<crate::types::MailboxName> {
-    subscribed_idle_folders(scopes).into_iter().next()
-}
-
-/// Every subscribed folder scope, sorted and deduplicated. One of these is
-/// SELECTed for IDLE; the rest are covered by NOTIFY when the server has
-/// it (see `register_notify`).
+/// Every subscribed folder scope, sorted and deduplicated.
+///
+/// This is both the admission ledger and the worker assignment. A
+/// HashMap/HashSet backs subscriptions, so the sort is what keeps iteration
+/// order from deciding which mailbox a slot watches. Worker `n` takes the
+/// nth entry; on a NOTIFY server only slot 0 runs and the rest of the list
+/// rides on `NOTIFY SET` from that one session. Admission caps the list at
+/// `idle_connection_budget` on a non-NOTIFY server, so every accepted folder
+/// always has a slot - the assignment of folder to slot index shifts when
+/// the set changes, the coverage of the set does not.
 fn subscribed_idle_folders(
     scopes: &HashMap<String, HashSet<CursorScope>>,
 ) -> Vec<crate::types::MailboxName> {
@@ -565,7 +702,7 @@ mod tests {
     /// something may have happened.
     #[tokio::test]
     async fn a_resubscribe_interrupted_idle_round_still_invalidates() {
-        let push = PushState::new();
+        let push = PushState::new(false, 4);
         let mut rx = push.tx.subscribe();
 
         signal_idle_interrupt_loss(&push);
@@ -599,7 +736,9 @@ mod tests {
         );
 
         assert_eq!(
-            subscribed_idle_folder(&scopes)
+            subscribed_idle_folders(&scopes)
+                .into_iter()
+                .next()
                 .expect("a subscribed folder")
                 .as_str(),
             "Archive"

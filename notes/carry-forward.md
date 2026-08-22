@@ -23,10 +23,10 @@ These are cross-crate. They bind every protocol crate, not just `bifrost-graph`.
   the outcome are submission positions.
 
   Non-Graph implementors were audited, not assumed: caldav, carddav and the IMAP
-  `StubAccount` refuse push outright; google (`users.watch` is per mailbox), jmap
-  (per-account PushSubscription) and imap (IDLE stores the whole scope set
-  unconditionally) genuinely cover the entire requested list when they return
-  `Ok`, so `all_succeeded` is correct for each.
+  `StubAccount` refuse push outright; google (`users.watch` is per mailbox) and
+  jmap (per-account PushSubscription) genuinely cover the entire requested list
+  when they return `Ok`, so `all_succeeded` is correct for each. **imap no
+  longer does** - see the IDLE budget below.
 
 - **`Account::is_inventory_cursor` must share ONE condition with
   `Account::inventory_resume_stream`.** A predicate that merely agrees with the
@@ -64,6 +64,55 @@ These are cross-crate. They bind every protocol crate, not just `bifrost-graph`.
   endless reconnect loop.
 
 - Cursor envelope is at **v4**.
+
+## From the bifrost-imap arc (round 2, 2026-08-22)
+
+- **IMAP push coverage is bounded and partial.** Without RFC 5465 NOTIFY the
+  account runs at most `ImapAccountConfig::idle_connection_budget` (default 4)
+  dedicated IDLE sessions, one per distinct pushed folder. Folders past the
+  budget come back in `PushSubscription.outcomes.failed` as
+  `Unsupported(PushSubscribe)`, distinguished from a non-folder scope only by
+  the diagnostic text. This is the first `Account` impl whose `push_subscribe`
+  legitimately partially fails, so it is the live test of the per-scope
+  contract above: `Err` stays reserved for whole-request faults, a refusal
+  never fails a sibling, and a subscribe that accepts nothing returns no
+  handle at all.
+
+  The coupling that makes this safe is that **bifrost-sync never suppresses
+  polling on push coverage.** `Engine::subscribe_push` records only
+  `outcomes.succeeded()` in the subscription registry, and that registry is
+  teardown bookkeeping only - no scheduler path consults it to skip a poll.
+  A refused folder therefore stays polled rather than becoming invisible. Any
+  future change that lets push coverage relax polling must first make the
+  uncovered-scope lane explicit, or it silently reintroduces that hole.
+
+- **`Pool::close()` means no session of that account is still connected when
+  it returns.** Every session the pool mints is registered weakly; `close`
+  gates the pool, closes the permit semaphore, drains the registry, requests
+  LOGOUT on all of them concurrently under one `command_timeout`, then aborts
+  any surviving driver and drops its transport. This holds for a checkout
+  whose command is still in flight - it is terminated, not waited for - and
+  the promise is about the transport, not about a graceful LOGOUT, which is
+  best effort. The `sessions` mutex is the linearization point: `close` stores
+  the flag before draining, registration re-reads it while holding the lock,
+  so a dial or a permit acquisition that completes after `close` refuses
+  rather than landing a live session past the drain. Registration also prunes
+  dead weak entries, because a reconnecting IDLE worker would otherwise grow
+  the registry by one entry per dial for the life of the account.
+
+- **Multi-worker wakeups must latch.** The IDLE workers are woken by a
+  `watch` generation counter, not a `Notify`: `notify_one` wakes one of N
+  workers and leaves the rest on a stale assignment, and `notify_waiters`
+  stores nothing, so a worker between deciding it has no folder and awaiting
+  the wake parks forever. Anything that fans out to several workers here needs
+  the same latching property.
+
+- **Get and mutation streams flush at `TARGET_BUFFER_ITEMS` (256) decoded
+  targets.** Output ordering is therefore input-window order, then lexical
+  folder order within a window; it used to be lexical folder order over the
+  whole input. bifrost-sync tolerates this because it keys results by
+  `ObjectId` and `BatchOutcome` carries its own submission-order index. A
+  consumer that starts depending on cross-window ordering breaks this.
 
 ## Standing lessons this project has paid for
 

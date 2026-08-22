@@ -37,6 +37,7 @@ pub(crate) fn get_stream(
     let (tx, rx) = tokio::sync::mpsc::channel(super::STREAM_CAPACITY);
     tokio::spawn(async move {
         let mut grouped: HashMap<String, (MailboxName, Vec<DecodedObjectId>)> = HashMap::new();
+        let mut buffered = 0usize;
         while let Some(id) = ids.next().await {
             match decode_object_id(&id) {
                 Ok(decoded) => {
@@ -45,6 +46,7 @@ pub(crate) fn get_stream(
                         .or_insert_with(|| (decoded.folder.clone(), Vec::new()))
                         .1
                         .push(decoded);
+                    buffered += 1;
                 }
                 Err(err) => {
                     // Locally-invalid id: surface as per-item Failed
@@ -63,57 +65,84 @@ pub(crate) fn get_stream(
                     }
                 }
             }
-        }
-
-        // Iterate folders in a deterministic order so cross-folder output
-        // ordering is reproducible run-to-run (a `HashMap` iteration order
-        // is not). Within a folder the UID FETCH order is server-driven;
-        // only the folder grouping is sorted here.
-        let mut groups: Vec<(MailboxName, Vec<DecodedObjectId>)> = grouped.into_values().collect();
-        groups.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
-        for (folder, ids) in groups {
-            let mut pending = ids;
-            match run_folder_get(&account, &folder, &mut pending, projection, &tx).await {
-                Ok(()) => {}
-                Err(GetError::ChannelDropped) => return,
-                Err(other) => {
-                    // Per-folder failure does not collapse the stream:
-                    // still-unresolved items in this folder surface as
-                    // `Uncertain`, the next folder still runs. Only ids
-                    // without a published outcome fall into that lane:
-                    // stale-UIDVALIDITY ids were already emitted as
-                    // `Failed` before the fallible FETCH, and re-emitting
-                    // them here would put one id in two lanes. A
-                    // shared-folder SELECT denial is pre-classified to
-                    // `ScopeRevoked` so it quarantines that scope rather
-                    // than masquerading as a generic hydration failure.
-                    let account_err = match other {
-                        GetError::Account(err) => err,
-                        GetError::Imap(err) => super::account_error_with(
-                            err,
-                            super::error::ImapErrorContext::operation(
-                                bifrost_types::AccountOperation::Hydrate,
-                            )
-                            .with_folder_scope(&folder),
-                        ),
-                        GetError::ChannelDropped => unreachable!("handled above"),
-                    };
-                    let uncertain: Vec<ItemOutcome<HydratedObject>> = pending
-                        .into_iter()
-                        .map(|id| {
-                            let item = BatchItemId(
-                                super::encode_object_id(&id.folder, id.uidvalidity, id.uid).0,
-                            );
-                            ItemOutcome::Uncertain(BatchUncertain::new(item, account_err.clone()))
-                        })
-                        .collect();
-                    let _ = tx.send(batch(uncertain, PageBoundary::Page, None)).await;
+            if buffered >= super::TARGET_BUFFER_ITEMS {
+                if flush_get_groups(&account, &mut grouped, projection, &tx)
+                    .await
+                    .is_err()
+                {
+                    return;
                 }
+                buffered = 0;
             }
+        }
+        if flush_get_groups(&account, &mut grouped, projection, &tx)
+            .await
+            .is_err()
+        {
+            return;
         }
         let _ = tx.send(SyncEvent::Done(None)).await;
     });
     boxed_receiver_stream(rx)
+}
+
+async fn flush_get_groups(
+    account: &ImapAccount,
+    grouped: &mut HashMap<String, (MailboxName, Vec<DecodedObjectId>)>,
+    projection: Projection,
+    tx: &tokio::sync::mpsc::Sender<SyncEvent<ItemOutcome<HydratedObject>>>,
+) -> Result<(), ()> {
+    // Folder order is deterministic inside each bounded input window.
+    let mut groups: Vec<(MailboxName, Vec<DecodedObjectId>)> =
+        std::mem::take(grouped).into_values().collect();
+    groups.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+    for (folder, ids) in groups {
+        let mut pending = ids;
+        match run_folder_get(account, &folder, &mut pending, projection, tx).await {
+            Ok(()) => {}
+            Err(GetError::ChannelDropped) => return Err(()),
+            Err(other) => {
+                // Per-folder failure does not collapse the stream:
+                // still-unresolved items in this folder surface as
+                // `Uncertain`, the next folder still runs. Only ids
+                // without a published outcome fall into that lane:
+                // stale-UIDVALIDITY ids were already emitted as
+                // `Failed` before the fallible FETCH, and re-emitting
+                // them here would put one id in two lanes. A
+                // shared-folder SELECT denial is pre-classified to
+                // `ScopeRevoked` so it quarantines that scope rather
+                // than masquerading as a generic hydration failure.
+                let account_err = match other {
+                    GetError::Account(err) => err,
+                    GetError::Imap(err) => super::account_error_with(
+                        err,
+                        super::error::ImapErrorContext::operation(
+                            bifrost_types::AccountOperation::Hydrate,
+                        )
+                        .with_folder_scope(&folder),
+                    ),
+                    GetError::ChannelDropped => unreachable!("handled above"),
+                };
+                let uncertain: Vec<ItemOutcome<HydratedObject>> = pending
+                    .into_iter()
+                    .map(|id| {
+                        let item = BatchItemId(
+                            super::encode_object_id(&id.folder, id.uidvalidity, id.uid).0,
+                        );
+                        ItemOutcome::Uncertain(BatchUncertain::new(item, account_err.clone()))
+                    })
+                    .collect();
+                if tx
+                    .send(batch(uncertain, PageBoundary::Page, None))
+                    .await
+                    .is_err()
+                {
+                    return Err(());
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Per-folder hydration failure: either an IMAP wire error to classify

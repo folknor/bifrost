@@ -63,6 +63,7 @@ fn scripted_sync_account(
         folders: Arc::new(folders),
         qresync_enabled,
         qresync_negotiation_warning,
+        supports_notify: false,
         bandwidth_cap,
         contacts: None,
         calendars: None,
@@ -218,6 +219,188 @@ async fn folder_get_failure_does_not_relabel_published_stale_ids() {
 
 fn created_name() -> crate::types::MailboxName {
     crate::types::MailboxName::new("Archive".to_owned()).unwrap()
+}
+
+/// The target buffer must flush at its exact ceiling even while the input
+/// producer remains open. Removing the production flush makes this test time
+/// out before the server sees SELECT.
+#[tokio::test]
+async fn get_flushes_at_target_buffer_boundary_before_input_closes() {
+    use bifrost_types::{Projection, SyncEvent};
+    use futures::StreamExt;
+
+    let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1")).await;
+    let account = scripted_account(conn, 1);
+    let script = tokio::spawn(async move {
+        let select = read_line(&mut server).await;
+        assert!(
+            select.contains("EXAMINE \"INBOX\""),
+            "expected SELECT, got {select}"
+        );
+        respond(&mut server, &format!(
+            "* FLAGS (\\Seen)\r\n* 256 EXISTS\r\n* 0 RECENT\r\n* OK [UIDVALIDITY 5] ok\r\n* OK [UIDNEXT 257] ok\r\n{} OK [READ-ONLY] done\r\n",
+            tag_of(&select),
+        )).await;
+        let fetch = read_line(&mut server).await;
+        assert!(
+            fetch.contains("UID FETCH"),
+            "expected bounded-window FETCH, got {fetch}"
+        );
+        respond(&mut server, &format!("{} OK done\r\n", tag_of(&fetch))).await;
+    });
+
+    let (input_tx, input_rx) = tokio::sync::mpsc::channel(257);
+    for uid in 1..=super::TARGET_BUFFER_ITEMS {
+        input_tx
+            .send(super::encode_object_id(
+                &crate::types::MailboxName::new("INBOX").unwrap(),
+                5,
+                u32::try_from(uid).unwrap(),
+            ))
+            .await
+            .unwrap();
+    }
+    let ids = Box::pin(futures::stream::unfold(input_rx, |mut rx| async move {
+        rx.recv().await.map(|item| (item, rx))
+    }));
+    let mut output = super::get::get_stream(account, ids, Projection::FlagsOnly);
+    let first = tokio::time::timeout(Duration::from_secs(5), output.next())
+        .await
+        .expect("the full buffer must flush before input closes")
+        .expect("one output batch");
+    assert!(
+        matches!(&first, SyncEvent::Batch(batch) if batch.items.iter().all(|item| !matches!(item, bifrost_types::ItemOutcome::Uncertain(_)))),
+        "SELECT failed before the boundary FETCH: {first:?}"
+    );
+    drop(input_tx);
+    script.await.unwrap();
+}
+
+#[tokio::test]
+async fn mutation_flushes_at_target_buffer_boundary_before_input_closes() {
+    use bifrost_types::{FlagOp, SyncEvent};
+    use futures::StreamExt;
+
+    let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1")).await;
+    let account = scripted_account(conn, 1);
+    let script = tokio::spawn(async move {
+        let select = read_line(&mut server).await;
+        assert!(
+            select.contains("SELECT \"INBOX\""),
+            "expected SELECT, got {select}"
+        );
+        respond(&mut server, &format!(
+            "* FLAGS (\\Seen)\r\n* 256 EXISTS\r\n* 0 RECENT\r\n* OK [UIDVALIDITY 5] ok\r\n* OK [UIDNEXT 257] ok\r\n{} OK [READ-WRITE] done\r\n",
+            tag_of(&select),
+        )).await;
+        let store = read_line(&mut server).await;
+        assert!(
+            store.contains("UID STORE"),
+            "expected bounded-window STORE, got {store}"
+        );
+        respond(&mut server, &format!("{} OK done\r\n", tag_of(&store))).await;
+    });
+
+    let (input_tx, input_rx) = tokio::sync::mpsc::channel(257);
+    for uid in 1..=super::TARGET_BUFFER_ITEMS {
+        input_tx
+            .send(super::encode_object_id(
+                &crate::types::MailboxName::new("INBOX").unwrap(),
+                5,
+                u32::try_from(uid).unwrap(),
+            ))
+            .await
+            .unwrap();
+    }
+    let ids = Box::pin(futures::stream::unfold(input_rx, |mut rx| async move {
+        rx.recv().await.map(|item| (item, rx))
+    }));
+    let mut output = super::mutate::mutation_stream(
+        account,
+        ids,
+        super::mutate::MutationKind::Flags(FlagOp::Add(std::collections::HashSet::from([
+            "$flagged".to_owned(),
+        ]))),
+    );
+    let first = tokio::time::timeout(Duration::from_secs(5), output.next())
+        .await
+        .expect("the full mutation buffer must flush before input closes")
+        .expect("one output batch");
+    assert!(
+        matches!(&first, SyncEvent::Batch(batch) if batch.items.iter().all(|item| !matches!(item, bifrost_types::ItemOutcome::Uncertain(_)))),
+        "SELECT failed before the boundary STORE: {first:?}"
+    );
+    drop(input_tx);
+    script.await.unwrap();
+}
+
+/// A non-NOTIFY server gets one dedicated IDLE session per pushed folder, so
+/// the fifth folder of a four-session budget cannot be pushed. It must be
+/// refused in the failed lane rather than silently accepted: bifrost-sync
+/// records only the succeeded scopes as pushed and keeps the rest polling, so
+/// a silent acceptance would make that folder invisible - neither pushed nor
+/// polled.
+///
+/// Pinned at the exact boundary in both directions. The fourth folder (item
+/// "3") must succeed and the fifth (item "4") must fail; an off-by-one in
+/// either direction moves one of those two.
+#[tokio::test]
+async fn non_notify_push_reports_the_folder_beyond_its_budget_as_poll_only() {
+    use bifrost_types::{Account, CursorScope, FolderId};
+
+    let (conn, server) = driver_pair(&preauth_greeting("IMAP4rev1")).await;
+    let account = scripted_account(conn, 1);
+    assert_eq!(
+        account.config.idle_connection_budget, 4,
+        "this transcript is written against the default budget",
+    );
+    let scopes: Vec<_> = ["A", "B", "C", "D", "E"]
+        .into_iter()
+        .map(|name| CursorScope::Folder(FolderId(name.to_owned())))
+        .collect();
+    let result = account
+        .push_subscribe(&scopes)
+        .await
+        .expect("a refused scope is a failed item, never a whole-request Err");
+    let succeeded: Vec<_> = result
+        .outcomes
+        .succeeded()
+        .iter()
+        .map(|item| item.item.0.clone())
+        .collect();
+    assert_eq!(
+        succeeded,
+        vec!["0", "1", "2", "3"],
+        "every folder up to and including the budget is pushed",
+    );
+    assert_eq!(result.outcomes.failed().len(), 1);
+    assert_eq!(
+        result.outcomes.failed()[0].item.0,
+        "4",
+        "the first folder past the budget, and only it, is rejected",
+    );
+    assert!(
+        result.outcomes.failed()[0]
+            .error
+            .user_safe_text()
+            .any(|text| text.contains("budget")),
+        "a capacity refusal must not read as an unsupported scope shape",
+    );
+    assert!(
+        result.handle.is_some(),
+        "accepted scopes retain one subscription handle"
+    );
+    // Workers are budget-many, not folder-many: the pool is started once and
+    // idle slots park until a folder is admitted to them. The point of the
+    // assertion is that a non-NOTIFY account runs the whole budget rather
+    // than the single worker a NOTIFY account needs.
+    assert_eq!(
+        account.push.task_cancel.lock().unwrap().len(),
+        account.config.idle_connection_budget,
+        "a non-NOTIFY account runs one IDLE worker per budgeted session"
+    );
+    drop(server);
+    account.close().await.unwrap();
 }
 
 /// DELETE must not be sent on a pooled connection that still has its target
