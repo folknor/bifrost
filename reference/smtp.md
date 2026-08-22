@@ -1,19 +1,26 @@
 # bifrost-smtp reference
 
-Current architecture of the SMTP client crate. Descended from lettre 0.11.22; the bifrost fork has substantially diverged. Native-tls only.
+Current architecture of the SMTP client crate. Descended from lettre 0.11.22; the bifrost fork has substantially diverged. Tokio and native-tls only.
+
+The crate is async-only. The blocking transport half - `SmtpTransport`,
+`LmtpTransport`, `SmtpConnection`, `NetworkStream`, the blocking pool, and the
+`Transport` trait - was removed, along with `oauth2_token_blocking`. Tokio is a
+hard dependency rather than an optional feature: there is no configuration of
+this crate that offers a non-Tokio transport, so gating one would only describe
+a build with no transport at all.
 
 ## Transport types
 
-Sync and async, SMTP and LMTP:
+Async SMTP and LMTP:
 
-- `SmtpTransport` / `AsyncSmtpTransport` - submission to MX/relay.
-- `LmtpTransport` / `AsyncLmtpTransport` - local delivery via LMTP.
+- `AsyncSmtpTransport` - submission to MX/relay.
+- `AsyncLmtpTransport` - local delivery via LMTP.
 
-`Transport::Ok` is `Response` for SMTP, `Vec<Response>` for LMTP (one per envelope recipient, original order preserved).
+`AsyncTransport::Ok` is `Response` for SMTP, `Vec<Response>` for LMTP (one per envelope recipient, original order preserved).
 
-Async transports support Tokio. TLS and plaintext URL parsing via `from_url` use the Tokio backend.
+Both are parameterized over `TokioExecutor`, the only executor. TLS and plaintext URL parsing via `from_url` use the Tokio backend.
 
-`BoxedTransport<Ok, Error>` and `BoxedAsyncTransport<Ok, Error>` erase the concrete type. `Box<T>` and `Arc<T>` get blanket `Transport` / `AsyncTransport` forwarding.
+`BoxedAsyncTransport<Ok, Error>` erases the concrete type. `Box<T>` and `Arc<T>` get blanket `AsyncTransport` forwarding.
 
 ## Connection lifecycle
 
@@ -27,7 +34,7 @@ EHLO is re-sent after STARTTLS and AUTH because capabilities can change.
 
 ## Connection state and cancel-safety
 
-Sync and async streams carry an explicit state: `Ok` / `Broken` / `Closed`. Writes, flushes, reads, and TLS upgrades set `Broken` before the await; only success restores `Ok`. Dropped futures leave state `Broken`; the pool drops the connection.
+The async stream carries an explicit state: `Ok` / `Broken` / `Closed`. Writes, flushes, reads, and TLS upgrades set `Broken` before the await; only success restores `Ok`. Dropped futures leave state `Broken`; the pool drops the connection.
 
 LMTP final delivery-status loop holds `Broken` until every accepted recipient's status has been read. A surplus final status that already reached the read buffer is a protocol violation: the connection is marked `Broken` and the drain fails (the batch driver keeps the per-recipient outcomes it already has, since the surplus changes only the stream's reusability).
 
@@ -36,7 +43,7 @@ Surplus bytes that have not yet crossed into the `BufReader` - still in the sock
 `test_connected()` (pooled NOOP probe) aborts on failure so a stale connection cannot be recycled.
 
 Envelope commands are constructed, and therefore validated, before `MAIL FROM`
-is written. Every send path - sync and async, DATA and BDAT, SMTP and LMTP,
+is written. Every send path - DATA and BDAT, SMTP and LMTP,
 pipelined and not, single-envelope and batch - builds the whole `Mail` plus
 `Rcpt` set up front (`build_transaction_commands` / `build_recipient_commands`)
 and only then opens the transaction. This is a connection-state invariant, not
@@ -65,9 +72,9 @@ When the server advertises PIPELINING, `MAIL FROM` and `RCPT TO` commands are wr
 
 Server-advertised `DSN` is verified before DSN parameters are emitted. Recipient-specific params override matching global keywords (RFC 3461 §4.1 no-duplicate-keyword). Automatic DATA `SIZE` declarations account for the DATA terminator's leading CRLF but exclude the terminator line itself and transparency dots, as RFC 1870 requires; BDAT uses its raw payload length.
 
-Batch sends validate every recipient's RCPT parameters before `MAIL FROM`, in both sync and async paths. A local parameter error is an unsent `RcptTo` failure, never a silent downgrade to an unparameterized RCPT command.
+Batch sends validate every recipient's RCPT parameters before `MAIL FROM`. A local parameter error is an unsent `RcptTo` failure, never a silent downgrade to an unparameterized RCPT command.
 
-Public entry points: `send_raw_with_options(...)` on SMTP and LMTP, sync and async.
+Public entry points: `send_raw_with_options(...)` on async SMTP and LMTP.
 
 ## xtext encoding
 
@@ -75,7 +82,7 @@ RFC 3461 §4.1: any byte outside `%x21-%x7E`, plus `+`, plus `=`, is encoded as 
 
 ## VRFY / EXPN
 
-`verify(addr, ...)` and `expand(list, ...)` on SMTP transports. Negative replies return as `Response`, not `Err`, because they are normal outcomes for these privacy-sensitive commands. Inputs are sanitized for CRLF and control characters before any wire write.
+`verify(addr, ...)` and `expand(list, ...)` on the async SMTP transport. Negative replies return as `Response`, not `Err`, because they are normal outcomes for these privacy-sensitive commands. Inputs are sanitized for CRLF and control characters before any wire write.
 
 `MAIL FROM` and `RCPT TO` apply the same single-line control-character check
 when their command values are constructed. This is a wire-boundary defense for
@@ -98,7 +105,7 @@ A consequence: `Message::formatted()` is not byte-identical to DATA delivery - d
 
 ## Auth
 
-`Credentials` is enum: `Password { username, password: Zeroizing<String> }` and `OAuth2 { identity, token_source: Arc<dyn TokenSource> }` (bifrost-net's trait). The OAuth token is read live from the shared source at each connect, so a token rotated on the source is presented on reconnect without rebuilding the transport. `Credentials` is `Clone` only - no `PartialEq`/`Eq`/serde derives (a live token source is neither comparable nor serializable; rotation material is the consumer's to persist). The `AUTH` command struct (`Auth`) likewise dropped those derives. The async transport reads the token via `oauth2_token().await`; the blocking transport via `oauth2_token_blocking()`, a single-poll of `current()` (a `StaticTokenSource` or already-fresh `OAuthRefresher` resolves immediately; a source needing a network refresh is rejected - live refresh requires the async transport).
+`Credentials` is enum: `Password { username, password: Zeroizing<String> }` and `OAuth2 { identity, token_source: Arc<dyn TokenSource> }` (bifrost-net's trait). The OAuth token is read live from the shared source at each connect, so a token rotated on the source is presented on reconnect without rebuilding the transport. `Credentials` is `Clone` only - no `PartialEq`/`Eq`/serde derives (a live token source is neither comparable nor serializable; rotation material is the consumer's to persist). The `AUTH` command struct (`Auth`) likewise dropped those derives. Authentication awaits `oauth2_token()`, so token sources may lock, join an in-flight refresh, or perform network refresh work without a polling shortcut.
 
 Mechanisms (`Mechanism`, `#[non_exhaustive]`): PLAIN, LOGIN, XOAUTH2, OAUTHBEARER, SCRAM-SHA-1, SCRAM-SHA-256, SCRAM-SHA-1-PLUS, SCRAM-SHA-256-PLUS. SCRAM is consumed from `bifrost-sasl` (the `-PLUS` suffix and token spelling have a single authority there); SMTP owns only the wire sequencing.
 
@@ -107,8 +114,8 @@ Password selection (`password_mechanism_order` + `first_attemptable` in `authent
 OAuth credentials never use SCRAM: they pick the first advertised OAUTHBEARER/XOAUTH2 rung in caller order (`oauth_mechanism`) and run the stateless encoder. The connection's auth driver resolves the access token from the source once, up front, and threads it into `Auth::new` / `Mechanism::response_with_token`. The XOAUTH2 / OAUTHBEARER payload bytes are built by `bifrost-sasl` (`xoauth2_payload` / `oauthbearer_payload`, including the OAUTHBEARER GS2 identity escape); `response_with_token` only base64-frames them and owns the RFC 7628 `\x01` error-continuation. OAUTHBEARER before XOAUTH2 by default.
 
 Stateless AUTH payloads remain `bifrost_sasl::Secret` values through the
-command boundary. Base64 framing returns a `Zeroizing<String>`, and both sync
-and async connections use zeroizing command buffers that are wiped before
+command boundary. Base64 framing returns a `Zeroizing<String>`, and the async
+connection uses zeroizing command buffers that are wiped before
 reuse, immediately after each write attempt, and on drop. The wipe covers the
 buffer the command was serialized into; it cannot cover an allocation the
 serializing `write!` outgrew and replaced, so a longer-than-usual AUTH line can
@@ -140,7 +147,7 @@ Per-recipient response model: vector length equals envelope recipient count. RCP
 
 Direct LMTP sends expose only that ordered response vector. Use the account-oriented batch send API when the caller needs each recipient's RCPT-versus-final-status phase and recovery classification.
 
-Unix-domain LMTP constructors are `#[cfg(unix)]` on sync and Tokio. Unix sockets refuse STARTTLS explicitly.
+The Unix-domain LMTP constructor is `#[cfg(unix)]` on Tokio. Unix sockets refuse STARTTLS explicitly.
 
 ## Native-tls only
 
@@ -180,11 +187,11 @@ Canonicalization follows RFC 6376 for empty bodies and missing final CRLFs. Rela
 
 ## Bandwidth metering
 
-`SmtpTransportBuilder::bandwidth_metering(sink, cap)` (and the async / LMTP
-siblings) installs a `bifrost_net::MeterSinkHandle` and an
+`AsyncSmtpTransportBuilder::bandwidth_metering(sink, cap)` installs a
+`bifrost_net::MeterSinkHandle` and an
 `Arc<AtomicU64>` cap on every connection the transport dials. Opt-in:
-without it, `SmtpInfo::metering` is `WireMetering::disabled()` and both
-socket funnels are unchanged. `UNLIMITED_BANDWIDTH` (`u64::MAX`) in the
+without it, `SmtpInfo::metering` is `WireMetering::disabled()` and the
+socket funnel is unchanged. `UNLIMITED_BANDWIDTH` (`u64::MAX`) in the
 atomic means no cap - the same encoding `bifrost-imap` uses, so ONE value
 drives both halves of an IMAP-shaped account.
 
@@ -197,17 +204,16 @@ exactly the upstream-heavy path a cap usually exists to protect.
 `open_submission` now passes the account's own meter handle and cap
 atomic, so one `set_bandwidth_cap` governs both halves.
 
-Both socket funnels are metered: `AsyncNetworkStream`'s
-`poll_read`/`poll_write` and `NetworkStream`'s blocking `Read`/`Write`.
-The bucket in `client/metering.rs` RETURNS the debt it wants slept rather
-than sleeping itself, which is the one design difference from IMAP's
-`WireMetering`: SMTP has three call shapes over one bucket (an `async
-fn`, a `poll_write` that cannot await, a blocking `Write`) and a
-debt-returning bucket serves all three without a second implementation to
-drift from the first. The async funnel parks the debt as a `Sleep` in the
-stream so a throttled connection yields to the runtime; the blocking
-funnel sleeps its calling thread, the semantic that caller already
-accepted.
+There is no LMTP-side builder method: `AsyncLmtpTransportBuilder` has no
+`bandwidth_metering`, so an LMTP transport is always unmetered. The blocking
+LMTP builder used to carry one; it went with the blocking half. This is
+tolerated because LMTP is local delivery, where a bandwidth cap protects
+nothing, and is recorded in `TODO.md` rather than papered over here.
+
+The `AsyncNetworkStream` socket funnel meters `poll_read` and `poll_write`.
+The bucket in `client/metering.rs` returns the debt it wants slept rather
+than sleeping itself. This lets the async funnel park debt as a `Sleep` in
+the stream, so a throttled connection yields to the runtime.
 
 Two properties worth not regressing: tokens may go NEGATIVE, so a
 transfer larger than one second of budget owes proportional time instead
@@ -235,8 +241,8 @@ Evidence must match what actually crossed the wire. A transport failure in the e
 
 ## Connection test harness
 
-`test_support::Transcript` is the in-process scripted peer both connection
-drivers test against; it replaced the socket-listener tests, which were neither
+`test_support::Transcript` is the in-process scripted peer the async connection
+driver tests against; it replaced the socket-listener tests, which were neither
 hermetic nor deterministic. A transcript is a greeting plus an ordered list of
 `expect(client_bytes, server_bytes)` steps. Three properties make it bite:
 
@@ -276,9 +282,9 @@ not a TCP socket.
 
 ## Example validation
 
-Examples live under `crates/smtp/examples`. Sync examples require no crate
-features. Tokio examples are gated by `tokio`. Validate examples with the SMTP
-crate checks under both the default feature set and `tokio`.
+Examples live under `crates/smtp/examples`. No example carries a
+`required-features` gate any more: Tokio is unconditional, so every example
+builds under the default feature set and the SMTP crate checks cover them.
 
 ## Module layout
 
@@ -287,9 +293,9 @@ crates/smtp/src/
 ├── message/             - builder, headers, MIME parts, address parsers
 ├── transport/
 │   └── smtp/
-│       ├── client/      - connection, async_connection, net, async_net
-│       ├── transport.rs / async_transport.rs - public sync + async transports
-│       ├── commands.rs  - EHLO, MAIL, RCPT, DATA, BDAT, AUTH, NOOP, RSET, QUIT, VRFY, EXPN, STARTTLS, LHLO
+│       ├── client/      - async connection, network funnel, and metering
+│       ├── async_transport.rs - public async SMTP and LMTP transports
+│       ├── commands.rs  - EHLO, MAIL, RCPT, DATA, BDAT, AUTH, NOOP, RSET, VRFY, EXPN, STARTTLS, LHLO
 │       ├── extension.rs - ServerInfo, SendOptions, MAIL/RCPT parameters
 │       ├── response.rs  - parser, enhanced status codes
 │       └── test_support.rs - in-process `Transcript` harness + mock servers

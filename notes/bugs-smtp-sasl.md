@@ -37,28 +37,3 @@ dedicated API decision", but the change is a two-line conditional
 (`if !buf.ends_with(b"\r\n") { write CRLF }`) plus the matching `smtp_data_size` adjustment, and it
 makes `formatted()` honest. The hunter's read is that the doc is rationalizing an inherited lettre
 bug and it is worth fixing rather than documenting.
-
-### The entire blocking transport half is dead weight in this workspace
-
-`connection.rs` (2867 lines) / `async_connection.rs` (2701), `transport.rs` (1429) /
-`async_transport.rs` (1433), `pool/sync_impl.rs` (358) / `pool/async_impl.rs` (377), `net.rs` (377) /
-`async_net.rs` (488): roughly 5,000 lines of hand-mirrored state machine, with two copies of the
-PIPELINING window drain, the LMTP final-status drain and retirement rule, the SCRAM driver, the
-metering funnel, and the connection-state (`Ok`/`Broken`/`Closed`) discipline. The only in-workspace
-consumer is `crates/imap/src/account/submission.rs`, which uses `AsyncSmtpTransport` exclusively.
-Every invariant in the "Connection state and cancel-safety" and "PIPELINING" sections of the
-reference has to be proven twice and can drift silently. Given the pre-1.0 posture, the right move is
-to delete the blocking half outright; if a blocking API must survive for external consumers, it
-should be a thin `block_on` shim over the async driver rather than a second implementation. This is
-the largest structural finding in the crate and it would remove more code than everything else here
-combined.
-
-### oauth2_token_blocking polls a future once with a noop waker and drops it
-
-`authentication.rs`. This exists solely to serve the blocking transport. Polling and dropping a
-`TokenSource::current()` future is not free in general: a source that acquires a lock, starts an HTTP
-refresh, or registers with a shared in-flight map will have that work started and then cancelled at
-an arbitrary await point, once per connect attempt. It also means a perfectly fresh token behind an
-async mutex returns `Pending` and is rejected with a misleading "requires a network refresh" message.
-It works today because the only sources are `StaticTokenSource` and `OAuthRefresher`; it is a
-correctness landmine for any third `TokenSource` impl. Deleting the sync transport deletes this.

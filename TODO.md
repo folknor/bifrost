@@ -4,6 +4,86 @@ Cross-crate work items surfaced by per-crate work but not fixable inside one
 crate. Each entry stands alone: symptom on the discovering side, what the other
 side would have to ship, what was done locally instead, and what remains wrong.
 
+## bifrost-smtp's `account-error` feature gates nothing and cannot be turned off
+
+**Symptom (discovered in bifrost-smtp).** `bifrost-smtp` declares
+`account-error = ["dep:bifrost-types"]` and puts it in `default`, but no source
+file anywhere in the crate carries `#[cfg(feature = "account-error")]`.
+`bifrost_types` is referenced unconditionally by `transport/smtp/mod.rs`,
+`account_error.rs`, `async_transport.rs`, `batch.rs`, and the async connection's
+test module. `brokkr check -p bifrost-smtp --no-default-features` therefore
+fails with 18 unresolved-crate errors, and has done so since before the
+async-only deletion round - it is not a regression from it. The configuration
+the feature name advertises has never existed.
+
+This is the same defect shape as the `tokio` feature that the async-only round
+removed: a cargo feature that reads like an option but describes a build that
+does not compile. It was left standing only because that round was scoped to
+the blocking transport, and removing a second public feature name was not part
+of the agreed change.
+
+**What the other side would have to ship.** Nothing external. This is entirely
+inside `bifrost-smtp`.
+
+**What was done here instead.** Disclosed only. The default build and the
+`--no-default-features --features account-error` build are both green, so no
+supported configuration is broken today.
+
+**What remains wrong.** The honest fix is to delete the `account-error` feature
+and make `bifrost-types` an unconditional dependency, exactly as was done for
+`tokio`. The alternative - actually gating the `AccountError` surface behind
+the feature - means cfg-gating the batch API, the error mapping and a large
+part of `async_transport.rs`, to support a build that no consumer in this
+workspace wants. Whichever is chosen, `default` should stop advertising an
+option that is not one. This is a pre-1.0 public feature removal and belongs in
+release notes alongside the `tokio` one.
+
+## bifrost-smtp no longer exposes a blocking transport API
+
+**Symptom (discovered in bifrost-smtp).** The crate exposed blocking SMTP and
+LMTP transports alongside its Tokio transports even though this workspace is
+async-only. The blocking driver mirrored the protocol state machine, pooling,
+PIPELINING, LMTP final-status draining, SCRAM, connection state, and metering.
+It also resolved OAuth tokens by polling `TokenSource::current()` once with a
+noop waker and dropping any pending future.
+
+**What an external consumer would have to ship.** An out-of-workspace caller
+that still requires a blocking API must provide its own runtime boundary around
+the async transport, or remain on an older bifrost-smtp release. The crate does
+not provide a `block_on` compatibility shim.
+
+**What was done here instead.** The blocking transports, connection driver,
+pool, socket funnel, transport trait and erasure, blocking stub, examples, and
+blocking-only tests were removed. Tests that uniquely pinned protocol
+invariants were moved to the async transcript harness. OAuth token resolution
+now has only the awaited path.
+
+The `tokio` cargo feature was removed with them. It had stopped gating an
+option and started gating the crate: with the blocking half gone, a build
+without Tokio offered no transport at all, and the crate's own `#![deny(...)]`
+turned that configuration into 144 dead-code errors under the DEFAULT feature
+set (`default = ["account-error"]`). Tokio and tokio-native-tls are now
+unconditional dependencies, so `--no-default-features` builds again.
+
+**What remains wrong.** Two things.
+
+First, `AsyncLmtpTransportBuilder` has no `bandwidth_metering`. The blocking
+LMTP builder carried one and the async LMTP builder never did, so deleting the
+blocking half removed the only way to meter an LMTP transport. An LMTP
+transport is now unconditionally unmetered. This is disclosed, not fixed: LMTP
+is local delivery, where a bytes-per-second ceiling protects nothing that a
+metered link would. If an LMTP consumer ever needs byte accounting rather than
+throttling, the fix is a two-line delegation on the LMTP builder mirroring the
+SMTP one, plus a transcript test through `a_metered_transport_reports_its_
+socket_bytes_to_the_sink`.
+
+Second, this is a pre-1.0 public API removal and must be called out in release
+notes so external consumers are not surprised by the missing `SmtpTransport`,
+`LmtpTransport`, `Transport`, `BoxedTransport`, and `StubTransport` symbols, or
+by the `tokio` feature no longer existing. An out-of-workspace caller that
+passed `features = ["tokio"]` will now fail to resolve that feature; the fix on
+their side is to drop it.
+
 ## An inventory partition that yields zero entries is the engine's exhaustion signal, and nothing enforces it
 
 **Symptom (discovered in bifrost-jmap).** `bifrost-sync`'s `BackfillPlan::OpenPages`

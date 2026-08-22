@@ -12,7 +12,7 @@ Crates present:
 - `crates/graph/` → `bifrost-graph` - Microsoft Graph account client.
 - `crates/carddav/` → `bifrost-carddav` - CardDAV account crate for contacts.
 - `crates/caldav/` → `bifrost-caldav` - CalDAV account crate for calendars.
-- `crates/smtp/` → `bifrost-smtp` - SMTP and LMTP client. Lettre-derived. Native-tls only.
+- `crates/smtp/` → `bifrost-smtp` - SMTP and LMTP client. Lettre-derived. Tokio + native-tls only; the blocking transport half was removed and Tokio is not an optional feature.
 - `crates/sasl/` → `bifrost-sasl` - private shared SASL/SCRAM computation layer (SCRAM, CRAM-MD5). Consumed by `bifrost-imap`; not public.
 
 All crates are pre-1.0, API stabilization phase.

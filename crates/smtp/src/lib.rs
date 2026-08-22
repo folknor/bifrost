@@ -4,7 +4,7 @@
 //! * Pluggable email transports
 //! * Unicode support
 //! * Secure defaults
-//! * Async support
+//! * Async SMTP and LMTP transports
 //!
 //! Bifrost SMTP requires the workspace Rust version or newer.
 //!
@@ -26,8 +26,7 @@
 //! Uses schannel on Windows, Security-Framework on macOS, and OpenSSL
 //! on all other platforms.
 //!
-//! TLS support is always available for the synchronous API.
-//! Enable **tokio** for TLS support in the async API.
+//! Enable **tokio** for SMTP and LMTP transport support.
 //!
 //! ##### Building Bifrost SMTP with OpenSSL
 //!
@@ -102,7 +101,6 @@ pub mod address;
 mod base64;
 // pub: message-builder errors are part of the public construction API.
 pub mod error;
-#[cfg(feature = "tokio")]
 mod executor;
 // pub: crate users build RFC 5322/MIME messages through this module.
 pub mod message;
@@ -112,13 +110,10 @@ pub mod transport;
 
 use std::error::Error as StdError;
 
-#[cfg(feature = "tokio")]
 // pub: async transport executors are chosen by users of the tokio API.
 pub use self::executor::Executor;
-#[cfg(feature = "tokio")]
 // pub: default tokio executor for async SMTP and LMTP transports.
 pub use self::executor::TokioExecutor;
-#[cfg(feature = "tokio")]
 #[doc(inline)]
 // pub: users erase async transports behind a crate-provided adapter.
 pub use self::transport::{AsyncTransport, BoxedAsyncTransport};
@@ -127,14 +122,8 @@ pub use crate::address::Address;
 #[doc(inline)]
 // pub: top-level convenience re-export for the message builder.
 pub use crate::message::Message;
-#[cfg(feature = "tokio")]
 // pub: top-level convenience re-export for async SMTP and LMTP transports.
 pub use crate::transport::smtp::{AsyncLmtpTransport, AsyncSmtpTransport};
-// pub: top-level convenience re-export for sync SMTP and LMTP transports.
-pub use crate::transport::smtp::{LmtpTransport, SmtpTransport};
-#[doc(inline)]
-// pub: top-level convenience re-export for transport traits and erasure.
-pub use crate::transport::{BoxedTransport, Transport};
 use crate::{address::Envelope, error::Error};
 
 pub(crate) type BoxError = Box<dyn StdError + Send + Sync>;

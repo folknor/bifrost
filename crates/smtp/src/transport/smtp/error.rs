@@ -454,7 +454,6 @@ pub(crate) fn connection<E: Into<BoxError>>(e: E) -> Error {
     Error::new(ErrorKind::Connection, Some(e))
 }
 
-#[cfg(feature = "tokio")]
 pub(crate) fn timeout(message: &'static str) -> Error {
     Error::new(
         ErrorKind::Timeout,

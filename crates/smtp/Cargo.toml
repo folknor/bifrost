@@ -39,15 +39,22 @@ email-encoding = "0.4"
 serde = { workspace = true, optional = true }
 
 hostname = "0.4"
-socket2 = { workspace = true }
 url = "2.4"
 percent-encoding = { workspace = true }
 zeroize = { workspace = true, features = ["serde"] }
 
 native-tls = { workspace = true }
 
-tokio = { workspace = true, optional = true }
-tokio-native-tls = { workspace = true, optional = true }
+# Not optional: the crate is async-only, and every transport it offers is a
+# Tokio transport. A build without Tokio would expose no transport at all.
+tokio = { workspace = true, features = [
+    "rt",
+    "time",
+    "net",
+    "io-util",
+    "sync",
+] }
+tokio-native-tls = { workspace = true }
 
 sha2 = { workspace = true, features = ["oid"], optional = true }
 rsa = { version = "0.10.0-rc.18", optional = true }
@@ -64,47 +71,8 @@ default = ["account-error"]
 
 account-error = ["dep:bifrost-types"]
 
-tokio = [
-    "dep:tokio",
-    "tokio/rt",
-    "tokio/time",
-    "tokio/net",
-    "tokio/io-util",
-    "tokio/sync",
-    "dep:tokio-native-tls",
-]
-
 dkim = ["dep:sha2", "dep:rsa", "dep:ed25519-compact"]
 
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
-
-[[example]]
-name = "autoconfigure"
-
-[[example]]
-name = "smtp"
-
-[[example]]
-name = "lmtp"
-
-[[example]]
-name = "smtp_tls"
-
-[[example]]
-name = "smtp_starttls"
-
-[[example]]
-name = "smtp_oauth2"
-
-[[example]]
-name = "smtp_selfsigned"
-
-[[example]]
-name = "tokio_smtp_tls"
-required-features = ["tokio"]
-
-[[example]]
-name = "tokio_smtp_starttls"
-required-features = ["tokio"]

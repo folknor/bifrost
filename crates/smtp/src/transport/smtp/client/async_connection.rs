@@ -159,7 +159,6 @@ impl AsyncSmtpConnection {
     /// ```
     #[cfg(test)]
     #[allow(dead_code)]
-    #[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
     pub(crate) async fn connect<T: tokio::net::ToSocketAddrs>(
         server: T,
         timeout: Option<Duration>,
@@ -1604,8 +1603,7 @@ impl AsyncSmtpConnection {
 
     /// Sends an AUTH command, selecting the strongest compatible mechanism.
     ///
-    /// Awaited twin of `SmtpConnection::auth`: same SCRAM-aware order, same
-    /// RFC 5802 Section 6 downgrade protection, same binding-skip fall-through.
+    /// Uses RFC 5802 Section 6 downgrade protection and binding-skip fall-through.
     pub(crate) async fn auth(
         &mut self,
         mechanisms: &[Mechanism],
@@ -2135,7 +2133,7 @@ impl AsyncSmtpConnection {
     }
 }
 
-#[cfg(all(test, feature = "tokio"))]
+#[cfg(test)]
 mod transcript_tests {
     use std::time::Duration;
 
@@ -2146,7 +2144,10 @@ mod transcript_tests {
             authentication::{Credentials, Mechanism},
             batch::SmtpBatchRecipient,
             commands::Noop,
-            extension::{ClientId, Extension, MailBodyParameter, MailParameter},
+            extension::{
+                ClientId, DeliverByMode, DsnNotify, DsnReturn, Extension, MailBodyParameter,
+                MailParameter,
+            },
             test_support::Transcript,
         },
     };
@@ -2242,6 +2243,54 @@ mod transcript_tests {
     }
 
     #[tokio::test(crate = "tokio")]
+    async fn later_pipelining_window_write_failure_is_unsent() {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let addresses: Vec<crate::address::Address> = (0..33)
+            .map(|index| format!("recipient-{index}@example.com").parse().unwrap())
+            .collect();
+        let mut first_window = "MAIL FROM:<sender@example.com>\r\n".to_owned();
+        first_window.extend(
+            addresses[..32]
+                .iter()
+                .map(|recipient| format!("RCPT TO:<{recipient}>\r\n")),
+        );
+        let mut replies = "250 sender ok\r\n".to_owned();
+        replies.push_str(&"250 recipient ok\r\n".repeat(31));
+        replies.push_str("550 recipient rejected\r\n");
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250-smtp.example\r\n250 PIPELINING\r\n")
+            .expect(first_window, replies);
+        let batch = addresses
+            .into_iter()
+            .enumerate()
+            .map(|(index, address)| SmtpBatchRecipient {
+                id: BatchItemId(format!("item-{index}")),
+                address,
+            })
+            .collect();
+        let mut connection =
+            AsyncSmtpConnection::from_transcript(transcript, &hello, Protocol::Smtp)
+                .await
+                .unwrap();
+
+        let outcome = connection
+            .send_smtp_batch(
+                Some("sender@example.com".parse().unwrap()),
+                batch,
+                b"body",
+                &Default::default(),
+            )
+            .await
+            .unwrap()
+            .resolve();
+
+        assert!(outcome.uncertain().is_empty());
+        assert!(outcome.succeeded().is_empty());
+        assert_eq!(outcome.failed().len(), 33);
+        assert_eq!(outcome.failed()[31].item.0, "item-31");
+    }
+
+    #[tokio::test(crate = "tokio")]
     async fn starttls_downgrade_is_refused_without_a_wire_command() {
         let hello = ClientId::Domain("client.example".to_owned());
         let transcript = Transcript::new("220 smtp.example\r\n")
@@ -2266,6 +2315,47 @@ mod transcript_tests {
         // The refusal happened before any byte hit the wire: the very next
         // scripted step is NOOP, so a stray STARTTLS write would be rejected.
         connection.command(Noop).await.unwrap();
+        transcript.assert_exhausted();
+    }
+
+    #[tokio::test(crate = "tokio")]
+    async fn advertised_starttls_writes_command_before_upgrade() {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250-smtp.example\r\n250 STARTTLS\r\n")
+            .expect("STARTTLS\r\n", "220 ready to start tls\r\n");
+        let mut connection =
+            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp)
+                .await
+                .unwrap();
+        let tls = super::TlsParameters::new("smtp.example".to_owned()).unwrap();
+
+        let error = connection.starttls(tls, &hello).await.unwrap_err();
+
+        assert!(error.to_string().contains("only supported on TCP"));
+        transcript.assert_exhausted();
+    }
+
+    #[tokio::test(crate = "tokio")]
+    async fn refused_starttls_reply_does_not_upgrade() {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250-smtp.example\r\n250 STARTTLS\r\n")
+            .expect("STARTTLS\r\n", "454 TLS temporarily unavailable\r\n");
+        let mut connection =
+            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp)
+                .await
+                .unwrap();
+        let tls = super::TlsParameters::new("smtp.example".to_owned()).unwrap();
+
+        let error = connection.starttls(tls, &hello).await.unwrap_err();
+
+        assert!(
+            error
+                .smtp_response()
+                .is_some_and(|response| response.has_code(454))
+        );
+        assert!(!connection.is_encrypted());
         transcript.assert_exhausted();
     }
 
@@ -2353,6 +2443,72 @@ mod transcript_tests {
             .unwrap();
 
         assert!(response.has_code(250));
+        transcript.assert_exhausted();
+    }
+
+    #[tokio::test(crate = "tokio")]
+    async fn bdat_is_length_framed_without_dot_stuffing() {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let message = b"Subject: test\r\n\r\n.Line\r\nBinary\0";
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(
+                HELLO,
+                "250-smtp.example\r\n250-CHUNKING\r\n250 BINARYMIME\r\n",
+            )
+            .expect(
+                "MAIL FROM:<sender@example.com> BODY=BINARYMIME\r\n",
+                "250 sender ok\r\n",
+            )
+            .expect(
+                "RCPT TO:<recipient@example.com>\r\n",
+                "250 recipient ok\r\n",
+            )
+            .expect(format!("BDAT {} LAST\r\n", message.len()), "")
+            .expect(message, "250 queued\r\n");
+        let envelope = Envelope::new(
+            Some("sender@example.com".parse().unwrap()),
+            vec!["recipient@example.com".parse().unwrap()],
+        )
+        .unwrap();
+        let options =
+            SendOptions::new().mail_parameter(MailParameter::Body(MailBodyParameter::BinaryMime));
+        let mut connection =
+            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp)
+                .await
+                .unwrap();
+
+        let response = connection
+            .send_bdat_with_options(&envelope, message, &options)
+            .await
+            .unwrap();
+
+        assert!(response.has_code(250));
+        transcript.assert_exhausted();
+    }
+
+    #[tokio::test(crate = "tokio")]
+    async fn unsupported_dsn_is_refused_before_mail_from() {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250 smtp.example\r\n")
+            .expect("NOOP\r\n", "250 noop ok\r\n");
+        let envelope = Envelope::new(
+            Some("sender@example.com".parse().unwrap()),
+            vec!["first@example.com".parse().unwrap()],
+        )
+        .unwrap();
+        let options = SendOptions::new().notify([DsnNotify::Failure]).unwrap();
+        let mut connection =
+            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp)
+                .await
+                .unwrap();
+
+        let error = connection
+            .send_with_options(&envelope, b"body", &options)
+            .await
+            .expect_err("DSN must be refused locally when it was not advertised");
+        assert!(error.to_string().contains("require server DSN support"));
+        assert!(connection.test_connected().await);
         transcript.assert_exhausted();
     }
 
@@ -2802,5 +2958,418 @@ mod transcript_tests {
         );
         assert!(connection.has_broken());
         assert!(connection.should_retire());
+    }
+
+    #[tokio::test(crate = "tokio")]
+    async fn lmtp_too_few_final_statuses_breaks_the_connection() {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let transcript = Transcript::new("220 lmtp.example\r\n")
+            .expect("LHLO client.example\r\n", "250 lmtp.example\r\n")
+            .expect("MAIL FROM:<sender@example.com>\r\n", "250 sender ok\r\n")
+            .expect("RCPT TO:<first@example.com>\r\n", "250 first ok\r\n")
+            .expect("RCPT TO:<second@example.com>\r\n", "250 second ok\r\n")
+            .expect("DATA\r\n", "354 send body\r\n")
+            .expect("body", "")
+            .expect_then_close("\r\n.\r\n", "250 first delivered\r\n");
+        let envelope = Envelope::new(
+            Some("sender@example.com".parse().unwrap()),
+            vec![
+                "first@example.com".parse().unwrap(),
+                "second@example.com".parse().unwrap(),
+            ],
+        )
+        .unwrap();
+        let mut connection =
+            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Lmtp)
+                .await
+                .unwrap();
+
+        assert!(connection.send_lmtp(&envelope, b"body").await.is_err());
+        assert!(connection.has_broken());
+        transcript.assert_exhausted();
+    }
+
+    #[tokio::test(crate = "tokio")]
+    async fn peer_closing_after_data_acceptance_leaves_recipient_uncertain() {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250 smtp.example\r\n")
+            .expect("MAIL FROM:<sender@example.com>\r\n", "250 sender ok\r\n")
+            .expect("RCPT TO:<first@example.com>\r\n", "250 first ok\r\n")
+            .expect_then_close("DATA\r\n", "354 send body\r\n");
+        let batch = vec![SmtpBatchRecipient {
+            id: BatchItemId("item-0".to_owned()),
+            address: "first@example.com".parse().unwrap(),
+        }];
+        let mut connection =
+            AsyncSmtpConnection::from_transcript(transcript, &hello, Protocol::Smtp)
+                .await
+                .unwrap();
+
+        let outcome = connection
+            .send_smtp_batch(
+                Some("sender@example.com".parse().unwrap()),
+                batch,
+                b"body",
+                &SendOptions::default(),
+            )
+            .await
+            .expect("a body-write failure is represented per recipient")
+            .resolve();
+
+        assert!(outcome.succeeded().is_empty());
+        assert_eq!(outcome.uncertain().len(), 1);
+        assert_eq!(outcome.uncertain()[0].item.0, "item-0");
+        assert!(connection.has_broken());
+    }
+
+    /// Every envelope-level parameter this crate can emit, on one pipelined
+    /// peer, in one window. This is the widest wire-shape assertion in the
+    /// crate: SIZE, HOLDFOR, BY, MT-PRIORITY, RET and the xtext-escaped ENVID
+    /// on `MAIL FROM`, uniform NOTIFY plus a per-recipient ORCPT on the RCPT
+    /// lines, and all of it written before any reply is read.
+    #[tokio::test(crate = "tokio")]
+    async fn send_with_options_pipelines_envelope_parameters_in_one_window() {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(
+                HELLO,
+                "250-smtp.example\r\n250-PIPELINING\r\n250-SIZE 1024\r\n250-FUTURERELEASE 3600\r\n250-DELIVERBY 240\r\n250-MT-PRIORITY\r\n250 DSN\r\n",
+            )
+            .expect(
+                concat!(
+                    "MAIL FROM:<sender@example.com> SIZE=24 HOLDFOR=60 BY=300;R MT-PRIORITY=-1 RET=HDRS ENVID=env+3D1\r\n",
+                    "RCPT TO:<first@example.com> NOTIFY=FAILURE,DELAY ORCPT=rfc822;alias+3Dfirst@example.com\r\n",
+                    "RCPT TO:<second@example.com> NOTIFY=FAILURE,DELAY\r\n",
+                ),
+                "250 sender ok\r\n250 first ok\r\n250 second ok\r\n",
+            )
+            .expect("DATA\r\n", "354 send body\r\n")
+            .expect("Subject: test\r\n\r\nHello", "")
+            .expect("\r\n.\r\n", "250 queued\r\n");
+        let first_recipient: crate::address::Address = "first@example.com".parse().unwrap();
+        let envelope = Envelope::new(
+            Some("sender@example.com".parse().unwrap()),
+            vec![
+                first_recipient.clone(),
+                "second@example.com".parse().unwrap(),
+            ],
+        )
+        .unwrap();
+        let options = SendOptions::new()
+            .hold_for(60)
+            .deliver_by(300, DeliverByMode::Return, false)
+            .unwrap()
+            .mt_priority(-1)
+            .unwrap()
+            .dsn_return(DsnReturn::Headers)
+            .envelope_id("env=1")
+            .notify([DsnNotify::Failure, DsnNotify::Delay])
+            .unwrap()
+            .recipient_original_recipient(first_recipient, "rfc822", "alias=first@example.com");
+        let mut connection =
+            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp)
+                .await
+                .unwrap();
+
+        let response = connection
+            .send_with_options(&envelope, b"Subject: test\r\n\r\nHello", &options)
+            .await
+            .unwrap();
+
+        assert!(response.has_code(250));
+        transcript.assert_exhausted();
+    }
+
+    /// Per-recipient DSN parameters override the uniform ones on the matching
+    /// RCPT line only, and the batch path emits the same wire shape as the
+    /// envelope path. Sequential (non-PIPELINING) peer, so each RCPT line is
+    /// pinned as its own write.
+    #[tokio::test(crate = "tokio")]
+    async fn batch_rcpt_options_are_emitted_per_recipient_in_order() {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250-smtp.example\r\n250 DSN\r\n")
+            .expect("MAIL FROM:<sender@example.com>\r\n", "250 sender ok\r\n")
+            .expect(
+                "RCPT TO:<first@example.com> NOTIFY=NEVER ORCPT=rfc822;alias+3Dfirst@example.com\r\n",
+                "250 first ok\r\n",
+            )
+            .expect(
+                "RCPT TO:<second@example.com> NOTIFY=FAILURE,DELAY\r\n",
+                "250 second ok\r\n",
+            )
+            .expect("DATA\r\n", "354 send body\r\n")
+            .expect("body", "")
+            .expect("\r\n.\r\n", "250 queued\r\n");
+        let first: crate::address::Address = "first@example.com".parse().unwrap();
+        let options = SendOptions::new()
+            .notify([DsnNotify::Failure, DsnNotify::Delay])
+            .unwrap()
+            .recipient_never_notify(first.clone())
+            .recipient_original_recipient(first.clone(), "rfc822", "alias=first@example.com");
+        let batch = ["first@example.com", "second@example.com"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, address)| SmtpBatchRecipient {
+                id: BatchItemId(format!("item-{index}")),
+                address: address.parse().unwrap(),
+            })
+            .collect();
+        let mut connection =
+            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp)
+                .await
+                .unwrap();
+
+        let outcome = connection
+            .send_smtp_batch(
+                Some("sender@example.com".parse().unwrap()),
+                batch,
+                b"body",
+                &options,
+            )
+            .await
+            .expect("the transaction completes")
+            .resolve();
+
+        assert_eq!(outcome.succeeded().len(), 2);
+        transcript.assert_exhausted();
+    }
+
+    /// Recipient-specific parameters are keyed by address. A parameter naming
+    /// an address that is not in the batch is a caller bug and must be caught
+    /// before `MAIL FROM`, leaving the connection clean and reusable.
+    #[tokio::test(crate = "tokio")]
+    async fn batch_rcpt_parameters_for_an_unknown_recipient_fail_before_mail_from() {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250-smtp.example\r\n250 DSN\r\n")
+            .expect("NOOP\r\n", "250 noop ok\r\n");
+        let options = SendOptions::new()
+            .recipient_notify("stranger@example.com".parse().unwrap(), [DsnNotify::Never])
+            .unwrap();
+        let batch = vec![SmtpBatchRecipient {
+            id: BatchItemId("item-0".to_owned()),
+            address: "first@example.com".parse().unwrap(),
+        }];
+        let mut connection =
+            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp)
+                .await
+                .unwrap();
+
+        let (error, progress) = connection
+            .send_smtp_batch(
+                Some("sender@example.com".parse().unwrap()),
+                batch,
+                b"body",
+                &options,
+            )
+            .await
+            .expect_err("unmatched recipient parameters are a pre-wire input error");
+        assert!(
+            error.to_string().contains("do not match a batch recipient"),
+            "expected an unmatched-recipient refusal, got: {error}"
+        );
+        assert!(progress.resolve().succeeded().is_empty());
+
+        // Nothing was written: the next scripted step is still NOOP.
+        connection.command(Noop).await.unwrap();
+        transcript.assert_exhausted();
+    }
+
+    /// A recipient rejected in the FIRST pipelining window must be reported
+    /// against its own batch id while later-window recipients still succeed.
+    /// The window boundary is where an implementation that re-indexes per
+    /// window misattributes the rejection.
+    #[tokio::test(crate = "tokio")]
+    async fn pipelined_batch_keeps_original_indexes_across_a_window_boundary() {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let addresses: Vec<crate::address::Address> = (0..33)
+            .map(|index| format!("recipient-{index}@example.com").parse().unwrap())
+            .collect();
+        let mut first_window = "MAIL FROM:<sender@example.com>\r\n".to_owned();
+        first_window.extend(
+            addresses[..32]
+                .iter()
+                .map(|recipient| format!("RCPT TO:<{recipient}>\r\n")),
+        );
+        let mut first_replies = "250 sender ok\r\n".to_owned();
+        first_replies.push_str(&"250 recipient ok\r\n".repeat(31));
+        first_replies.push_str("550 recipient rejected\r\n");
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250-smtp.example\r\n250 PIPELINING\r\n")
+            .expect(first_window, first_replies)
+            .expect(
+                format!("RCPT TO:<{}>\r\n", addresses[32]),
+                "250 recipient ok\r\n",
+            )
+            .expect("DATA\r\n", "354 send body\r\n")
+            .expect("body", "")
+            .expect("\r\n.\r\n", "250 queued\r\n");
+        let batch = addresses
+            .into_iter()
+            .enumerate()
+            .map(|(index, address)| SmtpBatchRecipient {
+                id: BatchItemId(format!("item-{index}")),
+                address,
+            })
+            .collect();
+        let mut connection =
+            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp)
+                .await
+                .unwrap();
+
+        let outcome = connection
+            .send_smtp_batch(
+                Some("sender@example.com".parse().unwrap()),
+                batch,
+                b"body",
+                &SendOptions::default(),
+            )
+            .await
+            .unwrap()
+            .resolve();
+
+        assert_eq!(outcome.failed().len(), 1);
+        assert_eq!(outcome.failed()[0].item.0, "item-31");
+        assert_eq!(outcome.succeeded().last().unwrap().item.0, "item-32");
+        transcript.assert_exhausted();
+    }
+
+    /// One final status per accepted recipient, mapped positionally: the
+    /// second recipient's rejection must not be reported against the first.
+    #[tokio::test(crate = "tokio")]
+    async fn lmtp_drains_one_final_status_per_accepted_recipient() {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let transcript = Transcript::new("220 lmtp.example\r\n")
+            .expect("LHLO client.example\r\n", "250 lmtp.example\r\n")
+            .expect("MAIL FROM:<sender@example.com>\r\n", "250 sender ok\r\n")
+            .expect("RCPT TO:<first@example.com>\r\n", "250 first ok\r\n")
+            .expect("RCPT TO:<second@example.com>\r\n", "250 second ok\r\n")
+            .expect("DATA\r\n", "354 send body\r\n")
+            .expect("body", "")
+            .expect(
+                "\r\n.\r\n",
+                "250 first delivered\r\n550 second rejected\r\n",
+            );
+        let envelope = Envelope::new(
+            Some("sender@example.com".parse().unwrap()),
+            vec![
+                "first@example.com".parse().unwrap(),
+                "second@example.com".parse().unwrap(),
+            ],
+        )
+        .unwrap();
+        let mut connection =
+            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Lmtp)
+                .await
+                .unwrap();
+
+        let statuses = connection.send_lmtp(&envelope, b"body").await.unwrap();
+
+        assert_eq!(statuses.len(), 2);
+        assert!(statuses[0].is_positive());
+        assert!(!statuses[1].is_positive());
+        // Surplus bytes below the read buffer are undetectable, so a completed
+        // LMTP drain retires the connection rather than recycling it.
+        assert!(connection.should_retire());
+        transcript.assert_exhausted();
+    }
+
+    /// The batch LMTP path, unlike `send_lmtp`, must keep the per-recipient
+    /// outcomes it already proved even when a surplus status desynchronizes
+    /// the stream. Both deliveries are known; only the connection is lost.
+    #[tokio::test(crate = "tokio")]
+    async fn lmtp_batch_surplus_final_status_retires_the_connection_and_keeps_outcomes() {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let transcript = Transcript::new("220 lmtp.example\r\n")
+            .expect("LHLO client.example\r\n", "250 lmtp.example\r\n")
+            .expect("MAIL FROM:<sender@example.com>\r\n", "250 sender ok\r\n")
+            .expect("RCPT TO:<first@example.com>\r\n", "250 first ok\r\n")
+            .expect("RCPT TO:<second@example.com>\r\n", "250 second ok\r\n")
+            .expect("DATA\r\n", "354 send body\r\n")
+            .expect("body", "")
+            .expect_coalesced(
+                "\r\n.\r\n",
+                "250 first delivered\r\n250 second delivered\r\n250 surplus response\r\n",
+            );
+        let batch = ["first@example.com", "second@example.com"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, address)| SmtpBatchRecipient {
+                id: BatchItemId(format!("item-{index}")),
+                address: address.parse().unwrap(),
+            })
+            .collect();
+        let mut connection =
+            AsyncSmtpConnection::from_transcript(transcript, &hello, Protocol::Lmtp)
+                .await
+                .unwrap();
+
+        let outcome = connection
+            .send_lmtp_batch(
+                Some("sender@example.com".parse().unwrap()),
+                batch,
+                b"body",
+                &SendOptions::default(),
+            )
+            .await
+            .unwrap()
+            .resolve();
+
+        assert_eq!(outcome.succeeded().len(), 2);
+        assert!(outcome.uncertain().is_empty());
+        assert!(connection.has_broken());
+        assert!(connection.should_retire());
+    }
+
+    /// A reply line cut short by a close is a parse failure, not a usable
+    /// connection carrying a half-read capability set.
+    #[tokio::test(crate = "tokio")]
+    async fn peer_closing_mid_reply_line_is_a_parse_failure() {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect_then_close(HELLO, "250-smtp.example\r\n250 PIPELI");
+
+        let Err(error) =
+            AsyncSmtpConnection::from_transcript(transcript, &hello, Protocol::Smtp).await
+        else {
+            panic!("a truncated EHLO reply cannot yield a usable connection");
+        };
+        assert!(
+            error.to_string().contains("incomplete response"),
+            "expected an incomplete-response parse error, got: {error}"
+        );
+    }
+
+    /// An unsolicited reply arriving in the same segment as a legitimate one
+    /// is buffered and consumed as the NEXT command's answer. This pins the
+    /// observable consequence rather than pretending the desync cannot happen.
+    #[tokio::test(crate = "tokio")]
+    async fn unsolicited_reply_coalesced_with_an_answer_desynchronizes_the_next_command() {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250 smtp.example\r\n")
+            .expect_coalesced("NOOP\r\n", "250 noop ok\r\n421 service closing\r\n")
+            .expect("RSET\r\n", "250 reset ok\r\n");
+        let mut connection =
+            AsyncSmtpConnection::from_transcript(transcript, &hello, Protocol::Smtp)
+                .await
+                .unwrap();
+
+        connection
+            .command(Noop)
+            .await
+            .expect("the NOOP reply itself is well formed");
+        let error = connection
+            .command(crate::transport::smtp::commands::Rset)
+            .await
+            .expect_err("the buffered 421 is consumed as the RSET reply");
+        assert!(
+            error
+                .smtp_response()
+                .is_some_and(|response| response.has_code(421)),
+            "expected the stale 421 to surface, got: {error}"
+        );
     }
 }

@@ -2,7 +2,6 @@
 
 use std::fmt::{self, Debug, Display, Formatter};
 use std::sync::Arc;
-use std::task::{Context, Poll, Waker};
 
 use bifrost_net::{AccessToken, StaticTokenSource, TokenSource};
 use bifrost_sasl::{ScramChannelBinding, ScramHash, Secret};
@@ -184,39 +183,6 @@ impl Credentials {
             } => {
                 let token = token_source.current().await.map_err(oauth_token_error)?;
                 Ok((identity.clone(), Zeroizing::new(token.as_str().to_owned())))
-            }
-            Credentials::Password { .. } => Err(error::invalid_input(
-                "password credentials cannot be used with OAuth2 authentication mechanisms",
-            )),
-        }
-    }
-
-    /// Resolve the OAuth identity and current access token without an
-    /// executor, by polling `current()` once. The blocking transport has
-    /// no async context to await a refresh in; a `StaticTokenSource` (and
-    /// an `OAuthRefresher` whose token is already fresh) resolves on the
-    /// first poll. A source that would need a network refresh yields
-    /// `Pending` and is rejected - live refresh requires the async
-    /// transport.
-    pub(crate) fn oauth2_token_blocking(&self) -> Result<(String, Zeroizing<String>), Error> {
-        match self {
-            Credentials::OAuth2 {
-                identity,
-                token_source,
-            } => {
-                let mut future = token_source.current();
-                let waker = Waker::noop();
-                let mut cx = Context::from_waker(waker);
-                match future.as_mut().poll(&mut cx) {
-                    Poll::Ready(Ok(token)) => {
-                        Ok((identity.clone(), Zeroizing::new(token.as_str().to_owned())))
-                    }
-                    Poll::Ready(Err(e)) => Err(oauth_token_error(e)),
-                    Poll::Pending => Err(error::invalid_input(
-                        "OAuth token source requires a network refresh; use the async SMTP transport",
-                    )
-                    .with_phase(SmtpCommandPhase::Auth)),
-                }
             }
             Credentials::Password { .. } => Err(error::invalid_input(
                 "password credentials cannot be used with OAuth2 authentication mechanisms",
@@ -1293,16 +1259,15 @@ mod test {
         );
     }
 
-    #[test]
-    fn test_accepts_zeroizing_secrets() {
+    #[tokio::test]
+    async fn test_accepts_zeroizing_secrets() {
         let credentials = Credentials::oauth2(
             "alice".to_owned(),
             Zeroizing::new("access-token".to_owned()),
         );
 
-        // The token threads through the source convenience constructor and
-        // is read back by the blocking resolver.
-        let (_identity, token) = credentials.oauth2_token_blocking().unwrap();
+        // The token threads through the source convenience constructor.
+        let (_identity, token) = credentials.oauth2_token().await.unwrap();
         assert_eq!(
             Mechanism::Xoauth2
                 .response_with_token(&credentials, None, Some(token.as_str()))
@@ -1321,7 +1286,7 @@ mod test {
         let credentials = Credentials::oauth2_source("user@example.com", Arc::new(source.clone()));
 
         // The SASL payload is built from the token the source currently
-        // holds, both through the async read and the blocking read.
+        // holds through the async read.
         let (_identity, token) = credentials.oauth2_token().await.unwrap();
         let payload = Mechanism::OAuthBearer
             .response_with_token(&credentials, None, Some(token.as_str()))
@@ -1344,8 +1309,5 @@ mod test {
             "got: {}",
             payload.as_str()
         );
-
-        let (_identity, token) = credentials.oauth2_token_blocking().unwrap();
-        assert_eq!(token.as_str(), "new-token");
     }
 }

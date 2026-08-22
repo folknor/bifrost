@@ -28,7 +28,7 @@ bifrost-net = { path = "../net" }
 bifrost-caldav = { path = "../caldav" }
 bifrost-carddav = { path = "../carddav" }
 bifrost-sasl = { path = "../sasl" }
-bifrost-smtp = { path = "../smtp", features = ["tokio"] }
+bifrost-smtp = { path = "../smtp" }
 bytes = { workspace = true }
 jiff = { workspace = true }
 flate2 = "1"

@@ -1,6 +1,6 @@
 //! ## Transports for sending emails
 //!
-//! This module contains `Transport`s for sending emails. A `Transport` implements a high-level API
+//! This module contains async transports for sending emails. An `AsyncTransport` implements a high-level API
 //! for sending emails. It automatically manages the underlying resources and doesn't require any
 //! specific knowledge of email protocols in order to be used.
 //!
@@ -17,7 +17,7 @@
 //!
 //! In most cases, the best option is to:
 //!
-//! * Use the [`SMTP`] transport, with the [`relay`] builder (or one of its async counterparts)
+//! * Use the [`SMTP`] transport with the [`relay`] builder
 //!   with your server's hostname. They provide modern and secure defaults.
 //! * Use the [`credentials`] method of the builder to pass your credentials.
 //!
@@ -27,10 +27,10 @@
 //!
 //! The following transports are available:
 //!
-//! | Module   | Protocol | Sync API              | Async API              | Description                                             |
-//! | -------- | -------- | --------------------- | ---------------------- | ------------------------------------------------------- |
-//! | [`smtp`] | SMTP     | [`SmtpTransport`]     | [`AsyncSmtpTransport`] | Uses the SMTP protocol to send emails to a relay server |
-//! | [`stub`] | Debug    | [`StubTransport`]     | [`AsyncStubTransport`] | Drops the email - Useful for debugging                  |
+//! | Module   | Protocol | Async API              | Description                                             |
+//! | -------- | -------- | ---------------------- | ------------------------------------------------------- |
+//! | [`smtp`] | SMTP     | [`AsyncSmtpTransport`] | Uses the SMTP protocol to send emails to a relay server |
+//! | [`stub`] | Debug    | [`AsyncStubTransport`] | Logs email for debugging and tests                      |
 //!
 //! ## Building an email
 //!
@@ -38,9 +38,9 @@
 //! (find out more about it by going over the [`message`][crate::message] module),
 //! or via external means.
 //!
-//! [`Message`]s can be sent via [`Transport::send`] or [`AsyncTransport::send`], while messages
-//! built without the crate's [`message`][crate::message] APIs can be sent via [`Transport::send_raw`]
-//! or [`AsyncTransport::send_raw`].
+//! [`Message`]s can be sent via [`AsyncTransport::send`], while messages
+//! built without the crate's [`message`][crate::message] APIs can be sent via
+//! [`AsyncTransport::send_raw`].
 //!
 //! ## Brief example
 //!
@@ -52,9 +52,11 @@
 //! ```rust,no_run
 //! # use std::error::Error;
 //! #
-//! # fn main() -> Result<(), Box<dyn Error>> {
+//! # #[tokio::main]
+//! # async fn main() -> Result<(), Box<dyn Error>> {
 //! use bifrost_smtp::{
-//!     Message, SmtpTransport, Transport, message::header::ContentType,
+//!     AsyncSmtpTransport, AsyncTransport, Message, TokioExecutor,
+//!     message::header::ContentType,
 //! };
 //!
 //! let email = Message::builder()
@@ -66,12 +68,12 @@
 //!     .body(String::from("Be happy!"))?;
 //!
 //! // Open a remote connection to the SMTP relay server
-//! let mailer = SmtpTransport::relay("smtp.gmail.com")?
+//! let mailer = AsyncSmtpTransport::<TokioExecutor>::relay("smtp.gmail.com")?
 //!     .password("smtp_username", "smtp_password")
 //!     .build();
 //!
 //! // Send the email
-//! match mailer.send(&email) {
+//! match mailer.send(&email).await {
 //!     Ok(_) => println!("Email sent successfully!"),
 //!     Err(e) => panic!("Could not send email: {e:?}"),
 //! }
@@ -81,13 +83,10 @@
 //!
 //! [MTA]: https://en.wikipedia.org/wiki/Message_transfer_agent
 //! [`SMTP`]: crate::transport::smtp
-//! [`relay`]: crate::SmtpTransport::relay
-//! [`starttls_relay`]: crate::SmtpTransport::starttls_relay
-//! [`credentials`]: crate::transport::smtp::SmtpTransportBuilder::credentials
+//! [`relay`]: crate::AsyncSmtpTransport::relay
+//! [`credentials`]: crate::transport::smtp::AsyncSmtpTransportBuilder::credentials
 //! [`Message`]: crate::Message
-//! [`SmtpTransport`]: crate::SmtpTransport
 //! [`AsyncSmtpTransport`]: crate::AsyncSmtpTransport
-//! [`StubTransport`]: crate::transport::stub::StubTransport
 //! [`AsyncStubTransport`]: crate::transport::stub::AsyncStubTransport
 
 use crate::Envelope;
@@ -98,80 +97,10 @@ pub mod smtp;
 // pub: users can swap in a logging transport for tests and dry runs.
 pub mod stub;
 
-/// Blocking Transport method for emails
-// pub: concrete transports implement this user-facing send trait.
-pub trait Transport {
-    /// Response produced by the Transport
-    type Ok;
-    /// Error produced by the Transport
-    type Error;
-
-    /// Sends the email
-    fn send(&self, message: &Message) -> Result<Self::Ok, Self::Error> {
-        #[cfg(feature = "tracing")]
-        tracing::trace!("starting to send an email");
-
-        let raw = message.formatted();
-        self.send_raw(message.envelope(), &raw)
-    }
-
-    fn send_raw(&self, envelope: &Envelope, email: &[u8]) -> Result<Self::Ok, Self::Error>;
-
-    /// Shuts down the transport. Future calls to [`Self::send`] and
-    /// [`Self::send_raw`] might fail.
-    fn shutdown(&self) {}
-}
-
-/// Boxed blocking transport trait object.
-// pub: users can erase concrete sync transport choices.
-pub type BoxedTransport<Ok, Error> = Box<dyn Transport<Ok = Ok, Error = Error> + Send + Sync>;
-
-impl<T> Transport for Box<T>
-where
-    T: Transport + ?Sized,
-{
-    type Ok = T::Ok;
-    type Error = T::Error;
-
-    fn send(&self, message: &Message) -> Result<Self::Ok, Self::Error> {
-        (**self).send(message)
-    }
-
-    fn send_raw(&self, envelope: &Envelope, email: &[u8]) -> Result<Self::Ok, Self::Error> {
-        (**self).send_raw(envelope, email)
-    }
-
-    fn shutdown(&self) {
-        (**self).shutdown();
-    }
-}
-
-impl<T> Transport for std::sync::Arc<T>
-where
-    T: Transport + ?Sized,
-{
-    type Ok = T::Ok;
-    type Error = T::Error;
-
-    fn send(&self, message: &Message) -> Result<Self::Ok, Self::Error> {
-        (**self).send(message)
-    }
-
-    fn send_raw(&self, envelope: &Envelope, email: &[u8]) -> Result<Self::Ok, Self::Error> {
-        (**self).send_raw(envelope, email)
-    }
-
-    fn shutdown(&self) {
-        (**self).shutdown();
-    }
-}
-
 /// Async Transport method for emails
 ///
 /// Implementations must be [`Sync`] so borrowed async methods can return
 /// [`Send`] futures.
-#[cfg(feature = "tokio")]
-#[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
 // pub: concrete async transports implement this user-facing send trait.
 pub trait AsyncTransport: Sync {
     /// Response produced by the Transport
@@ -206,7 +135,6 @@ pub trait AsyncTransport: Sync {
     }
 }
 
-#[cfg(feature = "tokio")]
 impl<T> AsyncTransport for Box<T>
 where
     T: AsyncTransport + ?Sized,
@@ -234,7 +162,6 @@ where
     }
 }
 
-#[cfg(feature = "tokio")]
 impl<T> AsyncTransport for std::sync::Arc<T>
 where
     T: AsyncTransport + Send + Sync + ?Sized,
@@ -262,7 +189,6 @@ where
     }
 }
 
-#[cfg(feature = "tokio")]
 trait ErasedAsyncTransport<Ok, Error>: Send + Sync {
     fn send_raw_boxed<'a>(
         &'a self,
@@ -273,7 +199,6 @@ trait ErasedAsyncTransport<Ok, Error>: Send + Sync {
     fn shutdown_boxed(&self) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send + '_>>;
 }
 
-#[cfg(feature = "tokio")]
 impl<Ok, Error, T> ErasedAsyncTransport<Ok, Error> for T
 where
     T: AsyncTransport<Ok = Ok, Error = Error> + Send + Sync,
@@ -298,14 +223,11 @@ where
 /// reintroducing `async-trait`. The wrapped transport must be `Send + Sync +
 /// 'static` because the heap-erased transport can outlive the construction
 /// frame and may be shared between runtime tasks.
-#[cfg(feature = "tokio")]
-#[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
 // pub: users can erase concrete async transport choices.
 pub struct BoxedAsyncTransport<Ok, Error> {
     inner: Box<dyn ErasedAsyncTransport<Ok, Error>>,
 }
 
-#[cfg(feature = "tokio")]
 impl<Ok, Error> BoxedAsyncTransport<Ok, Error> {
     /// Boxes an async transport.
     pub fn new<T>(transport: T) -> Self
@@ -318,7 +240,6 @@ impl<Ok, Error> BoxedAsyncTransport<Ok, Error> {
     }
 }
 
-#[cfg(feature = "tokio")]
 impl<Ok, Error> AsyncTransport for BoxedAsyncTransport<Ok, Error> {
     type Ok = Ok;
     type Error = Error;

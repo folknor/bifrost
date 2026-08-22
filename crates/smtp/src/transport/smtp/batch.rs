@@ -11,7 +11,7 @@
 //!    `Reconcile(PartialCompletionSignal)` recovery.
 //!
 //! The existing transport `send_raw*` paths are unchanged. The new batch
-//! helpers on `SmtpTransport` / `LmtpTransport` build a `SendProgress`, drive
+//! helpers on `AsyncSmtpTransport` / `AsyncLmtpTransport` build a `SendProgress`, drive
 //! it through the existing command sequence, then resolve into a
 //! `BatchOutcome<()>`.
 

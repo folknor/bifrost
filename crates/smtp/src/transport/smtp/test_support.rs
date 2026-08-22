@@ -44,7 +44,6 @@ impl Transcript {
     }
 
     /// A peer that accepts the connection and never sends its banner.
-    #[cfg(feature = "tokio")]
     pub(super) fn silent() -> Self {
         Self::with_state(VecDeque::new(), true)
     }
@@ -93,7 +92,6 @@ impl Transcript {
     }
 
     /// Accept the client bytes, then never answer.
-    #[cfg(feature = "tokio")]
     pub(super) fn expect_then_stall(self, client: impl AsRef<[u8]>) -> Self {
         self.push(client, b"", true, false, false)
     }
@@ -141,7 +139,7 @@ impl Transcript {
     }
 }
 
-/// A synchronous side of an in-process SMTP transcript.
+/// Shared in-process transcript state used by the async stream adapter.
 ///
 /// Each client write exactly matches one scripted step. Its paired server
 /// bytes become readable only after that write, so transcripts preserve the
@@ -233,13 +231,11 @@ impl std::io::Write for TranscriptStream {
     }
 }
 
-#[cfg(feature = "tokio")]
 #[derive(Clone, Debug)]
 pub(super) struct AsyncTranscriptStream {
     inner: TranscriptStream,
 }
 
-#[cfg(feature = "tokio")]
 impl AsyncTranscriptStream {
     pub(super) fn new(transcript: Transcript) -> Self {
         Self {
@@ -248,7 +244,6 @@ impl AsyncTranscriptStream {
     }
 }
 
-#[cfg(feature = "tokio")]
 impl tokio::io::AsyncRead for AsyncTranscriptStream {
     fn poll_read(
         mut self: std::pin::Pin<&mut Self>,
@@ -272,7 +267,6 @@ impl tokio::io::AsyncRead for AsyncTranscriptStream {
     }
 }
 
-#[cfg(feature = "tokio")]
 impl tokio::io::AsyncWrite for AsyncTranscriptStream {
     fn poll_write(
         mut self: std::pin::Pin<&mut Self>,

@@ -1,8 +1,6 @@
 use std::time::Duration;
 
-#[cfg(feature = "tokio")]
 pub(super) mod async_impl;
-pub(super) mod sync_impl;
 
 /// Configuration for a connection pool
 #[derive(Debug, Clone)]

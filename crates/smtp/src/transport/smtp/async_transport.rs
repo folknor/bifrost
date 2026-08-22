@@ -14,7 +14,6 @@ use std::sync::atomic::AtomicU64;
 use bifrost_net::MeterSinkHandle;
 
 use super::PoolConfig;
-#[cfg(feature = "tokio")]
 use super::Tls;
 use super::WireMetering;
 use super::batch::{SmtpBatchRecipient, batch_input_invalid_error, batch_level_error};
@@ -56,7 +55,6 @@ use crate::{Envelope, Executor};
 /// of this struct for the connection pool to be of any use.
 ///
 /// To customize connection pool settings, use [`AsyncSmtpTransportBuilder::pool_config`].
-#[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
 pub struct AsyncSmtpTransport<E: Executor> {
     inner: Arc<Pool<E>>,
 }
@@ -71,7 +69,6 @@ pub struct AsyncSmtpTransport<E: Executor> {
 /// Direct sends return only the ordered statuses. Use
 /// [`AsyncLmtpTransport::send_raw_batch_with_options`] when callers need the
 /// RCPT-versus-final-status phase and per-recipient recovery classification.
-#[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
 pub struct AsyncLmtpTransport<E: Executor> {
     inner: Arc<Pool<E>>,
 }
@@ -125,7 +122,6 @@ where
     ///
     /// Creates an encrypted transport over submissions port, using the provided domain
     /// to validate TLS certificates.
-    #[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
     pub fn relay(relay: &str) -> Result<AsyncSmtpTransportBuilder, Error> {
         use super::{SUBMISSIONS_PORT, Tls, TlsParameters};
 
@@ -147,7 +143,6 @@ where
     ///
     /// An error is returned if the connection can't be upgraded. No credentials
     /// or emails will be sent to the server, protecting from downgrade attacks.
-    #[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
     pub fn starttls_relay(relay: &str) -> Result<AsyncSmtpTransportBuilder, Error> {
         use super::{SUBMISSION_PORT, Tls, TlsParameters};
 
@@ -660,7 +655,6 @@ where
 /// Contains client configuration.
 /// Instances of this struct can be created using functions of [`AsyncSmtpTransport`].
 #[derive(Debug, Clone)]
-#[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
 pub struct AsyncSmtpTransportBuilder {
     info: SmtpInfo,
     pool_config: PoolConfig,
@@ -669,7 +663,6 @@ pub struct AsyncSmtpTransportBuilder {
 /// Contains LMTP client configuration.
 /// Instances of this struct can be created using functions of [`AsyncLmtpTransport`].
 #[derive(Debug, Clone)]
-#[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
 pub struct AsyncLmtpTransportBuilder {
     info: SmtpInfo,
     pool_config: PoolConfig,
@@ -818,8 +811,6 @@ impl AsyncSmtpTransportBuilder {
     ///
     /// Using the incorrect [`Tls`] and [`Self::port`] combination may
     /// lead to hard to debug IO errors coming from the TLS library.
-    #[cfg(feature = "tokio")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
     pub fn tls(mut self, tls: Tls) -> Self {
         self.info.tls = tls;
         self.info.unix_socket = None;
@@ -951,8 +942,6 @@ impl AsyncLmtpTransportBuilder {
     }
 
     /// Set the TLS settings to use
-    #[cfg(feature = "tokio")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
     pub fn tls(mut self, tls: Tls) -> Self {
         self.info.tls = tls;
         self.info.unix_socket = None;
@@ -1027,7 +1016,6 @@ impl<E> Debug for AsyncSmtpClient<E> {
 }
 
 #[cfg(test)]
-#[cfg(feature = "tokio")]
 mod tests {
     use std::{
         io::{BufRead, BufReader, Write},
@@ -1043,8 +1031,12 @@ mod tests {
     use crate::{
         AsyncLmtpTransport, AsyncSmtpTransport, AsyncTransport, TokioExecutor,
         address::Envelope,
-        transport::smtp::test_support::{
-            assert_lmtp_delivery_commands, spawn_lmtp_delivery_server,
+        transport::smtp::{
+            authentication::{
+                Credentials, DEFAULT_MECHANISMS, Mechanism, OAUTH2_MECHANISMS, PASSWORD_MECHANISMS,
+            },
+            client::Tls,
+            test_support::{assert_lmtp_delivery_commands, spawn_lmtp_delivery_server},
         },
     };
 
@@ -1065,6 +1057,160 @@ mod tests {
 
         assert_eq!(builder.info.port, super::super::LMTP_PORT);
         assert_eq!(builder.info.protocol, Protocol::Lmtp);
+    }
+
+    /// URL parsing decides the port, the TLS posture and the credentials, and
+    /// percent-decodes both halves of the userinfo. Getting any of those wrong
+    /// silently downgrades or misauthenticates the connection.
+    #[test]
+    fn tokio_transport_from_tls_url() {
+        let builder = AsyncSmtpTransport::<TokioExecutor>::from_url("smtp://127.0.0.1:2525")
+            .expect("a plaintext URL parses");
+        assert!(matches!(builder.info.tls, Tls::None));
+
+        let builder = AsyncSmtpTransport::<TokioExecutor>::from_url(
+            "smtps://username:password@smtp.example.com:465",
+        )
+        .expect("an implicit-TLS URL parses");
+        assert_eq!(builder.info.port, 465);
+        assert_eq!(builder.info.server, "smtp.example.com");
+        assert!(matches!(builder.info.tls, Tls::Wrapper(_)));
+        assert!(matches!(
+            builder.info.credentials,
+            Some(Credentials::Password { ref username, ref password })
+                if username == "username" && password.as_str() == "password"
+        ));
+
+        let builder = AsyncSmtpTransport::<TokioExecutor>::from_url(
+            "smtps://user%40example.com:pa$$word%3F%22!@smtp.example.com:465",
+        )
+        .expect("percent-encoded userinfo parses");
+        assert!(matches!(builder.info.tls, Tls::Wrapper(_)));
+        assert!(matches!(
+            builder.info.credentials,
+            Some(Credentials::Password { ref username, ref password })
+                if username == "user@example.com" && password.as_str() == "pa$$word?\"!"
+        ));
+
+        let builder = AsyncSmtpTransport::<TokioExecutor>::from_url(
+            "smtp://username:password@smtp.example.com:587?tls=required",
+        )
+        .expect("an explicit STARTTLS URL parses");
+        assert_eq!(builder.info.port, 587);
+        assert!(matches!(builder.info.tls, Tls::Required(_)));
+    }
+
+    /// The `password` helper picks the password mechanism ladder, strongest
+    /// first. SCRAM is offered out of the box; LOGIN is opt-in only. A silent
+    /// reordering here is a downgrade.
+    #[test]
+    fn tokio_password_helper_uses_password_mechanisms() {
+        let builder = AsyncSmtpTransport::<TokioExecutor>::builder_dangerous("smtp.example.com")
+            .password("username", "password");
+
+        assert!(matches!(
+            builder.info.credentials,
+            Some(Credentials::Password { ref username, ref password })
+                if username == "username" && password.as_str() == "password"
+        ));
+        assert_eq!(builder.info.authentication, PASSWORD_MECHANISMS);
+        assert_eq!(
+            builder.info.authentication,
+            vec![
+                Mechanism::ScramSha256Plus,
+                Mechanism::ScramSha1Plus,
+                Mechanism::ScramSha256,
+                Mechanism::ScramSha1,
+                Mechanism::Plain,
+            ]
+        );
+        assert_eq!(DEFAULT_MECHANISMS, PASSWORD_MECHANISMS);
+    }
+
+    /// OAUTHBEARER (RFC 7628) outranks the legacy XOAUTH2 draft.
+    #[test]
+    fn tokio_oauth2_helper_prefers_standard_bearer_mechanism() {
+        let builder = AsyncSmtpTransport::<TokioExecutor>::builder_dangerous("smtp.example.com")
+            .oauth2("user@example.com", "token");
+
+        assert!(matches!(
+            builder.info.credentials,
+            Some(Credentials::OAuth2 { ref identity, .. })
+                if identity == "user@example.com"
+        ));
+        assert_eq!(builder.info.authentication, OAUTH2_MECHANISMS);
+        assert_eq!(
+            builder.info.authentication,
+            [Mechanism::OAuthBearer, Mechanism::Xoauth2]
+        );
+    }
+
+    /// Setting credentials must not clobber an explicit mechanism list. A
+    /// caller who narrowed the ladder deliberately gets to keep it.
+    #[test]
+    fn tokio_credentials_preserve_explicit_authentication_mechanisms() {
+        let builder = AsyncSmtpTransport::<TokioExecutor>::builder_dangerous("smtp.example.com")
+            .authentication(vec![Mechanism::Xoauth2])
+            .oauth2("user@example.com", "token");
+        assert_eq!(builder.info.authentication, [Mechanism::Xoauth2]);
+
+        let builder = AsyncSmtpTransport::<TokioExecutor>::builder_dangerous("smtp.example.com")
+            .authentication(vec![Mechanism::Plain])
+            .password("username", "password");
+        assert_eq!(builder.info.authentication, [Mechanism::Plain]);
+    }
+
+    /// The insecure-auth escape hatch is a builder flag, and it is the only
+    /// thing that may relax the refusal. Both directions are pinned so the
+    /// flag cannot rot into a no-op (silently breaking local relays) or into
+    /// a default (silently sending credentials in the clear).
+    #[test]
+    fn tokio_dangerous_allow_insecure_auth_is_the_only_plaintext_escape_hatch() {
+        let guarded = AsyncSmtpTransport::<TokioExecutor>::builder_dangerous("smtp.example.com")
+            .password("user", "pass");
+        assert!(!guarded.info.allow_insecure_auth);
+        let error = guarded
+            .info
+            .ensure_can_authenticate(false)
+            .expect_err("plaintext AUTH is refused by default");
+        assert!(
+            error
+                .to_string()
+                .contains("refusing to authenticate over an unencrypted SMTP connection"),
+            "expected a plaintext-auth policy refusal, got: {error}"
+        );
+        guarded
+            .info
+            .ensure_can_authenticate(true)
+            .expect("an encrypted connection may authenticate");
+
+        let opted_in = AsyncSmtpTransport::<TokioExecutor>::builder_dangerous("smtp.example.com")
+            .password("user", "pass")
+            .dangerous_allow_insecure_auth(true);
+        assert!(opted_in.info.allow_insecure_auth);
+        opted_in
+            .info
+            .ensure_can_authenticate(false)
+            .expect("the opt-in escape hatch permits plaintext AUTH");
+    }
+
+    /// LMTP names itself in the refusal, so an operator reading a log knows
+    /// which transport refused.
+    #[test]
+    fn tokio_plaintext_auth_refusal_names_the_lmtp_protocol() {
+        let builder = AsyncLmtpTransport::<TokioExecutor>::builder_dangerous("localhost")
+            .password("user", "pass");
+
+        let error = builder
+            .info
+            .ensure_can_authenticate(false)
+            .expect_err("plaintext AUTH is refused for LMTP too");
+        assert!(
+            error
+                .to_string()
+                .contains("refusing to authenticate over an unencrypted LMTP connection"),
+            "expected an LMTP-labelled refusal, got: {error}"
+        );
     }
 
     #[tokio::test(crate = "tokio")]
@@ -1178,7 +1324,7 @@ mod tests {
     mod pooled_batch {
         use std::{marker::PhantomData, sync::Arc};
 
-        use bifrost_types::error::{BatchItem, BatchItemId};
+        use bifrost_types::error::{AccountErrorKind, BatchItem, BatchItemId, RequestErrorKind};
 
         use crate::transport::smtp::test_support::Transcript;
 
@@ -1428,6 +1574,56 @@ mod tests {
             assert_eq!(second.succeeded().len(), 1);
             assert_eq!(pool.idle_count_for_test().await, 1);
             transcript.assert_exhausted();
+        }
+
+        /// Batch input is validated before a connection is taken out of the
+        /// pool. Duplicate ids would make the per-item outcome lanes
+        /// ambiguous, and discovering that after checkout would burn a
+        /// connection (or, worse, open a transaction) over a caller bug. The
+        /// pool here is shut down, so any checkout attempt fails loudly with
+        /// a different error than the one asserted.
+        #[tokio::test(crate = "tokio")]
+        async fn invalid_batch_input_is_rejected_before_pool_checkout() {
+            let pool = Pool::new(
+                PoolConfig::new(),
+                AsyncSmtpClient::<TokioExecutor> {
+                    info: SmtpInfo::new("transcript.invalid", Protocol::Smtp),
+                    marker_: PhantomData,
+                },
+            );
+            pool.shutdown().await;
+            let transport = AsyncSmtpTransport::<TokioExecutor> {
+                inner: Arc::clone(&pool),
+            };
+            let duplicated = vec![
+                BatchItem::new(
+                    BatchItemId("dup".to_owned()),
+                    "first@example.com".parse().unwrap(),
+                ),
+                BatchItem::new(
+                    BatchItemId("dup".to_owned()),
+                    "second@example.com".parse().unwrap(),
+                ),
+            ];
+
+            let error = transport
+                .send_raw_batch_with_options(
+                    Some("sender@example.com".parse().unwrap()),
+                    duplicated,
+                    b"body",
+                    &SendOptions::default(),
+                )
+                .await
+                .expect_err("duplicate batch ids are refused");
+
+            assert!(
+                matches!(
+                    error.kind(),
+                    AccountErrorKind::Request(RequestErrorKind::BatchInputInvalid)
+                ),
+                "expected BatchInputInvalid before checkout, got {:?}",
+                error.kind()
+            );
         }
     }
 }
