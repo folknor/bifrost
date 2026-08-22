@@ -16,7 +16,6 @@ pub mod reconciler;
 pub mod subscription;
 
 use std::sync::Arc;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bifrost_types::{
@@ -36,9 +35,14 @@ pub use subscription::SubscriptionRegistry;
 /// `bifrost_sync_push_dropped_total`.
 #[derive(Debug)]
 pub struct InvalidationSinkInner {
-    senders: DashMap<AccountId, mpsc::Sender<WatchEvent>>,
-    drop_counter: AtomicU64,
-    runtime: OnceLock<tokio::runtime::Handle>,
+    senders: DashMap<AccountId, SinkSender>,
+    drop_counter: Arc<AtomicU64>,
+}
+
+#[derive(Debug, Clone)]
+enum SinkSender {
+    Queued(mpsc::UnboundedSender<WatchEvent>),
+    Direct(mpsc::Sender<WatchEvent>),
 }
 
 impl InvalidationSinkInner {
@@ -46,16 +50,26 @@ impl InvalidationSinkInner {
     pub fn new() -> Self {
         Self {
             senders: DashMap::new(),
-            drop_counter: AtomicU64::new(0),
-            runtime: OnceLock::new(),
+            drop_counter: Arc::new(AtomicU64::new(0)),
         }
     }
 
     pub fn register(&self, account: AccountId, sender: mpsc::Sender<WatchEvent>) {
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            let _ = self.runtime.set(handle);
+            // A single per-registration forwarder is the ordering point for
+            // every out-of-process event. In particular, once one event has
+            // to wait for bounded queue space, a later push cannot bypass it
+            // through a successful `try_send`.
+            let (ingress_tx, ingress_rx) = mpsc::unbounded_channel();
+            let drops = Arc::clone(&self.drop_counter);
+            handle.spawn(forward_events(ingress_rx, sender, drops, None));
+            self.senders.insert(account, SinkSender::Queued(ingress_tx));
+            return;
         }
-        self.senders.insert(account, sender);
+        // `register` is engine machinery and normally runs on the engine's
+        // Tokio runtime. Keep the off-runtime fallback explicit for callers
+        // that construct the sink directly: it cannot wait for capacity.
+        self.senders.insert(account, SinkSender::Direct(sender));
     }
 
     pub fn unregister(&self, account: &AccountId) {
@@ -65,6 +79,40 @@ impl InvalidationSinkInner {
     #[must_use]
     pub fn dropped(&self) -> u64 {
         self.drop_counter.load(Ordering::Relaxed)
+    }
+}
+
+async fn forward_events(
+    mut ingress: mpsc::UnboundedReceiver<WatchEvent>,
+    sender: mpsc::Sender<WatchEvent>,
+    drops: Arc<AtomicU64>,
+    waiting: Option<mpsc::UnboundedSender<()>>,
+) {
+    while let Some(event) = ingress.recv().await {
+        match sender.try_send(event) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Closed(_)) => break,
+            Err(mpsc::error::TrySendError::Full(rejected)) => {
+                let lossless = requires_lossless_delivery(&rejected);
+                let delivery = if lossless {
+                    rejected
+                } else {
+                    drops.fetch_add(1, Ordering::Relaxed);
+                    coalesced_event(rejected)
+                };
+                if let Some(waiting) = &waiting {
+                    let _ = waiting.send(());
+                }
+                if lossless {
+                    if sender.send(delivery).await.is_err() {
+                        break;
+                    }
+                } else {
+                    let deadline = tokio::time::Duration::from_millis(100);
+                    let _ = tokio::time::timeout(deadline, sender.send(delivery)).await;
+                }
+            }
+        }
     }
 }
 
@@ -79,46 +127,17 @@ impl InvalidationSink for InvalidationSinkInner {
         let Some(tx) = self.senders.get(&account) else {
             return;
         };
+        let SinkSender::Direct(tx) = tx.value() else {
+            if let SinkSender::Queued(tx) = tx.value() {
+                let _ = tx.send(event);
+            }
+            return;
+        };
         match tx.try_send(event) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(rejected)) => {
-                let sender = tx.clone();
-                let lossless = requires_lossless_delivery(&rejected);
-                if let Some(handle) = self.runtime.get() {
-                    // Only the lossy coalescing lane counts as a drop: the
-                    // lossless lane below waits for queue space and delivers
-                    // the original event.
-                    if !lossless {
-                        self.drop_counter.fetch_add(1, Ordering::Relaxed);
-                    }
-                    let delivery = if lossless {
-                        rejected
-                    } else {
-                        coalesced_event(rejected)
-                    };
-                    handle.spawn(async move {
-                        if lossless {
-                            // Terminal classifications and warnings
-                            // are control information, not redundant
-                            // invalidation hints. Preserve the exact
-                            // event and wait for queue space.
-                            let _ = sender.send(delivery).await;
-                        } else {
-                            // Invalidations and health transitions can
-                            // collapse to one bounded full reconcile.
-                            let deadline = tokio::time::Duration::from_millis(100);
-                            let _ = tokio::time::timeout(deadline, sender.send(delivery)).await;
-                        }
-                    });
-                } else {
-                    // No runtime handle was ever captured (`register` ran
-                    // outside Tokio), so nothing can wait for queue space:
-                    // the event is discarded regardless of classification.
-                    // A lossless discard is still a drop - leaving it
-                    // uncounted would hide the loss of control information
-                    // from the one signal built to expose it.
-                    self.drop_counter.fetch_add(1, Ordering::Relaxed);
-                }
+                let _ = rejected;
+                self.drop_counter.fetch_add(1, Ordering::Relaxed);
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 // Account detached during in-flight push.
@@ -171,12 +190,8 @@ mod tests {
         let sink = Arc::new(InvalidationSinkInner::new());
         let account = AccountId("warning".into());
         let (tx, mut rx) = mpsc::channel(1);
-        sink.register(account.clone(), tx);
-        sink.senders
-            .get(&account)
-            .expect("registered")
-            .try_send(invalidated())
-            .expect("fill queue");
+        sink.register(account.clone(), tx.clone());
+        tx.try_send(invalidated()).expect("fill queue");
 
         let outside = Arc::clone(&sink);
         std::thread::spawn(move || {
@@ -202,12 +217,8 @@ mod tests {
         let sink = Arc::new(InvalidationSinkInner::new());
         let account = AccountId("terminated".into());
         let (tx, mut rx) = mpsc::channel(1);
-        sink.register(account.clone(), tx);
-        sink.senders
-            .get(&account)
-            .expect("registered")
-            .try_send(invalidated())
-            .expect("fill queue");
+        sink.register(account.clone(), tx.clone());
+        tx.try_send(invalidated()).expect("fill queue");
         let error = crate::recovery::restart_scope_error(
             CursorScope::Account,
             AccountOperation::SyncChanges,
@@ -229,24 +240,65 @@ mod tests {
         let sink = Arc::new(InvalidationSinkInner::new());
         let account = AccountId("coalesced".into());
         let (tx, mut rx) = mpsc::channel(1);
-        sink.register(account.clone(), tx);
-        sink.senders
-            .get(&account)
-            .expect("registered")
-            .try_send(invalidated())
-            .expect("fill queue");
+        sink.register(account.clone(), tx.clone());
+        tx.try_send(invalidated()).expect("fill queue");
 
         sink.push(account, invalidated());
 
+        tokio::time::timeout(tokio::time::Duration::from_secs(1), async {
+            while sink.dropped() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("forwarder observes the full queue");
+
+        assert!(matches!(
+            rx.recv().await,
+            Some(WatchEvent::Invalidated { .. })
+        ));
+        assert!(matches!(
+            rx.recv().await,
+            Some(WatchEvent::Invalidated { .. })
+        ));
         assert_eq!(sink.dropped(), 1, "the replaced invalidation was dropped");
+    }
+
+    #[tokio::test]
+    async fn queued_forwarder_cannot_deliver_a_later_event_first() {
+        let (bounded_tx, mut bounded_rx) = mpsc::channel(1);
+        bounded_tx
+            .try_send(invalidated())
+            .expect("fill bounded queue");
+        let (ingress_tx, ingress_rx) = mpsc::unbounded_channel();
+        let (waiting_tx, mut waiting_rx) = mpsc::unbounded_channel();
+        let drops = Arc::new(AtomicU64::new(0));
+        let worker = tokio::spawn(forward_events(
+            ingress_rx,
+            bounded_tx,
+            drops,
+            Some(waiting_tx),
+        ));
+        let first = WatchEvent::Warning(Warning::user_safe(WarningKind::Other, "first"));
+        let second = WatchEvent::Warning(Warning::user_safe(WarningKind::Other, "second"));
+        ingress_tx.send(first).expect("queue first");
+        waiting_rx.recv().await.expect("first is waiting for space");
+        ingress_tx.send(second).expect("queue second behind first");
+
         assert!(matches!(
-            rx.recv().await,
+            bounded_rx.recv().await,
             Some(WatchEvent::Invalidated { .. })
         ));
-        assert!(matches!(
-            rx.recv().await,
-            Some(WatchEvent::Invalidated { .. })
-        ));
+        let WatchEvent::Warning(first) = bounded_rx.recv().await.expect("first warning") else {
+            panic!("first queued event was bypassed");
+        };
+        let WatchEvent::Warning(second) = bounded_rx.recv().await.expect("second warning") else {
+            panic!("second queued event missing");
+        };
+        assert_eq!(first.message.as_str(), "first");
+        assert_eq!(second.message.as_str(), "second");
+        drop(ingress_tx);
+        worker.await.expect("forwarder exits");
     }
 
     /// With no captured runtime handle nothing can wait for queue space, so
@@ -259,12 +311,8 @@ mod tests {
         let sink = Arc::new(InvalidationSinkInner::new());
         let account = AccountId("no-runtime".into());
         let (tx, mut rx) = mpsc::channel(1);
-        sink.register(account.clone(), tx);
-        sink.senders
-            .get(&account)
-            .expect("registered")
-            .try_send(invalidated())
-            .expect("fill queue");
+        sink.register(account.clone(), tx.clone());
+        tx.try_send(invalidated()).expect("fill queue");
 
         sink.push(
             account,

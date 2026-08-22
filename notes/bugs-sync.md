@@ -9,6 +9,17 @@ the cursor envelope outer version, the detach/re-attach teardown race, the scope
 identity bug, and the latched `CheckpointNow`. Their sections are removed below; the behaviour
 now lives in `reference/sync.md`. Everything still listed is unverified.
 
+2026-08-23: the push-ordering defect from `Smaller observations` is fixed - each account now has
+one forwarder task, so a later event cannot bypass an earlier one that is waiting for bounded
+queue space, and `Disconnected`/`Reconnected` can no longer invert.
+
+**A note on this document's remaining sections.** The findings below are structural and
+stylistic judgments, not defects: nothing here produces a wrong answer, loses data, or hangs.
+They are a refactor backlog. An earlier round of this hunt treated a section of the same kind
+as a mandate and deleted public API on that basis, which was not its call to make. Anything
+here that would remove or reshape a published surface is a proposal for the repository owner to
+accept or reject, not work to be picked up automatically.
+
 ## Structural: engine.rs is 5278 lines and mixes five unrelated concerns
 
 Lifecycle (attach/detach/reopen), recovery dispatch (~900 lines of free functions), the backfill
@@ -24,10 +35,6 @@ aspirationally; the code does not match it.
 
 ## Smaller observations
 
-- `push/mod.rs::push`: on a full queue the lossless lane spawns a task that `send().await`s, so a
-  later `try_send` that succeeds can be delivered before the earlier spawned event.
-  `Disconnected`/`Reconnected` ordering can invert, and the reconciler treats `Reconnected` as
-  "full reconcile", so an inverted pair leaves the account marked disconnected with no reconcile.
 - `drive_changes_stream` still takes `_account_id` and `_ack_tx` and threads them from four call
   sites through `spawn_scope_poll_inner`; dead parameters that obscure the actual data flow.
 - `InvalidationSinkInner::runtime` is a `OnceLock` captured from whichever account registered
