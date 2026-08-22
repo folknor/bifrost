@@ -203,7 +203,8 @@ crates/jmap/src/sync/
   pim.rs           - unified PIM primitives: mail mutations, send,
                      drafts, search, containers, settings, hydration
   filters.rs       - SieveScript-backed server-side filter scripts
-  blob.rs          - open_blob / open_blob_range / open_raw_rfc822 (Email/get blobId + download)
+  blob.rs          - open_blob / open_blob_range / open_raw_rfc822 (Email/get blobId + download,
+                     correlated on the submitted id rather than the head of the echoed list)
   error.rs         - to_recovery / to_account_error mapping
 ```
 
@@ -261,7 +262,7 @@ Validation rules in `state::decode`:
 
 Supported scopes for `inventory_stream` and `changes_stream`:
 
-- `CursorScope::Type(ObjectType::Email)` - inventory paginates `Email/query` (`receivedAt` desc) then `Email/get` with a fixed property set (Id, MailboxIds, ThreadId, BlobId, Size, Keywords, MessageId, References, InReplyTo, ReceivedAt). Changes use `Email/changes` emitting Created/Updated/Destroyed `ObjectChange`s. `inventory_partitioning` exposes `Page { from, to }` for Email only. Every inventory path advances its query position by ids consumed, rather than hydrated objects, and treats only an empty query page as end-of-inventory. This prevents a server query-page cap or a query-to-get deletion race from truncating a full or page-windowed backfill.
+- `CursorScope::Type(ObjectType::Email)` - inventory paginates `Email/query` (`receivedAt` desc) then `Email/get` with a fixed property set (Id, MailboxIds, ThreadId, BlobId, Size, Keywords, MessageId, References, InReplyTo, ReceivedAt). Changes use `Email/changes` emitting Created/Updated/Destroyed `ObjectChange`s. `inventory_partitioning` exposes `Page { from, to }` for Email only. Every inventory path advances its query position by ids consumed, rather than hydrated objects, and treats only an empty query page as end-of-inventory. This prevents a server query-page cap or a query-to-get deletion race from truncating a full or page-windowed backfill. Every inventory walk (Email and Mailbox alike) drops an object the server returned with no `id`, or an empty one, rather than minting `ObjectId("")`: an unidentifiable object is not an item under the crate's closed per-item accounting, and a bogus row qualifies into `"acct-9\u{1f}"` for a share and routes later reads at nothing. Hydration already drops the same shape so the submitted id falls through to the `PartialResponse` lane.
 - `CursorScope::Type(ObjectType::Mailbox)` - inventory is a single `Mailbox/get` (Id, Name, ParentId, Role, SortOrder, totals, unread counts, IsSubscribed). Changes use `Mailbox/changes`.
 - `CursorScope::Type(ObjectType::Thread)` and `CursorScope::Query(_)` are not discovered. A legacy cursor for either terminates unsupported: thread inventory derives from email inventory, and the v1 trait has no registered query definition to supply an `Email/queryChanges` filter/sort.
 - `CursorScope::Folder(FolderId(encode_foreign_account(account_id)))` - a foreign (shared/delegate) account, one account-level scope per share. Inventory paginates an UNFILTERED `Email/query` against the foreign account handle (one walk per share); changes use that account's `Email/changes`, which is account-wide and cannot be filtered by mailbox - which is exactly why the topology is one scope per account, never one per mailbox (a per-mailbox topology streamed the identical change set once per mailbox and fanned every foreign push out M ways). Per-mailbox membership is learned at hydration from the qualified `mailboxIds`, the same model the primary `Type(Email)` scope uses. A legacy per-mailbox `Folder` cursor still decodes and takes an `inMailbox`-filtered inventory walk, but is never seeded. See "Foreign (shared/delegate) accounts".
@@ -345,7 +346,7 @@ The `onSuccessUpdateEmail` payload (`EmailPatch::submitted_to_sent`) is built en
 
 Scheduled send rides RFC 8621/4865 FUTURERELEASE: when `SendRequest::scheduled` is `Some(t)`, the boundary validates `t` against `max_delayed_send`, forces an envelope, and stamps `holduntil` (RFC 3339) as a `mailFrom` parameter. A scheduled `send_message` returns the **EmailSubmission id** (undo-addressable). `cancel_scheduled_send` sets `undoStatus: canceled`; `reschedule_send` cancel-and-resubmits (no in-place reschedule) with a new `holduntil`.
 
-Search maps the shared `SearchRequest` AST to `Email/query` (query text as a JMAP `text` filter). `search_messages` returns native email ids; `search` uses `collapseThreads = true`, hydrates the emails' `threadId`, returns thread ids. Page cursors are opaque position bytes.
+Search maps the shared `SearchRequest` AST to `Email/query` (query text as a JMAP `text` filter). `search_messages` returns native email ids; `search` uses `collapseThreads = true`, hydrates the emails' `threadId`, returns thread ids. Page cursors are opaque position bytes, so the search query pins `receivedAt` desc exactly as the inventory walks do: RFC 8621 gives an unsorted `Email/query` a server-defined order with no cross-call stability guarantee, and paging an unstable order by integer position duplicates and skips results.
 
 Container CRUD is `Mailbox/get`/`set`. Mailboxes surface as `ContainerKind::Folder` (native mailbox id); `Mailbox.role` maps to `FolderRole` (`inbox`->INBOX, `sent`->SENT, `drafts`->DRAFT, `trash`->TRASH, `junk`->SPAM). `container_delete` leaves `onDestroyRemoveEmails = false`, so non-empty deletion fails rather than dropping messages.
 
@@ -546,7 +547,7 @@ a whole new share still waits for reopen.
   the foreign account via the qualified object-id codec. Foreign submission is
   supported, but scheduled foreign submission is not.
 - Raw-MIME projections unsupported; only `FlagsOnly` and `Metadata` work. Sync-layer push is WebSocket-subprotocol only; against a server without RFC 8887 the engine falls back to polling. The client-level EventSource API exists but is not wired in as a push fallback (deliberate; see `reference/jmap/DEFERRED.md`).
-- `BlobRangeSupport::No`; `open_blob_range` fatals `Error::Unsupported` even when the handle advertises range support (no transport `Range` hook).
+- `BlobRangeSupport::No`; `open_blob_range` fatals `Error::Unsupported` even when the handle advertises range support (no transport `Range` hook). Its one non-capability refusal, a `range.start` past the known blob size, is `Request(Malformed)` (-> `ClientBug`) instead: that is a caller argument fault, and reporting it as `Unsupported` would tell the engine the protocol has no ranged read at all.
 - `MutationReplaySafety::None`; `IdempotencyKey` is a wire no-op (read-back guard is the only lost-update protection).
 - `bulk_move` only `MembershipScope::Mailbox`; `inventory_partitioning` only `Page { from, to }` for `Email`.
 - Gmail labels, Graph categories/extended properties, and identity-default selection are unsupported. Attachment handles keep blob id + MIME but not uploaded filenames.

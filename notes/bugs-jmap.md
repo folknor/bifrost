@@ -6,6 +6,14 @@ Hunter: Claude Opus, single pass, 2026-08-05. Scope: `crates/jmap/` including
 Tree was clean at hunt time (`brokkr check -p bifrost-jmap`: 489 tests pass, zero
 clippy/gremlins), so everything below is behavior the suite does not cover.
 
+Fixed 2026-08-22 and removed from this document: the unsorted `Email/query`
+behind the positional search cursor, the inventory walks minting an
+`ObjectId("")` for an object the server returned without an id,
+`open_raw_rfc822` taking the head of the echoed `Email/get` list instead of
+correlating on the submitted id, and `open_blob_range`'s out-of-range start
+reported as `Unsupported` rather than `Request(Malformed)`.
+`reference/jmap.md` states each new rule.
+
 ## scope_lifecycle and the Mailbox change stream share one cursor
 
 `crates/jmap/src/sync/discover.rs` (`scope_lifecycle`), `crates/jmap/src/sync/changes.rs`
@@ -78,18 +86,6 @@ awaits teardown". It does not. `WsState::spawn` drops the `JoinHandle`
 (`let _reader = tokio::spawn(...)`), so nothing is ever awaited. The reader is detached;
 `close()` returning is not evidence it has stopped.
 
-## Email/query for search is sent with no sort, then paged by position
-
-`crates/jmap/src/sync/pim.rs` (`search_email_ids`).
-
-`search` and `search_messages` build `EmailQuery::new().collapse_threads(..).position(..).limit(..)`
-and never call `.sort(..)`. RFC 8621 leaves the order of an unsorted `Email/query`
-server-defined and gives no stability guarantee across calls. The page cursor is a bare integer
-position into that undefined ordering, so paging a search can duplicate and skip results on any
-server whose default order is not stable, and gives a different order per server. Every other
-query site in the crate (`inventory.rs`, all three loops) correctly pins `receivedAt desc`.
-Search should too.
-
 ## Unhandled SearchFilter variant silently becomes "match everything"
 
 `crates/jmap/src/sync/pim.rs` (`search_filter_to_jmap`), final arm:
@@ -118,37 +114,6 @@ the engine happens to reopen for an unrelated reason. The flag is a fully wired 
 no consumer: either drive `refresh_session()` off it, or surface it as
 `SyncState(CapabilityChanged) -> Engine(RestartAccount)`, but the current shape is a dead
 invariant that reads as if it were live.
-
-## Inventory mints entries with an empty ObjectId when the server omits id
-
-`crates/jmap/src/sync/inventory.rs`, two sites:
-`email.id().map(ToString::to_string).unwrap_or_default()`.
-
-An `Email`/`Mailbox` object arriving without `id` produces `InventoryEntry { id: ObjectId("") }`,
-which is emitted into the batch as a real inventory row, and in the foreign case gets qualified
-into `"acct-9\u{1f}"`. `hydrate::reconcile_hydration` handles the same condition correctly: it
-drops the object and lets the submitted id fall through to the `PartialResponse` lane.
-`discover::memberships` and `seed_account_state` also correctly filter `id.as_str().is_empty()`.
-Inventory is the one path that manufactures a bogus row instead. Given the crate's own "closed
-per-item accounting" doctrine this looks like an oversight, not a decision.
-
-## open_raw_rfc822 takes the first object in list without correlating the id
-
-`crates/jmap/src/sync/blob.rs`: `response.into_list().into_iter().next()`.
-
-One id was requested, so this is currently safe, but it is the same "trust the echoed list
-positionally" pattern that `reconcile_hydration` was written to eliminate. A server echoing an
-unrelated object would have its `blobId` downloaded and returned as the caller's message body.
-One `id ==` check closes it.
-
-## open_blob_range's out-of-range check is mislabeled
-
-`crates/jmap/src/sync/blob.rs`. A `range.start >= handle.size` is reported as
-`Unsupported(OpenBlobRange)`. That is a caller argument error (`Request(InvalidArgument)` /
-`ClientBug`), not a capability gap, and the engine's recovery derivation reads the difference.
-Low impact today because `BlobRangeSupport::No` makes every path terminate unsupported anyway,
-which raises the design question of why the two dead pre-checks exist at all ahead of the
-unconditional fatal.
 
 ## Design observations
 

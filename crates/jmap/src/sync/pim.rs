@@ -2119,14 +2119,7 @@ async fn search_email_ids<T: HttpTransport>(
 ) -> Result<Page<EmailId>, AccountError> {
     let position = decode_position(request.page_cursor.as_deref())?;
     let limit = request.limit.unwrap_or(50).max(1);
-    let mut query_request = crate::email::EmailQuery::new()
-        .collapse_threads(collapse_threads)
-        .position(position)
-        .limit(usize::try_from(limit).unwrap_or(usize::MAX))
-        .calculate_total(true);
-    if let Some(filter) = build_search_filter(request.filter, request.provider_query) {
-        query_request = query_request.filter(filter);
-    }
+    let query_request = build_search_query(request, collapse_threads, position, limit);
     let response = mail.call(query_request).await.map_err(to_acct_err(op))?;
     let total = response.total().and_then(|v| u64::try_from(v).ok());
     let ids = response.into_ids();
@@ -2145,6 +2138,34 @@ async fn search_email_ids<T: HttpTransport>(
         failed_ids: Vec::new(),
         skipped_scopes: Vec::new(),
     })
+}
+
+/// Build the `Email/query` a search page issues.
+///
+/// Split out from `search_email_ids` so the request shape is pinnable without
+/// a live session; the sort in particular is load-bearing. RFC 8621 leaves the
+/// order of an unsorted `Email/query` server-defined and guarantees nothing
+/// about its stability across calls, while the page cursor here is a bare
+/// integer position into that order. With no explicit comparator, paging a
+/// search can duplicate and skip results on any server whose default order is
+/// not stable, and returns a different order per server. Pin the same
+/// `receivedAt desc` every inventory query in the crate pins.
+fn build_search_query(
+    request: SearchRequest,
+    collapse_threads: bool,
+    position: i32,
+    limit: u32,
+) -> crate::email::EmailQuery {
+    let mut query_request = crate::email::EmailQuery::new()
+        .collapse_threads(collapse_threads)
+        .sort([query::Comparator::new(crate::email::query::Comparator::ReceivedAt).descending()])
+        .position(position)
+        .limit(usize::try_from(limit).unwrap_or(usize::MAX))
+        .calculate_total(true);
+    if let Some(filter) = build_search_filter(request.filter, request.provider_query) {
+        query_request = query_request.filter(filter);
+    }
+    query_request
 }
 
 fn decode_position(cursor: Option<&[u8]>) -> Result<i32, AccountError> {
@@ -2981,6 +3002,28 @@ mod tests {
             value["parentId"] = serde_json::Value::String(parent.to_string());
         }
         serde_json::from_value(value).expect("mailbox deserializes")
+    }
+
+    /// The search page cursor is a bare integer position, so the query it
+    /// pages MUST carry an explicit comparator: RFC 8621 gives an unsorted
+    /// `Email/query` a server-defined order with no stability guarantee, and
+    /// paging an unstable order duplicates and skips results.
+    #[test]
+    fn a_search_query_pins_its_sort_order() {
+        let mut request = SearchRequest::default();
+        request.limit = Some(10);
+        let query = build_search_query(request, true, 20, 10);
+        let value = serde_json::to_value(&query).expect("query serializes");
+
+        assert_eq!(
+            value.get("sort"),
+            Some(&serde_json::json!([
+                {"isAscending": false, "property": "receivedAt"}
+            ]))
+        );
+        assert_eq!(value.get("position"), Some(&serde_json::json!(20)));
+        assert_eq!(value.get("limit"), Some(&serde_json::json!(10)));
+        assert_eq!(value.get("collapseThreads"), Some(&serde_json::json!(true)));
     }
 
     // A foreign-account hydration must come back in the SAME id namespace

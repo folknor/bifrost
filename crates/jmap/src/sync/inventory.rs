@@ -164,7 +164,7 @@ fn foreign_email_inventory<T: HttpTransport>(
 
             let state = get_response.state().to_string();
             let mut items = Vec::new();
-            for email in get_response.into_list() {
+            for email in get_response.into_list().into_iter().filter(email_has_id) {
                 let mut entry = email_to_inventory(email, &state);
                 // Each foreign (shared/delegate) inventory item carries
                 // its owning account's `Mailbox(accountId)` membership in
@@ -330,7 +330,7 @@ fn email_inventory<T: HttpTransport>(
 
             let state = get_response.state().to_string();
             let mut items = Vec::new();
-            for email in get_response.into_list() {
+            for email in get_response.into_list().into_iter().filter(email_has_id) {
                 items.push(email_to_inventory(email, &state));
             }
 
@@ -489,6 +489,7 @@ fn email_inventory_page<T: HttpTransport>(
             let items = get_response
                 .into_list()
                 .into_iter()
+                .filter(email_has_id)
                 .map(|email| email_to_inventory(email, &state))
                 .collect::<Vec<_>>();
 
@@ -577,6 +578,7 @@ fn mailbox_inventory<T: HttpTransport>(
         let items = response
             .into_list()
             .into_iter()
+            .filter(mailbox_has_id)
             .map(|mailbox| mailbox_to_inventory(mailbox, &state))
             .collect::<Vec<_>>();
 
@@ -604,6 +606,26 @@ fn mailbox_inventory_properties() -> Vec<MailboxProperty> {
         MailboxProperty::UnreadThreads,
         MailboxProperty::IsSubscribed,
     ]
+}
+
+/// Whether a fetched object carries an id we can hand to a consumer.
+///
+/// An object arriving with no `id`, or an empty one, cannot become an
+/// inventory row: `ObjectId("")` is a handle to nothing, and once qualified
+/// for a foreign account it becomes the equally bogus `"acct-9\u{1f}"`, which
+/// then routes later reads at whatever that string happens to collide with.
+/// The rest of the crate already refuses the shape - hydration drops the
+/// object so the submitted id falls through to the `PartialResponse` lane, and
+/// container discovery filters it - so the inventory walks, the one path that
+/// used to manufacture the row instead, drop it here. Under the crate's closed
+/// per-item accounting an unidentifiable object is not an item.
+fn email_has_id(email: &Email) -> bool {
+    email.id().is_some_and(|id| !id.as_str().is_empty())
+}
+
+/// Mailbox counterpart of [`email_has_id`]; same reasoning.
+fn mailbox_has_id(mailbox: &Mailbox) -> bool {
+    mailbox.id().is_some_and(|id| !id.as_str().is_empty())
 }
 
 pub(crate) fn email_to_inventory(email: Email, state: &str) -> InventoryEntry {
@@ -835,5 +857,49 @@ mod tests {
             entry.thread_id.as_ref().map(|thread| thread.0.as_str()),
             Some("T1")
         );
+    }
+
+    /// An object the server returned without a usable `id` is not an
+    /// inventory item: the walks filter it rather than minting
+    /// `ObjectId("")`, which would qualify into `"acct-9\u{1f}"` for a
+    /// foreign share and route later reads at nothing.
+    #[test]
+    fn an_object_without_an_id_is_not_an_inventory_item() {
+        let missing: Email = serde_json::from_value(serde_json::json!({
+            "blobId": "B1",
+            "size": 10,
+            "mailboxIds": {"inbox": true},
+            "keywords": {}
+        }))
+        .expect("email deserializes");
+        assert!(!super::email_has_id(&missing));
+
+        let empty: Email = serde_json::from_value(serde_json::json!({
+            "id": "",
+            "blobId": "B1",
+            "size": 10,
+            "mailboxIds": {"inbox": true},
+            "keywords": {}
+        }))
+        .expect("email deserializes");
+        assert!(!super::email_has_id(&empty));
+
+        let present: Email = serde_json::from_value(serde_json::json!({
+            "id": "M1",
+            "blobId": "B1",
+            "size": 10,
+            "mailboxIds": {"inbox": true},
+            "keywords": {}
+        }))
+        .expect("email deserializes");
+        assert!(super::email_has_id(&present));
+
+        let mailbox: Mailbox = serde_json::from_value(serde_json::json!({"name": "Inbox"}))
+            .expect("mailbox deserializes");
+        assert!(!super::mailbox_has_id(&mailbox));
+        let mailbox: Mailbox =
+            serde_json::from_value(serde_json::json!({"id": "X1", "name": "Inbox"}))
+                .expect("mailbox deserializes");
+        assert!(super::mailbox_has_id(&mailbox));
     }
 }

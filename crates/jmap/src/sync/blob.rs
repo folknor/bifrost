@@ -109,8 +109,10 @@ pub(crate) fn open_raw_rfc822<T: HttpTransport>(
         let response = match mail
             .call(
                 EmailGet::new()
-                    .ids([EmailId::new(native_message)])
-                    .properties([Property::BlobId]),
+                    .ids([EmailId::new(native_message.clone())])
+                    // `Id` is requested explicitly so the correlation below
+                    // has something to match on.
+                    .properties([Property::Id, Property::BlobId]),
             )
             .await
         {
@@ -131,10 +133,17 @@ pub(crate) fn open_raw_rfc822<T: HttpTransport>(
             }
         };
 
-        let blob_id = match response.into_list().into_iter().next() {
-            Some(email) => email.blob_id().cloned(),
-            None => None,
-        };
+        // Correlate on the id we submitted rather than taking the head of the
+        // echoed list. One id was requested, so positional trust happens to be
+        // safe today, but it is the pattern `reconcile_hydration` was written
+        // to eliminate: a server echoing an unrelated object would have ITS
+        // blobId downloaded and returned as this caller's message body. An
+        // uncorrelated response falls through to the NotFound below.
+        let blob_id = response
+            .into_list()
+            .into_iter()
+            .find(|email| email.id().is_some_and(|id| id.as_str() == native_message))
+            .and_then(|email| email.blob_id().cloned());
         let Some(blob_id) = blob_id else {
             // Email present but `blobId` is `None`: no transport error to
             // convert, so build the NotFound directly. `terminated_unsupported`
@@ -189,13 +198,24 @@ pub(crate) fn open_range(
         if let (Some(total), start) = (handle.size, range.start)
             && start >= total
         {
-            yield super::error::terminated_unsupported(
-                AccountOperation::OpenBlobRange,
-                None,
-                format!(
-                    "JMAP blob range starts past the known blob size (start {start}, total {total})",
-                ),
-            );
+            // A start past the known size is a caller argument fault, not a
+            // capability gap: `Request(Malformed)` derives to `ClientBug`,
+            // where `Unsupported` would tell the engine the protocol has no
+            // ranged read at all and suppress the operation wholesale.
+            let err = AccountErrorBuilder::new(
+                AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed),
+                Cause::Request(RequestCause::InvalidArgument {
+                    field: Some("range.start"),
+                    message: Some(bifrost_types::DiagnosticText::support_only(format!(
+                        "JMAP blob range starts past the known blob size (start {start}, total {total})"
+                    ))),
+                }),
+            )
+            .operation(AccountOperation::OpenBlobRange)
+            .protocol(Protocol::Jmap)
+            .try_build()
+            .expect("valid account error classification");
+            yield super::error::terminated(err);
             return;
         }
 
