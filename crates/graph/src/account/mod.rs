@@ -23,6 +23,7 @@ mod push;
 mod push_stream;
 mod reactions;
 mod scopes;
+mod worker_slot;
 
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
@@ -45,8 +46,7 @@ use bifrost_types::{
 };
 use bytes::Bytes;
 use futures::{StreamExt, stream};
-use tokio::sync::{Mutex, RwLock, broadcast, watch};
-use tokio::task::JoinHandle;
+use tokio::sync::{RwLock, broadcast, watch};
 use tokio_util::sync::CancellationToken;
 
 // pub: consumers build a GraphClient before registering GraphAccountFactory with the engine.
@@ -89,9 +89,9 @@ pub(crate) struct GraphAccount {
     pub(crate) folder_tree: Arc<RwLock<FolderTree>>,
     pub(crate) graph_subscriptions:
         Arc<RwLock<HashMap<SubscriptionHandle, GraphSubscriptionGroup>>>,
-    pub(crate) graph_worker: Arc<Mutex<Option<JoinHandle<()>>>>,
+    pub(crate) graph_worker: worker_slot::WorkerSlot,
     pub(crate) ews_subscriptions: Arc<RwLock<HashMap<SubscriptionHandle, EwsSubscriptionState>>>,
-    pub(crate) ews_worker: Arc<Mutex<Option<JoinHandle<()>>>>,
+    pub(crate) ews_worker: worker_slot::WorkerSlot,
     /// Monotone generation counter bumped by `subscribe_ews` /
     /// `unsubscribe_ews` on every change to `ews_subscriptions`. The EWS
     /// worker marks the current generation seen immediately before each
@@ -269,9 +269,9 @@ impl GraphAccount {
             cursor_index: Arc::new(RwLock::new(CursorIndex::default())),
             folder_tree: Arc::new(RwLock::new(FolderTree::default())),
             graph_subscriptions: Arc::new(RwLock::new(HashMap::new())),
-            graph_worker: Arc::new(Mutex::new(None)),
+            graph_worker: worker_slot::worker_slot(),
             ews_subscriptions: Arc::new(RwLock::new(HashMap::new())),
-            ews_worker: Arc::new(Mutex::new(None)),
+            ews_worker: worker_slot::worker_slot(),
             ews_topology: Arc::new(watch::channel(0_u64).0),
             shutdown: CancellationToken::new(),
             etag_index: Arc::new(RwLock::new(EtagIndex::default())),
@@ -728,6 +728,13 @@ impl Account for GraphAccount {
             );
         }
         inventory::inventory_stream(self.clone(), scope)
+    }
+
+    fn inventory_resume_stream(
+        &self,
+        cursor: ChangeCursor,
+    ) -> Option<AccountStream<SyncEvent<InventoryEntry>>> {
+        inventory::resume_inventory_stream(self.clone(), cursor)
     }
 
     fn get_stream(
@@ -1308,7 +1315,7 @@ impl Account for GraphAccount {
             // server to drop them.
             push::retire_all_graph_subscriptions(&account).await;
             account.shutdown.cancel();
-            if let Some(worker) = account.ews_worker.lock().await.take() {
+            if let Some(worker) = worker_slot::take_worker(&account.ews_worker).await {
                 // Join rather than abort: the worker observes the cancelled
                 // token, then sends an EWS `Unsubscribe` for whatever
                 // streaming subscription it is holding. An abort here would
@@ -1333,7 +1340,7 @@ impl Account for GraphAccount {
             // The renewal worker holds no server-side state of its own (the
             // subscriptions it renews are already deleted above), so aborting
             // is honest here.
-            if let Some(worker) = account.graph_worker.lock().await.take() {
+            if let Some(worker) = worker_slot::take_worker(&account.graph_worker).await {
                 worker.abort();
             }
             Ok(())

@@ -64,7 +64,17 @@ arrived with cursor envelope v2, which forces a reseed.
   Subscribe / GetStreamingEvents / Unsubscribe XML, scope
   recovery, the long-lived worker loop - generic over the crate-private
   `EwsExecute` transport seam (`EwsClient` in production, a scripted
-  double in tests). At `push_subscribe` (in `push.rs`),
+  double in tests). One-shot SOAP calls use the buffered `execute` funnel;
+  `GetStreamingEvents` uses its separate chunked response seam and frames
+  each complete response message before parsing, so notifications arrive
+  while Exchange keeps the outer SOAP response open. Framing keys on the
+  element's LOCAL name, never on a serialized `m:` prefix - a namespace
+  prefix is a writer-chosen alias, and matching the bytes discarded every
+  otherwise-valid response without reporting a failure. A framed response
+  message keeps its typed `EwsError`: a classified response error inside
+  the stream (`ErrorAccessDenied` and friends) exits through
+  `WatchEvent::Terminated`, and only a malformed or truncated frame
+  reconnects. At `push_subscribe` (in `push.rs`),
   Graph REST folder `restId`s are translated once through
   `/me/translateExchangeIds` - deduplicated and chunked to Graph's 1,000-id
   request cap - to `ewsId`s and retained beside their `CursorScope` in
@@ -431,7 +441,7 @@ invalidation is exactly what `PushSource::Coalesced` exists for.
 ## Cursor envelope
 
 `OpaqueChangeState` for Graph is tagged `ProtocolKind::Graph` with
-`envelope_version = GRAPH_CURSOR_ENVELOPE_VERSION` (currently `2`);
+`envelope_version = GRAPH_CURSOR_ENVELOPE_VERSION` (currently `4`);
 `CHANGE_CURSOR_ENVELOPE_VERSION` is the matching
 `ChangeCursor.envelope_version`. v2 is an OBJECT-ID encoding change, not a
 payload-shape change: v1 minted bare `ThreadId`s for shared mailboxes, and
@@ -443,8 +453,15 @@ inventory, and keep routing thread hydration and thread-targeted writes at
 drops every durable cursor and re-establishes each scope through a full
 `inventory_stream` pass, which re-mints the ids. The ids are server-issued
 and not reconstructable from the stored bytes, so reseeding is the migration.
-`GraphCursorPayload` carries a kind, final
-`@odata.deltaLink`, and optional mid-walk page marker
+v3 added the calendarView window end to the payload. Graph retains that window
+inside every delta link it mints, so a cursor reseeds ninety days before its
+one-year end horizon rather than silently losing future events. The bound
+cannot be reconstructed from a v2 link safely, so v3 is also a reseed boundary.
+v4 adds the `inventory_in_progress` payload state: a page checkpoint has no
+delta link yet, so bifrost-sync recognizes it at attach and resumes
+`inventory_stream` at its saved next link rather than starting `changes_stream`.
+`GraphCursorPayload` carries a kind, final `@odata.deltaLink`, optional
+calendar window end, and optional mid-walk page marker
 (landing in `OpaqueChangeState::bytes`; page markers also in
 `ChangeCursor::advanced_through`).
 
@@ -498,7 +515,9 @@ Supported scopes:
   `internetMessageHeaders`, and a flags hash from `isRead` / `flag.flagStatus`
   / `categories`. `size` is `None` on this projection.
 - `FolderType { folder, Event | CalendarEvent }` -> calendarView delta over
-  a [-90d, +365d] window (`EVENT_SELECT`); thread/message-id fields empty.
+  a [-90d, +365d] window (`EVENT_SELECT`); its cursor records the end and
+  is reseeded with a new sliding window ninety days before that end;
+  thread/message-id fields empty.
 - `FolderType { folder, Contact }` -> initial URL
   `/{prefix}/contactFolders/{folder}/contacts/delta?$select=...&$top=250`
   (`CONTACT_SELECT`).
@@ -510,9 +529,12 @@ Supported scopes:
   `establish_initial_cursor` gates scopes before that point.
 
 The inventory walk reads pages via `get_json` / `get_absolute` (the
-`@odata.nextLink` chain), yielding `PageBoundary::Page` Batches until a
-`delta_link`, then a `Final` Batch + `Checkpoint::Change`. A page with neither
-link is a contract violation, never a successful cursor-less completion.
+`@odata.nextLink` chain), yielding `PageBoundary::Page` Batches with a
+consumer-acknowledged `inventory_in_progress` checkpoint until a `delta_link`,
+then a `Final` Batch + ordinary `Checkpoint::Change`. The payload stores the
+next link without inventing a delta link, and `changes_stream` rejects that
+state defensively. A page with neither link is a contract violation, never a
+successful cursor-less completion.
 `@removed` entries are skipped and evict their cached change key; harvested
 etags fold into the bounded LRU `account.etag_index` for the next `If-Match`.
 
@@ -871,9 +893,8 @@ Scope registrations ride a `watch`-channel generation counter
 every read of the subscription map, so a change can never fall between a
 read and a wait - a stored-permit `Notify` here turned the registration
 that starts the worker into a phantom topology change and a guaranteed
-redundant second subscription. Started before any scopes exist, the worker
-waits on that generation instead of polling the empty map. A bump while
-the stream is live cancels the in-flight `GetStreamingEvents`: the worker
+redundant second subscription. A bump while the stream is live cancels the
+in-flight `GetStreamingEvents`: the worker
 retires the abandoned subscription with a best-effort EWS `Unsubscribe`
 (Exchange holds streaming subscriptions against a per-mailbox quota, so
 leaking one per scope change accrues until each times out), subscribes to
@@ -886,7 +907,22 @@ so the Subscribe body is watermark-free (a `<t:Watermark>` there is a
 schema violation that broke every resubscribe once a watermark had been
 recorded), and gap coverage is always the `Reconnected` reconcile. The
 subscribe / long-poll / unsubscribe cycle is pinned hermetically through
-`EwsExecute` with a scripted transport.
+`EwsExecute` with a scripted transport. The worker is spawned only after a
+handle has installed a scope. If a topology change leaves the union empty, it
+retires the abandoned server-side subscription and exits rather than parking
+for the account lifetime; a later subscribe observes the emptied slot and
+starts a fresh worker.
+
+Both push modes share one worker-slot discipline (`worker_slot.rs`): a
+registration writes its state under the registration lock, drops that lock,
+and only then calls `ensure_worker`; a worker that decides to exit calls
+`retire_worker_slot` while it STILL holds the registration guard that made
+the decision. Lock order is registration-then-worker in both modes and
+`ensure_worker` takes only the worker lock, so the pair cannot deadlock.
+Without the guard-held retirement, a concurrent subscribe saw a
+still-unfinished `JoinHandle`, declined to spawn, and was left with no
+worker once the old one returned - push silently dead. That bug appeared
+independently in each mode before the lifecycle was unified.
 
 `push_subscribe` rejects any `Folder` (public-folder) scope as
 `Unsupported(PushSubscribe)` in both modes. The EWS arm narrows further via

@@ -12,6 +12,18 @@ use super::inventory::{
     removed_id, scope_matches_payload,
 };
 
+/// Refresh a calendarView delta link before its fixed horizon gets close.
+/// Keeping a ninety-day lead preserves the original 365-day forward view
+/// while avoiding a cursor that silently stops seeing future events.
+const CALENDAR_WINDOW_RESEED_LEAD_SECS: i64 = 90 * 24 * 60 * 60;
+
+fn calendar_window_needs_reseed(payload: &super::cursor::GraphCursorPayload, now: i64) -> bool {
+    matches!(&payload.kind, super::cursor::GraphCursorKind::Events { .. })
+        && payload
+            .calendar_window_end
+            .is_none_or(|end| now >= end.saturating_sub(CALENDAR_WINDOW_RESEED_LEAD_SECS))
+}
+
 pub(crate) fn changes_stream(
     account: GraphAccount,
     cursor: ChangeCursor,
@@ -32,6 +44,33 @@ pub(crate) fn changes_stream(
                 .with_scope(ErrorScope::Cursor(cursor.scope.clone()));
             yield SyncEvent::Terminated(cursor_error_to_account_error(
                 CursorError::SchemaIncompatible,
+                ctx,
+            ));
+            yield SyncEvent::Done(None);
+            return;
+        }
+        // A v4 in-progress inventory cursor carries a next link, not a
+        // delta link. `inventory_resume_stream` is the only correct way to
+        // consume one, and both engine establishment paths route it there;
+        // reaching here means something handed a page position to the
+        // changes walk, which would resume from an empty URL. Refuse
+        // instead, so the engine restarts the scope rather than silently
+        // syncing nothing.
+        if payload.inventory_in_progress {
+            let ctx = GraphErrorContext::graph(AccountOperation::SyncChanges)
+                .with_scope(ErrorScope::Cursor(cursor.scope.clone()));
+            yield SyncEvent::Terminated(cursor_error_to_account_error(
+                CursorError::InventoryInProgress,
+                ctx,
+            ));
+            yield SyncEvent::Done(None);
+            return;
+        }
+        if calendar_window_needs_reseed(&payload, jiff::Timestamp::now().as_second()) {
+            let ctx = GraphErrorContext::graph(AccountOperation::SyncChanges)
+                .with_scope(ErrorScope::Cursor(cursor.scope.clone()));
+            yield SyncEvent::Terminated(cursor_error_to_account_error(
+                CursorError::CalendarWindowExpired,
                 ctx,
             ));
             yield SyncEvent::Done(None);
@@ -224,6 +263,85 @@ mod tests {
             folder: FolderId(folder.to_string()),
             ty: ObjectType::Email,
         }
+    }
+
+    #[test]
+    fn calendar_window_reseeds_within_the_refresh_lead() {
+        let scope = CursorScope::FolderType {
+            folder: FolderId("calendar".to_string()),
+            ty: ObjectType::Event,
+        };
+        let payload = GraphCursorPayload::new(
+            kind_for_scope(&scope).expect("event scope maps"),
+            "https://graph.example/delta".to_string(),
+            None,
+        )
+        .with_calendar_window_end_option(Some(1_000));
+        assert!(calendar_window_needs_reseed(
+            &payload,
+            1_000 - CALENDAR_WINDOW_RESEED_LEAD_SECS
+        ));
+        assert!(!calendar_window_needs_reseed(
+            &payload,
+            1_000 - CALENDAR_WINDOW_RESEED_LEAD_SECS - 1
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_calendar_cursor_at_its_horizon_restarts_scope_before_the_wire() {
+        let scope = CursorScope::FolderType {
+            folder: FolderId("calendar".to_string()),
+            ty: ObjectType::Event,
+        };
+        let cursor = encode_cursor(
+            scope,
+            GraphCursorPayload::new(
+                kind_for_scope(&CursorScope::FolderType {
+                    folder: FolderId("calendar".to_string()),
+                    ty: ObjectType::Event,
+                })
+                .expect("event scope maps"),
+                "https://graph.example/delta".to_string(),
+                None,
+            )
+            .with_calendar_window_end_option(Some(0)),
+        )
+        .expect("cursor encodes");
+        let error = terminal_kind(cursor).await;
+        assert!(matches!(
+            error.kind(),
+            AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid)
+        ));
+    }
+
+    /// A v4 mid-inventory cursor holds a next link and an EMPTY delta link.
+    /// Both engine establishment paths route it to
+    /// `inventory_resume_stream`, but the changes walk must refuse it on
+    /// its own rather than resuming from an empty URL - a scope that
+    /// syncs nothing forever is the worst possible failure here.
+    #[tokio::test]
+    async fn an_in_progress_inventory_cursor_is_not_a_changes_cursor() {
+        let scope = CursorScope::FolderType {
+            folder: FolderId("inbox".to_string()),
+            ty: ObjectType::Email,
+        };
+        let cursor = encode_cursor(
+            scope.clone(),
+            GraphCursorPayload::inventory_page(
+                kind_for_scope(&scope).expect("email scope maps"),
+                super::super::inventory::page_marker(
+                    "https://graph.example/next?page=2".to_string(),
+                    None,
+                ),
+                None,
+            ),
+        )
+        .expect("cursor encodes");
+        let error = terminal_kind(cursor).await;
+        assert!(matches!(
+            error.kind(),
+            AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid)
+        ));
     }
 
     /// Drain a `changes_stream` that is expected to reject its cursor

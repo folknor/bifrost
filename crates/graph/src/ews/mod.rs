@@ -5,6 +5,9 @@ mod xml_helpers;
 
 use bifrost_net::AccountNet;
 use bifrost_types::DiagnosticText;
+use bytes::Bytes;
+use futures::Stream;
+use std::pin::Pin;
 
 pub(crate) use self::parse::*;
 pub(crate) use self::xml_helpers::*;
@@ -173,6 +176,11 @@ pub(crate) struct EwsClient {
     ews_url: String,
 }
 
+/// A streaming EWS response body. GetStreamingEvents keeps one HTTP response
+/// open and emits response-message frames as Exchange has notifications, so
+/// this must stay chunked all the way to the account worker.
+pub(crate) type EwsBodyStream = Pin<Box<dyn Stream<Item = Result<Bytes, EwsError>> + Send>>;
+
 /// The seam between the EWS worker loops and the wire.
 ///
 /// `EwsClient::execute` is the single funnel every EWS request in this
@@ -187,6 +195,22 @@ pub(crate) trait EwsExecute: Send + Sync {
         body_xml: &str,
         headers: &EwsHeaders,
     ) -> impl Future<Output = Result<String, EwsError>> + Send;
+
+    /// Open an EWS streaming response. The default keeps existing scripted
+    /// doubles source-compatible by treating their buffered answer as one
+    /// chunk; production overrides it with the transport byte stream.
+    fn execute_streaming(
+        &self,
+        body_xml: &str,
+        headers: &EwsHeaders,
+    ) -> impl Future<Output = Result<EwsBodyStream, EwsError>> + Send {
+        async move {
+            let response = self.execute(body_xml, headers).await?;
+            Ok(Box::pin(futures::stream::once(
+                async move { Ok(Bytes::from(response)) },
+            )) as EwsBodyStream)
+        }
+    }
 }
 
 #[cfg(test)]

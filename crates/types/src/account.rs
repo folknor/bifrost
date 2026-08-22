@@ -169,6 +169,21 @@ pub trait Account: Send + Sync {
     /// in its checkpoint.
     fn inventory_stream(&self, scope: CursorScope) -> AccountStream<SyncEvent<InventoryEntry>>;
 
+    /// Resume an in-progress inventory cursor that was consumer-acknowledged
+    /// at a page boundary. `None` means this protocol has no resumable
+    /// inventory state and the engine must use its normal establishment path.
+    ///
+    /// The `Some`/`None` answer is also how the engine ASKS whether a stored
+    /// cursor is a mid-inventory position, so building the stream must be
+    /// free of I/O and of observable side effects: the engine may construct
+    /// one purely to classify the cursor and drop it without polling.
+    fn inventory_resume_stream(
+        &self,
+        _cursor: ChangeCursor,
+    ) -> Option<AccountStream<SyncEvent<InventoryEntry>>> {
+        None
+    }
+
     /// Which inventory partition shape this account can serve for
     /// `scope`. Implementations that do not override this keep the
     /// original full-pass behavior.

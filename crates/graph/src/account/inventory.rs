@@ -24,6 +24,25 @@ pub(crate) fn inventory_stream(
     account: GraphAccount,
     scope: CursorScope,
 ) -> AccountStream<SyncEvent<InventoryEntry>> {
+    inventory_stream_from(account, scope, None)
+}
+
+pub(crate) fn resume_inventory_stream(
+    account: GraphAccount,
+    cursor: ChangeCursor,
+) -> Option<AccountStream<SyncEvent<InventoryEntry>>> {
+    let payload = super::cursor::decode_cursor(&cursor).ok()?;
+    if !payload.inventory_in_progress || !scope_matches_payload(&cursor.scope, &payload) {
+        return None;
+    }
+    Some(inventory_stream_from(account, cursor.scope, Some(payload)))
+}
+
+fn inventory_stream_from(
+    account: GraphAccount,
+    scope: CursorScope,
+    resume: Option<GraphCursorPayload>,
+) -> AccountStream<SyncEvent<InventoryEntry>> {
     Box::pin(async_stream::stream! {
         let sync_ctx = GraphErrorContext::graph(AccountOperation::SyncInventory)
             .with_scope(ErrorScope::Cursor(scope.clone()));
@@ -39,13 +58,26 @@ pub(crate) fn inventory_stream(
                 return;
             }
         };
-        let mut current_url = match initial_delta_url(&account, &scope) {
-            Ok(url) => url,
-            Err(error) => {
-                yield SyncEvent::Terminated(cursor_error_to_account_error(error, sync_ctx));
-                yield SyncEvent::Done(None);
-                return;
-            }
+        let (mut current_url, calendar_window_end) = match resume {
+            Some(payload) => match payload.advanced_through {
+                Some(marker) => (marker.next_link, payload.calendar_window_end),
+                None => {
+                    yield SyncEvent::Terminated(cursor_error_to_account_error(
+                        super::cursor::CursorError::SchemaIncompatible,
+                        sync_ctx,
+                    ));
+                    yield SyncEvent::Done(None);
+                    return;
+                }
+            },
+            None => match initial_delta_request(&account, &scope, jiff::Timestamp::now()) {
+                Ok(request) => request,
+                Err(error) => {
+                    yield SyncEvent::Terminated(cursor_error_to_account_error(error, sync_ctx));
+                    yield SyncEvent::Done(None);
+                    return;
+                }
+            },
         };
         // A foreign (shared) scope tags every inventory item with its
         // owning mailbox so the consumer maps the item to its shared
@@ -118,14 +150,30 @@ pub(crate) fn inventory_stream(
             }
 
             if let Some(next_link) = page.next_link {
-                if !entries.is_empty() {
-                    yield batch(entries, PageBoundary::Page, None);
-                }
+                let checkpoint_cursor = match encode_cursor(
+                    scope.clone(),
+                    GraphCursorPayload::inventory_page(
+                        kind.clone(),
+                        page_marker(next_link.clone(), entries.last().map(|entry| entry.id.0.clone())),
+                        calendar_window_end,
+                    ),
+                ) {
+                    Ok(cursor) => cursor,
+                    Err(error) => {
+                        let ctx = GraphErrorContext::graph(AccountOperation::SyncInventory)
+                            .with_scope(ErrorScope::Cursor(scope.clone()));
+                        yield SyncEvent::Terminated(cursor_error_to_account_error(error, ctx));
+                        yield SyncEvent::Done(None);
+                        return;
+                    }
+                };
+                yield batch(entries, PageBoundary::Page, Some(checkpoint_cursor));
                 current_url = next_link;
             } else if let Some(delta_link) = page.delta_link {
                 let cursor = match encode_cursor(
                     scope.clone(),
-                    GraphCursorPayload::new(kind.clone(), delta_link, None),
+                    GraphCursorPayload::new(kind.clone(), delta_link, None)
+                        .with_calendar_window_end_option(calendar_window_end),
                 ) {
                     Ok(cursor) => cursor,
                     Err(error) => {
@@ -264,14 +312,7 @@ pub(crate) fn removed_id(value: &Value) -> Option<ObjectId> {
 /// UTC form Graph expects. A bound that runs off the representable range
 /// falls back to `now` rather than widening the window unpredictably.
 fn calendar_view_bound(now: jiff::Timestamp, days: i64) -> String {
-    let at = jiff::Span::new()
-        .try_days(days)
-        .and_then(|span| now.checked_add(span))
-        .unwrap_or(now);
-    jiff::tz::Offset::UTC
-        .to_datetime(at)
-        .strftime("%Y-%m-%dT%H:%M:%SZ")
-        .to_string()
+    format_calendar_timestamp(calendar_view_timestamp(now, days))
 }
 
 pub(crate) fn page_marker(next_link: String, last_seen_id: Option<String>) -> GraphPageMarker {
@@ -281,10 +322,19 @@ pub(crate) fn page_marker(next_link: String, last_seen_id: Option<String>) -> Gr
     }
 }
 
+#[cfg(test)]
 pub(crate) fn initial_delta_url(
     account: &GraphAccount,
     scope: &CursorScope,
 ) -> Result<String, super::cursor::CursorError> {
+    initial_delta_request(account, scope, jiff::Timestamp::now()).map(|(url, _)| url)
+}
+
+fn initial_delta_request(
+    account: &GraphAccount,
+    scope: &CursorScope,
+    now: jiff::Timestamp,
+) -> Result<(String, Option<i64>), super::cursor::CursorError> {
     // Route the prefix through the scope's owning client (primary or a
     // shared mailbox) and use the *native* folder id in the path - the
     // foreign-mailbox prefix lives in the URL's `/users/{id}` segment,
@@ -298,25 +348,48 @@ pub(crate) fn initial_delta_url(
             let native = super::foreign::parse_folder(folder).native_id().to_string();
             let encoded = bifrost_net::url::encode_path_component(&native);
             match ty {
-                ObjectType::Email => Ok(format!(
-                    "{prefix}/mailFolders/{encoded}/messages/delta?$select={MESSAGE_SELECT}&$top=50"
+                ObjectType::Email => Ok((
+                    format!(
+                        "{prefix}/mailFolders/{encoded}/messages/delta?$select={MESSAGE_SELECT}&$top=50"
+                    ),
+                    None,
                 )),
                 ObjectType::Event | ObjectType::CalendarEvent => {
-                    let now = jiff::Timestamp::now();
                     let start = calendar_view_bound(now, -90);
-                    let end = calendar_view_bound(now, 365);
-                    Ok(format!(
-                        "{prefix}/calendars/{encoded}/calendarView/delta?startDateTime={start}&endDateTime={end}&$select={EVENT_SELECT}"
+                    let end_at = calendar_view_timestamp(now, 365);
+                    let end = format_calendar_timestamp(end_at);
+                    Ok((
+                        format!(
+                            "{prefix}/calendars/{encoded}/calendarView/delta?startDateTime={start}&endDateTime={end}&$select={EVENT_SELECT}"
+                        ),
+                        Some(end_at.as_second()),
                     ))
                 }
-                ObjectType::Contact => Ok(format!(
-                    "{prefix}/contactFolders/{encoded}/contacts/delta?$select={CONTACT_SELECT}&$top=250"
+                ObjectType::Contact => Ok((
+                    format!(
+                        "{prefix}/contactFolders/{encoded}/contacts/delta?$select={CONTACT_SELECT}&$top=250"
+                    ),
+                    None,
                 )),
                 _ => Err(super::cursor::CursorError::Unsupported),
             }
         }
         _ => Err(super::cursor::CursorError::Unsupported),
     }
+}
+
+fn calendar_view_timestamp(now: jiff::Timestamp, days: i64) -> jiff::Timestamp {
+    jiff::Span::new()
+        .try_days(days)
+        .and_then(|span| now.checked_add(span))
+        .unwrap_or(now)
+}
+
+fn format_calendar_timestamp(at: jiff::Timestamp) -> String {
+    jiff::tz::Offset::UTC
+        .to_datetime(at)
+        .strftime("%Y-%m-%dT%H:%M:%SZ")
+        .to_string()
 }
 
 pub(crate) fn batch<T>(
@@ -567,6 +640,51 @@ mod tests {
                 .contains("/me/mailFolders/inbox/messages/delta?")
         );
         assert_eq!(requests[1].url, "https://graph.example/next?page=2");
+    }
+
+    #[tokio::test]
+    async fn an_acked_inventory_page_resumes_at_its_next_link() {
+        let scope = CursorScope::FolderType {
+            folder: FolderId("inbox".to_string()),
+            ty: ObjectType::Email,
+        };
+        let first_client = GraphClient::new("token");
+        first_client.script_rest([ScriptedRestResponse::json(
+            reqwest::StatusCode::OK,
+            json!({
+                "value": [{"id": "one", "changeKey": "ck-one"}],
+                "@odata.nextLink": "https://graph.example/next?page=2"
+            }),
+        )]);
+        let first = GraphAccount::new_for_tests(first_client, PushMode::GraphSubscriptions);
+        let mut stream = inventory_stream(first, scope.clone());
+        let SyncEvent::Batch(batch) = stream.next().await.expect("first page") else {
+            panic!("expected first inventory batch");
+        };
+        let Some(Checkpoint::Change(cursor)) = batch.checkpoint else {
+            panic!("mid-inventory page must checkpoint");
+        };
+
+        let resumed_client = GraphClient::new("token");
+        resumed_client.script_rest([ScriptedRestResponse::json(
+            reqwest::StatusCode::OK,
+            json!({
+                "value": [{"id": "two", "changeKey": "ck-two"}],
+                "@odata.deltaLink": "https://graph.example/delta"
+            }),
+        )]);
+        let resumed =
+            GraphAccount::new_for_tests(resumed_client.clone(), PushMode::GraphSubscriptions);
+        let mut stream =
+            resume_inventory_stream(resumed, cursor).expect("Graph inventory cursor resumes");
+        assert!(matches!(stream.next().await, Some(SyncEvent::Batch(_))));
+        assert!(matches!(
+            stream.next().await,
+            Some(SyncEvent::Done(Some(_)))
+        ));
+        let requests = resumed_client.take_rest_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].url, "https://graph.example/next?page=2");
     }
 
     #[tokio::test]

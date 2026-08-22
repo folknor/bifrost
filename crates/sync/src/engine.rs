@@ -173,7 +173,21 @@ impl Default for SyncEngineBuilder {
 
 enum InitialScope {
     Ready,
-    DeferredInventory(CursorScope),
+    DeferredInventory(DeferredInventory),
+}
+
+enum DeferredInventory {
+    Start(CursorScope),
+    Resume(ChangeCursor),
+}
+
+impl DeferredInventory {
+    fn scope(&self) -> &CursorScope {
+        match self {
+            Self::Start(scope) => scope,
+            Self::Resume(cursor) => &cursor.scope,
+        }
+    }
 }
 
 /// Whether an `establish_initial_cursor` failure is contained to the scope
@@ -333,8 +347,8 @@ impl SyncEngine {
                 .await;
             match established {
                 Ok(InitialScope::Ready) => {}
-                Ok(InitialScope::DeferredInventory(scope)) => {
-                    deferred_inventory_scopes.push(scope);
+                Ok(InitialScope::DeferredInventory(inventory)) => {
+                    deferred_inventory_scopes.push(inventory);
                 }
                 // A scope-local failure must stay scope-local. The running
                 // path already quarantines one revoked shared/public scope
@@ -2771,6 +2785,11 @@ impl SyncEngine {
         // the one cursor that cannot be read. (sync-D10)
         match self.checkpoints.get_change_cursor(account_id, &scope).await {
             Ok(Some(existing)) => {
+                if account.inventory_resume_stream(existing.clone()).is_some() {
+                    return Ok(InitialScope::DeferredInventory(DeferredInventory::Resume(
+                        existing,
+                    )));
+                }
                 cursors.put(existing);
                 return Ok(InitialScope::Ready);
             }
@@ -2810,9 +2829,9 @@ impl SyncEngine {
                 self.persist_cursor(account_id, cursor, cursors).await?;
                 Ok(InitialScope::Ready)
             }
-            CursorEstablishment::EstablishViaInventory => {
-                Ok(InitialScope::DeferredInventory(scope))
-            }
+            CursorEstablishment::EstablishViaInventory => Ok(InitialScope::DeferredInventory(
+                DeferredInventory::Start(scope),
+            )),
             // `CursorEstablishment` is `#[non_exhaustive]`; treat any
             // future variant as "cannot establish" so the engine fails
             // closed rather than silently continuing.
@@ -3462,12 +3481,13 @@ async fn run_deferred_inventory_establishment(
     account_generation_tx: watch::Sender<u64>,
     reopen_lock: Arc<AsyncMutex<()>>,
     open_skips: Arc<std::sync::Mutex<Vec<SkippedScope>>>,
-    scopes: Vec<CursorScope>,
+    scopes: Vec<DeferredInventory>,
 ) {
     if !wait_for_real_subscriber(&changes_tx, &subscriber_notify, &shutdown).await {
         return;
     }
-    for scope in scopes {
+    for inventory in scopes {
+        let scope = inventory.scope().clone();
         if shutdown.is_cancelled() {
             return;
         }
@@ -3504,9 +3524,18 @@ async fn run_deferred_inventory_establishment(
                 cursors: Arc::clone(&cursors),
                 control: Some(control.clone()),
             };
-            let result = fusion
-                .run_with_broadcast(acc, scope.clone(), Some(changes_tx.clone()))
-                .await;
+            let result = match &inventory {
+                DeferredInventory::Start(_) => {
+                    fusion
+                        .run_with_broadcast(acc, scope.clone(), Some(changes_tx.clone()))
+                        .await
+                }
+                DeferredInventory::Resume(cursor) => {
+                    fusion
+                        .run_resume_with_broadcast(acc, cursor.clone(), Some(changes_tx.clone()))
+                        .await
+                }
+            };
             if matches!(result, Err(Error::Paused)) {
                 continue;
             }
@@ -4586,6 +4615,28 @@ async fn run_establish(
     };
     match store.get_change_cursor(account_id, &scope).await {
         Ok(Some(existing)) => {
+            // A stored cursor may be a mid-inventory page position rather
+            // than a live changes cursor. Putting one into the registry
+            // would hand it straight to `changes_stream`, which has no
+            // delta link to walk. Finish the inventory instead - the same
+            // decision `establish_initial_cursor` makes at open.
+            if account.inventory_resume_stream(existing.clone()).is_some() {
+                let fusion = crate::multiplexer::InventoryFusion {
+                    account_id: account_id.clone(),
+                    cursors: Arc::clone(&cursors),
+                    control: control.cloned(),
+                };
+                return match fusion
+                    .run_resume_with_broadcast(account, existing, Some(changes_tx))
+                    .await?
+                {
+                    crate::multiplexer::FusionOutcome::Established
+                    | crate::multiplexer::FusionOutcome::NoCursor => Ok(()),
+                    crate::multiplexer::FusionOutcome::Terminated(error) => {
+                        Err(Error::EstablishCursorTerminated(error))
+                    }
+                };
+            }
             cursors.put(existing);
             return Ok(());
         }

@@ -128,8 +128,9 @@ async fn submit_batch(
     // Graph answers 200 to it, and the caller would be told a flag change
     // landed that was never expressed on the wire. So the test is on the
     // body, not on the token namespace.
-    if matches!(kind, MutationKind::SetFlags(op) if flag_op_is_unexpressible(op)) {
-        let error = unsupported_account_error(AccountOperation::UpdateFlags);
+    if let MutationKind::SetFlags(op) = kind
+        && let Some(error) = invalid_flag_op_error(op)
+    {
         return Ok(vec![SyncEvent::Batch(Batch {
             items: ids
                 .iter()
@@ -599,6 +600,40 @@ fn flag_op_is_unexpressible(op: &FlagOp) -> bool {
         .is_none_or(serde_json::Map::is_empty)
 }
 
+/// Reject a Patch that asks for contradictory state before it reaches the
+/// provider. The same token is case-insensitive in every flag operation, and
+/// Graph's two owned aliases (`\\Seen`/`read`, `\\Flagged`/`starred`) name
+/// one field too, so those aliases are contradictions as well.
+fn invalid_flag_op_error(op: &FlagOp) -> Option<bifrost_types::AccountError> {
+    let FlagOp::Patch { add, remove } = op else {
+        return flag_op_is_unexpressible(op)
+            .then(|| unsupported_account_error(AccountOperation::UpdateFlags));
+    };
+    let overlaps = add.iter().any(|added| {
+        remove
+            .iter()
+            .any(|removed| canonical_flag_name(added) == canonical_flag_name(removed))
+    });
+    if overlaps {
+        Some(super::graph_error::invalid_account_error(
+            AccountOperation::UpdateFlags,
+            "FlagOp::Patch cannot add and remove the same flag",
+        ))
+    } else {
+        flag_op_is_unexpressible(op)
+            .then(|| unsupported_account_error(AccountOperation::UpdateFlags))
+    }
+}
+
+fn canonical_flag_name(flag: &str) -> String {
+    let normalized = flag.to_ascii_lowercase();
+    match normalized.as_str() {
+        "\\seen" | "read" => "\\seen".to_string(),
+        "\\flagged" | "flagged" | "starred" => "\\flagged".to_string(),
+        _ => normalized,
+    }
+}
+
 fn flag_op_requires_category_rmw(op: &FlagOp) -> bool {
     let has_categories =
         |flags: &HashSet<String>| flags.iter().any(|flag| flag.starts_with("category:"));
@@ -975,15 +1010,23 @@ mod tests {
     }
 
     #[test]
-    fn patch_applies_removes_after_adds_so_remove_wins_on_a_contested_flag() {
-        // `Patch` is one wire operation, so a flag present in both halves
-        // has to resolve deterministically. `apply_flag_removes` runs last.
-        let body = patch_for_flags(&FlagOp::Patch {
+    fn patch_rejects_a_contested_flag_before_building_a_body() {
+        let op = FlagOp::Patch {
             add: flag_set(&["\\Seen", "\\Flagged"]),
             remove: flag_set(&["\\Seen"]),
-        });
-        assert_eq!(body.get("isRead"), Some(&json!(false)));
-        assert_eq!(body.get("flag"), Some(&json!({ "flagStatus": "flagged" })));
+        };
+        let error = invalid_flag_op_error(&op).expect("contested Patch is invalid");
+        assert!(matches!(
+            error.kind(),
+            bifrost_types::AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed)
+        ));
+        assert!(
+            invalid_flag_op_error(&FlagOp::Patch {
+                add: flag_set(&["read"]),
+                remove: flag_set(&["\\Seen"]),
+            })
+            .is_some()
+        );
     }
 
     #[test]

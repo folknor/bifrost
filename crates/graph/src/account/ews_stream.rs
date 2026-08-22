@@ -5,12 +5,15 @@ use bifrost_types::{
     AccountOperation, CursorScope, DiagnosticText, HintPayload, InvalidationHint, PushSource,
     WatchEvent,
 };
+use futures::StreamExt;
 use quick_xml::Reader;
 use quick_xml::escape::unescape;
 use quick_xml::events::{BytesStart, Event};
 use tokio::sync::watch;
 
-use crate::ews::{EwsClient, EwsError, EwsExecute, EwsHeaders};
+use crate::ews::{
+    EwsBodyStream, EwsClient, EwsError, EwsExecute, EwsHeaders, check_response_error,
+};
 
 use super::GraphAccount;
 use super::graph_error::{GraphErrorContext, ews_error_to_account_error};
@@ -96,21 +99,28 @@ async fn run_worker<E: EwsExecute>(account: GraphAccount, ews: E) {
         // below is in flight - makes the next `changed()` fire, so no
         // registration can slip between the read and the wait.
         topology.borrow_and_update();
-        let scopes = active_ews_scopes(&account).await;
+        // Read the registration map and, if it has emptied, retire the
+        // worker slot WITHOUT releasing the guard in between. A worker is
+        // spawned only after `subscribe_ews` has installed a scope, so an
+        // empty union means the final handle was removed, not that work is
+        // about to arrive - the worker exits. Doing that without clearing
+        // the slot under the same guard is a race: a concurrent
+        // `subscribe_ews` inserts, its `ensure_ews_worker` sees this
+        // still-unfinished `JoinHandle`, declines to spawn, and then this
+        // task returns - leaving the new subscription with no worker and
+        // push silently dead. Holding the guard makes that insert wait
+        // until the slot is empty. This mirrors the Graph webhook worker's
+        // `retire_graph_worker_slot`; the shared rule lives in
+        // `worker_slot`.
+        let registrations = account.ews_subscriptions.read().await;
+        let scopes =
+            dedupe_by_ews_folder(registrations.values().flat_map(|state| state.scopes.iter()));
         if scopes.is_empty() {
-            // `push_stream` may start this worker before a caller has
-            // registered any EWS scopes. Wait for the topology to change
-            // rather than polling the empty map.
-            tokio::select! {
-                () = account.shutdown.cancelled() => return,
-                changed = topology.changed() => {
-                    if changed.is_err() {
-                        return;
-                    }
-                }
-            }
-            continue;
+            super::worker_slot::retire_worker_slot(&account.ews_worker).await;
+            drop(registrations);
+            return;
         }
+        drop(registrations);
 
         match subscribe(&ews, &scopes).await {
             Ok(subscription_id) => {
@@ -440,45 +450,14 @@ async fn run_get_events_loop<E: EwsExecute>(
                     Err(_) => StreamLoopExit::Shutdown,
                 };
             }
-            result = ews.execute(&body, &headers) => result,
+            result = ews.execute_streaming(&body, &headers) => result,
         };
         match result {
-            Ok(xml) => match parse_streaming_notifications(&xml) {
-                Ok(notifications) => {
-                    for notification in notifications {
-                        // A notification with a parent folder id resolves
-                        // to a known subscribed scope -> a specific hint.
-                        // One without it (a status/keep-alive-style frame,
-                        // or an unmapped folder) must NOT fabricate a
-                        // `FolderType { folder: FolderId(""), .. }` - that
-                        // is a hint for a scope that does not exist. Emit
-                        // an account-wide `Unknown` hint so the reconciler
-                        // re-checks broadly instead of chasing an empty id.
-                        let payloads = match notification.parent_folder_id.as_deref() {
-                            Some(folder_id) => {
-                                let scopes = scopes_for_folder(account, folder_id).await;
-                                if scopes.is_empty() {
-                                    vec![HintPayload::Unknown]
-                                } else {
-                                    scopes
-                                        .into_iter()
-                                        .map(HintPayload::SpecificCursorScope)
-                                        .collect()
-                                }
-                            }
-                            None => vec![HintPayload::Unknown],
-                        };
-                        for payload in payloads {
-                            let _ = account.push_tx.send(WatchEvent::Invalidated {
-                                hint: InvalidationHint {
-                                    source: PushSource::EwsStreaming,
-                                    payload,
-                                },
-                            });
-                        }
-                    }
-                }
-                Err(error) => {
+            Ok(stream) => match consume_streaming_events(stream, account, topology).await {
+                Ok(()) => continue,
+                Err(StreamLoopExit::Resubscribe) => return StreamLoopExit::Resubscribe,
+                Err(StreamLoopExit::Shutdown) => return StreamLoopExit::Shutdown,
+                Err(StreamLoopExit::Disconnected) => {
                     // A parse miss mid-long-poll is not necessarily a
                     // permanent contract violation: Microsoft interleaves
                     // keep-alive / status frames into the streaming
@@ -488,7 +467,10 @@ async fn run_get_events_loop<E: EwsExecute>(
                     // treat a transient parse failure the same way rather
                     // than terminating.
                     let account_error = ews_error_to_account_error(
-                        EwsError::MalformedXml(DiagnosticText::support_only(error)),
+                        EwsError::MalformedXml(DiagnosticText::support_only(
+                            "EWS streaming response ended with an incomplete or invalid frame"
+                                .to_string(),
+                        )),
                         GraphErrorContext::ews(AccountOperation::PushStream),
                     );
                     let telemetry = account_error.telemetry_fields();
@@ -500,6 +482,12 @@ async fn run_get_events_loop<E: EwsExecute>(
                     );
                     let _ = account.push_tx.send(WatchEvent::Disconnected);
                     return StreamLoopExit::Disconnected;
+                }
+                // A response error the frame consumer classified as
+                // terminal (authorization lost, conditional access) exits
+                // the worker; see `classify_frame_failure`.
+                Err(StreamLoopExit::Terminated(error)) => {
+                    return StreamLoopExit::Terminated(error);
                 }
             },
             Err(error) => {
@@ -524,6 +512,250 @@ async fn run_get_events_loop<E: EwsExecute>(
     }
 }
 
+/// EWS holds the outer SOAP document open for the duration of a streaming
+/// request. Frame each complete response-message element as bytes arrive,
+/// then parse that frame under a synthetic SOAP envelope. This handles a
+/// notification element split across arbitrary transport chunks without
+/// waiting for Exchange to close the thirty-minute response.
+struct StreamingFrameDecoder {
+    buffered: Vec<u8>,
+}
+
+/// The local (namespace-free) name of the element each streaming frame is.
+///
+/// The framing deliberately keys on the LOCAL name. An XML namespace prefix
+/// is an alias chosen by the writer, not part of the element's name: a
+/// response that binds the messages namespace to `a:`, or makes it the
+/// default namespace and writes the element unprefixed, is exactly as valid
+/// as Microsoft's usual `m:`. Matching the serialized bytes `<m:...` instead
+/// discarded every such response - `has_partial_frame` stayed false, so the
+/// stream ended reporting neither notifications nor a parse failure, and push
+/// went dead while `push_in_process()` still advertised it.
+const FRAME_LOCAL_NAME: &[u8] = b"GetStreamingEventsResponseMessage";
+
+/// How much of a namespace prefix the decoder is willing to reassemble
+/// across a chunk boundary. Prefixes are unbounded in XML; real EWS uses one
+/// or two characters.
+const MAX_PREFIX_LEN: usize = 64;
+
+impl StreamingFrameDecoder {
+    fn push(&mut self, chunk: &[u8]) -> Result<Vec<String>, String> {
+        self.buffered.extend_from_slice(chunk);
+        let mut frames = Vec::new();
+        loop {
+            let Some(start) = find_frame_start(&self.buffered) else {
+                // Keep enough trailing bytes to recognize a tag split across
+                // chunks (`<` + prefix + `:` + name + one boundary byte),
+                // discarding only unneeded outer-envelope content.
+                let keep = FRAME_LOCAL_NAME.len() + MAX_PREFIX_LEN + 3;
+                if self.buffered.len() > keep {
+                    self.buffered.drain(..self.buffered.len() - keep);
+                }
+                break;
+            };
+            if start > 0 {
+                self.buffered.drain(..start);
+            }
+            let Some(end) = find_frame_end(&self.buffered) else {
+                break;
+            };
+            let frame = self.buffered.drain(..end).collect::<Vec<_>>();
+            let frame = String::from_utf8(frame)
+                .map_err(|error| format!("streaming EWS frame was not UTF-8: {error}"))?;
+            frames.push(frame);
+        }
+        Ok(frames)
+    }
+
+    fn has_partial_frame(&self) -> bool {
+        find_frame_start(&self.buffered) == Some(0)
+    }
+}
+
+/// A name character that may appear in a namespace prefix. Deliberately
+/// permissive: the point is to bound the walk back to the `<`, not to
+/// validate XML the parser will validate anyway.
+fn is_prefix_char(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.')
+}
+
+/// Walk back from an occurrence of the local name over an optional
+/// `prefix:` and the opening `<` (or `</`), returning the tag's start.
+fn tag_start_before(bytes: &[u8], name_at: usize, closing: bool) -> Option<usize> {
+    let mut index = name_at;
+    if index > 0 && bytes[index - 1] == b':' {
+        let colon = index - 1;
+        index = colon;
+        while index > 0 && is_prefix_char(bytes[index - 1]) {
+            index -= 1;
+        }
+        if index == colon {
+            // `<:Name` - an empty prefix is not a name.
+            return None;
+        }
+    }
+    if closing {
+        (index >= 2 && bytes[index - 2] == b'<' && bytes[index - 1] == b'/').then(|| index - 2)
+    } else {
+        (index >= 1 && bytes[index - 1] == b'<').then(|| index - 1)
+    }
+}
+
+/// Start of `<[prefix:]GetStreamingEventsResponseMessage` followed by a real
+/// name boundary. A buffer that ends mid-name reports `None` so the caller
+/// waits for the rest rather than mistaking a prefix of the name for a hit.
+fn find_frame_start(bytes: &[u8]) -> Option<usize> {
+    let mut from = 0;
+    while let Some(offset) = find_bytes(&bytes[from..], FRAME_LOCAL_NAME) {
+        let name_at = from + offset;
+        let after = name_at + FRAME_LOCAL_NAME.len();
+        let boundary = matches!(bytes.get(after), Some(byte) if byte.is_ascii_whitespace() || *byte == b'>' || *byte == b'/');
+        if boundary && let Some(start) = tag_start_before(bytes, name_at, false) {
+            return Some(start);
+        }
+        from = name_at + 1;
+    }
+    None
+}
+
+/// One past the `>` of the matching `</[prefix:]…>` close tag.
+fn find_frame_end(bytes: &[u8]) -> Option<usize> {
+    let mut from = 0;
+    while let Some(offset) = find_bytes(&bytes[from..], FRAME_LOCAL_NAME) {
+        let name_at = from + offset;
+        let mut after = name_at + FRAME_LOCAL_NAME.len();
+        if tag_start_before(bytes, name_at, true).is_some() {
+            while matches!(bytes.get(after), Some(byte) if byte.is_ascii_whitespace()) {
+                after += 1;
+            }
+            if bytes.get(after) == Some(&b'>') {
+                return Some(after + 1);
+            }
+        }
+        from = name_at + 1;
+    }
+    None
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+/// Parse one framed response message, keeping the EWS classification.
+///
+/// The typed `EwsError` matters: `check_response_error` is what turns an
+/// `ErrorAccessDenied` response into a TERMINAL classification. Flattening
+/// it to a string here (and mapping every failure onto malformed XML at the
+/// call site) turned a permanent authorization failure into an endless
+/// disconnect-and-resubscribe loop.
+fn notifications_from_streaming_frame(
+    frame: &str,
+) -> Result<Vec<EwsStreamingNotification>, EwsError> {
+    // The synthetic envelope binds the conventional `m:`/`t:` prefixes so a
+    // frame that used them still resolves; the frame may declare its own
+    // prefixes, and neither this parser nor `check_response_error` is
+    // namespace-resolving, so both simply read local names.
+    let xml = format!(
+        r#"<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/" xmlns:m="http://schemas.microsoft.com/exchange/services/2006/messages" xmlns:t="http://schemas.microsoft.com/exchange/services/2006/types"><soap:Body><m:GetStreamingEventsResponse><m:ResponseMessages>{frame}</m:ResponseMessages></m:GetStreamingEventsResponse></soap:Body></soap:Envelope>"#
+    );
+    check_response_error(&xml)?;
+    parse_streaming_notifications(&xml)
+        .map_err(|error| EwsError::MalformedXml(DiagnosticText::support_only(error)))
+}
+
+async fn consume_streaming_events(
+    mut stream: EwsBodyStream,
+    account: &GraphAccount,
+    topology: &mut watch::Receiver<u64>,
+) -> Result<(), StreamLoopExit> {
+    let mut decoder = StreamingFrameDecoder {
+        buffered: Vec::new(),
+    };
+    loop {
+        let next = tokio::select! {
+            () = account.shutdown.cancelled() => return Err(StreamLoopExit::Shutdown),
+            changed = topology.changed() => {
+                return Err(if changed.is_ok() {
+                    StreamLoopExit::Resubscribe
+                } else {
+                    StreamLoopExit::Shutdown
+                });
+            }
+            chunk = stream.next() => chunk,
+        };
+        let Some(chunk) = next else {
+            return (!decoder.has_partial_frame())
+                .then_some(())
+                .ok_or(StreamLoopExit::Disconnected);
+        };
+        let chunk = chunk.map_err(|_| StreamLoopExit::Disconnected)?;
+        let frames = decoder
+            .push(&chunk)
+            .map_err(|_| StreamLoopExit::Disconnected)?;
+        for frame in frames {
+            let notifications =
+                notifications_from_streaming_frame(&frame).map_err(classify_frame_failure)?;
+            emit_streaming_notifications(account, notifications).await;
+        }
+    }
+}
+
+/// Decide whether a failed frame ends the worker or just the connection.
+///
+/// A malformed or truncated frame is transient - Exchange interleaves
+/// keep-alive and status frames into the streaming response, and a single
+/// bad chunk should reconnect. A CLASSIFIED response error is not: an
+/// `ErrorAccessDenied` inside the stream derives `NoPermission`, which
+/// nothing in this worker can fix, so reconnecting forever would burn a
+/// subscribe against the mailbox quota every few seconds and never report
+/// the failure. Terminal classifications exit through
+/// `WatchEvent::Terminated` exactly as the HTTP-error path does.
+fn classify_frame_failure(error: EwsError) -> StreamLoopExit {
+    let account_error =
+        ews_error_to_account_error(error, GraphErrorContext::ews(AccountOperation::PushStream));
+    if account_error.recovery().is_terminal() {
+        StreamLoopExit::Terminated(account_error)
+    } else {
+        StreamLoopExit::Disconnected
+    }
+}
+
+async fn emit_streaming_notifications(
+    account: &GraphAccount,
+    notifications: Vec<EwsStreamingNotification>,
+) {
+    for notification in notifications {
+        let payloads = match notification.parent_folder_id.as_deref() {
+            Some(folder_id) => {
+                let scopes = scopes_for_folder(account, folder_id).await;
+                if scopes.is_empty() {
+                    vec![HintPayload::Unknown]
+                } else {
+                    scopes
+                        .into_iter()
+                        .map(HintPayload::SpecificCursorScope)
+                        .collect()
+                }
+            }
+            None => vec![HintPayload::Unknown],
+        };
+        for payload in payloads {
+            let _ = account.push_tx.send(WatchEvent::Invalidated {
+                hint: InvalidationHint {
+                    source: PushSource::EwsStreaming,
+                    payload,
+                },
+            });
+        }
+    }
+}
+
+/// The union the worker subscribes to. The worker itself inlines this read
+/// so it can retire its slot under the same guard (see the exit path in
+/// `run_worker`); this wrapper exists for tests that only want the union.
+#[cfg(test)]
 async fn active_ews_scopes(account: &GraphAccount) -> Vec<EwsSubscriptionScope> {
     let states = account.ews_subscriptions.read().await;
     dedupe_by_ews_folder(states.values().flat_map(|state| state.scopes.iter()))
@@ -663,6 +895,107 @@ mod tests {
         );
         assert_eq!(notifications[1].event_type, EwsStreamingEventType::Modified);
         assert_eq!(notifications[1].item_id.as_deref(), Some("item-2"));
+    }
+
+    #[test]
+    fn streaming_frame_decoder_emits_before_the_outer_response_closes() {
+        let frame = r#"<m:GetStreamingEventsResponseMessage ResponseClass="Success"><m:Notifications><t:Notification><t:SubscriptionId>sub-1</t:SubscriptionId><t:NewMailEvent><t:ItemId Id="item-1"/><t:ParentFolderId Id="folder-1"/></t:NewMailEvent></t:Notification></m:Notifications></m:GetStreamingEventsResponseMessage>"#;
+        let mut decoder = StreamingFrameDecoder {
+            buffered: Vec::new(),
+        };
+        let split = frame.len() / 2;
+        let bytes = frame.as_bytes();
+        assert!(
+            decoder
+                .push(&bytes[..split])
+                .expect("first chunk")
+                .is_empty()
+        );
+        let frames = decoder.push(&bytes[split..]).expect("second chunk");
+        assert_eq!(frames, vec![frame.to_string()]);
+        let notifications = notifications_from_streaming_frame(&frames[0]).expect("frame parses");
+        assert_eq!(notifications.len(), 1);
+        assert_eq!(
+            notifications[0].parent_folder_id.as_deref(),
+            Some("folder-1")
+        );
+    }
+
+    /// An XML namespace prefix is an alias the writer picks. A response
+    /// that binds the messages namespace to something other than `m:` -
+    /// or makes it the default namespace and writes the element with no
+    /// prefix at all - is exactly as valid, and the framing must recognize
+    /// it. Byte-matching `<m:` dropped both shapes on the floor: no frame,
+    /// no partial frame, so the stream ended reporting neither an
+    /// invalidation nor a failure.
+    #[test]
+    fn the_framing_recognizes_any_namespace_prefix_and_the_default_namespace() {
+        for frame in [
+            r#"<a:GetStreamingEventsResponseMessage ResponseClass="Success"><a:Notifications><b:Notification><b:SubscriptionId>sub-1</b:SubscriptionId><b:NewMailEvent><b:ItemId Id="item-1"/><b:ParentFolderId Id="folder-1"/></b:NewMailEvent></b:Notification></a:Notifications></a:GetStreamingEventsResponseMessage>"#,
+            r#"<GetStreamingEventsResponseMessage xmlns="http://schemas.microsoft.com/exchange/services/2006/messages" ResponseClass="Success"><Notifications><Notification xmlns="http://schemas.microsoft.com/exchange/services/2006/types"><SubscriptionId>sub-1</SubscriptionId><NewMailEvent><ItemId Id="item-1"/><ParentFolderId Id="folder-1"/></NewMailEvent></Notification></Notifications></GetStreamingEventsResponseMessage>"#,
+        ] {
+            let mut decoder = StreamingFrameDecoder {
+                buffered: Vec::new(),
+            };
+            let bytes = frame.as_bytes();
+            let split = bytes.len() / 2;
+            assert!(
+                decoder
+                    .push(&bytes[..split])
+                    .expect("first chunk")
+                    .is_empty(),
+                "{frame}"
+            );
+            assert!(decoder.has_partial_frame(), "{frame}");
+            let frames = decoder.push(&bytes[split..]).expect("second chunk");
+            assert_eq!(frames, vec![frame.to_string()]);
+            assert!(!decoder.has_partial_frame(), "{frame}");
+            let notifications =
+                notifications_from_streaming_frame(&frames[0]).expect("frame parses");
+            assert_eq!(notifications.len(), 1, "{frame}");
+            assert_eq!(
+                notifications[0].parent_folder_id.as_deref(),
+                Some("folder-1"),
+                "{frame}"
+            );
+        }
+    }
+
+    /// The local name must be a whole element name, not a substring: an
+    /// element whose name merely ends with it, and an attribute value that
+    /// happens to contain it, are not frames.
+    #[test]
+    fn the_framing_matches_whole_element_names_only() {
+        assert_eq!(
+            find_frame_start(br#"<m:NotAGetStreamingEventsResponseMessage>"#),
+            None
+        );
+        assert_eq!(
+            find_frame_start(br#"<m:Other why="GetStreamingEventsResponseMessage">"#),
+            None
+        );
+        assert_eq!(
+            find_frame_start(br#"<m:GetStreamingEventsResponseMessageExtra>"#),
+            None
+        );
+        assert_eq!(
+            find_frame_start(br#"<:GetStreamingEventsResponseMessage>"#),
+            None
+        );
+        // A buffer that stops mid-name is not a hit yet; the boundary byte
+        // decides, and it has not arrived.
+        assert_eq!(
+            find_frame_start(b"<m:GetStreamingEventsResponseMessag"),
+            None
+        );
+        assert_eq!(
+            find_frame_start(b"...<m:GetStreamingEventsResponseMessage>"),
+            Some(3)
+        );
+        assert_eq!(
+            find_frame_end(b"</zz:GetStreamingEventsResponseMessage >rest"),
+            Some(40)
+        );
     }
 
     #[test]
@@ -1288,5 +1621,160 @@ mod tests {
 
         account.shutdown.cancel();
         worker.await.expect("worker joins");
+    }
+
+    /// The same dispatch, over a response that binds the EWS namespaces to
+    /// prefixes other than `m:`/`t:`. The framing keys on local names, so
+    /// this is an ordinary notification - not a silently discarded one.
+    #[tokio::test]
+    async fn a_notification_under_an_alien_namespace_prefix_still_invalidates() {
+        const ALIEN_PREFIX_XML: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<x:Envelope xmlns:x="http://schemas.xmlsoap.org/soap/envelope/">
+  <x:Body>
+    <a:GetStreamingEventsResponse xmlns:a="http://schemas.microsoft.com/exchange/services/2006/messages"
+                                  xmlns:b="http://schemas.microsoft.com/exchange/services/2006/types">
+      <a:ResponseMessages>
+        <a:GetStreamingEventsResponseMessage ResponseClass="Success">
+          <a:Notifications>
+            <b:Notification>
+              <b:SubscriptionId>sub-1</b:SubscriptionId>
+              <b:NewMailEvent>
+                <b:ItemId Id="item-1"/>
+                <b:ParentFolderId Id="folder-1"/>
+              </b:NewMailEvent>
+            </b:Notification>
+          </a:Notifications>
+        </a:GetStreamingEventsResponseMessage>
+      </a:ResponseMessages>
+    </a:GetStreamingEventsResponse>
+  </x:Body>
+</x:Envelope>"#;
+
+        let account =
+            GraphAccount::new_for_tests(GraphClient::new("token"), PushMode::EwsStreaming);
+        let mut events = account.push_tx.subscribe();
+        register(&account, "h1", vec![ews_scope("rest-a", "folder-1")]).await;
+        let (scripted, mut requests) = scripted(vec![
+            ScriptStep::Respond(subscribe_response_xml("sub-1")),
+            ScriptStep::Respond(ALIEN_PREFIX_XML.to_string()),
+            ScriptStep::Hang,
+            ScriptStep::Respond(unsubscribe_response_xml()),
+        ]);
+        let worker = tokio::spawn(run_worker(account.clone(), scripted));
+
+        let _subscribe = requests.recv().await.expect("subscribe");
+        let _first_poll = requests.recv().await.expect("first long poll");
+        let _second_poll = requests
+            .recv()
+            .await
+            .expect("re-poll after the notification");
+
+        match events.try_recv().expect("invalidation") {
+            WatchEvent::Invalidated { hint } => match hint.payload {
+                HintPayload::SpecificCursorScope(scope) => {
+                    assert_eq!(scope, email_scope("rest-a"));
+                }
+                other => panic!("expected a specific scope hint, got {other:?}"),
+            },
+            other => panic!("expected Invalidated, got {other:?}"),
+        }
+
+        account.shutdown.cancel();
+        worker.await.expect("worker joins");
+    }
+
+    /// A CLASSIFIED response error inside the stream is terminal, not a
+    /// reconnect. `ErrorAccessDenied` derives `NoPermission`, which no
+    /// amount of resubscribing fixes; flattening the typed `EwsError` into
+    /// a string turned it into an endless disconnect-and-resubscribe loop
+    /// that burned a subscription against the mailbox quota each time and
+    /// never told the engine anything.
+    #[tokio::test]
+    async fn a_terminal_response_error_in_the_stream_terminates_instead_of_reconnecting() {
+        const ACCESS_DENIED_XML: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Body>
+    <m:GetStreamingEventsResponse xmlns:m="http://schemas.microsoft.com/exchange/services/2006/messages"
+                                  xmlns:t="http://schemas.microsoft.com/exchange/services/2006/types">
+      <m:ResponseMessages>
+        <m:GetStreamingEventsResponseMessage ResponseClass="Error">
+          <m:MessageText>Access is denied. Check credentials and try again.</m:MessageText>
+          <m:ResponseCode>ErrorAccessDenied</m:ResponseCode>
+        </m:GetStreamingEventsResponseMessage>
+      </m:ResponseMessages>
+    </m:GetStreamingEventsResponse>
+  </s:Body>
+</s:Envelope>"#;
+
+        let account =
+            GraphAccount::new_for_tests(GraphClient::new("token"), PushMode::EwsStreaming);
+        let mut events = account.push_tx.subscribe();
+        register(&account, "h1", vec![ews_scope("rest-a", "folder-1")]).await;
+        // Deliberately short: a reconnect loop would demand a second
+        // Subscribe and blow up on the exhausted script instead of
+        // quietly passing.
+        let (scripted, mut requests) = scripted(vec![
+            ScriptStep::Respond(subscribe_response_xml("sub-1")),
+            ScriptStep::Respond(ACCESS_DENIED_XML.to_string()),
+            ScriptStep::Respond(unsubscribe_response_xml()),
+        ]);
+        let worker = tokio::spawn(run_worker(account.clone(), scripted));
+
+        let _subscribe = requests.recv().await.expect("subscribe");
+        let _poll = requests.recv().await.expect("long poll");
+        // The worker exits on its own: no shutdown, no topology change.
+        worker.await.expect("worker joins");
+
+        let release = requests.recv().await.expect("the subscription is released");
+        assert!(
+            release.contains("<m:SubscriptionId>sub-1</m:SubscriptionId>"),
+            "{release}"
+        );
+        assert!(
+            requests.try_recv().is_err(),
+            "a terminal error must not resubscribe"
+        );
+
+        match events.try_recv().expect("a terminal push event") {
+            WatchEvent::Terminated(error) => {
+                assert!(error.recovery().is_terminal(), "{error:?}");
+                assert_eq!(error.protocol(), Some(bifrost_types::Protocol::Ews));
+            }
+            other => panic!("expected Terminated, got {other:?}"),
+        }
+    }
+
+    /// The worker retires its own slot while still holding the guard that
+    /// told it the registration map is empty. Returning without clearing
+    /// the slot let a concurrent `subscribe_ews` see a still-unfinished
+    /// `JoinHandle`, decline to spawn a replacement, and end up with no EWS
+    /// worker at all once this task returned.
+    #[tokio::test]
+    async fn the_worker_clears_its_slot_when_the_last_registration_is_gone() {
+        let account =
+            GraphAccount::new_for_tests(GraphClient::new("token"), PushMode::EwsStreaming);
+        // Stand in for the handle `ensure_ews_worker` installed: a task
+        // that never finishes, so `is_finished` cannot paper over a slot
+        // this exit failed to clear.
+        *account.ews_worker.lock().await = Some(tokio::spawn(std::future::pending()));
+
+        let (scripted, mut requests) = scripted(Vec::new());
+        run_worker(account.clone(), scripted).await;
+
+        assert!(
+            account.ews_worker.lock().await.is_none(),
+            "the exiting worker must leave an empty slot for the next subscribe"
+        );
+        assert!(
+            requests.try_recv().is_err(),
+            "an empty registration map subscribes to nothing"
+        );
+
+        // What the emptied slot buys: the next registration starts a fresh
+        // worker rather than trusting the departed one.
+        register(&account, "h1", vec![ews_scope("rest-a", "folder-1")]).await;
+        super::super::push_stream::ensure_ews_worker(account.clone()).await;
+        assert!(account.ews_worker.lock().await.is_some());
+        account.shutdown.cancel();
     }
 }

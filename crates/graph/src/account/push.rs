@@ -400,16 +400,13 @@ async fn ensure_graph_worker(account: GraphAccount) {
     if account.push_mode != PushMode::GraphSubscriptions {
         return;
     }
-    let mut worker = account.graph_worker.lock().await;
-    let needs_start = worker
-        .as_ref()
-        .is_none_or(tokio::task::JoinHandle::is_finished);
-    if needs_start {
-        let worker_account = account.clone();
-        *worker = Some(tokio::spawn(async move {
+    let worker_account = account.clone();
+    super::worker_slot::ensure_worker(&account.graph_worker, move || {
+        tokio::spawn(async move {
             run_graph_subscription_worker(worker_account).await;
-        }));
-    }
+        })
+    })
+    .await;
 }
 
 async fn run_graph_subscription_worker(account: GraphAccount) {
@@ -564,18 +561,11 @@ fn has_live_graph_subscription_group(
 
 /// Clear the worker slot on the way out of `run_graph_subscription_worker`,
 /// so `ensure_graph_worker` starts a fresh worker for the next subscription.
-///
-/// Dropping whatever is in the slot is safe without identifying the handle:
-/// `ensure_graph_worker` installs one only when the slot is empty or its task
-/// has already finished, and the caller here is neither, so the slot holds
-/// either this task's own handle or `None` (`push_unsubscribe` took it to
-/// abort us). Dropping a `JoinHandle` detaches, it does not cancel.
-///
-/// Lock order is subscriptions-then-worker everywhere (`push_unsubscribe`
-/// holds its read guard across the same acquisition in a let-chain), and
-/// `ensure_graph_worker` takes only the worker lock, so this cannot deadlock.
+/// See `worker_slot` for the ordering rule this call is one half of; the
+/// caller must still hold the `graph_subscriptions` guard that decided to
+/// exit.
 async fn retire_graph_worker_slot(account: &GraphAccount) {
-    drop(account.graph_worker.lock().await.take());
+    super::worker_slot::retire_worker_slot(&account.graph_worker).await;
 }
 
 /// One subscription inside the renewal threshold, with everything the worker

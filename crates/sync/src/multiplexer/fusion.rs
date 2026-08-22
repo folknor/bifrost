@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use bifrost_types::{
     Account, AccountError, Change, Checkpoint, CursorScope, InventoryEntry, ObjectChange,
-    ObjectChangeKind, PageBoundary, SyncEvent,
+    ObjectChangeKind, SyncEvent,
 };
 use futures::stream::StreamExt;
 use tokio::sync::broadcast;
@@ -78,11 +78,36 @@ impl InventoryFusion {
         scope: CursorScope,
         changes_tx: Option<broadcast::Sender<MultiplexerEvent>>,
     ) -> Result<FusionOutcome, Error> {
+        let stream = account.inventory_stream(scope.clone());
+        self.run_stream(scope, stream, changes_tx).await
+    }
+
+    /// Resume a provider-owned inventory page cursor. The account returns
+    /// `None` for a cursor it does not own, so a stale or cross-provider row
+    /// cannot be accidentally reinterpreted as a fresh inventory walk.
+    pub async fn run_resume_with_broadcast(
+        &self,
+        account: &dyn Account,
+        cursor: bifrost_types::ChangeCursor,
+        changes_tx: Option<broadcast::Sender<MultiplexerEvent>>,
+    ) -> Result<FusionOutcome, Error> {
+        let scope = cursor.scope.clone();
+        let Some(stream) = account.inventory_resume_stream(cursor) else {
+            return Ok(FusionOutcome::NoCursor);
+        };
+        self.run_stream(scope, stream, changes_tx).await
+    }
+
+    async fn run_stream(
+        &self,
+        scope: CursorScope,
+        mut stream: bifrost_types::AccountStream<SyncEvent<InventoryEntry>>,
+        changes_tx: Option<broadcast::Sender<MultiplexerEvent>>,
+    ) -> Result<FusionOutcome, Error> {
         let _activity = match &self.control {
             Some(control) => Some(control.begin_activity().ok_or(Error::Paused)?),
             None => None,
         };
-        let mut stream = account.inventory_stream(scope.clone());
         while let Some(event) = stream.next().await {
             match event {
                 SyncEvent::Done(checkpoint) => {
@@ -120,14 +145,7 @@ impl InventoryFusion {
                 }
                 SyncEvent::Batch(batch) => {
                     if let Some(tx) = &changes_tx {
-                        Self::forward_inventory_batch(
-                            tx,
-                            &scope,
-                            &batch.items,
-                            batch.page_boundary,
-                            batch.server_latency,
-                            batch.bytes_in,
-                        );
+                        self.forward_inventory_batch(tx, &scope, &batch);
                     }
                 }
                 SyncEvent::Progress(_) | SyncEvent::Warning(_) => {}
@@ -138,19 +156,16 @@ impl InventoryFusion {
     }
 
     fn forward_inventory_batch(
+        &self,
         tx: &broadcast::Sender<MultiplexerEvent>,
         scope: &CursorScope,
-        items: &[InventoryEntry],
-        page_boundary: PageBoundary,
-        server_latency: std::time::Duration,
-        bytes_in: u64,
+        batch: &bifrost_types::Batch<InventoryEntry>,
     ) {
         // Inventory entries describe object existence; surface them as
         // `Created` changes so consumers handle inventory the same way
         // they handle a freshly-discovered object on the live stream.
-        // Note checkpoint is intentionally None: cursor establishment
-        // is signaled only at the inventory's terminal Done.
-        let changes: Vec<Change> = items
+        let changes: Vec<Change> = batch
+            .items
             .iter()
             .map(|entry| {
                 Change::ObjectChange(ObjectChange {
@@ -161,17 +176,25 @@ impl InventoryFusion {
             .collect();
         let synthetic = bifrost_types::Batch {
             items: changes,
-            page_boundary,
-            server_latency,
-            bytes_in,
-            checkpoint: None,
+            page_boundary: batch.page_boundary,
+            server_latency: batch.server_latency,
+            bytes_in: batch.bytes_in,
+            checkpoint: batch.checkpoint.clone(),
         };
         let me = MultiplexerEvent {
             scope: scope.clone(),
             event: Arc::new(SyncEvent::Batch(synthetic)),
-            checkpoint: None,
+            checkpoint: batch.checkpoint.clone(),
         };
-        let _ = tx.send(me);
+        if let (Some(control), Some(checkpoint)) = (&self.control, batch.checkpoint.as_ref()) {
+            control.expect_checkpoint(checkpoint.clone());
+        }
+        let delivered = tx.send(me).unwrap_or(0);
+        if delivered <= 1
+            && let (Some(control), Some(checkpoint)) = (&self.control, batch.checkpoint.as_ref())
+        {
+            control.retire_checkpoint(checkpoint);
+        }
     }
 
     async fn finalize(

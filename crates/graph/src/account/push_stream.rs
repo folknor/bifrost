@@ -47,14 +47,11 @@ pub(crate) async fn ensure_ews_worker(account: GraphAccount) {
     if account.push_mode != PushMode::EwsStreaming {
         return;
     }
-    let mut worker = account.ews_worker.lock().await;
-    let needs_start = worker
-        .as_ref()
-        .is_none_or(tokio::task::JoinHandle::is_finished);
-    if needs_start {
-        let worker_account = account.clone();
-        *worker = Some(tokio::spawn(async move {
+    let worker_account = account.clone();
+    super::worker_slot::ensure_worker(&account.ews_worker, move || {
+        tokio::spawn(async move {
             super::ews_stream::run_streaming_worker(worker_account).await;
-        }));
-    }
+        })
+    })
+    .await;
 }

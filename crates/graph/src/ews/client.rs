@@ -1,13 +1,35 @@
 use super::{
-    EwsClient, EwsError, EwsExecute, EwsHeaders, build_soap_envelope, check_response_error,
-    check_soap_fault, ews_url,
+    EwsBodyStream, EwsClient, EwsError, EwsExecute, EwsHeaders, build_soap_envelope,
+    check_response_error, check_soap_fault, ews_url,
 };
+use futures::TryStreamExt;
 
 impl EwsExecute for EwsClient {
     async fn execute(&self, body_xml: &str, headers: &EwsHeaders) -> Result<String, EwsError> {
         // Inherent methods outrank trait methods in resolution, so this
         // delegates rather than recursing.
         EwsClient::execute(self, body_xml, headers).await
+    }
+
+    async fn execute_streaming(
+        &self,
+        body_xml: &str,
+        headers: &EwsHeaders,
+    ) -> Result<EwsBodyStream, EwsError> {
+        let envelope = build_soap_envelope(body_xml);
+        let mut req = self
+            .net
+            .post(&self.ews_url)
+            .header("Content-Type", "text/xml; charset=utf-8");
+        for (name, value) in headers.pairs() {
+            req = req.header(name, &value);
+        }
+        let response = req
+            .body(bytes::Bytes::from(envelope))
+            .send_streaming()
+            .await
+            .map_err(EwsError::Transport)?;
+        Ok(Box::pin(response.body.map_err(EwsError::Transport)))
     }
 }
 

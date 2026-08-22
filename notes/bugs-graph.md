@@ -13,96 +13,20 @@ terminal renewal failure, and the `with_push_endpoint` constructor whose
 `clientState` no receiver could validate. `reference/graph.md` now states each
 new rule.
 
-## EWS streaming push is not actually streaming: it delivers in ~30-minute batches
-
-`crates/graph/src/ews/client.rs` - `EwsClient::execute` does `req.send().await`, then reads
-`resp.body` (a fully-buffered `bytes::Bytes`) and only then parses.
-`crates/graph/src/account/ews_stream.rs` issues
-`build_get_streaming_events_request(subscription_id, 30)`, a 30-minute `ConnectionTimeout`, and
-awaits that same buffered `execute`.
-
-EWS Streaming Notifications work by holding a chunked HTTP response open for the whole
-`ConnectionTimeout` and emitting `<m:GetStreamingEventsResponse>` fragments as events occur.
-Because the transport buffers the entire body, nothing is parsed until Exchange closes the
-connection at the 30-minute mark. So `PushMode::EwsStreaming`, whose whole point is
-`PushCapability::InProcess` low-latency invalidation, delivers invalidations with up to 30 minutes
-of latency, worse than the ordinary poll interval it is meant to pre-empt, and every notification
-arrives in one burst.
-
-Worse, the capability surface advertises `push_in_process() == true`, so the engine may relax its
-polling on the strength of a push channel that is effectively a 30-minute timer.
-
-Fixing this is not a tweak: it needs a streaming-body seam (`bytes_stream`) plus an incremental XML
-reader that emits notifications per response fragment, and correspondingly an `EwsExecute` variant
-that yields a stream. Given `EwsClient::execute` is also the funnel that runs `check_soap_fault` /
-`check_response_error` on a whole body, the honest move is to split EWS into two transports: the
-one-shot request/response funnel every other op uses, and a dedicated streaming funnel for
-`GetStreamingEvents` that frames per-envelope. Lowering `ConnectionTimeout` to e.g. 1 minute is a
-stopgap that trades latency for a Subscribe/reconnect storm, not a fix.
-
-Hunter confidence: high on the buffering; lower on whether Exchange flushes a complete parseable
-envelope per fragment or a single envelope split across the connection (it is the latter for the
-outer element, which is exactly why the incremental reader is required rather than "parse each
-chunk").
-
-## Calendar calendarView delta window is frozen at first seed and never slides
-
-`crates/graph/src/account/inventory.rs` computes `startDateTime`/`endDateTime` as `now-90d` /
-`now+365d` and bakes them into the initial delta URL. Graph carries the original window inside the
-`@odata.deltaLink` it mints; `changes_stream` then follows that link forever.
-
-`delta_token_expires_after: None`, `describe_cursor` reports a delta cursor as fresh
-unconditionally, and nothing re-runs `establish_initial_cursor` for a live scope. So an account
-running longer than a year stops seeing events past its frozen `endDateTime` entirely, and the
-trailing edge never advances either. The failure is silent: no error, no scope disable, just a
-calendar that goes blind at a horizon that recedes into the past.
-
-There is no mechanism in the crate to age out a cursor. Options: store the window bounds in
-`GraphCursorPayload` and have `changes_stream` force a reseed (`SyncState(CursorInvalid)` then
-`RestartScope`) once `now` approaches the frozen end, or make `describe_cursor` report a calendar
-cursor as stale past a threshold. Either way the cursor payload needs to carry the window it was
-minted against, which is an envelope bump.
-
-## FlagOp::Patch naming one flag in both sets has no rejection
-
-`crates/graph/src/account/mutate.rs`. The empty-patch half of this finding is fixed; what remains is
-that `FlagOp::Patch { add, remove }` naming the same flag in both sets resolves by evaluation order
-(`apply_flag_removes` runs last, so remove wins) rather than being refused as a contradictory
-request. Deterministic and pinned by a test, so this is a design question, not a live defect.
-
-## unsubscribe_ews never retires the EWS worker; the two push modes have divergent worker lifecycles
-
-`push.rs` removes the state and bumps topology. The worker then exits its `GetStreamingEvents` loop
-as `Resubscribe`, releases the subscription, finds an empty scope map, and parks forever on
-`topology.changed()`: one live task per account, for the account's whole lifetime, doing nothing.
-(`close()` now joins that worker rather than aborting it, so the task does end with the account -
-what remains is the idle-worker asymmetry between an `unsubscribe_ews` and an `unsubscribe_graph`.)
-
-The webhook mode built a careful protocol for exactly this (`has_live_graph_subscription_group`,
-`retire_graph_worker_slot`, the subscriptions-then-worker lock order, the "clear the slot before
-releasing the guard" ordering). The EWS mode has none of it. Two worker-lifecycle state machines,
-one hardened and one absent, guarding the same `Arc<Mutex<Option<JoinHandle>>>` shape. This is the
-duplicated machinery that most wants unifying in this file: one worker-slot abstraction with
-`ensure`/`retire` and the lock ordering pinned once, parameterized by "is there live work".
-
-Lower severity than it looks because the idle worker is cheap and correct, but it is the kind of
-asymmetry that hides the next bug.
-
-## inventory_stream never checkpoints mid-walk
-
-`inventory.rs`: a page with a `nextLink` yields `PageBoundary::Page` with `checkpoint: None`, and
-`current_url` advances only in memory. Only the final `deltaLink` page produces a
-`Checkpoint::Change`.
-
-`changes_stream` does the opposite: it checkpoints `advanced_through` at every page boundary, and
-`GraphPageMarker` exists precisely to carry that. So a 200k-message initial sync that drops its
-connection on the last page restarts from page one, while the incremental pass that follows it is
-fully resumable. That is backwards; the initial walk is the expensive one.
-
-The `GraphCursorPayload` for a mid-inventory position would need a `delta_link` it does not have
-yet, which is presumably why this was skipped, but a payload variant carrying only a page marker
-(and a `changes_stream` that refuses to resume one) is expressible, and `establish_initial_cursor`
-already has a reseed path for anything it cannot honor.
+Fixed 2026-08-22 and removed from this document: EWS streaming delivering in
+thirty-minute batches (there is now a chunked response seam and an incremental
+frame decoder), the frozen calendarView window (cursor envelope v3 records the
+horizon and reseeds ahead of it), the unrejected contradictory `FlagOp::Patch`,
+the EWS worker that parked forever after its last handle went away, and
+`inventory_stream` never checkpointing mid-walk (envelope v4 plus the
+`Account::inventory_resume_stream` hook). Three defects that pass introduced
+were caught in review and fixed in the same commit: the EWS worker retiring
+without clearing its slot (now one shared `worker_slot` discipline across both
+push modes), the frame decoder assuming the literal `m:` namespace prefix, and
+a classified SOAP response error inside the stream being downgraded to a
+malformed-XML reconnect loop. A fourth was found while auditing the consumers:
+the reopen path `run_establish` put a stored mid-inventory cursor straight into
+the registry, where `changes_stream` would have walked an empty delta link.
 
 ## Smaller observations
 

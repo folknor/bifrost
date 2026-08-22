@@ -1098,6 +1098,12 @@ pub(crate) fn cursor_error_to_account_error(
             Cause::State(StateCause::SchemaIncompatible),
         )
         .text(DiagnosticText::support_only(error.to_string())),
+        CursorError::CalendarWindowExpired | CursorError::InventoryInProgress => base_builder(
+            &ctx,
+            AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
+            Cause::State(StateCause::CursorInvalid),
+        )
+        .text(DiagnosticText::support_only(error.to_string())),
         CursorError::Unsupported => base_builder(
             &ctx,
             AccountErrorKind::Unsupported(ctx.operation),

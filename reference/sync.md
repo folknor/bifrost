@@ -259,8 +259,16 @@ never durably persisted come across again.
 
 `InventoryFusion::run_with_broadcast` follows the same shape for
 `EstablishViaInventory` scopes: inventory batches stream as the
-cursor-establishment pass progresses and the cursor persists on a
-successful `Done`.
+cursor-establishment pass progresses. A provider may attach a page checkpoint
+before its terminal cursor exists; that checkpoint persists only after the
+consumer ack, and BOTH cursor-establishment paths - `establish_initial_cursor`
+at attach and `run_establish` on reopen - ask the account's
+`inventory_resume_stream` hook whether it owns and can resume the saved
+inventory state before putting a stored cursor into the registry. A stored
+page position must never reach `changes_stream`, which has no delta link to
+walk; the hook is also the classifier, so building its stream must be free of
+I/O and side effects. The terminal `Done` still installs the ordinary live
+change cursor in the registry.
 
 `ChangesEvent` is the per-batch outcome returned by the driver:
 `Advanced` / `Done` / `Stopped` / `Paused` / `Terminated(AccountError)`.

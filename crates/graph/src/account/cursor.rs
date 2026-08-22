@@ -17,6 +17,14 @@ pub(crate) enum CursorError {
     SchemaIncompatible,
     /// Cursor operation is not supported for this scope.
     Unsupported,
+    /// A calendarView cursor's fixed end bound is too near. It must be
+    /// reseeded so Graph mints a delta link over a fresh window.
+    CalendarWindowExpired,
+    /// A mid-inventory page cursor was handed to the changes walk, which
+    /// has no delta link to resume from. The cursor itself is well formed,
+    /// so this restarts the one scope rather than declaring the stored
+    /// schema incompatible account-wide.
+    InventoryInProgress,
     /// A persisted foreign scope refers to a shared mailbox no longer
     /// configured on this account.
     Configuration(String),
@@ -31,6 +39,10 @@ impl std::fmt::Display for CursorError {
             Self::EnvelopeUnknown => f.write_str("cursor envelope version unknown"),
             Self::SchemaIncompatible => f.write_str("cursor schema incompatible"),
             Self::Unsupported => f.write_str("unsupported cursor scope"),
+            Self::CalendarWindowExpired => f.write_str("calendar cursor window expired"),
+            Self::InventoryInProgress => {
+                f.write_str("cursor is a mid-inventory page position, not a changes cursor")
+            }
             Self::Configuration(msg) => write!(f, "cursor configuration mismatch: {msg}"),
             Self::Encode(msg) => write!(f, "cursor encode/decode error: {msg}"),
         }
@@ -75,7 +87,13 @@ pub(crate) fn routing_error(error: crate::error::GraphError) -> CursorError {
 /// a full `inventory_stream` pass, which re-mints the ids under the new
 /// encoding. Reseeding is the cheapest correct migration here - the ids are
 /// server-issued and not reconstructable from the stored bytes.
-pub(crate) const GRAPH_CURSOR_ENVELOPE_VERSION: u32 = 2;
+///
+/// v3: calendarView delta links retain their original end bound, so the
+/// payload records that horizon and forces a scoped reseed before it expires.
+/// v4: an acknowledged initial-inventory page has a next link but no delta
+/// link; the payload distinguishes that resumable inventory position from a
+/// live changes cursor so bifrost-sync can restart the right stream.
+pub(crate) const GRAPH_CURSOR_ENVELOPE_VERSION: u32 = 4;
 pub(crate) const CHANGE_CURSOR_ENVELOPE_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -208,6 +226,20 @@ pub(crate) struct GraphCursorPayload {
     pub(crate) delta_link: String,
     #[serde(default)]
     pub(crate) advanced_through: Option<GraphPageMarker>,
+    /// The marker is an inventory page position rather than a delta page
+    /// position. It has no delta link yet and must resume through
+    /// `inventory_stream`, never `changes_stream`.
+    #[serde(default)]
+    pub(crate) inventory_in_progress: bool,
+    /// Unix timestamp of the end of the calendarView window that minted this
+    /// cursor. Calendar delta links retain their original query bounds, so a
+    /// live cursor must be reseeded before this horizon reaches the present.
+    ///
+    /// v3 is deliberately a reseed boundary rather than an additive read:
+    /// v2 cursors have no recoverable window horizon, and treating one as
+    /// current would preserve the frozen-window bug indefinitely.
+    #[serde(default)]
+    pub(crate) calendar_window_end: Option<i64>,
 }
 
 impl GraphCursorPayload {
@@ -220,6 +252,27 @@ impl GraphCursorPayload {
             kind,
             delta_link,
             advanced_through,
+            inventory_in_progress: false,
+            calendar_window_end: None,
+        }
+    }
+
+    pub(crate) fn with_calendar_window_end_option(mut self, end: Option<i64>) -> Self {
+        self.calendar_window_end = end;
+        self
+    }
+
+    pub(crate) fn inventory_page(
+        kind: GraphCursorKind,
+        marker: GraphPageMarker,
+        calendar_window_end: Option<i64>,
+    ) -> Self {
+        Self {
+            kind,
+            delta_link: String::new(),
+            advanced_through: Some(marker),
+            inventory_in_progress: true,
+            calendar_window_end,
         }
     }
 
@@ -231,6 +284,8 @@ impl GraphCursorPayload {
             kind: GraphCursorKind::PublicFolder(cursor),
             delta_link: String::new(),
             advanced_through: None,
+            inventory_in_progress: false,
+            calendar_window_end: None,
         }
     }
 
