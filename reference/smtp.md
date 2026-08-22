@@ -269,6 +269,16 @@ hermetic nor deterministic. A transcript is a greeting plus an ordered list of
   A truncated reply must surface as an `incomplete response` parse error,
   never a hang.
 
+The transcript stream carries no TLS, so `peer_certificate_der()` is `None`
+under test. A test-only seam on `AsyncNetworkStream`
+(`set_test_peer_certificate_der`, surfaced as
+`AsyncSmtpConnection::from_transcript_with_peer_certificate`) injects a DER so
+the connection-level channel-binding gate in `auth` is pinned hermetically in
+both directions: a PLUS-advertising server with a usable certificate must be
+answered with the PLUS mechanism, a present-but-unusable certificate is a hard
+error with no fallback AUTH written, and only an absent certificate falls
+through to a weaker mechanism.
+
 `expect_then_stall` and `Transcript::silent()` model a peer that accepts and
 then never answers; reads park with no waker, so only the caller's own timeout
 or cancellation resumes the task. That is what the async timeout, setup-deadline

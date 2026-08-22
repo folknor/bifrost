@@ -291,6 +291,30 @@ impl AsyncSmtpConnection {
         .await
     }
 
+    /// Transcript setup with a peer-certificate DER injected on the stream,
+    /// so the connection-level channel-binding gate in `auth` (resolve the
+    /// binding only when an allowed PLUS mechanism is advertised, and treat a
+    /// present-but-unusable certificate as a hard error) is testable without
+    /// TLS.
+    #[cfg(test)]
+    pub(in crate::transport::smtp) async fn from_transcript_with_peer_certificate(
+        transcript: crate::transport::smtp::test_support::Transcript,
+        hello_name: &ClientId,
+        protocol: Protocol,
+        peer_certificate_der: Vec<u8>,
+    ) -> Result<Self, Error> {
+        let mut stream = AsyncNetworkStream::from_transcript(transcript);
+        stream.set_test_peer_certificate_der(peer_certificate_der);
+        Self::connect_impl(
+            stream,
+            hello_name,
+            None,
+            TimeoutBudget::PerOperation(None),
+            protocol,
+        )
+        .await
+    }
+
     /// Transcript setup that goes through the same single setup deadline the
     /// real `connect` path uses, so banner and EHLO share one budget.
     #[cfg(test)]
@@ -2733,6 +2757,135 @@ mod transcript_tests {
                 .server_info()
                 .supports_feature(Extension::EightBitMime)
         );
+        transcript.assert_exhausted();
+    }
+
+    /// A minimal but structurally valid DER `Certificate` whose
+    /// `signatureAlgorithm` is sha256WithRSAEncryption, matching the fixture
+    /// shape bifrost-sasl's own channel-binding tests use. The parser only
+    /// walks to the signatureAlgorithm OID, so this is a usable certificate
+    /// for `resolve_scram_binding`.
+    fn usable_peer_certificate() -> Vec<u8> {
+        vec![
+            0x30, 0x12, // Certificate SEQUENCE
+            0x30, 0x00, // tbsCertificate: empty SEQUENCE
+            0x30, 0x0b, // signatureAlgorithm SEQUENCE
+            0x06, 0x09, // OID, 9 bytes
+            0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01,
+            0x0b, // 1.2.840.113549.1.1.11 sha256WithRSAEncryption
+            0x03, 0x01, 0x00, // signatureValue: empty BIT STRING
+        ]
+    }
+
+    #[tokio::test(crate = "tokio")]
+    async fn plus_advertising_server_with_certificate_is_answered_with_scram_plus() {
+        // Pins the connection-level `plus_candidate` gate in the true
+        // direction: with a usable peer certificate and SCRAM-SHA-256-PLUS
+        // advertised, the AUTH command on the wire must be the PLUS mechanism,
+        // never PLAIN. The SCRAM client-first is nonce-random and cannot be
+        // scripted, so the exchange is cut short with a 535 on the AUTH
+        // command itself; exhausting the transcript proves the PLUS command
+        // was written.
+        let hello = ClientId::Domain("client.example".to_owned());
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(
+                HELLO,
+                "250-smtp.example\r\n250 AUTH SCRAM-SHA-256-PLUS PLAIN\r\n",
+            )
+            .expect("AUTH SCRAM-SHA-256-PLUS\r\n", "535 rejected\r\n");
+        let mut connection = AsyncSmtpConnection::from_transcript_with_peer_certificate(
+            transcript.clone(),
+            &hello,
+            Protocol::Smtp,
+            usable_peer_certificate(),
+        )
+        .await
+        .unwrap();
+
+        let error = connection
+            .auth(
+                &[Mechanism::ScramSha256Plus, Mechanism::Plain],
+                &Credentials::password("user".to_owned(), "pass".to_owned()),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            error.is_permanent(),
+            "expected the scripted 535, got {error:?}"
+        );
+        assert!(connection.has_broken());
+        transcript.assert_exhausted();
+    }
+
+    #[tokio::test(crate = "tokio")]
+    async fn present_but_unusable_certificate_fails_auth_before_any_wire_write() {
+        // A peer certificate that exists but cannot produce a channel binding
+        // (truncated DER) must be a hard parse-class error, not a silent
+        // downgrade to PLAIN-over-TLS. The transcript scripts no AUTH step, so
+        // any attempt to write a fallback AUTH command would fail the
+        // transcript instead of returning the typed error asserted here.
+        let hello = ClientId::Domain("client.example".to_owned());
+        let transcript = Transcript::new("220 smtp.example\r\n").expect(
+            HELLO,
+            "250-smtp.example\r\n250 AUTH SCRAM-SHA-256-PLUS PLAIN\r\n",
+        );
+        let mut connection = AsyncSmtpConnection::from_transcript_with_peer_certificate(
+            transcript.clone(),
+            &hello,
+            Protocol::Smtp,
+            vec![0x30, 0x01, 0x00],
+        )
+        .await
+        .unwrap();
+
+        let error = connection
+            .auth(
+                &[Mechanism::ScramSha256Plus, Mechanism::Plain],
+                &Credentials::password("user".to_owned(), "pass".to_owned()),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            error.is_parse(),
+            "expected the typed binding parse error, got {error:?}"
+        );
+        transcript.assert_exhausted();
+    }
+
+    #[tokio::test(crate = "tokio")]
+    async fn plus_advertised_without_certificate_falls_through_to_plain() {
+        // No certificate at all (plaintext transcript, nothing injected):
+        // the PLUS rung is skipped as binding-unavailable and PLAIN is the
+        // answer. This is the only fall-through `resolve_scram_binding`
+        // permits.
+        let hello = ClientId::Domain("client.example".to_owned());
+        let plain = format!(
+            "AUTH PLAIN {}\r\n",
+            crate::base64::encode("\u{0}user\u{0}pass")
+        );
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(
+                HELLO,
+                "250-smtp.example\r\n250 AUTH SCRAM-SHA-256-PLUS PLAIN\r\n",
+            )
+            .expect(plain, "235 authenticated\r\n")
+            .expect(HELLO, "250 smtp.example\r\n");
+        let mut connection =
+            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp)
+                .await
+                .unwrap();
+
+        let response = connection
+            .auth(
+                &[Mechanism::ScramSha256Plus, Mechanism::Plain],
+                &Credentials::password("user".to_owned(), "pass".to_owned()),
+            )
+            .await
+            .unwrap();
+
+        assert!(response.has_code(235));
         transcript.assert_exhausted();
     }
 

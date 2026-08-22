@@ -106,6 +106,14 @@ pub(crate) struct AsyncNetworkStream {
     /// sleep in the stream means a throttled connection yields to the
     /// runtime like any other pending IO instead of blocking the task.
     throttle: Option<Pin<Box<Sleep>>>,
+    /// Test-injected peer-certificate DER, returned by
+    /// [`Self::peer_certificate_der`] ahead of the TLS session's. The
+    /// transcript harness is an in-memory duplex with no TLS, so without this
+    /// seam no hermetic test can make a certificate exist, and the
+    /// connection-level channel-binding gate (`plus_candidate` in `auth`)
+    /// would be untestable in both directions.
+    #[cfg(test)]
+    test_peer_certificate_der: Option<Vec<u8>>,
 }
 
 pub(crate) trait AsyncTokioStream:
@@ -150,6 +158,8 @@ impl AsyncNetworkStream {
             state: ConnectionState::Ok,
             metering: WireMetering::disabled(),
             throttle: None,
+            #[cfg(test)]
+            test_peer_certificate_der: None,
         }
     }
 
@@ -184,6 +194,12 @@ impl AsyncNetworkStream {
         if let Some(debt) = debt {
             self.throttle = Some(Box::pin(tokio::time::sleep(debt)));
         }
+    }
+
+    /// Inject a peer-certificate DER for tests. See the field's comment.
+    #[cfg(test)]
+    pub(crate) fn set_test_peer_certificate_der(&mut self, der: Vec<u8>) {
+        self.test_peer_certificate_der = Some(der);
     }
 
     #[cfg(test)]
@@ -348,6 +364,10 @@ impl AsyncNetworkStream {
     // SASL layer, so there is no in-crate caller yet.
     #[allow(dead_code)]
     pub(crate) fn peer_certificate_der(&self) -> Option<Vec<u8>> {
+        #[cfg(test)]
+        if let Some(der) = &self.test_peer_certificate_der {
+            return Some(der.clone());
+        }
         match &self.inner {
             InnerAsyncNetworkStream::TokioNativeTls(s) => s
                 .get_ref()

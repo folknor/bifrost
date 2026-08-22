@@ -307,6 +307,101 @@ bind the whole workspace.
   dependency. The grouping evidence is in `reference/types.md`. Do not reopen
   this without new evidence.
 
+## From the bifrost-smtp / bifrost-sasl arc (closed 2026-08-22, `cfd9f46` + `0613bde` + `dd92738` + `d20816c` + `488ffd7` plus close pass)
+
+Decisions already ruled on - do not silently relitigate:
+
+- **The crate is async-only, permanently.** The blocking transport half
+  (`SmtpTransport`, `LmtpTransport`, `Transport`, the blocking pool and
+  socket funnel, `oauth2_token_blocking`) and the `tokio` cargo feature are
+  deleted, not gated. A build without Tokio has no transport, so a feature
+  gating one described a build that cannot exist. The fifteen invariants only
+  the blocking tests had pinned were re-pinned as async transcript tests; a
+  restoration of the blocking half would have to re-earn all of that.
+  `TODO.md` carries the release-note obligation.
+- **SMTP has NO auth retry ladder, deliberately, and IMAP keeps one,
+  deliberately.** SMTP's `password_mechanism` returns exactly one mechanism
+  and a wire 535 is final: walking down to an unbound mechanism or PLAIN
+  after a rejection is the silent-downgrade class this arc spent rounds
+  refusing. IMAP's `password_mechanism_ladder` returns an ordered
+  `Attempt`/`Reject` list, but its driver walks past LOCAL rejections only
+  (policy gates, `ChannelBindingUnavailable`, capability skew surfacing as
+  `MissingCapability`); any wire rejection aborts the ladder. Collapsing the
+  two shapes into one, in either direction, reopens a downgrade.
+- **DATA reuses the message's final CRLF.** The RFC 5321 terminator's leading
+  CRLF is the message's own final CRLF; the writer appends one only when the
+  buffer does not end in CRLF (chunked writers track the last two bytes
+  across iterator items), and `smtp_data_size` matches the transmitted bytes
+  exactly. `Message::formatted()` is byte-identical to the delivered data
+  section for CRLF-terminated messages. `body_raw()` still appends an
+  unconditional CRLF for DKIM; that is verified-safe because RFC 6376 simple
+  and relaxed body canonicalization both strip trailing empty lines, so
+  signing and delivery agree in every terminator case. Restoring the
+  unconditional `\r\n.\r\n` re-adds a phantom empty line to every delivery
+  and breaks the SIZE arithmetic.
+
+Machinery a future arc may build on and must not break:
+
+- **Channel-binding policy is one rule in two crates: absence skips, presence
+  binds or hard-errors.** The pure seams (`resolve_scram_binding` in SMTP,
+  `scram_binding_from_der` in IMAP) both feed
+  `bifrost_sasl::tls_server_end_point`. Only a MISSING peer certificate may
+  skip the PLUS rung; a certificate that is present but unusable (EdDSA leaf,
+  unknown OID, malformed DER, ambiguous RSASSA-PSS params) is a hard typed
+  error that must never fall through to unbound SCRAM or PLAIN. RFC 5802
+  Section 6 additionally drops the unbound SCRAM-SHA-N rung whenever
+  SCRAM-SHA-N-PLUS is advertised. The two crates must not diverge here; they
+  did once (an `.ok()?` in each), and the prose got ahead of the IMAP code
+  for a round.
+- **The connection-level binding gate is pinned through a test seam, not
+  review.** The transcript harness has no TLS, so `AsyncNetworkStream` has a
+  test-only injected peer-certificate DER
+  (`from_transcript_with_peer_certificate`). Three transcript tests pin the
+  `plus_candidate` gate in both directions; before the seam, neutering the
+  gate to `false` left all 393 crate tests green while answering a
+  PLUS-advertising server with `AUTH PLAIN`. Keep the seam; it is the only
+  hermetic eye on those few lines of plumbing.
+- **Envelope commands are built before the transaction opens.**
+  `build_transaction_commands` / `build_recipient_commands` construct and
+  validate the whole `Mail` + `Rcpt` set before `MAIL FROM` is written, on
+  every send path. This is a connection-state invariant: a validation error
+  raised mid-transaction unwinds through `?` past the `try_smtp!` abort,
+  leaves the connection `Ok` inside an open transaction, and poisons the
+  pool. Any new validation on an envelope value must run in these builders,
+  not at the write site. (`build_recipient_commands` zips addresses with the
+  options slice; every call site builds both from the same recipient list,
+  which is what keeps the zip lossless.)
+- **bifrost-sasl is strict on both wire boundaries and zeroizes key
+  material.** Duplicate or malformed SCRAM attributes are protocol errors
+  even for keys the client never reads; server-supplied `i=` is bounded to
+  [4096, 100,000,000] (the floor is downgrade defence - `i=1` makes the
+  captured proof brute-forceable offline); the server nonce must strictly
+  extend the client nonce; SASLprep (RFC 4013, via `stringprep`) runs on
+  SCRAM usernames (`prepare_scram_username`, the only public path to an `n=`
+  value - the bare escaper is crate-private on purpose) and independently on
+  passwords before PBKDF2; verifier comparison is `subtle::ConstantTimeEq`;
+  salted keys, client/stored/server keys, proofs and the CRAM-MD5 buffer are
+  `Zeroizing`. `hmac_digest` / `xor_bytes` return `Zeroizing<Vec<u8>>` so
+  the next intermediate cannot be missed.
+- **AUTH payload hygiene at the SMTP boundary.** PLAIN refuses NUL in
+  username or password (RFC 4616: NUL is the field separator, so a NUL in
+  the username is an authzid injection). `HeaderName` enforces RFC 5322
+  `ftext` on both constructors (header-name CRLF injection). LOGIN answers
+  challenges by POSITION (`challenge_index`), never by prompt-text matching.
+  AUTH command buffers are `Zeroizing` through the socket write.
+- **`MAIL FROM` / `RCPT TO` reject control characters at command
+  construction**, which is the wire-boundary defence for
+  `Address::new_dangerous` values; VRFY/EXPN share the same single-line
+  check.
+
+Accepted residuals, on the record (all disclosed in `TODO.md`): the
+`account-error` feature gates nothing and `--no-default-features` alone does
+not build (the gate to run per commit is
+`brokkr check -p bifrost-smtp --no-default-features --features account-error`);
+`AsyncLmtpTransportBuilder` has no `bandwidth_metering` (LMTP is local
+delivery); the async-only deletion and the DATA byte change need release
+notes.
+
 ## Standing lessons this project has paid for
 
 - **Audit new tests for bite, mechanically.** Revert the production change,
@@ -333,7 +428,8 @@ bind the whole workspace.
   close pass it found real defects in exactly that half.
 
 - **Which arcs have had a close pass, and which have not.** `bugs-graph`,
-  `bugs-imap`, and `bugs-jmap` were closed properly. `bugs-net-types` was NOT: both rounds ran,
+  `bugs-imap`, `bugs-jmap`, and `bugs-smtp-sasl` were closed properly.
+  `bugs-net-types` was NOT: both rounds ran,
   but the arc-level review never did. Anything later that leans on
   `bifrost-net` machinery from that arc should treat it as reviewed once, not
   twice. The gap is recorded in the document itself.
