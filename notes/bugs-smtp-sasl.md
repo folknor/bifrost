@@ -6,38 +6,6 @@ Findings are unverified work material. Line numbers are as of the hunt and will 
 
 ## bifrost-smtp
 
-### Cleartext credentials leave Secret at the SMTP boundary
-
-`crates/smtp/src/transport/smtp/authentication.rs` and `commands.rs`.
-`Mechanism::response_with_token` returns `String`. For PLAIN it is
-`format!("\0{username}\0{password}")`; for LOGIN it is `password.to_owned()`; for
-XOAUTH2/OAUTHBEARER it copies the `Secret` out with `.as_str().to_owned()` immediately after
-`bifrost-sasl` went to the trouble of building it zeroizing. That `String` is then stored in the
-`Auth` command struct (`response: Option<String>`), cloned around, base64-encoded into another plain
-`String` in `Display`, and dropped un-wiped at every layer. The whole `Secret`/`Zeroizing` apparatus
-in sasl and in `Credentials` is defeated at this one boundary. `response_with_token` should return
-`bifrost_sasl::Secret`, `Auth.response` should hold one, and `crate::base64::encode` needs a
-zeroizing variant. Also `Credentials::oauth2` does `token.to_string()` on the `Zeroizing<String>`,
-creating an un-zeroized copy to hand to `StaticTokenSource`.
-
-### LOGIN challenge matching is text equality against a fixed list, and the helper is misnamed
-
-`authentication.rs`. `contains_ignore_ascii_case` does `needle.eq_ignore_ascii_case(haystack)`; it is
-`any_eq`, not `contains`, so the name is actively misleading and the list entries that look like
-substrings (`"Username:"` vs `"Username"`, `"User Name\0"`) are exact-match alternatives. Any server
-whose prompt is not exactly one of six strings (`"Enter username:"`, a localized prompt, a prompt
-with a trailing space) fails with "Unrecognized challenge". LOGIN is positional (first challenge is
-the username, second is the password) and driving it off a challenge counter would be both correct
-and shorter. Since LOGIN is now opt-in-only this is low-impact, but it is a latent breakage for the
-exact legacy servers LOGIN exists to serve.
-
-### Auth's Display can panic
-
-`commands.rs`: two `.unwrap()`s on `encoded_response`. `Auth::new` maintains the invariant today, but
-`Display` is an infallible trait impl on a type whose field is `Option`; the invariant is implicit
-and unenforced. Making `response` non-optional for the challenge/IR paths (separate constructors, or
-an enum) removes the possibility.
-
 ### Channel binding is resolved per-mechanism although it does not vary by mechanism
 
 `client/connection.rs` and the mirror in `async_connection.rs`. The loop calls
@@ -94,18 +62,3 @@ an arbitrary await point, once per connect attempt. It also means a perfectly fr
 async mutex returns `Pending` and is rejected with a misleading "requires a network refresh" message.
 It works today because the only sources are `StaticTokenSource` and `OAuthRefresher`; it is a
 correctness landmine for any third `TokenSource` impl. Deleting the sync transport deletes this.
-
-## Uncertain, needs a pin
-
-- The hunter did not verify whether `email_address::is_valid_local_part` rejects CR/LF inside a
-  quoted local part (`"a\r\nb"@x.com`). If it does not, `Address::from_str` into
-  `MAIL FROM:<{}>` in `commands.rs` is a command-injection path from a parsed address string, since
-  neither `Mail` nor `Rcpt` re-validate at `Display` time (`Vrfy`/`Expn` do, via
-  `validate_single_line_argument`). Either way, `Mail::new`/`Rcpt::new` should apply the same
-  control-character check the VRFY/EXPN builders apply: the defense belongs at the wire boundary, not
-  in a dependency's parser, and `Address::new_dangerous` is a public constructor that bypasses
-  validation entirely.
-- `parse_response`'s last-line `alt` (`response.rs`) requires either `" "` or an immediate CRLF after
-  the code, but there is a test named `parse_response_accepts_reply_without_a_space_separator`. The
-  hunter could not reconcile those by reading; either the test asserts a failure or the combinator was
-  misread. Worth a look.

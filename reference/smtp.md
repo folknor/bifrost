@@ -35,6 +35,18 @@ Surplus bytes that have not yet crossed into the `BufReader` - still in the sock
 
 `test_connected()` (pooled NOOP probe) aborts on failure so a stale connection cannot be recycled.
 
+Envelope commands are constructed, and therefore validated, before `MAIL FROM`
+is written. Every send path - sync and async, DATA and BDAT, SMTP and LMTP,
+pipelined and not, single-envelope and batch - builds the whole `Mail` plus
+`Rcpt` set up front (`build_transaction_commands` / `build_recipient_commands`)
+and only then opens the transaction. This is a connection-state invariant, not
+a stylistic one: a construction failure raised from inside the transaction
+would unwind through the caller's `?` without running the abort that a
+wire-level failure runs, so the connection would stay `Ok`, return to the pool,
+and hand the next send a half-open transaction. Building first keeps every
+address rejection on the clean side of `MAIL FROM`, where no abort is needed
+and the connection stays reusable.
+
 ## Async setup deadline
 
 `AsyncDeadline` is a single shared deadline across DNS, connect, TLS handshake, banner read, and initial EHLO. The deadline lives only until `connect_impl` returns; established connections use the per-operation timeout. `starttls(...)` on an established connection uses the per-operation timeout because it is an explicit command, not setup.
@@ -65,6 +77,11 @@ RFC 3461 §4.1: any byte outside `%x21-%x7E`, plus `+`, plus `=`, is encoded as 
 
 `verify(addr, ...)` and `expand(list, ...)` on SMTP transports. Negative replies return as `Response`, not `Err`, because they are normal outcomes for these privacy-sensitive commands. Inputs are sanitized for CRLF and control characters before any wire write.
 
+`MAIL FROM` and `RCPT TO` apply the same single-line control-character check
+when their command values are constructed. This is a wire-boundary defense for
+addresses created through the public unchecked constructor as well as parsed
+addresses; hostile values fail before either command is written.
+
 ## BDAT
 
 Opt-in via explicit `send_raw_bdat` / `send_raw_bdat_with_options`. Defaults still use DATA so dot-stuffing and BINARYMIME behavior are not changed silently. BDAT requires `CHUNKING` to be advertised.
@@ -88,6 +105,19 @@ Mechanisms (`Mechanism`, `#[non_exhaustive]`): PLAIN, LOGIN, XOAUTH2, OAUTHBEARE
 Password selection (`password_mechanism_order` + `first_attemptable` in `authentication.rs`): the advertised set is intersected with the allowed set in the fixed order `SCRAM-SHA-256-PLUS > SCRAM-SHA-1-PLUS > SCRAM-SHA-256 > SCRAM-SHA-1 > PLAIN > LOGIN`. RFC 5802 Section 6 downgrade protection: the unbound `SCRAM-SHA-N` rung is dropped when `SCRAM-SHA-N-PLUS` is advertised. A PLUS rung is skipped only when no TLS peer certificate exists. If a certificate is present but its channel binding cannot be computed, the typed parse error propagates and authentication cannot silently fall through to PLAIN. SCRAM runs as a no-IR `334` challenge exchange driven by `ScramExchange`; `Mechanism::response` is never called for SCRAM. PLUS channel binding (`tls-server-end-point`) comes from the cached peer-cert DER, no extra round trip.
 
 OAuth credentials never use SCRAM: they pick the first advertised OAUTHBEARER/XOAUTH2 rung in caller order (`oauth_mechanism`) and run the stateless encoder. The connection's auth driver resolves the access token from the source once, up front, and threads it into `Auth::new` / `Mechanism::response_with_token`. The XOAUTH2 / OAUTHBEARER payload bytes are built by `bifrost-sasl` (`xoauth2_payload` / `oauthbearer_payload`, including the OAUTHBEARER GS2 identity escape); `response_with_token` only base64-frames them and owns the RFC 7628 `\x01` error-continuation. OAUTHBEARER before XOAUTH2 by default.
+
+Stateless AUTH payloads remain `bifrost_sasl::Secret` values through the
+command boundary. Base64 framing returns a `Zeroizing<String>`, and both sync
+and async connections use zeroizing command buffers that are wiped before
+reuse, immediately after each write attempt, and on drop. The wipe covers the
+buffer the command was serialized into; it cannot cover an allocation the
+serializing `write!` outgrew and replaced, so a longer-than-usual AUTH line can
+still leave one stale heap copy behind. The `Auth`
+representation is an enum whose start, initial
+response, and continuation variants carry their formatting invariants
+structurally, so formatting has no optional response to unwrap. LOGIN ignores
+the server's human-readable prompt and answers its first and second challenges
+with username and password respectively.
 
 **Default behavior change (migration note).** `PASSWORD_MECHANISMS` now defaults to SCRAM (strongest first) then PLAIN, and LOGIN is no longer in it (opt-in legacy, mirroring IMAP's `allow_login = false`). A server advertising only `AUTH LOGIN` therefore yields an empty attempt order under the default and fails with "no compatible authentication mechanism" instead of silently downgrading to LOGIN. Callers that need LOGIN must pass it explicitly via `authentication(vec![Mechanism::Login, ..])`.
 

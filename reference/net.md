@@ -360,7 +360,10 @@ RATE, not the number of failing requests: every request during the
 interval still fails, it just fails locally off the cached error.
 
 `AccessToken` wraps `Zeroizing<String>`; `Debug` redacts the bytes
-and surfaces only length + expiry.
+and surfaces only length + expiry. `AccessToken::from_zeroizing` moves an
+existing zeroizing allocation into the wrapper without creating a plain
+`String` copy, for protocol convenience constructors that already own secret
+storage.
 
 ### Proactive-refresh window
 

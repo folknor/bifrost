@@ -9,6 +9,7 @@ use std::{
 };
 
 use bifrost_sasl::ScramChannelBinding;
+use zeroize::{Zeroize, Zeroizing};
 
 #[cfg(feature = "tracing")]
 use super::escape_crlf;
@@ -27,7 +28,10 @@ use crate::{
             resolve_scram_binding, scram_hash,
         },
         batch::{RecipientProgress, SendProgress, SmtpBatchRecipient},
-        commands::{Auth, Bdat, Data, Ehlo, Expn, Lhlo, Mail, Noop, Rcpt, Rset, Starttls, Vrfy},
+        commands::{
+            Auth, Bdat, Data, Ehlo, Expn, Lhlo, Mail, Noop, Rcpt, Rset, Starttls, Vrfy,
+            build_recipient_commands, build_transaction_commands,
+        },
         error,
         error::{Error, SmtpCommandPhase, SmtpTransmissionState},
         extension::{
@@ -77,7 +81,7 @@ pub(crate) struct SmtpConnection {
     /// Wire protocol used for this connection.
     protocol: Protocol,
     /// Reused storage for serializing individual SMTP commands.
-    command_buffer: String,
+    command_buffer: Zeroizing<String>,
     /// Set once an LMTP final-status drain has run: the connection must not
     /// go back into the pool because stream cleanliness cannot be proven.
     retire: bool,
@@ -126,7 +130,7 @@ impl SmtpConnection {
             server_info: ServerInfo::default(),
             hello_name: hello_name.clone(),
             protocol,
-            command_buffer: String::new(),
+            command_buffer: Zeroizing::new(String::new()),
             retire: false,
         };
         let _response = conn.read_response()?;
@@ -153,7 +157,7 @@ impl SmtpConnection {
             server_info: ServerInfo::default(),
             hello_name: hello_name.clone(),
             protocol,
-            command_buffer: String::new(),
+            command_buffer: Zeroizing::new(String::new()),
             retire: false,
         };
         conn.set_timeout(timeout).map_err(error::network)?;
@@ -183,7 +187,7 @@ impl SmtpConnection {
             server_info: ServerInfo::default(),
             hello_name: hello_name.clone(),
             protocol,
-            command_buffer: String::new(),
+            command_buffer: Zeroizing::new(String::new()),
             retire: false,
         };
         conn.set_timeout(timeout).map_err(error::network)?;
@@ -209,22 +213,16 @@ impl SmtpConnection {
         let mail_options = self.mail_options(envelope, email, options, false)?;
         let rcpt_options = self.rcpt_options(envelope, options)?;
 
+        let (mail, recipients) = build_transaction_commands(envelope, mail_options, &rcpt_options)?;
+
         if self.server_info().supports_pipelining() {
-            return self.send_pipelined(envelope, email, mail_options, rcpt_options);
+            return self.send_pipelined(email, mail, recipients);
         }
 
-        try_smtp!(
-            self.command(Mail::new(envelope.from().cloned(), mail_options)),
-            self,
-            SmtpCommandPhase::MailFrom
-        );
+        try_smtp!(self.command(mail), self, SmtpCommandPhase::MailFrom);
 
-        for (to_address, rcpt_options) in envelope.to().iter().zip(&rcpt_options) {
-            try_smtp!(
-                self.command(Rcpt::new(to_address.clone(), rcpt_options.clone())),
-                self,
-                SmtpCommandPhase::RcptTo
-            );
+        for recipient in recipients {
+            try_smtp!(self.command(recipient), self, SmtpCommandPhase::RcptTo);
         }
 
         try_smtp!(self.command(Data), self, SmtpCommandPhase::DataCommand);
@@ -247,18 +245,12 @@ impl SmtpConnection {
         let mail_options = self.mail_options(envelope, email, options, true)?;
         let rcpt_options = self.rcpt_options(envelope, options)?;
 
-        try_smtp!(
-            self.command(Mail::new(envelope.from().cloned(), mail_options)),
-            self,
-            SmtpCommandPhase::MailFrom
-        );
+        let (mail, recipients) = build_transaction_commands(envelope, mail_options, &rcpt_options)?;
 
-        for (to_address, rcpt_options) in envelope.to().iter().zip(&rcpt_options) {
-            try_smtp!(
-                self.command(Rcpt::new(to_address.clone(), rcpt_options.clone())),
-                self,
-                SmtpCommandPhase::RcptTo
-            );
+        try_smtp!(self.command(mail), self, SmtpCommandPhase::MailFrom);
+
+        for recipient in recipients {
+            try_smtp!(self.command(recipient), self, SmtpCommandPhase::RcptTo);
         }
 
         let result = try_smtp!(self.message_bdat(email), self, SmtpCommandPhase::BdatBody);
@@ -267,32 +259,24 @@ impl SmtpConnection {
 
     fn send_pipelined(
         &mut self,
-        envelope: &Envelope,
         email: &[u8],
-        mail_options: Vec<MailParameter>,
-        rcpt_options: Vec<Vec<RcptParameter>>,
+        mail: Mail,
+        recipients: Vec<Rcpt>,
     ) -> Result<Response, Error> {
-        for (window_index, recipients) in envelope
-            .to()
-            .chunks(PIPELINING_RECIPIENT_WINDOW)
-            .zip(rcpt_options.chunks(PIPELINING_RECIPIENT_WINDOW))
-            .enumerate()
-        {
+        for (window_index, window) in recipients.chunks(PIPELINING_RECIPIENT_WINDOW).enumerate() {
             let mut commands = String::new();
             if window_index == 0 {
-                commands.push_str(
-                    &Mail::new(envelope.from().cloned(), mail_options.clone()).to_string(),
-                );
+                commands.push_str(&mail.to_string());
             }
-            for (to_address, rcpt_options) in recipients.0.iter().zip(recipients.1) {
-                commands.push_str(&Rcpt::new(to_address.clone(), rcpt_options.clone()).to_string());
+            for recipient in window {
+                commands.push_str(&recipient.to_string());
             }
             self.write(commands.as_bytes())?;
 
             if window_index == 0 {
                 let mail_response = self.read_response_accepting_status()?;
                 if !mail_response.is_positive() {
-                    for _ in recipients.0 {
+                    for _ in window {
                         self.read_response_accepting_status()?;
                     }
                     return Err(Self::error_from_status(mail_response));
@@ -300,7 +284,7 @@ impl SmtpConnection {
             }
 
             let mut failure = None;
-            for _ in recipients.0 {
+            for _ in window {
                 let response = self.read_response_accepting_status()?;
                 if failure.is_none() && !response.is_positive() {
                     failure = Some(response);
@@ -343,18 +327,16 @@ impl SmtpConnection {
         let mail_options = self.mail_options(envelope, email, options, false)?;
         let rcpt_options = self.rcpt_options(envelope, options)?;
 
-        try_smtp!(
-            self.command(Mail::new(envelope.from().cloned(), mail_options)),
-            self,
-            SmtpCommandPhase::MailFrom
-        );
+        let (mail, recipients) = build_transaction_commands(envelope, mail_options, &rcpt_options)?;
 
-        let mut recipient_statuses = Vec::with_capacity(envelope.to().len());
+        try_smtp!(self.command(mail), self, SmtpCommandPhase::MailFrom);
+
+        let mut recipient_statuses = Vec::with_capacity(recipients.len());
         let mut accepted_recipients = 0;
 
-        for (to_address, rcpt_options) in envelope.to().iter().zip(&rcpt_options) {
+        for recipient in recipients {
             let response = try_smtp!(
-                self.command_accepting_status(Rcpt::new(to_address.clone(), rcpt_options.clone())),
+                self.command_accepting_status(recipient),
                 self,
                 SmtpCommandPhase::RcptTo
             );
@@ -414,18 +396,16 @@ impl SmtpConnection {
         let mail_options = self.mail_options(envelope, email, options, true)?;
         let rcpt_options = self.rcpt_options(envelope, options)?;
 
-        try_smtp!(
-            self.command(Mail::new(envelope.from().cloned(), mail_options)),
-            self,
-            SmtpCommandPhase::MailFrom
-        );
+        let (mail, recipients) = build_transaction_commands(envelope, mail_options, &rcpt_options)?;
 
-        let mut recipient_statuses = Vec::with_capacity(envelope.to().len());
+        try_smtp!(self.command(mail), self, SmtpCommandPhase::MailFrom);
+
+        let mut recipient_statuses = Vec::with_capacity(recipients.len());
         let mut accepted_recipients = 0;
 
-        for (to_address, rcpt_options) in envelope.to().iter().zip(&rcpt_options) {
+        for recipient in recipients {
             let response = try_smtp!(
-                self.command_accepting_status(Rcpt::new(to_address.clone(), rcpt_options.clone())),
+                self.command_accepting_status(recipient),
                 self,
                 SmtpCommandPhase::RcptTo
             );
@@ -506,14 +486,19 @@ impl SmtpConnection {
                 )
             })?;
 
+        // Every envelope address is validated here, before `MAIL FROM` opens a
+        // transaction. Constructing an `Rcpt` further down would let a rejected
+        // recipient return past an open transaction without aborting, leaving
+        // the connection poolable but dirty.
+        let mail_cmd = Mail::new(from, mail_options).map_err(|e| (e, progress.clone()))?;
+        let rcpt_cmds = build_recipient_commands(
+            progress.recipients.iter().map(|r| r.address.clone()),
+            &rcpt_options_all,
+        )
+        .map_err(|e| (e, progress.clone()))?;
+
         if self.server_info().supports_pipelining() {
-            return self.send_smtp_batch_pipelined(
-                from,
-                email,
-                mail_options,
-                rcpt_options_all,
-                progress,
-            );
+            return self.send_smtp_batch_pipelined(email, mail_cmd, rcpt_cmds, progress);
         }
 
         // Before DATA, no message content can have reached the peer,
@@ -521,7 +506,6 @@ impl SmtpConnection {
         // drain. Negative replies remain `Acknowledged`.
         // `command_accepting_status` keeps a negative reply as an `Ok`
         // response instead of folding it into a transport-shaped `Err`.
-        let mail_cmd = Mail::new(from, mail_options);
         match self.command_accepting_status(mail_cmd) {
             Ok(resp) if resp.is_positive() => {}
             Ok(resp) => {
@@ -543,17 +527,8 @@ impl SmtpConnection {
             }
         }
 
-        let recipient_addresses: Vec<Address> = progress
-            .recipients
-            .iter()
-            .map(|r| r.address.clone())
-            .collect();
-        for (i, (addr, rcpt_options)) in recipient_addresses
-            .into_iter()
-            .zip(rcpt_options_all)
-            .enumerate()
-        {
-            match self.command_accepting_status(Rcpt::new(addr, rcpt_options)) {
+        for (i, rcpt) in rcpt_cmds.into_iter().enumerate() {
+            match self.command_accepting_status(rcpt) {
                 Ok(resp) if resp.is_positive() => progress.record_rcpt_accepted(i),
                 Ok(resp) => progress.record_rcpt_rejected(i, resp),
                 Err(e) => {
@@ -649,10 +624,9 @@ impl SmtpConnection {
 
     fn send_smtp_batch_pipelined(
         &mut self,
-        from: Option<Address>,
         email: &[u8],
-        mail_options: Vec<MailParameter>,
-        rcpt_options_all: Vec<Vec<RcptParameter>>,
+        mail_cmd: Mail,
+        rcpt_cmds: Vec<Rcpt>,
         mut progress: SendProgress,
     ) -> Result<SendProgress, (Error, SendProgress)> {
         for window_start in (0..progress.recipients.len()).step_by(PIPELINING_RECIPIENT_WINDOW) {
@@ -660,13 +634,10 @@ impl SmtpConnection {
                 (window_start + PIPELINING_RECIPIENT_WINDOW).min(progress.recipients.len());
             let mut commands = String::new();
             if window_start == 0 {
-                commands.push_str(&Mail::new(from.clone(), mail_options.clone()).to_string());
+                commands.push_str(&mail_cmd.to_string());
             }
-            for (rec, rcpt_opts) in progress.recipients[window_start..window_end]
-                .iter()
-                .zip(&rcpt_options_all[window_start..window_end])
-            {
-                commands.push_str(&Rcpt::new(rec.address.clone(), rcpt_opts.clone()).to_string());
+            for rcpt in &rcpt_cmds[window_start..window_end] {
+                commands.push_str(&rcpt.to_string());
             }
             if let Err(e) = self.write(commands.as_bytes()) {
                 if window_start == 0 {
@@ -855,7 +826,15 @@ impl SmtpConnection {
 
         // Before DATA, a transport drop is `Unsent`; a server rejection is
         // still `Acknowledged`. The SMTP path applies the same split.
-        let mail_cmd = Mail::new(from, mail_options);
+        //
+        // Both commands are built before `MAIL FROM` goes out so that a
+        // rejected recipient cannot unwind past an open transaction.
+        let mail_cmd = Mail::new(from, mail_options).map_err(|e| (e, progress.clone()))?;
+        let rcpt_cmds = build_recipient_commands(
+            progress.recipients.iter().map(|r| r.address.clone()),
+            &rcpt_options_all,
+        )
+        .map_err(|e| (e, progress.clone()))?;
         match self.command_accepting_status(mail_cmd) {
             Ok(resp) if resp.is_positive() => {}
             Ok(resp) => {
@@ -877,18 +856,9 @@ impl SmtpConnection {
             }
         }
 
-        let recipient_addresses: Vec<Address> = progress
-            .recipients
-            .iter()
-            .map(|r| r.address.clone())
-            .collect();
         let mut accepted_count = 0usize;
-        for (i, (addr, rcpt_options)) in recipient_addresses
-            .into_iter()
-            .zip(rcpt_options_all)
-            .enumerate()
-        {
-            match self.command_accepting_status(Rcpt::new(addr, rcpt_options)) {
+        for (i, rcpt) in rcpt_cmds.into_iter().enumerate() {
+            match self.command_accepting_status(rcpt) {
                 Ok(resp) if resp.is_positive() => {
                     progress.record_rcpt_accepted(i);
                     accepted_count += 1;
@@ -1541,7 +1511,7 @@ impl SmtpConnection {
         // Bare `AUTH <mechanism>`: SCRAM has no initial response, so
         // `Mechanism::response` is never invoked and `Display` emits the bare
         // command.
-        let auth = Auth::new(mechanism, credentials.clone(), None, None)?;
+        let auth = Auth::new(mechanism, credentials.clone(), None)?;
         let response = try_smtp!(self.command(auth), self, SmtpCommandPhase::Auth);
         // Server's first 334 (empty challenge): send client-first.
         if !response.has_code(334) {
@@ -1628,7 +1598,8 @@ impl SmtpConnection {
     /// Write a base64 SASL continuation line (already encoded) and read the
     /// reply. An empty `line` emits a bare `\r\n`.
     fn write_auth_continuation(&mut self, line: &str) -> Result<Response, Error> {
-        self.write(format!("{line}\r\n").as_bytes())?;
+        let framed = Zeroizing::new(format!("{line}\r\n"));
+        self.write(framed.as_bytes())?;
         self.read_response()
     }
 
@@ -1657,7 +1628,12 @@ impl SmtpConnection {
 
         // Limit challenges to avoid blocking
         let mut challenges = 10;
-        let auth = Auth::new(mechanism, credentials.clone(), None, oauth_token)?;
+        // Position of the challenge within the exchange. LOGIN answers by
+        // position (username, then password) rather than by prompt text, so
+        // this counter is the only thing that selects which credential goes
+        // out; it must not be derived from the remaining-challenge budget.
+        let mut challenge_index: usize = 0;
+        let auth = Auth::new(mechanism, credentials.clone(), oauth_token)?;
         let mut response = try_smtp!(self.command(auth), self, SmtpCommandPhase::Auth);
 
         while challenges > 0 && response.has_code(334) {
@@ -1670,10 +1646,17 @@ impl SmtpConnection {
             // and carry the Auth phase, not leak through a bare `?` as an
             // untagged parse error.
             let continuation = try_smtp!(
-                Auth::new_from_response(mechanism, credentials.clone(), &response, oauth_token),
+                Auth::new_from_response_at_index(
+                    mechanism,
+                    credentials.clone(),
+                    &response,
+                    challenge_index,
+                    oauth_token,
+                ),
                 self,
                 SmtpCommandPhase::Auth
             );
+            challenge_index += 1;
             response = try_smtp!(self.command(continuation), self, SmtpCommandPhase::Auth);
         }
 
@@ -1791,10 +1774,12 @@ impl SmtpConnection {
     }
 
     fn write_command<C: Display>(&mut self, command: C) -> Result<(), Error> {
-        self.command_buffer.clear();
+        self.command_buffer.zeroize();
         write!(&mut self.command_buffer, "{command}")
             .map_err(|_| error::internal("failed to serialize SMTP command"))?;
-        Self::write_stream(&mut self.stream, self.command_buffer.as_bytes())
+        let result = Self::write_stream(&mut self.stream, self.command_buffer.as_bytes());
+        self.command_buffer.zeroize();
+        result
     }
 
     /// Closes out an LMTP final-status drain.
@@ -2410,6 +2395,78 @@ mod transcript_tests {
             .unwrap();
 
         assert!(response.has_code(250));
+        transcript.assert_exhausted();
+    }
+
+    #[test]
+    fn hostile_unchecked_sender_never_reaches_the_wire() {
+        // `is_err()` alone would hold even without the guard, because the
+        // transcript has no expectation for the smuggled `MAIL FROM` and would
+        // fail the write instead. The load-bearing assertions are that nothing
+        // was written and the connection is still clean.
+        let hello = ClientId::Domain("client.example".to_owned());
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250 smtp.example\r\n")
+            .expect("NOOP\r\n", "250 ok\r\n");
+        let envelope = Envelope::new(
+            Some(crate::address::Address::new_dangerous(
+                "sender\r\nRSET",
+                "example.com",
+            )),
+            vec!["recipient@example.com".parse().unwrap()],
+        )
+        .unwrap();
+        let mut connection =
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp).unwrap();
+
+        assert!(
+            connection
+                .send(&envelope, b"Subject: test\r\n\r\nHello")
+                .is_err()
+        );
+        assert!(
+            !connection.has_broken(),
+            "a rejected sender must not break the connection"
+        );
+        assert!(connection.test_connected(), "the connection stays reusable");
+        transcript.assert_exhausted();
+    }
+
+    #[test]
+    fn hostile_unchecked_recipient_leaves_no_open_transaction() {
+        // The sender is well-formed, so validation cannot short-circuit before
+        // `MAIL FROM` for the reason the sender test covers. What must hold is
+        // that the recipient is rejected while the connection is still clean:
+        // no `MAIL FROM` on the wire, no abort needed, and the connection is
+        // still usable afterwards rather than being pooled mid-transaction.
+        let hello = ClientId::Domain("client.example".to_owned());
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250 smtp.example\r\n")
+            .expect("NOOP\r\n", "250 ok\r\n");
+        let envelope = Envelope::new(
+            Some("sender@example.com".parse().unwrap()),
+            vec![
+                "good@example.com".parse().unwrap(),
+                crate::address::Address::new_dangerous("hostile\r\nRSET", "example.com"),
+            ],
+        )
+        .unwrap();
+        let mut connection =
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp).unwrap();
+
+        assert!(
+            connection
+                .send(&envelope, b"Subject: test\r\n\r\nHello")
+                .is_err()
+        );
+        assert!(
+            !connection.has_broken(),
+            "a rejection before MAIL FROM must not break the connection"
+        );
+        assert!(
+            connection.test_connected(),
+            "the connection must still be reusable, not stranded in a transaction"
+        );
         transcript.assert_exhausted();
     }
 

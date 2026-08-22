@@ -361,4 +361,9 @@ mod tests {
         assert_eq!(address.domain(), domain);
         assert_eq!(Address::new_dangerous(user, domain), address);
     }
+
+    #[test]
+    fn parser_rejects_crlf_inside_quoted_local_part() {
+        assert!("\"a\r\nb\"@example.com".parse::<Address>().is_err());
+    }
 }

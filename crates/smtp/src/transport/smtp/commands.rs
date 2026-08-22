@@ -1,9 +1,10 @@
 //! SMTP commands
 
+use bifrost_sasl::Secret;
 use std::fmt::{self, Display, Formatter};
 
 use crate::{
-    address::Address,
+    address::{Address, Envelope},
     transport::smtp::{
         authentication::{Credentials, Mechanism},
         error::{self, Error},
@@ -20,6 +21,43 @@ fn validate_single_line_argument(command: &str, argument: &str) -> Result<(), Er
     }
 
     Ok(())
+}
+
+/// Builds every envelope-level command of a transaction before any of them can
+/// reach the socket.
+///
+/// Address validation has to complete strictly before `MAIL FROM` is written.
+/// Constructing an `Rcpt` mid-transaction means a rejected recipient unwinds
+/// through the caller's `?` while the transaction is already open, and that
+/// early return skips the abort that a wire-level failure would have performed:
+/// the connection stays in the `Ok` state, goes back into the pool, and the
+/// next send on it inherits an unfinished transaction. Failing here instead
+/// keeps every rejection on the clean side of `MAIL FROM`.
+pub(crate) fn build_transaction_commands(
+    envelope: &Envelope,
+    mail_options: Vec<MailParameter>,
+    rcpt_options: &[Vec<RcptParameter>],
+) -> Result<(Mail, Vec<Rcpt>), Error> {
+    let mail = Mail::new(envelope.from().cloned(), mail_options)?;
+    let recipients = build_recipient_commands(envelope.to().iter().cloned(), rcpt_options)?;
+
+    Ok((mail, recipients))
+}
+
+/// Builds the `RCPT TO` commands for a whole transaction up front.
+///
+/// Same contract as `build_transaction_commands`: every recipient is validated
+/// before the caller opens a transaction, so a rejection can never unwind past
+/// an already-sent `MAIL FROM` and strand the connection mid-transaction.
+pub(crate) fn build_recipient_commands(
+    addresses: impl IntoIterator<Item = Address>,
+    rcpt_options: &[Vec<RcptParameter>],
+) -> Result<Vec<Rcpt>, Error> {
+    addresses
+        .into_iter()
+        .zip(rcpt_options)
+        .map(|(recipient, options)| Rcpt::new(recipient, options.clone()))
+        .collect()
 }
 
 /// EHLO command
@@ -97,8 +135,14 @@ impl Display for Mail {
 
 impl Mail {
     /// Creates a MAIL command
-    pub(crate) fn new(sender: Option<Address>, parameters: Vec<MailParameter>) -> Mail {
-        Mail { sender, parameters }
+    pub(crate) fn new(
+        sender: Option<Address>,
+        parameters: Vec<MailParameter>,
+    ) -> Result<Mail, Error> {
+        if let Some(sender) = &sender {
+            validate_single_line_argument("MAIL FROM", sender.as_ref())?;
+        }
+        Ok(Mail { sender, parameters })
     }
 }
 
@@ -122,11 +166,12 @@ impl Display for Rcpt {
 
 impl Rcpt {
     /// Creates an RCPT command
-    pub(crate) fn new(recipient: Address, parameters: Vec<RcptParameter>) -> Rcpt {
-        Rcpt {
+    pub(crate) fn new(recipient: Address, parameters: Vec<RcptParameter>) -> Result<Rcpt, Error> {
+        validate_single_line_argument("RCPT TO", recipient.as_ref())?;
+        Ok(Rcpt {
             recipient,
             parameters,
-        }
+        })
     }
 }
 
@@ -237,24 +282,29 @@ impl Display for Rset {
 // serializable. The wire bytes flow through `Display` over the
 // precomputed `response`, so these derives were never load-bearing.
 #[derive(Clone)]
-pub(crate) struct Auth {
-    mechanism: Mechanism,
-    challenge: Option<String>,
-    response: Option<String>,
+pub(crate) enum Auth {
+    Start(Mechanism),
+    Initial {
+        mechanism: Mechanism,
+        response: Secret,
+    },
+    Continuation(Secret),
 }
 
 impl Display for Auth {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        let encoded_response = self.response.as_ref().map(crate::base64::encode);
-
-        if self.challenge.is_some() {
-            f.write_str(&encoded_response.unwrap())?;
-        } else if self.mechanism.supports_initial_response() {
-            write!(f, "AUTH {} {}", self.mechanism, encoded_response.unwrap())?;
-        } else {
-            match encoded_response {
-                Some(response) => f.write_str(&response)?,
-                None => write!(f, "AUTH {}", self.mechanism)?,
+        match self {
+            Auth::Start(mechanism) => write!(f, "AUTH {mechanism}")?,
+            Auth::Initial {
+                mechanism,
+                response,
+            } => write!(
+                f,
+                "AUTH {mechanism} {}",
+                crate::base64::encode_zeroizing(response.as_bytes()).as_str()
+            )?,
+            Auth::Continuation(response) => {
+                f.write_str(crate::base64::encode_zeroizing(response.as_bytes()).as_str())?;
             }
         }
         f.write_str("\r\n")
@@ -270,27 +320,36 @@ impl Auth {
     pub(crate) fn new(
         mechanism: Mechanism,
         credentials: Credentials,
-        challenge: Option<String>,
         oauth_token: Option<&str>,
     ) -> Result<Auth, Error> {
-        let response = if mechanism.supports_initial_response() || challenge.is_some() {
-            Some(mechanism.response_with_token(&credentials, challenge.as_deref(), oauth_token)?)
+        if mechanism.supports_initial_response() {
+            let response = mechanism.response_with_token(&credentials, None, oauth_token)?;
+            Ok(Auth::Initial {
+                mechanism,
+                response,
+            })
         } else {
-            None
-        };
-        Ok(Auth {
-            mechanism,
-            challenge,
-            response,
-        })
+            Ok(Auth::Start(mechanism))
+        }
     }
 
     /// Creates an AUTH command from a response that needs to be a
     /// valid challenge (with 334 response code)
+    #[cfg(test)]
     pub(crate) fn new_from_response(
         mechanism: Mechanism,
         credentials: Credentials,
         response: &Response,
+        oauth_token: Option<&str>,
+    ) -> Result<Auth, Error> {
+        Self::new_from_response_at_index(mechanism, credentials, response, 0, oauth_token)
+    }
+
+    pub(crate) fn new_from_response_at_index(
+        mechanism: Mechanism,
+        credentials: Credentials,
+        response: &Response,
+        challenge_index: usize,
         oauth_token: Option<&str>,
     ) -> Result<Auth, Error> {
         if !response.has_code(334) {
@@ -308,17 +367,14 @@ impl Auth {
         #[cfg(feature = "tracing")]
         tracing::debug!("auth decoded challenge: {}", decoded_challenge);
 
-        let response = Some(mechanism.response_with_token(
+        let response = mechanism.response_with_token_at_index(
             &credentials,
             Some(decoded_challenge.as_ref()),
+            challenge_index,
             oauth_token,
-        )?);
+        )?;
 
-        Ok(Auth {
-            mechanism,
-            challenge: Some(decoded_challenge),
-            response,
-        })
+        Ok(Auth::Continuation(response))
     }
 }
 
@@ -344,14 +400,17 @@ mod test {
         assert_eq!(format!("{}", Ehlo::new(id.clone())), "EHLO localhost\r\n");
         assert_eq!(format!("{}", Lhlo::new(id)), "LHLO localhost\r\n");
         assert_eq!(
-            format!("{}", Mail::new(Some(email.clone()), vec![])),
+            format!("{}", Mail::new(Some(email.clone()), vec![]).unwrap()),
             "MAIL FROM:<test@example.com>\r\n"
         );
-        assert_eq!(format!("{}", Mail::new(None, vec![])), "MAIL FROM:<>\r\n");
+        assert_eq!(
+            format!("{}", Mail::new(None, vec![]).unwrap()),
+            "MAIL FROM:<>\r\n"
+        );
         assert_eq!(
             format!(
                 "{}",
-                Mail::new(Some(email.clone()), vec![MailParameter::Size(42)])
+                Mail::new(Some(email.clone()), vec![MailParameter::Size(42)]).unwrap()
             ),
             "MAIL FROM:<test@example.com> SIZE=42\r\n"
         );
@@ -366,15 +425,16 @@ mod test {
                         mail_parameter,
                     ],
                 )
+                .unwrap()
             ),
             "MAIL FROM:<test@example.com> SIZE=42 BODY=8BITMIME TEST=value\r\n"
         );
         assert_eq!(
-            format!("{}", Rcpt::new(email.clone(), vec![])),
+            format!("{}", Rcpt::new(email.clone(), vec![]).unwrap()),
             "RCPT TO:<test@example.com>\r\n"
         );
         assert_eq!(
-            format!("{}", Rcpt::new(email, vec![rcpt_parameter])),
+            format!("{}", Rcpt::new(email, vec![rcpt_parameter]).unwrap()),
             "RCPT TO:<test@example.com> TEST=value\r\n"
         );
         assert_eq!(format!("{}", Bdat::last(42)), "BDAT 42 LAST\r\n");
@@ -395,14 +455,14 @@ mod test {
         assert_eq!(
             format!(
                 "{}",
-                Auth::new(Mechanism::Plain, credentials.clone(), None, None).unwrap()
+                Auth::new(Mechanism::Plain, credentials.clone(), None).unwrap()
             ),
             "AUTH PLAIN AHVzZXIAcGFzc3dvcmQ=\r\n"
         );
         assert_eq!(
             format!(
                 "{}",
-                Auth::new(Mechanism::Login, credentials, None, None).unwrap()
+                Auth::new(Mechanism::Login, credentials, None).unwrap()
             ),
             "AUTH LOGIN\r\n"
         );
@@ -410,20 +470,14 @@ mod test {
         assert_eq!(
             format!(
                 "{}",
-                Auth::new(Mechanism::Xoauth2, credentials.clone(), None, Some("token")).unwrap()
+                Auth::new(Mechanism::Xoauth2, credentials.clone(), Some("token")).unwrap()
             ),
             "AUTH XOAUTH2 dXNlcj11c2VyAWF1dGg9QmVhcmVyIHRva2VuAQE=\r\n"
         );
         assert_eq!(
             format!(
                 "{}",
-                Auth::new(
-                    Mechanism::OAuthBearer,
-                    credentials.clone(),
-                    None,
-                    Some("token")
-                )
-                .unwrap()
+                Auth::new(Mechanism::OAuthBearer, credentials.clone(), Some("token")).unwrap()
             ),
             "AUTH OAUTHBEARER bixhPXVzZXIsAWF1dGg9QmVhcmVyIHRva2VuAQE=\r\n"
         );
@@ -502,6 +556,14 @@ mod test {
     }
 
     #[test]
+    fn mail_and_rcpt_reject_unchecked_addresses_with_control_characters() {
+        let hostile = Address::new_dangerous("safe\r\nRSET", "example.com");
+
+        assert!(Mail::new(Some(hostile.clone()), vec![]).is_err());
+        assert!(Rcpt::new(hostile, vec![]).is_err());
+    }
+
+    #[test]
     fn bdat_renders_a_zero_length_final_chunk() {
         assert_eq!(format!("{}", Bdat::last(0)), "BDAT 0 LAST\r\n");
     }
@@ -516,7 +578,8 @@ mod test {
                 MailParameter::RequireTls,
                 MailParameter::SmtpUtfEight,
             ],
-        );
+        )
+        .unwrap();
 
         assert_eq!(
             format!("{mail}"),
@@ -562,7 +625,7 @@ mod test {
         // so `Auth::new(.., None)` must not invoke `Mechanism::response` (which
         // errors for SCRAM) and must emit a bare `AUTH SCRAM-SHA-256`.
         let credentials = Credentials::password("user".to_owned(), "password".to_owned());
-        let auth = Auth::new(Mechanism::ScramSha256, credentials, None, None).unwrap();
+        let auth = Auth::new(Mechanism::ScramSha256, credentials, None).unwrap();
         assert_eq!(format!("{auth}"), "AUTH SCRAM-SHA-256\r\n");
     }
 }

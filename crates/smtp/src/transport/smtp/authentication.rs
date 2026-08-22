@@ -4,8 +4,8 @@ use std::fmt::{self, Debug, Display, Formatter};
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 
-use bifrost_net::{StaticTokenSource, TokenSource};
-use bifrost_sasl::{ScramChannelBinding, ScramHash};
+use bifrost_net::{AccessToken, StaticTokenSource, TokenSource};
+use bifrost_sasl::{ScramChannelBinding, ScramHash, Secret};
 
 use crate::transport::smtp::error::{self, Error, SmtpCommandPhase};
 use crate::transport::smtp::extension::ServerInfo;
@@ -116,7 +116,9 @@ impl Credentials {
         let token = access_token.into_secret_string();
         Credentials::oauth2_source(
             identity,
-            Arc::new(StaticTokenSource::new(token.to_string(), None)),
+            Arc::new(StaticTokenSource::from_token(AccessToken::from_zeroizing(
+                token, None,
+            ))),
         )
     }
 
@@ -327,7 +329,17 @@ impl Mechanism {
         credentials: &Credentials,
         challenge: Option<&str>,
         oauth_token: Option<&str>,
-    ) -> Result<String, Error> {
+    ) -> Result<Secret, Error> {
+        self.response_with_token_at_index(credentials, challenge, 0, oauth_token)
+    }
+
+    pub(crate) fn response_with_token_at_index(
+        self,
+        credentials: &Credentials,
+        challenge: Option<&str>,
+        challenge_index: usize,
+        oauth_token: Option<&str>,
+    ) -> Result<Secret, Error> {
         match self {
             Mechanism::ScramSha1
             | Mechanism::ScramSha256
@@ -351,30 +363,19 @@ impl Mechanism {
                             "PLAIN credentials must not contain a NUL byte",
                         ));
                     }
-                    Ok(format!("\u{0}{username}\u{0}{password}"))
+                    Ok(Secret::from(format!("\u{0}{username}\u{0}{password}")))
                 }
             },
             Mechanism::Login => {
                 let (username, password) = credentials.password_parts()?;
-                let decoded_challenge = challenge.ok_or_else(|| {
+                challenge.ok_or_else(|| {
                     error::invalid_input("This mechanism does expect a challenge")
                 })?;
-
-                if contains_ignore_ascii_case(
-                    decoded_challenge,
-                    ["User Name", "Username:", "Username", "User Name\0"],
-                ) {
-                    return Ok(username.to_owned());
+                match challenge_index {
+                    0 => Ok(Secret::from(username)),
+                    1 => Ok(Secret::from(password)),
+                    _ => Err(error::invalid_input("Unexpected LOGIN challenge")),
                 }
-
-                if contains_ignore_ascii_case(
-                    decoded_challenge,
-                    ["Password", "Password:", "Password\0"],
-                ) {
-                    return Ok(password.to_owned());
-                }
-
-                Err(error::invalid_input("Unrecognized challenge"))
             }
             Mechanism::Xoauth2 => match challenge {
                 // A failed XOAUTH2 auth returns `334 <base64-json-error>`
@@ -384,41 +385,28 @@ impl Mechanism {
                 // the `\x01` dummy-cancel line (`AQ==` on the wire), matching
                 // OAUTHBEARER's RFC 7628 error-continuation. The connection
                 // driver then classifies the negative reply on the Auth lane.
-                Some(_) => Ok("\x01".to_owned()),
+                Some(_) => Ok(Secret::from("\x01")),
                 None => {
                     let (identity, access_token) =
                         credentials.oauth_identity_and_token(oauth_token)?;
                     // Shared bifrost-sasl builder returns the raw payload as a
                     // zeroizing Secret; the AUTH command base64-frames it. The
                     // Secret drops and zeroizes after this owned copy.
-                    Ok(bifrost_sasl::xoauth2_payload(identity, access_token)
-                        .as_str()
-                        .to_owned())
+                    Ok(bifrost_sasl::xoauth2_payload(identity, access_token))
                 }
             },
             Mechanism::OAuthBearer => match challenge {
                 // RFC 7628 error-continuation response: protocol command flow,
                 // not payload construction, so it stays in SMTP.
-                Some(_) => Ok("\x01".to_owned()),
+                Some(_) => Ok(Secret::from("\x01")),
                 None => {
                     let (identity, access_token) =
                         credentials.oauth_identity_and_token(oauth_token)?;
-                    Ok(bifrost_sasl::oauthbearer_payload(identity, access_token)
-                        .as_str()
-                        .to_owned())
+                    Ok(bifrost_sasl::oauthbearer_payload(identity, access_token))
                 }
             },
         }
     }
-}
-
-fn contains_ignore_ascii_case<'a>(
-    haystack: &str,
-    needles: impl IntoIterator<Item = &'a str>,
-) -> bool {
-    needles
-        .into_iter()
-        .any(|item| item.eq_ignore_ascii_case(haystack))
 }
 
 /// Map a `bifrost-sasl` computation failure into the SMTP error model.
@@ -1113,7 +1101,8 @@ mod test {
         assert_eq!(
             mechanism
                 .response_with_token(&credentials, None, None)
-                .unwrap(),
+                .unwrap()
+                .as_str(),
             "\u{0}username\u{0}password"
         );
         assert!(
@@ -1154,13 +1143,15 @@ mod test {
         assert_eq!(
             mechanism
                 .response_with_token(&credentials, Some("Username"), None)
-                .unwrap(),
+                .unwrap()
+                .as_str(),
             "alice"
         );
         assert_eq!(
             mechanism
-                .response_with_token(&credentials, Some("Password"), None)
-                .unwrap(),
+                .response_with_token_at_index(&credentials, Some("Password"), 1, None)
+                .unwrap()
+                .as_str(),
             "wonderland"
         );
         assert!(
@@ -1171,21 +1162,23 @@ mod test {
     }
 
     #[test]
-    fn test_login_case_insensitive() {
+    fn login_challenges_are_positional_not_prompt_matched() {
         let mechanism = Mechanism::Login;
 
         let credentials = Credentials::password("alice".to_owned(), "wonderland".to_owned());
 
         assert_eq!(
             mechanism
-                .response_with_token(&credentials, Some("username"), None)
-                .unwrap(),
+                .response_with_token_at_index(&credentials, Some("Nom d'utilisateur: "), 0, None)
+                .unwrap()
+                .as_str(),
             "alice"
         );
         assert_eq!(
             mechanism
-                .response_with_token(&credentials, Some("password"), None)
-                .unwrap(),
+                .response_with_token_at_index(&credentials, Some("Enter password: "), 1, None)
+                .unwrap()
+                .as_str(),
             "wonderland"
         );
         assert!(
@@ -1208,7 +1201,8 @@ mod test {
         assert_eq!(
             mechanism
                 .response_with_token(&credentials, None, Some(token))
-                .unwrap(),
+                .unwrap()
+                .as_str(),
             "user=username\x01auth=Bearer vF9dft4qmTc2Nvb3RlckBhdHRhdmlzdGEuY29tCg==\x01\x01"
         );
         // A 334 challenge after the initial response is XOAUTH2's failed-auth
@@ -1218,7 +1212,8 @@ mod test {
         assert_eq!(
             mechanism
                 .response_with_token(&credentials, Some(r#"{"status":"401"}"#), Some(token))
-                .unwrap(),
+                .unwrap()
+                .as_str(),
             "\x01"
         );
     }
@@ -1237,7 +1232,7 @@ mod test {
             .response_with_token(&credentials, None, Some(token))
             .unwrap();
         assert_eq!(
-            response,
+            response.as_str(),
             "n,a=user@example.com,\x01auth=Bearer vF9dft4qmTc2Nvb3RlckBhdHRhdmlzdGEuY29tCg==\x01\x01"
         );
         assert!(!response.contains("\x01host="));
@@ -1245,7 +1240,8 @@ mod test {
         assert_eq!(
             mechanism
                 .response_with_token(&credentials, Some("{}"), Some(token))
-                .unwrap(),
+                .unwrap()
+                .as_str(),
             "\x01"
         );
         assert_eq!(
@@ -1255,7 +1251,8 @@ mod test {
                     Some(r#"{"status":"invalid_token"}"#),
                     Some(token)
                 )
-                .unwrap(),
+                .unwrap()
+                .as_str(),
             "\x01"
         );
     }
@@ -1268,7 +1265,8 @@ mod test {
         assert_eq!(
             mechanism
                 .response_with_token(&credentials, None, Some("token"))
-                .unwrap(),
+                .unwrap()
+                .as_str(),
             "n,a=a=2Cb=3Dc,\x01auth=Bearer token\x01\x01"
         );
     }
@@ -1308,7 +1306,8 @@ mod test {
         assert_eq!(
             Mechanism::Xoauth2
                 .response_with_token(&credentials, None, Some(token.as_str()))
-                .unwrap(),
+                .unwrap()
+                .as_str(),
             "user=alice\x01auth=Bearer access-token\x01\x01"
         );
     }
@@ -1327,7 +1326,11 @@ mod test {
         let payload = Mechanism::OAuthBearer
             .response_with_token(&credentials, None, Some(token.as_str()))
             .unwrap();
-        assert!(payload.contains("auth=Bearer old-token"), "got: {payload}");
+        assert!(
+            payload.contains("auth=Bearer old-token"),
+            "got: {}",
+            payload.as_str()
+        );
 
         // Rotate the token on the shared source; the next read presents the
         // new token with no reconstruction of the credential.
@@ -1336,7 +1339,11 @@ mod test {
         let payload = Mechanism::Xoauth2
             .response_with_token(&credentials, None, Some(token.as_str()))
             .unwrap();
-        assert!(payload.contains("auth=Bearer new-token"), "got: {payload}");
+        assert!(
+            payload.contains("auth=Bearer new-token"),
+            "got: {}",
+            payload.as_str()
+        );
 
         let (_identity, token) = credentials.oauth2_token_blocking().unwrap();
         assert_eq!(token.as_str(), "new-token");

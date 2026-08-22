@@ -153,6 +153,12 @@ impl AccessToken {
         }
     }
 
+    /// Build an `AccessToken` by moving an existing zeroizing allocation.
+    #[must_use]
+    pub fn from_zeroizing(secret: Zeroizing<String>, expires_at: Option<Instant>) -> Self {
+        Self { secret, expires_at }
+    }
+
     /// Borrow the bearer token as a string slice. Callers must not
     /// log or persist this value.
     #[must_use]
