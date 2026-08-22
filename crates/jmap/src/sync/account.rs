@@ -1272,9 +1272,28 @@ impl Account for JmapAccount {
 
         let client = self.client.clone();
         let shutdown = self.shutdown.clone();
+        let reader = self.ws.reader_handle();
+        // The same bound the reader applies to its own setup awaits. Both
+        // steps below are WebSocket sink writes or a task join, and a
+        // half-open socket parks either indefinitely - which would block
+        // the engine's teardown and reopen on a connection that is already
+        // gone. Teardown must be bounded on exactly the paths that motivated
+        // bounding the reader.
+        let teardown_timeout = self.ws.teardown_timeout();
         Box::pin(async move {
             shutdown.cancel();
-            let result = client.disable_push_ws().await;
+            let result =
+                match tokio::time::timeout(teardown_timeout, client.disable_push_ws()).await {
+                    Ok(result) => result,
+                    // The unsubscribe never made it out. The connection is
+                    // being dropped anyway and the server drops the
+                    // subscription with it, so this is not a close failure.
+                    Err(_) => Ok(()),
+                };
+            // Only NOW is the reader's stop observable: `close()` used to
+            // return while the detached task was still running, which is
+            // what made the reference's "awaits teardown" claim false.
+            super::push::join_reader(&reader, teardown_timeout).await;
             match result {
                 Ok(()) | Err(crate::Error::WebSocketNotConnected) => Ok(()),
                 Err(err) => Err(super::error::into_account_error(

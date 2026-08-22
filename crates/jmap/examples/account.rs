@@ -22,6 +22,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             initial: Duration::from_secs(1),
             max: Duration::from_secs(30),
             connect_timeout: Duration::from_secs(20),
+            keepalive: Duration::from_secs(120),
         })
         .build(),
     );

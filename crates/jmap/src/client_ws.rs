@@ -120,6 +120,12 @@ enum WebSocketMessage_ {
 pub(crate) enum WebSocketMessage {
     Response(Response),
     PushNotification(PushObject),
+    /// A control-frame pong. Surfaced rather than swallowed because it is
+    /// the only evidence the push reader can get that a silent connection
+    /// is still alive: JMAP defines no application-level keepalive, so a
+    /// half-open socket and a quiet mailbox look identical on this stream
+    /// until something answers a ping.
+    Pong,
 }
 
 pub(crate) struct WsStream {
@@ -311,6 +317,9 @@ where
                 }
                 Ok(message) if message.is_close() => {
                     saw_close = true;
+                }
+                Ok(message) if message.is_pong() => {
+                    yield Ok(WebSocketMessage::Pong);
                 }
                 Ok(_) => (),
                 // Post-handshake runtime drop. Classification is

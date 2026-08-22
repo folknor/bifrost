@@ -58,6 +58,19 @@ impl PushRouting {
 pub(crate) struct WsState {
     pub(crate) tx: broadcast::Sender<WatchEvent>,
     pub(crate) enabled: Arc<Mutex<DataTypeSet>>,
+    /// The spawned reader, kept so `close()` can prove it stopped.
+    ///
+    /// Dropping this handle detaches the task, which is what made
+    /// `close()` returning no evidence at all that the reader had ended:
+    /// it kept holding client resources for as long as it happened to take
+    /// to notice the cancellation. `None` when push is unavailable and no
+    /// reader was spawned, and taken by the first `join`.
+    reader: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// `ReconnectPolicy::connect_timeout`, carried so `close()` bounds its
+    /// teardown awaits by the same configured number the reader bounds its
+    /// setup awaits by, without threading the whole policy through the
+    /// account constructor.
+    teardown_timeout: Duration,
 }
 
 // pub: re-exported through crate::sync for AccountFactory reconnect tuning.
@@ -75,6 +88,19 @@ pub struct ReconnectPolicy {
     /// WebSocket sink lock, blocking every `push_subscribe` caller too.
     /// Exceeding the bound is treated as a transient disconnect.
     pub connect_timeout: Duration,
+    /// How long the read loop tolerates total silence before probing the
+    /// link with a WebSocket ping.
+    ///
+    /// The read loop is where the reader spends essentially all of its
+    /// life, and JMAP defines no application-level keepalive: on a
+    /// half-open TCP connection (NAT or firewall silently dropping state,
+    /// the common fate of a long-lived idle WebSocket) the stream never
+    /// errors and never closes, so the reader parks forever and push is
+    /// dead for the life of the account with the engine unable to tell it
+    /// apart from a quiet mailbox. A ping after this much silence forces
+    /// the question; the pong must then arrive within `connect_timeout` or
+    /// the connection is treated as a transient disconnect and rebuilt.
+    pub keepalive: Duration,
 }
 
 impl Default for ReconnectPolicy {
@@ -83,6 +109,7 @@ impl Default for ReconnectPolicy {
             initial: Duration::from_secs(1),
             max: Duration::from_secs(60),
             connect_timeout: Duration::from_secs(30),
+            keepalive: Duration::from_secs(120),
         }
     }
 }
@@ -105,6 +132,12 @@ pub(crate) trait PushTransport: Send + Sync + 'static {
         &self,
         data_types: &DataTypeSet,
     ) -> impl Future<Output = Result<(), AccountError>> + Send;
+
+    /// Send a WebSocket ping on the current connection.
+    ///
+    /// The reader's only liveness probe: the answering pong is the sole
+    /// evidence a silent connection is still carrying bytes.
+    fn ping_push(&self) -> impl Future<Output = crate::Result<()>> + Send;
 }
 
 type BoxedWsStream =
@@ -124,6 +157,10 @@ impl PushTransport for Client {
     ) -> impl Future<Output = Result<(), AccountError>> + Send {
         apply_push_set(self, data_types)
     }
+
+    fn ping_push(&self) -> impl Future<Output = crate::Result<()>> + Send {
+        self.ws_ping()
+    }
 }
 
 impl WsState {
@@ -136,18 +173,51 @@ impl WsState {
     ) -> Self {
         let (tx, _) = broadcast::channel(256);
         let enabled = Arc::new(Mutex::new(HashSet::new()));
-        if push_available {
-            let _reader = tokio::spawn(reader_loop(
+        let reader = push_available.then(|| {
+            tokio::spawn(reader_loop(
                 client,
                 tx.clone(),
                 Arc::clone(&enabled),
                 shutdown,
                 policy,
                 routing,
-            ));
-        }
+            ))
+        });
 
-        Self { tx, enabled }
+        Self {
+            tx,
+            enabled,
+            reader: Arc::new(Mutex::new(reader)),
+            teardown_timeout: policy.connect_timeout,
+        }
+    }
+
+    /// A handle onto the reader task, for `close()` to await.
+    pub(crate) fn reader_handle(&self) -> Arc<Mutex<Option<tokio::task::JoinHandle<()>>>> {
+        Arc::clone(&self.reader)
+    }
+
+    pub(crate) fn teardown_timeout(&self) -> Duration {
+        self.teardown_timeout
+    }
+}
+
+/// Wait for the spawned reader to finish, up to `timeout`.
+///
+/// Called after the shutdown token is cancelled. Every await the reader
+/// performs is cancellation-covered, so this normally returns immediately;
+/// the bound is there so a wedged reader cannot hold `close()` - and with
+/// it the engine's teardown/reopen - open indefinitely. A reader that
+/// outlives the bound is abandoned rather than aborted: aborting it at an
+/// arbitrary await point is no safer than leaving it to notice the token,
+/// and `close()` has already given up on it either way.
+pub(crate) async fn join_reader(
+    reader: &Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    timeout: Duration,
+) {
+    let handle = reader.lock().await.take();
+    if let Some(handle) = handle {
+        let _ = tokio::time::timeout(timeout, handle).await;
     }
 }
 
@@ -305,9 +375,10 @@ enum ReaderStep {
     /// the engine can reopen the account.
     Terminal(AccountError),
     /// Transient: emit `Disconnected` and back off. `reset_backoff` is
-    /// set only when the pass got all the way to a live, subscribed
-    /// connection, which is the evidence that the endpoint is healthy and
-    /// the backoff should start over.
+    /// set only when the pass actually read a message off the connection,
+    /// which is the evidence that the endpoint is healthy and the backoff
+    /// should start over. Merely reaching the read loop is not: the
+    /// push-enable rejection arrives there as a `RequestError`.
     Retry { reset_backoff: bool },
 }
 
@@ -443,19 +514,67 @@ async fn reader_pass<T: PushTransport>(
 
     let _ = tx.send(WatchEvent::Reconnected);
 
+    // Whether this pass ever read a message SUCCESSFULLY. It gates the
+    // backoff reset below: reaching the read loop is not evidence the
+    // endpoint is healthy, because the push-enable frame's only failure
+    // signal is a `RequestError` arriving asynchronously on this stream.
+    // A server that will never accept the subscription (unknown dataTypes
+    // value, capability withdrawn, quota) therefore completes handshake and
+    // sink write, gets `Reconnected` announced, answers `RequestError`, and
+    // - if the mere fact of having reached the loop reset the backoff -
+    // does it all again one second later, forever: an unbounded 1 Hz
+    // handshake storm plus a Disconnected/Reconnected pair per second on
+    // the broadcast channel. Only traffic the peer actually served counts.
+    let mut saw_traffic = false;
+    // Set once a ping is outstanding, so the next silence window is the
+    // pong deadline rather than another keepalive interval.
+    let mut awaiting_pong = false;
+
     loop {
+        let silence = if awaiting_pong {
+            policy.connect_timeout
+        } else {
+            policy.keepalive
+        };
         let message = tokio::select! {
             () = shutdown.cancelled() => return ReaderStep::Stop,
+            () = tokio::time::sleep(silence) => {
+                if awaiting_pong {
+                    // Pinged and got nothing back inside the deadline: the
+                    // socket is half-open. Drop it and reconnect rather
+                    // than park on a link that will never speak again.
+                    break;
+                }
+                match bounded(shutdown, policy.connect_timeout, transport.ping_push()).await {
+                    None => return interrupted(shutdown),
+                    // A ping that cannot even be written means the sink is
+                    // already gone; same transient handling.
+                    Some(Err(_)) => break,
+                    Some(Ok(())) => {}
+                }
+                awaiting_pong = true;
+                continue;
+            }
             message = futures::StreamExt::next(&mut ws) => message,
         };
         let Some(message) = message else {
             break;
         };
         match message {
+            // Any successful frame - a pong included - proves the link is
+            // carrying bytes, so it clears the outstanding probe.
             Ok(crate::client_ws::WebSocketMessage::PushNotification(push)) => {
+                saw_traffic = true;
+                awaiting_pong = false;
                 emit_push(push, tx, routing);
             }
-            Ok(crate::client_ws::WebSocketMessage::Response(_)) => {}
+            Ok(
+                crate::client_ws::WebSocketMessage::Response(_)
+                | crate::client_ws::WebSocketMessage::Pong,
+            ) => {
+                saw_traffic = true;
+                awaiting_pong = false;
+            }
             Err(err) => {
                 // Classify every exit error so consumers learn whether
                 // the loop ended for an auth-lost / schema-mismatch
@@ -477,7 +596,7 @@ async fn reader_pass<T: PushTransport>(
         return ReaderStep::Stop;
     }
     ReaderStep::Retry {
-        reset_backoff: true,
+        reset_backoff: saw_traffic,
     }
 }
 
@@ -879,6 +998,10 @@ mod tests {
                 Ok(())
             }
         }
+
+        async fn ping_push(&self) -> crate::Result<()> {
+            Ok(())
+        }
     }
 
     /// Spawn a reader on a stub that hangs at `hang`, wait until it is
@@ -903,6 +1026,7 @@ mod tests {
                 initial: Duration::from_secs(3600),
                 max: Duration::from_secs(3600),
                 connect_timeout: Duration::from_secs(3600),
+                keepalive: Duration::from_secs(3600),
             },
             Arc::new(routing()),
         ));
@@ -960,6 +1084,10 @@ mod tests {
                     "JMAP push: WebSocket not connected",
                 ))
             }
+        }
+
+        async fn ping_push(&self) -> crate::Result<()> {
+            Ok(())
         }
     }
 
@@ -1024,6 +1152,7 @@ mod tests {
                 initial: Duration::from_secs(1),
                 max: Duration::from_secs(60),
                 connect_timeout: Duration::from_secs(30),
+                keepalive: Duration::from_secs(120),
             },
             Arc::new(routing()),
         ));
@@ -1035,6 +1164,188 @@ mod tests {
 
         shutdown.cancel();
         reader.await.expect("reader task panicked");
+    }
+
+    /// Push transport that connects cleanly onto a permanently silent
+    /// stream and counts pings, never answering one.
+    struct SilentTransport {
+        pings: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl PushTransport for SilentTransport {
+        type Stream = BoxedWsStream;
+
+        async fn connect_push(&self) -> crate::Result<Self::Stream> {
+            let stream: Self::Stream = Box::pin(futures::stream::pending());
+            Ok(stream)
+        }
+
+        async fn set_push_data_types(&self, _data_types: &DataTypeSet) -> Result<(), AccountError> {
+            Ok(())
+        }
+
+        async fn ping_push(&self) -> crate::Result<()> {
+            self.pings.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    // The read loop is where the reader spends its life, and a half-open
+    // socket never errors and never closes there. Silence past the
+    // keepalive must therefore provoke a ping, and an unanswered ping must
+    // end the connection - otherwise push is dead for the life of the
+    // account and the engine cannot tell it apart from a quiet mailbox.
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_connection_is_pinged_and_dropped_when_the_pong_never_comes() {
+        let pings = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let shutdown = CancellationToken::new();
+        let (tx, mut rx) = broadcast::channel(8);
+        let reader = tokio::spawn(reader_loop(
+            SilentTransport {
+                pings: Arc::clone(&pings),
+            },
+            tx,
+            Arc::new(Mutex::new(HashSet::new())),
+            shutdown.clone(),
+            ReconnectPolicy {
+                initial: Duration::from_secs(1),
+                max: Duration::from_secs(60),
+                connect_timeout: Duration::from_secs(5),
+                keepalive: Duration::from_secs(10),
+            },
+            Arc::new(routing()),
+        ));
+
+        assert!(matches!(rx.recv().await, Ok(WatchEvent::Reconnected)));
+        assert!(
+            matches!(rx.recv().await, Ok(WatchEvent::Disconnected)),
+            "an unanswered keepalive must surface as a transient disconnect"
+        );
+        assert!(
+            pings.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "the reader must probe the silent link rather than park on it"
+        );
+
+        shutdown.cancel();
+        reader.await.expect("reader task panicked");
+    }
+
+    /// Push transport whose stream yields one non-terminal error right
+    /// away - the shape of a server that rejects the push-enable frame,
+    /// whose only failure signal is an asynchronous `RequestError` on the
+    /// read stream. Records when each connect happened.
+    struct RejectingTransport {
+        connects: Arc<std::sync::Mutex<Vec<tokio::time::Instant>>>,
+    }
+
+    impl PushTransport for RejectingTransport {
+        type Stream = BoxedWsStream;
+
+        async fn connect_push(&self) -> crate::Result<Self::Stream> {
+            self.connects
+                .lock()
+                .expect("connect log")
+                .push(tokio::time::Instant::now());
+            let stream: Self::Stream = Box::pin(futures::stream::once(async {
+                Err(crate::Error::WebSocketClosed)
+            }));
+            Ok(stream)
+        }
+
+        async fn set_push_data_types(&self, _data_types: &DataTypeSet) -> Result<(), AccountError> {
+            Ok(())
+        }
+
+        async fn ping_push(&self) -> crate::Result<()> {
+            Ok(())
+        }
+    }
+
+    // A server that will never accept the subscription completes the
+    // handshake and the sink write, then rejects on the read stream. If
+    // merely REACHING the read loop reset the backoff, that is an
+    // unbounded 1 Hz handshake storm plus a Disconnected/Reconnected pair
+    // per second forever. The backoff must keep growing.
+    #[tokio::test(start_paused = true)]
+    async fn a_pass_that_reads_no_traffic_does_not_reset_the_backoff() {
+        let connects = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let shutdown = CancellationToken::new();
+        let (tx, mut rx) = broadcast::channel(64);
+        let reader = tokio::spawn(reader_loop(
+            RejectingTransport {
+                connects: Arc::clone(&connects),
+            },
+            tx,
+            Arc::new(Mutex::new(HashSet::new())),
+            shutdown.clone(),
+            ReconnectPolicy {
+                initial: Duration::from_secs(1),
+                max: Duration::from_secs(60),
+                connect_timeout: Duration::from_secs(30),
+                keepalive: Duration::from_secs(120),
+            },
+            Arc::new(routing()),
+        ));
+
+        // Four passes: gaps must be 1s, 2s, 4s rather than 1s, 1s, 1s.
+        let mut disconnects = 0;
+        while disconnects < 4 {
+            if let Ok(WatchEvent::Disconnected) = rx.recv().await {
+                disconnects += 1;
+            }
+        }
+        shutdown.cancel();
+        reader.await.expect("reader task panicked");
+
+        let connects = connects.lock().expect("connect log").clone();
+        assert!(
+            connects.len() >= 4,
+            "expected four passes, got {connects:?}"
+        );
+        let gaps = connects
+            .windows(2)
+            .map(|pair| pair[1] - pair[0])
+            .collect::<Vec<_>>();
+        assert_eq!(
+            &gaps[..3],
+            &[
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                Duration::from_secs(4)
+            ],
+            "the backoff must keep doubling against a peer that only ever rejects"
+        );
+    }
+
+    // `close()` cancels the shutdown token and then joins the reader. The
+    // join is bounded so a wedged reader cannot hold teardown open, but a
+    // healthy one must be genuinely awaited - the old shape dropped the
+    // handle at spawn, so `close()` returning was no evidence at all.
+    #[tokio::test(start_paused = true)]
+    async fn joining_the_reader_waits_for_it_and_gives_up_on_a_wedged_one() {
+        let handle = Arc::new(Mutex::new(Some(tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }))));
+        let started = tokio::time::Instant::now();
+        join_reader(&handle, Duration::from_secs(30)).await;
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_secs(1),
+            "a healthy reader is awaited to completion"
+        );
+        assert!(
+            handle.lock().await.is_none(),
+            "the handle is consumed, so a second close is a no-op"
+        );
+
+        let wedged = Arc::new(Mutex::new(Some(tokio::spawn(std::future::pending::<()>()))));
+        let started = tokio::time::Instant::now();
+        join_reader(&wedged, Duration::from_secs(30)).await;
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_secs(30),
+            "a wedged reader must not hold teardown open past the bound"
+        );
     }
 
     #[tokio::test]

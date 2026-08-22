@@ -14,6 +14,17 @@ correlating on the submitted id, and `open_blob_range`'s out-of-range start
 reported as `Unsupported` rather than `Request(Malformed)`.
 `reference/jmap.md` states each new rule.
 
+Fixed 2026-08-22 in a second round and removed from this document: the push
+read loop having no liveness deadline (there is now a `keepalive` ping with a
+`connect_timeout` pong deadline, and `WebSocketMessage::Pong` exists so the
+reader can see the answer - which also gives the previously dead `ws_ping` its
+caller), the persistently-rejected push-enable becoming a 1 Hz reconnect storm
+(`reset_backoff` is now gated on the pass having read a message, not on having
+reached the loop), and `close()` being unbounded and unable to prove the
+reader stopped (`WsState` retains the `JoinHandle`; `close()` bounds both the
+push-disable and the join by `connect_timeout`, which also makes the
+reference's "awaits teardown" claim true).
+
 ## scope_lifecycle and the Mailbox change stream share one cursor
 
 `crates/jmap/src/sync/discover.rs` (`scope_lifecycle`), `crates/jmap/src/sync/changes.rs`
@@ -41,50 +52,6 @@ defending an invariant that a co-writer breaks anyway. The fix is structural: `s
 needs its own private state slot, not the shared `mailbox_states` map. That map exists to serve
 `ifInState` for `Mailbox/set` and to seed the changes cursor, two roles that tolerate
 fast-forwarding. A lifecycle poller cannot.
-
-## Push read loop has no liveness deadline; ws_ping is dead code
-
-`crates/jmap/src/sync/push.rs` (`reader_pass` read loop), `crates/jmap/src/client_ws.rs`.
-
-`bounded(..., connect_timeout, ...)` covers exactly two awaits: the handshake and the re-enable
-frame. The read loop itself is `select!(shutdown, ws.next())` with no idle timeout and no
-keepalive. `Client::ws_ping` exists and is called from nowhere in the crate. On a half-open TCP
-connection (NAT/firewall silently dropping state, the common case for a long-lived idle
-WebSocket) the reader parks on `ws.next()` forever: no error, no close frame, no reconnect.
-Push is dead for the life of the account and the engine cannot tell it apart from a quiet
-mailbox, which is precisely the failure mode the `connect_timeout` work was introduced to
-prevent, left uncovered on the await that is parked 99.9% of the time. What is needed is an
-idle deadline in the read `select!` that fires a ping, or just treats the silence as a
-disconnect.
-
-## Persistently rejected push-enable becomes a 1 Hz reconnect storm
-
-`crates/jmap/src/sync/push.rs`.
-
-The push-enable frame's only failure signal is a `RequestError` arriving asynchronously on the
-read stream (push.rs says so explicitly). So the sequence for a server that rejects the
-subscription (unknown `dataTypes` value, capability withdrawn, quota) is: connect OK, sink
-write OK, `Reconnected` emitted, `RequestError` read, non-terminal classification, `break`,
-`ReaderStep::Retry { reset_backoff: true }`. Because the read loop was reached, the backoff is
-reset to `policy.initial` (1s) on every pass. The result is an unbounded 1-request-per-second
-handshake loop against a server that will never accept the subscription, plus a
-`Disconnected`/`Reconnected` event pair per second on the broadcast channel. `reset_backoff`
-should be gated on the pass having produced useful work, or at least on not having ended in a
-`RequestError`, not merely on having reached the loop.
-
-## close() is unbounded and not cancellation-covered
-
-`crates/jmap/src/sync/account.rs`.
-
-`close()` cancels the shutdown token and then `client.disable_push_ws().await`, a WebSocket
-sink write, holding `self.ws` lock, with no timeout and no `select!` on anything. On the same
-half-open socket as above, `close()` hangs indefinitely, blocking the engine's teardown/reopen.
-This is the identical hazard `bounded` was added for, on the shutdown path.
-
-Related doc divergence: `reference/jmap.md` says `close()` "cancels the shutdown token ... then
-awaits teardown". It does not. `WsState::spawn` drops the `JoinHandle`
-(`let _reader = tokio::spawn(...)`), so nothing is ever awaited. The reader is detached;
-`close()` returning is not evidence it has stopped.
 
 ## Unhandled SearchFilter variant silently becomes "match everything"
 
