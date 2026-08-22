@@ -160,6 +160,60 @@ These bind every protocol crate, because `bifrost-net` sits under all of them.
   Tightening the parser moves inputs into the unreadable bucket, never out of
   it, so that hole cannot reopen from this direction.
 
+## From the bifrost-net / bifrost-types arc (2026-08-22)
+
+`crates/net` and `crates/types` sit under every protocol crate, so all of these
+bind the whole workspace.
+
+- **`NetConfig` is process-wide ONLY; per-account settings live on
+  `AccountSpec`.** The shared half owns the reqwest client: pool, keepalive and
+  TLS trust. The per-account half owns request/connect/read timeouts, User-Agent,
+  redirect policy, max buffered response, and token max-age. A protocol crate
+  that calls `Net::new` per account silently un-shares the connection pool, the
+  governor and the meter, which is exactly the defect this split fixed for JMAP.
+  Attach to a shared `Net` unless you genuinely own the transport.
+
+- **There is no client-level read timeout any more.** It is per-account
+  (`AccountSpec::read_timeout`). Anything that drains a response body must go
+  through `read_capped_response_body` with `account.read_timeout()`, never
+  `response.bytes()`. Two terminal-status drains were left on `bytes()` by the
+  split and would have blocked forever against a server that sends headers and
+  then stalls; google and graph accounts have no total request deadline to
+  rescue them. The capped reader also bounds memory, which `bytes()` does not.
+
+- **TLS trust selects WHICH shared client an account attaches to.** It cannot be
+  per-account, because it is a property of the reqwest client. Use
+  `Net::shared_for_tls(accept_invalid_certs)`. Never accept a caller's TLS
+  choice and discard it: JMAP did, so a self-signed deployment failed every HTTP
+  request while its WebSocket - which builds its own connector - succeeded, and
+  the option appeared to work and not.
+
+- **Redirects are followed inside bifrost-net, not by reqwest.**
+  `Policy::none()` is installed at client construction and that is the only
+  handoff point. reqwest's own policy cannot rewrite methods per RFC 7231, strip
+  `Authorization` across a host boundary, or carry a per-account trusted-host
+  allowlist - and a shared client could not carry the allowlist regardless.
+
+- **The rate governor is FIFO with generation-scoped tickets.** Every
+  `HostBucket` carries a generation; a ticket names a bucket INSTANCE, not a
+  host name. A waiter whose generation no longer matches, or whose ticket has
+  left the queue it joined, completes UNMETERED rather than parking. Burst
+  validation and enqueue happen under one lock. Two separate permanent-strand
+  bugs came out of getting this wrong, both during account detach/open churn.
+  `WaiterGuard::drop` is generation-scoped for the same reason, because
+  `next_waiter_id` restarts at zero per bucket.
+
+- **Token refresh backoff on the no-fallback path** escalates 1s to 60s by
+  doubling, resets on any success, and goes straight to the 60s floor on an
+  authoritative refusal (401/403 from the token endpoint, or `AuthLost`). This
+  bounds the ISSUER CALL RATE, not the number of failing requests - state it
+  that way, since the doc previously overclaimed here.
+
+- **The 94-method `Account` trait stays unified.** Audited lane by lane: a split
+  is object-safe but buys impl and accessor churn without removing a single
+  dependency. The grouping evidence is in `reference/types.md`. Do not reopen
+  this without new evidence.
+
 ## Standing lessons this project has paid for
 
 - **Audit new tests for bite, mechanically.** Revert the production change,
@@ -186,6 +240,16 @@ These bind every protocol crate, because `bifrost-net` sits under all of them.
 
 - **The recurring defect shape is a fix that opens a new hole one layer up.**
   Check what a fix does to its consumer, not only to the unit test in front of it.
+
+- **A refactor that MOVES a field must move the tests that pinned it.** The
+  `NetConfig` split deleted three tests along with the fields they described,
+  which was locally correct and left three defaults silently unpinned. A falling
+  test count after a refactor is the signal; chase it rather than accepting it.
+
+- **A `review` prompt over roughly 8k characters is rejected by the permission
+  layer.** Two ~10k briefs were denied outright; the same content trimmed to ~7k
+  went through unchanged. Budget brief length accordingly - this bites hardest on
+  exactly the large documents whose briefs most want to be long.
 
 - **`git add -N` every untracked source file before the cold review.** The fix
   pass leaves new modules untracked, and the cold review reads the unstaged diff,

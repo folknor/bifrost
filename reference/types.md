@@ -35,6 +35,53 @@ subscriptions, which use `push_unsubscribe`.
 
 ## Account trait tiers
 
+The trait currently has 94 methods. An audit grouped them by independent
+lane as follows:
+
+| Lane | Methods |
+|---|---:|
+| capabilities, provider metadata, and scheduling controls | 5 |
+| cursor discovery, lifecycle, inventory, hydration stream, and changes | 12 |
+| push | 3 |
+| blob and raw-message reads | 3 |
+| streaming bulk mutation | 4 |
+| mail mutation primitives | 8 |
+| compose, attachment, draft, and scheduled-send operations | 10 |
+| search | 2 |
+| containers | 5 |
+| settings | 5 |
+| filters | 5 |
+| contacts and directory | 10 |
+| calendar | 8 |
+| typed thread and message hydration | 2 |
+| convenience operations | 11 |
+| close | 1 |
+
+Push, contacts and directory, calendar, filters, and settings are genuinely
+independent optional lanes. They are already separated at the behavioral
+boundary by `AccountCapabilities`, structured `Unsupported` results, and
+default implementations where an implementation can safely be shared.
+
+A supertrait split is object-safe, but does not reduce the cost that motivated
+the audit. `Arc<dyn Account>` must retain every lane because this is the single
+consumer handle, so `Account` would have to inherit every new supertrait. Each
+existing implementation would then be divided into many impl blocks, and a new
+lane would still change the main trait bound and every implementor that does not
+receive a blanket implementation. Narrow optional traits exposed through
+accessor methods avoid that bound, but add one accessor per lane, duplicate the
+capability decision at runtime, and make consumers branch between capability
+metadata and a second dynamic-trait presence check. Blanket forwarding traits
+merely duplicate the 94 signatures and leave additions centralized on
+`Account`.
+
+The audited decision is therefore to keep one object-safe trait. The method
+count is real but is not currently causing mechanical duplication: optional
+lanes have defaults, required sync methods are coupled by engine invariants,
+and consumers need one erased handle spanning all advertised capabilities. A
+future split should be triggered only if a consumer can operate on a narrower
+handle without retaining `dyn Account`; that would remove a dependency rather
+than rearrange the same one.
+
 The required protocol surface in `account.rs` covers:
 
 - capability and scheduling controls;

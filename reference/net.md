@@ -22,8 +22,9 @@ let account = net.attach_account(account_id, spec);     // per-account
   `RateLimitGovernor`, and the `BandwidthMeter`. Cheap-cloneable
   (one `Arc` bump); shared across every account so multi-account
   quota coordination on Gmail / Graph hosts works out of the box.
-- `AccountNet` is account-scoped: token source, default
-  `RetryPolicy`, `AtomicU8` priority, `AtomicU64` bandwidth cap.
+- `AccountNet` is account-scoped: token source, timeouts, User-Agent,
+  buffered-body ceiling, redirect policy, default `RetryPolicy`,
+  `AtomicU8` priority, and `AtomicU64` bandwidth cap.
   `Clone` is one `Arc` bump; protocol crates clone per spawned task.
 - `Net::shared_default()` returns a process-wide `OnceLock<Net>`
   built from `NetConfig::default()`. The default registration target
@@ -33,6 +34,13 @@ let account = net.attach_account(account_id, spec);     // per-account
   bandwidth meter. Applications that need a custom `NetConfig` still
   call `Net::new` and hand the result to the protocol clients
   explicitly.
+
+`NetConfig` contains only client-instance settings: pool sizing, keepalive,
+and TLS trust. `AccountSpec` contains request behavior: header and body
+timeouts, optional total timeout, User-Agent, buffered-body ceiling, redirect
+policy, token max-age, retry policy, token source, and rate declarations.
+JMAP attaches every independently opened account to `shared_default`, so its
+accounts now share the client, governor, and meter as advertised.
 
 Every `attach_account` receives a monotone registration token carried
 by its `AccountNet`. `AccountNet::detach()` removes that exact
@@ -97,32 +105,22 @@ drains the body through the same metering reader.
 
 ### Deadlines and the buffered ceiling
 
-Two bounds:
+`AccountSpec` carries the per-account bounds. `connect_timeout` bounds
+dispatch until response headers arrive, and `read_timeout` bounds inactivity
+between response body chunks. Both default to 10s and 30s respectively.
+`RequestBuilder::timeout` remains the explicit total request deadline; an
+`AccountSpec::request_timeout` supplies its per-account default, and `None`
+means the pipeline invents no total deadline. This keeps a slow response that
+continues making progress distinct from a stalled response.
 
-- `NetConfig::connect_timeout` (10s) covers reaching the server.
-- `NetConfig::read_timeout` (30s) is an inactivity deadline between
-  response body chunks, installed on the shared client so it applies to
-  every request, buffered and streaming. Without it a request that
-  connects and then stalls mid-body produces no error at all: the retry
-  loop never fires, and the sync scope blocks indefinitely. Only JMAP
-  set a per-request timeout, so every Gmail and Graph call previously
-  had no deadline of any kind.
-
-The pipeline supplies no TOTAL request deadline. `RequestBuilder::timeout`
-exists for callers that want one (JMAP sets it), and nothing is applied
-when they do not.
-
-That is a consequence of the crate's position, not an oversight.
-Consumers program against `Account` / `AccountFactory` and never reach
-`NetConfig`; `bifrost-net` is an internal shared layer the same way
-`bifrost-sasl` is. So a value chosen here is the contract, not a default
-someone can override when it turns out wrong for their deployment - and
-that rules out any bound capable of failing a request that is making
-slow but genuine progress. A total deadline is exactly such a bound: a
-large `Email/get` with full bodies over a poor link is healthy and slow,
-and indistinguishable from a hang by wall-clock alone. An inactivity
-bound is not, because silence is unambiguous. `read_timeout` closes the
-reported hole (connect-then-stall) without the failure mode.
+Because `read_timeout` is the only inactivity bound and it is per-account, every
+body drain must apply it. Terminal statuses go through
+`read_capped_response_body(response, account.read_timeout())`, never
+`reqwest::Response::bytes()`: a server that sends 4xx headers and then stalls
+mid-body would otherwise block forever, and the google and graph accounts set no
+`request_timeout` to rescue it. The capped reader also stops reading at
+`STATUS_BODY_CAP`, where `bytes()` buffers the whole body before any cap
+applies.
 
 The same reasoning is why the knobs below are not exposed upward. If a
 per-deployment value is genuinely needed, it belongs on the protocol
@@ -133,7 +131,7 @@ consumers. (`GraphClient::with_account_net` is `pub` and takes an
 `AccountNet`, which does force a caller using it to depend on this
 crate directly. That predates the rule above and is a hole in it.)
 
-`NetConfig::max_buffered_response` (`DEFAULT_MAX_BUFFERED_RESPONSE`,
+`AccountSpec::max_buffered_response` (`DEFAULT_MAX_BUFFERED_RESPONSE`,
 64 MiB) caps what `send` will accumulate, failing with
 `Error::ResponseTooLarge` before the allocation that would exceed it
 and dropping the stream. Every JSON API call in google / graph / jmap
@@ -372,7 +370,7 @@ and surfaces only length + expiry.
   the cached token is older than the refresher's `max_age`. Default
   is `DEFAULT_TOKEN_MAX_AGE` (55 min, leaving a 5 min margin under
   the typical 60 min issuer TTL). Callers configure the value at
-  construction via `NetConfig::token_max_age`;
+  construction via `AccountSpec::token_max_age`;
   `Net::attach_account` reads it and wires it into the per-account
   refresher with `OAuthRefresher::with_max_age`, so production
   callers do not touch the builder directly. The previous behaviour
@@ -549,7 +547,25 @@ known total, which silently admitted truncated bodies.
 one `native_tls::Certificate` onto `root_certs` and returns `self`
 so callers can chain.
 
-`NetConfig::follow_redirects` is a `FollowRedirects` enum with two
+These settings belong to the shared reqwest client and therefore cannot vary
+per account. They do, however, decide *which* shared client an account attaches
+to. `Net::shared_for_tls(accept_invalid_certs)` returns `shared_default()` or
+`shared_accepting_invalid_certs()`, each a process-wide `OnceLock`, so sharing
+is preserved within each trust class and at most two clients exist - not one per
+account.
+
+JMAP's protocol-level `accept_invalid_certs` routes through that selector, so it
+governs HTTP as well as the separately built WebSocket transport. The
+alternative - accepting the flag and discarding it for HTTP - was tried and is
+wrong: a self-signed deployment failed every HTTP request while its WebSocket
+succeeded, so the option appeared to work and not, which is worse than either
+honoring it or refusing it outright.
+
+This is not new configuration exposure through the protocol-level `Account`
+API. `accept_invalid_certs` was already public on the JMAP factory; what changed
+is that it now does what it says.
+
+`AccountSpec::follow_redirects` is a `FollowRedirects` enum with two
 variants: `Disabled` and `Enabled(RedirectPolicy)`. The default is
 `Enabled` with an empty trusted-host allowlist and a ten-hop maximum.
 Regardless of the variant, `Net::new` always installs
@@ -628,10 +644,10 @@ duplicated the hop-cap + allowlist logic locally (`dav_redirect_policy`
 cap now follows bifrost-net's 10.
 
 `FollowRedirects::Disabled` skips the loop entirely; 3xx surfaces
-to the caller exactly as it did before the loop landed. The
-`NetConfig::follow_redirects(policy)` and
-`NetConfig::with_redirect_policy(RedirectPolicy)` builder helpers
-let callers configure the policy without naming the outer enum.
+to the caller exactly as it did before the loop landed. Redirects are
+disabled in reqwest for every `Net`; bifrost-net follows them itself because
+the reqwest policy cannot rewrite methods, strip headers, or carry a different
+trusted-host allowlist for each account sharing the client.
 
 `Net::new` returns `Error::InvalidRequest` for bad TLS / client
 configuration data: corrupt native-tls root cert DER, reqwest
@@ -683,7 +699,7 @@ variants:
   deadlines are stored on the wrapper for the account-error
   conversion.
 - `ResponseTooLarge { limit }` - a buffered body exceeded
-  `NetConfig::max_buffered_response`. Maps to
+  `AccountSpec::max_buffered_response`. Maps to
   `Protocol(ContractViolation)`, not a transport class: the server
   answered, and the same answer comes back on a retry.
 - `Cancelled` - request cancelled before completion. Produced by
@@ -782,7 +798,7 @@ values.
 crates/net/src/
   lib.rs          // re-exports; AccountFuture/AccountId/Priority/
                   // ByteRange from bifrost-types
-  config.rs       // NetConfig + with_root_cert + follow_redirects
+  config.rs       // process-wide NetConfig + with_root_cert
   net.rs          // Net + AccountNet; shared_default; attach/detach;
                   // download_stream
   request.rs      // RequestBuilder + Response/StreamingResponse;

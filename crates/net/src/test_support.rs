@@ -97,6 +97,23 @@ pub enum Canned {
         /// Message carried into the resulting `Error::Network`.
         message: String,
     },
+    /// A response whose status and headers arrive, and whose body then
+    /// stalls forever after the given chunks.
+    ///
+    /// Distinct from [`Canned::Pending`], which never produces a
+    /// response at all: here the caller already holds a status it can
+    /// act on, so anything that drains the body without a read timeout
+    /// blocks indefinitely. That is what a server sending 4xx headers
+    /// and then hanging looks like, and it is not reachable through
+    /// `StreamThenError`, whose stream does terminate.
+    StreamThenStall {
+        /// Status line.
+        status: StatusCode,
+        /// Response headers.
+        headers: HeaderMap,
+        /// Chunks delivered before the stall.
+        chunks: Vec<Bytes>,
+    },
     /// A transport-level failure, before any response exists. Drives
     /// the network-retry lane rather than the status lane.
     Error(Error),
@@ -120,7 +137,7 @@ pub struct RequestSnapshot {
     pub body: Option<Bytes>,
     /// Total request deadline as sent. `None` unless the caller set
     /// one: the pipeline supplies no deadline of its own, bounding a
-    /// stalled request with `NetConfig::read_timeout` instead. Exposed
+    /// stalled request with an account request timeout instead. Exposed
     /// so a test can assert what actually reached the wire rather than
     /// trusting the builder.
     pub timeout: Option<std::time::Duration>,
@@ -242,6 +259,22 @@ impl Dispatch for ScriptedDispatch {
                     ));
                     Ok(canned_response(status, &headers, body))
                 }
+                Canned::StreamThenStall {
+                    status,
+                    headers,
+                    chunks,
+                } => {
+                    use futures::StreamExt as _;
+
+                    let stall = futures::stream::once(futures::future::pending::<
+                        Result<Bytes, std::io::Error>,
+                    >());
+                    let body = reqwest::Body::wrap_stream(
+                        futures::stream::iter(chunks.into_iter().map(Ok::<Bytes, std::io::Error>))
+                            .chain(stall),
+                    );
+                    Ok(canned_response(status, &headers, body))
+                }
                 Canned::Error(error) => Err(error),
                 Canned::Pending => futures::future::pending().await,
             }
@@ -324,8 +357,8 @@ pub fn scripted_account(
         AccountId("scripted".to_string()),
         AccountSpec {
             hosts,
-            token_source: Some(token_source),
             default_retry,
+            ..AccountSpec::new(Some(token_source))
         },
     )
 }

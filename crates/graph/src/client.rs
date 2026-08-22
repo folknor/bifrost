@@ -1,7 +1,9 @@
 use std::sync::{Arc, RwLock};
 
+#[cfg(test)]
+use bifrost_net::RetryPolicy;
 use bifrost_net::{
-    AccountId, AccountNet, AccountSpec, Net, RateLimit, RetryPolicy, StaticTokenSource, TokenSource,
+    AccountId, AccountNet, AccountSpec, Net, RateLimit, StaticTokenSource, TokenSource,
 };
 use bifrost_types::TransmissionState;
 use bytes::Bytes;
@@ -413,8 +415,7 @@ impl GraphClient {
                         cost_default: 1,
                         burst: 10,
                     }],
-                    token_source: Some(token_source),
-                    default_retry: RetryPolicy::default(),
+                    ..AccountSpec::new(Some(token_source))
                 },
             );
             // Install the replacement first, then tear down whatever

@@ -17,7 +17,7 @@ use bifrost_types::TransmissionState;
 use futures::StreamExt;
 use reqwest::header::RANGE;
 
-use crate::auth::{OAuthRefresher, TokenSource};
+use crate::auth::{DEFAULT_TOKEN_MAX_AGE, OAuthRefresher, TokenSource};
 use crate::bandwidth::{AccountMeter, BandwidthMeter};
 use crate::config::NetConfig;
 use crate::error::{Error, RangeFailureKind};
@@ -27,6 +27,7 @@ use crate::request::{
 };
 use crate::retry::RetryPolicy;
 use crate::{AccountId, ByteRange, Priority};
+use crate::{DEFAULT_MAX_BUFFERED_RESPONSE, FollowRedirects};
 
 /// Process-wide HTTP transport. Holds the shared reqwest client, the
 /// per-host rate-limit governor, and the bandwidth meter. Cheap to
@@ -66,8 +67,9 @@ pub(crate) struct NetInner {
 impl Net {
     /// Construct a `Net` from a `NetConfig`. Builds the shared
     /// `reqwest::Client` with the requested pool, HTTP/2 keepalive,
-    /// TCP keepalive, connect-timeout, user-agent, and trust-store
-    /// settings. Native-tls only.
+    /// TCP keepalive and trust-store settings. Request timeouts,
+    /// User-Agent, and redirect behavior are account-scoped.
+    /// Native-tls only.
     ///
     /// # Errors
     /// Returns `Error::InvalidRequest` if `native_tls` rejects a
@@ -94,20 +96,10 @@ impl Net {
         let mut builder = reqwest::ClientBuilder::new()
             .pool_idle_timeout(config.pool_idle_timeout)
             .pool_max_idle_per_host(config.pool_max_idle_per_host)
-            .connect_timeout(config.connect_timeout)
             .http2_keep_alive_interval(config.http2_keep_alive_interval)
             .http2_keep_alive_timeout(config.http2_keep_alive_timeout)
             .tcp_keepalive(Some(config.tcp_keepalive))
-            .user_agent(&config.user_agent)
             .danger_accept_invalid_certs(config.dangerous_accept_invalid_certs);
-
-        // Inactivity deadline on the response body. `connect_timeout`
-        // only covers reaching the server, so without this a request
-        // that connects and then stalls mid-body never errors, the
-        // retry loop never fires, and the sync scope blocks forever.
-        if let Some(read_timeout) = config.read_timeout {
-            builder = builder.read_timeout(read_timeout);
-        }
 
         // bifrost-net owns the redirect loop unconditionally. Reqwest's
         // default policy follows 3xx but without RFC 7231 method
@@ -163,6 +155,47 @@ impl Net {
             .clone()
     }
 
+    /// Shared transport that accepts invalid TLS certificates.
+    ///
+    /// TLS trust is a property of the reqwest client, so it cannot be
+    /// per-account on a shared client. Rather than silently discarding
+    /// a caller's explicit request to accept invalid certificates -
+    /// which would leave a self-signed deployment failing on every
+    /// HTTP request while the caller believes it opted in - accounts
+    /// that ask for it share a second process-wide client. Sharing is
+    /// preserved within each trust class: at most two clients exist,
+    /// not one per account.
+    ///
+    /// Prefer [`Net::shared_default`]. This exists for deployments
+    /// against self-signed endpoints and is as dangerous as its name
+    /// suggests.
+    #[must_use]
+    pub fn shared_accepting_invalid_certs() -> Self {
+        static SHARED: OnceLock<Net> = OnceLock::new();
+        SHARED
+            .get_or_init(|| {
+                let config = NetConfig {
+                    dangerous_accept_invalid_certs: true,
+                    ..NetConfig::default()
+                };
+                Net::new(config).expect("default NetConfig should build")
+            })
+            .clone()
+    }
+
+    /// Pick the shared transport matching a caller's TLS trust
+    /// requirement. See [`Net::shared_accepting_invalid_certs`] for
+    /// why this is a choice between two shared clients rather than a
+    /// per-account setting.
+    #[must_use]
+    pub fn shared_for_tls(accept_invalid_certs: bool) -> Self {
+        if accept_invalid_certs {
+            Self::shared_accepting_invalid_certs()
+        } else {
+            Self::shared_default()
+        }
+    }
+
     /// Register an account with the transport. Returns an
     /// `AccountNet` carrying the per-account token source, rate
     /// limits, and default retry policy.
@@ -199,11 +232,16 @@ impl Net {
                 registration_id,
                 meter: account_meter,
                 token_source: spec.token_source.map(|source| {
-                    Arc::new(
-                        OAuthRefresher::new(source).with_max_age(self.inner.config.token_max_age),
-                    ) as Arc<dyn TokenSource>
+                    Arc::new(OAuthRefresher::new(source).with_max_age(spec.token_max_age))
+                        as Arc<dyn TokenSource>
                 }),
                 default_retry: spec.default_retry,
+                request_timeout: spec.request_timeout,
+                connect_timeout: spec.connect_timeout,
+                read_timeout: spec.read_timeout,
+                max_buffered_response: spec.max_buffered_response,
+                user_agent: spec.user_agent,
+                follow_redirects: spec.follow_redirects,
                 priority: AtomicU8::new(Priority::Foreground as u8),
                 bandwidth_cap: AtomicU64::new(BANDWIDTH_CAP_NONE),
             }),
@@ -318,6 +356,18 @@ pub(crate) struct AccountNetInner {
     /// Default retry policy applied to every request unless the
     /// caller overrides via `RequestBuilder::retry`.
     pub(crate) default_retry: RetryPolicy,
+    /// Default total request timeout. Individual builders may override it.
+    pub(crate) request_timeout: Option<Duration>,
+    /// Deadline for dispatch to produce response headers.
+    pub(crate) connect_timeout: Option<Duration>,
+    /// Inactivity deadline between response body chunks.
+    pub(crate) read_timeout: Option<Duration>,
+    /// Buffered response ceiling for this account.
+    pub(crate) max_buffered_response: Option<usize>,
+    /// User-Agent header inserted unless the request supplied one.
+    pub(crate) user_agent: String,
+    /// Account-scoped redirect policy and trusted-host allowlist.
+    pub(crate) follow_redirects: FollowRedirects,
     /// Engine-controlled priority hint. Atomic so the hot per-request
     /// read does not take a lock. Stored as the `Priority` enum's
     /// discriminant byte; `priority()` converts back.
@@ -350,6 +400,13 @@ impl Drop for AccountNetInner {
 }
 
 impl AccountNet {
+    /// True when two account handles use the same process-wide client,
+    /// governor, and meter.
+    #[must_use]
+    pub fn shares_transport_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner.net.inner, &other.inner.net.inner)
+    }
+
     /// Start a `GET` request. Not async because the builder itself is
     /// pure construction; the network round-trip happens in
     /// `RequestBuilder::send`.
@@ -570,6 +627,30 @@ impl AccountNet {
         &self.inner.default_retry
     }
 
+    pub(crate) fn request_timeout(&self) -> Option<Duration> {
+        self.inner.request_timeout
+    }
+
+    pub(crate) fn connect_timeout(&self) -> Option<Duration> {
+        self.inner.connect_timeout
+    }
+
+    pub(crate) fn read_timeout(&self) -> Option<Duration> {
+        self.inner.read_timeout
+    }
+
+    pub(crate) fn max_buffered_response(&self) -> Option<usize> {
+        self.inner.max_buffered_response
+    }
+
+    pub(crate) fn user_agent(&self) -> &str {
+        &self.inner.user_agent
+    }
+
+    pub(crate) fn follow_redirects(&self) -> &FollowRedirects {
+        &self.inner.follow_redirects
+    }
+
     /// Underlying token source. Exposed so the OAuth refresher in
     /// `auth.rs` can share the trait object across requests.
     #[must_use]
@@ -658,6 +739,12 @@ impl AccountNet {
                 meter: account_meter,
                 token_source: self.inner.token_source.clone(),
                 default_retry: self.inner.default_retry.clone(),
+                request_timeout: self.inner.request_timeout,
+                connect_timeout: self.inner.connect_timeout,
+                read_timeout: self.inner.read_timeout,
+                max_buffered_response: self.inner.max_buffered_response,
+                user_agent: self.inner.user_agent.clone(),
+                follow_redirects: self.inner.follow_redirects.clone(),
                 priority: AtomicU8::new(self.inner.priority.load(Ordering::Relaxed)),
                 bandwidth_cap: AtomicU64::new(self.inner.bandwidth_cap.load(Ordering::Relaxed)),
             }),
@@ -673,13 +760,47 @@ pub struct AccountSpec {
     /// enforcement for this account", which is the default for JMAP.
     pub hosts: Vec<RateLimit>,
     /// Optional raw OAuth token provider. `Net::attach_account` wraps this in
-    /// an `OAuthRefresher` using `NetConfig::token_max_age`, so callers
+    /// an `OAuthRefresher` using this spec's `token_max_age`, so callers
     /// should pass the provider itself rather than pre-wrapping it in
     /// another refresher.
     /// `None` expresses an account that does not use bearer auth.
     pub token_source: Option<Arc<dyn TokenSource>>,
     /// Default retry policy.
     pub default_retry: RetryPolicy,
+    /// Default total timeout applied to requests from this account.
+    /// `None` leaves requests unbounded unless a builder sets one.
+    pub request_timeout: Option<Duration>,
+    /// Deadline for receiving response headers from a request attempt.
+    pub connect_timeout: Option<Duration>,
+    /// Inactivity deadline between response body chunks.
+    pub read_timeout: Option<Duration>,
+    /// Ceiling for buffered response bodies. `None` disables it.
+    pub max_buffered_response: Option<usize>,
+    /// User-Agent header used for requests from this account.
+    pub user_agent: String,
+    /// Method-aware redirect policy, including the account's trusted hosts.
+    pub follow_redirects: FollowRedirects,
+    /// Refresh max-age for opaque bearer tokens without an expiry hint.
+    pub token_max_age: Duration,
+}
+
+impl AccountSpec {
+    /// Common account defaults used by protocol clients.
+    #[must_use]
+    pub fn new(token_source: Option<Arc<dyn TokenSource>>) -> Self {
+        Self {
+            hosts: Vec::new(),
+            token_source,
+            default_retry: RetryPolicy::default(),
+            request_timeout: None,
+            connect_timeout: Some(Duration::from_secs(10)),
+            read_timeout: Some(Duration::from_secs(30)),
+            max_buffered_response: Some(DEFAULT_MAX_BUFFERED_RESPONSE),
+            user_agent: format!("bifrost-net/{}", env!("CARGO_PKG_VERSION")),
+            follow_redirects: FollowRedirects::default(),
+            token_max_age: DEFAULT_TOKEN_MAX_AGE,
+        }
+    }
 }
 
 /// Encode a `ByteRange` as an HTTP `Range` header value.
@@ -942,7 +1063,10 @@ impl ByteBucket {
 
 /// Public re-export helper so `request.rs` can build a response body
 /// adapter without pulling the `Net` types in.
-pub(crate) fn into_byte_stream(response: reqwest::Response) -> ByteStream {
+pub(crate) fn into_byte_stream(
+    response: reqwest::Response,
+    read_timeout: Option<Duration>,
+) -> ByteStream {
     use futures::TryStreamExt;
     let stream = response.bytes_stream().map_err(|e| {
         if e.is_timeout() {
@@ -957,23 +1081,121 @@ pub(crate) fn into_byte_stream(response: reqwest::Response) -> ByteStream {
             }
         }
     });
-    Box::pin(stream)
+    let Some(read_timeout) = read_timeout else {
+        return Box::pin(stream);
+    };
+    use futures::StreamExt;
+    let timed = futures::stream::unfold((stream, false), move |(mut stream, done)| async move {
+        if done {
+            return None;
+        }
+        match tokio::time::timeout(read_timeout, stream.next()).await {
+            Ok(Some(item)) => Some((item, (stream, false))),
+            Ok(None) => None,
+            Err(_) => Some((
+                Err(Error::Timeout {
+                    transmission_state: TransmissionState::Acknowledged,
+                }),
+                (stream, true),
+            )),
+        }
+    });
+    Box::pin(timed)
 }
 
 #[cfg(test)]
 mod tests {
     use super::content_range_matches;
-    use super::{AccountId, AccountSpec, ByteBucket, ByteRange, Net, encode_range};
+    use super::{
+        AccountId, AccountSpec, ByteBucket, ByteRange, FollowRedirects, Net, encode_range,
+    };
     use crate::StaticTokenSource;
     use crate::config::NetConfig;
     use crate::rate::RateLimit;
-    use crate::retry::RetryPolicy;
     use std::sync::Arc;
     use std::time::Duration;
 
     #[test]
     fn content_range_rejects_inverted_response_range() {
         assert!(!content_range_matches("bytes=100-", "bytes 100-99/100"));
+    }
+
+    // ---- AccountSpec defaults -----------------------------------------
+    //
+    // These three defaults used to live on `NetConfig` and were pinned
+    // by tests there. The process-wide/per-account split moved the
+    // fields onto `AccountSpec` and the old tests went with the fields
+    // they described, which left the defaults themselves unpinned.
+    // They are re-pinned here, on their new home.
+
+    #[test]
+    fn tls_trust_selects_between_two_shared_clients() {
+        // TLS trust is a client property, so it cannot be per-account
+        // on a shared client. The split must not resolve that by
+        // silently discarding the caller's choice: an account that
+        // asked to accept invalid certificates gets a different shared
+        // client, not the default one.
+        let secure = Net::shared_for_tls(false);
+        let also_secure = Net::shared_for_tls(false);
+        let insecure = Net::shared_for_tls(true);
+        let also_insecure = Net::shared_for_tls(true);
+
+        assert!(
+            Arc::ptr_eq(&secure.inner, &also_secure.inner),
+            "accounts with the same trust requirement share one client"
+        );
+        assert!(
+            Arc::ptr_eq(&insecure.inner, &also_insecure.inner),
+            "sharing is preserved WITHIN the insecure class too - the \
+             point of the split is one client per trust class, not one \
+             per account"
+        );
+        assert!(
+            !Arc::ptr_eq(&secure.inner, &insecure.inner),
+            "a caller that opted into invalid certificates must not be \
+             handed the strict client, which would fail every request \
+             while appearing to have opted in"
+        );
+    }
+
+    #[test]
+    fn default_redirect_policy_is_enabled_with_ten_hops() {
+        let spec = AccountSpec::new(None);
+        let FollowRedirects::Enabled(policy) = spec.follow_redirects else {
+            panic!("redirect following is on by default");
+        };
+        assert_eq!(
+            policy.max_hops, 10,
+            "ten hops is the cap reqwest classically used, and callers \
+             rely on the default rather than setting it"
+        );
+        assert!(
+            policy.trusted_hosts.is_empty(),
+            "the allowlist is seeded per account from its own base host, \
+             so the default must start empty rather than trusting anything"
+        );
+    }
+
+    #[test]
+    fn token_max_age_leaves_a_margin_under_a_typical_one_hour_ttl() {
+        let spec = AccountSpec::new(None);
+        assert!(
+            spec.token_max_age < Duration::from_secs(60 * 60),
+            "an opaque token with no expiry hint must be refreshed before \
+             a typical one-hour TTL lapses, not exactly at it"
+        );
+    }
+
+    #[test]
+    fn a_bare_account_spec_carries_a_read_timeout() {
+        let spec = AccountSpec::new(None);
+        assert!(
+            spec.read_timeout.is_some(),
+            "the client-level read timeout moved per-account in the \
+             NetConfig split; if the default is None, a server that \
+             stalls mid-body blocks a caller with no total deadline \
+             forever"
+        );
     }
 
     #[test]
@@ -1141,6 +1363,7 @@ mod tests {
     }
 
     fn build_spec(host: &str) -> AccountSpec {
+        let token_source = Arc::new(StaticTokenSource::new("test-token", None));
         AccountSpec {
             hosts: vec![RateLimit {
                 host: host.to_string(),
@@ -1148,8 +1371,7 @@ mod tests {
                 cost_default: 1,
                 burst: 1,
             }],
-            token_source: Some(Arc::new(StaticTokenSource::new("test-token", None))),
-            default_retry: RetryPolicy::default(),
+            ..AccountSpec::new(Some(token_source))
         }
     }
 
@@ -1406,6 +1628,7 @@ mod tests {
     fn rejected_registration_cannot_unregister_a_later_valid_account() {
         let net = build_net();
         let id = AccountId("invalid-first".to_string());
+        let token_source = Arc::new(StaticTokenSource::new("test-token", None));
         let invalid = net.attach_account(
             id.clone(),
             AccountSpec {
@@ -1415,8 +1638,7 @@ mod tests {
                     cost_default: 1,
                     burst: 1,
                 }],
-                token_source: Some(Arc::new(StaticTokenSource::new("test-token", None))),
-                default_retry: RetryPolicy::default(),
+                ..AccountSpec::new(Some(token_source))
             },
         );
         let valid = net.attach_account(id, build_spec("shared.example"));

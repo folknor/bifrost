@@ -165,7 +165,7 @@ pub enum Error {
     Cancelled,
 
     /// A buffered response body exceeded
-    /// `NetConfig::max_buffered_response`.
+    /// `AccountSpec::max_buffered_response`.
     ///
     /// A contract violation rather than a transport failure: the server
     /// answered, and what it answered with is not something this client

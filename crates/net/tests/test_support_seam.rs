@@ -45,8 +45,8 @@ async fn extension_method_and_no_bearer_account_use_the_shared_pipeline() {
         AccountId("basic-dav".to_owned()),
         AccountSpec {
             hosts: Vec::new(),
-            token_source: None,
             default_retry: no_retry(),
+            ..AccountSpec::new(None)
         },
     );
     let method = Method::from_bytes(b"PROPFIND").unwrap();
@@ -82,8 +82,8 @@ async fn bearer_auth_without_a_token_source_fails_locally_and_sends_nothing() {
         AccountId("no-source".to_owned()),
         AccountSpec {
             hosts: Vec::new(),
-            token_source: None,
             default_retry: no_retry(),
+            ..AccountSpec::new(None)
         },
     );
 
@@ -167,6 +167,46 @@ async fn a_scripted_4xx_never_surfaces_as_a_response() {
         Error::Status { code, body, .. } => {
             assert_eq!(code, StatusCode::NOT_FOUND);
             assert_eq!(body, bytes::Bytes::from_static(br#"{"error":"gone"}"#));
+        }
+        other => panic!("expected Error::Status, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_terminal_status_whose_body_stalls_does_not_block_forever() {
+    // The client-level read timeout went away when `NetConfig` split
+    // into process-wide and per-account halves, so the terminal-status
+    // drains had to move onto the per-account one. A server that sends
+    // 4xx headers and then hangs mid-body is the shape that catches
+    // it, and google/graph accounts carry no total request deadline to
+    // rescue them. Draining with `bytes()` here never returns.
+    //
+    // The stall is infinite, so with the drain reverted to `bytes()`
+    // this test hangs and brokkr's per-test timeout reports it as a
+    // failure. Verified by ablation rather than assumed.
+    let script = ScriptedDispatch::new([Canned::StreamThenStall {
+        status: StatusCode::FORBIDDEN,
+        headers: HeaderMap::new(),
+        chunks: vec![bytes::Bytes::from_static(b"partial")],
+    }]);
+
+    let Err(error) = account(&script, no_retry())
+        .get("https://consumer.test/stalls")
+        .send()
+        .await
+    else {
+        panic!("4xx surfaces as Err, never as Ok(Response)");
+    };
+
+    match error {
+        Error::Status { code, body, .. } => {
+            assert_eq!(code, StatusCode::FORBIDDEN);
+            assert_eq!(
+                body,
+                bytes::Bytes::from_static(b"partial"),
+                "the bytes that did arrive before the stall are preserved \
+                 as error evidence rather than discarded"
+            );
         }
         other => panic!("expected Error::Status, got {other:?}"),
     }

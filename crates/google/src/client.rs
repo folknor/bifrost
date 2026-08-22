@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use bifrost_net::{
-    AccountId, AccountNet, AccountSpec, Net, RateLimit, RequestBuilder, Response, RetryPolicy,
+    AccountId, AccountNet, AccountSpec, Net, RateLimit, RequestBuilder, Response,
     StaticTokenSource, TokenSource,
 };
 use serde::Serialize;
@@ -308,8 +308,7 @@ fn default_account_net(
                     burst: PEOPLE_API_BURST,
                 },
             ],
-            token_source: Some(token_source),
-            default_retry: RetryPolicy::default(),
+            ..AccountSpec::new(Some(token_source))
         },
     )
 }

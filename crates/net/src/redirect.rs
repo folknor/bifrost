@@ -33,7 +33,7 @@ use reqwest::{
 
 use crate::error::{Error, MalformedRedirectKind};
 
-/// Top-level redirect policy. Stored on `NetConfig::follow_redirects`.
+/// Top-level redirect policy. Stored per account on `AccountSpec`.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub enum FollowRedirects {

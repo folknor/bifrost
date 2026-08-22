@@ -27,40 +27,33 @@ the line, and the two DAV blockers (`AccountNet::request(Method, &str)`, optiona
 `AccountSpec::token_source`). `Dispatch` stays private - assessed as correct. The FIFO change
 introduced and this round fixed a permanent-strand bug: a waiter woken by the final `unregister`
 could be recaptured by a bucket another account registered for the same host. Behaviour lives in
-`reference/net.md`. The two entries below remain unverified.
+`reference/net.md`. The two larger findings were left for the final round.
 
-## NetConfig conflates process-wide and per-account settings, destroying the sharing the crate exists for
+2026-08-22 (round 2, closing the document): `NetConfig` split into the
+process-wide half it always should have been (client pool, keepalive, TLS trust)
+and a per-account half on `AccountSpec` (timeouts, User-Agent, redirect policy,
+response ceiling, token max-age). JMAP now attaches to a shared `Net` instead of
+minting one per transport, so its accounts genuinely share one client, connection
+pool, governor and meter - which is what makes `reference/net.md`'s
+multi-account quota coordination claim true for JMAP rather than false. Redirects
+stay disabled in reqwest and are followed inside bifrost-net, which is the only
+way a shared client can carry a per-account trusted-host allowlist and the only
+place method rewriting and `Authorization` stripping exist. The 94-method
+`Account` trait was audited lane by lane and deliberately KEPT: a split is
+object-safe but adds impl and accessor churn without removing any dependency, and
+the grouping evidence is recorded in `reference/types.md` so the next person does
+not have to redo the audit.
 
-`Net` owns the reqwest client, the governor, and the meter, all genuinely process-wide. But
-`NetConfig` also carries `connect_timeout`, `user_agent`, `root_certs`,
-`dangerous_accept_invalid_certs`, `token_max_age`, and `follow_redirects` (whose `trusted_hosts`
-allowlist is inherently per-account: it is seeded from the account's own base host). The consequence
-is visible: `crates/jmap/src/transport_reqwest.rs` calls `Net::new(config)` per transport, i.e. per
-account, because it needs a per-account trusted-host allowlist and cert settings. Every JMAP account
-gets its own reqwest client, its own connection pool, its own empty governor, and its own meter. The
-"process-wide, multi-account quota coordination out of the box" story in `reference/net.md` is false
-for JMAP. Conversely google/graph use `Net::shared_default()` and therefore cannot configure TLS
-roots or timeouts at all.
-
-This wants a split: `NetConfig` keeps only what the shared client owns (pool, keepalive, TLS trust),
-and everything per-account (timeouts, UA, redirect policy, token max-age) moves onto
-`AccountSpec`/`AccountNet`. A breaking change worth taking pre-1.0; it is the single change that
-would make the crate deliver what it advertises.
-
-2026-08-07 amendment: the second sentence of the motivation above is wrong and should not drive
-the design. Consumers program against `Account` / `AccountFactory`; `bifrost-net` is an internal
-shared layer like `bifrost-sasl`, so google/graph being unable to configure TLS roots or timeouts
-is not a defect - it is the abstraction working. Where a per-deployment value is genuinely needed
-it belongs on the protocol crate's own config struct, which is already the pattern.
-
-The rest of the finding stands and is the reason to keep it: JMAP minting one `Net` per account
-means one reqwest client, connection pool, governor, and meter per account, which is a real
-resource and correctness problem and does make `reference/net.md`'s "multi-account quota
-coordination out of the box" false. The split is still the fix; the goal is sharing the client,
-not exposing configuration.
-
-## The 93-method Account trait
-
-Object-safe with default impls, so it does not force duplication mechanically, but every new lane on
-it is a workspace-wide edit. The hunter did not audit this deeply enough to propose a specific split;
-flagging it as the thing most likely to be the next structural cost.
+Three defects the split introduced, all found in review and fixed in the same
+commit. Two terminal-status drains still called `response.bytes()`, which had
+been safe only because of the client-level read timeout the split removed - a
+server sending 4xx headers and then stalling mid-body would have blocked forever,
+and google/graph accounts carry no total request deadline to rescue them; those
+drains also buffered an unbounded body before the cap applied. JMAP's
+`accept_invalid_certs` was accepted and discarded, so a self-signed deployment
+would have failed every HTTP request while its WebSocket succeeded, the option
+appearing to work and not; TLS trust now selects between two shared clients
+rather than being silently dropped, preserving sharing within each trust class.
+And the split deleted three tests that pinned `NetConfig` defaults which had
+merely MOVED to `AccountSpec`, leaving those defaults unpinned; they are
+re-pinned on their new home.

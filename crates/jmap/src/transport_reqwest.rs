@@ -3,8 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bifrost_net::{
-    AccountId, AccountNet, AccountSpec, FollowRedirects, Net, NetConfig, Priority, RateLimit,
-    RedirectPolicy, RetryPolicy,
+    AccountId, AccountNet, AccountSpec, FollowRedirects, Net, Priority, RedirectPolicy,
 };
 use bytes::Bytes;
 use reqwest::header;
@@ -34,24 +33,20 @@ impl ReqwestTransport {
         trusted_hosts: Arc<HashSet<String>>,
     ) -> Result<Self, TransportError> {
         let redirect_policy = redirect_policy_from_trusted_hosts(&trusted_hosts);
-        let config = NetConfig {
-            connect_timeout: timeout,
-            dangerous_accept_invalid_certs: accept_invalid_certs,
-            user_agent: concat!("bifrost-jmap/", env!("CARGO_PKG_VERSION")).to_string(),
-            follow_redirects: FollowRedirects::Enabled(redirect_policy),
-            ..NetConfig::default()
-        };
-        let net = Net::new(config)
-            .map_err(|e| TransportError::with_source("Failed to build HTTP transport", e))?;
         let token_source = authorization.account_token_source();
-        let net = net.attach_account(
-            account_id,
-            AccountSpec {
-                hosts: Vec::<RateLimit>::new(),
-                token_source: Some(token_source),
-                default_retry: RetryPolicy::default(),
-            },
-        );
+        let mut spec = AccountSpec::new(Some(token_source));
+        spec.request_timeout = Some(timeout);
+        spec.user_agent = concat!("bifrost-jmap/", env!("CARGO_PKG_VERSION")).to_string();
+        spec.follow_redirects = FollowRedirects::Enabled(redirect_policy);
+        // TLS trust lives on the reqwest client, so it selects WHICH
+        // shared client this account attaches to rather than being a
+        // per-account setting. Accounts opting into invalid
+        // certificates share one client among themselves; everything
+        // else shares the default. Discarding the flag here would
+        // leave a self-signed deployment failing every HTTP request
+        // while its WebSocket - which builds its own TLS connector -
+        // succeeded, so the option would appear to work and not.
+        let net = Net::shared_for_tls(accept_invalid_certs).attach_account(account_id, spec);
 
         Ok(Self {
             net,
@@ -289,4 +284,34 @@ fn redirect_policy_from_trusted_hosts(trusted_hosts: &HashSet<String>) -> Redire
         }
     }
     policy
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client::Credentials;
+
+    #[test]
+    fn independently_built_transports_share_the_process_net() {
+        let first = ReqwestTransport::new(
+            header::HeaderMap::new(),
+            Authorization::from_credentials_for_test(Credentials::basic("one", "secret")),
+            AccountId("first".to_owned()),
+            Duration::from_secs(30),
+            false,
+            Arc::new(HashSet::new()),
+        )
+        .expect("first transport builds");
+        let second = ReqwestTransport::new(
+            header::HeaderMap::new(),
+            Authorization::from_credentials_for_test(Credentials::basic("two", "secret")),
+            AccountId("second".to_owned()),
+            Duration::from_secs(30),
+            false,
+            Arc::new(HashSet::new()),
+        )
+        .expect("second transport builds");
+
+        assert!(first.net.shares_transport_with(&second.net));
+    }
 }

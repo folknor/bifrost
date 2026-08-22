@@ -244,31 +244,22 @@ impl RateLimitGovernor {
         let host = host.to_owned();
         let cost_f = f64::from(cost);
         Box::pin(async move {
-            // Up-front burst check. We re-read the bucket configuration
-            // under the lock so a config change between registration
-            // and acquisition is visible. The detection is done before
-            // the wait loop so a misconfigured cost cannot park
-            // anything.
-            {
-                let map = buckets.lock().expect("rate-governor lock poisoned");
-                if let Some(bucket) = map.get(&host)
-                    && cost_f > bucket.burst
-                {
-                    // `burst` originated as `RateLimit::burst: u32`
-                    // and is preserved exactly in `bucket.burst_max`,
-                    // so we round-trip through the integer field to
-                    // avoid `f64 -> u32` truncation lints.
-                    return Err(Error::CostExceedsBurst {
-                        cost,
-                        burst: bucket.burst_max,
-                    });
-                }
-            }
             let (ticket, waiter_notify) = {
                 let mut map = buckets.lock().expect("rate-governor lock poisoned");
                 let Some(bucket) = map.get_mut(&host) else {
                     return Ok(());
                 };
+                // Validate and enqueue under the same lock. Splitting
+                // these operations lets an unregister/register cycle
+                // replace the bucket with a smaller burst between the
+                // check and the enqueue, leaving an impossible head
+                // cost parked forever in the replacement generation.
+                if cost_f > bucket.burst {
+                    return Err(Error::CostExceedsBurst {
+                        cost,
+                        burst: bucket.burst_max,
+                    });
+                }
                 let ticket = Ticket {
                     generation: bucket.generation,
                     id: bucket.next_waiter_id,

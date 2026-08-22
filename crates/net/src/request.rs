@@ -281,7 +281,7 @@ impl RequestBuilder {
     /// Drive the request to completion with the configured retry
     /// budget, returning the buffered response.
     pub async fn send(self) -> Result<Response, Error> {
-        let limit = self.inner.account.net().config().max_buffered_response;
+        let limit = self.inner.account.max_buffered_response();
         let internal = send_streaming_inner(self).await?;
         // Drain the body into a single `Bytes`. The retry loop has
         // already validated status; everything from here is a
@@ -418,7 +418,7 @@ pub(crate) async fn send_streaming_inner(
         account,
         method,
         url,
-        headers,
+        mut headers,
         body,
         cost,
         retry,
@@ -437,7 +437,17 @@ pub(crate) async fn send_streaming_inner(
     }
 
     let policy = retry.unwrap_or_else(|| account.default_retry().clone());
-    let redirect_policy = account.net().config().follow_redirects.clone();
+    let redirect_policy = account.follow_redirects().clone();
+    let timeout = timeout.or_else(|| account.request_timeout());
+    if !headers.contains_key(reqwest::header::USER_AGENT) {
+        let value = reqwest::header::HeaderValue::from_str(account.user_agent()).map_err(|e| {
+            Error::InvalidRequest {
+                field: "user_agent",
+                detail: format!("invalid User-Agent header: {e}"),
+            }
+        })?;
+        headers.insert(reqwest::header::USER_AGENT, value);
+    }
     // Per-request method, URL, body, headers, host, cost. These
     // change across redirect hops: 301/302/303 rewrite to GET and
     // drop the body, 307/308 preserve, and a cross-host hop changes
@@ -536,7 +546,18 @@ pub(crate) async fn send_streaming_inner(
             timeout,
         );
 
-        let response = match account.net().dispatch().send(request).await {
+        let dispatched = account.net().dispatch().send(request);
+        let dispatched = if let Some(limit) = account.connect_timeout() {
+            match tokio::time::timeout(limit, dispatched).await {
+                Ok(result) => result,
+                Err(_) => Err(Error::Timeout {
+                    transmission_state: TransmissionState::InFlight,
+                }),
+            }
+        } else {
+            dispatched.await
+        };
+        let response = match dispatched {
             Ok(r) => {
                 if let Some(debit) = rate_debit.as_mut() {
                     debit.disarm();
@@ -573,7 +594,8 @@ pub(crate) async fn send_streaming_inner(
         // recovery does not eat into the network attempts left.
         if auth_for_next_hop && status == StatusCode::UNAUTHORIZED {
             if auth_retries >= MAX_AUTH_RETRIES {
-                let final_response = final_response_from_response(response).await;
+                let final_response =
+                    final_response_from_response(response, account.read_timeout()).await;
                 return Err(Error::AuthLost {
                     transmission_state: Some(TransmissionState::Acknowledged),
                     final_response: Some(final_response),
@@ -605,7 +627,7 @@ pub(crate) async fn send_streaming_inner(
         // surfaces (Graph's 304 on `$delta`) keep working.
         if status.is_success() {
             let headers_out = response.headers().clone();
-            let stream = into_byte_stream(response);
+            let stream = into_byte_stream(response, account.read_timeout());
             return Ok(InternalStreaming {
                 status,
                 headers: headers_out,
@@ -631,7 +653,7 @@ pub(crate) async fn send_streaming_inner(
                     // original implementation did. Caller code
                     // (conditional GET, 304 handling) reads the
                     // status + headers.
-                    let stream = into_byte_stream(response);
+                    let stream = into_byte_stream(response, account.read_timeout());
                     return Ok(InternalStreaming {
                         status,
                         headers: resp_headers,
@@ -728,10 +750,18 @@ pub(crate) async fn send_streaming_inner(
         // 4xx that the policy does not call retryable: terminal.
         if status.is_client_error() && !policy.statuses.contains(&status) {
             let headers_out = response.headers().clone();
-            let body_bytes = response.bytes().await.unwrap_or_default();
+            // Drain through the timeout-aware capped reader, not
+            // `bytes()`. There is no client-level read timeout any
+            // more (it moved per-account when `NetConfig` split), so
+            // a server that sends 4xx headers and then stalls
+            // mid-body would block here forever - and google/graph
+            // accounts carry no total request deadline to rescue it.
+            // The capped reader also bounds memory, where `bytes()`
+            // buffered the whole body before the cap was applied.
+            let body = read_capped_response_body(response, account.read_timeout()).await;
             return Err(Error::Status {
                 code: status,
-                body: crate::error::cap_status_body(body_bytes),
+                body,
                 headers: headers_out,
             });
         }
@@ -756,7 +786,8 @@ pub(crate) async fn send_streaming_inner(
                 if let Some(ra) = final_retry_after {
                     retry_after_history.push(ra);
                 }
-                let final_response = final_response_from_response(response).await;
+                let final_response =
+                    final_response_from_response(response, account.read_timeout()).await;
                 if status == StatusCode::TOO_MANY_REQUESTS {
                     let last = retry_after_history.last().copied();
                     return Err(Error::RateLimited {
@@ -798,12 +829,13 @@ pub(crate) async fn send_streaming_inner(
             continue;
         }
 
-        // Anything else: surface as Status, no retry.
+        // Anything else: surface as Status, no retry. Same reasoning
+        // as the terminal-4xx drain above.
         let headers_out = response.headers().clone();
-        let body_bytes = response.bytes().await.unwrap_or_default();
+        let body = read_capped_response_body(response, account.read_timeout()).await;
         return Err(Error::Status {
             code: status,
-            body: crate::error::cap_status_body(body_bytes),
+            body,
             headers: headers_out,
         });
     }
@@ -935,10 +967,13 @@ fn native_tls_error_in_source_chain(e: &reqwest::Error) -> bool {
     false
 }
 
-async fn final_response_from_response(response: reqwest::Response) -> FinalResponse {
+async fn final_response_from_response(
+    response: reqwest::Response,
+    read_timeout: Option<Duration>,
+) -> FinalResponse {
     let status = response.status();
     let headers = response.headers().clone();
-    let body = read_capped_response_body(response).await;
+    let body = read_capped_response_body(response, read_timeout).await;
     FinalResponse {
         status,
         headers,
@@ -946,12 +981,23 @@ async fn final_response_from_response(response: reqwest::Response) -> FinalRespo
     }
 }
 
-async fn read_capped_response_body(response: reqwest::Response) -> Bytes {
+async fn read_capped_response_body(
+    response: reqwest::Response,
+    read_timeout: Option<Duration>,
+) -> Bytes {
     use futures::StreamExt;
 
     let mut stream = response.bytes_stream();
     let mut buf = Vec::new();
-    while let Some(chunk) = stream.next().await {
+    loop {
+        let next = match read_timeout {
+            Some(limit) => match tokio::time::timeout(limit, stream.next()).await {
+                Ok(next) => next,
+                Err(_) => break,
+            },
+            None => stream.next().await,
+        };
+        let Some(chunk) = next else { break };
         let Ok(chunk) = chunk else {
             break;
         };
@@ -1324,11 +1370,12 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn a_buffered_body_past_the_ceiling_is_refused() {
         let script = ScriptedDispatch::new([canned(StatusCode::OK, &[b'x'; 4096])]);
-        let config = NetConfig {
-            max_buffered_response: Some(1024),
-            ..NetConfig::default()
-        };
-        let account = scripted_account(&script, config, Vec::new(), RetryPolicy::disabled());
+        let mut spec =
+            crate::AccountSpec::new(Some(Arc::new(StaticTokenSource::new("test", None))));
+        spec.max_buffered_response = Some(1024);
+        spec.default_retry = RetryPolicy::disabled();
+        let account = crate::test_support::scripted_net(&script, NetConfig::default())
+            .attach_account(crate::AccountId("buffer-limit".to_owned()), spec);
 
         let Err(error) = account.get("https://big.test/resource").send().await else {
             panic!("a 4 KiB body must not pass a 1 KiB ceiling");
@@ -1361,15 +1408,12 @@ mod tests {
             .expect("a small body is well under the default ceiling");
         assert_eq!(response.body, Bytes::from_static(b"small"));
 
-        let unbounded = scripted_account(
-            &script,
-            NetConfig {
-                max_buffered_response: None,
-                ..NetConfig::default()
-            },
-            Vec::new(),
-            RetryPolicy::disabled(),
-        );
+        let mut spec =
+            crate::AccountSpec::new(Some(Arc::new(StaticTokenSource::new("test", None))));
+        spec.max_buffered_response = None;
+        spec.default_retry = RetryPolicy::disabled();
+        let unbounded = crate::test_support::scripted_net(&script, NetConfig::default())
+            .attach_account(crate::AccountId("unbounded".to_owned()), spec);
         let response = unbounded
             .get("https://ok.test/resource")
             .send()
@@ -1381,11 +1425,8 @@ mod tests {
     /// The pipeline supplies no total deadline of its own - the only
     /// per-request timeout on the wire is one the caller asked for.
     ///
-    /// `NetConfig::read_timeout` is what bounds a stalled request, and
-    /// it is an inactivity bound precisely because it cannot be
-    /// overridden: consumers program against `Account` and never reach
-    /// the transport config, so a total deadline here would be able to
-    /// fail a slow-but-healthy large fetch with no recourse.
+    /// Account defaults and explicit builder timeouts are the only
+    /// request deadlines in this layer.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn the_only_request_deadline_is_one_the_caller_set() {
         let script = ScriptedDispatch::new([
@@ -1422,6 +1463,30 @@ mod tests {
             Some(Duration::from_secs(90)),
             "a caller-set timeout reaches the wire"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn account_connect_timeout_bounds_a_dispatch_that_never_answers() {
+        let script = ScriptedDispatch::new([Canned::Pending]);
+        let mut spec =
+            crate::AccountSpec::new(Some(Arc::new(StaticTokenSource::new("test", None))));
+        spec.connect_timeout = Some(Duration::from_secs(7));
+        spec.default_retry = RetryPolicy::disabled();
+        let account = crate::test_support::scripted_net(&script, NetConfig::default())
+            .attach_account(crate::AccountId("connect-timeout".to_owned()), spec);
+
+        let error = match account.get("https://pending.test/resource").send().await {
+            Err(error) => error,
+            Ok(_) => panic!("the account timeout must end a pending dispatch"),
+        };
+
+        assert!(matches!(
+            error,
+            Error::Timeout {
+                transmission_state: TransmissionState::InFlight
+            }
+        ));
+        assert_eq!(script.requests().len(), 1);
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -1539,9 +1604,12 @@ mod tests {
             )
         });
         let script = ScriptedDispatch::new(steps);
-        let config = NetConfig::default()
-            .follow_redirects(FollowRedirects::Enabled(RedirectPolicy::with_hops(255)));
-        let account = scripted_account(&script, config, Vec::new(), RetryPolicy::disabled());
+        let mut spec =
+            crate::AccountSpec::new(Some(Arc::new(StaticTokenSource::new("test", None))));
+        spec.follow_redirects = FollowRedirects::Enabled(RedirectPolicy::with_hops(255));
+        spec.default_retry = RetryPolicy::disabled();
+        let account = crate::test_support::scripted_net(&script, NetConfig::default())
+            .attach_account(crate::AccountId("redirect-limit".to_owned()), spec);
 
         let error = match account
             .get("https://redirect.test/start")
