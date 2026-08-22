@@ -28,12 +28,22 @@ pub(crate) fn set_flags<T: HttpTransport>(
     _key: IdempotencyKey,
 ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
     match &op {
-        FlagOp::Add(flags) | FlagOp::Remove(flags) if flags.is_empty() => {
-            skipped_flag_stream(targets, limits)
-        }
-        FlagOp::Patch { add, remove } if add.is_empty() && remove.is_empty() => {
-            skipped_flag_stream(targets, limits)
-        }
+        FlagOp::Add(flags) | FlagOp::Remove(flags) if flags.is_empty() => mutation_stream(
+            mail,
+            foreign_mail,
+            limits,
+            email_states,
+            targets,
+            MutationKind::SkipFlags,
+        ),
+        FlagOp::Patch { add, remove } if add.is_empty() && remove.is_empty() => mutation_stream(
+            mail,
+            foreign_mail,
+            limits,
+            email_states,
+            targets,
+            MutationKind::SkipFlags,
+        ),
         FlagOp::Add(_) | FlagOp::Remove(_) | FlagOp::Set(_) | FlagOp::Patch { .. } => {
             mutation_stream(
                 mail,
@@ -52,44 +62,6 @@ pub(crate) fn set_flags<T: HttpTransport>(
             );
         }),
     }
-}
-
-/// An empty additive/subtractive flag operation is an intentional local
-/// no-op. Preserve one outcome per target, but never send `{}` patches that a
-/// server would acknowledge as if a mutation had been applied.
-fn skipped_flag_stream(
-    mut targets: AccountStream<ObjectId>,
-    limits: CoreLimits,
-) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
-    Box::pin(async_stream::stream! {
-        let batch_size = limits.max_objects_in_set.clamp(1, 500);
-        let mut items = Vec::with_capacity(batch_size);
-        while let Some(id) = targets.next().await {
-            items.push(ItemOutcome::Succeeded(BatchSuccess::new(
-                BatchItemId(id.0),
-                MutationSuccess::Skipped,
-            )));
-            if items.len() >= batch_size {
-                yield SyncEvent::Batch(Batch {
-                    items: std::mem::take(&mut items),
-                    page_boundary: PageBoundary::Page,
-                    server_latency: std::time::Duration::ZERO,
-                    bytes_in: 0,
-                    checkpoint: None,
-                });
-            }
-        }
-        if !items.is_empty() {
-            yield SyncEvent::Batch(Batch {
-                items,
-                page_boundary: PageBoundary::Page,
-                server_latency: std::time::Duration::ZERO,
-                bytes_in: 0,
-                checkpoint: None,
-            });
-        }
-        yield SyncEvent::Done(None);
-    })
 }
 
 pub(crate) fn move_to<T: HttpTransport>(
@@ -135,6 +107,9 @@ pub(crate) fn destroy<T: HttpTransport>(
 }
 
 enum MutationKind {
+    /// Empty additive/subtractive flag operations are local no-ops, but use
+    /// the same routing, batching, tail flush, and Done path as wire mutations.
+    SkipFlags,
     Flags(FlagOp),
     Move(MailboxId),
     Destroy,
@@ -142,7 +117,7 @@ enum MutationKind {
 
 fn operation_for_kind(kind: &MutationKind) -> AccountOperation {
     match kind {
-        MutationKind::Flags(_) => AccountOperation::UpdateFlags,
+        MutationKind::SkipFlags | MutationKind::Flags(_) => AccountOperation::UpdateFlags,
         MutationKind::Move(_) => AccountOperation::BulkMove,
         MutationKind::Destroy => AccountOperation::BulkDestroy,
     }
@@ -420,6 +395,9 @@ async fn apply_batch<T: HttpTransport>(
         // state for it would spend a round trip to send nothing.
         return Ok(None);
     }
+    if matches!(kind, MutationKind::SkipFlags) {
+        return Ok(Some(skipped_batch(ids)));
+    }
     let mut state = current_or_probe_state(mail, email_states, account_id).await?;
 
     let mut response = match send_set(mail, &state, &ids, kind, foreign_account).await {
@@ -465,6 +443,7 @@ async fn apply_batch<T: HttpTransport>(
             MutationKind::Flags(_) | MutationKind::Move(_) => {
                 response.updated(&email_id).map(|_| ())
             }
+            MutationKind::SkipFlags => unreachable!("skip batches never reach Email/set"),
         };
         results.push(classify_set_response(raw, id, operation));
     }
@@ -476,6 +455,24 @@ async fn apply_batch<T: HttpTransport>(
         bytes_in: 0,
         checkpoint: None,
     }))
+}
+
+fn skipped_batch(ids: Vec<ObjectId>) -> Batch<ItemOutcome<MutationSuccess>> {
+    Batch {
+        items: ids
+            .into_iter()
+            .map(|id| {
+                ItemOutcome::Succeeded(BatchSuccess::new(
+                    BatchItemId(id.0),
+                    MutationSuccess::Skipped,
+                ))
+            })
+            .collect(),
+        page_boundary: PageBoundary::Page,
+        server_latency: std::time::Duration::ZERO,
+        bytes_in: 0,
+        checkpoint: None,
+    }
 }
 
 /// Turn the answer for one submitted `Email/set` id into exactly one
@@ -575,6 +572,7 @@ async fn send_set<T: HttpTransport>(
     let mut set = EmailSet::new().if_in_state(state.to_string());
 
     match kind {
+        MutationKind::SkipFlags => unreachable!("skip batches never reach Email/set"),
         MutationKind::Destroy => {
             set = set.destroy(
                 ids.iter()
@@ -685,6 +683,7 @@ mod tests {
     fn set_body(kind: &MutationKind, ids: &[&str], state: &str) -> serde_json::Value {
         let mut set = EmailSet::new().if_in_state(state.to_string());
         match kind {
+            MutationKind::SkipFlags => unreachable!("skip batches do not build Email/set"),
             MutationKind::Destroy => {
                 set = set.destroy(ids.iter().map(|id| EmailId::new(*id)));
             }
@@ -788,31 +787,16 @@ mod tests {
 
     #[tokio::test]
     async fn an_empty_flag_op_short_circuits_to_skipped_outcomes() {
-        let targets: AccountStream<ObjectId> = Box::pin(futures::stream::iter([
-            ObjectId("m1".into()),
-            ObjectId("m2".into()),
-        ]));
-        let mut stream = skipped_flag_stream(
-            targets,
-            CoreLimits {
-                max_objects_in_get: 1,
-                max_objects_in_set: 1,
-            },
-        );
+        let batch = skipped_batch(vec![ObjectId("m1".into()), ObjectId("m2".into())]);
 
-        for expected in ["m1", "m2"] {
-            match stream.next().await {
-                Some(SyncEvent::Batch(batch)) => match &batch.items[..] {
-                    [ItemOutcome::Succeeded(success)] => {
-                        assert_eq!(success.item.0, expected);
-                        assert_eq!(success.output, MutationSuccess::Skipped);
-                    }
-                    other => panic!("expected one skipped outcome, got {other:?}"),
-                },
-                other => panic!("expected skipped batch, got {other:?}"),
-            }
+        assert_eq!(batch.items.len(), 2);
+        for (outcome, expected) in batch.items.iter().zip(["m1", "m2"]) {
+            let ItemOutcome::Succeeded(success) = outcome else {
+                panic!("expected skipped success, got {outcome:?}");
+            };
+            assert_eq!(success.item.0, expected);
+            assert_eq!(success.output, MutationSuccess::Skipped);
         }
-        assert!(matches!(stream.next().await, Some(SyncEvent::Done(None))));
     }
 
     #[test]

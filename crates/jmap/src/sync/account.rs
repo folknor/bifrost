@@ -68,6 +68,10 @@ pub(crate) struct JmapAccount {
     /// single `Option<String>` would clobber one with the other.
     pub(crate) email_states: StateMap,
     pub(crate) mailbox_states: StateMap,
+    /// Private Mailbox/changes position for scope lifecycle polling. This is
+    /// deliberately separate from `mailbox_states`, whose consumers may
+    /// fast-forward it after a delta pass or local Mailbox/set.
+    pub(crate) lifecycle_mailbox_states: StateMap,
     pub(crate) mailbox_names: Arc<Mutex<HashMap<String, String>>>,
 }
 
@@ -93,6 +97,7 @@ impl JmapAccount {
         shutdown: CancellationToken,
         email_states: HashMap<String, Option<String>>,
         mailbox_states: HashMap<String, Option<String>>,
+        lifecycle_mailbox_states: HashMap<String, Option<String>>,
         mailbox_names: HashMap<String, String>,
     ) -> Self {
         Self {
@@ -118,6 +123,7 @@ impl JmapAccount {
             subscription_seq: AtomicU64::new(1),
             email_states: Arc::new(Mutex::new(email_states)),
             mailbox_states: Arc::new(Mutex::new(mailbox_states)),
+            lifecycle_mailbox_states: Arc::new(Mutex::new(lifecycle_mailbox_states)),
             mailbox_names: Arc::new(Mutex::new(mailbox_names)),
         }
     }
@@ -407,10 +413,11 @@ impl Account for JmapAccount {
         discover::scope_lifecycle(
             self.mail.clone(),
             self.core_limits,
-            Arc::clone(&self.mailbox_states),
+            Arc::clone(&self.lifecycle_mailbox_states),
             self.mail.id_str().to_string(),
             Arc::clone(&self.mailbox_names),
             self.shutdown.clone(),
+            self.client.clone(),
         )
     }
 

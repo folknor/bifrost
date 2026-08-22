@@ -7,6 +7,7 @@ use bifrost_types::{
     Account, AccountError, AccountFactory, AccountFuture, AccountId, CursorScope, ObjectType,
     OpenedAccount, SkippedScope,
 };
+use futures::stream::StreamExt;
 
 use tokio_util::sync::CancellationToken;
 
@@ -196,6 +197,8 @@ impl AccountFactory for JmapAccountFactory {
             let mut mailbox_states: HashMap<String, Option<String>> = HashMap::new();
             email_states.insert(primary_id.clone(), Some(email_state.clone()));
             mailbox_states.insert(primary_id.clone(), Some(mailbox_state.clone()));
+            let mut lifecycle_mailbox_states = HashMap::new();
+            lifecycle_mailbox_states.insert(primary_id.clone(), Some(mailbox_state.clone()));
 
             // Foreign (shared/delegate) accounts: the session lists every
             // non-personal mail account. For each, probe its two states
@@ -219,10 +222,35 @@ impl AccountFactory for JmapAccountFactory {
             let mut foreign_mail: HashMap<String, MailAccount> = HashMap::new();
             let mut foreign_submission = HashSet::new();
             let mut skipped_scopes: Vec<SkippedScope> = Vec::new();
-            for foreign_id in foreign_ids {
-                let foreign_account =
-                    MailAccount::new(client.clone(), JmapAccountId::new(&foreign_id));
-                match seed_foreign_account_or_skip(&foreign_id, &foreign_account).await {
+            // Probing the shares concurrently bounds open latency by the
+            // slowest share instead of their sum, but the concurrency has
+            // to be the server's number, not the share count: RFC 8620 s2
+            // advertises `maxConcurrentRequests`, and a client that
+            // exceeds it earns a request-level `limit` error - which here
+            // would arrive as a spurious skip of a perfectly healthy
+            // share. This is the only place in the crate that issues
+            // overlapping API requests, so the bound lives here.
+            let probe_concurrency = foreign_probe_concurrency(&session);
+            let foreign_results =
+                futures::stream::iter(foreign_ids.into_iter().map(|foreign_id| {
+                    let foreign_account =
+                        MailAccount::new(client.clone(), JmapAccountId::new(&foreign_id));
+                    async move {
+                        let result =
+                            seed_foreign_account_or_skip(&foreign_id, &foreign_account).await;
+                        (foreign_id, foreign_account, result)
+                    }
+                }))
+                .buffer_unordered(probe_concurrency)
+                .collect::<Vec<_>>()
+                .await;
+            // Completion order is arrival order; installation order must
+            // not be. Sorting by accountId keeps `foreign_mail`,
+            // `seed_states`, and `skipped_scopes` identical across runs.
+            let mut foreign_results = foreign_results;
+            foreign_results.sort_by(|a, b| a.0.cmp(&b.0));
+            for (foreign_id, foreign_account, result) in foreign_results {
+                match result {
                     Ok(seed) => {
                         apply_foreign_seed(
                             &foreign_id,
@@ -296,6 +324,7 @@ impl AccountFactory for JmapAccountFactory {
                 shutdown,
                 email_states,
                 mailbox_states,
+                lifecycle_mailbox_states,
                 mailbox_names,
             );
 
@@ -305,6 +334,25 @@ impl AccountFactory for JmapAccountFactory {
             })
         })
     }
+}
+
+/// How many foreign-account state probes may be in flight at once.
+///
+/// The server's advertised `maxConcurrentRequests` is the ceiling. A
+/// session that omits the core capability, or advertises zero, is treated
+/// as one: serial probing is slower but always legal, whereas guessing a
+/// number above the server's would turn healthy shares into skips. The
+/// upper clamp keeps a server advertising an absurd number from having
+/// `open` fan out that far.
+fn foreign_probe_concurrency(session: &crate::core::session::Session) -> usize {
+    const MAX_PROBE_CONCURRENCY: usize = 8;
+    session
+        .core_capabilities()
+        .map_or(
+            1,
+            crate::core::session::CoreCapabilities::max_concurrent_requests,
+        )
+        .clamp(1, MAX_PROBE_CONCURRENCY)
 }
 
 fn account_advertises_submission(session: &crate::core::session::Session, id: &str) -> bool {
@@ -1085,6 +1133,65 @@ mod tests {
         );
     }
 
+    /// Build a session whose only interesting property is the advertised
+    /// concurrency limit.
+    fn session_with_concurrency(max_concurrent_requests: Value) -> Session {
+        serde_json::from_value(json!({
+            "capabilities": {
+                "urn:ietf:params:jmap:core": {
+                    "maxSizeUpload": 1000,
+                    "maxConcurrentUpload": 2,
+                    "maxSizeRequest": 100_000,
+                    "maxConcurrentRequests": max_concurrent_requests,
+                    "maxCallsInRequest": 8,
+                    "maxObjectsInGet": 256,
+                    "maxObjectsInSet": 256,
+                    "collationAlgorithms": []
+                },
+                "urn:ietf:params:jmap:mail": {}
+            },
+            "accounts": {"primary": {"name": "Primary", "isPersonal": true, "isReadOnly": false, "accountCapabilities": {"urn:ietf:params:jmap:mail": {}}}},
+            "primaryAccounts": {"urn:ietf:params:jmap:mail": "primary"},
+            "username": "user@example.test",
+            "apiUrl": "https://example.test/jmap/api",
+            "downloadUrl": "https://example.test/download/{accountId}/{blobId}/{name}/{type}",
+            "uploadUrl": "https://example.test/upload/{accountId}",
+            "eventSourceUrl": "https://example.test/eventsource",
+            "state": "session-1"
+        }))
+        .expect("test session parses")
+    }
+
+    /// Foreign probing is the one place the crate puts overlapping API
+    /// requests on the wire, so it is the one place that has to honour
+    /// `maxConcurrentRequests` (RFC 8620 s2). Exceeding it does not
+    /// merely waste sockets: the server answers a request-level `limit`
+    /// error, which `seed_foreign_account_or_skip` would classify as a
+    /// probe failure and turn a healthy share into a skipped scope.
+    #[test]
+    fn foreign_probe_concurrency_never_exceeds_the_advertised_limit() {
+        assert_eq!(
+            foreign_probe_concurrency(&session_with_concurrency(json!(4))),
+            4,
+            "the server's own number is the ceiling"
+        );
+        assert_eq!(
+            foreign_probe_concurrency(&session_with_concurrency(json!(1))),
+            1,
+            "a strictly serial server must be probed serially"
+        );
+        assert_eq!(
+            foreign_probe_concurrency(&session_with_concurrency(json!(0))),
+            1,
+            "zero is not a usable buffer bound; serial is the safe reading"
+        );
+        assert_eq!(
+            foreign_probe_concurrency(&session_with_concurrency(json!(10_000))),
+            8,
+            "an absurd advertisement must not make open fan out that far"
+        );
+    }
+
     /// The routing guard's own bite: a reply armed for one account must
     /// panic when the request addresses another, because a positional
     /// answer to a misrouted request is exactly how a routing
@@ -1253,6 +1360,96 @@ mod tests {
             assert!(
                 query[1].get("filter").is_none(),
                 "the account-level scope walks the whole account, unfiltered: {query}"
+            );
+        }
+    }
+
+    /// An empty additive flag op is a local no-op, and it now rides the
+    /// shared `mutation_stream` rather than a private batching loop. Two
+    /// things have to stay true through that reuse, and neither is
+    /// visible from a unit test of the batch constructor: nothing may
+    /// reach the wire (an empty `{}` patch would have the server
+    /// acknowledge a mutation that never happened, and a state probe
+    /// would spend a round trip to send nothing), and every input target
+    /// must still leave on exactly one `Skipped` outcome even when the
+    /// targets route to different accounts. The script is armed EMPTY,
+    /// so any request at all fails the test by panicking at its ordinal.
+    #[tokio::test]
+    async fn an_empty_flag_op_reaches_no_wire_and_still_answers_every_target() {
+        for op in [
+            FlagOp::Add(HashSet::new()),
+            FlagOp::Remove(HashSet::new()),
+            FlagOp::Patch {
+                add: HashSet::new(),
+                remove: HashSet::new(),
+            },
+        ] {
+            let client = scripted_client([]);
+            let primary = client
+                .primary_account::<capability::Mail>()
+                .expect("primary mail account");
+            let shared = JmapMailAccount::new(client.clone(), JmapAccountId::new("shared"));
+            // Deliberately mixed routing: a bare primary id and a
+            // foreign-qualified one, which `mutation_stream` sends to
+            // two different owner routes.
+            let ids = [
+                ObjectId("M1".to_string()),
+                ObjectId(foreign::encode_object("shared", "M9")),
+                ObjectId("M2".to_string()),
+            ];
+            let targets = Box::pin(futures::stream::iter(ids.clone()));
+            let stream = crate::sync::mutation::set_flags(
+                primary,
+                Arc::new(HashMap::from([("shared".to_string(), shared)])),
+                // A batch bound of one forces the per-owner flush path
+                // rather than a single end-of-input drain.
+                super::capabilities::CoreLimits {
+                    max_objects_in_get: 1,
+                    max_objects_in_set: 1,
+                },
+                // Deliberately empty: a skip must not consult, probe, or
+                // populate the Email-state cache.
+                Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+                targets,
+                op.clone(),
+                idempotency_key(),
+            );
+            let events: Vec<_> = stream.collect().await;
+
+            assert!(
+                client.transport().requests().is_empty(),
+                "{op:?}: an empty flag op must never touch the wire"
+            );
+            let mut answered = Vec::new();
+            let mut saw_done = false;
+            for event in events {
+                match event {
+                    bifrost_types::SyncEvent::Batch(batch) => {
+                        for item in batch.items {
+                            match item {
+                                bifrost_types::ItemOutcome::Succeeded(success) => {
+                                    assert_eq!(
+                                        success.output,
+                                        bifrost_types::MutationSuccess::Skipped,
+                                        "{op:?}"
+                                    );
+                                    answered.push(success.item.0);
+                                }
+                                other => panic!("{op:?}: expected a skip, got {other:?}"),
+                            }
+                        }
+                    }
+                    bifrost_types::SyncEvent::Done(None) => saw_done = true,
+                    other => panic!("{op:?}: unexpected event {other:?}"),
+                }
+            }
+            assert!(saw_done, "{op:?}: the stream must terminate with Done");
+            answered.sort();
+            let mut expected: Vec<String> = ids.iter().map(|id| id.0.clone()).collect();
+            expected.sort();
+            assert_eq!(
+                answered, expected,
+                "{op:?}: exactly one outcome per input target, ids unchanged"
             );
         }
     }

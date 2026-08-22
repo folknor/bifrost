@@ -25,6 +25,23 @@ fn missing_core_capability() -> AccountError {
     .expect("valid account error classification")
 }
 
+/// A method response named a different session state. Account construction
+/// derives routing, limits, and capabilities from the old session, so the
+/// only safe consumer action is to reopen against a freshly fetched session.
+pub(crate) fn session_state_changed() -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::SyncState(SyncStateErrorKind::CapabilityChanged),
+        Cause::State(StateCause::CapabilityChanged { delta: None }),
+    )
+    .protocol(Protocol::Jmap)
+    .operation(AccountOperation::ScopeLifecycle)
+    .text(DiagnosticText::support_only(
+        "JMAP response sessionState diverged from the open session",
+    ))
+    .try_build()
+    .expect("valid account error classification")
+}
+
 /// Server advertises the core capability but with one or more
 /// zero-valued limits (`maxCallsInRequest`, `maxObjectsInGet`,
 /// `maxObjectsInSet`, `maxSizeRequest`). That is a `Protocol(ContractViolation)`:

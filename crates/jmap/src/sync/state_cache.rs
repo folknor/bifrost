@@ -35,9 +35,9 @@ pub(crate) async fn set(map: &StateMap, account_id: &str, state: String) {
 }
 
 /// Advance the cached state for an account to `state`, but only when the
-/// current value matches `expected` (last-writer-wins guard against a
-/// concurrent advance racing ahead). A `None` expected, or a currently
-/// absent/empty entry, always takes the new state.
+/// current value exactly matches `expected` (last-writer-wins guard against
+/// a concurrent advance racing ahead). `None` matches only an absent or
+/// explicitly empty entry.
 pub(crate) async fn advance(
     map: &StateMap,
     account_id: &str,
@@ -45,10 +45,11 @@ pub(crate) async fn advance(
     state: String,
 ) {
     let mut guard = map.lock().await;
-    let entry = guard.entry(account_id.to_string()).or_insert(None);
-    match (entry.as_deref(), expected) {
-        (Some(current), Some(expected)) if current != expected => {}
-        _ => *entry = Some(state),
+    match guard.get(account_id).and_then(|entry| entry.as_deref()) {
+        current if current == expected => {
+            guard.insert(account_id.to_string(), Some(state));
+        }
+        _ => {}
     }
 }
 
@@ -88,9 +89,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn advance_on_absent_entry_takes_value() {
+    async fn advance_with_expected_state_does_not_initialize_absent_entry() {
         let m = map();
         advance(&m, "acct-a", Some("ignored"), "s1".to_string()).await;
+        assert_eq!(get(&m, "acct-a").await, None);
+    }
+
+    #[tokio::test]
+    async fn advance_without_expected_state_initializes_absent_entry() {
+        let m = map();
+        advance(&m, "acct-a", None, "s1".to_string()).await;
         assert_eq!(get(&m, "acct-a").await, Some("s1".to_string()));
     }
 }

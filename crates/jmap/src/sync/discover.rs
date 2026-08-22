@@ -129,10 +129,18 @@ pub(crate) fn scope_lifecycle<T: HttpTransport>(
     account_id: String,
     mailbox_names: Arc<Mutex<HashMap<String, String>>>,
     shutdown: CancellationToken,
+    client: crate::client::Client<T>,
 ) -> AccountStream<ScopeLifecycleEvent> {
     Box::pin(async_stream::stream! {
         loop {
             if shutdown.is_cancelled() {
+                break;
+            }
+
+            if !client.is_session_updated() {
+                yield ScopeLifecycleEvent::Terminated(
+                    super::capabilities::session_state_changed(),
+                );
                 break;
             }
 
@@ -306,4 +314,258 @@ async fn replace_mailbox_name(
 async fn remove_mailbox_name(names: &Arc<Mutex<HashMap<String, String>>>, id: &str) {
     let mut guard = names.lock().await;
     guard.remove(id);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+    use std::sync::Mutex as StdMutex;
+
+    use bifrost_types::{AccountErrorKind, EngineDirective, RecoveryClass, SyncStateErrorKind};
+    use futures::StreamExt;
+
+    use super::*;
+    use crate::core::transport::TransportError;
+
+    /// A JMAP HTTP boundary answering a fixed script of response bodies.
+    /// Requests are recorded; an unscripted request is an error rather
+    /// than a plausible answer, so a loop that polls more than the test
+    /// planned for cannot pass quietly.
+    struct ScriptTransport {
+        replies: StdMutex<VecDeque<String>>,
+        requests: StdMutex<Vec<serde_json::Value>>,
+    }
+
+    impl ScriptTransport {
+        fn new(replies: impl IntoIterator<Item = String>) -> Self {
+            Self {
+                replies: StdMutex::new(replies.into_iter().collect()),
+                requests: StdMutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl HttpTransport for ScriptTransport {
+        async fn api_request(
+            &self,
+            _url: &str,
+            body: Vec<u8>,
+        ) -> Result<bytes::Bytes, TransportError> {
+            let request: serde_json::Value =
+                serde_json::from_slice(&body).expect("client emits JSON");
+            self.requests
+                .lock()
+                .expect("recorded requests")
+                .push(request);
+            // Exhaustion answers a TERMINAL JMAP error rather than a
+            // transport failure. The lifecycle loop retries transport
+            // hiccups forever by design, so a transport-shaped
+            // exhaustion would turn "the loop polled more than planned"
+            // into a hang instead of a failed assertion.
+            match self.replies.lock().expect("script").pop_front() {
+                Some(reply) => Ok(bytes::Bytes::from(reply)),
+                None => Ok(bytes::Bytes::from(
+                    serde_json::json!({
+                        "sessionState": "session-1",
+                        "methodResponses": [[
+                            "error",
+                            {"type": "invalidArguments", "description": "script exhausted"},
+                            "s0"
+                        ]]
+                    })
+                    .to_string(),
+                )),
+            }
+        }
+
+        async fn upload(
+            &self,
+            _url: &str,
+            _body: Vec<u8>,
+            _content_type: Option<&str>,
+        ) -> Result<bytes::Bytes, TransportError> {
+            Err(TransportError::new("no upload reply"))
+        }
+
+        async fn download(&self, _url: &str) -> Result<bytes::Bytes, TransportError> {
+            Err(TransportError::new("no download reply"))
+        }
+
+        async fn get_session(&self, _url: &str) -> Result<bytes::Bytes, TransportError> {
+            Err(TransportError::new("no session reply"))
+        }
+    }
+
+    fn test_session() -> crate::core::session::Session {
+        serde_json::from_value(serde_json::json!({
+            "capabilities": {
+                "urn:ietf:params:jmap:core": {
+                    "maxSizeUpload": 1000,
+                    "maxConcurrentUpload": 2,
+                    "maxSizeRequest": 100_000,
+                    "maxConcurrentRequests": 4,
+                    "maxCallsInRequest": 8,
+                    "maxObjectsInGet": 256,
+                    "maxObjectsInSet": 256,
+                    "collationAlgorithms": []
+                },
+                "urn:ietf:params:jmap:mail": {}
+            },
+            "accounts": {"primary": {"name": "Primary", "isPersonal": true, "isReadOnly": false, "accountCapabilities": {"urn:ietf:params:jmap:mail": {}}}},
+            "primaryAccounts": {"urn:ietf:params:jmap:mail": "primary"},
+            "username": "user@example.test",
+            "apiUrl": "https://example.test/jmap/api",
+            "downloadUrl": "https://example.test/download/{accountId}/{blobId}/{name}/{type}",
+            "uploadUrl": "https://example.test/upload/{accountId}",
+            "eventSourceUrl": "https://example.test/eventsource",
+            "state": "session-1"
+        }))
+        .expect("test session parses")
+    }
+
+    /// One `Mailbox/changes` answer, stamped with whatever
+    /// `sessionState` the test wants the server to claim.
+    fn mailbox_changes_reply(session_state: &str, created: &[&str]) -> String {
+        serde_json::json!({
+            "sessionState": session_state,
+            "methodResponses": [[
+                "Mailbox/changes",
+                {
+                    "accountId": "primary",
+                    "oldState": "mbx-1",
+                    "newState": "mbx-2",
+                    "hasMoreChanges": false,
+                    "created": created,
+                    "updated": [],
+                    "destroyed": []
+                },
+                "s0"
+            ]]
+        })
+        .to_string()
+    }
+
+    fn mailbox_get_reply(session_state: &str, id: &str, name: &str) -> String {
+        serde_json::json!({
+            "sessionState": session_state,
+            "methodResponses": [[
+                "Mailbox/get",
+                {
+                    "accountId": "primary",
+                    "state": "mbx-2",
+                    "list": [{"id": id, "name": name}],
+                    "notFound": []
+                },
+                "s0"
+            ]]
+        })
+        .to_string()
+    }
+
+    fn lifecycle_stream(
+        replies: impl IntoIterator<Item = String>,
+    ) -> (
+        AccountStream<ScopeLifecycleEvent>,
+        CancellationToken,
+        StateMap,
+    ) {
+        let client = crate::client::Client::with_transport(
+            ScriptTransport::new(replies),
+            test_session(),
+            "https://example.test/.well-known/jmap",
+        )
+        .expect("client builds");
+        let mail = crate::account::Account::new(client.clone(), "primary");
+        let states: StateMap = Arc::new(Mutex::new(HashMap::from([(
+            "primary".to_string(),
+            Some("mbx-1".to_string()),
+        )])));
+        let shutdown = CancellationToken::new();
+        let stream = scope_lifecycle(
+            mail,
+            CoreLimits {
+                max_objects_in_get: 256,
+                max_objects_in_set: 256,
+            },
+            Arc::clone(&states),
+            "primary".to_string(),
+            Arc::new(Mutex::new(HashMap::new())),
+            shutdown.clone(),
+            client,
+        );
+        (stream, shutdown, states)
+    }
+
+    /// The engine drives the scope-lifecycle stream for the whole life
+    /// of an account, which makes it the one always-running consumer
+    /// positioned to notice that the server has moved to a different
+    /// session. It is not enough for the client's staleness flag to
+    /// flip: `JmapAccount` froze its limits, capability set, primary and
+    /// foreign routing, and push topology from the OLD session document,
+    /// so the only correct consumer action is a full reopen. This pins
+    /// the whole path - divergence on the wire, through the detector,
+    /// into a classified `Terminated`, out as `RestartAccount`.
+    #[tokio::test(start_paused = true)]
+    async fn a_diverged_session_state_terminates_the_lifecycle_into_a_reopen() {
+        // The server answers the first poll while claiming a session
+        // the client has never read.
+        let (stream, _shutdown, _states) =
+            lifecycle_stream([mailbox_changes_reply("session-2", &[])]);
+        let events: Vec<_> = stream.collect().await;
+
+        match events.as_slice() {
+            [ScopeLifecycleEvent::Terminated(err)] => {
+                assert_eq!(
+                    err.kind(),
+                    &AccountErrorKind::SyncState(SyncStateErrorKind::CapabilityChanged),
+                    "divergence is a capability-shift class, not a transport error"
+                );
+                assert_eq!(
+                    err.recovery(),
+                    &RecoveryClass::Engine(EngineDirective::RestartAccount),
+                    "an in-place refresh cannot heal a frozen account; the engine must reopen"
+                );
+            }
+            other => panic!("expected a single terminal reopen directive, got {other:?}"),
+        }
+    }
+
+    /// The other half of the guard's bite: a server that keeps its
+    /// session must not have its lifecycle stream torn down. Without
+    /// this, a detector wired backwards - or one that fired on every
+    /// pass - would still satisfy the divergence test above while
+    /// making the account unusable.
+    #[tokio::test]
+    async fn a_matching_session_state_keeps_the_lifecycle_stream_running() {
+        let (mut stream, shutdown, states) = lifecycle_stream([
+            mailbox_changes_reply("session-1", &["mbx-new"]),
+            mailbox_get_reply("session-1", "mbx-new", "Archive"),
+        ]);
+
+        match stream.next().await {
+            Some(ScopeLifecycleEvent::Lifecycle(ScopeLifecycle::Created(
+                MembershipScope::Mailbox(id),
+            ))) => assert_eq!(id.0, "mbx-new"),
+            other => panic!("expected the created-mailbox lifecycle event, got {other:?}"),
+        }
+        // Cancelling before the next pull lets the loop run past its
+        // commit and out through the top-of-iteration check, rather than
+        // parking on the poll interval. That the stream ends here at all
+        // is the cancellation guarantee `close()` depends on.
+        shutdown.cancel();
+        assert!(
+            stream.next().await.is_none(),
+            "a cancelled token ends the loop instead of sleeping out the interval"
+        );
+        // The poller committed its OWN position, and only after every
+        // follow-up describing that response succeeded. Nothing else
+        // writes this map, which is the whole reason it is separate from
+        // the shared `mailbox_states` cache that a delta pass or a local
+        // `Mailbox/set` may fast-forward past unseen lifecycle events.
+        assert_eq!(
+            state_cache::get(&states, "primary").await,
+            Some("mbx-2".to_string()),
+            "the lifecycle poller advances the map it was handed"
+        );
+    }
 }

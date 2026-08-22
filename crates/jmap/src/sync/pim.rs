@@ -2119,7 +2119,7 @@ async fn search_email_ids<T: HttpTransport>(
 ) -> Result<Page<EmailId>, AccountError> {
     let position = decode_position(request.page_cursor.as_deref())?;
     let limit = request.limit.unwrap_or(50).max(1);
-    let query_request = build_search_query(request, collapse_threads, position, limit);
+    let query_request = build_search_query(request, collapse_threads, position, limit)?;
     let response = mail.call(query_request).await.map_err(to_acct_err(op))?;
     let total = response.total().and_then(|v| u64::try_from(v).ok());
     let ids = response.into_ids();
@@ -2155,17 +2155,17 @@ fn build_search_query(
     collapse_threads: bool,
     position: i32,
     limit: u32,
-) -> crate::email::EmailQuery {
+) -> Result<crate::email::EmailQuery, AccountError> {
     let mut query_request = crate::email::EmailQuery::new()
         .collapse_threads(collapse_threads)
         .sort([query::Comparator::new(crate::email::query::Comparator::ReceivedAt).descending()])
         .position(position)
         .limit(usize::try_from(limit).unwrap_or(usize::MAX))
         .calculate_total(true);
-    if let Some(filter) = build_search_filter(request.filter, request.provider_query) {
+    if let Some(filter) = build_search_filter(request.filter, request.provider_query)? {
         query_request = query_request.filter(filter);
     }
-    query_request
+    Ok(query_request)
 }
 
 fn decode_position(cursor: Option<&[u8]>) -> Result<i32, AccountError> {
@@ -2183,25 +2183,27 @@ fn decode_position(cursor: Option<&[u8]>) -> Result<i32, AccountError> {
 fn build_search_filter(
     filter: Option<SearchFilter>,
     provider_query: Option<String>,
-) -> Option<query::Filter<crate::email::query::Filter>> {
+) -> Result<Option<query::Filter<crate::email::query::Filter>>, AccountError> {
     let mut filters = Vec::new();
     if let Some(filter) = filter {
-        filters.push(search_filter_to_jmap(filter));
+        filters.push(search_filter_to_jmap(filter)?);
     }
     if let Some(provider_query) = provider_query
         && !provider_query.is_empty()
     {
         filters.push(crate::email::query::Filter::text(provider_query).into());
     }
-    match filters.len() {
+    Ok(match filters.len() {
         0 => None,
         1 => filters.pop(),
         _ => Some(query::Filter::and(filters)),
-    }
+    })
 }
 
-fn search_filter_to_jmap(filter: SearchFilter) -> query::Filter<crate::email::query::Filter> {
-    match filter {
+fn search_filter_to_jmap(
+    filter: SearchFilter,
+) -> Result<query::Filter<crate::email::query::Filter>, AccountError> {
+    Ok(match filter {
         SearchFilter::From(value) => crate::email::query::Filter::from(value).into(),
         SearchFilter::To(value) => query::Filter::or([
             crate::email::query::Filter::to(value.clone()),
@@ -2240,15 +2242,27 @@ fn search_filter_to_jmap(filter: SearchFilter) -> query::Filter<crate::email::qu
             }
             query::Filter::and(filters)
         }
-        SearchFilter::And(filters) => {
-            query::Filter::and(filters.into_iter().map(search_filter_to_jmap))
+        SearchFilter::And(filters) => query::Filter::and(
+            filters
+                .into_iter()
+                .map(search_filter_to_jmap)
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+        SearchFilter::Or(filters) => query::Filter::or(
+            filters
+                .into_iter()
+                .map(search_filter_to_jmap)
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+        SearchFilter::Not(filter) => query::Filter::not([search_filter_to_jmap(*filter)?]),
+        _ => {
+            return Err(super::error::unsupported_error(
+                AccountOperation::Search,
+                None,
+                "JMAP does not support this SearchFilter variant",
+            ));
         }
-        SearchFilter::Or(filters) => {
-            query::Filter::or(filters.into_iter().map(search_filter_to_jmap))
-        }
-        SearchFilter::Not(filter) => query::Filter::not([search_filter_to_jmap(*filter)]),
-        _ => query::Filter::and(Vec::<query::Filter<crate::email::query::Filter>>::new()),
-    }
+    })
 }
 
 async fn build_email_create_from_send<T: HttpTransport>(
@@ -3012,7 +3026,7 @@ mod tests {
     fn a_search_query_pins_its_sort_order() {
         let mut request = SearchRequest::default();
         request.limit = Some(10);
-        let query = build_search_query(request, true, 20, 10);
+        let query = build_search_query(request, true, 20, 10).expect("filter is supported");
         let value = serde_json::to_value(&query).expect("query serializes");
 
         assert_eq!(
