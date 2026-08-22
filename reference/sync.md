@@ -413,11 +413,15 @@ is whether positional resume is also possible:
 
 - **`OpenPages`** (JMAP Email): the orchestrator runs the persisted
   checkpoint through the pure `open_pages_resume` decision - completion
-  sentinel -> **skip entirely**; a short final `page:F:T`
-  (`items_done < T - F`) -> also skip (inventory ran out inside that window
-  even if no marker landed, e.g. the consumer never acked it); a full
-  `page:F:T` -> resume the walk at `T` rather than page 0; no checkpoint or
-  an unrecognised partition kind -> start fresh at 0.
+  sentinel -> **skip entirely**; any other `page:F:T` -> resume the walk
+  at `T` rather than page 0; no checkpoint or an unrecognised partition
+  kind -> start fresh at 0. A SHORT page (`items_done < T - F`) is
+  deliberately not read as exhaustion: a partition may emit fewer entries
+  than its window width while the scope still has results (ids deleted
+  between `Email/query` and `Email/get`, id-less objects dropped), so
+  only the completion marker proves exhaustion. Resuming at `T` after a
+  genuinely final short page costs one empty probe query, which then
+  lands the marker.
 - **`Fixed`** (`Full` / `TimeWindowed` / `UidRange`): the partition list is
   a known finite set with no positional "resume from here", so the signal
   is binary - the completion marker is present (`backfill_complete_recorded`

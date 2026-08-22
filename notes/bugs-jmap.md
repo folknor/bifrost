@@ -124,12 +124,6 @@ rather than left implied.
   `UNTIL`, `BYDAY`, `BYMONTH`, and `BYMONTHDAY`. Everything else now rejects
   loudly instead of producing a partial rule, but the mapping was not widened
   and `reference/jmap/DEFERRED.md` remains the place that tracks that.
-- The payload builder treats a failed RRULE conversion as "clear the
-  recurrence rules". That is only safe because `validate_shared_recurrence`
-  runs first on both the create and update paths with the same context. It is
-  a guard-by-call-order rather than a guard in the builder, and a future
-  caller that builds a patch without validating first would silently erase a
-  recurrence. Not fixed; the ordering is asserted by a test that names it.
 - `contacts.rs` outside postal addresses and titles (emails, phones, notes,
   media, name) was read but not driven to the same reject-unknown-vocabulary
   standard; those readers still skip values they cannot parse.

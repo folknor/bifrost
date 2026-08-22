@@ -3306,10 +3306,15 @@ fn backfill_complete_recorded(checkpoint: Option<&BackfillCheckpoint>) -> bool {
 ///
 /// - The completion sentinel means a prior run reached exhaustion and the
 ///   consumer acked it: skip entirely.
-/// - A short final `page:F:T` (`items_done < T - F`) means inventory ran
-///   out inside that window even though no completion marker landed (e.g.
-///   the consumer never acked it): still exhausted, so skip.
-/// - A full `page:F:T` means there may be more after it: resume at `T`.
+/// - Any other `page:F:T` resumes at `T`. A SHORT page (`items_done <
+///   T - F`) is deliberately NOT read as exhaustion: the partition
+///   contract is that zero entries means end-of-inventory, but a
+///   partition may legitimately emit fewer entries than its window width
+///   while the scope still has results - ids that vanished between
+///   listing and hydration, or objects dropped for arriving without an
+///   id. Only the completion marker proves exhaustion; a short page
+///   without one costs a single empty probe query on re-attach, whereas
+///   skipping on it would silently drop every message past the window.
 /// - No checkpoint, or an unrecognised partition kind, starts fresh at 0.
 ///
 /// Resume never skips a window the consumer has not durably persisted,
@@ -3321,13 +3326,8 @@ fn open_pages_resume(checkpoint: Option<&BackfillCheckpoint>) -> OpenPagesResume
     let Some(checkpoint) = checkpoint else {
         return OpenPagesResume::ResumeFrom(0);
     };
-    if let Some((from, to)) =
-        crate::backfill::partitioner::parse_page_partition(&checkpoint.partition)
+    if let Some((_, to)) = crate::backfill::partitioner::parse_page_partition(&checkpoint.partition)
     {
-        let width = u64::from(to.saturating_sub(from));
-        if checkpoint.progress.items_done < width {
-            return OpenPagesResume::Skip;
-        }
         return OpenPagesResume::ResumeFrom(to);
     }
     OpenPagesResume::ResumeFrom(0)
@@ -5390,16 +5390,24 @@ mod tests {
     }
 
     #[test]
-    fn open_pages_resume_short_final_page_skips() {
+    fn open_pages_resume_short_final_page_resumes_rather_than_skipping() {
         use super::{OpenPagesResume, open_pages_resume};
-        // A 256-of-500 page means inventory ran out inside the window.
+        // A 256-of-500 page is NOT proof the inventory ran out inside the
+        // window: a partition may emit fewer entries than its width while
+        // the scope still has results (ids deleted between listing and
+        // hydration, id-less objects dropped). Only the completion marker
+        // proves exhaustion. Skipping here would silently drop every
+        // message past the window on re-attach.
         let key =
             crate::backfill::partitioner::partition_key(&bifrost_types::InventoryPartition::Page {
                 from: 0,
                 to: 500,
             });
         let ck = checkpoint_on(key, 256);
-        assert_eq!(open_pages_resume(Some(&ck)), OpenPagesResume::Skip);
+        assert_eq!(
+            open_pages_resume(Some(&ck)),
+            OpenPagesResume::ResumeFrom(500)
+        );
     }
 
     #[test]

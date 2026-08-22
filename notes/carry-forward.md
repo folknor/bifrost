@@ -8,6 +8,99 @@ Keep this current as of the last close pass. It records invariants and couplings
 not history - when something here stops being true, change it rather than
 appending to it.
 
+## From the bifrost-jmap arc (closed 2026-08-22, `e866377..` five commits plus close pass)
+
+- **The email inventory walks are ONE loop, and its zero-entries contract is
+  load-bearing on both sides.** `inventory.rs::email_inventory_loop` is the
+  primary full walk, the foreign walk, and the bounded `Page` walk, chosen by
+  filter/owner/window parameters; the owner parameter is the only behavioral
+  difference (foreign error routing via `shared_scope_error`, foreign id and
+  membership qualification). The contract: a partition yields zero entries
+  ONLY when the scope has no results past `from` - the loop advances by ids
+  CONSUMED from `Email/query`, and a bounded window that fills without
+  emitting anything (ids deleted between query and get, id-less objects
+  dropped) keeps walking past the window until it emits or the query runs
+  dry. The engine side holds up the other half: `bifrost-sync`'s live
+  `OpenPages` walker stops only on `seen == 0`, and `open_pages_resume`
+  treats ONLY the completion marker as exhaustion - a short acked page
+  resumes at `to`, never skips. Do not reintroduce a short-page-means-done
+  inference on either side; the resume half of exactly that inference
+  survived one round and was removed by the close pass. The exhaustion
+  signal is still an inferred count, not a declared flag - `TODO.md` carries
+  that cross-crate writeup.
+- **Foreign probing at open is the crate's only overlapping-request site.**
+  `foreign_probe_concurrency` bounds the `buffer_unordered` by the server's
+  `maxConcurrentRequests` clamped `[1, 8]`, serial when the core capability
+  is unreadable; results sort by accountId before installation so topology
+  and skip ordering stay deterministic. A new call site that issues
+  concurrent requests must solve the same problem again (no bifrost-net
+  governor exists; `TODO.md`).
+- **The scope-lifecycle poller owns a private `lifecycle_mailbox_states`
+  map.** Nothing else may write it: the shared `mailbox_states` cache is
+  fast-forwarded by delta passes and local `Mailbox/set`, which silently eats
+  the poller's unread window. It is open-time process state, not a cursor -
+  it must not enter the cursor envelope. `state_cache::advance` is an exact
+  CAS: an expected state never initializes an absent or empty entry.
+- **`sessionState` divergence ends in a reopen, through the lifecycle
+  stream.** The always-driven lifecycle stream checks
+  `client.is_session_updated()` at the top of each poll and terminates with
+  `SyncState(CapabilityChanged)` -> `RestartAccount`. An in-place
+  `refresh_session` cannot heal a live account (limits, capabilities,
+  routing, push topology are frozen from the old session document); the poll
+  pacing is what bounds the reopen rate against a churning server.
+- **The push reader's health evidence is traffic, nothing else.**
+  `reset_backoff` requires a frame the peer actually served (a pong counts);
+  reaching the read loop is not evidence, because a push-enable rejection
+  arrives as an asynchronous `RequestError` on that stream - resetting on
+  loop entry is a 1 Hz handshake storm. The read loop pings after
+  `ReconnectPolicy::keepalive` of silence and drops the connection if the
+  pong misses `connect_timeout`. `WsState` retains the reader `JoinHandle`;
+  `close()` bounds both the push-disable write and the join by
+  `connect_timeout`, abandoning (not aborting) a reader that outlives it.
+  The reader talks through the `PushTransport` seam so all of this is
+  pinned in-process.
+- **Empty flag ops ride `mutation_stream` as `MutationKind::SkipFlags`.**
+  One batching engine: owner routing, batch bound, tail flush, `Done`. Do
+  not grow a second stream for a "simple" case; the last one missed owner
+  routing.
+- **The PIM mapping rejects what it cannot represent - ruled on, not open.**
+  Unknown attendee roles, participation statuses, address-component kinds
+  (including RFC-defined kinds the shared types cannot hold), non-simple
+  recurrence overrides, multiple or excluded recurrence rules, and RRULE
+  parts outside FREQ/INTERVAL/COUNT/UNTIL/BYDAY/BYMONTH/BYMONTHDAY all
+  return `Unsupported` instead of a plausible partial answer. The payload
+  builders reject a failed RRULE conversion THEMSELVES (never clear or omit
+  the recurrence), so the refusal does not depend on
+  `validate_shared_recurrence` call order. Widening the recurrence mapping
+  is tracked in `reference/jmap/DEFERRED.md`, not a bug.
+- **Calendar conversions read the current event when the patch cannot supply
+  context.** `event_patch_needs_current` gates one `CalendarEvent/get` in
+  `update`: UNTIL conversion and start/duration writes need the start
+  timezone and all-day flag, and an attendee patch needs the current owner
+  participants because JSCalendar keeps the organizer in the same
+  `participants` map a whole-list attendee write replaces
+  (`merge_owner_participants` carries owners over, updating a matching
+  attendee in place). Omitting `is_all_day` in a patch means "unchanged".
+  All-day starts are midnight `LocalDateTime` + `showWithoutTime` on the
+  wire (JSCalendar has no DATE type); the shared layer sees bare dates with
+  exclusive all-day ends.
+- **An object without a usable id is not an item, anywhere.** Email and
+  mailbox inventory, hydration, container discovery, and contact-card
+  reconciliation all drop the shape rather than minting `ObjectId("")` /
+  `ContactId("")`; the submitted id then travels the failed/partial lane
+  under the closed per-item accounting.
+- **Search pins `receivedAt desc`** (page cursors are integer positions into
+  the query order, and RFC 8621 gives an unsorted query no stable order),
+  and the `SearchFilter` non-exhaustive catch-all is `Unsupported(Search)`,
+  never an empty `AND`.
+- Accepted residuals, on the record: the audit was static (no live server);
+  `event_from_jmap` fails the whole page when one event is unrepresentable
+  (a `BatchOutcome` shaping question for bifrost-sync); the inventory
+  overshoot is unbounded in principle (ends at the first surviving message
+  in practice); contacts readers outside addresses/titles still skip
+  unparseable values. `notes/bugs-jmap.md` records these; do not re-open
+  them as findings without new evidence.
+
 ## From the bifrost-graph arc (closed 2026-08-22, `f0d7d99` and `b460cdb`)
 
 These are cross-crate. They bind every protocol crate, not just `bifrost-graph`.
@@ -239,8 +332,8 @@ bind the whole workspace.
   unreviewed. The close pass looks hardest there, and in both arcs that had a
   close pass it found real defects in exactly that half.
 
-- **Which arcs have had a close pass, and which have not.** `bugs-graph` and
-  `bugs-imap` were closed properly. `bugs-net-types` was NOT: both rounds ran,
+- **Which arcs have had a close pass, and which have not.** `bugs-graph`,
+  `bugs-imap`, and `bugs-jmap` were closed properly. `bugs-net-types` was NOT: both rounds ran,
   but the arc-level review never did. Anything later that leans on
   `bifrost-net` machinery from that arc should treat it as reviewed once, not
   twice. The gap is recorded in the document itself.

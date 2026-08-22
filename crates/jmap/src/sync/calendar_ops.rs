@@ -127,7 +127,10 @@ pub(crate) fn create<T: HttpTransport>(
         )?;
         validate_shared_attendees(&event.attendees, AccountOperation::EventCreate)?;
         let mut set = CalendarEventSet::new();
-        let create_id = set.create_item(jmap_create_from_event(&event));
+        let create_id = set.create_item(jmap_create_from_event(
+            &event,
+            AccountOperation::EventCreate,
+        )?);
         let mut response = calendars
             .call(set)
             .await
@@ -155,8 +158,12 @@ pub(crate) fn update<T: HttpTransport>(
         // event start nor its all-day flag, yet `UNTIL` conversion and the
         // start/duration write both need them. Read the current server state
         // for exactly the fields the patch leaves unset rather than defaulting
-        // to a timed, floating event and mangling the value.
-        let context = if event_patch_needs_context(&patch) {
+        // to a timed, floating event and mangling the value. An attendee patch
+        // needs the read too: JSCalendar `participants` holds the owner
+        // participant beside the attendees, so writing the attendee list as a
+        // whole-map replacement without carrying the owner over would silently
+        // delete the organizer from the event.
+        let context = if event_patch_needs_current(&patch) {
             let raw = get_raw_event(&calendars, id.clone(), AccountOperation::EventUpdate).await?;
             event_context_from_patch(&patch, Some(&raw))
         } else {
@@ -439,18 +446,28 @@ fn recurrence_from_jmap(
     })
 }
 
-fn jmap_create_from_event(event: &EventCreate) -> CalendarEventCreate {
+fn jmap_create_from_event(
+    event: &EventCreate,
+    operation: AccountOperation,
+) -> Result<CalendarEventCreate, AccountError> {
     let mut create = CalendarEventCreate::new(None);
-    write_event_create(&mut create, event);
-    create
+    write_event_create(&mut create, event, operation)?;
+    Ok(create)
 }
 
 /// The event start and all-day flag that JSCalendar conversion needs but an
-/// `EventPatch` is not required to carry.
+/// `EventPatch` is not required to carry, plus the owner participants an
+/// attendee patch must preserve.
 #[derive(Debug, Default, Clone)]
 struct EventContext {
     start: Option<EventTime>,
     is_all_day: bool,
+    /// The current event's owner-roled `participants` entries, keyed as the
+    /// server stores them. `EventPatch.attendees` describes only attendees,
+    /// but JSCalendar keeps the organizer in the same `participants` map, so
+    /// a whole-map attendee write must carry these over or it deletes the
+    /// organizer. Empty when the patch has no attendees or no read was made.
+    owner_participants: Map<String, Value>,
 }
 
 fn rrule_has_until(patch: &EventPatch) -> bool {
@@ -476,6 +493,14 @@ fn event_patch_needs_context(patch: &EventPatch) -> bool {
         || (patch.is_all_day.is_none() && (until || patch.start.is_some() || patch.end.is_some()))
 }
 
+/// Whether `update` must read the current event before building its patch:
+/// either the conversion context is missing (`event_patch_needs_context`),
+/// or the patch writes the attendee list, whose whole-map write must carry
+/// the current owner participants over.
+fn event_patch_needs_current(patch: &EventPatch) -> bool {
+    event_patch_needs_context(patch) || patch.attendees.is_some()
+}
+
 fn event_context_from_patch(
     patch: &EventPatch,
     current: Option<&JmapCalendarEvent>,
@@ -490,7 +515,24 @@ fn event_context_from_patch(
             timezone: event.time_zone().as_value().map(ToString::to_string),
         })
     });
-    EventContext { start, is_all_day }
+    let owner_participants = current
+        .and_then(JmapCalendarEvent::participants)
+        .into_iter()
+        .flat_map(Map::iter)
+        .filter(|(_, value)| {
+            value
+                .as_object()
+                .and_then(|object| object.get("roles"))
+                .and_then(Value::as_object)
+                .is_some_and(|roles| role_enabled(roles, "owner"))
+        })
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    EventContext {
+        start,
+        is_all_day,
+        owner_participants,
+    }
 }
 
 fn jmap_patch_from_event_patch(
@@ -565,15 +607,36 @@ fn jmap_patch_from_event_patch(
         out.set_property("privacy", json!(jmap_visibility(visibility)));
     }
     if let Some(attendees) = &patch.attendees {
-        out.participants(participants_from_attendees(attendees));
+        out.participants(merge_owner_participants(
+            &context.owner_participants,
+            attendees,
+        ));
     }
     if let Some(recurrence) = &patch.recurrence {
-        if let Some(rule) = recurrence.rrule.as_deref().and_then(|rrule| {
-            jmap_recurrence_rule_from_rrule(rrule, context.start.as_ref(), context.is_all_day)
-        }) {
-            out.recurrence_rules(vec![rule]);
-        } else {
-            out.set_property("recurrenceRules", Value::Null);
+        match recurrence.rrule.as_deref() {
+            // No rule in the shared recurrence means "no recurrence rule":
+            // clear whatever the server holds.
+            None => {
+                out.set_property("recurrenceRules", Value::Null);
+            }
+            // A rule that fails conversion is an error, never a clear. The
+            // callers validate first, but the builder must not depend on
+            // that call order: a future caller that skipped validation
+            // would otherwise silently erase the event's recurrence.
+            Some(rrule) => {
+                let rule = jmap_recurrence_rule_from_rrule(
+                    rrule,
+                    context.start.as_ref(),
+                    context.is_all_day,
+                )
+                .ok_or_else(|| {
+                    unsupported(
+                        operation,
+                        "JMAP shared recurrence contains RRULE fields unsupported by the JSCalendar mapper",
+                    )
+                })?;
+                out.recurrence_rules(vec![rule]);
+            }
         }
         let overrides = recurrence_overrides_from_shared(recurrence);
         if overrides.is_empty() {
@@ -583,6 +646,63 @@ fn jmap_patch_from_event_patch(
         }
     }
     Ok(out)
+}
+
+/// Merge a whole-list attendee write with the owner participants the
+/// current event holds.
+///
+/// JSCalendar keeps the organizer in the same `participants` map as the
+/// attendees, so replacing the map with only the new attendee entries
+/// would silently delete the organizer. The owner entries are carried
+/// over under their existing keys. An attendee whose email matches an
+/// owner participant updates that entry's name and participation status
+/// in place (its owner role is kept - the read path surfaces an owner as
+/// a `Chair` attendee, so a read-modify-write round trip stays stable);
+/// the rest get fresh keys that never collide with a kept one.
+fn merge_owner_participants(
+    owner_participants: &Map<String, Value>,
+    attendees: &[EventAttendee],
+) -> Map<String, Value> {
+    let mut participants = owner_participants.clone();
+    let mut next_key = 0_usize;
+    for attendee in attendees {
+        let owner_key = participants.iter().find_map(|(key, value)| {
+            let email = value.as_object()?.get("email")?.as_str()?;
+            email
+                .eq_ignore_ascii_case(&attendee.email)
+                .then(|| key.clone())
+        });
+        if let Some(owner_key) = owner_key {
+            if let Some(Value::Object(entry)) = participants.get_mut(&owner_key) {
+                match &attendee.name {
+                    Some(name) => {
+                        entry.insert("name".to_string(), json!(name));
+                    }
+                    None => {
+                        entry.remove("name");
+                    }
+                }
+                entry.insert(
+                    "participationStatus".to_string(),
+                    json!(rsvp_value(attendee.status)),
+                );
+            }
+            continue;
+        }
+        let mut key = format!("p{next_key}");
+        while participants.contains_key(&key) {
+            next_key += 1;
+            key = format!("p{next_key}");
+        }
+        next_key += 1;
+        let entry = participants_from_attendees(std::slice::from_ref(attendee))
+            .into_iter()
+            .next()
+            .map(|(_, value)| value)
+            .unwrap_or(Value::Null);
+        participants.insert(key, entry);
+    }
+    participants
 }
 
 fn jmap_rsvp_patch_from_participants(
@@ -646,7 +766,11 @@ fn rsvp_participant_id<'a>(
     }
 }
 
-fn write_event_create(target: &mut CalendarEventCreate, event: &EventCreate) {
+fn write_event_create(
+    target: &mut CalendarEventCreate,
+    event: &EventCreate,
+    operation: AccountOperation,
+) -> Result<(), AccountError> {
     target.set_property("@type", json!("Event"));
     target.calendar_ids([event.calendar_id.0.clone()]);
     if let Some(title) = &event.title {
@@ -669,15 +793,25 @@ fn write_event_create(target: &mut CalendarEventCreate, event: &EventCreate) {
     if !participants.is_empty() {
         target.participants(participants);
     }
-    if let Some(rule) = event.recurrence.rrule.as_deref().and_then(|rrule| {
-        jmap_recurrence_rule_from_rrule(rrule, Some(&event.start), event.is_all_day)
-    }) {
+    // A rule that fails conversion is an error, never a silent omission.
+    // `create` validates first, but the builder must not depend on that
+    // call order: a future caller that skipped validation would otherwise
+    // create the event with its recurrence quietly dropped.
+    if let Some(rrule) = event.recurrence.rrule.as_deref() {
+        let rule = jmap_recurrence_rule_from_rrule(rrule, Some(&event.start), event.is_all_day)
+            .ok_or_else(|| {
+                unsupported(
+                    operation,
+                    "JMAP shared recurrence contains RRULE fields unsupported by the JSCalendar mapper",
+                )
+            })?;
         target.recurrence_rules(vec![rule]);
     }
     let overrides = recurrence_overrides_from_shared(&event.recurrence);
     if !overrides.is_empty() {
         target.recurrence_overrides(overrides);
     }
+    Ok(())
 }
 
 fn recurrence_overrides_from_shared(recurrence: &EventRecurrence) -> Map<String, Value> {
@@ -1580,6 +1714,10 @@ mod tests {
         }
     }
 
+    fn create_payload(event: &EventCreate) -> CalendarEventCreate {
+        jmap_create_from_event(event, AccountOperation::EventCreate).expect("create payload")
+    }
+
     /// Builds the JMAP patch using only the context the `EventPatch` itself
     /// carries, which is what `update` does when it does not need to read the
     /// current event.
@@ -1751,7 +1889,7 @@ mod tests {
 
     #[test]
     fn create_payload_stamps_jscalendar_types() {
-        let create = jmap_create_from_event(&EventCreate {
+        let create = create_payload(&EventCreate {
             calendar_id: CalendarId("cal".to_string()),
             title: None,
             description: None,
@@ -2007,8 +2145,9 @@ mod tests {
         assert!(event_patch_needs_context(&recurrence_only));
         // Without that read the conversion cannot succeed, and the guard that
         // `update` runs first turns it into Unsupported. (The payload builder
-        // treats a failed conversion as "clear the rule", so this validation
-        // is what stops a recurrence patch from erasing the recurrence.)
+        // also rejects a failed conversion on its own, so this validation is
+        // an early door, not the only thing standing between a bad patch and
+        // an erased recurrence.)
         let error = validate_shared_recurrence(
             recurrence_only.recurrence.as_ref().expect("recurrence"),
             None,
@@ -2185,6 +2324,201 @@ mod tests {
         );
     }
 
+    /// The payload builders must reject a failed RRULE conversion on their
+    /// own, not clear or drop the recurrence. The callers validate first,
+    /// but an invariant that holds only by call order is not a guard: a
+    /// future caller that built a payload without validating would have
+    /// silently erased (patch) or omitted (create) the recurrence.
+    #[test]
+    fn payload_builders_reject_a_failed_rrule_conversion_instead_of_clearing() {
+        let bad_recurrence = EventRecurrence {
+            rrule: Some("FREQ=DAILY;BYHOUR=9".to_string()),
+            ..EventRecurrence::default()
+        };
+
+        let error = patch_with_patch_context(
+            &EventPatch {
+                recurrence: Some(bad_recurrence.clone()),
+                ..EventPatch::default()
+            },
+            AccountOperation::EventUpdate,
+        )
+        .expect_err("a failed conversion must not become a clear");
+        assert!(matches!(
+            error.kind(),
+            bifrost_types::AccountErrorKind::Unsupported(AccountOperation::EventUpdate)
+        ));
+
+        // An explicit no-rule recurrence still clears.
+        let clear = patch_with_patch_context(
+            &EventPatch {
+                recurrence: Some(EventRecurrence::default()),
+                ..EventPatch::default()
+            },
+            AccountOperation::EventUpdate,
+        )
+        .expect("clearing patch");
+        assert_eq!(clear.properties.get("recurrenceRules"), Some(&Value::Null));
+
+        let error = jmap_create_from_event(
+            &EventCreate {
+                calendar_id: CalendarId("cal".to_string()),
+                title: None,
+                description: None,
+                location: None,
+                start: time("2026-06-02T12:00:00Z"),
+                end: time("2026-06-02T13:00:00Z"),
+                is_all_day: false,
+                status: EventStatus::Confirmed,
+                availability: EventAvailability::Busy,
+                visibility: EventVisibility::Default,
+                organizer: None,
+                attendees: Vec::new(),
+                recurrence: bad_recurrence,
+            },
+            AccountOperation::EventCreate,
+        )
+        .expect_err("a failed conversion must not become an omission");
+        assert!(matches!(
+            error.kind(),
+            bifrost_types::AccountErrorKind::Unsupported(AccountOperation::EventCreate)
+        ));
+    }
+
+    /// JSCalendar keeps the organizer in the same `participants` map as the
+    /// attendees, so a whole-map attendee write must carry the owner entries
+    /// over or the patch silently deletes the organizer from the event.
+    /// Driven through the whole path `update` takes - the fetch decision,
+    /// the context extraction, and the patch builder - so an ablation of
+    /// any one stage fails it.
+    #[test]
+    fn an_attendee_patch_preserves_the_owner_participant() {
+        let current = JmapCalendarEvent {
+            properties: serde_json::from_value(json!({
+                "id": "e1",
+                "start": "2026-06-01T09:00:00",
+                "participants": {
+                    "owner": {
+                        "@type": "Participant",
+                        "email": "owner@example.test",
+                        "roles": {"owner": true}
+                    },
+                    "x1": {
+                        "@type": "Participant",
+                        "email": "old@example.test",
+                        "roles": {"attendee": true}
+                    }
+                }
+            }))
+            .expect("event"),
+        };
+        let patch = EventPatch {
+            attendees: Some(vec![EventAttendee {
+                email: "a@example.test".to_string(),
+                name: None,
+                role: AttendeeRole::Required,
+                status: RsvpStatus::NeedsAction,
+            }]),
+            ..EventPatch::default()
+        };
+        // An attendee-only patch needs no conversion context, but it still
+        // has to read the current event for the owner participants.
+        assert!(!event_patch_needs_context(&patch));
+        assert!(event_patch_needs_current(&patch));
+
+        let context = event_context_from_patch(&patch, Some(&current));
+        let built = jmap_patch_from_event_patch(&patch, &context, AccountOperation::EventUpdate)
+            .expect("patch");
+        let participants = built.properties["participants"]
+            .as_object()
+            .expect("participants map");
+
+        assert_eq!(
+            participants["owner"]["email"].as_str(),
+            Some("owner@example.test"),
+            "the owner participant survives an attendee write"
+        );
+        assert_eq!(
+            participants["owner"]["roles"]["owner"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(participants["p0"]["email"].as_str(), Some("a@example.test"));
+        assert_eq!(
+            participants.len(),
+            2,
+            "non-owner participants are replaced by the new attendee list"
+        );
+    }
+
+    /// The read path surfaces an owner as a `Chair` attendee, so a
+    /// read-modify-write of the attendee list includes the organizer's
+    /// email. That entry must update the kept owner participant in place -
+    /// keeping its owner role and key - rather than duplicating it or
+    /// demoting it to a plain chair.
+    #[test]
+    fn an_attendee_matching_the_owner_updates_it_in_place() {
+        let owners: Map<String, Value> = serde_json::from_value(json!({
+            "owner": {
+                "@type": "Participant",
+                "email": "owner@example.test",
+                "roles": {"owner": true},
+                "participationStatus": "needs-action"
+            }
+        }))
+        .expect("owners");
+
+        let merged = merge_owner_participants(
+            &owners,
+            &[EventAttendee {
+                email: "Owner@Example.Test".to_string(),
+                name: Some("The Owner".to_string()),
+                role: AttendeeRole::Chair,
+                status: RsvpStatus::Accepted,
+            }],
+        );
+
+        assert_eq!(merged.len(), 1, "no duplicate participant for the owner");
+        assert_eq!(merged["owner"]["roles"]["owner"].as_bool(), Some(true));
+        assert_eq!(
+            merged["owner"]["participationStatus"].as_str(),
+            Some("accepted")
+        );
+        assert_eq!(merged["owner"]["name"].as_str(), Some("The Owner"));
+    }
+
+    /// Fresh attendee keys must never collide with a kept owner key, even
+    /// when the server happened to store its owner participant under the
+    /// same `p{n}` shape the attendee writer mints.
+    #[test]
+    fn fresh_attendee_keys_skip_a_colliding_owner_key() {
+        let owners: Map<String, Value> = serde_json::from_value(json!({
+            "p0": {
+                "@type": "Participant",
+                "email": "owner@example.test",
+                "roles": {"owner": true}
+            }
+        }))
+        .expect("owners");
+
+        let merged = merge_owner_participants(
+            &owners,
+            &[EventAttendee {
+                email: "a@example.test".to_string(),
+                name: None,
+                role: AttendeeRole::Required,
+                status: RsvpStatus::NeedsAction,
+            }],
+        );
+
+        assert_eq!(merged.len(), 2);
+        assert_eq!(
+            merged["p0"]["email"].as_str(),
+            Some("owner@example.test"),
+            "the owner keeps its key"
+        );
+        assert_eq!(merged["p1"]["email"].as_str(), Some("a@example.test"));
+    }
+
     #[test]
     fn recurrence_validation_rejects_unsupported_rrule_parts() {
         let recurrence = EventRecurrence {
@@ -2351,7 +2685,7 @@ mod tests {
 
     #[test]
     fn create_payload_writes_organizer_as_owner_participant() {
-        let create = jmap_create_from_event(&EventCreate {
+        let create = create_payload(&EventCreate {
             calendar_id: CalendarId("cal".to_string()),
             title: None,
             description: None,
@@ -2467,7 +2801,7 @@ mod tests {
 
     #[test]
     fn create_payload_does_not_synthesize_uid() {
-        let create = jmap_create_from_event(&EventCreate {
+        let create = create_payload(&EventCreate {
             calendar_id: CalendarId("cal".to_string()),
             title: Some("Planning".to_string()),
             description: None,
@@ -2510,7 +2844,7 @@ mod tests {
 
     #[test]
     fn create_payload_writes_privacy() {
-        let create = jmap_create_from_event(&EventCreate {
+        let create = create_payload(&EventCreate {
             calendar_id: CalendarId("cal".to_string()),
             title: None,
             description: None,
@@ -2531,7 +2865,7 @@ mod tests {
 
     #[test]
     fn create_payload_writes_recurrence_rules_as_objects() {
-        let create = jmap_create_from_event(&EventCreate {
+        let create = create_payload(&EventCreate {
             calendar_id: CalendarId("cal".to_string()),
             title: None,
             description: None,

@@ -36,6 +36,12 @@ the engine already assumed. Overshooting re-reads positions the next partition
 also covers; inventory entries are idempotent, so duplication is the safe side
 of the trade. The engine comment that previously asserted an empty window was
 unambiguous has been corrected to state the requirement it actually relies on.
+The engine's resume path carried the same inference one layer up -
+`open_pages_resume` read a short acked page (`items_done < to - from`) as
+exhaustion and skipped the whole scope on re-attach, though a partition
+legitimately emits fewer entries than its width (deletion races, id-less
+objects dropped). It now resumes at `to` on any non-completion page; only the
+consumer-acked completion marker means exhausted.
 
 **What remains wrong.** The requirement is prose in a comment, not a type. JMAP
 is currently the only crate that implements `InventoryPartition::Page` - every

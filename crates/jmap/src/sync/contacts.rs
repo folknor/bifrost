@@ -295,9 +295,18 @@ fn reconcile_cards(
 
     let mut cards = Vec::with_capacity(list.len());
     for card in list {
-        if let Some(id) = card.id() {
-            answered.insert(id.into_string());
+        // An object the server returned without a usable id is not a card:
+        // `ContactId("")` is a handle to nothing, and the crate's other
+        // walks (inventory, hydration, container discovery) already refuse
+        // the shape. Dropping it leaves the submitted id unanswered, so it
+        // still reaches `failed_ids` below instead of vanishing.
+        let Some(id) = card.id().map(ContactCardId::into_string) else {
+            continue;
+        };
+        if id.is_empty() {
+            continue;
         }
+        answered.insert(id);
         cards.push(contact_from_jmap(card, operation)?);
     }
 
@@ -939,6 +948,27 @@ mod tests {
 
         assert_eq!(cards.len(), 1);
         assert_eq!(failed_ids, vec!["c0".to_string(), "c2".to_string()]);
+    }
+
+    /// A card the server returned without a usable id is not an item: it
+    /// must not surface as `ContactId("")`, and the requested id it fails
+    /// to answer lands on `failed_ids` rather than vanishing.
+    #[test]
+    fn an_id_less_card_is_dropped_and_its_request_rides_failed_ids() {
+        let id_less = JmapContactCard {
+            properties: serde_json::from_value(json!({ "name": {"full": "Nobody"} }))
+                .expect("object"),
+        };
+        let (cards, failed_ids) = reconcile_cards(
+            vec!["c0".to_string()],
+            &[],
+            vec![id_less],
+            AccountOperation::ContactsList,
+        )
+        .expect("supported cards");
+
+        assert!(cards.is_empty(), "no ContactId(\"\") row may be minted");
+        assert_eq!(failed_ids, vec!["c0".to_string()]);
     }
 
     #[test]
