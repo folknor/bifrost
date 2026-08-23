@@ -1856,6 +1856,149 @@ async fn aborted_reopen_preserves_preexisting_cursor_for_rediscovered_scope() {
     engine.detach(&account_id).await.expect("detach");
 }
 
+/// Store wrapper whose next `get_change_cursor` for one scripted scope
+/// fails once, then delegates. Models a transient store read failure at
+/// the worst point of a reattach: the read that decides whether a
+/// rediscovered scope's row is preexisting or freshly created.
+struct FlakyGetStore {
+    inner: Arc<InMemoryCheckpointStore>,
+    fail_get_for: Mutex<Option<CursorScope>>,
+}
+
+impl CheckpointStore for FlakyGetStore {
+    fn put_change_cursor<'a>(
+        &'a self,
+        account: &'a AccountId,
+        cursor: ChangeCursor,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send + 'a>> {
+        self.inner.put_change_cursor(account, cursor)
+    }
+
+    fn get_change_cursor<'a>(
+        &'a self,
+        account: &'a AccountId,
+        scope: &'a CursorScope,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Option<ChangeCursor>, Error>> + Send + 'a>>
+    {
+        {
+            let mut scripted = self.fail_get_for.lock().expect("flaky get lock");
+            if scripted.as_ref() == Some(scope) {
+                scripted.take();
+                return Box::pin(async {
+                    Err(Error::CheckpointStore("transient read failure".to_owned()))
+                });
+            }
+        }
+        self.inner.get_change_cursor(account, scope)
+    }
+
+    fn put_backfill<'a>(
+        &'a self,
+        account: &'a AccountId,
+        checkpoint: BackfillCheckpoint,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send + 'a>> {
+        self.inner.put_backfill(account, checkpoint)
+    }
+
+    fn get_backfill<'a>(
+        &'a self,
+        account: &'a AccountId,
+        scope: &'a CursorScope,
+    ) -> Pin<
+        Box<
+            dyn std::future::Future<Output = Result<Option<BackfillCheckpoint>, Error>> + Send + 'a,
+        >,
+    > {
+        self.inner.get_backfill(account, scope)
+    }
+
+    fn delete_change_cursor<'a>(
+        &'a self,
+        account: &'a AccountId,
+        scope: &'a CursorScope,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send + 'a>> {
+        self.inner.delete_change_cursor(account, scope)
+    }
+
+    fn delete_backfill<'a>(
+        &'a self,
+        account: &'a AccountId,
+        scope: &'a CursorScope,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send + 'a>> {
+        self.inner.delete_backfill(account, scope)
+    }
+}
+
+/// A transient store read failure while classifying a rediscovered
+/// scope's row must never demote that preexisting row to "freshly
+/// created": a scheme that swallows the error as "no row" hands the
+/// abort path a legitimately persisted prior-session cursor to delete.
+/// The reopen may fail - the read failed - but the row must survive.
+#[tokio::test]
+async fn transient_get_failure_cannot_demote_preexisting_cursor_to_created() {
+    let account_id = AccountId("flaky-get-rediscovered".to_owned());
+    let live_scope = CursorScope::Account;
+    let rediscovered = CursorScope::Type(bifrost_types::ObjectType::Email);
+    let factory = Arc::new(RotatingFactory {
+        scopes: Mutex::new(VecDeque::from([
+            vec![live_scope.clone()],
+            vec![live_scope.clone(), rediscovered.clone()],
+        ])),
+        established: Arc::new(Mutex::new(Vec::new())),
+        closed: Arc::new(AtomicUsize::new(0)),
+        closed_generations: Arc::new(Mutex::new(Vec::new())),
+        subscribed: Arc::new(Mutex::new(Vec::new())),
+        unsubscribed: Arc::new(Mutex::new(Vec::new())),
+        unsubscribe_failures: Arc::new(AtomicUsize::new(1)),
+        lifecycle_calls: Arc::new(Mutex::new(Vec::new())),
+        opens: AtomicUsize::new(0),
+    });
+    let inner = Arc::new(InMemoryCheckpointStore::new());
+    let store = Arc::new(FlakyGetStore {
+        inner: Arc::clone(&inner),
+        fail_get_for: Mutex::new(None),
+    });
+    let engine = SyncEngine::builder()
+        .checkpoints(Arc::clone(&store) as Arc<dyn CheckpointStore>)
+        .build()
+        .expect("default engine config is valid");
+    let factory_trait: Arc<dyn AccountFactory> = factory;
+
+    engine
+        .attach(account_id.clone(), factory_trait)
+        .await
+        .expect("attach");
+    engine
+        .subscribe_push(&account_id, std::slice::from_ref(&live_scope))
+        .await
+        .expect("subscribe");
+
+    let prior = cursor_for(&rediscovered, b"prior-session");
+    inner
+        .put_change_cursor(&account_id, prior.clone())
+        .await
+        .expect("seed prior-session cursor");
+    // Arm the transient failure only now, so it hits the reopen's
+    // classification read for the rediscovered scope and nothing else.
+    *store.fail_get_for.lock().expect("flaky get lock") = Some(rediscovered.clone());
+
+    assert!(
+        engine.reopen(&account_id).await.is_err(),
+        "a failed classification read must abort the swap"
+    );
+    let survived = inner
+        .get_change_cursor(&account_id, &rediscovered)
+        .await
+        .expect("rediscovered scope lookup")
+        .expect("a transient read failure must not cost a preexisting durable cursor");
+    assert_eq!(
+        survived.server_state.bytes, prior.server_state.bytes,
+        "the preexisting row must survive the failed reopen unchanged"
+    );
+
+    engine.detach(&account_id).await.expect("detach");
+}
+
 /// Store wrapper that records every change-cursor mutation and, on the
 /// first put, first writes a scripted "concurrent ack" row into the inner
 /// store - a deterministic stand-in for the old account's ack writer

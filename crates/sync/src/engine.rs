@@ -4061,7 +4061,7 @@ async fn re_establish_scope_with_backoff(ctx: &RecoveryContext<'_>, scope: Curso
         )
         .await
         {
-            Ok(()) => {
+            Ok(_) => {
                 if let Err(err) = link_discovered_memberships(acc, ctx.cursors).await {
                     tracing::warn!(
                         target: "bifrost.sync.changes",
@@ -4283,14 +4283,14 @@ async fn reattach_account(
             // A scope absent from the live registry may still have a durable
             // cursor - a prior session persisted it, this session's account
             // never discovered it, and the replacement discovers it again.
-            // `run_establish` resumes from that row without writing; it must
-            // never be counted as created here, or an aborted swap would
-            // delete a legitimately persisted cursor.
-            let had_durable_row = ctx
-                .store
-                .get_change_cursor(ctx.account_id, scope)
-                .await
-                .is_ok_and(|row| row.is_some());
+            // `run_establish` resumes from that row without writing, and
+            // reports the origin itself so a resumed row can never be
+            // counted as created here - an aborted swap would otherwise
+            // delete a legitimately persisted cursor. The origin comes from
+            // run_establish's own single store read, not a separate
+            // pre-check: a pre-check both races that read and, if it
+            // swallowed a store error as "no row", would misclassify a
+            // preexisting row as freshly created.
             match run_establish(
                 ctx.account_id,
                 next.as_ref(),
@@ -4303,10 +4303,9 @@ async fn reattach_account(
             )
             .await
             {
-                Ok(()) => {
-                    if !had_durable_row
-                        && let Some(cursor) = staged.snapshot(scope)
-                    {
+                Ok(EstablishOrigin::ResumedStored) => {}
+                Ok(EstablishOrigin::CreatedFresh) => {
+                    if let Some(cursor) = staged.snapshot(scope) {
                         newly_established.push(cursor);
                     }
                 }
@@ -4687,6 +4686,26 @@ fn broadcast_warning(
     let _ = changes_tx.send(me);
 }
 
+/// How `run_establish` obtained a scope's cursor. Reattach uses this to
+/// decide which durable rows an aborted swap may delete: only a cursor
+/// this establishment created fresh corresponds to a row the reattach
+/// itself will write, so only those may be compensated by deletion. The
+/// distinction is reported from inside `run_establish` - off the single
+/// store read it already performs - rather than probed by the caller
+/// beforehand, because a separate pre-check races that read (and a
+/// pre-check that swallowed a store error once misclassified a
+/// preexisting row as freshly created, which an abort then deleted).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EstablishOrigin {
+    /// A durable row already existed and was resumed from (directly, or
+    /// by finishing the inventory it recorded). The stored row is
+    /// preexisting data that no reattach abort may touch.
+    ResumedStored,
+    /// No durable row existed; whatever cursor the registry now holds
+    /// for the scope was created fresh by this establishment.
+    CreatedFresh,
+}
+
 /// Re-establish a single scope. Mirrors `SyncEngine::establish_one`
 /// but lives at file scope so the reopen listener task can call it
 /// without owning a reference to the engine.
@@ -4700,7 +4719,7 @@ async fn run_establish(
     changes_tx: broadcast::Sender<MultiplexerEvent>,
     control: Option<&SyncControl>,
     persist_ready: bool,
-) -> Result<(), Error> {
+) -> Result<EstablishOrigin, Error> {
     let _activity = match control {
         Some(control) => Some(control.begin_activity().ok_or(Error::Paused)?),
         None => None,
@@ -4723,14 +4742,16 @@ async fn run_establish(
                     .await?
                 {
                     crate::multiplexer::FusionOutcome::Established
-                    | crate::multiplexer::FusionOutcome::NoCursor => Ok(()),
+                    | crate::multiplexer::FusionOutcome::NoCursor => {
+                        Ok(EstablishOrigin::ResumedStored)
+                    }
                     crate::multiplexer::FusionOutcome::Terminated(error) => {
                         Err(Error::EstablishCursorTerminated(error))
                     }
                 };
             }
             cursors.put(existing);
-            return Ok(());
+            return Ok(EstablishOrigin::ResumedStored);
         }
         Ok(None) => {}
         // Unlike `establish_one`, this path runs with a live reopen
@@ -4755,7 +4776,7 @@ async fn run_establish(
                 store.put_change_cursor(account_id, cursor.clone()).await?;
             }
             cursors.put(cursor);
-            Ok(())
+            Ok(EstablishOrigin::CreatedFresh)
         }
         CursorEstablishment::EstablishViaInventory => {
             let fusion = crate::multiplexer::InventoryFusion {
@@ -4768,7 +4789,7 @@ async fn run_establish(
                 .await?
             {
                 crate::multiplexer::FusionOutcome::Established
-                | crate::multiplexer::FusionOutcome::NoCursor => Ok(()),
+                | crate::multiplexer::FusionOutcome::NoCursor => Ok(EstablishOrigin::CreatedFresh),
                 crate::multiplexer::FusionOutcome::Terminated(error) => {
                     Err(Error::EstablishCursorTerminated(error))
                 }

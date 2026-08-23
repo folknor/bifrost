@@ -555,6 +555,26 @@ notes.
   (published `MutationSuccess` variant) and the Calendar endpoint override (published
   `with_calendar_api_base` constructor). Both additive rather than removals.
 
+## From the bifrost-sync arc (closed 2026-08-23, `54290b2` plus close pass)
+
+- **Reattach's abort discipline: never write what an abort would have to restore.** Freshly
+  created cursors are staged in memory and persisted pre-teardown only when the scope had no
+  stored row; abort compensation is plain deletion of rows the reattach itself created;
+  vanished-scope rows are deleted only after the cutover commits, best-effort. A late ack
+  re-persisting a deleted row is a leak a later rediscovery validly resumes from, never loss.
+- **The close pass's find, same shape as the ledger's ten:** the committed code classified
+  "preexisting vs freshly created" with a separate pre-check `get` that swallowed store errors
+  (`.is_ok_and`), so a transient read failure demoted a preexisting prior-session row to
+  "created" and the abort path deleted it - the exact P1 the redesign existed to eliminate,
+  resurfacing through the error path of a duplicated read (plus a TOCTOU between the two
+  reads). Fixed by having `run_establish` report the origin off its own single store read
+  (`EstablishOrigin`); a store error now aborts the reattach before any durable write. Pinned
+  by `transient_get_failure_cannot_demote_preexisting_cursor_to_created`, ablation-verified
+  red against the pre-close-pass code. Lesson: a classification that feeds a destructive
+  compensation must come from the same read the action uses, and must fail closed on error.
+- A compare-and-swap primitive on `CheckpointStore` was considered and deliberately NOT taken
+  (published trait); it remains a possible owner-level proposal, not loop work.
+
 ## Standing lessons this project has paid for
 
 - **The loop does not get to delete public API. Ever. Ask the owner.** This is
@@ -622,8 +642,9 @@ notes.
 - **Which arcs have had a close pass.** `bugs-graph`, `bugs-imap`,
   `bugs-jmap`, `bugs-smtp-sasl`, `bugs-net-types` (close pass run
   2026-08-22, after its two rounds), `bugs-dav` (close pass `0796b29`,
-  2026-08-23, after four rounds), and `bugs-google` (close pass `d8eb9fe`,
-  2026-08-23, after three rounds) are all closed properly. The
+  2026-08-23, after four rounds), `bugs-google` (close pass `d8eb9fe`,
+  2026-08-23, after three rounds), and `bugs-sync` (close pass run
+  2026-08-23, after its single round `54290b2`) are all closed properly. The
   `bugs-net-types` close pass re-read the reconstructed `rate.rs` as new code
   and the un-cold-reviewed half of round 2, found no code defect, and fixed
   three doc-only drifts in `reference/net.md`; its residuals are recorded in
