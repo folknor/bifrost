@@ -277,17 +277,17 @@ pub(crate) fn parse_calendar_collections(xml: &str) -> Result<Vec<CalendarCollec
                     match (parent, name.as_str()) {
                         (Some("response"), "href") => current.href = trimmed(&text),
                         (Some("prop"), "displayname") => {
-                            current.propstat_display_name = trimmed(&text);
+                            current.staged.display_name = trimmed(&text);
                         }
                         (Some("prop"), "calendar-color") => {
-                            current.propstat_color =
+                            current.staged.color =
                                 trimmed(&text).map(|value| value.trim().to_string());
                         }
                         (Some("prop"), "sync-token") => {
-                            current.propstat_sync_token = trimmed(&text);
+                            current.staged.sync_token = trimmed(&text);
                         }
                         (Some("propstat"), "status") => {
-                            current.propstat_success = Some(status_line_is_success(&text));
+                            current.staged.success = Some(status_line_is_success(&text));
                         }
                         _ => {}
                     }
@@ -363,7 +363,7 @@ pub(crate) fn parse_propfind_events(xml: &str) -> Result<CalDavEventListing, Str
                         (Some("prop"), "getetag") => current.etag = normalize_etag(&text),
                         (Some("prop"), "getcontenttype") => current.content_type = trimmed(&text),
                         (Some("propstat"), "status") => {
-                            current.propstat_success = Some(status_line_is_success(&text));
+                            current.staged.success = Some(status_line_is_success(&text));
                         }
                         _ => {}
                     }
@@ -455,14 +455,14 @@ pub(crate) fn parse_multiget_report(xml: &str) -> Result<CalDavMultigetReport, S
                     match (parent, name.as_str()) {
                         (Some("response"), "href") => current.href = trimmed(&text),
                         (Some("prop"), "getetag") => {
-                            current.propstat_etag = normalize_etag(&text);
+                            current.staged.etag = normalize_etag(&text);
                         }
                         (Some("prop"), "calendar-data") => {
-                            current.propstat_calendar_data = trimmed(&text);
+                            current.staged.calendar_data = trimmed(&text);
                         }
                         (Some("propstat"), "status") => {
-                            current.propstat_status = trimmed(&text);
-                            current.propstat_success = Some(status_line_is_success(&text));
+                            current.staged.status = trimmed(&text);
+                            current.staged.success = Some(status_line_is_success(&text));
                         }
                         (Some("response"), "status") => current.status = trimmed(&text),
                         _ => {}
@@ -532,7 +532,7 @@ pub(crate) fn parse_sync_collection_report(xml: &str) -> Result<CalDavSyncReport
                         (Some("response"), "href") => current.href = trimmed(&text),
                         (Some("response"), "status") => current.status = trimmed(&text),
                         (Some("prop"), "getetag") => current.etag = normalize_etag(&text),
-                        (Some("propstat"), "status") => current.propstat_status = trimmed(&text),
+                        (Some("propstat"), "status") => current.staged.status = trimmed(&text),
                         _ => {}
                     }
                 } else if matches!(parent, Some("multistatus")) && name == "sync-token" {
@@ -720,60 +720,48 @@ fn local_name(raw: &[u8]) -> String {
 }
 
 #[derive(Default)]
+struct PropStat {
+    success: Option<bool>,
+    is_calendar: bool,
+    privilege_seen: bool,
+    write_seen: bool,
+    is_collection: bool,
+    display_name: Option<String>,
+    color: Option<String>,
+    sync_token: Option<String>,
+    status: Option<String>,
+    calendar_data: Option<String>,
+    etag: Option<String>,
+}
+
+#[derive(Default)]
 struct ResponseParts {
     in_response: bool,
     in_propstat: bool,
-    propstat_success: Option<bool>,
     has_success_propstat: bool,
     saw_failed_propstat: bool,
     is_calendar: bool,
-    propstat_is_calendar: bool,
     privilege_seen: bool,
-    propstat_privilege_seen: bool,
     write_seen: bool,
-    propstat_write_seen: bool,
     is_collection: bool,
-    propstat_is_collection: bool,
     href: Option<String>,
     etag: Option<String>,
     content_type: Option<String>,
     calendar_data: Option<String>,
     status: Option<String>,
     display_name: Option<String>,
-    propstat_display_name: Option<String>,
     color: Option<String>,
-    propstat_color: Option<String>,
     sync_token: Option<String>,
-    propstat_sync_token: Option<String>,
-    propstat_status: Option<String>,
-    /// Propstat-scoped `calendar-data` / `getetag`, promoted to the
-    /// response level by `commit_propstat` only when that propstat's
-    /// own status was 2xx. Multiget uses these instead of writing the
-    /// response-level fields directly, so a value can never be adopted
-    /// from a propstat the server refused, and a later unrelated
-    /// non-2xx propstat can never retract a value an earlier 2xx one
-    /// legitimately supplied.
-    propstat_calendar_data: Option<String>,
-    propstat_etag: Option<String>,
     /// Status codes of every non-2xx propstat in this response, in
     /// document order. Drives failure classification.
     failed_statuses: Vec<u16>,
+    staged: PropStat,
 }
 
 impl ResponseParts {
     fn begin_propstat(&mut self) {
         self.in_propstat = true;
-        self.propstat_success = None;
-        self.propstat_is_calendar = false;
-        self.propstat_is_collection = false;
-        self.propstat_privilege_seen = false;
-        self.propstat_write_seen = false;
-        self.propstat_display_name = None;
-        self.propstat_color = None;
-        self.propstat_sync_token = None;
-        self.propstat_status = None;
-        self.propstat_calendar_data = None;
-        self.propstat_etag = None;
+        self.staged = PropStat::default();
     }
 
     /// A `resourcetype` the server refused is not evidence about the
@@ -784,7 +772,7 @@ impl ResponseParts {
     /// the 404 prop skeleton) would be discarded as a collection.
     fn mark_collection(&mut self) {
         if self.in_propstat {
-            self.propstat_is_collection = true;
+            self.staged.is_collection = true;
         } else {
             self.is_collection = true;
         }
@@ -792,7 +780,7 @@ impl ResponseParts {
 
     fn mark_calendar(&mut self) {
         if self.in_propstat {
-            self.propstat_is_calendar = true;
+            self.staged.is_calendar = true;
         } else {
             self.is_calendar = true;
         }
@@ -800,7 +788,7 @@ impl ResponseParts {
 
     fn mark_privilege_seen(&mut self) {
         if self.in_propstat {
-            self.propstat_privilege_seen = true;
+            self.staged.privilege_seen = true;
         } else {
             self.privilege_seen = true;
         }
@@ -808,53 +796,43 @@ impl ResponseParts {
 
     fn mark_write_seen(&mut self) {
         if self.in_propstat {
-            self.propstat_write_seen = true;
+            self.staged.write_seen = true;
         } else {
             self.write_seen = true;
         }
     }
 
     fn commit_propstat(&mut self) {
-        if self.propstat_success == Some(false) {
+        let staged = std::mem::take(&mut self.staged);
+        self.in_propstat = false;
+        if staged.success == Some(false) {
             self.saw_failed_propstat = true;
-            if let Some(code) = self.propstat_status.as_deref().and_then(status_line_code) {
+            if let Some(code) = staged.status.as_deref().and_then(status_line_code) {
                 self.failed_statuses.push(code);
             }
         }
-        if self.propstat_success.unwrap_or(true) {
+        if staged.success.unwrap_or(true) {
             self.has_success_propstat = true;
-            self.is_calendar |= self.propstat_is_calendar;
-            self.is_collection |= self.propstat_is_collection;
-            self.privilege_seen |= self.propstat_privilege_seen;
-            self.write_seen |= self.propstat_write_seen;
-            if self.propstat_display_name.is_some() {
-                self.display_name = self.propstat_display_name.take();
+            self.is_calendar |= staged.is_calendar;
+            self.is_collection |= staged.is_collection;
+            self.privilege_seen |= staged.privilege_seen;
+            self.write_seen |= staged.write_seen;
+            if staged.display_name.is_some() {
+                self.display_name = staged.display_name;
             }
-            if self.propstat_color.is_some() {
-                self.color = self.propstat_color.take();
+            if staged.color.is_some() {
+                self.color = staged.color;
             }
-            if self.propstat_sync_token.is_some() {
-                self.sync_token = self.propstat_sync_token.take();
+            if staged.sync_token.is_some() {
+                self.sync_token = staged.sync_token;
             }
-            if self.propstat_calendar_data.is_some() {
-                self.calendar_data = self.propstat_calendar_data.take();
+            if staged.calendar_data.is_some() {
+                self.calendar_data = staged.calendar_data;
             }
-            if self.propstat_etag.is_some() {
-                self.etag = self.propstat_etag.take();
+            if staged.etag.is_some() {
+                self.etag = staged.etag;
             }
         }
-        self.in_propstat = false;
-        self.propstat_success = None;
-        self.propstat_is_calendar = false;
-        self.propstat_is_collection = false;
-        self.propstat_privilege_seen = false;
-        self.propstat_write_seen = false;
-        self.propstat_display_name = None;
-        self.propstat_color = None;
-        self.propstat_sync_token = None;
-        self.propstat_status = None;
-        self.propstat_calendar_data = None;
-        self.propstat_etag = None;
     }
 
     fn as_calendar_collection(&self) -> Option<CalendarCollection> {
@@ -944,7 +922,7 @@ impl ResponseParts {
                 .status
                 .as_deref()
                 .and_then(status_line_code)
-                .or_else(|| self.propstat_status.as_deref().and_then(status_line_code)),
+                .or_else(|| self.staged.status.as_deref().and_then(status_line_code)),
         })
     }
 }

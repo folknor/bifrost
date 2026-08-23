@@ -173,39 +173,6 @@ an event between calendars gets `Ok(())` and no move. `CardDavAccount::contact_u
 same case explicitly with a `local_error` ("cannot move contacts between address books"). CalDAV
 should do the same, or implement `MOVE`.
 
-## RSVP is a non-atomic two-phase write with no compensation
-
-**C2 latent defect.** Verified 2026-08-23: `event_rsvp` still posts the iTIP reply to the outbox and
-only then PUTs, with a bare `?` on the PUT, so nothing tells the consumer the reply already went
-out. The remedy is additive (populate `TransmissionState` on the second leg's error), touches no
-published shape, and is cheap.
-
-`event_rsvp` POSTs the iTIP `METHOD:REPLY` to the schedule outbox first, then PUTs the
-locally-rewritten resource. If the PUT fails (412 from `If-Match`, 503, token expiry), the organizer
-has already been told the user accepted while the user's own copy still says otherwise, and the
-returned error gives the consumer no way to know the reply went out. At minimum the error from the
-second leg should carry that the reply was already transmitted; the `TransmissionState` machinery in
-the error model exists for exactly this distinction and is not used here.
-
-## Discovery failures permanently disable RSVP for the account's lifetime
-
-**C2 latent defect.** Verified 2026-08-23: `open` still swallows both discovery probes with
-`.ok().flatten()` and bakes the result into an immutable capability. A network blip at open silently
-and permanently reports the server as non-scheduling. The trailing paragraph about three to six
-PROPFINDs on open is a separate **C3** cost observation.
-
-`CalDavAccount::open` calls `discover_calendar_user_email().await.ok().flatten()` and
-`discover_schedule_outbox_url().await.ok().flatten()`. A transient 503 or an expired token during
-open makes `scheduling_available` false, `caldav_capabilities(false)` bakes
-`pim_methods.event_rsvp = false` into an immutable field, and nothing re-probes: the account reports
-"this server does not do scheduling" until reopened. A hard failure or a retry would both be better
-than silently degrading a capability on a network blip.
-
-Also in `open`: `discover_calendar_user_email`, `discover_schedule_outbox_url`, and
-`discover_calendar_home` each independently call `discover_principal` (which itself may retry
-against `.well-known`). That is three to six PROPFINDs on open where one principal lookup plus one
-multi-prop PROPFIND would do; the three properties can be requested in a single `<D:prop>`.
-
 ## The structural finding: these are one crate wearing two hats
 
 **C4 product decision. PUBLISHED SURFACE. The loop must not act on this.** This is the single
@@ -255,13 +222,6 @@ collection, the depth-0 poll, and the resource-identification fixes land once.
 
 Two dependent structural notes:
 
-- **[C3, with a C2 inside it]** The transport-bypass note is a refactor proposal, but one fact
-  inside it is a defect on its own: `set_priority` and `set_bandwidth_cap` are published `Account`
-  methods that silently do nothing in both crates (confirmed 2026-08-23, both are empty bodies), so
-  a composed IMAP account with a `BandwidthMeter` does not meter or cap its DAV legs while
-  advertising that it does. That mismatch is fixable or documentable without the unification, and
-  `reference/caldav.md` not mentioning it at all is a doc bug.
-
 - The `DavTransport` seam exists solely because `bifrost-net`'s dispatcher is crate-private. The cost
   is that all DAV traffic bypasses bifrost-net entirely: no retry, no rate limiting, no bandwidth
   metering, no observability. `set_priority` and `set_bandwidth_cap` are no-ops in both crates, so an
@@ -283,11 +243,3 @@ Each bullet carries its category inline. None of these touches a published surfa
   projection. CardDAV's `contact_search` reruns the entire remote search and rehydrates everything
   for every page (documented as intentional in the reference, and it does make `failed_ids` per-page
   honest, but it is O(collection) per page).
-- **[C2]** `event_in_range` uses closed-interval overlap (`event_start <= range_end && event_end >= range_start`)
-  where CalDAV `time-range` is half-open. As a defensive guard it only over-includes, so it is not a
-  correctness bug, but all-day events (whose DTEND is exclusive per the crate's own contract) will
-  match a window starting exactly at their end.
-- **[C3]** The finding calls it harmless itself; the ask is observability, not a fix. `changes_from_cursor` (CalDAV) keeps the previous sync token when `report.sync_token` is `None`.
-  RFC 6578 requires the server to return one; a server that omits it makes every subsequent poll
-  replay the same window. Harmless because the diff absorbs it, but it hides a server bug forever
-  rather than surfacing it.

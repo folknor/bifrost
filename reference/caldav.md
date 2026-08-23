@@ -14,8 +14,11 @@ Current Stage 4 standalone CalDAV account implementation.
   `PartialEq`/`Eq`).
 - `CalDavAccountFactory` - implements `AccountFactory`.
 
-`CalDavAccountFactory::open(account_id)` discovers the CalDAV calendar
-home, caches the default calendar URL, and returns an `Arc<dyn Account>`
+`CalDavAccountFactory::open(account_id)` discovers the current principal once,
+then reads the calendar home, scheduling address set, and schedule outbox in
+one multi-property principal PROPFIND. Discovery errors fail the open rather
+than being mistaken for absent scheduling support. The factory caches the
+default calendar URL and returns an `Arc<dyn Account>`
 inside an `OpenedAccount` whose skip lane is always empty
 (single-principal surface).
 The raw DAV client, XML parser, and iCalendar projection stay
@@ -64,6 +67,9 @@ calendar primitives.
   block's status was 2xx, so a server echoing the requested prop skeleton
   (`<collection/>` included) back inside a 404 propstat cannot discard an
   event whose own properties came back 200.
+  Propstat-scoped values live in one `PropStat` staging struct cleared with
+  `mem::take` at commit. An absent status remains success, while a present but
+  unparseable status remains an explicit non-success.
   Event listing and multiget parsers use element-stack parent checks so
   nested same-name properties do not overwrite response-level hrefs or
   propstat status. Every text-bearing parser accepts both XML text and
@@ -156,8 +162,9 @@ Supported calendar primitives:
   before a REPORT is sent, and the encoder preserves legal one-sided ranges.
   Query REPORTs use `Depth: 1`; `calendar-multiget` REPORTs enumerate their
   hrefs in the body and use `Depth: 0`.
-  The local guard is
-  recurrence-aware: a recurring master whose own interval sits outside the
+  The local guard uses half-open overlap, matching CalDAV time-range and the
+  exclusive all-day end contract. It is recurrence-aware: a recurring master
+  whose own interval sits outside the
   window is retained when its RRULE can still yield an in-window occurrence
   (dropped only when it starts after the window, or an RRULE `UNTIL` ends it
   before the window). COUNT-bounded recurrences trust the server's
@@ -260,6 +267,13 @@ Supported calendar primitives:
   iTIP POST failing on the wire. The address-set is treated as a set:
   discovery examines every href and uses the first case-insensitive
   `mailto:` URI.
+  The outbox POST and local-resource PUT remain two server operations. Every
+  failure after the POST succeeds - the PUT itself and the local patch and
+  iCalendar encoding steps between them - is wrapped as a
+  `Protocol(PartialResponse)` carrying an acknowledged `Attempt` plus the
+  original cause chain. This routes the non-idempotent RSVP to reconciliation
+  and tells the consumer that the organizer may already have received it. The
+  flow is still not atomic; the error class is what communicates that.
 - `event_search` / `event_autocomplete` - non-empty searches issue
   CalDAV text-match `calendar-query` `REPORT`s over VEVENT summary,
   description, location, and attendee, then keep local filtering as a
@@ -288,6 +302,9 @@ before allocation. Range, search, inventory, changes, and their failed-id
 lanes all use resolved absolute resource URLs as native ids. Snapshot-poll
 fallback refreshes a collection token with a depth-0 `sync-token` PROPFIND,
 rather than repeating the calendar-home depth-1 listing.
+When a successful `sync-collection` response omits its required replacement
+sync token, the account emits a warning and retains the previous token. This
+keeps replay-and-deduplicate behavior while exposing the server violation.
 
 Known cursor limitation: VTODO / VJOURNAL resources sharing the collection
 still occupy the event cursor. Both change lanes key on the PROPFIND href
@@ -299,3 +316,7 @@ caldav-F1).
 
 All mail, contact, filter, blob, push, and settings methods return
 `AccountErrorKind::Unsupported` stamped with `Protocol::CalDav`.
+`set_priority` and `set_bandwidth_cap` are no-ops because this crate's local
+reqwest transport has no `AccountNet` or metered transport attachment. This
+also means DAV legs composed into an IMAP account are not included in that
+account's priority scheduling, bandwidth measurements, or bandwidth cap.

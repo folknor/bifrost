@@ -196,8 +196,10 @@ give one contact two ids.
 All mail, filter, blob, push, calendar, and settings methods return
 `AccountErrorKind::Unsupported` stamped with `Protocol::CardDav`.
 `push_stream` and `scope_lifecycle_stream` are empty streams.
-`set_priority` and `set_bandwidth_cap` are currently no-ops; this
-crate has no shared metered transport attachment.
+`set_priority` and `set_bandwidth_cap` are no-ops because this crate's local
+reqwest transport has no `AccountNet` or metered transport attachment. This
+also means CardDAV legs composed into an IMAP account are not included in that
+account's priority scheduling, bandwidth measurements, or bandwidth cap.
 
 ## Related providers
 

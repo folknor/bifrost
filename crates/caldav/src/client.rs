@@ -40,6 +40,13 @@ pub(crate) struct CalDavClient {
     trusted_origins: Arc<RwLock<Vec<String>>>,
 }
 
+#[derive(Debug)]
+pub(crate) struct CalDavDiscovery {
+    pub(crate) calendar_home: String,
+    pub(crate) calendar_user_email: Option<String>,
+    pub(crate) schedule_outbox_url: Option<String>,
+}
+
 impl fmt::Debug for CalDavClient {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CalDavClient")
@@ -148,99 +155,50 @@ impl CalDavClient {
         Self::with_transport(base_url, Arc::new(ReqwestDavTransport))
     }
 
-    pub(crate) async fn discover_calendar_home(&self) -> Result<String, AccountError> {
+    pub(crate) async fn discover_account(&self) -> Result<CalDavDiscovery, AccountError> {
         let base = self.base_url.clone();
-        match self.discover_from_root(&base).await {
-            Ok(home) => Ok(home),
+        match self.discover_account_from_root(&base).await {
+            Ok(discovery) => Ok(discovery),
             Err(error) if should_fallback_discovery(&error) => {
                 let well_known = format!("{}/.well-known/caldav", self.base_url);
-                self.discover_from_root(&well_known).await
+                self.discover_account_from_root(&well_known).await
             }
             Err(error) => Err(error),
         }
     }
 
-    pub(crate) async fn discover_calendar_user_email(
+    async fn discover_account_from_root(
         &self,
-    ) -> Result<Option<String>, AccountError> {
-        let base = self.base_url.clone();
-        match self.discover_email_from_root(&base).await {
-            Ok(email) => Ok(email),
-            Err(error) if should_fallback_discovery(&error) => {
-                let well_known = format!("{}/.well-known/caldav", self.base_url);
-                self.discover_email_from_root(&well_known).await
-            }
-            Err(error) => Err(error),
-        }
-    }
-
-    pub(crate) async fn discover_schedule_outbox_url(
-        &self,
-    ) -> Result<Option<String>, AccountError> {
-        let base = self.base_url.clone();
-        match self.discover_schedule_outbox_from_root(&base).await {
-            Ok(outbox) => Ok(outbox),
-            Err(error) if should_fallback_discovery(&error) => {
-                let well_known = format!("{}/.well-known/caldav", self.base_url);
-                self.discover_schedule_outbox_from_root(&well_known).await
-            }
-            Err(error) => Err(error),
-        }
-    }
-
-    async fn discover_from_root(&self, root: &str) -> Result<String, AccountError> {
+        root: &str,
+    ) -> Result<CalDavDiscovery, AccountError> {
         let principal = self.discover_principal(root).await?;
         let body = self
             .propfind_raw(
                 &principal,
                 "0",
-                PROPFIND_CALENDAR_HOME,
+                PROPFIND_ACCOUNT,
                 AccountOperation::Discover,
             )
             .await?;
-        extract_href_property(&body, "calendar-home-set")
+        let calendar_home = extract_href_property(&body, "calendar-home-set")
             .map_err(|error| parse_error(AccountOperation::Discover, error))?
             .map(|href| resolve_href(&self.base_url, &href))
             .inspect(|home| self.trust_discovered_url(home))
-            .ok_or_else(|| parse_error(AccountOperation::Discover, "missing calendar-home-set"))
-    }
-
-    async fn discover_email_from_root(&self, root: &str) -> Result<Option<String>, AccountError> {
-        let principal = self.discover_principal(root).await?;
-        let body = self
-            .propfind_raw(
-                &principal,
-                "0",
-                PROPFIND_CALENDAR_USER_ADDRESS,
-                AccountOperation::Discover,
-            )
-            .await?;
+            .ok_or_else(|| parse_error(AccountOperation::Discover, "missing calendar-home-set"))?;
         let hrefs = extract_href_properties(&body, "calendar-user-address-set")
             .map_err(|error| parse_error(AccountOperation::Discover, error))?;
-        Ok(hrefs.iter().find_map(|href| mailto_email(href)))
-    }
-
-    async fn discover_schedule_outbox_from_root(
-        &self,
-        root: &str,
-    ) -> Result<Option<String>, AccountError> {
-        let principal = self.discover_principal(root).await?;
-        let body = self
-            .propfind_raw(
-                &principal,
-                "0",
-                PROPFIND_SCHEDULE_OUTBOX,
-                AccountOperation::Discover,
-            )
-            .await?;
-        extract_href_property(&body, "schedule-outbox-URL")
+        let calendar_user_email = hrefs.iter().find_map(|href| mailto_email(href));
+        let schedule_outbox_url = extract_href_property(&body, "schedule-outbox-URL")
             .map_err(|error| parse_error(AccountOperation::Discover, error))
-            .map(|href| href.map(|href| resolve_href(&self.base_url, &href)))
-            .inspect(|outbox| {
-                if let Some(outbox) = outbox {
-                    self.trust_discovered_url(outbox);
-                }
-            })
+            .map(|href| href.map(|href| resolve_href(&self.base_url, &href)))?;
+        if let Some(outbox) = &schedule_outbox_url {
+            self.trust_discovered_url(outbox);
+        }
+        Ok(CalDavDiscovery {
+            calendar_home,
+            calendar_user_email,
+            schedule_outbox_url,
+        })
     }
 
     async fn discover_principal(&self, root: &str) -> Result<String, AccountError> {
@@ -1141,23 +1099,11 @@ const PROPFIND_PRINCIPAL: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
   </D:prop>\n\
 </D:propfind>";
 
-const PROPFIND_CALENDAR_HOME: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
+const PROPFIND_ACCOUNT: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
 <D:propfind xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\">\n\
   <D:prop>\n\
     <C:calendar-home-set/>\n\
-  </D:prop>\n\
-</D:propfind>";
-
-const PROPFIND_CALENDAR_USER_ADDRESS: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
-<D:propfind xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\">\n\
-  <D:prop>\n\
     <C:calendar-user-address-set/>\n\
-  </D:prop>\n\
-</D:propfind>";
-
-const PROPFIND_SCHEDULE_OUTBOX: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
-<D:propfind xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\">\n\
-  <D:prop>\n\
     <C:schedule-outbox-URL/>\n\
   </D:prop>\n\
 </D:propfind>";
@@ -1316,9 +1262,10 @@ mod tests {
         let client = CalDavClient::with_transport("https://dav.example.test", transport);
 
         let home = client
-            .discover_calendar_home()
+            .discover_account()
             .await
-            .expect("cross-origin home is discovered");
+            .expect("cross-origin home is discovered")
+            .calendar_home;
         assert_eq!(home, "https://cal.example.test/homes/ada/");
         client
             .list_calendars(&home)
@@ -1348,9 +1295,10 @@ mod tests {
         let client = CalDavClient::with_transport("https://dav.example.test", transport);
 
         let home = client
-            .discover_calendar_home()
+            .discover_account()
             .await
-            .expect("home href is still reported");
+            .expect("home href is still reported")
+            .calendar_home;
         assert_eq!(home, "http://cal.example.test/homes/ada/");
         client
             .list_calendars(&home)
@@ -1365,6 +1313,59 @@ mod tests {
                 .all(|request| request.url.starts_with("https://dav.example.test/")),
             "no request reached the plaintext origin: {:?}",
             requests.iter().map(|r| &r.url).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn account_discovery_reads_all_principal_properties_in_two_requests() {
+        let response = |body: &str| DavResponse {
+            status: StatusCode::MULTI_STATUS,
+            headers: HeaderMap::new(),
+            body: body.to_string(),
+        };
+        let script = ScriptedDavTransport::new([
+            response(
+                "<D:current-user-principal xmlns:D=\"DAV:\"><D:href>/principals/ada/</D:href></D:current-user-principal>",
+            ),
+            response(
+                "<D:multistatus xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\"><C:calendar-home-set><D:href>/cal/</D:href></C:calendar-home-set><C:calendar-user-address-set><D:href>mailto:ada@example.test</D:href></C:calendar-user-address-set><C:schedule-outbox-URL><D:href>/outbox/</D:href></C:schedule-outbox-URL></D:multistatus>",
+            ),
+        ]);
+        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
+        let client = CalDavClient::with_transport("https://dav.example.test", transport);
+
+        let discovery = client.discover_account().await.expect("discovery succeeds");
+
+        assert_eq!(discovery.calendar_home, "https://dav.example.test/cal/");
+        assert_eq!(
+            discovery.calendar_user_email.as_deref(),
+            Some("ada@example.test")
+        );
+        assert_eq!(
+            discovery.schedule_outbox_url.as_deref(),
+            Some("https://dav.example.test/outbox/")
+        );
+        assert_eq!(script.requests().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn scheduling_discovery_failure_is_not_downgraded_to_no_capability() {
+        let script = ScriptedDavTransport::new([DavResponse {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            headers: HeaderMap::new(),
+            body: "try later".to_string(),
+        }]);
+        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
+        let client = CalDavClient::with_transport("https://dav.example.test", transport);
+
+        let error = client
+            .discover_account()
+            .await
+            .expect_err("a transient discovery failure must fail the open, not be swallowed");
+
+        assert_eq!(
+            error.kind(),
+            &AccountErrorKind::Server(ServerErrorKind::Unavailable)
         );
     }
 
@@ -1581,7 +1582,7 @@ mod tests {
 
     #[test]
     fn schedule_outbox_propfind_requests_caldav_outbox_url() {
-        assert!(PROPFIND_SCHEDULE_OUTBOX.contains("<C:schedule-outbox-URL/>"));
+        assert!(PROPFIND_ACCOUNT.contains("<C:schedule-outbox-URL/>"));
     }
 
     #[test]

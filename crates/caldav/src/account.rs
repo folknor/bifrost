@@ -38,11 +38,9 @@ impl CalDavAccount {
         config: CalDavConfig,
     ) -> Result<Self, AccountError> {
         let client = CalDavClient::new(&config)?;
-        let rsvp_email = match rsvp_email_from_config(&config) {
-            Some(email) => Some(email),
-            None => client.discover_calendar_user_email().await.ok().flatten(),
-        };
-        let schedule_outbox_url = client.discover_schedule_outbox_url().await.ok().flatten();
+        let discovery = client.discover_account().await?;
+        let rsvp_email = rsvp_email_from_config(&config).or(discovery.calendar_user_email);
+        let schedule_outbox_url = discovery.schedule_outbox_url;
         // `event_rsvp` is discovery-derived, not assumed: the RSVP path
         // below hard-requires both of these and returns `unsupported`
         // without them, so advertising the method on a scheduling-less
@@ -50,7 +48,7 @@ impl CalDavAccount {
         // capability gate to the wire.
         let event_rsvp =
             scheduling_available(rsvp_email.as_deref(), schedule_outbox_url.as_deref());
-        let calendar_home = client.discover_calendar_home().await?;
+        let calendar_home = discovery.calendar_home;
         let collections = client.list_calendars(&calendar_home).await?;
         let default_calendar_url = collections
             .first()
@@ -881,10 +879,16 @@ impl Account for CalDavAccount {
             client
                 .post_schedule_reply(&schedule_outbox_url, &rsvp_email, &organizer_email, reply)
                 .await?;
-            let patch = rsvp_patch(&current, status, &rsvp_email)
-                .map_err(|_| unsupported_error(AccountOperation::EventRsvp))?;
-            let body = patch_to_ical(&current, &patch)
-                .map_err(|_| unsupported_error(AccountOperation::EventRsvp))?;
+            // Everything from here on runs after the organizer has already
+            // been told. Local encoding failures are as much a second-leg
+            // failure as a refused PUT, so they take the same wrapping
+            // rather than reporting a bare `unsupported`.
+            let patch = rsvp_patch(&current, status, &rsvp_email).map_err(|_| {
+                rsvp_local_write_error(unsupported_error(AccountOperation::EventRsvp))
+            })?;
+            let body = patch_to_ical(&current, &patch).map_err(|_| {
+                rsvp_local_write_error(unsupported_error(AccountOperation::EventRsvp))
+            })?;
             let url = client.resolve_url(&event.0);
             client
                 .put_event(
@@ -893,7 +897,8 @@ impl Account for CalDavAccount {
                     put_condition(current.etag.as_deref()),
                     AccountOperation::EventRsvp,
                 )
-                .await?;
+                .await
+                .map_err(rsvp_local_write_error)?;
             Ok(())
         })
     }
@@ -1012,6 +1017,32 @@ fn rsvp_email_from_config(config: &CalDavConfig) -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// The scheduling POST completed before the local PUT began. Preserve that
+/// acknowledged first-leg evidence on any second-leg failure so callers know
+/// the organizer may already have acted on the reply.
+fn rsvp_local_write_error(error: AccountError) -> AccountError {
+    let mut builder = AccountErrorBuilder::new(
+        AccountErrorKind::Protocol(ProtocolErrorKind::PartialResponse),
+        Cause::Wire(WireCause::MalformedResponse {
+            protocol: Protocol::CalDav,
+            detail: Some(DiagnosticText::support_only(
+                "schedule reply was accepted but the local event update failed",
+            )),
+        }),
+    )
+    .protocol(Protocol::CalDav)
+    .operation(AccountOperation::EventRsvp)
+    .push_cause(Cause::Attempt(AttemptCause::new(
+        TransmissionState::Acknowledged,
+    )));
+    for cause in error.chain().iter() {
+        builder = builder.push_cause(cause.clone());
+    }
+    builder
+        .try_build()
+        .expect("valid RSVP partial-response classification")
 }
 
 fn unsupported_future<T: Send + 'static>(
@@ -1210,6 +1241,13 @@ async fn changes_from_cursor(
             .sync_events(&previous.calendar_url, sync_token)
             .await?;
         let mut current = previous.clone();
+        if report.sync_token.is_none() {
+            tracing::warn!(
+                target: "bifrost_caldav::sync",
+                calendar = %previous.calendar_url,
+                "sync-collection response omitted the required sync-token; retaining the previous token"
+            );
+        }
         current.sync_token = report.sync_token.or_else(|| previous.sync_token.clone());
         let changes = apply_sync_report(&mut current, report.entries);
         return Ok((current, changes));
@@ -1432,7 +1470,7 @@ fn event_in_range(event: &CalendarEvent, start: &EventTime, end: &EventTime) -> 
     let rrule = event.recurrence.rrule.as_deref().unwrap_or_default();
     if rrule.is_empty() {
         // Non-recurring: plain interval overlap.
-        return event_start <= range_end && event_end >= range_start;
+        return event_start < range_end && event_end > range_start;
     }
     // Recurring master: its own interval can sit entirely before the
     // window while a later occurrence lands inside it. The server's
@@ -1441,10 +1479,10 @@ fn event_in_range(event: &CalendarEvent, start: &EventTime, end: &EventTime) -> 
     // not drop it. Occurrences only run forward from the master start, so
     // the series can reach the window unless it begins after the window
     // ends, or provably ends (RRULE UNTIL) before the window starts.
-    if event_start > range_end {
+    if event_start >= range_end {
         return false;
     }
-    if event_end >= range_start {
+    if event_end > range_start {
         return true;
     }
     match rrule_until(rrule) {
@@ -1678,7 +1716,7 @@ mod tests {
 
     #[test]
     fn range_filter_includes_all_day_on_window_start() {
-        let event = event("2026-06-02", "2026-06-02", true);
+        let event = event("2026-06-02", "2026-06-03", true);
 
         assert!(event_in_range(
             &event,
@@ -1706,6 +1744,34 @@ mod tests {
             &event,
             &time("2026-06-02T00:00:00Z"),
             &time("2026-06-03T00:00:00Z")
+        ));
+    }
+
+    #[test]
+    fn range_filter_excludes_event_ending_at_window_start() {
+        let event = event("2026-06-01", "2026-06-02", true);
+
+        assert!(!event_in_range(
+            &event,
+            &time("2026-06-02T00:00:00Z"),
+            &time("2026-06-03T00:00:00Z")
+        ));
+    }
+
+    #[test]
+    fn rsvp_second_leg_error_records_acknowledged_first_leg() {
+        let error = crate::client::transport_error(AccountOperation::EventRsvp, "put failed");
+        let decorated = rsvp_local_write_error(error);
+
+        assert!(decorated.chain().iter().any(|cause| matches!(
+            cause,
+            Cause::Attempt(attempt)
+                if attempt.transmission_state == TransmissionState::Acknowledged
+        )));
+        assert!(matches!(
+            decorated.recovery(),
+            RecoveryClass::Reconcile(advice)
+                if advice.reason == ReconcileReason::PartialCompletionSignal
         ));
     }
 

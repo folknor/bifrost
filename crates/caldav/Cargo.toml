@@ -27,6 +27,7 @@ jiff = { workspace = true }
 futures = { workspace = true }
 quick-xml = "0.41.0"
 reqwest = { workspace = true, features = ["native-tls"] }
+tracing = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
