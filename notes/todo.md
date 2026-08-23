@@ -1054,6 +1054,305 @@ blocking; each is a real defect or a real decision, not a cleanup.
     this function so the single-translation-boundary rule holds". Reworded
     to say what is true and why it is kept.
 
+## Open items folded in from the bug-hunt ledgers (2026-08-23)
+
+The eight `notes/bugs-*.md` ledgers and `notes/carry-forward.md` were closed out
+and deleted on 2026-08-23. Everything durable from them moved to `reference/*.md`
+or to inline comments at the code it describes; everything still open moved here.
+
+Categories, as the ledgers used them: **C1** live defect, **C2** latent defect,
+**C3** refactor opinion, **C4** product decision. **PUBLISHED SURFACE** means the
+remedy removes, renames, or reshapes a published item - those are the repository
+owner's call and must not be actioned without one, no matter how confident the
+argument reads. Ledger findings were never verified against a running server;
+confirm against the code before working any of them.
+
+### Fenced for the repository owner (published surface)
+
+- **dav-B1. Recurrence-override `EventId`s are unusable as resource ids.** [C1]
+  `crates/caldav/src/ical.rs::events_from_ical` mints
+  `EventId(format!("{uri}#{recurrence_id}"))` for an override VEVENT, and
+  `account.rs` feeds that straight into `client.resolve_url`. `reqwest` does not
+  put a fragment on the wire, so `event_get` returns the master, `event_update`
+  splices and PUTs the master, and **`event_delete` on one instance DELETEs the
+  whole `.ics` and destroys the entire recurring series.** No `#` guard exists in
+  either crate. This is the worst known defect in the tree. Remedies: reject
+  fragment-bearing ids in the mutation paths with a classified error (calls that
+  succeed today start failing), or make them real (resolve the resource, locate
+  the VEVENT by `RECURRENCE-ID`, splice or remove that component; an instance
+  delete means emitting `EXDATE` on the master). Either changes the documented
+  contract of `EventId` and of four published `Account` methods.
+- **dav-B2. Cursor sync only ever covers one collection.** [C1]
+  `establish_initial_cursor` / `inventory_stream` / `changes_stream` all read
+  `default_calendar_url` (CalDAV) or `default_addressbook_url` (CardDAV), and
+  `discover_cursor_scopes` yields a single `CursorScope::Type(CalendarEvent)` /
+  `Type(Contact)`. An account with three calendars enumerates all three in
+  `calendars_list` but syncs only the first: objects in the others never appear
+  in inventory or changes and never get an update or a delete. The honest model
+  is a `CursorScope` per collection href, which reshapes the published cursor
+  model and the stored envelope. Documenting the limitation loudly in
+  `reference/caldav.md` and `reference/carddav.md` is a doc fix the loop may do -
+  it is not permission to close this.
+- **dav-B3. CardDAV fabricates a phantom address book.** [C2]
+  `address_books_list` pushes a synthetic `AddressBook` pointing at the home when
+  the home enumerates zero addressbook collections. CalDAV removed exactly this
+  shape as a bug: a consumer cannot distinguish a genuinely empty backend and so
+  cannot reap stale collections, and the phantom's queries 404 against a
+  spec-correct server. Related in both crates: with zero collections
+  `default_*_url` falls back to `resolve_url(&home)`, so the cursor, inventory
+  and changes lanes target the home collection - the same phantom by another
+  name. The remedy removes a value a published method returns today.
+- **dav-B4. CalDAV silently ignores a calendar move.** [C1]
+  `CalDavAccount::event_update` uses `patch.calendar_id` only to pick the fetch
+  URL, then PUTs to `resolve_url(&event.0)` - the original location - and returns
+  `Ok(())`. The requested move silently does not happen, which is the worst of
+  the three possible answers. `CardDavAccount::contact_update` handles the same
+  case explicitly with a `local_error`. Refusing matches the sibling crate and is
+  the smaller change; implementing `MOVE` is the other option. Both change what a
+  published method does with an input it accepts today.
+- **dav-B5. Collapse both DAV crates into a shared `bifrost-dav`.** [C4]
+  Roughly 1500 duplicated lines across `client.rs` (transport, redirect policy,
+  `auth_headers`, `escape_xml`, etag handling, the raw request helpers, the
+  ~120-line `status_error` ladder), `parse.rs` (the whole propstat state machine,
+  href resolution, multiget classification) and `account.rs` (the cursor codec,
+  the snapshot diff, `put_condition`, URL comparison, and ~400 lines of
+  `Unsupported` stubs each crate carries for the other's domain). The genuinely
+  protocol-specific parts are the property names, the query XML, and the body
+  projection. **Do not act on this without the owner.** Its premise - "pre-1.0
+  and crate-private below a factory, so the blast radius is small" - is a claim
+  about this workspace, and both crates are published with consumers outside it
+  by definition. This is the same shape as the two deletions that had to be
+  reverted; see the standing lessons in `AGENTS.md`.
+- **google-B1. `bulk_destroy` reports `Applied` for messages that were only
+  trashed.** [C1] `crates/google/src/account/mutation.rs::apply_destroy`: when
+  `batchDelete` fails the scope check the fallback is a TRASH label patch, and
+  `apply_label_patch` returns `MutationSuccess::Applied`. The engine is told the
+  destroy succeeded while the messages still exist, so they reappear in the next
+  inventory or history pass - a permanent reconcile loop. The other half of the
+  original finding (the fallback firing on any unparseable 403) is fixed; only
+  the outcome reporting remains, and it needs a distinct published
+  `MutationSuccess` variant.
+- **google-B3. Calendar's endpoint override is an env var.** [C3, additive]
+  `calendar.rs::calendar_api_base()` reads
+  `std::env::var("RATATOSKR_TEST_GCAL_ENDPOINT")` on every call - the only
+  env-var read in the workspace. Nothing misbehaves; the objections are hygiene
+  (process-global state in a library, a per-request `getenv`, no way to run two
+  accounts against different calendar endpoints, and a bifrost crate naming its
+  downstream consumer). Remedy is a `calendar_base` field on `ClientInner` plus a
+  published `with_calendar_api_base` constructor, matching Gmail's
+  `with_api_base` and People's `with_people_api_base`. Related [C3]:
+  `default_account_net` registers rate limits for `www.googleapis.com` and
+  `people.googleapis.com` by literal string, so a redirected base is unlimited.
+- **google-B4. `calendars_list` returns a `Vec` with no streaming.** [C4] A
+  pathological account buys many sequential 250-item round trips before the
+  caller sees anything. The walk is bounded (repeated-token guard plus page
+  budget) and correctness is not at stake; the remedy changes the published
+  method's return type.
+- **google-B5. `inventory_stream` has no per-item failed lane.** [C4]
+  `Account::inventory_stream` in `bifrost-types` returns
+  `AccountStream<SyncEvent<InventoryEntry>>` with no `ItemOutcome` wrapper, so a
+  per-id failed lane is a published trait change. The data-loss symptom is
+  already handled - a hydration error classified `NotFound(Message)` is absorbed
+  as the ordinary list/get deletion race - but every other classified failure
+  still terminates the whole walk and discards every page already emitted. That
+  residual is real and unfixed.
+
+### Open defects
+
+- **google-B2. The Drive resumable session is abandoned on a mid-upload `Net`
+  error.** [C2] `upload_file_chunked` now rejects stalled, backward and
+  impossible resume offsets under a finite attempt budget, so it cannot hang. But
+  a `Net` error mid-upload aborts the function and abandons the resumable
+  session; Drive keeps the partial upload for a week. There is no cleanup and no
+  resume-on-reopen. The module doc acknowledges "a stray uploaded-but-unlinked
+  file is the worst failure mode" for the link step but not for the upload step.
+- **sync-B3. `MutationConfig::retry_queue_cap` bounds nothing.** [C2] The field
+  is declared in `crates/sync/src/types.rs` with a default of 4096 and a doc
+  comment reading "default per-campaign retry queue limit", and nothing in the
+  crate ever reads it - the campaign retry queue is an unbounded `Vec`. A
+  consumer tuning it gets no effect, and a pathological retry storm has no
+  ceiling. **The fix is to make the field actually cap the queue, not to delete
+  the field.** Deleting it was proposed once as part of a wider public-API
+  removal that had to be reverted; where a finding proposes removing something,
+  look for the fix that keeps it.
+- **dav-B9. All DAV traffic bypasses `bifrost-net`.** [C2] Both crates run their
+  own `ReqwestDavTransport` behind the `DavTransport` seam, so DAV legs get no
+  retry, no rate limiting, no bandwidth metering and no observability, and
+  `set_priority` / `set_bandwidth_cap` are silent no-ops in both. An IMAP account
+  composed `with_caldav` / `with_carddav` and given a `BandwidthMeter` silently
+  does not meter or cap its DAV legs. The two enablers shipped in the
+  `bifrost-net` round-1 work (`AccountNet::request(Method, &str)` and an optional
+  `AccountSpec::token_source`) deliberately without the migration; `Dispatch`
+  staying crate-private was assessed and is correct. `reference/net.md` scopes
+  the sharing claim to exclude these two crates rather than overclaiming.
+
+### Cross-crate shaping questions
+
+- **No concurrency governor in `bifrost-net`.** Nothing bounds the number of
+  simultaneously in-flight requests, per account or globally. The only
+  overlapping-request site in the workspace is JMAP's foreign probing at open,
+  which solves it locally: `foreign_probe_concurrency` bounds a
+  `buffer_unordered` by the server's `maxConcurrentRequests` clamped to `[1, 8]`,
+  serial when the core capability is unreadable, with results sorted by
+  `accountId` before installation so topology and skip ordering stay
+  deterministic. Any new concurrent call site has to solve it again from scratch.
+  This is a new permit-pool feature with its own API and test-bite obligations,
+  not a defect - it stays a recorded deferral until someone wants the feature.
+- **Inventory exhaustion is an inferred count, not a declared flag.** The email
+  inventory contract on both sides of the JMAP/sync boundary rests on "a
+  partition yields zero entries only when the scope has no results past `from`".
+  The live `OpenPages` walker stops only on `seen == 0` and `open_pages_resume`
+  treats only the completion marker as exhaustion. It works, but the signal is
+  inferred rather than declared, and a short-page-means-done inference has been
+  reintroduced on the resume half once already. A declared exhaustion flag would
+  remove the whole class - it reshapes a published stream contract.
+- **A single unrepresentable object fails its whole hydration page.** JMAP's
+  `event_from_jmap` returns `Unsupported` for an event with an unrepresentable
+  recurrence, participant role or participation status, which fails the page that
+  contains it rather than reporting that one event individually. That is the
+  right direction against silent lossiness; whether the engine wants a per-item
+  lane is a `BatchOutcome` shaping question for `bifrost-sync`, not a JMAP bug.
+  Same shape as google-B5.
+
+### Refactor backlog
+
+Nothing in this section misbehaves. None of it is a bug, and none of it blocks a
+defect fix - in particular, do not let a unification proposal become a
+prerequisite for the small local fixes above.
+
+- **sync-B1.** `crates/sync/src/engine.rs` is 5278 lines mixing five concerns:
+  lifecycle, ~900 lines of recovery dispatch free functions, the ~500-line
+  backfill orchestrator, the ~500-line mutation pipeline, and ~1200 lines of 1:1
+  passthrough forwarders that invent no semantics (every one is `live_account(id)?`
+  then forward, with an identical doc comment shape - a macro or a blanket
+  forwarding trait, not 60 hand-written methods). `recovery.rs` exists but holds
+  only the helpers while the dispatch stays in `engine.rs`, so the split is in
+  the wrong place. `reference/sync.md`'s file map already describes the intended
+  layout aspirationally and the code does not match it.
+- **sync-B2.** `drive_changes_stream` still takes `_account_id` and `_ack_tx` and
+  threads them from four call sites through `spawn_scope_poll_inner`. Dead
+  parameters that obscure the actual data flow.
+- **google-B6.** `inventory.rs::hydrate_one` issues both `get_message(id, "raw")`
+  and `get_message(id, "full")` for `Projection::FullWithBlobs`. For a message
+  with a 20 MB attachment that is ~40 MB of transfer and 10 quota units to obtain
+  data the `raw` fetch already contains - `full` adds only the attachment ids,
+  which are derivable from the MIME structure in the raw bytes or more cheaply
+  from a `format=metadata` call. The single most expensive line in the crate's
+  read path. The answer is correct, just expensive.
+- **google-B7.** `changes.rs`, `mutation.rs`, `inventory.rs::get_stream` and
+  `scopes.rs::scope_lifecycle_stream` are four near-identical hand-rolled
+  `stream::unfold` state machines, each with its own `finished`/`emitted_done`
+  pair, its own batching, its own terminate-and-emit-`Done` dance. Relatedly,
+  `terminates_mutation_stream` encodes a real fan-out policy in `error.rs` where
+  it belongs, but only the mutation driver consults it: inventory always
+  terminates, `get_stream` always fans per-item, and the lifecycle stream uses
+  `is_terminal() || requires_engine_action()`. Three different answers to one
+  question. A shared `BatchedStream` driver plus a `FailurePolicy::for(error, lane)`
+  would collapse ~400 lines and make the boundary and terminate contracts
+  enforceable in one place.
+- **google-B8, smaller observations.** All [C3]: `push.rs` builds the
+  transient-failure `Warning` with a constant `.with_retry_count(1)` regardless
+  of how many consecutive failures occurred, while the renewer already tracks the
+  `disconnected` state it could count from; `push_subscribe` emits
+  `WatchEvent::Reconnected` before any consumer can have called `push_stream()`,
+  and `broadcast` drops messages with no receivers, so the stream's first
+  observable state is undefined; `client.rs::execute` sets
+  `Content-Type: application/json` on bodyless GET and DELETE requests;
+  `calendar.rs::search`'s clipped-tail comment ("any clipped tail is
+  recoverable") is load-bearing but unverified - if Google ever returns more
+  items than `maxResults` without a `nextPageToken` the tail is dropped silently
+  and the cursor advances, so a `debug_assert` or an explicit `Warning` would
+  make the assumption visible; `mutation.rs::post_empty_json` re-implements URL
+  assembly that `GmailClient::api_url` already owns, so the raw-builder and typed
+  paths can drift; `flags.rs::patch_for_set` names every user label in the
+  account in `removeLabelIds`, which on an account with a few hundred labels
+  ships a several-KB body per batch (the engine's read-back guard already fetches
+  current state, so this is the site that would benefit most from
+  read-back-then-diff).
+- **dav-B6.** `CardDavAccount::contact_snapshot` always calls
+  `list_addressbooks_for_operation(home, ...)` - a depth-1 PROPFIND over the home
+  - purely to recover one collection's ctag, then does the depth-1 contact
+  listing. CalDAV already fixed exactly this: `event_snapshot` takes
+  `home: Option<&str>` and the poll path passes `None` to use the cheap depth-0
+  `collection_sync_token`. CardDAV even has the depth-0 helper
+  (`collection_ctag`), calls it in the short-circuit, then throws the answer away
+  and refetches it the expensive way. A changed-ctag poll costs three requests
+  where two suffice.
+- **dav-B7.** `open_carddav` and `open_caldav` run sequentially in the IMAP
+  composition seam, each paying the multi-round-trip discovery. Joining them is
+  free. (The seam itself is fine - `classify_dav_open` degrades correctly into
+  `skipped_scopes`.)
+- **dav-B8.** `event_search`'s empty-query branch lists and hydrates every
+  resource in the collection before applying `request.limit`, and
+  `events_in_range` likewise truncates to `limit` only after full hydration and
+  projection. CardDAV's `contact_search` reruns the entire remote search and
+  rehydrates everything for every page - documented as intentional and it does
+  make `failed_ids` per-page honest, but it is O(collection) per page.
+- **jmap-B1.** Three near-identical query/get/advance loops in the sync layer;
+  `imap` has four copies of the untagged-response dispatch loop. Recorded for
+  completeness with the other duplication findings; same standing as the above.
+
+### Ledger residuals recorded as accepted, not open
+
+Listed so they are not re-filed as untouched work. Each has its reasoning in the
+`reference/` doc for its crate.
+
+- The JMAP calendar and contacts audit was **static**, against the RFCs and the
+  in-crate types. No server was involved, per the project's testing rules, so "a
+  conforming server accepts this" is a reading of the spec, not an observation.
+  The all-day `DATE` defect that round found is exactly the class an in-process
+  round trip cannot catch.
+- JMAP's recurrence mapping still covers only `FREQ`, `INTERVAL`, `COUNT`,
+  `UNTIL`, `BYDAY`, `BYMONTH`, `BYMONTHDAY`; everything else rejects loudly.
+  Widening it is tracked in `reference/jmap/DEFERRED.md`.
+- JMAP `contacts.rs` outside postal addresses and titles (emails, phones, notes,
+  media, name) still skips values it cannot parse rather than rejecting.
+- JMAP's inventory overshoot is unbounded in principle - a bounded window that
+  emits nothing keeps walking - and ends at the first surviving message in
+  practice.
+- Google's per-poll `users.getProfile` round trip is **kept deliberately**. The
+  cost argument is correct (doubled request count and failure surface on the
+  30-second poll), but it is the only thing that catches a rotated token now
+  pointing at a different Google account before its history is mixed into the
+  existing slot. It comes out when a token-source identity binding exists
+  upstream, not before. Do not re-file this as free savings.
+- Google's `get_stream` marks `PageBoundary::Final` only when the id stream
+  closes during the batch drain, so a last batch that fills exactly to
+  `HYDRATE_BATCH_SIZE` stays `Page` with the following `Done` as terminator.
+  **Do not "finish" this with a one-item lookahead** - the ids come from a
+  backpressured producer, so polling for the next id before hydrating the batch
+  in hand deadlocks both sides. `bifrost-sync` reads `Final` in no hydration
+  path, so the boundary is advisory.
+- Google's cross-calendar event move stays non-atomic; the provider exposes the
+  move and the field PATCH as separate requests. A second-leg failure returns
+  `Protocol(PartialResponse)` scoped to the event in its destination calendar
+  with acknowledged first-leg evidence, which is what makes it legible. No
+  compensating move is attempted - that adds another blind write and another
+  partial-failure window.
+- A `close()` future dropped mid-`users.stop` leaves the Gmail-side watch running
+  until it expires. The local half is cancellation-safe; retrying the remote stop
+  needs a transport the close has already shed.
+- Google's `open_blob_range` returns a classified `Unsupported(OpenBlobRange)`
+  for every input including a forged handle claiming `supports_range`. That is a
+  decision that Gmail attachments have no byte-range transport, not a stub.
+- `read_capped_response_body` applies the read timeout per chunk, so a server
+  trickling one byte per interval can stretch a terminal-status drain to roughly
+  `STATUS_BODY_CAP` intervals. Bounded by the 4 KB cap; not worth a second
+  deadline.
+- CalDAV/CardDAV's credential-origin allowlist makes a request to an untrusted
+  origin fail locally rather than go out unauthenticated. A consumer whose server
+  names hrefs on a third origin - neither the configured base nor a discovered
+  home - now gets a hard local error where it previously got a credential leak.
+  Intended trade.
+- The DAV cursor v1 -> v2 bump costs consumers one full re-sync per DAV account,
+  once. `changes_from_cursor`'s token-retention path has no direct test and the
+  missing-`sync_token` warning is log-only.
+- RSVP is non-atomic by nature. Every failure path after the acknowledged outbox
+  POST, including the local encoding steps between the POST and the PUT, is
+  wrapped `Protocol(PartialResponse)` with `TransmissionState::Acknowledged`.
+- IMAP's NOTIFY-runtime-rejection misreport: a folder admitted to the IDLE budget
+  whose `NOTIFY SET` is rejected at runtime was already reported as pushed.
+
 ## Rules for agents working bug-hunt items
 
 These earned their keep during the 2026 fix slices - keep applying them

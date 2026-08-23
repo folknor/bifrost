@@ -15,6 +15,22 @@ Async transports support Tokio. TLS and plaintext URL parsing via `from_url` use
 
 `BoxedTransport<Ok, Error>` and `BoxedAsyncTransport<Ok, Error>` erase the concrete type. `Box<T>` and `Arc<T>` get blanket `Transport` / `AsyncTransport` forwarding.
 
+**The blocking half stays. Do not re-delete it.** `SmtpTransport`,
+`LmtpTransport`, the `Transport` trait, the blocking pool and socket funnel,
+`oauth2_token_blocking`, the blocking examples and the `tokio` cargo feature were
+once removed wholesale on the reasoning that the only IN-WORKSPACE consumer is
+async, and were restored at the repository owner's instruction. That reasoning
+does not hold for a library crate, whose consumers are outside this workspace by
+definition; "nothing calls it" established by grepping here is a fact about the
+workspace, not about who uses `SmtpTransport`.
+
+The two halves are held in step deliberately: the DATA-framing and auth-ladder
+fixes are mirrored into the blocking writers, and the fifteen invariants that
+only the blocking tests had pinned are now covered on BOTH sides. That test
+duplication is the intended end state, not debt to pay down. Any proposal to
+remove or reshape this surface is the owner's call - see the standing lessons in
+`AGENTS.md`.
+
 ## Connection lifecycle
 
 ```

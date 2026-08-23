@@ -342,3 +342,28 @@ All mail, contact, filter, blob, push, and settings methods return
 reqwest transport has no `AccountNet` or metered transport attachment. This
 also means DAV legs composed into an IMAP account are not included in that
 account's priority scheduling, bandwidth measurements, or bandwidth cap.
+
+## This crate and bifrost-carddav are near-duplicates, and drift is the defect
+
+Roughly 1500 lines are hand-mirrored between the two: the `DavTransport` seam
+and `ReqwestDavTransport`, `dav_redirect_policy`, `auth_headers`, `escape_xml`,
+etag normalization and `prepare_if_match`, the raw request helpers, the
+~120-line `status_error` ladder (identical but for `ResourceKind` and
+`Protocol`), the whole `ResponseParts` propstat state machine, href resolution,
+multiget classification, the cursor codec, the snapshot diff, `put_condition`,
+URL comparison, and the `Unsupported` stubs each crate carries for the other's
+domain.
+
+Nothing compares the two copies, so divergence is silent. Five separate defects
+in one hardening arc were exactly that: `escape_xml` quoting, the immediate
+collection-marker promotion, the eleven hand-maintained CalDAV `propstat_*`
+twins, the phantom-collection asymmetry, and `as_fetched_vcard` missing the
+`is_collection` guard its CalDAV twin already had (which surfaced an echoed
+collection as a phantom card).
+
+**Any fix to shared-shape code in one crate must be checked against the other.**
+Where the asymmetry is real - CardDAV has no `sync-collection` path and
+discovers one property - it is design, not oversight. Collapsing the two into a
+shared `bifrost-dav` has been proposed and is a repository-owner decision about
+the published surface, not an engineering conclusion the duplication count can
+settle; it is tracked in `notes/todo.md`.

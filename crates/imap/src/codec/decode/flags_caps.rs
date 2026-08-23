@@ -132,6 +132,15 @@ pub(super) fn uid_set(input: &[u8]) -> IResult<&[u8], Vec<UidRange>> {
 ///
 /// `*` represents the highest numbered message in the mailbox and is mapped to
 /// `u32::MAX` as a sentinel value.
+///
+/// This collides with a legal UID: 4294967295 is a valid `nz-number`, and
+/// `connection::expand_uid_ranges` treats any `u32::MAX` endpoint as `*` and
+/// returns `Error::SearchResultTruncated`. Assessed and deliberately kept. The
+/// collision fails SAFE - a refused expansion, never a wrong one - it needs a
+/// mailbox that has reached the last UID of its UIDVALIDITY epoch to trigger at
+/// all, and moving the sentinel out of band means changing `UidRange` itself,
+/// which every codec, encoder and cursor path touches. Reopening this needs new
+/// evidence, not a fresh reading.
 fn seq_number(input: &[u8]) -> IResult<&[u8], u32> {
     if input.first() == Some(&b'*') {
         // RFC 3501 Section 9: `"*"` refers to the largest number in use.

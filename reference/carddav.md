@@ -222,6 +222,18 @@ reqwest transport has no `AccountNet` or metered transport attachment. This
 also means CardDAV legs composed into an IMAP account are not included in that
 account's priority scheduling, bandwidth measurements, or bandwidth cap.
 
+## This crate and bifrost-caldav are near-duplicates, and drift is the defect
+
+The two crates hand-mirror roughly 1500 lines of DAV machinery. Nothing compares
+the copies, so divergence is silent, and five separate defects in one hardening
+arc were exactly that - most recently `as_fetched_vcard` missing the
+`is_collection` guard its CalDAV twin already had, which surfaced an echoed
+collection as a phantom card. **Any fix to shared-shape code here must be
+checked against `bifrost-caldav`, and vice versa.** The full inventory of the
+duplication, and the standing note that collapsing it into a shared `bifrost-dav`
+is the repository owner's decision rather than the loop's, live in
+`reference/caldav.md`.
+
 ## Related providers
 
 The IMAP account composes `bifrost-carddav` when configured with

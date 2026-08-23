@@ -687,6 +687,9 @@ pub(crate) fn map_idle_event(
         | IdleEvent::StatusUpdate { .. }
         | IdleEvent::NotificationOverflow { .. }
         | IdleEvent::Alert(_)
+        // Unreachable from the push loop - `event_closes_connection` matches
+        // `Bye` first. Kept deliberately: the mapping is total over a
+        // `#[non_exhaustive]` enum, and the arm costs nothing.
         | IdleEvent::Bye { .. }
         | IdleEvent::ExtensionEvent(_) => Some(invalidated(HintPayload::Unknown)),
         IdleEvent::Timeout | IdleEvent::Cancelled | IdleEvent::ServerTerminated => None,

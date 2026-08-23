@@ -109,6 +109,11 @@ pub(crate) fn destroy<T: HttpTransport>(
 enum MutationKind {
     /// Empty additive/subtractive flag operations are local no-ops, but use
     /// the same routing, batching, tail flush, and Done path as wire mutations.
+    ///
+    /// They ride `mutation_stream` rather than getting a stream of their own on
+    /// purpose. A separate "simple case" path was tried and missed owner
+    /// routing: a foreign-account target went out against the primary handle.
+    /// One batching engine, one owner-routing rule.
     SkipFlags,
     Flags(FlagOp),
     Move(MailboxId),

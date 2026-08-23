@@ -544,7 +544,18 @@ yields a `SyncEvent::Terminated(AccountError)` with kind
 `SyncState(SchemaIncompatible)`, which the central mapping
 resolves to `Engine(SchemaIncompatible)`. Email identity comparisons
 are ASCII-case-insensitive in both cursor decoding and the live profile
-check. With the identity
+check - `getProfile` returning different casing must not wedge the account into
+a permanent `SchemaIncompatible`-clear-re-establish cycle.
+
+This per-poll round trip is **kept deliberately**, and the cost objection to it
+has already been raised and answered. It genuinely doubles the request count and
+the failure surface on the 30-second poll path. It is also the only thing today
+that catches a rotated token now pointing at a DIFFERENT Google account before
+that account's history is mixed into the existing slot, and there is no
+token-source identity binding upstream to lean on. It comes out when that
+binding exists, not before; do not re-file it as free savings.
+
+With the identity
 confirmed, the stream pages `users.history.list` from
 `startHistoryId`. Intermediate pages emit `checkpoint: None`, because
 Gmail's opaque page token is not represented in the cursor and the
@@ -810,3 +821,57 @@ id - `AccountError` is `Arc<Inner>`-backed, so the clones share storage.
   (`from`/`to`/`subject`/attachment/size) plus native query strings surface as
   `FilterCondition::ProviderExpression`. Writes reject names, disabled rules,
   stop-processing, and unstorable actions. `filter_update` is unsupported.
+
+### Accepted residuals
+
+Assessed and deliberately left as they are. Open work sits in `notes/todo.md`;
+these are decisions, not gaps.
+
+- **Cross-calendar event update is non-atomic.** Google exposes the move and the
+  field PATCH as separate requests. A second-leg failure returns
+  `Protocol(PartialResponse)` scoped to the event in its DESTINATION calendar
+  (the caller's `source::` composite id no longer addresses it), carrying
+  provider, protocol, HTTP status, request and trace ids, native code, both
+  diagnostic tiers and the whole original cause chain as secondary evidence,
+  with `Attempt(Acknowledged)` pushed first so `derive` reads it. No
+  compensating move is attempted - that adds another blind write and another
+  partial-failure window. Note that a reclassification must carry the evidence
+  the consumer needs to act: a `Reconcile` directive that does not name its
+  target is barely better than the silent partial write it replaces. Because
+  `into_builder` is decoration-only and exposes no kind-changing path, a fresh
+  builder plus hand-copied evidence is the contract-correct route here, not a
+  shortcut.
+- **A `close()` future dropped mid-`users.stop` leaves the Gmail-side watch
+  running until it expires.** The local half is cancellation-safe at every await
+  - `closed` and `shutdown.cancel()` happen synchronously before the future
+  exists, and the bifrost-net detach lives in a drop guard constructed BEFORE
+  `Box::pin` and moved in. (A guard built inside the async block is never built
+  at all if the future is dropped before its first poll, and with `closed`
+  already set `Drop` would skip the detach too, leaking the rate-limiter
+  registration unreclaimably - the same shape as the bug the guard was added to
+  fix.) Only `users.stop` remains inside the future, because it needs the
+  transport the detach sheds, so retrying it after a cancelled close is not
+  possible.
+- **`open_blob_range` always returns a classified `Unsupported(OpenBlobRange)`**,
+  including for a forged handle claiming `supports_range`. That is a decision
+  that Gmail attachments have no byte-range transport, not a stub awaiting
+  implementation. The earlier "defensive" branch returned `stream::empty()`,
+  which is a silently-ended stream for any consumer awaiting bytes.
+- **`get_stream` marks `PageBoundary::Final` only from information the drain
+  already has.** A batch cut short by the id stream closing is `Final`; a last
+  batch that fills exactly to `HYDRATE_BATCH_SIZE` stays `Page` with the
+  following `Done` as terminator. **Do not "finish" this with a one-item
+  lookahead.** The ids come from a backpressured producer that may be waiting on
+  hydration output before it yields again, so polling for id 33 before hydrating
+  ids 1-32 parks both sides forever - and short of a deadlock it holds every
+  partial batch until one more id arrives. `bifrost-sync` reads `Final` in no
+  hydration path, so the boundary is advisory; losing it on one alignment is far
+  cheaper than a stall.
+- **Inventory absorbs the list/get deletion race and nothing else.** A precisely
+  classified `NotFound(Message)` from `users.messages.get` is routine on a large
+  mailbox and no longer terminates the whole backfill partition (which used to
+  discard every page already emitted). Every other classified failure still
+  terminates and still discards emitted progress; there is deliberately no
+  per-item failed lane, because `Account::inventory_stream` returns
+  `AccountStream<SyncEvent<InventoryEntry>>` with no `ItemOutcome` wrapper and
+  adding one is a published trait change.

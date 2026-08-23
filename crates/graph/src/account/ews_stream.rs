@@ -539,6 +539,10 @@ const FRAME_LOCAL_NAME: &[u8] = b"GetStreamingEventsResponseMessage";
 const MAX_PREFIX_LEN: usize = 64;
 
 impl StreamingFrameDecoder {
+    /// Rescans the buffer from index 0 on every chunk. Assessed and accepted as
+    /// a known bound, not a defect: every path below either drains the consumed
+    /// prefix or truncates the buffer to a bounded tail, so the quadratic case
+    /// needs a single frame larger than the whole transfer.
     fn push(&mut self, chunk: &[u8]) -> Result<Vec<String>, String> {
         self.buffered.extend_from_slice(chunk);
         let mut frames = Vec::new();

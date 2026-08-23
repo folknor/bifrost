@@ -293,6 +293,36 @@ pub trait Account: Send + Sync {
     fn changes_stream(&self, cursor: ChangeCursor) -> AccountStream<SyncEvent<Change>>;
 
     /// Server-side push subscription CRUD: create.
+    ///
+    /// **This answers per scope, not per request.** `PushSubscription` carries
+    /// an optional handle plus a validated per-scope `BatchOutcome` over the
+    /// three-lane model in `reference/error-model.md`, and its ids are
+    /// submission positions. A single refused scope must NEVER fail its
+    /// siblings, and that applies to every bail path - including ones that run
+    /// before any translation or resolution step, which is where an
+    /// all-or-nothing bail last survived a contract fix and kept the
+    /// user-visible symptom alive on every path that mattered. A subscribe that
+    /// accepts nothing returns no handle at all.
+    ///
+    /// `Err` is reserved for genuine whole-request faults: an empty scope list,
+    /// no endpoint configured, nothing subscribable at all, or a create failure
+    /// that was rolled back.
+    ///
+    /// Implementors differ legitimately in how much of the list they cover.
+    /// caldav, carddav and the IMAP `StubAccount` refuse push outright; google
+    /// (`users.watch` is per mailbox) and jmap (per-account PushSubscription)
+    /// genuinely cover the whole requested list when they return `Ok`; imap
+    /// partially fails by design, since without RFC 5465 NOTIFY it runs a
+    /// bounded budget of dedicated IDLE sessions and reports the excess in the
+    /// failed lane.
+    ///
+    /// The coupling that makes partial coverage safe lives in `bifrost-sync`:
+    /// push coverage never suppresses polling. `Engine::subscribe_push` records
+    /// only `outcomes.succeeded()`, and that registry is teardown bookkeeping
+    /// with no scheduler path consulting it, so a refused scope stays polled
+    /// rather than becoming invisible. Any future change that lets push
+    /// coverage relax polling must first make the uncovered-scope lane
+    /// explicit, or it silently reintroduces that hole.
     fn push_subscribe(
         &self,
         scopes: &[CursorScope],

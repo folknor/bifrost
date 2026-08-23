@@ -72,6 +72,13 @@ getrandom = { version = "0.4.2", features = ["std"] }
 zeroize = "1"
 
 # Diagnostics
+# Some member crates additionally ask for `features = ["std"]` and some take
+# this pin as-is. That difference is INERT, not drift: installing a
+# thread-scoped subscriber itself requires `tracing/std`, and Cargo unifies
+# features additively across the shared dependency instance, so any consumer
+# able to scope a subscriber at all has already enabled `std` for every crate in
+# the graph. Filed once as a diagnostics-loss defect and withdrawn on that
+# reasoning; reopening it needs evidence about a real build configuration.
 tracing = { version = "0.1", default-features = false }
 tracing-subscriber = "0.3"
 

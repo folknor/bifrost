@@ -250,6 +250,24 @@ that a later rediscovery validly resumes from - a leak, never data loss.
 Compensation failure is error-logged because the checkpoint-store trait has
 no transaction primitive.
 
+The rule that makes the above safe: **never write what an abort would have to
+restore**, and derive the "preexisting versus freshly created" classification
+from the SAME store read the action uses. A separate pre-check `get` whose
+errors were swallowed (`.is_ok_and`) demoted a preexisting prior-session row to
+"created" on a transient read failure, and the abort path then deleted it - the
+exact data loss the staged design existed to eliminate, resurfacing through the
+error path of a duplicated read, plus a TOCTOU between the two reads.
+`run_establish` now reports the origin off its own single read
+(`EstablishOrigin`), so a store error aborts the reattach before any durable
+write. Pinned by
+`transient_get_failure_cannot_demote_preexisting_cursor_to_created`. Generally:
+a classification that feeds a destructive compensation must come from the read
+the action uses, and must fail closed on error.
+
+A compare-and-swap primitive on `CheckpointStore` would remove the class
+outright. It was considered and deliberately not taken - it is a published trait
+change, so it is an owner-level proposal rather than hardening work.
+
 A public or engine-initiated reopen queues behind `Pause` and runs after
 resume: pause is a quiescence boundary, not permission to open a
 replacement connection in the background. The activity registration that
@@ -880,6 +898,19 @@ compose clusters - they deliberately bypass the idempotency / read-back /
 recovery pipeline that guards the volume mutations.
 
 ## Scheduler + budget
+
+**`Scheduler`, `ConcurrencyBudget`, `SchedulerConfig`, `MutationConfig`,
+`LiveSupersedes`, `BackfillCheckpointWriter` and `mutation::fanout` stay. Do not
+delete them.** All seven were removed in one commit on the reasoning that nothing
+in this workspace wired them, and restored at the repository owner's instruction.
+This is a library crate: its consumers are outside the workspace by definition,
+so a workspace-wide grep establishes nothing about who uses a published item, and
+"documented as deliberately unwired, with no dated plan" describes somebody's
+plan rather than evidence of abandonment. Where one of these reads as unfinished,
+the fix is to finish it - see `MutationConfig::retry_queue_cap` in
+`notes/todo.md`, which bounds nothing today and should be made to bound the
+queue rather than dropped. Removing or renaming any published item here is the
+owner's call; the standing lessons in `AGENTS.md` carry the full account.
 
 `Scheduler` is a strict-priority gate (not an executor) with four
 lanes: `Foreground` / `Normal` / `Background` / `Bulk`. Starvation

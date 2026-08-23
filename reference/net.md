@@ -360,6 +360,12 @@ help, and hammering an IdP that is refusing is how an account gets
 throttled or blocked there. Forced refreshes are subject to the same
 quiet interval; the state, not the caller, decides.
 
+What this bounds is the ISSUER CALL RATE, not the number of failing requests.
+Every request arriving during a quiet interval still fails - locally, off the
+shared cached error. An earlier version of this document claimed the backoff
+"prevents one refresh call per request", which overclaims in the direction that
+matters; state it as a rate bound.
+
 Note what this does and does not promise. It bounds the issuer call
 RATE, not the number of failing requests: every request during the
 interval still fails, it just fails locally off the cached error.
