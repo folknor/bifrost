@@ -1365,8 +1365,11 @@ async fn fetch_paged_values(
 ) -> Result<Vec<Value>, AccountError> {
     let ctx = GraphErrorContext::graph(AccountOperation::Hydrate);
     let mut values = Vec::new();
+    let mut walk = crate::paging::PageWalk::new("hydration values");
     let mut next_url = Some(first_url);
     while let Some(url) = next_url {
+        walk.enter(&url)
+            .map_err(|e| into_account_error(e, ctx.clone()))?;
         let page: ODataCollection<Value> = if url.starts_with("http") {
             client.get_absolute(&url).await
         } else {

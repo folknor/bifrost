@@ -1183,11 +1183,23 @@ confirm against the code before working any of them.
   last `std::env::var` read in the workspace and the last place a bifrost crate
   names a downstream consumer. Coordinate with those two repos; there is nothing
   to do here until they are ready.
-- **google-B4. `calendars_list` returns a `Vec` with no streaming.** [C4] A
-  pathological account buys many sequential 250-item round trips before the
-  caller sees anything. The walk is bounded (repeated-token guard plus page
-  budget) and correctness is not at stake; the remedy changes the published
-  method's return type.
+- **google-B4. `calendars_list` returns a `Vec` with no streaming.** [C4]
+  **CLOSED 2026-08-23 as a considered non-defect. Do not re-file without new
+  evidence.** The shape argument does not survive the numbers: Google paginates
+  at 250/page under a page budget with a repeated-token guard, and a real
+  account has tens of calendars, so it is one page. The scenario the finding
+  describes needs 250+ calendars. Against that, `calendars_list` is a published
+  `Account` trait method with six real implementors and five test stubs, plus
+  every out-of-workspace consumer. Note also that the trait already
+  distinguishes these cases deliberately - `contacts_list` returns
+  `Page<ContactCard>` with a page cursor because contacts number in the tens of
+  thousands, and calendars do not. The inconsistency is considered, not an
+  oversight.
+
+  Auditing it did surface a real defect in a different crate, which is fixed:
+  `bifrost-graph` had SIX unbounded `@odata.nextLink` loops with no page budget
+  and no repeated-link guard, plus an unguarded folder-parentage descent. See
+  `reference/graph.md`, "Bounded `nextLink` traversal".
 - **google-B5. `inventory_stream` has no per-item failed lane.** [C4]
   `Account::inventory_stream` in `bifrost-types` returns
   `AccountStream<SyncEvent<InventoryEntry>>` with no `ItemOutcome` wrapper, so a

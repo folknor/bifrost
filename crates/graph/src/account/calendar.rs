@@ -48,10 +48,13 @@ const EVENT_SEARCH_FIELDS: &[&str] = &[
 pub(crate) async fn calendars_list(account: GraphAccount) -> Result<Vec<Calendar>, AccountError> {
     let prefix = account.client.api_path_prefix();
     let mut calendars = Vec::new();
+    let mut walk = crate::paging::PageWalk::new("calendars");
     let mut next = Some(format!(
         "{prefix}/calendars?$select=id,name,canEdit,isDefaultCalendar&$top=250"
     ));
     while let Some(url) = next {
+        walk.enter(&url)
+            .map_err(|error| into_error(error, AccountOperation::CalendarsList))?;
         let page: ODataCollection<GraphCalendar> =
             get_page(&account, &url, AccountOperation::CalendarsList).await?;
         calendars.extend(page.value.into_iter().map(calendar_from_graph));

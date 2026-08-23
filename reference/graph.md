@@ -39,6 +39,9 @@ arrived with cursor envelope v2, which forces a reseed.
   `CursorIndex`, `FolderTree`.
 - `foreign.rs` - foreign (shared/delegate) mailbox folder codec:
   `encode_foreign` / `parse_folder` / `ParsedFolder` / `owner_tag`.
+
+Crate root: `paging.rs` - `PageWalk`, the shared bound on every
+`@odata.nextLink` traversal (see "Bounded `nextLink` traversal").
 - `inventory.rs` - initial `delta?$select=...` walk, page
   pagination, inventory entry projection from Graph JSON.
 - `changes.rs` - delta-token-driven change stream over the
@@ -1367,6 +1370,39 @@ on every pass instead of quarantining one folder.
 
 Non-byte-stream attachments emit a `BlobNotByteStream` `Warning` rather than a
 terminal error, so the engine continues past a referenceAttachment in a batch.
+
+## Bounded `nextLink` traversal
+
+Every Graph collection walk follows server-supplied `@odata.nextLink` values
+until the server stops sending them, which is an unbounded loop against a
+remote: a server that keeps emitting a link spins the walk forever while the
+accumulating `Vec` grows without limit. Six such loops existed with no bound of
+any kind - `list_mail_folders`, the `childFolders` descent,
+`list_message_rules`, `calendars_list`, `address_books_list`, and
+`fetch_paged_values`.
+
+`crates/graph/src/paging.rs` holds the shared guard. `PageWalk::enter` is called
+with each URL BEFORE fetching it, including the first, so a server echoing the
+request URI back as its own `nextLink` is caught rather than walked. It enforces
+two things, and both are load-bearing: a repeated-link check alone does not stop
+a server handing out a FRESH link every page, and a page budget alone lets a
+tight two-link cycle burn the whole budget on requests. `bifrost-google`'s
+`calendars_list` learned the same lesson independently and carries the same
+pair. The budget (10,000 pages, so 1,000,000+ objects at Graph's typical `$top`)
+is deliberately generous: it bounds a misbehaving server, not a large account.
+
+A refusal is a provider-contract violation, not a transport failure, so it
+travels as `GraphError::Json` - the crate's carrier for "the response did not
+match the documented contract" - classifying as `Protocol(ParseFailed)` /
+`Wire(MalformedResponse)`.
+
+`list_mail_folders_recursive` needs a SECOND, different guard, and no amount of
+page-link checking substitutes for it. Folder parentage is server-supplied, so a
+cycle (A claims B as a child, B claims A) or a folder reported under two parents
+re-enqueues ids forever while every individual page is well-formed and no link
+repeats. The descent keeps its own `expanded` set and skips an id it has already
+walked. Both guards are pinned by tests that ablate to "scripted dispatch
+exhausted" without them.
 
 ## Known limitations
 

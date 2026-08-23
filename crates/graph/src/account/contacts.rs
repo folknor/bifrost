@@ -34,10 +34,13 @@ pub(crate) async fn address_books_list(
         can_update_contacts: true,
         can_delete_contacts: true,
     }];
+    let mut walk = crate::paging::PageWalk::new("contactFolders");
     let mut next = Some(format!(
         "{prefix}/contactFolders?$select=id,displayName,parentFolderId&$top=250"
     ));
     while let Some(url) = next {
+        walk.enter(&url)
+            .map_err(|error| into_error(error, AccountOperation::AddressBooksList))?;
         let page: ODataCollection<GraphContactFolder> =
             get_page(&account, &url, AccountOperation::AddressBooksList).await?;
         books.extend(page.value.into_iter().map(folder_to_address_book));

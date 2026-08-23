@@ -13,5 +13,6 @@ mod api;
 mod client;
 mod error;
 mod ews;
+mod paging;
 mod types;
 mod webhooks;
