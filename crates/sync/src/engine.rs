@@ -3742,6 +3742,13 @@ pub(crate) async fn handle_account_error(
             // Every directive except `RestartAccount` is a bounded,
             // scope-local repair that must not interleave with a
             // connection swap, so it takes the serialization lock here.
+            // RestartScope and SchemaIncompatible deliberately retain the
+            // guard across their retry backoff. Releasing it during a sleep
+            // would let a reopen replace the account and registry topology
+            // halfway through the delete-then-establish transaction, or let
+            // a second recovery establish the same scope concurrently. The
+            // queueing cost is bounded by the three-attempt budget and is the
+            // price of keeping recovery transitions serial.
             //
             // `RestartAccount` must NOT take it here. It waits for the
             // boundary to read `Run` before each attempt, and that wait is
@@ -4050,6 +4057,7 @@ async fn re_establish_scope_with_backoff(ctx: &RecoveryContext<'_>, scope: Curso
             Arc::clone(ctx.store),
             ctx.changes_tx.clone(),
             Some(ctx.control),
+            true,
         )
         .await
         {
@@ -4178,6 +4186,31 @@ async fn unwind_replacement_subscriptions(
     ctx.subscriptions.restore(ctx.account_id.clone(), orphaned);
 }
 
+/// Delete the durable cursor rows an aborted reattach created.
+///
+/// This is deliberately the ONLY durable compensation the reopen path has,
+/// and it only ever deletes rows whose scope had no stored cursor before
+/// this reattach began. Preexisting rows are never deleted, snapshotted, or
+/// restored here: the old account's ack writer keeps persisting checkpoints
+/// concurrently (nothing serializes it against a reopen), so any
+/// snapshot-and-restore of a preexisting row could overwrite a newer
+/// consumer-acknowledged checkpoint. Deleting only rows this reattach itself
+/// created cannot destroy preexisting data - the worst outcome of a failed
+/// delete is a leaked cursor for a topology that was never installed.
+async fn rollback_reattach_inserts(ctx: &RecoveryContext<'_>, inserted: &[CursorScope]) {
+    for scope in inserted {
+        if let Err(error) = ctx.store.delete_change_cursor(ctx.account_id, scope).await {
+            tracing::error!(
+                target: "bifrost.sync.reopen",
+                account = ?ctx.account_id,
+                scope = ?scope,
+                error = %error,
+                "failed to roll back replacement cursor after aborted reattach"
+            );
+        }
+    }
+}
+
 /// Why no replacement connection was opened.
 enum ReplacementOpen {
     /// The boundary left `Run` before activity could be registered. Nothing
@@ -4240,12 +4273,24 @@ async fn reattach_account(
     let result = async {
         let discovered = discover_scopes_from(next.as_ref()).await?;
         let staged = Arc::new(CursorRegistry::new());
+        let mut newly_established = Vec::new();
 
         for scope in &discovered {
             if let Some(existing) = ctx.cursors.snapshot(scope) {
                 staged.put(existing);
                 continue;
             }
+            // A scope absent from the live registry may still have a durable
+            // cursor - a prior session persisted it, this session's account
+            // never discovered it, and the replacement discovers it again.
+            // `run_establish` resumes from that row without writing; it must
+            // never be counted as created here, or an aborted swap would
+            // delete a legitimately persisted cursor.
+            let had_durable_row = ctx
+                .store
+                .get_change_cursor(ctx.account_id, scope)
+                .await
+                .is_ok_and(|row| row.is_some());
             match run_establish(
                 ctx.account_id,
                 next.as_ref(),
@@ -4254,10 +4299,17 @@ async fn reattach_account(
                 Arc::clone(ctx.store),
                 ctx.changes_tx.clone(),
                 None,
+                false,
             )
             .await
             {
-                Ok(()) => {}
+                Ok(()) => {
+                    if !had_durable_row
+                        && let Some(cursor) = staged.snapshot(scope)
+                    {
+                        newly_established.push(cursor);
+                    }
+                }
                 Err(Error::Account(error)) if scope_local_establish_failure(&error) => {
                     tracing::warn!(
                         target: "bifrost.sync.reopen",
@@ -4274,16 +4326,12 @@ async fn reattach_account(
         link_discovered_memberships(next.as_ref(), &staged).await?;
 
         let discovered_set: HashSet<_> = discovered.iter().cloned().collect();
-        for vanished in ctx
+        let vanished: Vec<_> = ctx
             .cursors
             .all_scopes()
             .into_iter()
             .filter(|scope| !discovered_set.contains(scope))
-        {
-            ctx.store
-                .delete_change_cursor(ctx.account_id, &vanished)
-                .await?;
-        }
+            .collect();
 
         let previous_subscriptions = ctx.subscriptions.snapshot(ctx.account_id);
         let mut replacement_subscriptions = Vec::with_capacity(previous_subscriptions.len());
@@ -4330,6 +4378,34 @@ async fn reattach_account(
             }
         }
 
+        // Persist the freshly created cursors while the old account and its
+        // push subscriptions are still completely intact. Only rows whose
+        // scope had no stored cursor before this reattach are written here,
+        // so the abort path below can compensate by plain deletion without
+        // ever touching preexisting durable state. Vanished-scope rows are
+        // deliberately NOT deleted yet: the old account's ack writer may
+        // still be persisting checkpoints for them, and a delete now would
+        // need a snapshot-and-restore on abort that races that writer.
+        // Their deletion happens after the cutover, where an abort can no
+        // longer occur.
+        let mut inserted = Vec::new();
+        let durable_result = async {
+            for cursor in &newly_established {
+                ctx.store
+                    .put_change_cursor(ctx.account_id, cursor.clone())
+                    .await?;
+                inserted.push(cursor.scope.clone());
+            }
+            Ok::<(), Error>(())
+        }
+        .await;
+        if let Err(error) = durable_result {
+            rollback_reattach_inserts(ctx, &inserted).await;
+            unwind_replacement_subscriptions(ctx, next.as_ref(), &mut replacement_subscriptions)
+                .await;
+            return Err(error);
+        }
+
         // Accounts such as Graph retain server-side subscription ids after a
         // failed delete so the same handle can retry. Tear old handles down
         // before swapping and closing their account: otherwise a vanished
@@ -4367,6 +4443,7 @@ async fn reattach_account(
                     .await;
                     ctx.subscriptions
                         .mark_unconfirmed(ctx.account_id, &record.handle);
+                    rollback_reattach_inserts(ctx, &inserted).await;
                     return Err(Error::Account(error));
                 }
             }
@@ -4401,6 +4478,25 @@ async fn reattach_account(
         }
         ctx.account_generation_tx
             .send_modify(|generation| *generation = generation.saturating_add(1));
+
+        // Delete vanished-scope rows only now that the cutover is committed.
+        // Nothing after this point can abort the swap, so no compensation is
+        // needed; a failed (or raced) delete merely leaks a stale row for a
+        // scope no longer in the topology, and a later rediscovery of that
+        // scope resumes from it, which is valid. A retired stream's late ack
+        // can likewise re-persist such a row after this delete - the same
+        // benign leak, never data loss.
+        for scope in &vanished {
+            if let Err(error) = ctx.store.delete_change_cursor(ctx.account_id, scope).await {
+                tracing::warn!(
+                    target: "bifrost.sync.reopen",
+                    account = ?ctx.account_id,
+                    scope = ?scope,
+                    error = %error,
+                    "failed to delete vanished-scope cursor after reopen cutover"
+                );
+            }
+        }
 
         if let Err(error) = previous.close().await {
             tracing::warn!(
@@ -4594,6 +4690,7 @@ fn broadcast_warning(
 /// Re-establish a single scope. Mirrors `SyncEngine::establish_one`
 /// but lives at file scope so the reopen listener task can call it
 /// without owning a reference to the engine.
+#[allow(clippy::too_many_arguments)]
 async fn run_establish(
     account_id: &AccountId,
     account: &dyn Account,
@@ -4602,6 +4699,7 @@ async fn run_establish(
     store: Arc<DynCheckpointStore>,
     changes_tx: broadcast::Sender<MultiplexerEvent>,
     control: Option<&SyncControl>,
+    persist_ready: bool,
 ) -> Result<(), Error> {
     let _activity = match control {
         Some(control) => Some(control.begin_activity().ok_or(Error::Paused)?),
@@ -4653,7 +4751,9 @@ async fn run_establish(
         .map_err(Error::Account)?
     {
         CursorEstablishment::Ready(cursor) => {
-            store.put_change_cursor(account_id, cursor.clone()).await?;
+            if persist_ready {
+                store.put_change_cursor(account_id, cursor.clone()).await?;
+            }
             cursors.put(cursor);
             Ok(())
         }

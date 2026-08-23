@@ -518,6 +518,10 @@ mod tests {
 
         drop(activity);
         assert_eq!(waiter.await.expect("waiter task").expect("pause"), None);
+        assert!(
+            control.begin_activity().is_none(),
+            "paused accounts must refuse every new engine activity registration"
+        );
     }
 
     #[tokio::test]

@@ -1698,11 +1698,13 @@ async fn pause_cannot_report_quiescence_while_a_replacement_is_mid_open() {
 #[tokio::test]
 async fn correlated_teardown_failure_retains_both_sides_for_retry() {
     let account_id = AccountId("correlated-teardown".to_owned());
+    let old_scope = CursorScope::Account;
+    let new_scope = CursorScope::Type(bifrost_types::ObjectType::Email);
     let unsubscribed = Arc::new(Mutex::new(Vec::new()));
     let factory = Arc::new(RotatingFactory {
         scopes: Mutex::new(VecDeque::from([
-            vec![CursorScope::Account],
-            vec![CursorScope::Account],
+            vec![old_scope.clone()],
+            vec![old_scope.clone(), new_scope.clone()],
         ])),
         established: Arc::new(Mutex::new(Vec::new())),
         closed: Arc::new(AtomicUsize::new(0)),
@@ -1715,7 +1717,9 @@ async fn correlated_teardown_failure_retains_both_sides_for_retry() {
         lifecycle_calls: Arc::new(Mutex::new(Vec::new())),
         opens: AtomicUsize::new(0),
     });
+    let store = Arc::new(InMemoryCheckpointStore::new());
     let engine = SyncEngine::builder()
+        .checkpoints(Arc::clone(&store) as Arc<dyn CheckpointStore>)
         .build()
         .expect("default engine config is valid");
     let factory_trait: Arc<dyn AccountFactory> = factory;
@@ -1725,13 +1729,29 @@ async fn correlated_teardown_failure_retains_both_sides_for_retry() {
         .await
         .expect("attach");
     engine
-        .subscribe_push(&account_id, &[CursorScope::Account])
+        .subscribe_push(&account_id, std::slice::from_ref(&old_scope))
         .await
         .expect("subscribe");
 
     assert!(
         matches!(engine.reopen(&account_id).await, Err(Error::Account(_))),
         "an unconfirmed old-handle teardown must abort the swap"
+    );
+    assert!(
+        store
+            .get_change_cursor(&account_id, &new_scope)
+            .await
+            .expect("new scope lookup")
+            .is_none(),
+        "a replacement cursor must not become durable when the topology swap aborts"
+    );
+    assert!(
+        store
+            .get_change_cursor(&account_id, &old_scope)
+            .await
+            .expect("old scope lookup")
+            .is_some(),
+        "an aborted swap must retain the installed topology's durable cursor"
     );
     assert_eq!(
         *unsubscribed.lock().expect("unsubscribed lock"),
@@ -1757,6 +1777,245 @@ async fn correlated_teardown_failure_retains_both_sides_for_retry() {
             (0, SubscriptionHandle("generation-1".into())),
         ],
         "neither the old nor the replacement handle may be forgotten"
+    );
+
+    engine.detach(&account_id).await.expect("detach");
+}
+
+/// A prior session persisted a cursor for a scope this session's account
+/// never discovered. A replacement rediscovers the scope, so reattach
+/// resumes from the stored row without creating anything - and an aborted
+/// swap must therefore leave that row exactly as it found it. Treating
+/// "absent from the live registry" as "newly created" would make the abort
+/// path delete a legitimately persisted cursor.
+#[tokio::test]
+async fn aborted_reopen_preserves_preexisting_cursor_for_rediscovered_scope() {
+    let account_id = AccountId("rediscovered-preexisting".to_owned());
+    let live_scope = CursorScope::Account;
+    let rediscovered = CursorScope::Type(bifrost_types::ObjectType::Email);
+    let fresh = CursorScope::Type(bifrost_types::ObjectType::Contact);
+    let factory = Arc::new(RotatingFactory {
+        scopes: Mutex::new(VecDeque::from([
+            vec![live_scope.clone()],
+            vec![live_scope.clone(), rediscovered.clone(), fresh.clone()],
+        ])),
+        established: Arc::new(Mutex::new(Vec::new())),
+        closed: Arc::new(AtomicUsize::new(0)),
+        closed_generations: Arc::new(Mutex::new(Vec::new())),
+        subscribed: Arc::new(Mutex::new(Vec::new())),
+        unsubscribed: Arc::new(Mutex::new(Vec::new())),
+        unsubscribe_failures: Arc::new(AtomicUsize::new(1)),
+        lifecycle_calls: Arc::new(Mutex::new(Vec::new())),
+        opens: AtomicUsize::new(0),
+    });
+    let store = Arc::new(InMemoryCheckpointStore::new());
+    let engine = SyncEngine::builder()
+        .checkpoints(Arc::clone(&store) as Arc<dyn CheckpointStore>)
+        .build()
+        .expect("default engine config is valid");
+    let factory_trait: Arc<dyn AccountFactory> = factory;
+
+    engine
+        .attach(account_id.clone(), factory_trait)
+        .await
+        .expect("attach");
+    engine
+        .subscribe_push(&account_id, std::slice::from_ref(&live_scope))
+        .await
+        .expect("subscribe");
+
+    // The prior session's row: durable, valid, not in the live registry.
+    let prior = cursor_for(&rediscovered, b"prior-session");
+    store
+        .put_change_cursor(&account_id, prior.clone())
+        .await
+        .expect("seed prior-session cursor");
+
+    assert!(
+        matches!(engine.reopen(&account_id).await, Err(Error::Account(_))),
+        "the old-handle teardown failure must abort the swap"
+    );
+    let survived = store
+        .get_change_cursor(&account_id, &rediscovered)
+        .await
+        .expect("rediscovered scope lookup")
+        .expect("an aborted swap must not delete a preexisting durable cursor");
+    assert_eq!(
+        survived.server_state.bytes, prior.server_state.bytes,
+        "the preexisting row must survive the aborted swap unchanged"
+    );
+    assert!(
+        store
+            .get_change_cursor(&account_id, &fresh)
+            .await
+            .expect("fresh scope lookup")
+            .is_none(),
+        "a freshly created cursor must not stay durable after the aborted swap"
+    );
+
+    engine.detach(&account_id).await.expect("detach");
+}
+
+/// Store wrapper that records every change-cursor mutation and, on the
+/// first put, first writes a scripted "concurrent ack" row into the inner
+/// store - a deterministic stand-in for the old account's ack writer
+/// persisting a newer checkpoint in the middle of a reattach, at the worst
+/// possible interleaving point for any snapshot-and-restore scheme.
+struct AckRacingStore {
+    inner: Arc<InMemoryCheckpointStore>,
+    mutated_scopes: Mutex<Vec<CursorScope>>,
+    side_write: Mutex<Option<(AccountId, ChangeCursor)>>,
+}
+
+impl CheckpointStore for AckRacingStore {
+    fn put_change_cursor<'a>(
+        &'a self,
+        account: &'a AccountId,
+        cursor: ChangeCursor,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send + 'a>> {
+        self.mutated_scopes
+            .lock()
+            .expect("mutations lock")
+            .push(cursor.scope.clone());
+        let side = self.side_write.lock().expect("side write lock").take();
+        Box::pin(async move {
+            if let Some((ack_account, ack_cursor)) = side {
+                self.inner
+                    .put_change_cursor(&ack_account, ack_cursor)
+                    .await?;
+            }
+            self.inner.put_change_cursor(account, cursor).await
+        })
+    }
+
+    fn get_change_cursor<'a>(
+        &'a self,
+        account: &'a AccountId,
+        scope: &'a CursorScope,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Option<ChangeCursor>, Error>> + Send + 'a>>
+    {
+        self.inner.get_change_cursor(account, scope)
+    }
+
+    fn put_backfill<'a>(
+        &'a self,
+        account: &'a AccountId,
+        checkpoint: BackfillCheckpoint,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send + 'a>> {
+        self.inner.put_backfill(account, checkpoint)
+    }
+
+    fn get_backfill<'a>(
+        &'a self,
+        account: &'a AccountId,
+        scope: &'a CursorScope,
+    ) -> Pin<
+        Box<
+            dyn std::future::Future<Output = Result<Option<BackfillCheckpoint>, Error>> + Send + 'a,
+        >,
+    > {
+        self.inner.get_backfill(account, scope)
+    }
+
+    fn delete_change_cursor<'a>(
+        &'a self,
+        account: &'a AccountId,
+        scope: &'a CursorScope,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send + 'a>> {
+        self.mutated_scopes
+            .lock()
+            .expect("mutations lock")
+            .push(scope.clone());
+        self.inner.delete_change_cursor(account, scope)
+    }
+
+    fn delete_backfill<'a>(
+        &'a self,
+        account: &'a AccountId,
+        scope: &'a CursorScope,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send + 'a>> {
+        self.inner.delete_backfill(account, scope)
+    }
+}
+
+/// The old account's ack writer is not serialized against a reopen, so a
+/// consumer acknowledgement can persist a newer checkpoint at any point of
+/// the reattach - including for a scope the replacement no longer
+/// discovers. An aborted swap must leave that newer row standing: the
+/// abort path may only delete rows the reattach itself created, and every
+/// preexisting row (vanished or live) must remain untouched until the
+/// cutover is committed.
+#[tokio::test]
+async fn aborted_reopen_cannot_clobber_concurrently_acked_vanished_cursor() {
+    let account_id = AccountId("ack-race-vanished".to_owned());
+    let live_scope = CursorScope::Account;
+    let vanished = CursorScope::Type(bifrost_types::ObjectType::Mailbox);
+    let fresh = CursorScope::Type(bifrost_types::ObjectType::Contact);
+    let factory = Arc::new(RotatingFactory {
+        scopes: Mutex::new(VecDeque::from([
+            vec![live_scope.clone(), vanished.clone()],
+            vec![live_scope.clone(), fresh.clone()],
+        ])),
+        established: Arc::new(Mutex::new(Vec::new())),
+        closed: Arc::new(AtomicUsize::new(0)),
+        closed_generations: Arc::new(Mutex::new(Vec::new())),
+        subscribed: Arc::new(Mutex::new(Vec::new())),
+        unsubscribed: Arc::new(Mutex::new(Vec::new())),
+        unsubscribe_failures: Arc::new(AtomicUsize::new(1)),
+        lifecycle_calls: Arc::new(Mutex::new(Vec::new())),
+        opens: AtomicUsize::new(0),
+    });
+    let inner = Arc::new(InMemoryCheckpointStore::new());
+    let newer_ack = cursor_for(&vanished, b"newer-acked-checkpoint");
+    let store = Arc::new(AckRacingStore {
+        inner: Arc::clone(&inner),
+        mutated_scopes: Mutex::new(Vec::new()),
+        side_write: Mutex::new(Some((account_id.clone(), newer_ack.clone()))),
+    });
+    let engine = SyncEngine::builder()
+        .checkpoints(Arc::clone(&store) as Arc<dyn CheckpointStore>)
+        .build()
+        .expect("default engine config is valid");
+    let factory_trait: Arc<dyn AccountFactory> = factory;
+
+    engine
+        .attach(account_id.clone(), factory_trait)
+        .await
+        .expect("attach");
+    engine
+        .subscribe_push(&account_id, std::slice::from_ref(&live_scope))
+        .await
+        .expect("subscribe");
+    // Attach persisted both live scopes; only the reopen's mutations are
+    // under scrutiny. The scripted side write fires on the reopen's first
+    // put, so it lands mid-reattach by construction.
+    store.mutated_scopes.lock().expect("mutations lock").clear();
+
+    assert!(
+        matches!(engine.reopen(&account_id).await, Err(Error::Account(_))),
+        "the old-handle teardown failure must abort the swap"
+    );
+    let survived = inner
+        .get_change_cursor(&account_id, &vanished)
+        .await
+        .expect("vanished scope lookup")
+        .expect("an aborted swap must not delete a vanished scope's durable cursor");
+    assert_eq!(
+        survived.server_state.bytes, newer_ack.server_state.bytes,
+        "the concurrently acked checkpoint must survive the aborted swap"
+    );
+    assert!(
+        inner
+            .get_change_cursor(&account_id, &fresh)
+            .await
+            .expect("fresh scope lookup")
+            .is_none(),
+        "a freshly created cursor must not stay durable after the aborted swap"
+    );
+    let mutated = store.mutated_scopes.lock().expect("mutations lock").clone();
+    assert!(
+        mutated.iter().all(|scope| *scope == fresh),
+        "an aborted reopen may only mutate rows it created itself, got {mutated:?}"
     );
 
     engine.detach(&account_id).await.expect("detach");

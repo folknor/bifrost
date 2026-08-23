@@ -483,6 +483,78 @@ notes.
   move (C1), and the `bifrost-dav` collapse (C4). Each would remove, rename, or reshape
   published API or behavior. `notes/bugs-dav.md` holds them in full with their categories.
 
+## From the bifrost-google arc (closed 2026-08-23, `10f4034` + `a060489` + `74bc3ca` plus close pass `d8eb9fe`)
+
+- **Hydration must NEVER poll the id stream past the batch in hand.** A one-item lookahead to
+  determine `PageBoundary::Final` deadlocks a backpressured producer: `get_stream` streams ids
+  precisely so the producer can wait on output, so polling for id 33 before hydrating the first
+  32 parks both sides forever. `get_stream` marks `Final` from a flag set INSIDE the drain loop -
+  a batch cut short by a closed id stream is `Final`, a batch that fills exactly stays `Page`
+  with `Done` as terminator. Pinned by a paused-clock stall test. The residual (a last batch that
+  fills exactly is unmarked) is deliberate and the ledger carries an explicit
+  "do not finish this with a lookahead" note; `bifrost-sync` reads `Final` in no hydration path.
+- **Inventory absorbs the deletion race and nothing else.** A Gmail 404 for a message listed and
+  then deleted before `users.messages.get` is routine on a large mailbox, and it used to
+  terminate the whole backfill partition, discarding every page already emitted. Only a
+  precisely classified `NotFound(Message)` is absorbed; every other failure still terminates.
+  There is deliberately NO per-item failed lane here: `Account::inventory_stream` returns
+  `AccountStream<SyncEvent<InventoryEntry>>` with no `ItemOutcome` wrapper, so adding one is a
+  published trait change and is fenced for the owner.
+- **Quota is a dated table consulted through one lookup, never a hardcoded cost.** Gmail bills in
+  quota units, not requests; the old calibration was 250 requests/s at `cost_default: 1` while
+  the capability surface advertised a `QuotaUnits` model the transport did not implement. The
+  bucket is now 100 units/s with real per-method costs (source: published Gmail usage limits,
+  May 2026 revision, rechecked August 2026 - the note in `gmail_quota_cost` carries the
+  provenance, and the instruction is to re-read the table rather than re-derive from 429s). The
+  catch-all is 20 units, NOT 1: a cheap default was the original defect, so genuinely cheap
+  endpoints are listed explicitly instead. `messages.send` and `users.watch` sit exactly at the
+  burst ceiling, so those constants must move together - a test pins that no method costs more
+  than the burst. Non-Gmail hosts (Calendar, Drive, People) keep `cost_default: 1` in the
+  smaller bucket, so per-request billing is right for them. Both build sites consult the lookup.
+- **`close()` is cancellation-safe at every await, and the guard is built before the future.**
+  `closed` and `shutdown.cancel()` happen synchronously before the future exists, so the renewer
+  and the push/lifecycle streams retire whatever the caller does with it; the bifrost-net detach
+  lives in a `DetachOnDrop` guard CONSTRUCTED BEFORE `Box::pin` and moved in, because a guard
+  built inside the async block is never built at all if the future is dropped before its first
+  poll - and with `closed` already set, `Drop` skips the detach too, leaking the rate-limiter
+  registration unreclaimably. That was the close pass's find, and it is the same shape as the
+  bug the guard was added to fix. Only `users.stop` remains inside the future, since it needs
+  the transport the detach sheds.
+- **The watch renewer cannot outlive teardown.** It rechecks `shutdown` under the lifecycle
+  mutex, because it could otherwise win its `select!` just before close cancelled the token and
+  re-issue `users.watch`, resurrecting delivery for another seven days. `clear_watch_state`
+  aborts it while holding that mutex. Push handles persist beyond the in-memory set, so
+  `push_unsubscribe` after a restart is no longer a silent no-op, and a failed stop on the `Last`
+  path restores the handle rather than leaving an empty set beside a live renewer.
+- **An unparseable 403 is not evidence about delete scope.** `is_batch_delete_scope_failure`
+  returning `true` on a body it could not parse meant a 403 from a proxy or policy layer
+  silently downgraded a permanent delete into a trash. It now follows ordinary classified
+  failure handling. The remaining half - that a SUCCESSFUL permission fallback still reports
+  `MutationSuccess::Applied` for a message that was only trashed, which is a permanent engine
+  reconcile loop - is fenced for the owner, since the remedy adds a published variant.
+- **A reclassification carries the evidence the consumer needs to act.** A cross-calendar move
+  whose follow-up PATCH fails returns `Protocol(PartialResponse)` scoped to the event in its
+  DESTINATION calendar (the caller's `source::` composite id no longer addresses it), copying
+  provider, protocol, HTTP status, request and trace ids, native code, both diagnostic tiers,
+  and the whole original cause chain as secondary evidence, with `Attempt(Acknowledged)` pushed
+  first so `derive` reads it. `into_builder` is decoration-only and exposes no kind-changing
+  path, so a fresh builder plus hand-copying is the contract-correct route, not a shortcut.
+  Telling a consumer to reconcile without naming what to reconcile is barely better than silence.
+- **Every unbounded loop against a remote gets a budget.** The Drive chunk loop was
+  `while offset < total` with no attempt counter and could spin forever; it now rejects stalled,
+  backward and impossible resume offsets under a finite attempt budget. `calendars_list`
+  paginates with a repeated-token guard AND a page budget, because a server handing out a fresh
+  token every page slips the repeated-token check and only the budget stops it.
+- Accepted residuals, on the record: the per-poll `users.getProfile` call is KEPT deliberately -
+  it stops a rotated token pointing at a different Google account from mixing data into the
+  existing slot, so do not re-file it as free savings; the cross-calendar move stays non-atomic
+  with the classification making it legible; `calendars_list` returns a `Vec` with no streaming
+  (filed C4, published surface). `notes/bugs-google.md` records these across three dated
+  "Residuals from round N" sections, deliberately kept separate rather than consolidated.
+- **Fenced, awaiting the repository owner, NOT closed:** the `bulk_destroy` distinct-outcome half
+  (published `MutationSuccess` variant) and the Calendar endpoint override (published
+  `with_calendar_api_base` constructor). Both additive rather than removals.
+
 ## Standing lessons this project has paid for
 
 - **The loop does not get to delete public API. Ever. Ask the owner.** This is
@@ -549,8 +621,9 @@ notes.
 
 - **Which arcs have had a close pass.** `bugs-graph`, `bugs-imap`,
   `bugs-jmap`, `bugs-smtp-sasl`, `bugs-net-types` (close pass run
-  2026-08-22, after its two rounds), and `bugs-dav` (close pass `0796b29`,
-  2026-08-23, after four rounds) are all closed properly. The
+  2026-08-22, after its two rounds), `bugs-dav` (close pass `0796b29`,
+  2026-08-23, after four rounds), and `bugs-google` (close pass `d8eb9fe`,
+  2026-08-23, after three rounds) are all closed properly. The
   `bugs-net-types` close pass re-read the reconstructed `rate.rs` as new code
   and the un-cold-reviewed half of round 2, found no code defect, and fixed
   three doc-only drifts in `reference/net.md`; its residuals are recorded in
@@ -558,6 +631,24 @@ notes.
 
 - **The recurring defect shape is a fix that opens a new hole one layer up.**
   Check what a fix does to its consumer, not only to the unit test in front of it.
+
+  This is now measured, not impressionistic. Across the dav and google arcs
+  (2026-08-23) it fired ten times, and EVERY one was caught by the cold review
+  or the close pass, never by the fix pass's own tests. The sharpest cases are
+  worth naming because they rhyme: fixing a `PageBoundary::Final` contract gap
+  introduced a hydration deadlock; fixing a push-watch leak made `close()`
+  cancellation-unsafe, creating a different unreclaimable leak; and the guard
+  added to fix THAT was constructed inside the async block, so a future dropped
+  before its first poll leaked the same registration one poll earlier. A fix
+  aimed at a resource leak has produced a new resource leak three times running.
+  When the change is to teardown, ordering, or a lifetime, assume the hole moved
+  rather than closed, and go looking for where.
+
+  The corollary for the loop's structure: the cold review's value is entirely in
+  its ignorance. It is the only stage that does not share the orchestrator's
+  priors, and it has a perfect record on this defect shape. Every sentence of
+  context added to that prompt is a prior installed in the one reviewer that
+  should not have any.
 
 - **A refactor that MOVES a field must move the tests that pinned it.** The
   `NetConfig` split deleted three tests along with the fields they described,

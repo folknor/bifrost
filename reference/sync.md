@@ -232,6 +232,24 @@ A repeat failure on an already-unconfirmed record is logged rather than
 aborting the swap, because a handle belonging to a long-dead connection
 must not wedge every future reopen.
 
+Cursor establishment for newly discovered scopes is staged in memory. After
+replacement subscription creation, reattach durably persists only the cursors
+it freshly created - a scope whose row already existed in the store (persisted
+by a prior session and rediscovered by the replacement) is resumed from,
+never rewritten. An aborted swap (store failure or old-handle teardown
+failure) compensates by deleting exactly those freshly created rows, so a
+replacement that is later closed cannot leave durable cursor state for a
+topology the engine never installed, and the abort path can never destroy or
+overwrite a preexisting row. Vanished-scope rows are deleted only after the
+cutover is committed: the old account's ack writer persists checkpoints
+concurrently with a reopen (nothing serializes it against one), so a
+pre-cutover delete would need a snapshot-and-restore that races that writer
+and could overwrite a newer acknowledged checkpoint. A failed post-cutover
+delete, or a retired stream's late ack re-persisting one, leaks a stale row
+that a later rediscovery validly resumes from - a leak, never data loss.
+Compensation failure is error-logged because the checkpoint-store trait has
+no transaction primitive.
+
 A public or engine-initiated reopen queues behind `Pause` and runs after
 resume: pause is a quiescence boundary, not permission to open a
 replacement connection in the background. The activity registration that
@@ -573,18 +591,15 @@ counter is exposed as `bifrost_sync_push_dropped_total`.
 Implements `bifrost_types::InvalidationSink::push`:
 `try_send` first; on `Full`, increment the drop counter only for
 coalescible invalidations and connection-health transitions. They are
-coalesced into one
-`HintPayload::Unknown` send with a 100ms bound. `Terminated` and
-`Warning` are lossless control information: the captured engine
-runtime waits for queue space and sends the original event without
-demoting its classification or incrementing the drop counter. Capturing
-the runtime during `register` also lets receiver threads outside Tokio
-use the sink. If no runtime handle was ever captured (`register` itself
-ran outside Tokio), nothing can wait for queue space, so a full queue
-discards the event regardless of classification - and that discard is
-counted, because an uncounted lossless discard would hide the loss of
-control information from the one signal built to expose it. `Closed`
-(account detached mid-push) is silently ignored.
+coalesced into one `HintPayload::Unknown` send with a 100ms bound.
+`Terminated` and `Warning` are lossless control information. Each
+registration made on a Tokio runtime creates one ordered forwarder on that
+runtime and stores its unbounded ingress sender, so calls from receiver
+threads outside Tokio do not depend on whichever account registered first
+and later events cannot bypass an event waiting for bounded queue space. A
+registration made outside Tokio is explicitly a direct, non-waiting fallback;
+a full queue drops and counts every event. `Closed` (account detached
+mid-push) is silently ignored.
 
 The in-process push forwarder spawned in `attach` runs the same
 overflow policy against its per-account `tx`: redundant invalidations

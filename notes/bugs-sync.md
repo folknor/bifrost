@@ -37,26 +37,3 @@ aspirationally; the code does not match it.
 
 - `drive_changes_stream` still takes `_account_id` and `_ack_tx` and threads them from four call
   sites through `spawn_scope_poll_inner`; dead parameters that obscure the actual data flow.
-- `InvalidationSinkInner::runtime` is a `OnceLock` captured from whichever account registered
-  first. Correct today (all `register` calls happen on the engine's runtime) but fragile and
-  unstated.
-- `open_pages_resume`'s "short final page, skip" arm is largely unreachable: `get_backfill` picks
-  max `items_done`, so a full earlier window (500) outranks a short final one (300) and the walk
-  resumes at the earlier window's end. Self-healing, but the documented decision table describes a
-  path the store's selection rule mostly precludes.
-- `reattach_account` calls `run_establish` with the real `store`, so newly discovered scopes get
-  durable cursors written even when the swap later fails and the replacement is closed. Harmless
-  today, but it leaves durable state for a topology that was never installed.
-- `handle_schema_incompatible` and `restart_scope` hold `reopen_lock` across
-  `re_establish_scope_with_backoff`, which sleeps 1s/2s between attempts. Every other recovery for
-  that account queues behind it. Given the `unsubscribe_push` hang above, the lock's scope is
-  worth a deliberate pass.
-
-## Cross-cutting, outside this scope
-
-`reference/sync.md` reads as a design essay rather than a reference. Several of its strongest
-claims are invariants the code does not enforce: single sequential producer per lane+scope (half
-fixed - poll-vs-poll is now enforced by generation-matched scope tokens, poll-vs-push-reconcile
-is not, and the doc now says so); orchestrator excludes fused scopes; pause halts all
-engine-driven work; `replace_from` atomicity. A doc that must be true is more useful when its
-invariants are also test-pinned, and the remaining three have no test.
