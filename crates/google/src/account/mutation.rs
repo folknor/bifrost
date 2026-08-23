@@ -398,11 +398,18 @@ async fn post_empty_json<B: Serialize>(
     } else {
         format!("{}/{}", client.api_base(), path)
     };
-    let request = client
+    // Built through `account_net()` rather than `GmailClient::execute`,
+    // so the per-method quota cost has to be applied by hand here - the
+    // batch endpoints are 50 units each, and billing them as one would
+    // hand the batch lane a free ride on the shared per-user budget.
+    let mut request = client
         .account_net()
         .post(&url)
         .header("Content-Type", "application/json")
         .json(body);
+    if let Some(cost) = client.gmail_quota_cost(&url, "POST") {
+        request = request.cost(cost);
+    }
     let response = client.execute_builder(request, "Gmail API").await?;
     let status = response.status();
     if status.is_success() {

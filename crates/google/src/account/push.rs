@@ -64,6 +64,7 @@ pub(crate) struct PubSubControl {
     expiration: Mutex<Option<SystemTime>>,
     renewer: Mutex<Option<JoinHandle<()>>>,
     active_handles: Mutex<HashSet<String>>,
+    watch_lifecycle: Mutex<()>,
     health_tx: broadcast::Sender<WatchEvent>,
 }
 
@@ -83,6 +84,7 @@ impl PubSubControl {
             expiration: Mutex::new(None),
             renewer: Mutex::new(None),
             active_handles: Mutex::new(HashSet::new()),
+            watch_lifecycle: Mutex::new(()),
             health_tx,
         }
     }
@@ -102,7 +104,7 @@ impl PubSubControl {
         }
     }
 
-    async fn insert_handle(&self, handle: &SubscriptionHandle) {
+    pub(crate) async fn insert_handle(&self, handle: &SubscriptionHandle) {
         self.active_handles.lock().await.insert(handle.0.clone());
     }
 
@@ -116,6 +118,24 @@ impl PubSubControl {
         } else {
             HandleRemoval::Remaining
         }
+    }
+
+    async fn restore_handle(&self, handle: &SubscriptionHandle) {
+        self.active_handles.lock().await.insert(handle.0.clone());
+    }
+
+    pub(crate) async fn has_handles(&self) -> bool {
+        !self.active_handles.lock().await.is_empty()
+    }
+
+    async fn clear_watch_state(&self) {
+        *self.expiration.lock().await = None;
+        *self.last_history_id.lock().await = None;
+        self.abort_renewer().await;
+    }
+
+    async fn clear_handles(&self) {
+        self.active_handles.lock().await.clear();
     }
 
     fn report_health(&self, event: WatchEvent) {
@@ -163,6 +183,7 @@ pub(crate) fn push_subscribe(
                 error::GmailErrorContext::push_subscribe(),
             ));
         };
+        let _lifecycle = pubsub.watch_lifecycle.lock().await;
         let response = watch_once(&client, &config).await.map_err(|error| {
             error::into_account_error(error, error::GmailErrorContext::push_subscribe())
         })?;
@@ -212,18 +233,44 @@ pub(crate) fn push_unsubscribe(
                     error::GmailErrorContext::push_unsubscribe(),
                 )
             })?;
-        match pubsub.remove_handle(&handle).await {
+        let _lifecycle = pubsub.watch_lifecycle.lock().await;
+        let removal = pubsub.remove_handle(&handle).await;
+        match removal {
             HandleRemoval::Last => {}
-            HandleRemoval::Remaining | HandleRemoval::NotPresent => return Ok(()),
+            HandleRemoval::Remaining => return Ok(()),
+            HandleRemoval::NotPresent if pubsub.has_handles().await => return Ok(()),
+            HandleRemoval::NotPresent => {}
         }
-        stop_watch(&client).await.map_err(|error| {
-            error::into_account_error(error, error::GmailErrorContext::push_unsubscribe())
-        })?;
-        *pubsub.expiration.lock().await = None;
-        *pubsub.last_history_id.lock().await = None;
-        pubsub.abort_renewer().await;
+        if let Err(error) = stop_watch(&client).await {
+            if removal == HandleRemoval::Last {
+                pubsub.restore_handle(&handle).await;
+            }
+            return Err(error::into_account_error(
+                error,
+                error::GmailErrorContext::push_unsubscribe(),
+            ));
+        }
+        pubsub.clear_watch_state().await;
         Ok(())
     })
+}
+
+pub(crate) async fn close_watch(client: &GmailClient, pubsub: &PubSubControl) {
+    let _lifecycle = pubsub.watch_lifecycle.lock().await;
+    if pubsub.has_handles().await
+        && let Err(error) = stop_watch(client).await
+    {
+        let account_error =
+            error::into_account_error(error, error::GmailErrorContext::push_unsubscribe());
+        tracing::warn!(
+            target: "bifrost_google::push",
+            message_key = account_error.message_key(),
+            recovery = ?account_error.recovery(),
+            "close() could not retire the Gmail watch",
+        );
+    }
+    pubsub.clear_handles().await;
+    pubsub.clear_watch_state().await;
 }
 
 pub(crate) fn push_stream(
@@ -276,9 +323,24 @@ async fn start_renewer(
                 () = shutdown.cancelled() => return,
                 () = tokio::time::sleep(delay) => {}
             }
-            match watch_once(&client, &config).await {
-                Ok(response) => {
-                    control.store_watch_response(&response).await;
+            let watch_result = {
+                let _lifecycle = control.watch_lifecycle.lock().await;
+                // Re-check under the lifecycle lock. The select above can
+                // have been won before `close()` cancelled the token, and
+                // renewing a watch that close is about to retire - or has
+                // just retired - would resurrect Gmail-side delivery for
+                // another seven days.
+                if shutdown.is_cancelled() {
+                    return;
+                }
+                let result = watch_once(&client, &config).await;
+                if let Ok(response) = &result {
+                    control.store_watch_response(response).await;
+                }
+                result
+            };
+            match watch_result {
+                Ok(_) => {
                     retry_after = None;
                     if disconnected {
                         control.report_health(WatchEvent::Reconnected);
@@ -365,7 +427,48 @@ fn renewal_delay(expiration: Option<SystemTime>) -> Duration {
 
 #[cfg(test)]
 mod tests {
+    use bifrost_net::test_support::{Canned, ScriptedDispatch};
+    use bifrost_net::{NetConfig, RetryPolicy, StaticTokenSource};
+    use bytes::Bytes;
+    use reqwest::StatusCode;
+
     use super::*;
+
+    fn encoded_handle() -> SubscriptionHandle {
+        SubscriptionHandle(
+            serde_json::to_string(&GmailSubscriptionHandle {
+                topic: "projects/p/topics/t".to_owned(),
+                history_id: "12345".to_owned(),
+                expiration: Some("1700000000000".to_owned()),
+            })
+            .expect("handle encodes"),
+        )
+    }
+
+    fn scripted_client(
+        steps: impl IntoIterator<Item = Canned>,
+    ) -> (Arc<GmailClient>, Arc<ScriptedDispatch>) {
+        let script = ScriptedDispatch::new(steps);
+        let net = bifrost_net::test_support::scripted_account(
+            &script,
+            NetConfig::default(),
+            Vec::new(),
+            Arc::new(StaticTokenSource::new("token", None)),
+            RetryPolicy::disabled(),
+        );
+        (
+            Arc::new(GmailClient::with_account_net("https://gmail.test", net)),
+            script,
+        )
+    }
+
+    fn canned(status: StatusCode) -> Canned {
+        Canned::Response {
+            status,
+            headers: reqwest::header::HeaderMap::new(),
+            body: Bytes::new(),
+        }
+    }
 
     fn in_future(after: Duration) -> SystemTime {
         SystemTime::now() + after
@@ -522,6 +625,66 @@ mod tests {
             control.remove_handle(&second).await,
             HandleRemoval::NotPresent
         );
+    }
+
+    #[tokio::test]
+    async fn persisted_handle_after_restart_still_stops_the_watch() {
+        let (client, script) = scripted_client([canned(StatusCode::NO_CONTENT)]);
+        let control = Arc::new(PubSubControl::new(None));
+
+        push_unsubscribe(client, control, encoded_handle())
+            .await
+            .expect("persisted handle stops watch");
+
+        let requests = script.requests();
+        assert_eq!(requests.len(), 1, "the test must observe the stop request");
+        assert_eq!(requests[0].method, reqwest::Method::POST);
+        assert_eq!(requests[0].url.path(), "/stop");
+    }
+
+    #[tokio::test]
+    async fn failed_last_stop_restores_the_handle_for_retry() {
+        let (client, script) = scripted_client([
+            canned(StatusCode::FORBIDDEN),
+            canned(StatusCode::NO_CONTENT),
+        ]);
+        let control = Arc::new(PubSubControl::new(None));
+        let handle = encoded_handle();
+        control.insert_handle(&handle).await;
+
+        assert!(
+            push_unsubscribe(Arc::clone(&client), Arc::clone(&control), handle.clone())
+                .await
+                .is_err()
+        );
+        assert!(
+            control.has_handles().await,
+            "failed stop must remain retryable"
+        );
+
+        push_unsubscribe(client, Arc::clone(&control), handle)
+            .await
+            .expect("retry stops watch");
+        assert!(!control.has_handles().await);
+        assert_eq!(
+            script.requests().len(),
+            2,
+            "both stop attempts reached the wire"
+        );
+    }
+
+    #[tokio::test]
+    async fn close_stops_a_locally_active_watch_before_clearing_state() {
+        let (client, script) = scripted_client([canned(StatusCode::NO_CONTENT)]);
+        let control = Arc::new(PubSubControl::new(None));
+        control.insert_handle(&encoded_handle()).await;
+
+        close_watch(&client, &control).await;
+
+        assert!(!control.has_handles().await);
+        let requests = script.requests();
+        assert_eq!(requests.len(), 1, "close must reach users.stop");
+        assert_eq!(requests[0].url.path(), "/stop");
     }
 
     #[test]

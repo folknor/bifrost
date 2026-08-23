@@ -28,9 +28,6 @@ adds a `MutationSuccess` variant), and the calendar endpoint override (its remed
 `with_calendar_api_base` constructor). Both are additive rather than removals, which makes them the
 mild end of the category, but they are still the owner's to approve.
 
-Highest severity, ahead of its position: **the Drive chunk loop can spin forever with no attempt
-counter.** Verified against the current tree.
-
 ## Residuals from round 1 (2026-08-23)
 
 Round 1 closed six findings in the Gmail sync and blob lanes. Three of them were closed narrower
@@ -75,69 +72,44 @@ outcomes are recorded here so a later hunter does not re-file them as untouched.
   a deliberate decision that Gmail attachments have no byte-range transport, not an oversight to be
   implemented later.
 
-## The rate limiter is calibrated in requests but Gmail bills in quota units
+## Residuals from round 2 (2026-08-23)
 
-**C1 live defect.** Verified 2026-08-23: `GOOGLE_API_QUOTA_PER_SECOND = 250.0` with `cost_default:
-1` at both registration sites. The consequence is observable today on any real mailbox (sustained
-429 backoff on the inventory hot loop), and the capability surface separately advertises a
-`QuotaUnits` model the transport does not implement, which is a documentation-versus-code
-divergence of the kind this project has been bitten by. The remedy is additive plumbing, not a
-surface change.
-
-`crates/google/src/client.rs`: `GOOGLE_API_QUOTA_PER_SECOND = 250.0`, `cost_default: 1`. 250 is
-Gmail's per-user quota units per second, not requests per second. `messages.get` costs 5 units,
-`messages.list` 5, `messages.modify` 5, `threads.modify` 10, `messages.send` 100, `history.list` 2.
-At `cost_default: 1` the limiter will happily sustain 250 rps, i.e. ~1250 quota units/s: 5x over
-quota, and 25x on a send-heavy path. Meanwhile `capabilities.rs` advertises
-`quota_signal: QuotaUnits` and `rate_limit_class: Tiered`, so the capability surface claims a model
-the transport does not implement. The inventory hot loop is the worst case: `buffer_unordered(32)`
-of `messages.get` at 5 units each will spend the whole session in 429/`rateLimitExceeded` backoff.
-
-The fix is structural: pass a per-call cost into the bifrost-net rate limiter (Gmail publishes the
-table), rather than pretending every request costs 1.
+- **`bulk_destroy` still reports `Applied` when its documented permission fallback only moved the
+  messages to Trash.** [C1 PUBLISHED SURFACE, deferred] Round 2 narrowed the fallback to a parsed
+  Gmail `forbidden` or `insufficientPermissions` reason, so an unparseable proxy or policy 403 now
+  follows ordinary classified failure handling and is never silently downgraded. The remaining
+  successful-fallback outcome still needs a distinct published `MutationSuccess` variant, which is
+  fenced for the repository owner.
+- **The Drive resumable session is still abandoned on a mid-upload `Net` error.** [C2, open] Round 2
+  closed the hang half: `upload_file_chunked` now rejects stalled, backward and impossible resume
+  offsets and enforces a finite attempt budget. The second half is untouched - a `Net` error
+  mid-upload aborts the function and abandons the resumable session; Drive keeps a partial upload
+  for a week. There is no cleanup or resume-on-reopen. The module doc acknowledges "a stray
+  uploaded-but-unlinked file is the worst failure mode" for the link step but not for the upload
+  step.
+- **A `close()` future dropped mid-`users.stop` leaves the Gmail-side watch running until it
+  expires.** [C3, accepted] Not a ledger finding: the cold review of round 2 caught `close()`
+  marking the account closed before its teardown had run, which is fixed - the shutdown token is
+  cancelled at the synchronous linearization point and the transport detach runs from a drop guard,
+  so no local state survives a cancelled close. What cannot be made cancellation-safe is the remote
+  half: if the caller drops the future while `users.stop` is in flight, Gmail keeps delivering to
+  the topic for the remainder of the 7-day watch. Retrying a stop needs a transport the close has
+  already shed, so this is accepted rather than open.
 
 ## bulk_destroy reports Applied for messages that were only trashed
 
-**C1 live defect. PUBLISHED SURFACE (additive).** Verified 2026-08-23: the fallback path calls
-`apply_label_patch`, whose success arm is `applied_outcomes(ids)`, and
-`is_batch_delete_scope_failure` still returns `true` on an unparseable 403 body on both branches.
-A permanent delete silently becomes a trash reported as `Applied`, which is a permanent engine
-reconcile loop. Note the two halves are separable: narrowing the unparseable-body trigger needs no
-surface change at all and can land immediately; only the "distinct outcome" half touches the
-published `MutationSuccess` enum and needs the owner.
+**C1 live defect. PUBLISHED SURFACE (additive).**
 
 `crates/google/src/account/mutation.rs::apply_destroy`: when `batchDelete` fails the scope check,
 the fallback is a TRASH label patch, and `apply_label_patch` returns `applied_outcomes(ids)`, i.e.
 `MutationSuccess::Applied`. The engine is told the destroy succeeded; the messages are still in
 Trash and will reappear in the next inventory/history pass, generating a permanent reconcile loop
-between "engine thinks destroyed" and "server says exists". Worse,
-`is_batch_delete_scope_failure` treats any 403 whose body does not parse as a Gmail envelope as a
-fallback trigger (`None => return true` on both branches), so a 403 from a proxy or a policy layer
-also silently downgrades a permanent delete into a trash.
+between "engine thinks destroyed" and "server says exists".
 
-At minimum the downgrade needs a distinct outcome (`MutationSuccess::Skipped` plus a Warning, or a
-new variant); ideally it should not fire on an unparseable body at all.
-
-## push_unsubscribe leaks the Gmail watch across a process restart
-
-**C1 live defect (both halves).** Verified 2026-08-23: `HandleRemoval::NotPresent` is still folded
-into the early `return Ok(())`, and `active_handles` is still in-memory only, so unsubscribe after
-a restart is a silent no-op. The second half is confirmed by the code order too: `stop_watch(...)?`
-sits above the three state clears, so a failing stop leaves an empty handle set beside a live
-renewer.
-
-`crates/google/src/account/push.rs::push_unsubscribe`: `HandleRemoval::NotPresent` returns `Ok(())`
-without calling `users.stop`. `active_handles` lives only in the in-memory `PubSubControl`, so
-after any reopen/restart the set is empty and a persisted handle is always `NotPresent`. The
-consumer's "unsubscribe" is a silent no-op and Gmail keeps pushing to the topic for the remainder
-of the 7-day watch. Same class of leak: `GoogleAccount::close()` cancels the renewer but never
-calls `users.stop` either, and `Drop` cannot.
-
-Also in the same function: on the `Last` path, if `stop_watch` fails, the handle has already been
-removed from the set and neither `expiration`, `last_history_id`, nor the renewer are cleared. The
-account is left with an empty handle set and a live renewer that keeps re-issuing `users.watch`
-forever. The state teardown should happen regardless of the network result, or the handle should be
-re-inserted on failure.
+The downgrade needs a distinct outcome (`MutationSuccess::Skipped` plus a Warning, or a new
+variant). The other half of the original finding - the fallback firing on any 403 whose body does
+not parse as a Gmail envelope - was closed in round 2; only the outcome-reporting half remains, and
+it is fenced for the repository owner because it touches the published `MutationSuccess` enum.
 
 ## calendarList is not paginated, so accounts with many calendars silently lose data
 
@@ -188,42 +160,6 @@ caught by three times - fix both.
 encoders differ on exactly the characters that matter in a Google calendar id (`+` decoding to
 space, `&`/`=` truncating). The whole rest of the file uses `encode_query_value` for query
 positions; this is the one slip, and its test pins the wrong encoder.
-
-## move_placement_patch sends the caller's casing to addLabelIds
-
-**C2 latent defect.** Verified 2026-08-23: removal matching is still `eq_ignore_ascii_case` while
-`add_label_ids` gets `destination.to_string()` verbatim. The two halves of one function disagree
-about whether label ids are case-sensitive, and Gmail says they are. The finding's own note that a
-test asserts the current behavior as correct is the important part: that test has to change with
-the code, so do not read a green suite as evidence against this.
-
-`crates/google/src/account/flags.rs`: exclusive-container removal matching is
-`eq_ignore_ascii_case`, but the destination is pushed into `add_label_ids` verbatim.
-`move_placement_patch("inbox")` produces `addLabelIds: ["inbox"]`, which Gmail rejects (label ids
-are case-sensitive on the wire). The test `exclusive_container_match_is_case_insensitive` asserts
-this behavior as if it were correct. Either normalize a case-insensitive system-container match to
-its canonical spelling before adding, or drop the case-insensitive comparison entirely and require
-exact ids.
-
-## The Drive chunk loop can spin forever
-
-**C1 live defect (hang).** Verified 2026-08-23: `while offset < total` with
-`offset = parse_resume_offset(&response.headers)?` on 308 and no comparison against the previous
-offset, no attempt counter, and no cancellation token. A server repeating a Range answer holds the
-task forever. `parse_resume_offset` itself is correctly strict about gaps, which makes the missing
-progress check easy to miss. The second half (abandoned resumable session on a mid-upload `Net`
-error) is **C2**.
-
-`crates/google/src/account/cloud.rs::upload_file_chunked`: on 308 it sets
-`offset = parse_resume_offset(...)` with no check that the new offset is greater than the old one.
-A server that repeatedly answers `Range: bytes=0-N` for an unchanged N (or a smaller one) puts the
-loop into an unbounded re-upload of the same chunk, with no attempt counter and no cancellation
-token. Add a strict-progress assertion (`new_offset > offset`, else fail) and a bounded retry count.
-
-Second issue in the same file: a `Net` error mid-upload aborts the function and abandons the
-resumable session; Drive keeps a partial upload for a week. There is no cleanup or
-resume-on-reopen. The module doc acknowledges "a stray uploaded-but-unlinked file is the worst
-failure mode" for the link step but not for the upload step.
 
 ## FullWithBlobs fetches the whole message twice
 

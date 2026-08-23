@@ -204,6 +204,21 @@ impl GoogleAccount {
     }
 }
 
+/// Runs the transport detach when the close future finishes OR is
+/// dropped. Without it a cancelled `close()` would leave the account
+/// marked closed - every later `close()` returns `Ok(())` at once - while
+/// its rate-limiter registration stayed attached with no way to reclaim
+/// it short of dropping the account.
+struct DetachOnDrop {
+    client: Arc<GmailClient>,
+}
+
+impl Drop for DetachOnDrop {
+    fn drop(&mut self) {
+        self.client.detach_account();
+    }
+}
+
 impl Drop for GoogleAccount {
     fn drop(&mut self) {
         self.shutdown.cancel();
@@ -860,12 +875,142 @@ impl Account for GoogleAccount {
         if self.closed.swap(true, Ordering::AcqRel) {
             return Box::pin(async { Ok(()) });
         }
+        // Linearization point. `closed` is now observable, so everything a
+        // closed account promises must already hold before the caller can
+        // touch - or drop - the returned future. Cancelling the shutdown
+        // token here retires the watch renewer and the push and scope
+        // lifecycle streams synchronously, and `DetachOnDrop` runs the
+        // transport detach on every exit path of the future, completion and
+        // cancellation alike. Only the best-effort `users.stop` round trip is
+        // left inside the future, because it needs the transport that the
+        // detach sheds; a caller that drops the future mid-call leaves a
+        // Gmail-side watch that expires on its own within seven days, and
+        // never an account that is marked closed while its renewer, streams,
+        // or rate-limiter registration are still live.
         self.shutdown.cancel();
-        self.client.detach_account();
+        let client = Arc::clone(&self.client);
         let pubsub = Arc::clone(&self.pubsub);
         Box::pin(async move {
-            pubsub.abort_renewer().await;
+            let _detach = DetachOnDrop {
+                client: Arc::clone(&client),
+            };
+            push::close_watch(&client, &pubsub).await;
             Ok(())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bifrost_net::test_support::{Canned, ScriptedDispatch, scripted_net};
+    use bifrost_net::{AccountSpec, NetConfig, RateLimit, RetryPolicy, StaticTokenSource};
+
+    use super::*;
+
+    const TEST_HOST: &str = "gmail.test";
+
+    /// An account wired to a scripted transport, with one live watch
+    /// handle so `close()` actually issues `users.stop`.
+    fn scripted_account(script: &Arc<ScriptedDispatch>) -> (Arc<GoogleAccount>, bifrost_net::Net) {
+        let net = scripted_net(script, NetConfig::default());
+        let account_net = net.attach_account(
+            AccountId("close-test".to_owned()),
+            AccountSpec {
+                hosts: vec![RateLimit {
+                    host: TEST_HOST.to_owned(),
+                    quota_per_second: 100.0,
+                    cost_default: 1,
+                    burst: 100,
+                }],
+                default_retry: RetryPolicy::disabled(),
+                ..AccountSpec::new(Some(Arc::new(StaticTokenSource::new("token", None))))
+            },
+        );
+        let account = Arc::new(GoogleAccount {
+            client: Arc::new(GmailClient::with_account_net(
+                format!("https://{TEST_HOST}"),
+                account_net,
+            )),
+            capabilities: gmail_capabilities(),
+            profile: GmailProfile {
+                email_address: "user@gmail.test".to_owned(),
+                history_id: "1".to_owned(),
+            },
+            seed_state: encode_gmail_state(&GmailChangeState::new(1, "user@gmail.test".to_owned())),
+            pubsub: Arc::new(PubSubControl::new(None)),
+            scope_cache: Arc::new(std::sync::RwLock::new(ScopeSnapshot::empty())),
+            shutdown: CancellationToken::new(),
+            closed: AtomicBool::new(false),
+        });
+        (account, net)
+    }
+
+    /// `close()` flips `closed` before it is awaited, so every later
+    /// `close()` short-circuits to `Ok(())`. A caller that drops the
+    /// future while `users.stop` is in flight must therefore not be left
+    /// holding an account that reports itself closed while its shutdown
+    /// token, streams and rate-limiter registration are all still live -
+    /// nothing could reclaim them without dropping the account.
+    #[tokio::test]
+    async fn close_cancelled_mid_stop_still_shuts_down_and_detaches() {
+        let script = ScriptedDispatch::new([Canned::Pending]);
+        let (account, net) = scripted_account(&script);
+        account
+            .pubsub
+            .insert_handle(&SubscriptionHandle("watch-handle".to_owned()))
+            .await;
+        assert_eq!(net.governor().cost_default_for(TEST_HOST), Some(1));
+
+        // Drive the future into the stalled `users.stop` and then drop it
+        // there, which is exactly the cancellation the guard has to survive.
+        let mut close = account.close();
+        for _ in 0..8 {
+            assert!(
+                futures::future::poll_immediate(&mut close).await.is_none(),
+                "the stalled users.stop must keep the close future pending",
+            );
+            tokio::task::yield_now().await;
+        }
+        drop(close);
+        assert_eq!(
+            script.requests().len(),
+            1,
+            "the stop request must be in flight"
+        );
+
+        assert!(
+            account.shutdown.is_cancelled(),
+            "a cancelled close must still retire the renewer and streams",
+        );
+        assert_eq!(
+            net.governor().cost_default_for(TEST_HOST),
+            None,
+            "a cancelled close must still shed the transport registration",
+        );
+    }
+
+    /// The completing path keeps the same guarantees, and reaches the
+    /// wire for `users.stop` on its way there.
+    #[tokio::test]
+    async fn close_completes_by_stopping_the_watch_and_detaching() {
+        let script = ScriptedDispatch::new([Canned::Response {
+            status: reqwest::StatusCode::NO_CONTENT,
+            headers: reqwest::header::HeaderMap::new(),
+            body: Bytes::new(),
+        }]);
+        let (account, net) = scripted_account(&script);
+        account
+            .pubsub
+            .insert_handle(&SubscriptionHandle("watch-handle".to_owned()))
+            .await;
+
+        account.close().await.expect("close reports success");
+
+        let requests = script.requests();
+        assert_eq!(requests.len(), 1, "close must reach users.stop");
+        assert_eq!(requests[0].url.path(), "/stop");
+        assert!(account.shutdown.is_cancelled());
+        assert_eq!(net.governor().cost_default_for(TEST_HOST), None);
+        assert!(!account.pubsub.has_handles().await);
     }
 }

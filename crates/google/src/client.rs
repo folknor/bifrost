@@ -11,8 +11,15 @@ use crate::{Error, Result};
 
 const GMAIL_API_BASE: &str = "https://www.googleapis.com/gmail/v1/users/me";
 const PEOPLE_API_BASE: &str = "https://people.googleapis.com/v1";
-const GOOGLE_API_QUOTA_PER_SECOND: f64 = 250.0;
-const GOOGLE_API_BURST: u32 = 250;
+// Gmail meters per-user traffic in QUOTA UNITS, not requests: the
+// published per-user limit is 250 units/second, and each method has its
+// own unit cost (see `gmail_quota_cost`). We register a deliberately
+// conservative 100 units/second so a full backfill leaves headroom for
+// the interactive traffic sharing the same per-user budget, rather than
+// spending the whole allowance on hydration and driving the 429 backoff
+// that a flat one-unit-per-request model produced here.
+const GOOGLE_API_QUOTA_PER_SECOND: f64 = 100.0;
+const GOOGLE_API_BURST: u32 = 100;
 const PEOPLE_API_QUOTA_PER_SECOND: f64 = 1.5;
 const PEOPLE_API_BURST: u32 = 30;
 
@@ -248,11 +255,26 @@ impl GmailClient {
 
         builder = builder.header("Content-Type", "application/json");
 
+        if let Some(cost) = self.gmail_quota_cost(url, method) {
+            builder = builder.cost(cost);
+        }
+
         if let Some(b) = body {
             builder = builder.json(b);
         }
 
         builder.send().await.map_err(Error::from)
+    }
+
+    /// Quota units this URL costs, when it resolves against the Gmail
+    /// base. `None` for anything else (Calendar, Drive, People), which
+    /// keeps the host `cost_default`. Callers that build a request
+    /// through `account_net()` directly rather than through `execute`
+    /// must apply this themselves, or their traffic is billed at the
+    /// default and under-charges the shared per-user budget.
+    pub(crate) fn gmail_quota_cost(&self, url: &str, method: &str) -> Option<u32> {
+        let path = url.strip_prefix(self.api_base())?;
+        Some(gmail_quota_cost(path, method))
     }
 
     pub(crate) async fn execute_builder(
@@ -330,9 +352,179 @@ fn default_account_net(
     )
 }
 
+/// Quota units charged by one Gmail API method, keyed on the path
+/// suffix under the `users/me` base and the HTTP method.
+///
+/// PROVENANCE: transcribed from Google's published "Usage limits" table
+/// for the Gmail API (`developers.google.com/gmail/api/reference/quota`),
+/// as it stood in May 2026 - the revision that raised `messages.get` to
+/// 20 units and `threads.get` to 40. Checked twice, independently, in
+/// August 2026. Google restates these numbers periodically; when they
+/// move, re-read that table rather than re-deriving costs from observed
+/// 429s, and update this note with the date checked.
+///
+/// The catch-all is deliberately NOT one unit. An unlisted method is a
+/// method we have not checked, and under-charging it is the failure mode
+/// that produced sustained 429 backoff on the hydration loop, so it is
+/// billed like a `messages.get` until someone looks it up. Requests that
+/// do not resolve against the Gmail base at all - Calendar, Drive, raw
+/// builder traffic - keep the host `cost_default` of one unit, and are
+/// still throttled harder than before by the lower per-second budget.
+fn gmail_quota_cost(path: &str, method: &str) -> u32 {
+    /// Charged to any Gmail method not in the table below.
+    const UNLISTED_METHOD_COST: u32 = 20;
+
+    let path = path.split('?').next().unwrap_or(path);
+    let segments = path.trim_matches('/').split('/').collect::<Vec<_>>();
+
+    match (method, segments.as_slice()) {
+        ("GET", ["profile"]) => 1,
+        ("GET", ["history"]) => 2,
+        ("POST", ["watch"]) => 100,
+        ("POST", ["stop"]) => 50,
+        ("GET", ["labels"] | ["labels", _]) => 1,
+        ("POST", ["labels"]) => 5,
+        ("PATCH", ["labels", _]) | ("DELETE", ["labels", _]) => 5,
+        ("GET", ["threads"]) => 10,
+        ("GET", ["threads", _]) => 40,
+        ("POST", ["threads", _, "modify"]) => 10,
+        ("DELETE", ["threads", _]) => 20,
+        ("GET", ["messages"]) => 5,
+        ("GET", ["messages", _, "attachments", _]) => 20,
+        ("GET", ["messages", _]) => 20,
+        ("POST", ["messages", "send"]) => 100,
+        ("POST", ["messages", _, "modify"]) => 5,
+        ("DELETE", ["messages", _]) => 10,
+        ("POST", ["messages", "batchModify"] | ["messages", "batchDelete"]) => 50,
+        ("GET", ["drafts"]) => 5,
+        ("POST", ["drafts"]) => 10,
+        ("GET", ["drafts", _]) => 20,
+        ("PUT", ["drafts", _]) => 15,
+        ("DELETE", ["drafts", _]) => 10,
+        ("POST", ["drafts", "send"]) => 100,
+        ("GET", ["settings", "filters"] | ["settings", "sendAs"])
+        | ("GET", ["settings", "vacation"])
+        | ("GET", ["settings", "filters", _] | ["settings", "sendAs", _]) => 1,
+        ("POST", ["settings", "filters"]) | ("DELETE", ["settings", "filters", _]) => 5,
+        ("PATCH", ["settings", "sendAs", _]) => 100,
+        ("PUT", ["settings", "vacation"]) => 5,
+        _ => UNLISTED_METHOD_COST,
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use bifrost_net::test_support::{Canned, ScriptedDispatch};
+    use bytes::Bytes;
+    use reqwest::StatusCode;
+
     use super::*;
+
+    #[test]
+    fn gmail_method_costs_match_the_published_quota_table() {
+        assert_eq!(gmail_quota_cost("/profile", "GET"), 1);
+        assert_eq!(gmail_quota_cost("/history?startHistoryId=1", "GET"), 2);
+        assert_eq!(gmail_quota_cost("/messages", "GET"), 5);
+        assert_eq!(gmail_quota_cost("/messages/m1?format=metadata", "GET"), 20);
+        assert_eq!(gmail_quota_cost("/messages/m1/attachments/a1", "GET"), 20);
+        assert_eq!(gmail_quota_cost("/threads/t1", "GET"), 40);
+        assert_eq!(gmail_quota_cost("/messages/send", "POST"), 100);
+        assert_eq!(gmail_quota_cost("/messages/batchModify", "POST"), 50);
+        assert_eq!(gmail_quota_cost("/watch", "POST"), 100);
+        assert_eq!(gmail_quota_cost("/stop", "POST"), 50);
+    }
+
+    /// No single method may cost more than the bucket can ever hold, or
+    /// that method could never be admitted at all. `messages.send` and
+    /// `users.watch` sit exactly at the burst ceiling, so the two
+    /// constants have to move together.
+    #[test]
+    fn no_method_costs_more_than_the_burst_ceiling() {
+        for (path, method) in [
+            ("/messages/send", "POST"),
+            ("/drafts/send", "POST"),
+            ("/watch", "POST"),
+            ("/settings/sendAs/a", "PATCH"),
+            ("/unlisted", "POST"),
+        ] {
+            assert!(
+                gmail_quota_cost(path, method) <= GOOGLE_API_BURST,
+                "{method} {path} cannot be admitted by a {GOOGLE_API_BURST}-unit bucket",
+            );
+        }
+    }
+
+    /// A method we have not looked up must not ride free: it is billed
+    /// like a message fetch until someone checks the published table.
+    #[test]
+    fn unlisted_gmail_methods_are_billed_conservatively() {
+        assert_eq!(gmail_quota_cost("/messages/m1/unknownVerb", "POST"), 20);
+        assert_eq!(gmail_quota_cost("/somethingNew", "GET"), 20);
+        // Cheap reads this crate actually issues stay at their real cost
+        // rather than being swept into the conservative default.
+        assert_eq!(gmail_quota_cost("/labels/Label_1", "GET"), 1);
+        assert_eq!(gmail_quota_cost("/drafts", "GET"), 5);
+        assert_eq!(gmail_quota_cost("/settings/sendAs/a%40b.test", "GET"), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn gmail_requests_debit_their_method_quota_cost() {
+        let script = ScriptedDispatch::new([
+            Canned::Response {
+                status: StatusCode::OK,
+                headers: reqwest::header::HeaderMap::new(),
+                body: Bytes::new(),
+            },
+            Canned::Response {
+                status: StatusCode::OK,
+                headers: reqwest::header::HeaderMap::new(),
+                body: Bytes::new(),
+            },
+        ]);
+        let net = bifrost_net::test_support::scripted_account(
+            &script,
+            bifrost_net::NetConfig::default(),
+            vec![RateLimit {
+                host: "gmail.test".to_owned(),
+                quota_per_second: 100.0,
+                cost_default: 1,
+                burst: 100,
+            }],
+            Arc::new(StaticTokenSource::new("token", None)),
+            bifrost_net::RetryPolicy::disabled(),
+        );
+        let client = GmailClient::with_account_net("https://gmail.test", net);
+
+        client
+            .execute(
+                "https://gmail.test/messages/send",
+                "POST",
+                Some(&serde_json::json!({})),
+            )
+            .await
+            .expect("send dispatches");
+        let second_client = client.clone();
+        let second = tokio::spawn(async move {
+            second_client
+                .execute("https://gmail.test/profile", "GET", None::<&()>)
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(
+            script.requests().len(),
+            1,
+            "the 100-unit send drained the burst"
+        );
+
+        tokio::time::advance(Duration::from_millis(20)).await;
+        second
+            .await
+            .expect("task joins")
+            .expect("profile dispatches");
+        assert_eq!(script.requests().len(), 2);
+    }
 
     #[tokio::test]
     async fn trims_api_base() {

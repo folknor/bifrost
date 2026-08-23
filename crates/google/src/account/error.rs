@@ -361,11 +361,16 @@ pub(crate) fn skipped_outcomes(ids: &[ObjectId]) -> Vec<ItemOutcome<MutationSucc
         .collect()
 }
 
-/// Detection helper for the TRASH-fallback path. Returns true when
-/// the structured Gmail signal is `insufficientPermissions`,
-/// `forbidden`, or an HTTP 403 with no parsed Gmail reason - i.e. the
-/// token cannot permanently delete and the driver should retry the
-/// batch as a TRASH label patch.
+/// Detection helper for the TRASH-fallback path. Returns true only when
+/// Gmail's structured reason is `insufficientPermissions` or
+/// `forbidden` - i.e. the token cannot permanently delete and the driver
+/// should retry the batch as a TRASH label patch.
+///
+/// A 403 that carries no parseable Gmail envelope, or one whose envelope
+/// names no reason we recognize, is NOT a fallback trigger. A proxy or
+/// policy layer answering 403 says nothing about delete scope, and
+/// treating it as one silently downgrades a permanent delete into a move
+/// to Trash that is then reported as applied.
 ///
 /// The 403 can reach us in several shapes. `post_empty_json` converts a
 /// terminal HTTP error into `Error::Response` itself, but a 403 that
@@ -385,7 +390,7 @@ pub(crate) fn is_batch_delete_scope_failure(error: &Error) -> bool {
                 return false;
             }
             match resp.envelope.as_ref() {
-                None => return true,
+                None => return false,
                 Some(env) => env.primary_reason(),
             }
         }
@@ -399,20 +404,17 @@ pub(crate) fn is_batch_delete_scope_failure(error: &Error) -> bool {
                 return false;
             }
             match parse_envelope(body) {
-                None => return true,
+                None => return false,
                 Some(env) => {
                     return matches!(
                         env.primary_reason(),
-                        Some("forbidden") | Some("insufficientPermissions") | None
+                        Some("forbidden") | Some("insufficientPermissions")
                     );
                 }
             }
         }
     };
-    matches!(
-        reason,
-        Some("forbidden") | Some("insufficientPermissions") | None
-    )
+    matches!(reason, Some("forbidden") | Some("insufficientPermissions"))
 }
 
 /// Extract `(status, body)` from the bifrost-net `Error::Net` shapes that
@@ -1609,6 +1611,41 @@ mod tests {
         assert!(!is_batch_delete_scope_failure(&err));
     }
 
+    #[test]
+    fn batch_delete_unparseable_response_403_does_not_trigger_fallback() {
+        let err = gmail_response(403, "proxy policy response");
+        assert!(!is_batch_delete_scope_failure(&err));
+    }
+
+    /// A well-formed Gmail envelope that names no reason we recognize is
+    /// not evidence about delete scope either, on either shape the 403
+    /// can arrive in.
+    #[test]
+    fn batch_delete_403_without_a_recognized_reason_does_not_trigger_fallback() {
+        let body = r#"{"error":{"code":403,"message":"blocked by policy","errors":[{"domain":"global","reason":"domainPolicy"}]}}"#;
+        assert!(!is_batch_delete_scope_failure(&gmail_response(403, body)));
+
+        let wrapped = Error::Net(bifrost_net::Error::Status {
+            code: reqwest::StatusCode::FORBIDDEN,
+            body: Bytes::copy_from_slice(body.as_bytes()),
+            headers: reqwest::header::HeaderMap::new(),
+        });
+        assert!(!is_batch_delete_scope_failure(&wrapped));
+
+        // The envelope parses but names no reason at all - the shape that
+        // the fallback used to treat as a permission failure.
+        let reasonless = r#"{"error":{"code":403,"message":"blocked by policy"}}"#;
+        assert!(!is_batch_delete_scope_failure(&gmail_response(
+            403, reasonless
+        )));
+        let wrapped_reasonless = Error::Net(bifrost_net::Error::Status {
+            code: reqwest::StatusCode::FORBIDDEN,
+            body: Bytes::copy_from_slice(reasonless.as_bytes()),
+            headers: reqwest::header::HeaderMap::new(),
+        });
+        assert!(!is_batch_delete_scope_failure(&wrapped_reasonless));
+    }
+
     fn final_response(status: u16, body: &str) -> bifrost_net::FinalResponse {
         bifrost_net::FinalResponse {
             status: reqwest::StatusCode::from_u16(status).expect("status"),
@@ -1631,13 +1668,13 @@ mod tests {
     }
 
     #[test]
-    fn batch_delete_wrapped_net_status_403_no_body_triggers_fallback() {
+    fn batch_delete_wrapped_net_status_403_no_body_does_not_trigger_fallback() {
         let err = Error::Net(bifrost_net::Error::Status {
             code: reqwest::StatusCode::FORBIDDEN,
             body: Bytes::new(),
             headers: reqwest::header::HeaderMap::new(),
         });
-        assert!(is_batch_delete_scope_failure(&err));
+        assert!(!is_batch_delete_scope_failure(&err));
     }
 
     #[test]
@@ -1685,7 +1722,7 @@ mod tests {
     #[test]
     fn batch_delete_403_quota_reason_does_not_trigger_fallback() {
         // A 403 whose reason is a quota signal is not a delete-scope
-        // failure; only forbidden/insufficientPermissions/none qualify.
+        // failure; only forbidden/insufficientPermissions qualify.
         let err = Error::Net(bifrost_net::Error::Status {
             code: reqwest::StatusCode::FORBIDDEN,
             body: Bytes::copy_from_slice(body_with_reason("dailyLimitExceeded").as_bytes()),

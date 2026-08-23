@@ -51,10 +51,15 @@ pub(crate) fn is_archive_id(id: &str) -> bool {
 ///   spammed or trashed message actually takes it out of Spam / Trash.
 /// - `SPAM` / `TRASH` -> add it, drop the other two.
 pub(crate) fn move_placement_patch(destination: &str) -> LabelPatch {
-    let add_label_ids = if is_archive_id(destination) {
+    let canonical_destination = EXCLUSIVE_CONTAINERS
+        .iter()
+        .find(|container| destination.eq_ignore_ascii_case(container))
+        .copied()
+        .unwrap_or(destination);
+    let add_label_ids = if is_archive_id(canonical_destination) {
         Vec::new()
     } else {
-        vec![destination.to_string()]
+        vec![canonical_destination.to_string()]
     };
     let remove_label_ids = EXCLUSIVE_CONTAINERS
         .iter()
@@ -472,7 +477,7 @@ mod tests {
     #[test]
     fn exclusive_container_match_is_case_insensitive() {
         let patch = move_placement_patch("inbox");
-        assert_eq!(patch.add_label_ids, vec!["inbox".to_string()]);
+        assert_eq!(patch.add_label_ids, vec![LABEL_INBOX.to_string()]);
         assert_eq!(
             patch.remove_label_ids,
             vec![LABEL_SPAM.to_string(), LABEL_TRASH.to_string()],

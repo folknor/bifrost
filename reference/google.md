@@ -52,7 +52,10 @@ Internal modules:
   builder (sets `X-Upload-Content-*`, which typed `post` cannot); the
   pre-authed chunk PUT skips auth (`.without_bearer_auth()`) and
   resumes on 308 via `Range: bytes=0-N` - an absent/unparseable 308
-  `Range` is a hard failure, never a silent gap-skip. Then a
+  `Range`, a non-advancing/backward cursor, or a cursor beyond the bytes just
+  sent is a hard failure, never a silent gap-skip. The loop also bounds total
+  chunk attempts to the expected chunk count plus eight, so malicious tiny
+  progress cannot hold the caller forever. Then a
   `permissions` POST (`type: anyone` / `type: domain` + account domain)
   and a `webViewLink` GET. The 308 reaches the loop only via
   bifrost-net's missing-`Location` passthrough.
@@ -112,8 +115,16 @@ again with the same `AccountId`. The factory holds the credentials and
 client, so the new `GoogleAccount` carries a fresh
 `shutdown`/`pubsub`/`scope_cache` and reads the current profile at open.
 
-`close()` is idempotent: it marks `closed`, cancels `shutdown`, detaches
-the engine account from `bifrost-net`, and aborts the Pub/Sub renewer.
+`close()` is idempotent and cancellation-safe. It marks `closed` and cancels
+`shutdown` synchronously, before the returned future exists, so the renewer
+and the push and scope-lifecycle streams are retired whatever the caller does
+with that future. The future then makes a best-effort `users.stop` call for a
+locally active Gmail watch - it needs the transport, so it cannot precede the
+detach - and clears the watch state; the `bifrost-net` detach runs from a drop
+guard and therefore happens on completion and on cancellation alike. A stop
+failure is classified and logged but cannot keep a closing account alive. The
+one thing a dropped close future cannot guarantee is the remote half: Gmail
+may keep delivering until the 7-day watch expires.
 `Drop` also cancels and detaches as a fallback when a consumer omits
 `close()`. The renewer and `push_stream` both select on
 `shutdown.cancelled()` and exit cleanly.
@@ -140,8 +151,19 @@ the engine account from `bifrost-net`, and aborts the Pub/Sub renewer.
   75ms, flush_on_input_close: true }`. 1000 = Gmail's `batchModify`
   cap.
 - `rate_limit_class: RateLimitClass::Tiered`. Per-user quota units,
-  not a uniform rps cap.
-- `quota_signal: QuotaUnits`.
+  not a uniform rps cap. Gmail publishes a per-user rate of 250 quota units
+  per second; the Gmail host bucket is deliberately registered below it, at
+  100 units/s with a 100-unit burst, so a backfill leaves headroom for the
+  interactive traffic sharing the same per-user budget.
+- `quota_signal: QuotaUnits`. Every Gmail request debits the published
+  per-method cost, applied in `GmailClient::execute` and, for the raw batch
+  mutation builder, by calling `GmailClient::gmail_quota_cost` directly.
+  Method costs are transcribed from Google's published quota table (May 2026
+  revision, rechecked August 2026) in `client.rs::gmail_quota_cost`, which
+  carries the provenance note. A Gmail method absent from that table is billed
+  at 20 units rather than 1, so an unchecked method cannot under-charge. The
+  host `cost_default` of 1 unit applies only to the non-Gmail Google surfaces
+  sharing the transport (Calendar, Drive, People).
 - `requires_uidvalidity_recheck: false`. Gmail has no
   UIDVALIDITY model.
 - `historyid_expires_after: None`. No documented `historyId` retention window;
@@ -222,6 +244,10 @@ every exclusive container that is not `destination`*:
 - `archive` -> add nothing (it is not a Gmail label id, and Gmail
   rejects a modify that tries to apply it), drop all three.
 - `SPAM` / `TRASH` -> add it, drop the other two.
+
+Case-insensitive matches for the three system destinations are normalized to
+their canonical Gmail wire spelling before entering `addLabelIds`; user label
+ids retain the caller's exact casing.
 
 An optional `source` is the one part the destination cannot imply - a
 user label being filed out of - and it joins the same
@@ -542,14 +568,22 @@ The renewer task in `start_renewer`:
   `WatchEvent::Reconnected`. Every failure goes
   through the classifier first.
 - Selects on `shutdown.cancelled()` between every sleep and
-  every watch call so `close()` cuts the loop promptly.
+  every watch call, and rechecks it under the watch-lifecycle mutex before
+  issuing a renewal, so `close()` cuts the loop promptly and a renewal in
+  flight cannot resurrect a watch that close is retiring.
 
-`push_unsubscribe` decodes the handle envelope, removes the handle from
-the active-handle set, and only when a present handle was the last
-member does it call `users.stop`, clear the stored expiration and
-last-history-id, and abort the renewer. An unknown or replayed
-well-formed handle is a no-op. The active-handle set lets multiple
-subscribers share one Gmail watch.
+`push_subscribe`, renewals, `push_unsubscribe`, and close serialize through one
+watch-lifecycle mutex, so a renewal cannot recreate a watch after a successful
+stop and a concurrent subscribe cannot be stopped by the preceding teardown.
+`push_unsubscribe` decodes the handle envelope and removes it from the
+active-handle set. A non-last known handle, or an unknown handle while other
+known handles remain, is a no-op. When the set is empty, including on a fresh
+process receiving a persisted handle, it calls `users.stop`. A failed stop for
+the last known handle re-inserts that handle and leaves the expiration,
+history-id, and renewer intact so the engine can retry. A successful stop
+clears those fields and aborts the renewer. The active-handle set lets multiple
+subscribers share one Gmail watch; correctness after restart does not depend on
+that in-memory set surviving.
 
 `push_stream` is a `broadcast::Receiver<WatchEvent>` adapter
 with shutdown wiring. `Lagged` is treated as a skip rather than
@@ -580,10 +614,15 @@ share a single `mutation_stream` driver:
   is `bulk_move_from` with `source: None`.
 - Post the batch:
   - `SetFlags` / `Move` -> `users.messages.batchModify`.
-  - `Destroy` -> `users.messages.batchDelete`. On 403 it falls
+  - `Destroy` -> `users.messages.batchDelete`. On a parsed 403 Gmail reason of
+    `forbidden` or `insufficientPermissions` it falls
     back to a label patch that moves the messages into `TRASH`,
     matching the scopes Gmail OAuth tokens with the
     `gmail.modify` scope can perform but `gmail.metadata` cannot.
+    An unparseable 403 body follows ordinary classified failure handling and
+    never triggers the downgrade. A successful fallback still reports
+    `MutationSuccess::Applied`; distinguishing "trashed instead of destroyed"
+    needs the deferred published outcome variant.
 - The driver reads one item ahead at the 1000-item boundary. Every
   final mutation batch is marked `PageBoundary::Final`, including a
   stream whose item count is exactly divisible by 1000, followed by

@@ -35,6 +35,7 @@ const GDRIVE_CHUNK_ALIGN: usize = 256 * 1024;
 
 /// Default chunk size: 5 MiB. Must be a multiple of `GDRIVE_CHUNK_ALIGN`.
 const GDRIVE_CHUNK_SIZE: usize = 5 * 1024 * 1024;
+const GDRIVE_MAX_EXTRA_CHUNK_ATTEMPTS: usize = 8;
 
 const SESSION_URL: &str = "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable";
 
@@ -201,7 +202,18 @@ async fn upload_file_chunked(
     }
 
     let mut offset = 0usize;
+    let max_attempts = total
+        .div_ceil(chunk_size)
+        .saturating_add(GDRIVE_MAX_EXTRA_CHUNK_ATTEMPTS);
+    let mut attempts = 0usize;
     while offset < total {
+        attempts = attempts.saturating_add(1);
+        if attempts > max_attempts {
+            return Err(Error::invalid_request(
+                AccountOperation::HostAttachment,
+                format!("resumable upload exceeded {max_attempts} chunk attempts"),
+            ));
+        }
         let end = (offset + chunk_size).min(total);
         let chunk = data.slice(offset..end);
         let content_range = format!("bytes {offset}-{}/{total}", end - 1);
@@ -227,7 +239,16 @@ async fn upload_file_chunked(
                 return Ok(file.id);
             }
             308 => {
-                offset = parse_resume_offset(&response.headers)?;
+                let resumed = parse_resume_offset(&response.headers)?;
+                if resumed <= offset || resumed > end {
+                    return Err(Error::invalid_request(
+                        AccountOperation::HostAttachment,
+                        format!(
+                            "resumable 308 made invalid progress from {offset} to {resumed} after sending through {end}"
+                        ),
+                    ));
+                }
+                offset = resumed;
             }
             _ => {
                 return Err(response_error(&response.headers, status, response.body));
@@ -249,7 +270,7 @@ fn parse_resume_offset(headers: &reqwest::header::HeaderMap) -> Result<usize, Er
         .and_then(|v| v.to_str().ok())
         .and_then(|range| range.strip_prefix("bytes=0-"))
         .and_then(|end| end.parse::<usize>().ok())
-        .map(|last_byte| last_byte + 1)
+        .and_then(|last_byte| last_byte.checked_add(1))
         .ok_or_else(|| {
             Error::invalid_request(
                 AccountOperation::HostAttachment,
@@ -315,7 +336,25 @@ fn response_error(headers: &reqwest::header::HeaderMap, status: u16, body: Bytes
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use bifrost_net::test_support::{Canned, ScriptedDispatch};
+    use bifrost_net::{NetConfig, RetryPolicy, StaticTokenSource};
+
     use super::*;
+
+    fn resume_response(last_byte: usize) -> Canned {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "range",
+            format!("bytes=0-{last_byte}").parse().expect("valid Range"),
+        );
+        Canned::Response {
+            status: reqwest::StatusCode::PERMANENT_REDIRECT,
+            headers,
+            body: Bytes::new(),
+        }
+    }
 
     #[test]
     fn chunk_size_must_be_aligned() {
@@ -418,5 +457,68 @@ mod tests {
         let mut garbage = reqwest::header::HeaderMap::new();
         garbage.insert("range", "bytes=garbage".parse().unwrap());
         assert!(parse_resume_offset(&garbage).is_err());
+    }
+
+    #[tokio::test]
+    async fn repeated_resume_offset_terminates_instead_of_spinning() {
+        let script = ScriptedDispatch::new([resume_response(0), resume_response(0)]);
+        let net = bifrost_net::test_support::scripted_account(
+            &script,
+            NetConfig::default(),
+            Vec::new(),
+            Arc::new(StaticTokenSource::new("token", None)),
+            RetryPolicy::disabled(),
+        );
+        let client = GmailClient::with_account_net("https://gmail.test", net);
+
+        let result = upload_file_chunked(
+            &client,
+            "https://upload.test/session",
+            Bytes::from_static(b"payload"),
+            GDRIVE_CHUNK_ALIGN,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "a repeated offset must terminate the upload"
+        );
+        assert_eq!(
+            script.requests().len(),
+            2,
+            "the loop must stop on the first stall"
+        );
+    }
+
+    #[tokio::test]
+    async fn tiny_resume_progress_is_bounded_by_an_attempt_limit() {
+        let responses = (0..9).map(resume_response).collect::<Vec<_>>();
+        let script = ScriptedDispatch::new(responses);
+        let net = bifrost_net::test_support::scripted_account(
+            &script,
+            NetConfig::default(),
+            Vec::new(),
+            Arc::new(StaticTokenSource::new("token", None)),
+            RetryPolicy::disabled(),
+        );
+        let client = GmailClient::with_account_net("https://gmail.test", net);
+
+        let result = upload_file_chunked(
+            &client,
+            "https://upload.test/session",
+            Bytes::from_static(b"a payload longer than nine bytes"),
+            GDRIVE_CHUNK_ALIGN,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "tiny progress must exhaust a finite budget"
+        );
+        assert_eq!(
+            script.requests().len(),
+            9,
+            "attempt ten must fail before dispatch"
+        );
     }
 }
