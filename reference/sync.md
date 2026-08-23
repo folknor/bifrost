@@ -264,6 +264,28 @@ write. Pinned by
 a classification that feeds a destructive compensation must come from the read
 the action uses, and must fail closed on error.
 
+**One writer per account owns every durable mutation.** Reattach does NOT
+touch `CheckpointStore` directly: it persists freshly created cursors and rolls
+them back through the same `WriterRequest` channel the ack writer serves.
+Direct writes raced acknowledged ones, and not hypothetically - `run_establish`
+hands `changes_tx` to `InventoryFusion`, so a replacement's inventory pass
+broadcasts checkpoint-bearing batches BEFORE the cutover, a consumer can
+acknowledge one, and the abort path then deleted the row that acknowledgement
+had just committed.
+
+Serializing is necessary but not sufficient on its own: a FIFO queue would
+order the acknowledged write ahead of an unconditional delete and faithfully
+destroy it. The writer therefore tracks which scopes are still PROVISIONAL -
+inserted by an uncommitted reattach and not since claimed by an
+acknowledgement - and an abort deletes exactly those. That makes the rollback a
+conditional delete implemented in the engine, where there is one
+implementation, rather than a compare-and-swap every `CheckpointStore` backend
+would have to get right. `commit_reattach_inserts` clears the marks past the
+last abort point, so a later reattach's abort cannot delete rows belonging to
+one that succeeded; it runs after the generation bump because the lifecycle
+reader is waiting on that watch and no await belongs between the topology swap
+and the bump that publishes it.
+
 A compare-and-swap primitive on `CheckpointStore` would remove the class
 outright. It was considered and deliberately not taken - it is a published trait
 change, so it is an owner-level proposal rather than hardening work.

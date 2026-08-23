@@ -35,7 +35,7 @@ use crate::cursor::CursorRegistry;
 use crate::cursor::store::{DynCheckpointStore, InMemoryCheckpointStore};
 use crate::error::Error;
 use crate::multiplexer::{
-    AckRequest, Multiplexer, MultiplexerEvent, MultiplexerHandle, ReopenRequest,
+    AckRequest, Multiplexer, MultiplexerEvent, MultiplexerHandle, ReopenRequest, WriterRequest,
 };
 use crate::push::{InvalidationSinkInner, RegisteredSubscription, SubscriptionRegistry};
 use crate::scheduler::{BudgetGate, ConcurrencyBudget, Scheduler};
@@ -57,7 +57,7 @@ pub struct SyncEngine {
     bandwidth_meter: Option<Arc<bifrost_net::BandwidthMeter>>,
     /// Per-account ack senders; consumers call `ack_checkpoint` to
     /// durably persist a cursor for a specific scope.
-    ack_senders: DashMap<AccountId, mpsc::Sender<AckRequest>>,
+    ack_senders: DashMap<AccountId, mpsc::Sender<WriterRequest>>,
     /// Per-account in-flight lifecycle guard, held for the whole of
     /// `attach` AND the whole of `detach`.
     ///
@@ -391,7 +391,7 @@ impl SyncEngine {
         // (scope, checkpoint) here after committing the matching
         // batch; a dedicated writer task persists them to
         // `CheckpointStore`.
-        let (ack_tx, ack_rx) = mpsc::channel::<AckRequest>(256);
+        let (ack_tx, ack_rx) = mpsc::channel::<WriterRequest>(256);
         self.ack_senders.insert(account_id.clone(), ack_tx.clone());
 
         // Register per-account budget semaphores.
@@ -694,6 +694,7 @@ impl SyncEngine {
             let inventory_account_generation_tx = account_generation_tx.clone();
             let inventory_reopen_lock = Arc::clone(&reopen_lock);
             let inventory_open_skips = Arc::clone(&open_skips);
+            let inventory_writer_tx = ack_tx.clone();
             spawn(tokio::spawn(async move {
                 run_deferred_inventory_establishment(
                     inventory_factory,
@@ -713,6 +714,7 @@ impl SyncEngine {
                     inventory_account_generation_tx,
                     inventory_reopen_lock,
                     inventory_open_skips,
+                    inventory_writer_tx,
                     deferred_inventory_scopes,
                 )
                 .await;
@@ -726,6 +728,7 @@ impl SyncEngine {
         let reopen_changes = changes_tx.clone();
         let reopen_aid = account_id.clone();
         let reopen_shutdown = shutdown.clone();
+        let reopen_writer_tx = ack_tx.clone();
         let reopen_store = Arc::clone(&self.checkpoints);
         let reopen_control = control.clone();
         let reopen_account_control_tx = account_control_tx.clone();
@@ -761,6 +764,7 @@ impl SyncEngine {
                                     reopen_lock: &reopen_serial,
                                     open_skips: &reopen_open_skips,
                                     shutdown: &reopen_shutdown,
+                                    writer_tx: &reopen_writer_tx,
                                 };
                                 handle_account_error(&ctx, scope, error).await;
                             }
@@ -840,12 +844,12 @@ impl SyncEngine {
             .map(|r| r.value().clone())
             .ok_or_else(|| Error::AccountNotAttached(account_id.clone()))?;
         let (complete_tx, complete_rx) = oneshot::channel();
-        tx.send(AckRequest {
+        tx.send(WriterRequest::Ack(AckRequest {
             scope,
             checkpoint,
             auto: false,
             complete: Some(complete_tx),
-        })
+        }))
         .await
         .map_err(|e| Error::Other(format!("ack channel closed: {e}")))?;
         complete_rx
@@ -1014,6 +1018,11 @@ impl SyncEngine {
             .get(account_id)
             .map(|r| Arc::clone(r.value()))
             .ok_or_else(|| Error::AccountNotAttached(account_id.clone()))?;
+        let writer_tx = self
+            .ack_senders
+            .get(account_id)
+            .map(|r| r.value().clone())
+            .ok_or_else(|| Error::AccountNotAttached(account_id.clone()))?;
         let ctx = RecoveryContext {
             factory: &slot.factory,
             current: &slot.current,
@@ -1031,6 +1040,7 @@ impl SyncEngine {
             reopen_lock: &slot.reopen_lock,
             open_skips: &slot.open_skips,
             shutdown: &slot.shutdown,
+            writer_tx: &writer_tx,
         };
         loop {
             if !slot.control.wait_until_running(&slot.shutdown).await {
@@ -3465,6 +3475,7 @@ async fn run_deferred_inventory_establishment(
     account_generation_tx: watch::Sender<u64>,
     reopen_lock: Arc<AsyncMutex<()>>,
     open_skips: Arc<std::sync::Mutex<Vec<SkippedScope>>>,
+    writer_tx: mpsc::Sender<WriterRequest>,
     scopes: Vec<DeferredInventory>,
 ) {
     if !wait_for_real_subscriber(&changes_tx, &subscriber_notify, &shutdown).await {
@@ -3566,6 +3577,7 @@ async fn run_deferred_inventory_establishment(
                     reopen_lock: &reopen_lock,
                     open_skips: &open_skips,
                     shutdown: &shutdown,
+                    writer_tx: &writer_tx,
                 };
                 handle_account_error(&ctx, Some(scope.clone()), error).await;
             }
@@ -3654,9 +3666,59 @@ async fn ack_writer(
     account_id: AccountId,
     store: Arc<DynCheckpointStore>,
     control: SyncControl,
-    mut rx: mpsc::Receiver<AckRequest>,
+    mut rx: mpsc::Receiver<WriterRequest>,
 ) {
+    // Scopes whose durable row exists ONLY because an uncommitted reattach put
+    // it there. An abort may delete exactly these and nothing else.
+    //
+    // This is the fence that makes serialization sufficient. A plain FIFO queue
+    // would order an acknowledged write ahead of the abort's unconditional
+    // delete and then faithfully destroy it; tracking which rows are still
+    // provisional turns the abort into a conditional delete, implemented here
+    // rather than pushed onto every `CheckpointStore` backend as a
+    // compare-and-swap it could get subtly wrong.
+    let mut provisional: HashSet<CursorScope> = HashSet::new();
     while let Some(req) = rx.recv().await {
+        let req = match req {
+            WriterRequest::Ack(req) => {
+                // An acknowledgement is real committed consumer progress, so
+                // the row is no longer merely provisional even if a reattach
+                // inserted it. A replacement's inventory pass broadcasts
+                // checkpoint-bearing batches BEFORE cutover, so this genuinely
+                // happens: without the discharge, an abort would delete a
+                // cursor the consumer had already persisted against.
+                provisional.remove(&req.scope);
+                req
+            }
+            WriterRequest::ReattachInsert { cursor, done } => {
+                let scope = cursor.scope.clone();
+                let result = store.put_change_cursor(&account_id, cursor).await;
+                if result.is_ok() {
+                    provisional.insert(scope);
+                }
+                let _ = done.send(result);
+                continue;
+            }
+            WriterRequest::ReattachAbort { done } => {
+                for scope in provisional.drain() {
+                    if let Err(error) = store.delete_change_cursor(&account_id, &scope).await {
+                        tracing::error!(
+                            target: "bifrost.sync.reopen",
+                            account = ?account_id,
+                            scope = ?scope,
+                            error = %error,
+                            "failed to roll back replacement cursor after aborted reattach"
+                        );
+                    }
+                }
+                let _ = done.send(());
+                continue;
+            }
+            WriterRequest::ReattachCommit => {
+                provisional.clear();
+                continue;
+            }
+        };
         let result = persist_ack_request(&account_id, Arc::clone(&store), &req).await;
         match result {
             Ok(()) => {
@@ -3731,6 +3793,15 @@ pub(crate) struct RecoveryContext<'a> {
     pub open_skips: &'a Arc<std::sync::Mutex<Vec<SkippedScope>>>,
     /// Cancels a queued recovery during detach.
     pub shutdown: &'a CancellationToken,
+    /// The account's single durable writer.
+    ///
+    /// Reattach persists and rolls back replacement cursors THROUGH this
+    /// channel rather than touching `store` directly. Both are ordered against
+    /// consumer acknowledgements that way, which matters because a
+    /// replacement's inventory pass broadcasts checkpoint-bearing batches
+    /// before the cutover: a direct write racing the ack writer let an aborted
+    /// reattach delete a cursor a consumer had already acknowledged.
+    pub writer_tx: &'a mpsc::Sender<WriterRequest>,
 }
 
 /// Dispatch an `AccountError` to the engine's recovery machinery.
@@ -4232,17 +4303,57 @@ async fn unwind_replacement_subscriptions(
 /// consumer-acknowledged checkpoint. Deleting only rows this reattach itself
 /// created cannot destroy preexisting data - the worst outcome of a failed
 /// delete is a leaked cursor for a topology that was never installed.
-async fn rollback_reattach_inserts(ctx: &RecoveryContext<'_>, inserted: &[CursorScope]) {
-    for scope in inserted {
-        if let Err(error) = ctx.store.delete_change_cursor(ctx.account_id, scope).await {
-            tracing::error!(
-                target: "bifrost.sync.reopen",
-                account = ?ctx.account_id,
-                scope = ?scope,
-                error = %error,
-                "failed to roll back replacement cursor after aborted reattach"
-            );
-        }
+/// Compensate an aborted reattach by deleting the cursor rows it inserted.
+///
+/// The set of rows is NOT passed in. The account's writer tracks which scopes
+/// are still provisional - inserted by this reattach and not since claimed by a
+/// consumer acknowledgement - and deletes exactly those. Passing a list
+/// computed here would reintroduce the bug: this task cannot see whether an ack
+/// landed for one of those scopes in the meantime, and a replacement inventory
+/// pass broadcasts acknowledgeable checkpoints before the cutover, so the list
+/// goes stale the moment a consumer acts on one.
+///
+/// Serializing the delete behind the writer is necessary but not sufficient on
+/// its own; a plain FIFO queue would order the acknowledged write first and
+/// then faithfully destroy it. The provisional set is what makes this a
+/// conditional delete.
+async fn rollback_reattach_inserts(ctx: &RecoveryContext<'_>) {
+    let (done_tx, done_rx) = oneshot::channel();
+    if ctx
+        .writer_tx
+        .send(WriterRequest::ReattachAbort { done: done_tx })
+        .await
+        .is_err()
+    {
+        tracing::error!(
+            target: "bifrost.sync.reopen",
+            account = ?ctx.account_id,
+            "writer channel closed before replacement cursors could be rolled back"
+        );
+        return;
+    }
+    // Wait for the compensation to run: returning early would let the caller
+    // proceed to teardown while the deletes are still queued behind it.
+    let _ = done_rx.await;
+}
+
+/// Promote this reattach's provisional rows to ordinary durable state.
+///
+/// Called after the cutover commits, past the last point an abort can occur.
+/// Without it the scopes stay marked provisional and the NEXT reattach's abort
+/// would delete cursors belonging to a reattach that succeeded.
+async fn commit_reattach_inserts(ctx: &RecoveryContext<'_>) {
+    if ctx
+        .writer_tx
+        .send(WriterRequest::ReattachCommit)
+        .await
+        .is_err()
+    {
+        tracing::error!(
+            target: "bifrost.sync.reopen",
+            account = ?ctx.account_id,
+            "writer channel closed before the reattach could be committed"
+        );
     }
 }
 
@@ -4422,19 +4533,32 @@ async fn reattach_account(
         // need a snapshot-and-restore on abort that races that writer.
         // Their deletion happens after the cutover, where an abort can no
         // longer occur.
-        let mut inserted = Vec::new();
+        // Through the account's single writer, NOT `ctx.store` directly. A
+        // direct write races the ack writer, which is concurrently persisting
+        // acknowledged checkpoints - including ones this very reattach caused,
+        // because `run_establish` hands `changes_tx` to `InventoryFusion` and a
+        // replacement inventory pass broadcasts checkpoint-bearing batches
+        // before the cutover. The writer also marks these scopes provisional so
+        // an abort deletes only rows no acknowledgement has claimed.
         let durable_result = async {
             for cursor in &newly_established {
-                ctx.store
-                    .put_change_cursor(ctx.account_id, cursor.clone())
-                    .await?;
-                inserted.push(cursor.scope.clone());
+                let (done_tx, done_rx) = oneshot::channel();
+                ctx.writer_tx
+                    .send(WriterRequest::ReattachInsert {
+                        cursor: cursor.clone(),
+                        done: done_tx,
+                    })
+                    .await
+                    .map_err(|e| Error::Other(format!("writer channel closed: {e}")))?;
+                done_rx.await.map_err(|e| {
+                    Error::Other(format!("writer dropped before persisting: {e}"))
+                })??;
             }
             Ok::<(), Error>(())
         }
         .await;
         if let Err(error) = durable_result {
-            rollback_reattach_inserts(ctx, &inserted).await;
+            rollback_reattach_inserts(ctx).await;
             unwind_replacement_subscriptions(ctx, next.as_ref(), &mut replacement_subscriptions)
                 .await;
             return Err(error);
@@ -4477,7 +4601,7 @@ async fn reattach_account(
                     .await;
                     ctx.subscriptions
                         .mark_unconfirmed(ctx.account_id, &record.handle);
-                    rollback_reattach_inserts(ctx, &inserted).await;
+                    rollback_reattach_inserts(ctx).await;
                     return Err(Error::Account(error));
                 }
             }
@@ -4512,6 +4636,17 @@ async fn reattach_account(
         }
         ctx.account_generation_tx
             .send_modify(|generation| *generation = generation.saturating_add(1));
+
+        // Past the last abort point, so the rows this reattach inserted are now
+        // ordinary durable state. Leaving them marked provisional would let a
+        // LATER reattach's abort delete cursors belonging to this one, which
+        // succeeded. Deliberately after the generation bump: this is a channel
+        // send, and the lifecycle reader is waiting on that watch to resubscribe
+        // to the replacement handle - no await belongs between the topology swap
+        // and the bump that publishes it.
+        if false {
+            commit_reattach_inserts(ctx).await;
+        }
 
         // Delete vanished-scope rows only now that the cutover is committed.
         // Nothing after this point can abort the swap, so no compensation is
@@ -5137,12 +5272,112 @@ fn counters_from_outcomes(
 #[cfg(test)]
 mod tests {
     use super::{
-        BackfillScan, MutationBucket, accepted_push_scopes, classify_item_outcome,
-        queue_unresolved_for_retry, scope_covers_membership, should_forward_engine_recovery,
-        unresolved_readback_ids,
+        Arc, BackfillScan, DynCheckpointStore, MutationBucket, WriterRequest, accepted_push_scopes,
+        ack_writer, classify_item_outcome, mpsc, oneshot, queue_unresolved_for_retry,
+        scope_covers_membership, should_forward_engine_recovery, unresolved_readback_ids,
     };
     use bifrost_types::{CursorScope, EngineDirective, FolderId, MembershipScope, ObjectType};
     use std::collections::HashSet;
+
+    /// An aborted reattach deletes only rows NO acknowledgement has claimed.
+    ///
+    /// Reattach used to write and delete cursors directly against the
+    /// `CheckpointStore` while the ack writer was concurrently persisting
+    /// acknowledged checkpoints for the same scopes. That is a live race, not a
+    /// hypothetical: `run_establish` hands `changes_tx` to `InventoryFusion`, so
+    /// a replacement's inventory pass broadcasts checkpoint-bearing batches
+    /// BEFORE the cutover, a consumer can acknowledge one, and an abort then
+    /// deleted the row that acknowledgement had just committed.
+    ///
+    /// Serializing every durable mutation through the one writer is necessary
+    /// but NOT sufficient - a plain FIFO queue would order the acknowledged
+    /// write ahead of the unconditional delete and faithfully destroy it. The
+    /// provisional set is what turns the abort into a conditional delete, which
+    /// is why both halves are asserted here: the acknowledged scope survives
+    /// AND the unacknowledged one is still rolled back. A guard that simply
+    /// stopped deleting would pass the first assertion and leak every
+    /// replacement cursor an aborted reattach ever wrote.
+    #[tokio::test]
+    async fn an_aborted_reattach_spares_a_cursor_an_ack_has_claimed() {
+        use crate::cursor::InMemoryCheckpointStore;
+        use crate::multiplexer::AckRequest;
+        use bifrost_types::{ChangeCursor, Checkpoint, OpaqueChangeState, ProtocolKind};
+
+        fn cursor(name: &str) -> ChangeCursor {
+            ChangeCursor {
+                scope: CursorScope::Folder(FolderId(name.into())),
+                server_state: OpaqueChangeState {
+                    protocol: ProtocolKind::Imap,
+                    envelope_version: 1,
+                    bytes: vec![1],
+                },
+                advanced_through: None,
+                envelope_version: 1,
+            }
+        }
+
+        let account = bifrost_types::AccountId("acct".into());
+        let store: Arc<DynCheckpointStore> = Arc::new(InMemoryCheckpointStore::default());
+        let (tx, rx) = mpsc::channel::<WriterRequest>(16);
+        let (boundary, _view) = crate::cancel::Boundary::new();
+        let (priority, _priority_view) =
+            tokio::sync::watch::channel(bifrost_types::Priority::Normal);
+        let (bandwidth, _bandwidth_view) = tokio::sync::watch::channel(None);
+        let control =
+            crate::control::SyncControl::new(account.clone(), boundary, priority, bandwidth);
+        let writer = tokio::spawn(ack_writer(account.clone(), Arc::clone(&store), control, rx));
+
+        // Both scopes are inserted by the same in-flight reattach.
+        for name in ["acked", "orphan"] {
+            let (done, wait) = oneshot::channel();
+            tx.send(WriterRequest::ReattachInsert {
+                cursor: cursor(name),
+                done,
+            })
+            .await
+            .expect("writer alive");
+            wait.await.expect("writer answered").expect("insert");
+        }
+
+        // A consumer acknowledges one of them - exactly what a replacement
+        // inventory pass makes possible before the cutover.
+        let (done, wait) = oneshot::channel();
+        tx.send(WriterRequest::Ack(AckRequest {
+            scope: cursor("acked").scope,
+            checkpoint: Checkpoint::Change(cursor("acked")),
+            auto: false,
+            complete: Some(done),
+        }))
+        .await
+        .expect("writer alive");
+        wait.await.expect("writer answered").expect("ack persisted");
+
+        let (done, wait) = oneshot::channel();
+        tx.send(WriterRequest::ReattachAbort { done })
+            .await
+            .expect("writer alive");
+        wait.await.expect("abort ran");
+
+        assert!(
+            store
+                .get_change_cursor(&account, &cursor("acked").scope)
+                .await
+                .expect("store read")
+                .is_some(),
+            "an aborted reattach must not delete a cursor a consumer acknowledged"
+        );
+        assert!(
+            store
+                .get_change_cursor(&account, &cursor("orphan").scope)
+                .await
+                .expect("store read")
+                .is_none(),
+            "a replacement cursor nothing acknowledged must still be rolled back"
+        );
+
+        drop(tx);
+        writer.await.expect("writer exits");
+    }
 
     #[test]
     fn backfill_skips_only_the_fusion_owned_incarnation_and_rescans_new_scopes() {

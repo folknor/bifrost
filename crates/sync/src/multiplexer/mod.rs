@@ -36,7 +36,7 @@ use crate::cursor::CursorRegistry;
 use crate::error::Error;
 use crate::types::MultiplexerConfig;
 
-pub use changes::{AckRequest, ChangesEvent, drive_changes_stream};
+pub use changes::{AckRequest, ChangesEvent, WriterRequest, drive_changes_stream};
 pub use fusion::{FusionOutcome, InventoryFusion};
 pub use poll::{AdaptiveCadence, PollSchedule};
 
@@ -264,7 +264,7 @@ pub struct Multiplexer {
     pub control: SyncControl,
     pub shutdown: CancellationToken,
     pub reopen_tx: mpsc::Sender<ReopenRequest>,
-    pub ack_tx: Option<mpsc::Sender<AckRequest>>,
+    pub ack_tx: Option<mpsc::Sender<WriterRequest>>,
     /// Per-scope cancellation tokens keyed by membership-id so
     /// `ScopeLifecycle::Deleted` can stop the matching poll task.
     pub scope_tokens: ScopeTokens,
@@ -632,7 +632,7 @@ fn spawn_and_track_scope_poll(
     control: SyncControl,
     shutdown: CancellationToken,
     reopen_tx: mpsc::Sender<ReopenRequest>,
-    ack_tx: Option<mpsc::Sender<AckRequest>>,
+    ack_tx: Option<mpsc::Sender<WriterRequest>>,
     scope_tokens: ScopeTokens,
     throttles: Arc<StdMutex<crate::recovery::ThrottleBucket>>,
     scope: CursorScope,
@@ -695,7 +695,7 @@ fn spawn_missing_scope_polls(
     control: SyncControl,
     shutdown: CancellationToken,
     reopen_tx: mpsc::Sender<ReopenRequest>,
-    ack_tx: Option<mpsc::Sender<AckRequest>>,
+    ack_tx: Option<mpsc::Sender<WriterRequest>>,
     scope_tokens: ScopeTokens,
     throttles: Arc<StdMutex<crate::recovery::ThrottleBucket>>,
 ) {
@@ -747,7 +747,7 @@ async fn spawn_scope_poll_inner(
     shutdown: CancellationToken,
     scope_cancel: CancellationToken,
     reopen_tx: mpsc::Sender<ReopenRequest>,
-    ack_tx: Option<mpsc::Sender<AckRequest>>,
+    ack_tx: Option<mpsc::Sender<WriterRequest>>,
     throttles: Arc<StdMutex<crate::recovery::ThrottleBucket>>,
     scope: CursorScope,
 ) {

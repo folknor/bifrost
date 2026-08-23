@@ -87,7 +87,7 @@ pub async fn drive_changes_stream(
     changes_tx: broadcast::Sender<MultiplexerEvent>,
     boundary: BoundaryView,
     control: Option<SyncControl>,
-    _ack_tx: Option<mpsc::Sender<AckRequest>>,
+    _ack_tx: Option<mpsc::Sender<WriterRequest>>,
     registry_generation: Option<u64>,
 ) -> Result<ChangesEvent, Error> {
     let _activity = match &control {
@@ -213,6 +213,66 @@ impl std::fmt::Debug for AckRequest {
             .field("auto", &self.auto)
             .field("complete", &self.complete.is_some())
             .finish()
+    }
+}
+
+/// Everything that may mutate durable checkpoint state for one account.
+///
+/// There is exactly ONE writer per account and every durable mutation goes
+/// through this channel, because ordering between them is load-bearing.
+/// Reattach used to write and delete cursors directly against the
+/// `CheckpointStore` while the ack writer was concurrently persisting
+/// acknowledged checkpoints for the same scopes, which is a race: a
+/// replacement's inventory pass broadcasts checkpoint-bearing batches BEFORE
+/// the cutover (`run_establish` hands `changes_tx` to `InventoryFusion`), a
+/// consumer acknowledges one, and an aborted reattach then deleted the row
+/// that acknowledgement had just committed.
+///
+/// Serializing is necessary but NOT sufficient on its own: a FIFO queue would
+/// faithfully order the acknowledged write ahead of an unconditional delete and
+/// then destroy it. The writer therefore tracks which scopes are still
+/// provisional - see `ReattachInsert`.
+pub enum WriterRequest {
+    /// Persist an acknowledged checkpoint. Also DISCHARGES any provisional
+    /// mark on its scope: an acknowledgement is real committed consumer
+    /// progress, and a later reattach abort must not delete it.
+    Ack(AckRequest),
+    /// Persist a cursor the reattach freshly created, and mark its scope
+    /// provisional until the reattach commits or aborts.
+    ///
+    /// Provisional means "this row exists only because a replacement that has
+    /// not cut over put it there". Only such rows may be rolled back, which is
+    /// what lets the abort path compensate by plain deletion without ever
+    /// touching preexisting durable state.
+    ReattachInsert {
+        cursor: ChangeCursor,
+        done: oneshot::Sender<Result<(), Error>>,
+    },
+    /// The reattach aborted: delete the rows it inserted that are STILL
+    /// provisional. A scope whose checkpoint was acknowledged in the meantime
+    /// is no longer provisional and survives.
+    ReattachAbort { done: oneshot::Sender<()> },
+    /// The reattach cut over: its rows are now ordinary durable state.
+    ReattachCommit,
+}
+
+impl From<AckRequest> for WriterRequest {
+    fn from(request: AckRequest) -> Self {
+        Self::Ack(request)
+    }
+}
+
+impl std::fmt::Debug for WriterRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ack(request) => f.debug_tuple("Ack").field(request).finish(),
+            Self::ReattachInsert { cursor, .. } => f
+                .debug_struct("ReattachInsert")
+                .field("scope", &cursor.scope)
+                .finish(),
+            Self::ReattachAbort { .. } => f.write_str("ReattachAbort"),
+            Self::ReattachCommit => f.write_str("ReattachCommit"),
+        }
     }
 }
 

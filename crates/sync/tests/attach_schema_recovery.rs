@@ -1376,7 +1376,7 @@ async fn reopen_refreshes_topology_subscriptions_and_lifecycle_handle() {
         "successful reopen closes exactly the old handle"
     );
 
-    for _ in 0..1000 {
+    for _ in 0..200 {
         if lifecycle_calls
             .lock()
             .expect("lifecycle calls lock")
@@ -1384,7 +1384,7 @@ async fn reopen_refreshes_topology_subscriptions_and_lifecycle_handle() {
         {
             break;
         }
-        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
     assert!(
         lifecycle_calls

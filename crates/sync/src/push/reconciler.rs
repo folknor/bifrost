@@ -18,7 +18,7 @@ use crate::control::SyncControl;
 use crate::cursor::CursorRegistry;
 use crate::error::{Error, Warning};
 use crate::multiplexer::{
-    AckRequest, ChangesEvent, MultiplexerEvent, ReopenRequest, drive_changes_stream,
+    ChangesEvent, MultiplexerEvent, ReopenRequest, WriterRequest, drive_changes_stream,
 };
 
 pub struct Reconciler {
@@ -29,7 +29,7 @@ pub struct Reconciler {
     pub boundary: BoundaryView,
     pub shutdown: CancellationToken,
     pub control: SyncControl,
-    pub ack_tx: Option<mpsc::Sender<AckRequest>>,
+    pub ack_tx: Option<mpsc::Sender<WriterRequest>>,
     pub reopen_tx: mpsc::Sender<ReopenRequest>,
     /// Engine-wide throttle bucket. The reconciler honors account-wide
     /// deadlines before driving a hinted scope and records deadlines
