@@ -48,8 +48,8 @@ use crate::error::{
     MutationSuccess, RequestCause,
 };
 use crate::events::{
-    Change, InventoryEntry, InventoryPartition, InventoryPartitioning, Priority, SyncEvent,
-    WatchEvent,
+    Change, InventoryCompletion, InventoryEvent, InventoryPartition, InventoryPartitioning,
+    Priority, SyncEvent, WatchEvent,
 };
 use crate::filter::{
     FilterValidation, ServerFilter, ServerFilterCreate, ServerFilterId, ServerFilterPatch,
@@ -127,6 +127,28 @@ pub type AccountStream<T> = Pin<Box<dyn Stream<Item = T> + Send + 'static>>;
 /// `'static` because the returned future may outlive the Account
 /// handle's local borrow.
 pub type AccountFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
+
+/// An inventory stream that refuses `operation` and ends.
+///
+/// Shared rather than reimplemented per crate: six protocol crates need the
+/// same three lines, and six copies of a shared shape is how this workspace
+/// accumulated seven CalDAV/CardDAV divergences.
+///
+/// `Done` claims COMPLETE coverage, which is correct: a walk that enumerated
+/// nothing left nothing unaccounted for. The refusal rides `Terminated`.
+pub fn unsupported_inventory_stream(operation: AccountOperation) -> AccountStream<InventoryEvent> {
+    let error = AccountErrorBuilder::new(
+        AccountErrorKind::Unsupported(operation),
+        Cause::Request(RequestCause::Unsupported { operation }),
+    )
+    .operation(operation)
+    .try_build()
+    .expect("valid account error classification");
+    Box::pin(futures::stream::iter([
+        InventoryEvent::Terminated(error),
+        InventoryEvent::Done(InventoryCompletion::complete(None)),
+    ]))
+}
 
 /// The contract every protocol crate implements and the engine drives.
 ///
@@ -207,7 +229,7 @@ pub trait Account: Send + Sync {
     /// `CursorEstablishment::EstablishViaInventory`; for those scopes
     /// the terminal `SyncEvent::Done` carries the established cursor
     /// in its checkpoint.
-    fn inventory_stream(&self, scope: CursorScope) -> AccountStream<SyncEvent<InventoryEntry>>;
+    fn inventory_stream(&self, scope: CursorScope) -> AccountStream<InventoryEvent>;
 
     /// Resume an in-progress inventory cursor that was consumer-acknowledged
     /// at a page boundary. `None` means this protocol has no resumable
@@ -220,7 +242,7 @@ pub trait Account: Send + Sync {
     fn inventory_resume_stream(
         &self,
         _cursor: ChangeCursor,
-    ) -> Option<AccountStream<SyncEvent<InventoryEntry>>> {
+    ) -> Option<AccountStream<InventoryEvent>> {
         None
     }
 
@@ -255,23 +277,10 @@ pub trait Account: Send + Sync {
         &self,
         scope: CursorScope,
         partition: InventoryPartition,
-    ) -> AccountStream<SyncEvent<InventoryEntry>> {
+    ) -> AccountStream<InventoryEvent> {
         match partition {
             InventoryPartition::Full => self.inventory_stream(scope),
-            _ => {
-                let op = AccountOperation::SyncInventory;
-                let error = AccountErrorBuilder::new(
-                    AccountErrorKind::Unsupported(op),
-                    Cause::Request(RequestCause::Unsupported { operation: op }),
-                )
-                .operation(op)
-                .try_build()
-                .expect("valid account error classification");
-                Box::pin(futures::stream::iter([
-                    SyncEvent::Terminated(error),
-                    SyncEvent::Done(None),
-                ]))
-            }
+            _ => unsupported_inventory_stream(AccountOperation::SyncInventory),
         }
     }
 

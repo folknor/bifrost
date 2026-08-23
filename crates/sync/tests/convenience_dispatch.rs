@@ -21,7 +21,7 @@ use bifrost_types::{
     CursorFreshness, CursorScope, DraftHandle, DraftPatch, EventCreate, EventId, EventPatch,
     EventRange, EventSearchRequest, FilterRuleShape, FilterValidation, FlagOp, HostedAttachment,
     HydratedObject, HydrationProjection, IdempotencyKey, Identity, IdentityId, IdentityPatch,
-    Importance, InventoryEntry, InventoryPartition, ItemOutcome, Label, MembershipScope, Message,
+    Importance, InventoryEvent, InventoryPartition, ItemOutcome, Label, MembershipScope, Message,
     MutationCapabilities, MutationConcurrency, MutationReplaySafety, MutationSuccess,
     MutationTarget, ObjectId, Page, PimMethodSupport, Priority, Projection, ProtocolKind,
     Provenance, PushCapability, QuotaInfo, QuotaSignal, RateLimitClass, RequestCause, RsvpStatus,
@@ -129,9 +129,11 @@ impl Account for RecorderAccount {
         Box::pin(async { Err(unsupported(AccountOperation::EstablishCursor)) })
     }
 
-    fn inventory_stream(&self, _scope: CursorScope) -> AccountStream<SyncEvent<InventoryEntry>> {
+    fn inventory_stream(&self, _scope: CursorScope) -> AccountStream<InventoryEvent> {
         self.record("inventory_stream".into());
-        Box::pin(stream::once(async { SyncEvent::Done(None) }))
+        Box::pin(stream::once(async {
+            InventoryEvent::Done(bifrost_types::InventoryCompletion::complete(None))
+        }))
     }
 
     fn get_stream(
@@ -946,7 +948,10 @@ async fn default_partition_stream_serves_full_and_rejects_the_rest() {
         .inventory_partition_stream(CursorScope::Account, InventoryPartition::Full)
         .collect()
         .await;
-    assert!(matches!(events.as_slice(), [SyncEvent::Done(None)]));
+    assert!(matches!(
+        events.as_slice(),
+        [InventoryEvent::Done(completion)] if completion.checkpoint.is_none()
+    ));
     assert_eq!(account.calls(), vec!["inventory_stream".to_string()]);
 
     // A partition shape the account never advertised terminates with
@@ -959,9 +964,11 @@ async fn default_partition_stream_serves_full_and_rejects_the_rest() {
         .collect()
         .await;
     assert_eq!(events.len(), 2);
-    let SyncEvent::Terminated(err) = &events[0] else {
+    let InventoryEvent::Terminated(err) = &events[0] else {
         panic!("expected Terminated first, got {:?}", events[0]);
     };
     assert_unsupported(err, AccountOperation::SyncInventory);
-    assert!(matches!(events[1], SyncEvent::Done(None)));
+    assert!(
+        matches!(&events[1], InventoryEvent::Done(completion) if completion.checkpoint.is_none())
+    );
 }

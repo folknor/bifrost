@@ -27,13 +27,14 @@ use bifrost_types::{
     DirectoryGroup, DirectoryGroupId, DirectoryGroupMember, DraftHandle, DraftPatch, EventCreate,
     EventId, EventPatch, EventRange, EventSearchRequest, FilterValidation, FlagOp,
     HostedAttachment, HydratedObject, HydrationProjection, IdempotencyKey, Identity, IdentityId,
-    IdentityPatch, Importance, InventoryEntry, ItemOutcome, MembershipScope, Message,
+    IdentityPatch, Importance, InventoryEvent, ItemOutcome, MembershipScope, Message,
     MutationSuccess, MutationTarget, ObjectId, OpaqueChangeState, OpenedAccount, Page, Priority,
     Projection, QuotaInfo, RsvpStatus, ScopeLifecycleEvent, SearchRequest, SendRequest,
     ServerFilter, ServerFilterCreate, ServerFilterId, ServerFilterPatch, SubscriptionHandle,
     SyncEvent, SyncStrategy, ThreadHydration, ThreadId, VacationConfig, WatchEvent,
 };
 use bytes::Bytes;
+use futures::StreamExt as _;
 use tokio_util::sync::CancellationToken;
 
 use bifrost_net::TokenSource;
@@ -316,11 +317,17 @@ impl Account for GoogleAccount {
         })
     }
 
-    fn inventory_stream(&self, scope: CursorScope) -> AccountStream<SyncEvent<InventoryEntry>> {
-        inventory::inventory_stream(
-            Arc::clone(&self.client),
-            Arc::clone(&self.scope_cache),
-            scope,
+    fn inventory_stream(&self, scope: CursorScope) -> AccountStream<InventoryEvent> {
+        // COMPLETE coverage: this walk still terminates on every classified
+        // failure except the absorbed list/get deletion race, and an absorbed
+        // NotFound is a definitive absence rather than a gap.
+        Box::pin(
+            inventory::inventory_stream(
+                Arc::clone(&self.client),
+                Arc::clone(&self.scope_cache),
+                scope,
+            )
+            .map(InventoryEvent::from),
         )
     }
 

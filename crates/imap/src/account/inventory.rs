@@ -5,6 +5,7 @@ use bifrost_types::{
     DiagnosticText, Fingerprint, InventoryEntry, PageBoundary, ServerVersion, SyncEvent,
     SyncStrategy, ThreadId, Warning, WarningKind,
 };
+use futures::StreamExt as _;
 
 use crate::types::{FetchAttr, FetchResponse, MailboxName, UidSet};
 
@@ -35,7 +36,7 @@ pub(crate) fn establish_initial_cursor(
 pub(crate) fn inventory_stream(
     account: ImapAccount,
     scope: CursorScope,
-) -> AccountStream<SyncEvent<InventoryEntry>> {
+) -> AccountStream<bifrost_types::InventoryEvent> {
     // Route first: a typed scope owned by a sub-account delegates the
     // whole inventory stream rather than checking out an IMAP folder.
     match route_scope(
@@ -43,10 +44,15 @@ pub(crate) fn inventory_stream(
         &scope,
         bifrost_types::AccountOperation::SyncInventory,
     ) {
+        // The sub-account already speaks the inventory envelope, so its stream
+        // passes straight through. Converting here instead would relabel
+        // whatever coverage the delegate reported as COMPLETE.
         Ok(ScopeHandler::Delegate(sub)) => return sub.inventory_stream(scope),
         Ok(ScopeHandler::Folder(_)) => {}
         Err(error) => {
-            return Box::pin(futures::stream::iter([SyncEvent::Terminated(error)]));
+            return Box::pin(futures::stream::iter([
+                bifrost_types::InventoryEvent::Terminated(error),
+            ]));
         }
     }
     let (tx, rx) = tokio::sync::mpsc::channel(super::STREAM_CAPACITY);
@@ -71,7 +77,9 @@ pub(crate) fn inventory_stream(
             }
         }
     });
-    boxed_receiver_stream(rx)
+    // The channel carries `SyncEvent<InventoryEntry>` internally; this walk
+    // terminates wholesale on failure, so COMPLETE coverage is accurate.
+    Box::pin(boxed_receiver_stream(rx).map(bifrost_types::InventoryEvent::from))
 }
 
 /// Marker for an output-channel-dropped send failure. Per the IMAP plan,

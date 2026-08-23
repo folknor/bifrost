@@ -21,7 +21,7 @@ use bifrost_types::{
     CursorDescriptor, CursorEstablishment, CursorFreshness, CursorScope, DraftHandle, DraftPatch,
     EventCreate, EventId, EventPatch, EventRange, EventSearchRequest, FilterRuleShape,
     FilterValidation, FlagOp, HostedAttachment, HydratedObject, HydrationProjection,
-    IdempotencyKey, Identity, IdentityId, IdentityPatch, Importance, InventoryEntry, ItemOutcome,
+    IdempotencyKey, Identity, IdentityId, IdentityPatch, Importance, InventoryEvent, ItemOutcome,
     MembershipScope, Message, MutationCapabilities, MutationConcurrency, MutationReplaySafety,
     MutationSuccess, MutationTarget, ObjectId, Page, PimMethodSupport, Priority, Projection,
     PushCapability, QuotaInfo, QuotaSignal, RateLimitClass, RequestCause, RsvpStatus,
@@ -164,7 +164,7 @@ impl Account for SettingsAccount {
         })
     }
 
-    fn inventory_stream(&self, _scope: CursorScope) -> AccountStream<SyncEvent<InventoryEntry>> {
+    fn inventory_stream(&self, _scope: CursorScope) -> AccountStream<InventoryEvent> {
         Box::pin(stream::empty())
     }
 

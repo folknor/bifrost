@@ -315,10 +315,14 @@ impl Account for CalDavAccount {
         })
     }
 
-    fn inventory_stream(&self, scope: CursorScope) -> AccountStream<SyncEvent<InventoryEntry>> {
+    fn inventory_stream(&self, scope: CursorScope) -> AccountStream<InventoryEvent> {
         let client = Arc::clone(&self.client);
         let home = self.calendar_home.clone();
         let calendar = self.default_calendar_url.clone();
+        // COMPLETE coverage is an accurate claim here: this walk terminates
+        // wholesale on any failure, so it never advances a checkpoint across a
+        // gap. A version that starts absorbing per-item failures must build
+        // `InventoryBatch` directly rather than converting.
         Box::pin(
             stream::once(async move {
                 let mut events = Vec::new();
@@ -357,7 +361,8 @@ impl Account for CalDavAccount {
                 events.push(SyncEvent::Done(Some(Checkpoint::Change(checkpoint))));
                 events
             })
-            .flat_map(stream::iter),
+            .flat_map(stream::iter)
+            .map(InventoryEvent::from),
         )
     }
 
@@ -369,10 +374,10 @@ impl Account for CalDavAccount {
         &self,
         scope: CursorScope,
         partition: InventoryPartition,
-    ) -> AccountStream<SyncEvent<InventoryEntry>> {
+    ) -> AccountStream<InventoryEvent> {
         match partition {
             InventoryPartition::Full => self.inventory_stream(scope),
-            _ => unsupported_stream(AccountOperation::SyncInventory),
+            _ => bifrost_types::unsupported_inventory_stream(AccountOperation::SyncInventory),
         }
     }
 

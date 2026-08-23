@@ -19,8 +19,8 @@ use bifrost_types::{
     DirectoryGroup, DirectoryGroupId, DirectoryGroupMember, DraftHandle, DraftPatch, EventCreate,
     EventId, EventPatch, EventRange, EventSearchRequest, FilterRuleShape, FilterValidation, FlagOp,
     HostedAttachment, HydratedObject, HydrationProjection, IdempotencyKey, Identity, IdentityId,
-    IdentityPatch, Importance, InventoryEntry, ItemOutcome, MembershipScope, Message,
-    MutationCapabilities, MutationConcurrency, MutationReplaySafety, MutationSuccess,
+    IdentityPatch, Importance, InventoryEntry, InventoryEvent, ItemOutcome, MembershipScope,
+    Message, MutationCapabilities, MutationConcurrency, MutationReplaySafety, MutationSuccess,
     MutationTarget, ObjectId, Page, PageBoundary, PimMethodSupport, Priority, Projection,
     PushCapability, QuotaInfo, QuotaSignal, RateLimitClass, RequestCause, RsvpStatus,
     ScopeLifecycleEvent, SearchRequest, SendRequest, ServerFilter, ServerFilterCreate,
@@ -28,6 +28,7 @@ use bifrost_types::{
     ThreadHydration, ThreadId, VacationConfig, WatchEvent,
 };
 use bytes::Bytes;
+use futures::StreamExt as _;
 use futures::stream;
 
 fn unsupported(op: AccountOperation) -> AccountError {
@@ -209,12 +210,12 @@ impl Account for StubAccount {
         Box::pin(async { Ok(CursorEstablishment::EstablishViaInventory) })
     }
 
-    fn inventory_stream(&self, _scope: CursorScope) -> AccountStream<SyncEvent<InventoryEntry>> {
+    fn inventory_stream(&self, _scope: CursorScope) -> AccountStream<InventoryEvent> {
         self.inventory_called.store(true, Ordering::SeqCst);
-        Box::pin(stream::iter([
-            sentinel_inventory_batch(),
-            SyncEvent::Done(None),
-        ]))
+        Box::pin(
+            stream::iter([sentinel_inventory_batch(), SyncEvent::Done(None)])
+                .map(InventoryEvent::from),
+        )
     }
 
     fn get_stream(

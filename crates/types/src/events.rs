@@ -206,6 +206,111 @@ pub struct Batch<T> {
     pub checkpoint: Option<Checkpoint>,
 }
 
+/// One page of an inventory walk, plus what the walk PROVED up to here.
+///
+/// Distinct from `Batch<InventoryEntry>` because a page of an enumeration has
+/// to say more than a page of anything else: an advancing checkpoint must name
+/// every unresolved obligation preceding it, in the same event, or the
+/// checkpoint certifies coverage it does not have.
+///
+/// `coverage` describes THIS batch and everything before it, not just this
+/// batch. Obligations ride checkpoint-bearing batches rather than only the
+/// terminal completion because Graph and `BackfillRunner` both advance
+/// per page - waiting for `Done` would let a page checkpoint become durable
+/// across a gap it never declared.
+#[derive(Debug, Clone)]
+pub struct InventoryBatch {
+    pub items: Vec<InventoryEntry>,
+    pub page_boundary: PageBoundary,
+    pub server_latency: Duration,
+    pub bytes_in: u64,
+    pub checkpoint: Option<Checkpoint>,
+    pub coverage: InventoryCoverage,
+}
+
+/// How an inventory walk ended.
+///
+/// Deliberately NOT expressed as `Done(None)`. That already means "this stream
+/// established no cursor" for discovery and no-op passes, maps to
+/// `FusionOutcome::NoCursor`, and loses the reason - which invites a caller to
+/// read end-of-stream as success. An incomplete walk is a different fact from
+/// an empty one and gets its own carrier.
+#[derive(Debug, Clone)]
+pub struct InventoryCompletion {
+    pub checkpoint: Option<Checkpoint>,
+    /// Coverage for the walk as a whole. `Degraded` means the enumeration
+    /// space was NOT exhausted cleanly, so a consumer must not read `Done` as
+    /// proof of completeness and the engine must not write a backfill
+    /// completion sentinel.
+    pub coverage: InventoryCoverage,
+}
+
+impl InventoryCompletion {
+    /// A walk that exhausted its space with nothing left unaccounted for.
+    #[must_use]
+    pub fn complete(checkpoint: Option<Checkpoint>) -> Self {
+        Self {
+            checkpoint,
+            coverage: InventoryCoverage::Complete,
+        }
+    }
+}
+
+/// Inventory's own stream envelope.
+///
+/// Inventory does not use `SyncEvent<T>`. The generic envelope is shared by
+/// hydration, changes, discovery, blobs and mutation, and coverage is
+/// meaningless to all of them - adding an arm or a field there would force an
+/// irrelevant lane onto every consumer of every stream, which is precisely the
+/// "stale consumer policy silently applies to a new lane" hazard `ItemOutcome`
+/// is documented against.
+///
+/// It equally cannot live in the element type alone: an element can report an
+/// obligation, but only the envelope can say whether a later checkpoint
+/// includes that obligation atomically, or whether the stream finished with
+/// coverage unproven.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum InventoryEvent {
+    Batch(InventoryBatch),
+    Progress(Progress),
+    Warning(Warning),
+    /// The walk cannot continue at all. Distinct from finishing with degraded
+    /// coverage: this is a whole-response failure, not an item or region one.
+    Terminated(AccountError),
+    Done(InventoryCompletion),
+}
+
+impl From<SyncEvent<InventoryEntry>> for InventoryEvent {
+    /// Lift a generic stream event into the inventory envelope, asserting
+    /// COMPLETE coverage.
+    ///
+    /// For producers that have no way to express an unresolved obligation yet:
+    /// their current behaviour is to terminate the whole walk on any failure,
+    /// which never advances a checkpoint across a gap, so claiming `Complete`
+    /// is accurate for them. A producer that starts absorbing failures and
+    /// continuing MUST stop using this and build `InventoryBatch` /
+    /// `InventoryCompletion` itself - otherwise it reports full coverage over a
+    /// walk that skipped something, which is the exact failure this envelope
+    /// exists to make impossible.
+    fn from(event: SyncEvent<InventoryEntry>) -> Self {
+        match event {
+            SyncEvent::Batch(batch) => Self::Batch(InventoryBatch {
+                items: batch.items,
+                page_boundary: batch.page_boundary,
+                server_latency: batch.server_latency,
+                bytes_in: batch.bytes_in,
+                checkpoint: batch.checkpoint,
+                coverage: InventoryCoverage::Complete,
+            }),
+            SyncEvent::Progress(progress) => Self::Progress(progress),
+            SyncEvent::Warning(warning) => Self::Warning(warning),
+            SyncEvent::Terminated(error) => Self::Terminated(error),
+            SyncEvent::Done(checkpoint) => Self::Done(InventoryCompletion::complete(checkpoint)),
+        }
+    }
+}
+
 /// Top-level event from every Account-trait stream.
 ///
 /// `Done(Option<Checkpoint>)` carries the final checkpoint at stream

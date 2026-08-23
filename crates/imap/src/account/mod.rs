@@ -3,6 +3,7 @@
 use std::collections::VecDeque;
 use std::pin::Pin;
 use std::sync::Arc;
+
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -15,7 +16,7 @@ use bifrost_types::{
     DirectoryCard, DirectoryGroup, DirectoryGroupId, DirectoryGroupMember, DraftHandle, DraftPatch,
     EventCreate, EventId, EventPatch, EventRange, EventSearchRequest, FilterValidation,
     HostedAttachment, HydratedObject, HydrationProjection, IdempotencyKey, Identity, IdentityId,
-    IdentityPatch, Importance, InventoryEntry, ItemOutcome, MembershipScope, Message,
+    IdentityPatch, Importance, InventoryEvent, ItemOutcome, MembershipScope, Message,
     MutationSuccess, MutationTarget, ObjectId, Page, Priority, Projection, QuotaInfo, RsvpStatus,
     SearchRequest, SendRequest, ServerFilter, ServerFilterCreate, ServerFilterId,
     ServerFilterPatch, SubscriptionHandle, SyncEvent, ThreadHydration, ThreadId, VacationConfig,
@@ -349,7 +350,7 @@ impl Account for ImapAccount {
     }
 
     // Account: emits engine inventory batches; direct users compose UID SEARCH/FETCH.
-    fn inventory_stream(&self, scope: CursorScope) -> AccountStream<SyncEvent<InventoryEntry>> {
+    fn inventory_stream(&self, scope: CursorScope) -> AccountStream<InventoryEvent> {
         inventory::inventory_stream(self.clone(), scope)
     }
 
@@ -1146,7 +1147,7 @@ mod router_tests {
         let mut stream = sub.inventory_stream(scope);
         let first = stream.next().await.expect("delegated batch");
         match first {
-            bifrost_types::SyncEvent::Batch(batch) => {
+            bifrost_types::InventoryEvent::Batch(batch) => {
                 assert_eq!(
                     batch.items.first().map(|entry| entry.id.0.as_str()),
                     Some(super::test_support::STUB_SENTINEL),

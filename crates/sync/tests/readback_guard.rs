@@ -19,7 +19,7 @@ use bifrost_types::{
     CursorFreshness, CursorScope, DraftHandle, DraftPatch, EventCreate, EventId, EventPatch,
     EventRange, EventSearchRequest, FilterRuleShape, FilterValidation, FlagOp, HostedAttachment,
     HydratedObject, HydratedObjectKind, HydrationProjection, IdempotencyKey, Identity, IdentityId,
-    IdentityPatch, Importance, InventoryEntry, ItemOutcome, MembershipScope, Message,
+    IdentityPatch, Importance, InventoryEvent, ItemOutcome, MembershipScope, Message,
     MutationCapabilities, MutationConcurrency, MutationReplaySafety, MutationSuccess,
     MutationTarget, ObjectId, OpenedAccount, Page, PageBoundary, PimMethodSupport, Priority,
     Projection, ProtocolKind, PushCapability, QuotaInfo, QuotaSignal, RateLimitClass, RequestCause,
@@ -150,7 +150,7 @@ impl Account for FlagsAccount {
         })
     }
 
-    fn inventory_stream(&self, _scope: CursorScope) -> AccountStream<SyncEvent<InventoryEntry>> {
+    fn inventory_stream(&self, _scope: CursorScope) -> AccountStream<InventoryEvent> {
         Box::pin(stream::empty())
     }
 

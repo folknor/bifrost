@@ -18,8 +18,8 @@
 use std::sync::Arc;
 
 use bifrost_types::{
-    Account, AccountError, Change, Checkpoint, CursorScope, InventoryEntry, ObjectChange,
-    ObjectChangeKind, SyncEvent,
+    Account, AccountError, Change, Checkpoint, CursorScope, ObjectChange, ObjectChangeKind,
+    SyncEvent,
 };
 use futures::stream::StreamExt;
 use tokio::sync::broadcast;
@@ -101,7 +101,7 @@ impl InventoryFusion {
     async fn run_stream(
         &self,
         scope: CursorScope,
-        mut stream: bifrost_types::AccountStream<SyncEvent<InventoryEntry>>,
+        mut stream: bifrost_types::AccountStream<bifrost_types::InventoryEvent>,
         changes_tx: Option<broadcast::Sender<MultiplexerEvent>>,
     ) -> Result<FusionOutcome, Error> {
         let _activity = match &self.control {
@@ -110,7 +110,8 @@ impl InventoryFusion {
         };
         while let Some(event) = stream.next().await {
             match event {
-                SyncEvent::Done(checkpoint) => {
+                bifrost_types::InventoryEvent::Done(completion) => {
+                    let checkpoint = completion.checkpoint;
                     if let (Some(tx), Some(cp)) = (&changes_tx, checkpoint.clone()) {
                         let me = MultiplexerEvent {
                             scope: scope.clone(),
@@ -132,7 +133,7 @@ impl InventoryFusion {
                     }
                     return self.finalize(scope, checkpoint).await;
                 }
-                SyncEvent::Terminated(err) => {
+                bifrost_types::InventoryEvent::Terminated(err) => {
                     if let Some(tx) = &changes_tx {
                         let me = MultiplexerEvent {
                             scope: scope.clone(),
@@ -143,12 +144,13 @@ impl InventoryFusion {
                     }
                     return Ok(FusionOutcome::Terminated(err));
                 }
-                SyncEvent::Batch(batch) => {
+                bifrost_types::InventoryEvent::Batch(batch) => {
                     if let Some(tx) = &changes_tx {
                         self.forward_inventory_batch(tx, &scope, &batch);
                     }
                 }
-                SyncEvent::Progress(_) | SyncEvent::Warning(_) => {}
+                bifrost_types::InventoryEvent::Progress(_)
+                | bifrost_types::InventoryEvent::Warning(_) => {}
                 _ => {}
             }
         }
@@ -159,7 +161,7 @@ impl InventoryFusion {
         &self,
         tx: &broadcast::Sender<MultiplexerEvent>,
         scope: &CursorScope,
-        batch: &bifrost_types::Batch<InventoryEntry>,
+        batch: &bifrost_types::InventoryBatch,
     ) {
         // Inventory entries describe object existence; surface them as
         // `Created` changes so consumers handle inventory the same way

@@ -38,7 +38,7 @@ use bifrost_types::{
     DirectoryCard, DirectoryGroup, DirectoryGroupId, DirectoryGroupMember, DraftHandle, DraftPatch,
     EventCreate, EventId, EventPatch, EventRange, EventSearchRequest, FilterValidation,
     HostedAttachment, HydratedObject, HydrationProjection, IdempotencyKey, Importance,
-    InventoryEntry, ItemOutcome, MembershipScope, Message, MutationSuccess, MutationTarget,
+    InventoryEvent, ItemOutcome, MembershipScope, Message, MutationSuccess, MutationTarget,
     ObjectId, OpenedAccount, Page, Priority, Projection, RsvpStatus, ScopeLifecycleEvent,
     SearchRequest, SendRequest, ServerFilter, ServerFilterCreate, ServerFilterId,
     ServerFilterPatch, SkippedScope, SubscriptionHandle, SyncEvent, SyncStrategy, ThreadHydration,
@@ -707,7 +707,7 @@ impl Account for GraphAccount {
         })
     }
 
-    fn inventory_stream(&self, scope: CursorScope) -> AccountStream<SyncEvent<InventoryEntry>> {
+    fn inventory_stream(&self, scope: CursorScope) -> AccountStream<InventoryEvent> {
         // Route a public-folder `CursorScope::Folder` (present in the
         // routing map) to the no-delta-token inventory pass; everything
         // else (including a bare Folder for a non-public folder) stays
@@ -724,17 +724,19 @@ impl Account for GraphAccount {
                         inventory::inventory_stream(account, scope)
                     }
                 })
-                .flatten(),
+                .flatten()
+                .map(InventoryEvent::from),
             );
         }
-        inventory::inventory_stream(self.clone(), scope)
+        Box::pin(inventory::inventory_stream(self.clone(), scope).map(InventoryEvent::from))
     }
 
     fn inventory_resume_stream(
         &self,
         cursor: ChangeCursor,
-    ) -> Option<AccountStream<SyncEvent<InventoryEntry>>> {
-        inventory::resume_inventory_stream(self.clone(), cursor)
+    ) -> Option<AccountStream<InventoryEvent>> {
+        let stream = inventory::resume_inventory_stream(self.clone(), cursor)?;
+        Some(Box::pin(stream.map(InventoryEvent::from)))
     }
 
     fn is_inventory_cursor(&self, cursor: &ChangeCursor) -> bool {

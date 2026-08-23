@@ -254,7 +254,7 @@ impl BackfillRunner {
         let mut kept_total: u64 = 0;
         while let Some(event) = stream.next().await {
             match event {
-                SyncEvent::Batch(batch) => {
+                bifrost_types::InventoryEvent::Batch(batch) => {
                     let seen = u64::try_from(batch.items.len()).unwrap_or(u64::MAX);
                     seen_total = seen_total.saturating_add(seen);
                     let kept = filter_supersedes(&batch.items, live);
@@ -312,8 +312,8 @@ impl BackfillRunner {
                         }
                     }
                 }
-                SyncEvent::Done(_) => break,
-                SyncEvent::Terminated(err) => {
+                bifrost_types::InventoryEvent::Done(_) => break,
+                bifrost_types::InventoryEvent::Terminated(err) => {
                     if let Some(tx) = &changes_tx {
                         let me = MultiplexerEvent {
                             scope: scope.clone(),
@@ -324,7 +324,8 @@ impl BackfillRunner {
                     }
                     return Err(Error::Account(err));
                 }
-                SyncEvent::Progress(_) | SyncEvent::Warning(_) => {}
+                bifrost_types::InventoryEvent::Progress(_)
+                | bifrost_types::InventoryEvent::Warning(_) => {}
                 _ => {}
             }
         }

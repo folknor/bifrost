@@ -11,7 +11,7 @@ use bifrost_types::{
     DirectoryCard, DirectoryGroup, DirectoryGroupId, DirectoryGroupMember, DraftHandle, DraftPatch,
     ErrorScope, EventCreate, EventId, EventPatch, EventRange, EventSearchRequest, FilterValidation,
     FlagOp, HostedAttachment, HydratedObject, HydrationProjection, IdempotencyKey, Identity,
-    IdentityId, IdentityPatch, Importance, InventoryEntry, InventoryPartition,
+    IdentityId, IdentityPatch, Importance, InventoryEntry, InventoryEvent, InventoryPartition,
     InventoryPartitioning, ItemOutcome, MembershipScope, Message, MutationSuccess, MutationTarget,
     ObjectChange, ObjectChangeKind, ObjectId, ObjectType, OpaqueChangeState, Page, PageBoundary,
     Priority, ProtocolKind, QuotaInfo, RsvpStatus, SearchRequest, SendRequest, ServerFilter,
@@ -411,10 +411,12 @@ impl Account for CardDavAccount {
         })
     }
 
-    fn inventory_stream(&self, scope: CursorScope) -> AccountStream<SyncEvent<InventoryEntry>> {
+    fn inventory_stream(&self, scope: CursorScope) -> AccountStream<InventoryEvent> {
         let client = Arc::clone(&self.client);
         let home = self.addressbook_home.clone();
         let addressbook = self.default_addressbook_url.clone();
+        // COMPLETE coverage is accurate here: the walk terminates wholesale on
+        // any failure, so it never advances a checkpoint across a gap.
         Box::pin(
             stream::once(async move {
                 let mut events = Vec::new();
@@ -454,7 +456,8 @@ impl Account for CardDavAccount {
                 events.push(SyncEvent::Done(Some(Checkpoint::Change(checkpoint))));
                 events
             })
-            .flat_map(stream::iter),
+            .flat_map(stream::iter)
+            .map(InventoryEvent::from),
         )
     }
 
@@ -466,10 +469,10 @@ impl Account for CardDavAccount {
         &self,
         scope: CursorScope,
         partition: InventoryPartition,
-    ) -> AccountStream<SyncEvent<InventoryEntry>> {
+    ) -> AccountStream<InventoryEvent> {
         match partition {
             InventoryPartition::Full => self.inventory_stream(scope),
-            _ => unsupported_stream(AccountOperation::SyncInventory),
+            _ => bifrost_types::unsupported_inventory_stream(AccountOperation::SyncInventory),
         }
     }
 

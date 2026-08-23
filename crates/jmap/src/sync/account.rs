@@ -1,3 +1,4 @@
+use futures::StreamExt as _;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -11,7 +12,7 @@ use bifrost_types::{
     DirectoryGroupMember, DraftHandle, DraftPatch, ErrorScope, EventCreate, EventId, EventPatch,
     EventRange, EventSearchRequest, FilterValidation, HostedAttachment, HydratedObject,
     HydrationProjection, IdempotencyKey, Identity, IdentityId, IdentityPatch, Importance,
-    InventoryEntry, InventoryPartition, InventoryPartitioning, ItemOutcome, Label, MembershipScope,
+    InventoryEvent, InventoryPartition, InventoryPartitioning, ItemOutcome, Label, MembershipScope,
     Message, MutationSuccess, MutationTarget, ObjectId, Page, Priority, Projection, QuotaInfo,
     RsvpStatus, ScopeLifecycleEvent, SearchRequest, SendAs, SendRequest, ServerFilter,
     ServerFilterCreate, ServerFilterId, ServerFilterPatch, SubscriptionHandle, SyncEvent,
@@ -429,15 +430,18 @@ impl Account for JmapAccount {
         Box::pin(async move { establishment_for_seed(scope, seed) })
     }
 
-    fn inventory_stream(&self, scope: CursorScope) -> AccountStream<SyncEvent<InventoryEntry>> {
+    fn inventory_stream(&self, scope: CursorScope) -> AccountStream<InventoryEvent> {
         if self.is_unregistered_foreign_scope(&scope) {
             let err =
                 super::error::unregistered_foreign_scope(scope, AccountOperation::SyncInventory);
-            return Box::pin(async_stream::stream! { yield super::error::terminated(err); });
+            return Box::pin(
+                async_stream::stream! { yield super::error::terminated(err); }
+                    .map(InventoryEvent::from),
+            );
         }
         let mail = self.mail_for_scope(&scope).clone();
         let owner = self.owner_of_scope(&scope);
-        inventory::stream(mail, self.core_limits, scope, owner)
+        Box::pin(inventory::stream(mail, self.core_limits, scope, owner).map(InventoryEvent::from))
     }
 
     fn inventory_partitioning(&self, scope: &CursorScope) -> InventoryPartitioning {
@@ -448,15 +452,21 @@ impl Account for JmapAccount {
         &self,
         scope: CursorScope,
         partition: InventoryPartition,
-    ) -> AccountStream<SyncEvent<InventoryEntry>> {
+    ) -> AccountStream<InventoryEvent> {
         if self.is_unregistered_foreign_scope(&scope) {
             let err =
                 super::error::unregistered_foreign_scope(scope, AccountOperation::SyncInventory);
-            return Box::pin(async_stream::stream! { yield super::error::terminated(err); });
+            return Box::pin(
+                async_stream::stream! { yield super::error::terminated(err); }
+                    .map(InventoryEvent::from),
+            );
         }
         let mail = self.mail_for_scope(&scope).clone();
         let owner = self.owner_of_scope(&scope);
-        inventory::stream_partition(mail, self.core_limits, scope, partition, owner)
+        Box::pin(
+            inventory::stream_partition(mail, self.core_limits, scope, partition, owner)
+                .map(InventoryEvent::from),
+        )
     }
 
     fn get_stream(

@@ -30,7 +30,7 @@ use bifrost_types::{
     CursorFreshness, CursorScope, DraftHandle, DraftPatch, ErrorScope, EventCreate, EventId,
     EventPatch, EventRange, EventSearchRequest, FilterRuleShape, FilterValidation, FlagOp,
     HostedAttachment, HydratedObject, HydrationProjection, IdempotencyKey, Identity, IdentityId,
-    IdentityPatch, Importance, InventoryEntry, ItemOutcome, MembershipScope, Message,
+    IdentityPatch, Importance, InventoryEvent, ItemOutcome, MembershipScope, Message,
     MutationCapabilities, MutationConcurrency, MutationReplaySafety, MutationSuccess,
     MutationTarget, ObjectId, OpaqueChangeState, Page, PimMethodSupport, Priority, Projection,
     ProtocolKind, PushCapability, QuotaInfo, QuotaSignal, RateLimitClass, RequestCause, RsvpStatus,
@@ -456,7 +456,7 @@ impl Account for HealAccount {
         })
     }
 
-    fn inventory_stream(&self, _scope: CursorScope) -> AccountStream<SyncEvent<InventoryEntry>> {
+    fn inventory_stream(&self, _scope: CursorScope) -> AccountStream<InventoryEvent> {
         Box::pin(stream::empty())
     }
 

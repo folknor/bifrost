@@ -39,7 +39,7 @@ pub mod settings;
 // Account trait + factory + erased return aliases.
 pub use account::{
     Account, AccountFactory, AccountFuture, AccountStream, CategoryDefinition,
-    MessageReactionState, OpenedAccount, PushSubscription,
+    MessageReactionState, OpenedAccount, PushSubscription, unsupported_inventory_stream,
 };
 
 // Blob types.
@@ -132,10 +132,10 @@ pub use error::{
 // Stream-event types.
 pub use events::{
     AccountControl, BackfillCheckpoint, BackfillProgress, Batch, Change, Checkpoint, Control,
-    HintPayload, InvalidationHint, InvalidationSink, InventoryCoverage, InventoryEntry,
-    InventoryObligation, InventoryPartition, InventoryPartitioning, ObjectChange, ObjectChangeKind,
-    PageBoundary, Partition, PauseReason, Priority, Progress, PushSource, ScopeChange,
-    ScopeChangeKind, SyncEvent, WatchEvent,
+    HintPayload, InvalidationHint, InvalidationSink, InventoryBatch, InventoryCompletion,
+    InventoryCoverage, InventoryEntry, InventoryEvent, InventoryObligation, InventoryPartition,
+    InventoryPartitioning, ObjectChange, ObjectChangeKind, PageBoundary, Partition, PauseReason,
+    Priority, Progress, PushSource, ScopeChange, ScopeChangeKind, SyncEvent, WatchEvent,
 };
 
 // Threading + hydration types.
