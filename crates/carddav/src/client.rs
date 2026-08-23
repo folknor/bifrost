@@ -871,6 +871,28 @@ pub(crate) fn unsupported_error(operation: AccountOperation) -> AccountError {
     .expect("valid account error classification")
 }
 
+/// An `Unsupported` skip that names the scope it left behind.
+///
+/// Twin of bifrost-caldav's helper of the same name. Unlike
+/// `unsupported_error` it carries a scope and a diagnostic, because the whole
+/// value of the entry is WHICH collection went unsynced and why.
+pub(crate) fn unsupported_scope_error(
+    operation: AccountOperation,
+    scope: ErrorScope,
+    message: impl Into<String>,
+) -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::Unsupported(operation),
+        Cause::Request(RequestCause::Unsupported { operation }),
+    )
+    .protocol(Protocol::CardDav)
+    .operation(operation)
+    .scope(scope)
+    .text(DiagnosticText::support_only(message))
+    .try_build()
+    .expect("valid account error classification")
+}
+
 pub(crate) fn local_error(operation: AccountOperation, message: impl Into<String>) -> AccountError {
     AccountErrorBuilder::new(
         AccountErrorKind::Request(RequestErrorKind::Malformed),

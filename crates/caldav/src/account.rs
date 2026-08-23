@@ -11,6 +11,7 @@ use jiff::{Timestamp, civil};
 use crate::capabilities::{caldav_capabilities, scheduling_available};
 use crate::client::{
     CalDavClient, PutCondition, event_scope, missing_event_error, unsupported_error,
+    unsupported_scope_error,
 };
 use crate::ical::{
     EventProjectionError, create_to_ical, event_from_ical, events_from_ical, new_uid,
@@ -29,6 +30,28 @@ pub(crate) struct CalDavAccount {
     capabilities: AccountCapabilities,
     calendar_home: String,
     default_calendar_url: String,
+    /// Calendar collections discovery found and the cursor lanes do NOT cover.
+    ///
+    /// The cursor model here is one scope for the whole account
+    /// (`CursorScope::Type(CalendarEvent)`), and all three sync lanes -
+    /// `establish_initial_cursor`, `inventory_stream`, `changes_stream` - read
+    /// `default_calendar_url`, which is just `collections.first()`. So an
+    /// account with three calendars syncs one. The PIM primitives are
+    /// unaffected: `event_get` derives the collection from the event's own URL,
+    /// and create/update/search route through `calendar_url` with the caller's
+    /// `calendar_id`, so direct API access reaches every calendar.
+    ///
+    /// That asymmetry is the hazard this field exists to expose.
+    /// `calendars_list` enumerates all of them, so a consumer sees a complete
+    /// account and silently receives changes for one calendar.
+    /// `open_skipped_scopes` turns each of these into a `SkippedScope`, which
+    /// is where a consumer already looks for a surface that opened degraded.
+    ///
+    /// The honest fix is a `CursorScope::Folder(href)` per collection; it
+    /// reshapes the published cursor model and forces another envelope bump and
+    /// full re-sync, so it is the repository owner's call and is tracked in
+    /// `notes/todo.md`.
+    unsynced_calendar_urls: Vec<String>,
     rsvp_email: Option<String>,
     schedule_outbox_url: Option<String>,
 }
@@ -41,14 +64,47 @@ impl CalDavAccount {
     /// dominate a test that is about what a single call puts on the wire.
     #[cfg(test)]
     pub(crate) fn for_tests(client: Arc<CalDavClient>, default_calendar_url: &str) -> Self {
+        Self::for_tests_with_unsynced(client, default_calendar_url, Vec::new())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests_with_unsynced(
+        client: Arc<CalDavClient>,
+        default_calendar_url: &str,
+        unsynced_calendar_urls: Vec<String>,
+    ) -> Self {
         Self {
             client,
             capabilities: crate::capabilities::caldav_capabilities(false),
             calendar_home: default_calendar_url.to_string(),
             default_calendar_url: default_calendar_url.to_string(),
+            unsynced_calendar_urls,
             rsvp_email: None,
             schedule_outbox_url: None,
         }
+    }
+
+    /// One `SkippedScope` per calendar the cursor lanes do not cover.
+    ///
+    /// Empty for the common single-calendar account. The classification is
+    /// `Unsupported(DiscoverCursorScopes)`: it is a standing limitation of this
+    /// crate's cursor model, not a transient failure, so no reopen or retry
+    /// heals it and a consumer should treat the calendar as unsynced for as
+    /// long as it uses this account.
+    pub(crate) fn open_skipped_scopes(&self) -> Vec<SkippedScope> {
+        self.unsynced_calendar_urls
+            .iter()
+            .map(|url| SkippedScope {
+                scope: ErrorScope::Calendar { id: url.clone() },
+                error: unsupported_scope_error(
+                    AccountOperation::DiscoverCursorScopes,
+                    ErrorScope::Calendar { id: url.clone() },
+                    "bifrost-caldav syncs only the first discovered calendar \
+                     collection; this calendar is reachable through the event \
+                     primitives but produces no inventory or change events",
+                ),
+            })
+            .collect()
     }
 
     pub(crate) async fn open(
@@ -76,11 +132,20 @@ impl CalDavAccount {
             .first()
             .map(|collection| collection.href.clone())
             .unwrap_or_else(|| client.resolve_url(&calendar_home));
+        // Every collection past the first is enumerated but NOT synced - see
+        // `unsynced_calendar_urls`. Recorded at open so the gap is reportable
+        // rather than invisible.
+        let unsynced_calendar_urls = collections
+            .iter()
+            .skip(1)
+            .map(|collection| collection.href.clone())
+            .collect();
         Ok(Self {
             client: Arc::new(client),
             capabilities: caldav_capabilities(event_rsvp),
             calendar_home,
             default_calendar_url,
+            unsynced_calendar_urls,
             rsvp_email,
             schedule_outbox_url,
         })

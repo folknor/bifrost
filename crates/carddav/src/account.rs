@@ -27,6 +27,7 @@ use crate::CardDavConfig;
 use crate::capabilities::carddav_capabilities;
 use crate::client::{
     CardDavClient, PutCondition, local_error, not_found_error, parse_error, unsupported_error,
+    unsupported_scope_error,
 };
 use crate::parse::{AddressBookCollection, CardDavFetchedVCard, CardDavMultigetReport};
 use crate::vcard::{VCardParseError, contact_from_vcard, vcard_from_create, vcard_from_patch};
@@ -42,6 +43,21 @@ pub(crate) struct CardDavAccount {
     capabilities: AccountCapabilities,
     addressbook_home: String,
     default_addressbook_url: String,
+    /// Address books discovery found and the cursor lanes do NOT cover.
+    ///
+    /// Same shape as bifrost-caldav's `unsynced_calendar_urls`, and kept in
+    /// step with it deliberately: the cursor model is one scope for the whole
+    /// account (`CursorScope::Type(Contact)`) and all three sync lanes read
+    /// `default_addressbook_url`, which is just `collections.first()`. An
+    /// account with three address books syncs one. The contact primitives are
+    /// unaffected - they route through `addressbook_url` with the caller's
+    /// `address_book_id` - so direct API access reaches every book while
+    /// inventory and changes cover one.
+    ///
+    /// `address_books_list` enumerates all of them, so without
+    /// `open_skipped_scopes` a consumer sees a complete account and silently
+    /// receives changes for one book.
+    unsynced_addressbook_urls: Vec<String>,
 }
 
 impl CardDavAccount {
@@ -57,12 +73,44 @@ impl CardDavAccount {
             .first()
             .map(|collection| collection.href.clone())
             .unwrap_or_else(|| client.resolve_url(&addressbook_home));
+        // Every collection past the first is enumerated but NOT synced - see
+        // `unsynced_addressbook_urls`. Recorded at open so the gap is
+        // reportable rather than invisible.
+        let unsynced_addressbook_urls = collections
+            .iter()
+            .skip(1)
+            .map(|collection| collection.href.clone())
+            .collect();
         Ok(Self {
             client: Arc::new(client),
             capabilities: carddav_capabilities(),
             addressbook_home,
             default_addressbook_url,
+            unsynced_addressbook_urls,
         })
+    }
+
+    /// One `SkippedScope` per address book the cursor lanes do not cover.
+    ///
+    /// Empty for the common single-book account. `Unsupported(...)` because it
+    /// is a standing limitation of this crate's cursor model, not a transient
+    /// failure: no reopen or retry heals it. Mirrors
+    /// `CalDavAccount::open_skipped_scopes`.
+    pub(crate) fn open_skipped_scopes(&self) -> Vec<SkippedScope> {
+        self.unsynced_addressbook_urls
+            .iter()
+            .map(|url| SkippedScope {
+                scope: ErrorScope::Contact { id: url.clone() },
+                error: unsupported_scope_error(
+                    AccountOperation::DiscoverCursorScopes,
+                    ErrorScope::Contact { id: url.clone() },
+                    "bifrost-carddav syncs only the first discovered address \
+                     book collection; this address book is reachable through \
+                     the contact primitives but produces no inventory or \
+                     change events",
+                ),
+            })
+            .collect()
     }
 
     fn addressbook_url(

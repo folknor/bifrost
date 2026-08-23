@@ -372,6 +372,42 @@ reqwest transport has no `AccountNet` or metered transport attachment. This
 also means DAV legs composed into an IMAP account are not included in that
 account's priority scheduling, bandwidth measurements, or bandwidth cap.
 
+## Sync covers ONE calendar collection; the rest are reported as skipped
+
+`discover_cursor_scopes` yields a single `CursorScope::Type(CalendarEvent)`, and
+all three sync lanes - `establish_initial_cursor`, `inventory_stream`,
+`changes_stream` - read `default_calendar_url`, which is simply
+`collections.first()` from the calendar-home PROPFIND. **An account with three
+calendars syncs one.**
+
+The PIM primitives are NOT limited this way, and the asymmetry is the whole
+hazard. `event_get` derives the collection from the event's own URL, and
+create / update / search route through `calendar_url` with the caller's
+`calendar_id`, so direct API access reaches every calendar. `calendars_list`
+enumerates every calendar too. So a consumer sees a complete account, can read
+and write any calendar by hand, and silently receives inventory and change
+events for exactly one of them.
+
+`CalDavAccount::unsynced_calendar_urls` records the uncovered collections at
+open, and `open_skipped_scopes` turns each into a `SkippedScope` carrying
+`ErrorScope::Calendar { id }` and an `Unsupported(DiscoverCursorScopes)` error.
+The factory returns those on `OpenedAccount::skipped_scopes` rather than
+`OpenedAccount::complete`. `Unsupported` is deliberate: this is a standing
+limitation of the cursor model, not a transient failure, so no reopen or retry
+heals it and it must not be classified as retryable.
+
+The composed path carries them too. `bifrost-imap`'s `classify_dav_open`
+previously assumed a successful DAV open always answered an empty skip lane and
+dropped `opened.skipped_scopes` on the floor; it now forwards them onto the
+composed account's own lane, so an unsynced calendar is visible whether the DAV
+account is standalone or composed into IMAP.
+
+The honest fix is a `CursorScope::Folder(href)` per collection, which reshapes
+the published cursor model, forces another envelope bump, and costs every DAV
+account a second full re-sync. That is the repository owner's call and is
+tracked in `notes/todo.md`; the skip reporting is what makes the current
+limitation legible in the meantime, not a substitute for it.
+
 ## This crate and bifrost-carddav are near-duplicates, and drift is the defect
 
 Roughly 1500 lines are hand-mirrored between the two: the `DavTransport` seam

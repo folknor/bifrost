@@ -1069,17 +1069,31 @@ confirm against the code before working any of them.
 
 ### Fenced for the repository owner (published surface)
 
-- **dav-B2. Cursor sync only ever covers one collection.** [C1]
+- **dav-B2. Cursor sync only ever covers one collection.** [C1] **Partly
+  addressed 2026-08-23; the model fix itself is still open and still fenced.**
   `establish_initial_cursor` / `inventory_stream` / `changes_stream` all read
   `default_calendar_url` (CalDAV) or `default_addressbook_url` (CardDAV), and
   `discover_cursor_scopes` yields a single `CursorScope::Type(CalendarEvent)` /
   `Type(Contact)`. An account with three calendars enumerates all three in
   `calendars_list` but syncs only the first: objects in the others never appear
-  in inventory or changes and never get an update or a delete. The honest model
-  is a `CursorScope` per collection href, which reshapes the published cursor
-  model and the stored envelope. Documenting the limitation loudly in
-  `reference/caldav.md` and `reference/carddav.md` is a doc fix the loop may do -
-  it is not permission to close this.
+  in inventory or changes and never get an update or a delete. Note the PIM
+  primitives are unaffected - they route by the caller's `calendar_id` /
+  `address_book_id`, and `event_get` derives the collection from the event's own
+  URL - so it is specifically SYNC that is single-collection.
+
+  What landed: the uncovered collections are now reported at open as
+  `SkippedScope` entries (`ErrorScope::Calendar`/`Contact` plus an
+  `Unsupported(DiscoverCursorScopes)` error), in both crates and through
+  `bifrost-imap`'s composed path, which previously discarded a successful DAV
+  open's skip lane outright. That removes the "looks complete, silently is not"
+  trap without touching the cursor model.
+
+  What remains: the honest model is a `CursorScope::Folder(href)` per
+  collection, so every calendar and address book actually syncs. That reshapes
+  the published cursor model and the stored envelope, forces an envelope bump,
+  and costs every DAV account a second full re-sync (after the v1 -> v2 href
+  correction). Owner's call. It must land in both crates together or it becomes
+  another drift entry.
 - **dav-B3. CardDAV fabricates a phantom address book.** [C2]
   `address_books_list` pushes a synthetic `AddressBook` pointing at the home when
   the home enumerates zero addressbook collections. CalDAV removed exactly this

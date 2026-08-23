@@ -242,6 +242,26 @@ reqwest transport has no `AccountNet` or metered transport attachment. This
 also means CardDAV legs composed into an IMAP account are not included in that
 account's priority scheduling, bandwidth measurements, or bandwidth cap.
 
+## Sync covers ONE address book; the rest are reported as skipped
+
+`discover_cursor_scopes` yields a single `CursorScope::Type(Contact)` and all
+three sync lanes read `default_addressbook_url`, which is `collections.first()`.
+**An account with three address books syncs one.** The contact primitives are
+not limited this way - they route through `addressbook_url` with the caller's
+`address_book_id` - and `address_books_list` enumerates every book, so a
+consumer sees a complete account and silently receives changes for one of them.
+
+`unsynced_addressbook_urls` records the uncovered collections at open and
+`open_skipped_scopes` turns each into a `SkippedScope` carrying
+`ErrorScope::Contact { id }` and an `Unsupported(DiscoverCursorScopes)` error,
+returned on `OpenedAccount::skipped_scopes`. `Unsupported` because no reopen
+heals a model limitation. `bifrost-imap`'s `classify_dav_open` forwards these
+onto the composed account's lane, so the gap is visible standalone or composed.
+
+This mirrors `bifrost-caldav` exactly, deliberately - see that document for the
+full reasoning and for the per-collection `CursorScope::Folder(href)` fix, which
+is the repository owner's call and tracked in `notes/todo.md`.
+
 ## This crate and bifrost-caldav are near-duplicates, and drift is the defect
 
 The two crates hand-mirror roughly 1500 lines of DAV machinery. Nothing compares

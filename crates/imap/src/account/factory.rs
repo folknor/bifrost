@@ -228,7 +228,19 @@ impl AccountFactory for ImapAccountFactory {
 /// open cycle rather than failing the whole IMAP account (brick 5).
 enum DavAttach {
     /// Opened and attached.
-    Attached(Arc<dyn Account>),
+    Attached {
+        account: Arc<dyn Account>,
+        /// Skips the DAV factory itself reported on a SUCCESSFUL open.
+        ///
+        /// A DAV open can succeed and still leave part of its surface
+        /// uncovered: both DAV crates sync exactly one collection, so every
+        /// further calendar or address book is enumerated and reachable
+        /// through the PIM primitives while producing no inventory or change
+        /// events. Those entries have to be forwarded onto the composed
+        /// account's own lane, or composing DAV into IMAP silently discards
+        /// the only report of the gap.
+        skipped: Vec<SkippedScope>,
+    },
     /// Not configured.
     None,
     /// Configured but open failed; attach IMAP-only this cycle.
@@ -256,7 +268,13 @@ impl DavAttach {
         skipped: &mut Vec<SkippedScope>,
     ) -> Option<Arc<dyn Account>> {
         match self {
-            DavAttach::Attached(account) => Some(account),
+            DavAttach::Attached {
+                account,
+                skipped: sub_skipped,
+            } => {
+                skipped.extend(sub_skipped);
+                Some(account)
+            }
             DavAttach::None => None,
             DavAttach::Degraded { warning, skip, .. } => {
                 degraded.push(warning);
@@ -278,10 +296,17 @@ fn classify_dav_open(
     scope: bifrost_types::ErrorScope,
 ) -> DavAttach {
     match result {
-        // The DAV factories are single-namespace and answer an empty
-        // skip lane; the composed account's own lane carries only the
-        // sub-account-level degradations classified below.
-        Ok(opened) => DavAttach::Attached(opened.account),
+        // A successful open can still report skips: both DAV crates cover one
+        // collection, so any further collection comes back on
+        // `OpenedAccount::skipped_scopes`. Forward them onto the composed
+        // account's lane rather than dropping them - this arm used to assume
+        // the DAV factories always answered an empty skip lane, which silently
+        // hid every unsynced calendar and address book behind a composed
+        // account.
+        Ok(opened) => DavAttach::Attached {
+            account: opened.account,
+            skipped: opened.skipped_scopes,
+        },
         Err(error) => {
             // A retryable recovery class means the failure is transient
             // (transport blip, server unavailable, throttle); anything
@@ -894,14 +919,52 @@ mod tests {
             "CardDAV",
             contact_scope(),
         ) {
-            DavAttach::Attached(_) => {}
+            DavAttach::Attached { skipped, .. } => assert!(skipped.is_empty()),
             other => panic!("expected Attached, got {}", attach_label(&other)),
         }
     }
 
+    /// A DAV open that SUCCEEDS while reporting skips must forward them onto
+    /// the composed account's lane. Both DAV crates cover one collection, so
+    /// this is the path that carries an unsynced calendar or address book out
+    /// of a composed IMAP account; dropping it hides the gap entirely.
+    #[test]
+    fn a_successful_dav_open_forwards_its_own_skipped_scopes() {
+        let stub = crate::account::test_support::stub_arc(
+            crate::account::test_support::StubAccount::new(Vec::new()),
+        );
+        let contact_scope = bifrost_types::ErrorScope::ContactCollection;
+        let sub_skip = SkippedScope {
+            scope: contact_scope.clone(),
+            error: discover_err(crate::Error::Internal(
+                "second address book is not synced".to_string(),
+            )),
+        };
+        let opened = OpenedAccount {
+            account: stub,
+            skipped_scopes: vec![sub_skip],
+        };
+
+        let attach = classify_dav_open(Ok(opened), "CardDAV", contact_scope);
+        let mut degraded = Vec::new();
+        let mut skipped = Vec::new();
+        let account = attach.into_attached(&mut degraded, &mut skipped);
+
+        assert!(account.is_some(), "a successful open still attaches");
+        assert!(
+            degraded.is_empty(),
+            "a skip on a successful open is not a degradation"
+        );
+        assert_eq!(
+            skipped.len(),
+            1,
+            "the sub-account's own skip must reach the composed lane"
+        );
+    }
+
     fn attach_label(attach: &DavAttach) -> &'static str {
         match attach {
-            DavAttach::Attached(_) => "Attached",
+            DavAttach::Attached { .. } => "Attached",
             DavAttach::None => "None",
             DavAttach::Degraded { .. } => "Degraded",
         }

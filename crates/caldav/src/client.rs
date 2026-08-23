@@ -1072,6 +1072,28 @@ pub(crate) fn unsupported_error(operation: AccountOperation) -> AccountError {
     .expect("valid account error classification")
 }
 
+/// An `Unsupported` skip that names the scope it left behind.
+///
+/// Used for collections this crate enumerates but does not sync. Unlike
+/// `unsupported_error` it carries a scope and a diagnostic, because the whole
+/// value of the entry is WHICH collection went unsynced and why.
+pub(crate) fn unsupported_scope_error(
+    operation: AccountOperation,
+    scope: ErrorScope,
+    message: impl Into<String>,
+) -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::Unsupported(operation),
+        Cause::Request(RequestCause::Unsupported { operation }),
+    )
+    .protocol(Protocol::CalDav)
+    .operation(operation)
+    .scope(scope)
+    .text(DiagnosticText::support_only(message))
+    .try_build()
+    .expect("valid account error classification")
+}
+
 pub(crate) fn missing_event_error(operation: AccountOperation, id: String) -> AccountError {
     AccountErrorBuilder::new(
         AccountErrorKind::NotFound(ResourceKind::Calendar),
@@ -1365,6 +1387,53 @@ mod tests {
             script.requests().is_empty(),
             "a refused instance id must reach no transport at all"
         );
+    }
+
+    /// Calendars past the first are reported as skipped, not silently unsynced.
+    ///
+    /// The cursor model covers one collection while `calendars_list`
+    /// enumerates all of them, so without this the account looks complete and
+    /// silently delivers changes for exactly one calendar. The skip is
+    /// `Unsupported` rather than a transient class because no reopen heals it,
+    /// and it names the collection so a consumer can act on it.
+    #[test]
+    fn calendars_beyond_the_first_are_reported_as_skipped_scopes() {
+        let script = ScriptedDavTransport::new([]);
+        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
+        let client = Arc::new(CalDavClient::with_transport(
+            "https://dav.example.test",
+            transport,
+        ));
+
+        let single = crate::account::CalDavAccount::for_tests(
+            Arc::clone(&client),
+            "https://dav.example.test/cal/work/",
+        );
+        assert!(
+            single.open_skipped_scopes().is_empty(),
+            "the ordinary single-calendar account reports nothing"
+        );
+
+        let many = crate::account::CalDavAccount::for_tests_with_unsynced(
+            client,
+            "https://dav.example.test/cal/work/",
+            vec![
+                "https://dav.example.test/cal/personal/".to_string(),
+                "https://dav.example.test/cal/holidays/".to_string(),
+            ],
+        );
+        let skipped = many.open_skipped_scopes();
+        assert_eq!(skipped.len(), 2);
+        for skip in &skipped {
+            assert!(
+                matches!(skip.scope, bifrost_types::ErrorScope::Calendar { .. }),
+                "the entry must name WHICH calendar went unsynced"
+            );
+            assert!(
+                !skip.error.recovery().is_retryable(),
+                "a standing model limitation must not look like a transient failure"
+            );
+        }
     }
 
     #[tokio::test]

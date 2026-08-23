@@ -123,11 +123,17 @@ impl AccountFactory for CardDavAccountFactory {
         let config = self.config.clone();
         Box::pin(async move {
             let account = account::CardDavAccount::open(account_id, config).await?;
-            // Single-principal DAV surface: nothing discoverable can be
-            // skipped at open.
-            Ok(OpenedAccount::complete(
-                Arc::new(account) as Arc<dyn Account>
-            ))
+            // Not `complete`: this crate's cursor model covers ONE address book
+            // collection, so every further book discovery found is enumerated
+            // by `address_books_list` and reachable through the contact
+            // primitives while producing no inventory or change events. Left
+            // unreported, a three-book account looks fully synced and silently
+            // is not.
+            let skipped_scopes = account.open_skipped_scopes();
+            Ok(OpenedAccount {
+                account: Arc::new(account) as Arc<dyn Account>,
+                skipped_scopes,
+            })
         })
     }
 }
