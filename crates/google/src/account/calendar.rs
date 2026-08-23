@@ -1,10 +1,12 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use bifrost_types::{
-    AttendeeRole, Calendar, CalendarEvent, CalendarId, CalendarProvenance, EventAttendee,
-    EventAvailability, EventCreate, EventId, EventOrganizer, EventPatch, EventRange,
-    EventRecurrence, EventSearchRequest, EventStatus, EventTime, EventVisibility, Page,
-    ProtocolKind, RsvpStatus,
+    AccountErrorBuilder, AccountErrorKind, AttemptCause, AttendeeRole, Calendar, CalendarEvent,
+    CalendarId, CalendarProvenance, Cause, DiagnosticText, EventAttendee, EventAvailability,
+    EventCreate, EventId, EventOrganizer, EventPatch, EventRange, EventRecurrence,
+    EventSearchRequest, EventStatus, EventTime, EventVisibility, Page, Protocol, ProtocolErrorKind,
+    ProtocolKind, RsvpStatus, TransmissionState, WireCause,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -17,6 +19,8 @@ use bifrost_types::{AccountError, AccountFuture, AccountOperation};
 
 const CALENDAR_API_BASE: &str = "https://www.googleapis.com/calendar/v3";
 const EVENT_ID_SEPARATOR: &str = "::";
+const CALENDAR_LIST_PAGE_SIZE: u16 = 250;
+const MAX_CALENDAR_LIST_PAGES: usize = 10_000;
 
 fn calendar_api_base() -> String {
     std::env::var("RATATOSKR_TEST_GCAL_ENDPOINT").map_or_else(
@@ -29,17 +33,45 @@ pub(crate) fn calendars_list(
     client: Arc<GmailClient>,
 ) -> AccountFuture<Result<Vec<Calendar>, AccountError>> {
     Box::pin(async move {
-        let url = format!("{}/users/me/calendarList", calendar_api_base());
-        let response: CalendarListResponse = client
-            .get(&url)
-            .await
-            .map_err(|error| collection_error(error, AccountOperation::CalendarsList))?;
-        Ok(response
-            .items
-            .unwrap_or_default()
-            .into_iter()
-            .map(calendar_from_google)
-            .collect())
+        let base_url = format!(
+            "{}/users/me/calendarList?maxResults={CALENDAR_LIST_PAGE_SIZE}",
+            calendar_api_base()
+        );
+        let mut calendars = Vec::new();
+        let mut page_token = None;
+        let mut seen_tokens = HashSet::new();
+        for _ in 0..MAX_CALENDAR_LIST_PAGES {
+            let mut url = base_url.clone();
+            if let Some(token) = page_token.as_deref() {
+                url.push_str("&pageToken=");
+                url.push_str(&bifrost_net::url::encode_query_value(token));
+            }
+            let response: CalendarListResponse = client
+                .get(&url)
+                .await
+                .map_err(|error| collection_error(error, AccountOperation::CalendarsList))?;
+            calendars.extend(
+                response
+                    .items
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(calendar_from_google),
+            );
+            let Some(next_token) = response.next_page_token else {
+                return Ok(calendars);
+            };
+            if !seen_tokens.insert(next_token.clone()) {
+                return Err(calendar_contract_error(
+                    AccountOperation::CalendarsList,
+                    "Google Calendar calendarList repeated a page token".to_string(),
+                ));
+            }
+            page_token = Some(next_token);
+        }
+        Err(calendar_contract_error(
+            AccountOperation::CalendarsList,
+            format!("Google Calendar calendarList exceeded {MAX_CALENDAR_LIST_PAGES} pages"),
+        ))
     })
 }
 
@@ -141,6 +173,16 @@ pub(crate) fn update(
     Box::pin(async move {
         let (mut calendar_id, native_event_id) =
             split_event_id(&event.0, AccountOperation::EventUpdate)?;
+        let has_field_patch = event_patch_has_non_move_fields(&patch);
+        // Local, patch-only validation. It cannot see post-move state,
+        // so hoisting it ahead of the move is behaviour-preserving for
+        // any patch that would have passed, and it stops a patch that
+        // could never be applied from stranding the event in the
+        // destination calendar.
+        if has_field_patch {
+            reject_unexpressible_all_day_patch(&patch)?;
+        }
+        let mut moved = false;
         if let Some(target_calendar) = patch.calendar_id.as_ref()
             && target_calendar.0 != calendar_id
         {
@@ -154,16 +196,29 @@ pub(crate) fn update(
                     event_error(error, AccountOperation::EventUpdate, event.0.clone())
                 })?;
             calendar_id = target_calendar.0.clone();
+            moved = true;
         }
-        if !event_patch_has_non_move_fields(&patch) {
+        if !has_field_patch {
             return Ok(());
         }
-        reject_unexpressible_all_day_patch(&patch)?;
         let url = event_url(&calendar_id, &native_event_id);
+        // After a move the event lives under the destination calendar, so
+        // the composite id the caller passed in no longer addresses it.
+        // Scope the patch failure to where the event actually is - a
+        // reconcile directive that names the source calendar sends the
+        // consumer to look at a resource that is no longer there.
+        let target_event_id = join_event_id(&calendar_id, &native_event_id);
         let _: GoogleEvent = client
             .patch(&url, &google_event_from_patch(&patch))
             .await
-            .map_err(|error| event_error(error, AccountOperation::EventUpdate, event.0.clone()))?;
+            .map_err(|error| {
+                let error = event_error(error, AccountOperation::EventUpdate, target_event_id);
+                if moved {
+                    event_move_patch_error(&error)
+                } else {
+                    error
+                }
+            })?;
         Ok(())
     })
 }
@@ -674,8 +729,65 @@ fn event_move_url(calendar_id: &str, event_id: &str, target_calendar_id: &str) -
     format!(
         "{}/move?destination={}",
         event_url(calendar_id, event_id),
-        bifrost_net::url::encode_path_component(target_calendar_id)
+        bifrost_net::url::encode_query_value(target_calendar_id)
     )
+}
+
+// Reclassify a destination-side PATCH failure that followed a
+// successful `events.move`. The primary kind changes, so the error
+// model requires a fresh builder rather than `into_builder`, which is
+// a decoration path only. Everything a consumer or a support export
+// would otherwise lose is copied across by hand: the scope (which now
+// names the event in its destination calendar), the provenance, the
+// transport diagnostics, the tagged diagnostic text, and the whole
+// original cause chain as secondary evidence. A `Reconcile` directive
+// that does not say what to reconcile is barely better than the silent
+// partial write it replaces.
+fn event_move_patch_error(error: &AccountError) -> AccountError {
+    let consented = error.support_consented();
+    let telemetry = &consented.telemetry;
+    let mut builder = AccountErrorBuilder::new(
+        AccountErrorKind::Protocol(ProtocolErrorKind::PartialResponse),
+        Cause::Wire(WireCause::MalformedResponse {
+            protocol: telemetry.protocol.unwrap_or(Protocol::Gmail),
+            detail: Some(DiagnosticText::support_only(
+                "event move succeeded but the destination field patch failed",
+            )),
+        }),
+    )
+    .protocol(telemetry.protocol.unwrap_or(Protocol::Gmail))
+    .operation(AccountOperation::EventUpdate)
+    .status(telemetry.status)
+    .push_cause(Cause::Attempt(AttemptCause::new(
+        TransmissionState::Acknowledged,
+    )));
+    if let Some(scope) = consented.scope {
+        builder = builder.scope(scope.clone());
+    }
+    if let Some(provider) = telemetry.provider {
+        builder = builder.provider(provider);
+    }
+    if let Some(request_id) = telemetry.request_id {
+        builder = builder.request_id(request_id);
+    }
+    if let Some(trace_id) = telemetry.trace_id {
+        builder = builder.trace_id(trace_id);
+    }
+    if let Some(native_code) = telemetry.native_code {
+        builder = builder.native_code(native_code);
+    }
+    for text in &consented.user_safe_text {
+        builder = builder.text(DiagnosticText::user_safe(*text));
+    }
+    for text in &consented.support_text {
+        builder = builder.text(DiagnosticText::support_only(*text));
+    }
+    for cause in error.chain().iter() {
+        builder = builder.push_cause(cause.clone());
+    }
+    builder
+        .try_build()
+        .expect("valid Calendar move partial-response classification")
 }
 
 fn event_patch_has_non_move_fields(patch: &EventPatch) -> bool {
@@ -863,6 +975,13 @@ fn local_error(operation: AccountOperation, message: String) -> AccountError {
     local_error_with_field(operation, "calendar", message)
 }
 
+fn calendar_contract_error(operation: AccountOperation, detail: String) -> AccountError {
+    error::into_account_error(
+        crate::error::Error::Local(crate::error::GmailLocalError::Internal { detail }),
+        GmailErrorContext::calendar_collection(operation),
+    )
+}
+
 fn local_error_with_field(
     operation: AccountOperation,
     field: &'static str,
@@ -878,6 +997,7 @@ fn local_error_with_field(
 #[serde(rename_all = "camelCase")]
 struct CalendarListResponse {
     items: Option<Vec<GoogleCalendarListEntry>>,
+    next_page_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -980,7 +1100,36 @@ struct GoogleAttendee {
 
 #[cfg(test)]
 mod tests {
+    use bifrost_net::test_support::{Canned, ScriptedDispatch};
+    use bifrost_net::{NetConfig, RetryPolicy, StaticTokenSource};
+    use bifrost_types::{ReconcileReason, RecoveryClass};
+    use bytes::Bytes;
+    use reqwest::StatusCode;
+
     use super::*;
+
+    fn canned_json(status: StatusCode, value: serde_json::Value) -> Canned {
+        Canned::Response {
+            status,
+            headers: reqwest::header::HeaderMap::new(),
+            body: Bytes::from(serde_json::to_vec(&value).expect("fixture serializes")),
+        }
+    }
+
+    fn scripted_client(steps: Vec<Canned>) -> (Arc<GmailClient>, Arc<ScriptedDispatch>) {
+        let script = ScriptedDispatch::new(steps);
+        let net = bifrost_net::test_support::scripted_account(
+            &script,
+            NetConfig::default(),
+            Vec::new(),
+            Arc::new(StaticTokenSource::new("token", None)),
+            RetryPolicy::disabled(),
+        );
+        (
+            Arc::new(GmailClient::with_account_net("https://gmail.test", net)),
+            script,
+        )
+    }
 
     fn timed(value: &str) -> GoogleEventTime {
         GoogleEventTime {
@@ -1053,12 +1202,258 @@ mod tests {
         assert_eq!(token, None);
     }
 
+    #[tokio::test]
+    async fn calendars_list_walks_every_page_and_encodes_page_tokens() {
+        let (client, script) = scripted_client(vec![
+            canned_json(
+                StatusCode::OK,
+                json!({
+                    "items": [{"id": "first", "summary": "First"}],
+                    "nextPageToken": "next+page&owner=me"
+                }),
+            ),
+            canned_json(
+                StatusCode::OK,
+                json!({"items": [{"id": "second", "summary": "Second"}]}),
+            ),
+        ]);
+
+        let calendars = calendars_list(client).await.expect("all pages load");
+
+        assert_eq!(
+            calendars
+                .iter()
+                .map(|calendar| calendar.id.0.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "second"]
+        );
+        let requests = script.requests();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests[0]
+                .url
+                .as_str()
+                .ends_with("calendarList?maxResults=250")
+        );
+        assert!(
+            requests[1]
+                .url
+                .as_str()
+                .ends_with("calendarList?maxResults=250&pageToken=next%2Bpage%26owner%3Dme")
+        );
+    }
+
+    #[tokio::test]
+    async fn calendars_list_rejects_a_repeated_page_token() {
+        let (client, script) = scripted_client(vec![
+            canned_json(StatusCode::OK, json!({"nextPageToken": "stalled"})),
+            canned_json(StatusCode::OK, json!({"nextPageToken": "stalled"})),
+        ]);
+
+        let error = calendars_list(client)
+            .await
+            .expect_err("repeated token must terminate");
+
+        assert_eq!(error.operation(), Some(AccountOperation::CalendarsList));
+        assert!(matches!(
+            error.kind(),
+            AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation)
+        ));
+        assert_eq!(script.requests().len(), 2);
+    }
+
+    /// A server handing out a fresh token every page slips past the
+    /// repeated-token guard, so the page budget is the only thing left
+    /// stopping an unbounded walk. Observe it firing rather than
+    /// asserting the constant exists.
+    #[tokio::test]
+    async fn calendars_list_stops_at_the_page_budget() {
+        let steps = (0..MAX_CALENDAR_LIST_PAGES)
+            .map(|page| canned_json(StatusCode::OK, json!({"nextPageToken": format!("p{page}")})))
+            .collect();
+        let (client, script) = scripted_client(steps);
+
+        let error = calendars_list(client)
+            .await
+            .expect_err("the page budget must terminate the walk");
+
+        assert!(matches!(
+            error.kind(),
+            AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation)
+        ));
+        assert_eq!(script.requests().len(), MAX_CALENDAR_LIST_PAGES);
+    }
+
     #[test]
     fn event_move_url_encodes_destination_calendar() {
-        let url = event_move_url("primary", "event/1", "work calendar");
-
+        // The path and query encoders differ on exactly two inputs: the
+        // complete `.` and `..` components, which the path encoder
+        // double-escapes so the WHATWG parser cannot resolve them as
+        // navigation. `destination` is a query value, where dots carry
+        // no structural meaning, so both must survive verbatim.
+        let url = event_move_url("primary", "event/1", ".");
         assert!(url.contains("/calendars/primary/events/event%2F1/move"));
-        assert!(url.ends_with("destination=work%20calendar"));
+        assert!(url.ends_with("destination=."));
+
+        let parent = event_move_url("primary", "event/1", "..");
+        assert!(parent.ends_with("destination=.."));
+
+        // Everything else encodes identically under both, so a value
+        // carrying query delimiters still pins that the destination is
+        // escaped at all.
+        let delimited = event_move_url("primary", "event/1", "a&b=c+d");
+        assert!(delimited.ends_with("destination=a%26b%3Dc%2Bd"));
+    }
+
+    #[tokio::test]
+    async fn failed_patch_after_move_reports_partial_completion() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::HeaderName::from_static("x-goog-request-id"),
+            reqwest::header::HeaderValue::from_static("req-77"),
+        );
+        let (client, script) = scripted_client(vec![
+            canned_json(StatusCode::OK, json!({"id": "event-1"})),
+            Canned::Response {
+                status: StatusCode::FORBIDDEN,
+                headers,
+                body: Bytes::from(
+                    serde_json::to_vec(&json!({
+                        "error": {
+                            "code": 403,
+                            "message": "denied",
+                            "errors": [{"reason": "forbidden", "message": "denied"}]
+                        }
+                    }))
+                    .expect("fixture serializes"),
+                ),
+            },
+        ]);
+        let patch = EventPatch {
+            calendar_id: Some(CalendarId("destination".to_string())),
+            title: Some(Some("Updated".to_string())),
+            ..EventPatch::default()
+        };
+
+        let error = update(client, EventId("source::event-1".to_string()), patch)
+            .await
+            .expect_err("destination patch fails");
+
+        assert!(matches!(
+            error.kind(),
+            AccountErrorKind::Protocol(ProtocolErrorKind::PartialResponse)
+        ));
+        assert!(matches!(
+            error.recovery(),
+            RecoveryClass::Reconcile(advice)
+                if advice.reason == ReconcileReason::PartialCompletionSignal
+        ));
+        assert!(error.chain().iter().any(|cause| matches!(
+            cause,
+            Cause::Attempt(attempt)
+                if attempt.transmission_state == TransmissionState::Acknowledged
+        )));
+
+        // The whole value of the PartialResponse classification is that
+        // the consumer can act on it: the scope must name the moved
+        // event where it now lives, not the composite id it arrived
+        // under.
+        assert_eq!(
+            error.scope(),
+            Some(&bifrost_types::ErrorScope::Calendar {
+                id: "destination::event-1".to_string()
+            })
+        );
+
+        // The reclassification must not discard the underlying
+        // transport evidence.
+        let telemetry = error.telemetry_fields();
+        assert_eq!(telemetry.status, Some(403));
+        assert_eq!(telemetry.request_id, Some("req-77"));
+        assert_eq!(telemetry.provider, Some(bifrost_types::Provider::Gmail));
+        assert_eq!(telemetry.protocol, Some(Protocol::Gmail));
+        assert!(telemetry.native_code.is_some());
+        assert!(
+            error
+                .support_consented()
+                .support_text
+                .iter()
+                .any(|text| text.contains("denied")),
+            "the provider's own diagnostic text must survive reclassification"
+        );
+
+        // The original failure survives as secondary evidence rather
+        // than being replaced by the reclassification.
+        assert!(
+            error
+                .chain()
+                .iter()
+                .any(|cause| matches!(cause, Cause::Wire(WireCause::Gmail(_))))
+        );
+
+        let requests = script.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].method, reqwest::Method::POST);
+        assert_eq!(requests[1].method, reqwest::Method::PATCH);
+    }
+
+    /// Local patch validation is purely a function of the patch, so it
+    /// can run before the move. Doing so keeps a patch that could never
+    /// be valid from stranding the event in a new calendar: the cheap
+    /// prevention, as opposed to the `TransmissionState` evidence that
+    /// covers second-leg failures which genuinely cannot be prevented.
+    #[tokio::test]
+    async fn an_unexpressible_patch_is_rejected_before_the_move() {
+        let (client, script) = scripted_client(Vec::new());
+        let patch = EventPatch {
+            calendar_id: Some(CalendarId("destination".to_string())),
+            is_all_day: Some(true),
+            ..EventPatch::default()
+        };
+
+        let error = update(client, EventId("source::event-1".to_string()), patch)
+            .await
+            .expect_err("an all-day flip with no bounds is unexpressible");
+
+        assert!(matches!(
+            error.kind(),
+            AccountErrorKind::Unsupported(AccountOperation::EventUpdate)
+        ));
+        assert!(
+            script.requests().is_empty(),
+            "no move may be issued for a patch that can never be applied"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_patch_without_a_move_keeps_its_own_classification() {
+        let (client, script) = scripted_client(vec![canned_json(
+            StatusCode::FORBIDDEN,
+            json!({"error": {"code": 403, "message": "denied"}}),
+        )]);
+        let patch = EventPatch {
+            title: Some(Some("Updated".to_string())),
+            ..EventPatch::default()
+        };
+
+        let error = update(client, EventId("source::event-1".to_string()), patch)
+            .await
+            .expect_err("patch fails");
+
+        assert!(
+            !matches!(
+                error.kind(),
+                AccountErrorKind::Protocol(ProtocolErrorKind::PartialResponse)
+            ),
+            "a patch that was never preceded by a move is not a partial write"
+        );
+        assert_eq!(
+            error.scope(),
+            Some(&bifrost_types::ErrorScope::Calendar {
+                id: "source::event-1".to_string()
+            })
+        );
+        assert_eq!(script.requests().len(), 1);
     }
 
     #[test]

@@ -96,6 +96,23 @@ outcomes are recorded here so a later hunter does not re-file them as untouched.
   the topic for the remainder of the 7-day watch. Retrying a stop needs a transport the close has
   already shed, so this is accepted rather than open.
 
+## Residuals from round 3 (2026-08-23)
+
+- **Cross-calendar event update remains a non-atomic provider operation.** [resolved, declared
+  residual] Google exposes the move and field PATCH as separate requests. A second-leg failure now
+  returns `Protocol(PartialResponse)` with acknowledged first-leg evidence so the consumer
+  reconciles the event in its destination calendar. No compensating move is attempted because that
+  would add another blind write and another partial-failure window. The reclassification carries the
+  destination-scoped `EventId`, the provenance, the transport diagnostics, and the original cause
+  chain across the fresh builder that a primary-kind change requires; a `Reconcile` directive that
+  does not name its target is barely better than the silent partial write it replaces.
+- **The ledger entry on `event_move_url` named the wrong encoder difference.** [corrected]
+  `encode_path_component` and `encode_query_value` are the same function except for the complete
+  `.` and `..` components, which the path encoder double-escapes against WHATWG path navigation.
+  They do *not* differ on `+`, `&`, or `=` as the entry claimed - those are escaped identically by
+  both. The fix (query encoder for a query value) stands; the regression test pins the real
+  difference and was checked by reverting the production change.
+
 ## bulk_destroy reports Applied for messages that were only trashed
 
 **C1 live defect. PUBLISHED SURFACE (additive).**
@@ -110,20 +127,6 @@ The downgrade needs a distinct outcome (`MutationSuccess::Skipped` plus a Warnin
 variant). The other half of the original finding - the fallback firing on any 403 whose body does
 not parse as a Gmail envelope - was closed in round 2; only the outcome-reporting half remains, and
 it is fenced for the repository owner because it touches the published `MutationSuccess` enum.
-
-## calendarList is not paginated, so accounts with many calendars silently lose data
-
-**C1 live defect.** Verified 2026-08-23: `calendars_list` still issues one GET and returns
-`response.items` with no `nextPageToken` loop. Silent truncation at 100 calendars, and search
-inherits it.
-
-`crates/google/src/account/calendar.rs::calendars_list` issues one GET to `/users/me/calendarList`
-and returns `response.items`. Google paginates that endpoint (default 100, max 250, with
-`nextPageToken`). An account with more than 100 calendars gets a truncated `calendars_list`, and
-worse, `search` with no `calendar_id` builds its cross-calendar cursor index from that truncated
-list, so events in calendars 101+ are invisible to search and a cursor minted before a list change
-can resolve to the wrong index (`decode_cross_calendar_cursor` matches by id, so it errors rather
-than mis-indexes; but the truncation itself is silent).
 
 ## Calendar's endpoint override is an env var, unlike every other Google surface
 
@@ -145,21 +148,6 @@ Related: `default_account_net` registers rate limits for `www.googleapis.com` an
 `people.googleapis.com` by literal string. If the calendar or Gmail base is redirected, requests to
 the redirected host are unlimited; that is test-only, but the People host being hardcoded while its
 base is configurable is the same asymmetry.
-
-## event_move_url encodes a query value with the path encoder
-
-**C2 latent defect.** Verified 2026-08-23: `event_move_url` still calls
-`bifrost_net::url::encode_path_component` on `destination`. Latent because ordinary Google calendar
-ids survive the wrong encoder; it bites on ids carrying `+`, `&`, or `=`. Note the finding also
-says the test pins the wrong encoder, which is the "test with no bite" shape this project has been
-caught by three times - fix both.
-
-`calendar.rs`:
-`format!("{}/move?destination={}", event_url(...), bifrost_net::url::encode_path_component(target_calendar_id))`.
-`destination` is a query parameter and must go through `encode_query_value`. Path and query
-encoders differ on exactly the characters that matter in a Google calendar id (`+` decoding to
-space, `&`/`=` truncating). The whole rest of the file uses `encode_query_value` for query
-positions; this is the one slip, and its test pins the wrong encoder.
 
 ## FullWithBlobs fetches the whole message twice
 
@@ -188,8 +176,6 @@ Each bullet carries its category inline. None of these touches a published surfa
   first observable state is undefined.
 - **[C3]** `client.rs::execute` sets `Content-Type: application/json` on GET and DELETE requests that have no
   body.
-- **[C2]** `calendar.rs::update`: a cross-calendar move followed by a failing field PATCH leaves the event
-  moved but unpatched, with no compensation and no mention in the reference doc.
 - **[C3]** `calendar.rs::search`: the clipped-tail comment ("Any clipped tail is recoverable") is
   load-bearing but unverified. If Google ever returns more items than `maxResults` without a
   `nextPageToken`, the tail is dropped silently and the cursor advances to the next calendar. A

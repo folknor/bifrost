@@ -373,11 +373,36 @@ with unmodeled attendee fields preserved. Event status maps through Google
 Calendar `status` on read, create, and update. Event search uses the
 requested calendar when supplied; otherwise it walks the calendar list and
 searches each, using an internal cursor that records the calendar id plus
-the provider page token. Cross-calendar
+the provider page token. `calendars_list` walks every `calendarList` page at
+the provider's 250-item maximum, rejects repeated page tokens, and has a
+finite 10,000-page request budget. Each page is one ordinary request
+against `www.googleapis.com`, so it debits the host `cost_default` of one
+unit through the same governor as before; the paginated walk costs units
+in proportion to the pages the provider actually hands back, and no
+Calendar traffic rides for free. Calendar ids occupy path components on
+event resource URLs, while the `events.move` destination occupies a query
+value and uses the corresponding encoder. The two encoders differ only on
+the complete `.` and `..` components, which the path encoder
+double-escapes so the URL parser cannot resolve a provider id as path
+navigation; in a query value dots carry no structural meaning. Cross-calendar
 search respects the requested `limit`, never over-fetching at a calendar
 boundary and clipping any loose provider page. Calendar update
 uses `events.move` when `EventPatch.calendar_id` targets a different
 calendar, then applies any remaining field patch against the destination.
+Patch-local validation runs before the move, so a patch that could never
+be applied cannot strand the event in the destination calendar.
+That provider operation is non-atomic. If the move succeeds and the field
+PATCH fails, the returned error is `Protocol(PartialResponse)` with an
+acknowledged attempt cause, which directs the consumer to reconcile the moved
+event. Because the primary kind changes, the reclassification builds a
+fresh `AccountErrorBuilder` rather than taking the `into_builder`
+decoration path, and copies across by hand everything a consumer or a
+support export would otherwise lose: the `ErrorScope::Calendar` naming
+the event under its *destination* calendar, the provider and protocol,
+the HTTP status, request and trace ids, native code, the tagged
+diagnostic text, and the entire original cause chain as secondary
+evidence. There is no compensating move because that would add another
+blind write and another partial-failure window.
 A present `EventPatch.recurrence` always writes the `recurrence` key; an
 empty `EventRecurrence` sends `[]` (the Google idiom for clearing
 RRULE/RDATE/EXDATE), while an absent recurrence patch omits the key.
