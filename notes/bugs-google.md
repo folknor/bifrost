@@ -24,9 +24,11 @@ Categories were checked against the tree on 2026-08-23; where the check changed 
 marker says so. Resolved findings are removed rather than annotated in place.
 
 Published-surface findings in this document, collected: the `bulk_destroy` downgrade (its remedy
-adds a `MutationSuccess` variant), and the calendar endpoint override (its remedy adds a published
-`with_calendar_api_base` constructor). Both are additive rather than removals, which makes them the
-mild end of the category, but they are still the owner's to approve.
+adds a `MutationSuccess` variant), the calendar endpoint override (its remedy adds a published
+`with_calendar_api_base` constructor), the missing per-item failed lane in `inventory_stream`
+(its remedy reshapes the published `Account::inventory_stream` return type; recorded under
+"Residuals from round 1"), and the non-streaming `calendars_list` shape (its remedy changes the
+published method's return type; see the smaller observations). All are the owner's to approve.
 
 ## Residuals from round 1 (2026-08-23)
 
@@ -164,12 +166,18 @@ line in the crate's read path.
 
 ## Smaller / lower-confidence observations
 
-Each bullet carries its category inline. None of these touches a published surface.
+Each bullet carries its category inline. None of these touches a published surface, except the
+`calendars_list` streaming shape, which is marked as such.
 
 - **[C3]** `push.rs`: the transient-failure `Warning` is always built `.with_retry_count(1)` regardless of
   how many consecutive failures have occurred: misleading telemetry, and the renewer already tracks
-  `disconnected` state it could count from. Also, `WatchEvent::Warning` is emitted by the renewer
-  but `reference/google.md`'s renewer section documents only `Terminated`/`Disconnected`/`Reconnected`.
+  `disconnected` state it could count from. (The other half of this bullet - `reference/google.md`
+  omitting `WatchEvent::Warning` from the renewer section - was fixed by the close pass 2026-08-23.)
+- **[C4 PUBLISHED SURFACE]** `calendar.rs::calendars_list` returns a `Vec` with no streaming, so a
+  pathological account buys many sequential 250-item round trips before the caller sees anything.
+  Flagged by round 3, judged a shape question rather than a defect, and the close pass agrees: the
+  walk is bounded (repeated-token guard plus page budget), correctness is not at stake, and the
+  remedy changes the published method's return type, which is the owner's call.
 - **[C3]** `push.rs`: `push_subscribe` emits `WatchEvent::Reconnected` on the broadcast channel before any
   consumer has had a chance to call `push_stream()`. `broadcast` drops messages with no receivers,
   so the initial `Reconnected` is normally lost. Not harmful today, but it means the event stream's

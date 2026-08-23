@@ -121,7 +121,9 @@ and the push and scope-lifecycle streams are retired whatever the caller does
 with that future. The future then makes a best-effort `users.stop` call for a
 locally active Gmail watch - it needs the transport, so it cannot precede the
 detach - and clears the watch state; the `bifrost-net` detach runs from a drop
-guard and therefore happens on completion and on cancellation alike. A stop
+guard constructed before the future is returned, and therefore happens on
+completion, on mid-poll cancellation, and when the future is dropped
+without ever being polled. A stop
 failure is classified and logged but cannot keep a closing account alive. The
 one thing a dropped close future cannot guarantee is the remote half: Gmail
 may keep delivering until the 7-day watch expires.
@@ -587,8 +589,9 @@ The renewer task in `start_renewer`:
   and routes on `RecoveryClass::is_terminal()`. Terminal classes
   (auth lost, policy block, account disabled, schema break) emit
   `WatchEvent::Terminated(AccountError)` and exit the renewer so the
-  engine can take over. Transient classes emit
-  `WatchEvent::Disconnected` (once) and retry after
+  engine can take over. Transient classes emit a structured
+  `WatchEvent::Warning` per failure (support-only text carrying the
+  message key) plus `WatchEvent::Disconnected` (once) and retry after
   `RENEW_RETRY_AFTER` (five minutes); the next success emits
   `WatchEvent::Reconnected`. Every failure goes
   through the classifier first.

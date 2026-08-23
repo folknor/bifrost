@@ -890,10 +890,17 @@ impl Account for GoogleAccount {
         self.shutdown.cancel();
         let client = Arc::clone(&self.client);
         let pubsub = Arc::clone(&self.pubsub);
+        // Built here, not inside the async block: a future is inert until
+        // its first poll, so a guard constructed inside the block would
+        // never exist - and never detach - for a caller that drops the
+        // returned future unpolled. Owned by the future either way, the
+        // guard fires on completion, mid-poll cancellation, and the
+        // never-polled drop alike.
+        let detach = DetachOnDrop {
+            client: Arc::clone(&client),
+        };
         Box::pin(async move {
-            let _detach = DetachOnDrop {
-                client: Arc::clone(&client),
-            };
+            let _detach = detach;
             push::close_watch(&client, &pubsub).await;
             Ok(())
         })
@@ -986,6 +993,27 @@ mod tests {
             net.governor().cost_default_for(TEST_HOST),
             None,
             "a cancelled close must still shed the transport registration",
+        );
+    }
+
+    /// A future is inert until first polled, so the detach guard must
+    /// exist before the caller can drop the future - a guard constructed
+    /// inside the async block never runs for a close future that is
+    /// dropped unpolled, and `closed` is already set, so nothing else
+    /// would ever reclaim the registration.
+    #[tokio::test]
+    async fn close_dropped_before_first_poll_still_detaches() {
+        let script = ScriptedDispatch::new([Canned::Pending]);
+        let (account, net) = scripted_account(&script);
+        assert_eq!(net.governor().cost_default_for(TEST_HOST), Some(1));
+
+        drop(account.close());
+
+        assert!(account.shutdown.is_cancelled());
+        assert_eq!(
+            net.governor().cost_default_for(TEST_HOST),
+            None,
+            "an unpolled dropped close must still shed the transport registration",
         );
     }
 

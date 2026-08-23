@@ -687,6 +687,74 @@ mod tests {
         assert_eq!(requests[0].url.path(), "/stop");
     }
 
+    /// The renewer's shutdown select can be won before `close()` cancels
+    /// the token; without the second check under the lifecycle mutex the
+    /// renewal then re-issues `users.watch` and resurrects Gmail-side
+    /// delivery for seven days after the account closed. The test wins
+    /// that race deliberately: it holds the lifecycle mutex, lets the
+    /// paused clock fire the renewal sleep, cancels the token while the
+    /// renewer is parked on the mutex, and then releases it.
+    #[tokio::test(start_paused = true)]
+    async fn renewer_parked_on_the_lifecycle_mutex_does_not_resurrect_a_closed_watch() {
+        let now_millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_millis();
+        let watch_body = format!("{{\"historyId\":\"1\",\"expiration\":\"{now_millis}\"}}");
+        let (client, script) = scripted_client([
+            Canned::Response {
+                status: StatusCode::OK,
+                headers: reqwest::header::HeaderMap::new(),
+                body: Bytes::from(watch_body.clone().into_bytes()),
+            },
+            // Consumed only by the bug: a renewal that fires anyway.
+            Canned::Response {
+                status: StatusCode::OK,
+                headers: reqwest::header::HeaderMap::new(),
+                body: Bytes::from(watch_body.into_bytes()),
+            },
+        ]);
+        let pubsub = Arc::new(PubSubControl::new(Some(PubSubConfig::new(
+            "projects/p/topics/t",
+        ))));
+        let shutdown = CancellationToken::new();
+
+        push_subscribe(
+            Arc::clone(&client),
+            Arc::clone(&pubsub),
+            shutdown.clone(),
+            vec![CursorScope::Account],
+        )
+        .await
+        .expect("subscribe issues the watch");
+        assert_eq!(script.requests().len(), 1);
+
+        // Park the renewer: hold the lifecycle mutex, then let the paused
+        // clock auto-advance through the renewal delay while this task is
+        // itself blocked on time.
+        let lifecycle = pubsub.watch_lifecycle.lock().await;
+        tokio::time::sleep(MIN_RENEW_DELAY + Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+
+        // The close-side ordering: token cancelled while the renewer is
+        // already past its select, then the mutex released.
+        shutdown.cancel();
+        drop(lifecycle);
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(
+            script.requests().len(),
+            1,
+            "a renewal in flight at close must not re-issue users.watch",
+        );
+        let renewer = pubsub.renewer.lock().await.take();
+        if let Some(handle) = renewer {
+            handle.await.expect("the renewer must have exited cleanly");
+        }
+    }
+
     #[test]
     fn watch_response_decodes_gmails_string_shaped_fields() {
         let response: GmailWatchResponse =
