@@ -21,36 +21,59 @@ now carries a category on its own line under its heading (or inline, for bullets
 reshape a published item or behavior, and needs the owner's sign-off whatever its category.
 
 Categories were checked against the tree on 2026-08-23; where the check changed the picture the
-marker says so. No finding text was altered, compressed, or removed.
+marker says so. Resolved findings are removed rather than annotated in place.
 
 Published-surface findings in this document, collected: the `bulk_destroy` downgrade (its remedy
 adds a `MutationSuccess` variant), and the calendar endpoint override (its remedy adds a published
 `with_calendar_api_base` constructor). Both are additive rather than removals, which makes them the
 mild end of the category, but they are still the owner's to approve.
 
-Highest severity, ahead of its position: **a single message 404 terminating the whole inventory
-walk is a live data-loss-of-progress defect on the crate's most expensive path, and the Drive chunk
-loop can spin forever with no attempt counter.** Both verified against the current tree.
+Highest severity, ahead of its position: **the Drive chunk loop can spin forever with no attempt
+counter.** Verified against the current tree.
 
-## A single message 404 kills the entire inventory walk
+## Residuals from round 1 (2026-08-23)
 
-**C1 live defect.** Verified 2026-08-23: the hydration loop's `Err` arm still does
-`yield SyncEvent::Terminated(...); return;` with no classification step, while `get_stream` in the
-same file fans every hydrate failure into `ItemOutcome::Failed`. Two lanes, opposite policies, one
-routine server behavior. No published shape changes to fix it.
+Round 1 closed six findings in the Gmail sync and blob lanes. Three of them were closed narrower
+than the original finding asked, and one was closed by deciding not to change the code. Those four
+outcomes are recorded here so a later hunter does not re-file them as untouched.
 
-`crates/google/src/account/inventory.rs`, `inventory_stream`: the `buffer_unordered(32)`
-hydration loop does `Err(error) => { yield SyncEvent::Terminated(...); return; }`. Gmail returns
-404 for a message id that was listed and then deleted/moved between `users.messages.list` and
-`users.messages.get`, which is routine on a mailbox with hundreds of thousands of messages where
-a full walk takes many minutes. One such 404 terminates the whole backfill partition and discards
-every page already emitted for it.
-
-`get_stream` in the same file already has the right shape (per-item `ItemOutcome::Failed(BatchFailure)`
-so "a single bad id no longer poisons the stream", per the doc). Inventory has the opposite policy
-and the reference doc does not mention the divergence. Inventory should fan out per-id failures the
-same way; the only failures that should terminate are the ones `terminates_mutation_stream`-style
-classification calls terminal.
+- **Inventory still has no per-item failed lane.** [C4 PUBLISHED SURFACE, deferred] The original
+  finding wanted `inventory_stream` to fan per-id hydration failures into `ItemOutcome::Failed` the
+  way `get_stream` does. It cannot: `Account::inventory_stream` in `bifrost-types` returns
+  `AccountStream<SyncEvent<InventoryEntry>>`, with no `ItemOutcome` wrapper, so a failed lane there
+  is a published trait change and the owner's call. What round 1 fixed instead is the data-loss
+  symptom: a hydration error classified `NotFound(Message)` is absorbed as the ordinary list/get
+  deletion race, so a routine 404 no longer discards every page already emitted. Every other
+  classified failure still terminates the whole walk and still discards emitted progress. That
+  residual is real and unfixed.
+- **`get_stream` marks `Final` only when the id stream closes during the batch drain.** [C2,
+  accepted residual] The obvious fix - one-item lookahead past a full batch, as the mutation driver
+  and `inventory_stream` do - deadlocks here, and the round-1 fix pass shipped exactly that before
+  a cold review caught it. `get_stream`'s ids come from a backpressured producer that may be
+  waiting on hydration output before it yields again; polling for id 33 before hydrating ids 1-32
+  parks both sides forever, and even short of a deadlock it holds every partial batch until one
+  more id arrives. So the boundary is set only from information the drain already has: a batch cut
+  short by the stream closing is `Final`, and a batch that happens to fill exactly to
+  `HYDRATE_BATCH_SIZE` as the last one stays `Page` with the following `Done` as terminator. The
+  triage below already established that `bifrost-sync` reads `PageBoundary::Final` in no hydration
+  path, so the boundary is advisory; losing it on one alignment is far cheaper than a stall. Do not
+  "finish" this with a lookahead. `hydration_emits_a_full_batch_without_waiting_for_another_id`
+  pins the stall.
+- **The per-poll `users.getProfile` round trip stays.** [C3, decided, do not re-file] The cost
+  argument is correct - it is a doubled request count and a doubled failure surface on the
+  30-second poll path - but the call is the only thing today that catches a rotated token now
+  pointing at a different Google account before its history is mixed into the existing account
+  slot. There is no token-source identity binding upstream to lean on. It comes out when that
+  binding exists, not before. The case-sensitivity half of that finding was a genuine C2 and is
+  fixed: both `changes.rs` and `cursor::decode_gmail_state_for_profile` now compare
+  ASCII-case-insensitively, so `getProfile` returning different casing no longer wedges the account
+  into a permanent `SchemaIncompatible`-clear-re-establish cycle.
+- **`open_blob_range` lost its range branch rather than growing one.** [resolved, noted for
+  intent] The "defensive" branch returned `stream::empty()`, which is a silently-ended stream for
+  any consumer awaiting bytes. It is gone: the function now always returns a classified
+  `Unsupported(OpenBlobRange)`, including for a forged handle that claims `supports_range`. This is
+  a deliberate decision that Gmail attachments have no byte-range transport, not an oversight to be
+  implemented later.
 
 ## The rate limiter is calibrated in requests but Gmail bills in quota units
 
@@ -115,23 +138,6 @@ removed from the set and neither `expiration`, `last_history_id`, nor the renewe
 account is left with an empty handle set and a live renewer that keeps re-issuing `users.watch`
 forever. The state teardown should happen regardless of the network result, or the handle should be
 re-inserted on failure.
-
-## open_blob_range returns an empty stream on its "unreachable" branch
-
-**C2 latent defect, plus a live doc defect.** Verified 2026-08-23: the branch is still
-`let _ = client; Box::pin(stream::empty())` and the comment above it calls itself defensive while
-claiming "we slice locally", which it does not. Unreachable today (`supports_range` is hardcoded
-false at construction and a test asserts it), so the stream half is latent; the reference doc being
-wrong is true right now. Note the finding offers "delete the branch" as one remedy - that is a
-private function, not published surface, so it is a legitimate option here rather than the pattern
-this triage warns about.
-
-`crates/google/src/account/blobs.rs`: if `handle.capabilities.supports_range` is ever true, the
-function returns `stream::empty()`: no `Batch`, no `Done`, no `Terminated`. A consumer awaiting
-bytes gets a silently-ended stream. `reference/google.md` claims "The range-supporting branch
-(slicing the decoded buffer) exists for trait symmetry"; there is no slicing branch, only
-`let _ = client;` and an empty stream. Either delete the branch and always return `Unsupported`, or
-implement the slice. The doc is wrong today.
 
 ## calendarList is not paginated, so accounts with many calendars silently lose data
 
@@ -199,53 +205,6 @@ this behavior as if it were correct. Either normalize a case-insensitive system-
 its canonical spelling before adding, or drop the case-insensitive comparison entirely and require
 exact ids.
 
-## get_stream never emits PageBoundary::Final
-
-**C2 latent defect (contract), downgraded by verification.** The symptom is confirmed:
-`get_stream` hardcodes `page_boundary: PageBoundary::Page` on every batch and ends with
-`Done(None)`. The finding asks for the consumer to be checked, so it was: as of 2026-08-23
-`bifrost-sync` reads `PageBoundary::Final` in no hydration path - `fusion.rs` and
-`backfill/runner.rs` only propagate `batch.page_boundary` through, and the sole `Final` literal in
-the crate is in a test. So nothing breaks today and this is a contract inconsistency with a fuse on
-it, not the live break the finding's "medium confidence" allowed for. The sub-point about
-`inventory_stream` emitting no `Final` batch when the last page hydrates to zero items is also
-confirmed, same category.
-
-`inventory.rs::get_stream` hardcodes `page_boundary: PageBoundary::Page` on every batch and then
-emits `Done(None)`. Both the mutation driver and `inventory_stream` do one-item lookahead
-specifically so the last batch is marked `Final`; `get_stream` does not, and the reference doc does
-not call this out as intentional. Any consumer keyed on `Final` (the mutation driver's own tests
-assert the invariant matters) will never see it for hydration. Medium confidence this is a real
-contract break rather than a documented exemption; worth checking against `bifrost-sync`.
-
-Related smaller edge case in `inventory_stream`: the `Final` batch is only emitted
-`if !items.is_empty()`. A last list page whose hydration produced zero items, or an entirely empty
-mailbox, yields no `Final` batch at all, only `Done`.
-
-## changes_stream pays a users.getProfile round trip on every poll
-
-**C3 refactor opinion (cost), containing a C2.** The round-trip half is a cost argument: nothing
-misbehaves, the call is redundant with a local check, and removing it is a judgment about how much
-identity re-validation belongs on the hot path. The second half is a real **C2 latent defect** -
-the exact-case `!=` comparison wedges the account into a permanent
-`SchemaIncompatible`-clear-re-establish cycle if `getProfile` ever returns different casing, and
-`eq_ignore_ascii_case` costs nothing. Fix the comparison independently of the round-trip question.
-
-`crates/google/src/account/changes.rs`: before the first `history.list` page it decodes the cursor,
-compares `decoded.profile_email` against the already-held `state.profile.email_address` (a pure
-local check), and then issues `client.get_profile()` to compare a third time. The open-time profile
-is already the account identity; the extra call only catches "the token now points at a different
-Google account", which is an auth-layer concern, not a per-sync-tick one. On a 30-second poll
-cadence that is a doubled request count on the highest-frequency path, plus a doubled failure
-surface (a transient 5xx on `getProfile` terminates the change stream that would otherwise have
-succeeded).
-
-Also: the email comparison is exact-case (`!=`) in both `changes.rs` and
-`cursor::decode_gmail_state_for_profile`. Google normalizes addresses, but if `getProfile` ever
-returns a differently-cased local part the account wedges permanently into `SchemaIncompatible`,
-the engine clears the cursor, re-establishes, and hits the same mismatch. `eq_ignore_ascii_case`
-costs nothing here.
-
 ## The Drive chunk loop can spin forever
 
 **C1 live defect (hang).** Verified 2026-08-23: `while offset < total` with
@@ -291,16 +250,8 @@ Each bullet carries its category inline. None of these touches a published surfa
   consumer has had a chance to call `push_stream()`. `broadcast` drops messages with no receivers,
   so the initial `Reconnected` is normally lost. Not harmful today, but it means the event stream's
   first observable state is undefined.
-- **[C2]** `cursor.rs`: `encode_gmail_state` uses `serde_json::to_vec(state).unwrap_or_default()`, so a
-  serialization failure silently mints an empty cursor envelope that decodes as `MalformedPayload`,
-  then `CursorInvalid`, then the engine restarts the scope. Practically unreachable for this struct,
-  but "silently produce a poisoned cursor" is the wrong failure mode; the function should return
-  `Result` or `expect`.
 - **[C3]** `client.rs::execute` sets `Content-Type: application/json` on GET and DELETE requests that have no
   body.
-- **[C2]** `blobs.rs::open_blob` reports `bytes_in: handle.size.unwrap_or(0)`, the decoded size, whereas the
-  wire carried base64url inside a JSON envelope (~4/3 larger). Bandwidth accounting under-reports by
-  a third on every attachment.
 - **[C2]** `calendar.rs::update`: a cross-calendar move followed by a failing field PATCH leaves the event
   moved but unpatched, with no compensation and no mention in the reference doc.
 - **[C3]** `calendar.rs::search`: the clipped-tail comment ("Any clipped tail is recoverable") is

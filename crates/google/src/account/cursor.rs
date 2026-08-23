@@ -34,7 +34,7 @@ impl GmailChangeState {
 }
 
 pub(crate) fn encode_gmail_state(state: &GmailChangeState) -> OpaqueChangeState {
-    let bytes = serde_json::to_vec(state).unwrap_or_default();
+    let bytes = serde_json::to_vec(state).expect("GmailChangeState must serialize");
     OpaqueChangeState {
         protocol: GMAIL_PROTOCOL,
         envelope_version: GMAIL_ENVELOPE_VERSION,
@@ -81,7 +81,7 @@ pub(crate) fn decode_gmail_state_for_profile(
     profile_email: &str,
 ) -> Result<GmailChangeState, Error> {
     let decoded = decode_gmail_state(state)?;
-    if decoded.profile_email != profile_email {
+    if !decoded.profile_email.eq_ignore_ascii_case(profile_email) {
         return Err(Error::Local(GmailLocalError::AccountIdentityMismatch {
             cursor_email: decoded.profile_email,
             profile_email: profile_email.to_string(),
@@ -170,6 +170,14 @@ mod tests {
         assert_eq!(decoded.history_id, 42);
         assert_eq!(decoded.profile_email, "a@example.test");
         assert_eq!(decoded.schema_version, GMAIL_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn accepts_matching_profile_with_different_ascii_case() {
+        let opaque = encode_gmail_state(&GmailChangeState::new(42, "Person@Example.Test"));
+        let decoded = decode_gmail_state_for_profile(&opaque, "person@example.test")
+            .expect("email identity comparison is case-insensitive");
+        assert_eq!(decoded.history_id, 42);
     }
 
     #[test]

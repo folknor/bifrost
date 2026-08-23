@@ -36,6 +36,20 @@ struct ClientInner {
 }
 
 impl GmailClient {
+    #[cfg(test)]
+    pub(crate) fn with_account_net(api_base: impl Into<String>, net: AccountNet) -> Self {
+        let token_source: Arc<dyn TokenSource> = Arc::new(StaticTokenSource::new("token", None));
+        Self {
+            inner: Arc::new(ClientInner {
+                net: Some(net),
+                parent_net: Net::shared_default(),
+                api_base: api_base.into().trim_end_matches('/').to_string(),
+                people_base: PEOPLE_API_BASE.to_string(),
+                token_source,
+            }),
+        }
+    }
+
     pub(crate) fn new(access_token: impl Into<String>) -> Self {
         Self::with_api_base(GMAIL_API_BASE, access_token)
     }
@@ -192,7 +206,7 @@ impl GmailClient {
         check_response_status(response, "Gmail API").await
     }
 
-    fn api_url(&self, path: &str) -> String {
+    pub(crate) fn api_url(&self, path: &str) -> String {
         if path.starts_with("http://") || path.starts_with("https://") {
             path.to_string()
         } else if path.starts_with('/') {
@@ -212,7 +226,7 @@ impl GmailClient {
         parse_json_response(response, "Gmail API").await
     }
 
-    async fn execute<B: Serialize>(
+    pub(crate) async fn execute<B: Serialize>(
         &self,
         url: &str,
         method: &str,
@@ -254,7 +268,10 @@ impl GmailClient {
     }
 }
 
-async fn parse_json_response<T: DeserializeOwned>(response: Response, _service: &str) -> Result<T> {
+pub(crate) async fn parse_json_response<T: DeserializeOwned>(
+    response: Response,
+    _service: &str,
+) -> Result<T> {
     let status = response.status();
     if !status.is_success() {
         let headers = crate::error::GmailResponseHeaders::from_headers(response.headers());

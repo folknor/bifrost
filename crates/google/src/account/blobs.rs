@@ -40,11 +40,11 @@ pub(crate) fn open_blob(
         stream::once(async move {
             let started = Instant::now();
             match download_blob(&client, &handle).await {
-                Ok(bytes) => SyncEvent::Batch(Batch {
+                Ok((bytes, transferred_size)) => SyncEvent::Batch(Batch {
                     items: vec![bytes],
                     page_boundary: PageBoundary::Final,
                     server_latency: started.elapsed(),
-                    bytes_in: handle.size.unwrap_or(0),
+                    bytes_in: transferred_size,
                     checkpoint: None,
                 }),
                 Err(error) => terminate_blob(translate(error, &handle.id)),
@@ -55,27 +55,20 @@ pub(crate) fn open_blob(
 }
 
 pub(crate) fn open_blob_range(
-    client: Arc<GmailClient>,
+    _client: Arc<GmailClient>,
     handle: BlobHandle,
     _range: ByteRange,
 ) -> AccountStream<SyncEvent<Bytes>> {
     // Gmail attachments never support byte ranges; the convergence
     // contract requires `Unsupported(OpenBlobRange)` rather than a
     // range-not-supported terminal error.
-    if !handle.capabilities.supports_range {
-        let error = error::into_account_error(
-            crate::error::Error::Local(GmailLocalError::BlobRangeUnsupported {
-                blob_id: handle.id.0.clone(),
-            }),
-            error::GmailErrorContext::open_blob_range(),
-        );
-        return Box::pin(stream::iter([terminate_blob(error)]));
-    }
-
-    // Defensive branch: the capability gate is the source of truth, but
-    // if a handle somehow advertises range support we slice locally.
-    let _ = client;
-    Box::pin(stream::empty())
+    let error = error::into_account_error(
+        crate::error::Error::Local(GmailLocalError::BlobRangeUnsupported {
+            blob_id: handle.id.0.clone(),
+        }),
+        error::GmailErrorContext::open_blob_range(),
+    );
+    Box::pin(stream::iter([terminate_blob(error)]))
 }
 
 /// Open a message's assembled RFC822 octets via Gmail `format=raw`.
@@ -214,14 +207,17 @@ enum BlobError {
     Gmail(crate::Error),
 }
 
-async fn download_blob(client: &GmailClient, handle: &BlobHandle) -> Result<Bytes, BlobError> {
+async fn download_blob(
+    client: &GmailClient,
+    handle: &BlobHandle,
+) -> Result<(Bytes, u64), BlobError> {
     let key = decode_blob_id(&handle.id)?;
-    let attachment = client
-        .get_attachment(&key.message_id, &key.attachment_id)
+    let (attachment, transferred_size) = client
+        .get_attachment_with_transferred_size(&key.message_id, &key.attachment_id)
         .await
         .map_err(BlobError::Gmail)?;
     let decoded = decode_base64url_nopad(&attachment.data).map_err(BlobError::Gmail)?;
-    Ok(Bytes::from(decoded))
+    Ok((Bytes::from(decoded), transferred_size))
 }
 
 fn decode_blob_id(id: &BlobId) -> Result<GmailBlobKey, BlobError> {
@@ -250,11 +246,34 @@ fn terminate_blob(error: AccountError) -> SyncEvent<Bytes> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use bifrost_net::test_support::{Canned, ScriptedDispatch};
+    use bifrost_net::{NetConfig, RetryPolicy, StaticTokenSource};
+    use futures::StreamExt;
+    use reqwest::StatusCode;
+
     use super::*;
     use serde_json::json;
 
     fn message(value: serde_json::Value) -> GmailMessage {
         serde_json::from_value(value).expect("message fixture deserializes")
+    }
+
+    fn scripted_client(body: Vec<u8>) -> Arc<GmailClient> {
+        let script = ScriptedDispatch::new([Canned::Response {
+            status: StatusCode::OK,
+            headers: reqwest::header::HeaderMap::new(),
+            body: Bytes::from(body),
+        }]);
+        let net = bifrost_net::test_support::scripted_account(
+            &script,
+            NetConfig::default(),
+            Vec::new(),
+            Arc::new(StaticTokenSource::new("token", None)),
+            RetryPolicy::disabled(),
+        );
+        Arc::new(GmailClient::with_account_net("https://gmail.test", net))
     }
 
     #[test]
@@ -411,5 +430,68 @@ mod tests {
         };
         assert_eq!(decoded.message_id, r#"m"1"#);
         assert_eq!(decoded.attachment_id, "a\\b");
+    }
+
+    #[tokio::test]
+    async fn open_blob_reports_the_transferred_json_size() {
+        let body = br#"{ "data": "aGVsbG8" }"#.to_vec();
+        let transferred = body.len() as u64;
+        let handle = BlobHandle {
+            id: encode_blob_id("m1", "a1"),
+            size: Some(5),
+            content_type: None,
+            digest: None,
+            capabilities: BlobCapabilities {
+                supports_range: false,
+                supports_parallel: false,
+                digest_available_pre_download: false,
+                encoding: BlobEncoding::Base64Url,
+            },
+        };
+
+        let events = open_blob(scripted_client(body), handle)
+            .collect::<Vec<_>>()
+            .await;
+        let SyncEvent::Batch(batch) = &events[0] else {
+            panic!("blob open must emit a batch");
+        };
+        assert_eq!(batch.items[0].as_ref(), b"hello");
+        assert_eq!(batch.bytes_in, transferred);
+        assert_ne!(batch.bytes_in, 5, "decoded size is not transferred size");
+    }
+
+    #[tokio::test]
+    async fn range_claim_on_a_forged_handle_still_returns_unsupported() {
+        let handle = BlobHandle {
+            id: encode_blob_id("m1", "a1"),
+            size: Some(5),
+            content_type: None,
+            digest: None,
+            capabilities: BlobCapabilities {
+                supports_range: true,
+                supports_parallel: false,
+                digest_available_pre_download: false,
+                encoding: BlobEncoding::Base64Url,
+            },
+        };
+        let client = scripted_client(br#"{"data":"aGVsbG8"}"#.to_vec());
+        let events = open_blob_range(
+            client,
+            handle,
+            ByteRange {
+                start: 0,
+                length: Some(1),
+            },
+        )
+        .collect::<Vec<_>>()
+        .await;
+        assert_eq!(events.len(), 1);
+        let SyncEvent::Terminated(error) = &events[0] else {
+            panic!("range open must terminate with Unsupported");
+        };
+        assert!(matches!(
+            error.kind(),
+            bifrost_types::AccountErrorKind::Unsupported(AccountOperation::OpenBlobRange)
+        ));
     }
 }

@@ -406,6 +406,83 @@ not build (the gate to run per commit is
 delivery); the async-only deletion and the DATA byte change need release
 notes.
 
+## From the bifrost-caldav / bifrost-carddav arc (closed 2026-08-23, `4f6e4cb` + `b7b86d6` + `5d4de38` + `ddc749f` plus close pass `0796b29`)
+
+- **Multistatus hrefs resolve against the EFFECTIVE request URI, never `base_url`.** RFC 4918
+  makes an href relative to the request URI, and the request URI is the POST-REDIRECT one:
+  `DavResponse` carries `response.url()`, `DavBody` pairs it with the body out of
+  `propfind_raw` / `report_raw` / `send_body_request`, and every parser takes it as its
+  resolution base. No `resolve_href(&self.base_url, ...)` survives in either crate.
+  `client.resolve_url` still uses `base_url` correctly - it runs id-to-URL on already-absolute
+  native ids and short-circuits on the scheme guard. Reintroducing a base-relative resolution
+  mints ids on the wrong host, which the credential allowlist then passes and which 404.
+- **Both DAV cursor payloads are at v2, and v1 is rejected, not decoded.** A v1 payload is
+  byte-identical in SHAPE to a v2 one, so a permissive decode hands back base-relative ids and
+  the snapshot diff emits every object as a delete plus a create. The rejection is classified
+  `SyncState(SchemaIncompatible)` and deliberately NOT a scope restart: only the
+  schema-incompatible directive also deletes the backfill checkpoint, and without the re-walk
+  the already-backfilled objects keep their pre-correction id spelling forever. Consumers take
+  one full re-sync per DAV account on upgrade, once. Do not reclassify this to `RestartScope`;
+  that makes the migration half-happen.
+- **Common-deployment ids did not move, and that is pinned against a literal.** The
+  pre-migration base was `base_url` with its trailing slash trimmed, and an absolute-path href
+  resolves identically against that, against the collection URI, and against a post-redirect
+  URI. The stability tests assert the literal id, so a regression cannot pass by changing both
+  sides at once. This is the invariant that makes the v2 bump a clean migration rather than a
+  silent id change; anything touching resolution must keep it.
+- **Redirects: same-origin inside reqwest, cross-origin by hand.** reqwest's
+  `remove_sensitive_headers` strips `Authorization`, `Cookie` and `Proxy-Authorization` on any
+  scheme, host or effective-port change, and the redirect policy closure runs earlier with no
+  header access - so a cross-origin hop followed INSIDE reqwest arrives unauthenticated and
+  401s. The policy therefore follows same-origin hops only (exact scheme/host/effective-port,
+  the credential gate's own origin definition), and a cross-origin 3xx surfaces to
+  `send_raw_request` for hop-bounded manual re-dispatch with fresh `auth_headers` for the
+  target. Method and body are preserved on 301/302/307/308; 303 is terminal. `auth_headers`
+  refuses unadmitted origins, so a server-controlled `Location` can SPEND trust that
+  authenticated discovery admitted but can never widen it. Moving the hop above the transport
+  seam is also what makes the leak hermetically observable - the reason this beat simply
+  refusing cross-origin hops.
+- **Discovery stages origins; `open` finalizes them before the client is shared.** Both trust
+  gates - credential and redirect - use the same exact-origin definition. A discovery transport
+  failure FAILS THE OPEN rather than silently degrading a capability: CalDAV discovery is one
+  principal lookup plus one multi-property PROPFIND (a test asserts the request count is
+  exactly 2), and a blip no longer bakes `event_rsvp = false` into an immutable field for the
+  account's lifetime.
+- **The propstat state machine commits on success only, and EVERY property obeys it.** The
+  collection marker stages with its propstat (`mark_collection`) and is promoted in
+  `commit_propstat`; promoting it immediately discards a resource whose own properties
+  succeeded but whose `resourcetype` block failed. `ResponseParts` is ONE `PropStat` struct
+  cleared with `mem::take` in both crates - CalDAV's eleven hand-maintained `propstat_*` twins,
+  reset in three places, were one forgotten field away from leaking a previous propstat's
+  value. The `propstat_success.unwrap_or(true)` hole stays closed because an UNPARSEABLE status
+  is still `Some(false)` while an ABSENT one stays `None` into success; `bifrost_net::status_line_code`
+  reading the status POSITION is what keeps tightening the parser from reopening it.
+- **Resource identification is not extension-based.** Listings accept extensionless resource
+  names in both crates, and CardDAV requests `resourcetype` so collections are excluded from
+  the success AND failure lanes. Extension-only gating silently dropped sync-collection
+  deletion entries and wedged the cursor in a permanent no-observation state.
+- **RSVP is non-atomic by nature, and says so.** Every failure path after the acknowledged
+  outbox POST - including the local encoding steps between the POST and the PUT - is wrapped
+  `Protocol(PartialResponse)` with `TransmissionState::Acknowledged`, so a consumer knows the
+  organizer was already told. Three of the four paths were left unwrapped by the first pass.
+- **These two crates are near-duplicates and DRIFT IS THE DEFECT.** Five separate bugs in this
+  one arc were CalDAV/CardDAV divergence: `escape_xml` quoting, the immediate collection-marker
+  promotion, the propstat twins, the phantom-collection asymmetry, and finally the close pass's
+  own find - `as_fetched_vcard` missing the `is_collection` guard its CalDAV twin got in round 1,
+  surfacing an echoed collection as a phantom card. Any fix to one crate's shared-shape code
+  must be checked against the other. Where the asymmetry is real - CardDAV has no
+  `sync-collection` path and discovers one property - it is design, not oversight.
+- Accepted residuals, on the record: RSVP's non-atomicity itself; the one-time re-sync from the
+  v2 bump; `changes_from_cursor`'s token-retention path having no direct test and the
+  missing-`sync_token` warning being log-only; `bifrost-caldav` taking `tracing` without `std`,
+  matching google and graph but not imap/sync/net/types (filed as a C2 in
+  `notes/bugs-cross-cutting.md`). Do not reopen these as findings without new evidence.
+- **Fenced, awaiting the repository owner, NOT closed:** the recurrence-override `EventId`
+  contract (C1, `event_delete` on one instance destroys the whole series), the single-collection
+  cursor scope (C1), the CardDAV phantom address book (C2), the silently-ignored CalDAV calendar
+  move (C1), and the `bifrost-dav` collapse (C4). Each would remove, rename, or reshape
+  published API or behavior. `notes/bugs-dav.md` holds them in full with their categories.
+
 ## Standing lessons this project has paid for
 
 - **The loop does not get to delete public API. Ever. Ask the owner.** This is
@@ -471,8 +548,9 @@ notes.
   close pass it found real defects in exactly that half.
 
 - **Which arcs have had a close pass.** `bugs-graph`, `bugs-imap`,
-  `bugs-jmap`, `bugs-smtp-sasl`, and `bugs-net-types` (close pass run
-  2026-08-22, after its two rounds) are all closed properly. The
+  `bugs-jmap`, `bugs-smtp-sasl`, `bugs-net-types` (close pass run
+  2026-08-22, after its two rounds), and `bugs-dav` (close pass `0796b29`,
+  2026-08-23, after four rounds) are all closed properly. The
   `bugs-net-types` close pass re-read the reconstructed `rate.rs` as new code
   and the un-cold-reviewed half of round 2, found no code defect, and fixed
   three doc-only drifts in `reference/net.md`; its residuals are recorded in

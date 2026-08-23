@@ -2,10 +2,10 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use bifrost_types::{
-    AccountOperation, AccountStream, Batch, BatchFailure, BatchItemId, BatchSuccess, Checkpoint,
-    CursorScope, Fingerprint, HydratedObject, HydratedObjectKind, InventoryEntry, ItemOutcome,
-    LabelId, MembershipScope, ObjectId, PageBoundary, Projection, ServerVersion, SyncEvent,
-    ThreadId,
+    AccountErrorKind, AccountOperation, AccountStream, Batch, BatchFailure, BatchItemId,
+    BatchSuccess, Checkpoint, CursorScope, Fingerprint, HydratedObject, HydratedObjectKind,
+    InventoryEntry, ItemOutcome, LabelId, MembershipScope, ObjectId, PageBoundary, Projection,
+    ResourceKind, ServerVersion, SyncEvent, ThreadId,
 };
 use bytes::Bytes;
 use futures::{StreamExt, stream};
@@ -128,6 +128,18 @@ pub(crate) fn inventory_stream(
                             error,
                             error::GmailErrorContext::inventory(),
                         );
+                        // A message may be deleted after users.messages.list
+                        // names it and before users.messages.get hydrates it.
+                        // Inventory has no per-item failure lane, and absence
+                        // is the correct current state, so absorb only this
+                        // precisely classified race. Every other failure still
+                        // terminates the walk.
+                        if matches!(
+                            account_error.kind(),
+                            AccountErrorKind::NotFound(ResourceKind::Message)
+                        ) {
+                            continue;
+                        }
                         yield SyncEvent::Terminated(account_error);
                         return;
                     }
@@ -135,15 +147,13 @@ pub(crate) fn inventory_stream(
             }
 
             if final_page {
-                if !items.is_empty() {
-                    yield SyncEvent::Batch(Batch {
-                        items,
-                        page_boundary: PageBoundary::Final,
-                        server_latency: started.elapsed(),
-                        bytes_in: 0,
-                        checkpoint: checkpoint.clone(),
-                    });
-                }
+                yield SyncEvent::Batch(Batch {
+                    items,
+                    page_boundary: PageBoundary::Final,
+                    server_latency: started.elapsed(),
+                    bytes_in: 0,
+                    checkpoint: checkpoint.clone(),
+                });
                 yield SyncEvent::Done(checkpoint);
                 break;
             }
@@ -187,16 +197,32 @@ pub(crate) fn get_stream(
         }
 
         let mut ids = Vec::new();
+        // `final_batch` is set only when the drain itself observes the id
+        // stream close. Never poll past a full batch to learn whether more
+        // ids follow: `ids` is a backpressured producer that may be waiting
+        // on our output before it yields again, so a lookahead poll here
+        // deadlocks hydration against its own caller, and even when it does
+        // not it holds every batch hostage until one more id arrives. A full
+        // last batch therefore stays `Page` and the terminator is the
+        // following `Done`; the boundary is advisory and losing it on that
+        // one alignment is strictly cheaper than a stall.
+        let mut final_batch = false;
         while ids.len() < HYDRATE_BATCH_SIZE {
             match state.ids.next().await {
                 Some(id) => ids.push(id),
-                None => break,
+                None => {
+                    final_batch = true;
+                    break;
+                }
             }
         }
         if ids.is_empty() {
             state.finished = true;
             state.emitted_done = true;
             return Some((SyncEvent::Done(None), state));
+        }
+        if final_batch {
+            state.finished = true;
         }
 
         // Resolved after the id drain, not before it: `labels_for_flags`
@@ -247,7 +273,11 @@ pub(crate) fn get_stream(
         Some((
             SyncEvent::Batch(Batch {
                 items,
-                page_boundary: PageBoundary::Page,
+                page_boundary: if final_batch {
+                    PageBoundary::Final
+                } else {
+                    PageBoundary::Page
+                },
                 server_latency: started.elapsed(),
                 bytes_in: 0,
                 checkpoint: None,
@@ -411,6 +441,13 @@ fn non_negative_u64(value: Option<i64>) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use bifrost_net::test_support::{Canned, ScriptedDispatch, canned};
+    use bifrost_net::{NetConfig, RetryPolicy, StaticTokenSource};
+    use futures::StreamExt;
+    use reqwest::StatusCode;
+
     use super::*;
     use serde_json::json;
 
@@ -436,6 +473,28 @@ mod tests {
             label_type: Some("user".to_owned()),
             color: None,
         }]
+    }
+
+    fn scripted_client(steps: Vec<Canned>) -> Arc<GmailClient> {
+        let script = ScriptedDispatch::new(steps);
+        let token_source = Arc::new(StaticTokenSource::new("token", None));
+        let net = bifrost_net::test_support::scripted_account(
+            &script,
+            NetConfig::default(),
+            Vec::new(),
+            token_source,
+            RetryPolicy::disabled(),
+        );
+        Arc::new(GmailClient::with_account_net("https://gmail.test", net))
+    }
+
+    fn ok_json(value: serde_json::Value) -> Canned {
+        let body = serde_json::to_vec(&value).expect("fixture serializes");
+        Canned::Response {
+            status: StatusCode::OK,
+            headers: reqwest::header::HeaderMap::new(),
+            body: Bytes::from(body),
+        }
     }
 
     #[test]
@@ -661,5 +720,138 @@ mod tests {
             super::super::cursor::decode_gmail_state(&cursor.server_state).expect("decode state");
         assert_eq!(state.history_id, 100);
         assert_eq!(state.profile_email, "person@example.com");
+    }
+
+    #[tokio::test]
+    async fn inventory_absorbs_a_list_get_not_found_race_and_finishes() {
+        let client = scripted_client(vec![
+            ok_json(json!({ "emailAddress": "person@example.com", "historyId": "100" })),
+            ok_json(json!({ "labels": [] })),
+            ok_json(json!({ "messages": [{ "id": "gone" }, { "id": "live" }] })),
+            canned(
+                StatusCode::NOT_FOUND,
+                br#"{"error":{"code":404,"message":"Not Found","status":"NOT_FOUND"}}"#,
+            ),
+            ok_json(json!({ "id": "live", "threadId": "thread-live" })),
+        ]);
+
+        let events = inventory_stream(
+            client,
+            Arc::new(std::sync::RwLock::new(
+                super::super::scopes::ScopeSnapshot::empty(),
+            )),
+            CursorScope::Account,
+        )
+        .collect::<Vec<_>>()
+        .await;
+
+        assert_eq!(events.len(), 2);
+        let SyncEvent::Batch(batch) = &events[0] else {
+            panic!("inventory must emit its surviving final batch");
+        };
+        assert!(matches!(batch.page_boundary, PageBoundary::Final));
+        assert_eq!(batch.items.len(), 1);
+        assert_eq!(batch.items[0].id, ObjectId("live".to_string()));
+        assert!(matches!(events[1], SyncEvent::Done(Some(_))));
+    }
+
+    #[tokio::test]
+    async fn empty_inventory_emits_a_checkpointed_final_batch() {
+        let client = scripted_client(vec![
+            ok_json(json!({ "emailAddress": "person@example.com", "historyId": "100" })),
+            ok_json(json!({ "labels": [] })),
+            ok_json(json!({ "messages": [] })),
+        ]);
+
+        let events = inventory_stream(
+            client,
+            Arc::new(std::sync::RwLock::new(
+                super::super::scopes::ScopeSnapshot::empty(),
+            )),
+            CursorScope::Account,
+        )
+        .collect::<Vec<_>>()
+        .await;
+
+        assert_eq!(events.len(), 2);
+        let SyncEvent::Batch(batch) = &events[0] else {
+            panic!("empty inventory must still expose its final boundary");
+        };
+        assert!(batch.items.is_empty());
+        assert!(matches!(batch.page_boundary, PageBoundary::Final));
+        assert!(batch.checkpoint.is_some());
+        assert!(matches!(events[1], SyncEvent::Done(Some(_))));
+    }
+
+    #[tokio::test]
+    async fn get_stream_marks_its_last_nonempty_batch_final() {
+        let client = scripted_client(vec![
+            ok_json(json!({ "labels": [] })),
+            ok_json(json!({ "id": "m1", "threadId": "t1" })),
+            ok_json(json!({ "id": "m2", "threadId": "t2" })),
+        ]);
+        let ids = Box::pin(stream::iter([
+            ObjectId("m1".to_string()),
+            ObjectId("m2".to_string()),
+        ]));
+
+        let events = get_stream(
+            client,
+            Arc::new(std::sync::RwLock::new(
+                super::super::scopes::ScopeSnapshot::empty(),
+            )),
+            ids,
+            Projection::Metadata,
+        )
+        .collect::<Vec<_>>()
+        .await;
+
+        assert_eq!(events.len(), 2);
+        let SyncEvent::Batch(batch) = &events[0] else {
+            panic!("hydration must emit a batch");
+        };
+        assert!(matches!(batch.page_boundary, PageBoundary::Final));
+        assert_eq!(batch.items.len(), 2);
+        assert!(matches!(events[1], SyncEvent::Done(None)));
+    }
+
+    // A backpressured producer hands over a full batch and then goes quiet
+    // while it waits for hydration output. Hydration must emit that batch
+    // without polling the id stream again; a lookahead poll to decide the
+    // page boundary parks here forever. Time is paused, so the timeout fires
+    // only once every other task is idle - that is the deadlock, not a race
+    // against a wall clock.
+    #[tokio::test(start_paused = true)]
+    async fn hydration_emits_a_full_batch_without_waiting_for_another_id() {
+        let mut script = vec![ok_json(json!({ "labels": [] }))];
+        let mut ids = Vec::new();
+        for index in 0..HYDRATE_BATCH_SIZE {
+            let id = format!("m{index}");
+            script.push(ok_json(json!({ "id": id, "threadId": "t" })));
+            ids.push(ObjectId(id));
+        }
+
+        // Yields exactly one full batch, then stays open and pending.
+        let id_stream = Box::pin(stream::iter(ids).chain(stream::once(futures::future::pending())));
+
+        let mut events = get_stream(
+            scripted_client(script),
+            Arc::new(std::sync::RwLock::new(
+                super::super::scopes::ScopeSnapshot::empty(),
+            )),
+            id_stream,
+            Projection::Metadata,
+        );
+
+        let first = tokio::time::timeout(std::time::Duration::from_secs(30), events.next())
+            .await
+            .expect("hydration must not block on an id beyond the batch it already holds");
+
+        let Some(SyncEvent::Batch(batch)) = first else {
+            panic!("hydration must emit the full batch it already holds");
+        };
+        assert_eq!(batch.items.len(), HYDRATE_BATCH_SIZE);
+        // The producer is still open, so this batch cannot claim to be final.
+        assert!(matches!(batch.page_boundary, PageBoundary::Page));
     }
 }

@@ -185,6 +185,22 @@ impl GmailClient {
         .await
     }
 
+    pub(crate) async fn get_attachment_with_transferred_size(
+        &self,
+        message_id: &str,
+        attachment_id: &str,
+    ) -> Result<(GmailAttachmentData, u64)> {
+        let message_id = bifrost_net::url::encode_path_component(message_id);
+        let attachment_id = bifrost_net::url::encode_path_component(attachment_id);
+        let url = self.api_url(&format!(
+            "/messages/{message_id}/attachments/{attachment_id}"
+        ));
+        let response = self.execute(&url, "GET", None::<&()>).await?;
+        let transferred_size = u64::try_from(response.body.len()).unwrap_or(u64::MAX);
+        let attachment = super::client::parse_json_response(response, "Gmail API").await?;
+        Ok((attachment, transferred_size))
+    }
+
     pub(crate) async fn get_history(
         &self,
         start_history_id: &str,

@@ -378,13 +378,16 @@ safety net, and wiring `If-Match` is a deferred concurrency-model decision.
 
 `encode_gmail_state` serializes to JSON and wraps as
 `OpaqueChangeState { protocol: ProtocolKind::Gmail,
-envelope_version: 1, bytes }`. `decode_gmail_state` rejects
+envelope_version: 1, bytes }`. Serialization is an invariant boundary:
+the data-only state must serialize, and an impossible encoder failure
+panics instead of minting an empty poisoned cursor. `decode_gmail_state` rejects
 wrong protocol, wrong envelope version, and wrong schema
 version, mapping each to `AccountError::SchemaIncompatible`.
 JSON deserialization errors map to `AccountError::Other`.
 
 `decode_gmail_state_for_profile` layers an identity check on top: the decoded
-`profile_email` must equal the open account's `email_address`. A mismatch
+`profile_email` must equal the open account's `email_address` under an
+ASCII-case-insensitive comparison. A mismatch
 returns `AccountError::Other` describing both sides, preventing a checkpoint
 from one Google account being replayed into another (for example after the
 consumer rotates accounts under the same persistence key).
@@ -409,7 +412,12 @@ page, then walks `users.messages.list` in pages of 500 ids and
 hydrates each page through `users.messages.get` with the `metadata`
 format under `buffer_unordered` concurrency of 32. Page boundaries are
 `PageBoundary::Page` for intermediate batches and `PageBoundary::Final`
-for the last batch.
+for the last batch. The final batch is emitted even when it has no items,
+so an empty mailbox or a terminal page whose listed messages all vanished
+still exposes the boundary and checkpoint. A message-level
+`NotFound(Message)` during hydration is absorbed as the ordinary
+list/get deletion race; every other classified hydration failure terminates
+the inventory stream.
 
 The checkpoint that final batch and the terminal `Done` carry is
 derived from the pre-walk profile sample, and **the engine does not
@@ -456,6 +464,16 @@ Per-item hydration outcomes flow as `ItemOutcome::Succeeded` for a
 hydrated message and `ItemOutcome::Failed(BatchFailure)` carrying
 the classified `AccountError` for an id that Gmail refused or that
 parsed badly. A single bad id no longer poisons the stream. The
+boundary a hydration batch carries is derived only from what draining
+the id stream already revealed: a batch cut short because the id stream
+closed is `PageBoundary::Final`, every other batch is `PageBoundary::Page`,
+and an empty input emits only `Done(None)`. A last batch that happens to
+fill exactly to the 32-id hydration width therefore stays `Page`, with the
+terminal `Done(None)` as its only end marker. This is deliberate and must
+not be "fixed" with a one-item lookahead: the ids arrive from a
+backpressured producer that may be waiting on hydration output before it
+yields again, so polling for one more id before hydrating the batch
+already in hand deadlocks the two sides against each other. The
 dispatch per `Projection` is:
 
 - `FlagsOnly` - `format=minimal` then `flag_set` over the label list.
@@ -471,7 +489,9 @@ dispatch per `Projection` is:
 account still matches the cursor's recorded identity. A drift
 yields a `SyncEvent::Terminated(AccountError)` with kind
 `SyncState(SchemaIncompatible)`, which the central mapping
-resolves to `Engine(SchemaIncompatible)`. With the identity
+resolves to `Engine(SchemaIncompatible)`. Email identity comparisons
+are ASCII-case-insensitive in both cursor decoding and the live profile
+check. With the identity
 confirmed, the stream pages `users.history.list` from
 `startHistoryId`. Intermediate pages emit `checkpoint: None`, because
 Gmail's opaque page token is not represented in the cursor and the
@@ -628,13 +648,13 @@ than wiring it onto the request.
 `{ message_id, attachment_id }` payload), fetches the
 attachment, base64url-decodes the body, and emits a single
 `Batch { items: vec![bytes], page_boundary: Final }` followed
-by `Done`.
+by `Done`. The batch's `bytes_in` is the exact buffered JSON response-body
+length transferred, not the smaller decoded attachment size.
 
-`open_blob_range` short-circuits with a Fatal carrying
-`AccountError::RangeNotSupported` when the handle's `supports_range`
-is false - the builder always sets it false for Gmail blobs. The
-range-supporting branch (slicing the decoded buffer) exists for trait
-symmetry but is unreachable.
+`open_blob_range` always short-circuits with a Fatal carrying
+`Unsupported(OpenBlobRange)`. Gmail attachment bodies are base64url inside
+JSON and expose no byte-range transport, and a forged handle claiming range
+support cannot bypass that provider capability.
 
 `attachments_for_message` walks the MIME tree, surfacing any part
 whose `body.attachment_id` is set as a `MessageAttachment` with

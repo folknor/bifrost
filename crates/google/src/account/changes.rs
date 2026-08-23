@@ -73,7 +73,10 @@ pub(crate) fn changes_stream(
                     return Some((SyncEvent::Terminated(account_error), state));
                 }
             };
-            if decoded.profile_email != state.profile.email_address {
+            if !decoded
+                .profile_email
+                .eq_ignore_ascii_case(&state.profile.email_address)
+            {
                 state.finished = true;
                 state.emitted_done = true;
                 let account_error = account_error::into_account_error(
@@ -86,7 +89,11 @@ pub(crate) fn changes_stream(
                 return Some((SyncEvent::Terminated(account_error), state));
             }
             match state.client.get_profile().await {
-                Ok(current) if current.email_address == decoded.profile_email => {
+                Ok(current)
+                    if current
+                        .email_address
+                        .eq_ignore_ascii_case(&decoded.profile_email) =>
+                {
                     state.start_history_id = Some(decoded.history_id.to_string());
                     state.checked_profile = true;
                 }
@@ -270,6 +277,14 @@ fn label_ids(message: &GmailMessage) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use bifrost_net::test_support::{Canned, ScriptedDispatch};
+    use bifrost_net::{NetConfig, RetryPolicy, StaticTokenSource};
+    use bytes::Bytes;
+    use futures::StreamExt;
+    use reqwest::StatusCode;
+
     use super::*;
     use serde_json::json;
 
@@ -289,12 +304,56 @@ mod tests {
         serde_json::from_value(value).expect("history fixture deserializes")
     }
 
+    fn ok_json(value: serde_json::Value) -> Canned {
+        Canned::Response {
+            status: StatusCode::OK,
+            headers: reqwest::header::HeaderMap::new(),
+            body: Bytes::from(serde_json::to_vec(&value).expect("fixture serializes")),
+        }
+    }
+
+    fn scripted_client(steps: Vec<Canned>) -> Arc<GmailClient> {
+        let script = ScriptedDispatch::new(steps);
+        let net = bifrost_net::test_support::scripted_account(
+            &script,
+            NetConfig::default(),
+            Vec::new(),
+            Arc::new(StaticTokenSource::new("token", None)),
+            RetryPolicy::disabled(),
+        );
+        Arc::new(GmailClient::with_account_net("https://gmail.test", net))
+    }
+
     fn message(id: &str, labels: &[&str]) -> serde_json::Value {
         json!({
             "id": id,
             "threadId": format!("t-{id}"),
             "labelIds": labels,
         })
+    }
+
+    #[tokio::test]
+    async fn changes_accepts_profile_email_case_drift() {
+        let client = scripted_client(vec![
+            ok_json(json!({ "emailAddress": "PERSON@example.com", "historyId": "100" })),
+            ok_json(json!({ "historyId": "101", "history": [] })),
+        ]);
+        let profile = GmailProfile {
+            email_address: "person@example.com".to_string(),
+            history_id: "100".to_string(),
+        };
+        let cursor = cursor_for_history(100, "Person@Example.com");
+
+        let events = changes_stream(client, profile, cursor)
+            .collect::<Vec<_>>()
+            .await;
+
+        assert_eq!(events.len(), 2);
+        let SyncEvent::Batch(batch) = &events[0] else {
+            panic!("case-only profile drift must not terminate changes");
+        };
+        assert!(matches!(batch.page_boundary, PageBoundary::Final));
+        assert!(matches!(events[1], SyncEvent::Done(None)));
     }
 
     fn object_changes(changes: &[Change]) -> Vec<(String, ObjectChangeKind)> {
