@@ -52,7 +52,7 @@ The line is hermeticity, not size. A test belongs here if it is deterministic an
 Use `brokkr` (not `cargo`) for check/test. By default output is filtered to changed files and capped at 20 diagnostics per phase.
 
 - `brokkr check` - gremlins + clippy + all tests (changed-files scope)
-- `brokkr check --all` - show every diagnostic, no cap, no scope filter
+- `brokkr check --triage` - show every gremlins/clippy diagnostic, no cap, no scope filter, sorted by (level, lint code, file, line). Does not widen the test phase; the failure list was never capped or scoped. (There is no `--all` flag - `brokkr check` rejects it. `--gate` exists but needs a `[test] gate_profile` in `brokkr.toml`, which this project does not define.)
 - `brokkr check -p <crate>` - scope to one package (e.g. `-p app`). You generally do not want to run this; a single `brokkr check` is faster than 2-3 `-p` runs, and brokkr intelligently filters which warnings and errors to show you
 - `brokkr check -- --test <file>` - forward args to `cargo test` (args after the second `--` go to the test binary)
 - `brokkr test -p <crate> <NAME>` - focused single-test runner. Always passes `--include-ignored --nocapture --test-threads=1`. Profile comes from `[test] debug` in `brokkr.toml`, which is currently `true`, so it builds dev by default. `<NAME>` is a case-sensitive substring filter (matches both unit and integration tests). Streams the test's own stdout/stderr live and prints a `[test] PASS/FAIL` footer with wall time. Defaults to `--all-features`; runs a second sweep if `[check].consumer_features` is set in `brokkr.toml`. Gated off for litehtml/sluggrs (use `brokkr visual` there).

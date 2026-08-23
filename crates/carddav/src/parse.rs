@@ -233,8 +233,23 @@ pub(crate) fn parse_propfind_contacts(xml: &str) -> Result<CardDavContactListing
                 if current.in_response && name == "propstat" {
                     current.begin_propstat();
                 }
+                if current.in_response
+                    && name == "collection"
+                    && stack.iter().any(|item| item == "resourcetype")
+                {
+                    current.mark_collection();
+                }
                 stack.push(name);
                 text.clear();
+            }
+            Ok(Event::Empty(element)) => {
+                let name = local_name(element.name().as_ref());
+                if current.in_response
+                    && name == "collection"
+                    && stack.iter().any(|item| item == "resourcetype")
+                {
+                    current.mark_collection();
+                }
             }
             Ok(Event::Text(value)) => {
                 push_text(&mut text, value.as_ref())?;
@@ -304,7 +319,7 @@ pub(crate) fn parse_multiget_report(xml: &str) -> Result<CardDavMultigetReport, 
                     && name == "collection"
                     && stack.iter().any(|item| item == "resourcetype")
                 {
-                    current.is_collection = true;
+                    current.mark_collection();
                 }
                 stack.push(name);
                 text.clear();
@@ -315,7 +330,7 @@ pub(crate) fn parse_multiget_report(xml: &str) -> Result<CardDavMultigetReport, 
                     && name == "collection"
                     && stack.iter().any(|item| item == "resourcetype")
                 {
-                    current.is_collection = true;
+                    current.mark_collection();
                 }
             }
             Ok(Event::Text(value)) => {
@@ -525,13 +540,6 @@ fn normalize_etag(text: &str) -> Option<String> {
     })
 }
 
-fn is_vcard_resource(href: &str, content_type: &Option<String>) -> bool {
-    content_type
-        .as_deref()
-        .is_some_and(|ty| ty.to_ascii_lowercase().contains("text/vcard"))
-        || href.to_ascii_lowercase().ends_with(".vcf")
-}
-
 fn local_name(raw: &[u8]) -> String {
     let full = String::from_utf8_lossy(raw);
     match full.rfind(':') {
@@ -555,6 +563,7 @@ struct PropStat {
     success: Option<bool>,
     status: Option<String>,
     is_addressbook: bool,
+    is_collection: bool,
     etag: Option<String>,
     content_type: Option<String>,
     address_data: Option<String>,
@@ -595,6 +604,20 @@ impl ResponseParts {
         self.staged = PropStat::default();
     }
 
+    /// A `resourcetype` the server refused is not evidence about the
+    /// resource, so a `collection` marker seen inside a propstat is staged
+    /// and only promoted when that propstat's own status was 2xx. Otherwise
+    /// a response whose contact properties succeeded but whose `resourcetype`
+    /// block was rejected (echoing back `<collection/>` in the 404 prop
+    /// skeleton) would be discarded as a collection.
+    fn mark_collection(&mut self) {
+        if self.in_propstat {
+            self.staged.is_collection = true;
+        } else {
+            self.is_collection = true;
+        }
+    }
+
     fn mark_addressbook(&mut self) {
         if self.in_propstat {
             self.staged.is_addressbook = true;
@@ -618,6 +641,7 @@ impl ResponseParts {
         if staged.success.unwrap_or(true) {
             self.has_success_propstat = true;
             self.is_addressbook |= staged.is_addressbook;
+            self.is_collection |= staged.is_collection;
             commit_if_present(&mut self.etag, staged.etag);
             commit_if_present(&mut self.content_type, staged.content_type);
             commit_if_present(&mut self.address_data, staged.address_data);
@@ -640,10 +664,7 @@ impl ResponseParts {
 
     fn as_contact_entry(&self) -> Option<CardDavContactEntry> {
         let href = self.href.as_ref()?;
-        if !self.has_success_propstat {
-            return None;
-        }
-        if !is_vcard_resource(href, &self.content_type) {
+        if self.is_collection || !self.has_success_propstat {
             return None;
         }
         Some(CardDavContactEntry {
@@ -653,20 +674,13 @@ impl ResponseParts {
     }
 
     /// The href of a resource the server reported *failed* within the
-    /// 207 (a non-2xx propstat, no success propstat). Only vcard
-    /// resources are surfaced - a failed collection is not a
-    /// transiently-failed resource and must not leak into the
-    /// failed-href channel. Content-type is committed only on success,
-    /// so detection keys on the `.vcf` href suffix.
+    /// 207 (a non-2xx propstat, no success propstat). A response known
+    /// to be a collection is excluded; resource names need no `.vcf` suffix.
     fn as_failed_contact_href(&self) -> Option<String> {
-        if self.has_success_propstat || !self.saw_failed_propstat {
+        if self.is_collection || self.has_success_propstat || !self.saw_failed_propstat {
             return None;
         }
-        let href = self.href.as_ref()?;
-        if !href.to_ascii_lowercase().ends_with(".vcf") {
-            return None;
-        }
-        Some(href.clone())
+        self.href.clone()
     }
 
     fn as_fetched_vcard(&self) -> Option<CardDavFetchedVCard> {
@@ -723,6 +737,7 @@ mod tests {
     <D:href>/contacts/</D:href>
     <D:propstat>
       <D:prop>
+        <D:resourcetype><D:collection/></D:resourcetype>
         <D:getetag>"collection"</D:getetag>
         <D:getcontenttype>httpd/unix-directory</D:getcontenttype>
       </D:prop>
@@ -739,6 +754,22 @@ mod tests {
             }]
         );
         assert!(listing.failed_hrefs.is_empty());
+    }
+
+    #[test]
+    fn propfind_contacts_accepts_extensionless_resources_and_skips_collections() {
+        let xml = r#"<D:multistatus xmlns:D="DAV:">
+          <D:response><D:href>/contacts/opaque-id</D:href><D:propstat><D:prop>
+          <D:resourcetype/><D:getetag>"abc"</D:getetag></D:prop>
+          <D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>
+          <D:response><D:href>/contacts/child</D:href><D:propstat><D:prop>
+          <D:resourcetype><D:collection/></D:resourcetype></D:prop>
+          <D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>
+          </D:multistatus>"#;
+
+        let listing = parse_propfind_contacts(xml).expect("valid XML");
+        assert_eq!(listing.entries.len(), 1);
+        assert_eq!(listing.entries[0].uri, "/contacts/opaque-id");
     }
 
     #[test]
@@ -766,6 +797,43 @@ mod tests {
             listing.failed_hrefs,
             vec!["/contacts/card-1.vcf".to_string()]
         );
+    }
+
+    #[test]
+    fn propfind_contacts_preserves_failed_extensionless_resource_but_not_collection() {
+        let xml = r#"<D:multistatus xmlns:D="DAV:">
+          <D:response><D:href>/contacts/opaque-id</D:href><D:propstat><D:prop><D:getetag/></D:prop>
+          <D:status>HTTP/1.1 503 Unavailable</D:status></D:propstat></D:response>
+          <D:response><D:href>/contacts/child</D:href>
+          <D:propstat><D:prop><D:resourcetype><D:collection/></D:resourcetype></D:prop>
+          <D:status>HTTP/1.1 200 OK</D:status></D:propstat>
+          <D:propstat><D:prop><D:getetag/></D:prop>
+          <D:status>HTTP/1.1 503 Unavailable</D:status></D:propstat></D:response>
+          </D:multistatus>"#;
+
+        let listing = parse_propfind_contacts(xml).expect("valid XML");
+        assert_eq!(listing.failed_hrefs, vec!["/contacts/opaque-id"]);
+    }
+
+    /// A `resourcetype` block the server REFUSED says nothing about the
+    /// resource. Servers routinely echo the requested prop skeleton back
+    /// inside a 404 propstat, and some echo a `<collection/>` child with
+    /// it; treating that as authoritative discarded a real contact whose
+    /// own properties came back 200.
+    #[test]
+    fn propfind_contacts_ignores_collection_marker_in_a_failed_propstat() {
+        let xml = r#"<D:multistatus xmlns:D="DAV:">
+          <D:response><D:href>/contacts/opaque-id</D:href>
+          <D:propstat><D:prop><D:getetag>"abc"</D:getetag></D:prop>
+          <D:status>HTTP/1.1 200 OK</D:status></D:propstat>
+          <D:propstat><D:prop><D:resourcetype><D:collection/></D:resourcetype></D:prop>
+          <D:status>HTTP/1.1 404 Not Found</D:status></D:propstat></D:response>
+          </D:multistatus>"#;
+
+        let listing = parse_propfind_contacts(xml).expect("valid XML");
+        assert_eq!(listing.entries.len(), 1);
+        assert_eq!(listing.entries[0].uri, "/contacts/opaque-id");
+        assert_eq!(listing.entries[0].etag, Some("abc".to_string()));
     }
 
     #[test]

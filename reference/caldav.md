@@ -51,9 +51,19 @@ calendar primitives.
   `propstat` and committed only for successful 2xx statuses or a missing
   status, which RFC 4918 requires but the parser tolerates as success.
   `parse_propfind_events` returns a
-  `CalDavEventListing`: committed `entries` plus `failed_hrefs` (`.ics`
-  resources whose only propstat failed within the 207), so the snapshot
+  `CalDavEventListing`: committed non-collection `entries` plus
+  `failed_hrefs` (non-collection resources whose only propstat failed within
+  the 207), so the snapshot
   diff preserves a transiently-failed resource instead of destroying it.
+  Resource identification does not depend on an `.ics` suffix or a returned
+  content type. The depth-1 listing requests `resourcetype` and excludes
+  collections; `sync-collection` accepts every returned member href because
+  that REPORT supplies neither content type nor a naming convention. The
+  `collection` marker obeys the same commit-on-success rule as every other
+  property: seen inside a `propstat` it is staged and promoted only if that
+  block's status was 2xx, so a server echoing the requested prop skeleton
+  (`<collection/>` included) back inside a 404 propstat cannot discard an
+  event whose own properties came back 200.
   Event listing and multiget parsers use element-stack parent checks so
   nested same-name properties do not overwrite response-level hrefs or
   propstat status. Every text-bearing parser accepts both XML text and
@@ -144,6 +154,8 @@ Supported calendar primitives:
   `time-range` filter and calendar-data hydration, followed by local
   overlap filtering as a defensive guard. Invalid time bounds fail locally
   before a REPORT is sent, and the encoder preserves legal one-sided ranges.
+  Query REPORTs use `Depth: 1`; `calendar-multiget` REPORTs enumerate their
+  hrefs in the body and use `Depth: 0`.
   The local guard is
   recurrence-aware: a recurring master whose own interval sits outside the
   window is retained when its RRULE can still yield an in-window occurrence

@@ -291,7 +291,9 @@ impl CardDavClient {
   </D:prop>\n\
 {href_elements}</C:addressbook-multiget>"
             );
-            let response = self.report_raw(addressbook_url, &body, operation).await?;
+            let response = self
+                .report_raw(addressbook_url, "0", &body, operation)
+                .await?;
             let mut parsed = parse_multiget_report(&response)
                 .map_err(|error| parse_error(operation, format!("multiget: {error}")))?;
             parsed.resolve_hrefs(&self.base_url);
@@ -313,7 +315,7 @@ impl CardDavClient {
         for property in ["FN", "N", "EMAIL", "TEL", "ADR", "ORG", "TITLE", "NOTE"] {
             let body = addressbook_text_query_body(property, query);
             let response = self
-                .report_raw(addressbook_url, &body, AccountOperation::ContactSearch)
+                .report_raw(addressbook_url, "1", &body, AccountOperation::ContactSearch)
                 .await?;
             let mut parsed = parse_multiget_report(&response).map_err(|error| {
                 parse_error(AccountOperation::ContactSearch, format!("query: {error}"))
@@ -422,6 +424,7 @@ impl CardDavClient {
     async fn report_raw(
         &self,
         url: &str,
+        depth: &str,
         body: &str,
         operation: AccountOperation,
     ) -> Result<String, AccountError> {
@@ -431,7 +434,7 @@ impl CardDavClient {
             .http
             .request(method, url)
             .header(CONTENT_TYPE, "application/xml; charset=utf-8")
-            .header("Depth", "1")
+            .header("Depth", depth)
             .headers(self.auth_headers(url, operation).await?)
             .body(body.to_string());
         self.send_body_request(request, operation).await
@@ -595,6 +598,8 @@ fn escape_xml(value: &str) -> String {
         .replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
 }
 
 fn addressbook_text_query_body(property: &str, query: &str) -> String {
@@ -704,7 +709,14 @@ fn recovery_rank(class: &RecoveryClass) -> u8 {
         | RecoveryClass::NoPermission { .. } => 3,
         RecoveryClass::Retry(_) => 0,
         RecoveryClass::Reconcile(_) | RecoveryClass::Engine(_) => 1,
-        _ => 2,
+        RecoveryClass::Unsupported(_)
+        | RecoveryClass::ClientBug
+        | RecoveryClass::ProviderContractViolation
+        | RecoveryClass::ProviderRefused
+        | RecoveryClass::UnknownPermanent => 2,
+        // RecoveryClass is non-exhaustive. An unknown future class must win
+        // rather than being silently ranked below a known terminal failure.
+        _ => u8::MAX,
     }
 }
 
@@ -902,6 +914,7 @@ const PROPFIND_CTAG: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
 const PROPFIND_CONTACTS: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
 <D:propfind xmlns:D=\"DAV:\">\n\
   <D:prop>\n\
+    <D:resourcetype/>\n\
     <D:getetag/>\n\
     <D:getcontenttype/>\n\
   </D:prop>\n\
@@ -1165,7 +1178,7 @@ mod tests {
                 .headers
                 .get("depth")
                 .and_then(|value| value.to_str().ok()),
-            Some("1")
+            Some("0")
         );
         assert_eq!(
             requests[0]
@@ -1296,6 +1309,34 @@ mod tests {
     }
 
     #[test]
+    fn addressbook_text_query_escapes_quotes_consistently() {
+        let body = addressbook_text_query_body("EMAIL", "Ada's \"team\"");
+        assert!(body.contains("Ada&apos;s &quot;team&quot;"));
+    }
+
+    #[tokio::test]
+    async fn addressbook_multiget_uses_depth_zero() {
+        let script = ScriptedDavTransport::new([DavResponse {
+            status: StatusCode::MULTI_STATUS,
+            headers: HeaderMap::new(),
+            body: "<D:multistatus xmlns:D=\"DAV:\"/>".to_string(),
+        }]);
+        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
+        let client = CardDavClient::with_transport("https://dav.example.test", transport);
+
+        client
+            .fetch_vcards(
+                "https://dav.example.test/book/",
+                &["https://dav.example.test/book/opaque-id".to_string()],
+                AccountOperation::ContactsList,
+            )
+            .await
+            .expect("empty multistatus is usable");
+
+        assert_eq!(script.requests()[0].headers["Depth"], "0");
+    }
+
+    #[test]
     fn weak_etag_is_never_sent_in_if_match() {
         assert_eq!(normalize_http_etag("W/\"abc\""), "W/\"abc\"");
         assert_eq!(prepare_if_match("W/\"abc\""), None);
@@ -1384,6 +1425,65 @@ mod tests {
             .expect("nothing usable came back");
 
         assert_eq!(error.recovery(), &RecoveryClass::AuthLost);
+    }
+
+    /// Pins the whole known ladder, not just the 401-vs-503 pair the test
+    /// below covers. The two DAV crates carry byte-identical copies of this
+    /// function and have drifted before, so the ordering is asserted
+    /// explicitly in each.
+    ///
+    /// The `_ =>` arm cannot be pinned hermetically: `RecoveryClass` is
+    /// `#[non_exhaustive]` and lives in `bifrost-types`, so no test in this
+    /// crate can name a variant this `match` does not already list. What is
+    /// pinnable is that every variant we CAN name ranks strictly below the
+    /// sentinel, which is what makes an unknown one win by construction.
+    #[test]
+    fn recovery_ranks_order_from_retryable_up_to_auth_lost() {
+        use bifrost_types::{EngineDirective, RetryAdvice, RetryDisposition, RetryReason};
+
+        let retry = RecoveryClass::Retry(RetryAdvice::new(
+            RetryDisposition::SameRequest,
+            None,
+            RetryReason::Transport,
+            None,
+        ));
+        let engine = RecoveryClass::Engine(EngineDirective::RestartAccount);
+        let terminal = [
+            RecoveryClass::Unsupported(AccountOperation::ContactSearch),
+            RecoveryClass::ClientBug,
+            RecoveryClass::ProviderContractViolation,
+            RecoveryClass::ProviderRefused,
+            RecoveryClass::UnknownPermanent,
+        ];
+        let consent = [
+            RecoveryClass::NeedsAdminConsent { needed: "scope" },
+            RecoveryClass::NeedsPolicyChange,
+            RecoveryClass::NoPermission { resource: None },
+        ];
+
+        assert!(recovery_rank(&retry) < recovery_rank(&engine));
+        for class in &terminal {
+            assert!(
+                recovery_rank(&engine) < recovery_rank(class),
+                "{class:?} must outrank an engine directive"
+            );
+            for stronger in &consent {
+                assert!(
+                    recovery_rank(class) < recovery_rank(stronger),
+                    "{stronger:?} must outrank {class:?}"
+                );
+            }
+        }
+        for class in &consent {
+            assert!(
+                recovery_rank(class) < recovery_rank(&RecoveryClass::AuthLost),
+                "AuthLost must outrank {class:?}"
+            );
+            // Every named variant sits below the catch-all sentinel, so an
+            // unknown future class escalates rather than being buried.
+            assert!(recovery_rank(class) < u8::MAX);
+        }
+        assert!(recovery_rank(&RecoveryClass::AuthLost) < u8::MAX);
     }
 
     #[test]

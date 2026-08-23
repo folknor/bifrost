@@ -51,14 +51,22 @@ its successful body does not identify a current-user principal.
   statuses or a missing status, which RFC 4918 requires but the parser
   tolerates as success.
   `parse_propfind_contacts` returns a `CardDavContactListing`: committed
-  `entries` plus `failed_hrefs` (vcard resources whose only propstat
-  failed within the 207), so the snapshot diff can preserve a
+  non-collection `entries` plus `failed_hrefs` (non-collection resources
+  whose only propstat failed within the 207), so the snapshot diff can preserve a
   transiently-failed resource instead of destroying it. Response parsers
   use element-stack parent checks so nested same-name properties do not
   overwrite response-level hrefs. Every text-bearing parser accepts both
   XML text and CDATA. Response hrefs are rebased to absolute native URLs at
   the decode boundary, before the account layer can consume success or
   failure lanes.
+  Resource identification does not depend on a `.vcf` suffix or a returned
+  content type. The contact PROPFIND requests `resourcetype`, and both its
+  success and failure lanes exclude responses known to be collections. The
+  `collection` marker obeys the same commit-on-success rule as every other
+  property: seen inside a `propstat` it is staged and promoted only if that
+  block's status was 2xx, so a server echoing the requested prop skeleton
+  (`<collection/>` included) back inside a 404 propstat cannot discard a
+  contact whose own properties came back 200.
 - `vcard.rs` - small vCard projection between DAV resources and
   `bifrost-types` contact cards. **Parse-in** uses caldata's `LineReader`
   for RFC 6350 line unfolding (deletes exactly one leading WSP, not the
@@ -100,7 +108,9 @@ Supported contact primitives:
   `addressbook`.
 - `contacts_list` - `PROPFIND` depth 1 for vCard resources, local
   offset-cursor slicing of hrefs, then batched `addressbook-multiget`
-  `REPORT` hydration for only the requested page. A hydrated vCard that
+  `REPORT` hydration for only the requested page. Multiget REPORTs enumerate
+  hrefs in the body and use `Depth: 0`; `addressbook-query` uses `Depth: 1`.
+  A hydrated vCard that
   will not parse is recorded (by native uri) in `Page::failed_ids` via
   the pure `partition_hydrated_vcards` helper rather than silently
   dropped, so a consumer can tell a transient per-resource hydration

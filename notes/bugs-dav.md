@@ -206,35 +206,11 @@ Also in `open`: `discover_calendar_user_email`, `discover_schedule_outbox_url`, 
 against `.well-known`). That is three to six PROPFINDs on open where one principal lookup plus one
 multi-prop PROPFIND would do; the three properties can be requested in a single `<D:prop>`.
 
-## Resource identification is extension-based, and drops resources it does not recognize
-
-**C2 latent defect.** Verified 2026-08-23: `parse.rs` still gates on `.ends_with(".ics")` in both
-`as_failed_event_href` and `as_sync_entry` while `is_calendar_resource` also accepts the content
-type, and `PROPFIND_CONTACTS` still requests only `getetag` and `getcontenttype`, so
-`parse_propfind_contacts` genuinely cannot see `resourcetype`. Latent rather than live because it
-needs a server that names resources without the conventional extension; when one arrives the failure
-is silent lost deletes plus a wedged cursor, which is severe. Worth working ahead of its position.
-
-`is_calendar_resource` accepts `text/calendar` or an `.ics` suffix, but `as_failed_event_href` and
-`as_sync_entry` require the `.ics` suffix unconditionally (the sync-collection report carries no
-content type at all). A server that names event resources without an extension, which is legal and
-some do, yields an empty listing, which then trips `diff_event_snapshots`'s empty-multistatus guard
-and wedges the cursor in a permanent "no observation" state that never resolves and never reports an
-error. Same shape in CardDAV with `.vcf`. Worse: `sync-collection` deletion entries for such
-resources are dropped silently, so deletes are lost even when the listing works.
-
-Relatedly, `PROPFIND_CONTACTS` (CardDAV) does not request `resourcetype`, so
-`parse_propfind_contacts` cannot detect collections at all and `as_contact_entry` has no
-`is_collection` guard, unlike CalDAV's `as_event_entry`. The doc comment on
-`as_failed_contact_href` claims "a failed collection is not a transiently-failed resource" as if it
-were checking, when the only thing standing between a sub-collection and the failed-href lane is the
-`.vcf` suffix.
-
 ## The structural finding: these are one crate wearing two hats
 
 **C4 product decision. PUBLISHED SURFACE. The loop must not act on this.** This is the single
 highest-risk entry in the document and it is the exact shape that produced the two restored
-deletions: a real observation (the duplication is genuine, and `escape_xml` really has diverged)
+deletions: a real observation (the duplication is genuine)
 attached to a remedy that collapses two published pre-1.0 crates into one. Whether `bifrost-caldav`
 and `bifrost-carddav` should become projections over a `bifrost-dav` is the repository owner's call
 about the shipped surface, not an engineering conclusion the duplication count can settle. Note also
@@ -242,14 +218,11 @@ that the argument's premise ("pre-1.0 with both crates crate-private below a fac
 radius is small") is a claim about this workspace; both crates are published and their consumers are
 outside it by definition.
 
-The drift the finding names is separately actionable without any collapse: `escape_xml` differing
-between the two copies is a **C2 latent defect** in its own right and can be fixed where it is.
-
 Beyond `dav-F5`'s tracked transport seam, the duplication is far larger than the TODO records, and
 it is not just `client.rs`:
 
 - `client.rs`: `DavTransport` + `DavResponse` + `ReqwestDavTransport`, `dav_redirect_policy`,
-  `auth_headers`, `escape_xml` (**already diverged**: CalDAV escapes `"`/`'`, CardDAV does not),
+  `auth_headers`, `escape_xml`,
   `normalize_http_etag`, `prepare_if_match`, `propfind_raw`, `report_raw`,
   `send_body_request`/`send_status_request`/`send_raw_request`, `MultigetFetch`, `worse_recovery`,
   `recovery_rank`, `multiget_failure`, and the ~120-line `status_error` if-ladder (identical but for
@@ -268,7 +241,7 @@ it is not just `client.rs`:
 
 That is on the order of 1500 duplicated lines. The dav-F5 commit message is right about the
 mechanism and understates the scope: a comment was holding two copies in step, and it was not
-holding. Two copies have already drifted (`escape_xml`; the discovery order; the phantom collection;
+holding. Two copies have already drifted (the discovery order; the phantom collection;
 the depth-0 poll) and the drift is invisible because nothing compares them.
 
 The hunter's recommendation is stronger than "extract helpers": collapse to a single `bifrost-dav`
@@ -314,15 +287,7 @@ Each bullet carries its category inline. None of these touches a published surfa
   where CalDAV `time-range` is half-open. As a defensive guard it only over-includes, so it is not a
   correctness bug, but all-day events (whose DTEND is exclusive per the crate's own contract) will
   match a window starting exactly at their end.
-- **[C2]** Verified 2026-08-23, still present in both crates. `recovery_rank` in both crates has a `_ => 2` catch-all over a `#[non_exhaustive]` enum: a new
-  `RecoveryClass` more severe than `AuthLost` would silently rank below it.
 - **[C3]** The finding calls it harmless itself; the ask is observability, not a fix. `changes_from_cursor` (CalDAV) keeps the previous sync token when `report.sync_token` is `None`.
   RFC 6578 requires the server to return one; a server that omits it makes every subsequent poll
   replay the same window. Harmless because the diff absorbs it, but it hides a server bug forever
   rather than surfacing it.
-- **[C2]** Verified 2026-08-23: `report_raw` still hardcodes `report_raw_with_depth(url, "1", ...)`. CalDAV `report_raw` and CardDAV `report_raw` both send `Depth: 1` for every REPORT including
-  `calendar-multiget`/`addressbook-multiget`, where the hrefs are enumerated in the body and RFC 4791
-  section 7.9 / RFC 6352 section 8.7 use `Depth: 0`. Most servers ignore it; low confidence that any
-  rejects it.
-- **[C2]** `as_fetched_event` (CalDAV) has no `is_collection` guard, unlike `as_failed_multiget_resource` and
-  `as_missing_multiget_data` in the same file.

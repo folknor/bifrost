@@ -335,7 +335,7 @@ pub(crate) fn parse_propfind_events(xml: &str) -> Result<CalDavEventListing, Str
                     && name == "collection"
                     && stack.iter().any(|item| item == "resourcetype")
                 {
-                    current.is_collection = true;
+                    current.mark_collection();
                 }
                 stack.push(name);
                 text.clear();
@@ -346,7 +346,7 @@ pub(crate) fn parse_propfind_events(xml: &str) -> Result<CalDavEventListing, Str
                     && name == "collection"
                     && stack.iter().any(|item| item == "resourcetype")
                 {
-                    current.is_collection = true;
+                    current.mark_collection();
                 }
             }
             Ok(Event::Text(value)) => push_text(&mut text, value.as_ref())?,
@@ -422,7 +422,7 @@ pub(crate) fn parse_multiget_report(xml: &str) -> Result<CalDavMultigetReport, S
                     && name == "collection"
                     && stack.iter().any(|item| item == "resourcetype")
                 {
-                    current.is_collection = true;
+                    current.mark_collection();
                 }
                 stack.push(name);
                 text.clear();
@@ -433,7 +433,7 @@ pub(crate) fn parse_multiget_report(xml: &str) -> Result<CalDavMultigetReport, S
                     && name == "collection"
                     && stack.iter().any(|item| item == "resourcetype")
                 {
-                    current.is_collection = true;
+                    current.mark_collection();
                 }
             }
             Ok(Event::Text(value)) => push_text(&mut text, value.as_ref())?,
@@ -711,13 +711,6 @@ fn normalize_etag(text: &str) -> Option<String> {
     })
 }
 
-fn is_calendar_resource(href: &str, content_type: &Option<String>) -> bool {
-    content_type
-        .as_deref()
-        .is_some_and(|ty| ty.to_ascii_lowercase().contains("text/calendar"))
-        || href.to_ascii_lowercase().ends_with(".ics")
-}
-
 fn local_name(raw: &[u8]) -> String {
     let full = String::from_utf8_lossy(raw);
     match full.rfind(':') {
@@ -740,6 +733,7 @@ struct ResponseParts {
     write_seen: bool,
     propstat_write_seen: bool,
     is_collection: bool,
+    propstat_is_collection: bool,
     href: Option<String>,
     etag: Option<String>,
     content_type: Option<String>,
@@ -771,6 +765,7 @@ impl ResponseParts {
         self.in_propstat = true;
         self.propstat_success = None;
         self.propstat_is_calendar = false;
+        self.propstat_is_collection = false;
         self.propstat_privilege_seen = false;
         self.propstat_write_seen = false;
         self.propstat_display_name = None;
@@ -779,6 +774,20 @@ impl ResponseParts {
         self.propstat_status = None;
         self.propstat_calendar_data = None;
         self.propstat_etag = None;
+    }
+
+    /// A `resourcetype` the server refused is not evidence about the
+    /// resource, so a `collection` marker seen inside a propstat is staged
+    /// and only promoted when that propstat's own status was 2xx. Otherwise
+    /// a response whose contact/event properties succeeded but whose
+    /// `resourcetype` block was rejected (echoing back `<collection/>` in
+    /// the 404 prop skeleton) would be discarded as a collection.
+    fn mark_collection(&mut self) {
+        if self.in_propstat {
+            self.propstat_is_collection = true;
+        } else {
+            self.is_collection = true;
+        }
     }
 
     fn mark_calendar(&mut self) {
@@ -815,6 +824,7 @@ impl ResponseParts {
         if self.propstat_success.unwrap_or(true) {
             self.has_success_propstat = true;
             self.is_calendar |= self.propstat_is_calendar;
+            self.is_collection |= self.propstat_is_collection;
             self.privilege_seen |= self.propstat_privilege_seen;
             self.write_seen |= self.propstat_write_seen;
             if self.propstat_display_name.is_some() {
@@ -836,6 +846,7 @@ impl ResponseParts {
         self.in_propstat = false;
         self.propstat_success = None;
         self.propstat_is_calendar = false;
+        self.propstat_is_collection = false;
         self.propstat_privilege_seen = false;
         self.propstat_write_seen = false;
         self.propstat_display_name = None;
@@ -869,9 +880,6 @@ impl ResponseParts {
         if self.saw_failed_propstat && !self.has_success_propstat {
             return None;
         }
-        if !is_calendar_resource(href, &self.content_type) {
-            return None;
-        }
         Some(CalDavEventEntry {
             uri: href.clone(),
             etag: self.etag.clone(),
@@ -879,21 +887,19 @@ impl ResponseParts {
     }
 
     /// The href of an event resource the server reported *failed* within
-    /// the 207 (a non-2xx propstat, no success propstat). Only `.ics`
-    /// resources surface - a failed collection is not a
-    /// transiently-failed resource.
+    /// the 207 (a non-2xx propstat, no success propstat). A response known
+    /// to be a collection is excluded; resource names need no `.ics` suffix.
     fn as_failed_event_href(&self) -> Option<String> {
         if self.is_collection || self.has_success_propstat || !self.saw_failed_propstat {
             return None;
         }
-        let href = self.href.as_ref()?;
-        if !href.to_ascii_lowercase().ends_with(".ics") {
-            return None;
-        }
-        Some(href.clone())
+        self.href.clone()
     }
 
     fn as_fetched_event(&self) -> Option<CalDavFetchedEvent> {
+        if self.is_collection {
+            return None;
+        }
         Some(CalDavFetchedEvent {
             uri: self.href.as_ref()?.clone(),
             etag: self.etag.clone(),
@@ -931,9 +937,6 @@ impl ResponseParts {
 
     fn as_sync_entry(&self) -> Option<CalDavSyncEntry> {
         let href = self.href.as_ref()?;
-        if !href.to_ascii_lowercase().ends_with(".ics") {
-            return None;
-        }
         Some(CalDavSyncEntry {
             uri: href.clone(),
             etag: self.etag.clone(),
@@ -1109,6 +1112,18 @@ mod tests {
     }
 
     #[test]
+    fn propfind_events_accepts_extensionless_resources() {
+        let xml = r#"<D:multistatus xmlns:D="DAV:"><D:response>
+          <D:href>/cal/opaque-id</D:href><D:propstat><D:prop>
+          <D:resourcetype/><D:getetag>"abc"</D:getetag>
+          </D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat>
+          </D:response></D:multistatus>"#;
+
+        let listing = parse_propfind_events(xml).expect("valid XML");
+        assert_eq!(listing.entries[0].uri, "/cal/opaque-id");
+    }
+
+    #[test]
     fn propfind_events_ignores_nested_href_properties() {
         let xml = r#"
 <D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
@@ -1168,6 +1183,70 @@ mod tests {
         let listing = parse_propfind_events(xml).expect("valid XML");
         assert!(listing.entries.is_empty());
         assert_eq!(listing.failed_hrefs, vec!["/cal/one.ics".to_string()]);
+    }
+
+    /// A `resourcetype` block the server REFUSED says nothing about the
+    /// resource. Servers routinely echo the requested prop skeleton back
+    /// inside a 404 propstat, and some echo a `<collection/>` child with
+    /// it; treating that as authoritative discarded a real event whose own
+    /// properties came back 200.
+    #[test]
+    fn propfind_events_ignores_collection_marker_in_a_failed_propstat() {
+        let xml = r#"<D:multistatus xmlns:D="DAV:"><D:response>
+          <D:href>/cal/opaque-id</D:href>
+          <D:propstat><D:prop><D:getetag>"abc"</D:getetag></D:prop>
+          <D:status>HTTP/1.1 200 OK</D:status></D:propstat>
+          <D:propstat><D:prop><D:resourcetype><D:collection/></D:resourcetype></D:prop>
+          <D:status>HTTP/1.1 404 Not Found</D:status></D:propstat>
+          </D:response></D:multistatus>"#;
+
+        let listing = parse_propfind_events(xml).expect("valid XML");
+        assert_eq!(listing.entries.len(), 1);
+        assert_eq!(listing.entries[0].uri, "/cal/opaque-id");
+        assert_eq!(listing.entries[0].etag, Some("abc".to_string()));
+    }
+
+    /// Same rule on the multiget lane: a refused `resourcetype` must not
+    /// suppress calendar data a successful propstat supplied.
+    #[test]
+    fn multiget_ignores_collection_marker_in_a_failed_propstat() {
+        let xml = r#"<D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+          <D:response><D:href>/cal/opaque-id</D:href>
+          <D:propstat><D:prop><D:getetag>"abc"</D:getetag>
+          <C:calendar-data>BEGIN:VCALENDAR
+END:VCALENDAR</C:calendar-data></D:prop>
+          <D:status>HTTP/1.1 200 OK</D:status></D:propstat>
+          <D:propstat><D:prop><D:resourcetype><D:collection/></D:resourcetype></D:prop>
+          <D:status>HTTP/1.1 404 Not Found</D:status></D:propstat>
+          </D:response></D:multistatus>"#;
+
+        let report = parse_multiget_report(xml).expect("valid XML");
+        assert_eq!(report.events.len(), 1);
+        assert_eq!(report.events[0].uri, "/cal/opaque-id");
+    }
+
+    #[test]
+    fn propfind_events_preserves_failed_extensionless_resource() {
+        let xml = r#"<D:multistatus xmlns:D="DAV:"><D:response>
+          <D:href>/cal/opaque-id</D:href><D:propstat><D:prop><D:getetag/></D:prop>
+          <D:status>HTTP/1.1 503 Unavailable</D:status></D:propstat>
+          </D:response></D:multistatus>"#;
+
+        let listing = parse_propfind_events(xml).expect("valid XML");
+        assert_eq!(listing.failed_hrefs, vec!["/cal/opaque-id"]);
+    }
+
+    #[test]
+    fn multiget_does_not_fetch_an_echoed_collection() {
+        let xml = r#"<D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+          <D:response><D:href>/cal/</D:href><D:propstat><D:prop>
+          <D:resourcetype><D:collection/></D:resourcetype>
+          <C:calendar-data>not an event</C:calendar-data></D:prop>
+          <D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>
+          </D:multistatus>"#;
+
+        let report = parse_multiget_report(xml).expect("valid XML");
+        assert!(report.events.is_empty());
     }
 
     #[test]
@@ -1608,6 +1687,17 @@ END:VCALENDAR</C:calendar-data>
         )
         .expect("valid property");
         assert_eq!(href.as_deref(), Some("/principals/ada/"));
+    }
+
+    #[test]
+    fn sync_report_accepts_extensionless_resource_ids() {
+        let report = parse_sync_collection_report(
+            r#"<D:multistatus xmlns:D="DAV:"><D:response><D:href>/cal/opaque-id</D:href><D:status>HTTP/1.1 404 Not Found</D:status></D:response></D:multistatus>"#,
+        )
+        .expect("valid XML");
+
+        assert_eq!(report.entries[0].uri, "/cal/opaque-id");
+        assert_eq!(report.entries[0].status, Some(404));
     }
 
     #[test]

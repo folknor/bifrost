@@ -319,7 +319,7 @@ impl CalDavClient {
     ) -> Result<CalDavMultigetReport, AccountError> {
         let body = calendar_query_body(start, end);
         let response = self
-            .report_raw(calendar_url, &body, AccountOperation::EventsInRange)
+            .report_raw(calendar_url, "1", &body, AccountOperation::EventsInRange)
             .await?;
         let mut parsed = parse_multiget_report(&response).map_err(|error| {
             parse_error(AccountOperation::EventsInRange, format!("query: {error}"))
@@ -338,7 +338,7 @@ impl CalDavClient {
         for property in ["SUMMARY", "DESCRIPTION", "LOCATION", "ATTENDEE"] {
             let body = calendar_text_query_body(property, query);
             let response = self
-                .report_raw(calendar_url, &body, AccountOperation::EventSearch)
+                .report_raw(calendar_url, "1", &body, AccountOperation::EventSearch)
                 .await?;
             let mut parsed = parse_multiget_report(&response).map_err(|error| {
                 parse_error(AccountOperation::EventSearch, format!("query: {error}"))
@@ -377,7 +377,7 @@ impl CalDavClient {
   </D:prop>\n\
 {href_elements}</C:calendar-multiget>"
             );
-            let response = self.report_raw(calendar_url, &body, operation).await?;
+            let response = self.report_raw(calendar_url, "0", &body, operation).await?;
             let mut parsed = parse_multiget_report(&response)
                 .map_err(|error| parse_error(operation, format!("multiget: {error}")))?;
             parsed.resolve_hrefs(&self.base_url);
@@ -555,6 +555,7 @@ impl CalDavClient {
     async fn report_raw(
         &self,
         url: &str,
+        depth: &str,
         body: &str,
         operation: AccountOperation,
     ) -> Result<String, AccountError> {
@@ -562,7 +563,7 @@ impl CalDavClient {
         // body request; only `sync_events` takes the raw-response path,
         // because it has to inspect 403/410 before they become errors.
         let response = self
-            .report_raw_with_depth(url, "1", body, operation)
+            .report_raw_with_depth(url, depth, body, operation)
             .await?;
         if response.status.is_success() {
             Ok(response.body)
@@ -945,7 +946,14 @@ fn recovery_rank(class: &RecoveryClass) -> u8 {
         | RecoveryClass::NoPermission { .. } => 3,
         RecoveryClass::Retry(_) => 0,
         RecoveryClass::Reconcile(_) | RecoveryClass::Engine(_) => 1,
-        _ => 2,
+        RecoveryClass::Unsupported(_)
+        | RecoveryClass::ClientBug
+        | RecoveryClass::ProviderContractViolation
+        | RecoveryClass::ProviderRefused
+        | RecoveryClass::UnknownPermanent => 2,
+        // RecoveryClass is non-exhaustive. An unknown future class must win
+        // rather than being silently ranked below a known terminal failure.
+        _ => u8::MAX,
     }
 }
 
@@ -1549,6 +1557,28 @@ mod tests {
         assert!(body.contains("plan &amp; meet"));
     }
 
+    #[tokio::test]
+    async fn calendar_multiget_uses_depth_zero() {
+        let script = ScriptedDavTransport::new([DavResponse {
+            status: StatusCode::MULTI_STATUS,
+            headers: HeaderMap::new(),
+            body: "<D:multistatus xmlns:D=\"DAV:\"/>".to_string(),
+        }]);
+        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
+        let client = CalDavClient::with_transport("https://dav.example.test", transport);
+
+        client
+            .fetch_events(
+                "https://dav.example.test/cal/",
+                &["https://dav.example.test/cal/opaque-id".to_string()],
+                AccountOperation::EventSearch,
+            )
+            .await
+            .expect("empty multistatus is usable");
+
+        assert_eq!(script.requests()[0].headers["Depth"], "0");
+    }
+
     #[test]
     fn schedule_outbox_propfind_requests_caldav_outbox_url() {
         assert!(PROPFIND_SCHEDULE_OUTBOX.contains("<C:schedule-outbox-URL/>"));
@@ -1675,6 +1705,65 @@ mod tests {
             .expect("nothing usable came back");
 
         assert_eq!(error.recovery(), &RecoveryClass::AuthLost);
+    }
+
+    /// Pins the whole known ladder, not just the 401-vs-503 pair the test
+    /// below covers. The two DAV crates carry byte-identical copies of this
+    /// function and have drifted before, so the ordering is asserted
+    /// explicitly in each.
+    ///
+    /// The `_ =>` arm cannot be pinned hermetically: `RecoveryClass` is
+    /// `#[non_exhaustive]` and lives in `bifrost-types`, so no test in this
+    /// crate can name a variant this `match` does not already list. What is
+    /// pinnable is that every variant we CAN name ranks strictly below the
+    /// sentinel, which is what makes an unknown one win by construction.
+    #[test]
+    fn recovery_ranks_order_from_retryable_up_to_auth_lost() {
+        use bifrost_types::{EngineDirective, RetryAdvice, RetryDisposition, RetryReason};
+
+        let retry = RecoveryClass::Retry(RetryAdvice::new(
+            RetryDisposition::SameRequest,
+            None,
+            RetryReason::Transport,
+            None,
+        ));
+        let engine = RecoveryClass::Engine(EngineDirective::RestartAccount);
+        let terminal = [
+            RecoveryClass::Unsupported(AccountOperation::EventSearch),
+            RecoveryClass::ClientBug,
+            RecoveryClass::ProviderContractViolation,
+            RecoveryClass::ProviderRefused,
+            RecoveryClass::UnknownPermanent,
+        ];
+        let consent = [
+            RecoveryClass::NeedsAdminConsent { needed: "scope" },
+            RecoveryClass::NeedsPolicyChange,
+            RecoveryClass::NoPermission { resource: None },
+        ];
+
+        assert!(recovery_rank(&retry) < recovery_rank(&engine));
+        for class in &terminal {
+            assert!(
+                recovery_rank(&engine) < recovery_rank(class),
+                "{class:?} must outrank an engine directive"
+            );
+            for stronger in &consent {
+                assert!(
+                    recovery_rank(class) < recovery_rank(stronger),
+                    "{stronger:?} must outrank {class:?}"
+                );
+            }
+        }
+        for class in &consent {
+            assert!(
+                recovery_rank(class) < recovery_rank(&RecoveryClass::AuthLost),
+                "AuthLost must outrank {class:?}"
+            );
+            // Every named variant sits below the catch-all sentinel, so an
+            // unknown future class escalates rather than being buried.
+            assert!(recovery_rank(class) < u8::MAX);
+        }
+        assert!(recovery_rank(&RecoveryClass::AuthLost) < u8::MAX);
     }
 
     #[test]
