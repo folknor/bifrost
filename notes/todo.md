@@ -1169,17 +1169,20 @@ confirm against the code before working any of them.
   path fixed), and what remains duplicated is stable code - `escape_xml`,
   `status_error`, the cursor codec - which has drifted rarely because it
   changes rarely.
-- **google-B3. Calendar's endpoint override is an env var.** [C3, additive]
-  `calendar.rs::calendar_api_base()` reads
-  `std::env::var("RATATOSKR_TEST_GCAL_ENDPOINT")` on every call - the only
-  env-var read in the workspace. Nothing misbehaves; the objections are hygiene
-  (process-global state in a library, a per-request `getenv`, no way to run two
-  accounts against different calendar endpoints, and a bifrost crate naming its
-  downstream consumer). Remedy is a `calendar_base` field on `ClientInner` plus a
-  published `with_calendar_api_base` constructor, matching Gmail's
-  `with_api_base` and People's `with_people_api_base`. Related [C3]:
-  `default_account_net` registers rate limits for `www.googleapis.com` and
-  `people.googleapis.com` by literal string, so a redirected base is unlimited.
+- **google-B12. Retire `RATATOSKR_TEST_GCAL_ENDPOINT`.** [C3] Tail of google-B3,
+  which landed 2026-08-23: `GoogleAccountFactory::with_calendar_api_base` now
+  exists and takes precedence, the base is stored on `ClientInner`, the read
+  happens once at construction instead of per request, and rate limits are
+  registered from the configured bases rather than literal hostnames.
+
+  The environment variable was KEPT on purpose. `ratatoskr` and `sæhrimnir` both
+  set it, and deleting it would not fail their builds - it would silently stop
+  redirecting and point their test traffic at the real Google Calendar API. Once
+  both have migrated to `with_calendar_api_base`, delete `default_calendar_base`
+  and have the constructors take `CALENDAR_API_BASE` directly. That removes the
+  last `std::env::var` read in the workspace and the last place a bifrost crate
+  names a downstream consumer. Coordinate with those two repos; there is nothing
+  to do here until they are ready.
 - **google-B4. `calendars_list` returns a `Vec` with no streaming.** [C4] A
   pathological account buys many sequential 250-item round trips before the
   caller sees anything. The walk is bounded (repeated-token guard plus page

@@ -78,6 +78,42 @@ attach a `PubSubConfig` via `with_pubsub_config`/`with_pubsub_topic`.
 The factory is the only public entry point; the raw `GmailClient`,
 Gmail wire DTOs, and crate-local `Error` are `pub(crate)`.
 
+### Three independent API bases
+
+The crate talks to three Google surfaces, and each base is configured
+separately because none can be derived from another:
+
+| Surface | Production base | Override |
+|---|---|---|
+| Gmail mail | `www.googleapis.com/gmail/v1/users/me` | `from_access_token_with_api_base` / `from_token_source_with_api_base` |
+| People (contacts, directory) | `people.googleapis.com/v1` | `with_people_api_base` |
+| Calendar | `www.googleapis.com/calendar/v3` | `with_calendar_api_base` |
+
+Calendar shares a HOST with Gmail but not a path root, so it cannot ride the
+Gmail base; People differs in both. All three compose, so a harness can redirect
+any subset.
+
+`RATATOSKR_TEST_GCAL_ENDPOINT` still sets the Calendar base when
+`with_calendar_api_base` is not called. It is **legacy, kept working
+deliberately**: downstream harnesses set it, and removing it would not fail
+their builds - it would silently stop redirecting and send their test traffic to
+the real Google Calendar API. It is now read ONCE per client construction
+(`default_calendar_base`) rather than on every request. It was previously a
+`std::env::var` read per call, which meant a `getenv` on a hot path,
+process-global state read from inside a library, no way to point two accounts at
+two Calendar endpoints in one process, and a bifrost crate naming its downstream
+consumer in an identifier. An explicit `with_calendar_api_base` always wins; a
+variable set after a client is built does not affect that client.
+
+Rate limits are registered against the hosts derived from these configured
+bases, not against literal production hostnames - a redirected base was
+otherwise completely unmetered. The same host is registered once: Gmail and
+Calendar share `www.googleapis.com` in production, and registering it twice
+would install a second bucket for one host so the effective limit became
+whichever registration won. A base that fails to parse falls back to the
+production host, so a malformed override meters the real host rather than
+nothing.
+
 `GoogleAccountFactory` carries an `Arc<GmailClient>` and an optional
 `PubSubConfig`. `open(account_id)` asks the client for an
 account-scoped clone attached to `bifrost-net` under the engine

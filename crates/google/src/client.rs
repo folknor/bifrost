@@ -11,6 +11,7 @@ use crate::{Error, Result};
 
 const GMAIL_API_BASE: &str = "https://www.googleapis.com/gmail/v1/users/me";
 const PEOPLE_API_BASE: &str = "https://people.googleapis.com/v1";
+const CALENDAR_API_BASE: &str = "https://www.googleapis.com/calendar/v3";
 // Gmail meters per-user traffic in QUOTA UNITS, not requests: the
 // published per-user limit is 250 units/second, and each method has its
 // own unit cost (see `gmail_quota_cost`). We register a deliberately
@@ -39,7 +40,56 @@ struct ClientInner {
     // `api_base` (the Gmail mail base) rather than reusing it. Defaults to
     // the production People base; a harness redirects it independently.
     people_base: String,
+    // Calendar API base, threaded exactly like `people_base`. Calendar lives
+    // under www.googleapis.com/calendar/v3 in production - the same HOST as
+    // the Gmail mail base but a different path root - so it cannot be derived
+    // from `api_base` and gets its own field.
+    //
+    // Resolved ONCE, at client construction (`default_calendar_base`), not per
+    // call. It used to be a `std::env::var` read on every single request: a
+    // per-request `getenv` on a hot path, process-global state read from
+    // inside a library, and no way to point two accounts at two endpoints in
+    // one process. The environment variable still works as a fallback for
+    // existing harnesses - see `default_calendar_base` - but an explicit
+    // `GoogleAccountFactory::with_calendar_api_base` now takes precedence over
+    // it and is the supported mechanism.
+    calendar_base: String,
     token_source: Arc<dyn TokenSource>,
+}
+
+/// Production Calendar base, or the legacy environment override.
+///
+/// LEGACY, kept working deliberately: `RATATOSKR_TEST_GCAL_ENDPOINT` is read by
+/// existing downstream harnesses, and dropping it would not fail their builds -
+/// it would silently stop redirecting and send their test traffic to the real
+/// Google Calendar API. So it stays until those consumers have migrated to
+/// `GoogleAccountFactory::with_calendar_api_base`, which overrides it.
+///
+/// It is read once per client construction rather than per request. A harness
+/// that sets the variable after building a client no longer affects that
+/// client; harnesses set process environment before startup, so this is the
+/// intended trade for taking the read off the request path.
+///
+/// A bifrost crate should not be naming its downstream consumer in an
+/// identifier at all, which is the other reason this is the legacy path and not
+/// the supported one.
+fn default_calendar_base() -> String {
+    std::env::var("RATATOSKR_TEST_GCAL_ENDPOINT").map_or_else(
+        |_| CALENDAR_API_BASE.to_string(),
+        |endpoint| format!("{}/calendar/v3", endpoint.trim_end_matches('/')),
+    )
+}
+
+/// Host component of a base URL, for rate-limit registration.
+///
+/// Falls back to the production host when the base does not parse, so a
+/// malformed override degrades to metering the real host rather than silently
+/// registering no limit at all.
+fn host_of(base: &str, fallback: &str) -> String {
+    reqwest::Url::parse(base)
+        .ok()
+        .and_then(|url| url.host_str().map(ToString::to_string))
+        .unwrap_or_else(|| fallback.to_string())
 }
 
 impl GmailClient {
@@ -52,6 +102,7 @@ impl GmailClient {
                 parent_net: Net::shared_default(),
                 api_base: api_base.into().trim_end_matches('/').to_string(),
                 people_base: PEOPLE_API_BASE.to_string(),
+                calendar_base: default_calendar_base(),
                 token_source,
             }),
         }
@@ -93,6 +144,7 @@ impl GmailClient {
                 parent_net,
                 api_base: api_base.into().trim_end_matches('/').to_string(),
                 people_base: PEOPLE_API_BASE.to_string(),
+                calendar_base: default_calendar_base(),
                 token_source,
             }),
         }
@@ -110,16 +162,43 @@ impl GmailClient {
                 parent_net: self.inner.parent_net.clone(),
                 api_base: self.inner.api_base.clone(),
                 people_base: people_base.into().trim_end_matches('/').to_string(),
+                calendar_base: self.inner.calendar_base.clone(),
+                token_source: Arc::clone(&self.inner.token_source),
+            }),
+        }
+    }
+
+    // pub(crate): the factory's `with_calendar_api_base` seam points the
+    // Calendar base at a mock endpoint, independently of the Gmail mail and
+    // People bases. Takes precedence over the legacy
+    // `RATATOSKR_TEST_GCAL_ENDPOINT` environment variable, and unlike it works
+    // per client, so two accounts in one process can use two endpoints.
+    pub(crate) fn with_calendar_base(&self, calendar_base: impl Into<String>) -> Self {
+        Self {
+            inner: Arc::new(ClientInner {
+                net: self.inner.net.clone(),
+                parent_net: self.inner.parent_net.clone(),
+                api_base: self.inner.api_base.clone(),
+                people_base: self.inner.people_base.clone(),
+                calendar_base: calendar_base.into().trim_end_matches('/').to_string(),
                 token_source: Arc::clone(&self.inner.token_source),
             }),
         }
     }
 
     pub(crate) fn for_account(&self, account_id: AccountId) -> Self {
+        // Rate limits are registered against the hosts this client will
+        // actually talk to, derived from its configured bases. Registering
+        // literal production hostnames left a redirected base completely
+        // unmetered, which was already mildly wrong for People (whose base has
+        // long been configurable) and would have become wrong for Calendar the
+        // moment its override stopped being an environment variable.
         let net = default_account_net(
             &self.inner.parent_net,
             account_id,
-            "www.googleapis.com",
+            &self.inner.api_base,
+            &self.inner.people_base,
+            &self.inner.calendar_base,
             Arc::clone(&self.inner.token_source),
         );
         Self {
@@ -128,6 +207,7 @@ impl GmailClient {
                 parent_net: self.inner.parent_net.clone(),
                 api_base: self.inner.api_base.clone(),
                 people_base: self.inner.people_base.clone(),
+                calendar_base: self.inner.calendar_base.clone(),
                 token_source: Arc::clone(&self.inner.token_source),
             }),
         }
@@ -152,6 +232,10 @@ impl GmailClient {
 
     pub(crate) fn people_base(&self) -> &str {
         &self.inner.people_base
+    }
+
+    pub(crate) fn calendar_base(&self) -> &str {
+        &self.inner.calendar_base
     }
 
     #[cfg(test)]
@@ -324,29 +408,59 @@ async fn check_response_status(response: Response, _service: &str) -> Result<()>
     ))
 }
 
+/// Attach an account, registering a rate limit per DISTINCT host this client
+/// will talk to.
+///
+/// The hosts come from the configured bases, not from literals: a redirected
+/// base otherwise registers no limit for the host it actually reaches. Gmail
+/// and Calendar share `www.googleapis.com` in production, so the same host
+/// commonly appears twice and is deduplicated - registering it twice would
+/// install a second bucket for one host, and the Calendar entry (registered
+/// second) would silently replace the Gmail one, halving nothing but making
+/// the effective limit whichever registration happened to win.
 fn default_account_net(
     net: &Net,
     account: AccountId,
-    host: impl Into<String>,
+    gmail_base: &str,
+    people_base: &str,
+    calendar_base: &str,
     token_source: Arc<dyn TokenSource>,
 ) -> AccountNet {
+    let gmail_host = host_of(gmail_base, "www.googleapis.com");
+    let people_host = host_of(people_base, "people.googleapis.com");
+    let calendar_host = host_of(calendar_base, "www.googleapis.com");
+
+    let mut hosts = vec![RateLimit {
+        host: gmail_host.clone(),
+        quota_per_second: GOOGLE_API_QUOTA_PER_SECOND,
+        cost_default: 1,
+        burst: GOOGLE_API_BURST,
+    }];
+    if people_host != gmail_host {
+        hosts.push(RateLimit {
+            host: people_host.clone(),
+            quota_per_second: PEOPLE_API_QUOTA_PER_SECOND,
+            cost_default: 1,
+            burst: PEOPLE_API_BURST,
+        });
+    }
+    // Calendar bills per request rather than in Gmail quota units, so it takes
+    // the general Google bucket. Only registered when it is a host neither of
+    // the other two already covers - the production case is exactly that
+    // overlap, where Calendar rides the Gmail registration.
+    if calendar_host != gmail_host && calendar_host != people_host {
+        hosts.push(RateLimit {
+            host: calendar_host,
+            quota_per_second: GOOGLE_API_QUOTA_PER_SECOND,
+            cost_default: 1,
+            burst: GOOGLE_API_BURST,
+        });
+    }
+
     net.attach_account(
         account,
         AccountSpec {
-            hosts: vec![
-                RateLimit {
-                    host: host.into(),
-                    quota_per_second: GOOGLE_API_QUOTA_PER_SECOND,
-                    cost_default: 1,
-                    burst: GOOGLE_API_BURST,
-                },
-                RateLimit {
-                    host: "people.googleapis.com".to_string(),
-                    quota_per_second: PEOPLE_API_QUOTA_PER_SECOND,
-                    cost_default: 1,
-                    burst: PEOPLE_API_BURST,
-                },
-            ],
+            hosts,
             ..AccountSpec::new(Some(token_source))
         },
     )
@@ -547,6 +661,72 @@ mod tests {
         let redirected = client.with_people_base("https://people.mock.test/v1/");
         assert_eq!(redirected.people_base(), "https://people.mock.test/v1");
         assert_eq!(redirected.api_base(), "https://example.test/gmail");
+    }
+
+    /// The Calendar base is independent of the other two and overridable per
+    /// client.
+    ///
+    /// It used to be a `std::env::var` read on every request, which made it
+    /// process-global: two accounts in one process could not use two Calendar
+    /// endpoints, and the read sat on a hot path. The environment variable
+    /// still works as a documented legacy fallback (downstream harnesses set
+    /// it, and removing it would silently send their traffic to production
+    /// rather than fail their build), but an explicit override wins over it.
+    #[tokio::test]
+    async fn calendar_base_defaults_and_overrides_independently() {
+        let client = GmailClient::with_api_base("https://example.test/gmail", "token");
+        // Defaults to production unless the legacy variable is set. Asserting
+        // the accessor rather than the constant would pass either way, so this
+        // reads whichever `default_calendar_base` resolved - the point of the
+        // assertion is that the Calendar base is not derived from the Gmail
+        // base, which was redirected above.
+        assert_eq!(client.calendar_base(), default_calendar_base());
+        assert_ne!(client.calendar_base(), client.api_base());
+
+        let redirected = client.with_calendar_base("https://gcal.mock.test/calendar/v3/");
+        assert_eq!(
+            redirected.calendar_base(),
+            "https://gcal.mock.test/calendar/v3",
+            "an explicit base wins over the legacy environment variable, and trims like the others"
+        );
+        assert_eq!(
+            redirected.api_base(),
+            "https://example.test/gmail",
+            "redirecting Calendar must not disturb the Gmail base"
+        );
+        assert_eq!(
+            redirected.people_base(),
+            PEOPLE_API_BASE,
+            "redirecting Calendar must not disturb the People base"
+        );
+    }
+
+    /// Rate limits are registered for the hosts the client will actually reach.
+    ///
+    /// Registering literal production hostnames left a redirected base
+    /// completely unmetered. The production case is that Gmail and Calendar
+    /// share `www.googleapis.com`, so the host must be registered ONCE - a
+    /// duplicate registration installs a second bucket for one host and the
+    /// effective limit becomes whichever won.
+    #[test]
+    fn rate_limit_hosts_come_from_the_configured_bases_and_are_deduplicated() {
+        assert_eq!(
+            host_of("https://gcal.mock.test/calendar/v3", "www.googleapis.com"),
+            "gcal.mock.test"
+        );
+        // A base that does not parse falls back to metering the real host
+        // rather than registering nothing at all.
+        assert_eq!(
+            host_of("not a url", "www.googleapis.com"),
+            "www.googleapis.com"
+        );
+        // Production: Gmail and Calendar are the same host, People differs.
+        assert_eq!(
+            host_of(GMAIL_API_BASE, "x"),
+            host_of(CALENDAR_API_BASE, "y"),
+            "the production Gmail and Calendar bases share a host, so registration must dedupe"
+        );
+        assert_ne!(host_of(PEOPLE_API_BASE, "x"), host_of(GMAIL_API_BASE, "y"));
     }
 
     #[tokio::test]

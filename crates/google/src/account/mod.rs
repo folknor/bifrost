@@ -126,6 +126,30 @@ impl GoogleAccountFactory {
         }
     }
 
+    /// Redirect the Calendar API base for opened accounts. Test seam
+    /// completing the set alongside the Gmail-base constructors and
+    /// [`Self::with_people_api_base`]: Calendar lives under
+    /// `www.googleapis.com/calendar/v3` in production - the same host as the
+    /// Gmail mail base but a different path root - so it is configured
+    /// independently of both. Composes with the other overrides: build the
+    /// factory with a redirected Gmail base, then call this and/or
+    /// `with_people_api_base` to redirect the others.
+    ///
+    /// This supersedes the `RATATOSKR_TEST_GCAL_ENDPOINT` environment variable,
+    /// which still works as a fallback for existing harnesses but is legacy.
+    /// Prefer this: it is per client rather than process-global, so two
+    /// accounts in one process can use two different Calendar endpoints; it is
+    /// resolved once at construction rather than on every request; and a
+    /// library has no business reading its downstream consumer's name out of
+    /// the environment. An explicit call here always wins over the variable.
+    #[must_use]
+    pub fn with_calendar_api_base(self, calendar_base: impl Into<String>) -> Self {
+        Self {
+            client: Arc::new(self.client.with_calendar_base(calendar_base)),
+            pubsub: self.pubsub,
+        }
+    }
+
     /// Configure Gmail Cloud Pub/Sub watch ownership for opened accounts.
     #[must_use]
     pub fn with_pubsub_config(mut self, config: PubSubConfig) -> Self {

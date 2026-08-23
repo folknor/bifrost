@@ -17,17 +17,9 @@ use super::error::{self, GmailErrorContext};
 use super::non_empty;
 use bifrost_types::{AccountError, AccountFuture, AccountOperation};
 
-const CALENDAR_API_BASE: &str = "https://www.googleapis.com/calendar/v3";
 const EVENT_ID_SEPARATOR: &str = "::";
 const CALENDAR_LIST_PAGE_SIZE: u16 = 250;
 const MAX_CALENDAR_LIST_PAGES: usize = 10_000;
-
-fn calendar_api_base() -> String {
-    std::env::var("RATATOSKR_TEST_GCAL_ENDPOINT").map_or_else(
-        |_| CALENDAR_API_BASE.to_string(),
-        |endpoint| format!("{}/calendar/v3", endpoint.trim_end_matches('/')),
-    )
-}
 
 pub(crate) fn calendars_list(
     client: Arc<GmailClient>,
@@ -35,7 +27,7 @@ pub(crate) fn calendars_list(
     Box::pin(async move {
         let base_url = format!(
             "{}/users/me/calendarList?maxResults={CALENDAR_LIST_PAGE_SIZE}",
-            calendar_api_base()
+            client.calendar_base()
         );
         let mut calendars = Vec::new();
         let mut page_token = None;
@@ -97,7 +89,7 @@ pub(crate) fn events_in_range(
         let time_max = google_range_bound(&range.end, "timeMax")?;
         let mut url = format!(
             "{}/calendars/{encoded}/events?singleEvents=true&orderBy=startTime&timeMin={}&timeMax={}",
-            calendar_api_base(),
+            client.calendar_base(),
             bifrost_net::url::encode_query_value(&time_min),
             bifrost_net::url::encode_query_value(&time_max)
         );
@@ -123,7 +115,7 @@ pub(crate) fn get(
 ) -> AccountFuture<Result<CalendarEvent, AccountError>> {
     Box::pin(async move {
         let (calendar_id, event_id) = split_event_id(&event.0, AccountOperation::EventGet)?;
-        let url = event_url(&calendar_id, &event_id);
+        let url = event_url(client.calendar_base(), &calendar_id, &event_id);
         let event: GoogleEvent = client
             .get(&url)
             .await
@@ -140,7 +132,7 @@ pub(crate) fn create(
         reject_create_organizer(&event)?;
         let calendar_id = event.calendar_id.0.clone();
         let encoded = bifrost_net::url::encode_path_component(&calendar_id);
-        let url = format!("{}/calendars/{encoded}/events", calendar_api_base());
+        let url = format!("{}/calendars/{encoded}/events", client.calendar_base());
         let created: GoogleEvent = client
             .post(&url, &google_event_from_create(&event))
             .await
@@ -188,7 +180,12 @@ pub(crate) fn update(
         {
             let _: GoogleEvent = client
                 .post(
-                    &event_move_url(&calendar_id, &native_event_id, &target_calendar.0),
+                    &event_move_url(
+                        client.calendar_base(),
+                        &calendar_id,
+                        &native_event_id,
+                        &target_calendar.0,
+                    ),
                     &json!({}),
                 )
                 .await
@@ -201,7 +198,7 @@ pub(crate) fn update(
         if !has_field_patch {
             return Ok(());
         }
-        let url = event_url(&calendar_id, &native_event_id);
+        let url = event_url(client.calendar_base(), &calendar_id, &native_event_id);
         // After a move the event lives under the destination calendar, so
         // the composite id the caller passed in no longer addresses it.
         // Scope the patch failure to where the event actually is - a
@@ -230,7 +227,7 @@ pub(crate) fn delete(
     Box::pin(async move {
         let (calendar_id, event_id) = split_event_id(&event.0, AccountOperation::EventDelete)?;
         client
-            .delete(&event_url(&calendar_id, &event_id))
+            .delete(&event_url(client.calendar_base(), &calendar_id, &event_id))
             .await
             .map_err(|error| event_error(error, AccountOperation::EventDelete, event.0.clone()))
     })
@@ -245,13 +242,13 @@ pub(crate) fn rsvp(
     Box::pin(async move {
         let (calendar_id, event_id) = split_event_id(&event.0, AccountOperation::EventRsvp)?;
         let mut current: GoogleEvent = client
-            .get(&event_url(&calendar_id, &event_id))
+            .get(&event_url(client.calendar_base(), &calendar_id, &event_id))
             .await
             .map_err(|error| event_error(error, AccountOperation::EventRsvp, event.0.clone()))?;
         rsvp_google_attendees_for_self(&mut current.attendees, &self_email, status)?;
         let _: GoogleEvent = client
             .patch(
-                &event_url(&calendar_id, &event_id),
+                &event_url(client.calendar_base(), &calendar_id, &event_id),
                 &GoogleEventPatch {
                     attendees: current.attendees,
                     ..GoogleEventPatch::default()
@@ -365,7 +362,7 @@ async fn search_one_calendar(
     let encoded = bifrost_net::url::encode_path_component(&calendar_id);
     let mut url = format!(
         "{}/calendars/{encoded}/events?singleEvents=true&orderBy=startTime&q={}",
-        calendar_api_base(),
+        client.calendar_base(),
         bifrost_net::url::encode_query_value(query)
     );
     if let Some(limit) = limit {
@@ -716,19 +713,26 @@ fn event_time(time: GoogleEventTime) -> EventTime {
     }
 }
 
-fn event_url(calendar_id: &str, event_id: &str) -> String {
+fn event_url(base: &str, calendar_id: &str, event_id: &str) -> String {
     format!(
-        "{}/calendars/{}/events/{}",
-        calendar_api_base(),
+        "{base}/calendars/{}/events/{}",
         bifrost_net::url::encode_path_component(calendar_id),
         bifrost_net::url::encode_path_component(event_id)
     )
 }
 
-fn event_move_url(calendar_id: &str, event_id: &str, target_calendar_id: &str) -> String {
+fn event_move_url(
+    base: &str,
+    calendar_id: &str,
+    event_id: &str,
+    target_calendar_id: &str,
+) -> String {
     format!(
         "{}/move?destination={}",
-        event_url(calendar_id, event_id),
+        event_url(base, calendar_id, event_id),
+        // Query encoder, not the path encoder: the two differ on the complete
+        // `.` and `..` components, which the path encoder double-escapes
+        // against WHATWG path navigation. A calendar id is a query value here.
         bifrost_net::url::encode_query_value(target_calendar_id)
     )
 }
@@ -1291,17 +1295,18 @@ mod tests {
         // double-escapes so the WHATWG parser cannot resolve them as
         // navigation. `destination` is a query value, where dots carry
         // no structural meaning, so both must survive verbatim.
-        let url = event_move_url("primary", "event/1", ".");
+        let base = "https://www.googleapis.com/calendar/v3";
+        let url = event_move_url(base, "primary", "event/1", ".");
         assert!(url.contains("/calendars/primary/events/event%2F1/move"));
         assert!(url.ends_with("destination=."));
 
-        let parent = event_move_url("primary", "event/1", "..");
+        let parent = event_move_url(base, "primary", "event/1", "..");
         assert!(parent.ends_with("destination=.."));
 
         // Everything else encodes identically under both, so a value
         // carrying query delimiters still pins that the destination is
         // escaped at all.
-        let delimited = event_move_url("primary", "event/1", "a&b=c+d");
+        let delimited = event_move_url(base, "primary", "event/1", "a&b=c+d");
         assert!(delimited.ends_with("destination=a%26b%3Dc%2Bd"));
     }
 
