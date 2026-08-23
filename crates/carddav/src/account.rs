@@ -61,6 +61,21 @@ pub(crate) struct CardDavAccount {
 }
 
 impl CardDavAccount {
+    /// Build an account directly around a client, skipping discovery.
+    ///
+    /// Twin of `CalDavAccount::for_tests`: discovery is several round trips of
+    /// its own and would dominate a test about what one call does.
+    #[cfg(test)]
+    pub(crate) fn for_tests(client: Arc<CardDavClient>, addressbook_home: &str) -> Self {
+        Self {
+            client,
+            capabilities: carddav_capabilities(),
+            addressbook_home: addressbook_home.to_string(),
+            default_addressbook_url: addressbook_home.to_string(),
+            unsynced_addressbook_urls: Vec::new(),
+        }
+    }
+
     pub(crate) async fn open(
         _account_id: AccountId,
         config: CardDavConfig,
@@ -854,24 +869,21 @@ impl Account for CardDavAccount {
                 .into_iter()
                 .map(Self::map_addressbook)
                 .collect::<Vec<_>>();
-            if books.is_empty() {
-                let native = client.resolve_url(&home);
-                books.push(AddressBook {
-                    id: AddressBookId(native.clone()),
-                    native_id: native.clone(),
-                    name: "Address Book".to_string(),
-                    provenance: ContactProvenance {
-                        provider: ProtocolKind::CardDav,
-                        native,
-                        address_book_native: None,
-                    },
-                    corpus: ContactCorpus::Main,
-                    is_default: true,
-                    can_create_contacts: true,
-                    can_update_contacts: true,
-                    can_delete_contacts: true,
-                });
-            } else if let Some(first) = books.first_mut() {
+            // An address book home that enumerates zero addressbook
+            // collections surfaces as an empty list, not a fabricated
+            // placeholder. The depth-1 PROPFIND above returns the home's own
+            // response too, so a home that is itself an addressbook collection
+            // is already mapped by the parse path. An empty result here
+            // therefore means a genuinely empty backend; reporting it as empty
+            // lets a consumer reap stale address books rather than chase a
+            // phantom home-book whose queries a spec-correct server 404s.
+            //
+            // The phantom this replaces also advertised `can_create_contacts:
+            // true`, so a consumer that trusted it and POSTed a vCard to the
+            // home URL got a 404 or 405 it had done nothing to deserve.
+            // `bifrost-caldav::calendars_list` removed the identical shape for
+            // the identical reasons; the two must not drift apart again.
+            if let Some(first) = books.first_mut() {
                 first.is_default = true;
             }
             Ok(books)

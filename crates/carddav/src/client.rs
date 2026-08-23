@@ -1260,6 +1260,45 @@ mod tests {
         );
     }
 
+    /// An empty address book home lists NOTHING - no fabricated placeholder.
+    ///
+    /// The phantom this pins the absence of pointed at the home itself and
+    /// advertised `can_create_contacts: true`, so a consumer that trusted it and
+    /// POSTed a vCard to the home URL got a 404 or 405 from a spec-correct
+    /// server. An empty list also lets a consumer tell a genuinely empty backend
+    /// from a real single book, and so reap stale ones.
+    ///
+    /// `bifrost-caldav::calendars_list` removed the identical shape for the
+    /// identical reasons, and the two crates drifted on it for a long time
+    /// precisely because neither side pinned it. Both are pinned now; keep them
+    /// in step.
+    #[tokio::test]
+    async fn an_empty_home_lists_no_address_books_rather_than_a_phantom() {
+        use bifrost_types::account::Account as _;
+
+        let script = ScriptedDavTransport::new([DavResponse {
+            status: StatusCode::MULTI_STATUS,
+            headers: HeaderMap::new(),
+            body: "<D:multistatus xmlns:D=\"DAV:\"/>".to_string(),
+            url: String::new(),
+        }]);
+        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
+        let client = Arc::new(CardDavClient::with_transport(
+            "https://dav.example.test",
+            transport,
+        ));
+        let account = crate::account::CardDavAccount::for_tests(
+            client,
+            "https://dav.example.test/books/ada/",
+        );
+
+        let books = account.address_books_list().await.expect("list");
+        assert!(
+            books.is_empty(),
+            "an empty home must not fabricate an address book: {books:?}"
+        );
+    }
+
     #[tokio::test]
     async fn discovery_falls_back_to_base_after_empty_well_known_response() {
         let response = |body: &str| DavResponse {

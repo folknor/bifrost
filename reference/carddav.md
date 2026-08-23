@@ -119,7 +119,20 @@ Supported contact primitives:
 
 - `address_books_list` - `PROPFIND` depth 1 on the discovered
   addressbook home, filtering `resourcetype` entries that contain
-  `addressbook`.
+  `addressbook`. A home enumerating zero addressbook collections yields an
+  EMPTY list, never a fabricated placeholder. The depth-1 parse returns the
+  home's own response too, so a home that is itself an addressbook collection
+  is already mapped; an empty result therefore means a genuinely empty
+  backend, and reporting it as empty lets a consumer reap stale books rather
+  than chase a phantom whose queries a spec-correct server 404s. The phantom
+  that used to be synthesised here also advertised
+  `can_create_contacts: true`, so a consumer that trusted it and POSTed a
+  vCard to the home URL earned a 404 or 405 it had done nothing to deserve.
+  `bifrost-caldav::calendars_list` removed the identical shape for the
+  identical reasons; the two drifted on this for a long time because neither
+  side pinned it, and both are pinned now
+  (`an_empty_home_lists_no_address_books_rather_than_a_phantom` and its
+  CalDAV twin).
 - `contacts_list` - `PROPFIND` depth 1 for vCard resources, local
   offset-cursor slicing of hrefs, then batched `addressbook-multiget`
   `REPORT` hydration for only the requested page. Multiget REPORTs enumerate

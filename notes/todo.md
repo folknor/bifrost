@@ -1094,15 +1094,20 @@ confirm against the code before working any of them.
   and costs every DAV account a second full re-sync (after the v1 -> v2 href
   correction). Owner's call. It must land in both crates together or it becomes
   another drift entry.
-- **dav-B3. CardDAV fabricates a phantom address book.** [C2]
-  `address_books_list` pushes a synthetic `AddressBook` pointing at the home when
-  the home enumerates zero addressbook collections. CalDAV removed exactly this
-  shape as a bug: a consumer cannot distinguish a genuinely empty backend and so
-  cannot reap stale collections, and the phantom's queries 404 against a
-  spec-correct server. Related in both crates: with zero collections
-  `default_*_url` falls back to `resolve_url(&home)`, so the cursor, inventory
-  and changes lanes target the home collection - the same phantom by another
-  name. The remedy removes a value a published method returns today.
+- **dav-B10. `default_*_url` falls back to the collection home.** [C2] Split out
+  of dav-B3, whose list-side phantom was removed 2026-08-23. This is the
+  symmetric half and it is present in BOTH crates: when discovery finds zero
+  collections, `default_calendar_url` / `default_addressbook_url` fall back to
+  `client.resolve_url(&home)`, so the cursor, inventory and changes lanes target
+  the home collection - the same phantom by another name, one layer down. A
+  spec-correct server 404s those queries.
+
+  It is not simply removable the way the list phantom was: the field is not an
+  `Option`, and the lanes need an answer for "no collection exists". The likely
+  shape is an open-time `SkippedScope` (the machinery now exists, see dav-B2)
+  plus empty inventory and change streams, which is enough design to deserve its
+  own decision rather than riding along with a one-line deletion. Fix both
+  crates together.
 - **dav-B4. CalDAV silently ignores a calendar move.** [C1]
   `CalDavAccount::event_update` uses `patch.calendar_id` only to pick the fetch
   URL, then PUTs to `resolve_url(&event.0)` - the original location - and returns

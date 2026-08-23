@@ -1436,6 +1436,38 @@ mod tests {
         }
     }
 
+    /// An empty calendar home lists NOTHING - no fabricated placeholder.
+    ///
+    /// This crate removed its phantom home-calendar long ago but never pinned
+    /// the absence, which is exactly how bifrost-carddav kept an identical
+    /// phantom for as long as it did. The twin is
+    /// `an_empty_home_lists_no_address_books_rather_than_a_phantom`; keep the
+    /// pair in step.
+    #[tokio::test]
+    async fn an_empty_home_lists_no_calendars_rather_than_a_phantom() {
+        use bifrost_types::account::Account as _;
+
+        let script = ScriptedDavTransport::new([DavResponse {
+            status: StatusCode::MULTI_STATUS,
+            headers: HeaderMap::new(),
+            body: "<D:multistatus xmlns:D=\"DAV:\"/>".to_string(),
+            url: String::new(),
+        }]);
+        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
+        let client = Arc::new(CalDavClient::with_transport(
+            "https://dav.example.test",
+            transport,
+        ));
+        let account =
+            crate::account::CalDavAccount::for_tests(client, "https://dav.example.test/cal/ada/");
+
+        let calendars = account.calendars_list().await.expect("list");
+        assert!(
+            calendars.is_empty(),
+            "an empty home must not fabricate a calendar: {calendars:?}"
+        );
+    }
+
     #[tokio::test]
     async fn credentials_never_reach_a_resource_href_origin() {
         // Two canned responses, so a neutered guard reaches the transport and
