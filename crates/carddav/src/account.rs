@@ -231,19 +231,35 @@ impl CardDavAccount {
         })
     }
 
-    async fn contact_snapshot(
+    /// Snapshot one address book's contact listing plus its ctag.
+    ///
+    /// `ctag` says where the collection tag comes from, because the callers
+    /// differ in what they already know:
+    ///
+    /// - [`CtagSource::Home`] runs the depth-1 PROPFIND over the address book
+    ///   home and picks this collection out of it. Cursor establishment and
+    ///   inventory use it: they have no prior cursor to compare against.
+    /// - [`CtagSource::Known`] takes a value the caller already has. The poll
+    ///   path uses it, because deciding whether to short-circuit at all
+    ///   required asking for the ctag first - re-deriving it from a depth-1
+    ///   listing of the whole home made a changed-ctag poll cost three round
+    ///   trips where two suffice, and that listing grows with the number of
+    ///   address books rather than staying one collection wide.
+    pub(crate) async fn contact_snapshot(
         client: &CardDavClient,
-        home: &str,
+        ctag: CtagSource<'_>,
         addressbook: &str,
         operation: AccountOperation,
     ) -> Result<ContactSnapshot, AccountError> {
-        let collections = client
-            .list_addressbooks_for_operation(home, operation)
-            .await?;
-        let ctag = collections
-            .into_iter()
-            .find(|collection| same_collection_url(&collection.href, addressbook))
-            .and_then(|collection| collection.ctag);
+        let ctag = match ctag {
+            CtagSource::Home(home) => client
+                .list_addressbooks_for_operation(home, operation)
+                .await?
+                .into_iter()
+                .find(|collection| same_collection_url(&collection.href, addressbook))
+                .and_then(|collection| collection.ctag),
+            CtagSource::Known(ctag) => ctag,
+        };
         let listing = client.list_contacts_listing(addressbook, operation).await?;
         let mut entries = listing
             .entries
@@ -262,6 +278,14 @@ impl CardDavAccount {
             failed_hrefs,
         })
     }
+}
+
+/// Where [`CardDavAccount::contact_snapshot`] gets a collection's ctag.
+pub(crate) enum CtagSource<'a> {
+    /// Pick it out of a depth-1 PROPFIND over the address book home.
+    Home(&'a str),
+    /// Use a value the caller already resolved, spending no request.
+    Known(Option<String>),
 }
 
 impl Account for CardDavAccount {
@@ -313,7 +337,7 @@ impl Account for CardDavAccount {
             validate_contact_scope(&scope, AccountOperation::EstablishCursor)?;
             let snapshot = Self::contact_snapshot(
                 &client,
-                &home,
+                CtagSource::Home(&home),
                 &addressbook,
                 AccountOperation::EstablishCursor,
             )
@@ -339,7 +363,7 @@ impl Account for CardDavAccount {
                 let started = Instant::now();
                 let snapshot = match Self::contact_snapshot(
                     &client,
-                    &home,
+                    CtagSource::Home(&home),
                     &addressbook,
                     AccountOperation::SyncInventory,
                 )
@@ -396,7 +420,8 @@ impl Account for CardDavAccount {
 
     fn changes_stream(&self, cursor: ChangeCursor) -> AccountStream<SyncEvent<Change>> {
         let client = Arc::clone(&self.client);
-        let home = self.addressbook_home.clone();
+        // No address book home is captured: the poll path resolves its ctag
+        // against the collection itself, never by re-listing the home.
         Box::pin(
             stream::once(async move {
                 let mut events = Vec::new();
@@ -413,36 +438,55 @@ impl Account for CardDavAccount {
                 // shows the collection unchanged, skip the full depth-1
                 // PROPFIND + diff and carry the cursor forward with no
                 // changes. Mirrors CalDAV's sync-token short-circuit.
-                if let Some(prev_ctag) = previous.ctag.as_deref() {
-                    match client
-                        .collection_ctag(&previous.addressbook_url, AccountOperation::SyncChanges)
-                        .await
-                    {
-                        Ok(Some(current_ctag)) if current_ctag == prev_ctag => {
-                            let checkpoint = cursor_from_snapshot(cursor.scope, &previous);
-                            events.push(SyncEvent::Batch(bifrost_types::Batch {
-                                items: Vec::new(),
-                                page_boundary: PageBoundary::Final,
-                                server_latency: started.elapsed(),
-                                bytes_in: 0,
-                                checkpoint: Some(Checkpoint::Change(checkpoint.clone())),
-                            }));
-                            events.push(SyncEvent::Done(Some(Checkpoint::Change(checkpoint))));
-                            return events;
-                        }
-                        // ctag changed or server omits getctag: fall
-                        // through to the full snapshot + diff (which
-                        // still runs brick 6's empty-207 guard).
-                        Ok(_) => {}
-                        Err(error) => {
-                            events.push(SyncEvent::Terminated(error));
-                            return events;
-                        }
+                //
+                // The ctag is resolved AT MOST ONCE per poll, and the value is
+                // carried into the snapshot below rather than re-derived. It
+                // used to be fetched here and then recovered a second time from
+                // a depth-1 listing of the whole address book home - three
+                // round trips for a changed collection, one of them scaling
+                // with the number of address books.
+                // Resolved unconditionally, not only when the prior cursor
+                // carried one. A cursor with no ctag previously had to recover
+                // one from the depth-1 home listing, which is both dearer and
+                // likelier to come back empty (it finds nothing when the
+                // collection does not appear in its own home). Asking the
+                // collection directly seeds the ctag for the next poll, so a
+                // cursor that starts without one is not stuck without one.
+                let current_ctag = match client
+                    .collection_ctag(&previous.addressbook_url, AccountOperation::SyncChanges)
+                    .await
+                {
+                    Ok(ctag) => ctag,
+                    Err(error) => {
+                        events.push(SyncEvent::Terminated(error));
+                        return events;
                     }
+                };
+                if let (Some(prev_ctag), Some(current_ctag)) =
+                    (previous.ctag.as_deref(), current_ctag.as_deref())
+                    && prev_ctag == current_ctag
+                {
+                    let checkpoint = cursor_from_snapshot(cursor.scope, &previous);
+                    events.push(SyncEvent::Batch(bifrost_types::Batch {
+                        items: Vec::new(),
+                        page_boundary: PageBoundary::Final,
+                        server_latency: started.elapsed(),
+                        bytes_in: 0,
+                        checkpoint: Some(Checkpoint::Change(checkpoint.clone())),
+                    }));
+                    events.push(SyncEvent::Done(Some(Checkpoint::Change(checkpoint))));
+                    return events;
                 }
+                // ctag changed, server omits getctag, or the prior cursor
+                // carried none: fall through to the full snapshot + diff
+                // (which still runs brick 6's empty-207 guard). `Known`
+                // spends no request - it reuses whatever the check above
+                // resolved, including `None`, which is exactly the value the
+                // old depth-1 path would have produced for a server that does
+                // not publish getctag.
                 let current = match Self::contact_snapshot(
                     &client,
-                    &home,
+                    CtagSource::Known(current_ctag),
                     &previous.addressbook_url,
                     AccountOperation::SyncChanges,
                 )
@@ -1101,9 +1145,9 @@ fn project_error(operation: AccountOperation, error: &VCardParseError) -> Accoun
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-struct ContactSnapshot {
+pub(crate) struct ContactSnapshot {
     addressbook_url: String,
-    ctag: Option<String>,
+    pub(crate) ctag: Option<String>,
     entries: Vec<ContactSnapshotEntry>,
     /// Hrefs the server reported *failed* within the 207 of the poll
     /// that built this snapshot. Not persisted in the cursor (a

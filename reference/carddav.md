@@ -190,12 +190,32 @@ Cursor support is contact-only. `discover_cursor_scopes` returns
 `CursorScope::Type(ObjectType::Contact)`. `establish_initial_cursor`
 builds a hybrid cursor from the address book URL, the collection
 `getctag` when present, and a sorted href/etag snapshot. `changes_stream`
-first runs a **ctag short-circuit**: when the prior cursor carries a ctag
-and a cheap depth-0 `getctag` PROPFIND (`client.collection_ctag`) shows it
-unchanged, it emits an empty batch and carries the cursor forward, skipping
-the full depth-1 PROPFIND + diff. Otherwise it polls the current snapshot
-and diffs hrefs/etags. Full WebDAV `sync-collection` parity with CalDAV is
-a named follow-up. The PROPFIND-snapshot diff is hardened against
+first runs a **ctag short-circuit**: a cheap depth-0 `getctag` PROPFIND
+(`client.collection_ctag`) resolves the collection's current tag, and when
+that matches the prior cursor's it emits an empty batch and carries the
+cursor forward, skipping the full depth-1 PROPFIND + diff. Otherwise it
+polls the current snapshot and diffs hrefs/etags. Full WebDAV
+`sync-collection` parity with CalDAV is a named follow-up.
+
+The poll resolves the ctag **at most once**, and hands the value it already
+has to the snapshot as `CtagSource::Known` rather than letting the snapshot
+re-derive it. `contact_snapshot` takes a `CtagSource` for exactly this
+reason: `Home(home)` picks the tag out of a depth-1 PROPFIND over the
+address book home, which is what cursor establishment and inventory want
+since they are enumerating anyway, while `Known` spends no request at all.
+Re-deriving it from the home made a changed-ctag poll cost three round trips
+where two suffice, and that third request grows with the number of address
+books rather than staying one collection wide - the CalDAV twin
+(`event_snapshot`, taking `home: Option<&str>`) had taken the cheap path
+already, so this was drift, not a design difference.
+`poll_snapshot_never_relists_the_address_book_home` pins it against the
+request transcript.
+
+The depth-0 request is issued whether or not the prior cursor carried a
+ctag. A cursor without one previously had to recover it from the home
+listing, which is dearer and comes back empty when the collection does not
+appear in its own home; asking the collection directly seeds the tag, so a
+cursor that starts without one does not stay without one. The PROPFIND-snapshot diff is hardened against
 destroy-everything failure modes: an empty multistatus against a populated
 prior snapshot suppresses the mass-delete (treated as "no observation"),
 and any href in `current.failed_hrefs` is preserved rather than destroyed.

@@ -1260,15 +1260,6 @@ prerequisite for the small local fixes above.
   ships a several-KB body per batch (the engine's read-back guard already fetches
   current state, so this is the site that would benefit most from
   read-back-then-diff).
-- **dav-B6.** `CardDavAccount::contact_snapshot` always calls
-  `list_addressbooks_for_operation(home, ...)` - a depth-1 PROPFIND over the home
-  - purely to recover one collection's ctag, then does the depth-1 contact
-  listing. CalDAV already fixed exactly this: `event_snapshot` takes
-  `home: Option<&str>` and the poll path passes `None` to use the cheap depth-0
-  `collection_sync_token`. CardDAV even has the depth-0 helper
-  (`collection_ctag`), calls it in the short-circuit, then throws the answer away
-  and refetches it the expensive way. A changed-ctag poll costs three requests
-  where two suffice.
 - **dav-B7.** `open_carddav` and `open_caldav` run sequentially in the IMAP
   composition seam, each paying the multi-round-trip discovery. Joining them is
   free. (The seam itself is fine - `classify_dav_open` degrades correctly into

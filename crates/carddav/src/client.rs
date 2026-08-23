@@ -48,7 +48,7 @@ impl fmt::Debug for CardDavClient {
 }
 
 #[derive(Debug, Clone)]
-struct DavResponse {
+pub(crate) struct DavResponse {
     status: StatusCode,
     headers: HeaderMap,
     body: String,
@@ -72,7 +72,7 @@ struct DavBody {
 
 /// Local DAV transport boundary. `bifrost-net` keeps its dispatcher private,
 /// while this client still owns Basic auth and DAV redirect policy.
-trait DavTransport: Send + Sync {
+pub(crate) trait DavTransport: Send + Sync {
     fn send(&self, request: reqwest::RequestBuilder) -> AccountFuture<Result<DavResponse, String>>;
 }
 
@@ -393,7 +393,7 @@ impl CardDavClient {
     }
 
     #[cfg(test)]
-    fn with_transport(base_url: &str, transport: Arc<dyn DavTransport>) -> Self {
+    pub(crate) fn with_transport(base_url: &str, transport: Arc<dyn DavTransport>) -> Self {
         let trusted_origins = url_origin(base_url).into_iter().collect::<Vec<_>>();
         Self {
             http: reqwest::Client::new(),
@@ -1144,6 +1144,97 @@ mod tests {
                 .get(AUTHORIZATION)
                 .and_then(|value| value.to_str().ok()),
             Some("Bearer token")
+        );
+    }
+
+    /// A poll-path snapshot spends the depth-0 ctag request and the depth-1
+    /// contact listing, and never re-lists the address book home.
+    ///
+    /// `CtagSource::Known` is what makes that true: the poll already asked the
+    /// collection for its ctag in order to decide whether to short-circuit, so
+    /// re-deriving the same value from a depth-1 PROPFIND over the home cost a
+    /// third round trip - one that grows with the number of address books
+    /// rather than staying a single collection wide. CalDAV's `event_snapshot`
+    /// has taken the cheap path for a while; this is the CardDAV twin catching
+    /// up, and the assertion is written against the transcript so the two
+    /// cannot drift back apart silently.
+    #[tokio::test]
+    async fn poll_snapshot_never_relists_the_address_book_home() {
+        let multistatus = |body: &str| DavResponse {
+            status: StatusCode::MULTI_STATUS,
+            headers: HeaderMap::new(),
+            body: body.to_string(),
+            url: String::new(),
+        };
+        // Only two responses are scripted. A regression that re-lists the home
+        // starves the script and fails loudly here rather than silently
+        // spending a third request.
+        let script = ScriptedDavTransport::new([multistatus(
+            r#"<D:multistatus xmlns:D="DAV:" xmlns:CS="http://calendarserver.org/ns/">
+  <D:response>
+    <D:href>/books/ada/personal/</D:href>
+    <D:propstat>
+      <D:prop><CS:getctag>ctag-7</CS:getctag></D:prop>
+      <D:status>HTTP/1.1 200 OK</D:status>
+    </D:propstat>
+  </D:response>
+</D:multistatus>"#,
+        )]);
+        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
+        let client = CardDavClient::with_transport("https://dav.example.test", transport);
+
+        let ctag = client
+            .collection_ctag(
+                "https://dav.example.test/books/ada/personal/",
+                AccountOperation::SyncChanges,
+            )
+            .await
+            .expect("ctag resolves");
+        assert_eq!(ctag.as_deref(), Some("ctag-7"));
+
+        let script = ScriptedDavTransport::new([multistatus(
+            r#"<D:multistatus xmlns:D="DAV:">
+  <D:response>
+    <D:href>/books/ada/personal/one.vcf</D:href>
+    <D:propstat>
+      <D:prop><D:getetag>"etag-1"</D:getetag></D:prop>
+      <D:status>HTTP/1.1 200 OK</D:status>
+    </D:propstat>
+  </D:response>
+</D:multistatus>"#,
+        )]);
+        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
+        let client = CardDavClient::with_transport("https://dav.example.test", transport);
+
+        let snapshot = crate::account::CardDavAccount::contact_snapshot(
+            &client,
+            crate::account::CtagSource::Known(ctag),
+            "https://dav.example.test/books/ada/personal/",
+            AccountOperation::SyncChanges,
+        )
+        .await
+        .expect("snapshot");
+
+        // The known ctag survived into the snapshot without being refetched.
+        assert_eq!(snapshot.ctag.as_deref(), Some("ctag-7"));
+
+        let requests = script.requests();
+        assert_eq!(
+            requests.len(),
+            1,
+            "a Known ctag must cost the listing request and nothing else"
+        );
+        assert_eq!(
+            requests[0].url, "https://dav.example.test/books/ada/personal/",
+            "the one request addresses the collection, never the home"
+        );
+        assert_eq!(
+            requests[0]
+                .headers
+                .get("depth")
+                .and_then(|value| value.to_str().ok()),
+            Some("1"),
+            "the listing is the depth-1 request"
         );
     }
 
