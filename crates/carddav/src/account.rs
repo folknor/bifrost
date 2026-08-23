@@ -49,8 +49,9 @@ impl CardDavAccount {
         _account_id: AccountId,
         config: CardDavConfig,
     ) -> Result<Self, AccountError> {
-        let client = CardDavClient::new(&config)?;
+        let mut client = CardDavClient::new(&config)?;
         let addressbook_home = client.discover_addressbook_home().await?;
+        client.admit_discovered_urls(std::iter::once(addressbook_home.clone()));
         let collections = client.list_addressbooks(&addressbook_home).await?;
         let default_addressbook_url = collections
             .first()

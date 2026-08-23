@@ -1,6 +1,5 @@
 use std::fmt;
 use std::sync::Arc;
-use std::sync::RwLock;
 use std::time::Duration;
 
 use base64::Engine;
@@ -36,7 +35,7 @@ pub(crate) struct CardDavClient {
     transport: Arc<dyn DavTransport>,
     base_url: String,
     credentials: CardDavCredentials,
-    trusted_origins: Arc<RwLock<Vec<String>>>,
+    trusted_origins: Vec<String>,
 }
 
 impl fmt::Debug for CardDavClient {
@@ -133,16 +132,17 @@ async fn read_capped_body(response: reqwest::Response) -> Result<String, String>
 impl CardDavClient {
     pub(crate) fn new(config: &CardDavConfig) -> Result<Self, AccountError> {
         let http = reqwest::Client::builder()
-            .redirect(dav_redirect_policy(&config.base_url))
+            .redirect(dav_redirect_policy())
             .timeout(DAV_CLIENT_TIMEOUT)
             .build()
             .map_err(|error| local_error(AccountOperation::Discover, error.to_string()))?;
 
         let base_url = config.base_url.trim_end_matches('/').to_string();
+        let trusted_origins = url_origin(&base_url).into_iter().collect::<Vec<_>>();
         Ok(Self {
             http,
             transport: Arc::new(ReqwestDavTransport),
-            trusted_origins: Arc::new(RwLock::new(url_origin(&base_url).into_iter().collect())),
+            trusted_origins,
             base_url,
             credentials: config.credentials.clone(),
         })
@@ -204,7 +204,6 @@ impl CardDavClient {
         extract_href_property(&response.text, "addressbook-home-set")
             .map_err(|error| parse_error(AccountOperation::Discover, error))?
             .map(|href| resolve_href(&response.url, &href))
-            .inspect(|home| self.trust_discovered_url(home))
             .ok_or_else(|| parse_error(AccountOperation::Discover, "missing addressbook-home-set"))
     }
 
@@ -395,12 +394,13 @@ impl CardDavClient {
 
     #[cfg(test)]
     fn with_transport(base_url: &str, transport: Arc<dyn DavTransport>) -> Self {
+        let trusted_origins = url_origin(base_url).into_iter().collect::<Vec<_>>();
         Self {
             http: reqwest::Client::new(),
             transport,
             base_url: base_url.trim_end_matches('/').to_string(),
             credentials: CardDavCredentials::bearer("token"),
-            trusted_origins: Arc::new(RwLock::new(url_origin(base_url).into_iter().collect())),
+            trusted_origins,
         }
     }
 
@@ -485,15 +485,94 @@ impl CardDavClient {
         }
     }
 
+    /// Send a request, following cross-origin redirects by hand.
+    ///
+    /// Same-origin hops are followed inside reqwest, which preserves the
+    /// `Authorization` header when scheme, host, and effective port are all
+    /// unchanged. A cross-origin hop cannot ride that path: reqwest strips
+    /// `Authorization` on any origin change and its redirect policy has no
+    /// way to restore it, so a followed hop would reach the destination
+    /// unauthenticated. Cross-origin 3xx responses are therefore stopped by
+    /// the policy and re-dispatched here with fresh `auth_headers` for the
+    /// target - and `auth_headers` refuses any origin discovery did not
+    /// admit, so a server-controlled `Location` can never widen trust, only
+    /// spend trust that authenticated discovery already granted. The method
+    /// and body are preserved on 301/302/307/308; DAV verbs have no useful
+    /// GET rewrite, and RFC 7231 permits preserving them. A 303 is not
+    /// followed and classifies as a terminal status downstream.
     async fn send_raw_request(
         &self,
         request: reqwest::RequestBuilder,
         operation: AccountOperation,
     ) -> Result<DavResponse, AccountError> {
-        self.transport
-            .send(request)
-            .await
-            .map_err(|error| transport_error(operation, error))
+        let max_hops = usize::from(bifrost_net::RedirectPolicy::default().max_hops);
+        let mut request = request;
+        let mut hops = 0usize;
+        loop {
+            let replay = request.try_clone();
+            let response = self
+                .transport
+                .send(request)
+                .await
+                .map_err(|error| transport_error(operation, error))?;
+            let redirect = matches!(
+                response.status,
+                StatusCode::MOVED_PERMANENTLY
+                    | StatusCode::FOUND
+                    | StatusCode::TEMPORARY_REDIRECT
+                    | StatusCode::PERMANENT_REDIRECT
+            );
+            let location = response
+                .headers
+                .get(reqwest::header::LOCATION)
+                .and_then(|value| value.to_str().ok());
+            let Some(location) = location.filter(|_| redirect) else {
+                if !self.is_trusted_url(&response.url) {
+                    return Err(local_error(
+                        operation,
+                        format!(
+                            "response arrived from an untrusted DAV origin: {}",
+                            response.url
+                        ),
+                    ));
+                }
+                return Ok(response);
+            };
+            let next = Url::parse(&response.url)
+                .and_then(|base| base.join(location))
+                .map_err(|error| {
+                    local_error(operation, format!("unresolvable redirect target: {error}"))
+                })?;
+            hops += 1;
+            if hops >= max_hops {
+                return Err(local_error(operation, "too many redirects"));
+            }
+            let Some(replay) = replay else {
+                return Err(local_error(
+                    operation,
+                    "redirected DAV request cannot be replayed",
+                ));
+            };
+            let previous = replay
+                .build()
+                .map_err(|error| local_error(operation, error.to_string()))?;
+            // Fresh credentials for the target origin; refused locally when
+            // the origin was never admitted by discovery.
+            let auth = self.auth_headers(next.as_str(), operation).await?;
+            let mut headers = previous.headers().clone();
+            headers.remove(AUTHORIZATION);
+            for (name, value) in &auth {
+                headers.insert(name, value.clone());
+            }
+            let mut rebuilt = self
+                .http
+                .request(previous.method().clone(), next)
+                .headers(headers);
+            if let Some(body) = previous.body().and_then(reqwest::Body::as_bytes) {
+                rebuilt = rebuilt.body(body.to_vec());
+            }
+            request = rebuilt;
+        }
     }
 
     /// Build the per-request auth headers. The bearer token is read from
@@ -534,7 +613,7 @@ impl CardDavClient {
         Ok(headers)
     }
 
-    /// Admit a discovered DAV home to the credential-bearing origin set.
+    /// Admit successfully discovered DAV origins to both trust gates.
     ///
     /// Discovery is server-steered: the address book home comes out of the
     /// principal's own PROPFIND response, so a compromised or hostile server
@@ -545,27 +624,25 @@ impl CardDavClient {
     /// turn discovery into a downgrade channel for the account credential. A
     /// cross-origin HTTPS home is still admitted; that is a real deployment
     /// shape, where the principal and the address book home live on different
-    /// hosts of the same service.
-    fn trust_discovered_url(&self, url: &str) {
-        let Some(origin) = url_origin(url) else {
-            return;
-        };
-        if origin_is_secure(&self.base_url) && !origin_is_secure(url) {
-            return;
-        }
-        let mut origins = self.trusted_origins.write().expect("trusted origins lock");
-        if !origins.contains(&origin) {
-            origins.push(origin);
+    /// hosts of the same service. Admission happens only after the complete
+    /// authenticated discovery result is available, before the account is
+    /// shared or a home request can be in flight.
+    pub(crate) fn admit_discovered_urls(&mut self, urls: impl IntoIterator<Item = String>) {
+        for url in urls {
+            let Some(origin) = url_origin(&url) else {
+                continue;
+            };
+            if origin_is_secure(&self.base_url) && !origin_is_secure(&url) {
+                continue;
+            }
+            if !self.trusted_origins.contains(&origin) {
+                self.trusted_origins.push(origin);
+            }
         }
     }
 
     fn is_trusted_url(&self, url: &str) -> bool {
-        url_origin(url).is_some_and(|origin| {
-            self.trusted_origins
-                .read()
-                .expect("trusted origins lock")
-                .contains(&origin)
-        })
+        url_origin(url).is_some_and(|origin| self.trusted_origins.contains(&origin))
     }
 }
 
@@ -605,23 +682,33 @@ fn url_origin(value: &str) -> Option<String> {
     ))
 }
 
-/// Hardened redirect policy for the DAV `reqwest::Client`, sourced from
-/// `bifrost-net`'s single source of truth. The hop cap and the
-/// case-insensitive host allowlist check both live in
-/// `RedirectPolicy::reqwest_policy`; here we only seed the allowlist with
-/// the configured base URL's host so cross-host redirects are stopped.
-/// When the base URL has no parseable host the allowlist stays empty and
-/// the policy degrades to a hop cap only - reqwest's own cross-origin
-/// `Authorization` stripping still applies regardless.
-fn dav_redirect_policy(base_url: &str) -> reqwest::redirect::Policy {
-    let mut policy = bifrost_net::RedirectPolicy::default();
-    if let Some(host) = Url::parse(base_url.trim_end_matches('/'))
-        .ok()
-        .and_then(|url| url.host_str().map(str::to_owned))
-    {
-        policy = policy.trust_host(host);
-    }
-    policy.reqwest_policy()
+/// Hardened redirect policy for the DAV `reqwest::Client`.
+///
+/// Follows a hop only when the next URL keeps the exact origin (scheme,
+/// host, effective port) of the URL that issued the redirect; reqwest
+/// preserves `Authorization` precisely under that condition, and strips it
+/// on any origin change with no way for a policy to restore it. Every
+/// cross-origin hop is stopped so the 3xx surfaces to `send_raw_request`,
+/// which re-dispatches it with fresh credentials against the admitted
+/// origin set. The hop cap comes from `bifrost-net`.
+fn dav_redirect_policy() -> reqwest::redirect::Policy {
+    let max_hops = usize::from(bifrost_net::RedirectPolicy::default().max_hops);
+    reqwest::redirect::Policy::custom(move |attempt| {
+        if attempt.previous().len() >= max_hops {
+            return attempt.error("too many redirects");
+        }
+        let same_origin = attempt
+            .previous()
+            .last()
+            .and_then(|previous| url_origin(previous.as_str()))
+            .zip(url_origin(attempt.url().as_str()))
+            .is_some_and(|(previous, next)| previous == next);
+        if same_origin {
+            attempt.follow()
+        } else {
+            attempt.stop()
+        }
+    })
 }
 
 fn escape_xml(value: &str) -> String {
@@ -1127,13 +1214,14 @@ mod tests {
     async fn discovered_cross_origin_https_home_receives_credentials() {
         let script = discovery_script("https://books.example.test/homes/ada/");
         let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
-        let client = CardDavClient::with_transport("https://dav.example.test", transport);
+        let mut client = CardDavClient::with_transport("https://dav.example.test", transport);
 
         let home = client
             .discover_addressbook_home()
             .await
             .expect("cross-origin home is discovered");
         assert_eq!(home, "https://books.example.test/homes/ada/");
+        client.admit_discovered_urls(std::iter::once(home.clone()));
         client
             .list_addressbooks(&home)
             .await
@@ -1151,25 +1239,88 @@ mod tests {
         );
     }
 
+    /// The reviewer-found hole this pins: a cross-origin hop followed inside
+    /// reqwest arrives with `Authorization` stripped and cannot get it back.
+    /// The manual re-dispatch must therefore carry fresh credentials to the
+    /// admitted target - the assertion that bites is the auth header on the
+    /// SECOND transcript entry, and the href assertion additionally keeps
+    /// round 3's guarantee that resolution uses the post-redirect URI.
     #[tokio::test]
-    async fn cross_origin_addressbook_hrefs_resolve_against_the_home_request() {
+    async fn cross_origin_redirect_is_redispatched_with_credentials() {
+        let mut redirect_headers = HeaderMap::new();
+        redirect_headers.insert(
+            reqwest::header::LOCATION,
+            HeaderValue::from_static("https://books.example.test/dav/homes/ada/"),
+        );
+        let script = ScriptedDavTransport::new([
+            DavResponse {
+                status: StatusCode::MOVED_PERMANENTLY,
+                headers: redirect_headers,
+                body: String::new(),
+                url: String::new(),
+            },
+            DavResponse {
+                status: StatusCode::MULTI_STATUS,
+                headers: HeaderMap::new(),
+                body: "<D:multistatus xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:carddav\"><D:response><D:href>team/</D:href><D:propstat><D:prop><D:resourcetype><D:collection/><C:addressbook/></D:resourcetype></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response></D:multistatus>".to_string(),
+                url: String::new(),
+            },
+        ]);
+        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
+        let mut client = CardDavClient::with_transport("https://dav.example.test", transport);
+        client.admit_discovered_urls(std::iter::once(
+            "https://books.example.test/homes/ada/".to_string(),
+        ));
+
+        let books = client
+            .list_addressbooks("https://dav.example.test/books/ada/")
+            .await
+            .expect("cross-origin redirect is followed with credentials");
+
+        let requests = script.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1].url, "https://books.example.test/dav/homes/ada/");
+        assert_eq!(
+            requests[1].method,
+            Method::from_bytes(b"PROPFIND").expect("PROPFIND method")
+        );
+        assert_eq!(
+            requests[1]
+                .headers
+                .get(AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer token")
+        );
+        assert_eq!(
+            books[0].href,
+            "https://books.example.test/dav/homes/ada/team/"
+        );
+    }
+
+    /// A redirect is server-controlled input: an origin discovery never
+    /// admitted must fail locally, and no request at all may reach it.
+    #[tokio::test]
+    async fn redirect_to_an_unadmitted_origin_is_refused_locally() {
+        let mut redirect_headers = HeaderMap::new();
+        redirect_headers.insert(
+            reqwest::header::LOCATION,
+            HeaderValue::from_static("https://evil.test/dav/"),
+        );
         let script = ScriptedDavTransport::new([DavResponse {
-            status: StatusCode::MULTI_STATUS,
-            headers: HeaderMap::new(),
-            body: "<D:multistatus xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:carddav\"><D:response><D:href>team/</D:href><D:propstat><D:prop><D:resourcetype><D:collection/><C:addressbook/></D:resourcetype></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response></D:multistatus>".to_string(),
+            status: StatusCode::FOUND,
+            headers: redirect_headers,
+            body: String::new(),
             url: String::new(),
         }]);
         let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
         let client = CardDavClient::with_transport("https://dav.example.test", transport);
-        let home = "https://books.example.test/homes/ada/";
-        client.trust_discovered_url(home);
 
-        let books = client
-            .list_addressbooks(home)
+        client
+            .list_addressbooks("https://dav.example.test/books/ada/")
             .await
-            .expect("cross-origin listing succeeds");
+            .expect_err("an unadmitted redirect target is refused");
 
-        assert_eq!(books[0].href, "https://books.example.test/homes/ada/team/");
+        assert_eq!(script.requests().len(), 1);
     }
 
     /// RFC 4918 resolves a relative href against the EFFECTIVE request URI.
@@ -1210,13 +1361,14 @@ mod tests {
     async fn discovered_plaintext_home_never_receives_credentials() {
         let script = discovery_script("http://books.example.test/homes/ada/");
         let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
-        let client = CardDavClient::with_transport("https://dav.example.test", transport);
+        let mut client = CardDavClient::with_transport("https://dav.example.test", transport);
 
         let home = client
             .discover_addressbook_home()
             .await
             .expect("home href is still reported");
         assert_eq!(home, "http://books.example.test/homes/ada/");
+        client.admit_discovered_urls(std::iter::once(home.clone()));
         client
             .list_addressbooks(&home)
             .await

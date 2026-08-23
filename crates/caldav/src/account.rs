@@ -38,10 +38,14 @@ impl CalDavAccount {
         _account_id: AccountId,
         config: CalDavConfig,
     ) -> Result<Self, AccountError> {
-        let client = CalDavClient::new(&config)?;
+        let mut client = CalDavClient::new(&config)?;
         let discovery = client.discover_account().await?;
         let rsvp_email = rsvp_email_from_config(&config).or(discovery.calendar_user_email);
         let schedule_outbox_url = discovery.schedule_outbox_url;
+        client.admit_discovered_urls(
+            std::iter::once(discovery.calendar_home.clone())
+                .chain(schedule_outbox_url.iter().cloned()),
+        );
         // `event_rsvp` is discovery-derived, not assumed: the RSVP path
         // below hard-requires both of these and returns `unsupported`
         // without them, so advertising the method on a scheduling-less

@@ -44,21 +44,6 @@ base nor a discovered home - now gets a hard local error where it previously got
 That is the intended trade. It is a behavior change, not an API change: no published item was
 removed, renamed, or reshaped.
 
-New finding, filed 2026-08-23 by the round-3 fix-and-commit stage while threading the effective
-response URL through href resolution.
-
-**[C2] A redirect issued by a cross-origin DAV home fails the operation.** `dav_redirect_policy`
-seeds its host allowlist from the configured `base_url` only. Discovery may legitimately place the
-calendar or address book home on a different origin - the credential-origin allowlist was written
-specifically not to break that - but the one `reqwest::Client` driving every request still trusts
-only the base host. A 301/302 from the cross-origin home is therefore stopped, the 3xx reaches
-`settle_body` as a non-success status, and the operation fails with a status error rather than
-following a hop the server considers routine. Correct today for the common single-origin
-deployment; the fuse is a provider that both splits the home onto its own host and redirects within
-it. The fix is to widen the allowlist as origins are admitted to the trusted set, which means
-rebuilding or re-seeding the client after discovery - not a one-line change, and it interacts with
-the credential allowlist, so it wants its own round.
-
 Highest severity, ahead of its position in the document: **the recurrence-override EventId finding
 destroys an entire recurring series on an instance delete, verified against the current tree (no
 `#` guard exists anywhere in either crate).** It is worse than a document ordered by discovery

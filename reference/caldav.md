@@ -47,7 +47,18 @@ calendar primitives.
   refused admission, so discovery cannot become a downgrade channel for the
   account credential. A cross-origin `https` home is admitted, because a
   principal and a calendar home on different hosts of one service is a real
-  deployment shape.
+  deployment shape. Discovery stages these origins without changing trust;
+  they are admitted only after the complete authenticated discovery succeeds,
+  before the account is shared or a home request starts. Redirects split into
+  two paths. Same-origin hops (exact scheme, host, effective port) are
+  followed inside reqwest, which preserves `Authorization` under exactly that
+  condition. Cross-origin hops are never followed inside reqwest - it strips
+  `Authorization` on any origin change and a redirect policy cannot restore
+  it - so the policy stops them and `send_raw_request` re-dispatches the hop
+  manually with fresh credentials, gated by the same admitted-origin set the
+  credential gate reads. A `Location` naming an unadmitted origin fails
+  locally without a request going out; a 303 is not followed. Both the
+  reqwest chain and the manual hops are bounded by bifrost-net's hop cap.
 - `parse.rs` - XML response parsers for calendar discovery, event
   listing, multiget hydration, and nested href properties. Calendar
   collection metadata and href-valued discovery properties are staged per
@@ -79,7 +90,7 @@ calendar primitives.
   yielding absolute native URLs at the decode boundary before the account
   layer can consume success or failure lanes. The base is the EFFECTIVE
   request URI: the DAV transport carries the post-redirect URL back on
-  every response, because the redirect policy follows same-host hops and
+  every response, because the redirect policy follows admitted-origin hops and
   RFC 4918 resolves against the URI that actually served the body.
 - `ical.rs` - iCalendar projection between DAV resources and
   `bifrost-types` calendar events. Parsing-in uses `caldata`'s streaming

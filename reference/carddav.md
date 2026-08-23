@@ -43,7 +43,18 @@ its successful body does not identify a current-user principal.
   refused admission, so discovery cannot become a downgrade channel for the
   account credential. A cross-origin `https` home is admitted, because a
   principal and an address book home on different hosts of one service is a
-  real deployment shape.
+  real deployment shape. Discovery stages the home without changing trust;
+  it is admitted only after the complete authenticated discovery succeeds,
+  before the account is shared or a home request starts. Redirects split into
+  two paths. Same-origin hops (exact scheme, host, effective port) are
+  followed inside reqwest, which preserves `Authorization` under exactly that
+  condition. Cross-origin hops are never followed inside reqwest - it strips
+  `Authorization` on any origin change and a redirect policy cannot restore
+  it - so the policy stops them and `send_raw_request` re-dispatches the hop
+  manually with fresh credentials, gated by the same admitted-origin set the
+  credential gate reads. A `Location` naming an unadmitted origin fails
+  locally without a request going out; a 303 is not followed. Both the
+  reqwest chain and the manual hops are bounded by bifrost-net's hop cap.
 - `parse.rs` - XML response parsers for addressbook discovery,
   contact listing, multiget hydration, depth-0 `getctag`, and nested href
   properties. Addressbook/listing/multiget and href-valued discovery
@@ -60,7 +71,7 @@ its successful body does not identify a current-user principal.
   that produced the multistatus, yielding absolute native URLs at the decode
   boundary before the account layer can consume success or failure lanes. The
   base is the EFFECTIVE request URI: the DAV transport carries the post-redirect
-  URL back on every response, because the redirect policy follows same-host hops
+  URL back on every response, because the redirect policy follows admitted-origin hops
   and RFC 4918 resolves against the URI that actually served the body.
   Resource identification does not depend on a `.vcf` suffix or a returned
   content type. The contact PROPFIND requests `resourcetype`, and both its
