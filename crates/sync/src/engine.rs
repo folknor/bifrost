@@ -1347,10 +1347,9 @@ impl SyncEngine {
     /// retry loop, the stream-terminated recovery dispatch
     /// (Retry / Reconcile / Engine / Terminal), and the final read-back
     /// guard - with two op-specific seams: the wire submit call and the
-    /// matching read-back guard. `bulk_set_flags` deliberately keeps its
-    /// own copy of the loop (its read-back is `FlagOp`-shaped); this
-    /// helper is the move/destroy counterpart whose read-back is
-    /// membership/absence-shaped.
+    /// matching read-back guard. All three entry points route through
+    /// here; the read-back shape (`FlagOp` / membership / absence) is
+    /// selected from `op` rather than by duplicating the loop.
     async fn run_bulk_pipeline(
         &self,
         account_id: &AccountId,
@@ -1366,6 +1365,7 @@ impl SyncEngine {
             .map(|r| Arc::clone(r.value()))
             .ok_or_else(|| Error::AccountNotAttached(account_id.clone()))?;
         let max_retries = self.config.mutation_max_retries;
+        let retry_queue_cap = self.config.mutation.retry_queue_cap;
 
         let key = vendor.next(protocol);
 
@@ -1574,6 +1574,41 @@ impl SyncEngine {
                 .filter(|id| retry_set.contains(*id))
                 .cloned()
                 .collect();
+            // `MutationConfig::retry_queue_cap` bounds how wide ONE
+            // resubmission may be. The retry set only ever shrinks (it is
+            // filtered out of `remaining`), so this is not a guard against
+            // unbounded growth - it is a ceiling on the per-attempt work a
+            // single oversized campaign can demand of the account, which
+            // otherwise resubmits its whole still-failing set on every one of
+            // `mutation_max_retries` attempts.
+            //
+            // The excess is NOT dropped. It is marked `PendingRetry` HERE
+            // rather than left to the post-loop sweep below, because that sweep
+            // runs only on the break path: an id merely truncated out of
+            // `next_remaining` before a `continue` is no longer in `remaining`,
+            // so no later attempt resolves it and it would leave the campaign
+            // uncounted entirely - reporting success for work that never
+            // happened. Marked here, it is counted as pending and then run
+            // through the read-back guard, so a mutation that actually landed
+            // is still reconciled rather than reported as outstanding.
+            //
+            // `split_off` keeps the retained prefix in `remaining` order, so
+            // what survives is the earliest-submitted ids rather than an
+            // arbitrary hash-order slice.
+            if next_remaining.len() > retry_queue_cap {
+                let deferred = next_remaining.split_off(retry_queue_cap);
+                tracing::warn!(
+                    target: "bifrost.sync.mutation",
+                    account_id = ?account_id,
+                    attempt,
+                    cap = retry_queue_cap,
+                    deferred = deferred.len(),
+                    "retry queue cap reached; deferring the excess as pending retry"
+                );
+                for id in deferred {
+                    outcomes.insert(id, MutationBucket::PendingRetry);
+                }
+            }
             if attempt < max_retries && !next_remaining.is_empty() {
                 retry_advice = stream_termination_advice;
                 std::mem::swap(&mut remaining, &mut next_remaining);

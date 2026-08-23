@@ -59,6 +59,10 @@ struct CampaignState {
     submissions: AtomicUsize,
     submitted: tokio::sync::Notify,
     keys: std::sync::Mutex<Vec<IdempotencyKey>>,
+    /// How many targets each successive submission actually carried, so a
+    /// test can observe the width of a resubmission rather than only its
+    /// count.
+    widths: std::sync::Mutex<Vec<usize>>,
 }
 
 struct FlagsFactory(Arc<FlagsAccount>);
@@ -242,9 +246,29 @@ impl Account for FlagsAccount {
         let attempt = campaign.submissions.fetch_add(1, Ordering::SeqCst);
         campaign.submitted.notify_one();
         if attempt == 0 {
-            return Box::pin(stream::iter([SyncEvent::Terminated(retryable_transport())]));
+            // Drain first so the submission width is recorded, then terminate
+            // retryably without emitting any per-item outcome. Whether the
+            // account consumed its own input stream is invisible to the engine,
+            // which sweeps unresolved ids out of `remaining`, so this records
+            // the width without changing what the campaign observes.
+            let campaign = Arc::clone(campaign);
+            return Box::pin(stream::once(async move {
+                let width = targets.count().await;
+                campaign.widths.lock().expect("widths lock").push(width);
+                SyncEvent::Terminated(retryable_transport())
+            }));
         }
+        let widths = Arc::clone(campaign);
         Box::pin(stream::once(async move {
+            let targets = {
+                let collected: Vec<ObjectId> = targets.collect().await;
+                widths
+                    .widths
+                    .lock()
+                    .expect("widths lock")
+                    .push(collected.len());
+                stream::iter(collected)
+            };
             let items = targets
                 .map(|id| {
                     ItemOutcome::Succeeded(bifrost_types::BatchSuccess::new(
@@ -906,6 +930,77 @@ async fn paused_campaign_resumes_once_without_losing_retry_accounting() {
         assert_eq!(keys[0].sequence, keys[1].sequence);
         assert_eq!(keys[0].protocol_salt, keys[1].protocol_salt);
     }
+    engine.detach(&account_id).await.expect("detach");
+}
+
+/// `MutationConfig::retry_queue_cap` bounds how wide ONE resubmission may be,
+/// and the targets it defers are reported rather than dropped.
+///
+/// The first submission terminates retryably with no per-item outcome, so all
+/// five targets become retry candidates. With the cap at two, the second
+/// submission may carry only two of them - and the other three must still be
+/// accounted for, because an id merely truncated out of the resubmission is no
+/// longer among the campaign's outstanding targets and no later attempt will
+/// resolve it. Before the cap was wired, the field was never read and the
+/// second submission carried all five.
+#[tokio::test(start_paused = true)]
+async fn retry_queue_cap_bounds_a_resubmission_without_losing_the_excess() {
+    let state = Arc::new(CampaignState::default());
+    let mut config = bifrost_sync::EngineConfig::default();
+    config.mutation.retry_queue_cap = 2;
+    let engine = Arc::new(
+        SyncEngine::builder()
+            .config(config)
+            .build()
+            .expect("engine"),
+    );
+    let account_id = AccountId("retry-queue-cap".into());
+    engine
+        .attach(
+            account_id.clone(),
+            Arc::new(FlagsFactory(campaign_account(Arc::clone(&state)))),
+        )
+        .await
+        .expect("attach");
+
+    let counters = engine
+        .bulk_set_flags(
+            &account_id,
+            (0..5)
+                .map(|n| ObjectId(format!("id-{n}")))
+                .collect::<Vec<_>>(),
+            FlagOp::Add(set(&["\\Seen"])),
+            &vendor(),
+            ProtocolKind::Imap,
+        )
+        .await
+        .expect("campaign");
+
+    {
+        let widths = state.widths.lock().expect("widths lock");
+        assert_eq!(
+            widths.as_slice(),
+            &[5, 2],
+            "the resubmission must be capped at retry_queue_cap"
+        );
+    }
+    // Two were retried and applied. The three the cap deferred are marked
+    // pending and then run through the read-back guard, which resolves them
+    // against real server state - so they land in the skipped or still-failed
+    // lane rather than staying nominally outstanding. Which lane is the
+    // guard's business; what this pins is that all five are still accounted
+    // for. Truncating the resubmission WITHOUT marking the excess drops them
+    // from every lane and this total falls to two.
+    assert_eq!(counters.applied, 2);
+    let accounted = counters.applied
+        + counters.skipped
+        + counters.failed_terminal
+        + counters.blocked_by_engine
+        + counters.pending_retry;
+    assert_eq!(
+        accounted, 5,
+        "every submitted target must land in exactly one lane: {counters:?}"
+    );
     engine.detach(&account_id).await.expect("detach");
 }
 

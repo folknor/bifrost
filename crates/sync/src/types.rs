@@ -136,9 +136,25 @@ pub struct PushConfig {}
 /// Mutation pipeline config.
 #[derive(Debug, Clone, Copy)]
 pub struct MutationConfig {
-    /// Default fan-out per-account sub-channel buffer.
+    /// Recommended capacity for the per-account sub-channels a caller
+    /// pre-builds for [`crate::mutation::fanout::partition_by_account`].
+    ///
+    /// Advisory by construction: `partition_by_account` takes senders the
+    /// caller already made, so the engine cannot apply this on the caller's
+    /// behalf. It is the default a consumer should reach for, not a bound the
+    /// engine enforces.
     pub fanout_buffer: usize,
-    /// Default per-campaign retry queue limit.
+    /// Widest single resubmission a bulk-mutation campaign may make.
+    ///
+    /// A campaign's retry set only ever shrinks - it is filtered out of the
+    /// targets still outstanding - so this is not a guard against unbounded
+    /// growth. It caps the per-attempt work one oversized campaign can demand
+    /// of an account, which would otherwise resubmit its entire still-failing
+    /// set on every attempt up to `EngineConfig::mutation_max_retries`.
+    ///
+    /// Targets past the cap are reported `pending_retry` and still pass through
+    /// the read-back guard, so nothing is silently dropped; they are deferred,
+    /// not failed. Campaigns smaller than this are unaffected.
     pub retry_queue_cap: usize,
 }
 

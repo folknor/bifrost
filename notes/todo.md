@@ -1166,15 +1166,6 @@ confirm against the code before working any of them.
   session; Drive keeps the partial upload for a week. There is no cleanup and no
   resume-on-reopen. The module doc acknowledges "a stray uploaded-but-unlinked
   file is the worst failure mode" for the link step but not for the upload step.
-- **sync-B3. `MutationConfig::retry_queue_cap` bounds nothing.** [C2] The field
-  is declared in `crates/sync/src/types.rs` with a default of 4096 and a doc
-  comment reading "default per-campaign retry queue limit", and nothing in the
-  crate ever reads it - the campaign retry queue is an unbounded `Vec`. A
-  consumer tuning it gets no effect, and a pathological retry storm has no
-  ceiling. **The fix is to make the field actually cap the queue, not to delete
-  the field.** Deleting it was proposed once as part of a wider public-API
-  removal that had to be reverted; where a finding proposes removing something,
-  look for the fix that keeps it.
 - **dav-B9. All DAV traffic bypasses `bifrost-net`.** [C2] Both crates run their
   own `ReqwestDavTransport` behind the `DavTransport` seam, so DAV legs get no
   retry, no rate limiting, no bandwidth metering and no observability, and

@@ -743,6 +743,21 @@ method and final read-back guard. Campaign flow:
    `IdempotencyKey`
    (engine bookkeeping; no protocol today emits it on the wire).
    Repeat up to `EngineConfig::mutation_max_retries`.
+
+   One resubmission is at most `MutationConfig::retry_queue_cap` targets
+   wide (default 4096). The retry set only shrinks - it is filtered out of
+   the ids still outstanding - so this is not a guard against unbounded
+   growth; it caps the per-attempt work one oversized campaign can demand of
+   an account, which would otherwise resubmit its whole still-failing set on
+   every attempt. Targets past the cap are marked `PendingRetry` AT THE
+   TRUNCATION, not left to the sweep that runs when the loop exits: an id
+   merely truncated out of the resubmission is no longer among the campaign's
+   outstanding targets, so no later attempt resolves it and it would leave
+   the campaign counted in no lane at all - the campaign reporting success
+   for work that never happened. Marked, it is counted as pending and then
+   passes through the read-back guard like any other unresolved id.
+   `retry_queue_cap_bounds_a_resubmission_without_losing_the_excess` pins
+   both halves, and was checked by ablation against each.
 4. Run `run_readback_guard` once at the end against unresolved
    failures: `get_stream(Projection::FlagsOnly)` re-fetches and
    reconciles applied / skipped / failed_terminal. The read-back set
