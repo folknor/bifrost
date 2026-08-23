@@ -169,12 +169,19 @@ impl AccountFactory for ImapAccountFactory {
             // sub-account with its classified error.
             let mut dav_degraded = Vec::new();
             let mut skipped_scopes = Vec::new();
-            let contacts = open_carddav(&cfg, account_id.clone())
-                .await
-                .into_attached(&mut dav_degraded, &mut skipped_scopes);
-            let calendars = open_caldav(&cfg, account_id.clone())
-                .await
-                .into_attached(&mut dav_degraded, &mut skipped_scopes);
+            // Joined, not sequential: each DAV open is its own multi-round-trip
+            // discovery against its own endpoint with its own client, so
+            // awaiting them in turn made an IMAP open pay both latencies for no
+            // reason. `into_attached` is applied afterwards in a fixed order so
+            // the degradation and skipped-scope lanes stay deterministic - the
+            // futures may finish in either order, the reporting may not.
+            let (contacts, calendars) = futures::future::join(
+                open_carddav(&cfg, account_id.clone()),
+                open_caldav(&cfg, account_id.clone()),
+            )
+            .await;
+            let contacts = contacts.into_attached(&mut dav_degraded, &mut skipped_scopes);
+            let calendars = calendars.into_attached(&mut dav_degraded, &mut skipped_scopes);
             let submission = open_submission(&cfg, meter.clone(), Arc::clone(&bandwidth_cap))?;
             let caps = capabilities::build_capabilities(
                 &profile,

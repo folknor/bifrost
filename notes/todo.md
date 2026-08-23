@@ -1260,10 +1260,6 @@ prerequisite for the small local fixes above.
   ships a several-KB body per batch (the engine's read-back guard already fetches
   current state, so this is the site that would benefit most from
   read-back-then-diff).
-- **dav-B7.** `open_carddav` and `open_caldav` run sequentially in the IMAP
-  composition seam, each paying the multi-round-trip discovery. Joining them is
-  free. (The seam itself is fine - `classify_dav_open` degrades correctly into
-  `skipped_scopes`.)
 - **dav-B8.** `event_search`'s empty-query branch lists and hydrates every
   resource in the collection before applying `request.limit`, and
   `events_in_range` likewise truncates to `limit` only after full hydration and
