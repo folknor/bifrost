@@ -103,6 +103,35 @@ calendar primitives.
   plus each recurrence override / CANCEL), carrying RECURRENCE-ID and STATUS
   through, and is used by the range/search listing paths (override instances
   take a recurrence-qualified `EventId` but keep the resource native id).
+
+  **A recurrence-qualified `EventId` is READ-ONLY, and the account enforces
+  that.** `EventId("{uri}#{recurrence_id}")` exists so a consumer index can tell
+  the occurrences of a series apart; it is not addressable.
+  `client.resolve_url` returns an absolute href verbatim and a URL fragment is
+  never sent on the wire, so every such id resolves to the master resource.
+  `event_get`, `event_update`, `event_delete` and `event_rsvp` therefore refuse
+  an id containing `#` via `reject_recurrence_instance_id`, before any I/O, as
+  `Request(Malformed)` -> `ClientBug` (no retry or reopen heals a caller passing
+  a non-handle). Unguarded, `event_get` returned the master instead of the
+  instance asked for, `event_update` spliced and PUT the master so editing one
+  occurrence rewrote the series, `event_rsvp` answered for the series, and
+  `event_delete` DELETEd the whole `.ics` - **deleting one occurrence destroyed
+  every occurrence**.
+  `recurrence_instance_ids_are_refused_before_reaching_the_wire` pins all four
+  against an empty transport script, so a removed guard starves the script
+  rather than failing quietly.
+
+  Real per-occurrence writes would mean resolving the resource, locating the
+  VEVENT by RECURRENCE-ID, and splicing or removing that component (an
+  occurrence delete emitting `EXDATE` on the master, or `STATUS:CANCELLED` on
+  the override - they differ in what attendees see). This is deliberately not
+  scheduled. CalDAV is the only calendar crate with the problem, because it is
+  the only one whose provider exposes no per-occurrence resource: Graph syncs
+  through `calendarView`, whose occurrences carry genuine Graph ids; JMAP keeps
+  overrides inside the master object and returns `Unsupported` for one it cannot
+  represent; Google's `{calendar}::{event}` ids wrap the provider's own instance
+  ids. None can inherit this shape, so fixing it here buys them nothing.
+
   VALARM sub-components project into `CalendarEvent.reminders` (relative
   DURATION or absolute DATE-TIME triggers). All-day ends follow the
   exclusive `EventTime` contract: an iCalendar all-day DTEND is neither

@@ -34,6 +34,23 @@ pub(crate) struct CalDavAccount {
 }
 
 impl CalDavAccount {
+    /// Build an account directly around a client, skipping discovery.
+    ///
+    /// Exists so the `Account` methods can be driven against a scripted
+    /// transport: discovery is several round trips of its own and would
+    /// dominate a test that is about what a single call puts on the wire.
+    #[cfg(test)]
+    pub(crate) fn for_tests(client: Arc<CalDavClient>, default_calendar_url: &str) -> Self {
+        Self {
+            client,
+            capabilities: crate::capabilities::caldav_capabilities(false),
+            calendar_home: default_calendar_url.to_string(),
+            default_calendar_url: default_calendar_url.to_string(),
+            rsvp_email: None,
+            schedule_outbox_url: None,
+        }
+    }
+
     pub(crate) async fn open(
         _account_id: AccountId,
         config: CalDavConfig,
@@ -768,6 +785,7 @@ impl Account for CalDavAccount {
         let client = Arc::clone(&self.client);
         let default_calendar_url = self.default_calendar_url.clone();
         Box::pin(async move {
+            reject_recurrence_instance_id(&event, AccountOperation::EventGet)?;
             Self::fetch_event_from_url(
                 client,
                 default_calendar_url,
@@ -812,6 +830,7 @@ impl Account for CalDavAccount {
         let client = Arc::clone(&self.client);
         let default_calendar_url = self.default_calendar_url.clone();
         Box::pin(async move {
+            reject_recurrence_instance_id(&event, AccountOperation::EventUpdate)?;
             let current = Self::fetch_event_from_url(
                 Arc::clone(&client),
                 default_calendar_url,
@@ -838,6 +857,7 @@ impl Account for CalDavAccount {
     fn event_delete(&self, event: EventId) -> AccountFuture<Result<(), AccountError>> {
         let client = Arc::clone(&self.client);
         Box::pin(async move {
+            reject_recurrence_instance_id(&event, AccountOperation::EventDelete)?;
             let url = client.resolve_url(&event.0);
             client
                 .delete_event(&url, AccountOperation::EventDelete)
@@ -855,6 +875,7 @@ impl Account for CalDavAccount {
         let rsvp_email = self.rsvp_email.clone();
         let schedule_outbox_url = self.schedule_outbox_url.clone();
         Box::pin(async move {
+            reject_recurrence_instance_id(&event, AccountOperation::EventRsvp)?;
             let current = Self::fetch_event_from_url(
                 Arc::clone(&client),
                 default_calendar_url,
@@ -1157,6 +1178,51 @@ struct EventSnapshot {
 struct EventSnapshotEntry {
     uri: String,
     etag: Option<String>,
+}
+
+/// Refuse an `EventId` that names one occurrence of a recurring series.
+///
+/// `events_from_ical` mints `EventId("{uri}#{recurrence_id}")` for an override
+/// VEVENT so a consumer's index can tell the occurrences of a series apart.
+/// That id is NOT addressable: `client.resolve_url` returns an absolute href
+/// verbatim, and a URL fragment is never sent on the wire, so every one of
+/// these ids silently resolves to the master resource. Unguarded,
+/// `event_get` returned the master instead of the instance asked for,
+/// `event_update` spliced and PUT the master so editing one occurrence
+/// rewrote the series, `event_rsvp` answered for the series, and
+/// `event_delete` DELETEd the whole `.ics` - deleting one occurrence
+/// destroyed every occurrence.
+///
+/// A fragment id is therefore read-only, and saying so out loud is the whole
+/// point: `Request(Malformed)` classifies to `ClientBug`, which no retry or
+/// reopen can heal, and the caller learns the id is not a handle rather than
+/// discovering later that a series is gone. This mirrors CardDAV refusing a
+/// cross-address-book contact move through the same `local_error` helper.
+///
+/// Real per-occurrence support means resolving the resource, locating the
+/// VEVENT by `RECURRENCE-ID`, and splicing or removing that component (an
+/// occurrence delete emitting `EXDATE` on the master, or `STATUS:CANCELLED`
+/// on the override - they differ in what attendees see). That is deliberately
+/// NOT scheduled: this is the only calendar crate with the problem, because
+/// it is the only one whose provider has no per-occurrence resource. Graph
+/// syncs through `calendarView`, whose occurrences carry genuine Graph ids;
+/// JMAP keeps overrides inside the master object and returns `Unsupported`
+/// for one it cannot represent; Google's ids are `{calendar}::{event}` over
+/// the provider's own instance ids. None of them can inherit this bug, and
+/// none of them benefits from fixing it here.
+fn reject_recurrence_instance_id(
+    event: &EventId,
+    operation: AccountOperation,
+) -> Result<(), AccountError> {
+    if event.0.contains('#') {
+        return Err(crate::client::local_error(
+            operation,
+            "recurrence-instance event ids are read-only: they address the whole \
+             series resource on the wire, so writing through one would change or \
+             destroy every occurrence",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_event_scope(

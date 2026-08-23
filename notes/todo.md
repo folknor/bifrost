@@ -1069,19 +1069,6 @@ confirm against the code before working any of them.
 
 ### Fenced for the repository owner (published surface)
 
-- **dav-B1. Recurrence-override `EventId`s are unusable as resource ids.** [C1]
-  `crates/caldav/src/ical.rs::events_from_ical` mints
-  `EventId(format!("{uri}#{recurrence_id}"))` for an override VEVENT, and
-  `account.rs` feeds that straight into `client.resolve_url`. `reqwest` does not
-  put a fragment on the wire, so `event_get` returns the master, `event_update`
-  splices and PUTs the master, and **`event_delete` on one instance DELETEs the
-  whole `.ics` and destroys the entire recurring series.** No `#` guard exists in
-  either crate. This is the worst known defect in the tree. Remedies: reject
-  fragment-bearing ids in the mutation paths with a classified error (calls that
-  succeed today start failing), or make them real (resolve the resource, locate
-  the VEVENT by `RECURRENCE-ID`, splice or remove that component; an instance
-  delete means emitting `EXDATE` on the master). Either changes the documented
-  contract of `EventId` and of four published `Account` methods.
 - **dav-B2. Cursor sync only ever covers one collection.** [C1]
   `establish_initial_cursor` / `inventory_stream` / `changes_stream` all read
   `default_calendar_url` (CalDAV) or `default_addressbook_url` (CardDAV), and

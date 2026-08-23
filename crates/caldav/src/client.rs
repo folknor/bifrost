@@ -56,7 +56,7 @@ impl fmt::Debug for CalDavClient {
 }
 
 #[derive(Debug, Clone)]
-struct DavResponse {
+pub(crate) struct DavResponse {
     status: StatusCode,
     headers: HeaderMap,
     body: String,
@@ -81,7 +81,7 @@ struct DavBody {
 /// Local DAV transport boundary. `bifrost-net`'s dispatcher is intentionally
 /// crate-private, while DAV keeps Basic auth and its own redirect policy, so
 /// the seam belongs here until these clients move onto `AccountNet`.
-trait DavTransport: Send + Sync {
+pub(crate) trait DavTransport: Send + Sync {
     fn send(&self, request: reqwest::RequestBuilder) -> AccountFuture<Result<DavResponse, String>>;
 }
 
@@ -158,7 +158,7 @@ impl CalDavClient {
     }
 
     #[cfg(test)]
-    fn with_transport(base_url: &str, transport: Arc<dyn DavTransport>) -> Self {
+    pub(crate) fn with_transport(base_url: &str, transport: Arc<dyn DavTransport>) -> Self {
         let trusted_origins = url_origin(base_url).into_iter().collect::<Vec<_>>();
         Self {
             http: reqwest::Client::new(),
@@ -1314,6 +1314,57 @@ mod tests {
             }
             Box::pin(async move { Ok(response) })
         }
+    }
+
+    /// A recurrence-instance `EventId` is refused before anything is sent.
+    ///
+    /// `events_from_ical` mints `"{uri}#{recurrence_id}"` for override VEVENTs,
+    /// and a URL fragment never goes on the wire - so unguarded, every one of
+    /// these ids addressed the master resource. `event_delete` was the severe
+    /// case: deleting one occurrence DELETEd the whole `.ics` and destroyed the
+    /// entire series.
+    ///
+    /// The script is deliberately EMPTY. Any request at all starves it and
+    /// panics, so this fails loudly if a guard is removed rather than quietly
+    /// asserting on an error some other layer produced. All four write and read
+    /// doors are covered, because all four resolved the same wrong URL.
+    #[tokio::test]
+    async fn recurrence_instance_ids_are_refused_before_reaching_the_wire() {
+        use bifrost_types::account::Account as _;
+
+        let script = ScriptedDavTransport::new([]);
+        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
+        let client = Arc::new(CalDavClient::with_transport(
+            "https://dav.example.test",
+            transport,
+        ));
+        let account =
+            crate::account::CalDavAccount::for_tests(client, "https://dav.example.test/calendar/");
+        let instance = bifrost_types::EventId(
+            "https://dav.example.test/calendar/series.ics#20260609T120000Z".to_string(),
+        );
+
+        account
+            .event_delete(instance.clone())
+            .await
+            .expect_err("deleting one occurrence must not delete the series");
+        account
+            .event_get(instance.clone())
+            .await
+            .expect_err("reading one occurrence must not silently return the master");
+        account
+            .event_update(instance.clone(), bifrost_types::EventPatch::default())
+            .await
+            .expect_err("editing one occurrence must not rewrite the series");
+        account
+            .event_rsvp(instance, bifrost_types::RsvpStatus::Accepted)
+            .await
+            .expect_err("answering for one occurrence must not answer for the series");
+
+        assert!(
+            script.requests().is_empty(),
+            "a refused instance id must reach no transport at all"
+        );
     }
 
     #[tokio::test]
