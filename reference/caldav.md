@@ -274,7 +274,22 @@ Supported calendar primitives:
   definitions; an unknown zone emits the bare VTIMEZONE with no offset block.
 - `event_update` - fetches the current event, applies the shared
   `EventPatch`, and writes the replacement resource with `If-Match`
-  when a strong etag was present. Weak ETags retain their `W/` marker for
+  when a strong etag was present.
+
+  **A cross-calendar move is REFUSED, before any I/O.** `patch.calendar_id`
+  only ever selected which calendar to FETCH from; the PUT always returns the
+  resource to `resolve_url(&event.0)`, its original location. So a request to
+  move an event between calendars used to return `Ok(())` having moved
+  nothing, with no record that the instruction had been dropped - worse than
+  either refusing it or performing it. A `calendar_id` differing from the
+  event's own collection (derived by `event_calendar_url`) is now
+  `local_error` -> `Request(Malformed)` -> `ClientBug`, matching
+  `bifrost-carddav::contact_update`, which already refused the same shape. A
+  patch that RESTATES the event's current calendar is not a move and still
+  updates normally; `event_update_refuses_a_cross_calendar_move_but_allows_a_restated_calendar`
+  pins both halves, the refusal against an empty transport script. Actually
+  performing the move (WebDAV `MOVE`, or GET + PUT-to-new +
+  DELETE-from-old) is tracked in `notes/todo.md`. Weak ETags retain their `W/` marker for
   snapshot comparison but deliberately make the PUT unconditional because
   If-Match requires strong comparison (RFC 7232), so a weak validator has
   no conforming conditional form. Against a server that only ever emits

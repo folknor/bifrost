@@ -1108,14 +1108,23 @@ confirm against the code before working any of them.
   plus empty inventory and change streams, which is enough design to deserve its
   own decision rather than riding along with a one-line deletion. Fix both
   crates together.
-- **dav-B4. CalDAV silently ignores a calendar move.** [C1]
-  `CalDavAccount::event_update` uses `patch.calendar_id` only to pick the fetch
-  URL, then PUTs to `resolve_url(&event.0)` - the original location - and returns
-  `Ok(())`. The requested move silently does not happen, which is the worst of
-  the three possible answers. `CardDavAccount::contact_update` handles the same
-  case explicitly with a `local_error`. Refusing matches the sibling crate and is
-  the smaller change; implementing `MOVE` is the other option. Both change what a
-  published method does with an input it accepts today.
+- **dav-B11. Implement cross-collection moves in the DAV crates.** [C4, feature]
+  Split out of dav-B4, whose silent-drop half was fixed 2026-08-23: CalDAV now
+  refuses a cross-calendar `event_update` the way CardDAV already refused a
+  cross-address-book `contact_update`, so neither crate can drop a relocation
+  request on the floor any more. Neither can perform one.
+
+  Doing it means WebDAV `MOVE` with a `Destination` header - one request, atomic
+  where the server supports it - with a fallback for servers that do not:
+  GET + PUT-to-new + DELETE-from-old, which is non-atomic and needs the
+  `Protocol(PartialResponse)` + `TransmissionState::Acknowledged` treatment that
+  `event_rsvp` already uses for its own non-atomic sequence, so a consumer can
+  tell "not moved" from "copied but not cleaned up".
+
+  This is a feature request with a design, not a latent bug: nothing is silently
+  wrong while it is absent. If it happens it should land in both crates together,
+  since a move that works for events and refuses for contacts is a new
+  asymmetry rather than a fixed one.
 - **dav-B5. Collapse both DAV crates into a shared `bifrost-dav`.** [C4]
   Roughly 1500 duplicated lines across `client.rs` (transport, redirect policy,
   `auth_headers`, `escape_xml`, etag handling, the raw request helpers, the

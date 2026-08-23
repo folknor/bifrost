@@ -896,6 +896,33 @@ impl Account for CalDavAccount {
         let default_calendar_url = self.default_calendar_url.clone();
         Box::pin(async move {
             reject_recurrence_instance_id(&event, AccountOperation::EventUpdate)?;
+            // A cross-calendar move is refused, not silently dropped.
+            //
+            // `patch.calendar_id` only ever selected which calendar to FETCH
+            // from; the PUT below always goes back to `resolve_url(&event.0)`,
+            // the event's original location. So a caller asking to move an
+            // event from one calendar to another used to get `Ok(())` and no
+            // move - worse than either refusing or doing it, because nothing
+            // recorded that the request had been dropped.
+            //
+            // `bifrost-carddav::contact_update` already refuses the same shape
+            // through this same helper; the two must answer an unsupported
+            // relocation the same way. Implementing it (WebDAV `MOVE`, or
+            // GET + PUT-to-new + DELETE-from-old with its own partial-failure
+            // story) is tracked in `notes/todo.md`, not started here.
+            let target_calendar = patch
+                .calendar_id
+                .as_ref()
+                .map(|calendar| client.resolve_url(&calendar.0));
+            if let Some(target) = target_calendar.as_deref()
+                && let Some(source) = event_calendar_url(&client.resolve_url(&event.0))
+                && !same_url(target, &source)
+            {
+                return Err(crate::client::local_error(
+                    AccountOperation::EventUpdate,
+                    "CalDAV event_update cannot move events between calendars",
+                ));
+            }
             let current = Self::fetch_event_from_url(
                 Arc::clone(&client),
                 default_calendar_url,

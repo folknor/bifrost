@@ -1468,6 +1468,84 @@ mod tests {
         );
     }
 
+    /// A cross-calendar `event_update` is refused, and refused before any I/O.
+    ///
+    /// `patch.calendar_id` only ever chose which calendar to FETCH from - the
+    /// PUT always went back to the event's original location - so a move
+    /// request used to return `Ok(())` having done nothing, which is worse than
+    /// either refusing or performing it. bifrost-carddav's `contact_update`
+    /// already refuses the same shape; these two must not drift apart.
+    ///
+    /// The second half matters as much as the first: a patch that RESTATES the
+    /// event's current calendar is legal and common, and must still go through.
+    /// A guard that refuses any `calendar_id` at all would pass the first
+    /// assertion and break every ordinary update.
+    #[tokio::test]
+    async fn event_update_refuses_a_cross_calendar_move_but_allows_a_restated_calendar() {
+        use bifrost_types::account::Account as _;
+
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:u1\r\nSUMMARY:One\r\n\
+                   DTSTART:20260602T120000Z\r\nDTEND:20260602T130000Z\r\n\
+                   END:VEVENT\r\nEND:VCALENDAR\r\n";
+        let event =
+            || bifrost_types::EventId("https://dav.example.test/cal/work/one.ics".to_string());
+        let patch_to = |calendar: &str| bifrost_types::EventPatch {
+            calendar_id: Some(bifrost_types::CalendarId(calendar.to_string())),
+            ..Default::default()
+        };
+
+        // Refused, with an EMPTY script: a regression sends a request and
+        // starves the transport rather than failing a soft assertion.
+        let script = ScriptedDavTransport::new([]);
+        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
+        let client = Arc::new(CalDavClient::with_transport(
+            "https://dav.example.test",
+            transport,
+        ));
+        let account =
+            crate::account::CalDavAccount::for_tests(client, "https://dav.example.test/cal/work/");
+        account
+            .event_update(event(), patch_to("https://dav.example.test/cal/personal/"))
+            .await
+            .expect_err("a move between calendars must be refused, not dropped");
+        assert!(
+            script.requests().is_empty(),
+            "a refused move must reach no transport at all"
+        );
+
+        // Restating the event's own calendar is not a move, and still updates.
+        let script = ScriptedDavTransport::new([
+            DavResponse {
+                status: StatusCode::OK,
+                headers: HeaderMap::new(),
+                body: ics.to_string(),
+                url: String::new(),
+            },
+            DavResponse {
+                status: StatusCode::NO_CONTENT,
+                headers: HeaderMap::new(),
+                body: String::new(),
+                url: String::new(),
+            },
+        ]);
+        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
+        let client = Arc::new(CalDavClient::with_transport(
+            "https://dav.example.test",
+            transport,
+        ));
+        let account =
+            crate::account::CalDavAccount::for_tests(client, "https://dav.example.test/cal/work/");
+        account
+            .event_update(event(), patch_to("https://dav.example.test/cal/work/"))
+            .await
+            .expect("restating the current calendar is not a move");
+        assert_eq!(
+            script.requests().len(),
+            2,
+            "an ordinary update is still a GET plus a PUT"
+        );
+    }
+
     #[tokio::test]
     async fn credentials_never_reach_a_resource_href_origin() {
         // Two canned responses, so a neutered guard reaches the transport and
