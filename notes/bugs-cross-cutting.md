@@ -87,17 +87,28 @@ of that report's findings), jmap (three near-identical query/get/advance loops),
 of the untagged-response dispatch loop), graph (two worker-lifecycle state machines, one hardened
 and one absent).
 
-**[C2] `tracing` feature drift across the account crates.** Filed 2026-08-23 by the bugs-dav round-2
-fix-and-commit stage. The workspace pins `tracing` with `default-features = false`. `bifrost-caldav`
-(which gained the dependency in that round), `bifrost-google` and `bifrost-graph` take it as pinned,
-so they build without the `std` feature; `bifrost-imap`, `bifrost-sync`, `bifrost-net` and
-`bifrost-types` ask for `features = ["std"]`. The consequence is not cosmetic: without `std`, a
-crate's events reach a globally-installed subscriber but NOT a thread-scoped one, so a consumer
-using thread-local subscriber scoping silently loses the diagnostics of exactly half the account
-crates while receiving the other half. The drift is pre-existing and was matched rather than
-changed when caldav was added, on the reasoning that an account crate should follow the
-account-crate precedent. Deciding which half is correct is the actual fix; either answer is cheap,
-and leaving it split is the only bad option.
+## Settled non-defect, recorded so it is not re-filed
+
+**`tracing` feature drift across the account crates is NOT a defect.** Filed 2026-08-23 as a C2 by
+the bugs-dav round-2 fix-and-commit stage, investigated the same day, and withdrawn. It is kept here
+rather than deleted because the manifest difference is still plainly visible in the tree and will be
+noticed again.
+
+The observation is accurate: the workspace pins `tracing` with `default-features = false`;
+`bifrost-caldav`, `bifrost-google` and `bifrost-graph` take it as pinned, while `bifrost-imap`,
+`bifrost-sync`, `bifrost-net`, `bifrost-types`, `bifrost-jmap` and `bifrost-smtp` ask for
+`features = ["std"]`. The claimed CONSEQUENCE is what fails. It was that a crate built without `std`
+reaches a globally-installed subscriber but not a thread-scoped one, so a consumer using
+thread-local scoping would silently lose half the account crates' diagnostics.
+
+Against the locked `tracing 0.1.44` / `tracing-core 0.1.36`: installing a thread-scoped subscriber
+itself requires `tracing/std`, and Cargo unifies features additively across the shared dependency
+instance in a build graph. So any consumer able to scope a subscriber at all has already enabled
+`std` for every crate in that graph that depends on `tracing`, the three "without `std`" crates
+included. The difference is inert, and the original filing's inventory was also incomplete - it
+missed that jmap and smtp already request `std`.
+
+Reopening this needs evidence about a real build configuration, not a re-reading of the manifests.
 
 ## Process notes
 
