@@ -24,7 +24,10 @@ use bifrost_types::{ChangeCursor, CursorScope, MembershipScope};
 pub use envelope::{
     CursorEnvelope, ENGINE_VERSION, EnvelopeKind, MIN_MIGRATABLE, decode_envelope, encode_envelope,
 };
-pub use store::{CheckpointStore, DynCheckpointStore, InMemoryCheckpointStore};
+pub use store::{
+    BackfillCheckpointRecord, ChangeCheckpointRecord, CheckpointStore, DynCheckpointStore,
+    InMemoryCheckpointStore,
+};
 
 /// In-memory cursor registry. Holds the latest known `ChangeCursor`
 /// per `(account, scope)` pair plus a side index from `MembershipScope`

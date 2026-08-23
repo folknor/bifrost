@@ -18,35 +18,95 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
-use bifrost_types::{AccountId, BackfillCheckpoint, ChangeCursor, CursorScope, Partition};
+use bifrost_types::{
+    AccountId, BackfillCheckpoint, ChangeCursor, CursorScope, InventoryCoverage, Partition,
+};
 
 use crate::error::Error;
+
+/// One durable change-cursor row: the cursor AND what the enumeration behind it
+/// proved.
+///
+/// Cursor and coverage are ONE logical record, and every implementation must
+/// persist them all-or-nothing. Partial persistence is a contract violation,
+/// not a degraded mode. A backend may store them across several tables
+/// internally - the representation is backend-owned, the atomicity is not.
+///
+/// They cannot be two store operations. No ordering of two independent writes
+/// is crash-safe: cursor-first recreates the silent loss the coverage record
+/// exists to prevent, and coverage-first can leave debt whose cursor never
+/// commits. That is why this is an aggregate rather than a separate
+/// "obligations lane" - two successful calls are not equivalent to one atomic
+/// one, however carefully they are sequenced.
+#[derive(Debug, Clone)]
+pub struct ChangeCheckpointRecord {
+    pub cursor: ChangeCursor,
+    pub coverage: InventoryCoverage,
+}
+
+impl ChangeCheckpointRecord {
+    /// A record whose enumeration left nothing unaccounted for.
+    #[must_use]
+    pub fn complete(cursor: ChangeCursor) -> Self {
+        Self {
+            cursor,
+            coverage: InventoryCoverage::Complete,
+        }
+    }
+}
+
+/// One durable backfill row, with the same atomicity contract as
+/// [`ChangeCheckpointRecord`].
+///
+/// Backfill needs coverage for the same reason the change cursor does, and it
+/// is not a lesser case: `BackfillRunner` emits a checkpoint on EVERY batch and
+/// counts only the entries a page materialized, so a dropped object is not even
+/// counted, and the orchestrator can then write a completion sentinel that
+/// permanently skips the scope. Every provider reaches this path, including
+/// ones whose live cursor was established separately.
+#[derive(Debug, Clone)]
+pub struct BackfillCheckpointRecord {
+    pub checkpoint: BackfillCheckpoint,
+    pub coverage: InventoryCoverage,
+}
+
+impl BackfillCheckpointRecord {
+    #[must_use]
+    pub fn complete(checkpoint: BackfillCheckpoint) -> Self {
+        Self {
+            checkpoint,
+            coverage: InventoryCoverage::Complete,
+        }
+    }
+}
 
 /// Persistence contract.
 ///
 /// All methods are async because real persistence backends are
 /// IO-bound. The in-memory impl returns ready futures.
 pub trait CheckpointStore: Send + Sync {
-    /// Persist or replace the change cursor for `(account, scope)`.
-    fn put_change_cursor<'a>(
+    /// Persist or replace the change-cursor record for `(account, scope)`.
+    ///
+    /// The whole record lands or none of it does. See
+    /// [`ChangeCheckpointRecord`].
+    fn put_change_record<'a>(
         &'a self,
         account: &'a AccountId,
-        cursor: ChangeCursor,
+        record: ChangeCheckpointRecord,
     ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + 'a>>;
 
-    /// Read the latest change cursor for `(account, scope)` if any.
-    fn get_change_cursor<'a>(
+    /// Read the latest change-cursor record for `(account, scope)` if any.
+    fn get_change_record<'a>(
         &'a self,
         account: &'a AccountId,
         scope: &'a CursorScope,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<ChangeCursor>, Error>> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = Result<Option<ChangeCheckpointRecord>, Error>> + Send + 'a>>;
 
-    /// Persist or replace a backfill checkpoint for
-    /// `(account, scope, partition)`.
+    /// Persist or replace a backfill record for `(account, scope, partition)`.
     fn put_backfill<'a>(
         &'a self,
         account: &'a AccountId,
-        checkpoint: BackfillCheckpoint,
+        record: BackfillCheckpointRecord,
     ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + 'a>>;
 
     /// Read the latest backfill checkpoint for `(account, scope)`.
@@ -66,7 +126,41 @@ pub trait CheckpointStore: Send + Sync {
         &'a self,
         account: &'a AccountId,
         scope: &'a CursorScope,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<BackfillCheckpoint>, Error>> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = Result<Option<BackfillCheckpointRecord>, Error>> + Send + 'a>>;
+
+    /// Convenience: persist a cursor whose enumeration was complete.
+    ///
+    /// DO NOT OVERRIDE. This exists so callers that have nothing to say about
+    /// coverage do not have to spell out `ChangeCheckpointRecord::complete`;
+    /// the atomic unit is still [`Self::put_change_record`]. An implementation
+    /// that overrides this instead of the record method would silently stop
+    /// persisting coverage.
+    fn put_change_cursor<'a>(
+        &'a self,
+        account: &'a AccountId,
+        cursor: ChangeCursor,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + 'a>> {
+        self.put_change_record(account, ChangeCheckpointRecord::complete(cursor))
+    }
+
+    /// Convenience: read just the cursor, discarding coverage.
+    ///
+    /// DO NOT OVERRIDE, and prefer [`Self::get_change_record`] anywhere the
+    /// answer feeds a decision about whether progress may be accepted -
+    /// discarding coverage is exactly how an unresolved obligation gets
+    /// forgotten.
+    fn get_change_cursor<'a>(
+        &'a self,
+        account: &'a AccountId,
+        scope: &'a CursorScope,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<ChangeCursor>, Error>> + Send + 'a>> {
+        Box::pin(async move {
+            Ok(self
+                .get_change_record(account, scope)
+                .await?
+                .map(|record| record.cursor))
+        })
+    }
 
     /// Drop the change cursor for `(account, scope)`. Used by the
     /// engine's `EngineDirective::RestartScope` recovery path so the
@@ -111,8 +205,8 @@ pub struct InMemoryCheckpointStore {
 
 #[derive(Debug, Default)]
 struct Inner {
-    change: HashMap<(AccountId, CursorScope), ChangeCursor>,
-    backfill: HashMap<(AccountId, CursorScope, Partition), BackfillCheckpoint>,
+    change: HashMap<(AccountId, CursorScope), ChangeCheckpointRecord>,
+    backfill: HashMap<(AccountId, CursorScope, Partition), BackfillCheckpointRecord>,
 }
 
 impl InMemoryCheckpointStore {
@@ -130,24 +224,30 @@ impl InMemoryCheckpointStore {
 }
 
 impl CheckpointStore for InMemoryCheckpointStore {
-    fn put_change_cursor<'a>(
+    fn put_change_record<'a>(
         &'a self,
         account: &'a AccountId,
-        cursor: ChangeCursor,
+        record: ChangeCheckpointRecord,
     ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + 'a>> {
         let account = account.clone();
         Box::pin(async move {
             let mut guard = self.inner.lock().expect("poisoned");
-            guard.change.insert((account, cursor.scope.clone()), cursor);
+            // One map entry, so cursor and coverage cannot land apart. A
+            // backend spreading them over tables owes the same guarantee
+            // through a transaction.
+            guard
+                .change
+                .insert((account, record.cursor.scope.clone()), record);
             Ok(())
         })
     }
 
-    fn get_change_cursor<'a>(
+    fn get_change_record<'a>(
         &'a self,
         account: &'a AccountId,
         scope: &'a CursorScope,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<ChangeCursor>, Error>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Option<ChangeCheckpointRecord>, Error>> + Send + 'a>>
+    {
         let account = account.clone();
         let scope = scope.clone();
         Box::pin(async move {
@@ -159,17 +259,17 @@ impl CheckpointStore for InMemoryCheckpointStore {
     fn put_backfill<'a>(
         &'a self,
         account: &'a AccountId,
-        checkpoint: BackfillCheckpoint,
+        record: BackfillCheckpointRecord,
     ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + 'a>> {
         let account = account.clone();
         Box::pin(async move {
             let mut guard = self.inner.lock().expect("poisoned");
             let key = (
                 account,
-                checkpoint.scope.clone(),
-                checkpoint.partition.clone(),
+                record.checkpoint.scope.clone(),
+                record.checkpoint.partition.clone(),
             );
-            guard.backfill.insert(key, checkpoint);
+            guard.backfill.insert(key, record);
             Ok(())
         })
     }
@@ -178,17 +278,20 @@ impl CheckpointStore for InMemoryCheckpointStore {
         &'a self,
         account: &'a AccountId,
         scope: &'a CursorScope,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<BackfillCheckpoint>, Error>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Option<BackfillCheckpointRecord>, Error>> + Send + 'a>>
+    {
         let account = account.clone();
         let scope = scope.clone();
         Box::pin(async move {
             let guard = self.inner.lock().expect("poisoned");
-            let mut latest: Option<BackfillCheckpoint> = None;
+            let mut latest: Option<BackfillCheckpointRecord> = None;
             for ((aid, s, _p), ck) in &guard.backfill {
                 if aid == &account && s == &scope {
                     let beats_current = match &latest {
                         None => true,
-                        Some(existing) => backfill_checkpoint_is_later(ck, existing),
+                        Some(existing) => {
+                            backfill_checkpoint_is_later(&ck.checkpoint, &existing.checkpoint)
+                        }
                     };
                     if beats_current {
                         latest = Some(ck.clone());

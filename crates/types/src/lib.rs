@@ -132,9 +132,10 @@ pub use error::{
 // Stream-event types.
 pub use events::{
     AccountControl, BackfillCheckpoint, BackfillProgress, Batch, Change, Checkpoint, Control,
-    HintPayload, InvalidationHint, InvalidationSink, InventoryEntry, InventoryPartition,
-    InventoryPartitioning, ObjectChange, ObjectChangeKind, PageBoundary, Partition, PauseReason,
-    Priority, Progress, PushSource, ScopeChange, ScopeChangeKind, SyncEvent, WatchEvent,
+    HintPayload, InvalidationHint, InvalidationSink, InventoryCoverage, InventoryEntry,
+    InventoryObligation, InventoryPartition, InventoryPartitioning, ObjectChange, ObjectChangeKind,
+    PageBoundary, Partition, PauseReason, Priority, Progress, PushSource, ScopeChange,
+    ScopeChangeKind, SyncEvent, WatchEvent,
 };
 
 // Threading + hydration types.

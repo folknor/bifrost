@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use bifrost_types::{AccountId, BackfillCheckpoint};
 
-use crate::cursor::store::DynCheckpointStore;
+use crate::cursor::store::{BackfillCheckpointRecord, DynCheckpointStore};
 use crate::error::Error;
 
 /// Backfill checkpoint writer.
@@ -20,6 +20,11 @@ pub struct BackfillCheckpointWriter {
 
 impl BackfillCheckpointWriter {
     pub async fn persist(&self, checkpoint: BackfillCheckpoint) -> Result<(), Error> {
-        self.store.put_backfill(&self.account_id, checkpoint).await
+        self.store
+            .put_backfill(
+                &self.account_id,
+                BackfillCheckpointRecord::complete(checkpoint),
+            )
+            .await
     }
 }

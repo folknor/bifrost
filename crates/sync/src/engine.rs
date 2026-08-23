@@ -32,7 +32,9 @@ use crate::backfill::{
 use crate::cancel::{Boundary, BoundaryRequest};
 use crate::control::{SyncActivityGuard, SyncControl};
 use crate::cursor::CursorRegistry;
-use crate::cursor::store::{DynCheckpointStore, InMemoryCheckpointStore};
+use crate::cursor::store::{
+    BackfillCheckpointRecord, ChangeCheckpointRecord, DynCheckpointStore, InMemoryCheckpointStore,
+};
 use crate::error::Error;
 use crate::multiplexer::{
     AckRequest, Multiplexer, MultiplexerEvent, MultiplexerHandle, ReopenRequest, WriterRequest,
@@ -2671,8 +2673,9 @@ impl SyncEngine {
         // Dropping the row and re-establishing this scope is exactly
         // what `handle_schema_incompatible` would have done, scoped to
         // the one cursor that cannot be read. (sync-D10)
-        match self.checkpoints.get_change_cursor(account_id, &scope).await {
-            Ok(Some(existing)) => {
+        match self.checkpoints.get_change_record(account_id, &scope).await {
+            Ok(Some(record)) => {
+                let existing = record.cursor;
                 if account.is_inventory_cursor(&existing) {
                     return Ok(InitialScope::DeferredInventory(DeferredInventory::Resume(
                         existing,
@@ -2736,7 +2739,7 @@ impl SyncEngine {
         cursors: Arc<CursorRegistry>,
     ) -> Result<(), Error> {
         self.checkpoints
-            .put_change_cursor(account_id, cursor.clone())
+            .put_change_record(account_id, ChangeCheckpointRecord::complete(cursor.clone()))
             .await?;
         cursors.put(cursor);
         Ok(())
@@ -2913,7 +2916,7 @@ async fn run_backfill_orchestrator(
                     // idempotent, so a crash mid-plan simply re-walks).
                     match store.get_backfill(&account_id, &scope).await {
                         Ok(opt) => {
-                            if backfill_complete_recorded(opt.as_ref()) {
+                            if backfill_complete_recorded(opt.as_ref().map(|r| &r.checkpoint)) {
                                 registry.mark(
                                     account_id.clone(),
                                     scope.clone(),
@@ -3004,7 +3007,7 @@ async fn run_backfill_orchestrator(
                     // has not durably persisted.
                     let mut from = 0_u32;
                     match store.get_backfill(&account_id, &scope).await {
-                        Ok(opt) => match open_pages_resume(opt.as_ref()) {
+                        Ok(opt) => match open_pages_resume(opt.as_ref().map(|r| &r.checkpoint)) {
                             OpenPagesResume::Skip => {
                                 registry.mark(
                                     account_id.clone(),
@@ -3692,7 +3695,13 @@ async fn ack_writer(
             }
             WriterRequest::ReattachInsert { cursor, done } => {
                 let scope = cursor.scope.clone();
-                let result = store.put_change_cursor(&account_id, cursor).await;
+                // Coverage is Complete here: nothing in the current pipeline
+                // produces obligations yet. When it does, this is the site that
+                // must carry them, because this write and the coverage must land
+                // atomically.
+                let result = store
+                    .put_change_record(&account_id, ChangeCheckpointRecord::complete(cursor))
+                    .await;
                 if result.is_ok() {
                     provisional.insert(scope);
                 }
@@ -3761,8 +3770,16 @@ async fn persist_ack_request(
     req: &AckRequest,
 ) -> Result<(), Error> {
     match &req.checkpoint {
-        Checkpoint::Change(c) => store.put_change_cursor(account_id, c.clone()).await,
-        Checkpoint::Backfill(b) => store.put_backfill(account_id, b.clone()).await,
+        Checkpoint::Change(c) => {
+            store
+                .put_change_record(account_id, ChangeCheckpointRecord::complete(c.clone()))
+                .await
+        }
+        Checkpoint::Backfill(b) => {
+            store
+                .put_backfill(account_id, BackfillCheckpointRecord::complete(b.clone()))
+                .await
+        }
         _ => Err(Error::CheckpointStore(
             "unknown checkpoint variant in ack".into(),
         )),
@@ -4894,8 +4911,9 @@ async fn run_establish(
         Some(control) => Some(control.begin_activity().ok_or(Error::Paused)?),
         None => None,
     };
-    match store.get_change_cursor(account_id, &scope).await {
-        Ok(Some(existing)) => {
+    match store.get_change_record(account_id, &scope).await {
+        Ok(Some(record)) => {
+            let existing = record.cursor;
             // A stored cursor may be a mid-inventory page position rather
             // than a live changes cursor. Putting one into the registry
             // would hand it straight to `changes_stream`, which has no
@@ -4943,7 +4961,9 @@ async fn run_establish(
     {
         CursorEstablishment::Ready(cursor) => {
             if persist_ready {
-                store.put_change_cursor(account_id, cursor.clone()).await?;
+                store
+                    .put_change_record(account_id, ChangeCheckpointRecord::complete(cursor.clone()))
+                    .await?;
             }
             cursors.put(cursor);
             Ok(EstablishOrigin::CreatedFresh)
@@ -5360,7 +5380,7 @@ mod tests {
 
         assert!(
             store
-                .get_change_cursor(&account, &cursor("acked").scope)
+                .get_change_record(&account, &cursor("acked").scope)
                 .await
                 .expect("store read")
                 .is_some(),
@@ -5368,7 +5388,7 @@ mod tests {
         );
         assert!(
             store
-                .get_change_cursor(&account, &cursor("orphan").scope)
+                .get_change_record(&account, &cursor("orphan").scope)
                 .await
                 .expect("store read")
                 .is_none(),

@@ -44,6 +44,78 @@ pub struct BackfillCheckpoint {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Partition(pub Vec<u8>);
 
+/// What an enumeration pass PROVED about the objects it walked past.
+///
+/// The load-bearing rule for inventory is not that failures are visible, it is
+/// that no accepted checkpoint may certify coverage it does not have:
+///
+/// > Any accepted inventory progress checkpoint must certify that every
+/// > provider result before that checkpoint was either materialized as an
+/// > `InventoryEntry` or proved irrelevant to the inventory snapshot.
+///
+/// A checkpoint advances a cursor past the objects behind it, and the changes
+/// stream only reports SUBSEQUENT changes - so an object the walk skipped
+/// without recording becomes permanently invisible to that account. Surfacing
+/// the failure to a consumer does not fix that; the checkpoint has to carry the
+/// unresolved obligations with it, atomically, or not advance.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum InventoryCoverage {
+    /// Every result before this point was materialized or definitively
+    /// discharged. The checkpoint certifies full coverage.
+    Complete,
+    /// The walk advanced but left obligations open. The scope is live and
+    /// DEGRADED: it converges and enters the change stream rather than
+    /// re-walking forever, and the obligations are the rediscovery mechanism
+    /// for what it could not represent.
+    Degraded {
+        obligations: Vec<InventoryObligation>,
+    },
+}
+
+impl InventoryCoverage {
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        matches!(self, Self::Complete)
+    }
+}
+
+/// One thing an enumeration pass could not account for.
+///
+/// Split by what is KNOWN, because that decides what repair is possible.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum InventoryObligation {
+    /// A discovered object with a stable identity that could not be
+    /// represented. Repairable by id: a later read either produces the entry
+    /// or proves the object absent.
+    Object {
+        id: ObjectId,
+        error: AccountError,
+        /// Account-owned opaque repair token. The engine persists and returns
+        /// it without interpreting it - only the protocol crate knows what a
+        /// provider-native re-read of this object requires.
+        repair: Vec<u8>,
+    },
+    /// A provider result that could not even be assigned an identity, or a page
+    /// whose completeness could not be established.
+    ///
+    /// Deliberately NOT an `Object` with a synthetic id. An absent id may mean
+    /// one malformed object, a schema mismatch affecting many, a truncated
+    /// page, or a response that cannot be correlated with pagination at all -
+    /// so calling it a single-object loss overstates what is known, and there
+    /// is nothing to name, retry, or reconcile against. The obligation is
+    /// therefore scoped to a replayable REGION instead.
+    Region {
+        /// Account-defined key naming the failure, for deduplicated operator
+        /// reporting.
+        failure_key: String,
+        error: AccountError,
+        /// Account-owned opaque token identifying the region to replay.
+        replay: Vec<u8>,
+    },
+}
+
 /// Account-facing inventory partition.
 ///
 /// `Full` preserves the original one-pass inventory contract. Other
