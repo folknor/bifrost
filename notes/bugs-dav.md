@@ -44,33 +44,25 @@ base nor a discovered home - now gets a hard local error where it previously got
 That is the intended trade. It is a behavior change, not an API change: no published item was
 removed, renamed, or reshaped.
 
+New finding, filed 2026-08-23 by the round-3 fix-and-commit stage while threading the effective
+response URL through href resolution.
+
+**[C2] A redirect issued by a cross-origin DAV home fails the operation.** `dav_redirect_policy`
+seeds its host allowlist from the configured `base_url` only. Discovery may legitimately place the
+calendar or address book home on a different origin - the credential-origin allowlist was written
+specifically not to break that - but the one `reqwest::Client` driving every request still trusts
+only the base host. A 301/302 from the cross-origin home is therefore stopped, the 3xx reaches
+`settle_body` as a non-success status, and the operation fails with a status error rather than
+following a hop the server considers routine. Correct today for the common single-origin
+deployment; the fuse is a provider that both splits the home onto its own host and redirects within
+it. The fix is to widen the allowlist as origins are admitted to the trusted set, which means
+rebuilding or re-seeding the client after discovery - not a one-line change, and it interacts with
+the credential allowlist, so it wants its own round.
+
 Highest severity, ahead of its position in the document: **the recurrence-override EventId finding
 destroys an entire recurring series on an instance delete, verified against the current tree (no
 `#` guard exists anywhere in either crate).** It is worse than a document ordered by discovery
 makes it look.
-
-## Multistatus hrefs are resolved against the configured base URL, not against the request URI
-
-**C2 latent defect. Found 2026-08-23 by the round-1 fix-and-commit stage, not by the original
-hunt.** Every `resolve_href` / `resolve_hrefs` call site in both crates passes `self.base_url` as
-the base: `list_calendars_for_operation`, `list_events_listing`, the multiget and sync-collection
-readers, and the CardDAV equivalents. RFC 4918 makes a multistatus `href` relative to the *request
-URI*, not to whatever root the account happens to be configured with. The two coincide for the
-common deployment, where the base URL is the DAV root and servers emit absolute-path hrefs, which
-is why this has never bitten.
-
-It acquires a fuse in this round. The credential-origin allowlist now deliberately supports a
-calendar or address book home on a *different origin* than the configured base - that is the
-legitimate deployment the allowlist was written not to break. A PROPFIND against such a home whose
-response carries relative hrefs will resolve them against the base origin, producing collection and
-resource URLs on the wrong host. Those URLs are on the base origin, so the allowlist passes them,
-and they simply 404 (or, worse, hit an unrelated resource of the same path). Reported as
-"not found" rather than as a resolution bug.
-
-Fix: resolve against the request URI at each decode boundary rather than against `base_url`. Left
-open deliberately - it changes the value of native ids at twelve call sites across two crates, and
-landing that unreviewed at the end of a round is exactly the shape the loop keeps paying for. It
-wants its own round, or at minimum its own review.
 
 ## Recurrence-override EventIds are unusable as resource ids; event_delete on one instance destroys the whole series
 

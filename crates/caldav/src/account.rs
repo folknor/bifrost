@@ -19,7 +19,8 @@ use crate::ical::{
 use crate::parse::CalendarCollection;
 use crate::{CalDavConfig, CalDavCredentials};
 
-const CURSOR_ENVELOPE_VERSION: u32 = 1;
+// Version 2 changes snapshot ids from base-URL-relative to request-URI-relative.
+const CURSOR_ENVELOPE_VERSION: u32 = 2;
 const CURSOR_MAGIC: &[u8] = b"CALDAVET1";
 
 #[derive(Debug)]
@@ -1924,6 +1925,31 @@ mod tests {
         let decoded = decode_cursor_snapshot(&cursor).expect("cursor should decode");
 
         assert_eq!(decoded, snapshot);
+    }
+
+    /// A v1 payload is byte-identical in shape to a v2 one, so the version
+    /// gate has to reject it BEFORE the reader runs - a misparse would hand
+    /// back base-relative ids that then surface as a wave of deletes plus
+    /// creates. The recovery has to be `SchemaIncompatible` specifically, not
+    /// a scope restart: only that directive deletes the backfill checkpoint,
+    /// and without the re-walk the already-backfilled objects keep their old
+    /// id spelling forever.
+    #[test]
+    fn event_cursor_rejects_the_base_relative_id_version() {
+        let snapshot = EventSnapshot::default();
+        let mut cursor =
+            cursor_from_snapshot(CursorScope::Type(ObjectType::CalendarEvent), &snapshot);
+        cursor.server_state.envelope_version = 1;
+
+        let error = decode_cursor_snapshot(&cursor).expect_err("v1 cursors are disowned");
+        assert!(matches!(
+            error.kind(),
+            AccountErrorKind::SyncState(SyncStateErrorKind::SchemaIncompatible)
+        ));
+        assert!(matches!(
+            error.recovery(),
+            RecoveryClass::Engine(EngineDirective::SchemaIncompatible)
+        ));
     }
 
     #[test]

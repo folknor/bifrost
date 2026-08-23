@@ -89,51 +89,52 @@ pub(crate) struct AddressBookCollection {
 }
 
 impl AddressBookCollection {
-    pub(crate) fn resolve_href(&mut self, base_url: &str) {
-        self.href = resolve_href(base_url, &self.href);
+    pub(crate) fn resolve_href(&mut self, request_url: &str) {
+        self.href = resolve_href(request_url, &self.href);
     }
 }
 
 impl CardDavContactListing {
-    pub(crate) fn resolve_hrefs(&mut self, base_url: &str) {
+    pub(crate) fn resolve_hrefs(&mut self, request_url: &str) {
         for entry in &mut self.entries {
-            entry.uri = resolve_href(base_url, &entry.uri);
+            entry.uri = resolve_href(request_url, &entry.uri);
         }
         for href in &mut self.failed_hrefs {
-            *href = resolve_href(base_url, href);
+            *href = resolve_href(request_url, href);
         }
     }
 }
 
 impl CardDavMultigetReport {
-    pub(crate) fn resolve_hrefs(&mut self, base_url: &str) {
+    pub(crate) fn resolve_hrefs(&mut self, request_url: &str) {
         for card in &mut self.cards {
-            card.uri = resolve_href(base_url, &card.uri);
+            card.uri = resolve_href(request_url, &card.uri);
         }
         for failed in &mut self.failed {
-            failed.href = resolve_href(base_url, &failed.href);
+            failed.href = resolve_href(request_url, &failed.href);
         }
         for href in &mut self.missing_data {
-            *href = resolve_href(base_url, href);
+            *href = resolve_href(request_url, href);
         }
     }
 }
 
-/// Rebase a DAV response href at the XML decoding boundary. Client callers
-/// never expose parsed relative hrefs to the account layer.
-pub(crate) fn resolve_href(base_url: &str, href: &str) -> String {
+/// Rebase a DAV response href against its request URI at the XML decoding
+/// boundary. Client callers never expose parsed relative hrefs to the account
+/// layer.
+pub(crate) fn resolve_href(request_url: &str, href: &str) -> String {
     if href.starts_with("http://") || href.starts_with("https://") {
         return href.to_string();
     }
-    if let Ok(base) = Url::parse(base_url)
+    if let Ok(base) = Url::parse(request_url)
         && let Ok(resolved) = base.join(href)
     {
         return resolved.to_string();
     }
-    if base_url.ends_with('/') || href.starts_with('/') {
-        format!("{base_url}{href}")
+    if request_url.ends_with('/') || href.starts_with('/') {
+        format!("{request_url}{href}")
     } else {
-        format!("{base_url}/{href}")
+        format!("{request_url}/{href}")
     }
 }
 
@@ -719,6 +720,38 @@ impl ResponseParts {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hrefs_resolve_against_the_request_uri() {
+        assert_eq!(
+            resolve_href("https://books.example.test/homes/ada/", "team/one.vcf"),
+            "https://books.example.test/homes/ada/team/one.vcf"
+        );
+    }
+
+    /// The migration to request-URI resolution must not respell ids that
+    /// were already correct. Most servers emit absolute-path hrefs, and the
+    /// pre-migration base was `CardDavConfig::base_url` with its trailing
+    /// slash trimmed. Pin both spellings against the post-migration request
+    /// URI, and pin the literal so a regression cannot pass by changing both
+    /// sides at once.
+    #[test]
+    fn absolute_path_href_keeps_the_common_deployment_id() {
+        let href = "/addressbooks/ada/one.vcf";
+        let previous = resolve_href("https://dav.example.test", href);
+        assert_eq!(
+            previous,
+            "https://dav.example.test/addressbooks/ada/one.vcf"
+        );
+        assert_eq!(
+            resolve_href("https://dav.example.test/addressbooks/ada/", href),
+            previous
+        );
+        assert_eq!(
+            resolve_href("https://dav.example.test/dav/users/ada/addressbook/", href),
+            previous
+        );
+    }
 
     #[test]
     fn propfind_contacts_extracts_vcards_and_etags() {

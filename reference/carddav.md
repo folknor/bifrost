@@ -56,9 +56,12 @@ its successful body does not identify a current-user principal.
   transiently-failed resource instead of destroying it. Response parsers
   use element-stack parent checks so nested same-name properties do not
   overwrite response-level hrefs. Every text-bearing parser accepts both
-  XML text and CDATA. Response hrefs are rebased to absolute native URLs at
-  the decode boundary, before the account layer can consume success or
-  failure lanes.
+  XML text and CDATA. Response hrefs are rebased against the URI of the request
+  that produced the multistatus, yielding absolute native URLs at the decode
+  boundary before the account layer can consume success or failure lanes. The
+  base is the EFFECTIVE request URI: the DAV transport carries the post-redirect
+  URL back on every response, because the redirect policy follows same-host hops
+  and RFC 4918 resolves against the URI that actually served the body.
   Resource identification does not depend on a `.vcf` suffix or a returned
   content type. The contact PROPFIND requests `resourcetype`, and both its
   success and failure lanes exclude responses known to be collections. The
@@ -187,6 +190,13 @@ prior snapshot suppresses the mass-delete (treated as "no observation"),
 and any href in `current.failed_hrefs` is preserved rather than destroyed.
 `inventory_stream` emits contact inventory entries with ETag fingerprints
 for the same contact scope.
+The CardDAV cursor payload is version 2. Version 2 records the request-relative
+native-id namespace; version 1 cursors are rejected so a namespace correction
+cannot surface as a delete plus create during snapshot diffing. The rejection is
+classified `SyncState(SchemaIncompatible)`, deriving to
+`Engine(SchemaIncompatible)` rather than a scope restart: only that directive
+also deletes the backfill checkpoint, and without the re-walk the objects
+already backfilled would keep their pre-correction id spelling.
 Cursor entry counts are checked against the remaining payload before
 allocation. Multiget response hrefs are rebased onto the same resolved
 absolute native-id namespace the snapshot, inventory, and changes lanes

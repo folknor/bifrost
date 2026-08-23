@@ -61,6 +61,22 @@ struct DavResponse {
     status: StatusCode,
     headers: HeaderMap,
     body: String,
+    /// Effective request URI, after any redirects the client followed.
+    ///
+    /// RFC 4918 relative hrefs in a Multi-Status resolve against the
+    /// effective request URI, not the URI the caller submitted. The DAV
+    /// redirect policy permits same-host hops, so a PROPFIND on
+    /// `/calendar` that lands on `/dav/users/ada/calendar/` is a real
+    /// deployment shape; resolving `one.ics` against the submitted URI
+    /// there mints a wrong native id and a wrong follow-up request URL.
+    url: String,
+}
+
+/// A DAV response body paired with the effective URI that produced it,
+/// so href resolution has the base RFC 4918 requires.
+struct DavBody {
+    text: String,
+    url: String,
 }
 
 /// Local DAV transport boundary. `bifrost-net`'s dispatcher is intentionally
@@ -78,11 +94,13 @@ impl DavTransport for ReqwestDavTransport {
             let response = request.send().await.map_err(|error| error.to_string())?;
             let status = response.status();
             let headers = response.headers().clone();
+            let url = response.url().to_string();
             let body = read_capped_body(response).await?;
             Ok(DavResponse {
                 status,
                 headers,
                 body,
+                url,
             })
         })
     }
@@ -172,7 +190,7 @@ impl CalDavClient {
         root: &str,
     ) -> Result<CalDavDiscovery, AccountError> {
         let principal = self.discover_principal(root).await?;
-        let body = self
+        let response = self
             .propfind_raw(
                 &principal,
                 "0",
@@ -180,9 +198,11 @@ impl CalDavClient {
                 AccountOperation::Discover,
             )
             .await?;
+        let body = response.text;
+        let base = response.url;
         let calendar_home = extract_href_property(&body, "calendar-home-set")
             .map_err(|error| parse_error(AccountOperation::Discover, error))?
-            .map(|href| resolve_href(&self.base_url, &href))
+            .map(|href| resolve_href(&base, &href))
             .inspect(|home| self.trust_discovered_url(home))
             .ok_or_else(|| parse_error(AccountOperation::Discover, "missing calendar-home-set"))?;
         let hrefs = extract_href_properties(&body, "calendar-user-address-set")
@@ -190,7 +210,7 @@ impl CalDavClient {
         let calendar_user_email = hrefs.iter().find_map(|href| mailto_email(href));
         let schedule_outbox_url = extract_href_property(&body, "schedule-outbox-URL")
             .map_err(|error| parse_error(AccountOperation::Discover, error))
-            .map(|href| href.map(|href| resolve_href(&self.base_url, &href)))?;
+            .map(|href| href.map(|href| resolve_href(&base, &href)))?;
         if let Some(outbox) = &schedule_outbox_url {
             self.trust_discovered_url(outbox);
         }
@@ -202,12 +222,12 @@ impl CalDavClient {
     }
 
     async fn discover_principal(&self, root: &str) -> Result<String, AccountError> {
-        let body = self
+        let response = self
             .propfind_raw(root, "0", PROPFIND_PRINCIPAL, AccountOperation::Discover)
             .await?;
-        extract_href_property(&body, "current-user-principal")
+        extract_href_property(&response.text, "current-user-principal")
             .map_err(|error| parse_error(AccountOperation::Discover, error))?
-            .map(|href| resolve_href(&self.base_url, &href))
+            .map(|href| resolve_href(&response.url, &href))
             .ok_or_else(|| {
                 parse_error(AccountOperation::Discover, "missing current-user-principal")
             })
@@ -226,13 +246,13 @@ impl CalDavClient {
         home_url: &str,
         operation: AccountOperation,
     ) -> Result<Vec<CalendarCollection>, AccountError> {
-        let body = self
+        let response = self
             .propfind_raw(home_url, "1", PROPFIND_CALENDARS, operation)
             .await?;
-        let mut collections = parse_calendar_collections(&body)
+        let mut collections = parse_calendar_collections(&response.text)
             .map_err(|error| parse_error(operation, format!("calendar list: {error}")))?;
         for collection in &mut collections {
-            collection.resolve_href(&self.base_url);
+            collection.resolve_href(&response.url);
         }
         Ok(collections)
     }
@@ -246,12 +266,12 @@ impl CalDavClient {
         calendar_url: &str,
         operation: AccountOperation,
     ) -> Result<crate::parse::CalDavEventListing, AccountError> {
-        let body = self
+        let response = self
             .propfind_raw(calendar_url, "1", PROPFIND_EVENTS, operation)
             .await?;
         let mut listing =
-            parse_propfind_events(&body).map_err(|error| parse_error(operation, error))?;
-        listing.resolve_hrefs(&self.base_url);
+            parse_propfind_events(&response.text).map_err(|error| parse_error(operation, error))?;
+        listing.resolve_hrefs(&response.url);
         Ok(listing)
     }
 
@@ -262,10 +282,10 @@ impl CalDavClient {
         calendar_url: &str,
         operation: AccountOperation,
     ) -> Result<Option<String>, AccountError> {
-        let body = self
+        let response = self
             .propfind_raw(calendar_url, "0", PROPFIND_SYNC_TOKEN, operation)
             .await?;
-        crate::parse::parse_collection_sync_token(&body)
+        crate::parse::parse_collection_sync_token(&response.text)
             .map_err(|error| parse_error(operation, format!("collection sync token: {error}")))
     }
 
@@ -279,10 +299,10 @@ impl CalDavClient {
         let response = self
             .report_raw(calendar_url, "1", &body, AccountOperation::EventsInRange)
             .await?;
-        let mut parsed = parse_multiget_report(&response).map_err(|error| {
+        let mut parsed = parse_multiget_report(&response.text).map_err(|error| {
             parse_error(AccountOperation::EventsInRange, format!("query: {error}"))
         })?;
-        parsed.resolve_hrefs(&self.base_url);
+        parsed.resolve_hrefs(&response.url);
         multiget_failure(&parsed, AccountOperation::EventsInRange).map_or(Ok(parsed), Err)
     }
 
@@ -298,10 +318,10 @@ impl CalDavClient {
             let response = self
                 .report_raw(calendar_url, "1", &body, AccountOperation::EventSearch)
                 .await?;
-            let mut parsed = parse_multiget_report(&response).map_err(|error| {
+            let mut parsed = parse_multiget_report(&response.text).map_err(|error| {
                 parse_error(AccountOperation::EventSearch, format!("query: {error}"))
             })?;
-            parsed.resolve_hrefs(&self.base_url);
+            parsed.resolve_hrefs(&response.url);
             if let Some(error) = multiget_failure(&parsed, AccountOperation::EventSearch) {
                 degraded = worse_recovery(degraded, error);
             }
@@ -336,9 +356,9 @@ impl CalDavClient {
 {href_elements}</C:calendar-multiget>"
             );
             let response = self.report_raw(calendar_url, "0", &body, operation).await?;
-            let mut parsed = parse_multiget_report(&response)
+            let mut parsed = parse_multiget_report(&response.text)
                 .map_err(|error| parse_error(operation, format!("multiget: {error}")))?;
-            parsed.resolve_hrefs(&self.base_url);
+            parsed.resolve_hrefs(&response.url);
             if let Some(error) = multiget_failure(&parsed, operation) {
                 degraded = worse_recovery(degraded, error);
             }
@@ -358,6 +378,7 @@ impl CalDavClient {
             .report_raw_with_depth(calendar_url, "0", &body, operation)
             .await?;
         let status = response.status;
+        let effective_url = response.url;
         let body = response.body;
         if status == StatusCode::GONE
             || (status == StatusCode::FORBIDDEN
@@ -371,7 +392,7 @@ impl CalDavClient {
         let mut report = parse_sync_collection_report(&body).map_err(|error| {
             parse_error(AccountOperation::SyncChanges, format!("sync: {error}"))
         })?;
-        report.resolve_hrefs(&self.base_url);
+        report.resolve_hrefs(&effective_url);
         Ok(report)
     }
 
@@ -497,7 +518,7 @@ impl CalDavClient {
         depth: &str,
         body: &str,
         operation: AccountOperation,
-    ) -> Result<String, AccountError> {
+    ) -> Result<DavBody, AccountError> {
         let method = Method::from_bytes(b"PROPFIND")
             .map_err(|error| local_error(operation, error.to_string()))?;
         let request = self
@@ -516,18 +537,14 @@ impl CalDavClient {
         depth: &str,
         body: &str,
         operation: AccountOperation,
-    ) -> Result<String, AccountError> {
+    ) -> Result<DavBody, AccountError> {
         // Ordinary REPORTs get the same status classification as any other
         // body request; only `sync_events` takes the raw-response path,
         // because it has to inspect 403/410 before they become errors.
         let response = self
             .report_raw_with_depth(url, depth, body, operation)
             .await?;
-        if response.status.is_success() {
-            Ok(response.body)
-        } else {
-            Err(status_error(operation, response.status, response.body))
-        }
+        settle_body(response, operation)
     }
 
     async fn report_raw_with_depth(
@@ -553,13 +570,9 @@ impl CalDavClient {
         &self,
         request: reqwest::RequestBuilder,
         operation: AccountOperation,
-    ) -> Result<String, AccountError> {
+    ) -> Result<DavBody, AccountError> {
         let response = self.send_raw_request(request, operation).await?;
-        if response.status.is_success() {
-            Ok(response.body)
-        } else {
-            Err(status_error(operation, response.status, response.body))
-        }
+        settle_body(response, operation)
     }
 
     async fn send_status_request(
@@ -663,6 +676,23 @@ impl CalDavClient {
 ///
 /// Only `https` qualifies; an unparseable URL is treated as insecure so the
 /// downgrade check fails closed.
+/// Classify a completed DAV response and keep the effective URI attached
+/// to the body, so the caller resolves hrefs against the URI that actually
+/// served the Multi-Status rather than the one it submitted.
+fn settle_body(
+    response: DavResponse,
+    operation: AccountOperation,
+) -> Result<DavBody, AccountError> {
+    if response.status.is_success() {
+        Ok(DavBody {
+            text: response.body,
+            url: response.url,
+        })
+    } else {
+        Err(status_error(operation, response.status, response.body))
+    }
+}
+
 fn origin_is_secure(value: &str) -> bool {
     Url::parse(value).is_ok_and(|url| url.scheme().eq_ignore_ascii_case("https"))
 }
@@ -1186,12 +1216,18 @@ mod tests {
                     url: request.url().to_string(),
                     headers: request.headers().clone(),
                 });
-            let response = self
+            let mut response = self
                 .responses
                 .lock()
                 .expect("scripted DAV response lock poisoned")
                 .pop_front()
                 .expect("scripted DAV transport exhausted");
+            // A scripted response with no effective URL models the ordinary
+            // no-redirect case: reqwest reports the submitted URI back. A
+            // script that sets one models a followed redirect.
+            if response.url.is_empty() {
+                response.url = request.url().to_string();
+            }
             Box::pin(async move { Ok(response) })
         }
     }
@@ -1205,6 +1241,7 @@ mod tests {
             status: StatusCode::OK,
             headers: HeaderMap::new(),
             body: "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:one\nEND:VEVENT\nEND:VCALENDAR".to_string(),
+            url: String::new(),
         };
         let script = ScriptedDavTransport::new([event(), event()]);
         let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
@@ -1239,6 +1276,7 @@ mod tests {
             status: StatusCode::MULTI_STATUS,
             headers: HeaderMap::new(),
             body,
+            url: String::new(),
         };
         ScriptedDavTransport::new([
             response(
@@ -1284,6 +1322,60 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn cross_origin_calendar_hrefs_resolve_against_the_home_request() {
+        let script = ScriptedDavTransport::new([DavResponse {
+            status: StatusCode::MULTI_STATUS,
+            headers: HeaderMap::new(),
+            body: "<D:multistatus xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\"><D:response><D:href>team/</D:href><D:propstat><D:prop><D:resourcetype><D:collection/><C:calendar/></D:resourcetype></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response></D:multistatus>".to_string(),
+            url: String::new(),
+        }]);
+        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
+        let client = CalDavClient::with_transport("https://dav.example.test", transport);
+        let home = "https://cal.example.test/homes/ada/";
+        client.trust_discovered_url(home);
+
+        let calendars = client
+            .list_calendars(home)
+            .await
+            .expect("cross-origin listing succeeds");
+
+        assert_eq!(
+            calendars[0].href,
+            "https://cal.example.test/homes/ada/team/"
+        );
+    }
+
+    /// RFC 4918 resolves a relative href against the EFFECTIVE request URI.
+    /// `dav_redirect_policy` follows same-host hops, so a PROPFIND submitted
+    /// to `/calendar` can be served from `/dav/users/ada/calendar/`. Resolving
+    /// `one.ics` against the submitted URI mints `/one.ics` - a native id that
+    /// does not exist, and a follow-up GET that 404s.
+    #[tokio::test]
+    async fn event_hrefs_resolve_against_the_post_redirect_url() {
+        let script = ScriptedDavTransport::new([DavResponse {
+            status: StatusCode::MULTI_STATUS,
+            headers: HeaderMap::new(),
+            body: "<D:multistatus xmlns:D=\"DAV:\"><D:response><D:href>one.ics</D:href><D:propstat><D:prop><D:getetag>\"e1\"</D:getetag></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response></D:multistatus>".to_string(),
+            url: "https://dav.example.test/dav/users/ada/calendar/".to_string(),
+        }]);
+        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
+        let client = CalDavClient::with_transport("https://dav.example.test", transport);
+
+        let listing = client
+            .list_events_listing(
+                "https://dav.example.test/calendar",
+                AccountOperation::EventsInRange,
+            )
+            .await
+            .expect("redirected listing succeeds");
+
+        assert_eq!(
+            listing.entries[0].uri,
+            "https://dav.example.test/dav/users/ada/calendar/one.ics"
+        );
+    }
+
     /// Discovery is server-steered, so a discovered home must never weaken the
     /// transport guarantee the configured HTTPS base URL established. The
     /// assertion that matters is the destination: no request at all reaches the
@@ -1322,6 +1414,7 @@ mod tests {
             status: StatusCode::MULTI_STATUS,
             headers: HeaderMap::new(),
             body: body.to_string(),
+            url: String::new(),
         };
         let script = ScriptedDavTransport::new([
             response(
@@ -1354,6 +1447,7 @@ mod tests {
             status: StatusCode::SERVICE_UNAVAILABLE,
             headers: HeaderMap::new(),
             body: "try later".to_string(),
+            url: String::new(),
         }]);
         let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
         let client = CalDavClient::with_transport("https://dav.example.test", transport);
@@ -1377,6 +1471,7 @@ mod tests {
             body:
                 "<D:multistatus xmlns:D=\"DAV:\"><D:sync-token>next</D:sync-token><D:response><D:href>/calendar/one.ics</D:href><D:status>HTTP/1.1 200 OK</D:status></D:response></D:multistatus>"
                     .to_string(),
+            url: String::new(),
         }]);
         let concrete_transport = Arc::clone(&script);
         let transport: Arc<dyn DavTransport> = concrete_transport;
@@ -1425,6 +1520,7 @@ mod tests {
             status: StatusCode::UNAUTHORIZED,
             headers: HeaderMap::new(),
             body: "<html><body>401 Unauthorized</body></html>".to_string(),
+            url: String::new(),
         }]);
         let concrete_transport = Arc::clone(&script);
         let transport: Arc<dyn DavTransport> = concrete_transport;
@@ -1564,6 +1660,7 @@ mod tests {
             status: StatusCode::MULTI_STATUS,
             headers: HeaderMap::new(),
             body: "<D:multistatus xmlns:D=\"DAV:\"/>".to_string(),
+            url: String::new(),
         }]);
         let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
         let client = CalDavClient::with_transport("https://dav.example.test", transport);

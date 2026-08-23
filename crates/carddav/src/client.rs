@@ -53,6 +53,22 @@ struct DavResponse {
     status: StatusCode,
     headers: HeaderMap,
     body: String,
+    /// Effective request URI, after any redirects the client followed.
+    ///
+    /// RFC 4918 relative hrefs in a Multi-Status resolve against the
+    /// effective request URI, not the URI the caller submitted. The DAV
+    /// redirect policy permits same-host hops, so a PROPFIND on
+    /// `/addressbook` that lands on `/dav/users/ada/addressbook/` is a
+    /// real deployment shape; resolving `one.vcf` against the submitted
+    /// URI there mints a wrong native id and a wrong follow-up request.
+    url: String,
+}
+
+/// A DAV response body paired with the effective URI that produced it,
+/// so href resolution has the base RFC 4918 requires.
+struct DavBody {
+    text: String,
+    url: String,
 }
 
 /// Local DAV transport boundary. `bifrost-net` keeps its dispatcher private,
@@ -69,11 +85,13 @@ impl DavTransport for ReqwestDavTransport {
             let response = request.send().await.map_err(|error| error.to_string())?;
             let status = response.status();
             let headers = response.headers().clone();
+            let url = response.url().to_string();
             let body = read_capped_body(response).await?;
             Ok(DavResponse {
                 status,
                 headers,
                 body,
+                url,
             })
         })
     }
@@ -141,9 +159,9 @@ impl CardDavClient {
             )
             .await
         {
-            Ok(body) => match extract_href_property(&body, "current-user-principal")
+            Ok(response) => match extract_href_property(&response.text, "current-user-principal")
                 .map_err(|error| parse_error(AccountOperation::Discover, error))?
-                .map(|href| resolve_href(&self.base_url, &href))
+                .map(|href| resolve_href(&response.url, &href))
             {
                 Some(principal) => {
                     return self.addressbook_home_for_principal(principal).await;
@@ -154,7 +172,7 @@ impl CardDavClient {
             Err(error) => return Err(error),
         };
 
-        let body = self
+        let response = self
             .propfind_raw(
                 &dav_root,
                 "0",
@@ -162,9 +180,9 @@ impl CardDavClient {
                 AccountOperation::Discover,
             )
             .await?;
-        let principal = extract_href_property(&body, "current-user-principal")
+        let principal = extract_href_property(&response.text, "current-user-principal")
             .map_err(|error| parse_error(AccountOperation::Discover, error))?
-            .map(|href| resolve_href(&self.base_url, &href))
+            .map(|href| resolve_href(&response.url, &href))
             .ok_or_else(|| {
                 parse_error(AccountOperation::Discover, "missing current-user-principal")
             })?;
@@ -175,7 +193,7 @@ impl CardDavClient {
         &self,
         principal: String,
     ) -> Result<String, AccountError> {
-        let body = self
+        let response = self
             .propfind_raw(
                 &principal,
                 "0",
@@ -183,9 +201,9 @@ impl CardDavClient {
                 AccountOperation::Discover,
             )
             .await?;
-        extract_href_property(&body, "addressbook-home-set")
+        extract_href_property(&response.text, "addressbook-home-set")
             .map_err(|error| parse_error(AccountOperation::Discover, error))?
-            .map(|href| resolve_href(&self.base_url, &href))
+            .map(|href| resolve_href(&response.url, &href))
             .inspect(|home| self.trust_discovered_url(home))
             .ok_or_else(|| parse_error(AccountOperation::Discover, "missing addressbook-home-set"))
     }
@@ -203,13 +221,13 @@ impl CardDavClient {
         home_url: &str,
         operation: AccountOperation,
     ) -> Result<Vec<AddressBookCollection>, AccountError> {
-        let body = self
+        let response = self
             .propfind_raw(home_url, "1", PROPFIND_ADDRESSBOOKS, operation)
             .await?;
-        let mut collections = parse_addressbook_collections(&body)
+        let mut collections = parse_addressbook_collections(&response.text)
             .map_err(|error| parse_error(operation, format!("addressbook list: {error}")))?;
         for collection in &mut collections {
-            collection.resolve_href(&self.base_url);
+            collection.resolve_href(&response.url);
         }
         Ok(collections)
     }
@@ -230,10 +248,10 @@ impl CardDavClient {
         addressbook_url: &str,
         operation: AccountOperation,
     ) -> Result<Option<String>, AccountError> {
-        let body = self
+        let response = self
             .propfind_raw(addressbook_url, "0", PROPFIND_CTAG, operation)
             .await?;
-        crate::parse::parse_collection_ctag(&body)
+        crate::parse::parse_collection_ctag(&response.text)
             .map_err(|error| parse_error(operation, format!("collection ctag: {error}")))
     }
 
@@ -257,12 +275,12 @@ impl CardDavClient {
         addressbook_url: &str,
         operation: AccountOperation,
     ) -> Result<CardDavContactListing, AccountError> {
-        let body = self
+        let response = self
             .propfind_raw(addressbook_url, "1", PROPFIND_CONTACTS, operation)
             .await?;
-        let mut listing = parse_propfind_contacts(&body)
+        let mut listing = parse_propfind_contacts(&response.text)
             .map_err(|error| parse_error(operation, format!("contact list: {error}")))?;
-        listing.resolve_hrefs(&self.base_url);
+        listing.resolve_hrefs(&response.url);
         Ok(listing)
     }
 
@@ -294,9 +312,9 @@ impl CardDavClient {
             let response = self
                 .report_raw(addressbook_url, "0", &body, operation)
                 .await?;
-            let mut parsed = parse_multiget_report(&response)
+            let mut parsed = parse_multiget_report(&response.text)
                 .map_err(|error| parse_error(operation, format!("multiget: {error}")))?;
-            parsed.resolve_hrefs(&self.base_url);
+            parsed.resolve_hrefs(&response.url);
             if let Some(error) = multiget_failure(&parsed, operation) {
                 degraded = worse_recovery(degraded, error);
             }
@@ -317,10 +335,10 @@ impl CardDavClient {
             let response = self
                 .report_raw(addressbook_url, "1", &body, AccountOperation::ContactSearch)
                 .await?;
-            let mut parsed = parse_multiget_report(&response).map_err(|error| {
+            let mut parsed = parse_multiget_report(&response.text).map_err(|error| {
                 parse_error(AccountOperation::ContactSearch, format!("query: {error}"))
             })?;
-            parsed.resolve_hrefs(&self.base_url);
+            parsed.resolve_hrefs(&response.url);
             if let Some(error) = multiget_failure(&parsed, AccountOperation::ContactSearch) {
                 degraded = worse_recovery(degraded, error);
             }
@@ -408,7 +426,7 @@ impl CardDavClient {
         depth: &str,
         body: &str,
         operation: AccountOperation,
-    ) -> Result<String, AccountError> {
+    ) -> Result<DavBody, AccountError> {
         let method = Method::from_bytes(b"PROPFIND")
             .map_err(|error| local_error(operation, error.to_string()))?;
         let request = self
@@ -427,7 +445,7 @@ impl CardDavClient {
         depth: &str,
         body: &str,
         operation: AccountOperation,
-    ) -> Result<String, AccountError> {
+    ) -> Result<DavBody, AccountError> {
         let method = Method::from_bytes(b"REPORT")
             .map_err(|error| local_error(operation, error.to_string()))?;
         let request = self
@@ -444,13 +462,9 @@ impl CardDavClient {
         &self,
         request: reqwest::RequestBuilder,
         operation: AccountOperation,
-    ) -> Result<String, AccountError> {
+    ) -> Result<DavBody, AccountError> {
         let response = self.send_raw_request(request, operation).await?;
-        if response.status.is_success() {
-            Ok(response.body)
-        } else {
-            Err(status_error(operation, response.status, response.body))
-        }
+        settle_body(response, operation)
     }
 
     async fn send_status_request(
@@ -559,6 +573,23 @@ impl CardDavClient {
 ///
 /// Only `https` qualifies; an unparseable URL is treated as insecure so the
 /// downgrade check fails closed.
+/// Classify a completed DAV response and keep the effective URI attached
+/// to the body, so the caller resolves hrefs against the URI that actually
+/// served the Multi-Status rather than the one it submitted.
+fn settle_body(
+    response: DavResponse,
+    operation: AccountOperation,
+) -> Result<DavBody, AccountError> {
+    if response.status.is_success() {
+        Ok(DavBody {
+            text: response.body,
+            url: response.url,
+        })
+    } else {
+        Err(status_error(operation, response.status, response.body))
+    }
+}
+
 fn origin_is_secure(value: &str) -> bool {
     Url::parse(value).is_ok_and(|url| url.scheme().eq_ignore_ascii_case("https"))
 }
@@ -971,12 +1002,18 @@ mod tests {
                     url: request.url().to_string(),
                     headers: request.headers().clone(),
                 });
-            let response = self
+            let mut response = self
                 .responses
                 .lock()
                 .expect("scripted DAV response lock poisoned")
                 .pop_front()
                 .expect("scripted DAV transport exhausted");
+            // A scripted response with no effective URL models the ordinary
+            // no-redirect case: reqwest reports the submitted URI back. A
+            // script that sets one models a followed redirect.
+            if response.url.is_empty() {
+                response.url = request.url().to_string();
+            }
             Box::pin(async move { Ok(response) })
         }
     }
@@ -990,6 +1027,7 @@ mod tests {
             status: StatusCode::NO_CONTENT,
             headers: HeaderMap::new(),
             body: String::new(),
+            url: String::new(),
         };
         let script = ScriptedDavTransport::new([deleted(), deleted()]);
         let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
@@ -1028,6 +1066,7 @@ mod tests {
             status: StatusCode::MULTI_STATUS,
             headers: HeaderMap::new(),
             body: body.to_string(),
+            url: String::new(),
         };
         let script = ScriptedDavTransport::new([
             response("<D:multistatus xmlns:D=\"DAV:\"/>"),
@@ -1067,6 +1106,7 @@ mod tests {
             status: StatusCode::MULTI_STATUS,
             headers: HeaderMap::new(),
             body,
+            url: String::new(),
         };
         ScriptedDavTransport::new([
             response(
@@ -1111,6 +1151,57 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn cross_origin_addressbook_hrefs_resolve_against_the_home_request() {
+        let script = ScriptedDavTransport::new([DavResponse {
+            status: StatusCode::MULTI_STATUS,
+            headers: HeaderMap::new(),
+            body: "<D:multistatus xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:carddav\"><D:response><D:href>team/</D:href><D:propstat><D:prop><D:resourcetype><D:collection/><C:addressbook/></D:resourcetype></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response></D:multistatus>".to_string(),
+            url: String::new(),
+        }]);
+        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
+        let client = CardDavClient::with_transport("https://dav.example.test", transport);
+        let home = "https://books.example.test/homes/ada/";
+        client.trust_discovered_url(home);
+
+        let books = client
+            .list_addressbooks(home)
+            .await
+            .expect("cross-origin listing succeeds");
+
+        assert_eq!(books[0].href, "https://books.example.test/homes/ada/team/");
+    }
+
+    /// RFC 4918 resolves a relative href against the EFFECTIVE request URI.
+    /// `dav_redirect_policy` follows same-host hops, so a PROPFIND submitted
+    /// to `/addressbook` can be served from `/dav/users/ada/addressbook/`.
+    /// Resolving `one.vcf` against the submitted URI mints `/one.vcf` - a
+    /// native id that does not exist, and a follow-up GET that 404s.
+    #[tokio::test]
+    async fn contact_hrefs_resolve_against_the_post_redirect_url() {
+        let script = ScriptedDavTransport::new([DavResponse {
+            status: StatusCode::MULTI_STATUS,
+            headers: HeaderMap::new(),
+            body: "<D:multistatus xmlns:D=\"DAV:\"><D:response><D:href>one.vcf</D:href><D:propstat><D:prop><D:getetag>\"e1\"</D:getetag></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response></D:multistatus>".to_string(),
+            url: "https://dav.example.test/dav/users/ada/addressbook/".to_string(),
+        }]);
+        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
+        let client = CardDavClient::with_transport("https://dav.example.test", transport);
+
+        let listing = client
+            .list_contacts_listing(
+                "https://dav.example.test/addressbook",
+                AccountOperation::ContactsList,
+            )
+            .await
+            .expect("redirected listing succeeds");
+
+        assert_eq!(
+            listing.entries[0].uri,
+            "https://dav.example.test/dav/users/ada/addressbook/one.vcf"
+        );
+    }
+
     /// Discovery is server-steered, so a discovered home must never weaken the
     /// transport guarantee the configured HTTPS base URL established. The
     /// assertion that matters is the destination: no request at all reaches the
@@ -1148,6 +1239,7 @@ mod tests {
             status: StatusCode::MULTI_STATUS,
             headers: HeaderMap::new(),
             body: "<D:multistatus xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:carddav\"><D:response><D:href>/book/one.vcf</D:href><D:propstat><D:prop><C:address-data>BEGIN:VCARD\nVERSION:4.0\nFN:One\nEND:VCARD</C:address-data></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response></D:multistatus>".to_string(),
+            url: String::new(),
         }]);
         let concrete_transport = Arc::clone(&script);
         let transport: Arc<dyn DavTransport> = concrete_transport;
@@ -1198,6 +1290,7 @@ mod tests {
             status: StatusCode::UNAUTHORIZED,
             headers: HeaderMap::new(),
             body: "<html><body>401 Unauthorized</body></html>".to_string(),
+            url: String::new(),
         }]);
         let concrete_transport = Arc::clone(&script);
         let transport: Arc<dyn DavTransport> = concrete_transport;
@@ -1320,6 +1413,7 @@ mod tests {
             status: StatusCode::MULTI_STATUS,
             headers: HeaderMap::new(),
             body: "<D:multistatus xmlns:D=\"DAV:\"/>".to_string(),
+            url: String::new(),
         }]);
         let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
         let client = CardDavClient::with_transport("https://dav.example.test", transport);

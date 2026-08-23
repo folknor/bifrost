@@ -75,8 +75,12 @@ calendar primitives.
   propstat status. Every text-bearing parser accepts both XML text and
   CDATA. Scheduling address-set extraction returns every nested href;
   single-valued discovery properties use the first. Response hrefs are
-  rebased to absolute native URLs at the decode boundary, before the account
-  layer can consume success or failure lanes.
+  rebased against the URI of the request that produced the multistatus,
+  yielding absolute native URLs at the decode boundary before the account
+  layer can consume success or failure lanes. The base is the EFFECTIVE
+  request URI: the DAV transport carries the post-redirect URL back on
+  every response, because the redirect policy follows same-host hops and
+  RFC 4918 resolves against the URI that actually served the body.
 - `ical.rs` - iCalendar projection between DAV resources and
   `bifrost-types` calendar events. Parsing-in uses `caldata`'s streaming
   `ContentLineParser` (RFC 5545 unfolding that strips exactly one fold WSP,
@@ -295,6 +299,13 @@ empty multistatus against a populated prior snapshot suppresses the
 mass-delete, and any href in `current.failed_hrefs` is preserved rather
 than destroyed. `inventory_stream` emits event inventory entries with ETag
 fingerprints for the same cursor scope.
+The CalDAV cursor payload is version 2. Version 2 records the request-relative
+native-id namespace; version 1 cursors are rejected so a namespace correction
+cannot surface as a delete plus create during snapshot diffing. The rejection is
+classified `SyncState(SchemaIncompatible)`, deriving to
+`Engine(SchemaIncompatible)` rather than a scope restart: only that directive
+also deletes the backfill checkpoint, and without the re-walk the objects
+already backfilled would keep their pre-correction id spelling.
 An expired token reported as 403 with `DAV:valid-sync-token`, or as 410,
 becomes scoped `SyncState(CursorInvalid)`, which directs the engine to
 restart the calendar-event cursor. Cursor entry counts are payload-bounded
