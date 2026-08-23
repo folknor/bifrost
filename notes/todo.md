@@ -1200,38 +1200,72 @@ confirm against the code before working any of them.
   `bifrost-graph` had SIX unbounded `@odata.nextLink` loops with no page budget
   and no repeated-link guard, plus an unguarded folder-parentage descent. See
   `reference/graph.md`, "Bounded `nextLink` traversal".
-- **sync-B4. Work off inventory coverage debt (the repair path).** [C2] Tail of
-  google-B5, whose mechanism landed 2026-08-23. Inventory now has an
-  `InventoryCoverage` model: a walk that cannot represent an object records an
-  `InventoryObligation` and keeps going, every checkpoint from that point
-  declares the gap, cursor and coverage are persisted in ONE atomic record, the
-  backfill completion sentinel is withheld, and a warning is raised. So the
-  scope converges live-and-degraded and nothing is silently lost.
+- **sync-B4. Provider-native repair of inventory coverage debt.** [C2] Tail of
+  google-B5. The durable-truth layer landed 2026-08-23 in a second pass that
+  also fixed two live defects in the first one; see `reference/sync.md`,
+  "Inventory coverage", for the mechanism as built.
 
-  What does NOT exist yet is anything that works the debt off. Obligations sit
-  in the durable record until a later walk of that scope reports `Complete`.
-  For a Gmail account that means the object stays missing until the next full
-  inventory, and for a scope whose backfill has finished there may be no next
-  walk at all.
+  What that pass established: reports carry a semantic `CoverageDomain` (so a
+  partition's success cannot discharge its neighbours' debt, and page ranges are
+  incomparable across snapshots); the engine owns a `DebtLedger` with proof and
+  policy as independent axes; coverage claims are correlated by engine-issued
+  `PublicationId` rather than by scope or checkpoint value; checkpoint and
+  ledger land in one `apply_transition`; a non-replayable `Region` is a
+  `CheckpointBarrier` that taints its walk; sentinel eligibility is evaluated by
+  the writer against the current ledger; debt is enumerable via
+  `SyncEngine::debt` and waivable, occurrence by occurrence, via
+  `waive_obligation`.
 
-  The design, argued out with the cold reviewer and recorded in
-  `reference/sync.md`: a repair pass reads the obligations back and retries
-  them, using the account's own opaque `repair` / `replay` tokens rather than
-  ordinary `get_stream` - only the protocol crate knows what a provider-native
-  re-read needs, and a `Region` obligation names a page to replay rather than
-  an id to fetch. A later success removes the obligation and emits the recovered
-  entry; a definitive absence removes it without one. Obligation states worth
-  having: `Pending` (retry normally), `OperatorBlocked` (a retry budget expired;
-  stop trying automatically but stay visible), and `Waived` (an operator
-  explicitly accepts the omission). **Only `Waived` is true abandonment, and it
-  must never happen because a local retry counter ran out** - the account layer
-  classifies evidence, it does not choose the user's acceptable-loss policy.
+  What does NOT exist is a provider-native re-read. Debt is discharged today
+  only by a later walk whose domain covers it, or by an operator waiver. For a
+  scope whose backfill has finished there may be no next walk, so an obligation
+  can sit open indefinitely with the waiver as its only terminal state.
 
-  Note the `Region` case has a hard boundary: the main cursor may advance past
-  a replayable region only if that region can later be replayed INDEPENDENTLY of
-  the advanced cursor. If Graph's delta API cannot replay a page after the delta
-  link moves on, there is no honest discharge and that page has to remain a
-  checkpoint barrier.
+  The design for the remaining half, argued out with the cold reviewer:
+
+  - A dedicated Account entry point and envelope, NOT `get_stream` (which
+    hydrates known ids at a projection and cannot express region replay,
+    completeness proof, or authoritative absence) and NOT `InventoryEvent`
+    (whose main-cursor checkpoints and cumulative walk coverage are wrong during
+    repair). Correlated outcomes: `Recovered`, `DefinitivelyIrrelevant`,
+    `Deferred`, `Replaced`.
+  - A region is discharged only on proof that the WHOLE named region was
+    accounted for. Producing some entries is not enough.
+  - Definitive absence is a typed account conclusion about snapshot semantics,
+    never a status code. Gmail's landed discharge of a mid-walk `NotFound` is
+    the model: it rests on the id coming from this walk's own listing and the
+    cursor being anchored before the walk, not on the error kind.
+  - Repair may discover new obligations. That is an ATOMIC REPLACEMENT of the
+    parent with its children, not an append - otherwise the parent is replayed
+    forever and double-counted. `LedgerEntry::parent` exists for this, unused so
+    far. Retry budgeting must follow the unresolved LINEAGE, or an account
+    evades every budget by re-minting an equivalent obligation each pass.
+  - `PolicyStatus::Retrying { attempts }` counts COMPLETED outcomes only. A
+    crash after provider work but before acknowledgement must cost a repeated
+    attempt, not a consumed budget. `attempts` may drive `OperatorBlocked`; it
+    may never drive `Waived` or `Discharged`.
+  - Ordering: publish repair batch -> consumer persists -> consumer acknowledges
+    -> writer conditionally discharges. The reverse recreates silent loss. A
+    crash between the middle steps yields duplicate recovery, which is the same
+    at-least-once asymmetry ordinary checkpoint delivery already has.
+  - **The unsolved part is the race with the live change stream.** A repaired
+    entry describes an older snapshot while the changes stream may already have
+    applied a newer update or deletion, so applying it blindly can resurrect
+    deleted data. `ServerVersion` cannot arbitrate generically: `ETag` and
+    `StateAt` are equality tokens, `ModSeq` orders only within a UIDVALIDITY
+    epoch, and the type derives `Eq` and not `Ord` for exactly that reason. This
+    needs either per-object serialization on the consumer side, a fill-absence-
+    only rule with tombstone retention, or an account-owned `VersionRelation`
+    hook that answers `Incomparable` honestly for most providers. Decide this
+    before building the executor; it is a consumer-contract question, not an
+    engine-internal one.
+
+- **sync-B5. Ledger compaction and audit retention.** [C4] Discharged entries
+  are retained forever for audit, so the ledger grows monotonically. Compaction
+  needs to preserve the proved/waived distinction rather than flattening it -
+  separate counters or audit roots for proved discharges, waived unresolved
+  loss, and currently-open obligations. Not urgent at present volumes; it
+  becomes real once provider-native repair starts churning entries.
 
 ### Open defects
 

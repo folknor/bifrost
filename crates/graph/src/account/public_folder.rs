@@ -976,7 +976,7 @@ pub(crate) fn public_folder_inventory_stream(
                 .with_scope(ErrorScope::Cursor(scope.clone()));
             yield bifrost_types::InventoryEvent::Terminated(cursor_error_to_account_error(
                 super::cursor::CursorError::Unsupported, ctx));
-            yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion::complete(None));
+            yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion::complete(scope.clone(), None));
             return;
         };
 
@@ -985,7 +985,7 @@ pub(crate) fn public_folder_inventory_stream(
                 .with_scope(ErrorScope::Cursor(scope.clone()));
             yield bifrost_types::InventoryEvent::Terminated(cursor_error_to_account_error(
                 super::cursor::CursorError::Unsupported, ctx));
-            yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion::complete(None));
+            yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion::complete(scope.clone(), None));
             return;
         };
         let owner = MailboxId(routing.anchor_mailbox.clone());
@@ -1007,7 +1007,7 @@ pub(crate) fn public_folder_inventory_stream(
                 None,
                 ctx,
             ));
-            yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion::complete(None));
+            yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion::complete(scope.clone(), None));
             return;
         };
 
@@ -1018,7 +1018,7 @@ pub(crate) fn public_folder_inventory_stream(
                     .with_scope(ErrorScope::Cursor(scope.clone()));
                 yield bifrost_types::InventoryEvent::Terminated(ews_shared_scope_error(
                     error, &scope, Some(&owner), ctx));
-                yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion::complete(None));
+                yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion::complete(scope.clone(), None));
                 return;
             }
         };
@@ -1031,7 +1031,7 @@ pub(crate) fn public_folder_inventory_stream(
                 .with_scope(ErrorScope::Cursor(scope.clone()));
             yield bifrost_types::InventoryEvent::Terminated(ews_shared_scope_error(
                 incomplete_walk_error(&folder.0), &scope, Some(&owner), ctx));
-            yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion::complete(None));
+            yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion::complete(scope.clone(), None));
             return;
         }
         let ItemWalk { items, unhandled_classes: unhandled, .. } = walk;
@@ -1087,7 +1087,7 @@ pub(crate) fn public_folder_inventory_stream(
                 let ctx = GraphErrorContext::graph(AccountOperation::SyncInventory)
                     .with_scope(ErrorScope::Cursor(scope.clone()));
                 yield bifrost_types::InventoryEvent::Terminated(cursor_error_to_account_error(error, ctx));
-                yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion::complete(None));
+                yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion::complete(scope.clone(), None));
                 return;
             }
         };
@@ -1097,9 +1097,9 @@ pub(crate) fn public_folder_inventory_stream(
             entries,
             PageBoundary::Final,
             Some(cursor),
-            bifrost_types::InventoryCoverage::Complete,
+            bifrost_types::InventoryCoverageReport::complete(scope.clone()),
         );
-        yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion::complete(Some(
+        yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion::complete(scope.clone(), Some(
             checkpoint,
         )));
     })

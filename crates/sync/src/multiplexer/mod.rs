@@ -36,7 +36,9 @@ use crate::cursor::CursorRegistry;
 use crate::error::Error;
 use crate::types::MultiplexerConfig;
 
-pub use changes::{AckRequest, ChangesEvent, WriterRequest, drive_changes_stream};
+pub use changes::{
+    AckRequest, ChangesEvent, OperatorDecision, WriterRequest, drive_changes_stream,
+};
 pub use fusion::{FusionOutcome, InventoryFusion};
 pub use poll::{AdaptiveCadence, PollSchedule};
 
@@ -60,6 +62,30 @@ pub struct MultiplexerEvent {
     pub scope: CursorScope,
     pub event: Arc<SyncEvent<bifrost_types::Change>>,
     pub checkpoint: Option<Checkpoint>,
+    /// Engine-issued identity for THIS publication of `checkpoint`, to be
+    /// passed back to `Engine::ack_checkpoint`.
+    ///
+    /// `Some` exactly when `checkpoint` is `Some`. It exists because
+    /// `Checkpoint` equality is value equality and cannot identify a
+    /// publication: a backfill page whose content was entirely unrepresentable
+    /// increments no item count and produces a checkpoint byte-identical to its
+    /// predecessor, and inventory fusion publishes its final checkpoint twice.
+    /// Acknowledging by value would then apply one publication's coverage claim
+    /// to a different publication's checkpoint.
+    pub publication: Option<crate::cursor::PublicationId>,
+}
+
+impl MultiplexerEvent {
+    /// An event carrying no checkpoint, and so nothing to acknowledge.
+    #[must_use]
+    pub fn unacked(scope: CursorScope, event: Arc<SyncEvent<bifrost_types::Change>>) -> Self {
+        Self {
+            scope,
+            event,
+            checkpoint: None,
+            publication: None,
+        }
+    }
 }
 
 /// Consumer-facing receiver that turns broadcast ring overflow into an
@@ -142,6 +168,7 @@ fn lag_warning(skipped: u64, abandoned: usize) -> MultiplexerEvent {
         scope: CursorScope::Account,
         event: Arc::new(SyncEvent::Warning(warning)),
         checkpoint: None,
+        publication: None,
     }
 }
 
@@ -442,6 +469,7 @@ impl Multiplexer {
                                                 scope: CursorScope::Account,
                                                 event: Arc::new(SyncEvent::Terminated(err)),
                                                 checkpoint: None,
+                                                publication: None,
                                             });
                                             return;
                                         }
@@ -1091,6 +1119,7 @@ mod tests {
                 message,
             ))),
             checkpoint: None,
+            publication: None,
         }
     }
 

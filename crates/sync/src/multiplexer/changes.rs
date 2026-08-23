@@ -118,6 +118,7 @@ pub async fn drive_changes_stream(
             scope: scope.clone(),
             event: Arc::new(event),
             checkpoint: checkpoint.clone(),
+            publication: None,
         };
         // Broadcast (item + checkpoint) together. Subscribers persist
         // `(items, checkpoint)` atomically in their own store, then
@@ -194,6 +195,16 @@ fn post_publish_boundary(request: BoundaryRequest, has_checkpoint: bool) -> Opti
 pub struct AckRequest {
     pub scope: CursorScope,
     pub checkpoint: Checkpoint,
+    /// Which PUBLICATION of `checkpoint` this acknowledges.
+    ///
+    /// `Checkpoint` equality cannot serve: a backfill page whose content was
+    /// entirely unrepresentable increments no item count and produces a
+    /// byte-identical checkpoint to its predecessor, and inventory fusion
+    /// publishes its final checkpoint twice. Without the identity, one
+    /// publication's coverage claim gets applied to another's checkpoint.
+    ///
+    /// `None` only for engine-internal acks that carry no coverage claim.
+    pub publication: Option<crate::cursor::PublicationId>,
     /// True for legacy engine-generated acks. Current production code
     /// sends only consumer acks (`false`), but the field remains for
     /// trace readability if old tests or callers construct requests
@@ -210,6 +221,7 @@ impl std::fmt::Debug for AckRequest {
         f.debug_struct("AckRequest")
             .field("scope", &self.scope)
             .field("checkpoint", &self.checkpoint)
+            .field("publication", &self.publication)
             .field("auto", &self.auto)
             .field("complete", &self.complete.is_some())
             .finish()
@@ -254,6 +266,51 @@ pub enum WriterRequest {
     ReattachAbort { done: oneshot::Sender<()> },
     /// The reattach cut over: its rows are now ordinary durable state.
     ReattachCommit,
+    /// Record a walk that stopped at a region the cursor may not cross.
+    ///
+    /// Has no checkpoint of its own by definition - nothing advanced - so it
+    /// cannot ride the acknowledgement path like every other durable mutation.
+    /// It still goes through this writer, because it shares the ledger with
+    /// everything that does.
+    RecordBarrier {
+        incident: crate::cursor::BarrierIncident,
+        done: oneshot::Sender<Result<(), Error>>,
+    },
+    /// Record obligations from a report that has no acknowledgeable checkpoint
+    /// of its own - a backfill partition's terminal summary, say.
+    ///
+    /// Debt only, never proof: the report may describe entries the consumer
+    /// never persisted, so it may not discharge anything. Over-reporting debt
+    /// costs a scope that stays degraded until something re-reads it;
+    /// under-reporting it costs objects nobody ever sees again.
+    RecordDebt {
+        report: bifrost_types::InventoryCoverageReport,
+        generation: u64,
+        done: oneshot::Sender<Result<(), Error>>,
+    },
+    /// Operator action on one obligation or barrier occurrence.
+    ///
+    /// `Waive` is the only path to accepted loss, and it exists only here:
+    /// nothing automatic may reach it, because a retry budget expiring is
+    /// evidence that retrying is not working, not a decision about what loss is
+    /// acceptable.
+    OperatorDecision {
+        key: bifrost_types::ObligationKey,
+        decision: OperatorDecision,
+        done: oneshot::Sender<Result<bool, Error>>,
+    },
+}
+
+/// What an operator decided about an obligation.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum OperatorDecision {
+    /// Accept the loss. Changes POLICY only: the record goes on saying that
+    /// coverage was never proved, because it never was.
+    Waive { by: String, at_unix_seconds: i64 },
+    /// Stop automatic retries without accepting the loss. Stays visible, stays
+    /// blocking, stays manually retryable.
+    Block,
 }
 
 impl From<AckRequest> for WriterRequest {
@@ -272,6 +329,19 @@ impl std::fmt::Debug for WriterRequest {
                 .finish(),
             Self::ReattachAbort { .. } => f.write_str("ReattachAbort"),
             Self::ReattachCommit => f.write_str("ReattachCommit"),
+            Self::RecordDebt { generation, .. } => f
+                .debug_struct("RecordDebt")
+                .field("generation", generation)
+                .finish(),
+            Self::RecordBarrier { incident, .. } => f
+                .debug_struct("RecordBarrier")
+                .field("key", &incident.key)
+                .finish(),
+            Self::OperatorDecision { key, decision, .. } => f
+                .debug_struct("OperatorDecision")
+                .field("key", key)
+                .field("decision", decision)
+                .finish(),
         }
     }
 }

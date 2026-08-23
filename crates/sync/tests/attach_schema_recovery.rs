@@ -18,8 +18,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bifrost_sync::{
-    BackfillCheckpointRecord, ChangeCheckpointRecord, CheckpointStore, Error,
-    InMemoryCheckpointStore, SyncEngine,
+    CheckpointStore, CheckpointTransition, DebtLedger, Error, InMemoryCheckpointStore, SyncEngine,
 };
 use bifrost_types::{
     Account, AccountCapabilities, AccountError, AccountErrorBuilder, AccountErrorKind,
@@ -39,6 +38,7 @@ use bifrost_types::{
     VacationConfig, WatchEvent,
 };
 use bifrost_types::{AddressBook, AddressBookId};
+use bifrost_types::{BackfillCheckpoint, Checkpoint};
 use bifrost_types::{Calendar, CalendarEvent};
 use bytes::Bytes;
 use futures::stream;
@@ -127,25 +127,35 @@ impl PoisonedStore {
 }
 
 impl CheckpointStore for PoisonedStore {
-    fn put_change_record<'a>(
+    fn apply_transition<'a>(
         &'a self,
         account: &'a AccountId,
-        record: ChangeCheckpointRecord,
+        transition: CheckpointTransition,
     ) -> Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send + 'a>> {
-        self.inner.put_change_record(account, record)
+        self.inner.apply_transition(account, transition)
     }
 
-    fn get_change_record<'a>(
+    fn put_ledger<'a>(
+        &'a self,
+        account: &'a AccountId,
+        ledger: DebtLedger,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send + 'a>> {
+        self.inner.put_ledger(account, ledger)
+    }
+
+    fn get_ledger<'a>(
+        &'a self,
+        account: &'a AccountId,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<DebtLedger, Error>> + Send + 'a>> {
+        self.inner.get_ledger(account)
+    }
+
+    fn get_change_cursor<'a>(
         &'a self,
         account: &'a AccountId,
         scope: &'a CursorScope,
-    ) -> Pin<
-        Box<
-            dyn std::future::Future<Output = Result<Option<ChangeCheckpointRecord>, Error>>
-                + Send
-                + 'a,
-        >,
-    > {
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Option<ChangeCursor>, Error>> + Send + 'a>>
+    {
         if self.fail_reads {
             return Box::pin(async {
                 Err(Error::CheckpointStore(
@@ -162,15 +172,7 @@ impl CheckpointStore for PoisonedStore {
         if still_poisoned {
             return Box::pin(async { Err(Error::SchemaIncompatible) });
         }
-        self.inner.get_change_record(account, scope)
-    }
-
-    fn put_backfill<'a>(
-        &'a self,
-        account: &'a AccountId,
-        record: BackfillCheckpointRecord,
-    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send + 'a>> {
-        self.inner.put_backfill(account, record)
+        self.inner.get_change_cursor(account, scope)
     }
 
     fn get_backfill<'a>(
@@ -179,9 +181,7 @@ impl CheckpointStore for PoisonedStore {
         scope: &'a CursorScope,
     ) -> Pin<
         Box<
-            dyn std::future::Future<Output = Result<Option<BackfillCheckpointRecord>, Error>>
-                + Send
-                + 'a,
+            dyn std::future::Future<Output = Result<Option<BackfillCheckpoint>, Error>> + Send + 'a,
         >,
     > {
         self.inner.get_backfill(account, scope)
@@ -1876,25 +1876,35 @@ struct FlakyGetStore {
 }
 
 impl CheckpointStore for FlakyGetStore {
-    fn put_change_record<'a>(
+    fn apply_transition<'a>(
         &'a self,
         account: &'a AccountId,
-        record: ChangeCheckpointRecord,
+        transition: CheckpointTransition,
     ) -> Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send + 'a>> {
-        self.inner.put_change_record(account, record)
+        self.inner.apply_transition(account, transition)
     }
 
-    fn get_change_record<'a>(
+    fn put_ledger<'a>(
+        &'a self,
+        account: &'a AccountId,
+        ledger: DebtLedger,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send + 'a>> {
+        self.inner.put_ledger(account, ledger)
+    }
+
+    fn get_ledger<'a>(
+        &'a self,
+        account: &'a AccountId,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<DebtLedger, Error>> + Send + 'a>> {
+        self.inner.get_ledger(account)
+    }
+
+    fn get_change_cursor<'a>(
         &'a self,
         account: &'a AccountId,
         scope: &'a CursorScope,
-    ) -> Pin<
-        Box<
-            dyn std::future::Future<Output = Result<Option<ChangeCheckpointRecord>, Error>>
-                + Send
-                + 'a,
-        >,
-    > {
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Option<ChangeCursor>, Error>> + Send + 'a>>
+    {
         {
             let mut scripted = self.fail_get_for.lock().expect("flaky get lock");
             if scripted.as_ref() == Some(scope) {
@@ -1904,15 +1914,7 @@ impl CheckpointStore for FlakyGetStore {
                 });
             }
         }
-        self.inner.get_change_record(account, scope)
-    }
-
-    fn put_backfill<'a>(
-        &'a self,
-        account: &'a AccountId,
-        record: BackfillCheckpointRecord,
-    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send + 'a>> {
-        self.inner.put_backfill(account, record)
+        self.inner.get_change_cursor(account, scope)
     }
 
     fn get_backfill<'a>(
@@ -1921,9 +1923,7 @@ impl CheckpointStore for FlakyGetStore {
         scope: &'a CursorScope,
     ) -> Pin<
         Box<
-            dyn std::future::Future<Output = Result<Option<BackfillCheckpointRecord>, Error>>
-                + Send
-                + 'a,
+            dyn std::future::Future<Output = Result<Option<BackfillCheckpoint>, Error>> + Send + 'a,
         >,
     > {
         self.inner.get_backfill(account, scope)
@@ -2028,46 +2028,56 @@ struct AckRacingStore {
 }
 
 impl CheckpointStore for AckRacingStore {
-    fn put_change_record<'a>(
+    fn apply_transition<'a>(
         &'a self,
         account: &'a AccountId,
-        record: ChangeCheckpointRecord,
+        transition: CheckpointTransition,
     ) -> Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send + 'a>> {
-        self.mutated_scopes
-            .lock()
-            .expect("mutations lock")
-            .push(record.cursor.scope.clone());
+        if let Checkpoint::Change(cursor) = &transition.checkpoint {
+            self.mutated_scopes
+                .lock()
+                .expect("mutations lock")
+                .push(cursor.scope.clone());
+        }
         let side = self.side_write.lock().expect("side write lock").take();
         Box::pin(async move {
             if let Some((ack_account, ack_cursor)) = side {
                 self.inner
-                    .put_change_record(&ack_account, ChangeCheckpointRecord::complete(ack_cursor))
+                    .apply_transition(
+                        &ack_account,
+                        CheckpointTransition {
+                            checkpoint: Checkpoint::Change(ack_cursor),
+                            ledger: DebtLedger::default(),
+                        },
+                    )
                     .await?;
             }
-            self.inner.put_change_record(account, record).await
+            self.inner.apply_transition(account, transition).await
         })
     }
 
-    fn get_change_record<'a>(
+    fn put_ledger<'a>(
+        &'a self,
+        account: &'a AccountId,
+        ledger: DebtLedger,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send + 'a>> {
+        self.inner.put_ledger(account, ledger)
+    }
+
+    fn get_ledger<'a>(
+        &'a self,
+        account: &'a AccountId,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<DebtLedger, Error>> + Send + 'a>> {
+        self.inner.get_ledger(account)
+    }
+
+    fn get_change_cursor<'a>(
         &'a self,
         account: &'a AccountId,
         scope: &'a CursorScope,
-    ) -> Pin<
-        Box<
-            dyn std::future::Future<Output = Result<Option<ChangeCheckpointRecord>, Error>>
-                + Send
-                + 'a,
-        >,
-    > {
-        self.inner.get_change_record(account, scope)
-    }
-
-    fn put_backfill<'a>(
-        &'a self,
-        account: &'a AccountId,
-        record: BackfillCheckpointRecord,
-    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send + 'a>> {
-        self.inner.put_backfill(account, record)
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Option<ChangeCursor>, Error>> + Send + 'a>>
+    {
+        self.inner.get_change_cursor(account, scope)
     }
 
     fn get_backfill<'a>(
@@ -2076,9 +2086,7 @@ impl CheckpointStore for AckRacingStore {
         scope: &'a CursorScope,
     ) -> Pin<
         Box<
-            dyn std::future::Future<Output = Result<Option<BackfillCheckpointRecord>, Error>>
-                + Send
-                + 'a,
+            dyn std::future::Future<Output = Result<Option<BackfillCheckpoint>, Error>> + Send + 'a,
         >,
     > {
         self.inner.get_backfill(account, scope)

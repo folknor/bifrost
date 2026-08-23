@@ -210,11 +210,12 @@ impl Account for StubAccount {
         Box::pin(async { Ok(CursorEstablishment::EstablishViaInventory) })
     }
 
-    fn inventory_stream(&self, _scope: CursorScope) -> AccountStream<InventoryEvent> {
+    fn inventory_stream(&self, scope: CursorScope) -> AccountStream<InventoryEvent> {
         self.inventory_called.store(true, Ordering::SeqCst);
         Box::pin(
-            stream::iter([sentinel_inventory_batch(), SyncEvent::Done(None)])
-                .map(InventoryEvent::from),
+            stream::iter([sentinel_inventory_batch(), SyncEvent::Done(None)]).map(
+                bifrost_types::lift_complete_walk(bifrost_types::CoverageDomain::full(scope)),
+            ),
         )
     }
 

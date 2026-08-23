@@ -12,6 +12,7 @@
 
 pub mod coverage;
 pub mod envelope;
+pub mod ledger;
 pub mod store;
 
 use std::collections::HashMap;
@@ -22,13 +23,15 @@ use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 use bifrost_types::{ChangeCursor, CursorScope, MembershipScope};
 
-pub use coverage::PendingCoverage;
+pub use coverage::{ClaimLookup, CoverageClaim, PendingCoverage, PublicationId};
 pub use envelope::{
     CursorEnvelope, ENGINE_VERSION, EnvelopeKind, MIN_MIGRATABLE, decode_envelope, encode_envelope,
 };
+pub use ledger::{
+    BarrierIncident, DebtLedger, DischargeEvidence, LedgerEntry, PolicyStatus, ProofStatus,
+};
 pub use store::{
-    BackfillCheckpointRecord, ChangeCheckpointRecord, CheckpointStore, DynCheckpointStore,
-    InMemoryCheckpointStore,
+    CheckpointStore, CheckpointTransition, DynCheckpointStore, InMemoryCheckpointStore,
 };
 
 /// In-memory cursor registry. Holds the latest known `ChangeCursor`

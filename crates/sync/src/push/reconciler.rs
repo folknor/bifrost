@@ -142,6 +142,7 @@ impl Reconciler {
                             scope: CursorScope::Account,
                             event: Arc::new(bifrost_types::SyncEvent::Warning(warning)),
                             checkpoint: None,
+                            publication: None,
                         };
                         let _ = self.changes_tx.send(me);
                     }
@@ -157,6 +158,7 @@ impl Reconciler {
                             scope: CursorScope::Account,
                             event: Arc::new(bifrost_types::SyncEvent::Warning(warning)),
                             checkpoint: None,
+                            publication: None,
                         };
                         let _ = self.changes_tx.send(me);
                     }
@@ -167,6 +169,7 @@ impl Reconciler {
                                 fatal.into_inner(),
                             )),
                             checkpoint: None,
+                            publication: None,
                         };
                         let _ = self.changes_tx.send(me);
                     }
@@ -281,6 +284,7 @@ impl Reconciler {
             scope: CursorScope::Account,
             event: Arc::new(bifrost_types::SyncEvent::Warning(warning)),
             checkpoint: None,
+            publication: None,
         }
     }
 }

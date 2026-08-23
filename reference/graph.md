@@ -1371,6 +1371,36 @@ on every pass instead of quarantining one folder.
 Non-byte-stream attachments emit a `BlobNotByteStream` `Warning` rather than a
 terminal error, so the engine continues past a referenceAttachment in a batch.
 
+## An id-less delta value is a checkpoint barrier
+
+A non-removed value in a delta page with no usable `id` cannot become an
+`InventoryEntry` - there is nothing to key it by. It becomes a `Region`
+obligation rather than an `Object` one, because an absent id may mean one
+malformed value, a schema mismatch affecting many, a truncated page, or a
+response that cannot be correlated with pagination at all, and calling it a
+single-object loss would claim knowledge the walk does not have.
+
+Its `RegionRecovery` is `CheckpointBarrier`, not `DurableReplay`. The only token
+available at page granularity is the current page URL, which is a continuation of
+THIS delta session: once the walk takes its `deltaLink` and the cursor advances,
+that skip token is dead. Recording it as a repair capability would create durable
+debt nothing could ever discharge, which is silent permanent loss wearing a
+declared-debt costume. Graph publishes no durable snapshot handle for a page of a
+delta enumeration, so the honest answer is that the cursor must not cross the
+page at all.
+
+The engine consequence, per `reference/sync.md`: the batch's items are still
+delivered, its checkpoint is stripped, the walk stops, and a `BarrierIncident` is
+persisted. Earlier checkpoints from the same walk stand, because each certifies a
+prefix ending before the failing page begins - the previous page's checkpoint
+holds the `nextLink` that BECAME this page's URL, so accepting it does not cross
+the malformed value. The scope then cannot advance until an operator waives that
+specific occurrence. The obligation key names the page, not the failure class, so
+a waiver cannot silently accept every future id-less value in the scope.
+
+An earlier revision recorded the page URL as a replay token and let the delta link
+advance regardless, with a test pinning that as correct.
+
 ## Bounded `nextLink` traversal
 
 Every Graph collection walk follows server-supplied `@odata.nextLink` values

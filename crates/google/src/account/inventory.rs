@@ -45,15 +45,16 @@ struct GmailMessageStub {
 /// it, and a page checkpoint that claimed `Complete` would let the cursor
 /// advance past an object nothing recorded.
 fn coverage_of(
+    scope: &CursorScope,
     obligations: &[bifrost_types::InventoryObligation],
-) -> bifrost_types::InventoryCoverage {
-    if obligations.is_empty() {
-        bifrost_types::InventoryCoverage::Complete
-    } else {
-        bifrost_types::InventoryCoverage::Degraded {
-            obligations: obligations.to_vec(),
-        }
-    }
+) -> bifrost_types::InventoryCoverageReport {
+    // `Full` is the honest domain: Gmail inventory walks the whole mailbox in
+    // one pass rather than by partition, so a clean finish here really does
+    // prove the whole scope.
+    bifrost_types::InventoryCoverageReport::from_obligations(
+        bifrost_types::CoverageDomain::full(scope.clone()),
+        obligations,
+    )
 }
 
 pub(crate) fn inventory_stream(
@@ -148,7 +149,7 @@ pub(crate) fn inventory_stream(
                                 server_latency: started.elapsed(),
                                 bytes_in: 0,
                                 checkpoint: None,
-                                coverage: coverage_of(&obligations),
+                                coverage: coverage_of(&scope, &obligations),
                             });
                         }
                     }
@@ -181,6 +182,14 @@ pub(crate) fn inventory_stream(
                         // the scope converges while staying honest about what
                         // it is missing.
                         obligations.push(bifrost_types::InventoryObligation::Object {
+                            // The Gmail message id IS the stable identity, and
+                            // it is stable across walks, so the same
+                            // unreadable message re-raises the same key rather
+                            // than minting a fresh obligation every pass -
+                            // which is what would let it evade a retry budget.
+                            key: bifrost_types::ObligationKey(
+                                format!("gmail:message:{id}").into_bytes(),
+                            ),
                             id: bifrost_types::ObjectId(id),
                             error: account_error,
                             // No provider-native repair token: a Gmail message
@@ -199,11 +208,11 @@ pub(crate) fn inventory_stream(
                     server_latency: started.elapsed(),
                     bytes_in: 0,
                     checkpoint: checkpoint.clone(),
-                    coverage: coverage_of(&obligations),
+                    coverage: coverage_of(&scope, &obligations),
                 });
                 yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion {
                     checkpoint,
-                    coverage: coverage_of(&obligations),
+                    coverage: coverage_of(&scope, &obligations),
                 });
                 break;
             }
@@ -215,7 +224,7 @@ pub(crate) fn inventory_stream(
                     server_latency: started.elapsed(),
                     bytes_in: 0,
                     checkpoint: None,
-                    coverage: coverage_of(&obligations),
+                    coverage: coverage_of(&scope, &obligations),
                 });
             }
             page_token = page.next_page_token;
@@ -828,10 +837,11 @@ mod tests {
             completion.checkpoint.is_some(),
             "the scope must converge rather than re-walking forever"
         );
-        let bifrost_types::InventoryCoverage::Degraded { obligations } = &completion.coverage
-        else {
-            panic!("a checkpoint over an unrepresented object must declare the gap");
-        };
+        assert!(
+            !completion.coverage.is_complete(),
+            "a checkpoint over an unrepresented object must declare the gap"
+        );
+        let obligations = completion.coverage.obligations();
         assert_eq!(obligations.len(), 1);
         assert!(
             matches!(

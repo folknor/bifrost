@@ -8,7 +8,7 @@
 //! bound wins, making resume deterministic and preventing a needless
 //! re-walk from an earlier equal-sized window.
 
-use bifrost_sync::{BackfillCheckpointRecord, CheckpointStore, InMemoryCheckpointStore};
+use bifrost_sync::{CheckpointStore, InMemoryCheckpointStore};
 use bifrost_types::{
     AccountId, BackfillCheckpoint, BackfillProgress, ChangeCursor, CursorScope, FolderId,
     ObjectType, OpaqueChangeState, Partition, ProtocolKind,
@@ -31,8 +31,8 @@ fn change_cursor(scope: &CursorScope, state: &[u8]) -> ChangeCursor {
     }
 }
 
-fn backfill(scope: &CursorScope, partition: &[u8], items_done: u64) -> BackfillCheckpointRecord {
-    BackfillCheckpointRecord::complete(BackfillCheckpoint {
+fn backfill(scope: &CursorScope, partition: &[u8], items_done: u64) -> BackfillCheckpoint {
+    BackfillCheckpoint {
         scope: scope.clone(),
         partition: Partition(partition.to_vec()),
         progress_marker: None,
@@ -41,7 +41,7 @@ fn backfill(scope: &CursorScope, partition: &[u8], items_done: u64) -> BackfillC
             items_estimated: None,
         },
         envelope_version: 1,
-    })
+    }
 }
 
 #[tokio::test]
@@ -173,11 +173,8 @@ async fn get_backfill_returns_the_strictly_largest_items_done() {
         .await
         .expect("get")
         .expect("present");
-    assert_eq!(
-        got.checkpoint.partition,
-        Partition(b"page:500:1000".to_vec())
-    );
-    assert_eq!(got.checkpoint.progress.items_done, 501);
+    assert_eq!(got.partition, Partition(b"page:500:1000".to_vec()));
+    assert_eq!(got.progress.items_done, 501);
 }
 
 #[tokio::test]
@@ -200,10 +197,7 @@ async fn get_backfill_tie_selects_the_furthest_page_window() {
         .await
         .expect("get")
         .expect("present");
-    assert_eq!(
-        got.checkpoint.partition,
-        Partition(b"page:1000:1500".to_vec())
-    );
+    assert_eq!(got.partition, Partition(b"page:1000:1500".to_vec()));
 }
 
 #[tokio::test]
@@ -230,7 +224,7 @@ async fn completion_marker_wins_get_backfill_when_items_done_is_larger() {
         .await
         .expect("get")
         .expect("present");
-    assert_eq!(got.checkpoint.partition, Partition(b"complete".to_vec()));
+    assert_eq!(got.partition, Partition(b"complete".to_vec()));
 }
 
 #[tokio::test]
@@ -276,7 +270,7 @@ async fn put_backfill_replaces_the_same_partition_row() {
         .await
         .expect("get")
         .expect("present");
-    assert_eq!(got.checkpoint.progress.items_done, 400);
+    assert_eq!(got.progress.items_done, 400);
 }
 
 /// `delete_backfill` is the schema-clear half of the reseed contract:
@@ -325,7 +319,6 @@ async fn delete_backfill_drops_every_partition_for_the_scope_only() {
             .await
             .expect("get")
             .expect("sibling scope survives")
-            .checkpoint
             .progress
             .items_done,
         42
@@ -336,7 +329,6 @@ async fn delete_backfill_drops_every_partition_for_the_scope_only() {
             .await
             .expect("get")
             .expect("sibling account survives")
-            .checkpoint
             .progress
             .items_done,
         7

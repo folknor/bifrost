@@ -134,9 +134,13 @@ pub type AccountFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
 /// same three lines, and six copies of a shared shape is how this workspace
 /// accumulated seven CalDAV/CardDAV divergences.
 ///
-/// `Done` claims COMPLETE coverage, which is correct: a walk that enumerated
-/// nothing left nothing unaccounted for. The refusal rides `Terminated`.
-pub fn unsupported_inventory_stream(operation: AccountOperation) -> AccountStream<InventoryEvent> {
+/// `Done` claims COMPLETE coverage over `scope`, which is correct: a walk that
+/// enumerated nothing left nothing unaccounted for. The refusal rides
+/// `Terminated`.
+pub fn unsupported_inventory_stream(
+    scope: CursorScope,
+    operation: AccountOperation,
+) -> AccountStream<InventoryEvent> {
     let error = AccountErrorBuilder::new(
         AccountErrorKind::Unsupported(operation),
         Cause::Request(RequestCause::Unsupported { operation }),
@@ -146,7 +150,7 @@ pub fn unsupported_inventory_stream(operation: AccountOperation) -> AccountStrea
     .expect("valid account error classification");
     Box::pin(futures::stream::iter([
         InventoryEvent::Terminated(error),
-        InventoryEvent::Done(InventoryCompletion::complete(None)),
+        InventoryEvent::Done(InventoryCompletion::complete(scope, None)),
     ]))
 }
 
@@ -280,7 +284,7 @@ pub trait Account: Send + Sync {
     ) -> AccountStream<InventoryEvent> {
         match partition {
             InventoryPartition::Full => self.inventory_stream(scope),
-            _ => unsupported_inventory_stream(AccountOperation::SyncInventory),
+            _ => unsupported_inventory_stream(scope, AccountOperation::SyncInventory),
         }
     }
 

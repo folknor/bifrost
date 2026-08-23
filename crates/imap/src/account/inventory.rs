@@ -55,6 +55,7 @@ pub(crate) fn inventory_stream(
             ]));
         }
     }
+    let domain = bifrost_types::CoverageDomain::full(scope.clone());
     let (tx, rx) = tokio::sync::mpsc::channel(super::STREAM_CAPACITY);
     tokio::spawn(async move {
         match run_inventory(account, scope.clone(), tx.clone()).await {
@@ -79,7 +80,7 @@ pub(crate) fn inventory_stream(
     });
     // The channel carries `SyncEvent<InventoryEntry>` internally; this walk
     // terminates wholesale on failure, so COMPLETE coverage is accurate.
-    Box::pin(boxed_receiver_stream(rx).map(bifrost_types::InventoryEvent::from))
+    Box::pin(boxed_receiver_stream(rx).map(bifrost_types::lift_complete_walk(domain)))
 }
 
 /// Marker for an output-channel-dropped send failure. Per the IMAP plan,

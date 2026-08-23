@@ -23,6 +23,7 @@ pub mod cloud;
 pub mod compose;
 pub mod contact;
 pub mod container;
+pub mod coverage;
 pub mod cursor;
 pub mod directory;
 pub mod error;
@@ -133,9 +134,17 @@ pub use error::{
 pub use events::{
     AccountControl, BackfillCheckpoint, BackfillProgress, Batch, Change, Checkpoint, Control,
     HintPayload, InvalidationHint, InvalidationSink, InventoryBatch, InventoryCompletion,
-    InventoryCoverage, InventoryEntry, InventoryEvent, InventoryObligation, InventoryPartition,
-    InventoryPartitioning, ObjectChange, ObjectChangeKind, PageBoundary, Partition, PauseReason,
-    Priority, Progress, PushSource, ScopeChange, ScopeChangeKind, SyncEvent, WatchEvent,
+    InventoryEntry, InventoryEvent, InventoryPartition, InventoryPartitioning, ObjectChange,
+    ObjectChangeKind, PageBoundary, Partition, PauseReason, Priority, Progress, PushSource,
+    ScopeChange, ScopeChangeKind, SyncEvent, WatchEvent, lift_complete_walk,
+};
+
+// Inventory coverage: what an enumeration proved, and about which region of
+// which snapshot. Kept out of `events` because the coverage lattice is a
+// domain of its own, not stream plumbing.
+pub use coverage::{
+    CoverageCoordinate, CoverageDomain, CoverageOutcome, InventoryCoverageReport,
+    InventoryObligation, ObligationKey, RegionRecovery, SnapshotIdentity, TransientReplayHint,
 };
 
 // Threading + hydration types.

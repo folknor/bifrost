@@ -1096,51 +1096,188 @@ unresolved obligations with it, atomically, or not advance.
 
 Inventory therefore has its own envelope (`InventoryEvent`, not `SyncEvent<T>`)
 in which every checkpoint-bearing `InventoryBatch` and the terminal
-`InventoryCompletion` carry an `InventoryCoverage`. Coverage rides
+`InventoryCompletion` carry an `InventoryCoverageReport`. Coverage rides
 checkpoint-bearing BATCHES, not only the terminal completion, because Graph and
 `BackfillRunner` both advance per page - waiting for `Done` would let a page
 checkpoint become durable across a gap it never declared.
+
+### Report and ledger are different things
+
+`InventoryCoverageReport` (in `bifrost-types`) is one account's observation about
+one enumeration of one region. `DebtLedger` (in `bifrost-sync`) is what the
+engine has concluded after folding every ACCEPTED report, every operator
+decision, and eventually every repair result together. Calling both "coverage"
+hid the seam, and the seam is where the mistakes live: the account reports
+evidence, the engine owns retry and acceptable-loss policy, and no protocol crate
+constructs ledger state. `DebtLedger::ingest` is the single exhaustive path in.
+
+### A report names its extent
+
+A completeness claim is only meaningful about a stated region, so every report
+carries a `CoverageDomain`: scope, a semantic `CoverageCoordinate`, and a
+`SnapshotIdentity`. The coordinate is deliberately NOT the durable `Partition`
+key - that key names an execution unit and indexes resume state, and says nothing
+about what range of objects the unit covered. Repartitioning makes the difference
+concrete: debt raised under a `30d..90d` window is covered by the union of
+`7d..60d` and `60d..180d` and by neither alone, and an opaque key comparison sees
+three unrelated strings.
+
+`CoverageDomain::covers` answers conservatively, because a wrong `true`
+discharges debt nothing re-read (silent loss with a proof record attached) while
+a wrong `false` only leaves a scope degraded until something wider covers it. Two
+rules with teeth: a UID range does not cross a UIDVALIDITY change, and PAGE
+RANGES ARE INCOMPARABLE ACROSS SNAPSHOTS - page 500..1000 of a later walk may
+hold entirely different objects, so repeating the coordinate proves nothing
+unless both reports observed the same snapshot. Two walks that cannot name their
+snapshot are never the same snapshot, which is why `SnapshotIdentity` comparison
+is `same_snapshot_as` rather than `==`.
+
+Discharge needs BOTH a generation not older than the debt's AND a covering
+domain. Generation alone stops a stale report overwriting newer state; it proves
+nothing on its own, because a newer partial walk is still partial.
+
+### Proof and policy are separate axes
+
+`ProofStatus` is what the system knows (`Unresolved` / `Discharged`).
+`PolicyStatus` is what it will do (`Retrying` / `OperatorBlocked` / `Waived`).
+
+Collapsing them is the mistake the split exists to prevent. A waiver is accepted
+loss, NOT proof that anything was materialized or proved irrelevant, so a waived
+obligation stays `Unresolved` forever - what changes is that it stops blocking
+automatic completion. Otherwise no audit, and no later walk, can tell proved
+coverage from loss somebody agreed to live with.
+
+**No local counter may produce `Waived` or `Discharged`.** A retry budget
+expiring is evidence that automatic work is not helping, which is
+`OperatorBlocked`: still visible, still blocking, still manually retryable. Only
+an operator waives, through `SyncEngine::waive_obligation`, because only an
+operator can decide what loss is acceptable. Waiver targets ONE occurrence by
+`ObligationKey`; waiving a failure CLASS would authorize every future instance
+sight unseen.
+
+### `Object`, `Region`, and the barrier
 
 `InventoryObligation` splits `Object` from `Region`. An id-less provider result
 must not become an `Object` with a synthetic id: an absent id may mean one
 malformed object, a schema mismatch affecting many, a truncated page, or a
 response that cannot be correlated with pagination at all, so naming it a
-single-object loss claims knowledge the walk does not have. Repair and replay
-tokens are account-owned opaque bytes; the engine persists and returns them
-without interpreting provider pagination.
+single-object loss claims knowledge the walk does not have.
 
-**The scope converges DEGRADED rather than never converging.** A walk that hits
-an unreadable object records it and keeps going, so the cursor establishes and
-the account enters its change stream. The obligation - not the changes stream -
-is the rediscovery mechanism for what could not be represented. The alternative
+A `Region` declares its `RegionRecovery`: `DurableReplay { token }` or
+`CheckpointBarrier`. Two variants, not three. A finite-horizon token - "this page
+link works for another thirty minutes" - is not durable coverage, because the
+engine cannot guarantee repair before a deadline across crashes, offline periods
+or operator blocking; at the moment the checkpoint is considered it has exactly
+the same safe disposition as no token at all. Converting a perishable
+continuation into a durable artifact is the ACCOUNT's job, done before it hands
+the obligation over. `CheckpointBarrier::transient_replay` is diagnostics only,
+deliberately a field rather than a variant so no scheduler can read "not expired
+yet" as permission to advance.
+
+**A barrier taints the walk.** Refusing one checkpoint is not enough - the next
+page's checkpoint or the terminal delta link would leap the same region. So the
+batch's items are still delivered, its checkpoint is stripped, and the walk
+stops. Checkpoints accepted EARLIER in that walk stand: each certifies a prefix
+ending before the barrier region begins. Barriers do not become ledger debt (no
+cursor advanced past them, so there is nothing durable to hang debt off); they
+are recorded as `BarrierIncident`, which is what gives a restart its memory and
+an operator something to waive.
+
+`bifrost-graph` reports its id-less-value case as `CheckpointBarrier`. The only
+token at page granularity is a continuation of that delta session, dead as soon
+as the walk takes its `deltaLink`, so recording it as repairable would create
+debt nothing could ever discharge - silent permanent loss wearing a declared-debt
+costume.
+
+**Elsewhere, the scope converges DEGRADED rather than never converging.** A walk
+that hits an unreadable but re-readable object records it and keeps going, so the
+cursor establishes and the account enters its change stream. The alternative
 considered and rejected was refusing every checkpoint after the first failure,
 which is safe but never converges: one permanently-broken object would cost the
 mailbox its entire backfill, forever. Declared loss beats permanent
-non-convergence; SILENT loss beats neither.
+non-convergence; SILENT loss beats neither. For a barrier there is no third
+option that preserves both progress and coverage, which is exactly why the
+operator waiver is load-bearing rather than a nicety.
 
-Coverage reaches the durable record through `PendingCoverage`, an in-memory
-per-account map. It cannot ride `Checkpoint`, which is a published type crossing
-the broadcast channel to the consumer and back through `ack_checkpoint`. The
-producer records what it proved when it emits a checkpoint-bearing batch, and
-the single writer reads it back when the matching acknowledgement arrives - so
-the durable write is still ONE atomic record carrying both cursor and coverage.
-Losing the map on a crash is consistent by construction: if the process dies
-before the acknowledgement, the checkpoint never became durable either.
+### Publication identity
 
-`BackfillRunner` reports `complete` per partition, and the orchestrator
-withholds the completion sentinel when it is false. That sentinel makes the next
-attach skip the walk entirely, so writing it over an unresolved obligation would
-convert a declared gap into a permanent one. Note `seen` counts only entries a
-page materialized, so an object that never became an entry is not in that total
-- the count cannot be used to detect this.
+Coverage reaches the durable record through `PendingCoverage`, keyed by an
+engine-issued `PublicationId`. It cannot ride `Checkpoint`, which is a published
+type crossing the broadcast channel and back through `ack_checkpoint`.
+
+Keying by scope is unsound: two backfill partitions of one scope are in flight
+together, and the second's report overwrites the first's. Keying by `Checkpoint`
+VALUE is also unsound, because `Checkpoint: Eq` is value equality and never
+promised to identify a publication:
+
+- `BackfillRunner` counts only entries a page MATERIALIZED, so a page whose
+  content was entirely unrepresentable increments nothing, and with no progress
+  marker the next `BackfillCheckpoint` is byte-identical to its predecessor while
+  describing a different boundary and a different report;
+- inventory fusion publishes its final checkpoint twice, on the final batch and
+  again on `Done`;
+- a later walk can produce the same cursor bytes as an earlier one while proving
+  different coverage.
+
+`MultiplexerEvent::publication` therefore carries the identity to the consumer,
+and `ack_checkpoint` takes it back. A repeated acknowledgement of the same
+publication is idempotent; an UNKNOWN one is refused. It is never defaulted to
+complete coverage - that is the original lying-record bug in another costume.
+
+Supersession FOLDS (`PendingCoverage::supersede`). When a newer publication
+supersedes an older outstanding one for acknowledgement purposes, the survivor
+absorbs the superseded claim; dropping it would stop the control path waiting for
+the older checkpoint while quietly discarding its obligations. Cumulative reports
+within one walk make this harmless duplication; across partitions it is the only
+thing keeping partition A's debt alive when B supersedes it.
+
+### One atomic transition
+
+`CheckpointStore::apply_transition` is the only mutating operation, taking the
+checkpoint and the resulting ledger together. They cannot be two calls: checkpoint
+first loses the debt, ledger first records debt for progress that never
+committed. `put_change_cursor` / `put_backfill` remain as conveniences for writes
+that carry NO coverage report, and they read the ledger and write it back
+unchanged - "this write says nothing about coverage" means the debt survives, and
+emphatically not that coverage is complete. An earlier revision had a convenience
+of exactly that shape stamping `Complete` on every write, which is how a durable
+record ends up certifying coverage nothing proved.
+
+Two mutations have no cursor to ride and use `put_ledger`: a barrier incident
+(nothing advanced, by definition) and an operator decision.
+
+Claims are applied when the CONSUMER acknowledges, never when the account emits.
+An unacknowledged report may describe entries the consumer never persisted, so it
+cannot prove anything. The one exception is `ingest_debt_only`, used for a
+backfill partition's terminal summary, which has no checkpoint of its own: it
+records obligations but never proof, because over-reporting debt costs a degraded
+scope while under-reporting it costs objects nobody sees again.
+
+### Sentinel eligibility is decided by the writer
+
+`BackfillRunner` reports `complete` per partition, but that flag is NOT
+authoritative for the durable sentinel. Debt from a sibling partition can be
+acknowledged after the runner decides and before the sentinel reaches the writer,
+and the sentinel makes the next attach skip the walk entirely - so writing it
+over an open obligation converts a declared gap into a permanent one. The writer
+therefore evaluates `DebtLedger::completion_permitted` against the ledger AS IT
+STANDS at the moment it processes the sentinel acknowledgement, and withholds the
+marker if the scope owes anything unwaived. The consumer's acknowledgement still
+succeeds; the marker simply does not become durable, so the next attach re-walks.
+
+Note `seen` counts only entries a page materialized, so an object that never
+became an entry is not in that total - the count cannot be used to detect any of
+this.
 
 Degraded coverage is surfaced to the consumer as a
-`Warning::OperatorAttentionNeeded`. Durable debt that nothing reports is only
-half a fix.
+`Warning::OperatorAttentionNeeded`, and open debt is enumerable through
+`SyncEngine::debt`. Durable debt that nothing reports, or that nothing can list,
+is only half a fix.
 
-**Not yet built: the repair path.** Obligations are durable, declared, and block
-the completion sentinel, so nothing is silently lost - but nothing yet works the
-debt off. See `notes/todo.md`.
+**Not yet built: provider-native repair.** Debt is durable, attributable,
+enumerable, waivable, and dischargeable by a later covering walk - but no
+provider-native re-read exists yet, so an object whose scope is never re-walked
+stays owed until an operator waives it. See `notes/todo.md`.
 
 ## Cursor envelope
 

@@ -8,6 +8,7 @@
 
 use std::time::Duration;
 
+use crate::coverage::{CoverageDomain, CoverageOutcome, InventoryCoverageReport};
 use crate::cursor::{ChangeCursor, CursorScope, MembershipScope};
 use crate::error::{AccountError, Warning};
 use crate::ids::{AccountId, ObjectId};
@@ -43,78 +44,6 @@ pub struct BackfillCheckpoint {
 /// byte key is the durable checkpoint identity derived from it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Partition(pub Vec<u8>);
-
-/// What an enumeration pass PROVED about the objects it walked past.
-///
-/// The load-bearing rule for inventory is not that failures are visible, it is
-/// that no accepted checkpoint may certify coverage it does not have:
-///
-/// > Any accepted inventory progress checkpoint must certify that every
-/// > provider result before that checkpoint was either materialized as an
-/// > `InventoryEntry` or proved irrelevant to the inventory snapshot.
-///
-/// A checkpoint advances a cursor past the objects behind it, and the changes
-/// stream only reports SUBSEQUENT changes - so an object the walk skipped
-/// without recording becomes permanently invisible to that account. Surfacing
-/// the failure to a consumer does not fix that; the checkpoint has to carry the
-/// unresolved obligations with it, atomically, or not advance.
-#[derive(Debug, Clone)]
-#[non_exhaustive]
-pub enum InventoryCoverage {
-    /// Every result before this point was materialized or definitively
-    /// discharged. The checkpoint certifies full coverage.
-    Complete,
-    /// The walk advanced but left obligations open. The scope is live and
-    /// DEGRADED: it converges and enters the change stream rather than
-    /// re-walking forever, and the obligations are the rediscovery mechanism
-    /// for what it could not represent.
-    Degraded {
-        obligations: Vec<InventoryObligation>,
-    },
-}
-
-impl InventoryCoverage {
-    #[must_use]
-    pub fn is_complete(&self) -> bool {
-        matches!(self, Self::Complete)
-    }
-}
-
-/// One thing an enumeration pass could not account for.
-///
-/// Split by what is KNOWN, because that decides what repair is possible.
-#[derive(Debug, Clone)]
-#[non_exhaustive]
-pub enum InventoryObligation {
-    /// A discovered object with a stable identity that could not be
-    /// represented. Repairable by id: a later read either produces the entry
-    /// or proves the object absent.
-    Object {
-        id: ObjectId,
-        error: AccountError,
-        /// Account-owned opaque repair token. The engine persists and returns
-        /// it without interpreting it - only the protocol crate knows what a
-        /// provider-native re-read of this object requires.
-        repair: Vec<u8>,
-    },
-    /// A provider result that could not even be assigned an identity, or a page
-    /// whose completeness could not be established.
-    ///
-    /// Deliberately NOT an `Object` with a synthetic id. An absent id may mean
-    /// one malformed object, a schema mismatch affecting many, a truncated
-    /// page, or a response that cannot be correlated with pagination at all -
-    /// so calling it a single-object loss overstates what is known, and there
-    /// is nothing to name, retry, or reconcile against. The obligation is
-    /// therefore scoped to a replayable REGION instead.
-    Region {
-        /// Account-defined key naming the failure, for deduplicated operator
-        /// reporting.
-        failure_key: String,
-        error: AccountError,
-        /// Account-owned opaque token identifying the region to replay.
-        replay: Vec<u8>,
-    },
-}
 
 /// Account-facing inventory partition.
 ///
@@ -225,7 +154,7 @@ pub struct InventoryBatch {
     pub server_latency: Duration,
     pub bytes_in: u64,
     pub checkpoint: Option<Checkpoint>,
-    pub coverage: InventoryCoverage,
+    pub coverage: InventoryCoverageReport,
 }
 
 /// How an inventory walk ended.
@@ -242,16 +171,22 @@ pub struct InventoryCompletion {
     /// space was NOT exhausted cleanly, so a consumer must not read `Done` as
     /// proof of completeness and the engine must not write a backfill
     /// completion sentinel.
-    pub coverage: InventoryCoverage,
+    pub coverage: InventoryCoverageReport,
 }
 
 impl InventoryCompletion {
-    /// A walk that exhausted its space with nothing left unaccounted for.
+    /// A walk that exhausted the whole of `scope` with nothing left
+    /// unaccounted for.
+    ///
+    /// Takes the scope because a completeness claim is only meaningful about a
+    /// stated extent: "complete" is a fact about a region of one enumeration,
+    /// not about a scope in the abstract, and a claim with no domain cannot be
+    /// checked against the debt it would discharge.
     #[must_use]
-    pub fn complete(checkpoint: Option<Checkpoint>) -> Self {
+    pub fn complete(scope: CursorScope, checkpoint: Option<Checkpoint>) -> Self {
         Self {
             checkpoint,
-            coverage: InventoryCoverage::Complete,
+            coverage: InventoryCoverageReport::complete(scope),
         }
     }
 }
@@ -281,33 +216,50 @@ pub enum InventoryEvent {
     Done(InventoryCompletion),
 }
 
-impl From<SyncEvent<InventoryEntry>> for InventoryEvent {
-    /// Lift a generic stream event into the inventory envelope, asserting
-    /// COMPLETE coverage.
-    ///
-    /// For producers that have no way to express an unresolved obligation yet:
-    /// their current behaviour is to terminate the whole walk on any failure,
-    /// which never advances a checkpoint across a gap, so claiming `Complete`
-    /// is accurate for them. A producer that starts absorbing failures and
-    /// continuing MUST stop using this and build `InventoryBatch` /
-    /// `InventoryCompletion` itself - otherwise it reports full coverage over a
-    /// walk that skipped something, which is the exact failure this envelope
-    /// exists to make impossible.
-    fn from(event: SyncEvent<InventoryEntry>) -> Self {
-        match event {
-            SyncEvent::Batch(batch) => Self::Batch(InventoryBatch {
-                items: batch.items,
-                page_boundary: batch.page_boundary,
-                server_latency: batch.server_latency,
-                bytes_in: batch.bytes_in,
-                checkpoint: batch.checkpoint,
-                coverage: InventoryCoverage::Complete,
-            }),
-            SyncEvent::Progress(progress) => Self::Progress(progress),
-            SyncEvent::Warning(warning) => Self::Warning(warning),
-            SyncEvent::Terminated(error) => Self::Terminated(error),
-            SyncEvent::Done(checkpoint) => Self::Done(InventoryCompletion::complete(checkpoint)),
-        }
+/// Lift a generic stream event into the inventory envelope, asserting COMPLETE
+/// coverage over `domain`.
+///
+/// The domain is the caller's to state, and a PARTITION walk must not pass a
+/// full-scope domain: a partition that finished cleanly proves nothing about
+/// the partitions either side of it, and a `Full` claim would discharge their
+/// debt on the strength of an unrelated range's success.
+///
+/// For producers that have no way to express an unresolved obligation: their
+/// behaviour is to terminate the whole walk on any failure, which never
+/// advances a checkpoint across a gap, so claiming `Complete` is accurate for
+/// them. A producer that starts absorbing failures and continuing MUST stop
+/// using this and build `InventoryBatch` / `InventoryCompletion` itself -
+/// otherwise it reports full coverage over a walk that skipped something, which
+/// is the exact failure this envelope exists to make impossible.
+///
+/// Deliberately a scope-taking adapter rather than a `From` impl. A bare
+/// `.into()` manufactured a completeness claim out of nothing, with no extent
+/// attached and no syntax at the call site to notice - the same shape as every
+/// other implicit-`Complete` path that let a durable record certify coverage it
+/// did not have.
+pub fn lift_complete_walk(
+    domain: CoverageDomain,
+) -> impl FnMut(SyncEvent<InventoryEntry>) -> InventoryEvent {
+    let report = move || InventoryCoverageReport {
+        domain: domain.clone(),
+        outcome: CoverageOutcome::Complete,
+    };
+    move |event| match event {
+        SyncEvent::Batch(batch) => InventoryEvent::Batch(InventoryBatch {
+            items: batch.items,
+            page_boundary: batch.page_boundary,
+            server_latency: batch.server_latency,
+            bytes_in: batch.bytes_in,
+            checkpoint: batch.checkpoint,
+            coverage: report(),
+        }),
+        SyncEvent::Progress(progress) => InventoryEvent::Progress(progress),
+        SyncEvent::Warning(warning) => InventoryEvent::Warning(warning),
+        SyncEvent::Terminated(error) => InventoryEvent::Terminated(error),
+        SyncEvent::Done(checkpoint) => InventoryEvent::Done(InventoryCompletion {
+            checkpoint,
+            coverage: report(),
+        }),
     }
 }
 

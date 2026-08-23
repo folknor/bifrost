@@ -49,10 +49,17 @@ pub struct InventoryFusion {
     pub account_id: bifrost_types::AccountId,
     pub cursors: Arc<CursorRegistry>,
     pub control: Option<SyncControl>,
-    /// Where this walk records what it proved, so the durable writer can put
+    /// Where this walk registers what it proved, so the durable writer can put
     /// coverage and cursor into one atomic record when the consumer
     /// acknowledges. `None` in contexts with no writer behind them.
     pub coverage: Option<Arc<crate::cursor::PendingCoverage>>,
+    /// Durable writer, for barrier incidents. A barrier advances no cursor, so
+    /// it has no checkpoint to ride and cannot reach the store through the
+    /// acknowledgement path like everything else does.
+    pub writer_tx: Option<tokio::sync::mpsc::Sender<super::WriterRequest>>,
+    /// Engine-issued generation for this walk. Orders proof events even when
+    /// two walks produce identical cursor bytes.
+    pub generation: u64,
 }
 
 impl InventoryFusion {
@@ -112,23 +119,38 @@ impl InventoryFusion {
             Some(control) => Some(control.begin_activity().ok_or(Error::Paused)?),
             None => None,
         };
+        // The last checkpoint this walk published. If a later page turns out to
+        // be a barrier, this is the position a future walk resumes from - it
+        // certifies a prefix ending before the barrier region begins.
+        let mut last_accepted: Option<Checkpoint> = None;
         while let Some(event) = stream.next().await {
             match event {
                 bifrost_types::InventoryEvent::Done(completion) => {
-                    // Record BEFORE publishing: a fast consumer can acknowledge
-                    // between the send and a later record, and the writer would
-                    // then persist the cursor with stale coverage.
-                    self.record_coverage(&scope, &completion.coverage);
+                    if completion.coverage.has_barrier() {
+                        // The walk ended on ground the cursor may not cross.
+                        // Establishing here would advance past a region nothing
+                        // can ever replay.
+                        self.record_barriers(&scope, &completion.coverage, None)
+                            .await;
+                        Self::warn_degraded(&changes_tx, &scope, &completion.coverage);
+                        return Ok(FusionOutcome::NoCursor);
+                    }
                     let degraded = !completion.coverage.is_complete();
                     if degraded {
                         Self::warn_degraded(&changes_tx, &scope, &completion.coverage);
                     }
                     let checkpoint = completion.checkpoint;
                     if let (Some(tx), Some(cp)) = (&changes_tx, checkpoint.clone()) {
+                        // Register the claim BEFORE publishing: a fast consumer
+                        // can acknowledge between the send and a later
+                        // registration, and the writer would then find no claim
+                        // for a checkpoint that carried one.
+                        let publication = self.publish_claim(&completion.coverage);
                         let me = MultiplexerEvent {
                             scope: scope.clone(),
                             event: Arc::new(SyncEvent::Done(Some(cp.clone()))),
                             checkpoint: Some(cp.clone()),
+                            publication,
                         };
                         // Register before publishing so a fast consumer
                         // ack cannot land before the entry exists and
@@ -137,10 +159,14 @@ impl InventoryFusion {
                             control.expect_checkpoint(cp.clone());
                         }
                         let delivered = tx.send(me).unwrap_or(0);
-                        if !super::delivered_to_real_subscriber(delivered)
-                            && let Some(control) = &self.control
-                        {
-                            control.retire_checkpoint(&cp);
+                        if !super::delivered_to_real_subscriber(delivered) {
+                            // Nothing can ever acknowledge it, so the claim
+                            // would sit in the registry for the life of the
+                            // attachment.
+                            self.retire_claim(publication);
+                            if let Some(control) = &self.control {
+                                control.retire_checkpoint(&cp);
+                            }
                         }
                     }
                     return self.finalize(scope, checkpoint).await;
@@ -151,19 +177,34 @@ impl InventoryFusion {
                             scope: scope.clone(),
                             event: Arc::new(SyncEvent::Terminated(err.clone())),
                             checkpoint: None,
+                            publication: None,
                         };
                         let _ = tx.send(me);
                     }
                     return Ok(FusionOutcome::Terminated(err));
                 }
                 bifrost_types::InventoryEvent::Batch(batch) => {
-                    // Every checkpoint-bearing batch names the coverage it
-                    // advances across, not just the terminal completion:
-                    // Graph checkpoints per page, so waiting for `Done` would
-                    // let a page checkpoint become durable across a gap it
-                    // never declared.
+                    // A barrier TAINTS THE WALK. Refusing only this one
+                    // checkpoint is not enough: the next page's checkpoint, or
+                    // the terminal delta link, would simply leap over the same
+                    // region. So the batch's items are still delivered - they
+                    // were really seen - but the checkpoint is stripped and the
+                    // walk stops here. Checkpoints already accepted earlier in
+                    // this walk stand: each of them certifies a prefix that
+                    // ends before this region begins.
+                    if batch.coverage.has_barrier() {
+                        self.record_barriers(&scope, &batch.coverage, last_accepted.clone())
+                            .await;
+                        if let Some(tx) = &changes_tx {
+                            let mut stripped = batch;
+                            stripped.checkpoint = None;
+                            self.forward_inventory_batch(tx, &scope, &stripped);
+                            Self::warn_degraded(&changes_tx, &scope, &stripped.coverage);
+                        }
+                        return Ok(FusionOutcome::NoCursor);
+                    }
                     if batch.checkpoint.is_some() {
-                        self.record_coverage(&scope, &batch.coverage);
+                        last_accepted = batch.checkpoint.clone();
                     }
                     if let Some(tx) = &changes_tx {
                         self.forward_inventory_batch(tx, &scope, &batch);
@@ -177,9 +218,86 @@ impl InventoryFusion {
         Ok(FusionOutcome::NoCursor)
     }
 
-    fn record_coverage(&self, scope: &CursorScope, coverage: &bifrost_types::InventoryCoverage) {
-        if let Some(pending) = &self.coverage {
-            pending.record(scope.clone(), coverage.clone());
+    /// Register what this publication will make durable, and get its identity.
+    ///
+    /// `None` when there is no writer behind this fusion, in which case nothing
+    /// can be acknowledged and nothing needs an identity.
+    fn publish_claim(
+        &self,
+        coverage: &bifrost_types::InventoryCoverageReport,
+    ) -> Option<crate::cursor::PublicationId> {
+        self.coverage.as_ref().map(|pending| {
+            pending.publish(crate::cursor::CoverageClaim::new(
+                coverage.clone(),
+                self.generation,
+            ))
+        })
+    }
+
+    fn retire_claim(&self, publication: Option<crate::cursor::PublicationId>) {
+        if let (Some(pending), Some(id)) = (&self.coverage, publication) {
+            pending.retire(id);
+        }
+    }
+
+    /// Persist the blocked-progress incidents in `coverage`.
+    ///
+    /// A barrier is not debt behind an advanced cursor - no checkpoint was
+    /// accepted past it - so it cannot ride the acknowledgement path. Writing
+    /// nothing at all would be worse than it sounds: every restart would forget
+    /// the scope keeps hitting the same wall, and an operator would have no
+    /// durable object to waive.
+    async fn record_barriers(
+        &self,
+        scope: &CursorScope,
+        coverage: &bifrost_types::InventoryCoverageReport,
+        resume_from: Option<Checkpoint>,
+    ) {
+        let Some(writer) = &self.writer_tx else {
+            return;
+        };
+        for obligation in coverage.obligations() {
+            let bifrost_types::InventoryObligation::Region {
+                key,
+                failure_label,
+                error,
+                recovery,
+            } = obligation
+            else {
+                continue;
+            };
+            if !recovery.is_barrier() {
+                continue;
+            }
+            let incident = crate::cursor::BarrierIncident {
+                key: key.clone(),
+                domain: coverage.domain.clone(),
+                generation: self.generation,
+                failure_label: failure_label.clone(),
+                evidence: error.clone(),
+                policy: crate::cursor::PolicyStatus::Retrying { attempts: 0 },
+                resume_from: resume_from.clone(),
+            };
+            let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+            if writer
+                .send(super::WriterRequest::RecordBarrier {
+                    incident,
+                    done: done_tx,
+                })
+                .await
+                .is_err()
+            {
+                return;
+            }
+            if let Ok(Err(error)) = done_rx.await {
+                tracing::error!(
+                    target: "bifrost.sync.inventory",
+                    account = ?self.account_id,
+                    scope = ?scope,
+                    error = %error,
+                    "failed to persist inventory barrier incident"
+                );
+            }
         }
     }
 
@@ -191,24 +309,37 @@ impl InventoryFusion {
     fn warn_degraded(
         changes_tx: &Option<broadcast::Sender<MultiplexerEvent>>,
         scope: &CursorScope,
-        coverage: &bifrost_types::InventoryCoverage,
+        coverage: &bifrost_types::InventoryCoverageReport,
     ) {
-        let bifrost_types::InventoryCoverage::Degraded { obligations } = coverage else {
+        if coverage.is_complete() {
             return;
-        };
+        }
+        let obligations = coverage.obligations();
         let Some(tx) = changes_tx else { return };
+        let barriers = obligations
+            .iter()
+            .filter(|obligation| obligation.is_barrier())
+            .count();
         let warning = bifrost_types::Warning::user_safe(
             bifrost_types::WarningKind::OperatorAttentionNeeded,
-            format!(
-                "inventory completed with {} object(s) or region(s) it could not represent; \
-                 the scope is live but incomplete",
-                obligations.len()
-            ),
+            if barriers > 0 {
+                format!(
+                    "inventory stopped at {barriers} region(s) it cannot represent and cannot \
+                     replay; the scope cannot advance past them until an operator waives them"
+                )
+            } else {
+                format!(
+                    "inventory completed with {} object(s) or region(s) it could not represent; \
+                     the scope is live but incomplete",
+                    obligations.len()
+                )
+            },
         );
         let _ = tx.send(MultiplexerEvent {
             scope: scope.clone(),
             event: Arc::new(SyncEvent::Warning(warning)),
             checkpoint: None,
+            publication: None,
         });
     }
 
@@ -238,19 +369,29 @@ impl InventoryFusion {
             bytes_in: batch.bytes_in,
             checkpoint: batch.checkpoint.clone(),
         };
+        // A checkpoint-bearing batch declares the coverage it advances across,
+        // not just the terminal completion: Graph checkpoints per page, so
+        // waiting for `Done` would let a page checkpoint become durable across
+        // a gap it never declared.
+        let publication = batch
+            .checkpoint
+            .as_ref()
+            .and_then(|_| self.publish_claim(&batch.coverage));
         let me = MultiplexerEvent {
             scope: scope.clone(),
             event: Arc::new(SyncEvent::Batch(synthetic)),
             checkpoint: batch.checkpoint.clone(),
+            publication,
         };
         if let (Some(control), Some(checkpoint)) = (&self.control, batch.checkpoint.as_ref()) {
             control.expect_checkpoint(checkpoint.clone());
         }
         let delivered = tx.send(me).unwrap_or(0);
-        if !super::delivered_to_real_subscriber(delivered)
-            && let (Some(control), Some(checkpoint)) = (&self.control, batch.checkpoint.as_ref())
-        {
-            control.retire_checkpoint(checkpoint);
+        if !super::delivered_to_real_subscriber(delivered) {
+            self.retire_claim(publication);
+            if let (Some(control), Some(checkpoint)) = (&self.control, batch.checkpoint.as_ref()) {
+                control.retire_checkpoint(checkpoint);
+            }
         }
     }
 

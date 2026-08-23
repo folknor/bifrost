@@ -432,16 +432,21 @@ impl Account for JmapAccount {
 
     fn inventory_stream(&self, scope: CursorScope) -> AccountStream<InventoryEvent> {
         if self.is_unregistered_foreign_scope(&scope) {
+            let domain = bifrost_types::CoverageDomain::full(scope.clone());
             let err =
                 super::error::unregistered_foreign_scope(scope, AccountOperation::SyncInventory);
             return Box::pin(
                 async_stream::stream! { yield super::error::terminated(err); }
-                    .map(InventoryEvent::from),
+                    .map(bifrost_types::lift_complete_walk(domain)),
             );
         }
         let mail = self.mail_for_scope(&scope).clone();
         let owner = self.owner_of_scope(&scope);
-        Box::pin(inventory::stream(mail, self.core_limits, scope, owner).map(InventoryEvent::from))
+        let domain = bifrost_types::CoverageDomain::full(scope.clone());
+        Box::pin(
+            inventory::stream(mail, self.core_limits, scope, owner)
+                .map(bifrost_types::lift_complete_walk(domain)),
+        )
     }
 
     fn inventory_partitioning(&self, scope: &CursorScope) -> InventoryPartitioning {
@@ -454,18 +459,27 @@ impl Account for JmapAccount {
         partition: InventoryPartition,
     ) -> AccountStream<InventoryEvent> {
         if self.is_unregistered_foreign_scope(&scope) {
+            let domain = bifrost_types::CoverageDomain::full(scope.clone());
             let err =
                 super::error::unregistered_foreign_scope(scope, AccountOperation::SyncInventory);
             return Box::pin(
                 async_stream::stream! { yield super::error::terminated(err); }
-                    .map(InventoryEvent::from),
+                    .map(bifrost_types::lift_complete_walk(domain)),
             );
         }
         let mail = self.mail_for_scope(&scope).clone();
         let owner = self.owner_of_scope(&scope);
+        // The domain is the PARTITION's extent, not the scope's. A partition
+        // that finished cleanly proves nothing about its neighbours, and a
+        // full-scope claim here would discharge their debt for free.
+        //
+        // `uid_validity` is unused: JMAP advertises `Time` / `PageCount`
+        // partitioning, never `Uid`, so the UID arm is unreachable from this
+        // account.
+        let domain = bifrost_types::CoverageDomain::for_partition(scope.clone(), &partition, 0);
         Box::pin(
             inventory::stream_partition(mail, self.core_limits, scope, partition, owner)
-                .map(InventoryEvent::from),
+                .map(bifrost_types::lift_complete_walk(domain)),
         )
     }
 

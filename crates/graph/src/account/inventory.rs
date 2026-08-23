@@ -71,7 +71,7 @@ fn inventory_stream_from(
                     super::cursor::routing_error(error),
                     sync_ctx,
                 ));
-                yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion { checkpoint: None, coverage: coverage_of(&obligations) });
+                yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion { checkpoint: None, coverage: coverage_of(&scope, &obligations) });
                 return;
             }
         };
@@ -83,7 +83,7 @@ fn inventory_stream_from(
                         super::cursor::CursorError::SchemaIncompatible,
                         sync_ctx,
                     ));
-                    yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion { checkpoint: None, coverage: coverage_of(&obligations) });
+                    yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion { checkpoint: None, coverage: coverage_of(&scope, &obligations) });
                     return;
                 }
             },
@@ -91,7 +91,7 @@ fn inventory_stream_from(
                 Ok(request) => request,
                 Err(error) => {
                     yield bifrost_types::InventoryEvent::Terminated(cursor_error_to_account_error(error, sync_ctx));
-                    yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion { checkpoint: None, coverage: coverage_of(&obligations) });
+                    yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion { checkpoint: None, coverage: coverage_of(&scope, &obligations) });
                     return;
                 }
             },
@@ -108,7 +108,7 @@ fn inventory_stream_from(
                 let ctx = GraphErrorContext::graph(AccountOperation::SyncInventory)
                     .with_scope(ErrorScope::Cursor(scope.clone()));
                 yield bifrost_types::InventoryEvent::Terminated(cursor_error_to_account_error(error, ctx));
-                yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion { checkpoint: None, coverage: coverage_of(&obligations) });
+                yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion { checkpoint: None, coverage: coverage_of(&scope, &obligations) });
                 return;
             }
         };
@@ -129,7 +129,7 @@ fn inventory_stream_from(
                         owner.as_ref(),
                         ctx,
                     ));
-                    yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion { checkpoint: None, coverage: coverage_of(&obligations) });
+                    yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion { checkpoint: None, coverage: coverage_of(&scope, &obligations) });
                     return;
                 }
             };
@@ -155,14 +155,36 @@ fn inventory_stream_from(
                     // many, a truncated page, or a response that cannot be
                     // correlated with pagination at all - calling it a
                     // single-object loss would claim knowledge the walk does
-                    // not have. The replay token is the page link, because
-                    // that is the granularity anything could be re-read at.
+                    // not have.
+                    //
+                    // It is a CHECKPOINT BARRIER, not a durable replay. The
+                    // only token available at this granularity is the current
+                    // page URL, which is a continuation of THIS delta session:
+                    // once the walk takes its deltaLink and the cursor
+                    // advances, that skip token is dead. Handing it over as a
+                    // repair capability would record debt nothing can ever
+                    // discharge - silent permanent loss wearing a declared-debt
+                    // costume. Graph publishes no durable snapshot handle for a
+                    // page of a delta enumeration, so the honest answer is that
+                    // the cursor must not cross this page at all.
                     obligations.push(bifrost_types::InventoryObligation::Region {
-                        failure_key: format!("{scope:?}:unidentifiable-value"),
+                        // Identity is the page, not the failure class. The
+                        // label alone names every id-less value in the scope
+                        // forever, and an operator waiver keyed on that would
+                        // silently accept all future ones.
+                        key: bifrost_types::ObligationKey(
+                            format!("graph:unidentifiable-value:{current_url}").into_bytes(),
+                        ),
+                        failure_label: format!("{scope:?}:unidentifiable-value"),
                         error: super::graph_error::unsupported_account_error(
                             AccountOperation::SyncInventory,
                         ),
-                        replay: current_url.clone().into_bytes(),
+                        recovery: bifrost_types::RegionRecovery::CheckpointBarrier {
+                            transient_replay: Some(bifrost_types::TransientReplayHint {
+                                token: current_url.clone().into_bytes(),
+                                note: "delta-session page link; dies with the enumeration".into(),
+                            }),
+                        },
                     });
                     continue;
                 };
@@ -201,11 +223,11 @@ fn inventory_stream_from(
                         let ctx = GraphErrorContext::graph(AccountOperation::SyncInventory)
                             .with_scope(ErrorScope::Cursor(scope.clone()));
                         yield bifrost_types::InventoryEvent::Terminated(cursor_error_to_account_error(error, ctx));
-                        yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion { checkpoint: None, coverage: coverage_of(&obligations) });
+                        yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion { checkpoint: None, coverage: coverage_of(&scope, &obligations) });
                         return;
                     }
                 };
-                yield inventory_batch(entries, PageBoundary::Page, Some(checkpoint_cursor), coverage_of(&obligations));
+                yield inventory_batch(entries, PageBoundary::Page, Some(checkpoint_cursor), coverage_of(&scope, &obligations));
                 current_url = next_link;
             } else if let Some(delta_link) = page.delta_link {
                 let cursor = match encode_cursor(
@@ -218,13 +240,13 @@ fn inventory_stream_from(
                         let ctx = GraphErrorContext::graph(AccountOperation::SyncInventory)
                             .with_scope(ErrorScope::Cursor(scope.clone()));
                         yield bifrost_types::InventoryEvent::Terminated(cursor_error_to_account_error(error, ctx));
-                        yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion { checkpoint: None, coverage: coverage_of(&obligations) });
+                        yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion { checkpoint: None, coverage: coverage_of(&scope, &obligations) });
                         return;
                     }
                 };
                 let checkpoint = Checkpoint::Change(cursor.clone());
-                yield inventory_batch(entries, PageBoundary::Final, Some(cursor), coverage_of(&obligations));
-                yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion { checkpoint: Some(checkpoint), coverage: coverage_of(&obligations) });
+                yield inventory_batch(entries, PageBoundary::Final, Some(cursor), coverage_of(&scope, &obligations));
+                yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion { checkpoint: Some(checkpoint), coverage: coverage_of(&scope, &obligations) });
                 return;
             } else {
                 // A delta page must advance with either a next link or a
@@ -236,7 +258,7 @@ fn inventory_stream_from(
                     Some(ErrorScope::Cursor(scope.clone())),
                     "Graph delta page had neither @odata.nextLink nor @odata.deltaLink",
                 ));
-                yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion { checkpoint: None, coverage: coverage_of(&obligations) });
+                yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion { checkpoint: None, coverage: coverage_of(&scope, &obligations) });
                 return;
             }
         }
@@ -438,7 +460,7 @@ pub(crate) fn inventory_batch(
     items: Vec<InventoryEntry>,
     page_boundary: PageBoundary,
     cursor: Option<ChangeCursor>,
-    coverage: bifrost_types::InventoryCoverage,
+    coverage: bifrost_types::InventoryCoverageReport,
 ) -> bifrost_types::InventoryEvent {
     bifrost_types::InventoryEvent::Batch(bifrost_types::InventoryBatch {
         items,
@@ -451,16 +473,18 @@ pub(crate) fn inventory_batch(
 }
 
 /// Coverage for a checkpoint emitted after `obligations` were observed.
+///
+/// The domain is the whole scope: a Graph delta enumeration walks the scope in
+/// one logical pass, paging through it, rather than serving engine-chosen
+/// partitions.
 pub(crate) fn coverage_of(
+    scope: &CursorScope,
     obligations: &[bifrost_types::InventoryObligation],
-) -> bifrost_types::InventoryCoverage {
-    if obligations.is_empty() {
-        bifrost_types::InventoryCoverage::Complete
-    } else {
-        bifrost_types::InventoryCoverage::Degraded {
-            obligations: obligations.to_vec(),
-        }
-    }
+) -> bifrost_types::InventoryCoverageReport {
+    bifrost_types::InventoryCoverageReport::from_obligations(
+        bifrost_types::CoverageDomain::full(scope.clone()),
+        obligations,
+    )
 }
 
 pub(crate) fn batch<T>(
@@ -1265,8 +1289,14 @@ mod tests {
     /// an absent id may mean one malformed value, a schema mismatch affecting
     /// many, or a truncated page, so claiming a single-object loss would assert
     /// knowledge the walk does not have.
+    ///
+    /// And it is a CHECKPOINT BARRIER, not a durable replay. The only token at
+    /// page granularity is a continuation of this delta session, which dies
+    /// when the walk takes its deltaLink - so recording it as repairable would
+    /// create debt nothing can ever discharge. An earlier revision did exactly
+    /// that, and this assertion is what stops it coming back.
     #[tokio::test]
-    async fn an_id_less_value_becomes_a_region_obligation() {
+    async fn an_id_less_value_becomes_a_barrier_region_obligation() {
         let client = GraphClient::new("token");
         client.script_rest([ScriptedRestResponse::json(
             reqwest::StatusCode::OK,
@@ -1293,16 +1323,36 @@ mod tests {
                 _ => None,
             })
             .expect("the walk must finish");
-        let bifrost_types::InventoryCoverage::Degraded { obligations } = &completion.coverage
-        else {
-            panic!("an id-less value must not be reported as complete coverage");
-        };
         assert!(
-            obligations.iter().any(|obligation| matches!(
-                obligation,
-                bifrost_types::InventoryObligation::Region { .. }
-            )),
-            "an unidentifiable value is a region, not a named object: {obligations:?}"
+            !completion.coverage.is_complete(),
+            "an id-less value must not be reported as complete coverage"
+        );
+        let obligations = completion.coverage.obligations();
+        let region = obligations
+            .iter()
+            .find_map(|obligation| match obligation {
+                bifrost_types::InventoryObligation::Region { recovery, key, .. } => {
+                    Some((recovery, key))
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| {
+                panic!("an unidentifiable value is a region, not a named object: {obligations:?}")
+            });
+        assert!(
+            region.0.is_barrier(),
+            "a delta-session page link is not durable replay, so the cursor must not cross it"
+        );
+        assert!(
+            completion.coverage.has_barrier(),
+            "the report must surface the barrier so the engine can refuse the checkpoint"
+        );
+        // Identity is the page, not the failure class: a waiver keyed on
+        // "this scope has id-less values" would accept every future one.
+        let key = String::from_utf8_lossy(&region.1.0);
+        assert!(
+            key.contains("/messages/delta"),
+            "the obligation key must name the specific page: {key}"
         );
     }
 

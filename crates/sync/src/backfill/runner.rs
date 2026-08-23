@@ -244,6 +244,7 @@ impl BackfillRunner {
     /// entries observed before filtering because it describes the
     /// inventory position, while the returned outcome reports both the
     /// observed and forwarded totals.
+    #[allow(clippy::too_many_arguments)]
     pub async fn run_partition(
         account: &dyn Account,
         scope: CursorScope,
@@ -252,6 +253,9 @@ impl BackfillRunner {
         changes_tx: Option<broadcast::Sender<MultiplexerEvent>>,
         envelope_version: u32,
         control: Option<&SyncControl>,
+        coverage: Option<&Arc<crate::cursor::PendingCoverage>>,
+        writer_tx: Option<&tokio::sync::mpsc::Sender<crate::multiplexer::WriterRequest>>,
+        generation: u64,
     ) -> Result<BackfillPartitionOutcome, Error> {
         let _activity = match control {
             Some(control) => Some(control.begin_activity().ok_or(Error::Paused)?),
@@ -305,10 +309,29 @@ impl BackfillRunner {
                             bytes_in: batch.bytes_in,
                             checkpoint: Some(Checkpoint::Backfill(bf.clone())),
                         };
+                        // REGISTER THE COVERAGE CLAIM. Without this the page's
+                        // obligations never reach the durable record at all:
+                        // the runner used to read `batch.coverage` only to
+                        // clear its local `complete` flag, so an acknowledged
+                        // degraded page persisted a record asserting complete
+                        // coverage over objects nothing had recorded - the
+                        // exact invariant this machinery exists to enforce.
+                        //
+                        // Note the claim rides the PUBLICATION, not the scope.
+                        // Two partitions of one scope are in flight at once, so
+                        // a scope-keyed claim would let partition B's report be
+                        // persisted under partition A's acknowledgement.
+                        let publication = coverage.map(|pending| {
+                            pending.publish(crate::cursor::CoverageClaim::new(
+                                batch.coverage.clone(),
+                                generation,
+                            ))
+                        });
                         let me = MultiplexerEvent {
                             scope: scope.clone(),
                             event: Arc::new(SyncEvent::Batch(synthetic)),
                             checkpoint: Some(Checkpoint::Backfill(bf.clone())),
+                            publication,
                         };
                         // Register before publishing so a fast consumer
                         // ack cannot land before the entry exists and
@@ -318,16 +341,42 @@ impl BackfillRunner {
                             control.expect_checkpoint(expected.clone());
                         }
                         let delivered = tx.send(me).unwrap_or(0);
-                        if !crate::multiplexer::delivered_to_real_subscriber(delivered)
-                            && let Some(control) = control
-                        {
-                            control.retire_checkpoint(&expected);
+                        if !crate::multiplexer::delivered_to_real_subscriber(delivered) {
+                            if let (Some(pending), Some(id)) = (coverage, publication) {
+                                pending.retire(id);
+                            }
+                            if let Some(control) = control {
+                                control.retire_checkpoint(&expected);
+                            }
                         }
                     }
                 }
                 bifrost_types::InventoryEvent::Done(completion) => {
                     if !completion.coverage.is_complete() {
                         complete = false;
+                        // The terminal summary has no checkpoint of its own to
+                        // ride, so its obligations reach the ledger directly -
+                        // as DEBT ONLY, never proof. Both current providers
+                        // make this report cumulative with the final page, so
+                        // in practice this is usually a re-assertion of what a
+                        // page claim already carried; re-raising an obligation
+                        // is idempotent and preserves its history. Relying on
+                        // that cumulativeness instead would be an assumption
+                        // about every future provider.
+                        if let Some(writer) = writer_tx {
+                            let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+                            if writer
+                                .send(crate::multiplexer::WriterRequest::RecordDebt {
+                                    report: completion.coverage.clone(),
+                                    generation,
+                                    done: done_tx,
+                                })
+                                .await
+                                .is_ok()
+                            {
+                                let _ = done_rx.await;
+                            }
+                        }
                     }
                     break;
                 }
@@ -337,6 +386,7 @@ impl BackfillRunner {
                             scope: scope.clone(),
                             event: Arc::new(SyncEvent::Terminated(err.clone())),
                             checkpoint: None,
+                            publication: None,
                         };
                         let _ = tx.send(me);
                     }

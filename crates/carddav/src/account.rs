@@ -415,6 +415,7 @@ impl Account for CardDavAccount {
         let client = Arc::clone(&self.client);
         let home = self.addressbook_home.clone();
         let addressbook = self.default_addressbook_url.clone();
+        let coverage_scope = scope.clone();
         // COMPLETE coverage is accurate here: the walk terminates wholesale on
         // any failure, so it never advances a checkpoint across a gap.
         Box::pin(
@@ -457,7 +458,9 @@ impl Account for CardDavAccount {
                 events
             })
             .flat_map(stream::iter)
-            .map(InventoryEvent::from),
+            .map(bifrost_types::lift_complete_walk(
+                bifrost_types::CoverageDomain::full(coverage_scope),
+            )),
         )
     }
 
@@ -472,7 +475,9 @@ impl Account for CardDavAccount {
     ) -> AccountStream<InventoryEvent> {
         match partition {
             InventoryPartition::Full => self.inventory_stream(scope),
-            _ => bifrost_types::unsupported_inventory_stream(AccountOperation::SyncInventory),
+            _ => {
+                bifrost_types::unsupported_inventory_stream(scope, AccountOperation::SyncInventory)
+            }
         }
     }
 

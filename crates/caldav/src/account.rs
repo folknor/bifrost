@@ -319,6 +319,7 @@ impl Account for CalDavAccount {
         let client = Arc::clone(&self.client);
         let home = self.calendar_home.clone();
         let calendar = self.default_calendar_url.clone();
+        let coverage_scope = scope.clone();
         // COMPLETE coverage is an accurate claim here: this walk terminates
         // wholesale on any failure, so it never advances a checkpoint across a
         // gap. A version that starts absorbing per-item failures must build
@@ -362,7 +363,9 @@ impl Account for CalDavAccount {
                 events
             })
             .flat_map(stream::iter)
-            .map(InventoryEvent::from),
+            .map(bifrost_types::lift_complete_walk(
+                bifrost_types::CoverageDomain::full(coverage_scope),
+            )),
         )
     }
 
@@ -377,7 +380,9 @@ impl Account for CalDavAccount {
     ) -> AccountStream<InventoryEvent> {
         match partition {
             InventoryPartition::Full => self.inventory_stream(scope),
-            _ => bifrost_types::unsupported_inventory_stream(AccountOperation::SyncInventory),
+            _ => {
+                bifrost_types::unsupported_inventory_stream(scope, AccountOperation::SyncInventory)
+            }
         }
     }
 

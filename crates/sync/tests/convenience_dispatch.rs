@@ -129,10 +129,10 @@ impl Account for RecorderAccount {
         Box::pin(async { Err(unsupported(AccountOperation::EstablishCursor)) })
     }
 
-    fn inventory_stream(&self, _scope: CursorScope) -> AccountStream<InventoryEvent> {
+    fn inventory_stream(&self, scope: CursorScope) -> AccountStream<InventoryEvent> {
         self.record("inventory_stream".into());
-        Box::pin(stream::once(async {
-            InventoryEvent::Done(bifrost_types::InventoryCompletion::complete(None))
+        Box::pin(stream::once(async move {
+            InventoryEvent::Done(bifrost_types::InventoryCompletion::complete(scope, None))
         }))
     }
 
