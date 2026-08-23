@@ -34,6 +34,7 @@ pub mod ids;
 pub mod mime;
 pub mod mutation;
 pub mod page;
+pub mod repair;
 pub mod search;
 pub mod settings;
 
@@ -137,6 +138,12 @@ pub use events::{
     InventoryEntry, InventoryEvent, InventoryPartition, InventoryPartitioning, ObjectChange,
     ObjectChangeKind, PageBoundary, Partition, PauseReason, Priority, Progress, PushSource,
     ScopeChange, ScopeChangeKind, SyncEvent, WatchEvent, lift_complete_walk,
+};
+
+// Provider-native repair of coverage debt.
+pub use repair::{
+    DefinitiveIrrelevance, InventoryRepairEvent, InventoryRepairOutcome, InventoryRepairRequest,
+    InventoryRepairTarget, RegionRepairProof, RepairAttemptId,
 };
 
 // Inventory coverage: what an enumeration proved, and about which region of

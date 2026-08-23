@@ -1200,12 +1200,36 @@ confirm against the code before working any of them.
   `bifrost-graph` had SIX unbounded `@odata.nextLink` loops with no page budget
   and no repeated-link guard, plus an unguarded folder-parentage descent. See
   `reference/graph.md`, "Bounded `nextLink` traversal".
-- **sync-B4. Provider-native repair of inventory coverage debt.** [C2] Tail of
-  google-B5. The durable-truth layer landed 2026-08-23 in a second pass that
-  also fixed two live defects in the first one; see `reference/sync.md`,
-  "Inventory coverage", for the mechanism as built.
+- **sync-B4b. Region repair has no live provider.** [C4] The repair path landed
+  2026-08-23; see `reference/sync.md`, "Inventory coverage" / "Repair". The
+  object lane is implemented end to end and Google implements it. The REGION
+  lane is built and tested but no provider produces it: Graph's only region is a
+  `CheckpointBarrier` by construction, so `RegionRepairProof::ExactReplay`,
+  `Partitioned`, conservation across children, and lineage splitting are
+  exercised only by in-crate tests.
 
-  What that pass established: reports carry a semantic `CoverageDomain` (so a
+  That is not a defect - the shapes are unreachable rather than wrong - but it
+  means the region contract is validated against tests rather than a provider,
+  and the first real implementor should be reviewed against it rather than
+  assumed to fit. A candidate would need a replay token that survives its own
+  enumeration, which is exactly what Graph lacks.
+
+- **sync-B4. Provider-native repair of inventory coverage debt.** [DONE
+  2026-08-23] Kept briefly for context; delete once the arc is cold. The
+  durable-truth layer landed first (publication-correlated claims, semantic
+  coverage domains, the proof/policy ledger, writer-time sentinel eligibility,
+  barrier-taints-walk), then the executor on top of it.
+
+  The design question that looked hardest turned out to be dissolved by an
+  existing contract rather than solved: repair appeared to need conditional
+  application, tombstones or a version-relation hook to avoid resurrecting a
+  deleted object, until it became clear that NO inventory path delivers an
+  `InventoryEntry` to a consumer - fusion and backfill both publish ids and
+  discard the entry. Repair carrying ids only inherits that safety exactly, and
+  the discharge bar becomes "the consumer was told this id exists", which is all
+  a successful walk ever achieves.
+
+  What the first pass established: reports carry a semantic `CoverageDomain` (so a
   partition's success cannot discharge its neighbours' debt, and page ranges are
   incomparable across snapshots); the engine owns a `DebtLedger` with proof and
   policy as independent axes; coverage claims are correlated by engine-issued
@@ -1216,56 +1240,23 @@ confirm against the code before working any of them.
   `SyncEngine::debt` and waivable, occurrence by occurrence, via
   `waive_obligation`.
 
-  What does NOT exist is a provider-native re-read. Debt is discharged today
-  only by a later walk whose domain covers it, or by an operator waiver. For a
-  scope whose backfill has finished there may be no next walk, so an obligation
-  can sit open indefinitely with the waiver as its only terminal state.
-
-  The design for the remaining half, argued out with the cold reviewer:
-
-  - A dedicated Account entry point and envelope, NOT `get_stream` (which
-    hydrates known ids at a projection and cannot express region replay,
-    completeness proof, or authoritative absence) and NOT `InventoryEvent`
-    (whose main-cursor checkpoints and cumulative walk coverage are wrong during
-    repair). Correlated outcomes: `Recovered`, `DefinitivelyIrrelevant`,
-    `Deferred`, `Replaced`.
-  - A region is discharged only on proof that the WHOLE named region was
-    accounted for. Producing some entries is not enough.
-  - Definitive absence is a typed account conclusion about snapshot semantics,
-    never a status code. Gmail's landed discharge of a mid-walk `NotFound` is
-    the model: it rests on the id coming from this walk's own listing and the
-    cursor being anchored before the walk, not on the error kind.
-  - Repair may discover new obligations. That is an ATOMIC REPLACEMENT of the
-    parent with its children, not an append - otherwise the parent is replayed
-    forever and double-counted. `LedgerEntry::parent` exists for this, unused so
-    far. Retry budgeting must follow the unresolved LINEAGE, or an account
-    evades every budget by re-minting an equivalent obligation each pass.
-  - `PolicyStatus::Retrying { attempts }` counts COMPLETED outcomes only. A
-    crash after provider work but before acknowledgement must cost a repeated
-    attempt, not a consumed budget. `attempts` may drive `OperatorBlocked`; it
-    may never drive `Waived` or `Discharged`.
-  - Ordering: publish repair batch -> consumer persists -> consumer acknowledges
-    -> writer conditionally discharges. The reverse recreates silent loss. A
-    crash between the middle steps yields duplicate recovery, which is the same
-    at-least-once asymmetry ordinary checkpoint delivery already has.
-  - **The unsolved part is the race with the live change stream.** A repaired
-    entry describes an older snapshot while the changes stream may already have
-    applied a newer update or deletion, so applying it blindly can resurrect
-    deleted data. `ServerVersion` cannot arbitrate generically: `ETag` and
-    `StateAt` are equality tokens, `ModSeq` orders only within a UIDVALIDITY
-    epoch, and the type derives `Eq` and not `Ord` for exactly that reason. This
-    needs either per-object serialization on the consumer side, a fill-absence-
-    only rule with tombstone retention, or an account-owned `VersionRelation`
-    hook that answers `Incomparable` honestly for most providers. Decide this
-    before building the executor; it is a consumer-contract question, not an
-    engine-internal one.
-
 - **sync-B5. Ledger compaction and audit retention.** [C4] Discharged entries
   are retained forever for audit, so the ledger grows monotonically. Compaction
   needs to preserve the proved/waived distinction rather than flattening it -
   separate counters or audit roots for proved discharges, waived unresolved
   loss, and currently-open obligations. Not urgent at present volumes; it
-  becomes real once provider-native repair starts churning entries.
+  becomes real now that repair churns entries.
+
+- **sync-B6. Repair is caller-driven, with no scheduler.** [C4]
+  `SyncEngine::repair_debt(account, max_requests)` runs exactly one pass when a
+  consumer asks. Nothing schedules it, so debt sits until someone calls. That is
+  deliberate for now - repair is remote work against an account that may be
+  throttled, paused or degraded, and the consumer knows better than the engine
+  when to spend that budget - but a consumer that never calls it gets the
+  pre-repair behaviour, which is the state this whole arc set out to leave. If
+  it becomes a scheduled lane it needs the throttle-deadline and pause checks
+  the backfill partition runner already does, and it should respect
+  `OperatorBlocked` without re-arming it on a timer.
 
 ### Open defects
 

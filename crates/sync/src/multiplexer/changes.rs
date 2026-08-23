@@ -288,6 +288,19 @@ pub enum WriterRequest {
         generation: u64,
         done: oneshot::Sender<Result<(), Error>>,
     },
+    /// Apply the outcomes of one repair pass.
+    ///
+    /// `publication` is the repair batch's acknowledgement identity, present
+    /// only when ids were actually published to a live subscriber. A
+    /// `Recovered` resolution discharges only once that publication is
+    /// acknowledged: the account having re-read the object proves the
+    /// representation healed, but until the consumer durably accepts the
+    /// existence notification it still does not know the object is there.
+    ApplyRepair {
+        resolutions: Vec<crate::repair::RepairResolution>,
+        publication: Option<crate::cursor::PublicationId>,
+        done: oneshot::Sender<Result<(), Error>>,
+    },
     /// Operator action on one obligation or barrier occurrence.
     ///
     /// `Waive` is the only path to accepted loss, and it exists only here:
@@ -329,6 +342,10 @@ impl std::fmt::Debug for WriterRequest {
                 .finish(),
             Self::ReattachAbort { .. } => f.write_str("ReattachAbort"),
             Self::ReattachCommit => f.write_str("ReattachCommit"),
+            Self::ApplyRepair { resolutions, .. } => f
+                .debug_struct("ApplyRepair")
+                .field("resolutions", &resolutions.len())
+                .finish(),
             Self::RecordDebt { generation, .. } => f
                 .debug_struct("RecordDebt")
                 .field("generation", generation)

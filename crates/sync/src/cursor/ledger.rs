@@ -31,7 +31,8 @@
 use std::collections::BTreeMap;
 
 use bifrost_types::{
-    AccountError, CoverageDomain, InventoryCoverageReport, InventoryObligation, ObligationKey,
+    AccountError, CoverageDomain, InventoryCoverageReport, InventoryObligation,
+    InventoryRepairTarget, ObligationKey,
 };
 
 /// What the system KNOWS about an obligation.
@@ -44,6 +45,35 @@ pub enum ProofStatus {
     Discharged { evidence: DischargeEvidence },
 }
 
+/// Bound on parent-link walking, so a cycle from a buggy replacement cannot
+/// hang the single writer every durable mutation funnels through.
+const LINEAGE_DEPTH_CAP: usize = 64;
+
+/// Whether a replacement improved the situation or merely reshaped it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ReplacementProgress {
+    Progressed,
+    /// Same unresolved extent, same granularity, no proof gained, no better
+    /// repair authority. Repeated stalls exhaust the lineage budget rather
+    /// than looping forever.
+    Stalled,
+}
+
+/// Why the engine refused a replacement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ReplacementRefusal {
+    UnknownObligation,
+    /// The obligation moved on, or was already closed, since this repair result
+    /// was computed.
+    StaleGeneration,
+    /// A child key is already open under a different lineage root. Accepting it
+    /// would give one obligation two roots and let a retry budget reset by
+    /// picking whichever root is convenient.
+    ChildCollidesWithForeignLineage,
+}
+
 /// Why an obligation is considered discharged.
 ///
 /// Recorded rather than inferred so an audit can tell a re-enumeration from a
@@ -54,6 +84,24 @@ pub enum ProofStatus {
 pub enum DischargeEvidence {
     /// A later accepted report proved a domain covering this obligation.
     CoveringWalk { domain: CoverageDomain },
+    /// A repair pass re-read the object authoritatively, rebuilt its entry, and
+    /// the consumer durably accepted the resulting existence notification.
+    ///
+    /// Both halves are recorded because neither alone suffices: an account
+    /// recovery nobody was told about leaves the consumer unaware, and a
+    /// published id with no successful account result merely repeats an id
+    /// without proving the representation failure healed.
+    RepairedAndPublished {
+        attempt: bifrost_types::RepairAttemptId,
+    },
+    /// A repair pass proved the object is not owed at all - absent under a
+    /// cursor bridge that will report its removal, or out of scope. Emits
+    /// nothing to the consumer: absence from an old inventory snapshot is not a
+    /// deletion to apply against current state.
+    ProvedIrrelevant { detail: String },
+    /// Superseded by the children it was split into. The parent is closed so it
+    /// cannot be replayed or double-counted; the debt lives on in the children.
+    ReplacedByChildren { children: Vec<ObligationKey> },
 }
 
 /// What the system will DO about an obligation.
@@ -93,6 +141,14 @@ pub struct LedgerEntry {
     pub generation: u64,
     pub proof: ProofStatus,
     pub policy: PolicyStatus,
+    /// The account-minted material a repair pass needs to address this.
+    ///
+    /// Retained because the executor cannot reconstruct a request without it:
+    /// key, domain and error are engine- or diagnostic-level facts, and the
+    /// error in particular must never be used as a repair descriptor because
+    /// classifications and messages change between revisions. `None` for an
+    /// obligation with no repair path.
+    pub target: Option<InventoryRepairTarget>,
     /// The obligation this one replaced, when a repair pass narrowed a region
     /// into smaller pieces. Retry budgeting follows the LINEAGE, so an account
     /// cannot reset a budget by re-minting an equivalent obligation.
@@ -285,6 +341,9 @@ impl DebtLedger {
                 existing.generation = generation;
                 existing.domain = domain.clone();
                 existing.last_error = obligation.error().clone();
+                // The token may legitimately rotate while naming the same gap,
+                // so the descriptor refreshes even though identity does not.
+                existing.target = InventoryRepairTarget::from_obligation(obligation);
                 // Rediscovery is proof it is still missing, so an earlier
                 // discharge was wrong. Reopen it - but never touch policy: an
                 // operator's waiver stands until the operator revokes it.
@@ -299,6 +358,7 @@ impl DebtLedger {
                         generation,
                         proof: ProofStatus::Unresolved,
                         policy: PolicyStatus::Retrying { attempts: 0 },
+                        target: InventoryRepairTarget::from_obligation(obligation),
                         parent: None,
                         first_seen_unix_seconds: now,
                         last_error: obligation.error().clone(),
@@ -350,6 +410,205 @@ impl DebtLedger {
         }
     }
 
+    /// Obligations eligible for an automatic repair attempt.
+    ///
+    /// Unresolved, not waived, not operator-blocked, and carrying a repair
+    /// descriptor. A barrier has no descriptor and is correctly excluded: no
+    /// checkpoint advanced past it, so it is blocked progress rather than debt,
+    /// and its only terminal state is an operator waiver.
+    pub fn repairable(&self) -> impl Iterator<Item = &LedgerEntry> {
+        self.entries.values().filter(|entry| {
+            entry.is_open()
+                && entry.target.is_some()
+                && matches!(entry.policy, PolicyStatus::Retrying { .. })
+        })
+    }
+
+    /// The lineage root `key` belongs to.
+    ///
+    /// Budgets accrue at the root, not per key, or an account evades every
+    /// budget by re-minting an equivalent obligation under a fresh key each
+    /// pass. Walks parent links with a bound, so a cycle introduced by a buggy
+    /// replacement cannot hang the writer.
+    #[must_use]
+    pub fn lineage_root(&self, key: &ObligationKey) -> ObligationKey {
+        let mut current = key.clone();
+        for _ in 0..LINEAGE_DEPTH_CAP {
+            match self.entries.get(&current).and_then(|e| e.parent.clone()) {
+                Some(parent) => current = parent,
+                None => return current,
+            }
+        }
+        current
+    }
+
+    /// Record one COMPLETED repair attempt against `key`'s lineage root.
+    ///
+    /// Completed, never merely started: a crash after provider work but before
+    /// the acknowledgement must cost a repeated attempt, not a consumed budget,
+    /// so nothing durable is written before an outcome comes back.
+    ///
+    /// Returns whether the budget expired on this attempt. An expired budget
+    /// yields `OperatorBlocked` - automatic work stopped, still visible, still
+    /// blocking, still manually retryable. It NEVER yields `Waived` or
+    /// `Discharged`: a counter running out is evidence that retrying is not
+    /// working, not a decision about what loss is acceptable.
+    pub fn record_attempt(&mut self, key: &ObligationKey, budget: u32) -> bool {
+        let root = self.lineage_root(key);
+        let Some(entry) = self.entries.get_mut(&root) else {
+            return false;
+        };
+        let PolicyStatus::Retrying { attempts } = &mut entry.policy else {
+            return false;
+        };
+        *attempts = attempts.saturating_add(1);
+        if *attempts >= budget {
+            entry.policy = PolicyStatus::OperatorBlocked;
+            return true;
+        }
+        false
+    }
+
+    /// Discharge `key` on proof that a repair recovered it and the consumer
+    /// durably accepted the resulting notification.
+    ///
+    /// Conditional on generation: a result computed against an older view of
+    /// the obligation must not close a version of it that has since been
+    /// re-raised. Serialization through the single writer orders the messages;
+    /// it does not by itself reject stale intent, which is what this check is
+    /// for.
+    ///
+    /// Returns whether anything changed.
+    pub fn discharge_repaired(
+        &mut self,
+        key: &ObligationKey,
+        generation: u64,
+        evidence: DischargeEvidence,
+    ) -> bool {
+        let Some(entry) = self.entries.get_mut(key) else {
+            return false;
+        };
+        if entry.generation > generation || !entry.is_open() {
+            return false;
+        }
+        entry.proof = ProofStatus::Discharged { evidence };
+        true
+    }
+
+    /// Atomically replace `key` with `children`, recording `proved` as covered.
+    ///
+    /// A replacement is a SWAP, never an append. Appending children while the
+    /// parent stays open double-counts the extent and replays the parent
+    /// forever.
+    ///
+    /// Conservation is the safety property: nothing may vanish from the parent
+    /// merely because no child names it. Where the extent is expressible in the
+    /// lattice the engine verifies that `proved` plus the children's domains
+    /// cover the parent; where it is opaque it cannot, so the account's
+    /// assertion is recorded rather than the engine pretending it verified one.
+    ///
+    /// Children inherit the lineage root, so the retry budget follows the
+    /// unresolved lineage rather than resetting per generated key.
+    ///
+    /// Returns `Err` with a reason when the replacement is refused.
+    pub fn replace_obligation(
+        &mut self,
+        key: &ObligationKey,
+        proved: &[CoverageDomain],
+        children: &[InventoryObligation],
+        generation: u64,
+        now: i64,
+    ) -> Result<ReplacementProgress, ReplacementRefusal> {
+        let Some(parent) = self.entries.get(key).cloned() else {
+            return Err(ReplacementRefusal::UnknownObligation);
+        };
+        if parent.generation > generation || !parent.is_open() {
+            return Err(ReplacementRefusal::StaleGeneration);
+        }
+        // A child colliding with an obligation from another lineage would give
+        // one key two roots and let a budget reset by choosing the convenient
+        // one. Refused as a contract violation rather than resolved silently.
+        let root = self.lineage_root(key);
+        for child in children {
+            if let Some(existing) = self.entries.get(child.key())
+                && self.lineage_root(child.key()) != root
+                && existing.is_open()
+            {
+                return Err(ReplacementRefusal::ChildCollidesWithForeignLineage);
+            }
+        }
+
+        let progress = self.classify_progress(&parent, proved, children);
+
+        for domain in proved {
+            self.record_proof(domain.clone(), generation);
+        }
+        for child in children {
+            if child.is_barrier() {
+                continue;
+            }
+            self.upsert(child, &parent.domain, generation, now);
+            if let Some(entry) = self.entries.get_mut(child.key()) {
+                entry.parent = Some(root.clone());
+            }
+        }
+        if let Some(entry) = self.entries.get_mut(key) {
+            entry.proof = ProofStatus::Discharged {
+                evidence: DischargeEvidence::ReplacedByChildren {
+                    children: children.iter().map(|c| c.key().clone()).collect(),
+                },
+            };
+        }
+        Ok(progress)
+    }
+
+    /// Whether a replacement actually improved the situation.
+    ///
+    /// Extent equality alone is the wrong test in both directions. It REJECTS
+    /// real progress: turning one opaque region into three stable object
+    /// obligations leaves the unresolved extent unchanged while making every
+    /// piece independently retryable and dischargeable. And it ACCEPTS fake
+    /// progress: a provider can repartition a region into children whose union
+    /// equals the parent, with fresh keys and rotated tokens, forever.
+    ///
+    /// So progress is judged across several dimensions, and token rotation or
+    /// error reclassification alone is not one of them.
+    fn classify_progress(
+        &self,
+        parent: &LedgerEntry,
+        proved: &[CoverageDomain],
+        children: &[InventoryObligation],
+    ) -> ReplacementProgress {
+        if !proved.is_empty() {
+            return ReplacementProgress::Progressed;
+        }
+        // An opaque region becoming addressable objects is progress even at
+        // identical extent.
+        let parent_is_region = matches!(parent.target, Some(InventoryRepairTarget::Region { .. }));
+        let children_are_objects = !children.is_empty()
+            && children
+                .iter()
+                .all(|c| matches!(c, InventoryObligation::Object { .. }));
+        if parent_is_region && children_are_objects {
+            return ReplacementProgress::Progressed;
+        }
+        // A barrier becoming durably replayable is progress: repair authority
+        // strictly improved.
+        if children.iter().any(|child| {
+            matches!(
+                child,
+                InventoryObligation::Region {
+                    recovery: bifrost_types::RegionRecovery::DurableReplay { .. },
+                    ..
+                }
+            )
+        }) && parent.target.is_none()
+        {
+            return ReplacementProgress::Progressed;
+        }
+        ReplacementProgress::Stalled
+    }
+
     /// Operator action: accept the loss at `key`.
     ///
     /// Targets ONE occurrence. A waiver keyed on a failure label would
@@ -392,7 +651,10 @@ impl DebtLedger {
 
 #[cfg(test)]
 mod tests {
-    use super::{BarrierIncident, DebtLedger, PolicyStatus, ProofStatus};
+    use super::{
+        BarrierIncident, DebtLedger, DischargeEvidence, PolicyStatus, ProofStatus,
+        ReplacementProgress, ReplacementRefusal,
+    };
     use bifrost_types::{
         AccountErrorBuilder, AccountErrorKind, Cause, CoverageCoordinate, CoverageDomain,
         CursorScope, DiagnosticText, InventoryCoverageReport, InventoryObligation, ObjectId,
@@ -612,6 +874,215 @@ mod tests {
         assert!(
             ledger.completion_permitted(&scope()),
             "a waived barrier releases the scope; that is the only escape hatch it has"
+        );
+    }
+
+    fn region(key: &str, recovery: RegionRecovery) -> InventoryObligation {
+        InventoryObligation::Region {
+            key: ObligationKey(key.as_bytes().to_vec()),
+            failure_label: "truncated".into(),
+            error: error(),
+            recovery,
+        }
+    }
+
+    fn replayable(key: &str) -> InventoryObligation {
+        region(
+            key,
+            RegionRecovery::DurableReplay {
+                token: b"tok".to_vec(),
+            },
+        )
+    }
+
+    fn ingest_one(ledger: &mut DebtLedger, obligation: InventoryObligation, generation: u64) {
+        ledger.ingest(
+            &InventoryCoverageReport::degraded(CoverageDomain::full(scope()), vec![obligation]),
+            generation,
+            100,
+        );
+    }
+
+    /// A barrier has no repair descriptor, so nothing may try to repair it. Its
+    /// only terminal state is an operator waiver.
+    #[test]
+    fn only_obligations_with_a_repair_descriptor_are_repairable() {
+        let mut ledger = DebtLedger::new();
+        ingest_one(&mut ledger, object("a"), 1);
+        ingest_one(&mut ledger, replayable("r"), 1);
+        ingest_one(&mut ledger, region("b", RegionRecovery::barrier()), 1);
+        assert_eq!(ledger.repairable().count(), 2);
+    }
+
+    /// A waived or blocked obligation is not retried automatically.
+    #[test]
+    fn waived_and_blocked_obligations_are_not_repairable() {
+        let mut ledger = DebtLedger::new();
+        ingest_one(&mut ledger, object("a"), 1);
+        ingest_one(&mut ledger, object("b"), 1);
+        ledger.waive(&ObligationKey(b"a".to_vec()), "operator".into(), 1);
+        ledger.block(&ObligationKey(b"b".to_vec()));
+        assert_eq!(ledger.repairable().count(), 0);
+    }
+
+    /// A spent budget stops automatic work and NOTHING else. It must never
+    /// reach Waived or Discharged: a counter running out is evidence that
+    /// retrying is not helping, not a decision about acceptable loss.
+    #[test]
+    fn an_expired_budget_blocks_rather_than_abandons() {
+        let mut ledger = DebtLedger::new();
+        ingest_one(&mut ledger, object("a"), 1);
+        let key = ObligationKey(b"a".to_vec());
+
+        assert!(!ledger.record_attempt(&key, 3));
+        assert!(!ledger.record_attempt(&key, 3));
+        assert!(
+            ledger.record_attempt(&key, 3),
+            "the third attempt exhausts it"
+        );
+
+        let entry = ledger.entry(&key).expect("entry");
+        assert_eq!(entry.policy, PolicyStatus::OperatorBlocked);
+        assert!(entry.is_open(), "a spent budget proves nothing");
+        assert!(
+            entry.blocks_completion(),
+            "blocked is not waived - it must still hold the sentinel"
+        );
+    }
+
+    /// The budget follows the LINEAGE. An account that answers every pass by
+    /// replacing an obligation with an equivalent one under a fresh key would
+    /// otherwise never exhaust a budget.
+    #[test]
+    fn attempts_accrue_at_the_lineage_root() {
+        let mut ledger = DebtLedger::new();
+        ingest_one(&mut ledger, replayable("parent"), 1);
+        let parent = ObligationKey(b"parent".to_vec());
+        ledger.record_attempt(&parent, 10);
+
+        ledger
+            .replace_obligation(&parent, &[], &[replayable("child")], 1, 200)
+            .expect("replacement accepted");
+        let child = ObligationKey(b"child".to_vec());
+        assert_eq!(ledger.lineage_root(&child), parent);
+
+        // An attempt charged against the child lands on the root's counter.
+        ledger.record_attempt(&child, 10);
+        let PolicyStatus::Retrying { attempts } = ledger.entry(&parent).expect("root entry").policy
+        else {
+            panic!("root should still be retrying");
+        };
+        assert_eq!(attempts, 2, "both attempts must accrue to the one root");
+    }
+
+    /// Replacement is a SWAP. Leaving the parent open alongside its children
+    /// double-counts the extent and replays the parent forever.
+    #[test]
+    fn replacement_closes_the_parent() {
+        let mut ledger = DebtLedger::new();
+        ingest_one(&mut ledger, replayable("parent"), 1);
+        let parent = ObligationKey(b"parent".to_vec());
+
+        ledger
+            .replace_obligation(&parent, &[], &[object("child")], 1, 200)
+            .expect("replacement accepted");
+
+        assert!(!ledger.entry(&parent).expect("parent retained").is_open());
+        assert!(
+            ledger
+                .entry(&ObligationKey(b"child".to_vec()))
+                .expect("child")
+                .is_open()
+        );
+        assert_eq!(ledger.open_debt().count(), 1);
+    }
+
+    /// Turning one opaque region into addressable objects is real progress even
+    /// though the unresolved extent is unchanged - each piece is now
+    /// independently retryable. Extent equality alone would call this a stall.
+    #[test]
+    fn a_region_becoming_objects_counts_as_progress() {
+        let mut ledger = DebtLedger::new();
+        ingest_one(&mut ledger, replayable("parent"), 1);
+        let progress = ledger
+            .replace_obligation(
+                &ObligationKey(b"parent".to_vec()),
+                &[],
+                &[object("c1"), object("c2")],
+                1,
+                200,
+            )
+            .expect("replacement accepted");
+        assert_eq!(progress, ReplacementProgress::Progressed);
+    }
+
+    /// Repartitioning a region into equally opaque regions, recovering nothing
+    /// and proving nothing, is not progress. Left uncharged it is an infinite
+    /// loop with fresh keys each pass.
+    #[test]
+    fn repartitioning_into_equally_opaque_regions_is_a_stall() {
+        let mut ledger = DebtLedger::new();
+        ingest_one(&mut ledger, replayable("parent"), 1);
+        let progress = ledger
+            .replace_obligation(
+                &ObligationKey(b"parent".to_vec()),
+                &[],
+                &[replayable("r1"), replayable("r2")],
+                1,
+                200,
+            )
+            .expect("replacement accepted");
+        assert_eq!(progress, ReplacementProgress::Stalled);
+    }
+
+    /// A result computed against an older view of an obligation must not close
+    /// a version of it that has since been re-raised. Serializing through one
+    /// writer orders the messages; it does not reject stale intent.
+    #[test]
+    fn a_stale_repair_result_cannot_discharge_a_reopened_obligation() {
+        let mut ledger = DebtLedger::new();
+        ingest_one(&mut ledger, object("a"), 1);
+        // Rediscovered by a later walk: the obligation moves to generation 5.
+        ingest_one(&mut ledger, object("a"), 5);
+
+        let discharged = ledger.discharge_repaired(
+            &ObligationKey(b"a".to_vec()),
+            1,
+            DischargeEvidence::RepairedAndPublished {
+                attempt: bifrost_types::RepairAttemptId(1),
+            },
+        );
+        assert!(
+            !discharged,
+            "a generation-1 result must not close generation 5"
+        );
+        assert!(
+            ledger
+                .entry(&ObligationKey(b"a".to_vec()))
+                .expect("entry")
+                .is_open()
+        );
+    }
+
+    /// A child already open under a different root would give one obligation
+    /// two lineages, and a budget could then be reset by picking whichever root
+    /// is convenient.
+    #[test]
+    fn a_child_colliding_with_a_foreign_lineage_is_refused() {
+        let mut ledger = DebtLedger::new();
+        ingest_one(&mut ledger, replayable("parent-a"), 1);
+        ingest_one(&mut ledger, replayable("parent-b"), 1);
+
+        let refusal = ledger.replace_obligation(
+            &ObligationKey(b"parent-a".to_vec()),
+            &[],
+            &[replayable("parent-b")],
+            1,
+            200,
+        );
+        assert_eq!(
+            refusal,
+            Err(ReplacementRefusal::ChildCollidesWithForeignLineage)
         );
     }
 

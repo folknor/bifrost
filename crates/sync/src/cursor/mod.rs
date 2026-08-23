@@ -29,6 +29,7 @@ pub use envelope::{
 };
 pub use ledger::{
     BarrierIncident, DebtLedger, DischargeEvidence, LedgerEntry, PolicyStatus, ProofStatus,
+    ReplacementProgress, ReplacementRefusal,
 };
 pub use store::{
     CheckpointStore, CheckpointTransition, DynCheckpointStore, InMemoryCheckpointStore,

@@ -891,6 +891,54 @@ impl SyncEngine {
         self.checkpoints.get_ledger(account_id).await
     }
 
+    /// Run one repair pass over this account's open coverage debt.
+    ///
+    /// Asks the account to re-read what an enumeration could not represent,
+    /// publishes recovered ids as ordinary `Created` signals, and discharges
+    /// only what the consumer durably acknowledges. Returns how many
+    /// obligations reached a terminal resolution.
+    ///
+    /// Skips anything waived, operator-blocked, or lacking a repair
+    /// descriptor. That last case is every barrier, by construction: no
+    /// checkpoint advanced past a barrier, so it is blocked progress rather
+    /// than debt, and its only terminal state is [`Self::waive_obligation`].
+    ///
+    /// Deliberately caller-driven rather than scheduled. Repair is remote work
+    /// against an account that may be throttled, paused, or degraded, and the
+    /// consumer is better placed than the engine to decide when to spend that
+    /// budget.
+    pub async fn repair_debt(
+        &self,
+        account_id: &AccountId,
+        max_requests: usize,
+    ) -> Result<usize, Error> {
+        let slot = self
+            .accounts
+            .get(account_id)
+            .ok_or_else(|| Error::AccountNotAttached(account_id.clone()))?;
+        let account = slot.current.load_full();
+        let changes_tx = slot.multiplexer.changes_tx.clone();
+        let coverage = Arc::clone(&slot.coverage);
+        let writer_tx = self
+            .ack_senders
+            .get(account_id)
+            .map(|r| r.value().clone())
+            .ok_or_else(|| Error::AccountNotAttached(account_id.clone()))?;
+        drop(slot);
+
+        let ledger = self.checkpoints.get_ledger(account_id).await?;
+        crate::repair::run_repair_pass(
+            account.as_ref().as_ref(),
+            account_id,
+            &ledger,
+            Some(&changes_tx),
+            &writer_tx,
+            &coverage,
+            max_requests,
+        )
+        .await
+    }
+
     /// Accept the loss at `key`, permanently and on the record.
     ///
     /// The ONLY route to abandonment, and it is deliberately reachable only
@@ -3913,6 +3961,23 @@ async fn ack_writer(
                 let _ = done.send(result);
                 continue;
             }
+            WriterRequest::ApplyRepair {
+                resolutions,
+                publication,
+                done,
+            } => {
+                let result = apply_repair_resolutions(
+                    &account_id,
+                    &store,
+                    &coverage,
+                    &mut ledger,
+                    resolutions,
+                    publication,
+                )
+                .await;
+                let _ = done.send(result);
+                continue;
+            }
             WriterRequest::RecordDebt {
                 report,
                 generation,
@@ -4008,6 +4073,152 @@ async fn persist_ledger_only(
     ledger: &crate::cursor::DebtLedger,
 ) -> Result<(), Error> {
     store.put_ledger(account_id, ledger.clone()).await
+}
+
+/// Fold one repair pass's outcomes into the ledger.
+///
+/// The ordering that matters: a `Recovered` resolution discharges ONLY when the
+/// consumer has acknowledged the publication carrying its id. Discharging
+/// before that recreates the original silent loss - the engine would forget the
+/// obligation while the consumer never learned the object exists. If the
+/// publication was never acknowledged (no subscriber, lag, cancellation) the
+/// obligation simply stays open and a later pass tries again; a crash between
+/// publish and acknowledgement costs a duplicate recovery, which is the same
+/// at-least-once asymmetry ordinary checkpoint delivery already has.
+async fn apply_repair_resolutions(
+    account_id: &AccountId,
+    store: &Arc<DynCheckpointStore>,
+    coverage: &PendingCoverage,
+    ledger: &mut crate::cursor::DebtLedger,
+    resolutions: Vec<crate::repair::RepairResolution>,
+    publication: Option<crate::cursor::PublicationId>,
+) -> Result<(), Error> {
+    // Was the batch of recovered ids durably accepted? Only then may anything
+    // recovered be discharged.
+    let published_and_acknowledged = match publication {
+        Some(id) => matches!(
+            coverage.claim(id),
+            ClaimLookup::Apply(_) | ClaimLookup::AlreadyPersisted
+        ),
+        None => false,
+    };
+    let now = jiff::Timestamp::now().as_second();
+
+    for resolution in resolutions {
+        match resolution {
+            crate::repair::RepairResolution::Recovered {
+                key,
+                attempt,
+                generation,
+            } => {
+                if !published_and_acknowledged {
+                    // Recovered but never delivered. Costs an attempt and stays
+                    // owed, which is the conservative direction.
+                    ledger.record_attempt(&key, crate::repair::DEFAULT_REPAIR_BUDGET);
+                    continue;
+                }
+                if !ledger.discharge_repaired(
+                    &key,
+                    generation,
+                    crate::cursor::DischargeEvidence::RepairedAndPublished { attempt },
+                ) {
+                    tracing::debug!(
+                        target: "bifrost.sync.repair",
+                        account = ?account_id,
+                        "repair result refused: the obligation moved on since it was read"
+                    );
+                }
+            }
+            crate::repair::RepairResolution::Irrelevant {
+                key,
+                detail,
+                generation,
+            } => {
+                // Nothing was published and nothing needs to be: absence from
+                // an old inventory snapshot is not a deletion to apply against
+                // current consumer state.
+                ledger.discharge_repaired(
+                    &key,
+                    generation,
+                    crate::cursor::DischargeEvidence::ProvedIrrelevant { detail },
+                );
+            }
+            crate::repair::RepairResolution::Replaced {
+                key,
+                proof,
+                generation,
+            } => {
+                apply_replacement(ledger, &key, &proof, generation, now);
+            }
+            crate::repair::RepairResolution::Deferred { key } => {
+                ledger.record_attempt(&key, crate::repair::DEFAULT_REPAIR_BUDGET);
+            }
+        }
+    }
+
+    persist_ledger_only(account_id, store, ledger).await
+}
+
+/// Apply a region proof, which either discharges the region or splits it.
+fn apply_replacement(
+    ledger: &mut crate::cursor::DebtLedger,
+    key: &bifrost_types::ObligationKey,
+    proof: &bifrost_types::RegionRepairProof,
+    generation: u64,
+    now: i64,
+) {
+    match proof {
+        // The account consumed the exact region its own durable token named and
+        // accounted for every result. Identity is what is checked here, not set
+        // inclusion - the lattice cannot do algebra over an opaque token.
+        bifrost_types::RegionRepairProof::ExactReplay => {
+            ledger.discharge_repaired(
+                key,
+                generation,
+                crate::cursor::DischargeEvidence::ProvedIrrelevant {
+                    detail: "exact replay of the named region accounted for every result".into(),
+                },
+            );
+        }
+        // Expressible in the lattice, so the engine checks it rather than
+        // taking the account's word.
+        bifrost_types::RegionRepairProof::CoveredBy { domain } => {
+            let covers = ledger
+                .entry(key)
+                .is_some_and(|entry| domain.covers(&entry.domain));
+            if covers {
+                ledger.discharge_repaired(
+                    key,
+                    generation,
+                    crate::cursor::DischargeEvidence::CoveringWalk {
+                        domain: domain.clone(),
+                    },
+                );
+            }
+        }
+        bifrost_types::RegionRepairProof::Partitioned {
+            proved, residual, ..
+        } => {
+            match ledger.replace_obligation(key, proved, residual, generation, now) {
+                Ok(crate::cursor::ReplacementProgress::Stalled) => {
+                    // Reshaped without improving anything. Charged against the
+                    // lineage so an account cannot loop forever by rotating
+                    // keys and tokens over the same unresolved extent.
+                    ledger.record_attempt(key, crate::repair::DEFAULT_REPAIR_BUDGET);
+                }
+                Ok(crate::cursor::ReplacementProgress::Progressed) => {}
+                Err(refusal) => {
+                    tracing::warn!(
+                        target: "bifrost.sync.repair",
+                        refusal = ?refusal,
+                        "refusing a region replacement"
+                    );
+                    ledger.record_attempt(key, crate::repair::DEFAULT_REPAIR_BUDGET);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Persist one acknowledged checkpoint together with everything it proves.
@@ -5934,6 +6145,166 @@ mod tests {
         assert!(
             result.is_err(),
             "an unrecognized publication must not be persisted as complete coverage"
+        );
+
+        drop(tx);
+        writer.await.expect("writer exits");
+    }
+
+    async fn seed_debt(
+        tx: &mpsc::Sender<WriterRequest>,
+        coverage: &crate::cursor::PendingCoverage,
+        key: &str,
+    ) {
+        let publication = coverage.publish(crate::cursor::CoverageClaim::new(
+            bifrost_types::InventoryCoverageReport::degraded(
+                bifrost_types::CoverageDomain::full(email_scope()),
+                vec![unrepresentable(key)],
+            ),
+            1,
+        ));
+        ack(
+            tx,
+            backfill_checkpoint(bifrost_types::Partition(b"page-0".to_vec())),
+            Some(publication),
+        )
+        .await
+        .expect("ack persisted");
+    }
+
+    async fn apply_repair(
+        tx: &mpsc::Sender<WriterRequest>,
+        resolutions: Vec<crate::repair::RepairResolution>,
+        publication: Option<crate::cursor::PublicationId>,
+    ) {
+        let (done, wait) = oneshot::channel();
+        tx.send(WriterRequest::ApplyRepair {
+            resolutions,
+            publication,
+            done,
+        })
+        .await
+        .expect("writer alive");
+        wait.await
+            .expect("writer answered")
+            .expect("repair applied");
+    }
+
+    /// A recovered object discharges only once the consumer has acknowledged
+    /// the publication carrying its id.
+    ///
+    /// Discharging on the account's success alone recreates the original silent
+    /// loss in a new place: the engine would forget the obligation while the
+    /// consumer never learned the object exists.
+    #[tokio::test]
+    async fn a_recovery_discharges_only_after_the_consumer_acknowledges() {
+        let (account, store, coverage, tx, writer) = writer_harness();
+        seed_debt(&tx, &coverage, "broken").await;
+        let key = bifrost_types::ObligationKey(b"broken".to_vec());
+
+        // Published, but nothing acknowledged it.
+        apply_repair(
+            &tx,
+            vec![crate::repair::RepairResolution::Recovered {
+                key: key.clone(),
+                attempt: bifrost_types::RepairAttemptId(1),
+                generation: 1,
+            }],
+            None,
+        )
+        .await;
+        assert!(
+            store
+                .get_ledger(&account)
+                .await
+                .expect("ledger")
+                .entry(&key)
+                .expect("entry")
+                .is_open(),
+            "an unacknowledged recovery must leave the obligation owed"
+        );
+
+        // Now with an acknowledgeable publication.
+        let publication = coverage.publish_without_report(0);
+        apply_repair(
+            &tx,
+            vec![crate::repair::RepairResolution::Recovered {
+                key: key.clone(),
+                attempt: bifrost_types::RepairAttemptId(2),
+                generation: 1,
+            }],
+            Some(publication),
+        )
+        .await;
+
+        let ledger = store.get_ledger(&account).await.expect("ledger");
+        let entry = ledger.entry(&key).expect("entry");
+        assert!(!entry.is_open(), "an acknowledged recovery discharges");
+        assert!(matches!(
+            entry.proof,
+            crate::cursor::ProofStatus::Discharged {
+                evidence: crate::cursor::DischargeEvidence::RepairedAndPublished { .. }
+            }
+        ));
+        assert!(ledger.completion_permitted(&email_scope()));
+
+        drop(tx);
+        writer.await.expect("writer exits");
+    }
+
+    /// A definitively-irrelevant object discharges with NOTHING published.
+    /// Absence from an old inventory snapshot is not a deletion to apply
+    /// against current consumer state.
+    #[tokio::test]
+    async fn definitive_irrelevance_discharges_without_publishing() {
+        let (account, store, coverage, tx, writer) = writer_harness();
+        seed_debt(&tx, &coverage, "gone").await;
+        let key = bifrost_types::ObligationKey(b"gone".to_vec());
+
+        apply_repair(
+            &tx,
+            vec![crate::repair::RepairResolution::Irrelevant {
+                key: key.clone(),
+                detail: "absent under cursor bridge".into(),
+                generation: 1,
+            }],
+            None,
+        )
+        .await;
+
+        let ledger = store.get_ledger(&account).await.expect("ledger");
+        assert!(!ledger.entry(&key).expect("entry").is_open());
+        assert!(ledger.completion_permitted(&email_scope()));
+
+        drop(tx);
+        writer.await.expect("writer exits");
+    }
+
+    /// Deferrals spend the lineage budget and land on `OperatorBlocked` - never
+    /// on a discharge, and never on a waiver. A counter running out is evidence
+    /// that retrying is not working, not a decision about acceptable loss.
+    #[tokio::test]
+    async fn repeated_deferrals_block_rather_than_abandon() {
+        let (account, store, coverage, tx, writer) = writer_harness();
+        seed_debt(&tx, &coverage, "stuck").await;
+        let key = bifrost_types::ObligationKey(b"stuck".to_vec());
+
+        for _ in 0..crate::repair::DEFAULT_REPAIR_BUDGET {
+            apply_repair(
+                &tx,
+                vec![crate::repair::RepairResolution::Deferred { key: key.clone() }],
+                None,
+            )
+            .await;
+        }
+
+        let ledger = store.get_ledger(&account).await.expect("ledger");
+        let entry = ledger.entry(&key).expect("entry");
+        assert_eq!(entry.policy, crate::cursor::PolicyStatus::OperatorBlocked);
+        assert!(entry.is_open(), "a spent budget proves nothing");
+        assert!(
+            !ledger.completion_permitted(&email_scope()),
+            "blocked debt must still hold the completion sentinel"
         );
 
         drop(tx);

@@ -35,6 +35,7 @@ pub mod multiplexer;
 pub mod mutation;
 pub mod push;
 pub mod recovery;
+pub mod repair;
 pub mod scheduler;
 pub mod types;
 
@@ -64,6 +65,9 @@ pub use cursor::{
     MIN_MIGRATABLE, PendingCoverage, PolicyStatus, ProofStatus, PublicationId, decode_envelope,
     encode_envelope,
 };
+
+// Inventory coverage repair.
+pub use repair::{DEFAULT_REPAIR_BUDGET, RepairResolution, run_repair_pass};
 
 // Backfill policy types.
 pub use backfill::{BackfillPolicy, BackfillStrategy};

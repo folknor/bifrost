@@ -57,6 +57,107 @@ fn coverage_of(
     )
 }
 
+/// Work off inventory coverage debt by re-reading each object from Gmail.
+///
+/// Gmail's object lane is the simple case: a message is addressable by id
+/// alone, so the repair token is empty and the request needs nothing the walk
+/// did not already know. `users.messages.get` is authoritative for current
+/// existence, and the entry is rebuilt from that fresh read rather than from
+/// anything cached - which is what makes the recovered representation safe to
+/// announce.
+///
+/// One terminal outcome per request, always, including for shapes this account
+/// cannot serve: a region request reaches here only through an engine bug, and
+/// answering it with `Deferred` keeps the correlation contract intact instead
+/// of leaving the attempt dangling.
+pub(crate) fn repair_inventory(
+    client: Arc<GmailClient>,
+    cache: ScopeCache,
+    requests: AccountStream<bifrost_types::InventoryRepairRequest>,
+) -> AccountStream<bifrost_types::InventoryRepairEvent> {
+    Box::pin(async_stream::stream! {
+        let labels = match labels_for_flags(&client, &cache).await {
+            Ok(labels) => Arc::new(labels),
+            Err(error) => {
+                // No per-request conclusion is possible without the label map,
+                // so the stream terminates and the engine converts every
+                // outstanding attempt to a local deferral. It must not invent
+                // an answer none of them received.
+                yield bifrost_types::InventoryRepairEvent::Terminated(
+                    error::into_account_error(error, error::GmailErrorContext::inventory()),
+                );
+                return;
+            }
+        };
+
+        let mut requests = requests;
+        while let Some(request) = requests.next().await {
+            let attempt = request.attempt;
+            let bifrost_types::InventoryRepairTarget::Object { id, .. } = &request.target else {
+                let account_error = error::into_account_error(
+                    crate::error::Error::unsupported(AccountOperation::SyncInventory),
+                    error::GmailErrorContext::inventory(),
+                );
+                yield bifrost_types::InventoryRepairEvent::Outcome(
+                    bifrost_types::InventoryRepairOutcome::Deferred { attempt, error: account_error },
+                );
+                continue;
+            };
+
+            let outcome = match client.get_message(&id.0, "metadata").await {
+                Ok(message) => {
+                    // Rebuilding the entry IS the proof: the obligation was
+                    // raised because this object could not be represented, so
+                    // re-reading it is only half the answer.
+                    let entry = inventory_entry_from_message(&message, labels.as_slice());
+                    bifrost_types::InventoryRepairOutcome::ObjectRecovered {
+                        attempt,
+                        entry: Box::new(entry),
+                    }
+                }
+                Err(error) => {
+                    let account_error = error::into_account_error(
+                        error,
+                        error::GmailErrorContext::inventory(),
+                    );
+                    if matches!(
+                        account_error.kind(),
+                        AccountErrorKind::NotFound(ResourceKind::Message)
+                    ) {
+                        // Definitive, and the reason is the cursor model rather
+                        // than the status code. Gmail's cursor is anchored at
+                        // the historyId sampled BEFORE the walk that raised
+                        // this obligation, so any deletion since then is
+                        // reported by the change stream the consumer is already
+                        // reading. Absence is therefore the correct inventory
+                        // state and nothing is owed. Under a different
+                        // pagination or cursor model the same NotFound would
+                        // NOT be dischargeable.
+                        bifrost_types::InventoryRepairOutcome::DefinitivelyIrrelevant {
+                            attempt,
+                            evidence:
+                                bifrost_types::DefinitiveIrrelevance::AbsentUnderCursorBridge {
+                                    detail: format!(
+                                        "gmail message {} absent; the scope cursor is anchored \
+                                         before the walk that raised this obligation, so its \
+                                         removal is carried by the change stream",
+                                        id.0
+                                    ),
+                                },
+                        }
+                    } else {
+                        bifrost_types::InventoryRepairOutcome::Deferred {
+                            attempt,
+                            error: account_error,
+                        }
+                    }
+                }
+            };
+            yield bifrost_types::InventoryRepairEvent::Outcome(outcome);
+        }
+    })
+}
+
 pub(crate) fn inventory_stream(
     client: Arc<GmailClient>,
     cache: ScopeCache,

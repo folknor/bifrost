@@ -326,6 +326,17 @@ impl Account for GoogleAccount {
         )
     }
 
+    fn repair_inventory(
+        &self,
+        requests: AccountStream<bifrost_types::InventoryRepairRequest>,
+    ) -> AccountStream<bifrost_types::InventoryRepairEvent> {
+        inventory::repair_inventory(
+            Arc::clone(&self.client),
+            Arc::clone(&self.scope_cache),
+            requests,
+        )
+    }
+
     fn get_stream(
         &self,
         ids: AccountStream<ObjectId>,

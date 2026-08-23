@@ -58,6 +58,7 @@ use crate::hydration::{HydrationProjection, Importance, Message, ThreadHydration
 use crate::ids::{AccountId, ObjectId, SubscriptionHandle, ThreadId};
 use crate::mutation::{FlagOp, HydratedObject, IdempotencyKey, Projection};
 use crate::page::{Page, SkippedScope};
+use crate::repair::{InventoryRepairEvent, InventoryRepairOutcome, InventoryRepairRequest};
 use crate::search::SearchRequest;
 use crate::settings::{Identity, IdentityPatch, QuotaInfo, VacationConfig};
 
@@ -286,6 +287,61 @@ pub trait Account: Send + Sync {
             InventoryPartition::Full => self.inventory_stream(scope),
             _ => unsupported_inventory_stream(scope, AccountOperation::SyncInventory),
         }
+    }
+
+    /// Work off inventory coverage debt with a provider-native re-read.
+    ///
+    /// Deliberately not `get_stream`, which hydrates known ids at a projection
+    /// and cannot express region replay, completeness proof, or authoritative
+    /// absence. Requests stream so the engine can backpressure a long repair
+    /// pass, mirroring `get_stream`'s input.
+    ///
+    /// The contract, all of which the engine enforces:
+    ///
+    /// - EXACTLY ONE terminal outcome per accepted request, correlated by
+    ///   `RepairAttemptId`. Two outcomes for one attempt, an unknown attempt,
+    ///   or an outcome whose kind does not match its request are all rejected.
+    /// - `Terminated` explains why the stream stopped; it does NOT stand in for
+    ///   the missing outcomes. The engine converts still-outstanding requests
+    ///   to a local deferral rather than recording a conclusion the account
+    ///   never reached.
+    /// - A recovered object must be READ AUTHORITATIVELY AND CURRENTLY, not
+    ///   replayed out of an old snapshot. `RegionRecovery::DurableReplay` means
+    ///   the region can be re-read independently of the walk that found it; it
+    ///   does not mean the bytes it returns are current. An account whose
+    ///   replay is historical must follow it with current reads and emit only
+    ///   current representations.
+    /// - `ObjectRecovered` carries the rebuilt `InventoryEntry` because
+    ///   constructing it is the proof that the representation failure which
+    ///   raised the obligation has healed. Only its id reaches the consumer:
+    ///   the engine validates the entry, keeps the id, and discards the rest,
+    ///   exactly as a successful inventory walk does.
+    ///
+    /// The default implementation refuses PER REQUEST rather than terminating
+    /// the stream, so every attempt gets its correlated answer and the engine
+    /// can classify unsupported repair as `OperatorBlocked` immediately instead
+    /// of spending a transient retry budget on a capability that will never
+    /// exist.
+    fn repair_inventory(
+        &self,
+        requests: AccountStream<InventoryRepairRequest>,
+    ) -> AccountStream<InventoryRepairEvent> {
+        use futures::StreamExt;
+        Box::pin(requests.map(|request| {
+            let error = AccountErrorBuilder::new(
+                AccountErrorKind::Unsupported(AccountOperation::SyncInventory),
+                Cause::Request(RequestCause::Unsupported {
+                    operation: AccountOperation::SyncInventory,
+                }),
+            )
+            .operation(AccountOperation::SyncInventory)
+            .try_build()
+            .expect("valid account error classification");
+            InventoryRepairEvent::Outcome(InventoryRepairOutcome::Deferred {
+                attempt: request.attempt,
+                error,
+            })
+        }))
     }
 
     /// Hydrate known ids at a chosen projection. Input ids are

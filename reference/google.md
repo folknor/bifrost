@@ -609,6 +609,40 @@ History entries map to `Change` variants in
 - `labelsAdded` / `labelsRemoved` -> `ScopeChange` rows scoped
   per label.
 
+## Repairing inventory coverage debt
+
+Gmail is the first `Account::repair_inventory` implementor, and it exercises the
+object lane only - it has no region obligations to repair.
+
+`repair_inventory` re-reads each requested message with
+`users.messages.get(format=metadata)` and rebuilds its `InventoryEntry` from
+that fresh read. Rebuilding is the point, not a side effect: the obligation was
+raised because the object could not be REPRESENTED, so confirming it still
+exists proves only half of what is owed. The rebuilt entry crosses the Account
+boundary as proof and is then discarded by the engine, which publishes only the
+id - the same thing a successful walk publishes.
+
+A `NotFound` becomes `DefinitiveIrrelevance::AbsentUnderCursorBridge`, and the
+reason is the cursor model rather than the status code. The scope cursor is
+anchored at the `historyId` sampled BEFORE the walk that raised the obligation,
+so any deletion since then is carried by the change stream the consumer is
+already reading; absence is therefore the correct inventory state and nothing is
+owed. Under a different pagination or cursor model the identical `NotFound`
+would NOT be dischargeable, which is why the conclusion is typed and carries its
+authority rather than being inferred from the error kind. This is the same
+argument the inventory walk already uses to discharge a message deleted between
+`users.messages.list` and `users.messages.get`.
+
+Everything else defers, costing one attempt against the lineage budget. A region
+request reaching this account is an engine bug; it is answered with `Deferred`
+rather than dropped, so the one-terminal-outcome-per-request contract holds even
+then.
+
+The label map is fetched once per pass. If that fetch fails no per-request
+conclusion is possible, so the stream terminates and the engine converts every
+outstanding attempt to a local deferral - it must not record a conclusion the
+account never reached.
+
 ## Push: Cloud Pub/Sub
 
 Push is out-of-process. `PubSubConfig` holds a `topic` and an

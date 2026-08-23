@@ -1274,10 +1274,101 @@ Degraded coverage is surfaced to the consumer as a
 `SyncEngine::debt`. Durable debt that nothing reports, or that nothing can list,
 is only half a fix.
 
-**Not yet built: provider-native repair.** Debt is durable, attributable,
-enumerable, waivable, and dischargeable by a later covering walk - but no
-provider-native re-read exists yet, so an object whose scope is never re-walked
-stays owed until an operator waives it. See `notes/todo.md`.
+### Repair
+
+`SyncEngine::repair_debt` runs one pass: it reads the ledger back, asks the
+account to re-read what it could not represent, publishes what came back, and
+discharges only what the consumer acknowledged. Caller-driven rather than
+scheduled, because repair is remote work against an account that may be
+throttled or degraded and the consumer knows better than the engine when to
+spend that budget.
+
+`Account::repair_inventory` takes a stream of `InventoryRepairRequest` and
+yields correlated outcomes. Not `get_stream`, which hydrates known ids at a
+projection and cannot express region replay, completeness proof, or
+authoritative absence. The default implementation refuses PER REQUEST rather
+than terminating the stream, so every attempt gets its answer and unsupported
+repair classifies straight to `OperatorBlocked` instead of burning a transient
+budget on a capability that will never exist.
+
+Correlation is by engine-issued `RepairAttemptId`, not by `ObligationKey`. The
+key identifies durable debt, not one execution: an attempt may be retried after
+a stream terminates, a stale event may arrive from an abandoned stream, and the
+same key may be reopened at a newer generation - so key-only correlation risks
+applying an old result to a newly reopened instance. Exactly one terminal
+outcome per accepted request; a duplicate, an unknown attempt, or an outcome
+whose kind does not match its request is dropped. `Terminated` explains why a
+stream stopped and does NOT answer for outstanding requests: those become LOCAL
+deferrals, because recording a conclusion nobody reached is the same invented
+certainty the coverage model exists to prevent.
+
+Ledger entries retain the account-minted `InventoryRepairTarget`. Without it the
+executor cannot reconstruct a request at all - key, domain and error are engine
+or diagnostic facts, and the error in particular must never serve as a repair
+descriptor because classifications change between revisions.
+
+**Repair publishes ids, never object state, and that is what removes the race it
+looks like it should have.** No inventory path delivers an `InventoryEntry` to a
+consumer: `InventoryFusion` and `BackfillRunner` both keep the id, discard the
+entry, and publish `ObjectChange::Created`. Repair mirrors that exactly. A
+repair publication therefore carries no payload that could overwrite a newer
+representation and nothing to insert after a tombstone; a stale repair `Created`
+is resolved the way a stale backfill `Created` already is, by hydration
+returning not-found. So there is no conditional application, no tombstone
+requirement, no version-relation hook, and no lease held against polling. This
+matters because `ServerVersion` could not have arbitrated it anyway - `ETag` and
+`StateAt` are equality tokens, `ModSeq` orders only within a UIDVALIDITY epoch,
+and the type derives `Eq` and not `Ord` for exactly that reason.
+
+The entry still crosses the ACCOUNT boundary on `ObjectRecovered`, because
+building it is the proof that the representation failure which raised the
+obligation has healed; an id alone would only prove the object still exists. The
+engine validates it (one entry, matching id, right request kind), keeps the id,
+and drops the rest.
+
+Discharge happens on the consumer's acknowledgement of the repair publication,
+and both halves are recorded as `DischargeEvidence::RepairedAndPublished`.
+Neither alone suffices: an account recovery nobody was told about leaves the
+consumer unaware, and a published id with no successful account result merely
+repeats an id. An unacknowledged recovery costs an attempt and stays owed. The
+bar is deliberately no higher than the successful path's: a durably acknowledged
+`Created` is the most any walk ever achieves for any object, so demanding proof
+of successful hydration would fuse two failure domains - coverage asks whether
+enumeration announced the object, hydration asks whether a projection can be
+fetched now, and a later hydration failure belongs to the hydration lane and its
+`ItemOutcome`.
+
+`DefinitivelyIrrelevant` discharges and publishes NOTHING: absence from an old
+inventory snapshot is not a deletion to apply against current state. It is a
+typed account conclusion, never a status code - a 404 may mean deleted, moved
+out of scope, permission lost, wrongly routed, or not yet replicated. Google's
+variant is `AbsentUnderCursorBridge`, and it rests on the Gmail cursor being
+anchored at the historyId sampled BEFORE the walk that raised the obligation, so
+any deletion since is carried by the change stream. Under a different cursor
+model the same `NotFound` would not be dischargeable.
+
+Region discharge needs proof, never just entries. `RegionRepairProof` is
+`ExactReplay` (identity-checked: the account consumed the exact region its own
+token named), `CoveredBy` (checked with `CoverageDomain::covers`), or
+`Partitioned` (the account asserts the split where the extent is opaque and the
+lattice cannot do set algebra over it).
+
+Retry budgets accrue at the LINEAGE ROOT, counting completed outcomes only. A
+crash after provider work but before acknowledgement must cost a repeated
+attempt, not a consumed budget. Per-key budgets would be evaded by re-minting an
+equivalent obligation each pass, so `replace_obligation` is an atomic
+parent-to-children swap - appending would double-count the extent and replay the
+parent forever - and children inherit the root. A child already open under a
+different root is refused outright rather than silently given two lineages.
+Progress is judged across extent, granularity, proof gained and repair
+authority, not extent equality: turning one opaque region into three addressable
+objects is progress at identical extent, while repartitioning into equally
+opaque children is not, and only the multi-dimensional test gets both right.
+
+**Still not built:** region repair has no provider implementing it (Graph's
+region is a barrier by construction), so `ExactReplay`, `Partitioned` and
+lineage splitting are exercised by tests rather than by a live provider. Ledger
+compaction is also outstanding - see `notes/todo.md`.
 
 ## Cursor envelope
 
