@@ -1200,14 +1200,38 @@ confirm against the code before working any of them.
   `bifrost-graph` had SIX unbounded `@odata.nextLink` loops with no page budget
   and no repeated-link guard, plus an unguarded folder-parentage descent. See
   `reference/graph.md`, "Bounded `nextLink` traversal".
-- **google-B5. `inventory_stream` has no per-item failed lane.** [C4]
-  `Account::inventory_stream` in `bifrost-types` returns
-  `AccountStream<SyncEvent<InventoryEntry>>` with no `ItemOutcome` wrapper, so a
-  per-id failed lane is a published trait change. The data-loss symptom is
-  already handled - a hydration error classified `NotFound(Message)` is absorbed
-  as the ordinary list/get deletion race - but every other classified failure
-  still terminates the whole walk and discards every page already emitted. That
-  residual is real and unfixed.
+- **sync-B4. Work off inventory coverage debt (the repair path).** [C2] Tail of
+  google-B5, whose mechanism landed 2026-08-23. Inventory now has an
+  `InventoryCoverage` model: a walk that cannot represent an object records an
+  `InventoryObligation` and keeps going, every checkpoint from that point
+  declares the gap, cursor and coverage are persisted in ONE atomic record, the
+  backfill completion sentinel is withheld, and a warning is raised. So the
+  scope converges live-and-degraded and nothing is silently lost.
+
+  What does NOT exist yet is anything that works the debt off. Obligations sit
+  in the durable record until a later walk of that scope reports `Complete`.
+  For a Gmail account that means the object stays missing until the next full
+  inventory, and for a scope whose backfill has finished there may be no next
+  walk at all.
+
+  The design, argued out with the cold reviewer and recorded in
+  `reference/sync.md`: a repair pass reads the obligations back and retries
+  them, using the account's own opaque `repair` / `replay` tokens rather than
+  ordinary `get_stream` - only the protocol crate knows what a provider-native
+  re-read needs, and a `Region` obligation names a page to replay rather than
+  an id to fetch. A later success removes the obligation and emits the recovered
+  entry; a definitive absence removes it without one. Obligation states worth
+  having: `Pending` (retry normally), `OperatorBlocked` (a retry budget expired;
+  stop trying automatically but stay visible), and `Waived` (an operator
+  explicitly accepts the omission). **Only `Waived` is true abandonment, and it
+  must never happen because a local retry counter ran out** - the account layer
+  classifies evidence, it does not choose the user's acceptable-loss policy.
+
+  Note the `Region` case has a hard boundary: the main cursor may advance past
+  a replayable region only if that region can later be replayed INDEPENDENTLY of
+  the advanced cursor. If Graph's delta API cannot replay a page after the delta
+  link moves on, there is no honest discharge and that page has to remain a
+  checkpoint barrier.
 
 ### Open defects
 

@@ -60,8 +60,8 @@ pub use recovery::ThrottleBucket;
 // Cursor and checkpoint plumbing.
 pub use cursor::{
     BackfillCheckpointRecord, ChangeCheckpointRecord, CheckpointStore, CursorRegistry,
-    DynCheckpointStore, ENGINE_VERSION, InMemoryCheckpointStore, MIN_MIGRATABLE, decode_envelope,
-    encode_envelope,
+    DynCheckpointStore, ENGINE_VERSION, InMemoryCheckpointStore, MIN_MIGRATABLE, PendingCoverage,
+    decode_envelope, encode_envelope,
 };
 
 // Backfill policy types.

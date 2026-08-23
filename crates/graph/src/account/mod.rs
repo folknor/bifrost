@@ -724,19 +724,17 @@ impl Account for GraphAccount {
                         inventory::inventory_stream(account, scope)
                     }
                 })
-                .flatten()
-                .map(InventoryEvent::from),
+                .flatten(),
             );
         }
-        Box::pin(inventory::inventory_stream(self.clone(), scope).map(InventoryEvent::from))
+        inventory::inventory_stream(self.clone(), scope)
     }
 
     fn inventory_resume_stream(
         &self,
         cursor: ChangeCursor,
     ) -> Option<AccountStream<InventoryEvent>> {
-        let stream = inventory::resume_inventory_stream(self.clone(), cursor)?;
-        Some(Box::pin(stream.map(InventoryEvent::from)))
+        inventory::resume_inventory_stream(self.clone(), cursor)
     }
 
     fn is_inventory_cursor(&self, cursor: &ChangeCursor) -> bool {

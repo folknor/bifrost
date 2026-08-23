@@ -38,17 +38,37 @@ struct GmailMessageStub {
     id: String,
 }
 
+/// Coverage for a checkpoint emitted after `obligations` were observed.
+///
+/// Every checkpoint from the first unresolved obligation onward declares the
+/// gap, not just the terminal one: a checkpoint certifies the results BEFORE
+/// it, and a page checkpoint that claimed `Complete` would let the cursor
+/// advance past an object nothing recorded.
+fn coverage_of(
+    obligations: &[bifrost_types::InventoryObligation],
+) -> bifrost_types::InventoryCoverage {
+    if obligations.is_empty() {
+        bifrost_types::InventoryCoverage::Complete
+    } else {
+        bifrost_types::InventoryCoverage::Degraded {
+            obligations: obligations.to_vec(),
+        }
+    }
+}
+
 pub(crate) fn inventory_stream(
     client: Arc<GmailClient>,
     cache: ScopeCache,
     scope: CursorScope,
-) -> AccountStream<SyncEvent<InventoryEntry>> {
+) -> AccountStream<bifrost_types::InventoryEvent> {
     if !matches!(scope, CursorScope::Account) {
         let account_error = error::into_account_error(
             crate::error::Error::unsupported(bifrost_types::AccountOperation::SyncInventory),
             error::GmailErrorContext::inventory(),
         );
-        return Box::pin(stream::iter([SyncEvent::Terminated(account_error)]));
+        return Box::pin(stream::iter([bifrost_types::InventoryEvent::Terminated(
+            account_error,
+        )]));
     }
 
     Box::pin(async_stream::stream! {
@@ -74,11 +94,15 @@ pub(crate) fn inventory_stream(
                     error,
                     error::GmailErrorContext::inventory(),
                 );
-                yield SyncEvent::Terminated(account_error);
+                yield bifrost_types::InventoryEvent::Terminated(account_error);
                 return;
             }
         };
         let mut page_token = None;
+        // Objects this walk discovered but could not represent. Once non-empty
+        // every later checkpoint declares DEGRADED coverage, because a
+        // checkpoint must name every unresolved obligation preceding it.
+        let mut obligations: Vec<bifrost_types::InventoryObligation> = Vec::new();
 
         loop {
             let started = Instant::now();
@@ -89,37 +113,42 @@ pub(crate) fn inventory_stream(
                         error,
                         error::GmailErrorContext::inventory(),
                     );
-                    yield SyncEvent::Terminated(account_error);
+                    yield bifrost_types::InventoryEvent::Terminated(account_error);
                     return;
                 }
             };
 
             let final_page = page.next_page_token.is_none();
+            // The id travels with its result: a per-item failure has to NAME
+            // the object it could not represent, or the obligation is a region
+            // with nothing to retry against.
             let mut hydrated = stream::iter(page.messages.into_iter().map(|stub| {
                 let client = Arc::clone(&client);
                 let labels = Arc::clone(&labels);
                 async move {
-                    client
+                    let outcome = client
                         .get_message(&stub.id, "metadata")
                         .await
-                        .map(|message| inventory_entry_from_message(&message, labels.as_slice()))
+                        .map(|message| inventory_entry_from_message(&message, labels.as_slice()));
+                    (stub.id, outcome)
                 }
             }))
             .buffer_unordered(HYDRATE_BATCH_SIZE);
 
             let mut items = Vec::with_capacity(HYDRATE_BATCH_SIZE);
-            while let Some(result) = hydrated.next().await {
+            while let Some((id, result)) = hydrated.next().await {
                 match result {
                     Ok(item) => {
                         items.push(item);
                         if items.len() >= HYDRATE_BATCH_SIZE {
                             let out = std::mem::take(&mut items);
-                            yield SyncEvent::Batch(Batch {
+                            yield bifrost_types::InventoryEvent::Batch(bifrost_types::InventoryBatch {
                                 items: out,
                                 page_boundary: PageBoundary::Page,
                                 server_latency: started.elapsed(),
                                 bytes_in: 0,
                                 checkpoint: None,
+                                coverage: coverage_of(&obligations),
                             });
                         }
                     }
@@ -130,41 +159,63 @@ pub(crate) fn inventory_stream(
                         );
                         // A message may be deleted after users.messages.list
                         // names it and before users.messages.get hydrates it.
-                        // Inventory has no per-item failure lane, and absence
-                        // is the correct current state, so absorb only this
-                        // precisely classified race. Every other failure still
-                        // terminates the walk.
+                        // That is DISCHARGED, not deferred: the id came from
+                        // this walk's own listing, the cursor is anchored
+                        // before the walk, and absence is the correct
+                        // inventory state - so nothing is owed. Note this
+                        // rests on those facts, not on the error kind alone;
+                        // the same NotFound under a different pagination model
+                        // would not be dischargeable.
                         if matches!(
                             account_error.kind(),
                             AccountErrorKind::NotFound(ResourceKind::Message)
                         ) {
                             continue;
                         }
-                        yield SyncEvent::Terminated(account_error);
-                        return;
+                        // Everything else is an OBLIGATION, not a reason to
+                        // discard the walk. Terminating here cost the whole
+                        // backfill partition - every page already emitted -
+                        // for one unreadable object, repeatedly, because the
+                        // next attempt hit the same object. The walk now
+                        // continues and the checkpoint declares the gap, so
+                        // the scope converges while staying honest about what
+                        // it is missing.
+                        obligations.push(bifrost_types::InventoryObligation::Object {
+                            id: bifrost_types::ObjectId(id),
+                            error: account_error,
+                            // No provider-native repair token: a Gmail message
+                            // is re-readable from its id alone.
+                            repair: Vec::new(),
+                        });
+                        continue;
                     }
                 }
             }
 
             if final_page {
-                yield SyncEvent::Batch(Batch {
+                yield bifrost_types::InventoryEvent::Batch(bifrost_types::InventoryBatch {
                     items,
                     page_boundary: PageBoundary::Final,
                     server_latency: started.elapsed(),
                     bytes_in: 0,
                     checkpoint: checkpoint.clone(),
+                    coverage: coverage_of(&obligations),
                 });
-                yield SyncEvent::Done(checkpoint);
+                yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion {
+                    checkpoint,
+                    coverage: coverage_of(&obligations),
+                });
                 break;
             }
 
             if !items.is_empty() {
-                yield SyncEvent::Batch(Batch {
+                yield bifrost_types::InventoryEvent::Batch(bifrost_types::InventoryBatch {
                     items,
                     page_boundary: PageBoundary::Page,
                     server_latency: started.elapsed(),
                     bytes_in: 0,
                     checkpoint: None,
+                    coverage: coverage_of(&obligations),
                 });
             }
             page_token = page.next_page_token;
@@ -722,6 +773,89 @@ mod tests {
         assert_eq!(state.profile_email, "person@example.com");
     }
 
+    /// An unreadable object costs that object, not the whole partition.
+    ///
+    /// This is the defect the coverage model exists for. A classified
+    /// hydration failure that is NOT the list/get deletion race used to yield
+    /// `Terminated`, discarding every page the walk had already emitted and
+    /// leaving no cursor - so the next attempt re-walked from the start, hit
+    /// the same object, and failed the same way, forever.
+    ///
+    /// The walk now keeps going and records the object as an obligation, and
+    /// the checkpoint DECLARES that gap rather than certifying coverage it
+    /// does not have. Both halves are asserted: the surviving message is still
+    /// delivered with a checkpoint, and the completion reports `Degraded`
+    /// naming the object. A change that kept walking but claimed `Complete`
+    /// would pass the first half while silently making the object permanently
+    /// invisible - the cursor advances past it and the changes stream only
+    /// reports what happens next.
+    #[tokio::test]
+    async fn an_unreadable_object_becomes_an_obligation_instead_of_killing_the_walk() {
+        let client = scripted_client(vec![
+            ok_json(json!({ "emailAddress": "person@example.com", "historyId": "100" })),
+            ok_json(json!({ "labels": [] })),
+            ok_json(json!({ "messages": [{ "id": "broken" }, { "id": "live" }] })),
+            // Not a 404: a permission failure is not evidence of absence, so
+            // nothing is discharged and an obligation is owed.
+            canned(
+                StatusCode::FORBIDDEN,
+                br#"{"error":{"code":403,"message":"Forbidden","status":"PERMISSION_DENIED"}}"#,
+            ),
+            ok_json(json!({ "id": "live", "threadId": "thread-live" })),
+        ]);
+
+        let events = inventory_stream(
+            client,
+            Arc::new(std::sync::RwLock::new(
+                super::super::scopes::ScopeSnapshot::empty(),
+            )),
+            CursorScope::Account,
+        )
+        .collect::<Vec<_>>()
+        .await;
+
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, bifrost_types::InventoryEvent::Terminated(_))),
+            "one unreadable object must not discard the walk: {events:?}"
+        );
+
+        let bifrost_types::InventoryEvent::Done(completion) = events.last().expect("events") else {
+            panic!("the walk must finish, not stall: {events:?}");
+        };
+        assert!(
+            completion.checkpoint.is_some(),
+            "the scope must converge rather than re-walking forever"
+        );
+        let bifrost_types::InventoryCoverage::Degraded { obligations } = &completion.coverage
+        else {
+            panic!("a checkpoint over an unrepresented object must declare the gap");
+        };
+        assert_eq!(obligations.len(), 1);
+        assert!(
+            matches!(
+                &obligations[0],
+                bifrost_types::InventoryObligation::Object { id, .. }
+                    if id.0 == "broken"
+            ),
+            "the obligation must name the object so a repair can address it: {obligations:?}"
+        );
+
+        // The surviving message is still delivered, and its batch declares the
+        // gap too - a page checkpoint certifies the results before it.
+        let batch = events
+            .iter()
+            .find_map(|event| match event {
+                bifrost_types::InventoryEvent::Batch(batch) => Some(batch),
+                _ => None,
+            })
+            .expect("the surviving message must still be delivered");
+        assert_eq!(batch.items.len(), 1);
+        assert_eq!(batch.items[0].id, ObjectId("live".to_string()));
+        assert!(!batch.coverage.is_complete());
+    }
+
     #[tokio::test]
     async fn inventory_absorbs_a_list_get_not_found_race_and_finishes() {
         let client = scripted_client(vec![
@@ -746,13 +880,16 @@ mod tests {
         .await;
 
         assert_eq!(events.len(), 2);
-        let SyncEvent::Batch(batch) = &events[0] else {
+        let bifrost_types::InventoryEvent::Batch(batch) = &events[0] else {
             panic!("inventory must emit its surviving final batch");
         };
         assert!(matches!(batch.page_boundary, PageBoundary::Final));
         assert_eq!(batch.items.len(), 1);
         assert_eq!(batch.items[0].id, ObjectId("live".to_string()));
-        assert!(matches!(events[1], SyncEvent::Done(Some(_))));
+        assert!(matches!(
+            &events[1],
+            bifrost_types::InventoryEvent::Done(completion) if completion.checkpoint.is_some()
+        ));
     }
 
     #[tokio::test]
@@ -774,13 +911,16 @@ mod tests {
         .await;
 
         assert_eq!(events.len(), 2);
-        let SyncEvent::Batch(batch) = &events[0] else {
+        let bifrost_types::InventoryEvent::Batch(batch) = &events[0] else {
             panic!("empty inventory must still expose its final boundary");
         };
         assert!(batch.items.is_empty());
         assert!(matches!(batch.page_boundary, PageBoundary::Final));
         assert!(batch.checkpoint.is_some());
-        assert!(matches!(events[1], SyncEvent::Done(Some(_))));
+        assert!(matches!(
+            &events[1],
+            bifrost_types::InventoryEvent::Done(completion) if completion.checkpoint.is_some()
+        ));
     }
 
     #[tokio::test]

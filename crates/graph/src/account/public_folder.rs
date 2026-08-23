@@ -967,25 +967,25 @@ async fn resolve_content_routing(
 pub(crate) fn public_folder_inventory_stream(
     account: GraphAccount,
     scope: CursorScope,
-) -> AccountStream<SyncEvent<InventoryEntry>> {
+) -> AccountStream<bifrost_types::InventoryEvent> {
     Box::pin(async_stream::stream! {
         let CursorScope::Folder(folder) = scope.clone() else {
             // Routed here only for `CursorScope::Folder` in the routing
             // map; any other shape is a wiring bug.
             let ctx = GraphErrorContext::graph(AccountOperation::SyncInventory)
                 .with_scope(ErrorScope::Cursor(scope.clone()));
-            yield SyncEvent::Terminated(cursor_error_to_account_error(
+            yield bifrost_types::InventoryEvent::Terminated(cursor_error_to_account_error(
                 super::cursor::CursorError::Unsupported, ctx));
-            yield SyncEvent::Done(None);
+            yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion::complete(None));
             return;
         };
 
         let Some(routing) = account.public_folder_routing(&folder).await else {
             let ctx = GraphErrorContext::graph(AccountOperation::SyncInventory)
                 .with_scope(ErrorScope::Cursor(scope.clone()));
-            yield SyncEvent::Terminated(cursor_error_to_account_error(
+            yield bifrost_types::InventoryEvent::Terminated(cursor_error_to_account_error(
                 super::cursor::CursorError::Unsupported, ctx));
-            yield SyncEvent::Done(None);
+            yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion::complete(None));
             return;
         };
         let owner = MailboxId(routing.anchor_mailbox.clone());
@@ -993,7 +993,7 @@ pub(crate) fn public_folder_inventory_stream(
         let Some(ews) = ews_client(&account) else {
             let ctx = GraphErrorContext::ews(AccountOperation::SyncInventory)
                 .with_scope(ErrorScope::Cursor(scope.clone()));
-            yield SyncEvent::Terminated(ews_shared_scope_error(
+            yield bifrost_types::InventoryEvent::Terminated(ews_shared_scope_error(
                 // Not-yet-attached is a transient lifecycle condition
                 // (the engine reopens), not a malformed wire response;
                 // route it as a retryable Transport(Unsent) rather than a
@@ -1007,7 +1007,7 @@ pub(crate) fn public_folder_inventory_stream(
                 None,
                 ctx,
             ));
-            yield SyncEvent::Done(None);
+            yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion::complete(None));
             return;
         };
 
@@ -1016,9 +1016,9 @@ pub(crate) fn public_folder_inventory_stream(
             Err(error) => {
                 let ctx = GraphErrorContext::ews(AccountOperation::SyncInventory)
                     .with_scope(ErrorScope::Cursor(scope.clone()));
-                yield SyncEvent::Terminated(ews_shared_scope_error(
+                yield bifrost_types::InventoryEvent::Terminated(ews_shared_scope_error(
                     error, &scope, Some(&owner), ctx));
-                yield SyncEvent::Done(None);
+                yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion::complete(None));
                 return;
             }
         };
@@ -1029,14 +1029,14 @@ pub(crate) fn public_folder_inventory_stream(
         if !walk.complete {
             let ctx = GraphErrorContext::ews(AccountOperation::SyncInventory)
                 .with_scope(ErrorScope::Cursor(scope.clone()));
-            yield SyncEvent::Terminated(ews_shared_scope_error(
+            yield bifrost_types::InventoryEvent::Terminated(ews_shared_scope_error(
                 incomplete_walk_error(&folder.0), &scope, Some(&owner), ctx));
-            yield SyncEvent::Done(None);
+            yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion::complete(None));
             return;
         }
         let ItemWalk { items, unhandled_classes: unhandled, .. } = walk;
         if let Some(warning) = unhandled_classes_warning(&folder.0, &unhandled) {
-            yield SyncEvent::Warning(warning);
+            yield bifrost_types::InventoryEvent::Warning(warning);
         }
 
         let watermark = advance_watermark(None, &items);
@@ -1058,7 +1058,7 @@ pub(crate) fn public_folder_inventory_stream(
             None => (Vec::new(), true),
         };
         if degraded {
-            yield SyncEvent::Warning(Warning::support_only(
+            yield bifrost_types::InventoryEvent::Warning(Warning::support_only(
                 WarningKind::StrategyDowngraded,
                 format!(
                     "public folder {} exceeds {} items; deletion reconcile \
@@ -1086,15 +1086,22 @@ pub(crate) fn public_folder_inventory_stream(
             Err(error) => {
                 let ctx = GraphErrorContext::graph(AccountOperation::SyncInventory)
                     .with_scope(ErrorScope::Cursor(scope.clone()));
-                yield SyncEvent::Terminated(cursor_error_to_account_error(error, ctx));
-                yield SyncEvent::Done(None);
+                yield bifrost_types::InventoryEvent::Terminated(cursor_error_to_account_error(error, ctx));
+                yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion::complete(None));
                 return;
             }
         };
 
         let checkpoint = Checkpoint::Change(cursor.clone());
-        yield batch(entries, PageBoundary::Final, Some(cursor));
-        yield SyncEvent::Done(Some(checkpoint));
+        yield super::inventory::inventory_batch(
+            entries,
+            PageBoundary::Final,
+            Some(cursor),
+            bifrost_types::InventoryCoverage::Complete,
+        );
+        yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion::complete(Some(
+            checkpoint,
+        )));
     })
 }
 

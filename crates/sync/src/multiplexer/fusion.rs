@@ -49,6 +49,10 @@ pub struct InventoryFusion {
     pub account_id: bifrost_types::AccountId,
     pub cursors: Arc<CursorRegistry>,
     pub control: Option<SyncControl>,
+    /// Where this walk records what it proved, so the durable writer can put
+    /// coverage and cursor into one atomic record when the consumer
+    /// acknowledges. `None` in contexts with no writer behind them.
+    pub coverage: Option<Arc<crate::cursor::PendingCoverage>>,
 }
 
 impl InventoryFusion {
@@ -111,6 +115,14 @@ impl InventoryFusion {
         while let Some(event) = stream.next().await {
             match event {
                 bifrost_types::InventoryEvent::Done(completion) => {
+                    // Record BEFORE publishing: a fast consumer can acknowledge
+                    // between the send and a later record, and the writer would
+                    // then persist the cursor with stale coverage.
+                    self.record_coverage(&scope, &completion.coverage);
+                    let degraded = !completion.coverage.is_complete();
+                    if degraded {
+                        Self::warn_degraded(&changes_tx, &scope, &completion.coverage);
+                    }
                     let checkpoint = completion.checkpoint;
                     if let (Some(tx), Some(cp)) = (&changes_tx, checkpoint.clone()) {
                         let me = MultiplexerEvent {
@@ -145,6 +157,14 @@ impl InventoryFusion {
                     return Ok(FusionOutcome::Terminated(err));
                 }
                 bifrost_types::InventoryEvent::Batch(batch) => {
+                    // Every checkpoint-bearing batch names the coverage it
+                    // advances across, not just the terminal completion:
+                    // Graph checkpoints per page, so waiting for `Done` would
+                    // let a page checkpoint become durable across a gap it
+                    // never declared.
+                    if batch.checkpoint.is_some() {
+                        self.record_coverage(&scope, &batch.coverage);
+                    }
                     if let Some(tx) = &changes_tx {
                         self.forward_inventory_batch(tx, &scope, &batch);
                     }
@@ -155,6 +175,41 @@ impl InventoryFusion {
             }
         }
         Ok(FusionOutcome::NoCursor)
+    }
+
+    fn record_coverage(&self, scope: &CursorScope, coverage: &bifrost_types::InventoryCoverage) {
+        if let Some(pending) = &self.coverage {
+            pending.record(scope.clone(), coverage.clone());
+        }
+    }
+
+    /// Surface degraded coverage to the consumer.
+    ///
+    /// Durable debt that nothing reports is only half a fix: the scope is live
+    /// and converging, but objects are known-missing and only an operator can
+    /// decide whether to repair, wait, or accept the gap.
+    fn warn_degraded(
+        changes_tx: &Option<broadcast::Sender<MultiplexerEvent>>,
+        scope: &CursorScope,
+        coverage: &bifrost_types::InventoryCoverage,
+    ) {
+        let bifrost_types::InventoryCoverage::Degraded { obligations } = coverage else {
+            return;
+        };
+        let Some(tx) = changes_tx else { return };
+        let warning = bifrost_types::Warning::user_safe(
+            bifrost_types::WarningKind::OperatorAttentionNeeded,
+            format!(
+                "inventory completed with {} object(s) or region(s) it could not represent; \
+                 the scope is live but incomplete",
+                obligations.len()
+            ),
+        );
+        let _ = tx.send(MultiplexerEvent {
+            scope: scope.clone(),
+            event: Arc::new(SyncEvent::Warning(warning)),
+            checkpoint: None,
+        });
     }
 
     fn forward_inventory_batch(

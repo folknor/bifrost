@@ -32,6 +32,7 @@ use crate::backfill::{
 use crate::cancel::{Boundary, BoundaryRequest};
 use crate::control::{SyncActivityGuard, SyncControl};
 use crate::cursor::CursorRegistry;
+use crate::cursor::PendingCoverage;
 use crate::cursor::store::{
     BackfillCheckpointRecord, ChangeCheckpointRecord, DynCheckpointStore, InMemoryCheckpointStore,
 };
@@ -442,10 +443,14 @@ impl SyncEngine {
         let ack_writer_store = Arc::clone(&self.checkpoints);
         let ack_writer_aid = account_id.clone();
         let ack_writer_control = control.clone();
+        // Producers record what each enumeration proved; the single writer
+        // reads it back when the matching acknowledgement arrives.
+        let pending_coverage = Arc::new(PendingCoverage::new());
         spawn(tokio::spawn(ack_writer(
             ack_writer_aid,
             ack_writer_store,
             ack_writer_control,
+            Arc::clone(&pending_coverage),
             ack_rx,
         )));
 
@@ -697,6 +702,7 @@ impl SyncEngine {
             let inventory_reopen_lock = Arc::clone(&reopen_lock);
             let inventory_open_skips = Arc::clone(&open_skips);
             let inventory_writer_tx = ack_tx.clone();
+            let inventory_coverage = Arc::clone(&pending_coverage);
             spawn(tokio::spawn(async move {
                 run_deferred_inventory_establishment(
                     inventory_factory,
@@ -717,6 +723,7 @@ impl SyncEngine {
                     inventory_reopen_lock,
                     inventory_open_skips,
                     inventory_writer_tx,
+                    inventory_coverage,
                     deferred_inventory_scopes,
                 )
                 .await;
@@ -731,6 +738,7 @@ impl SyncEngine {
         let reopen_aid = account_id.clone();
         let reopen_shutdown = shutdown.clone();
         let reopen_writer_tx = ack_tx.clone();
+        let reopen_coverage = Arc::clone(&pending_coverage);
         let reopen_store = Arc::clone(&self.checkpoints);
         let reopen_control = control.clone();
         let reopen_account_control_tx = account_control_tx.clone();
@@ -767,6 +775,7 @@ impl SyncEngine {
                                     open_skips: &reopen_open_skips,
                                     shutdown: &reopen_shutdown,
                                     writer_tx: &reopen_writer_tx,
+                                    coverage: &reopen_coverage,
                                 };
                                 handle_account_error(&ctx, scope, error).await;
                             }
@@ -810,6 +819,7 @@ impl SyncEngine {
             capabilities,
             multiplexer,
             cursors: Arc::clone(&cursors),
+            coverage: Arc::clone(&pending_coverage),
             checkpoints: Arc::clone(&self.checkpoints),
             boundary_tx: boundary.sender(),
             shutdown: shutdown.clone(),
@@ -1043,6 +1053,7 @@ impl SyncEngine {
             open_skips: &slot.open_skips,
             shutdown: &slot.shutdown,
             writer_tx: &writer_tx,
+            coverage: &slot.coverage,
         };
         loop {
             if !slot.control.wait_until_running(&slot.shutdown).await {
@@ -2960,6 +2971,22 @@ async fn run_backfill_orchestrator(
                         match result {
                             Ok(outcome) => {
                                 total_seen = total_seen.saturating_add(outcome.seen);
+                                if !outcome.complete {
+                                    // The partition finished but left coverage
+                                    // obligations open. Completion is about the
+                                    // enumeration space being exhausted, and it
+                                    // was not - writing the sentinel here would
+                                    // make the next attach skip the walk and
+                                    // turn a declared gap into a permanent one.
+                                    tracing::warn!(
+                                        target: "bifrost.sync.backfill",
+                                        account = ?account_id,
+                                        scope = ?scope,
+                                        "backfill partition completed with unresolved coverage; \
+                                         withholding the completion marker"
+                                    );
+                                    completed = false;
+                                }
                             }
                             Err(err) => {
                                 tracing::warn!(
@@ -3073,6 +3100,20 @@ async fn run_backfill_orchestrator(
                                 // required to keep walking past the window until they
                                 // produce an entry or the listing runs dry. Given
                                 // that, `seen == 0` is unambiguous here.
+                                if !outcome.complete {
+                                    // Same rule as the finite-partition walk:
+                                    // an unresolved obligation means the
+                                    // enumeration space was not exhausted, so
+                                    // the completion marker must be withheld.
+                                    tracing::warn!(
+                                        target: "bifrost.sync.backfill",
+                                        account = ?account_id,
+                                        scope = ?scope,
+                                        "backfill page completed with unresolved coverage; \
+                                         withholding the completion marker"
+                                    );
+                                    completed = false;
+                                }
                                 if outcome.seen == 0 {
                                     break;
                                 }
@@ -3479,6 +3520,7 @@ async fn run_deferred_inventory_establishment(
     reopen_lock: Arc<AsyncMutex<()>>,
     open_skips: Arc<std::sync::Mutex<Vec<SkippedScope>>>,
     writer_tx: mpsc::Sender<WriterRequest>,
+    coverage: Arc<PendingCoverage>,
     scopes: Vec<DeferredInventory>,
 ) {
     if !wait_for_real_subscriber(&changes_tx, &subscriber_notify, &shutdown).await {
@@ -3521,6 +3563,7 @@ async fn run_deferred_inventory_establishment(
                 account_id: account_id.clone(),
                 cursors: Arc::clone(&cursors),
                 control: Some(control.clone()),
+                coverage: Some(Arc::clone(&coverage)),
             };
             let result = match &inventory {
                 DeferredInventory::Start(_) => {
@@ -3581,6 +3624,7 @@ async fn run_deferred_inventory_establishment(
                     open_skips: &open_skips,
                     shutdown: &shutdown,
                     writer_tx: &writer_tx,
+                    coverage: &coverage,
                 };
                 handle_account_error(&ctx, Some(scope.clone()), error).await;
             }
@@ -3669,6 +3713,7 @@ async fn ack_writer(
     account_id: AccountId,
     store: Arc<DynCheckpointStore>,
     control: SyncControl,
+    coverage: Arc<PendingCoverage>,
     mut rx: mpsc::Receiver<WriterRequest>,
 ) {
     // Scopes whose durable row exists ONLY because an uncommitted reattach put
@@ -3728,7 +3773,7 @@ async fn ack_writer(
                 continue;
             }
         };
-        let result = persist_ack_request(&account_id, Arc::clone(&store), &req).await;
+        let result = persist_ack_request(&account_id, Arc::clone(&store), &coverage, &req).await;
         match result {
             Ok(()) => {
                 // Notify pause / checkpoint_now waiters AFTER the
@@ -3767,18 +3812,28 @@ async fn ack_writer(
 async fn persist_ack_request(
     account_id: &AccountId,
     store: Arc<DynCheckpointStore>,
+    coverage: &PendingCoverage,
     req: &AckRequest,
 ) -> Result<(), Error> {
+    // Cursor and coverage land in ONE store operation. The coverage comes from
+    // engine memory rather than from the checkpoint, because `Checkpoint` is a
+    // published type that crosses the broadcast channel to the consumer and
+    // back - but the durable write is still a single atomic record, which is
+    // the property that matters.
     match &req.checkpoint {
         Checkpoint::Change(c) => {
-            store
-                .put_change_record(account_id, ChangeCheckpointRecord::complete(c.clone()))
-                .await
+            let record = ChangeCheckpointRecord {
+                cursor: c.clone(),
+                coverage: coverage.for_scope(&c.scope),
+            };
+            store.put_change_record(account_id, record).await
         }
         Checkpoint::Backfill(b) => {
-            store
-                .put_backfill(account_id, BackfillCheckpointRecord::complete(b.clone()))
-                .await
+            let record = BackfillCheckpointRecord {
+                checkpoint: b.clone(),
+                coverage: coverage.for_scope(&b.scope),
+            };
+            store.put_backfill(account_id, record).await
         }
         _ => Err(Error::CheckpointStore(
             "unknown checkpoint variant in ack".into(),
@@ -3819,6 +3874,8 @@ pub(crate) struct RecoveryContext<'a> {
     /// before the cutover: a direct write racing the ack writer let an aborted
     /// reattach delete a cursor a consumer had already acknowledged.
     pub writer_tx: &'a mpsc::Sender<WriterRequest>,
+    /// Where inventory walks record what they proved, read back by the writer.
+    pub coverage: &'a Arc<PendingCoverage>,
 }
 
 /// Dispatch an `AccountError` to the engine's recovery machinery.
@@ -4180,6 +4237,7 @@ async fn re_establish_scope_with_backoff(ctx: &RecoveryContext<'_>, scope: Curso
             Arc::clone(ctx.store),
             ctx.changes_tx.clone(),
             Some(ctx.control),
+            Arc::clone(ctx.coverage),
             true,
         )
         .await
@@ -4462,6 +4520,7 @@ async fn reattach_account(
                 Arc::clone(ctx.store),
                 ctx.changes_tx.clone(),
                 None,
+                Arc::clone(ctx.coverage),
                 false,
             )
             .await
@@ -4905,6 +4964,7 @@ async fn run_establish(
     store: Arc<DynCheckpointStore>,
     changes_tx: broadcast::Sender<MultiplexerEvent>,
     control: Option<&SyncControl>,
+    coverage: Arc<PendingCoverage>,
     persist_ready: bool,
 ) -> Result<EstablishOrigin, Error> {
     let _activity = match control {
@@ -4924,6 +4984,7 @@ async fn run_establish(
                     account_id: account_id.clone(),
                     cursors: Arc::clone(&cursors),
                     control: control.cloned(),
+                    coverage: Some(Arc::clone(&coverage)),
                 };
                 return match fusion
                     .run_resume_with_broadcast(account, existing, Some(changes_tx))
@@ -4973,6 +5034,7 @@ async fn run_establish(
                 account_id: account_id.clone(),
                 cursors: Arc::clone(&cursors),
                 control: control.cloned(),
+                coverage: Some(Arc::clone(&coverage)),
             };
             match fusion
                 .run_with_broadcast(account, scope, Some(changes_tx))
@@ -5345,7 +5407,13 @@ mod tests {
         let (bandwidth, _bandwidth_view) = tokio::sync::watch::channel(None);
         let control =
             crate::control::SyncControl::new(account.clone(), boundary, priority, bandwidth);
-        let writer = tokio::spawn(ack_writer(account.clone(), Arc::clone(&store), control, rx));
+        let writer = tokio::spawn(ack_writer(
+            account.clone(),
+            Arc::clone(&store),
+            control,
+            Arc::new(crate::cursor::PendingCoverage::new()),
+            rx,
+        ));
 
         // Both scopes are inserted by the same in-flight reattach.
         for name in ["acked", "orphan"] {

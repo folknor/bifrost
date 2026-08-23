@@ -1079,6 +1079,69 @@ writes:
   and `detach` then waits out its whole timeout. `Boundary::set` is
   still the unconditional primitive the engine's own teardown uses.
 
+## Inventory coverage
+
+Inventory answers a question no other stream does: what did the enumeration
+PROVE about the objects it walked past? The rule is
+
+> Any accepted inventory progress checkpoint must certify that every provider
+> result before that checkpoint was either materialized as an `InventoryEntry`
+> or proved irrelevant to the inventory snapshot.
+
+A checkpoint advances a cursor past everything behind it, and the changes
+stream only reports SUBSEQUENT changes, so an object a walk skipped without
+recording becomes permanently invisible to that account. Making the failure
+visible to a consumer does not fix that; the checkpoint has to carry the
+unresolved obligations with it, atomically, or not advance.
+
+Inventory therefore has its own envelope (`InventoryEvent`, not `SyncEvent<T>`)
+in which every checkpoint-bearing `InventoryBatch` and the terminal
+`InventoryCompletion` carry an `InventoryCoverage`. Coverage rides
+checkpoint-bearing BATCHES, not only the terminal completion, because Graph and
+`BackfillRunner` both advance per page - waiting for `Done` would let a page
+checkpoint become durable across a gap it never declared.
+
+`InventoryObligation` splits `Object` from `Region`. An id-less provider result
+must not become an `Object` with a synthetic id: an absent id may mean one
+malformed object, a schema mismatch affecting many, a truncated page, or a
+response that cannot be correlated with pagination at all, so naming it a
+single-object loss claims knowledge the walk does not have. Repair and replay
+tokens are account-owned opaque bytes; the engine persists and returns them
+without interpreting provider pagination.
+
+**The scope converges DEGRADED rather than never converging.** A walk that hits
+an unreadable object records it and keeps going, so the cursor establishes and
+the account enters its change stream. The obligation - not the changes stream -
+is the rediscovery mechanism for what could not be represented. The alternative
+considered and rejected was refusing every checkpoint after the first failure,
+which is safe but never converges: one permanently-broken object would cost the
+mailbox its entire backfill, forever. Declared loss beats permanent
+non-convergence; SILENT loss beats neither.
+
+Coverage reaches the durable record through `PendingCoverage`, an in-memory
+per-account map. It cannot ride `Checkpoint`, which is a published type crossing
+the broadcast channel to the consumer and back through `ack_checkpoint`. The
+producer records what it proved when it emits a checkpoint-bearing batch, and
+the single writer reads it back when the matching acknowledgement arrives - so
+the durable write is still ONE atomic record carrying both cursor and coverage.
+Losing the map on a crash is consistent by construction: if the process dies
+before the acknowledgement, the checkpoint never became durable either.
+
+`BackfillRunner` reports `complete` per partition, and the orchestrator
+withholds the completion sentinel when it is false. That sentinel makes the next
+attach skip the walk entirely, so writing it over an unresolved obligation would
+convert a declared gap into a permanent one. Note `seen` counts only entries a
+page materialized, so an object that never became an entry is not in that total
+- the count cannot be used to detect this.
+
+Degraded coverage is surfaced to the consumer as a
+`Warning::OperatorAttentionNeeded`. Durable debt that nothing reports is only
+half a fix.
+
+**Not yet built: the repair path.** Obligations are durable, declared, and block
+the completion sentinel, so nothing is silently lost - but nothing yet works the
+debt off. See `notes/todo.md`.
+
 ## Cursor envelope
 
 `OpaqueChangeState` carries `protocol`, `envelope_version`, and

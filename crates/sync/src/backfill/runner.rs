@@ -223,6 +223,15 @@ pub struct BackfillPartitionOutcome {
     pub seen: u64,
     /// Inventory entries forwarded after the live-supersedes filter.
     pub kept: u64,
+    /// Whether the walk exhausted its space with everything accounted for.
+    ///
+    /// `false` means the partition finished but left obligations open, so the
+    /// orchestrator must NOT write a completion sentinel for the scope: the
+    /// sentinel makes the next attach skip the walk entirely, which would turn
+    /// a declared gap into a permanent one. Note `seen` counts only entries a
+    /// page materialized, so an object that never became an entry is not even
+    /// in that total - the count cannot be used to detect this.
+    pub complete: bool,
 }
 
 impl BackfillRunner {
@@ -252,9 +261,13 @@ impl BackfillRunner {
         let mut stream = account.inventory_partition_stream(scope.clone(), partition);
         let mut seen_total: u64 = 0;
         let mut kept_total: u64 = 0;
+        let mut complete = true;
         while let Some(event) = stream.next().await {
             match event {
                 bifrost_types::InventoryEvent::Batch(batch) => {
+                    if !batch.coverage.is_complete() {
+                        complete = false;
+                    }
                     let seen = u64::try_from(batch.items.len()).unwrap_or(u64::MAX);
                     seen_total = seen_total.saturating_add(seen);
                     let kept = filter_supersedes(&batch.items, live);
@@ -312,7 +325,12 @@ impl BackfillRunner {
                         }
                     }
                 }
-                bifrost_types::InventoryEvent::Done(_) => break,
+                bifrost_types::InventoryEvent::Done(completion) => {
+                    if !completion.coverage.is_complete() {
+                        complete = false;
+                    }
+                    break;
+                }
                 bifrost_types::InventoryEvent::Terminated(err) => {
                     if let Some(tx) = &changes_tx {
                         let me = MultiplexerEvent {
@@ -332,6 +350,7 @@ impl BackfillRunner {
         Ok(BackfillPartitionOutcome {
             seen: seen_total,
             kept: kept_total,
+            complete,
         })
     }
 }

@@ -10,6 +10,7 @@
 //!    `CursorRegistry` at every batch boundary; advance-checkpoints
 //!    rewrite both the registry and the store atomically.
 
+pub mod coverage;
 pub mod envelope;
 pub mod store;
 
@@ -21,6 +22,7 @@ use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 use bifrost_types::{ChangeCursor, CursorScope, MembershipScope};
 
+pub use coverage::PendingCoverage;
 pub use envelope::{
     CursorEnvelope, ENGINE_VERSION, EnvelopeKind, MIN_MIGRATABLE, decode_envelope, encode_envelope,
 };

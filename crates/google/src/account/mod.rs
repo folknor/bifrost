@@ -34,7 +34,6 @@ use bifrost_types::{
     SyncEvent, SyncStrategy, ThreadHydration, ThreadId, VacationConfig, WatchEvent,
 };
 use bytes::Bytes;
-use futures::StreamExt as _;
 use tokio_util::sync::CancellationToken;
 
 use bifrost_net::TokenSource;
@@ -318,16 +317,12 @@ impl Account for GoogleAccount {
     }
 
     fn inventory_stream(&self, scope: CursorScope) -> AccountStream<InventoryEvent> {
-        // COMPLETE coverage: this walk still terminates on every classified
-        // failure except the absorbed list/get deletion race, and an absorbed
-        // NotFound is a definitive absence rather than a gap.
-        Box::pin(
-            inventory::inventory_stream(
-                Arc::clone(&self.client),
-                Arc::clone(&self.scope_cache),
-                scope,
-            )
-            .map(InventoryEvent::from),
+        // Emits real coverage: this walk records an unreadable object as an
+        // obligation and keeps going rather than discarding the partition.
+        inventory::inventory_stream(
+            Arc::clone(&self.client),
+            Arc::clone(&self.scope_cache),
+            scope,
         )
     }
 

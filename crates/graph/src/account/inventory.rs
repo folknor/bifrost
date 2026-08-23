@@ -23,7 +23,7 @@ responseStatus,isCancelled,changeKey";
 pub(crate) fn inventory_stream(
     account: GraphAccount,
     scope: CursorScope,
-) -> AccountStream<SyncEvent<InventoryEntry>> {
+) -> AccountStream<bifrost_types::InventoryEvent> {
     inventory_stream_from(account, scope, None)
 }
 
@@ -47,7 +47,7 @@ pub(crate) fn resumable_inventory_payload(cursor: &ChangeCursor) -> Option<Graph
 pub(crate) fn resume_inventory_stream(
     account: GraphAccount,
     cursor: ChangeCursor,
-) -> Option<AccountStream<SyncEvent<InventoryEntry>>> {
+) -> Option<AccountStream<bifrost_types::InventoryEvent>> {
     let payload = resumable_inventory_payload(&cursor)?;
     Some(inventory_stream_from(account, cursor.scope, Some(payload)))
 }
@@ -56,19 +56,22 @@ fn inventory_stream_from(
     account: GraphAccount,
     scope: CursorScope,
     resume: Option<GraphCursorPayload>,
-) -> AccountStream<SyncEvent<InventoryEntry>> {
+) -> AccountStream<bifrost_types::InventoryEvent> {
     Box::pin(async_stream::stream! {
         let sync_ctx = GraphErrorContext::graph(AccountOperation::SyncInventory)
             .with_scope(ErrorScope::Cursor(scope.clone()));
+        // Results this walk could not account for. Every checkpoint from the
+        // first one onward declares the gap.
+        let mut obligations: Vec<bifrost_types::InventoryObligation> = Vec::new();
 
         let client = match account.client_for_scope(&scope) {
             Ok(client) => client.clone(),
             Err(error) => {
-                yield SyncEvent::Terminated(cursor_error_to_account_error(
+                yield bifrost_types::InventoryEvent::Terminated(cursor_error_to_account_error(
                     super::cursor::routing_error(error),
                     sync_ctx,
                 ));
-                yield SyncEvent::Done(None);
+                yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion { checkpoint: None, coverage: coverage_of(&obligations) });
                 return;
             }
         };
@@ -76,19 +79,19 @@ fn inventory_stream_from(
             Some(payload) => match payload.advanced_through {
                 Some(marker) => (marker.next_link, payload.calendar_window_end),
                 None => {
-                    yield SyncEvent::Terminated(cursor_error_to_account_error(
+                    yield bifrost_types::InventoryEvent::Terminated(cursor_error_to_account_error(
                         super::cursor::CursorError::SchemaIncompatible,
                         sync_ctx,
                     ));
-                    yield SyncEvent::Done(None);
+                    yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion { checkpoint: None, coverage: coverage_of(&obligations) });
                     return;
                 }
             },
             None => match initial_delta_request(&account, &scope, jiff::Timestamp::now()) {
                 Ok(request) => request,
                 Err(error) => {
-                    yield SyncEvent::Terminated(cursor_error_to_account_error(error, sync_ctx));
-                    yield SyncEvent::Done(None);
+                    yield bifrost_types::InventoryEvent::Terminated(cursor_error_to_account_error(error, sync_ctx));
+                    yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion { checkpoint: None, coverage: coverage_of(&obligations) });
                     return;
                 }
             },
@@ -104,8 +107,8 @@ fn inventory_stream_from(
             Err(error) => {
                 let ctx = GraphErrorContext::graph(AccountOperation::SyncInventory)
                     .with_scope(ErrorScope::Cursor(scope.clone()));
-                yield SyncEvent::Terminated(cursor_error_to_account_error(error, ctx));
-                yield SyncEvent::Done(None);
+                yield bifrost_types::InventoryEvent::Terminated(cursor_error_to_account_error(error, ctx));
+                yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion { checkpoint: None, coverage: coverage_of(&obligations) });
                 return;
             }
         };
@@ -120,13 +123,13 @@ fn inventory_stream_from(
                     // quarantines just this scope; a primary-scope
                     // denial stays terminal account-wide. `owner` is
                     // hoisted above the loop (it is scope-invariant).
-                    yield SyncEvent::Terminated(super::graph_error::graph_shared_scope_error(
+                    yield bifrost_types::InventoryEvent::Terminated(super::graph_error::graph_shared_scope_error(
                         error,
                         &scope,
                         owner.as_ref(),
                         ctx,
                     ));
-                    yield SyncEvent::Done(None);
+                    yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion { checkpoint: None, coverage: coverage_of(&obligations) });
                     return;
                 }
             };
@@ -140,17 +143,38 @@ fn inventory_stream_from(
                     }
                     continue;
                 }
-                if let Some(mut entry) = inventory_entry_from_value(&scope, &value) {
-                    if let ServerVersion::ETag(etag) = &entry.fingerprint.server_version {
-                        etags.push((entry.id.0.clone(), etag.clone()));
-                    }
-                    if let Some(owner) = &owner {
-                        entry
-                            .memberships
-                            .push(bifrost_types::MembershipScope::Mailbox(owner.clone()));
-                    }
-                    entries.push(entry);
+                let Some(mut entry) = inventory_entry_from_value(&scope, &value) else {
+                    // A non-removed value with no usable `id`. It used to be
+                    // dropped silently while the delta link advanced past it,
+                    // which violates the checkpoint contract: the walk cannot
+                    // name, retry, or later reconcile the thing it skipped.
+                    //
+                    // It becomes a REGION obligation, not an object one, and
+                    // that distinction is the honest part. An absent id may
+                    // mean one malformed value, a schema mismatch affecting
+                    // many, a truncated page, or a response that cannot be
+                    // correlated with pagination at all - calling it a
+                    // single-object loss would claim knowledge the walk does
+                    // not have. The replay token is the page link, because
+                    // that is the granularity anything could be re-read at.
+                    obligations.push(bifrost_types::InventoryObligation::Region {
+                        failure_key: format!("{scope:?}:unidentifiable-value"),
+                        error: super::graph_error::unsupported_account_error(
+                            AccountOperation::SyncInventory,
+                        ),
+                        replay: current_url.clone().into_bytes(),
+                    });
+                    continue;
+                };
+                if let ServerVersion::ETag(etag) = &entry.fingerprint.server_version {
+                    etags.push((entry.id.0.clone(), etag.clone()));
                 }
+                if let Some(owner) = &owner {
+                    entry
+                        .memberships
+                        .push(bifrost_types::MembershipScope::Mailbox(owner.clone()));
+                }
+                entries.push(entry);
             }
 
             if !etags.is_empty() || !removed_etag_ids.is_empty() {
@@ -176,12 +200,12 @@ fn inventory_stream_from(
                     Err(error) => {
                         let ctx = GraphErrorContext::graph(AccountOperation::SyncInventory)
                             .with_scope(ErrorScope::Cursor(scope.clone()));
-                        yield SyncEvent::Terminated(cursor_error_to_account_error(error, ctx));
-                        yield SyncEvent::Done(None);
+                        yield bifrost_types::InventoryEvent::Terminated(cursor_error_to_account_error(error, ctx));
+                        yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion { checkpoint: None, coverage: coverage_of(&obligations) });
                         return;
                     }
                 };
-                yield batch(entries, PageBoundary::Page, Some(checkpoint_cursor));
+                yield inventory_batch(entries, PageBoundary::Page, Some(checkpoint_cursor), coverage_of(&obligations));
                 current_url = next_link;
             } else if let Some(delta_link) = page.delta_link {
                 let cursor = match encode_cursor(
@@ -193,26 +217,26 @@ fn inventory_stream_from(
                     Err(error) => {
                         let ctx = GraphErrorContext::graph(AccountOperation::SyncInventory)
                             .with_scope(ErrorScope::Cursor(scope.clone()));
-                        yield SyncEvent::Terminated(cursor_error_to_account_error(error, ctx));
-                        yield SyncEvent::Done(None);
+                        yield bifrost_types::InventoryEvent::Terminated(cursor_error_to_account_error(error, ctx));
+                        yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion { checkpoint: None, coverage: coverage_of(&obligations) });
                         return;
                     }
                 };
                 let checkpoint = Checkpoint::Change(cursor.clone());
-                yield batch(entries, PageBoundary::Final, Some(cursor));
-                yield SyncEvent::Done(Some(checkpoint));
+                yield inventory_batch(entries, PageBoundary::Final, Some(cursor), coverage_of(&obligations));
+                yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion { checkpoint: Some(checkpoint), coverage: coverage_of(&obligations) });
                 return;
             } else {
                 // A delta page must advance with either a next link or a
                 // delta link. Completing without a checkpoint would make
                 // the engine restart inventory from page one forever.
-                yield SyncEvent::Terminated(super::graph_error::protocol_violation(
+                yield bifrost_types::InventoryEvent::Terminated(super::graph_error::protocol_violation(
                     bifrost_types::ProtocolErrorKind::ContractViolation,
                     AccountOperation::SyncInventory,
                     Some(ErrorScope::Cursor(scope.clone())),
                     "Graph delta page had neither @odata.nextLink nor @odata.deltaLink",
                 ));
-                yield SyncEvent::Done(None);
+                yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion { checkpoint: None, coverage: coverage_of(&obligations) });
                 return;
             }
         }
@@ -406,6 +430,39 @@ fn format_calendar_timestamp(at: jiff::Timestamp) -> String {
         .to_string()
 }
 
+/// Inventory page carrying the coverage it advances across.
+///
+/// Separate from the generic `batch` helper because that one is also used for
+/// change streams, where coverage is meaningless.
+pub(crate) fn inventory_batch(
+    items: Vec<InventoryEntry>,
+    page_boundary: PageBoundary,
+    cursor: Option<ChangeCursor>,
+    coverage: bifrost_types::InventoryCoverage,
+) -> bifrost_types::InventoryEvent {
+    bifrost_types::InventoryEvent::Batch(bifrost_types::InventoryBatch {
+        items,
+        page_boundary,
+        server_latency: Duration::default(),
+        bytes_in: 0,
+        checkpoint: cursor.map(Checkpoint::Change),
+        coverage,
+    })
+}
+
+/// Coverage for a checkpoint emitted after `obligations` were observed.
+pub(crate) fn coverage_of(
+    obligations: &[bifrost_types::InventoryObligation],
+) -> bifrost_types::InventoryCoverage {
+    if obligations.is_empty() {
+        bifrost_types::InventoryCoverage::Complete
+    } else {
+        bifrost_types::InventoryCoverage::Degraded {
+            obligations: obligations.to_vec(),
+        }
+    }
+}
+
 pub(crate) fn batch<T>(
     items: Vec<T>,
     page_boundary: PageBoundary,
@@ -590,8 +647,10 @@ mod tests {
             ty: ObjectType::Email,
         };
         let mut stream = inventory_stream(account, stale.clone());
-        let SyncEvent::Terminated(error) = stream.next().await.expect("an event") else {
-            panic!("expected SyncEvent::Terminated");
+        let bifrost_types::InventoryEvent::Terminated(error) =
+            stream.next().await.expect("an event")
+        else {
+            panic!("expected InventoryEvent::Terminated");
         };
         assert!(matches!(
             error.kind(),
@@ -606,7 +665,10 @@ mod tests {
             )) => assert_eq!(scope, &stale),
             other => panic!("expected DisableScope, got {other:?}"),
         }
-        assert!(matches!(stream.next().await, Some(SyncEvent::Done(None))));
+        assert!(matches!(
+            stream.next().await,
+            Some(bifrost_types::InventoryEvent::Done(_))
+        ));
         assert!(stream.next().await.is_none());
     }
 
@@ -634,8 +696,12 @@ mod tests {
             ty: ObjectType::Email,
         };
         let mut stream = inventory_stream(account, scope);
-        assert!(matches!(stream.next().await, Some(SyncEvent::Batch(_))));
-        let SyncEvent::Terminated(error) = stream.next().await.expect("neither-link failure")
+        assert!(matches!(
+            stream.next().await,
+            Some(bifrost_types::InventoryEvent::Batch(_))
+        ));
+        let bifrost_types::InventoryEvent::Terminated(error) =
+            stream.next().await.expect("neither-link failure")
         else {
             panic!("expected termination")
         };
@@ -645,7 +711,10 @@ mod tests {
                 bifrost_types::ProtocolErrorKind::ContractViolation
             )
         ));
-        assert!(matches!(stream.next().await, Some(SyncEvent::Done(None))));
+        assert!(matches!(
+            stream.next().await,
+            Some(bifrost_types::InventoryEvent::Done(_))
+        ));
         let requests = client.take_rest_requests();
         assert_eq!(requests.len(), 2);
         assert!(
@@ -672,7 +741,8 @@ mod tests {
         )]);
         let first = GraphAccount::new_for_tests(first_client, PushMode::GraphSubscriptions);
         let mut stream = inventory_stream(first, scope.clone());
-        let SyncEvent::Batch(batch) = stream.next().await.expect("first page") else {
+        let bifrost_types::InventoryEvent::Batch(batch) = stream.next().await.expect("first page")
+        else {
             panic!("expected first inventory batch");
         };
         let Some(Checkpoint::Change(cursor)) = batch.checkpoint else {
@@ -691,10 +761,13 @@ mod tests {
             GraphAccount::new_for_tests(resumed_client.clone(), PushMode::GraphSubscriptions);
         let mut stream =
             resume_inventory_stream(resumed, cursor).expect("Graph inventory cursor resumes");
-        assert!(matches!(stream.next().await, Some(SyncEvent::Batch(_))));
         assert!(matches!(
             stream.next().await,
-            Some(SyncEvent::Done(Some(_)))
+            Some(bifrost_types::InventoryEvent::Batch(_))
+        ));
+        assert!(matches!(
+            stream.next().await,
+            Some(bifrost_types::InventoryEvent::Done(_))
         ));
         let requests = resumed_client.take_rest_requests();
         assert_eq!(requests.len(), 1);
@@ -791,11 +864,17 @@ mod tests {
         };
 
         let mut stream = inventory_stream(account, scope);
-        assert!(matches!(stream.next().await, Some(SyncEvent::Batch(_))));
-        assert!(matches!(stream.next().await, Some(SyncEvent::Batch(_))));
         assert!(matches!(
             stream.next().await,
-            Some(SyncEvent::Done(Some(_)))
+            Some(bifrost_types::InventoryEvent::Batch(_))
+        ));
+        assert!(matches!(
+            stream.next().await,
+            Some(bifrost_types::InventoryEvent::Batch(_))
+        ));
+        assert!(matches!(
+            stream.next().await,
+            Some(bifrost_types::InventoryEvent::Done(_))
         ));
 
         let requests = shared.take_rest_requests();
@@ -931,9 +1010,12 @@ mod tests {
         let account = test_account();
         let mut stream = inventory_stream(account, CursorScope::Account);
         let first = stream.next().await.expect("fatal event");
-        assert!(matches!(first, SyncEvent::Terminated(_)));
+        assert!(matches!(
+            first,
+            bifrost_types::InventoryEvent::Terminated(_)
+        ));
         let second = stream.next().await.expect("done event");
-        assert!(matches!(second, SyncEvent::Done(None)));
+        assert!(matches!(second, bifrost_types::InventoryEvent::Done(_)));
         assert!(stream.next().await.is_none());
     }
 
@@ -943,9 +1025,12 @@ mod tests {
         let scope = CursorScope::Query(QueryId("q1".to_string()));
         let mut stream = inventory_stream(account, scope);
         let first = stream.next().await.expect("fatal event");
-        assert!(matches!(first, SyncEvent::Terminated(_)));
+        assert!(matches!(
+            first,
+            bifrost_types::InventoryEvent::Terminated(_)
+        ));
         let second = stream.next().await.expect("done event");
-        assert!(matches!(second, SyncEvent::Done(None)));
+        assert!(matches!(second, bifrost_types::InventoryEvent::Done(_)));
     }
 
     #[tokio::test]
@@ -957,7 +1042,10 @@ mod tests {
         };
         let mut stream = inventory_stream(account, scope);
         let first = stream.next().await.expect("fatal event");
-        assert!(matches!(first, SyncEvent::Terminated(_)));
+        assert!(matches!(
+            first,
+            bifrost_types::InventoryEvent::Terminated(_)
+        ));
     }
 
     #[test]
@@ -1149,13 +1237,73 @@ mod tests {
         ));
     }
 
+    /// A value with no usable id yields no ENTRY - it cannot, there is nothing
+    /// to key it by.
+    ///
+    /// What that must NOT mean is that the walk forgets it. The caller turns
+    /// this `None` into a `Region` obligation so the delta link cannot advance
+    /// past the value while claiming complete coverage; this test pins only the
+    /// projection half. It previously read as `an_entry_without_an_id_is_dropped`
+    /// and, together with the caller's silent `if let Some`, pinned the drop
+    /// itself as correct behaviour.
     #[test]
-    fn an_entry_without_an_id_is_dropped() {
+    fn a_value_without_an_id_yields_no_entry() {
         let scope = CursorScope::FolderType {
             folder: FolderId("inbox".to_string()),
             ty: ObjectType::Email,
         };
         assert!(inventory_entry_from_value(&scope, &json!({ "changeKey": "CK1" })).is_none());
+    }
+
+    /// An id-less value poisons the page's coverage rather than vanishing.
+    ///
+    /// The old behaviour dropped it and advanced the delta link, which violates
+    /// the checkpoint contract outright: nothing could name, retry, or later
+    /// reconcile the skipped value, and the cursor moved past it for good.
+    ///
+    /// It is a `Region`, not an `Object`, and that is the honest classification:
+    /// an absent id may mean one malformed value, a schema mismatch affecting
+    /// many, or a truncated page, so claiming a single-object loss would assert
+    /// knowledge the walk does not have.
+    #[tokio::test]
+    async fn an_id_less_value_becomes_a_region_obligation() {
+        let client = GraphClient::new("token");
+        client.script_rest([ScriptedRestResponse::json(
+            reqwest::StatusCode::OK,
+            json!({
+                "value": [
+                    { "id": "m1", "changeKey": "CK1" },
+                    { "changeKey": "CK2" },
+                ],
+                "@odata.deltaLink": "https://graph.example/delta?token=final"
+            }),
+        )]);
+        let account = GraphAccount::new_for_tests(client, PushMode::GraphSubscriptions);
+        let scope = CursorScope::FolderType {
+            folder: FolderId("inbox".to_string()),
+            ty: ObjectType::Email,
+        };
+
+        let events: Vec<_> = inventory_stream(account, scope).collect().await;
+
+        let completion = events
+            .iter()
+            .find_map(|event| match event {
+                bifrost_types::InventoryEvent::Done(completion) => Some(completion),
+                _ => None,
+            })
+            .expect("the walk must finish");
+        let bifrost_types::InventoryCoverage::Degraded { obligations } = &completion.coverage
+        else {
+            panic!("an id-less value must not be reported as complete coverage");
+        };
+        assert!(
+            obligations.iter().any(|obligation| matches!(
+                obligation,
+                bifrost_types::InventoryObligation::Region { .. }
+            )),
+            "an unidentifiable value is a region, not a named object: {obligations:?}"
+        );
     }
 
     #[test]

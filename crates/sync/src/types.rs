@@ -185,6 +185,10 @@ pub(crate) struct AccountSlot {
     pub capabilities: Arc<std::sync::RwLock<AccountCapabilities>>,
     pub multiplexer: MultiplexerHandle,
     pub cursors: Arc<CursorRegistry>,
+    /// What each scope's latest enumeration proved, pending the
+    /// acknowledgement that makes it durable. Shared with the account's single
+    /// writer, which reads it back to build one atomic checkpoint record.
+    pub coverage: Arc<crate::cursor::PendingCoverage>,
     pub checkpoints: Arc<DynCheckpointStore>,
     pub boundary_tx: watch::Sender<BoundaryRequest>,
     pub shutdown: CancellationToken,
