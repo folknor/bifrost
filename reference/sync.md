@@ -766,6 +766,20 @@ method and final read-back guard. Campaign flow:
    accumulated during it, so an id parked in the read-back lane cannot
    be dropped by a later attempt that resubmits its siblings.
 
+`ItemOutcome::Succeeded` buckets by its `MutationSuccess` payload:
+`Applied` -> `applied`, `Skipped` -> `skipped`, and **`Downgraded` ->
+`PendingReadback`**. A downgrade means the provider did something weaker than
+asked, so its own success report is precisely the claim that must not be
+trusted; routing it into the read-back set makes the final accounting come
+from observed state. It is deliberately NOT pushed onto `retry_ids`: a
+downgrade is not transient, and resubmitting earns the same downgrade while
+consuming the campaign's attempts. Gmail's trash-instead-of-destroy fallback
+is the motivating case, and filing it `Applied` produced a permanent
+destroy/reappear reconcile loop. The catch-all arm for this match sends any
+FUTURE `MutationSuccess` variant to `PendingReadback` too, rather than
+assuming success - folding an unknown variant into `Applied` is how the
+downgrade went unnoticed originally.
+
 `MutationCounters` buckets `ItemOutcome::Failed` outcomes via
 `crate::recovery::plan_recovery`:
 - `Retry { SameRequest | AfterAuthRefresh }` -> `pending_retry`.

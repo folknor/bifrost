@@ -14,9 +14,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use bifrost_types::{
-    AccountError, AccountOperation, AccountStream, Batch, BatchFailure, BatchItemId, FlagOp,
-    IdempotencyKey, ItemOutcome, LabelId, MembershipScope, MutationSuccess, ObjectId, PageBoundary,
-    SyncEvent,
+    AccountError, AccountOperation, AccountStream, Batch, BatchFailure, BatchItemId, BatchSuccess,
+    FlagOp, IdempotencyKey, ItemOutcome, LabelId, MembershipScope, MutationSuccess, ObjectId,
+    PageBoundary, SyncEvent,
 };
 use futures::{StreamExt, stream};
 use serde::Serialize;
@@ -295,7 +295,24 @@ async fn apply_destroy(
             let fallback = flags::move_placement_patch(LABEL_TRASH);
             match apply_label_patch(client, ids, fallback, key, AccountOperation::BulkDestroy).await
             {
-                MutationApply::Batch(outcomes) => MutationApply::Batch(outcomes),
+                // The patch succeeding does NOT mean the destroy succeeded.
+                // These messages were moved to Trash; they still exist. Taking
+                // the patch's own `Applied` outcomes told the engine they were
+                // destroyed, so the next inventory pass observed them again and
+                // destroyed them again - a permanent reconcile loop, on the
+                // ordinary `gmail.modify` scope that triggers this fallback by
+                // design. Report the downgrade instead and let the engine
+                // read-back-verify it.
+                //
+                // Rebuilt from `ids` rather than mapped over the patch's
+                // outcomes on purpose: `apply_label_patch` may legitimately
+                // report per-item failures, and a failed trash is a failure,
+                // not a downgrade. Only ids the patch reported as SUCCEEDED
+                // become `Downgraded`; everything else keeps the lane the
+                // patch gave it.
+                MutationApply::Batch(outcomes) => {
+                    MutationApply::Batch(downgrade_succeeded_outcomes(outcomes))
+                }
                 MutationApply::Terminate(fallback_error) => {
                     MutationApply::Terminate(merge_delete_fallback_error(fallback_error, &primary))
                 }
@@ -310,6 +327,29 @@ async fn apply_destroy(
             Err(account_error) => MutationApply::Terminate(account_error),
         },
     }
+}
+
+/// Re-label the SUCCEEDED outcomes of a `bulk_destroy` permission fallback as
+/// `Downgraded`, leaving the other lanes untouched.
+///
+/// The fallback trashes messages a permanent delete was refused for. A message
+/// the trash patch reported as succeeded therefore exists in Trash: not
+/// destroyed (`Applied` is false) and not unchanged (`Skipped` is false). The
+/// failed and uncertain lanes pass through unchanged, because an id whose trash
+/// patch FAILED was not downgraded - it was simply not mutated, and its
+/// classified failure is the honest answer for it.
+fn downgrade_succeeded_outcomes(
+    outcomes: Vec<ItemOutcome<MutationSuccess>>,
+) -> Vec<ItemOutcome<MutationSuccess>> {
+    outcomes
+        .into_iter()
+        .map(|outcome| match outcome {
+            ItemOutcome::Succeeded(success) => {
+                ItemOutcome::Succeeded(BatchSuccess::new(success.item, MutationSuccess::Downgraded))
+            }
+            other => other,
+        })
+        .collect()
 }
 
 fn terminate_event(error: AccountError) -> SyncEvent<ItemOutcome<MutationSuccess>> {
@@ -431,6 +471,52 @@ mod tests {
 
     fn label(id: &str) -> MembershipScope {
         MembershipScope::Label(LabelId(id.to_string()))
+    }
+
+    /// The trash fallback reports `Downgraded`, and only for ids it actually
+    /// trashed.
+    ///
+    /// `bulk_destroy` falls back to a TRASH patch when `batchDelete` is refused
+    /// for scope reasons - the ordinary case under the `gmail.modify` OAuth
+    /// scope, which does not permit permanent delete. Those messages moved but
+    /// still exist, so taking the patch's own `Applied` outcomes told the engine
+    /// they were destroyed and earned a permanent destroy/reappear reconcile
+    /// loop.
+    ///
+    /// The second assertion is the one that is easy to get wrong: an id whose
+    /// trash patch FAILED was not downgraded, it was not mutated at all, and
+    /// its classified failure is the honest answer. Re-labelling every id from
+    /// the input list would bury those failures as successes-of-a-weaker-kind.
+    #[test]
+    fn the_destroy_trash_fallback_downgrades_only_what_it_trashed() {
+        use bifrost_types::{BatchFailure, BatchSuccess};
+
+        let failure = crate::account::error::into_account_error(
+            crate::Error::invalid_request(AccountOperation::BulkDestroy, "trash patch refused"),
+            GmailErrorContext::mutation(AccountOperation::BulkDestroy),
+        );
+        let outcomes = vec![
+            ItemOutcome::Succeeded(BatchSuccess::new(
+                BatchItemId("trashed".into()),
+                MutationSuccess::Applied,
+            )),
+            ItemOutcome::Failed(BatchFailure::new(BatchItemId("refused".into()), failure)),
+        ];
+
+        let downgraded = downgrade_succeeded_outcomes(outcomes);
+
+        match &downgraded[0] {
+            ItemOutcome::Succeeded(success) => assert_eq!(
+                success.output,
+                MutationSuccess::Downgraded,
+                "a trashed message was not destroyed and must not report Applied"
+            ),
+            other => panic!("expected a succeeded outcome, got {other:?}"),
+        }
+        assert!(
+            matches!(&downgraded[1], ItemOutcome::Failed(_)),
+            "an id whose trash patch failed was not downgraded, it was not mutated"
+        );
     }
 
     #[test]

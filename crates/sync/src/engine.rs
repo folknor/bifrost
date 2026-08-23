@@ -4980,7 +4980,23 @@ fn classify_item_outcome(
             let bucket = match success.output {
                 MutationSuccess::Applied => MutationBucket::Applied,
                 MutationSuccess::Skipped => MutationBucket::Skipped,
-                _ => MutationBucket::Applied,
+                // The provider did something weaker than asked, so its claim
+                // is exactly what must not be trusted. `PendingReadback` puts
+                // the id in the read-back set (`unresolved_readback_ids`)
+                // WITHOUT queueing a resubmission - a downgrade is not a
+                // transient failure and replaying it just earns the same
+                // downgrade - so the final accounting comes from observed
+                // state. For the motivating case, a Gmail message trashed
+                // instead of destroyed still hydrates, so the guard files it
+                // `still_failed`: honest, and it breaks the permanent
+                // destroy/reappear reconcile loop that reporting `Applied`
+                // created.
+                MutationSuccess::Downgraded => MutationBucket::PendingReadback,
+                // `MutationSuccess` is #[non_exhaustive]. A new variant must
+                // be classified deliberately, not folded into `Applied` - that
+                // is how a downgrade got reported as a clean success in the
+                // first place.
+                _ => MutationBucket::PendingReadback,
             };
             outcomes.insert(id, bucket);
             None
@@ -5290,6 +5306,57 @@ mod tests {
         queue_unresolved_for_retry(&remaining, &outcomes, &mut retry_ids);
 
         assert_eq!(retry_ids, vec![unseen]);
+    }
+
+    /// A `Downgraded` success is read-back-verified, never trusted, and never
+    /// resubmitted.
+    ///
+    /// The provider did something WEAKER than asked, so its own report is
+    /// exactly the thing that must not be believed. Filing it `Applied` is what
+    /// produced a permanent reconcile loop for Gmail's trash-instead-of-destroy
+    /// fallback: the engine believed the messages were gone, the next inventory
+    /// pass saw them, and it destroyed them again forever. It must equally not
+    /// land in `retry_ids` - replaying a downgrade earns the same downgrade,
+    /// burning the campaign's attempts to no purpose.
+    #[test]
+    fn a_downgraded_mutation_is_read_back_verified_and_not_retried() {
+        use bifrost_types::{BatchItemId, BatchSuccess, ItemOutcome, MutationSuccess};
+
+        let id = bifrost_types::ObjectId("message".into());
+        let item: ItemOutcome<MutationSuccess> = ItemOutcome::Succeeded(BatchSuccess::new(
+            BatchItemId("message".into()),
+            MutationSuccess::Downgraded,
+        ));
+        let mut outcomes = std::collections::HashMap::new();
+        let mut retry = Vec::new();
+        let mut dedupe = 0;
+        let throttles = std::sync::Mutex::new(crate::recovery::ThrottleBucket::new());
+        let account = bifrost_types::AccountId("acc".into());
+
+        let forwarded = classify_item_outcome(
+            item,
+            &mut outcomes,
+            &mut retry,
+            &mut dedupe,
+            &throttles,
+            &account,
+        );
+
+        assert!(forwarded.is_none(), "a downgrade is not an engine recovery");
+        assert_eq!(
+            outcomes.get(&id),
+            Some(&MutationBucket::PendingReadback),
+            "a downgrade must not be filed as Applied"
+        );
+        assert!(
+            retry.is_empty(),
+            "a downgrade is not transient; resubmitting it earns the same downgrade"
+        );
+        assert_eq!(
+            unresolved_readback_ids(&outcomes),
+            vec![id],
+            "the read-back guard must resolve it against observed state"
+        );
     }
 
     #[test]

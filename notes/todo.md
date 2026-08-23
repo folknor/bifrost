@@ -1125,7 +1125,9 @@ confirm against the code before working any of them.
   wrong while it is absent. If it happens it should land in both crates together,
   since a move that works for events and refuses for contacts is a new
   asymmetry rather than a fixed one.
-- **dav-B5. Collapse both DAV crates into a shared `bifrost-dav`.** [C4]
+- **dav-B5. The CalDAV/CardDAV duplication.** [C4] **Deliberately left open on
+  2026-08-23; not resolved, and not to be acted on without the owner.**
+
   Roughly 1500 duplicated lines across `client.rs` (transport, redirect policy,
   `auth_headers`, `escape_xml`, etag handling, the raw request helpers, the
   ~120-line `status_error` ladder), `parse.rs` (the whole propstat state machine,
@@ -1133,20 +1135,40 @@ confirm against the code before working any of them.
   the snapshot diff, `put_condition`, URL comparison, and ~400 lines of
   `Unsupported` stubs each crate carries for the other's domain). The genuinely
   protocol-specific parts are the property names, the query XML, and the body
-  projection. **Do not act on this without the owner.** Its premise - "pre-1.0
-  and crate-private below a factory, so the blast radius is small" - is a claim
-  about this workspace, and both crates are published with consumers outside it
-  by definition. This is the same shape as the two deletions that had to be
-  reverted; see the standing lessons in `AGENTS.md`.
-- **google-B1. `bulk_destroy` reports `Applied` for messages that were only
-  trashed.** [C1] `crates/google/src/account/mutation.rs::apply_destroy`: when
-  `batchDelete` fails the scope check the fallback is a TRASH label patch, and
-  `apply_label_patch` returns `MutationSuccess::Applied`. The engine is told the
-  destroy succeeded while the messages still exist, so they reappear in the next
-  inventory or history pass - a permanent reconcile loop. The other half of the
-  original finding (the fallback firing on any unparseable 403) is fixed; only
-  the outcome reporting remains, and it needs a distinct published
-  `MutationSuccess` variant.
+  projection.
+
+  The duplication is real and the drift it causes is measured, not theoretical:
+  SEVEN divergences have been found between these two crates, three of them
+  fixed on 2026-08-23 (the `contact_snapshot` ctag path, the phantom collection,
+  the silently-dropped calendar move). Every one was a case of a fix landing in
+  one crate and not its twin.
+
+  Three options, none picked:
+
+  **A. Collapse to a single `bifrost-dav`** parameterized over the
+  collection/resource kind, with CalDAV and CardDAV as thin projection layers
+  (`ical.rs` / `vcard.rs`) plus their prop constants and query bodies. Removes
+  the duplication outright. Highest blast radius: it reshapes two PUBLISHED
+  pre-1.0 crates. Note the original argument for it - "pre-1.0 and crate-private
+  below a factory, so the blast radius is small" - is a claim about THIS
+  workspace, and both crates are published with consumers outside it by
+  definition. That is the same reasoning that produced two public-API deletions
+  which had to be reverted; see the standing lessons in `AGENTS.md`.
+
+  **B. Extract the protocol-neutral half into a PRIVATE shared crate**, leaving
+  both published surfaces exactly as they are. `bifrost-sasl` is the existing
+  precedent in this workspace: a private shared computation layer consumed by a
+  protocol crate and not published as public API. Kills the drift without
+  touching either crate's contract. Real work, no user-visible benefit.
+
+  **C. Leave it, and rely on the drift rule.** `reference/caldav.md` and
+  `reference/carddav.md` now both state that these crates are near-duplicates
+  and that any fix to shared-shape code must be checked against the other.
+  Defensible: after the 2026-08-23 round the drift-prone code is mostly
+  unified already (one `PropStat` struct, one href-resolution rule, the ctag
+  path fixed), and what remains duplicated is stable code - `escape_xml`,
+  `status_error`, the cursor codec - which has drifted rarely because it
+  changes rarely.
 - **google-B3. Calendar's endpoint override is an env var.** [C3, additive]
   `calendar.rs::calendar_api_base()` reads
   `std::env::var("RATATOSKR_TEST_GCAL_ENDPOINT")` on every call - the only

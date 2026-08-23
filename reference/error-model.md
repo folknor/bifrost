@@ -308,8 +308,24 @@ name the same folder twice. No fourth lane and no parallel contract: an
 `Uncertain(BatchUncertain)` - the same closed three-lane model, emitted
 per item instead of collected. Deliberately not `#[non_exhaustive]`: a
 wildcard arm would let stale consumer policy silently apply to a new
-lane. `MutationSuccess::{Applied, Skipped}` is the flag-mutation
-success payload.
+lane. `MutationSuccess::{Applied, Skipped, Downgraded}` is the
+mutation success payload, and the three are distinct answers to
+distinct questions: `Applied` means the target is in the requested
+state, `Skipped` means it already was and nothing was done, and
+`Downgraded` means the provider accepted a WEAKER operation - the
+target changed but is not in the requested state.
+
+`Downgraded` exists because reporting either neighbour in its place is
+a wrong answer a consumer cannot detect. Gmail `bulk_destroy` under the
+`gmail.modify` OAuth scope cannot permanently delete, so it falls back
+to moving the messages to Trash: reported `Applied`, the engine believed
+a state it re-observed as false on every subsequent pass and re-issued
+the destroy forever; reported `Skipped`, a real mutation would be
+hidden. `bifrost-sync` files it `PendingReadback` rather than trusting
+it, so the final accounting comes from observed state - a downgrade is
+the one success report whose own claim is known to be incomplete.
+It is deliberately NOT queued for resubmission: a downgrade is not
+transient, and replaying it earns the same downgrade.
 
 ## Diagnostics and consent tiers
 

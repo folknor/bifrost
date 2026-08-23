@@ -659,9 +659,26 @@ share a single `mutation_stream` driver:
     matching the scopes Gmail OAuth tokens with the
     `gmail.modify` scope can perform but `gmail.metadata` cannot.
     An unparseable 403 body follows ordinary classified failure handling and
-    never triggers the downgrade. A successful fallback still reports
-    `MutationSuccess::Applied`; distinguishing "trashed instead of destroyed"
-    needs the deferred published outcome variant.
+    never triggers the downgrade.
+
+    A successful fallback reports `MutationSuccess::Downgraded`, never
+    `Applied`: those messages moved to Trash and still exist. Reported as
+    `Applied` they came back on the next inventory or history pass, were
+    destroyed again, and the account sat in a permanent reconcile loop - on
+    the ordinary `gmail.modify` scope, which triggers this fallback by design
+    rather than by misconfiguration. `bifrost-sync` read-back-verifies the
+    `Downgraded` lane instead of trusting it, and a trashed message still
+    hydrates, so the guard files it `still_failed`: honest, and terminal.
+
+    Only ids the trash patch reported as SUCCEEDED are downgraded
+    (`downgrade_succeeded_outcomes`). An id whose trash patch failed was not
+    downgraded - it was not mutated at all - and keeps its classified failure.
+    That helper is the crate's only producer of `Downgraded`, so removing the
+    call site fails the build as dead code; the helper's own semantics,
+    including the lane-preservation rule, are pinned by
+    `the_destroy_trash_fallback_downgrades_only_what_it_trashed`. There is no
+    hermetic end-to-end test of `apply_destroy` itself, because the crate has
+    no scripted-transport seam and the testing rules forbid a socket.
 - The driver reads one item ahead at the 1000-item boundary. Every
   final mutation batch is marked `PageBoundary::Final`, including a
   stream whose item count is exactly divisible by 1000, followed by
@@ -673,6 +690,9 @@ Result classification:
   `MutationSuccess::Applied`.
 - A legitimate empty patch (label op with no changes) ->
   `ItemOutcome::Succeeded` with `MutationSuccess::Skipped` per id.
+- A `Destroy` that fell back to a TRASH patch for scope reasons ->
+  `ItemOutcome::Succeeded` with `MutationSuccess::Downgraded` per
+  successfully-trashed id (see the `Destroy` bullet above).
 - An unsupported flag or non-label move scope is malformed caller
   input and produces `ItemOutcome::Failed` per id with a
   `Request(Malformed)` account error. It is never reported as a
