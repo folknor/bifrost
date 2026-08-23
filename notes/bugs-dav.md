@@ -44,7 +44,8 @@ base nor a discovered home - now gets a hard local error where it previously got
 That is the intended trade. It is a behavior change, not an API change: no published item was
 removed, renamed, or reshaped.
 
-Highest severity, ahead of its position in the document: **the recurrence-override EventId finding
+Highest severity (it now also sits first in the document, after triage deletions): **the
+recurrence-override EventId finding
 destroys an entire recurring series on an instance delete, verified against the current tree (no
 `#` guard exists anywhere in either crate).** It is worse than a document ordered by discovery
 makes it look.
@@ -199,7 +200,8 @@ collection, the depth-0 poll, and the resource-identification fixes land once.
 
 Two dependent structural notes:
 
-- The `DavTransport` seam exists solely because `bifrost-net`'s dispatcher is crate-private. The cost
+- **[C2]** (marker added by the 2026-08-23 close pass; the text below is the hunter's.) The
+  `DavTransport` seam exists solely because `bifrost-net`'s dispatcher is crate-private. The cost
   is that all DAV traffic bypasses bifrost-net entirely: no retry, no rate limiting, no bandwidth
   metering, no observability. `set_priority` and `set_bandwidth_cap` are no-ops in both crates, so an
   IMAP account composed `with_caldav`/`with_carddav` and a `BandwidthMeter` silently does not meter

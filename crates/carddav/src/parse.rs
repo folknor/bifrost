@@ -685,6 +685,9 @@ impl ResponseParts {
     }
 
     fn as_fetched_vcard(&self) -> Option<CardDavFetchedVCard> {
+        if self.is_collection {
+            return None;
+        }
         Some(CardDavFetchedVCard {
             uri: self.href.as_ref()?.clone(),
             etag: self.etag.clone(),
@@ -867,6 +870,43 @@ mod tests {
         assert_eq!(listing.entries.len(), 1);
         assert_eq!(listing.entries[0].uri, "/contacts/opaque-id");
         assert_eq!(listing.entries[0].etag, Some("abc".to_string()));
+    }
+
+    /// Same rule on the multiget lane: a refused `resourcetype` must not
+    /// suppress address data a successful propstat supplied.
+    #[test]
+    fn multiget_ignores_collection_marker_in_a_failed_propstat() {
+        let xml = r#"<D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:carddav">
+          <D:response><D:href>/contacts/opaque-id</D:href>
+          <D:propstat><D:prop><D:getetag>"abc"</D:getetag>
+          <C:address-data>BEGIN:VCARD
+VERSION:4.0
+FN:One
+END:VCARD</C:address-data></D:prop>
+          <D:status>HTTP/1.1 200 OK</D:status></D:propstat>
+          <D:propstat><D:prop><D:resourcetype><D:collection/></D:resourcetype></D:prop>
+          <D:status>HTTP/1.1 404 Not Found</D:status></D:propstat>
+          </D:response></D:multistatus>"#;
+
+        let report = parse_multiget_report(xml).expect("valid XML");
+        assert_eq!(report.cards.len(), 1);
+        assert_eq!(report.cards[0].uri, "/contacts/opaque-id");
+    }
+
+    /// The CalDAV twin guards this; the two crates had drifted. A server
+    /// echoing the collection itself alongside the requested resources must
+    /// not surface the collection URL as a card id.
+    #[test]
+    fn multiget_does_not_fetch_an_echoed_collection() {
+        let xml = r#"<D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:carddav">
+          <D:response><D:href>/contacts/</D:href><D:propstat><D:prop>
+          <D:resourcetype><D:collection/></D:resourcetype>
+          <C:address-data>not a card</C:address-data></D:prop>
+          <D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>
+          </D:multistatus>"#;
+
+        let report = parse_multiget_report(xml).expect("valid XML");
+        assert!(report.cards.is_empty());
     }
 
     #[test]
