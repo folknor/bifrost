@@ -126,6 +126,17 @@ pub enum PageBoundary {
 ///
 /// The consumer atomically persists `(items, checkpoint.unwrap())` in
 /// one transaction when `checkpoint` is `Some`.
+///
+/// The fields stay public and `try_new` is therefore a CONVENIENCE, not a
+/// gate: an implementor can still assemble `Partial` + `Some(checkpoint)`
+/// literally and never touch the constructor. Making the fields private
+/// would enforce it, at the cost of deleting published fields every
+/// protocol crate constructs, which is not on the table. So the invariant
+/// is enforced where it can actually be enforced - `bifrost-sync` calls
+/// `validate_boundary` on every batch it receives from an account and
+/// terminates the scope with a classified `ProviderContractViolation`
+/// rather than trusting the shape. Producers should use `try_new` to find
+/// out at the source; consumers must not assume they did.
 #[derive(Debug, Clone)]
 pub struct Batch<T> {
     pub items: Vec<T>,
@@ -134,6 +145,47 @@ pub struct Batch<T> {
     pub bytes_in: u64,
     pub checkpoint: Option<Checkpoint>,
 }
+
+impl<T> Batch<T> {
+    pub fn try_new(
+        items: Vec<T>,
+        page_boundary: PageBoundary,
+        server_latency: Duration,
+        bytes_in: u64,
+        checkpoint: Option<Checkpoint>,
+    ) -> Result<Self, BatchBoundaryError> {
+        let batch = Self {
+            items,
+            page_boundary,
+            server_latency,
+            bytes_in,
+            checkpoint,
+        };
+        batch.validate_boundary()?;
+        Ok(batch)
+    }
+
+    /// Reject the one boundary/checkpoint combination that cannot describe a
+    /// durable transaction. Consumers must call this at the account boundary.
+    pub fn validate_boundary(&self) -> Result<(), BatchBoundaryError> {
+        if matches!(self.page_boundary, PageBoundary::Partial) && self.checkpoint.is_some() {
+            Err(BatchBoundaryError)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BatchBoundaryError;
+
+impl std::fmt::Display for BatchBoundaryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a partial page boundary cannot carry a checkpoint")
+    }
+}
+
+impl std::error::Error for BatchBoundaryError {}
 
 /// One page of an inventory walk, plus what the walk PROVED up to here.
 ///
@@ -155,6 +207,36 @@ pub struct InventoryBatch {
     pub bytes_in: u64,
     pub checkpoint: Option<Checkpoint>,
     pub coverage: InventoryCoverageReport,
+}
+
+impl InventoryBatch {
+    pub fn try_new(
+        items: Vec<InventoryEntry>,
+        page_boundary: PageBoundary,
+        server_latency: Duration,
+        bytes_in: u64,
+        checkpoint: Option<Checkpoint>,
+        coverage: InventoryCoverageReport,
+    ) -> Result<Self, BatchBoundaryError> {
+        let batch = Self {
+            items,
+            page_boundary,
+            server_latency,
+            bytes_in,
+            checkpoint,
+            coverage,
+        };
+        batch.validate_boundary()?;
+        Ok(batch)
+    }
+
+    pub fn validate_boundary(&self) -> Result<(), BatchBoundaryError> {
+        if matches!(self.page_boundary, PageBoundary::Partial) && self.checkpoint.is_some() {
+            Err(BatchBoundaryError)
+        } else {
+            Ok(())
+        }
+    }
 }
 
 /// How an inventory walk ended.
@@ -527,4 +609,32 @@ pub enum PauseReason {
     /// Engine exhausted its retry budget for a recurring failure;
     /// consumer intervention required before further attempts.
     RetryBudgetExhausted,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Batch, Checkpoint, PageBoundary};
+    use crate::{ChangeCursor, CursorScope, OpaqueChangeState, ProtocolKind};
+    use std::time::Duration;
+
+    #[test]
+    fn partial_batch_rejects_checkpoint() {
+        let batch = Batch::<()> {
+            items: vec![],
+            page_boundary: PageBoundary::Partial,
+            server_latency: Duration::ZERO,
+            bytes_in: 0,
+            checkpoint: Some(Checkpoint::Change(ChangeCursor {
+                scope: CursorScope::Account,
+                server_state: OpaqueChangeState {
+                    protocol: ProtocolKind::Imap,
+                    envelope_version: 1,
+                    bytes: vec![1],
+                },
+                advanced_through: None,
+                envelope_version: 1,
+            })),
+        };
+        assert!(batch.validate_boundary().is_err());
+    }
 }

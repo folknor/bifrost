@@ -31,9 +31,9 @@ use bifrost_types::{
     HostedAttachment, HydratedObject, HydrationProjection, IdempotencyKey, Identity, IdentityId,
     IdentityPatch, Importance, InventoryEvent, ItemOutcome, MembershipScope, Message,
     MutationCapabilities, MutationConcurrency, MutationReplaySafety, MutationSuccess,
-    MutationTarget, ObjectId, OpaqueChangeState, Page, PimMethodSupport, Priority, Projection,
-    ProtocolKind, PushCapability, QuotaInfo, QuotaSignal, RateLimitClass, RequestCause, RsvpStatus,
-    ScopeLifecycleEvent, SearchRequest, SendRequest, ServerFilter, ServerFilterCreate,
+    MutationTarget, ObjectId, OpaqueChangeState, Page, PageBoundary, PimMethodSupport, Priority,
+    Projection, ProtocolKind, PushCapability, QuotaInfo, QuotaSignal, RateLimitClass, RequestCause,
+    RsvpStatus, ScopeLifecycleEvent, SearchRequest, SendRequest, ServerFilter, ServerFilterCreate,
     ServerFilterId, ServerFilterPatch, SubscriptionHandle, SyncEvent, ThreadHydration, ThreadId,
     VacationConfig, WatchEvent,
 };
@@ -42,6 +42,7 @@ use bifrost_types::{BackfillCheckpoint, Checkpoint};
 use bifrost_types::{Calendar, CalendarEvent};
 use bytes::Bytes;
 use futures::stream;
+use std::sync::atomic::AtomicUsize as BoundaryCounter;
 
 fn unsupported(op: bifrost_types::AccountOperation) -> AccountError {
     AccountErrorBuilder::new(
@@ -241,6 +242,12 @@ struct HealAccount {
     /// parks until released, holding `detach` open inside its teardown
     /// window. `None` for every test that does not stage that window.
     close_gate: Arc<Mutex<Option<CloseGate>>>,
+    /// When `Some`, `changes_stream` emits an ENDLESS run of batches that
+    /// violate the boundary contract (`PageBoundary::Partial` carrying a
+    /// checkpoint), counting each one it hands out. Endless is the point:
+    /// a driver that merely logs the violation and re-polls would consume
+    /// them without bound, so the count is the spin detector.
+    bad_boundary_batches: Option<Arc<AtomicUsize>>,
 }
 
 /// Test handle for pinning `detach` inside `Account::close()`.
@@ -331,6 +338,7 @@ impl AccountFactory for HealFactory {
                 lifecycle_script: Arc::new(Mutex::new(VecDeque::new())),
                 degraded_contacts,
                 close_gate: Arc::clone(&close_gate),
+                bad_boundary_batches: None,
             });
             Ok(bifrost_types::OpenedAccount::complete(account))
         })
@@ -389,6 +397,7 @@ impl AccountFactory for RotatingFactory {
                 lifecycle_script: Arc::new(Mutex::new(VecDeque::new())),
                 degraded_contacts: false,
                 close_gate: no_close_gate(),
+                bad_boundary_batches: None,
             });
             Ok(bifrost_types::OpenedAccount::complete(account))
         })
@@ -468,8 +477,20 @@ impl Account for HealAccount {
         Box::pin(stream::empty())
     }
 
-    fn changes_stream(&self, _cursor: ChangeCursor) -> AccountStream<SyncEvent<Change>> {
-        Box::pin(stream::empty())
+    fn changes_stream(&self, cursor: ChangeCursor) -> AccountStream<SyncEvent<Change>> {
+        let Some(counter) = self.bad_boundary_batches.clone() else {
+            return Box::pin(stream::empty());
+        };
+        Box::pin(stream::repeat_with(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            SyncEvent::Batch(Batch {
+                items: Vec::new(),
+                page_boundary: PageBoundary::Partial,
+                server_latency: std::time::Duration::ZERO,
+                bytes_in: 0,
+                checkpoint: Some(Checkpoint::Change(cursor.clone())),
+            })
+        }))
     }
 
     fn push_subscribe(
@@ -857,7 +878,7 @@ impl Account for HealAccount {
             // A successful page with both lanes empty - the shape that
             // must stay silent. An `Err` here would exercise the `?`
             // instead of the emptiness guard.
-            return Box::pin(async { Ok(Page::single(Vec::new())) });
+            return Box::pin(async { Ok(Page::single(Vec::new(), Vec::new(), Vec::new())) });
         }
         // A walk that returned some cards, could not materialize one
         // resource, and gave up on a whole address book part way
@@ -1632,6 +1653,7 @@ impl AccountFactory for GatingFactory {
                 lifecycle_script: Arc::new(Mutex::new(VecDeque::new())),
                 degraded_contacts: false,
                 close_gate: no_close_gate(),
+                bad_boundary_batches: None,
             });
             Ok(bifrost_types::OpenedAccount::complete(account))
         })
@@ -2234,6 +2256,7 @@ impl AccountFactory for SkippingFactory {
                 lifecycle_script: Arc::new(Mutex::new(VecDeque::new())),
                 degraded_contacts: false,
                 close_gate: no_close_gate(),
+                bad_boundary_batches: None,
             });
             Ok(bifrost_types::OpenedAccount {
                 account,
@@ -2339,6 +2362,7 @@ impl AccountFactory for ParkedReopenFactory {
                 lifecycle_script,
                 degraded_contacts: false,
                 close_gate: no_close_gate(),
+                bad_boundary_batches: None,
             });
             Ok(bifrost_types::OpenedAccount::complete(account))
         })
@@ -2450,6 +2474,7 @@ impl AccountFactory for ExhaustingFactory {
                 lifecycle_script,
                 degraded_contacts: false,
                 close_gate: no_close_gate(),
+                bad_boundary_batches: None,
             });
             Ok(bifrost_types::OpenedAccount::complete(account))
         })
@@ -2588,4 +2613,85 @@ async fn three_failed_reopens_terminate_and_pause_the_account() {
         .resume_account(&account_id)
         .expect("the paused account resumes on consumer request");
     engine.detach(&account_id).await.expect("detach");
+}
+
+/// A provider that violates the batch boundary contract must STOP the scope,
+/// not be logged and retried.
+///
+/// `Batch`'s fields are public, so nothing prevents an account from emitting
+/// `PageBoundary::Partial` with a checkpoint attached. The first guard against
+/// it returned a bare engine error, which `handle_drive_outcome` only logs
+/// before re-entering the poll loop from the same unchanged cursor: against a
+/// provider that keeps doing it, that is an unbounded run of requests with no
+/// recovery dispatch, no scope stop, and nothing on the stream telling a
+/// consumer the scope has quietly stopped making progress.
+///
+/// The stub's stream is endless on purpose. Exactly one batch may be drawn
+/// from it, the driver must report `Terminated`, the classified error must be
+/// terminal so `plan_recovery` stops the scope rather than scheduling another
+/// attempt, and a subscriber must see the termination.
+#[tokio::test]
+async fn a_partial_batch_carrying_a_checkpoint_terminates_the_scope() {
+    use bifrost_sync::cancel::Boundary;
+    use bifrost_sync::cursor::CursorRegistry;
+    use bifrost_sync::multiplexer::{ChangesEvent, drive_changes_stream};
+
+    let scope = CursorScope::Account;
+    let emitted = Arc::new(BoundaryCounter::new(0));
+    let account = HealAccount {
+        caps: caps(),
+        scopes: vec![scope.clone()],
+        established: Arc::new(Mutex::new(Vec::new())),
+        closed: Arc::new(AtomicUsize::new(0)),
+        generation: 0,
+        closed_generations: Arc::new(Mutex::new(Vec::new())),
+        subscribed: Arc::new(Mutex::new(Vec::new())),
+        unsubscribed: Arc::new(Mutex::new(Vec::new())),
+        unsubscribe_failures: Arc::new(AtomicUsize::new(0)),
+        lifecycle_calls: Arc::new(Mutex::new(Vec::new())),
+        lifecycle_script: Arc::new(Mutex::new(VecDeque::new())),
+        degraded_contacts: false,
+        close_gate: no_close_gate(),
+        bad_boundary_batches: Some(Arc::clone(&emitted)),
+    };
+
+    let (changes_tx, mut changes_rx) = tokio::sync::broadcast::channel(16);
+    let (boundary, _handle) = Boundary::new();
+    let outcome = drive_changes_stream(
+        &account,
+        scope.clone(),
+        cursor_for(&scope, b"live"),
+        Arc::new(CursorRegistry::new()),
+        AccountId("bad-boundary".into()),
+        changes_tx,
+        boundary.subscribe(),
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("the violation is reported as a terminated scope, not an engine error");
+
+    let ChangesEvent::Terminated(error) = outcome else {
+        panic!("a boundary violation must terminate the scope, got {outcome:?}");
+    };
+    assert!(
+        error.recovery().is_terminal(),
+        "a non-terminal class would send the poll loop back at the same cursor: {:?}",
+        error.recovery()
+    );
+    assert_eq!(
+        emitted.load(Ordering::SeqCst),
+        1,
+        "the driver must stop on the first bad batch, never keep drawing from a provider that repeats it"
+    );
+
+    let published = changes_rx
+        .try_recv()
+        .expect("subscribers must be told the scope terminated");
+    assert!(
+        matches!(published.event.as_ref(), SyncEvent::Terminated(_)),
+        "the published event must be the termination, got {:?}",
+        published.event
+    );
 }

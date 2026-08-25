@@ -180,7 +180,21 @@ reports `expected` and `found`.
 A batch carries items, page-boundary metadata, wire observations, and
 an optional checkpoint. The item set and checkpoint are one consumer
 transaction. A checkpoint must not be persisted unless the matching
-items were persisted.
+items were persisted. `PageBoundary::Partial` carrying a checkpoint is the
+one combination that cannot describe such a transaction, and `try_new` /
+`validate_boundary` name it on both `Batch` and `InventoryBatch`.
+
+`try_new` is a convenience, NOT a gate. `Batch`'s fields are public and stay
+public - every protocol crate constructs one literally, and making them
+private would delete published fields - so an implementor can always build
+the nonsense shape without touching the constructor. The invariant is
+therefore enforced where it can be: `bifrost-sync` validates every batch it
+receives at the account boundary and, on a violation, terminates the scope
+with a classified `Protocol(ContractViolation)` whose recovery is
+`ProviderContractViolation`. That class is terminal, so the engine stops the
+scope and publishes `SyncEvent::Terminated` instead of re-polling the
+unchanged cursor forever. A guard that only refuses the batch would trade a
+nonsense state for a silent non-progressing scope.
 
 `ScopeLifecycleEvent` carries created, renamed, and deleted membership
 events or a structured termination. `WatchEvent` carries invalidation,
@@ -208,6 +222,9 @@ a partition walk that passes `CoverageDomain::full(scope)` discharges the
 coverage debt for the whole scope on the strength of having enumerated one
 window of it. `unsupported_inventory_stream` accordingly emits only
 `Terminated`; a refusal proves nothing and now claims nothing.
+`CoverageOutcome::Degraded` carries `NonEmptyInventoryObligations`, so an empty
+ledger is represented only as `Complete`; `InventoryCoverageReport::degraded`
+funnels through the same rule.
 
 `Fingerprint::flags_hash` is produced by `canonical_flags_hash` and by nothing
 else. Producers with no flag set pass an empty iterator (the empty set has a
@@ -224,7 +241,8 @@ Batch and streaming mutations use the same closed three-lane model:
 - uncertain.
 
 `BatchOutcomeBuilder::finalize` enforces that every submitted
-`BatchItemId` appears exactly once. A whole-operation `Err` means
+`BatchItemId` appears exactly once, counting repeated ids as repeated
+submissions. A whole-operation `Err` means
 nothing was transmitted. `Ok(BatchOutcome)` means every item is
 accounted for. `ItemOutcome::Uncertain` means the write may have landed
 and must be read back rather than replayed blindly.

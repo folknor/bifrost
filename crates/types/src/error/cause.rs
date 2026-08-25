@@ -426,6 +426,8 @@ pub enum RequestCause {
     BatchInputInvalid {
         items: Vec<BatchInputInvalidItem>,
     },
+    /// The batch itself was empty, so there is no item id to report.
+    BatchInputEmpty,
     Unsupported {
         operation: AccountOperation,
     },
@@ -455,6 +457,7 @@ impl RequestCause {
             } => Some(message.as_str()),
             Self::NotFound { id: Some(id), .. } => Some(id.as_str()),
             Self::BatchInputInvalid { .. }
+            | Self::BatchInputEmpty
             | Self::Unsupported { .. }
             | Self::InvalidArgument { message: None, .. }
             | Self::NotFound { id: None, .. } => None,

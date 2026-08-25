@@ -393,7 +393,7 @@ pub(crate) fn directory_search(
             {
                 let err = collection_error(error, AccountOperation::DirectorySearch);
                 if is_directory_absence(&err) {
-                    return Ok(Page::single(vec![]));
+                    return Ok(Page::single(vec![], vec![], vec![]));
                 } else if err.recovery().is_terminal() {
                     // A terminal non-absence failure (e.g. PolicyBlocked) is
                     // a real refusal; surface it.
@@ -443,7 +443,7 @@ pub(crate) fn directory_search(
 /// then branch on the typed kind, per the error-model contract.
 fn directory_absence_to_empty(err: AccountError) -> Result<Page<DirectoryCard>, AccountError> {
     if is_directory_absence(&err) {
-        Ok(Page::single(vec![]))
+        Ok(Page::single(vec![], vec![], vec![]))
     } else {
         Err(err)
     }

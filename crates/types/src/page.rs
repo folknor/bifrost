@@ -68,13 +68,17 @@ pub struct SkippedScope {
 impl<T> Page<T> {
     /// Single-page result.
     #[must_use]
-    pub fn single(items: Vec<T>) -> Self {
+    pub fn single(
+        items: Vec<T>,
+        failed_ids: Vec<String>,
+        skipped_scopes: Vec<SkippedScope>,
+    ) -> Self {
         Self {
             items,
             next_cursor: None,
             estimated_total: None,
-            failed_ids: Vec::new(),
-            skipped_scopes: Vec::new(),
+            failed_ids,
+            skipped_scopes,
         }
     }
 
@@ -82,5 +86,16 @@ impl<T> Page<T> {
     #[must_use]
     pub fn is_terminal(&self) -> bool {
         self.next_cursor.is_none()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Page;
+
+    #[test]
+    fn single_preserves_failed_ids() {
+        let page = Page::<()>::single(vec![], vec!["bad".to_owned()], vec![]);
+        assert_eq!(page.failed_ids, ["bad"]);
     }
 }

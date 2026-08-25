@@ -200,6 +200,64 @@ pub(crate) fn cursor_decode_failure(operation: AccountOperation) -> AccountError
     .expect("valid account error classification")
 }
 
+/// Classify an account's violation of the batch boundary contract: a
+/// `PageBoundary::Partial` batch that nonetheless carries a checkpoint.
+///
+/// This MUST be a classified `AccountError` and not a bare engine error.
+/// `Batch`'s fields are public, so the type system cannot stop a protocol
+/// crate from emitting the shape, and an engine that merely logged it would
+/// re-poll the same unchanged cursor at the scope's cadence forever: no
+/// backoff past `poll_max`, no recovery dispatch, no `Terminated` event, and
+/// a consumer that sees a scope which has silently stopped making progress
+/// with nothing in the stream to say so. `ProviderContractViolation` is
+/// terminal, so `plan_recovery` stops the scope instead - the honest outcome,
+/// because a provider emitting a nonsense boundary does not heal by being
+/// asked again.
+///
+/// The protocol tag is read off the offending checkpoint. There is no
+/// protocol accessor on `dyn Account`, so where the checkpoint carries no
+/// tag of its own the error says `Protocol::Unknown` rather than guessing.
+#[must_use]
+pub(crate) fn batch_boundary_violation(
+    checkpoint: Option<&bifrost_types::Checkpoint>,
+    operation: AccountOperation,
+    scope: &CursorScope,
+) -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::Protocol(bifrost_types::ProtocolErrorKind::ContractViolation),
+        Cause::Wire(bifrost_types::WireCause::MalformedResponse {
+            protocol: checkpoint_protocol(checkpoint),
+            detail: Some(bifrost_types::DiagnosticText::support_only(
+                "a PageBoundary::Partial batch carried a checkpoint",
+            )),
+        }),
+    )
+    .operation(operation)
+    .scope(ErrorScope::Cursor(scope.clone()))
+    .try_build()
+    .expect("valid account error classification")
+}
+
+fn checkpoint_protocol(checkpoint: Option<&bifrost_types::Checkpoint>) -> bifrost_types::Protocol {
+    use bifrost_types::{Checkpoint, Protocol, ProtocolKind};
+    let Some(Checkpoint::Change(cursor)) = checkpoint else {
+        // A backfill checkpoint carries no protocol tag at all.
+        return Protocol::Unknown;
+    };
+    match cursor.server_state.protocol {
+        ProtocolKind::Jmap => Protocol::Jmap,
+        ProtocolKind::Imap => Protocol::Imap,
+        ProtocolKind::Gmail => Protocol::Gmail,
+        ProtocolKind::CardDav => Protocol::CardDav,
+        ProtocolKind::CalDav => Protocol::CalDav,
+        ProtocolKind::Graph => Protocol::Graph,
+        // `ProtocolKind` is `#[non_exhaustive]`; a variant added upstream is
+        // unmappable here, and naming the wrong protocol is worse than
+        // declining to name one.
+        _ => Protocol::Unknown,
+    }
+}
+
 /// Engine-scope throttle bucket. Records "do not drive work for this
 /// key before `wait_until`" deadlines and answers "how long should I
 /// pause work that maps to this key now?".

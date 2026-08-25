@@ -297,6 +297,15 @@ pub enum Protocol {
     Graph,
     Ews,
     CalDav,
+    /// The protocol is not derivable at the point the error was classified.
+    ///
+    /// Reserved for errors the ENGINE mints about an account's behaviour
+    /// rather than errors a protocol crate maps from a wire response: the
+    /// engine holds an `Arc<dyn Account>` and there is no protocol accessor on
+    /// the trait, so where the offending payload carries no protocol tag of its
+    /// own there is nothing honest to report. Protocol crates always know their
+    /// own protocol and must never use this.
+    Unknown,
 }
 
 #[cfg(test)]

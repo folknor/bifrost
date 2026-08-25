@@ -389,8 +389,26 @@ pub enum CoverageOutcome {
     Complete,
     /// The walk left obligations open.
     Degraded {
-        obligations: Vec<InventoryObligation>,
+        obligations: NonEmptyInventoryObligations,
     },
+}
+
+/// A non-empty obligation ledger. Its private storage prevents callers from
+/// constructing a degraded coverage claim with nothing to repair.
+#[derive(Debug, Clone)]
+pub struct NonEmptyInventoryObligations(Vec<InventoryObligation>);
+
+impl NonEmptyInventoryObligations {
+    #[must_use]
+    pub fn new(first: InventoryObligation, mut rest: Vec<InventoryObligation>) -> Self {
+        rest.insert(0, first);
+        Self(rest)
+    }
+
+    #[must_use]
+    pub fn as_slice(&self) -> &[InventoryObligation] {
+        &self.0
+    }
 }
 
 /// An account's report about one enumeration, and the extent it speaks for.
@@ -418,10 +436,7 @@ impl InventoryCoverageReport {
 
     #[must_use]
     pub fn degraded(domain: CoverageDomain, obligations: Vec<InventoryObligation>) -> Self {
-        Self {
-            domain,
-            outcome: CoverageOutcome::Degraded { obligations },
-        }
+        Self::from_obligations(domain, &obligations)
     }
 
     /// Build from a running obligation list: `Complete` exactly when it is
@@ -434,7 +449,14 @@ impl InventoryCoverageReport {
                 outcome: CoverageOutcome::Complete,
             }
         } else {
-            Self::degraded(domain, obligations.to_vec())
+            let mut obligations = obligations.to_vec();
+            let first = obligations.remove(0);
+            Self {
+                domain,
+                outcome: CoverageOutcome::Degraded {
+                    obligations: NonEmptyInventoryObligations::new(first, obligations),
+                },
+            }
         }
     }
 
@@ -447,7 +469,7 @@ impl InventoryCoverageReport {
     pub fn obligations(&self) -> &[InventoryObligation] {
         match &self.outcome {
             CoverageOutcome::Complete => &[],
-            CoverageOutcome::Degraded { obligations } => obligations,
+            CoverageOutcome::Degraded { obligations } => obligations.as_slice(),
         }
     }
 
@@ -613,5 +635,11 @@ mod tests {
     fn an_empty_obligation_list_reports_complete() {
         let report = InventoryCoverageReport::from_obligations(CoverageDomain::full(scope()), &[]);
         assert!(report.is_complete());
+        // `degraded` is the sibling that used to build the unresolvable
+        // "degraded with nothing to repair" state directly. It now funnels
+        // through the same rule, so both doors give the same answer.
+        let sibling = InventoryCoverageReport::degraded(CoverageDomain::full(scope()), vec![]);
+        assert!(sibling.is_complete());
+        assert!(sibling.obligations().is_empty());
     }
 }

@@ -135,11 +135,11 @@ pub use error::{
 
 // Stream-event types.
 pub use events::{
-    AccountControl, BackfillCheckpoint, BackfillProgress, Batch, Change, Checkpoint, Control,
-    HintPayload, InvalidationHint, InvalidationSink, InventoryBatch, InventoryCompletion,
-    InventoryEntry, InventoryEvent, InventoryPartition, InventoryPartitioning, ObjectChange,
-    ObjectChangeKind, PageBoundary, Partition, PauseReason, Priority, Progress, PushSource,
-    ScopeChange, ScopeChangeKind, SyncEvent, WatchEvent, lift_complete_walk,
+    AccountControl, BackfillCheckpoint, BackfillProgress, Batch, BatchBoundaryError, Change,
+    Checkpoint, Control, HintPayload, InvalidationHint, InvalidationSink, InventoryBatch,
+    InventoryCompletion, InventoryEntry, InventoryEvent, InventoryPartition, InventoryPartitioning,
+    ObjectChange, ObjectChangeKind, PageBoundary, Partition, PauseReason, Priority, Progress,
+    PushSource, ScopeChange, ScopeChangeKind, SyncEvent, WatchEvent, lift_complete_walk,
 };
 
 // Provider-native repair of coverage debt.
@@ -153,7 +153,8 @@ pub use repair::{
 // domain of its own, not stream plumbing.
 pub use coverage::{
     CoverageCoordinate, CoverageDomain, CoverageOutcome, InventoryCoverageReport,
-    InventoryObligation, ObligationKey, RegionRecovery, SnapshotIdentity, TransientReplayHint,
+    InventoryObligation, NonEmptyInventoryObligations, ObligationKey, RegionRecovery,
+    SnapshotIdentity, TransientReplayHint,
 };
 
 // Threading + hydration types.

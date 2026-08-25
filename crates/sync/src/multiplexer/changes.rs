@@ -104,6 +104,34 @@ pub async fn drive_changes_stream(
             BoundaryRequest::Pause => {}
             BoundaryRequest::CheckpointNow | BoundaryRequest::Run => {}
         }
+        // A batch the account should never have produced. Returning a bare
+        // engine error here would be a livelock: the poll loop logs it,
+        // re-enters from the SAME unchanged cursor, and the account
+        // reproduces it forever while consumers see nothing at all. Classify
+        // it, publish a `Terminated` so subscribers learn the scope stopped,
+        // and hand the engine a terminal recovery to dispatch.
+        //
+        // The offending batch is NOT forwarded with its checkpoint stripped,
+        // the way fusion forwards a barrier page. A barrier is a legitimate
+        // provider signal whose items were genuinely observed; this is an
+        // account contradicting its own stream contract, and there is no
+        // reason to trust its items more than its boundary.
+        if let SyncEvent::Batch(batch) = &event
+            && batch.validate_boundary().is_err()
+        {
+            let error = crate::recovery::batch_boundary_violation(
+                batch.checkpoint.as_ref(),
+                bifrost_types::AccountOperation::SyncChanges,
+                &scope,
+            );
+            let _ = changes_tx.send(MultiplexerEvent {
+                scope: scope.clone(),
+                event: Arc::new(SyncEvent::Terminated(error.clone())),
+                checkpoint: None,
+                publication: None,
+            });
+            return Ok(ChangesEvent::Terminated(error));
+        }
         let checkpoint = checkpoint_for(&event).cloned();
         if let Some(Checkpoint::Change(cursor)) = &checkpoint {
             cursor.validate_envelope().map_err(|_| {

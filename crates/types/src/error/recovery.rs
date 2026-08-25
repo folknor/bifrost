@@ -442,7 +442,7 @@ pub(crate) fn kind_matches_cause(kind: &AccountErrorKind, cause: &Cause) -> bool
         )
         | (
             AccountErrorKind::Request(RequestErrorKind::BatchInputInvalid),
-            Cause::Request(RequestCause::BatchInputInvalid { .. }),
+            Cause::Request(RequestCause::BatchInputInvalid { .. } | RequestCause::BatchInputEmpty),
         ) => true,
         (AccountErrorKind::NotFound(kind), Cause::Request(RequestCause::NotFound { what, .. })) => {
             kind == what

@@ -8,41 +8,6 @@ Hunter note: `mime/` was not audited in depth - a self-contained parser/renderer
 with its own tests, orthogonal to the contract questions asked. Worth a second
 pass if wanted.
 
-## 8. `PageBoundary::Partial` documents "checkpoint is `None`" and nothing enforces it
-
-`events.rs:113-136`. `Batch` has all-public fields and no constructor, so
-`Partial` + `Some(checkpoint)` is constructible and the consumer's persist rule
-keys off `checkpoint.is_some()`.
-
-**Confidence: high.** The structural fix is to move the payload into the
-discriminant: `Partial`, `Page(Option<Checkpoint>)`, `Final(Option<Checkpoint>)`,
-deleting `Batch::checkpoint`. That is the same "two encodings can disagree"
-argument the current doc makes, applied in the direction that actually removes
-the nonsense state.
-
-## 9. `CoverageOutcome::Degraded { obligations: vec![] }` is constructible and unresolvable
-
-`coverage.rs:420`. `InventoryCoverageReport::degraded` does not reject an empty
-list, producing a scope that is permanently degraded with nothing to repair and
-no way to discharge. `from_obligations` gets it right; the sibling constructor
-does not.
-
-**Confidence: high.** Fix: make `degraded` take a non-empty first obligation, or
-funnel it through `from_obligations`.
-
-## 10. `finalize`'s accounting invariant is weaker than advertised when ids repeat
-
-`error/batch.rs:126-177`, and the test `a_duplicated_expectation_does_not_change_the_verdict`
-(line 385) pins it: two submitted items both named `"a"` are satisfied by **one**
-lane entry, and one real item silently receives no outcome. The stated contract is
-"every submitted id appears in exactly one lane." `validate_batch_input` would
-have caught the duplicate, but it is a separate function `finalize` does not
-require, and `push_subscribe` deliberately allows repeated scopes (positions as
-ids).
-
-**Confidence: medium-high.** Fix: `finalize` should count expectations, not
-set-membership them, or reject a duplicated `expected` outright.
-
 ## 17. `FlagOp::Patch { add, remove }` permits the same flag in both sets
 
 `mutation.rs:179`. The outcome is provider-dependent order-of-application; nothing
@@ -50,23 +15,6 @@ rejects it and nothing documents a precedence rule. Same class: `Add(empty)` is 
 wire round-trip that means nothing.
 
 **Confidence: medium.**
-
-## 19. `validate_batch_input`'s empty-input case fabricates a sentinel id
-
-`error/batch.rs:276-280` returns `BatchInputInvalidItem { id:
-BatchItemId(String::new()), reason: Empty }` for an empty *input vec* - the same
-shape it uses for an empty *id*, and precisely the "builders must not synthesize
-sentinel values" rule `AccountErrorBuilder::status` states two files away. The two
-conditions want separate carriers. Also, the function returns raw
-`Vec<BatchInputInvalidItem>`, so six protocol crates each hand-assemble the
-identical `Request(BatchInputInvalid)` error; it should return the `AccountError`.
-
-## 24. `Page::single` undoes the guarantee `Page`'s own doc claims
-
-`page.rs:71-79`. The type is deliberately not `#[non_exhaustive]` so a new lane
-"must break every constructor" - but `single` defaults all four non-item lanes, so
-any impl using it silently absorbs the new lane instead of answering for it. Same
-pattern in `OpenedAccount::complete`.
 
 ## 25. `ReconcileAdvice` is not `#[non_exhaustive]` but is unconstructable downstream anyway
 
@@ -104,6 +52,47 @@ listing's id and the URL should move to diagnostic text.
 
 **Confidence: high** that the values differ in kind; **unknown** whether they
 differ in practice until the CalDAV listing path is checked.
+
+## 27. The fusion inventory-cursor agreement guard has no test reaching it
+
+Round 3 (finding 14) added a bidirectional guard in
+`crates/sync/src/multiplexer/fusion.rs` enforcing that `is_inventory_cursor` and
+`inventory_resume_stream` agree: it errors both when the classifier says yes and
+the resume hook says no, and when the reverse holds. The guard is real code, not
+an observation, but nothing exercises it. `InventoryFusion` is not exported from
+`bifrost_sync`, so the existing `RecorderAccount` integration harness cannot
+reach it, and an in-file stub would mean hand-writing the roughly 34 required
+trait methods. The round-3 agent judged that not worth doing for a two-branch
+guard and flagged it as the one verification gap of that round.
+
+This is the "seams beat review" shape: the coupling is exactly the kind that has
+produced a defect in a later round elsewhere in this loop. The fix is a seam - a
+minimal test double reachable from the fusion path, or a narrow `pub(crate)`
+export plus an in-crate test - not more review.
+
+**Confidence: high** that the gap exists; the guard's own correctness was read
+and looks right.
+
+## 28. No written contract for which `InventoryEntry` fields a consumer must diff
+
+Round 3 narrowed JMAP's `flags_hash` to keyword state only, which is correct -
+it previously overloaded the field with `mailboxIds`, `receivedAt` and `size`.
+The consequence is that `InventoryEntry::memberships` is now the only carrier of
+mailbox membership in the JMAP diff path.
+
+`Fingerprint`'s own doc invites a consumer to diff on the fingerprint alone
+("compares `local.fingerprint != server.fingerprint` to decide whether to
+refetch"). A consumer that does exactly that sees no signal when a JMAP message
+moves between mailboxes with no keyword change. The old overloading masked this;
+the narrowing exposes it. `flags_hash` is also comparable within one provider
+only (`\Seen` vs `$seen` vs `UNREAD`), which round 3 documented on the type after
+the fix pass had wrongly called it cross-provider.
+
+The defect is the missing consumer-side contract, not the narrowing: nothing
+states which fields together constitute "changed". Two rounds have now touched
+this area without writing it down.
+
+**Confidence: high.**
 
 ## The structural story
 

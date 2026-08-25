@@ -1,10 +1,14 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use serde::Serialize;
 
 use super::account_error::AccountError;
-use super::cause::{BatchInputInvalidItem, BatchInputInvalidReason};
+use super::builder::AccountErrorBuilder;
+use super::cause::{BatchInputInvalidItem, BatchInputInvalidReason, Cause, RequestCause};
+use super::kind::{AccountErrorKind, RequestErrorKind};
+use super::scope::AccountOperation;
+use crate::Protocol;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BatchItem<I> {
@@ -120,8 +124,15 @@ impl<T> BatchOutcomeBuilder<T> {
     }
 
     /// Freeze the builder into an immutable [`BatchOutcome`]. Validates
-    /// that every id in `expected` appears in exactly one lane, no
-    /// unknown ids were added, and no id was duplicated across lanes.
+    /// that every SUBMISSION in `expected` receives exactly one lane
+    /// entry, and that no unknown ids were added.
+    ///
+    /// `expected` is a list of submissions, not a set of ids: an id listed
+    /// twice was submitted twice and requires two lane entries. Treating it
+    /// as a set let one outcome discharge both copies, so a real item
+    /// silently received no outcome at all. Producers whose ids can repeat
+    /// (`push_subscribe`, where two requested scopes may name the same
+    /// folder) already key on submission position, so they are unaffected.
     /// Returns `Err(BatchInvariantError)` on any violation; protocol
     /// crates with bugs that miscount items surface them here rather
     /// than silently shipping a wrong outcome.
@@ -135,8 +146,11 @@ impl<T> BatchOutcomeBuilder<T> {
         // a 1000-item Gmail batch cost roughly a million string
         // compares to prove an invariant that is almost always
         // satisfied.
-        let known: HashSet<&BatchItemId> = expected.iter().collect();
-        let mut seen: HashSet<&BatchItemId> = HashSet::with_capacity(expected.len());
+        let mut remaining: HashMap<&BatchItemId, usize> = HashMap::new();
+        for id in expected {
+            *remaining.entry(id).or_default() += 1;
+        }
+        let known: HashSet<&BatchItemId> = remaining.keys().copied().collect();
         let mut duplicates: Vec<BatchItemId> = Vec::new();
         let mut unknown: Vec<BatchItemId> = Vec::new();
 
@@ -151,16 +165,22 @@ impl<T> BatchOutcomeBuilder<T> {
                 unknown.push(id.clone());
                 continue;
             }
-            if !seen.insert(id) {
+            let count = remaining.get_mut(id).expect("known id has an expectation");
+            if *count == 0 {
                 duplicates.push(id.clone());
+            } else {
+                *count -= 1;
             }
         }
 
-        let missing: Vec<BatchItemId> = expected
-            .iter()
-            .filter(|id| !seen.contains(id))
-            .cloned()
-            .collect();
+        let mut missing = Vec::new();
+        for id in expected {
+            let count = remaining.get_mut(id).expect("expected id is indexed");
+            if *count != 0 {
+                missing.push(id.clone());
+                *count -= 1;
+            }
+        }
 
         if !missing.is_empty() || !duplicates.is_empty() || !unknown.is_empty() {
             return Err(BatchInvariantError {
@@ -266,19 +286,29 @@ impl BatchUncertain {
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 pub struct BatchItemId(pub String);
 
-/// Pre-flight validation for Vec-batch input. Returns the list of
-/// offending items if any `BatchItemId` is empty or duplicate, or if
-/// the input itself is empty. Protocol crates that build a
-/// `Vec<BatchItem<_>>` interface must call this before any byte
-/// crosses the side-effect boundary so empty/duplicate identifiers
-/// surface as `Err(AccountError { kind: Request(BatchInputInvalid),
-/// .. })` rather than silently splitting the caller's intent.
-pub fn validate_batch_input<I>(items: &[BatchItem<I>]) -> Result<(), Vec<BatchInputInvalidItem>> {
+/// Pre-flight validation for Vec-batch input. Protocol crates that build a
+/// `Vec<BatchItem<_>>` interface must call this before any byte crosses the
+/// side-effect boundary so empty/duplicate identifiers surface as
+/// `Err(AccountError { kind: Request(BatchInputInvalid), .. })` rather than
+/// silently splitting the caller's intent.
+///
+/// `operation` is not decoration. It is the field telemetry and support
+/// exports identify the rejected operation by, and it is also what
+/// `AccountOperation::is_idempotent` reads to derive retry safety, so a
+/// caller that omitted it would report an unattributed client bug. It is a
+/// required parameter rather than a post-hoc decoration precisely because
+/// centralizing the construction here is what made losing it possible.
+pub fn validate_batch_input<I>(
+    items: &[BatchItem<I>],
+    protocol: Protocol,
+    operation: AccountOperation,
+) -> Result<(), AccountError> {
     if items.is_empty() {
-        return Err(vec![BatchInputInvalidItem {
-            id: BatchItemId(String::new()),
-            reason: BatchInputInvalidReason::Empty,
-        }]);
+        return Err(batch_input_error(
+            protocol,
+            operation,
+            RequestCause::BatchInputEmpty,
+        ));
     }
 
     let mut seen = HashSet::new();
@@ -302,8 +332,27 @@ pub fn validate_batch_input<I>(items: &[BatchItem<I>]) -> Result<(), Vec<BatchIn
     if invalid.is_empty() {
         Ok(())
     } else {
-        Err(invalid)
+        Err(batch_input_error(
+            protocol,
+            operation,
+            RequestCause::BatchInputInvalid { items: invalid },
+        ))
     }
+}
+
+fn batch_input_error(
+    protocol: Protocol,
+    operation: AccountOperation,
+    cause: RequestCause,
+) -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::Request(RequestErrorKind::BatchInputInvalid),
+        Cause::Request(cause),
+    )
+    .protocol(protocol)
+    .operation(operation)
+    .try_build()
+    .expect("valid batch input error classification")
 }
 
 #[cfg(test)]
@@ -384,14 +433,14 @@ mod tests {
     /// is known, so it is not `unknown`, and one lane entry satisfies
     /// both copies of the expectation rather than reporting `missing`.
     #[test]
-    fn a_duplicated_expectation_does_not_change_the_verdict() {
+    fn duplicated_expectations_require_one_outcome_each() {
         let mut builder = BatchOutcomeBuilder::<()>::new();
         builder.push_succeeded(BatchItemId("a".to_string()), ());
 
-        let outcome = builder
+        let err = builder
             .finalize(&ids(&["a", "a"]))
-            .expect("a known id is accounted for");
-        assert_eq!(outcome.succeeded.len(), 1);
+            .expect_err("one submitted item is missing");
+        assert_eq!(err.missing, ids(&["a"]));
     }
 
     #[test]
@@ -411,10 +460,41 @@ mod tests {
             },
         ];
 
-        let errors = validate_batch_input(&items).expect_err("input must be invalid");
+        let error = validate_batch_input(&items, Protocol::Smtp, AccountOperation::Send)
+            .expect_err("input must be invalid");
+        let Cause::Request(RequestCause::BatchInputInvalid { items }) = error.chain().outermost()
+        else {
+            panic!("item diagnostics expected");
+        };
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].reason, BatchInputInvalidReason::Empty);
+        assert_eq!(items[1].reason, BatchInputInvalidReason::Duplicate);
+    }
 
-        assert_eq!(errors.len(), 2);
-        assert_eq!(errors[0].reason, BatchInputInvalidReason::Empty);
-        assert_eq!(errors[1].reason, BatchInputInvalidReason::Duplicate);
+    /// Centralizing the error construction here is exactly what made it
+    /// possible to drop the operation the caller was performing. Both
+    /// rejection shapes must carry it, or telemetry and support exports
+    /// cannot say which operation refused the input, and the derived
+    /// idempotency is wrong on top of that.
+    #[test]
+    fn both_rejection_shapes_carry_the_operation_and_protocol() {
+        let empty: Vec<BatchItem<()>> = Vec::new();
+        let duplicated = [
+            BatchItem {
+                id: BatchItemId("a".to_string()),
+                input: (),
+            },
+            BatchItem {
+                id: BatchItemId("a".to_string()),
+                input: (),
+            },
+        ];
+
+        for items in [&empty[..], &duplicated[..]] {
+            let error = validate_batch_input(items, Protocol::Lmtp, AccountOperation::Send)
+                .expect_err("input must be invalid");
+            assert_eq!(error.operation(), Some(AccountOperation::Send));
+            assert_eq!(error.protocol(), Some(Protocol::Lmtp));
+        }
     }
 }

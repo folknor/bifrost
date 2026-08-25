@@ -192,6 +192,27 @@ impl InventoryFusion {
                     return Ok(FusionOutcome::Terminated(err));
                 }
                 bifrost_types::InventoryEvent::Batch(batch) => {
+                    // Same reasoning as the changes driver: a bare engine
+                    // error would leave the establish path retrying an
+                    // unchanged position with nothing on the stream to tell
+                    // a consumer the walk stopped. Terminate the walk with a
+                    // classified provider-contract violation instead.
+                    if batch.validate_boundary().is_err() {
+                        let error = crate::recovery::batch_boundary_violation(
+                            batch.checkpoint.as_ref(),
+                            bifrost_types::AccountOperation::SyncInventory,
+                            &scope,
+                        );
+                        if let Some(tx) = &changes_tx {
+                            let _ = tx.send(MultiplexerEvent {
+                                scope: scope.clone(),
+                                event: Arc::new(SyncEvent::Terminated(error.clone())),
+                                checkpoint: None,
+                                publication: None,
+                            });
+                        }
+                        return Ok(FusionOutcome::Terminated(error));
+                    }
                     // A barrier TAINTS THE WALK. Refusing only this one
                     // checkpoint is not enough: the next page's checkpoint, or
                     // the terminal delta link, would simply leap over the same

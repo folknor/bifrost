@@ -16,9 +16,9 @@
 //! `BatchOutcome<()>`.
 
 use bifrost_types::error::{
-    AccountError, AccountErrorBuilder, AccountErrorKind, AccountOperation, AttemptCause,
-    BatchInputInvalidItem, BatchItem, BatchItemId, BatchOutcome, Cause, DiagnosticText, Protocol,
-    ProtocolErrorKind, RequestCause, RequestErrorKind, TransmissionState, WireCause,
+    AccountError, AccountErrorBuilder, AccountErrorKind, AccountOperation, AttemptCause, BatchItem,
+    BatchItemId, BatchOutcome, Cause, DiagnosticText, Protocol, ProtocolErrorKind,
+    TransmissionState, WireCause,
 };
 
 use crate::address::Address;
@@ -320,21 +320,6 @@ fn partial_completion_error(protocol: Protocol, address: &Address) -> AccountErr
     .expect("valid account error classification")
 }
 
-pub(crate) fn batch_input_invalid_error(
-    protocol: Protocol,
-    items: Vec<BatchInputInvalidItem>,
-) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Request(RequestErrorKind::BatchInputInvalid),
-        Cause::Request(RequestCause::BatchInputInvalid { items }),
-    )
-    .protocol(protocol)
-    .operation(AccountOperation::Send)
-    .idempotency_override(false)
-    .try_build()
-    .expect("valid account error classification")
-}
-
 /// Convert a fatal transport-level `SmtpError` that aborted the batch into the
 /// `Err(AccountError)` returned by the batch helpers. This is the path used
 /// when no recipient-specific outcome can be reported (MAIL FROM reject,
@@ -349,7 +334,7 @@ mod tests {
     use crate::transport::smtp::response::{Category, Code, Detail, Severity};
     use bifrost_types::error::{
         AccountErrorKind, BatchInputInvalidReason, BatchItem, BatchItemId, ReconcileReason,
-        RecoveryClass, RequestErrorKind, ResourceKind, validate_batch_input,
+        RecoveryClass, RequestCause, RequestErrorKind, ResourceKind, validate_batch_input,
     };
 
     fn recip(id: &str, addr: &str) -> SmtpBatchRecipient {
@@ -395,13 +380,15 @@ mod tests {
     #[test]
     fn validation_rejects_empty() {
         let items: Vec<BatchItem<Address>> = Vec::new();
-        let err = validate_batch_input(&items).unwrap_err();
-        assert_eq!(err.len(), 1);
-        assert_eq!(err[0].reason, BatchInputInvalidReason::Empty);
-        let account = batch_input_invalid_error(Protocol::Smtp, err);
+        let account =
+            validate_batch_input(&items, Protocol::Smtp, AccountOperation::Send).unwrap_err();
         assert!(matches!(
             account.kind(),
             AccountErrorKind::Request(RequestErrorKind::BatchInputInvalid)
+        ));
+        assert!(matches!(
+            account.chain().outermost(),
+            Cause::Request(RequestCause::BatchInputEmpty)
         ));
     }
 
@@ -417,9 +404,13 @@ mod tests {
                 "b@example.com".parse::<Address>().unwrap(),
             ),
         ];
-        let err = validate_batch_input(&items).unwrap_err();
-        assert_eq!(err.len(), 1);
-        assert_eq!(err[0].reason, BatchInputInvalidReason::Duplicate);
+        let err = validate_batch_input(&items, Protocol::Smtp, AccountOperation::Send).unwrap_err();
+        let Cause::Request(RequestCause::BatchInputInvalid { items }) = err.chain().outermost()
+        else {
+            panic!("item diagnostics expected");
+        };
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].reason, BatchInputInvalidReason::Duplicate);
     }
 
     #[test]

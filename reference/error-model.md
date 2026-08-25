@@ -302,7 +302,24 @@ means every item is accounted for exactly once** across the three
 lanes. `validate_batch_input` is the pre-flight guard - empty input or
 empty/duplicate `BatchItemId`s surface as
 `Request(BatchInputInvalid)` before any byte crosses the side-effect
-boundary.
+boundary. The guard returns the classified `AccountError` directly. Empty
+input uses `RequestCause::BatchInputEmpty`, with no fabricated item id;
+item-specific failures use `BatchInputInvalid { items }`.
+
+`validate_batch_input(items, protocol, operation)` takes the operation as a
+required parameter, not as something the caller decorates afterwards.
+Centralizing the construction is exactly what made dropping it possible -
+the first centralization did drop it, and SMTP's rejections stopped
+reporting `AccountOperation::Send`, leaving telemetry and support exports
+unable to say which operation refused the input and the derived idempotency
+wrong on top of that.
+
+`Protocol::Unknown` exists for errors the ENGINE mints about an account's
+behaviour rather than errors a protocol crate maps from a wire response.
+There is no protocol accessor on `dyn Account`, so where the offending
+payload carries no protocol tag of its own (a backfill checkpoint, say) the
+error declines to name one rather than guessing. Protocol crates always know
+their own protocol and must never use it.
 
 The same three lanes carry `push_subscribe`, whose input is a scope list
 rather than a `Vec<BatchItem<_>>`. `PushSubscription { handle, outcomes }`

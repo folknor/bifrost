@@ -11,7 +11,7 @@ use bifrost_net::MeterSinkHandle;
 
 use super::PoolConfig;
 use super::WireMetering;
-use super::batch::{SmtpBatchRecipient, batch_input_invalid_error, batch_level_error};
+use super::batch::{SmtpBatchRecipient, batch_level_error};
 use super::pool::sync_impl::Pool;
 use super::{
     ClientId, Credentials, Error, Mechanism, Protocol, Response, SendOptions, SmtpConnection,
@@ -367,9 +367,11 @@ impl SmtpTransport {
     ) -> Result<BatchOutcome<()>, AccountError> {
         let ctx = SmtpErrorContext::send(Protocol::Smtp);
 
-        if let Err(invalid) = bifrost_types::error::validate_batch_input(&recipients) {
-            return Err(batch_input_invalid_error(Protocol::Smtp, invalid));
-        }
+        bifrost_types::error::validate_batch_input(
+            &recipients,
+            Protocol::Smtp,
+            bifrost_types::error::AccountOperation::Send,
+        )?;
 
         let batch_recipients: Vec<SmtpBatchRecipient> = recipients
             .into_iter()
@@ -503,9 +505,11 @@ impl LmtpTransport {
     ) -> Result<BatchOutcome<()>, AccountError> {
         let ctx = SmtpErrorContext::send(Protocol::Lmtp);
 
-        if let Err(invalid) = bifrost_types::error::validate_batch_input(&recipients) {
-            return Err(batch_input_invalid_error(Protocol::Lmtp, invalid));
-        }
+        bifrost_types::error::validate_batch_input(
+            &recipients,
+            Protocol::Lmtp,
+            bifrost_types::error::AccountOperation::Send,
+        )?;
 
         let batch_recipients: Vec<SmtpBatchRecipient> = recipients
             .into_iter()

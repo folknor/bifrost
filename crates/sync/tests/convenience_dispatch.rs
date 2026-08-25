@@ -508,7 +508,7 @@ impl Account for RecorderAccount {
             "contact_search:{}:{:?}",
             request.query, request.limit
         ));
-        Box::pin(async { Ok(Page::single(Vec::new())) })
+        Box::pin(async { Ok(Page::single(Vec::new(), Vec::new(), Vec::new())) })
     }
 
     fn directory_search(
@@ -584,7 +584,7 @@ impl Account for RecorderAccount {
             "event_search:{}:{:?}",
             request.query, request.limit
         ));
-        Box::pin(async { Ok(Page::single(Vec::new())) })
+        Box::pin(async { Ok(Page::single(Vec::new(), Vec::new(), Vec::new())) })
     }
 
     fn thread_hydrate(

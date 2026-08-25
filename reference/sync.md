@@ -301,6 +301,31 @@ to the boundary wait without spending a retry attempt.
 
 ## Stream contract: broadcast + consumer ack
 
+### Batch boundary validation
+
+Before anything else, `drive_changes_stream` and `InventoryFusion::run_stream`
+call `validate_boundary` on every batch the account yields. `Batch`'s fields
+are public, so `PageBoundary::Partial` carrying a checkpoint is constructible
+and no type can stop a protocol crate from emitting it.
+
+A violation is NOT a bare `Error::Other`. `handle_drive_outcome` only logs a
+generic engine error before re-entering the poll loop from the same unchanged
+cursor, so against a provider that keeps producing the shape that is an
+unbounded run of requests with no recovery dispatch, no scope stop, and
+nothing on the stream to tell a consumer the scope has quietly stopped making
+progress. `recovery::batch_boundary_violation` classifies it as
+`Protocol(ContractViolation)`, which derives to the terminal
+`ProviderContractViolation`; the driver publishes `SyncEvent::Terminated` to
+subscribers and returns `ChangesEvent::Terminated` /
+`FusionOutcome::Terminated`, so `plan_recovery` stops the scope. A provider
+emitting a nonsense boundary does not heal by being asked again.
+
+The protocol tag on that error is read off the offending checkpoint's change
+cursor. There is no protocol accessor on `dyn Account`, so a checkpoint that
+carries no tag yields `Protocol::Unknown` rather than a guess.
+
+### Broadcast
+
 `drive_changes_stream` broadcasts each `Batch` (item plus
 optional `Checkpoint`) onto the per-account broadcast channel and
 advances the in-memory `CursorRegistry` immediately so the next

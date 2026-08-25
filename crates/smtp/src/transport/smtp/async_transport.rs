@@ -17,7 +17,7 @@ use super::PoolConfig;
 #[cfg(feature = "tokio")]
 use super::Tls;
 use super::WireMetering;
-use super::batch::{SmtpBatchRecipient, batch_input_invalid_error, batch_level_error};
+use super::batch::{SmtpBatchRecipient, batch_level_error};
 use super::pool::async_impl::Pool;
 use super::{
     AsyncSmtpConnection, ClientId, Credentials, Error, Mechanism, Protocol, Response, SendOptions,
@@ -410,9 +410,11 @@ where
     {
         let ctx = SmtpErrorContext::send(Protocol::Smtp);
 
-        if let Err(invalid) = bifrost_types::error::validate_batch_input(&recipients) {
-            return Err(batch_input_invalid_error(Protocol::Smtp, invalid));
-        }
+        bifrost_types::error::validate_batch_input(
+            &recipients,
+            Protocol::Smtp,
+            bifrost_types::error::AccountOperation::Send,
+        )?;
 
         let batch_recipients: Vec<SmtpBatchRecipient> = recipients
             .into_iter()
@@ -594,9 +596,11 @@ where
     {
         let ctx = SmtpErrorContext::send(Protocol::Lmtp);
 
-        if let Err(invalid) = bifrost_types::error::validate_batch_input(&recipients) {
-            return Err(batch_input_invalid_error(Protocol::Lmtp, invalid));
-        }
+        bifrost_types::error::validate_batch_input(
+            &recipients,
+            Protocol::Lmtp,
+            bifrost_types::error::AccountOperation::Send,
+        )?;
 
         let batch_recipients: Vec<SmtpBatchRecipient> = recipients
             .into_iter()
