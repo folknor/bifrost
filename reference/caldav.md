@@ -200,6 +200,9 @@ Supported calendar primitives:
   backend (and reap stale calendars) from a real single calendar, and
   avoids a phantom home-calendar whose `events_in_range` REPORT a
   spec-correct server 404s.
+  A CalDAV `CalendarId` IS the resolved collection href used by the account;
+  `Calendar.id`, `Calendar.native_id`, event `calendar_id`, request routing,
+  and `ErrorScope::Calendar` all carry that same URL identity.
 - `events_in_range` - `calendar-query` `REPORT` with a CalDAV
   `time-range` filter and calendar-data hydration, followed by local
   overlap filtering as a defensive guard. Invalid time bounds fail locally

@@ -133,12 +133,19 @@ pub async fn drive_changes_stream(
             return Ok(ChangesEvent::Terminated(error));
         }
         let checkpoint = checkpoint_for(&event).cloned();
-        if let Some(Checkpoint::Change(cursor)) = &checkpoint {
-            cursor.validate_envelope().map_err(|_| {
-                Error::Account(crate::recovery::cursor_decode_failure(
-                    bifrost_types::AccountOperation::SyncChanges,
-                ))
-            })?;
+        if let Some(Checkpoint::Change(cursor)) = &checkpoint
+            && cursor.validate_envelope().is_err()
+        {
+            let error = crate::recovery::cursor_decode_failure(
+                bifrost_types::AccountOperation::SyncChanges,
+            );
+            let _ = changes_tx.send(MultiplexerEvent {
+                scope: scope.clone(),
+                event: Arc::new(SyncEvent::Terminated(error.clone())),
+                checkpoint: None,
+                publication: None,
+            });
+            return Err(Error::Account(error));
         }
         let is_done = matches!(&event, SyncEvent::Done(_));
         // Capture the full `AccountError` so the engine has the

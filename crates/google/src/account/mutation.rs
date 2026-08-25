@@ -41,6 +41,9 @@ pub(crate) fn bulk_set_flags(
     op: FlagOp,
     key: IdempotencyKey,
 ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
+    if let Err(error) = op.validate_for_account(bifrost_types::Protocol::Gmail) {
+        return Box::pin(stream::once(async move { SyncEvent::Terminated(error) }));
+    }
     mutation_stream(client, cache, targets, MutationKind::SetFlags(op), key)
 }
 

@@ -164,6 +164,9 @@ QuotaExhausted, ConcurrencyConflict, RefreshTransient}`.
 ThrottledMidFlight}`
 plus `guidance.actions: Vec<ReconcileAction>` where `ReconcileAction`
 is `CheckTarget` / `DedupeByClientId`.
+Both advice structs are explicitly `#[non_exhaustive]`.
+`ReconcileGuidance` is an ordinary constructible public struct, so the nested
+shape is not accidentally sealed.
 
 `ThrottleScope::{CurrentOperation, Mailbox, Account, Tenant, Provider}`
 is the producer hint; the engine lifts the sharable scopes into a

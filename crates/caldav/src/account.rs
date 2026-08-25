@@ -470,10 +470,15 @@ impl Account for CalDavAccount {
     fn bulk_set_flags(
         &self,
         _targets: AccountStream<ObjectId>,
-        _op: FlagOp,
+        op: FlagOp,
         _key: IdempotencyKey,
     ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
-        unsupported_stream(AccountOperation::UpdateFlags)
+        match op.validate_for_account(Protocol::CalDav) {
+            Ok(()) => unsupported_stream(AccountOperation::UpdateFlags),
+            Err(error) => Box::pin(futures::stream::once(async move {
+                SyncEvent::Terminated(error)
+            })),
+        }
     }
 
     fn bulk_move(
@@ -1778,6 +1783,39 @@ fn contains(value: &str, needle: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A CalDAV `CalendarId` IS the resolved collection href, on the listing
+    /// surface as well as on the request-routing and `ErrorScope` surfaces.
+    ///
+    /// This is the agreement a consumer relies on when it correlates an
+    /// `ErrorScope::Calendar` against ids from `list_calendars`. It holds
+    /// because the XML decode boundary rebases every href against its request
+    /// URI, which makes the account layer's `resolve_url` a no-op on an id
+    /// that came out of the listing. Pinned rather than merely written down:
+    /// if either side stopped absolutizing, the two ids would still both be
+    /// `CalendarId` and the mismatch would be silent.
+    #[test]
+    fn a_listed_calendar_id_is_the_absolute_href_error_scopes_carry() {
+        let client = CalDavClient::for_base_url("https://dav.example.com/dav/");
+        let mut collection = CalendarCollection {
+            href: "work/".to_string(),
+            display_name: Some("Work".to_string()),
+            color: None,
+            can_edit: Some(true),
+            sync_token: None,
+        };
+        collection.resolve_href("https://dav.example.com/dav/calendars/");
+
+        let calendar = CalDavAccount::map_calendar(collection);
+
+        assert_eq!(calendar.id.0, "https://dav.example.com/dav/calendars/work/");
+        assert_eq!(calendar.native_id, calendar.id.0);
+        assert_eq!(
+            client.resolve_url(&calendar.id.0),
+            calendar.id.0,
+            "the routing/ErrorScope side must not rewrite a listed calendar id"
+        );
+    }
 
     #[test]
     fn a_materialized_resource_leaves_the_failure_lane() {

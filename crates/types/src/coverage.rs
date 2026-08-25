@@ -400,9 +400,11 @@ pub struct NonEmptyInventoryObligations(Vec<InventoryObligation>);
 
 impl NonEmptyInventoryObligations {
     #[must_use]
-    pub fn new(first: InventoryObligation, mut rest: Vec<InventoryObligation>) -> Self {
-        rest.insert(0, first);
-        Self(rest)
+    pub fn new(first: InventoryObligation, rest: Vec<InventoryObligation>) -> Self {
+        let mut obligations = Vec::with_capacity(rest.len() + 1);
+        obligations.push(first);
+        obligations.extend(rest);
+        Self(obligations)
     }
 
     #[must_use]
@@ -629,6 +631,40 @@ mod tests {
             }],
         );
         assert!(!replayable.has_barrier());
+    }
+
+    /// `from_obligations` splits the head off the caller's list and
+    /// `NonEmptyInventoryObligations::new` puts it back in front. Both halves
+    /// of that round trip have to agree, and a single-element list cannot tell
+    /// an order-preserving reassembly from an order-reversing one - so this
+    /// pins the order with a list long enough to distinguish them.
+    #[test]
+    fn a_degraded_report_preserves_the_caller_obligation_order() {
+        let keys: [&[u8]; 3] = [b"region-1", b"region-2", b"region-3"];
+        let report = InventoryCoverageReport::degraded(
+            CoverageDomain::full(scope()),
+            keys.iter()
+                .map(|key| InventoryObligation::Region {
+                    key: ObligationKey((*key).to_vec()),
+                    failure_label: "unidentifiable-value".into(),
+                    error: error(),
+                    recovery: RegionRecovery::barrier(),
+                })
+                .collect(),
+        );
+
+        let super::CoverageOutcome::Degraded { obligations } = &report.outcome else {
+            panic!("expected a degraded report");
+        };
+        let observed: Vec<&[u8]> = obligations
+            .as_slice()
+            .iter()
+            .map(|obligation| match obligation {
+                InventoryObligation::Region { key, .. } => key.0.as_slice(),
+                other => panic!("expected a Region obligation, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(observed, keys);
     }
 
     #[test]

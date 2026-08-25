@@ -170,8 +170,8 @@ pub use ids::{
 
 // Mutation + projection + hydration types.
 pub use mutation::{
-    Fingerprint, FlagOp, HydratedObject, HydratedObjectKind, IdempotencyKey, Projection,
-    ProtocolSalt, ServerVersion, canonical_flags_hash,
+    Fingerprint, FlagOp, FlagOpValidationError, HydratedObject, HydratedObjectKind, IdempotencyKey,
+    Projection, ProtocolSalt, ServerVersion, canonical_flags_hash,
 };
 
 // Pagination.

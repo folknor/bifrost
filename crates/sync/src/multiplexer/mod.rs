@@ -920,6 +920,13 @@ async fn handle_drive_outcome(
     account_id: &AccountId,
     throttles: &StdMutex<crate::recovery::ThrottleBucket>,
 ) -> DriveRecovery {
+    // Account errors already carry the complete recovery verdict. Normalize
+    // them onto the same path as an account-authored Terminated event instead
+    // of letting the generic engine-error arm silently choose "retry".
+    let outcome = match outcome {
+        Err(Error::Account(error)) => Ok(ChangesEvent::Terminated(error)),
+        other => other,
+    };
     match outcome {
         Ok(ChangesEvent::Advanced | ChangesEvent::Done) => {
             let advanced = cursors
@@ -1164,6 +1171,36 @@ mod tests {
             advanced_through: None,
             envelope_version: 1,
         })
+    }
+
+    #[tokio::test]
+    async fn account_error_from_driver_routes_through_recovery_plan() {
+        let scope = CursorScope::Account;
+        let cursors = CursorRegistry::new();
+        cursors.put(match account_change_checkpoint(b"unchanged") {
+            Checkpoint::Change(cursor) => cursor,
+            _ => unreachable!(),
+        });
+        let (reopen_tx, mut reopen_rx) = mpsc::channel(1);
+        let error = crate::recovery::cursor_decode_failure(AccountOperation::SyncChanges);
+        let recovery = handle_drive_outcome(
+            &scope,
+            Err(Error::Account(error.clone())),
+            &cursors,
+            b"unchanged",
+            &reopen_tx,
+            &AccountId("routing".into()),
+            &StdMutex::new(crate::recovery::ThrottleBucket::default()),
+        )
+        .await;
+
+        assert!(!recovery.exit);
+        let request = reopen_rx.try_recv().expect("engine directive forwarded");
+        assert!(matches!(
+            request,
+            ReopenRequest::Recovery { error: routed, .. }
+                if routed.kind() == error.kind()
+        ));
     }
 
     /// A lag destroys batches whose checkpoints are already registered

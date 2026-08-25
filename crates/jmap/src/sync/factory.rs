@@ -1636,18 +1636,10 @@ mod tests {
         ));
     }
 
-    /// An empty additive flag op is a local no-op, and it now rides the
-    /// shared `mutation_stream` rather than a private batching loop. Two
-    /// things have to stay true through that reuse, and neither is
-    /// visible from a unit test of the batch constructor: nothing may
-    /// reach the wire (an empty `{}` patch would have the server
-    /// acknowledge a mutation that never happened, and a state probe
-    /// would spend a round trip to send nothing), and every input target
-    /// must still leave on exactly one `Skipped` outcome even when the
-    /// targets route to different accounts. The script is armed EMPTY,
-    /// so any request at all fails the test by panicking at its ordinal.
+    /// Empty additive flag operations are caller errors. The shared guard must
+    /// reject them before routing targets or touching the wire.
     #[tokio::test]
-    async fn an_empty_flag_op_reaches_no_wire_and_still_answers_every_target() {
+    async fn an_empty_flag_op_is_rejected_before_wire_or_target_routing() {
         for op in [
             FlagOp::Add(HashSet::new()),
             FlagOp::Remove(HashSet::new()),
@@ -1692,37 +1684,17 @@ mod tests {
                 client.transport().requests().is_empty(),
                 "{op:?}: an empty flag op must never touch the wire"
             );
-            let mut answered = Vec::new();
-            let mut saw_done = false;
-            for event in events {
-                match event {
-                    bifrost_types::SyncEvent::Batch(batch) => {
-                        for item in batch.items {
-                            match item {
-                                bifrost_types::ItemOutcome::Succeeded(success) => {
-                                    assert_eq!(
-                                        success.output,
-                                        bifrost_types::MutationSuccess::Skipped,
-                                        "{op:?}"
-                                    );
-                                    answered.push(success.item.0);
-                                }
-                                other => panic!("{op:?}: expected a skip, got {other:?}"),
-                            }
-                        }
-                    }
-                    bifrost_types::SyncEvent::Done(None) => saw_done = true,
-                    other => panic!("{op:?}: unexpected event {other:?}"),
-                }
-            }
-            assert!(saw_done, "{op:?}: the stream must terminate with Done");
-            answered.sort();
-            let mut expected: Vec<String> = ids.iter().map(|id| id.0.clone()).collect();
-            expected.sort();
-            assert_eq!(
-                answered, expected,
-                "{op:?}: exactly one outcome per input target, ids unchanged"
-            );
+            assert_eq!(events.len(), 1, "{op:?}");
+            assert!(matches!(
+                &events[0],
+                bifrost_types::SyncEvent::Terminated(error)
+                    if matches!(
+                        error.kind(),
+                        bifrost_types::AccountErrorKind::Request(
+                            bifrost_types::RequestErrorKind::Malformed
+                        )
+                    )
+            ));
         }
     }
 

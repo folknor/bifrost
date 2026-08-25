@@ -8,95 +8,38 @@ Hunter note: `mime/` was not audited in depth - a self-contained parser/renderer
 with its own tests, orthogonal to the contract questions asked. Worth a second
 pass if wanted.
 
-## 17. `FlagOp::Patch { add, remove }` permits the same flag in both sets
+## Status: closed
 
-`mutation.rs:179`. The outcome is provider-dependent order-of-application; nothing
-rejects it and nothing documents a precedence rule. Same class: `Add(empty)` is a
-wire round-trip that means nothing.
+All thirty findings are worked. The five landed rounds were 657f257 (4, 5, 6, 7,
+20, 21), ea5d477 (11, 12, 13, 15, 16, 18), f874de0 (1, 2, 3, 14, 22, 23),
+d5bc7af (8, 9, 10, 19, 24), and the final round (17, 25, 26, 27, 28, 29, 30).
 
-**Confidence: medium.**
+Two of the last round's findings closed on evidence rather than on a code fix,
+and both are worth recording because the evidence contradicted the finding:
 
-## 25. `ReconcileAdvice` is not `#[non_exhaustive]` but is unconstructable downstream anyway
-
-`error/recovery.rs`. `ReconcileGuidance` is `#[non_exhaustive]` while
-`ReconcileAdvice`, which owns a `guidance: ReconcileGuidance` field, is not. An
-external consumer can therefore name `ReconcileAdvice` in a struct literal and
-still never complete it, because it cannot construct the `guidance` value the
-literal requires. The omitted marker buys nothing - the struct is effectively
-sealed regardless - and it reads as a deliberate "this shape is stable" promise
-that the nested type contradicts. Either mark `ReconcileAdvice`
-`#[non_exhaustive]` too (making the seal explicit and honest) or give
-`ReconcileGuidance` a public constructor so the un-marked struct is actually
-buildable. Note `RetryAdvice` next door for the same question.
-
-Surfaced during round 1 of this ledger; deliberately not fixed there, because
-choosing between the two answers is a published-surface decision.
-
-**Confidence: high** on the inconsistency, **medium** on which way to resolve it.
-
-## 26. `bifrost-caldav` files a collection URL as a `CalendarId`
-
-`crates/caldav/src/account.rs`. CalDAV builds `ErrorScope::Calendar { id }` with
-the calendar *collection URL* as the id. Round 1 converted `ErrorScope`'s
-id-bearing variants from `String` to the typed account ids, so this now types as
-a `CalendarId` - and a `CalendarId` everywhere else in the workspace is the
-provider's calendar identifier, not a href. The semantics are pre-existing and
-unchanged; the newtype is what makes the mismatch visible. A consumer that
-correlates `ErrorScope::Calendar` against ids from the calendar listing gets no
-match on CalDAV accounts.
-
-Resolution is a real decision, not a rename: either CalDAV's `CalendarId` IS its
-collection URL everywhere (in which case the listing surface should be checked to
-confirm it agrees, and the invariant written down), or the scope should carry the
-listing's id and the URL should move to diagnostic text.
-
-**Confidence: high** that the values differ in kind; **unknown** whether they
-differ in practice until the CalDAV listing path is checked.
-
-## 27. The fusion inventory-cursor agreement guard has no test reaching it
-
-Round 3 (finding 14) added a bidirectional guard in
-`crates/sync/src/multiplexer/fusion.rs` enforcing that `is_inventory_cursor` and
-`inventory_resume_stream` agree: it errors both when the classifier says yes and
-the resume hook says no, and when the reverse holds. The guard is real code, not
-an observation, but nothing exercises it. `InventoryFusion` is not exported from
-`bifrost_sync`, so the existing `RecorderAccount` integration harness cannot
-reach it, and an in-file stub would mean hand-writing the roughly 34 required
-trait methods. The round-3 agent judged that not worth doing for a two-branch
-guard and flagged it as the one verification gap of that round.
-
-This is the "seams beat review" shape: the coupling is exactly the kind that has
-produced a defect in a later round elsewhere in this loop. The fix is a seam - a
-minimal test double reachable from the fusion path, or a narrow `pub(crate)`
-export plus an in-crate test - not more review.
-
-**Confidence: high** that the gap exists; the guard's own correctness was read
-and looks right.
-
-## 28. No written contract for which `InventoryEntry` fields a consumer must diff
-
-Round 3 narrowed JMAP's `flags_hash` to keyword state only, which is correct -
-it previously overloaded the field with `mailboxIds`, `receivedAt` and `size`.
-The consequence is that `InventoryEntry::memberships` is now the only carrier of
-mailbox membership in the JMAP diff path.
-
-`Fingerprint`'s own doc invites a consumer to diff on the fingerprint alone
-("compares `local.fingerprint != server.fingerprint` to decide whether to
-refetch"). A consumer that does exactly that sees no signal when a JMAP message
-moves between mailboxes with no keyword change. The old overloading masked this;
-the narrowing exposes it. `flags_hash` is also comparable within one provider
-only (`\Seen` vs `$seen` vs `UNREAD`), which round 3 documented on the type after
-the fix pass had wrongly called it cross-provider.
-
-The defect is the missing consumer-side contract, not the narrowing: nothing
-states which fields together constitute "changed". Two rounds have now touched
-this area without writing it down.
-
-**Confidence: high.**
+- **25 rested on an inverted premise.** It reported `ReconcileAdvice` as lacking
+  `#[non_exhaustive]` while `ReconcileGuidance` carried it. The code is and
+  always was the other way round: `ReconcileAdvice` and `RetryAdvice` have both
+  been `#[non_exhaustive]` since the original error-model commit, and
+  `ReconcileGuidance` is a plain public struct with a public field, so it is
+  genuinely constructible downstream. The state the finding asked us to choose
+  between is the state that already exists - an explicit seal on the advice
+  structs and a real constructor path for the nested guidance. Nothing to
+  decide; `reference/error-model.md` now states the posture so it is not
+  rediscovered as an accident a third time.
+- **26 was a real question with a clean answer.** A CalDAV `CalendarId` IS the
+  resolved collection href on the listing surface too: `map_calendar` files
+  `collection.href` as both `id` and `native_id`, and the XML decode boundary
+  rebases every href against its request URI before the account layer sees it,
+  which makes `resolve_url` a no-op on any id that came out of the listing. So
+  the ids a consumer correlates against `ErrorScope::Calendar` do match. The
+  invariant is now pinned by a test rather than only asserted in prose, because
+  it is an agreement between two files that would drift silently.
 
 ## The structural story
 
-Two things dominate, and both are bigger than any individual defect above.
+Two things dominate, and both are bigger than any individual defect the ledger
+recorded.
 
 **`PimMethodSupport` is a 60-field hand-maintained mirror of the trait surface
 with no mechanical link to it.** `capabilities.rs:151-276`. Nothing checks that a

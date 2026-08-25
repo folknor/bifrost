@@ -20,6 +20,11 @@ pub(crate) fn bulk_set_flags(
     op: FlagOp,
     _key: IdempotencyKey,
 ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
+    if let Err(error) = op.validate_for_account(Protocol::Imap) {
+        return Box::pin(futures::stream::once(async move {
+            SyncEvent::Terminated(error)
+        }));
+    }
     mutation_stream(account, targets, MutationKind::Flags(op))
 }
 

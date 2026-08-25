@@ -468,6 +468,26 @@ pub struct InventoryEntry {
     pub in_reply_to: Option<String>,
 }
 
+impl InventoryEntry {
+    /// Whether any inventory-visible representation changed.
+    ///
+    /// Consumers must compare the complete entry, not only `fingerprint`:
+    /// memberships and threading/header projections can change without a
+    /// provider changing flags, size, or its version token.
+    #[must_use]
+    pub fn differs_from(&self, other: &Self) -> bool {
+        self.id != other.id
+            || self.memberships != other.memberships
+            || self.size != other.size
+            || self.blob_id != other.blob_id
+            || self.fingerprint != other.fingerprint
+            || self.thread_id != other.thread_id
+            || self.message_id != other.message_id
+            || self.references != other.references
+            || self.in_reply_to != other.in_reply_to
+    }
+}
+
 /// Push wake-up event. Push surfaces are wake-ups, not change feeds.
 ///
 /// `Terminated(AccountError)` carries a classified error when the push
@@ -613,8 +633,11 @@ pub enum PauseReason {
 
 #[cfg(test)]
 mod tests {
-    use super::{Batch, Checkpoint, PageBoundary};
-    use crate::{ChangeCursor, CursorScope, OpaqueChangeState, ProtocolKind};
+    use super::{Batch, Checkpoint, InventoryEntry, PageBoundary};
+    use crate::{
+        ChangeCursor, CursorScope, Fingerprint, MembershipScope, ObjectId, OpaqueChangeState,
+        ProtocolKind, ServerVersion,
+    };
     use std::time::Duration;
 
     #[test]
@@ -636,5 +659,28 @@ mod tests {
             })),
         };
         assert!(batch.validate_boundary().is_err());
+    }
+
+    #[test]
+    fn inventory_change_comparison_includes_memberships_outside_fingerprint() {
+        let first = InventoryEntry {
+            id: ObjectId("message".into()),
+            memberships: vec![MembershipScope::Mailbox("inbox".into())],
+            size: Some(10),
+            blob_id: None,
+            fingerprint: Fingerprint {
+                server_version: ServerVersion::StateAt("same".into()),
+                size: Some(10),
+                flags_hash: 1,
+            },
+            thread_id: None,
+            message_id: None,
+            references: Vec::new(),
+            in_reply_to: None,
+        };
+        let mut moved = first.clone();
+        moved.memberships = vec![MembershipScope::Mailbox("archive".into())];
+
+        assert!(first.differs_from(&moved));
     }
 }

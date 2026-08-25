@@ -232,7 +232,19 @@ defined, non-zero hash) rather than hard-coding `0`; producers of objects with
 tracked state but no flags encode that state as `key=value` pseudo-flags. The
 value is comparable within one provider and object namespace only.
 
+An inventory representation is "changed" when ANY field of `InventoryEntry`
+differs: id, memberships, size, blob id, fingerprint, thread id, message id,
+references, or in-reply-to. `InventoryEntry::differs_from` is the canonical
+comparison. Comparing `Fingerprint` alone is insufficient: JMAP mailbox
+membership can change without keyword state changing.
+
 ## Mutation outcomes
+
+`FlagOp::validate` is the account-boundary guard for flag mutations. Empty
+add/remove deltas and an entirely empty patch are invalid; `Set(empty)` means
+"clear all flags". A patch may not name the same flag in both sets under
+ASCII-case-insensitive identity. Invalid operations are caller errors and must
+be rejected before provider I/O.
 
 Batch and streaming mutations use the same closed three-lane model:
 

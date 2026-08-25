@@ -27,23 +27,15 @@ pub(crate) fn set_flags<T: HttpTransport>(
     op: FlagOp,
     _key: IdempotencyKey,
 ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
+    if let Err(error) = op.validate_for_account(bifrost_types::Protocol::Jmap) {
+        return Box::pin(futures::stream::once(async move {
+            SyncEvent::Terminated(error)
+        }));
+    }
+    // `validate_for_account` has already rejected every empty additive,
+    // subtractive, and wholly empty patch operation, so no no-op flag
+    // mutation reaches the routing match below.
     match &op {
-        FlagOp::Add(flags) | FlagOp::Remove(flags) if flags.is_empty() => mutation_stream(
-            mail,
-            foreign_mail,
-            limits,
-            email_states,
-            targets,
-            MutationKind::SkipFlags,
-        ),
-        FlagOp::Patch { add, remove } if add.is_empty() && remove.is_empty() => mutation_stream(
-            mail,
-            foreign_mail,
-            limits,
-            email_states,
-            targets,
-            MutationKind::SkipFlags,
-        ),
         FlagOp::Add(_) | FlagOp::Remove(_) | FlagOp::Set(_) | FlagOp::Patch { .. } => {
             mutation_stream(
                 mail,
@@ -107,14 +99,6 @@ pub(crate) fn destroy<T: HttpTransport>(
 }
 
 enum MutationKind {
-    /// Empty additive/subtractive flag operations are local no-ops, but use
-    /// the same routing, batching, tail flush, and Done path as wire mutations.
-    ///
-    /// They ride `mutation_stream` rather than getting a stream of their own on
-    /// purpose. A separate "simple case" path was tried and missed owner
-    /// routing: a foreign-account target went out against the primary handle.
-    /// One batching engine, one owner-routing rule.
-    SkipFlags,
     Flags(FlagOp),
     Move(MailboxId),
     Destroy,
@@ -122,7 +106,7 @@ enum MutationKind {
 
 fn operation_for_kind(kind: &MutationKind) -> AccountOperation {
     match kind {
-        MutationKind::SkipFlags | MutationKind::Flags(_) => AccountOperation::UpdateFlags,
+        MutationKind::Flags(_) => AccountOperation::UpdateFlags,
         MutationKind::Move(_) => AccountOperation::BulkMove,
         MutationKind::Destroy => AccountOperation::BulkDestroy,
     }
@@ -400,9 +384,6 @@ async fn apply_batch<T: HttpTransport>(
         // state for it would spend a round trip to send nothing.
         return Ok(None);
     }
-    if matches!(kind, MutationKind::SkipFlags) {
-        return Ok(Some(skipped_batch(ids)));
-    }
     let mut state = current_or_probe_state(mail, email_states, account_id).await?;
 
     let mut response = match send_set(mail, &state, &ids, kind, foreign_account).await {
@@ -448,7 +429,6 @@ async fn apply_batch<T: HttpTransport>(
             MutationKind::Flags(_) | MutationKind::Move(_) => {
                 response.updated(&email_id).map(|_| ())
             }
-            MutationKind::SkipFlags => unreachable!("skip batches never reach Email/set"),
         };
         results.push(classify_set_response(raw, id, operation));
     }
@@ -460,24 +440,6 @@ async fn apply_batch<T: HttpTransport>(
         bytes_in: 0,
         checkpoint: None,
     }))
-}
-
-fn skipped_batch(ids: Vec<ObjectId>) -> Batch<ItemOutcome<MutationSuccess>> {
-    Batch {
-        items: ids
-            .into_iter()
-            .map(|id| {
-                ItemOutcome::Succeeded(BatchSuccess::new(
-                    BatchItemId(id.0),
-                    MutationSuccess::Skipped,
-                ))
-            })
-            .collect(),
-        page_boundary: PageBoundary::Page,
-        server_latency: std::time::Duration::ZERO,
-        bytes_in: 0,
-        checkpoint: None,
-    }
 }
 
 /// Turn the answer for one submitted `Email/set` id into exactly one
@@ -582,7 +544,6 @@ async fn send_set<T: HttpTransport>(
     let mut set = EmailSet::new().if_in_state(state.to_string());
 
     match kind {
-        MutationKind::SkipFlags => unreachable!("skip batches never reach Email/set"),
         MutationKind::Destroy => {
             set = set.destroy(
                 ids.iter()
@@ -693,7 +654,6 @@ mod tests {
     fn set_body(kind: &MutationKind, ids: &[&str], state: &str) -> serde_json::Value {
         let mut set = EmailSet::new().if_in_state(state.to_string());
         match kind {
-            MutationKind::SkipFlags => unreachable!("skip batches do not build Email/set"),
             MutationKind::Destroy => {
                 set = set.destroy(ids.iter().map(|id| EmailId::new(*id)));
             }
@@ -795,19 +755,13 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn an_empty_flag_op_short_circuits_to_skipped_outcomes() {
-        let batch = skipped_batch(vec![ObjectId("m1".into()), ObjectId("m2".into())]);
-
-        assert_eq!(batch.items.len(), 2);
-        for (outcome, expected) in batch.items.iter().zip(["m1", "m2"]) {
-            let ItemOutcome::Succeeded(success) = outcome else {
-                panic!("expected skipped success, got {outcome:?}");
-            };
-            assert_eq!(success.item.0, expected);
-            assert_eq!(success.output, MutationSuccess::Skipped);
-        }
-    }
+    // The former `an_empty_flag_op_short_circuits_to_skipped_outcomes` test is
+    // deliberately gone with the `SkipFlags` path it pinned: an empty additive
+    // or subtractive flag operation is now a rejected caller error rather than
+    // a batch of `Skipped` outcomes. The replacement coverage is
+    // `FlagOp::validate` in `bifrost-types` and
+    // `an_empty_flag_op_is_rejected_before_wire_or_target_routing` in
+    // `sync::factory`, which drives the whole account surface.
 
     #[test]
     fn a_move_assigns_the_destination_as_the_only_mailbox() {

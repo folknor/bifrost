@@ -31,6 +31,11 @@ pub(crate) fn bulk_set_flags_stream(
     op: FlagOp,
     _key: IdempotencyKey,
 ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
+    if let Err(error) = op.validate_for_account(bifrost_types::Protocol::Graph) {
+        return Box::pin(futures::stream::once(async move {
+            SyncEvent::Terminated(error)
+        }));
+    }
     bulk_mutation_stream(account, targets, MutationKind::SetFlags(op))
 }
 

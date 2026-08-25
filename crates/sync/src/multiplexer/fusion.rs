@@ -104,15 +104,13 @@ impl InventoryFusion {
     ) -> Result<FusionOutcome, Error> {
         let scope = cursor.scope.clone();
         let classified_as_inventory = account.is_inventory_cursor(&cursor);
-        let Some(stream) = account.inventory_resume_stream(cursor) else {
-            if classified_as_inventory {
-                return Err(inventory_cursor_contract_error());
-            }
+        let stream = inventory_resume_stream_checked(
+            classified_as_inventory,
+            account.inventory_resume_stream(cursor),
+        )?;
+        let Some(stream) = stream else {
             return Ok(FusionOutcome::NoCursor);
         };
-        if !classified_as_inventory {
-            return Err(inventory_cursor_contract_error());
-        }
         self.run_stream(scope, stream, changes_tx).await
     }
 
@@ -459,4 +457,32 @@ fn inventory_cursor_contract_error() -> Error {
     Error::Account(crate::recovery::cursor_decode_failure(
         bifrost_types::AccountOperation::SyncInventory,
     ))
+}
+
+fn inventory_resume_stream_checked(
+    classified_as_inventory: bool,
+    stream: Option<bifrost_types::AccountStream<bifrost_types::InventoryEvent>>,
+) -> Result<Option<bifrost_types::AccountStream<bifrost_types::InventoryEvent>>, Error> {
+    if classified_as_inventory != stream.is_some() {
+        Err(inventory_cursor_contract_error())
+    } else {
+        Ok(stream)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty_inventory_stream() -> bifrost_types::AccountStream<bifrost_types::InventoryEvent> {
+        Box::pin(futures::stream::empty())
+    }
+
+    #[test]
+    fn resume_guard_rejects_both_classifier_hook_disagreements() {
+        assert!(inventory_resume_stream_checked(true, None).is_err());
+        assert!(inventory_resume_stream_checked(false, Some(empty_inventory_stream())).is_err());
+        assert!(inventory_resume_stream_checked(false, None).is_ok());
+        assert!(inventory_resume_stream_checked(true, Some(empty_inventory_stream())).is_ok());
+    }
 }

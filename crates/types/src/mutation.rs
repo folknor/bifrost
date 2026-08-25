@@ -227,9 +227,75 @@ pub enum FlagOp {
     },
 }
 
+/// Why a [`FlagOp`] cannot describe one deterministic target transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum FlagOpValidationError {
+    #[error("an additive or subtractive flag operation must name at least one flag")]
+    EmptyDelta,
+    #[error("a flag patch cannot add and remove the same flag")]
+    ContradictoryPatch,
+}
+
+impl FlagOp {
+    /// Validate the operation before it crosses an account boundary.
+    ///
+    /// Flag identity is ASCII-case-insensitive, matching
+    /// [`canonical_flags_hash`]. `Set(empty)` remains valid because it means
+    /// clear every flag; empty additive/subtractive deltas do not describe a
+    /// mutation.
+    pub fn validate(&self) -> Result<(), FlagOpValidationError> {
+        match self {
+            Self::Add(flags) | Self::Remove(flags) if flags.is_empty() => {
+                Err(FlagOpValidationError::EmptyDelta)
+            }
+            Self::Patch { add, remove } if add.is_empty() && remove.is_empty() => {
+                Err(FlagOpValidationError::EmptyDelta)
+            }
+            Self::Patch { add, remove } => {
+                let overlaps = add.iter().any(|added| {
+                    remove
+                        .iter()
+                        .any(|removed| added.eq_ignore_ascii_case(removed))
+                });
+                if overlaps {
+                    Err(FlagOpValidationError::ContradictoryPatch)
+                } else {
+                    Ok(())
+                }
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Validate at an [`Account`](crate::Account) implementation boundary and
+    /// return the shared classified caller-error shape.
+    pub fn validate_for_account(
+        &self,
+        protocol: crate::error::Protocol,
+    ) -> Result<(), crate::error::AccountError> {
+        self.validate().map_err(|error| {
+            crate::error::AccountErrorBuilder::new(
+                crate::error::AccountErrorKind::Request(crate::error::RequestErrorKind::Malformed),
+                crate::error::Cause::Request(crate::error::RequestCause::InvalidArgument {
+                    field: Some("flags"),
+                    message: Some(crate::error::DiagnosticText::support_only(
+                        error.to_string(),
+                    )),
+                }),
+            )
+            .operation(crate::error::AccountOperation::UpdateFlags)
+            .protocol(protocol)
+            .try_build()
+            .expect("valid flag operation error classification")
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::canonical_flags_hash;
+    use super::{FlagOp, FlagOpValidationError, canonical_flags_hash};
+    use std::collections::HashSet;
 
     #[test]
     fn canonical_flag_hash_ignores_order_case_and_duplicates() {
@@ -245,5 +311,22 @@ mod tests {
             canonical_flags_hash(["a", "bc"])
         );
         assert_ne!(canonical_flags_hash(std::iter::empty::<&str>()), 0);
+    }
+
+    #[test]
+    fn flag_operations_reject_empty_deltas_and_contradictory_patches() {
+        assert_eq!(
+            FlagOp::Add(HashSet::new()).validate(),
+            Err(FlagOpValidationError::EmptyDelta)
+        );
+        assert_eq!(
+            FlagOp::Patch {
+                add: HashSet::from(["\\Seen".to_string()]),
+                remove: HashSet::from(["\\seen".to_string()]),
+            }
+            .validate(),
+            Err(FlagOpValidationError::ContradictoryPatch)
+        );
+        assert!(FlagOp::Set(HashSet::new()).validate().is_ok());
     }
 }

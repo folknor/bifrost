@@ -626,10 +626,15 @@ impl Account for CardDavAccount {
     fn bulk_set_flags(
         &self,
         _targets: AccountStream<ObjectId>,
-        _op: FlagOp,
+        op: FlagOp,
         _key: IdempotencyKey,
     ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
-        unsupported_stream(AccountOperation::UpdateFlags)
+        match op.validate_for_account(bifrost_types::Protocol::CardDav) {
+            Ok(()) => unsupported_stream(AccountOperation::UpdateFlags),
+            Err(error) => Box::pin(futures::stream::once(async move {
+                SyncEvent::Terminated(error)
+            })),
+        }
     }
 
     fn bulk_move(

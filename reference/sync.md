@@ -320,6 +320,13 @@ subscribers and returns `ChangesEvent::Terminated` /
 `FusionOutcome::Terminated`, so `plan_recovery` stops the scope. A provider
 emitting a nonsense boundary does not heal by being asked again.
 
+More generally, `handle_drive_outcome` normalizes every `Error::Account` onto
+the same `plan_recovery` path as `ChangesEvent::Terminated`; the generic
+log-and-repoll arm is reserved for engine-internal errors with no account
+recovery classification. Cursor-envelope rejection publishes `Terminated`
+before returning its classified account error, so an engine directive is
+dispatched and subscribers are not left with a silently stalled scope.
+
 The protocol tag on that error is read off the offending checkpoint's change
 cursor. There is no protocol accessor on `dyn Account`, so a checkpoint that
 carries no tag yields `Protocol::Unknown` rather than a guess.
