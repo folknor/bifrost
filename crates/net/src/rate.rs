@@ -23,6 +23,7 @@ use crate::error::Error;
 /// per-tenant 10 units/sec, etc. Protocol crates hand a list of
 /// these to `Net::attach_account`.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct RateLimit {
     /// Host the limit applies to. Matched against `Url::host_str` for
     /// outbound requests.
@@ -45,6 +46,28 @@ pub trait RequestCost {
     /// endpoints and Graph's per-request floor.
     fn cost(&self) -> u32 {
         1
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Identity of the bucket instance that admitted a debit.
+pub struct RateGeneration(u64);
+
+impl RateLimit {
+    /// Construct a rate declaration for one host.
+    #[must_use]
+    pub fn new(
+        host: impl Into<String>,
+        quota_per_second: f64,
+        cost_default: u32,
+        burst: u32,
+    ) -> Self {
+        Self {
+            host: host.into(),
+            quota_per_second,
+            cost_default,
+            burst,
+        }
     }
 }
 
@@ -158,12 +181,18 @@ impl RateLimitGovernor {
                 true
             }
             None => {
-                if !limit.quota_per_second.is_finite() || limit.quota_per_second <= 0.0 {
+                if !limit.quota_per_second.is_finite()
+                    || limit.quota_per_second <= 0.0
+                    || limit.burst == 0
+                    || limit.burst < limit.cost_default
+                {
                     tracing::warn!(
                         target: "bifrost_net::rate",
                         host = %limit.host,
                         quota_per_second = limit.quota_per_second,
-                        "ignoring RateLimit registration with a non-finite or non-positive quota",
+                        burst = limit.burst,
+                        cost_default = limit.cost_default,
+                        "ignoring invalid RateLimit registration",
                     );
                     return false;
                 }
@@ -240,6 +269,23 @@ impl RateLimitGovernor {
         host: &str,
         cost: u32,
     ) -> Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send + 'static>> {
+        let future = self.acquire_generation(host, cost);
+        Box::pin(async move { future.await.map(|_| ()) })
+    }
+
+    /// Acquire a debit and return the admitting bucket generation.
+    /// Unregistered hosts return `None` because no debit occurred.
+    pub fn acquire_generation(
+        &self,
+        host: &str,
+        cost: u32,
+    ) -> Pin<
+        Box<
+            dyn std::future::Future<Output = Result<Option<RateGeneration>, Error>>
+                + Send
+                + 'static,
+        >,
+    > {
         let buckets = Arc::clone(&self.buckets);
         let host = host.to_owned();
         let cost_f = f64::from(cost);
@@ -247,7 +293,7 @@ impl RateLimitGovernor {
             let (ticket, waiter_notify) = {
                 let mut map = buckets.lock().expect("rate-governor lock poisoned");
                 let Some(bucket) = map.get_mut(&host) else {
-                    return Ok(());
+                    return Ok(None);
                 };
                 // Validate and enqueue under the same lock. Splitting
                 // these operations lets an unregister/register cycle
@@ -296,7 +342,7 @@ impl RateLimitGovernor {
                             && bucket.waiters.iter().any(|waiter| waiter.id == ticket.id)
                     }) else {
                         guard.armed = false;
-                        return Ok(());
+                        return Ok(None);
                     };
                     bucket.waiters.front().map(|waiter| waiter.id) == Some(ticket.id)
                 };
@@ -316,7 +362,7 @@ impl RateLimitGovernor {
                         // queued on was replaced; either way this
                         // request is now unmetered.
                         guard.armed = false;
-                        return Ok(());
+                        return Ok(None);
                     };
                     let now = Instant::now();
                     let elapsed = now.duration_since(bucket.last_refill).as_secs_f64();
@@ -330,7 +376,7 @@ impl RateLimitGovernor {
                             next.notify.notify_one();
                         }
                         guard.armed = false;
-                        return Ok(());
+                        return Ok(Some(RateGeneration(ticket.generation)));
                     }
                     // Not enough tokens. Compute the minimum wait until
                     // the bucket can satisfy the request, capped at
@@ -364,9 +410,13 @@ impl RateLimitGovernor {
     /// chain of 503s from a host that just came back up) cannot wake N
     /// waiters to race for one slot. A refund that arrives with the
     /// queue empty simply raises the token count for the next arrival.
-    pub fn refund(&self, host: &str, cost: u32) {
+    /// Refund a debit only if the same bucket generation is still installed.
+    pub fn refund(&self, host: &str, cost: u32, generation: RateGeneration) {
         let mut map = self.buckets.lock().expect("rate-governor lock poisoned");
-        let Some(bucket) = map.get_mut(host) else {
+        let Some(bucket) = map
+            .get_mut(host)
+            .filter(|bucket| bucket.generation == generation.0)
+        else {
             return;
         };
         bucket.tokens = (bucket.tokens + f64::from(cost)).min(bucket.burst);
@@ -431,5 +481,34 @@ impl Drop for WaiterGuard {
 impl Default for RateLimitGovernor {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn stale_generation_refund_cannot_credit_replacement_bucket() {
+        let governor = RateLimitGovernor::new();
+        governor.register(RateLimit::new("churn.test", 0.001, 1, 1));
+        let old_generation = governor
+            .acquire_generation("churn.test", 1)
+            .await
+            .expect("old debit succeeds")
+            .expect("registered bucket has a generation");
+        governor.unregister("churn.test");
+        governor.register(RateLimit::new("churn.test", 0.001, 1, 1));
+        governor
+            .acquire("churn.test", 1)
+            .await
+            .expect("replacement bucket starts full");
+
+        governor.refund("churn.test", 1, old_generation);
+        let blocked = governor.acquire("churn.test", 1);
+        assert!(
+            tokio::time::timeout(Duration::ZERO, blocked).await.is_err(),
+            "stale refund credited replacement generation"
+        );
     }
 }

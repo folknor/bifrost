@@ -40,6 +40,9 @@ connection setup timeout, and TLS trust. `AccountSpec` contains request behavior
 response-header and body timeouts, optional total timeout, User-Agent,
 buffered-body ceiling, redirect policy, token max-age, retry policy, token source,
 and rate declarations.
+The caller-authored configuration records `NetConfig`, `AccountSpec`,
+`RateLimit`, `RetryPolicy`, and `RedirectPolicy` are `#[non_exhaustive]`; callers
+start from their constructors or defaults and then assign supported fields.
 JMAP attaches every independently opened account to the shared transport
 selected by `Net::shared_for_tls` (see the TLS section), so its accounts share
 the client, governor, and meter within each trust class as advertised. The
@@ -135,7 +138,7 @@ per-attempt-versus-overall conflation is exactly the bug the split was made to
 prevent.
 
 The deadline reaches the response body as well as the retry loop, through
-`wrap_metered`. That matters because the bandwidth-cap throttle sleeps inside
+`wrap_metered` and the capped status-body reader. That matters because the bandwidth-cap throttle sleeps inside
 `ByteBucket::consume` are the one class of wait a request performs that the
 retry loop never observes: with a low cap, a buffered response could otherwise
 finish minutes after an explicit total timeout, and a streaming response could
@@ -153,12 +156,29 @@ the payload as though it were the whole response.
 
 Because `read_timeout` is the only inactivity bound and it is per-account, every
 body drain must apply it. Terminal statuses go through
-`read_capped_response_body(response, account.read_timeout())`, never
+`read_capped_response_body(response, account, deadline)`, never
 `reqwest::Response::bytes()`: a server that sends 4xx headers and then stalls
 mid-body would otherwise block forever, and the google and graph accounts set no
 `request_timeout` to rescue it. The capped reader also stops reading at
 `STATUS_BODY_CAP`, where `bytes()` buffers the whole body before any cap
 applies.
+
+The capped reader meters every chunk, then checks the deadline, then pays the
+per-account bandwidth cap - the same three steps in the same order as the success
+body. This includes terminal statuses, failed attempts drained before retry,
+rejected-token 401 bodies, and followed redirects. Its evidence
+distinguishes the 4 KB ceiling, inactivity or overall timeout, and a connection
+failure with separate visible body markers, so provider JSON classifiers never
+treat an interrupted document as complete.
+
+Metering these drains without throttling them was a half-fix, and the reason the
+throttle belongs here is that a byte counted against the account must also be paid
+for: repeated 429/5xx responses or a long redirect chain read real inbound bytes,
+and a cap that only the success path honors is not a per-account cap. The throttle
+wait is bounded by the overall deadline exactly as `wrap_metered`'s is, so putting a
+sleep on an error path cannot turn a failing request into a hang. Each drain builds
+its own `ByteBucket`, starting full, so a short error body is never delayed and the
+cap bites only once a single drain runs long.
 
 The same reasoning is why the knobs below are not exposed upward. If a
 per-deployment value is genuinely needed, it belongs on the protocol
@@ -339,7 +359,10 @@ The rate-limit slot is **refunded on every retried failure**, not
 just 429-with-Retry-After, so 5xx retries don't burn quota for work
 the server didn't perform.
 
-Each acquired slot is held by an armed guard until a response arrives.
+Each acquired slot is held by an armed guard until a response arrives. The debit
+carries the bucket generation returned by `acquire_generation`; both guard-drop
+and acknowledged-response refunds require that generation, so detach and reopen
+cannot credit the replacement bucket.
 Dropping or cancelling the request future before server
 acknowledgement refunds the slot automatically. Response-backed retry
 and redirect paths retain their explicit refund rules.
@@ -479,7 +502,8 @@ not a runtime condition.
 Unregistered hosts are unmetered (no-op `acquire`).
 
 For a previously unregistered host, registration rejects non-finite,
-zero, and negative `quota_per_second` values with a warning and
+zero, and negative `quota_per_second` values, plus `burst == 0` and
+`burst < cost_default`, with a warning and
 returns `false`. `Net` records only successful registrations in the
 attachment token's host set, so a rejected account cannot later
 unregister another account's valid bucket. A duplicate declaration,
@@ -517,8 +541,14 @@ estimate, not an on-wire byte counter: reqwest does not expose the
 point at which an in-memory body is written, so an `Unsent` DNS/connect
 failure can count bytes that never reached the wire. Moving the count
 after dispatch would instead miss in-flight failures and cancellation
-after a partial write. Inbound metering is per-chunk on the response
-body reader, both buffered and streaming.
+after a partial write. Inbound metering is per-chunk on every response
+body the transport reads, including buffered and streaming successes, terminal
+errors, retry drains, 401 recovery, and followed redirects. The cumulative
+meter remains account-scoped; it does not expose per-request accounting.
+
+One inbound stream is outside this: the token-endpoint traffic `OAuthRefresher`
+drives goes through the caller's own `TokenSource`, not this pipeline, so it is
+neither metered nor capped. Closing that would change the `TokenSource` contract.
 
 `AccountNet` caches its `AccountMeter` at attach or retag time, avoiding
 an account-id allocation and meter-map lookup on each request attempt.
@@ -543,14 +573,23 @@ re-registers it.
 ### Bandwidth cap
 
 Per-account cap stored on `AccountNet` in `AtomicU64` with
-`u64::MAX` sentinel for `None`. Throttles via `ByteBucket` on the
-response-body reader. Chunks larger than the per-second cap are
+`u64::MAX` sentinel for `None`. Throttles via `ByteBucket` on every
+response-body reader - the success stream in `wrap_metered` and the capped
+status-body drains alike. Chunks larger than the per-second cap are
 admitted after `(chunk_size / cap)` seconds of sleep (the cap is a
 smoothing throttle, not a hard ceiling on chunk size). `ByteBucket`
 also uses `tokio::time::Instant`, matching its Tokio sleep clock and
 allowing deterministic virtual-time tests. Every throttle wait is bounded by
 the request's total deadline (see "Deadlines and the buffered ceiling"), so a
 low cap can slow a response but cannot carry it past an explicit total timeout.
+If a stream starts uncapped and receives a cap while live, its bucket initializes
+full on that first capped chunk rather than charging for time before the cap
+existed.
+
+`RequestBuilder::without_timeout()` explicitly suppresses an account default
+total deadline while retaining header and body inactivity bounds. JMAP uses it
+for long-lived EventSource responses; ordinary JMAP requests continue to use the
+configured request timeout.
 
 `set_bandwidth_cap(Some(0))` is **not** a sentinel for unlimited
 (that is `None`'s job). It is normalised to `Some(1)` with a

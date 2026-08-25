@@ -53,7 +53,7 @@ pub use config::{DEFAULT_MAX_BUFFERED_RESPONSE, NetConfig};
 pub use error::{Error, FinalResponse, MalformedRedirectKind, RangeFailureKind, STATUS_BODY_CAP};
 pub use http::Method;
 pub use net::{AccountNet, AccountSpec, Net};
-pub use rate::{RateLimit, RateLimitGovernor, RequestCost};
+pub use rate::{RateGeneration, RateLimit, RateLimitGovernor, RequestCost};
 pub use redirect::{FollowRedirects, RedirectAction, RedirectPolicy, RedirectStep};
 pub use request::{ByteStream, RequestBuilder, Response, StreamingResponse, parse_retry_after};
 pub use retry::RetryPolicy;

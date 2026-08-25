@@ -60,7 +60,9 @@ returns `Error::Method` for JMAP method-level errors.
   mandatory RFC 8620 session property, unlike the RFC 8887 WebSocket
   extension `sync/` push relies on. Wiring EventSource in as the sync-layer
   push fallback for servers without WebSocket push is tracked in
-  `reference/jmap/DEFERRED.md`.
+  `reference/jmap/DEFERRED.md`. The long-lived SSE response explicitly suppresses
+  the ordinary JMAP request deadline while retaining response-header and body
+  inactivity bounds.
 - `ReqwestTransport` - default implementation with a pooled reqwest::Client.
 - `Client::with_transport(transport, session, session_url)` - crate-internal custom transport injection. The session URL is required and rejected when empty: a client built without one could never re-fetch its session, so `refresh_session` was a silent no-op against the wrong (empty) URL.
 - WebSocket remains reqwest-specific (documented).

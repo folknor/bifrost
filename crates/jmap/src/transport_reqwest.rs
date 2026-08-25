@@ -183,7 +183,7 @@ impl SseTransport for ReqwestTransport {
             .net
             .get(url)
             .header(header::ACCEPT.as_str(), "text/event-stream")
-            .timeout(self.timeout);
+            .without_timeout();
         for (name, value) in &self.headers {
             let value = value.to_str().map_err(|e| {
                 TransportError::with_source(format!("Invalid default header value for {name}"), e)
@@ -290,6 +290,8 @@ fn redirect_policy_from_trusted_hosts(trusted_hosts: &HashSet<String>) -> Redire
 mod tests {
     use super::*;
     use crate::client::Credentials;
+    use bifrost_net::StaticTokenSource;
+    use bifrost_net::test_support::{Canned, ScriptedDispatch, scripted_net};
 
     #[test]
     fn independently_built_transports_share_the_process_net() {
@@ -313,5 +315,33 @@ mod tests {
         .expect("second transport builds");
 
         assert!(first.net.shares_transport_with(&second.net));
+    }
+
+    #[tokio::test]
+    async fn event_source_suppresses_the_ordinary_request_deadline() {
+        let script = ScriptedDispatch::new([Canned::Stream {
+            status: reqwest::StatusCode::OK,
+            headers: header::HeaderMap::new(),
+            chunks: Vec::new(),
+        }]);
+        let mut spec = AccountSpec::new(Some(Arc::new(StaticTokenSource::new("token", None))));
+        spec.request_timeout = Some(Duration::from_secs(30));
+        let account = scripted_net(&script, bifrost_net::NetConfig::default())
+            .attach_account(AccountId("sse-timeout".to_owned()), spec);
+        let transport = ReqwestTransport {
+            net: account,
+            headers: header::HeaderMap::new(),
+            authorization: Authorization::from_credentials_for_test(Credentials::basic(
+                "user", "secret",
+            )),
+            timeout: Duration::from_secs(30),
+        };
+
+        transport
+            .open_sse("https://push.test/events", None)
+            .await
+            .expect("SSE headers succeed");
+
+        assert_eq!(script.requests()[0].timeout, None);
     }
 }

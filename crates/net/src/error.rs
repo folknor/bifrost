@@ -32,6 +32,8 @@ pub const STATUS_BODY_CAP: usize = 4096;
 /// that pattern-match the body for diagnostics can detect truncation
 /// without an extra field on the variant.
 const STATUS_BODY_TRUNCATED_MARKER: &[u8] = b" ... (truncated)";
+pub(crate) const STATUS_BODY_TIMEOUT_MARKER: &[u8] = b" ... (body read timed out)";
+pub(crate) const STATUS_BODY_CONNECTION_MARKER: &[u8] = b" ... (body read failed)";
 
 /// Final HTTP response evidence preserved for retry-budget,
 /// rate-limit, and repeated-auth failures. `body` is capped with the

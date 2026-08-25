@@ -957,19 +957,10 @@ mod tests {
     /// handle so `close()` actually issues `users.stop`.
     fn scripted_account(script: &Arc<ScriptedDispatch>) -> (Arc<GoogleAccount>, bifrost_net::Net) {
         let net = scripted_net(script, NetConfig::default());
-        let account_net = net.attach_account(
-            AccountId("close-test".to_owned()),
-            AccountSpec {
-                hosts: vec![RateLimit {
-                    host: TEST_HOST.to_owned(),
-                    quota_per_second: 100.0,
-                    cost_default: 1,
-                    burst: 100,
-                }],
-                default_retry: RetryPolicy::disabled(),
-                ..AccountSpec::new(Some(Arc::new(StaticTokenSource::new("token", None))))
-            },
-        );
+        let mut spec = AccountSpec::new(Some(Arc::new(StaticTokenSource::new("token", None))));
+        spec.hosts = vec![RateLimit::new(TEST_HOST, 100.0, 1, 100)];
+        spec.default_retry = RetryPolicy::disabled();
+        let account_net = net.attach_account(AccountId("close-test".to_owned()), spec);
         let account = Arc::new(GoogleAccount {
             client: Arc::new(GmailClient::with_account_net(
                 format!("https://{TEST_HOST}"),

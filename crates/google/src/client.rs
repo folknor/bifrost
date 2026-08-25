@@ -430,40 +430,36 @@ fn default_account_net(
     let people_host = host_of(people_base, "people.googleapis.com");
     let calendar_host = host_of(calendar_base, "www.googleapis.com");
 
-    let mut hosts = vec![RateLimit {
-        host: gmail_host.clone(),
-        quota_per_second: GOOGLE_API_QUOTA_PER_SECOND,
-        cost_default: 1,
-        burst: GOOGLE_API_BURST,
-    }];
+    let mut hosts = vec![RateLimit::new(
+        gmail_host.clone(),
+        GOOGLE_API_QUOTA_PER_SECOND,
+        1,
+        GOOGLE_API_BURST,
+    )];
     if people_host != gmail_host {
-        hosts.push(RateLimit {
-            host: people_host.clone(),
-            quota_per_second: PEOPLE_API_QUOTA_PER_SECOND,
-            cost_default: 1,
-            burst: PEOPLE_API_BURST,
-        });
+        hosts.push(RateLimit::new(
+            people_host.clone(),
+            PEOPLE_API_QUOTA_PER_SECOND,
+            1,
+            PEOPLE_API_BURST,
+        ));
     }
     // Calendar bills per request rather than in Gmail quota units, so it takes
     // the general Google bucket. Only registered when it is a host neither of
     // the other two already covers - the production case is exactly that
     // overlap, where Calendar rides the Gmail registration.
     if calendar_host != gmail_host && calendar_host != people_host {
-        hosts.push(RateLimit {
-            host: calendar_host,
-            quota_per_second: GOOGLE_API_QUOTA_PER_SECOND,
-            cost_default: 1,
-            burst: GOOGLE_API_BURST,
-        });
+        hosts.push(RateLimit::new(
+            calendar_host,
+            GOOGLE_API_QUOTA_PER_SECOND,
+            1,
+            GOOGLE_API_BURST,
+        ));
     }
 
-    net.attach_account(
-        account,
-        AccountSpec {
-            hosts,
-            ..AccountSpec::new(Some(token_source))
-        },
-    )
+    let mut spec = AccountSpec::new(Some(token_source));
+    spec.hosts = hosts;
+    net.attach_account(account, spec)
 }
 
 /// Quota units charged by one Gmail API method, keyed on the path
@@ -600,12 +596,7 @@ mod tests {
         let net = bifrost_net::test_support::scripted_account(
             &script,
             bifrost_net::NetConfig::default(),
-            vec![RateLimit {
-                host: "gmail.test".to_owned(),
-                quota_per_second: 100.0,
-                cost_default: 1,
-                burst: 100,
-            }],
+            vec![RateLimit::new("gmail.test", 100.0, 1, 100)],
             Arc::new(StaticTokenSource::new("token", None)),
             bifrost_net::RetryPolicy::disabled(),
         );

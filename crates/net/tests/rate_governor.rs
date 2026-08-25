@@ -22,13 +22,12 @@ use bifrost_net::rate::{RateLimit, RateLimitGovernor};
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn a_cancelled_head_hands_the_front_over_without_letting_the_tail_overtake() {
     let governor = std::sync::Arc::new(RateLimitGovernor::new());
-    governor.register(RateLimit {
-        host: "fifo.test".to_owned(),
-        quota_per_second: 0.001,
-        cost_default: 1,
-        burst: 3,
-    });
-    governor.acquire("fifo.test", 3).await.unwrap();
+    governor.register(RateLimit::new("fifo.test", 0.001, 1, 3));
+    let generation = governor
+        .acquire_generation("fifo.test", 3)
+        .await
+        .unwrap()
+        .unwrap();
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let mut tasks = Vec::new();
@@ -48,33 +47,32 @@ async fn a_cancelled_head_hands_the_front_over_without_letting_the_tail_overtake
     tokio::task::yield_now().await;
 
     for _ in 0..2 {
-        governor.refund("fifo.test", 1);
+        governor.refund("fifo.test", 1, generation);
         tokio::task::yield_now().await;
         assert!(
             rx.try_recv().is_err(),
             "a partially funded head must not let its successor overtake"
         );
     }
-    governor.refund("fifo.test", 1);
+    governor.refund("fifo.test", 1, generation);
     assert_eq!(
         rx.recv().await,
         Some(1),
         "the cancelled head handed the front to B"
     );
-    governor.refund("fifo.test", 1);
+    governor.refund("fifo.test", 1, generation);
     assert_eq!(rx.recv().await, Some(2));
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn a_cheaper_later_waiter_cannot_overtake_the_fifo_head() {
     let governor = std::sync::Arc::new(RateLimitGovernor::new());
-    governor.register(RateLimit {
-        host: "cost-fifo.test".to_owned(),
-        quota_per_second: 0.001,
-        cost_default: 1,
-        burst: 2,
-    });
-    governor.acquire("cost-fifo.test", 2).await.unwrap();
+    governor.register(RateLimit::new("cost-fifo.test", 0.001, 1, 2));
+    let generation = governor
+        .acquire_generation("cost-fifo.test", 2)
+        .await
+        .unwrap()
+        .unwrap();
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     for (id, cost) in [(0, 2), (1, 1)] {
@@ -87,24 +85,19 @@ async fn a_cheaper_later_waiter_cannot_overtake_the_fifo_head() {
         tokio::task::yield_now().await;
     }
 
-    governor.refund("cost-fifo.test", 1);
+    governor.refund("cost-fifo.test", 1, generation);
     tokio::task::yield_now().await;
     assert!(rx.try_recv().is_err(), "the one-unit follower overtook");
-    governor.refund("cost-fifo.test", 1);
+    governor.refund("cost-fifo.test", 1, generation);
     assert_eq!(rx.recv().await, Some(0));
-    governor.refund("cost-fifo.test", 1);
+    governor.refund("cost-fifo.test", 1, generation);
     assert_eq!(rx.recv().await, Some(1));
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn unregister_releases_every_queued_waiter() {
     let governor = std::sync::Arc::new(RateLimitGovernor::new());
-    governor.register(RateLimit {
-        host: "detach.test".to_owned(),
-        quota_per_second: 0.001,
-        cost_default: 1,
-        burst: 1,
-    });
+    governor.register(RateLimit::new("detach.test", 0.001, 1, 1));
     governor.acquire("detach.test", 1).await.unwrap();
 
     let mut tasks = Vec::new();
@@ -132,12 +125,7 @@ async fn unregister_releases_every_queued_waiter() {
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn a_waiter_woken_by_unregister_is_not_recaptured_by_a_re_registered_host() {
     let governor = std::sync::Arc::new(RateLimitGovernor::new());
-    let limit = || RateLimit {
-        host: "churn.test".to_owned(),
-        quota_per_second: 0.001,
-        cost_default: 1,
-        burst: 1,
-    };
+    let limit = || RateLimit::new("churn.test", 0.001, 1, 1);
     governor.register(limit());
     governor.acquire("churn.test", 1).await.unwrap();
 
@@ -169,12 +157,7 @@ async fn a_waiter_woken_by_unregister_is_not_recaptured_by_a_re_registered_host(
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn token_bucket_drains_refills_and_refunds_wake_waiter() {
     let governor = std::sync::Arc::new(RateLimitGovernor::new());
-    governor.register(RateLimit {
-        host: "rate.test".to_owned(),
-        quota_per_second: 10.0,
-        cost_default: 1,
-        burst: 5,
-    });
+    governor.register(RateLimit::new("rate.test", 10.0, 1, 5));
 
     // Drain: 5 single-token acquires should each return immediately.
     for _ in 0..5 {
@@ -194,7 +177,12 @@ async fn token_bucket_drains_refills_and_refunds_wake_waiter() {
     tokio::task::yield_now().await;
 
     // Refund: explicit token return, should wake the waiter.
-    governor.refund("rate.test", 1);
+    let generation = governor
+        .acquire_generation("rate.test", 0)
+        .await
+        .unwrap()
+        .unwrap();
+    governor.refund("rate.test", 1, generation);
 
     // The waiter should complete promptly. We give it generous
     // virtual time so the test does not race on busy CI.
@@ -234,12 +222,7 @@ async fn token_bucket_refills_on_tokio_virtual_time() {
 #[tokio::test(flavor = "current_thread")]
 async fn acquire_cost_exceeds_burst_short_circuits() {
     let governor = RateLimitGovernor::new();
-    governor.register(RateLimit {
-        host: "burst.test".to_owned(),
-        quota_per_second: 1.0,
-        cost_default: 1,
-        burst: 3,
-    });
+    governor.register(RateLimit::new("burst.test", 1.0, 1, 3));
 
     let res = governor.acquire("burst.test", 10).await;
     match res {
@@ -257,28 +240,18 @@ async fn acquire_cost_exceeds_burst_short_circuits() {
 #[tokio::test]
 async fn cost_default_for_returns_registered_default() {
     let governor = RateLimitGovernor::new();
-    governor.register(RateLimit {
-        host: "default.test".to_owned(),
-        quota_per_second: 1.0,
-        cost_default: 7,
-        burst: 10,
-    });
+    governor.register(RateLimit::new("default.test", 1.0, 7, 10));
     assert_eq!(governor.cost_default_for("default.test"), Some(7));
     assert_eq!(governor.cost_default_for("unknown.test"), None);
 }
 
 fn limit(host: &str, quota_per_second: f64, burst: u32) -> RateLimit {
-    RateLimit {
-        host: host.to_owned(),
-        quota_per_second,
-        cost_default: 1,
-        burst,
-    }
+    RateLimit::new(host, quota_per_second, 1, burst)
 }
 
 /// A host nobody registered is unmetered: `acquire` returns
-/// immediately whatever the cost, and `refund` is a no-op rather than a
-/// panic. JMAP relies on this - it registers no rate limits at all.
+/// immediately whatever the cost. JMAP relies on this - it registers no
+/// rate limits at all.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn unregistered_hosts_are_unmetered() {
     let governor = RateLimitGovernor::new();
@@ -286,7 +259,6 @@ async fn unregistered_hosts_are_unmetered() {
         .acquire("nobody.test", 10_000)
         .await
         .expect("an unregistered host never blocks");
-    governor.refund("nobody.test", 5);
     assert_eq!(governor.cost_default_for("nobody.test"), None);
 }
 
@@ -329,9 +301,13 @@ async fn zero_cost_requests_bypass_the_bucket() {
 async fn refund_clamps_at_burst() {
     let governor = RateLimitGovernor::new();
     governor.register(limit("clamp.test", 1.0, 1));
-    governor.acquire("clamp.test", 1).await.expect("drain");
+    let generation = governor
+        .acquire_generation("clamp.test", 1)
+        .await
+        .expect("drain")
+        .unwrap();
 
-    governor.refund("clamp.test", 1_000);
+    governor.refund("clamp.test", 1_000, generation);
     governor
         .acquire("clamp.test", 1)
         .await
@@ -381,18 +357,8 @@ async fn attach_counts_keep_a_shared_bucket_alive() {
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn duplicate_registration_keeps_the_first_configuration() {
     let governor = RateLimitGovernor::new();
-    governor.register(RateLimit {
-        host: "dup.test".to_owned(),
-        quota_per_second: 250.0,
-        cost_default: 5,
-        burst: 250,
-    });
-    governor.register(RateLimit {
-        host: "dup.test".to_owned(),
-        quota_per_second: 1.0,
-        cost_default: 99,
-        burst: 1,
-    });
+    governor.register(RateLimit::new("dup.test", 250.0, 5, 250));
+    governor.register(RateLimit::new("dup.test", 1.0, 99, 1));
 
     assert_eq!(governor.cost_default_for("dup.test"), Some(5));
     governor
@@ -416,6 +382,23 @@ async fn invalid_quotas_are_ignored_and_leave_the_host_unmetered() {
             .acquire(host, u32::MAX)
             .await
             .expect("a host with an invalid registration is unmetered");
+    }
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn unusable_bursts_are_rejected_and_leave_the_host_unmetered() {
+    let governor = RateLimitGovernor::new();
+    for limit in [
+        RateLimit::new("zero-burst.test", 1.0, 1, 0),
+        RateLimit::new("default-over-burst.test", 1.0, 2, 1),
+    ] {
+        let host = limit.host.clone();
+        assert!(!governor.register(limit));
+        assert_eq!(governor.cost_default_for(&host), None);
+        governor
+            .acquire(&host, u32::MAX)
+            .await
+            .expect("a rejected declaration leaves the host unmetered");
     }
 }
 

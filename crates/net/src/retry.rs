@@ -14,6 +14,7 @@ use reqwest::StatusCode;
 /// decide whether to retry, how long to wait, and when to surface a
 /// `RetryBudgetExhausted` error.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct RetryPolicy {
     /// Maximum number of attempts including the initial one. A value
     /// of 1 disables retry.

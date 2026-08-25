@@ -406,18 +406,14 @@ impl GraphClient {
     pub(crate) fn attach_account(&self, account_id: AccountId) {
         if let Some(net) = self.inner.net.as_ref() {
             let token_source = Arc::clone(&self.inner.token_source);
-            let account_net = net.attach_account(
-                account_id,
-                AccountSpec {
-                    hosts: vec![RateLimit {
-                        host: self.inner.rate_limit_host.clone(),
-                        quota_per_second: 10.0,
-                        cost_default: 1,
-                        burst: 10,
-                    }],
-                    ..AccountSpec::new(Some(token_source))
-                },
-            );
+            let mut spec = AccountSpec::new(Some(token_source));
+            spec.hosts = vec![RateLimit::new(
+                self.inner.rate_limit_host.clone(),
+                10.0,
+                1,
+                10,
+            )];
+            let account_net = net.attach_account(account_id, spec);
             // Install the replacement first, then tear down whatever
             // registration it displaced. `Net::attach_account` mints a
             // fresh token on every call and no longer unregisters a

@@ -9,61 +9,20 @@ Hunter note: read the crate end to end (`request.rs`, `net.rs`, `rate.rs`,
 account-error mapping table) against `reference/net.md`, and confirmed both
 cross-scope claims by grep.
 
-## N-3. Inbound bandwidth accounting is blind on every non-2xx path
+## N-3a. OAuth token-endpoint traffic is still unmetered (residual of N-3)
 
-**High confidence, medium severity.** Metering is attached only by `wrap_metered`,
-which runs in `send` / `send_streaming` / `download_stream` - i.e. only on the body
-that reaches the caller. Every other body read bypasses the meter entirely:
-`read_capped_response_body` on terminal 4xx, on `final_response_from_response` for
-`AuthLost` / `RetryBudgetExhausted` / `RateLimited`, the `drop(response)` on the 5xx
-retry path, the dropped 3xx bodies on redirect hops, and the
-`futures::stream::empty()` substituted for a `PassThrough` body. An account being
-throttled hard, or walking a long redirect chain, reads real bytes off the wire that
-`observed_bps` never sees. Outbound is worse in a different way: `body.len()` only,
-headers excluded by design - and the OAuth token endpoint traffic driven by
-`OAuthRefresher` is not metered at all, because it goes through the caller's own
-`TokenSource`, not this pipeline.
-
-## N-5. `refund` is not generation-scoped, so a refund can credit a different account's bucket
-
-**High confidence, low severity.** `RateDebit` carries only `(host, cost)`.
-`RateLimitGovernor::refund` looks the host up by name and credits whatever bucket is
-there now. Every other ticket-handling path in `rate.rs` was carefully made
-generation-aware precisely because detach/reopen churn recycles host names -
-`Ticket`, the `is_front` filter, `WaiterGuard::drop` all check `generation`. `refund`
-is the one hole left. The consequence is bounded (tokens clamp at `burst`) but it is a
-real quota inflation for the replacement bucket, and it is inconsistent with the rest
-of the module's own invariant. Give `RateDebit` the generation and have `refund`
-filter on it.
-
-## N-6. `register` validates `quota_per_second` but not `burst`, and `burst = 0` makes every request to that host fail permanently
-
-**High confidence, low-medium severity.** A new-host registration with a positive
-quota and `burst: 0` installs a bucket with `burst = 0.0`. Every `acquire` with `cost
->= 1` then short-circuits to `Error::CostExceedsBurst` forever - a hard,
-non-retryable failure on every request to that host, from a config value nothing
-rejected. Same for `burst < cost_default`, which is silently a permanently-broken
-host. Extend the existing rejection arm: reject `burst == 0` and warn when `burst <
-cost_default`, both with the same `return false` that already keeps a rejected
-registration out of the attachment token's host set.
-
-## N-7. `read_capped_response_body` swallows body-read failures and truncation indistinguishably
-
-**High confidence, low severity.** Both a chunk error and a read timeout `break` out
-of the loop and return whatever was accumulated. The `Error::Status` /
-`FinalResponse` that results looks identical to a complete short body. Since this is
-the evidence `into_account_error` uses to build provider-error causes, a JSON error
-document truncated by a mid-body reset is parsed as if complete. A truncation marker
-(which `cap_status_body` already has a concept of) should distinguish "capped at 4
-KB", "timed out", and "connection failed".
-
-## N-8. `ByteBucket` is constructed from the cap at stream start, but `consume` reads the cap per chunk
-
-**Medium confidence, low severity.** `ByteBucket::new(account.bandwidth_cap())` gives
-`tokens = 0.0` when the cap is `None` at stream start. If the engine then sets a cap
-mid-stream (the documented reason `cap_now` is re-read per chunk), the bucket begins
-empty and the next chunk pays a full refill window it did not earn. Initialise lazily
-on first capped chunk instead.
+**Open. High confidence, low severity.** N-3's response-body half is fixed: every
+body the transport reads - buffered and streaming successes, terminal statuses,
+pre-retry drains, rejected-token 401 bodies, followed redirects - now meters its
+chunks and pays the per-account bandwidth cap. The rest of N-3 is not fixed and is
+recorded here so its removal from this document does not read as closure. The
+refresh traffic `OAuthRefresher` drives never touches this pipeline: it goes out
+through the caller's own `TokenSource`, so `observed_bps` cannot see it and the
+per-account cap cannot throttle it. Closing it means either a metered HTTP client
+handed to token sources or a `MeterSink`-shaped hook they call, both of which change
+the `TokenSource` contract. Outbound request metering also remains `body.len()` with
+headers excluded, which is documented as deliberate in `reference/net.md` rather than
+a defect.
 
 ## N-10. There is no per-request or per-batch byte accounting seam - only per-account cumulative counters. This is why the consumers hard-code `bytes_in: 0`
 

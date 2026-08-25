@@ -759,6 +759,7 @@ impl AccountNet {
 /// Caller-supplied spec describing how `Net::attach_account` should
 /// register an account: which hosts have rate limits, where bearer
 /// tokens come from, and what retry budget to apply by default.
+#[non_exhaustive]
 pub struct AccountSpec {
     /// Per-host rate-limit declarations. Empty means "no governor
     /// enforcement for this account", which is the default for JMAP.
@@ -1003,18 +1004,20 @@ struct ByteBucketState {
     tokens: f64,
     /// Last refill instant.
     last_refill: tokio::time::Instant,
+    initialized: bool,
 }
 
 impl ByteBucket {
     /// Construct a full bucket. Initial tokens equal the configured
     /// cap so the first chunk of a brand-new download flows without
     /// delay; subsequent chunks pay the bandwidth-per-second cost.
-    fn new(cap: Option<u64>) -> Self {
+    pub(crate) fn new(cap: Option<u64>) -> Self {
         let initial = cap.map_or(0.0, |c| c as f64);
         Self {
             state: Arc::new(std::sync::Mutex::new(ByteBucketState {
                 tokens: initial,
                 last_refill: tokio::time::Instant::now(),
+                initialized: cap.is_some(),
             })),
         }
     }
@@ -1035,13 +1038,21 @@ impl ByteBucket {
     /// (`chunk_size / cap` seconds) and let the chunk through; the
     /// bucket then resets to the empty state. The cap is a smoothing
     /// throttle, not a hard per-chunk ceiling.
-    async fn consume(&self, n: u64, cap: Option<u64>) {
+    pub(crate) async fn consume(&self, n: u64, cap: Option<u64>) {
         let Some(cap) = cap else { return };
         if cap == 0 {
             return;
         }
         let cap_f = cap as f64;
         let want = n as f64;
+        {
+            let mut state = self.state.lock().expect("byte-bucket lock poisoned");
+            if !state.initialized {
+                state.tokens = cap_f;
+                state.last_refill = tokio::time::Instant::now();
+                state.initialized = true;
+            }
+        }
         // Oversized-chunk path: pay the proportional throttle and
         // continue. We zero the bucket and reset `last_refill` to
         // `now`. Side effect: the *next* normal-sized chunk starts
@@ -1380,6 +1391,24 @@ mod tests {
 
         tokio::time::advance(Duration::from_secs(1)).await;
         waiting.await.expect("byte-bucket waiter completes");
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn byte_bucket_initializes_when_a_cap_first_appears() {
+        let bucket = ByteBucket::new(None);
+        bucket.consume(10, None).await;
+        let started = tokio::time::Instant::now();
+        bucket.consume(10, Some(10)).await;
+        assert_eq!(started.elapsed(), Duration::ZERO);
+
+        let waiting = tokio::spawn(async move {
+            bucket.consume(10, Some(10)).await;
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !waiting.is_finished(),
+            "only the first capped chunk starts full"
+        );
     }
 
     fn build_net() -> Net {

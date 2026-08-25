@@ -12,6 +12,7 @@ pub const DEFAULT_MAX_BUFFERED_RESPONSE: usize = 64 * 1024 * 1024;
 /// an explicit config struct so future migrations off reqwest can
 /// remap fields without breaking the public surface.
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct NetConfig {
     /// Deadline for DNS resolution and establishing the TCP/TLS
     /// connection. Reqwest can therefore report expiry before any

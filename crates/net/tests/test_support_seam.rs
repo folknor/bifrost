@@ -41,14 +41,9 @@ fn no_retry() -> RetryPolicy {
 async fn extension_method_and_no_bearer_account_use_the_shared_pipeline() {
     let script = ScriptedDispatch::new([canned(StatusCode::MULTI_STATUS, b"dav")]);
     let net = bifrost_net::test_support::scripted_net(&script, NetConfig::default());
-    let account = net.attach_account(
-        AccountId("basic-dav".to_owned()),
-        AccountSpec {
-            hosts: Vec::new(),
-            default_retry: no_retry(),
-            ..AccountSpec::new(None)
-        },
-    );
+    let mut spec = AccountSpec::new(None);
+    spec.default_retry = no_retry();
+    let account = net.attach_account(AccountId("basic-dav".to_owned()), spec);
     let method = Method::from_bytes(b"PROPFIND").unwrap();
 
     account
@@ -78,14 +73,9 @@ async fn extension_method_and_no_bearer_account_use_the_shared_pipeline() {
 async fn bearer_auth_without_a_token_source_fails_locally_and_sends_nothing() {
     let script = ScriptedDispatch::new([canned(StatusCode::OK, b"never reached")]);
     let net = bifrost_net::test_support::scripted_net(&script, NetConfig::default());
-    let account = net.attach_account(
-        AccountId("no-source".to_owned()),
-        AccountSpec {
-            hosts: Vec::new(),
-            default_retry: no_retry(),
-            ..AccountSpec::new(None)
-        },
-    );
+    let mut spec = AccountSpec::new(None);
+    spec.default_retry = no_retry();
+    let account = net.attach_account(AccountId("no-source".to_owned()), spec);
 
     let Err(error) = account.get("https://api.test/thing").send().await else {
         panic!("bearer auth with no token source is a local configuration failure");
@@ -153,11 +143,8 @@ async fn a_scripted_4xx_never_surfaces_as_a_response() {
 
     // `Response` is deliberately not `Debug` (it carries response bodies),
     // so unwrap the result by hand rather than via `expect_err`.
-    let Err(error) = account(&script, no_retry())
-        .get("https://consumer.test/missing")
-        .send()
-        .await
-    else {
+    let account = account(&script, no_retry());
+    let Err(error) = account.get("https://consumer.test/missing").send().await else {
         panic!("4xx surfaces as Err, never as Ok(Response)");
     };
 
@@ -190,11 +177,8 @@ async fn a_terminal_status_whose_body_stalls_does_not_block_forever() {
         chunks: vec![bytes::Bytes::from_static(b"partial")],
     }]);
 
-    let Err(error) = account(&script, no_retry())
-        .get("https://consumer.test/stalls")
-        .send()
-        .await
-    else {
+    let account = account(&script, no_retry());
+    let Err(error) = account.get("https://consumer.test/stalls").send().await else {
         panic!("4xx surfaces as Err, never as Ok(Response)");
     };
 
@@ -203,13 +187,37 @@ async fn a_terminal_status_whose_body_stalls_does_not_block_forever() {
             assert_eq!(code, StatusCode::FORBIDDEN);
             assert_eq!(
                 body,
-                bytes::Bytes::from_static(b"partial"),
+                bytes::Bytes::from_static(b"partial ... (body read timed out)"),
                 "the bytes that did arrive before the stall are preserved \
                  as error evidence rather than discarded"
             );
         }
         other => panic!("expected Error::Status, got {other:?}"),
     }
+    assert_eq!(account.meter().bytes_in(), 7);
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn terminal_body_connection_failure_is_marked_and_metered() {
+    let script = ScriptedDispatch::new([Canned::StreamThenError {
+        status: StatusCode::BAD_REQUEST,
+        headers: HeaderMap::new(),
+        chunks: vec![bytes::Bytes::from_static(b"partial")],
+        message: "reset".to_owned(),
+    }]);
+    let account = account(&script, no_retry());
+
+    let body = match account.get("https://consumer.test/reset-body").send().await {
+        Err(Error::Status { body, .. }) => body,
+        Err(other) => panic!("expected terminal status error, got {other:?}"),
+        Ok(_) => panic!("terminal status remains the primary error"),
+    };
+
+    assert_eq!(
+        body,
+        bytes::Bytes::from_static(b"partial ... (body read failed)")
+    );
+    assert_eq!(account.meter().bytes_in(), 7);
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -224,19 +232,15 @@ async fn the_consumer_seam_drives_the_real_retry_loop() {
         canned(StatusCode::OK, b"recovered"),
     ]);
 
-    let response = account(
-        &script,
-        RetryPolicy {
-            max_attempts: 2,
-            initial_backoff: Duration::ZERO,
-            max_backoff: Duration::ZERO,
-            ..RetryPolicy::default()
-        },
-    )
-    .get("https://consumer.test/flaky")
-    .send()
-    .await
-    .expect("the retried 503 succeeds on the second attempt");
+    let mut retry = RetryPolicy::default();
+    retry.max_attempts = 2;
+    retry.initial_backoff = Duration::ZERO;
+    retry.max_backoff = Duration::ZERO;
+    let response = account(&script, retry)
+        .get("https://consumer.test/flaky")
+        .send()
+        .await
+        .expect("the retried 503 succeeds on the second attempt");
 
     assert_eq!(response.body, bytes::Bytes::from_static(b"recovered"));
     assert_eq!(
@@ -257,20 +261,16 @@ async fn a_transport_failure_is_scriptable_without_a_socket() {
         canned(StatusCode::OK, b"recovered"),
     ]);
 
-    let response = account(
-        &script,
-        RetryPolicy {
-            max_attempts: 2,
-            initial_backoff: Duration::ZERO,
-            max_backoff: Duration::ZERO,
-            ..RetryPolicy::default()
-        },
-    )
-    .get("https://consumer.test/reset")
-    .without_bearer_auth()
-    .send()
-    .await
-    .expect("the network failure retries through the same loop");
+    let mut retry = RetryPolicy::default();
+    retry.max_attempts = 2;
+    retry.initial_backoff = Duration::ZERO;
+    retry.max_backoff = Duration::ZERO;
+    let response = account(&script, retry)
+        .get("https://consumer.test/reset")
+        .without_bearer_auth()
+        .send()
+        .await
+        .expect("the network failure retries through the same loop");
 
     assert_eq!(response.body, bytes::Bytes::from_static(b"recovered"));
     assert_eq!(script.requests().len(), 2);

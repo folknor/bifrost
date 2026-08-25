@@ -19,9 +19,12 @@ use reqwest::{
 use serde::Serialize;
 
 use crate::auth::AccessToken;
-use crate::error::{Error, FinalResponse, STATUS_BODY_CAP};
-use crate::net::{AccountNet, into_byte_stream, wrap_metered};
-use crate::rate::RateLimitGovernor;
+use crate::error::{
+    Error, FinalResponse, STATUS_BODY_CAP, STATUS_BODY_CONNECTION_MARKER,
+    STATUS_BODY_TIMEOUT_MARKER,
+};
+use crate::net::{AccountNet, ByteBucket, into_byte_stream, wrap_metered};
+use crate::rate::{RateGeneration, RateLimitGovernor};
 use crate::redirect::{FollowRedirects, RedirectAction, RedirectPolicy, classify_redirect};
 use crate::retry::RetryPolicy;
 
@@ -198,15 +201,22 @@ struct RateDebit {
     governor: RateLimitGovernor,
     host: String,
     cost: u32,
+    generation: Option<RateGeneration>,
     armed: bool,
 }
 
 impl RateDebit {
-    fn new(governor: RateLimitGovernor, host: String, cost: u32) -> Self {
+    fn new(
+        governor: RateLimitGovernor,
+        host: String,
+        cost: u32,
+        generation: Option<RateGeneration>,
+    ) -> Self {
         Self {
             governor,
             host,
             cost,
+            generation,
             armed: true,
         }
     }
@@ -214,12 +224,20 @@ impl RateDebit {
     fn disarm(&mut self) {
         self.armed = false;
     }
+
+    fn refund_acknowledged(&self) {
+        if let Some(generation) = self.generation {
+            self.governor.refund(&self.host, self.cost, generation);
+        }
+    }
 }
 
 impl Drop for RateDebit {
     fn drop(&mut self) {
-        if self.armed {
-            self.governor.refund(&self.host, self.cost);
+        if self.armed
+            && let Some(generation) = self.generation
+        {
+            self.governor.refund(&self.host, self.cost, generation);
         }
     }
 }
@@ -254,7 +272,7 @@ struct RequestBuilderInner {
     /// Optional per-request retry policy override.
     retry: Option<RetryPolicy>,
     /// Optional per-request timeout override.
-    timeout: Option<Duration>,
+    timeout: Option<Option<Duration>>,
     /// Caller's override of whether replaying this request can change
     /// server state. `None` derives it from the HTTP method.
     idempotent: Option<bool>,
@@ -385,7 +403,15 @@ impl RequestBuilder {
     /// Override the per-request timeout.
     #[must_use]
     pub fn timeout(mut self, timeout: Duration) -> Self {
-        self.inner.timeout = Some(timeout);
+        self.inner.timeout = Some(Some(timeout));
+        self
+    }
+
+    /// Disable the account's default total request deadline for this request.
+    /// Header and body inactivity timeouts still apply.
+    #[must_use]
+    pub fn without_timeout(mut self) -> Self {
+        self.inner.timeout = Some(None);
         self
     }
 
@@ -589,7 +615,8 @@ pub(crate) async fn send_streaming_inner(
     let policy = retry.unwrap_or_else(|| account.default_retry().clone());
     let retry_attempt_limit = policy.max_attempts;
     let redirect_policy = account.follow_redirects().clone();
-    let deadline = RequestDeadline::from_timeout(timeout.or_else(|| account.request_timeout()));
+    let deadline =
+        RequestDeadline::from_timeout(timeout.unwrap_or_else(|| account.request_timeout()));
     if !headers.contains_key(reqwest::header::USER_AGENT) {
         let value = reqwest::header::HeaderValue::from_str(account.user_agent()).map_err(|e| {
             Error::InvalidRequest {
@@ -644,19 +671,26 @@ pub(crate) async fn send_streaming_inner(
         // more units than the host's bucket can ever hold; that is a
         // configuration bug, not a transient condition, so we do not
         // burn retry budget on it.
-        if let Some(ref h) = host {
+        let rate_generation = if let Some(ref h) = host {
             deadline
-                .bound(account.net().governor().acquire(h, cost_units))
-                .await??;
-        }
+                .bound(account.net().governor().acquire_generation(h, cost_units))
+                .await??
+        } else {
+            None
+        };
         // Until the server acknowledges the request, cancellation or
         // any early return must restore the debited slot. Once a
         // response arrives the guard is disarmed because the server
         // has consumed the attempt. Explicit retry and redirect paths
         // below retain their existing refund rules.
-        let mut rate_debit = host
-            .as_ref()
-            .map(|h| RateDebit::new(account.net().governor().clone(), h.clone(), cost_units));
+        let mut rate_debit = host.as_ref().map(|h| {
+            RateDebit::new(
+                account.net().governor().clone(),
+                h.clone(),
+                cost_units,
+                rate_generation,
+            )
+        });
 
         // Mint a fresh `Authorization` from the token source. The
         // token source itself handles single-flight refresh.
@@ -762,15 +796,15 @@ pub(crate) async fn send_streaming_inner(
         if auth_for_next_hop && status == StatusCode::UNAUTHORIZED {
             if !auth_budget.take() {
                 let final_response =
-                    final_response_from_response(response, account.read_timeout()).await;
+                    final_response_from_response(response, &account, deadline).await?;
                 return Err(Error::AuthLost {
                     transmission_state: Some(TransmissionState::Acknowledged),
                     final_response: Some(final_response),
                 });
             }
-            drop(response);
-            if let Some(ref h) = host {
-                account.net().governor().refund(h, cost_units);
+            let _ = read_capped_response_body(response, &account, deadline).await?;
+            if let Some(debit) = rate_debit.as_ref() {
+                debit.refund_acknowledged();
             }
             let rejected_token = token.expect("authenticated request minted a token");
             let refresh = account
@@ -830,7 +864,7 @@ pub(crate) async fn send_streaming_inner(
                     });
                 }
                 Some(policy) => {
-                    drop(response);
+                    let response = response;
                     let parsed_url =
                         reqwest::Url::parse(&url).map_err(|e| Error::InvalidRequest {
                             field: "url",
@@ -838,6 +872,7 @@ pub(crate) async fn send_streaming_inner(
                         })?;
                     match classify_redirect(policy, &method, &parsed_url, status, &resp_headers)? {
                         RedirectAction::PassThrough => {
+                            drop(response);
                             // Build an empty byte stream so downstream
                             // unwrap paths (e.g. send().drain) still
                             // work. 304/305/306 carry no body the caller
@@ -861,13 +896,14 @@ pub(crate) async fn send_streaming_inner(
                             });
                         }
                         RedirectAction::Follow(step) => {
+                            let _ = read_capped_response_body(response, &account, deadline).await?;
                             redirects.follow()?;
                             // The next hop will issue a fresh request
                             // and debit anew, so refund the slot the
                             // 3xx debited. Otherwise a 10-hop chain
                             // would burn 10 units instead of one.
-                            if let Some(ref h) = host {
-                                account.net().governor().refund(h, cost_units);
+                            if let Some(debit) = rate_debit.as_ref() {
+                                debit.refund_acknowledged();
                             }
                             method = step.next_method;
                             url = step.next_url;
@@ -922,7 +958,7 @@ pub(crate) async fn send_streaming_inner(
             // accounts carry no total request deadline to rescue it.
             // The capped reader also bounds memory, where `bytes()`
             // buffered the whole body before the cap was applied.
-            let body = read_capped_response_body(response, account.read_timeout()).await;
+            let body = read_capped_response_body(response, &account, deadline).await?;
             return Err(Error::Status {
                 code: status,
                 body,
@@ -951,7 +987,7 @@ pub(crate) async fn send_streaming_inner(
                     retry_after_history.push(ra);
                 }
                 let final_response =
-                    final_response_from_response(response, account.read_timeout()).await;
+                    final_response_from_response(response, &account, deadline).await?;
                 if status == StatusCode::TOO_MANY_REQUESTS {
                     let last = retry_after_history.last().copied();
                     return Err(Error::RateLimited {
@@ -978,7 +1014,7 @@ pub(crate) async fn send_streaming_inner(
             }
             // Discard the body so the underlying connection can be
             // returned to the pool.
-            drop(response);
+            let _ = read_capped_response_body(response, &account, deadline).await?;
             // Refund the rate-limit slot on every retried failure: the
             // server did not consume real work on a 5xx or 429, so
             // burning a token across the retry would just starve other
@@ -986,8 +1022,8 @@ pub(crate) async fn send_streaming_inner(
             // `Retry-After` refunded; a plain 503 with no header burned
             // tokens across all three attempts and stalled neighboring
             // requests for the duration of the backoff.
-            if let Some(ref h) = host {
-                account.net().governor().refund(h, cost_units);
+            if let Some(debit) = rate_debit.as_ref() {
+                debit.refund_acknowledged();
             }
             deadline.sleep(wait).await?;
             continue;
@@ -996,7 +1032,7 @@ pub(crate) async fn send_streaming_inner(
         // Anything else: surface as Status, no retry. Same reasoning
         // as the terminal-4xx drain above.
         let headers_out = response.headers().clone();
-        let body = read_capped_response_body(response, account.read_timeout()).await;
+        let body = read_capped_response_body(response, &account, deadline).await?;
         return Err(Error::Status {
             code: status,
             body,
@@ -1133,38 +1169,77 @@ fn native_tls_error_in_source_chain(e: &reqwest::Error) -> bool {
 
 async fn final_response_from_response(
     response: reqwest::Response,
-    read_timeout: Option<Duration>,
-) -> FinalResponse {
+    account: &AccountNet,
+    deadline: RequestDeadline,
+) -> Result<FinalResponse, Error> {
     let status = response.status();
     let headers = response.headers().clone();
-    let body = read_capped_response_body(response, read_timeout).await;
-    FinalResponse {
+    let body = read_capped_response_body(response, account, deadline).await?;
+    Ok(FinalResponse {
         status,
         headers,
         body,
-    }
+    })
 }
 
 async fn read_capped_response_body(
     response: reqwest::Response,
-    read_timeout: Option<Duration>,
-) -> Bytes {
+    account: &AccountNet,
+    deadline: RequestDeadline,
+) -> Result<Bytes, Error> {
     use futures::StreamExt;
 
     let mut stream = response.bytes_stream();
     let mut buf = Vec::new();
+    // A byte counted against the account must also be paid for. These
+    // drains - terminal statuses, pre-retry discards, rejected-token
+    // 401 bodies, followed redirects - read real inbound bytes, so
+    // they owe the same per-account bandwidth cap the success body
+    // pays in `wrap_metered`. Without this a 429/5xx storm or a long
+    // redirect chain consumes uncapped inbound bandwidth. The bucket
+    // is per-drain rather than per-request for the same reason
+    // `wrap_metered` builds one per stream: it starts full so a short
+    // error body is never delayed, and the cap only bites once a
+    // single drain runs long.
+    let bucket = ByteBucket::new(account.bandwidth_cap());
     loop {
-        let next = match read_timeout {
-            Some(limit) => match tokio::time::timeout(limit, stream.next()).await {
-                Ok(next) => next,
-                Err(_) => break,
+        let next = match account.read_timeout() {
+            Some(limit) => match deadline
+                .bound_body(tokio::time::timeout(limit, stream.next()))
+                .await
+            {
+                Ok(Ok(next)) => next,
+                Ok(Err(_)) => {
+                    append_status_marker(&mut buf, STATUS_BODY_TIMEOUT_MARKER);
+                    break;
+                }
+                Err(error) => return Err(error),
             },
-            None => stream.next().await,
+            None => match deadline.bound_body(stream.next()).await {
+                Ok(next) => next,
+                Err(error) => return Err(error),
+            },
         };
         let Some(chunk) = next else { break };
-        let Ok(chunk) = chunk else {
-            break;
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(_) => {
+                append_status_marker(&mut buf, STATUS_BODY_CONNECTION_MARKER);
+                break;
+            }
         };
+        let n = u64::try_from(chunk.len()).unwrap_or(u64::MAX);
+        // Meter first, then the deadline, then the throttle - the
+        // ordering the success body uses. The throttle wait is bounded
+        // by the overall deadline exactly as `wrap_metered`'s is, so
+        // adding it to an error path cannot turn a failing request
+        // into a hang.
+        account.meter().record_bytes_in(n);
+        deadline.check_body()?;
+        let cap_now = account.bandwidth_cap();
+        if cap_now.is_some() {
+            deadline.bound_body(bucket.consume(n, cap_now)).await?;
+        }
         if buf.len() <= STATUS_BODY_CAP {
             let remaining = STATUS_BODY_CAP + 1 - buf.len();
             if chunk.len() > remaining {
@@ -1176,7 +1251,12 @@ async fn read_capped_response_body(
             break;
         }
     }
-    crate::error::cap_status_body(Bytes::from(buf))
+    Ok(crate::error::cap_status_body(Bytes::from(buf)))
+}
+
+fn append_status_marker(buf: &mut Vec<u8>, marker: &[u8]) {
+    buf.truncate(STATUS_BODY_CAP.saturating_sub(marker.len()));
+    buf.extend_from_slice(marker);
 }
 
 /// Extract host string from a URL. Returns `None` if the URL is not
@@ -1524,6 +1604,11 @@ mod tests {
 
         assert_eq!(response.body, Bytes::from_static(b"recovered"));
         assert_eq!(script.requests().len(), 2);
+        assert_eq!(
+            account.meter().bytes_in(),
+            18,
+            "the discarded 503 body and successful retry body are both metered"
+        );
     }
 
     /// `send` buffers the whole body, and every JSON API call in
@@ -1679,6 +1764,36 @@ mod tests {
         assert_eq!(script.requests().len(), 1);
     }
 
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn total_deadline_during_retry_body_drain_stays_acknowledged() {
+        let script = ScriptedDispatch::new([
+            Canned::StreamThenStall {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                headers: HeaderMap::new(),
+                chunks: vec![Bytes::from_static(b"partial")],
+            },
+            canned(StatusCode::OK, b"must not retry"),
+        ]);
+        let account = scripted_account(&script, NetConfig::default(), Vec::new(), two_attempts());
+
+        let error = account
+            .post("https://deadline.test/mutate")
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            .err()
+            .expect("the overall deadline interrupts the retry-body drain");
+
+        assert!(matches!(
+            error,
+            Error::Timeout {
+                transmission_state: TransmissionState::Acknowledged
+            }
+        ));
+        assert_eq!(script.requests().len(), 1);
+        assert_eq!(account.meter().bytes_in(), 7);
+    }
+
     // The bandwidth-cap throttle sleeps inside the metering wrapper,
     // which the retry loop never sees. A 4 KiB body under a 256 B/s cap
     // owes sixteen seconds of throttle; the three-second total deadline
@@ -1716,6 +1831,86 @@ mod tests {
             "mid-body deadline expiry is acknowledged truncation, got {error:?}"
         );
         assert_eq!(started.elapsed(), Duration::from_secs(3));
+    }
+
+    // A byte counted against the account must also be paid for. The
+    // error-path drains meter their chunks, so they owe the same
+    // bandwidth cap the success body pays: otherwise a 429/5xx storm
+    // or a long redirect chain reads inbound bytes the per-account cap
+    // never sees. Four 256-byte chunks under a 256 B/s cap: the first
+    // rides the full bucket, the remaining three owe a second each.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn terminal_status_drain_pays_the_bandwidth_cap() {
+        let script = ScriptedDispatch::new([Canned::Stream {
+            status: StatusCode::NOT_FOUND,
+            headers: HeaderMap::new(),
+            chunks: vec![Bytes::from_static(&[b'x'; 256]); 4],
+        }]);
+        let account = scripted_account(
+            &script,
+            NetConfig::default(),
+            Vec::new(),
+            RetryPolicy::disabled(),
+        );
+        account.set_bandwidth_cap(Some(256));
+        let started = tokio::time::Instant::now();
+
+        let error = account
+            .get("https://capped.test/missing")
+            .send()
+            .await
+            .err()
+            .expect("a 404 is terminal");
+
+        assert!(
+            matches!(error, Error::Status { code, .. } if code == StatusCode::NOT_FOUND),
+            "the drain still yields the terminal status, got {error:?}"
+        );
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_secs(3),
+            "the error-path drain must pay the per-account bandwidth cap"
+        );
+        assert_eq!(account.meter().bytes_in(), 1024);
+    }
+
+    // Adding a throttle to an error path must not convert an
+    // accounting bug into a hang: the wait is bounded by the overall
+    // deadline exactly as the success body's is.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn the_throttled_error_drain_is_bounded_by_the_total_deadline() {
+        let script = ScriptedDispatch::new([Canned::Stream {
+            status: StatusCode::NOT_FOUND,
+            headers: HeaderMap::new(),
+            chunks: vec![Bytes::from_static(&[b'x'; 256]); 4],
+        }]);
+        let account = scripted_account(
+            &script,
+            NetConfig::default(),
+            Vec::new(),
+            RetryPolicy::disabled(),
+        );
+        account.set_bandwidth_cap(Some(256));
+        let started = tokio::time::Instant::now();
+
+        let error = account
+            .get("https://capped.test/missing")
+            .timeout(Duration::from_secs(1))
+            .send()
+            .await
+            .err()
+            .expect("the deadline interrupts the throttled drain");
+
+        assert!(
+            matches!(
+                error,
+                Error::Timeout {
+                    transmission_state: TransmissionState::Acknowledged
+                }
+            ),
+            "a drain cut short mid-body is acknowledged truncation, got {error:?}"
+        );
+        assert_eq!(started.elapsed(), Duration::from_secs(1));
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -1980,14 +2175,15 @@ mod tests {
             cost_default: 1,
             burst: 1,
         });
-        governor
-            .acquire("cancel.test", 1)
+        let generation = governor
+            .acquire_generation("cancel.test", 1)
             .await
             .expect("initial debit");
         drop(RateDebit::new(
             governor.clone(),
             "cancel.test".to_string(),
             1,
+            generation,
         ));
 
         governor

@@ -64,6 +64,7 @@ sync = [
 debug = []
 
 [dev-dependencies]
+bifrost-net = { path = "../net", features = ["test-support"] }
 tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
 
 [[example]]
