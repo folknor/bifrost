@@ -445,20 +445,17 @@ impl InventoryCoverageReport {
     /// empty. The common shape in every protocol crate's walk loop.
     #[must_use]
     pub fn from_obligations(domain: CoverageDomain, obligations: &[InventoryObligation]) -> Self {
-        if obligations.is_empty() {
-            Self {
+        match obligations.split_first() {
+            None => Self {
                 domain,
                 outcome: CoverageOutcome::Complete,
-            }
-        } else {
-            let mut obligations = obligations.to_vec();
-            let first = obligations.remove(0);
-            Self {
+            },
+            Some((first, rest)) => Self {
                 domain,
                 outcome: CoverageOutcome::Degraded {
-                    obligations: NonEmptyInventoryObligations::new(first, obligations),
+                    obligations: NonEmptyInventoryObligations::new(first.clone(), rest.to_vec()),
                 },
-            }
+            },
         }
     }
 
