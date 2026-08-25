@@ -2,9 +2,8 @@
 //!
 //! Read once at account-open via `Account::capabilities()`. Capability
 //! transitions mid-session are not delivered through this surface; the
-//! protocol crate ends affected streams with a Fatal carrying
-//! `RecoveryClass::CapabilityChanged { delta }` and the engine re-opens
-//! the account.
+//! protocol crate ends affected streams with a capability-change error whose
+//! recovery directive makes the engine re-open the account.
 
 use std::time::Duration;
 
@@ -441,9 +440,8 @@ pub struct CapabilityChange {
     pub to: CapabilityValue,
 }
 
-/// Delta between two `AccountCapabilities` snapshots. Carried on
-/// `RecoveryClass::CapabilityChanged` so the engine can reason about
-/// what changed without re-reading the full snapshot.
+/// Delta between two `AccountCapabilities` snapshots. Carried as structured
+/// cause evidence on a capability-change error.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct CapabilityDelta {
     pub added: Vec<CapabilityKey>,

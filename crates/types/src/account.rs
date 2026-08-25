@@ -48,8 +48,8 @@ use crate::error::{
     MutationSuccess, RequestCause,
 };
 use crate::events::{
-    Change, InventoryCompletion, InventoryEvent, InventoryPartition, InventoryPartitioning,
-    Priority, SyncEvent, WatchEvent,
+    Change, InventoryEvent, InventoryPartition, InventoryPartitioning, Priority, SyncEvent,
+    WatchEvent,
 };
 use crate::filter::{
     FilterValidation, ServerFilter, ServerFilterCreate, ServerFilterId, ServerFilterPatch,
@@ -135,11 +135,26 @@ pub type AccountFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
 /// same three lines, and six copies of a shared shape is how this workspace
 /// accumulated seven CalDAV/CardDAV divergences.
 ///
-/// `Done` claims COMPLETE coverage over `scope`, which is correct: a walk that
-/// enumerated nothing left nothing unaccounted for. The refusal rides
-/// `Terminated`.
+/// The stream yields exactly one event, `Terminated`, and ends. It emits no
+/// `Done`, and in particular no completeness claim.
+///
+/// It used to close with `Done(InventoryCompletion::complete(scope, None))`, on
+/// the reasoning that a walk enumerating nothing leaves nothing unaccounted
+/// for. That was wrong twice over. The claim is scoped to the whole of `scope`
+/// while the refusal is usually about one PARTITION of it - the default
+/// `inventory_partition_stream` routes every non-`Full` partition request
+/// through here - so a refused `Uid` window discharged the coverage debt for
+/// the entire scope, which is precisely the ledger lie `coverage.rs` exists to
+/// prevent. And a stream carrying both `Terminated` and `Done` contradicts
+/// `InventoryEvent`'s own contract, where `Terminated` means the walk cannot
+/// continue at all: a consumer reading last-event-wins saw success, one reading
+/// first-event-wins saw failure.
+///
+/// `scope` is retained in the signature because the refusal is about a
+/// particular scope and callers already have it to hand; nothing is derived
+/// from it now.
 pub fn unsupported_inventory_stream(
-    scope: CursorScope,
+    _scope: CursorScope,
     operation: AccountOperation,
 ) -> AccountStream<InventoryEvent> {
     let error = AccountErrorBuilder::new(
@@ -149,10 +164,9 @@ pub fn unsupported_inventory_stream(
     .operation(operation)
     .try_build()
     .expect("valid account error classification");
-    Box::pin(futures::stream::iter([
-        InventoryEvent::Terminated(error),
-        InventoryEvent::Done(InventoryCompletion::complete(scope, None)),
-    ]))
+    Box::pin(futures::stream::once(async move {
+        InventoryEvent::Terminated(error)
+    }))
 }
 
 /// The contract every protocol crate implements and the engine drives.
@@ -163,8 +177,8 @@ pub fn unsupported_inventory_stream(
 pub trait Account: Send + Sync {
     /// Read-once snapshot of the account's capabilities. Mid-session
     /// transitions are signaled by ending streams with
-    /// `RecoveryClass::CapabilityChanged`, never through a live
-    /// channel here.
+    /// a capability-change error that causes an account reopen, never through
+    /// a live channel here.
     fn capabilities(&self) -> &AccountCapabilities;
 
     /// List provider category definitions when the protocol supports them.
@@ -263,8 +277,8 @@ pub trait Account: Send + Sync {
     /// `changes_stream` would have been classified and restarted. Implement
     /// the condition once and have both entry points read it, rather than
     /// having two bodies agree by inspection.
-    fn is_inventory_cursor(&self, _cursor: &ChangeCursor) -> bool {
-        false
+    fn is_inventory_cursor(&self, cursor: &ChangeCursor) -> bool {
+        self.inventory_resume_stream(cursor.clone()).is_some()
     }
 
     /// Which inventory partition shape this account can serve for

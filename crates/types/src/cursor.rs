@@ -8,6 +8,17 @@
 
 use crate::ids::{FolderId, LabelId, MailboxId, QueryId};
 
+/// Current layout version of the trait-owned [`ChangeCursor`] envelope.
+pub const CHANGE_CURSOR_ENVELOPE_VERSION: u32 = 1;
+
+/// A cursor was minted for a different trait-owned envelope layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ChangeCursorEnvelopeMismatch {
+    pub expected: u32,
+    pub found: u32,
+}
+
 /// What does a change cursor track?
 ///
 /// - Gmail: `Account` (singleton historyId).
@@ -103,6 +114,20 @@ pub struct ChangeCursor {
     pub envelope_version: u32,
 }
 
+impl ChangeCursor {
+    /// Validate the trait-owned outer envelope before protocol dispatch.
+    pub fn validate_envelope(&self) -> Result<(), ChangeCursorEnvelopeMismatch> {
+        if self.envelope_version == CHANGE_CURSOR_ENVELOPE_VERSION {
+            Ok(())
+        } else {
+            Err(ChangeCursorEnvelopeMismatch {
+                expected: CHANGE_CURSOR_ENVELOPE_VERSION,
+                found: self.envelope_version,
+            })
+        }
+    }
+}
+
 /// Result of `Account::establish_initial_cursor(scope)`.
 ///
 /// - `Ready(cursor)`: the protocol minted a cursor cheaply (one
@@ -188,4 +213,28 @@ pub enum SyncStrategy {
     ServerCursor,
     Poll,
     None,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn outer_cursor_envelope_validation_rejects_any_other_version() {
+        let cursor = ChangeCursor {
+            scope: CursorScope::Account,
+            server_state: OpaqueChangeState {
+                protocol: ProtocolKind::Gmail,
+                envelope_version: 9,
+                bytes: Vec::new(),
+            },
+            advanced_through: None,
+            envelope_version: CHANGE_CURSOR_ENVELOPE_VERSION + 1,
+        };
+        let mismatch = cursor
+            .validate_envelope()
+            .expect_err("version must be gated");
+        assert_eq!(mismatch.expected, CHANGE_CURSOR_ENVELOPE_VERSION);
+        assert_eq!(mismatch.found, CHANGE_CURSOR_ENVELOPE_VERSION + 1);
+    }
 }

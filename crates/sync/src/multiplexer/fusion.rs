@@ -103,9 +103,16 @@ impl InventoryFusion {
         changes_tx: Option<broadcast::Sender<MultiplexerEvent>>,
     ) -> Result<FusionOutcome, Error> {
         let scope = cursor.scope.clone();
+        let classified_as_inventory = account.is_inventory_cursor(&cursor);
         let Some(stream) = account.inventory_resume_stream(cursor) else {
+            if classified_as_inventory {
+                return Err(inventory_cursor_contract_error());
+            }
             return Ok(FusionOutcome::NoCursor);
         };
+        if !classified_as_inventory {
+            return Err(inventory_cursor_contract_error());
+        }
         self.run_stream(scope, stream, changes_tx).await
     }
 
@@ -135,6 +142,7 @@ impl InventoryFusion {
                         Self::warn_degraded(&changes_tx, &scope, &completion.coverage);
                         return Ok(FusionOutcome::NoCursor);
                     }
+                    validate_checkpoint_envelope(completion.checkpoint.as_ref())?;
                     let degraded = !completion.coverage.is_complete();
                     if degraded {
                         Self::warn_degraded(&changes_tx, &scope, &completion.coverage);
@@ -203,6 +211,7 @@ impl InventoryFusion {
                         }
                         return Ok(FusionOutcome::NoCursor);
                     }
+                    validate_checkpoint_envelope(batch.checkpoint.as_ref())?;
                     if batch.checkpoint.is_some() {
                         last_accepted = batch.checkpoint.clone();
                     }
@@ -412,4 +421,21 @@ impl InventoryFusion {
         self.cursors.put(cursor);
         Ok(FusionOutcome::Established)
     }
+}
+
+fn validate_checkpoint_envelope(checkpoint: Option<&Checkpoint>) -> Result<(), Error> {
+    if let Some(Checkpoint::Change(cursor)) = checkpoint {
+        cursor.validate_envelope().map_err(|_| {
+            Error::Account(crate::recovery::cursor_decode_failure(
+                bifrost_types::AccountOperation::SyncInventory,
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+fn inventory_cursor_contract_error() -> Error {
+    Error::Account(crate::recovery::cursor_decode_failure(
+        bifrost_types::AccountOperation::SyncInventory,
+    ))
 }

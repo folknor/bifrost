@@ -49,7 +49,7 @@ fn uid_range_plan_is_newest_first_and_complete() {
     let first = &plan.partitions[0];
     let last = &plan.partitions[plan.partitions.len() - 1];
     match first {
-        PartitionBounds::Uid { from: _, to } => assert_eq!(*to, 4500),
+        PartitionBounds::Uid { from: _, to } => assert_eq!(*to, 4501),
         _ => panic!("expected UID partition"),
     }
     match last {
@@ -116,7 +116,7 @@ fn small_total_uid_yields_one_partition() {
     let plan = partitioner::plan(&policy, fixed_now(), 12);
     assert_eq!(
         plan.partitions,
-        vec![PartitionBounds::Uid { from: 1, to: 12 }]
+        vec![PartitionBounds::Uid { from: 1, to: 13 }]
     );
 }
 

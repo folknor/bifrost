@@ -4,9 +4,6 @@ use bifrost_types::FlagOp;
 
 use crate::types::GmailLabel;
 
-const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-
 const LABEL_UNREAD: &str = "UNREAD";
 const LABEL_STARRED: &str = "STARRED";
 const LABEL_DRAFT: &str = "DRAFT";
@@ -137,7 +134,7 @@ pub(crate) fn canonical_flags(label_ids: &[String], labels: &[GmailLabel]) -> Ca
 
     flags.sort();
     flags.dedup();
-    let hash = fnv1a_hash(&flags);
+    let hash = bifrost_types::canonical_flags_hash(&flags);
     CanonicalFlags { flags, hash }
 }
 
@@ -325,19 +322,6 @@ fn push_unique(items: &mut Vec<String>, item: String) {
     if !items.contains(&item) {
         items.push(item);
     }
-}
-
-fn fnv1a_hash(flags: &[String]) -> u64 {
-    let mut hash = FNV_OFFSET;
-    for flag in flags {
-        for byte in flag.as_bytes() {
-            hash ^= u64::from(*byte);
-            hash = hash.wrapping_mul(FNV_PRIME);
-        }
-        hash ^= 0xff;
-        hash = hash.wrapping_mul(FNV_PRIME);
-    }
-    hash
 }
 
 #[cfg(test)]

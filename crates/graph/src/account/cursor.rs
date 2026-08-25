@@ -94,7 +94,8 @@ pub(crate) fn routing_error(error: crate::error::GraphError) -> CursorError {
 /// link; the payload distinguishes that resumable inventory position from a
 /// live changes cursor so bifrost-sync can restart the right stream.
 pub(crate) const GRAPH_CURSOR_ENVELOPE_VERSION: u32 = 4;
-pub(crate) const CHANGE_CURSOR_ENVELOPE_VERSION: u32 = 1;
+pub(crate) const CHANGE_CURSOR_ENVELOPE_VERSION: u32 =
+    bifrost_types::CHANGE_CURSOR_ENVELOPE_VERSION;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]

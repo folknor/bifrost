@@ -625,6 +625,15 @@ impl Multiplexer {
     ) -> Result<(), Error> {
         match done {
             Some(Checkpoint::Change(c)) if &c.scope == scope => {
+                // Last account-authored seam before the registry. A wrong
+                // outer version is a bad cursor, not a bug in this engine, so
+                // it classifies as schema recovery rather than reaching the
+                // registry's unreachable-by-construction debug assertion.
+                c.validate_envelope().map_err(|_| {
+                    Error::Account(crate::recovery::cursor_decode_failure(
+                        bifrost_types::AccountOperation::SyncInventory,
+                    ))
+                })?;
                 self.cursors.put(c);
                 Ok(())
             }

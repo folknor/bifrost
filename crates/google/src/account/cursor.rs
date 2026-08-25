@@ -95,7 +95,7 @@ pub(crate) fn cursor_from_state(state: OpaqueChangeState) -> ChangeCursor {
         scope: CursorScope::Account,
         server_state: state,
         advanced_through: None,
-        envelope_version: GMAIL_ENVELOPE_VERSION,
+        envelope_version: bifrost_types::CHANGE_CURSOR_ENVELOPE_VERSION,
     }
 }
 

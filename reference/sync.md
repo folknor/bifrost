@@ -338,17 +338,14 @@ never durably persisted come across again.
 cursor-establishment pass progresses. A provider may attach a page checkpoint
 before its terminal cursor exists; that checkpoint persists only after the
 consumer ack, and BOTH cursor-establishment paths - `establish_initial_cursor`
-at attach and `run_establish` on reopen - ask the account's
-`is_inventory_cursor` predicate whether the saved state is a resumable
-inventory position before putting it into the registry. A stored page position
-must never reach `changes_stream`, which has no delta link to walk. Only after
-classification does `inventory_resume_stream` build the stream. The predicate
-and the hook must accept exactly the same cursors, and an account implementing
-one implements both from a single condition: a cursor the predicate accepts but
-the hook refuses reaches the deferred inventory worker, which gets `None`,
-reports `NoCursor`, and leaves the scope with neither a live cursor nor a
-recovery path - whereas that same cursor reaching `changes_stream` would be
-classified schema-incompatible and restarted. The terminal
+at attach and `run_establish` on reopen - ask whether the saved state is a
+resumable inventory position before putting it into the registry. The default
+`is_inventory_cursor` implementation delegates directly to
+`inventory_resume_stream(cursor.clone()).is_some()`, and the resume seam guards
+both directions of that equivalence with classified schema recovery so an
+override cannot silently diverge. A
+stored page position must never reach `changes_stream`, which has no delta link
+to walk. The terminal
 `Done` still installs the ordinary live
 change cursor in the registry.
 
@@ -479,6 +476,28 @@ inventory page and the consumer ingests zero objects. The partitioner
 `UidRange` (newest-first chunking), and `PageCount` (page-size
 chunking). `Full` falls through as a single partition; JMAP
 Email currently advertises open-ended `PageCount`.
+
+Every range partition in this workspace is HALF-OPEN, `[from, to)`, with no
+exceptions. `PartitionBounds::Time`, `PartitionBounds::Page`,
+`InventoryPartition::Time`, `InventoryPartition::Page` and
+`CoverageCoordinate::PageRange` always were; `PartitionBounds::Uid`,
+`InventoryPartition::Uid` and `CoverageCoordinate::UidRange` were inclusive
+until this was unified, and are now half-open too. Their endpoints are `u64`
+rather than `u32` for exactly that reason: a walk covering the whole UID space
+has an exclusive end of `u32::MAX + 1`, which a `u32` cannot hold. The UID
+values themselves are still `u32` - `InventoryPartitioning::UidRange`'s
+`max_uid` and the partitioner's `total` stay `u32`, and the widening is only
+in the range endpoints. No protocol crate currently serves
+`InventoryPartition::Uid`, so the only producers and consumers are the
+partitioner and `CoverageDomain::for_partition`; `CoverageDomain::covers`
+tests containment (`self_from <= other_from && self_to >= other_to`) and reads
+identically under either convention.
+
+One upgrade consequence: `partition_key` renders a UID partition as
+`uid:{from}:{to}`, so durable backfill checkpoints written under the old
+inclusive convention no longer match the newly planned keys. Those partitions
+re-walk once. That is re-work, not loss - a missing partition checkpoint means
+"start this chunk over", and the chunk boundaries themselves are unchanged.
 
 The deferred-inventory set captured at attach is a structural exclusion:
 the first registry incarnation of each such scope belongs to
@@ -1414,20 +1433,50 @@ attach would fail identically.
 variants.)
 
 `ChangeCursor` carries its own `envelope_version` separately from
-`OpaqueChangeState.envelope_version` (outer vs inner versioning). The
-outer one is engine-owned and `pack_envelope` stamps `ENGINE_VERSION`
-into the header rather than reading the field off the checkpoint. The
-field is authored by whichever protocol crate minted the cursor, and
-IMAP, CalDAV, CardDAV, and Gmail all fill it from the same constant
-that versions their own opaque payload; trusting it means the first
-protocol-side bump - which is exactly what that constant is for -
-stamps a header the engine then refuses to read, turning a payload
-format change into permanently unreadable rows for every account on
-that protocol. JMAP and Graph keep the two apart explicitly
-(`OUTER_CURSOR_ENVELOPE_VERSION` vs `PAYLOAD_ENVELOPE_VERSION`). The
-inner version rides inside the payload, where a bump invalidates only
-that protocol's own bytes. Pinned by
-`tests/envelope_roundtrip.rs::a_protocol_authored_outer_version_does_not_reach_the_header`.
+`OpaqueChangeState.envelope_version` (outer vs inner versioning). The outer
+version is owned by `bifrost-types` through
+`CHANGE_CURSOR_ENVELOPE_VERSION`; every producer stamps that shared constant,
+the persisted change envelope carries it, and the engine calls
+`ChangeCursor::validate_envelope` before protocol dispatch. The inner version
+remains protocol-owned and rides inside the payload, where a bump invalidates
+only that protocol's bytes.
+
+`validate_envelope` is a STRICT EQUALITY gate, and the decoder is the single
+migration boundary that makes that safe. `decode_envelope` accepts the whole
+`[MIN_MIGRATABLE, ENGINE_VERSION]` window, but a `Checkpoint::Change` it
+returns has already been run through `migrate_change_cursor` and stamped
+current - so every cursor in the engine's hands is at the current layout, and
+the codec is the only code in the workspace that knows a historical one.
+
+The alternative - widening `validate_envelope` to accept the migration window -
+was considered and rejected. It spreads knowledge of every past layout across
+every consumer, and it hands a protocol crate a cursor in a shape that crate
+has no code to interpret. Leaving the window and the gate disagreeing was the
+live defect: a version-1 row would decode successfully and then fail
+validation, so the engine would classify a migratable durable checkpoint as
+`SchemaIncompatible` and discard it - a full resync per account, arriving the
+moment `ENGINE_VERSION` is first bumped.
+
+Pinned by
+`tests/envelope_roundtrip.rs::every_accepted_envelope_version_decodes_into_a_cursor_that_validates`,
+which loops the window constants rather than a literal so it widens on its own
+at the next bump, and by
+`an_unknown_change_cursor_outer_version_is_detectable`. Bumping
+`ENGINE_VERSION` means adding the per-version fixup in `migrate_change_cursor`
+AND a real byte fixture for the outgoing layout; the window loop patches the
+header over current-layout bytes and so cannot prove a fixup reads an old
+payload correctly.
+
+Validation is applied at every seam where an account-authored cursor enters the
+engine - the attach path, `run_establish`, `persist_ack_request`,
+`drive_changes_stream`, the inventory fusion checkpoints, and
+`fuse_inventory_done` - and a mismatch maps to classified schema recovery
+(`Error::SchemaIncompatible` or `recovery::cursor_decode_failure`), never to a
+silent drop. `CursorRegistry::put` carries only a `debug_assert!`: by then the
+condition is unreachable, and aborting on a value a third-party `Account` impl
+authored would trade a recoverable resync for an outage. `encode_envelope` does
+panic on an unsupported outer version, consistent with the rest of that codec,
+which refuses to write any row its own decoder would reject.
 
 ## Checkpoint store
 

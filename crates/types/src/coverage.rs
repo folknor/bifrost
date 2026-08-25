@@ -84,12 +84,12 @@ pub enum CoverageCoordinate {
         from_unix_seconds: Option<i64>,
         to_unix_seconds: Option<i64>,
     },
-    /// Inclusive UID range within a UIDVALIDITY epoch. The epoch is part of the
+    /// Inclusive-exclusive UID range within a UIDVALIDITY epoch. The epoch is part of the
     /// coordinate because UIDs are only comparable inside one.
     UidRange {
         uid_validity: u32,
-        from: u32,
-        to: u32,
+        from: u64,
+        to: u64,
     },
     /// Positional page range, inclusive-exclusive. Meaningful only within one
     /// snapshot: see [`CoverageDomain::covers`].
@@ -407,11 +407,11 @@ pub struct InventoryCoverageReport {
 }
 
 impl InventoryCoverageReport {
-    /// A clean walk over the whole of `scope`.
+    /// A clean walk over the stated domain.
     #[must_use]
-    pub fn complete(scope: CursorScope) -> Self {
+    pub fn complete(domain: CoverageDomain) -> Self {
         Self {
-            domain: CoverageDomain::full(scope),
+            domain,
             outcome: CoverageOutcome::Complete,
         }
     }

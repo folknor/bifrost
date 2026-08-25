@@ -109,9 +109,10 @@ pub use directory::{DirectoryGroup, DirectoryGroupId, DirectoryGroupKind, Direct
 
 // Cursor + scope types.
 pub use cursor::{
-    ChangeCursor, CostClass, CursorDescriptor, CursorEstablishment, CursorScope, MembershipScope,
-    ObjectType, OpaqueChangeState, OpaqueProgressBytes, ProtocolKind, ScopeLifecycle,
-    ScopeLifecycleEvent, SyncStrategy,
+    CHANGE_CURSOR_ENVELOPE_VERSION, ChangeCursor, ChangeCursorEnvelopeMismatch, CostClass,
+    CursorDescriptor, CursorEstablishment, CursorScope, MembershipScope, ObjectType,
+    OpaqueChangeState, OpaqueProgressBytes, ProtocolKind, ScopeLifecycle, ScopeLifecycleEvent,
+    SyncStrategy,
 };
 
 // Error + recovery vocabulary.
@@ -169,7 +170,7 @@ pub use ids::{
 // Mutation + projection + hydration types.
 pub use mutation::{
     Fingerprint, FlagOp, HydratedObject, HydratedObjectKind, IdempotencyKey, Projection,
-    ProtocolSalt, ServerVersion,
+    ProtocolSalt, ServerVersion, canonical_flags_hash,
 };
 
 // Pagination.

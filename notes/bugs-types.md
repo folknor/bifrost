@@ -8,70 +8,6 @@ Hunter note: `mime/` was not audited in depth - a self-contained parser/renderer
 with its own tests, orthogonal to the contract questions asked. Worth a second
 pass if wanted.
 
-## 1. `unsupported_inventory_stream` manufactures a full-scope COMPLETE coverage claim out of a refusal
-
-`crates/types/src/account.rs:141-156`. It yields `Terminated(error)` followed by
-`Done(InventoryCompletion::complete(scope, None))`. `InventoryCompletion::complete`
-hard-codes `CoverageDomain::full(scope)` + `CoverageOutcome::Complete`. Two
-independent problems:
-
-(a) The default `inventory_partition_stream` (`account.rs:281-290`) routes *every
-non-`Full` partition request* through it, so a refused `Time`/`Uid`/`Page`
-partition returns a proof of complete coverage over the **whole scope** - exactly
-the ledger lie `coverage.rs`'s module doc exists to prevent, and exactly the
-hazard `lift_complete_walk`'s doc warns about ("a PARTITION walk must not pass a
-full-scope domain").
-
-(b) Emitting `Terminated` and `Done` in one stream contradicts `InventoryEvent`'s
-own doc, where `Terminated` is "the walk cannot continue at all". A consumer that
-reads the last event wins sees success; one that reads the first sees failure.
-
-**Confidence: high.** Fix that keeps the helper: make it emit only `Terminated`,
-or have it take a `CoverageDomain` and report `Degraded` with a barrier region.
-Separately, `InventoryCompletion::complete(scope, cp)` should take a
-`CoverageDomain`, not a `CursorScope` - it is the unsafe twin of the
-deliberately-safe `lift_complete_walk`, and callers reach for it (graph's
-`public_folder.rs` uses it at six early-exit points).
-
-## 2. `ChangeCursor::envelope_version` gates nothing and is owned by nobody
-
-`cursor.rs:103`. Its doc says this field means "the trait crate said its outer
-cursor shape ticked" - but `bifrost-types` exports no constant and performs no
-check. Five crates each invent their own value for it
-(`OUTER_CURSOR_ENVELOPE_VERSION`, `CHANGE_CURSOR_ENVELOPE_VERSION`,
-`ENVELOPE_VERSION`, `CURSOR_ENVELOPE_VERSION`, `ENGINE_VERSION`), so the same
-"outer shape" is simultaneously several different numbers. Worse,
-`sync/src/cursor/envelope.rs` overwrites the decoded value with `ENGINE_VERSION`
-rather than round-tripping it (`sync/tests/envelope_roundtrip.rs:153-164` pins
-exactly that), so a mismatch is undetectable by construction. Only the *inner*
-`OpaqueChangeState::envelope_version` actually gates anything.
-
-**Confidence: high.** Fix: `pub const CHANGE_CURSOR_ENVELOPE_VERSION: u32` in
-types plus a `ChangeCursor::validate_envelope()` the engine calls before handing
-a cursor back to a protocol crate.
-
-## 3. `Fingerprint::flags_hash` is a cross-producer comparison field with no defined derivation
-
-`mutation.rs:40-44`. The type is the documented cross-protocol diff primitive,
-but the crate supplies no canonicalization and no hash function, so each producer
-invents one: imap hashes a `Flag` list, graph hashes a JSON `Value` in
-`inventory.rs` but uses `u64::from(is_read)` in `public_folder.rs`, google uses a
-canonical label hash, and carddav/sync/test-support hard-code `0`. Two producers
-for the same account therefore emit different fingerprints for identical state,
-and the engine diffs them as permanently changed. The root cause is the missing
-contract here, not in the protocol crates.
-
-**Confidence: high** on the types-side gap; the graph two-hasher divergence is a
-live symptom noticed in passing (out of scope,
-`crates/graph/src/account/public_folder.rs:517` vs `inventory.rs:550`).
-
-Cross-check: the graph hunter tested that symptom and **refuted it as stated** -
-the two graph producers mint disjoint id namespaces, so no consumer can compare
-their hashes. It found a different, worse defect at that site instead; see
-`bugs-graph.md`. The types-side gap (no crate-owned derivation) is unaffected by
-the refutation, and the carddav/sync/test-support hard-coded `0` producers were
-not tested by anyone.
-
 ## 8. `PageBoundary::Partial` documents "checkpoint is `None`" and nothing enforces it
 
 `events.rs:113-136`. `Batch` has all-public fields and no constructor, so
@@ -107,19 +43,6 @@ ids).
 **Confidence: medium-high.** Fix: `finalize` should count expectations, not
 set-membership them, or reject a duplicated `expected` outright.
 
-## 14. `is_inventory_cursor` and `inventory_resume_stream` must agree, and the type system cannot make them
-
-`account.rs:247-268`. The doc spends a paragraph on the failure mode and ends with
-"implement the condition once and have both entry points read it" - which the
-two-method shape prevents. By the doc's own rule that building the resume stream
-is I/O-free and side-effect-free, `is_inventory_cursor` is redundant:
-`inventory_resume_stream(c).is_some()` is the classification.
-
-**Confidence: high.** This is a removal, so filed as a finding: delete
-`is_inventory_cursor`, or keep it and have the default impl be exactly
-`self.inventory_resume_stream(cursor.clone()).is_some()` so divergence requires
-overriding a method that already answers correctly.
-
 ## 17. `FlagOp::Patch { add, remove }` permits the same flag in both sets
 
 `mutation.rs:179`. The outcome is provider-dependent order-of-application; nothing
@@ -137,23 +60,6 @@ sentinel values" rule `AccountErrorBuilder::status` states two files away. The t
 conditions want separate carriers. Also, the function returns raw
 `Vec<BatchInputInvalidItem>`, so six protocol crates each hand-assemble the
 identical `Request(BatchInputInvalid)` error; it should return the `AccountError`.
-
-## 22. `InventoryPartition` mixes range conventions inside one enum
-
-`events.rs:55-72`: `Time` and `Page` are inclusive-exclusive, `Uid` is inclusive.
-`CoverageCoordinate` inherits the same split. An off-by-one magnet for every
-implementor.
-
-## 23. Stale references to a removed variant, in three load-bearing doc comments
-
-`capabilities.rs:5-7`, `capabilities.rs:443`, and `account.rs:165` all describe
-`RecoveryClass::CapabilityChanged { delta }`, which no longer exists
-(`error-model.md` records its removal). Also `reference/types.md`'s file map omits
-`coverage.rs` and `repair.rs` entirely, and still claims "94 methods" against a
-trait that has grown since (`repair_inventory`, `bulk_move_from`,
-`send_raw_message`, `message_reactions`, `category_definitions_list`,
-`inventory_resume_stream`, `is_inventory_cursor` are all in the file but absent
-from the lane table).
 
 ## 24. `Page::single` undoes the guarantee `Page`'s own doc claims
 
@@ -220,16 +126,6 @@ a published struct, so it is filed rather than mandated; the keep-it version is 
 `#[test]` in each protocol crate that drives every gated method and asserts the
 flag agrees with the result, which is mechanical to generate and would have caught
 the graph fingerprint split too.
-
-**The coverage/obligation machinery is well-designed and one constructor away from
-being defeatable.** `coverage.rs` reasons carefully about why a completeness claim
-needs a stated extent, and `lift_complete_walk` refuses to be a `From` impl
-precisely so nobody manufactures one by accident. Then
-`InventoryCompletion::complete(scope, cp)` and `unsupported_inventory_stream` do
-exactly that, and the trait's own default `inventory_partition_stream` is the
-biggest caller. The fix is small and worth doing first: every constructor of a
-`Complete` outcome should require a `CoverageDomain`, with no scope-only shortcut
-anywhere in the crate.
 
 Two smaller structural notes. The error model's `Reconcile` lane is missing the
 fields `Retry` has (finding 6) - the two advice types should share a common

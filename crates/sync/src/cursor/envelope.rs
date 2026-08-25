@@ -26,7 +26,7 @@ use crate::error::Error;
 
 /// Current envelope version. Bumped each time the layout outside the
 /// protocol-owned `OpaqueChangeState::bytes` changes.
-pub const ENGINE_VERSION: u32 = 1;
+pub const ENGINE_VERSION: u32 = bifrost_types::CHANGE_CURSOR_ENVELOPE_VERSION;
 
 /// Lowest envelope version still readable by this engine. Engine
 /// rejects on-disk envelopes below this with
@@ -84,6 +84,19 @@ pub struct CursorEnvelope {
 
 /// Serialize a `Checkpoint` to envelope bytes. Stable across engine
 /// versions sharing the same `ENGINE_VERSION`.
+///
+/// # Panics
+///
+/// Panics on a `Checkpoint` this revision cannot represent on disk: an
+/// unknown `Checkpoint` variant, an unknown `ObjectType` / `ProtocolKind`,
+/// or a `Checkpoint::Change` whose `ChangeCursor::envelope_version` is not
+/// `CHANGE_CURSOR_ENVELOPE_VERSION`. Refusing loudly is deliberate and
+/// matches the rest of this codec: the alternative is writing a durable row
+/// whose own decoder rejects it, which strands the account instead of
+/// healing it. Every engine ingress validates the outer version and maps a
+/// mismatch to `Error::SchemaIncompatible` before reaching this function,
+/// so the panic is not reachable through the engine - only through a direct
+/// call with a hand-built cursor.
 #[must_use]
 pub fn encode_envelope(checkpoint: &Checkpoint) -> Vec<u8> {
     match checkpoint {
@@ -97,33 +110,24 @@ pub fn encode_envelope(checkpoint: &Checkpoint) -> Vec<u8> {
 }
 
 fn encode_change(c: &ChangeCursor) -> Vec<u8> {
+    assert!(
+        c.validate_envelope().is_ok(),
+        "cursor envelope: unsupported ChangeCursor envelope version"
+    );
     let scope = encode_scope(&c.scope);
     let payload = encode_change_payload(c);
-    pack_envelope(EnvelopeKind::Change, &scope, &payload)
+    pack_envelope(EnvelopeKind::Change, c.envelope_version, &scope, &payload)
 }
 
 fn encode_backfill(b: &BackfillCheckpoint) -> Vec<u8> {
     let scope = encode_scope(&b.scope);
     let payload = encode_backfill_payload(b);
-    pack_envelope(EnvelopeKind::Backfill, &scope, &payload)
+    pack_envelope(EnvelopeKind::Backfill, ENGINE_VERSION, &scope, &payload)
 }
 
-/// The header version is always `ENGINE_VERSION`, never the
-/// `envelope_version` field carried on the in-memory checkpoint.
-///
-/// That field is the OUTER version and belongs to this codec, but the
-/// value reaching us was authored by whichever protocol crate minted
-/// the cursor, and several of them fill it from the same constant they
-/// use to version their own opaque payload (`ENVELOPE_VERSION` in
-/// `crates/imap/src/account/envelope.rs`, and the CalDAV / CardDAV /
-/// Gmail equivalents). Trusting it means the first protocol-side bump
-/// stamps a header this engine then refuses to read, poisoning every
-/// persisted row for that protocol. The engine stamps its own layout
-/// version; the protocol's payload version rides in
-/// `OpaqueChangeState::envelope_version` inside the payload, where a
-/// bump only invalidates that protocol's own bytes.
-fn pack_envelope(kind: EnvelopeKind, scope: &[u8], payload: &[u8]) -> Vec<u8> {
-    let version = ENGINE_VERSION;
+/// Pack one engine-owned envelope. Change cursors pass their validated
+/// trait-owned outer version; backfill checkpoints pass `ENGINE_VERSION`.
+fn pack_envelope(kind: EnvelopeKind, version: u32, scope: &[u8], payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(13 + scope.len() + payload.len());
     out.push(MAGIC);
     out.extend_from_slice(&[0u8, 0, 0]);
@@ -159,6 +163,10 @@ fn pack_envelope(kind: EnvelopeKind, scope: &[u8], payload: &[u8]) -> Vec<u8> {
 /// propagate as an ordinary establish failure, burn the reopen budget,
 /// broadcast `Terminated`, and leave the unreadable row on disk for
 /// every subsequent attach to trip over identically.
+///
+/// A version inside the window is migrated, not merely accepted: every
+/// `Checkpoint::Change` this returns satisfies `validate_envelope`. See
+/// `migrate_change_cursor` for why decode owns that boundary.
 pub fn decode_envelope(bytes: &[u8]) -> Result<Checkpoint, Error> {
     let env = parse_envelope(bytes)?;
     if env.version < MIN_MIGRATABLE || env.version > ENGINE_VERSION {
@@ -434,16 +442,53 @@ fn decode_change_payload(
         let (p, _) = read_bytes(&bytes[cursor_bytes_end + 1..])?;
         Some(OpaqueProgressBytes(p))
     };
-    Ok(ChangeCursor {
-        scope,
-        server_state: OpaqueChangeState {
-            protocol,
-            envelope_version: inner_version,
-            bytes: payload,
-        },
-        advanced_through,
+    Ok(migrate_change_cursor(
         envelope_version,
-    })
+        ChangeCursor {
+            scope,
+            server_state: OpaqueChangeState {
+                protocol,
+                envelope_version: inner_version,
+                bytes: payload,
+            },
+            advanced_through,
+            envelope_version,
+        },
+    ))
+}
+
+/// Bring a cursor decoded from an accepted historical layout up to the
+/// current one, and stamp it.
+///
+/// Decode is the single migration boundary for the outer envelope. The
+/// codec is the only place in the workspace that knows how to read a layout
+/// older than the current one, so it is the only place that may hold a
+/// `ChangeCursor` whose `envelope_version` is not
+/// `CHANGE_CURSOR_ENVELOPE_VERSION`. Everywhere else - the registry, the ack
+/// path, `run_establish`, the changes and inventory seams, and any protocol
+/// crate about to interpret `OpaqueChangeState::bytes` - a cursor is either
+/// current or unusable, and `ChangeCursor::validate_envelope` is a strict
+/// equality gate rather than a range check.
+///
+/// The alternative contract - teaching `validate_envelope` to accept the
+/// whole `MIN_MIGRATABLE..=ENGINE_VERSION` window - was rejected. It spreads
+/// knowledge of every historical layout across every consumer, and it hands
+/// a protocol crate a cursor in a shape that crate has no code to interpret.
+/// Leaving the two disagreeing was the live defect: a version-1 row would
+/// decode inside the window and then fail an equality gate, so the engine
+/// would classify a perfectly migratable durable checkpoint as
+/// `SchemaIncompatible` and discard it, forcing a full resync at the first
+/// version bump.
+///
+/// `MIN_MIGRATABLE == ENGINE_VERSION` today, so the chain is empty and this
+/// is only the stamp. When `ENGINE_VERSION` is bumped, the per-version fixup
+/// goes here, and `tests/envelope_roundtrip.rs` gains a byte fixture for the
+/// outgoing layout - the window loop there widens on its own, but only a
+/// fixture can prove the fixup reads the old payload correctly.
+fn migrate_change_cursor(from_version: u32, mut cursor: ChangeCursor) -> ChangeCursor {
+    let _ = from_version;
+    cursor.envelope_version = bifrost_types::CHANGE_CURSOR_ENVELOPE_VERSION;
+    cursor
 }
 
 // ---------- backfill-checkpoint payload codec ----------
@@ -570,4 +615,47 @@ fn read_bytes(bytes: &[u8]) -> Result<(Vec<u8>, usize), Error> {
         ));
     }
     Ok((bytes[4..end].to_vec(), end))
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+
+    fn cursor_at(version: u32) -> ChangeCursor {
+        ChangeCursor {
+            scope: CursorScope::Account,
+            server_state: OpaqueChangeState {
+                protocol: ProtocolKind::Gmail,
+                envelope_version: 7,
+                bytes: vec![1, 2, 3],
+            },
+            advanced_through: None,
+            envelope_version: version,
+        }
+    }
+
+    /// A cursor decoded from an older-but-accepted layout must leave the
+    /// codec already stamped current, because every consumer downstream gates
+    /// on strict equality. `MIN_MIGRATABLE == ENGINE_VERSION` today, so no
+    /// real on-disk row can carry an older version yet; the migration entry
+    /// point is driven directly with a synthetic one so the stamp is pinned
+    /// before the first bump rather than after it.
+    #[test]
+    fn migration_stamps_the_current_outer_version() {
+        let stale = cursor_at(ENGINE_VERSION.saturating_sub(1));
+        let migrated = migrate_change_cursor(ENGINE_VERSION.saturating_sub(1), stale.clone());
+        assert_eq!(
+            migrated.envelope_version,
+            bifrost_types::CHANGE_CURSOR_ENVELOPE_VERSION
+        );
+        assert!(
+            migrated.validate_envelope().is_ok(),
+            "the codec must not hand out a cursor its own consumers reject"
+        );
+        assert_eq!(
+            migrated.server_state, stale.server_state,
+            "the protocol-owned payload and its inner version ride through untouched"
+        );
+        assert_eq!(migrated.scope, stale.scope);
+    }
 }

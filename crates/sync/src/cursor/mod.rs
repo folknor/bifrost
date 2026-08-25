@@ -73,12 +73,29 @@ impl CursorRegistry {
     }
 
     /// Store the latest cursor for a scope.
+    ///
+    /// Every cursor reaching the registry has already had its outer envelope
+    /// version validated at the seam that produced it - the changes and
+    /// inventory drive loops, `fuse_inventory_done`, `run_establish`, and the
+    /// attach path all map a mismatch to classified schema recovery, and the
+    /// envelope decoder migrates and stamps whatever it reads off disk. So an
+    /// unsupported version here is unreachable by construction.
+    ///
+    /// The check is a `debug_assert!` rather than an `assert!` deliberately:
+    /// the value is authored by a protocol crate, and a wrong number in a
+    /// third-party `Account` impl is a bad-cursor condition the engine already
+    /// knows how to recover from at the seams. Aborting the process for it
+    /// would trade a recoverable resync for an outage.
     pub fn put(&self, cursor: ChangeCursor) {
         let mut guard = self.state.write().expect("poisoned");
         self.put_locked(&mut guard, cursor);
     }
 
     fn put_locked(&self, guard: &mut RegistryState, cursor: ChangeCursor) {
+        debug_assert!(
+            cursor.validate_envelope().is_ok(),
+            "CursorRegistry received an unsupported ChangeCursor envelope version"
+        );
         if !guard.cursors.contains_key(&cursor.scope) {
             let incarnation = self.next_incarnation.fetch_add(1, Ordering::Relaxed);
             guard.incarnations.insert(cursor.scope.clone(), incarnation);

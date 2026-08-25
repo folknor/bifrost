@@ -401,7 +401,7 @@ mod tests {
             fingerprint: Fingerprint {
                 server_version: ServerVersion::Unavailable,
                 size: None,
-                flags_hash: 0,
+                flags_hash: bifrost_types::canonical_flags_hash(std::iter::empty::<&str>()),
             },
             thread_id: None,
             message_id: None,

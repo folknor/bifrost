@@ -59,10 +59,10 @@ pub enum InventoryPartition {
         from_unix_seconds: Option<i64>,
         to_unix_seconds: Option<i64>,
     },
-    /// Inclusive UID range.
+    /// UID range, inclusive-exclusive.
     Uid {
-        from: u32,
-        to: u32,
+        from: u64,
+        to: u64,
     },
     /// Count-based page range, inclusive-exclusive.
     Page {
@@ -175,19 +175,35 @@ pub struct InventoryCompletion {
 }
 
 impl InventoryCompletion {
-    /// A walk that exhausted the whole of `scope` with nothing left
-    /// unaccounted for.
+    /// A walk that exhausted `domain` with nothing left unaccounted for.
     ///
-    /// Takes the scope because a completeness claim is only meaningful about a
+    /// Takes the domain because a completeness claim is only meaningful about a
     /// stated extent: "complete" is a fact about a region of one enumeration,
     /// not about a scope in the abstract, and a claim with no domain cannot be
     /// checked against the debt it would discharge.
     #[must_use]
-    pub fn complete(scope: CursorScope, checkpoint: Option<Checkpoint>) -> Self {
+    pub fn complete(domain: CoverageDomain, checkpoint: Option<Checkpoint>) -> Self {
         Self {
             checkpoint,
-            coverage: InventoryCoverageReport::complete(scope),
+            coverage: InventoryCoverageReport::complete(domain),
         }
+    }
+}
+
+#[cfg(test)]
+mod inventory_completion_tests {
+    use super::*;
+
+    #[test]
+    fn complete_preserves_the_exact_partition_domain() {
+        let domain = CoverageDomain::for_partition(
+            CursorScope::Account,
+            &InventoryPartition::Page { from: 10, to: 20 },
+            0,
+        );
+        let completion = InventoryCompletion::complete(domain.clone(), None);
+        assert_eq!(completion.coverage.domain, domain);
+        assert!(completion.coverage.is_complete());
     }
 }
 

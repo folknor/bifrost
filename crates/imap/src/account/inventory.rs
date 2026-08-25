@@ -299,19 +299,7 @@ pub(crate) fn fetch_to_inventory(
 }
 
 pub(crate) fn flags_hash(flags: &[crate::types::Flag]) -> u64 {
-    let mut canonical: Vec<String> = flags
-        .iter()
-        .map(|flag| flag.as_imap_str().to_ascii_lowercase())
-        .collect();
-    canonical.sort_unstable();
-    canonical.dedup();
-
-    let mut hash = 0xcbf29ce484222325u64;
-    for byte in canonical.join("\n").as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    hash
+    bifrost_types::canonical_flags_hash(flags.iter().map(crate::types::Flag::as_imap_str))
 }
 
 pub(crate) fn flags_set(flags: &[crate::types::Flag]) -> HashSet<String> {

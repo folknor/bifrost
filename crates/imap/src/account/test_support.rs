@@ -126,7 +126,7 @@ fn sentinel_inventory_batch() -> SyncEvent<InventoryEntry> {
             fingerprint: bifrost_types::Fingerprint {
                 server_version: bifrost_types::ServerVersion::Unavailable,
                 size: None,
-                flags_hash: 0,
+                flags_hash: bifrost_types::canonical_flags_hash(std::iter::empty::<&str>()),
             },
             thread_id: None,
             message_id: None,

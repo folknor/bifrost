@@ -59,7 +59,7 @@ pub(crate) fn encode_cursor(scope: CursorScope, cursor: &FolderCursor) -> Change
             bytes: encode_folder_cursor(cursor),
         },
         advanced_through: None,
-        envelope_version: ENVELOPE_VERSION,
+        envelope_version: bifrost_types::CHANGE_CURSOR_ENVELOPE_VERSION,
     }
 }
 

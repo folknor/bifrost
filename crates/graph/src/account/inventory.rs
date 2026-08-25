@@ -29,15 +29,8 @@ pub(crate) fn inventory_stream(
 
 /// The single acceptance condition for resuming a stored inventory page.
 ///
-/// `resume_inventory_stream` and `Account::is_inventory_cursor` must never
-/// disagree. The predicate is what sync consults to decide whether to route a
-/// stored cursor to the deferred inventory worker; the hook is what that
-/// worker then calls. If the predicate accepts a cursor the hook refuses, the
-/// worker gets `None`, reports `NoCursor`, and the scope is left with neither
-/// a live cursor nor a recovery path - whereas the same cursor reaching
-/// `changes_stream` is correctly classified as schema-incompatible and
-/// restarted. So the two share this one function rather than two call sites
-/// agreeing on a condition that can drift apart.
+/// `Account::is_inventory_cursor` delegates to `resume_inventory_stream`, so
+/// this is the single acceptance condition for both classification and resume.
 pub(crate) fn resumable_inventory_payload(cursor: &ChangeCursor) -> Option<GraphCursorPayload> {
     let payload = super::cursor::decode_cursor(cursor).ok()?;
     (payload.inventory_in_progress && scope_matches_payload(&cursor.scope, &payload))
@@ -566,18 +559,7 @@ fn flags_hash(value: &Value) -> u64 {
             }
         }
     }
-    flags.sort();
-
-    let mut hash = 0xcbf29ce484222325_u64;
-    for flag in flags {
-        for byte in flag.as_bytes() {
-            hash ^= u64::from(*byte);
-            hash = hash.wrapping_mul(0x100000001b3);
-        }
-        hash ^= u64::from(0xff_u8);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    hash
+    bifrost_types::canonical_flags_hash(flags)
 }
 
 #[cfg(test)]

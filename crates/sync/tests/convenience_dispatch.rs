@@ -132,8 +132,18 @@ impl Account for RecorderAccount {
     fn inventory_stream(&self, scope: CursorScope) -> AccountStream<InventoryEvent> {
         self.record("inventory_stream".into());
         Box::pin(stream::once(async move {
-            InventoryEvent::Done(bifrost_types::InventoryCompletion::complete(scope, None))
+            InventoryEvent::Done(bifrost_types::InventoryCompletion::complete(
+                bifrost_types::CoverageDomain::full(scope),
+                None,
+            ))
         }))
+    }
+
+    fn inventory_resume_stream(
+        &self,
+        _cursor: ChangeCursor,
+    ) -> Option<AccountStream<InventoryEvent>> {
+        Some(Box::pin(stream::empty()))
     }
 
     fn get_stream(
@@ -593,6 +603,24 @@ impl Account for RecorderAccount {
     }
 }
 
+#[test]
+fn default_inventory_cursor_classifier_delegates_to_resume_hook() {
+    let cursor = ChangeCursor {
+        scope: CursorScope::Account,
+        server_state: bifrost_types::OpaqueChangeState {
+            protocol: ProtocolKind::Gmail,
+            envelope_version: 1,
+            bytes: Vec::new(),
+        },
+        advanced_through: None,
+        envelope_version: bifrost_types::CHANGE_CURSOR_ENVELOPE_VERSION,
+    };
+    assert!(Account::is_inventory_cursor(
+        &RecorderAccount::with_conveniences(ConvenienceShape::default()),
+        &cursor,
+    ));
+}
+
 fn target() -> MutationTarget {
     MutationTarget::Message(ObjectId("m-1".into()))
 }
@@ -962,7 +990,7 @@ async fn default_partition_stream_serves_full_and_rejects_the_rest() {
     assert_eq!(account.calls(), vec!["inventory_stream".to_string()]);
 
     // A partition shape the account never advertised terminates with
-    // Unsupported(SyncInventory) and then closes with Done.
+    // Unsupported(SyncInventory) and closes without a contradictory Done.
     let events: Vec<_> = account
         .inventory_partition_stream(
             CursorScope::Account,
@@ -970,12 +998,9 @@ async fn default_partition_stream_serves_full_and_rejects_the_rest() {
         )
         .collect()
         .await;
-    assert_eq!(events.len(), 2);
+    assert_eq!(events.len(), 1);
     let InventoryEvent::Terminated(err) = &events[0] else {
         panic!("expected Terminated first, got {:?}", events[0]);
     };
     assert_unsupported(err, AccountOperation::SyncInventory);
-    assert!(
-        matches!(&events[1], InventoryEvent::Done(completion) if completion.checkpoint.is_none())
-    );
 }

@@ -36,11 +36,56 @@ pub enum ServerVersion {
 /// refetch. `size` is `Option` because Graph does not expose message
 /// size on the message resource; consumers fall back to
 /// `(server_version, flags_hash)` there.
+///
+/// `flags_hash` MUST be produced by [`canonical_flags_hash`]. It is the one
+/// field here with no self-describing representation, so every producer that
+/// invented its own derivation made the field mean something different per
+/// crate while looking comparable; the crate now owns the derivation so it
+/// means one thing. A producer with no flag set passes an empty iterator
+/// rather than hard-coding `0` - the empty set has a defined hash, and `0` is
+/// not it. A producer whose object has no flags but does have tracked state
+/// (a mailbox, a public-folder item) encodes that state as `key=value`
+/// pseudo-flags and runs it through the same function.
+///
+/// The hash is comparable only within one provider and one object namespace.
+/// Providers spell their flags differently (`\Seen` vs `$seen` vs `UNREAD`),
+/// so a shared derivation buys a single definition of "same flag set", not
+/// cross-provider equality.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Fingerprint {
     pub server_version: ServerVersion,
     pub size: Option<u64>,
     pub flags_hash: u64,
+}
+
+/// Hash a logical flag set. The single derivation behind
+/// [`Fingerprint::flags_hash`].
+///
+/// Set semantics: flag spelling is ASCII-case-insensitive, and ordering and
+/// duplicates do not affect the result. A separator byte terminates each flag
+/// so that `{"ab", "c"}` and `{"a", "bc"}` hash differently. The empty set has
+/// a defined, non-zero hash.
+///
+/// FNV-1a, chosen for stability rather than strength: this value is compared,
+/// never trusted, and a fixed algorithm here is the whole point - it must not
+/// drift between releases or between producers.
+#[must_use]
+pub fn canonical_flags_hash(flags: impl IntoIterator<Item = impl AsRef<str>>) -> u64 {
+    let mut flags = flags
+        .into_iter()
+        .map(|flag| flag.as_ref().to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    flags.sort_unstable();
+    flags.dedup();
+
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for flag in flags {
+        for byte in flag.bytes().chain(std::iter::once(0xff)) {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    hash
 }
 
 /// Projection level for `Account::get_stream`.
@@ -180,4 +225,25 @@ pub enum FlagOp {
         add: HashSet<String>,
         remove: HashSet<String>,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::canonical_flags_hash;
+
+    #[test]
+    fn canonical_flag_hash_ignores_order_case_and_duplicates() {
+        let first = canonical_flags_hash(["\\Seen", "$Important", "\\Seen"]);
+        let second = canonical_flags_hash(["$IMPORTANT", "\\SEEN"]);
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn canonical_flag_hash_has_unambiguous_boundaries() {
+        assert_ne!(
+            canonical_flags_hash(["ab", "c"]),
+            canonical_flags_hash(["a", "bc"])
+        );
+        assert_ne!(canonical_flags_hash(std::iter::empty::<&str>()), 0);
+    }
 }

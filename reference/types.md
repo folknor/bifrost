@@ -35,8 +35,8 @@ subscriptions, which use `push_unsubscribe`.
 
 ## Account trait tiers
 
-The trait currently has 94 methods. An audit grouped them by independent
-lane as follows:
+The trait is intentionally broad. Its methods group by independent lane as
+follows:
 
 | Lane | Methods |
 |---|---:|
@@ -155,7 +155,14 @@ collapsed. One account-wide cursor can cover many memberships, and one
 object can have several memberships.
 
 `ChangeCursor` combines a scope, protocol-tagged opaque server state,
-an optional progress marker, and an outer envelope version.
+an optional progress marker, and an outer envelope version. The outer version
+comes from `CHANGE_CURSOR_ENVELOPE_VERSION`; `validate_envelope` is the gate the
+engine applies before dispatching a stored cursor to a protocol account, and it
+is a strict equality check, never a range. Migration of an older persisted
+layout belongs entirely to `bifrost-sync`'s envelope decoder, which stamps the
+current version on the way out, so a `ChangeCursor` a protocol crate is handed
+is always at the layout that crate compiles against. `ChangeCursorEnvelopeMismatch`
+reports `expected` and `found`.
 `CursorEstablishment` is either `Ready(ChangeCursor)` or
 `EstablishViaInventory`. In the latter case the terminal inventory
 `Done` event carries the new change checkpoint.
@@ -184,6 +191,29 @@ feed the engine from a non-async thread.
 `Control::pause` and `Control::checkpoint_now` return
 `Result<Option<Checkpoint>, AccountError>`. `None` means the stream is
 at a safe boundary but has never produced a durable checkpoint.
+
+### Inventory ranges and completeness
+
+Every range in `InventoryPartition` and `CoverageCoordinate` is half-open,
+`[from, to)`. `Uid` and `UidRange` used to be inclusive while `Time` and `Page`
+were not; one enum with two conventions is an off-by-one magnet for every
+implementor, so `Uid` is now half-open like the rest. Its endpoints are `u64`
+so that an exclusive end of `u32::MAX + 1` is representable; the UID values
+themselves remain `u32`.
+
+A completeness claim always names its extent. `InventoryCompletion::complete`
+and `InventoryCoverageReport::complete` take a `CoverageDomain`, not a
+`CursorScope` - there is no scope-only shortcut anywhere in the crate, because
+a partition walk that passes `CoverageDomain::full(scope)` discharges the
+coverage debt for the whole scope on the strength of having enumerated one
+window of it. `unsupported_inventory_stream` accordingly emits only
+`Terminated`; a refusal proves nothing and now claims nothing.
+
+`Fingerprint::flags_hash` is produced by `canonical_flags_hash` and by nothing
+else. Producers with no flag set pass an empty iterator (the empty set has a
+defined, non-zero hash) rather than hard-coding `0`; producers of objects with
+tracked state but no flags encode that state as `key=value` pseudo-flags. The
+value is comparable within one provider and object namespace only.
 
 ## Mutation outcomes
 
@@ -300,7 +330,9 @@ crates/types/src/
   capabilities.rs     declarative feature and dispatch shapes
   cursor.rs           cursor scope, membership scope, cursor state
   events.rs           SyncEvent, Batch, Checkpoint, Control, push hints
+  coverage.rs         inventory coverage domains, reports, obligations
   mutation.rs         mutation targets, flags, labels, fingerprints
+  repair.rs           inventory repair requests and terminal outcomes
   hydration.rs        projections and hydrated object vocabulary
   blob.rs             blob handles, byte ranges, range support
   container.rs        containers, labels, roles, provenance,

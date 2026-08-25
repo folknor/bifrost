@@ -105,6 +105,13 @@ pub async fn drive_changes_stream(
             BoundaryRequest::CheckpointNow | BoundaryRequest::Run => {}
         }
         let checkpoint = checkpoint_for(&event).cloned();
+        if let Some(Checkpoint::Change(cursor)) = &checkpoint {
+            cursor.validate_envelope().map_err(|_| {
+                Error::Account(crate::recovery::cursor_decode_failure(
+                    bifrost_types::AccountOperation::SyncChanges,
+                ))
+            })?;
+        }
         let is_done = matches!(&event, SyncEvent::Done(_));
         // Capture the full `AccountError` so the engine has the
         // derived recovery, scope, operation, provider, protocol, and

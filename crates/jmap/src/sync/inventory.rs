@@ -549,6 +549,12 @@ fn mailbox_to_inventory(mailbox: Mailbox, state: &str) -> InventoryEntry {
     }
 }
 
+/// Container state condensed into the `flags_hash` slot of a mailbox
+/// `Fingerprint`. A mailbox has no flag set, so the tracked properties are
+/// encoded as `key=value` pseudo-flags and run through the same crate-owned
+/// derivation every other `flags_hash` producer uses - the point of finding 3
+/// is that no producer of this field invents its own hash. Set semantics are
+/// harmless here because the keys are distinct by construction.
 fn mailbox_flags_hash(mailbox: &Mailbox) -> u64 {
     let mut parts = Vec::new();
     if let Some(name) = mailbox.name() {
@@ -578,49 +584,19 @@ fn mailbox_flags_hash(mailbox: &Mailbox) -> u64 {
     if let Some(is_subscribed) = mailbox.is_subscribed() {
         parts.push(format!("subscribed={is_subscribed}"));
     }
-    fnv1a64(parts)
+    bifrost_types::canonical_flags_hash(parts)
 }
 
+/// The email's keyword set, and only that.
+///
+/// This used to fold `mailboxIds`, `receivedAt` and `size` into the same u64,
+/// which made a field named `flags_hash` a general change detector. Each of
+/// those is now carried where the consumer can actually read it:
+/// `InventoryEntry::memberships` holds the mailbox set, `Fingerprint::size`
+/// holds the size, and `receivedAt` is immutable in JMAP. Narrowing loses no
+/// diff signal and makes the field mean what its contract says.
 pub(crate) fn flags_hash(email: &Email) -> u64 {
-    let mut parts = Vec::new();
-    let mut keywords = email
-        .keywords()
-        .into_iter()
-        .map(str::to_ascii_lowercase)
-        .collect::<Vec<_>>();
-    keywords.sort_unstable();
-    parts.extend(keywords);
-
-    let mut mailboxes = email
-        .mailbox_ids()
-        .into_iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>();
-    mailboxes.sort_unstable();
-    parts.extend(mailboxes);
-
-    if let Some(received_at) = email.received_at() {
-        parts.push(received_at.to_string());
-    }
-    parts.push(email.size().to_string());
-
-    fnv1a64(parts)
-}
-
-pub(crate) fn fnv1a64(parts: impl IntoIterator<Item = String>) -> u64 {
-    const OFFSET: u64 = 0xcbf29ce484222325;
-    const PRIME: u64 = 0x100000001b3;
-
-    let mut hash = OFFSET;
-    for part in parts {
-        for byte in part.as_bytes() {
-            hash ^= u64::from(*byte);
-            hash = hash.wrapping_mul(PRIME);
-        }
-        hash ^= 0xff;
-        hash = hash.wrapping_mul(PRIME);
-    }
-    hash
+    bifrost_types::canonical_flags_hash(email.keywords())
 }
 
 #[cfg(test)]
@@ -663,7 +639,7 @@ mod tests {
             fingerprint: Fingerprint {
                 server_version: ServerVersion::StateAt("s1".to_string()),
                 size: Some(10),
-                flags_hash: 0,
+                flags_hash: bifrost_types::canonical_flags_hash(std::iter::empty::<&str>()),
             },
             thread_id: Some(ThreadId("T1".to_string())),
             message_id: None,

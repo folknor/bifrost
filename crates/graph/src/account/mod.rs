@@ -737,10 +737,6 @@ impl Account for GraphAccount {
         inventory::resume_inventory_stream(self.clone(), cursor)
     }
 
-    fn is_inventory_cursor(&self, cursor: &ChangeCursor) -> bool {
-        inventory::resumable_inventory_payload(cursor).is_some()
-    }
-
     fn get_stream(
         &self,
         ids: AccountStream<ObjectId>,

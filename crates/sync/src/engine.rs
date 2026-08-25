@@ -2839,7 +2839,7 @@ impl SyncEngine {
         // what `handle_schema_incompatible` would have done, scoped to
         // the one cursor that cannot be read. (sync-D10)
         match self.checkpoints.get_change_cursor(account_id, &scope).await {
-            Ok(Some(existing)) => {
+            Ok(Some(existing)) if existing.validate_envelope().is_ok() => {
                 if account.is_inventory_cursor(&existing) {
                     return Ok(InitialScope::DeferredInventory(DeferredInventory::Resume(
                         existing,
@@ -2849,7 +2849,7 @@ impl SyncEngine {
                 return Ok(InitialScope::Ready);
             }
             Ok(None) => {}
-            Err(Error::SchemaIncompatible) => {
+            Ok(Some(_)) | Err(Error::SchemaIncompatible) => {
                 tracing::warn!(
                     target: "bifrost.sync.attach",
                     account = ?account_id,
@@ -2902,6 +2902,9 @@ impl SyncEngine {
         cursor: ChangeCursor,
         cursors: Arc<CursorRegistry>,
     ) -> Result<(), Error> {
+        cursor
+            .validate_envelope()
+            .map_err(|_| Error::SchemaIncompatible)?;
         // Carries no coverage report, so the ledger is preserved rather than
         // overwritten: establishing a cursor proves nothing about what any
         // enumeration covered.
@@ -4248,6 +4251,11 @@ async fn persist_ack_request(
     ledger: &mut crate::cursor::DebtLedger,
     req: &AckRequest,
 ) -> Result<(), Error> {
+    if let Checkpoint::Change(cursor) = &req.checkpoint {
+        cursor
+            .validate_envelope()
+            .map_err(|_| Error::SchemaIncompatible)?;
+    }
     match req.publication.map(|id| coverage.claim(id)) {
         Some(ClaimLookup::Apply(claim)) => {
             let now = jiff::Timestamp::now().as_second();
@@ -5442,7 +5450,7 @@ async fn run_establish(
         None => None,
     };
     match store.get_change_cursor(account_id, &scope).await {
-        Ok(Some(existing)) => {
+        Ok(Some(existing)) if existing.validate_envelope().is_ok() => {
             // A stored cursor may be a mid-inventory page position rather
             // than a live changes cursor. Putting one into the registry
             // would hand it straight to `changes_stream`, which has no
@@ -5479,7 +5487,7 @@ async fn run_establish(
         // error whose derived `RecoveryClass` is
         // `Engine(SchemaIncompatible)` and the listener runs the
         // account-wide schema-clear loop.
-        Err(Error::SchemaIncompatible) => {
+        Ok(Some(_)) | Err(Error::SchemaIncompatible) => {
             return Err(Error::Account(crate::recovery::cursor_decode_failure(
                 bifrost_types::AccountOperation::EstablishCursor,
             )));
@@ -5492,6 +5500,11 @@ async fn run_establish(
         .map_err(Error::Account)?
     {
         CursorEstablishment::Ready(cursor) => {
+            cursor.validate_envelope().map_err(|_| {
+                Error::Account(crate::recovery::cursor_decode_failure(
+                    bifrost_types::AccountOperation::EstablishCursor,
+                ))
+            })?;
             if persist_ready {
                 // No coverage report: preserve the ledger rather than
                 // asserting completeness a cursor establishment never proved.
@@ -6009,7 +6022,9 @@ mod tests {
         ));
         // Partition B publishes AFTER A, and reports a clean walk.
         let _second = coverage.publish(crate::cursor::CoverageClaim::new(
-            bifrost_types::InventoryCoverageReport::complete(email_scope()),
+            bifrost_types::InventoryCoverageReport::complete(bifrost_types::CoverageDomain::full(
+                email_scope(),
+            )),
             1,
         ));
 

@@ -34,7 +34,7 @@ pub(crate) const PAYLOAD_ENVELOPE_VERSION: u32 = 2;
 /// This versions the `bifrost-types` cursor wrapper (scope + opaque payload +
 /// `advanced_through`), not the JMAP payload inside it, and has never needed a
 /// bump. Bumping `PAYLOAD_ENVELOPE_VERSION` does not touch this one.
-pub(crate) const OUTER_CURSOR_ENVELOPE_VERSION: u32 = 1;
+pub(crate) const OUTER_CURSOR_ENVELOPE_VERSION: u32 = bifrost_types::CHANGE_CURSOR_ENVELOPE_VERSION;
 
 const STATE_TAG_V1: u8 = 1;
 

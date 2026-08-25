@@ -79,8 +79,8 @@ pub struct PartitionPlan {
 pub enum PartitionBounds {
     /// `[from, to)` inclusive-exclusive time window.
     Time { from: Timestamp, to: Timestamp },
-    /// `[from, to]` inclusive UID range.
-    Uid { from: u32, to: u32 },
+    /// `[from, to)` inclusive-exclusive UID range.
+    Uid { from: u64, to: u64 },
     /// `[from, to)` page-count range.
     Page { from: u32, to: u32 },
 }
@@ -220,14 +220,15 @@ fn plan_uid(chunk: u32, total: u32) -> PartitionPlan {
     }
     let mut partitions = Vec::new();
     // Newest-first: walk high UIDs down.
-    let mut to = total;
-    while to > 0 {
-        let from = to.saturating_sub(chunk).saturating_add(1).max(1);
+    let mut to = u64::from(total) + 1;
+    let chunk = u64::from(chunk);
+    while to > 1 {
+        let from = to.saturating_sub(chunk).max(1);
         partitions.push(PartitionBounds::Uid { from, to });
         if from == 1 {
             break;
         }
-        to = from.saturating_sub(1);
+        to = from;
     }
     PartitionPlan { partitions }
 }
@@ -291,13 +292,13 @@ mod tests {
             vec![
                 PartitionBounds::Uid {
                     from: 1501,
-                    to: 2500
+                    to: 2501
                 },
                 PartitionBounds::Uid {
                     from: 501,
-                    to: 1500
+                    to: 1501
                 },
-                PartitionBounds::Uid { from: 1, to: 500 },
+                PartitionBounds::Uid { from: 1, to: 501 },
             ]
         );
     }

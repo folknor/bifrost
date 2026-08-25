@@ -1354,7 +1354,7 @@ fn cursor_from_snapshot(scope: CursorScope, snapshot: &EventSnapshot) -> ChangeC
             bytes: encode_cursor_snapshot(snapshot),
         },
         advanced_through: None,
-        envelope_version: CURSOR_ENVELOPE_VERSION,
+        envelope_version: bifrost_types::CHANGE_CURSOR_ENVELOPE_VERSION,
     }
 }
 
@@ -1558,7 +1558,7 @@ fn inventory_entry_from_snapshot(entry: &EventSnapshotEntry) -> InventoryEntry {
                 .map(ServerVersion::ETag)
                 .unwrap_or(ServerVersion::Unavailable),
             size: None,
-            flags_hash: 0,
+            flags_hash: bifrost_types::canonical_flags_hash(std::iter::empty::<&str>()),
         },
         thread_id: None,
         message_id: None,
