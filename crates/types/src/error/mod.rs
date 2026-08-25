@@ -24,7 +24,7 @@ pub use cause::{
 };
 pub use diagnostic::{
     DetailVisibility, DiagnosticInfo, DiagnosticText, SupportExportConsented,
-    SupportExportInternal, SupportExportMinimal, TelemetryView,
+    SupportExportInternal, SupportExportMinimal, TelemetryToken, TelemetryView,
 };
 pub use kind::{
     AccessErrorKind, AccountErrorKind, AuthErrorKind, MailboxUnavailableKind, ProtocolErrorKind,
@@ -36,5 +36,5 @@ pub use recovery::{
     StrategyDowngrade, ThrottleKey, ThrottleScope,
 };
 pub use scope::{AccountOperation, ErrorScope, Protocol, Provider};
-pub use stream::{ItemOutcome, MutationSuccess};
+pub use stream::{ItemOutcome, MutationEffect, MutationSuccess};
 pub use warning::{Warning, WarningKind};

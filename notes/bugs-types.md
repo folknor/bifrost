@@ -107,42 +107,6 @@ ids).
 **Confidence: medium-high.** Fix: `finalize` should count expectations, not
 set-membership them, or reject a duplicated `expected` outright.
 
-## 11. `TelemetryView`'s "no free-form text" guarantee is unenforced, and the test named for it is vacuous
-
-`error/diagnostic.rs:62-80`, `account_error.rs:328`. `native_code`, `request_id`,
-and `trace_id` are producer-supplied `String`s copied straight through, so "safe
-to ship to metrics unconditionally" holds only by convention.
-`telemetry_has_no_free_form_text` asserts two field values and checks nothing
-about free-form text - it passes regardless.
-
-**Confidence: high.** Fix: make `native_code` a bounded/validated type (or an
-interned `&'static str` per provider vocabulary - `WireCause::code()` already
-produces exactly that), and rewrite the test to assert over the serialized field
-set.
-
-## 12. `CauseSummary` discards most of what the internal export tier exists to carry
-
-`cause.rs:73-132`. `TransportCause.kind` (Network/Timeout/Tls),
-`AccessCause::PermissionDenied{resource}` and `InsufficientScope{needed}`,
-`StateCause::StrategyFailure{downgrade}` and `CapabilityChanged{delta}`, and the
-entire `RequestCause::BatchInputInvalid{items}` list all vanish. A batch-input
-producer bug reaches support with zero detail. Relatedly, `StdError::source()`
-bridges only to `chain.outermost()` and `Cause::source()` returns `None`, so an
-`anyhow`-style walker reaches exactly one of N causes - the reference claims
-walkers "reach the cause graph."
-
-**Confidence: high.**
-
-## 13. `MutationSuccess::Downgraded` carries no statement of what was actually done
-
-`error/stream.rs:41`. The variant's whole justification is that reporting a
-neighbour is "a wrong answer a consumer cannot detect" - but `Downgraded` itself
-is a unit variant, so the consumer still cannot detect *what* state the target is
-in and read-back is the only recourse. Give it a payload (the weaker operation
-actually applied, or the resulting membership).
-
-**Confidence: medium-high.**
-
 ## 14. `is_inventory_cursor` and `inventory_resume_stream` must agree, and the type system cannot make them
 
 `account.rs:247-268`. The doc spends a paragraph on the failure mode and ends with
@@ -156,28 +120,6 @@ is I/O-free and side-effect-free, `is_inventory_cursor` is redundant:
 `self.inventory_resume_stream(cursor.clone()).is_some()` so divergence requires
 overriding a method that already answers correctly.
 
-## 15. Four distinct conveniences all report `Unsupported(UpdateFlags)`
-
-`account.rs:1097, 1123, 1144, 1158` - `set_starred`, `mark_replied`,
-`mark_forwarded`, `mark_mdn_sent` are indistinguishable to the consumer, directly
-against `unsupported_error`'s own doc ("narrows the error so the consumer knows
-which operation was rejected"). `AccountOperation` has no variants for them.
-
-**Confidence: high.** Fix: add the four operations.
-
-## 16. `AccountOperation::is_idempotent` contradicts its own stated rule for the `*Update`/`Rename` family
-
-`error/scope.rs:197-254`. The comment says absolute-state writes are idempotent,
-then places `DraftUpdate`, `ContactUpdate`, `EventUpdate`, `IdentityUpdate`,
-`ContainerRename`, and `VacationSet` in the non-idempotent set. Each is a
-set-to-this-value write against a known id - the same shape as `SetIsRead`, which
-is on the idempotent side. Either the rule or the table is wrong; as it stands, an
-in-flight drop on a contact edit reconciles where the identical operation on a
-flag retries.
-
-**Confidence: medium** (there may be a deliberate reason for the DAV/If-Match
-cases, but nothing records it).
-
 ## 17. `FlagOp::Patch { add, remove }` permits the same flag in both sets
 
 `mutation.rs:179`. The outcome is provider-dependent order-of-application; nothing
@@ -185,16 +127,6 @@ rejects it and nothing documents a precedence rule. Same class: `Add(empty)` is 
 wire round-trip that means nothing.
 
 **Confidence: medium.**
-
-## 18. `RecoveryClass::is_terminal()` is defined by negation over a `#[non_exhaustive]` enum
-
-`error/recovery.rs:53`. Any future non-terminal variant is silently classified
-terminal and accepted by `Fatal::try_from` - the type-system collapse point that
-is supposed to mean "the engine has nothing left to try" would swallow it. The
-exclusivity test iterates a hand-maintained variant list, which catches nothing at
-compile time.
-
-**Confidence: medium-high.** Fix: exhaustive match in `is_terminal`.
 
 ## 19. `validate_batch_input`'s empty-input case fabricates a sentinel id
 
@@ -229,6 +161,43 @@ from the lane table).
 "must break every constructor" - but `single` defaults all four non-item lanes, so
 any impl using it silently absorbs the new lane instead of answering for it. Same
 pattern in `OpenedAccount::complete`.
+
+## 25. `ReconcileAdvice` is not `#[non_exhaustive]` but is unconstructable downstream anyway
+
+`error/recovery.rs`. `ReconcileGuidance` is `#[non_exhaustive]` while
+`ReconcileAdvice`, which owns a `guidance: ReconcileGuidance` field, is not. An
+external consumer can therefore name `ReconcileAdvice` in a struct literal and
+still never complete it, because it cannot construct the `guidance` value the
+literal requires. The omitted marker buys nothing - the struct is effectively
+sealed regardless - and it reads as a deliberate "this shape is stable" promise
+that the nested type contradicts. Either mark `ReconcileAdvice`
+`#[non_exhaustive]` too (making the seal explicit and honest) or give
+`ReconcileGuidance` a public constructor so the un-marked struct is actually
+buildable. Note `RetryAdvice` next door for the same question.
+
+Surfaced during round 1 of this ledger; deliberately not fixed there, because
+choosing between the two answers is a published-surface decision.
+
+**Confidence: high** on the inconsistency, **medium** on which way to resolve it.
+
+## 26. `bifrost-caldav` files a collection URL as a `CalendarId`
+
+`crates/caldav/src/account.rs`. CalDAV builds `ErrorScope::Calendar { id }` with
+the calendar *collection URL* as the id. Round 1 converted `ErrorScope`'s
+id-bearing variants from `String` to the typed account ids, so this now types as
+a `CalendarId` - and a `CalendarId` everywhere else in the workspace is the
+provider's calendar identifier, not a href. The semantics are pre-existing and
+unchanged; the newtype is what makes the mismatch visible. A consumer that
+correlates `ErrorScope::Calendar` against ids from the calendar listing gets no
+match on CalDAV accounts.
+
+Resolution is a real decision, not a rename: either CalDAV's `CalendarId` IS its
+collection URL everywhere (in which case the listing surface should be checked to
+confirm it agrees, and the invariant written down), or the scope should carry the
+listing's id and the URL should move to diagnostic text.
+
+**Confidence: high** that the values differ in kind; **unknown** whether they
+differ in practice until the CalDAV listing path is checked.
 
 ## The structural story
 

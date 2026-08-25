@@ -138,6 +138,10 @@ pub enum AccountOperation {
     PushUnsubscribe,
     PushStream,
     UpdateFlags,
+    SetStarred,
+    MarkReplied,
+    MarkForwarded,
+    MarkMdnSent,
     BulkMove,
     BulkDestroy,
     MoveThread,
@@ -206,9 +210,10 @@ impl AccountOperation {
         // The non-idempotent set is every operation whose blind same-request
         // retry could double-apply a side effect: sends, creates, moves,
         // destroys/expunges/discards, attachment uploads, and the draft /
-        // container / contact / event / filter / identity / vacation
-        // writers. For these, an in-flight transport drop must route to
-        // `Reconcile` (probe the target), not a blind `Retry(SameRequest)`.
+        // destructive container/contact/event/filter operations and other
+        // non-repeatable writers. For these, an in-flight transport drop must
+        // route to `Reconcile` (probe the target), not a blind
+        // `Retry(SameRequest)`.
         //
         // Destroy/expunge/discard are non-idempotent here even though a
         // re-delete of an already-gone object reaches the same end state:
@@ -217,10 +222,22 @@ impl AccountOperation {
         // land?" handling. Moves are non-idempotent for the same reason
         // (the source may already be gone).
         //
-        // Absolute-state writes are idempotent and stay OUT of this set:
+        // `ContainerRename` looks like an absolute-state write but is NOT one
+        // on every protocol: IMAP `RENAME old new` is keyed on the OLD NAME,
+        // not on a stable id, so a blind replay after an in-flight drop that
+        // actually landed addresses a mailbox that no longer exists and
+        // reports a spurious permanent failure for an operation that
+        // succeeded. JMAP/Gmail/Graph rename by id and would be safe, but this
+        // table has no provider dimension, so it takes the conservative
+        // branch; a provider that renames by id can widen its own case with
+        // `idempotency_override(true)`.
+        //
+        // Absolute-state writes against known ids are idempotent and stay OUT
+        // of this set:
         // re-applying `UpdateFlags` / `SetKeyword` / `SetLabelMembership` /
         // `SetCategory` / `SetExtendedProperty` / `SetImportance` /
-        // `SetIsRead` drives the target to the same value, so a blind retry
+        // `SetIsRead`, the `*Update` family, and the singleton settings
+        // writers drive the target to the same value, so a blind retry
         // is safe (pinned by the JMAP `UpdateFlags` contract test).
         // Read-only and discovery operations are idempotent by omission.
         !matches!(
@@ -236,7 +253,6 @@ impl AccountOperation {
                 | Self::AttachmentUpload
                 | Self::HostAttachment
                 | Self::DraftCreate
-                | Self::DraftUpdate
                 | Self::DraftDiscard
                 | Self::DraftSend
                 | Self::CancelScheduledSend
@@ -245,16 +261,12 @@ impl AccountOperation {
                 | Self::ContainerRename
                 | Self::ContainerMove
                 | Self::ContainerDelete
-                | Self::IdentityUpdate
-                | Self::VacationSet
                 | Self::FilterCreate
                 | Self::FilterUpdate
                 | Self::FilterDelete
                 | Self::ContactCreate
-                | Self::ContactUpdate
                 | Self::ContactDelete
                 | Self::EventCreate
-                | Self::EventUpdate
                 | Self::EventDelete
                 | Self::EventRsvp
                 | Self::Expunge
@@ -428,9 +440,22 @@ mod tests {
             AccountOperation::SetExtendedProperty,
             AccountOperation::SetImportance,
             AccountOperation::SetIsRead,
+            AccountOperation::DraftUpdate,
+            AccountOperation::ContactUpdate,
+            AccountOperation::EventUpdate,
+            AccountOperation::IdentityUpdate,
+            AccountOperation::VacationSet,
         ] {
             assert!(op.is_idempotent(), "{op:?} must stay idempotent");
         }
+    }
+
+    #[test]
+    fn rename_is_not_an_absolute_state_write() {
+        // IMAP `RENAME old new` keys on the old name, so replaying a rename
+        // that already landed addresses a mailbox that is gone. It belongs
+        // with the moves, not with the `*Update` family.
+        assert!(!AccountOperation::ContainerRename.is_idempotent());
     }
 
     #[test]

@@ -789,7 +789,7 @@ method and final read-back guard. Campaign flow:
    be dropped by a later attempt that resubmits its siblings.
 
 `ItemOutcome::Succeeded` buckets by its `MutationSuccess` payload:
-`Applied` -> `applied`, `Skipped` -> `skipped`, and **`Downgraded` ->
+`Applied` -> `applied`, `Skipped` -> `skipped`, and **`Downgraded { .. }` ->
 `PendingReadback`**. A downgrade means the provider did something weaker than
 asked, so its own success report is precisely the claim that must not be
 trusted; routing it into the read-back set makes the final accounting come

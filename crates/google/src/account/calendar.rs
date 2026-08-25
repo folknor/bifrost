@@ -761,6 +761,10 @@ fn event_move_patch_error(error: &AccountError) -> AccountError {
     )
     .protocol(telemetry.protocol.unwrap_or(Protocol::Gmail))
     .operation(AccountOperation::EventUpdate)
+    // The generic known-id EventUpdate is an absolute-state write and is
+    // idempotent. This composite path has already completed events.move,
+    // however, so replaying the whole request would apply a second move.
+    .idempotency_override(false)
     .status(telemetry.status)
     .push_cause(Cause::Attempt(AttemptCause::new(
         TransmissionState::Acknowledged,

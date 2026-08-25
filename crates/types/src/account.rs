@@ -1094,7 +1094,7 @@ pub trait Account: Send + Sync {
                 self.set_category(target, STARRED_KEYWORD.to_string(), starred)
             }
             StarredFlagShape::None => {
-                Box::pin(async { Err(unsupported_error(AccountOperation::UpdateFlags)) })
+                Box::pin(async { Err(unsupported_error(AccountOperation::SetStarred)) })
             }
         }
     }
@@ -1120,7 +1120,7 @@ pub trait Account: Send + Sync {
                 Some(PR_LAST_VERB_REPLIED.to_string()),
             );
         }
-        Box::pin(async { Err(unsupported_error(AccountOperation::UpdateFlags)) })
+        Box::pin(async { Err(unsupported_error(AccountOperation::MarkReplied)) })
     }
 
     /// Mark a message as forwarded. Same dispatch shape as
@@ -1141,21 +1141,21 @@ pub trait Account: Send + Sync {
                 Some(PR_LAST_VERB_FORWARDED.to_string()),
             );
         }
-        Box::pin(async { Err(unsupported_error(AccountOperation::UpdateFlags)) })
+        Box::pin(async { Err(unsupported_error(AccountOperation::MarkForwarded)) })
     }
 
     /// Persist that an MDN (read receipt) was dispatched for `message`, by
     /// flipping the `$MDNSent` keyword. Dispatches through
     /// `capabilities().conveniences.mdn_sent_via_keyword`; accounts whose
     /// read-receipt model is read-only (Gmail, Graph) leave it `false` and
-    /// the convenience returns `Unsupported(UpdateFlags)`.
+    /// the convenience returns `Unsupported(MarkMdnSent)`.
     fn mark_mdn_sent(&self, message: ObjectId) -> AccountFuture<Result<(), AccountError>> {
         const MDN_SENT_KEYWORD: &str = "$MDNSent";
         let target = MutationTarget::Message(message);
         if self.capabilities().conveniences.mdn_sent_via_keyword {
             return self.set_keyword(target, MDN_SENT_KEYWORD.to_string(), true);
         }
-        Box::pin(async { Err(unsupported_error(AccountOperation::UpdateFlags)) })
+        Box::pin(async { Err(unsupported_error(AccountOperation::MarkMdnSent)) })
     }
 
     /// Contact autocomplete convenience for recipient and attendee

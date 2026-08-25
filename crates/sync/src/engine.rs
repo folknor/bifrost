@@ -5690,7 +5690,7 @@ fn classify_item_outcome(
                 // `still_failed`: honest, and it breaks the permanent
                 // destroy/reappear reconcile loop that reporting `Applied`
                 // created.
-                MutationSuccess::Downgraded => MutationBucket::PendingReadback,
+                MutationSuccess::Downgraded { .. } => MutationBucket::PendingReadback,
                 // `MutationSuccess` is #[non_exhaustive]. A new variant must
                 // be classified deliberately, not folded into `Applied` - that
                 // is how a downgrade got reported as a clean success in the
@@ -6614,7 +6614,11 @@ mod tests {
         let id = bifrost_types::ObjectId("message".into());
         let item: ItemOutcome<MutationSuccess> = ItemOutcome::Succeeded(BatchSuccess::new(
             BatchItemId("message".into()),
-            MutationSuccess::Downgraded,
+            MutationSuccess::Downgraded {
+                actual: bifrost_types::MutationEffect::MovedToContainer(
+                    bifrost_types::ContainerId("trash".into()),
+                ),
+            },
         ));
         let mut outcomes = std::collections::HashMap::new();
         let mut retry = Vec::new();

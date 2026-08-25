@@ -122,13 +122,14 @@ pub use error::{
     BatchItemOutcome, BatchOutcome, BatchOutcomeBuilder, BatchSuccess, BatchUncertain, Cause,
     CauseChain, DetailVisibility, DiagnosticInfo, DiagnosticText, EngineDirective,
     EnhancedStatusCode, ErrorScope, Fatal, GmailSignal, GraphSignal, ImapResponseCode, ItemOutcome,
-    JmapMethod, MailboxUnavailableKind, MutationSuccess, Protocol, ProtocolErrorKind, Provider,
-    ReconcileAction, ReconcileAdvice, ReconcileGuidance, ReconcileReason, RecoveryClass,
-    RemediationAction, RequestCause, RequestErrorKind, ResourceKind, RetryAdvice, RetryDisposition,
-    RetryHint, RetryReason, ServerCause, ServerErrorKind, StateCause, StrategyDowngrade,
-    SupportExportConsented, SupportExportInternal, SupportExportMinimal, SyncStateErrorKind,
-    TelemetryView, ThrottleKey, ThrottleScope, TransmissionState, TransportCause,
-    TransportErrorKind, TransportKind, Warning, WarningKind, WireCause, validate_batch_input,
+    JmapMethod, MailboxUnavailableKind, MutationEffect, MutationSuccess, Protocol,
+    ProtocolErrorKind, Provider, ReconcileAction, ReconcileAdvice, ReconcileGuidance,
+    ReconcileReason, RecoveryClass, RemediationAction, RequestCause, RequestErrorKind,
+    ResourceKind, RetryAdvice, RetryDisposition, RetryHint, RetryReason, ServerCause,
+    ServerErrorKind, StateCause, StrategyDowngrade, SupportExportConsented, SupportExportInternal,
+    SupportExportMinimal, SyncStateErrorKind, TelemetryView, ThrottleKey, ThrottleScope,
+    TransmissionState, TransportCause, TransportErrorKind, TransportKind, Warning, WarningKind,
+    WireCause, validate_batch_input,
 };
 
 // Stream-event types.

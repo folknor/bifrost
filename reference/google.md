@@ -241,7 +241,7 @@ may keep delivering until the 7-day watch expires.
   Replied and forwarded convenience flags are false because Gmail
   derives that state from messages rather than exposing a writeable
   flag. `mdn_sent_via_keyword` is false: Gmail's read-receipt model is
-  read-only, so `mark_mdn_sent` returns `Unsupported(UpdateFlags)`.
+  read-only, so `mark_mdn_sent` returns `Unsupported(MarkMdnSent)`.
   Hydrated `Message.importance` is always `Normal`.
 
 ## PIM primitives and conveniences
@@ -731,7 +731,8 @@ share a single `mutation_stream` driver:
     An unparseable 403 body follows ordinary classified failure handling and
     never triggers the downgrade.
 
-    A successful fallback reports `MutationSuccess::Downgraded`, never
+    A successful fallback reports `MutationSuccess::Downgraded { actual:
+    MovedToContainer(TRASH) }`, never
     `Applied`: those messages moved to Trash and still exist. Reported as
     `Applied` they came back on the next inventory or history pass, were
     destroyed again, and the account sat in a permanent reconcile loop - on
@@ -761,7 +762,8 @@ Result classification:
 - A legitimate empty patch (label op with no changes) ->
   `ItemOutcome::Succeeded` with `MutationSuccess::Skipped` per id.
 - A `Destroy` that fell back to a TRASH patch for scope reasons ->
-  `ItemOutcome::Succeeded` with `MutationSuccess::Downgraded` per
+  `ItemOutcome::Succeeded` with `MutationSuccess::Downgraded { actual:
+  MovedToContainer(TRASH) }` per
   successfully-trashed id (see the `Destroy` bullet above).
 - An unsupported flag or non-label move scope is malformed caller
   input and produces `ItemOutcome::Failed` per id with a

@@ -82,6 +82,8 @@ impl Cause {
                 transmission_state: None,
                 status: None,
                 native_code: None,
+                transport_kind: Some(cause.kind),
+                ..CauseSummary::empty("transport")
             },
             Self::Attempt(cause) => CauseSummary {
                 kind: "attempt",
@@ -89,6 +91,7 @@ impl Cause {
                 transmission_state: Some(cause.transmission_state),
                 status: None,
                 native_code: None,
+                ..CauseSummary::empty("attempt")
             },
             Self::Auth(cause) => CauseSummary {
                 kind: "auth",
@@ -96,6 +99,7 @@ impl Cause {
                 transmission_state: None,
                 status: None,
                 native_code: cause.native_code(),
+                ..CauseSummary::empty("auth")
             },
             Self::Access(cause) => CauseSummary {
                 kind: "access",
@@ -103,6 +107,16 @@ impl Cause {
                 transmission_state: None,
                 status: None,
                 native_code: cause.native_code(),
+                resource: match cause {
+                    AccessCause::PermissionDenied { resource } => *resource,
+                    _ => None,
+                },
+                needed: match cause {
+                    AccessCause::InsufficientScope { needed }
+                    | AccessCause::AdminConsentRequired { needed } => Some(*needed),
+                    _ => None,
+                },
+                ..CauseSummary::empty("access")
             },
             Self::Server(cause) => CauseSummary {
                 kind: "server",
@@ -110,6 +124,7 @@ impl Cause {
                 transmission_state: None,
                 status: cause.status(),
                 native_code: None,
+                ..CauseSummary::empty("server")
             },
             Self::State(cause) => CauseSummary {
                 kind: "state",
@@ -117,6 +132,15 @@ impl Cause {
                 transmission_state: None,
                 status: None,
                 native_code: None,
+                downgrade: match cause {
+                    StateCause::StrategyFailure { downgrade } => Some(*downgrade),
+                    _ => None,
+                },
+                capability_delta: match cause {
+                    StateCause::CapabilityChanged { delta } => delta.as_ref(),
+                    _ => None,
+                },
+                ..CauseSummary::empty("state")
             },
             Self::Request(cause) => CauseSummary {
                 kind: "request",
@@ -124,6 +148,23 @@ impl Cause {
                 transmission_state: None,
                 status: None,
                 native_code: None,
+                resource: match cause {
+                    RequestCause::NotFound { what, .. } => Some(*what),
+                    _ => None,
+                },
+                batch_items: match cause {
+                    RequestCause::BatchInputInvalid { items } => Some(items.as_slice()),
+                    _ => None,
+                },
+                operation: match cause {
+                    RequestCause::Unsupported { operation } => Some(*operation),
+                    _ => None,
+                },
+                field: match cause {
+                    RequestCause::InvalidArgument { field, .. } => *field,
+                    _ => None,
+                },
+                ..CauseSummary::empty("request")
             },
             Self::Wire(cause) => CauseSummary {
                 kind: "wire",
@@ -131,6 +172,7 @@ impl Cause {
                 transmission_state: None,
                 status: cause.status(),
                 native_code: cause.native_code(),
+                ..CauseSummary::empty("wire")
             },
         }
     }
@@ -187,7 +229,7 @@ impl fmt::Display for TransportCause {
 
 impl StdError for TransportCause {}
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[non_exhaustive]
 pub enum TransportKind {
     Network,
@@ -862,15 +904,43 @@ pub struct CauseSummary<'a> {
     pub transmission_state: Option<TransmissionState>,
     pub status: Option<u16>,
     pub native_code: Option<&'a str>,
+    pub transport_kind: Option<TransportKind>,
+    pub resource: Option<ResourceKind>,
+    pub needed: Option<&'a str>,
+    pub downgrade: Option<StrategyDowngrade>,
+    pub capability_delta: Option<&'a CapabilityDelta>,
+    pub batch_items: Option<&'a [BatchInputInvalidItem]>,
+    pub operation: Option<AccountOperation>,
+    pub field: Option<&'static str>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+impl<'a> CauseSummary<'a> {
+    fn empty(kind: &'static str) -> Self {
+        Self {
+            kind,
+            detail: None,
+            transmission_state: None,
+            status: None,
+            native_code: None,
+            transport_kind: None,
+            resource: None,
+            needed: None,
+            downgrade: None,
+            capability_delta: None,
+            batch_items: None,
+            operation: None,
+            field: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct BatchInputInvalidItem {
     pub id: BatchItemId,
     pub reason: BatchInputInvalidReason,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[non_exhaustive]
 pub enum BatchInputInvalidReason {
     Malformed,
@@ -918,6 +988,29 @@ mod tests {
         assert_eq!(
             cause.summary().transmission_state,
             Some(TransmissionState::Acknowledged)
+        );
+    }
+
+    #[test]
+    fn cause_summary_preserves_structured_internal_evidence() {
+        let items = vec![BatchInputInvalidItem {
+            id: BatchItemId("duplicate".into()),
+            reason: BatchInputInvalidReason::Duplicate,
+        }];
+        let request = Cause::Request(RequestCause::BatchInputInvalid { items });
+        assert_eq!(request.summary().batch_items.expect("items").len(), 1);
+
+        let access = Cause::Access(AccessCause::PermissionDenied {
+            resource: Some(ResourceKind::Calendar),
+        });
+        assert_eq!(access.summary().resource, Some(ResourceKind::Calendar));
+
+        let state = Cause::State(StateCause::StrategyFailure {
+            downgrade: StrategyDowngrade::QResyncToCondstore,
+        });
+        assert_eq!(
+            state.summary().downgrade,
+            Some(StrategyDowngrade::QResyncToCondstore)
         );
     }
 }

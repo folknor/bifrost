@@ -448,7 +448,7 @@ invalidation is exactly what `PushSource::Coalesced` exists for.
 - `conveniences`: `starred = Category` (reserved `$flagged` ->
   `flag.flagStatus`); replied/forwarded dispatch to `set_extended_property`
   with `PidTagLastVerbExecuted` 102/104; `mdn_sent_via_keyword = false`
-  (Graph `isReadReceiptRequested` read-only -> `Unsupported(UpdateFlags)`).
+  (Graph `isReadReceiptRequested` read-only -> `Unsupported(MarkMdnSent)`).
 
 ## Cursor envelope
 

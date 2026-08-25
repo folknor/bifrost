@@ -5,7 +5,7 @@ use std::sync::Arc;
 use super::cause::CauseChain;
 use super::diagnostic::{
     DetailVisibility, DiagnosticInfo, SupportExportConsented, SupportExportInternal,
-    SupportExportMinimal, TelemetryView, account_kind_discriminant,
+    SupportExportMinimal, TelemetryToken, TelemetryView, account_kind_discriminant,
 };
 use super::kind::AccountErrorKind;
 use super::recovery::{
@@ -227,9 +227,24 @@ impl<'a> TelemetryView<'a> {
             provider: error.provider(),
             protocol: error.protocol(),
             status: error.inner.diagnostics.status,
-            native_code: error.inner.diagnostics.native_code.as_deref(),
-            request_id: error.inner.diagnostics.request_id.as_deref(),
-            trace_id: error.inner.diagnostics.trace_id.as_deref(),
+            native_code: error
+                .inner
+                .diagnostics
+                .native_code
+                .as_ref()
+                .map(TelemetryToken::as_str),
+            request_id: error
+                .inner
+                .diagnostics
+                .request_id
+                .as_ref()
+                .map(TelemetryToken::as_str),
+            trace_id: error
+                .inner
+                .diagnostics
+                .trace_id
+                .as_ref()
+                .map(TelemetryToken::as_str),
             retry_disposition,
             retry_reason,
             throttle_scope,
@@ -332,11 +347,45 @@ mod tests {
 
     #[test]
     fn telemetry_has_no_free_form_text() {
-        let error = request_error();
-        let telemetry = error.telemetry_fields();
+        let error = request_error()
+            .into_builder()
+            .request_id("request id with spaces")
+            .trace_id("trace\nline")
+            .native_code("native code")
+            .try_build()
+            .expect("valid account error classification");
+        let serialized = serde_json::to_value(error.telemetry_fields()).expect("serialize");
+        let object = serialized.as_object().expect("telemetry object");
+        let mut fields = object.keys().map(String::as_str).collect::<Vec<_>>();
+        fields.sort_unstable();
 
-        assert_eq!(telemetry.message_key, "request.malformed");
-        assert_eq!(telemetry.kind_discriminant, "request");
+        assert_eq!(
+            fields,
+            [
+                "kind_discriminant",
+                "message_key",
+                "native_code",
+                "operation",
+                "protocol",
+                "provider",
+                "reconcile_actions",
+                "reconcile_reason",
+                "recovery_discriminant",
+                "request_id",
+                "retry_disposition",
+                "retry_reason",
+                "status",
+                "throttle_scope",
+                "trace_id",
+                "transmission_state",
+            ]
+        );
+        assert_eq!(object["request_id"], serde_json::Value::Null);
+        assert_eq!(object["trace_id"], serde_json::Value::Null);
+        assert_eq!(object["native_code"], serde_json::Value::Null);
+        let encoded = serialized.to_string();
+        assert!(!encoded.contains("raw provider body"));
+        assert!(!encoded.contains("request id with spaces"));
     }
 
     #[test]

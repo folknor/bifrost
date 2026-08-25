@@ -685,7 +685,7 @@ mod mdn_tests {
     async fn mark_mdn_sent_unsupported_when_read_only() {
         // mdn_sent_via_keyword: false -> the read-receipt model is
         // read-only (Gmail/Graph), so the convenience surfaces
-        // Unsupported(UpdateFlags) and never touches set_keyword.
+        // Unsupported(MarkMdnSent) and never touches set_keyword.
         let stub = StubAccount::with_capabilities(caps_with_mdn(false));
         let err = stub
             .mark_mdn_sent(ObjectId("m1".to_string()))
@@ -693,7 +693,7 @@ mod mdn_tests {
             .expect_err("mark_mdn_sent is unsupported when read-only");
         assert_eq!(
             err.kind(),
-            &AccountErrorKind::Unsupported(AccountOperation::UpdateFlags)
+            &AccountErrorKind::Unsupported(AccountOperation::MarkMdnSent)
         );
         assert!(stub.last_set_keyword.lock().expect("stub mutex").is_none());
     }

@@ -15,8 +15,8 @@ use std::time::Instant;
 
 use bifrost_types::{
     AccountError, AccountOperation, AccountStream, Batch, BatchFailure, BatchItemId, BatchSuccess,
-    FlagOp, IdempotencyKey, ItemOutcome, LabelId, MembershipScope, MutationSuccess, ObjectId,
-    PageBoundary, SyncEvent,
+    ContainerId, FlagOp, IdempotencyKey, ItemOutcome, LabelId, MembershipScope, MutationEffect,
+    MutationSuccess, ObjectId, PageBoundary, SyncEvent,
 };
 use futures::{StreamExt, stream};
 use serde::Serialize;
@@ -344,9 +344,12 @@ fn downgrade_succeeded_outcomes(
     outcomes
         .into_iter()
         .map(|outcome| match outcome {
-            ItemOutcome::Succeeded(success) => {
-                ItemOutcome::Succeeded(BatchSuccess::new(success.item, MutationSuccess::Downgraded))
-            }
+            ItemOutcome::Succeeded(success) => ItemOutcome::Succeeded(BatchSuccess::new(
+                success.item,
+                MutationSuccess::Downgraded {
+                    actual: MutationEffect::MovedToContainer(ContainerId("TRASH".to_string())),
+                },
+            )),
             other => other,
         })
         .collect()
@@ -508,8 +511,10 @@ mod tests {
         match &downgraded[0] {
             ItemOutcome::Succeeded(success) => assert_eq!(
                 success.output,
-                MutationSuccess::Downgraded,
-                "a trashed message was not destroyed and must not report Applied"
+                MutationSuccess::Downgraded {
+                    actual: MutationEffect::MovedToContainer(ContainerId("TRASH".to_string())),
+                },
+                "a trashed message was not destroyed and must report the state it applied"
             ),
             other => panic!("expected a succeeded outcome, got {other:?}"),
         }

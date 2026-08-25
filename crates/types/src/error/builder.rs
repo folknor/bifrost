@@ -2,11 +2,28 @@ use std::fmt;
 
 use super::account_error::{AccountError, AccountErrorParts};
 use super::cause::{Cause, CauseChain};
-use super::diagnostic::{DiagnosticInfo, DiagnosticText};
+use super::diagnostic::{DiagnosticInfo, DiagnosticText, TelemetryToken};
 use super::kind::{AccountErrorKind, ServerErrorKind, SyncStateErrorKind};
 use super::message_key;
 use super::recovery::{self, ThrottleScope};
 use super::scope::{AccountOperation, ErrorScope, Protocol, Provider};
+
+#[derive(Clone, Copy)]
+enum TelemetryField {
+    RequestId,
+    TraceId,
+    NativeCode,
+}
+
+impl TelemetryField {
+    fn name(self) -> &'static str {
+        match self {
+            Self::RequestId => "request id",
+            Self::TraceId => "trace id",
+            Self::NativeCode => "native code",
+        }
+    }
+}
 
 /// Producer-bug invariants that `AccountErrorBuilder::try_build`
 /// detects at construction time. These never escape into
@@ -184,13 +201,13 @@ impl AccountErrorBuilder {
 
     #[must_use]
     pub fn request_id(mut self, id: impl Into<String>) -> Self {
-        self.diagnostics.request_id = Some(id.into());
+        self.set_telemetry_token(id.into(), TelemetryField::RequestId);
         self
     }
 
     #[must_use]
     pub fn trace_id(mut self, id: impl Into<String>) -> Self {
-        self.diagnostics.trace_id = Some(id.into());
+        self.set_telemetry_token(id.into(), TelemetryField::TraceId);
         self
     }
 
@@ -207,8 +224,34 @@ impl AccountErrorBuilder {
 
     #[must_use]
     pub fn native_code(mut self, code: impl Into<String>) -> Self {
-        self.diagnostics.native_code = Some(code.into());
+        self.set_telemetry_token(code.into(), TelemetryField::NativeCode);
         self
+    }
+
+    /// A setter call always REPLACES the selected field, whether or not the
+    /// new value validates. Keeping a previously-installed token when the
+    /// replacement is rejected would attribute the error to the wrong request
+    /// or trace, and telemetry has no way to tell that happened - a stale id
+    /// is worse than an absent one. This is reachable in practice because
+    /// `AccountError::into_builder` hands back a builder whose telemetry
+    /// fields are already populated; from an empty builder the rejected case
+    /// simply writes `None` over `None`.
+    fn set_telemetry_token(&mut self, value: String, field: TelemetryField) {
+        let token = TelemetryToken::new(value.as_str());
+        let rejected = token.is_none();
+        match field {
+            TelemetryField::RequestId => self.diagnostics.request_id = token,
+            TelemetryField::TraceId => self.diagnostics.trace_id = token,
+            TelemetryField::NativeCode => self.diagnostics.native_code = token,
+        }
+        if rejected {
+            self.diagnostics
+                .text
+                .push(DiagnosticText::support_only(format!(
+                    "invalid {} omitted from telemetry: {value}",
+                    field.name()
+                )));
+        }
     }
 
     #[must_use]
@@ -354,6 +397,43 @@ mod tests {
 
         assert_eq!(err.message_key(), "request.malformed");
         assert!(err.recovery().is_terminal());
+    }
+
+    #[test]
+    fn rejected_telemetry_replacement_clears_the_previous_token() {
+        // Starting from an EMPTY builder cannot detect this: the bug is that a
+        // rejected replacement used to leave the earlier valid token in place,
+        // so telemetry attributed the rebuilt error to the wrong request.
+        let err = AccountErrorBuilder::new(
+            AccountErrorKind::Request(RequestErrorKind::Malformed),
+            Cause::Request(RequestCause::Malformed {
+                detail: DiagnosticText::support_only("bad"),
+            }),
+        )
+        .request_id("req-1")
+        .trace_id("trace-1")
+        .native_code("code-1")
+        .try_build()
+        .expect("valid account error classification");
+        let telemetry = err.telemetry_fields();
+        assert_eq!(telemetry.request_id, Some("req-1"));
+        assert_eq!(telemetry.trace_id, Some("trace-1"));
+        assert_eq!(telemetry.native_code, Some("code-1"));
+
+        let replaced = err
+            .into_builder()
+            .request_id("req 2 with spaces")
+            .trace_id("trace\n2")
+            .native_code(String::new())
+            .try_build()
+            .expect("valid account error classification");
+        let telemetry = replaced.telemetry_fields();
+        assert_eq!(
+            telemetry.request_id, None,
+            "a rejected request id must not leave the previous one attributed"
+        );
+        assert_eq!(telemetry.trace_id, None);
+        assert_eq!(telemetry.native_code, None);
     }
 
     #[test]

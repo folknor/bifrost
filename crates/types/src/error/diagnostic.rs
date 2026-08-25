@@ -1,3 +1,5 @@
+use std::fmt;
+
 use serde::Serialize;
 
 use super::cause::{CauseSummary, TransmissionState};
@@ -10,11 +12,40 @@ use super::scope::{AccountOperation, ErrorScope, Protocol, Provider};
 #[derive(Clone, Debug, Default)]
 #[non_exhaustive]
 pub struct DiagnosticInfo {
-    pub request_id: Option<String>,
-    pub trace_id: Option<String>,
+    pub request_id: Option<TelemetryToken>,
+    pub trace_id: Option<TelemetryToken>,
     pub status: Option<u16>,
-    pub native_code: Option<String>,
+    pub native_code: Option<TelemetryToken>,
     pub text: Vec<DiagnosticText>,
+}
+
+/// A bounded, single-line token safe for unconditional telemetry export.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct TelemetryToken(String);
+
+impl TelemetryToken {
+    pub const MAX_LEN: usize = 256;
+
+    #[must_use]
+    pub fn new(value: impl Into<String>) -> Option<Self> {
+        let value = value.into();
+        (!value.is_empty()
+            && value.len() <= Self::MAX_LEN
+            && value.bytes().all(|byte| byte.is_ascii_graphic()))
+        .then_some(Self(value))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl fmt::Display for TelemetryToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

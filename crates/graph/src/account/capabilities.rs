@@ -104,7 +104,7 @@ pub(crate) fn build_capabilities(push_mode: PushMode) -> AccountCapabilities {
             forwarded_via_keyword: false,
             forwarded_via_extended_property: true,
             // Graph's read-receipt bit (isReadReceiptRequested) is
-            // read-only; mark_mdn_sent surfaces Unsupported(UpdateFlags).
+            // read-only; mark_mdn_sent surfaces Unsupported(MarkMdnSent).
             mdn_sent_via_keyword: false,
         },
         // Graph's foreign surfaces (delegate mailboxes, public-folder

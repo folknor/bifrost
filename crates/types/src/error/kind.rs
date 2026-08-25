@@ -1,4 +1,5 @@
 use super::scope::AccountOperation;
+use serde::Serialize;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -86,7 +87,7 @@ pub enum ProtocolErrorKind {
     Unknown,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize)]
 #[non_exhaustive]
 pub enum ResourceKind {
     Message,

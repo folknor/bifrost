@@ -51,7 +51,18 @@ impl RecoveryClass {
 
     #[must_use]
     pub fn is_terminal(&self) -> bool {
-        !self.is_retryable() && !self.requires_reconciliation() && !self.requires_engine_action()
+        match self {
+            Self::Retry(_) | Self::Reconcile(_) | Self::Engine(_) => false,
+            Self::AuthLost
+            | Self::NeedsAdminConsent { .. }
+            | Self::NeedsPolicyChange
+            | Self::NoPermission { .. }
+            | Self::Unsupported(_)
+            | Self::ClientBug
+            | Self::ProviderContractViolation
+            | Self::ProviderRefused
+            | Self::UnknownPermanent => true,
+        }
     }
 }
 
@@ -273,7 +284,7 @@ impl TryFrom<AccountError> for Fatal {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[non_exhaustive]
 pub enum StrategyDowngrade {
     QResyncToCondstore,

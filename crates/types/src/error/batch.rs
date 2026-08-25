@@ -1,6 +1,8 @@
 use std::collections::HashSet;
 use std::fmt;
 
+use serde::Serialize;
+
 use super::account_error::AccountError;
 use super::cause::{BatchInputInvalidItem, BatchInputInvalidReason};
 
@@ -261,7 +263,7 @@ impl BatchUncertain {
     }
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 pub struct BatchItemId(pub String);
 
 /// Pre-flight validation for Vec-batch input. Returns the list of

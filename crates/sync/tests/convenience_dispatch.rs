@@ -669,7 +669,7 @@ async fn set_starred_category_shape_sends_the_dollar_flagged_sentinel() {
 async fn set_starred_none_shape_is_unsupported() {
     let account = RecorderAccount::with_conveniences(ConvenienceShape::default());
     let err = account.set_starred(target(), true).await.expect_err("err");
-    assert_unsupported(&err, AccountOperation::UpdateFlags);
+    assert_unsupported(&err, AccountOperation::SetStarred);
     assert!(account.calls().is_empty(), "no primitive may fire");
 }
 
@@ -733,7 +733,7 @@ async fn mark_replied_with_no_shape_is_unsupported() {
         .mark_replied(ObjectId("m-1".into()))
         .await
         .expect_err("err");
-    assert_unsupported(&err, AccountOperation::UpdateFlags);
+    assert_unsupported(&err, AccountOperation::MarkReplied);
 }
 
 #[tokio::test]
@@ -750,6 +750,13 @@ async fn mark_forwarded_paths_mirror_replied_with_forwarded_values() {
         keyword_account.calls(),
         vec![format!("set_keyword:{:?}:$forwarded:true", target())]
     );
+
+    let disabled = RecorderAccount::with_conveniences(ConvenienceShape::default());
+    let err = disabled
+        .mark_forwarded(ObjectId("m-1".into()))
+        .await
+        .expect_err("err");
+    assert_unsupported(&err, AccountOperation::MarkForwarded);
 
     let ext_account = RecorderAccount::with_conveniences(ConvenienceShape {
         forwarded_via_extended_property: true,
@@ -788,7 +795,7 @@ async fn mark_mdn_sent_flips_the_mdnsent_keyword_or_refuses() {
         .mark_mdn_sent(ObjectId("m-1".into()))
         .await
         .expect_err("err");
-    assert_unsupported(&err, AccountOperation::UpdateFlags);
+    assert_unsupported(&err, AccountOperation::MarkMdnSent);
 }
 
 // ---------- apply_label / remove_label provenance matrix ----------

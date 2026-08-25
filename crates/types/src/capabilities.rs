@@ -8,6 +8,8 @@
 
 use std::time::Duration;
 
+use serde::Serialize;
+
 use crate::filter::FilterRuleShape;
 
 /// How the cursor's identity is established.
@@ -322,7 +324,7 @@ pub struct ConvenienceShape {
     /// True iff `mark_mdn_sent` should flip the `$MDNSent` keyword via
     /// `set_keyword`. `true` on JMAP and IMAP. `false` on Gmail and Graph:
     /// their read-receipt model (Graph `isReadReceiptRequested`) is
-    /// read-only, so the convenience returns `Unsupported(UpdateFlags)`.
+    /// read-only, so the convenience returns `Unsupported(MarkMdnSent)`.
     pub mdn_sent_via_keyword: bool,
 }
 
@@ -420,7 +422,7 @@ impl AccountCapabilities {
 /// `CapabilityDelta`. Opaque newtype around a String so the engine and
 /// observability layers can name capabilities without coupling to a
 /// specific enum.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub struct CapabilityKey(pub String);
 
 /// A capability's stringified value at some point in time. Used for
@@ -428,11 +430,11 @@ pub struct CapabilityKey(pub String);
 /// in `CapabilityChange` distinguishes them. (The prior draft had
 /// separate `OldValue` / `NewValue` newtypes wrapping the same
 /// `String` shape, which was redundant.)
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CapabilityValue(pub String);
 
 /// One named capability transition.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CapabilityChange {
     pub key: CapabilityKey,
     pub from: CapabilityValue,
@@ -442,7 +444,7 @@ pub struct CapabilityChange {
 /// Delta between two `AccountCapabilities` snapshots. Carried on
 /// `RecoveryClass::CapabilityChanged` so the engine can reason about
 /// what changed without re-reading the full snapshot.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct CapabilityDelta {
     pub added: Vec<CapabilityKey>,
     pub removed: Vec<CapabilityKey>,

@@ -24,9 +24,11 @@ Accessors (all `&self`, cheap): `kind`, `recovery`,
 `suggested_remediation`, `scope`, `operation`, `provider`, `protocol`,
 `message_key`, `chain`, plus the diagnostic projections below.
 `Display` prints `"{message_key} ({kind:?})"` - never free-form
-provider text. `StdError::source()` bridges to
-`chain.outermost()` so `?`-chaining and `anyhow`-style walkers reach
-the cause graph; each `Cause` variant is itself `StdError`.
+provider text. `StdError::source()` bridges to `chain.outermost()` so
+`?`-chaining and `anyhow`-style walkers reach the primary cause. Rust's
+`StdError` source interface is linear and cannot represent the remaining
+sibling evidence; the full ordered chain is available through `chain()` and
+the internal support export. Each `Cause` variant is itself `StdError`.
 
 `into_builder(self)` is the **decoration** path, not reclassification.
 It unwraps the Arc (clone-on-share), splits the chain into primary +
@@ -131,7 +133,7 @@ it (proven by `recovery_helpers_are_mutually_exclusive_and_exhaustive`):
 - `is_retryable()` -> `Retry(RetryAdvice)`.
 - `requires_reconciliation()` -> `Reconcile(ReconcileAdvice)`.
 - `requires_engine_action()` -> `Engine(EngineDirective)`.
-- `is_terminal()` - the negation: everything else (`AuthLost`,
+- `is_terminal()` - an explicit match over the terminal variants (`AuthLost`,
   `NeedsAdminConsent`, `NeedsPolicyChange`, `NoPermission`,
   `Unsupported`, `ClientBug`, `ProviderContractViolation`,
   `ProviderRefused`, `UnknownPermanent`).
@@ -267,10 +269,12 @@ the provider's native vocabulary for support exports:
 `Graph(GraphSignal)`, `Jmap(JmapMethod)`, `Imap(ImapResponseCode)`,
 `Smtp(EnhancedStatusCode)`, `Gmail(GmailSignal)`, and
 `MalformedResponse { protocol, detail }`. Each provider enum exposes
-`code()` (the on-wire string) for telemetry. `Cause::summary()`
-projects any cause into a flat `CauseSummary { kind, detail,
-transmission_state, status, native_code }` for the internal export
-tier.
+`code()` (the on-wire string) for telemetry. `Cause::summary()` projects any
+cause into a flat `CauseSummary` for the internal export tier. Alongside kind,
+detail, transmission state, status, and native code, the projection preserves
+structured transport kind, access resource and needed scope, strategy
+downgrade, capability delta, invalid batch items, unsupported operation, and
+invalid argument field evidence.
 
 ## Batch and stream outcomes
 
@@ -315,12 +319,13 @@ name the same folder twice. No fourth lane and no parallel contract: an
 `Uncertain(BatchUncertain)` - the same closed three-lane model, emitted
 per item instead of collected. Deliberately not `#[non_exhaustive]`: a
 wildcard arm would let stale consumer policy silently apply to a new
-lane. `MutationSuccess::{Applied, Skipped, Downgraded}` is the
+lane. `MutationSuccess::{Applied, Skipped, Downgraded { actual }}` is the
 mutation success payload, and the three are distinct answers to
 distinct questions: `Applied` means the target is in the requested
 state, `Skipped` means it already was and nothing was done, and
-`Downgraded` means the provider accepted a WEAKER operation - the
-target changed but is not in the requested state.
+`Downgraded` means the provider accepted a WEAKER operation - the target
+changed but is not in the requested state, and `actual: MutationEffect` says
+what weaker operation landed.
 
 `Downgraded` exists because reporting either neighbour in its place is
 a wrong answer a consumer cannot detect. Gmail `bulk_destroy` under the
@@ -331,7 +336,8 @@ the destroy forever; reported `Skipped`, a real mutation would be
 hidden. `bifrost-sync` files it `PendingReadback` rather than trusting
 it, so the final accounting comes from observed state - a downgrade is
 the one success report whose own claim is known to be incomplete.
-It is deliberately NOT queued for resubmission: a downgrade is not
+Gmail reports `MovedToContainer(TRASH)`. It is deliberately NOT queued for
+resubmission: a downgrade is not
 transient, and replaying it earns the same downgrade.
 
 ## Diagnostics and consent tiers
@@ -344,8 +350,10 @@ transient, and replaying it earns the same downgrade.
 consent-tier export off `AccountError`:
 
 - `telemetry_fields()` / `support_minimal()` -> `TelemetryView`:
-  discriminants + ids + structured recovery fields + transmission
-  state. **No free-form text** (`telemetry_has_no_free_form_text`); safe
+  discriminants + ids + structured recovery fields + transmission state.
+  Producer-supplied ids and native codes pass through the bounded, single-line
+  `TelemetryToken`; rejected values remain support-only text and are omitted
+  from telemetry. **No free-form text** (`telemetry_has_no_free_form_text`); safe
   to ship to metrics unconditionally.
 - `user_safe_text()` -> iterator over only the `UserSafe` strings.
 - `support_consented()` -> `SupportExportConsented`: telemetry +
@@ -373,9 +381,12 @@ across the variable-width cursor shapes - a drift that self-describing
 JSON hides but length-prefixed formats turn into corrupt output.
 `AccountOperation` is the large
 `#[non_exhaustive]` operation enum; `is_idempotent()` is the
-**authoritative idempotency source** `derive` consults (the explicit
-non-idempotent set is the mutating ops - sends, creates, updates,
-deletes, moves, container/draft/contact/event writes). `Provider` and
+**authoritative idempotency source** `derive` consults. Absolute-state writes
+against a known id, including the `*Update` family and the singleton settings
+writers, are idempotent; sends, creates, deletes, moves, renames, uploads, and
+other potentially double-applied side effects are not. Rename is with the moves
+deliberately: IMAP `RENAME` keys on the old name rather than an id, so a replay
+of a rename that landed names a mailbox that no longer exists. `Provider` and
 `Protocol` are the small stable provenance enums.
 
 ## Warning is outside the error model

@@ -1,4 +1,5 @@
 use super::batch::{BatchFailure, BatchSuccess, BatchUncertain};
+use crate::container::ContainerId;
 
 /// Per-item outcome in a streaming bulk operation. The three-lane
 /// model is closed by design: adding a fourth lane is a deliberate
@@ -38,5 +39,12 @@ pub enum MutationSuccess {
     /// `bifrost-sync` routes this through the read-back guard rather than
     /// trusting it, so the final accounting comes from observed state rather
     /// than from the provider's claim.
-    Downgraded,
+    Downgraded { actual: MutationEffect },
+}
+
+/// The weaker mutation a provider actually applied.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum MutationEffect {
+    MovedToContainer(ContainerId),
 }
