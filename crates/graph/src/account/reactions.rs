@@ -95,7 +95,7 @@ pub(crate) async fn message_reactions(
     for id in unsupported {
         builder.push_failed(
             BatchItemId(id.0.clone()),
-            unsupported_item_error(operation, ErrorScope::Message { id: id.0 }),
+            unsupported_item_error(operation, ErrorScope::Message { id: id.0.into() }),
         );
     }
 
@@ -211,7 +211,7 @@ fn classify_chunk(
                 body,
             );
             let ctx = GraphErrorContext::graph(operation).with_scope(ErrorScope::Message {
-                id: message_id.0.clone(),
+                id: (message_id.0.clone()).into(),
             });
             builder.push_failed(
                 BatchItemId(message_id.0.clone()),
@@ -234,7 +234,7 @@ fn classify_chunk(
                 batch_response_missing(
                     operation,
                     Some(ErrorScope::Message {
-                        id: message_id.0.clone(),
+                        id: (message_id.0.clone()).into(),
                     }),
                     format!(
                         "Graph $batch returned no response for reaction read {index} \
@@ -425,7 +425,7 @@ mod tests {
         assert_eq!(
             stale_entry.error.scope(),
             Some(&ErrorScope::Message {
-                id: stale.0.clone()
+                id: (stale.0.clone()).into()
             })
         );
         assert!(

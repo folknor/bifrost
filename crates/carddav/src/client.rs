@@ -1010,7 +1010,9 @@ pub(crate) fn status_error(
 }
 
 pub(crate) fn contact_scope(id: impl Into<String>) -> ErrorScope {
-    ErrorScope::Contact { id: id.into() }
+    ErrorScope::Contact {
+        id: (id.into()).into(),
+    }
 }
 
 pub(crate) fn not_found_error(operation: AccountOperation, id: impl Into<String>) -> AccountError {

@@ -33,10 +33,10 @@ It unwraps the Arc (clone-on-share), splits the chain into primary +
 extras, and returns a builder pre-loaded with the original `kind`,
 primary `Cause`, top-level fields, and diagnostics. The builder exposes
 no kind-changing method; `push_cause` only appends secondary evidence.
-Derived fields recompute on `try_build`. Builder-only overrides
-(`idempotency_override`, `throttle_scope`) are **not** preserved across
-the round-trip and must be reapplied; a `ServerCause` retry hint
-survives structurally because it lives in the chain. Reclassifying to a
+Derived fields recompute on `try_build`. Builder overrides
+(`idempotency_override`, `throttle_scope`) are preserved across the
+round-trip, as is a `ServerCause` retry hint because it lives in the
+chain. Reclassifying to a
 different primary kind/cause requires a fresh `AccountErrorBuilder::new`.
 
 ## AccountErrorBuilder funnel
@@ -55,7 +55,9 @@ translation boundaries call
 (`#[non_exhaustive]`) enumerates the five enforced invariants:
 
 - `EmptyChain` - every error carries at least one primary `Cause`.
-  (In practice unreachable from `new`, which requires a primary.)
+  `CauseChain::try_new` enforces this at the chain boundary. The current
+  public `new` requires a primary, so this remains a defensive invariant
+  for future construction paths.
 - `KindCauseMismatch { kind, primary_cause }` - the declared `kind`
   and the outermost `Cause` disagree (`recovery::kind_matches_cause`).
 - `ThrottleScopeNotApplicable { kind, throttle_scope }` - a
@@ -112,11 +114,12 @@ namespace: dotted, family-prefixed, hyphenated leaf
 `authz.admin-consent-required`, `server.rate-limited`,
 `syncstate.cursor-invalid`, `concurrency.conflict`,
 `request.batch-input-invalid`, `notfound.message`,
-`protocol.partial-response`, ...). The keys are exhaustively pinned by
+`protocol.partial-response`, `unsupported.operation`, ...). The keys are
+exhaustively pinned by
 `documented_message_keys_are_derived`. Two collapse subkind detail:
 `Server(Error { status })` is always `server.error` (status rides in
-`DiagnosticInfo`, not the key), and `Unsupported(_)` is the bare
-`unsupported`. The dotted convention is the contract; read
+`DiagnosticInfo`, not the key), and `Unsupported(_)` is
+`unsupported.operation`. The dotted convention is the contract; read
 `message_key.rs` for the live list rather than copying it here.
 
 ## RecoveryClass
@@ -154,8 +157,9 @@ the convergence rewrite eliminated). `disposition` is
 `reason` is `RetryReason::{Transport, ServerUnavailable, RateLimited,
 QuotaExhausted, ConcurrencyConflict, RefreshTransient}`.
 
-`ReconcileAdvice { reason, guidance }`:
-`ReconcileReason::{TransportDropAfterSend, PartialCompletionSignal}`
+`ReconcileAdvice { reason, guidance, retry_hint, throttle_scope }`:
+`ReconcileReason::{TransportDropAfterSend, PartialCompletionSignal,
+ThrottledMidFlight}`
 plus `guidance.actions: Vec<ReconcileAction>` where `ReconcileAction`
 is `CheckTarget` / `DedupeByClientId`.
 
@@ -207,7 +211,10 @@ operation is treated idempotent). The rules at altitude (read
   `MailboxUnavailable(Transient)` -> `Retry(SameRequest)`.
 - **Server** -> `Unavailable`/`RateLimited`/`QuotaExhausted` route
   through `transient_retry_or_reconcile` (rate/quota propagate
-  `throttle_scope` and the retry hint). `Error { status }`: 5xx (or no
+  `throttle_scope` and the retry hint). A rate/quota response on an
+  in-flight non-idempotent operation reconciles as `ThrottledMidFlight`
+  while retaining both fields, so engine buckets and the reconciliation
+  delay still honor the provider signal. `Error { status }`: 5xx (or no
   numeric status while `InFlight`) is transient; everything else (4xx,
   IMAP `NO`/`BAD` not in-flight) -> `ProviderRefused`.
 - **SyncState** -> all `Engine(_)`: `CursorInvalid` -> `RestartScope`
@@ -347,16 +354,24 @@ consent-tier export off `AccountError`:
   plus the full `chain` as `CauseSummary`s. Internal tier only.
 
 All export structs are `Serialize`; `TelemetryView` projects the
-recovery fields (disposition/reason/throttle for retry, reason/actions
-for reconcile, none for terminal) via the `recovery_fields` /
-`recovery_discriminant` matches in `account_error.rs`.
+recovery fields (disposition/reason/throttle for retry,
+reason/actions/throttle for reconcile, none for terminal) via the
+`recovery_fields` / `recovery_discriminant` matches in
+`account_error.rs`.
 
 ## Scope, operation, provider, protocol
 
 `scope.rs`. `ErrorScope` (`#[non_exhaustive]`, custom `Serialize`)
 locates the failure: `Account`, `Cursor(CursorScope)`, and id-bearing
 `Mailbox` / `Message` / `Thread` / `Calendar` / `Contact` plus the
-collection variants. `AccountOperation` is the large
+collection variants. The id-bearing variants use the same typed ids as
+the account surface (`MailboxId`, `ObjectId`, `ThreadId`, `CalendarId`,
+`ContactId`) and serialize their inner strings for support exports.
+`scope_fields` is the single source for both the declared struct field
+count and the fields written, so the count cannot drift from the body
+across the variable-width cursor shapes - a drift that self-describing
+JSON hides but length-prefixed formats turn into corrupt output.
+`AccountOperation` is the large
 `#[non_exhaustive]` operation enum; `is_idempotent()` is the
 **authoritative idempotency source** `derive` consults (the explicit
 non-idempotent set is the mutating ops - sends, creates, updates,

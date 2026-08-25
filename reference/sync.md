@@ -1576,13 +1576,15 @@ fact, not a deadline, and is bounded by the identity space.
 `ThrottleScope::CurrentOperation` is a per-call hint and never
 enters the bucket.
 
-Both sides are wired. Recording: the reopen listener
-(`apply_throttle`), the poll loop's and push reconciler's Retry
-arms (both the per-drive terminations and the reconciler's
-top-level retryable `WatchEvent::Terminated`), and the mutation
-campaigns (per-item Retry outcomes in `classify_item_outcome` and
-stream-level Retry terminations) all funnel through
-`recovery::record_throttle`, which resolves the key from the
+Both sides are wired. Recording: the reopen listener, the poll loop's
+and push reconciler's Retry and Reconcile arms (both the per-drive
+terminations and the reconciler's top-level `WatchEvent::Terminated`),
+and the mutation campaigns (per-item outcomes and stream-level
+terminations) funnel through `recovery::record_throttle` or
+`recovery::record_reconcile_throttle`, and the local sleep those arms
+observe comes from `recovery::retry_delay` /
+`recovery::reconcile_delay`, which honor the carried `RetryHint` and
+otherwise fall back to one second. Both recorders resolve the key from the
 identities the classified error actually carries
 (`ErrorScope::Mailbox`, `AccountError::provider()`) and degrades
 toward the `Account` key rather than dropping the deadline - the

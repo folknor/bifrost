@@ -31,9 +31,12 @@ use std::time::{Duration, SystemTime};
 
 use bifrost_types::{
     AccountError, AccountErrorBuilder, AccountErrorKind, AccountId, AccountOperation, Cause,
-    CursorScope, EngineDirective, ErrorScope, Fatal, MailboxId, ReconcileAdvice, RecoveryClass,
-    RetryAdvice, StateCause, SyncStateErrorKind, ThrottleKey, ThrottleScope,
+    CursorScope, EngineDirective, ErrorScope, Fatal, ReconcileAdvice, RecoveryClass, RetryAdvice,
+    StateCause, SyncStateErrorKind, ThrottleKey, ThrottleScope,
 };
+
+#[cfg(test)]
+use bifrost_types::MailboxId;
 
 /// Closed four-arm plan derived from a `RecoveryClass`. Every engine
 /// dispatch site routes through [`plan_recovery`] so an added
@@ -90,6 +93,22 @@ pub(crate) fn plan_recovery(error: AccountError) -> RecoveryPlan {
 /// `fallback` is the duration used when the advice carries no hint.
 #[must_use]
 pub(crate) fn retry_delay(advice: &RetryAdvice, now: SystemTime, fallback: Duration) -> Duration {
+    advice
+        .retry_hint
+        .map_or(fallback, |hint| hint.min_delay(now))
+}
+
+/// The reconcile counterpart of [`retry_delay`]. A throttle that lands
+/// mid-flight on a non-idempotent operation classifies as
+/// `Reconcile(ThrottledMidFlight)` rather than `Retry`, and it carries
+/// the provider's retry hint; honoring it keeps the read-back probe
+/// from re-entering the same rate limit it just hit.
+#[must_use]
+pub(crate) fn reconcile_delay(
+    advice: &ReconcileAdvice,
+    now: SystemTime,
+    fallback: Duration,
+) -> Duration {
     advice
         .retry_hint
         .map_or(fallback, |hint| hint.min_delay(now))
@@ -312,7 +331,7 @@ pub(crate) fn resolve_throttle_key(
         ThrottleScope::Mailbox => Some(match error.scope() {
             Some(ErrorScope::Mailbox { id }) => ThrottleKey::Mailbox {
                 account: account.clone(),
-                mailbox: MailboxId(id.clone()),
+                mailbox: id.clone(),
             },
             _ => account_key(),
         }),
@@ -340,10 +359,41 @@ pub(crate) fn record_throttle(
     advice: &RetryAdvice,
     error: &AccountError,
 ) {
-    let Some(scope) = advice.throttle_scope else {
+    record_throttle_parts(
+        bucket,
+        account,
+        advice.throttle_scope,
+        advice.retry_hint,
+        error,
+    );
+}
+
+pub(crate) fn record_reconcile_throttle(
+    bucket: &std::sync::Mutex<ThrottleBucket>,
+    account: &AccountId,
+    advice: &ReconcileAdvice,
+    error: &AccountError,
+) {
+    record_throttle_parts(
+        bucket,
+        account,
+        advice.throttle_scope,
+        advice.retry_hint,
+        error,
+    );
+}
+
+fn record_throttle_parts(
+    bucket: &std::sync::Mutex<ThrottleBucket>,
+    account: &AccountId,
+    throttle_scope: Option<ThrottleScope>,
+    retry_hint: Option<bifrost_types::RetryHint>,
+    error: &AccountError,
+) {
+    let Some(scope) = throttle_scope else {
         return;
     };
-    let Some(hint) = advice.retry_hint else {
+    let Some(hint) = retry_hint else {
         return;
     };
     let Some(key) = resolve_throttle_key(scope, account, error) else {
@@ -375,7 +425,8 @@ mod tests {
     use super::*;
     use bifrost_types::{
         AttemptCause, AuthCause, AuthErrorKind, Provider, RetryDisposition, RetryHint, RetryReason,
-        TransmissionState, TransportCause, TransportErrorKind, TransportKind,
+        ServerCause, ServerErrorKind, TransmissionState, TransportCause, TransportErrorKind,
+        TransportKind,
     };
 
     fn build_retry() -> AccountError {
@@ -669,6 +720,57 @@ mod tests {
             builder = builder.provider(provider);
         }
         builder.try_build().expect("valid")
+    }
+
+    #[test]
+    fn reconcile_throttle_is_recorded_for_the_account() {
+        let account = AccountId("a".into());
+        let error = AccountErrorBuilder::new(
+            AccountErrorKind::Server(ServerErrorKind::RateLimited),
+            Cause::Server(ServerCause::RateLimited {
+                retry_hint: Some(RetryHint::After(Duration::from_secs(30))),
+            }),
+        )
+        .operation(AccountOperation::Send)
+        .push_cause(Cause::Attempt(AttemptCause::new(
+            TransmissionState::InFlight,
+        )))
+        .throttle_scope(ThrottleScope::Account)
+        .try_build()
+        .expect("valid");
+        let RecoveryClass::Reconcile(advice) = error.recovery() else {
+            panic!("in-flight send must reconcile");
+        };
+        let bucket = std::sync::Mutex::new(ThrottleBucket::new());
+
+        record_reconcile_throttle(&bucket, &account, advice, &error);
+
+        assert!(account_throttle_wait(&bucket, &account, SystemTime::now()).is_some());
+
+        // The drive loop and the push reconciler sleep this before
+        // probing; the provider hint must win over the 1s fallback or
+        // the read-back walks straight back into the rate limit.
+        let delay = reconcile_delay(advice, SystemTime::now(), Duration::from_secs(1));
+        assert!(
+            delay > Duration::from_secs(25),
+            "throttled reconcile must honor the provider hint, got {delay:?}"
+        );
+    }
+
+    #[test]
+    fn reconcile_delay_falls_back_when_no_hint_is_carried() {
+        // A transport drop mid-send reconciles without any provider
+        // timing signal; the caller's fallback is what must apply.
+        let error = build_reconcile();
+        let RecoveryClass::Reconcile(advice) = error.recovery() else {
+            panic!("in-flight non-idempotent transport drop must reconcile");
+        };
+        assert_eq!(advice.retry_hint, None);
+
+        assert_eq!(
+            reconcile_delay(advice, SystemTime::now(), Duration::from_secs(1)),
+            Duration::from_secs(1)
+        );
     }
 
     #[test]

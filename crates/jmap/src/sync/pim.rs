@@ -1150,7 +1150,7 @@ pub(crate) fn thread_hydrate<T: HttpTransport>(
                 crate::Error::IdNotFound(thread.0.clone()),
                 super::error::JmapErrorContext::new(AccountOperation::HydrateThread).with_scope(
                     bifrost_types::ErrorScope::Thread {
-                        id: thread.0.clone(),
+                        id: (thread.0.clone()).into(),
                     },
                 ),
             )
@@ -1318,7 +1318,7 @@ pub(crate) fn message_hydrate<T: HttpTransport>(
                 crate::Error::IdNotFound(message.0.clone()),
                 super::error::JmapErrorContext::new(AccountOperation::HydrateMessage).with_scope(
                     bifrost_types::ErrorScope::Message {
-                        id: message.0.clone(),
+                        id: (message.0.clone()).into(),
                     },
                 ),
             )
@@ -1512,7 +1512,7 @@ async fn resolve_target<T: HttpTransport>(
                     crate::Error::IdNotFound(thread.0.clone()),
                     super::error::JmapErrorContext::new(op).with_scope(
                         bifrost_types::ErrorScope::Thread {
-                            id: thread.0.clone(),
+                            id: (thread.0.clone()).into(),
                         },
                     ),
                 )
@@ -1981,7 +1981,7 @@ async fn fetch_foreign_containers<T: HttpTransport>(
             })),
             Err(error) => skipped.push(SkippedScope {
                 scope: bifrost_types::ErrorScope::Mailbox {
-                    id: account_id.clone(),
+                    id: (account_id.clone()).into(),
                 },
                 error,
             }),

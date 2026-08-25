@@ -887,7 +887,7 @@ fn concurrency_conflict_error(operation: AccountOperation, folder: &MailboxName)
     .protocol(Protocol::Imap)
     .operation(operation)
     .scope(bifrost_types::ErrorScope::Mailbox {
-        id: folder.as_str().to_owned(),
+        id: folder.as_str().into(),
     })
     .try_build()
     .expect("valid account error classification")
@@ -904,7 +904,7 @@ fn uidvalidity_changed_error(operation: AccountOperation, folder: &MailboxName) 
     .protocol(Protocol::Imap)
     .operation(operation)
     .scope(bifrost_types::ErrorScope::Mailbox {
-        id: folder.as_str().to_owned(),
+        id: folder.as_str().into(),
     })
     .try_build()
     .expect("valid account error classification")
@@ -925,7 +925,7 @@ fn store_failed_error(operation: AccountOperation, folder: &MailboxName) -> Acco
     .protocol(Protocol::Imap)
     .operation(operation)
     .scope(bifrost_types::ErrorScope::Mailbox {
-        id: folder.as_str().to_owned(),
+        id: folder.as_str().into(),
     })
     .try_build()
     .expect("valid account error classification")

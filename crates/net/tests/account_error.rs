@@ -39,7 +39,9 @@ fn message_ctx(operation: AccountOperation, id: &str) -> NetErrorContext {
         provider: None,
         protocol: Protocol::Jmap,
         operation,
-        scope: Some(ErrorScope::Message { id: id.to_owned() }),
+        scope: Some(ErrorScope::Message {
+            id: (id.to_owned()).into(),
+        }),
     }
 }
 

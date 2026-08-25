@@ -11,6 +11,18 @@ use crate::cursor::ProtocolKind;
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CalendarId(pub String);
 
+impl From<String> for CalendarId {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl From<&str> for CalendarId {
+    fn from(value: &str) -> Self {
+        Self(value.to_owned())
+    }
+}
+
 /// Engine-facing event identifier.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct EventId(pub String);

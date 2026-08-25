@@ -172,7 +172,7 @@ fn uidvalidity_changed_error(folder: &MailboxName) -> AccountError {
     .protocol(Protocol::Imap)
     .operation(AccountOperation::Hydrate)
     .scope(bifrost_types::ErrorScope::Mailbox {
-        id: folder.as_str().to_owned(),
+        id: folder.as_str().into(),
     })
     .try_build()
     .expect("valid account error classification")
@@ -189,7 +189,7 @@ fn message_not_found_error(id: &DecodedObjectId) -> AccountError {
     .protocol(Protocol::Imap)
     .operation(AccountOperation::Hydrate)
     .scope(bifrost_types::ErrorScope::Message {
-        id: super::encode_object_id(&id.folder, id.uidvalidity, id.uid).0,
+        id: super::encode_object_id(&id.folder, id.uidvalidity, id.uid),
     })
     .try_build()
     .expect("valid account error classification")

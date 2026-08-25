@@ -138,7 +138,7 @@ async fn run_fetch(
             .protocol(Protocol::Imap)
             .operation(op)
             .scope(bifrost_types::ErrorScope::Mailbox {
-                id: folder.as_str().to_owned(),
+                id: folder.as_str().into(),
             })
             .try_build()
             .expect("valid account error classification"),

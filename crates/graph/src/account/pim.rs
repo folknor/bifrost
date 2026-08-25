@@ -75,7 +75,9 @@ pub(crate) async fn set_category(
         let etag = graph_etag(&message).ok_or_else(|| {
             pim_protocol_error(
                 AccountOperation::SetCategory,
-                Some(ErrorScope::Message { id: id.0.clone() }),
+                Some(ErrorScope::Message {
+                    id: id.0.clone().into(),
+                }),
                 format!("Graph message {} did not expose an etag", id.0),
             )
         })?;
@@ -128,7 +130,9 @@ pub(crate) async fn set_extended_property(
                 let etag = graph_etag(&message).ok_or_else(|| {
                     pim_protocol_error(
                         AccountOperation::SetExtendedProperty,
-                        Some(ErrorScope::Message { id: id.0.clone() }),
+                        Some(ErrorScope::Message {
+                            id: id.0.clone().into(),
+                        }),
                         format!("Graph message {} did not expose an etag", id.0),
                     )
                 })?;
@@ -211,7 +215,9 @@ pub(crate) async fn set_is_read(
         let etag = graph_etag(&message).ok_or_else(|| {
             pim_protocol_error(
                 AccountOperation::SetIsRead,
-                Some(ErrorScope::Message { id: id.0.clone() }),
+                Some(ErrorScope::Message {
+                    id: id.0.clone().into(),
+                }),
                 format!("Graph message {} did not expose an etag", id.0),
             )
         })?;
@@ -251,7 +257,9 @@ pub(crate) async fn set_importance(
         let etag = graph_etag(&message).ok_or_else(|| {
             pim_protocol_error(
                 AccountOperation::SetImportance,
-                Some(ErrorScope::Message { id: id.0.clone() }),
+                Some(ErrorScope::Message {
+                    id: id.0.clone().into(),
+                }),
                 format!("Graph message {} did not expose an etag", id.0),
             )
         })?;
@@ -705,7 +713,7 @@ async fn shared_containers(account: &GraphAccount) -> (Vec<Container>, Vec<Skipp
             ),
             Err(error) => skipped.push(SkippedScope {
                 scope: ErrorScope::Mailbox {
-                    id: mailbox.clone(),
+                    id: mailbox.clone().into(),
                 },
                 error: into_account_error(
                     error,
@@ -1061,7 +1069,9 @@ async fn public_message_hydrate(
         return Err(protocol_violation(
             ProtocolErrorKind::MissingField,
             AccountOperation::HydrateMessage,
-            Some(ErrorScope::Message { id: id.0.clone() }),
+            Some(ErrorScope::Message {
+                id: id.0.clone().into(),
+            }),
             format!("public folder {} has no routing entry", folder.0),
         ));
     };
@@ -1072,8 +1082,11 @@ async fn public_message_hydrate(
                 transmission_state: bifrost_types::TransmissionState::Unsent,
                 source: None,
             }),
-            GraphErrorContext::ews(AccountOperation::HydrateMessage)
-                .with_scope(ErrorScope::Message { id: id.0.clone() }),
+            GraphErrorContext::ews(AccountOperation::HydrateMessage).with_scope(
+                ErrorScope::Message {
+                    id: id.0.clone().into(),
+                },
+            ),
         ));
     };
     let native = super::foreign::parse_message_id(id).native_id().to_string();
@@ -1083,8 +1096,11 @@ async fn public_message_hydrate(
         .map_err(|error| {
             super::graph_error::ews_error_to_account_error(
                 error,
-                GraphErrorContext::ews(AccountOperation::HydrateMessage)
-                    .with_scope(ErrorScope::Message { id: id.0.clone() }),
+                GraphErrorContext::ews(AccountOperation::HydrateMessage).with_scope(
+                    ErrorScope::Message {
+                        id: id.0.clone().into(),
+                    },
+                ),
             )
         })?;
     Ok(message_from_ews_item(id.clone(), &item, folder, projection))
@@ -1195,7 +1211,7 @@ pub(crate) async fn delete_thread(
         .owner()
         .map(str::to_string);
     let scope = ErrorScope::Thread {
-        id: thread.0.clone(),
+        id: (thread.0.clone()).into(),
     };
     let ids = resolve_target_ids(
         &account,
@@ -1314,8 +1330,9 @@ async fn fetch_message_value(
     let client = account.client_for_owner(parsed.owner()).map_err(|error| {
         into_account_error(
             error,
-            GraphErrorContext::graph(AccountOperation::Hydrate)
-                .with_scope(ErrorScope::Message { id: id.0.clone() }),
+            GraphErrorContext::graph(AccountOperation::Hydrate).with_scope(ErrorScope::Message {
+                id: id.0.clone().into(),
+            }),
         )
     })?;
     let path = format!(
@@ -1345,7 +1362,7 @@ async fn message_values_for_thread(
         into_account_error(
             error,
             GraphErrorContext::graph(AccountOperation::Hydrate).with_scope(ErrorScope::Thread {
-                id: thread.0.clone(),
+                id: (thread.0.clone()).into(),
             }),
         )
     })?;
@@ -1405,8 +1422,9 @@ pub(crate) fn message_batch_url(
         .map_err(|error| {
             into_account_error(
                 error,
-                GraphErrorContext::graph(operation)
-                    .with_scope(ErrorScope::Message { id: id.0.clone() }),
+                GraphErrorContext::graph(operation).with_scope(ErrorScope::Message {
+                    id: id.0.clone().into(),
+                }),
             )
         })?
         .api_path_prefix();
@@ -1459,7 +1477,9 @@ async fn move_messages(
         let etag = graph_etag(value).ok_or_else(|| {
             pim_protocol_error(
                 operation,
-                Some(ErrorScope::Message { id: id.0.clone() }),
+                Some(ErrorScope::Message {
+                    id: id.0.clone().into(),
+                }),
                 format!("Graph message {} did not expose an etag", id.0),
             )
         })?;
@@ -1469,7 +1489,9 @@ async fn move_messages(
         if dest.foreign().map(|f| f.mailbox.as_str()) != source_owner.as_deref() {
             return Err(pim_protocol_error(
                 operation,
-                Some(ErrorScope::Message { id: id.0.clone() }),
+                Some(ErrorScope::Message {
+                    id: id.0.clone().into(),
+                }),
                 format!(
                     "Graph move for {} targets a folder in a different mailbox than the message",
                     id.0
@@ -1617,7 +1639,9 @@ async fn submit_write_batch_with_targets(
             .cloned();
         let scope = target
             .as_ref()
-            .map(|id| ErrorScope::Message { id: id.0.clone() })
+            .map(|id| ErrorScope::Message {
+                id: (id.0.clone()).into(),
+            })
             .unwrap_or(ErrorScope::Account);
         let outcome = mutation_item_outcome(
             item.status,
@@ -1672,7 +1696,9 @@ async fn submit_write_batch_with_targets(
             .parse::<usize>()
             .ok()
             .and_then(|idx| targets.get(idx))
-            .map(|id| ErrorScope::Message { id: id.0.clone() });
+            .map(|id| ErrorScope::Message {
+                id: (id.0.clone()).into(),
+            });
         return Err(batch_response_missing(
             operation,
             scope,
@@ -2039,7 +2065,7 @@ async fn search_message_rows(
                     return Err(into_account_error(error, ctx));
                 };
                 let scope = ErrorScope::Mailbox {
-                    id: mailbox.to_string(),
+                    id: (mailbox.to_string()).into(),
                 };
                 let error = into_account_error(error, ctx.with_scope(scope.clone()));
                 if !matches!(
@@ -3699,7 +3725,7 @@ mod tests {
         assert_eq!(
             skip.scope,
             ErrorScope::Mailbox {
-                id: "b@contoso.com".to_string()
+                id: ("b@contoso.com".to_string()).into()
             }
         );
         assert!(matches!(
@@ -3761,7 +3787,7 @@ mod tests {
         assert_eq!(
             last.skipped_scopes[0].scope,
             ErrorScope::Mailbox {
-                id: mailbox.to_string()
+                id: (mailbox.to_string()).into()
             }
         );
     }
@@ -4238,7 +4264,9 @@ mod tests {
         // actionable on the lane it lands in.
         assert_eq!(
             error.scope(),
-            Some(&ErrorScope::Message { id: id.0.clone() })
+            Some(&ErrorScope::Message {
+                id: (id.0.clone()).into()
+            })
         );
     }
 

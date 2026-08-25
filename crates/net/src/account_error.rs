@@ -623,13 +623,11 @@ fn resource_from_scope(scope: Option<&ErrorScope>) -> Option<ResourceKind> {
 
 fn id_from_scope(scope: Option<&ErrorScope>) -> Option<String> {
     match scope {
-        Some(
-            ErrorScope::Message { id }
-            | ErrorScope::Mailbox { id }
-            | ErrorScope::Thread { id }
-            | ErrorScope::Calendar { id }
-            | ErrorScope::Contact { id },
-        ) => Some(id.clone()),
+        Some(ErrorScope::Message { id }) => Some(id.0.clone()),
+        Some(ErrorScope::Mailbox { id }) => Some(id.0.clone()),
+        Some(ErrorScope::Thread { id }) => Some(id.0.clone()),
+        Some(ErrorScope::Calendar { id }) => Some(id.0.clone()),
+        Some(ErrorScope::Contact { id }) => Some(id.0.clone()),
         Some(_) | None => None,
     }
 }

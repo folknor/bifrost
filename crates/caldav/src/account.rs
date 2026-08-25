@@ -95,10 +95,14 @@ impl CalDavAccount {
         self.unsynced_calendar_urls
             .iter()
             .map(|url| SkippedScope {
-                scope: ErrorScope::Calendar { id: url.clone() },
+                scope: ErrorScope::Calendar {
+                    id: (url.clone()).into(),
+                },
                 error: unsupported_scope_error(
                     AccountOperation::DiscoverCursorScopes,
-                    ErrorScope::Calendar { id: url.clone() },
+                    ErrorScope::Calendar {
+                        id: (url.clone()).into(),
+                    },
                     "bifrost-caldav syncs only the first discovered calendar \
                      collection; this calendar is reachable through the event \
                      primitives but produces no inventory or change events",
@@ -1243,7 +1247,7 @@ fn skipped_calendar_scope(calendar_url: &str, degraded: Option<AccountError>) ->
     degraded
         .map(|error| SkippedScope {
             scope: ErrorScope::Calendar {
-                id: calendar_url.to_string(),
+                id: calendar_url.to_string().into(),
             },
             error,
         })
@@ -1804,7 +1808,7 @@ mod tests {
         assert_eq!(
             skipped[0].scope,
             ErrorScope::Calendar {
-                id: "https://dav.example.test/cal/".to_string(),
+                id: ("https://dav.example.test/cal/".to_string()).into(),
             }
         );
         assert_eq!(skipped[0].error.recovery(), &recovery);

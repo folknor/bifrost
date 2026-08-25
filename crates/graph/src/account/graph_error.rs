@@ -849,11 +849,11 @@ fn resource_from_scope(scope: Option<&ErrorScope>) -> Option<ResourceKind> {
 
 fn id_from_scope(scope: Option<&ErrorScope>) -> Option<String> {
     match scope? {
-        ErrorScope::Message { id }
-        | ErrorScope::Mailbox { id }
-        | ErrorScope::Thread { id }
-        | ErrorScope::Calendar { id }
-        | ErrorScope::Contact { id } => Some(id.clone()),
+        ErrorScope::Message { id } => Some(id.0.clone()),
+        ErrorScope::Mailbox { id } => Some(id.0.clone()),
+        ErrorScope::Thread { id } => Some(id.0.clone()),
+        ErrorScope::Calendar { id } => Some(id.0.clone()),
+        ErrorScope::Contact { id } => Some(id.0.clone()),
         ErrorScope::Account
         | ErrorScope::Cursor(_)
         | ErrorScope::CalendarCollection
@@ -1297,7 +1297,7 @@ mod tests {
                     .to_string(),
             },
             graph_ctx(AccountOperation::BulkDestroy).with_scope(ErrorScope::Message {
-                id: "AAMkmsg".to_string(),
+                id: ("AAMkmsg".to_string()).into(),
             }),
         );
         assert!(matches!(
@@ -1310,7 +1310,7 @@ mod tests {
         assert_eq!(
             error.scope(),
             Some(&ErrorScope::Message {
-                id: "AAMkmsg".to_string()
+                id: ("AAMkmsg".to_string()).into()
             })
         );
     }
@@ -1400,7 +1400,7 @@ mod tests {
             let err = batch_response_missing(
                 operation,
                 Some(ErrorScope::Message {
-                    id: "m1".to_string(),
+                    id: ("m1".to_string()).into(),
                 }),
                 "Graph $batch returned no response for m1",
             );
@@ -1763,7 +1763,7 @@ mod tests {
             StatusCode::NOT_FOUND,
             "",
             graph_ctx(AccountOperation::HydrateMessage).with_scope(ErrorScope::Message {
-                id: "abc".to_string(),
+                id: ("abc".to_string()).into(),
             }),
             &[],
         );
@@ -2008,7 +2008,7 @@ mod tests {
             bifrost_types::BatchItemId("m1".to_string()),
             AccountOperation::UpdateFlags,
             ErrorScope::Message {
-                id: "m1".to_string(),
+                id: ("m1".to_string()).into(),
             },
         );
         assert!(matches!(
@@ -2027,7 +2027,7 @@ mod tests {
             bifrost_types::BatchItemId("m1".to_string()),
             AccountOperation::BulkDestroy,
             ErrorScope::Message {
-                id: "m1".to_string(),
+                id: ("m1".to_string()).into(),
             },
         );
         assert!(matches!(
@@ -2046,7 +2046,7 @@ mod tests {
             bifrost_types::BatchItemId("m1".to_string()),
             AccountOperation::SetIsRead,
             ErrorScope::Message {
-                id: "m1".to_string(),
+                id: ("m1".to_string()).into(),
             },
         );
         match outcome {
@@ -2070,7 +2070,7 @@ mod tests {
             bifrost_types::BatchItemId("m1".to_string()),
             AccountOperation::UpdateFlags,
             ErrorScope::Message {
-                id: "m1".to_string(),
+                id: ("m1".to_string()).into(),
             },
         );
         match outcome {
@@ -2094,7 +2094,7 @@ mod tests {
             bifrost_types::BatchItemId("m1".to_string()),
             AccountOperation::BulkMove,
             ErrorScope::Message {
-                id: "m1".to_string(),
+                id: ("m1".to_string()).into(),
             },
         );
         match outcome {
@@ -2128,7 +2128,7 @@ mod tests {
             bifrost_types::BatchItemId("m1".to_string()),
             AccountOperation::BulkMove,
             ErrorScope::Message {
-                id: "m1".to_string(),
+                id: ("m1".to_string()).into(),
             },
         );
         let bifrost_types::ItemOutcome::Failed(failure) = outcome else {
@@ -2377,7 +2377,7 @@ mod tests {
                 detail: DiagnosticText::support_only("gone".to_string()),
             },
             GraphErrorContext::ews(AccountOperation::Hydrate).with_scope(ErrorScope::Message {
-                id: "AAMkItem=".to_string(),
+                id: ("AAMkItem=".to_string()).into(),
             }),
         );
         assert!(matches!(

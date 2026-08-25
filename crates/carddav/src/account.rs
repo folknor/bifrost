@@ -115,10 +115,14 @@ impl CardDavAccount {
         self.unsynced_addressbook_urls
             .iter()
             .map(|url| SkippedScope {
-                scope: ErrorScope::Contact { id: url.clone() },
+                scope: ErrorScope::Contact {
+                    id: (url.clone()).into(),
+                },
                 error: unsupported_scope_error(
                     AccountOperation::DiscoverCursorScopes,
-                    ErrorScope::Contact { id: url.clone() },
+                    ErrorScope::Contact {
+                        id: (url.clone()).into(),
+                    },
                     "bifrost-carddav syncs only the first discovered address \
                      book collection; this address book is reachable through \
                      the contact primitives but produces no inventory or \

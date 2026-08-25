@@ -78,7 +78,7 @@ pub(crate) fn derive(kind: &AccountErrorKind) -> &'static str {
         AccountErrorKind::NotFound(ResourceKind::PushSubscription) => "notfound.push-subscription",
         AccountErrorKind::NotFound(ResourceKind::Account) => "notfound.account",
         AccountErrorKind::NotFound(ResourceKind::Filter) => "notfound.filter",
-        AccountErrorKind::Unsupported(_) => "unsupported",
+        AccountErrorKind::Unsupported(_) => "unsupported.operation",
         AccountErrorKind::Protocol(ProtocolErrorKind::ParseFailed) => "protocol.parse-failed",
         AccountErrorKind::Protocol(ProtocolErrorKind::MissingField) => "protocol.missing-field",
         AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation) => {
@@ -240,12 +240,32 @@ mod tests {
                 "notfound.contact",
             ),
             (
+                AccountErrorKind::NotFound(ResourceKind::Draft),
+                "notfound.draft",
+            ),
+            (
+                AccountErrorKind::NotFound(ResourceKind::Identity),
+                "notfound.identity",
+            ),
+            (
+                AccountErrorKind::NotFound(ResourceKind::Vacation),
+                "notfound.vacation",
+            ),
+            (
+                AccountErrorKind::NotFound(ResourceKind::PushSubscription),
+                "notfound.push-subscription",
+            ),
+            (
+                AccountErrorKind::NotFound(ResourceKind::Account),
+                "notfound.account",
+            ),
+            (
                 AccountErrorKind::NotFound(ResourceKind::Filter),
                 "notfound.filter",
             ),
             (
                 AccountErrorKind::Unsupported(AccountOperation::Search),
-                "unsupported",
+                "unsupported.operation",
             ),
             (
                 AccountErrorKind::Protocol(ProtocolErrorKind::ParseFailed),

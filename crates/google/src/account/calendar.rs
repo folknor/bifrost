@@ -1366,7 +1366,7 @@ mod tests {
         assert_eq!(
             error.scope(),
             Some(&bifrost_types::ErrorScope::Calendar {
-                id: "destination::event-1".to_string()
+                id: ("destination::event-1".to_string()).into()
             })
         );
 
@@ -1455,7 +1455,7 @@ mod tests {
         assert_eq!(
             error.scope(),
             Some(&bifrost_types::ErrorScope::Calendar {
-                id: "source::event-1".to_string()
+                id: ("source::event-1".to_string()).into()
             })
         );
         assert_eq!(script.requests().len(), 1);

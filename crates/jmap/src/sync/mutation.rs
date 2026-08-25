@@ -495,23 +495,27 @@ fn classify_set_response(
         )),
         Err(crate::Error::Set(set_error)) => {
             let ctx = super::error::JmapErrorContext::new(operation);
-            let item_scope = Some(ErrorScope::Message { id: id.0.clone() });
+            let item_scope = Some(ErrorScope::Message {
+                id: (id.0.clone()).into(),
+            });
             super::error::classify_set_item(set_error, ctx, BatchItemId(id.0.clone()), item_scope)
         }
         Err(crate::Error::IdNotFound(_)) => ItemOutcome::Failed(BatchFailure::new(
             BatchItemId(id.0.clone()),
             super::error::set_id_unanswered(
                 &id.0,
-                super::error::JmapErrorContext::new(operation)
-                    .with_scope(ErrorScope::Message { id: id.0.clone() }),
+                super::error::JmapErrorContext::new(operation).with_scope(ErrorScope::Message {
+                    id: (id.0.clone()).into(),
+                }),
             ),
         )),
         Err(err) => ItemOutcome::Failed(BatchFailure::new(
             BatchItemId(id.0.clone()),
             super::error::into_account_error(
                 err,
-                super::error::JmapErrorContext::new(operation)
-                    .with_scope(ErrorScope::Message { id: id.0.clone() }),
+                super::error::JmapErrorContext::new(operation).with_scope(ErrorScope::Message {
+                    id: (id.0.clone()).into(),
+                }),
             ),
         )),
     }
@@ -543,8 +547,9 @@ fn state_mismatch_failed_batch(
         };
         let account_error = super::error::into_account_error(
             item_err,
-            super::error::JmapErrorContext::new(operation)
-                .with_scope(ErrorScope::Message { id: id.0.clone() }),
+            super::error::JmapErrorContext::new(operation).with_scope(ErrorScope::Message {
+                id: (id.0.clone()).into(),
+            }),
         );
         results.push(ItemOutcome::Failed(BatchFailure::new(
             BatchItemId(id.0.clone()),

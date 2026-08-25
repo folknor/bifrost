@@ -128,14 +128,18 @@ impl GmailErrorContext {
 
     pub(crate) fn hydrate_message(id: impl Into<String>) -> Self {
         let mut ctx = Self::base(AccountOperation::HydrateMessage);
-        ctx.scope = Some(ErrorScope::Message { id: id.into() });
+        ctx.scope = Some(ErrorScope::Message {
+            id: (id.into()).into(),
+        });
         ctx.resource = Some(GmailResource::Message);
         ctx
     }
 
     pub(crate) fn hydrate_thread(id: impl Into<String>) -> Self {
         let mut ctx = Self::base(AccountOperation::HydrateThread);
-        ctx.scope = Some(ErrorScope::Thread { id: id.into() });
+        ctx.scope = Some(ErrorScope::Thread {
+            id: (id.into()).into(),
+        });
         ctx.resource = Some(GmailResource::Thread);
         ctx
     }
@@ -166,7 +170,9 @@ impl GmailErrorContext {
         // the parent message scope so consumer routing can find the
         // owning message; the blob id itself is preserved as a
         // diagnostic note.
-        ctx.scope = Some(ErrorScope::Message { id: id.clone() });
+        ctx.scope = Some(ErrorScope::Message {
+            id: (id.clone()).into(),
+        });
         ctx.diagnostic_id = Some(id);
         ctx
     }
@@ -181,7 +187,9 @@ impl GmailErrorContext {
         let id = id.into();
         let mut ctx = Self::base(AccountOperation::OpenRawRfc822);
         ctx.resource = Some(GmailResource::Message);
-        ctx.scope = Some(ErrorScope::Message { id: id.clone() });
+        ctx.scope = Some(ErrorScope::Message {
+            id: (id.clone()).into(),
+        });
         ctx.diagnostic_id = Some(id);
         ctx
     }
@@ -256,7 +264,9 @@ impl GmailErrorContext {
 
     pub(crate) fn calendar_event(operation: AccountOperation, id: impl Into<String>) -> Self {
         let mut ctx = Self::base(operation);
-        ctx.scope = Some(ErrorScope::Calendar { id: id.into() });
+        ctx.scope = Some(ErrorScope::Calendar {
+            id: (id.into()).into(),
+        });
         ctx.resource = Some(GmailResource::Calendar);
         ctx
     }
@@ -270,7 +280,9 @@ impl GmailErrorContext {
 
     pub(crate) fn contact(operation: AccountOperation, id: impl Into<String>) -> Self {
         let mut ctx = Self::base(operation);
-        ctx.scope = Some(ErrorScope::Contact { id: id.into() });
+        ctx.scope = Some(ErrorScope::Contact {
+            id: (id.into()).into(),
+        });
         ctx.resource = Some(GmailResource::Contact);
         ctx
     }
@@ -976,11 +988,11 @@ fn not_found_kind_cause(ctx: &GmailErrorContext) -> (AccountErrorKind, Cause) {
         .and_then(GmailResource::to_resource_kind)
         .unwrap_or(ResourceKind::Message);
     let id = ctx.scope.as_ref().and_then(|scope| match scope {
-        ErrorScope::Message { id }
-        | ErrorScope::Mailbox { id }
-        | ErrorScope::Thread { id }
-        | ErrorScope::Calendar { id }
-        | ErrorScope::Contact { id } => Some(id.clone()),
+        ErrorScope::Message { id } => Some(id.0.clone()),
+        ErrorScope::Mailbox { id } => Some(id.0.clone()),
+        ErrorScope::Thread { id } => Some(id.0.clone()),
+        ErrorScope::Calendar { id } => Some(id.0.clone()),
+        ErrorScope::Contact { id } => Some(id.0.clone()),
         ErrorScope::Account
         | ErrorScope::Cursor(_)
         | ErrorScope::CalendarCollection

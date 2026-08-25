@@ -93,6 +93,8 @@ pub(crate) struct RebuildParts {
     pub provider: Option<Provider>,
     pub protocol: Option<Protocol>,
     pub diagnostics: DiagnosticInfo,
+    pub idempotency_override: Option<bool>,
+    pub throttle_scope: Option<ThrottleScope>,
 }
 
 #[derive(Clone, Debug)]
@@ -132,12 +134,8 @@ impl AccountErrorBuilder {
     /// `push_cause`, then `try_build()` to obtain a new `AccountError`
     /// with derived fields recomputed.
     ///
-    /// The `idempotency_override` and `throttle_scope` builder
-    /// overrides are reset on round-trip; the derived `recovery` will
-    /// be recomputed from the chain. Callers that want to preserve
-    /// those overrides must reapply them after `into_builder`. A
-    /// retry hint that was set on a `ServerCause` is preserved
-    /// structurally through the chain - no separate side-channel.
+    /// Builder overrides and the cause chain are preserved so
+    /// decoration cannot alter recovery classification.
     #[must_use]
     pub(crate) fn from_rebuild(parts: RebuildParts) -> Self {
         Self {
@@ -149,8 +147,8 @@ impl AccountErrorBuilder {
             provider: parts.provider,
             protocol: parts.protocol,
             diagnostics: parts.diagnostics,
-            idempotency_override: None,
-            throttle_scope: None,
+            idempotency_override: parts.idempotency_override,
+            throttle_scope: parts.throttle_scope,
         }
     }
 
@@ -290,9 +288,7 @@ impl AccountErrorBuilder {
         let mut causes = Vec::with_capacity(1 + self.chain_extras.len());
         causes.push(self.primary_cause);
         causes.extend(self.chain_extras);
-        // CauseChain::new asserts non-empty; the vec above always has
-        // the primary cause so the assertion never trips here.
-        let chain = CauseChain::new(causes);
+        let chain = CauseChain::try_new(causes).ok_or(AccountErrorBuildError::EmptyChain)?;
 
         // Transport(_) cannot pair with an Acknowledged Attempt. The
         // wire-level evidence contradicts the kind.
@@ -331,6 +327,8 @@ impl AccountErrorBuilder {
             diagnostics: self.diagnostics,
             chain,
             message_key,
+            idempotency_override: self.idempotency_override,
+            throttle_scope: self.throttle_scope,
         }))
     }
 }

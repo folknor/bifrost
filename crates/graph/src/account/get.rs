@@ -137,7 +137,9 @@ async fn fetch_ews_outcomes(
                 super::graph_error::protocol_violation(
                     bifrost_types::ProtocolErrorKind::MissingField,
                     AccountOperation::Hydrate,
-                    Some(ErrorScope::Message { id: id.0.clone() }),
+                    Some(ErrorScope::Message {
+                        id: (id.0.clone()).into(),
+                    }),
                     format!("public folder {} has no routing entry", folder.0),
                 ),
             )));
@@ -152,8 +154,11 @@ async fn fetch_ews_outcomes(
                         transmission_state: bifrost_types::TransmissionState::Unsent,
                         source: None,
                     }),
-                    GraphErrorContext::ews(AccountOperation::Hydrate)
-                        .with_scope(ErrorScope::Message { id: id.0.clone() }),
+                    GraphErrorContext::ews(AccountOperation::Hydrate).with_scope(
+                        ErrorScope::Message {
+                            id: (id.0.clone()).into(),
+                        },
+                    ),
                 ),
             )));
             continue;
@@ -174,8 +179,11 @@ async fn fetch_ews_outcomes(
                 batch_id,
                 super::graph_error::ews_error_to_account_error(
                     error,
-                    GraphErrorContext::ews(AccountOperation::Hydrate)
-                        .with_scope(ErrorScope::Message { id: id.0.clone() }),
+                    GraphErrorContext::ews(AccountOperation::Hydrate).with_scope(
+                        ErrorScope::Message {
+                            id: (id.0.clone()).into(),
+                        },
+                    ),
                 ),
             ))),
         }
@@ -271,8 +279,10 @@ async fn fetch_batch(
         hydrate_url_for_id(account, id, select)
     });
     for (id, error) in rejected {
-        let ctx = GraphErrorContext::graph(AccountOperation::Hydrate)
-            .with_scope(ErrorScope::Message { id: id.0.clone() });
+        let ctx =
+            GraphErrorContext::graph(AccountOperation::Hydrate).with_scope(ErrorScope::Message {
+                id: (id.0.clone()).into(),
+            });
         outcomes.push(ItemOutcome::Failed(BatchFailure::new(
             BatchItemId(id.0.clone()),
             into_account_error(error, ctx),
@@ -399,8 +409,11 @@ fn reconcile_hydration_responses(
                 headers,
                 body,
             );
-            let ctx = GraphErrorContext::graph(AccountOperation::Hydrate)
-                .with_scope(ErrorScope::Message { id: id.0.clone() });
+            let ctx = GraphErrorContext::graph(AccountOperation::Hydrate).with_scope(
+                ErrorScope::Message {
+                    id: (id.0.clone()).into(),
+                },
+            );
             let error = response_to_account_error_pub(response, &ctx);
             outcomes.push(ItemOutcome::Failed(BatchFailure::new(batch_id, error)));
             continue;
@@ -413,7 +426,9 @@ fn reconcile_hydration_responses(
             let error = super::graph_error::protocol_violation(
                 bifrost_types::ProtocolErrorKind::MissingField,
                 AccountOperation::Hydrate,
-                Some(ErrorScope::Message { id: id.0.clone() }),
+                Some(ErrorScope::Message {
+                    id: (id.0.clone()).into(),
+                }),
                 format!("Graph $batch GET for {} returned 2xx with no body", id.0),
             );
             outcomes.push(ItemOutcome::Failed(BatchFailure::new(batch_id, error)));
@@ -436,7 +451,9 @@ fn reconcile_hydration_responses(
             BatchItemId(id.0.clone()),
             super::graph_error::batch_response_missing(
                 AccountOperation::Hydrate,
-                Some(ErrorScope::Message { id: id.0.clone() }),
+                Some(ErrorScope::Message {
+                    id: (id.0.clone()).into(),
+                }),
                 format!("Graph $batch returned no response for {}", id.0),
             ),
         )));
@@ -767,8 +784,9 @@ mod tests {
         let (id, error) = rejected.into_iter().next().expect("one rejection");
         let account_error = into_account_error(
             error,
-            GraphErrorContext::graph(AccountOperation::Hydrate)
-                .with_scope(ErrorScope::Message { id: id.0.clone() }),
+            GraphErrorContext::graph(AccountOperation::Hydrate).with_scope(ErrorScope::Message {
+                id: (id.0.clone()).into(),
+            }),
         );
         assert!(matches!(
             account_error.kind(),
@@ -776,7 +794,9 @@ mod tests {
         ));
         assert_eq!(
             account_error.scope(),
-            Some(&ErrorScope::Message { id: id.0.clone() })
+            Some(&ErrorScope::Message {
+                id: (id.0.clone()).into()
+            })
         );
     }
 

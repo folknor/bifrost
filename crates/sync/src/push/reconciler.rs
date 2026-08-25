@@ -146,7 +146,13 @@ impl Reconciler {
                         };
                         let _ = self.changes_tx.send(me);
                     }
-                    RecoveryPlan::Reconcile(_) => {
+                    RecoveryPlan::Reconcile(advice) => {
+                        crate::recovery::record_reconcile_throttle(
+                            &self.throttles,
+                            &self.account_id,
+                            &advice,
+                            &original,
+                        );
                         // Surface a warning so dashboards observe the
                         // hiccup; the forwarder reconnects on its next
                         // iteration.
@@ -254,8 +260,19 @@ impl Reconciler {
                             );
                             tokio::time::sleep(delay).await;
                         }
-                        RecoveryPlan::Reconcile(_) => {
-                            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        RecoveryPlan::Reconcile(advice) => {
+                            crate::recovery::record_reconcile_throttle(
+                                &self.throttles,
+                                &self.account_id,
+                                &advice,
+                                &original,
+                            );
+                            let delay = crate::recovery::reconcile_delay(
+                                &advice,
+                                std::time::SystemTime::now(),
+                                std::time::Duration::from_secs(1),
+                            );
+                            tokio::time::sleep(delay).await;
                         }
                         RecoveryPlan::Engine(directive) => {
                             let directive_scope = directive_target_scope(&directive);

@@ -179,8 +179,11 @@ async fn submit_batch(
                     BatchItemId(id.0.clone()),
                     into_account_error(
                         error,
-                        GraphErrorContext::graph(operation_for_kind(kind))
-                            .with_scope(ErrorScope::Message { id: id.0.clone() }),
+                        GraphErrorContext::graph(operation_for_kind(kind)).with_scope(
+                            ErrorScope::Message {
+                                id: (id.0.clone()).into(),
+                            },
+                        ),
                     ),
                 )));
                 continue;
@@ -203,7 +206,7 @@ async fn submit_batch(
                 super::graph_error::protocol_violation(
                     bifrost_types::ProtocolErrorKind::ContractViolation,
                     operation_for_kind(kind),
-                    Some(bifrost_types::ErrorScope::Message { id: id.0.clone() }),
+                    Some(bifrost_types::ErrorScope::Message { id: (id.0.clone() ).into()}),
                     format!(
                         "Graph Move request for {} did not resolve to a same-mailbox folder destination",
                         id.0
@@ -293,7 +296,9 @@ fn reconcile_mutation_responses(
             continue;
         }
         let id = request_ids[index].clone();
-        let scope = ErrorScope::Message { id: id.0.clone() };
+        let scope = ErrorScope::Message {
+            id: (id.0.clone()).into(),
+        };
         let headers = item
             .headers
             .map(|h| {
@@ -333,7 +338,9 @@ fn reconcile_mutation_responses(
             BatchItemId(id.0.clone()),
             super::graph_error::batch_response_missing(
                 operation_for_kind(kind),
-                Some(ErrorScope::Message { id: id.0.clone() }),
+                Some(ErrorScope::Message {
+                    id: (id.0.clone()).into(),
+                }),
                 format!(
                     "Graph $batch returned no response for {}; the item's fate is unknown",
                     id.0
@@ -380,8 +387,11 @@ async fn refresh_missing_etags(
                     BatchItemId(id.0.clone()),
                     into_account_error(
                         error,
-                        GraphErrorContext::graph(operation_for_kind(kind))
-                            .with_scope(ErrorScope::Message { id: id.0.clone() }),
+                        GraphErrorContext::graph(operation_for_kind(kind)).with_scope(
+                            ErrorScope::Message {
+                                id: (id.0.clone()).into(),
+                            },
+                        ),
                     ),
                 )));
                 continue;
@@ -406,7 +416,9 @@ async fn refresh_missing_etags(
                         protocol_violation(
                             ProtocolErrorKind::MissingField,
                             operation_for_kind(kind),
-                            Some(ErrorScope::Message { id: id.0.clone() }),
+                            Some(ErrorScope::Message {
+                                id: (id.0.clone()).into(),
+                            }),
                             format!(
                                 "Graph message {} did not expose an etag after refresh",
                                 id.0
@@ -416,8 +428,11 @@ async fn refresh_missing_etags(
                 }
             }
             Err(error) => {
-                let ctx = GraphErrorContext::graph(operation_for_kind(kind))
-                    .with_scope(ErrorScope::Message { id: id.0.clone() });
+                let ctx = GraphErrorContext::graph(operation_for_kind(kind)).with_scope(
+                    ErrorScope::Message {
+                        id: (id.0.clone()).into(),
+                    },
+                );
                 failed.push(ItemOutcome::Failed(BatchFailure::new(
                     BatchItemId(id.0.clone()),
                     into_account_error(error, ctx),
@@ -937,7 +952,9 @@ mod tests {
             ));
             assert_eq!(
                 failure.error.scope(),
-                Some(&ErrorScope::Message { id: id.0.clone() })
+                Some(&ErrorScope::Message {
+                    id: (id.0.clone()).into()
+                })
             );
         }
     }

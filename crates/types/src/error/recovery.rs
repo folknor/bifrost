@@ -154,6 +154,8 @@ pub enum RetryDisposition {
 pub struct ReconcileAdvice {
     pub reason: ReconcileReason,
     pub guidance: ReconcileGuidance,
+    pub retry_hint: Option<RetryHint>,
+    pub throttle_scope: Option<ThrottleScope>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -161,6 +163,7 @@ pub struct ReconcileAdvice {
 pub enum ReconcileReason {
     TransportDropAfterSend,
     PartialCompletionSignal,
+    ThrottledMidFlight,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -726,6 +729,8 @@ fn derive_protocol(kind: ProtocolErrorKind, idempotent: bool) -> RecoveryClass {
                     ReconcileAction::DedupeByClientId,
                 ],
             },
+            retry_hint: None,
+            throttle_scope: None,
         }),
         ProtocolErrorKind::Unknown => RecoveryClass::UnknownPermanent,
     }
@@ -749,10 +754,17 @@ fn transient_retry_or_reconcile(
         // `Acknowledged`, or `InFlight`+idempotent -> `Retry(SameRequest)`;
         // `InFlight`+non-idempotent -> `Reconcile`.
         TransmissionState::InFlight if !idempotent => RecoveryClass::Reconcile(ReconcileAdvice {
-            reason: ReconcileReason::TransportDropAfterSend,
+            reason: match reason {
+                RetryReason::RateLimited | RetryReason::QuotaExhausted => {
+                    ReconcileReason::ThrottledMidFlight
+                }
+                _ => ReconcileReason::TransportDropAfterSend,
+            },
             guidance: ReconcileGuidance {
                 actions: vec![ReconcileAction::CheckTarget],
             },
+            retry_hint,
+            throttle_scope,
         }),
         TransmissionState::Unsent
         | TransmissionState::InFlight
@@ -1051,12 +1063,15 @@ mod tests {
 
     #[test]
     fn quota_inflight_non_idempotent_reconciles() {
+        let hint = RetryHint::After(Duration::from_secs(45));
         let recovery = derive(
             &AccountErrorKind::Server(ServerErrorKind::QuotaExhausted),
             None,
             Some(AccountOperation::Send),
             &CauseChain::new(vec![
-                Cause::Server(ServerCause::QuotaExhausted { retry_hint: None }),
+                Cause::Server(ServerCause::QuotaExhausted {
+                    retry_hint: Some(hint),
+                }),
                 Cause::Attempt(AttemptCause {
                     transmission_state: TransmissionState::InFlight,
                 }),
@@ -1068,9 +1083,12 @@ mod tests {
         assert!(matches!(
             recovery,
             RecoveryClass::Reconcile(ReconcileAdvice {
-                reason: ReconcileReason::TransportDropAfterSend,
+                reason: ReconcileReason::ThrottledMidFlight,
+                retry_hint: Some(actual_hint),
+                throttle_scope: Some(ThrottleScope::Account),
                 ..
             })
+            if actual_hint == hint
         ));
     }
 
@@ -1357,6 +1375,8 @@ mod tests {
                 guidance: ReconcileGuidance {
                     actions: vec![ReconcileAction::CheckTarget],
                 },
+                retry_hint: None,
+                throttle_scope: None,
             }),
             RecoveryClass::Engine(EngineDirective::RestartAccount),
             RecoveryClass::AuthLost,

@@ -17,9 +17,13 @@ pub struct CauseChain {
 }
 
 impl CauseChain {
+    pub(crate) fn try_new(causes: Vec<Cause>) -> Option<Self> {
+        (!causes.is_empty()).then_some(Self { causes })
+    }
+
+    #[cfg(test)]
     pub(crate) fn new(causes: Vec<Cause>) -> Self {
-        debug_assert!(!causes.is_empty());
-        Self { causes }
+        Self::try_new(causes).expect("test cause chain must be non-empty")
     }
 
     #[must_use]
@@ -898,6 +902,11 @@ mod tests {
             Cause::Wire(WireCause::Jmap(JmapMethod::StateMismatch))
         ));
         assert_eq!(chain.iter().count(), 2);
+    }
+
+    #[test]
+    fn cause_chain_rejects_empty_input() {
+        assert!(CauseChain::try_new(Vec::new()).is_none());
     }
 
     #[test]

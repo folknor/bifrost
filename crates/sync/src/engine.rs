@@ -1658,6 +1658,12 @@ impl SyncEngine {
                                 break;
                             }
                             RecoveryPlan::Reconcile(advice) => {
+                                crate::recovery::record_reconcile_throttle(
+                                    &slot.throttles,
+                                    account_id,
+                                    &advice,
+                                    &original,
+                                );
                                 let mut wants_dedupe = false;
                                 for action in &advice.guidance.actions {
                                     match action {
@@ -4365,6 +4371,12 @@ pub(crate) async fn handle_account_error(
             );
         }
         RecoveryPlan::Reconcile(advice) => {
+            crate::recovery::record_reconcile_throttle(
+                ctx.throttles,
+                ctx.account_id,
+                &advice,
+                &error,
+            );
             // The poll loop / push reconciler perform the actual probe;
             // if we reach this branch via the reopen listener their
             // next pass owns the reconcile. Surface the actions for
@@ -5719,6 +5731,9 @@ fn classify_item_outcome(
                     }
                 }
                 RecoveryPlan::Reconcile(advice) => {
+                    crate::recovery::record_reconcile_throttle(
+                        throttles, account_id, &advice, &original,
+                    );
                     for action in &advice.guidance.actions {
                         if matches!(action, ReconcileAction::DedupeByClientId) {
                             *dedupe_count = dedupe_count.saturating_add(1);

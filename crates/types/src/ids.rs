@@ -11,6 +11,18 @@
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ObjectId(pub String);
 
+impl From<String> for ObjectId {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl From<&str> for ObjectId {
+    fn from(value: &str) -> Self {
+        Self(value.to_owned())
+    }
+}
+
 /// Folder identifier (IMAP mailbox path encoded by the protocol crate, Graph
 /// folder id, etc.). Opaque to the engine.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -28,6 +40,18 @@ pub struct LabelId(pub String);
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MailboxId(pub String);
 
+impl From<String> for MailboxId {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl From<&str> for MailboxId {
+    fn from(value: &str) -> Self {
+        Self(value.to_owned())
+    }
+}
+
 /// Blob handle identifier. Opaque; protocol crates resolve it to a URL
 /// (JMAP, Gmail, Graph) or to `UID + section` (IMAP).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -38,6 +62,18 @@ pub struct BlobId(pub String);
 /// across protocols.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ThreadId(pub String);
+
+impl From<String> for ThreadId {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl From<&str> for ThreadId {
+    fn from(value: &str) -> Self {
+        Self(value.to_owned())
+    }
+}
 
 /// Identifier for a registered account (engine-side).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

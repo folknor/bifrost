@@ -16,6 +16,18 @@ pub struct AddressBookId(pub String);
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ContactId(pub String);
 
+impl From<String> for ContactId {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl From<&str> for ContactId {
+    fn from(value: &str) -> Self {
+        Self(value.to_owned())
+    }
+}
+
 /// Which corpus an address book - and every contact under it - belongs
 /// to.
 ///

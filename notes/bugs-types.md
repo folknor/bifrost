@@ -72,56 +72,6 @@ their hashes. It found a different, worse defect at that site instead; see
 the refutation, and the carddav/sync/test-support hard-coded `0` producers were
 not tested by anyone.
 
-## 4. `ErrorScope`'s hand-written `Serialize` declares a field count it never writes
-
-`error/scope.rs:26` - `serialize_struct("ErrorScope", 4)` for arms that write 1,
-2, or 3 fields. Self-describing formats (JSON) tolerate this; length-prefixed
-ones (bincode, postcard, MessagePack in compact mode) produce corrupt output.
-`ErrorScope` rides `SupportExportConsented`, which is exactly the thing you would
-ship to a support pipeline in a binary format.
-
-**Confidence: high** on the bug, medium on whether any current consumer uses a
-non-self-describing format.
-
-## 5. `into_builder` silently downgrades recovery classification
-
-`error/account_error.rs:167` / `builder.rs:142-155`. `idempotency_override` and
-`throttle_scope` are dropped on the round-trip and derived fields recompute from
-what remains. A tenant-scoped `Server(RateLimited)` that any layer decorates with
-an extra cause loses its `ThrottleScope`, so the engine never lifts it into a
-`ThrottleKey` bucket and keeps hammering the tenant with sibling accounts' work.
-It is documented as a caveat, but "the decoration path silently changes the
-classification unless every caller remembers to reapply two setters" is a
-defaulting choice, not a caveat.
-
-**Confidence: high.** Fix: carry both in `RebuildParts`.
-
-## 6. `ThrottleScope` and `retry_hint` are dropped whenever a throttle reconciles
-
-`error/recovery.rs:734-766`. `transient_retry_or_reconcile` on `InFlight` +
-non-idempotent produces `Reconcile`, which has no field for either. So a
-rate-limit or quota failure hit during a non-idempotent send never enters the
-throttle bucket at all. Compounding this, the `ReconcileReason` it reports is
-`TransportDropAfterSend` - for a `QuotaExhausted` error. The test at
-`recovery.rs:1053` pins that lie as correct behaviour. Throttling is orthogonal
-to retry-vs-reconcile and the enum shape forces the producer to misdescribe what
-happened.
-
-**Confidence: high.** Fix: hoist `throttle_scope`/`retry_hint` onto
-`RecoveryClass::Reconcile` (or beside it on the error), and add a
-`ReconcileReason::ThrottledMidFlight` arm.
-
-## 7. `AccountErrorBuildError::EmptyChain` is documented as an enforced invariant and is enforced nowhere
-
-`builder.rs:27`; `reference/error-model.md:57` calls it one of "the five enforced
-invariants". No code path returns it. The actual protection is `CauseChain::new`'s
-`debug_assert!` (`cause.rs:21`) plus `outermost()` indexing `causes[0]` - in
-release, an empty chain is an index panic, not a `BuildError`.
-
-**Confidence: high** (grep-verified). Fix that keeps the variant: make
-`CauseChain::new` fallible and have `try_build` return `EmptyChain`, or make the
-chain a genuine non-empty type (`(Cause, Vec<Cause>)`) and delete the variant.
-
 ## 8. `PageBoundary::Partial` documents "checkpoint is `None`" and nothing enforces it
 
 `events.rs:113-136`. `Batch` has all-public fields and no constructor, so
@@ -255,22 +205,6 @@ sentinel values" rule `AccountErrorBuilder::status` states two files away. The t
 conditions want separate carriers. Also, the function returns raw
 `Vec<BatchInputInvalidItem>`, so six protocol crates each hand-assemble the
 identical `Request(BatchInputInvalid)` error; it should return the `AccountError`.
-
-## 20. `message_key` for `Unsupported` breaks its own namespace convention
-
-`error/message_key.rs:81` - bare `"unsupported"` with no family prefix, in a
-namespace documented as "dotted, family-prefixed". Prefix-grouped dashboards
-mis-bucket it. And the reference's claim that the keys are "exhaustively pinned by
-`documented_message_keys_are_derived`" is false: `NotFound::{Draft, Identity,
-Vacation, PushSubscription, Account}` - five of eleven arms - are not in the
-test's case list.
-
-## 21. `ErrorScope` is the only place in the crate where ids are stringly typed
-
-`error/scope.rs:10-16` uses `Mailbox { id: String }`, `Message { id: String }`, …
-while the crate ships `MailboxId`, `ObjectId`, `ThreadId`, `CalendarId`,
-`ContactId` newtypes and uses them everywhere else. Producers stringify at the
-error boundary and consumers cannot round-trip back.
 
 ## 22. `InventoryPartition` mixes range conventions inside one enum
 

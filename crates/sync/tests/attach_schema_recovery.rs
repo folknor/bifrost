@@ -870,7 +870,7 @@ impl Account for HealAccount {
                 failed_ids: vec!["urn:uuid:unparseable-vcard".to_owned()],
                 skipped_scopes: vec![bifrost_types::SkippedScope {
                     scope: ErrorScope::Mailbox {
-                        id: "shared-book".to_owned(),
+                        id: "shared-book".into(),
                     },
                     error: unsupported(bifrost_types::AccountOperation::ContactsList),
                 }],
@@ -2248,7 +2248,7 @@ async fn open_skips_surface_on_attach_and_reopen_replaces_them() {
     let account_id = AccountId("open-skips".to_owned());
     let skip = bifrost_types::SkippedScope {
         scope: bifrost_types::ErrorScope::Mailbox {
-            id: "shared-acct".to_owned(),
+            id: "shared-acct".into(),
         },
         error: unsupported(bifrost_types::AccountOperation::Discover),
     };
@@ -2280,7 +2280,7 @@ async fn open_skips_surface_on_attach_and_reopen_replaces_them() {
         .expect("attached account exposes its skip lane");
     assert_eq!(skips.len(), 1, "attach stores the open-time skip");
     assert!(
-        matches!(&skips[0].scope, bifrost_types::ErrorScope::Mailbox { id } if id == "shared-acct"),
+        matches!(&skips[0].scope, bifrost_types::ErrorScope::Mailbox { id } if id.0 == "shared-acct"),
         "the lane preserves WHICH scope was skipped: {:?}",
         skips[0].scope
     );

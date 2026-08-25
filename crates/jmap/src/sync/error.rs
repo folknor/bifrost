@@ -71,7 +71,9 @@ impl JmapErrorContext {
 
     #[must_use]
     pub(crate) fn message(operation: AccountOperation, id: impl Into<String>) -> Self {
-        Self::new(operation).with_scope(ErrorScope::Message { id: id.into() })
+        Self::new(operation).with_scope(ErrorScope::Message {
+            id: (id.into()).into(),
+        })
     }
 
     /// Unused convenience wrappers: both scopes ARE produced (see
@@ -83,13 +85,17 @@ impl JmapErrorContext {
     #[allow(dead_code)]
     #[must_use]
     pub(crate) fn mailbox(operation: AccountOperation, id: impl Into<String>) -> Self {
-        Self::new(operation).with_scope(ErrorScope::Mailbox { id: id.into() })
+        Self::new(operation).with_scope(ErrorScope::Mailbox {
+            id: (id.into()).into(),
+        })
     }
 
     #[allow(dead_code)]
     #[must_use]
     pub(crate) fn thread(operation: AccountOperation, id: impl Into<String>) -> Self {
-        Self::new(operation).with_scope(ErrorScope::Thread { id: id.into() })
+        Self::new(operation).with_scope(ErrorScope::Thread {
+            id: (id.into()).into(),
+        })
     }
 }
 
@@ -347,7 +353,7 @@ pub(crate) fn cross_account_destination(
     .protocol(Protocol::Jmap)
     .operation(operation)
     .scope(ErrorScope::Message {
-        id: target_id.to_string(),
+        id: (target_id.to_string()).into(),
     })
     .try_build()
     .expect("valid account error classification")
@@ -754,11 +760,11 @@ fn resource_from_scope(scope: Option<&ErrorScope>) -> Option<ResourceKind> {
 
 fn id_from_scope(scope: Option<&ErrorScope>) -> Option<String> {
     match scope? {
-        ErrorScope::Message { id }
-        | ErrorScope::Mailbox { id }
-        | ErrorScope::Thread { id }
-        | ErrorScope::Calendar { id }
-        | ErrorScope::Contact { id } => Some(id.clone()),
+        ErrorScope::Message { id } => Some(id.0.clone()),
+        ErrorScope::Mailbox { id } => Some(id.0.clone()),
+        ErrorScope::Thread { id } => Some(id.0.clone()),
+        ErrorScope::Calendar { id } => Some(id.0.clone()),
+        ErrorScope::Contact { id } => Some(id.0.clone()),
         ErrorScope::Account
         | ErrorScope::Cursor(_)
         | ErrorScope::CalendarCollection
@@ -2149,7 +2155,7 @@ mod tests {
             assert_wire_shape(&bare, code);
 
             let item_scope = ErrorScope::Message {
-                id: "msg-1".to_string(),
+                id: ("msg-1".to_string()).into(),
             };
             let scoped = set_error_to_account_error(
                 set_error(code),
@@ -2204,7 +2210,7 @@ mod tests {
                     JmapErrorContext::new(operation),
                     BatchItemId("msg-1".to_string()),
                     Some(ErrorScope::Message {
-                        id: "msg-1".to_string(),
+                        id: ("msg-1".to_string()).into(),
                     }),
                 );
                 assert!(
@@ -2231,7 +2237,7 @@ mod tests {
                 JmapErrorContext::new(operation),
                 BatchItemId("msg-1".to_string()),
                 Some(ErrorScope::Message {
-                    id: "msg-1".to_string(),
+                    id: ("msg-1".to_string()).into(),
                 }),
             );
             assert!(

@@ -1,19 +1,89 @@
 use serde::Serialize;
 
+use crate::calendar::CalendarId;
+use crate::contact::ContactId;
 use crate::cursor::{CursorScope, ObjectType};
+use crate::ids::{MailboxId, ObjectId, ThreadId};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum ErrorScope {
     Account,
     Cursor(CursorScope),
-    Mailbox { id: String },
-    Message { id: String },
-    Thread { id: String },
-    Calendar { id: String },
+    Mailbox { id: MailboxId },
+    Message { id: ObjectId },
+    Thread { id: ThreadId },
+    Calendar { id: CalendarId },
     CalendarCollection,
-    Contact { id: String },
+    Contact { id: ContactId },
     ContactCollection,
+}
+
+/// One serialized `(name, value)` pair. Every `ErrorScope` field is a
+/// string, so the whole projection fits a flat array.
+type ScopeField<'a> = (&'static str, &'a str);
+
+/// Fixed-capacity accumulator for the serialized projection. Four is
+/// the widest shape (`Cursor(FolderType)`: kind + scope_kind +
+/// folder_id + object_type).
+struct ScopeFields<'a> {
+    buf: [ScopeField<'a>; 4],
+    len: usize,
+}
+
+impl<'a> ScopeFields<'a> {
+    fn new() -> Self {
+        Self {
+            buf: [("", ""); 4],
+            len: 0,
+        }
+    }
+
+    fn push(mut self, name: &'static str, value: &'a str) -> Self {
+        self.buf[self.len] = (name, value);
+        self.len += 1;
+        self
+    }
+
+    fn as_slice(&self) -> &[ScopeField<'a>] {
+        &self.buf[..self.len]
+    }
+}
+
+/// The serialized projection of an `ErrorScope`, names and values
+/// together. `serialize` declares `len()` as the struct field count and
+/// then writes exactly these pairs, so the declared count cannot drift
+/// from the fields actually written. A mismatch corrupts output in
+/// length-prefixed formats (bincode, postcard, compact MessagePack),
+/// which self-describing JSON would have hidden.
+fn scope_fields(scope: &ErrorScope) -> ScopeFields<'_> {
+    let fields = ScopeFields::new();
+    match scope {
+        ErrorScope::Account => fields.push("kind", "account"),
+        ErrorScope::Cursor(cursor) => cursor_scope_fields(fields.push("kind", "cursor"), cursor),
+        ErrorScope::Mailbox { id } => fields.push("kind", "mailbox").push("id", &id.0),
+        ErrorScope::Message { id } => fields.push("kind", "message").push("id", &id.0),
+        ErrorScope::Thread { id } => fields.push("kind", "thread").push("id", &id.0),
+        ErrorScope::Calendar { id } => fields.push("kind", "calendar").push("id", &id.0),
+        ErrorScope::CalendarCollection => fields.push("kind", "calendar_collection"),
+        ErrorScope::Contact { id } => fields.push("kind", "contact").push("id", &id.0),
+        ErrorScope::ContactCollection => fields.push("kind", "contact_collection"),
+    }
+}
+
+fn cursor_scope_fields<'a>(fields: ScopeFields<'a>, scope: &'a CursorScope) -> ScopeFields<'a> {
+    match scope {
+        CursorScope::Account => fields.push("scope_kind", "account"),
+        CursorScope::Type(ty) => fields
+            .push("scope_kind", "type")
+            .push("object_type", object_type_name(*ty)),
+        CursorScope::Query(id) => fields.push("scope_kind", "query").push("query_id", &id.0),
+        CursorScope::Folder(id) => fields.push("scope_kind", "folder").push("folder_id", &id.0),
+        CursorScope::FolderType { folder, ty } => fields
+            .push("scope_kind", "folder_type")
+            .push("folder_id", &folder.0)
+            .push("object_type", object_type_name(*ty)),
+    }
 }
 
 impl Serialize for ErrorScope {
@@ -23,76 +93,14 @@ impl Serialize for ErrorScope {
     {
         use serde::ser::SerializeStruct;
 
-        let mut state = serializer.serialize_struct("ErrorScope", 4)?;
-        match self {
-            Self::Account => {
-                state.serialize_field("kind", "account")?;
-            }
-            Self::Cursor(scope) => {
-                state.serialize_field("kind", "cursor")?;
-                serialize_cursor_scope(&mut state, scope)?;
-            }
-            Self::Mailbox { id } => {
-                state.serialize_field("kind", "mailbox")?;
-                state.serialize_field("id", id)?;
-            }
-            Self::Message { id } => {
-                state.serialize_field("kind", "message")?;
-                state.serialize_field("id", id)?;
-            }
-            Self::Thread { id } => {
-                state.serialize_field("kind", "thread")?;
-                state.serialize_field("id", id)?;
-            }
-            Self::Calendar { id } => {
-                state.serialize_field("kind", "calendar")?;
-                state.serialize_field("id", id)?;
-            }
-            Self::CalendarCollection => {
-                state.serialize_field("kind", "calendar_collection")?;
-            }
-            Self::Contact { id } => {
-                state.serialize_field("kind", "contact")?;
-                state.serialize_field("id", id)?;
-            }
-            Self::ContactCollection => {
-                state.serialize_field("kind", "contact_collection")?;
-            }
+        let fields = scope_fields(self);
+        let fields = fields.as_slice();
+        let mut state = serializer.serialize_struct("ErrorScope", fields.len())?;
+        for (name, value) in fields {
+            state.serialize_field(name, value)?;
         }
         state.end()
     }
-}
-
-fn serialize_cursor_scope<S>(
-    state: &mut S,
-    scope: &CursorScope,
-) -> Result<(), <S as serde::ser::SerializeStruct>::Error>
-where
-    S: serde::ser::SerializeStruct,
-{
-    match scope {
-        CursorScope::Account => {
-            state.serialize_field("scope_kind", "account")?;
-        }
-        CursorScope::Type(ty) => {
-            state.serialize_field("scope_kind", "type")?;
-            state.serialize_field("object_type", object_type_name(*ty))?;
-        }
-        CursorScope::Query(id) => {
-            state.serialize_field("scope_kind", "query")?;
-            state.serialize_field("query_id", &id.0)?;
-        }
-        CursorScope::Folder(id) => {
-            state.serialize_field("scope_kind", "folder")?;
-            state.serialize_field("folder_id", &id.0)?;
-        }
-        CursorScope::FolderType { folder, ty } => {
-            state.serialize_field("scope_kind", "folder_type")?;
-            state.serialize_field("folder_id", &folder.0)?;
-            state.serialize_field("object_type", object_type_name(*ty))?;
-        }
-    }
-    Ok(())
 }
 
 fn object_type_name(ty: ObjectType) -> &'static str {
@@ -281,7 +289,97 @@ pub enum Protocol {
 
 #[cfg(test)]
 mod tests {
-    use super::AccountOperation;
+    use super::{AccountOperation, ErrorScope, scope_fields};
+    use crate::cursor::{CursorScope, ObjectType};
+    use crate::ids::{FolderId, QueryId};
+
+    /// `scope_fields` is the single source for both the declared struct
+    /// field count and the fields written, so pinning it pins the
+    /// serialized shape. A count that overstates the fields written
+    /// corrupts length-prefixed output.
+    #[test]
+    fn scope_fields_pin_the_serialized_shape() {
+        let cases: Vec<(ErrorScope, Vec<(&str, &str)>)> = vec![
+            (ErrorScope::Account, vec![("kind", "account")]),
+            (
+                ErrorScope::CalendarCollection,
+                vec![("kind", "calendar_collection")],
+            ),
+            (
+                ErrorScope::ContactCollection,
+                vec![("kind", "contact_collection")],
+            ),
+            (
+                ErrorScope::Mailbox { id: "b".into() },
+                vec![("kind", "mailbox"), ("id", "b")],
+            ),
+            (
+                ErrorScope::Message { id: "m".into() },
+                vec![("kind", "message"), ("id", "m")],
+            ),
+            (
+                ErrorScope::Thread { id: "t".into() },
+                vec![("kind", "thread"), ("id", "t")],
+            ),
+            (
+                ErrorScope::Calendar { id: "c".into() },
+                vec![("kind", "calendar"), ("id", "c")],
+            ),
+            (
+                ErrorScope::Contact { id: "p".into() },
+                vec![("kind", "contact"), ("id", "p")],
+            ),
+            (
+                ErrorScope::Cursor(CursorScope::Account),
+                vec![("kind", "cursor"), ("scope_kind", "account")],
+            ),
+            (
+                ErrorScope::Cursor(CursorScope::Type(ObjectType::Email)),
+                vec![
+                    ("kind", "cursor"),
+                    ("scope_kind", "type"),
+                    ("object_type", "email"),
+                ],
+            ),
+            (
+                ErrorScope::Cursor(CursorScope::Query(QueryId("q".into()))),
+                vec![
+                    ("kind", "cursor"),
+                    ("scope_kind", "query"),
+                    ("query_id", "q"),
+                ],
+            ),
+            (
+                ErrorScope::Cursor(CursorScope::Folder(FolderId("f".into()))),
+                vec![
+                    ("kind", "cursor"),
+                    ("scope_kind", "folder"),
+                    ("folder_id", "f"),
+                ],
+            ),
+            (
+                ErrorScope::Cursor(CursorScope::FolderType {
+                    folder: FolderId("f".into()),
+                    ty: ObjectType::Email,
+                }),
+                vec![
+                    ("kind", "cursor"),
+                    ("scope_kind", "folder_type"),
+                    ("folder_id", "f"),
+                    ("object_type", "email"),
+                ],
+            ),
+        ];
+
+        for (scope, expected) in cases {
+            let fields = scope_fields(&scope);
+            assert_eq!(
+                fields.as_slice(),
+                expected.as_slice(),
+                "serialized projection for {scope:?}"
+            );
+        }
+    }
 
     #[test]
     fn host_attachment_is_not_idempotent() {

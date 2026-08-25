@@ -969,7 +969,10 @@ async fn handle_drive_outcome(
                         exit: false,
                     }
                 }
-                RecoveryPlan::Reconcile(_) => {
+                RecoveryPlan::Reconcile(advice) => {
+                    crate::recovery::record_reconcile_throttle(
+                        throttles, account_id, &advice, &original,
+                    );
                     // A read stream's reconcile collapses to "rerun
                     // this scope soon". Sleep briefly so we do not
                     // hot-spin, then re-enter the poll loop. The
@@ -977,7 +980,12 @@ async fn handle_drive_outcome(
                     // DedupeByClientId) drive through the mutation
                     // pipeline; the change-stream side does not have a
                     // per-item lane to dedupe.
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    let delay = crate::recovery::reconcile_delay(
+                        &advice,
+                        std::time::SystemTime::now(),
+                        std::time::Duration::from_secs(1),
+                    );
+                    tokio::time::sleep(delay).await;
                     DriveRecovery {
                         advanced: false,
                         exit: false,

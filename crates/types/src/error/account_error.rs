@@ -32,6 +32,8 @@ struct AccountErrorInner {
     diagnostics: DiagnosticInfo,
     chain: CauseChain,
     message_key: &'static str,
+    idempotency_override: Option<bool>,
+    throttle_scope: Option<ThrottleScope>,
 }
 
 impl AccountError {
@@ -48,6 +50,8 @@ impl AccountError {
                 diagnostics: parts.diagnostics,
                 chain: parts.chain,
                 message_key: parts.message_key,
+                idempotency_override: parts.idempotency_override,
+                throttle_scope: parts.throttle_scope,
             }),
         }
     }
@@ -159,11 +163,9 @@ impl AccountError {
     /// must construct a fresh builder via `AccountErrorBuilder::new`.
     ///
     /// Derived fields (`recovery`, `remediation`, `message_key`) are
-    /// recomputed on `try_build()`. Builder-only overrides
-    /// (`idempotency_override`, `throttle_scope`) are not preserved by
-    /// the round-trip and must be reapplied if the caller needs them.
-    /// Retry hints set on a `ServerCause` survive structurally through
-    /// the chain.
+    /// recomputed on `try_build()`. Builder overrides
+    /// (`idempotency_override`, `throttle_scope`) and retry hints set on
+    /// a `ServerCause` survive the round-trip.
     #[must_use]
     pub fn into_builder(self) -> super::builder::AccountErrorBuilder {
         let inner = Arc::try_unwrap(self.inner).unwrap_or_else(|arc| (*arc).clone());
@@ -178,6 +180,8 @@ impl AccountError {
             provider: inner.provider,
             protocol: inner.protocol,
             diagnostics: inner.diagnostics,
+            idempotency_override: inner.idempotency_override,
+            throttle_scope: inner.throttle_scope,
         })
     }
 }
@@ -205,6 +209,8 @@ pub(crate) struct AccountErrorParts {
     pub diagnostics: DiagnosticInfo,
     pub chain: CauseChain,
     pub message_key: &'static str,
+    pub idempotency_override: Option<bool>,
+    pub throttle_scope: Option<ThrottleScope>,
 }
 
 impl<'a> TelemetryView<'a> {
@@ -261,7 +267,7 @@ fn recovery_fields(recovery: &RecoveryClass) -> RecoveryFields<'_> {
         RecoveryClass::Reconcile(advice) => (
             None,
             None,
-            None,
+            advice.throttle_scope,
             Some(advice.reason),
             Some(advice.guidance.actions.as_slice()),
         ),
@@ -386,5 +392,47 @@ mod tests {
             }))
         );
         assert!(last_cause_is_attempt);
+    }
+
+    #[test]
+    fn into_builder_preserves_recovery_overrides() {
+        use std::time::Duration;
+
+        use crate::error::{
+            AccountOperation, AttemptCause, Cause, ReconcileReason, RetryHint, ServerCause,
+            ServerErrorKind, ThrottleScope, TransmissionState,
+        };
+
+        let hint = RetryHint::After(Duration::from_secs(30));
+        let original = AccountErrorBuilder::new(
+            AccountErrorKind::Server(ServerErrorKind::RateLimited),
+            Cause::Server(ServerCause::RateLimited {
+                retry_hint: Some(hint),
+            }),
+        )
+        .operation(AccountOperation::Send)
+        .push_cause(Cause::Attempt(AttemptCause::new(
+            TransmissionState::InFlight,
+        )))
+        .idempotency_override(false)
+        .throttle_scope(ThrottleScope::Tenant)
+        .try_build()
+        .expect("valid account error classification");
+
+        let rebuilt = original
+            .into_builder()
+            .push_cause(Cause::Attempt(AttemptCause::new(
+                TransmissionState::InFlight,
+            )))
+            .try_build()
+            .expect("valid account error classification");
+
+        assert!(matches!(
+            rebuilt.recovery(),
+            RecoveryClass::Reconcile(advice)
+                if advice.reason == ReconcileReason::ThrottledMidFlight
+                    && advice.retry_hint == Some(hint)
+                    && advice.throttle_scope == Some(ThrottleScope::Tenant)
+        ));
     }
 }

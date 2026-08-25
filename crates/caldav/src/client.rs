@@ -1225,7 +1225,9 @@ pub(crate) fn status_error(
 }
 
 pub(crate) fn event_scope(id: impl Into<String>) -> ErrorScope {
-    ErrorScope::Calendar { id: id.into() }
+    ErrorScope::Calendar {
+        id: (id.into()).into(),
+    }
 }
 
 const PROPFIND_PRINCIPAL: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\

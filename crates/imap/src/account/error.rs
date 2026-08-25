@@ -102,7 +102,7 @@ impl ImapErrorContext {
     #[must_use]
     pub(crate) fn with_mailbox(mut self, mailbox: &MailboxName) -> Self {
         self.scope = Some(ErrorScope::Mailbox {
-            id: mailbox.as_str().to_owned(),
+            id: mailbox.as_str().into(),
         });
         self
     }
@@ -126,7 +126,9 @@ impl ImapErrorContext {
 
     #[must_use]
     pub(crate) fn with_message_id(mut self, id: impl Into<String>) -> Self {
-        self.scope = Some(ErrorScope::Message { id: id.into() });
+        self.scope = Some(ErrorScope::Message {
+            id: (id.into()).into(),
+        });
         self
     }
 
@@ -739,10 +741,10 @@ fn classify_response_code(code: &ResponseCode, ctx: &ImapErrorContext) -> Option
     // matching only the latter silently degrades on every real
     // folder-scoped failure rather than on none of them.
     let id_from_scope = || match ctx.scope.as_ref() {
-        Some(ErrorScope::Mailbox { id }) => Some(id.clone()),
+        Some(ErrorScope::Mailbox { id }) => Some(id.0.clone()),
         Some(ErrorScope::Cursor(CursorScope::Folder(folder))) => Some(folder.0.clone()),
-        Some(ErrorScope::Message { id }) => Some(id.clone()),
-        Some(ErrorScope::Thread { id }) => Some(id.clone()),
+        Some(ErrorScope::Message { id }) => Some(id.0.clone()),
+        Some(ErrorScope::Thread { id }) => Some(id.0.clone()),
         _ => None,
     };
     let mailbox_throttle = || match ctx.scope.as_ref() {

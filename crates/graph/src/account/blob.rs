@@ -213,7 +213,7 @@ fn open_ews_blob_stream(
             }
             Err(EwsAttachmentError::Ews(error)) => {
                 let ctx = GraphErrorContext::ews(AccountOperation::OpenBlob)
-                    .with_scope(ErrorScope::Message { id: locator.message_id.clone() });
+                    .with_scope(ErrorScope::Message { id: (locator.message_id.clone() ).into()});
                 yield SyncEvent::Terminated(super::graph_error::ews_error_to_account_error(
                     *error, ctx,
                 ));
@@ -355,7 +355,7 @@ pub(crate) fn open_raw_rfc822(
             Ok(stream) => stream,
             Err(error) => {
                 let ctx = GraphErrorContext::graph(op)
-                    .with_scope(ErrorScope::Message { id: message.0.clone() });
+                    .with_scope(ErrorScope::Message { id: (message.0.clone() ).into()});
                 yield SyncEvent::Terminated(into_account_error(*error, ctx));
                 yield SyncEvent::Done(None);
                 return;
@@ -387,7 +387,7 @@ pub(crate) fn open_raw_rfc822(
                     .operation(op)
                     .provider(Provider::Microsoft)
                     .protocol(Protocol::Graph)
-                    .scope(ErrorScope::Message { id: message.0.clone() })
+                    .scope(ErrorScope::Message { id: (message.0.clone() ).into()})
                     .try_build()
                     .expect("valid account error classification");
                     yield SyncEvent::Terminated(account_error);

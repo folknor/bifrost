@@ -523,12 +523,12 @@ async fn seed_foreign_account_or_skip<T: HttpTransport>(
                 err,
                 super::error::JmapErrorContext::new(bifrost_types::AccountOperation::Discover)
                     .with_scope(bifrost_types::ErrorScope::Mailbox {
-                        id: foreign_id.to_string(),
+                        id: (foreign_id.to_string()).into(),
                     }),
             );
             Err(SkippedScope {
                 scope: bifrost_types::ErrorScope::Mailbox {
-                    id: foreign_id.to_string(),
+                    id: (foreign_id.to_string()).into(),
                 },
                 error,
             })
@@ -2304,7 +2304,7 @@ mod tests {
         };
 
         assert!(
-            matches!(&skip.scope, bifrost_types::ErrorScope::Mailbox { id } if id == "shared"),
+            matches!(&skip.scope, bifrost_types::ErrorScope::Mailbox { id } if id.0 == "shared"),
             "the skip names the degraded foreign account: {:?}",
             skip.scope
         );
@@ -2331,7 +2331,7 @@ mod tests {
         };
 
         assert!(
-            matches!(&skip.scope, bifrost_types::ErrorScope::Mailbox { id } if id == "shared"),
+            matches!(&skip.scope, bifrost_types::ErrorScope::Mailbox { id } if id.0 == "shared"),
             "the skip names the degraded foreign account: {:?}",
             skip.scope
         );
