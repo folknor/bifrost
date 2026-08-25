@@ -77,6 +77,19 @@ pub trait TokenSource: Send + Sync + 'static {
     /// 401-retry path. Implementations must not coalesce internally;
     /// the refresher handles single-flighting.
     fn refresh(&self) -> AccountFuture<Result<AccessToken, Error>>;
+
+    /// Refresh only if `used` is still the token this source exposes.
+    ///
+    /// The default preserves the behavior of simple token sources. A
+    /// coordinating cache overrides this to collapse concurrent 401s:
+    /// once one request has replaced the rejected token, later requests
+    /// reuse that replacement instead of contacting the issuer again.
+    fn refresh_if_unchanged(
+        &self,
+        _used: AccessToken,
+    ) -> AccountFuture<Result<AccessToken, Error>> {
+        self.refresh()
+    }
 }
 
 /// An OAuth access token. The bytes are held in a `Zeroizing<String>`
@@ -265,7 +278,7 @@ impl OAuthRefresher {
     /// refresh driver. Concurrent callers register a oneshot receiver
     /// and await.
     pub async fn token(&self) -> Result<AccessToken, Error> {
-        self.token_inner(false).await
+        self.token_inner(false, None).await
     }
 
     /// Force a fresh token, bypassing the proactive-refresh window.
@@ -274,14 +287,28 @@ impl OAuthRefresher {
     /// flight registers as a waiter on the existing refresh rather
     /// than launching a second network round-trip.
     pub async fn force_refresh(&self) -> Result<AccessToken, Error> {
-        self.token_inner(true).await
+        self.token_inner(true, None).await
+    }
+
+    /// Refresh after a target 401 only while the rejected token is still
+    /// current. If another request already replaced it, return that newer
+    /// token without another issuer call.
+    pub async fn force_refresh_if_unchanged(
+        &self,
+        used: &AccessToken,
+    ) -> Result<AccessToken, Error> {
+        self.token_inner(true, Some(used)).await
     }
 
     /// Shared engine driving both `token()` and `force_refresh()`.
     /// The only difference between the two flows is whether a `Fresh`
     /// token within its proactive-refresh window short-circuits;
     /// everything else is identical.
-    async fn token_inner(&self, force: bool) -> Result<AccessToken, Error> {
+    async fn token_inner(
+        &self,
+        force: bool,
+        rejected: Option<&AccessToken>,
+    ) -> Result<AccessToken, Error> {
         // Lifetime block: snapshot the state, decide the path, drop
         // the guard before any `.await`.
         let role = {
@@ -303,6 +330,9 @@ impl OAuthRefresher {
                     refreshed_at,
                     ..
                 } => {
+                    if rejected.is_some_and(|rejected| rejected.secret != token.secret) {
+                        return Ok(token.clone());
+                    }
                     // This caller is responsible for spawning the
                     // refresh driver. Register it as the first waiter
                     // before dropping the lock so cancellation of this
@@ -482,7 +512,7 @@ impl TokenSource for OAuthRefresher {
             max_age: self.max_age,
             consecutive_failures: Arc::clone(&self.consecutive_failures),
         };
-        Box::pin(async move { me.token().await })
+        Box::pin(async move { me.token_inner(false, None).await })
     }
 
     fn refresh(&self) -> AccountFuture<Result<AccessToken, Error>> {
@@ -493,6 +523,11 @@ impl TokenSource for OAuthRefresher {
             consecutive_failures: Arc::clone(&self.consecutive_failures),
         };
         Box::pin(async move { me.force_refresh().await })
+    }
+
+    fn refresh_if_unchanged(&self, used: AccessToken) -> AccountFuture<Result<AccessToken, Error>> {
+        let me = self.clone_handle();
+        Box::pin(async move { me.force_refresh_if_unchanged(&used).await })
     }
 }
 
@@ -708,6 +743,72 @@ mod tests {
     use bytes::Bytes;
     use reqwest::header::{HeaderMap, HeaderValue, WWW_AUTHENTICATE};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use tokio::sync::Notify;
+
+    struct ControlledRefreshSource {
+        calls: AtomicUsize,
+        release_replacement: Arc<Notify>,
+    }
+
+    impl TokenSource for ControlledRefreshSource {
+        fn current(&self) -> AccountFuture<Result<AccessToken, Error>> {
+            self.refresh()
+        }
+
+        fn refresh(&self) -> AccountFuture<Result<AccessToken, Error>> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            let release = Arc::clone(&self.release_replacement);
+            Box::pin(async move {
+                if call == 2 {
+                    release.notified().await;
+                }
+                Ok(AccessToken::new(format!("token-{call}"), None))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_token_refresh_is_single_flight_and_cancellation_safe() {
+        let source = Arc::new(ControlledRefreshSource {
+            calls: AtomicUsize::new(0),
+            release_replacement: Arc::new(Notify::new()),
+        });
+        let refresher = OAuthRefresher::new(Arc::clone(&source) as Arc<dyn TokenSource>);
+        let rejected = refresher.token().await.expect("initial token");
+        assert_eq!(source.calls.load(Ordering::SeqCst), 1);
+
+        let first = refresher.clone_handle();
+        let first_rejected = rejected.clone();
+        let driver =
+            tokio::spawn(async move { first.force_refresh_if_unchanged(&first_rejected).await });
+        tokio::task::yield_now().await;
+
+        let second = refresher.clone_handle();
+        let second_rejected = rejected.clone();
+        let waiter =
+            tokio::spawn(async move { second.force_refresh_if_unchanged(&second_rejected).await });
+        tokio::task::yield_now().await;
+        assert_eq!(source.calls.load(Ordering::SeqCst), 2);
+
+        driver.abort();
+        source.release_replacement.notify_one();
+        let replacement = waiter
+            .await
+            .expect("waiter task")
+            .expect("shared refresh succeeds");
+        assert_eq!(replacement.as_str(), "token-2");
+
+        let reused = refresher
+            .force_refresh_if_unchanged(&rejected)
+            .await
+            .expect("stale 401 reuses replacement");
+        assert_eq!(reused.as_str(), "token-2");
+        assert_eq!(
+            source.calls.load(Ordering::SeqCst),
+            2,
+            "a stale rejected token must not start another issuer call"
+        );
+    }
 
     struct FailingRefreshSource {
         calls: AtomicUsize,

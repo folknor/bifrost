@@ -100,6 +100,9 @@ impl Net {
             .http2_keep_alive_timeout(config.http2_keep_alive_timeout)
             .tcp_keepalive(Some(config.tcp_keepalive))
             .danger_accept_invalid_certs(config.dangerous_accept_invalid_certs);
+        if let Some(connect_timeout) = config.connect_timeout {
+            builder = builder.connect_timeout(connect_timeout);
+        }
 
         // bifrost-net owns the redirect loop unconditionally. Reqwest's
         // default policy follows 3xx but without RFC 7231 method
@@ -237,7 +240,7 @@ impl Net {
                 }),
                 default_retry: spec.default_retry,
                 request_timeout: spec.request_timeout,
-                connect_timeout: spec.connect_timeout,
+                response_headers_timeout: spec.response_headers_timeout.or(spec.connect_timeout),
                 read_timeout: spec.read_timeout,
                 max_buffered_response: spec.max_buffered_response,
                 user_agent: spec.user_agent,
@@ -359,7 +362,7 @@ pub(crate) struct AccountNetInner {
     /// Default total request timeout. Individual builders may override it.
     pub(crate) request_timeout: Option<Duration>,
     /// Deadline for dispatch to produce response headers.
-    pub(crate) connect_timeout: Option<Duration>,
+    pub(crate) response_headers_timeout: Option<Duration>,
     /// Inactivity deadline between response body chunks.
     pub(crate) read_timeout: Option<Duration>,
     /// Buffered response ceiling for this account.
@@ -501,6 +504,7 @@ impl AccountNet {
             headers,
             body,
             account: _,
+            deadline,
         } = send_streaming_inner(builder).await?;
 
         // Ranged-download safety: if the caller asked for a specific
@@ -535,7 +539,7 @@ impl AccountNet {
         }
 
         // Wrap the body in a metering + bandwidth-cap adapter.
-        let metered = wrap_metered(body, self.clone());
+        let metered = wrap_metered(body, self.clone(), deadline);
         Ok(metered)
     }
 
@@ -631,8 +635,8 @@ impl AccountNet {
         self.inner.request_timeout
     }
 
-    pub(crate) fn connect_timeout(&self) -> Option<Duration> {
-        self.inner.connect_timeout
+    pub(crate) fn response_headers_timeout(&self) -> Option<Duration> {
+        self.inner.response_headers_timeout
     }
 
     pub(crate) fn read_timeout(&self) -> Option<Duration> {
@@ -740,7 +744,7 @@ impl AccountNet {
                 token_source: self.inner.token_source.clone(),
                 default_retry: self.inner.default_retry.clone(),
                 request_timeout: self.inner.request_timeout,
-                connect_timeout: self.inner.connect_timeout,
+                response_headers_timeout: self.inner.response_headers_timeout,
                 read_timeout: self.inner.read_timeout,
                 max_buffered_response: self.inner.max_buffered_response,
                 user_agent: self.inner.user_agent.clone(),
@@ -770,8 +774,11 @@ pub struct AccountSpec {
     /// Default total timeout applied to requests from this account.
     /// `None` leaves requests unbounded unless a builder sets one.
     pub request_timeout: Option<Duration>,
-    /// Deadline for receiving response headers from a request attempt.
+    /// Legacy name for `response_headers_timeout`. Retained for source
+    /// compatibility; new code should set `response_headers_timeout`.
     pub connect_timeout: Option<Duration>,
+    /// Per-attempt deadline for receiving response headers.
+    pub response_headers_timeout: Option<Duration>,
     /// Inactivity deadline between response body chunks.
     pub read_timeout: Option<Duration>,
     /// Ceiling for buffered response bodies. `None` disables it.
@@ -794,6 +801,7 @@ impl AccountSpec {
             default_retry: RetryPolicy::default(),
             request_timeout: None,
             connect_timeout: Some(Duration::from_secs(10)),
+            response_headers_timeout: None,
             read_timeout: Some(Duration::from_secs(30)),
             max_buffered_response: Some(DEFAULT_MAX_BUFFERED_RESPONSE),
             user_agent: format!("bifrost-net/{}", env!("CARGO_PKG_VERSION")),
@@ -942,7 +950,19 @@ fn content_range_matches(req_range: &str, resp_range: &str) -> bool {
 /// bucket refilled at `AccountNet::bandwidth_cap` bytes per second;
 /// when the cap is `None`, the wrapper is meter-only. The cap is
 /// re-read on every chunk so the engine can hot-swap it mid-stream.
-pub(crate) fn wrap_metered(body: ByteStream, account: AccountNet) -> ByteStream {
+///
+/// `deadline` is the request's total deadline. The throttle sleeps
+/// below are the only waits a request performs that the retry loop
+/// never observes, so without this the cap could carry a body well
+/// past an explicit total timeout - the lower the cap, the further
+/// past. Expiry mid-body yields `Timeout { Acknowledged }`, which is a
+/// truncation error rather than a clean end-of-stream, so a partial
+/// body can never be handed back as a complete one.
+pub(crate) fn wrap_metered(
+    body: ByteStream,
+    account: AccountNet,
+    deadline: crate::request::RequestDeadline,
+) -> ByteStream {
     let meter = account.meter();
     // Bucket carries its own state across chunks. Constructed full so
     // the first chunk of a download flows immediately, then subsequent
@@ -956,9 +976,13 @@ pub(crate) fn wrap_metered(body: ByteStream, account: AccountNet) -> ByteStream 
         async move {
             let chunk = chunk?;
             let n = u64::try_from(chunk.len()).unwrap_or(u64::MAX);
+            // Metered before the deadline check: these bytes did come
+            // off the wire, whether or not we are still allowed to
+            // hand them up.
             meter.record_bytes_in(n);
+            deadline.check_body()?;
             if cap_now.is_some() {
-                bucket.consume(n, cap_now).await;
+                deadline.bound_body(bucket.consume(n, cap_now)).await?;
             }
             Ok(chunk)
         }

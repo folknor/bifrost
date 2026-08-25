@@ -13,6 +13,10 @@ pub const DEFAULT_MAX_BUFFERED_RESPONSE: usize = 64 * 1024 * 1024;
 /// remap fields without breaking the public surface.
 #[derive(Clone)]
 pub struct NetConfig {
+    /// Deadline for DNS resolution and establishing the TCP/TLS
+    /// connection. Reqwest can therefore report expiry before any
+    /// target-request bytes were transmitted.
+    pub connect_timeout: Option<Duration>,
     /// Idle eviction timeout for pooled connections.
     pub pool_idle_timeout: Duration,
     /// Maximum idle connections kept per host.
@@ -36,6 +40,7 @@ pub struct NetConfig {
 impl Default for NetConfig {
     fn default() -> Self {
         Self {
+            connect_timeout: Some(Duration::from_secs(10)),
             pool_idle_timeout: Duration::from_secs(60),
             pool_max_idle_per_host: 8,
             http2_keep_alive_interval: Duration::from_secs(30),

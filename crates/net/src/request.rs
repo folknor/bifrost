@@ -25,6 +25,152 @@ use crate::rate::RateLimitGovernor;
 use crate::redirect::{FollowRedirects, RedirectAction, RedirectPolicy, classify_redirect};
 use crate::retry::RetryPolicy;
 
+#[derive(Clone, Copy)]
+pub(crate) struct RequestDeadline(Option<tokio::time::Instant>);
+
+impl RequestDeadline {
+    fn from_timeout(timeout: Option<Duration>) -> Self {
+        Self(timeout.map(|timeout| tokio::time::Instant::now() + timeout))
+    }
+
+    /// Deadline check for the response-body path.
+    ///
+    /// Expiry here is not the same event as expiry before dispatch:
+    /// response headers already arrived, so the server acted on the
+    /// request and the evidence is `Acknowledged`. That routes to
+    /// `Protocol(PartialResponse)` rather than a transport class, which
+    /// is what a truncated body is. The point is that a body cut short
+    /// by the deadline must never surface as a clean end-of-stream -
+    /// `send()` would otherwise hand back a prefix of the payload as if
+    /// it were the whole response.
+    pub(crate) fn check_body(self) -> Result<(), Error> {
+        match self.0 {
+            Some(at) if tokio::time::Instant::now() >= at => Err(Error::Timeout {
+                transmission_state: TransmissionState::Acknowledged,
+            }),
+            _ => Ok(()),
+        }
+    }
+
+    /// Bound a wait on the response-body path by the total deadline.
+    /// The bandwidth-cap throttle sleeps inside `ByteBucket::consume`
+    /// are the reason this exists: they are the one class of wait the
+    /// retry loop never sees, and with a low cap they can outlast the
+    /// caller's total timeout by minutes.
+    pub(crate) async fn bound_body<F: std::future::Future>(
+        self,
+        future: F,
+    ) -> Result<F::Output, Error> {
+        match self.0 {
+            Some(at) => tokio::time::timeout_at(at, future)
+                .await
+                .map_err(|_| Error::Timeout {
+                    transmission_state: TransmissionState::Acknowledged,
+                }),
+            None => Ok(future.await),
+        }
+    }
+
+    fn remaining(self) -> Result<Option<Duration>, Error> {
+        self.0
+            .map(|deadline| {
+                deadline
+                    .checked_duration_since(tokio::time::Instant::now())
+                    .filter(|remaining| !remaining.is_zero())
+                    .ok_or(Error::Timeout {
+                        transmission_state: TransmissionState::Unsent,
+                    })
+            })
+            .transpose()
+    }
+
+    /// Bound a pre-acknowledgement wait by the total deadline.
+    ///
+    /// Everything this covers - rate-limit admission, token lookup, the
+    /// forced refresh after a 401 - happens before the replacement
+    /// attempt puts anything on the wire, so expiry is `Unsent`. The
+    /// post-header counterpart is `bound_body`, which is `Acknowledged`;
+    /// keeping the two apart is the whole point of routing every wait
+    /// through this type rather than reaching for the instant directly.
+    async fn bound<F: std::future::Future>(self, future: F) -> Result<F::Output, Error> {
+        match self.0 {
+            Some(at) => tokio::time::timeout_at(at, future)
+                .await
+                .map_err(|_| Error::Timeout {
+                    transmission_state: TransmissionState::Unsent,
+                }),
+            None => Ok(future.await),
+        }
+    }
+
+    async fn sleep(self, delay: Duration) -> Result<(), Error> {
+        match self.0 {
+            Some(deadline) => tokio::time::timeout_at(deadline, tokio::time::sleep(delay))
+                .await
+                .map_err(|_| Error::Timeout {
+                    transmission_state: TransmissionState::Unsent,
+                }),
+            None => {
+                tokio::time::sleep(delay).await;
+                Ok(())
+            }
+        }
+    }
+}
+
+struct AttemptBudget {
+    used: u32,
+    limit: u32,
+}
+
+impl AttemptBudget {
+    fn new(limit: u32) -> Self {
+        Self { used: 0, limit }
+    }
+
+    fn begin(&mut self) -> u32 {
+        self.used = self.used.saturating_add(1);
+        self.used
+    }
+
+    fn can_retry(&self) -> bool {
+        self.used < self.limit
+    }
+
+    fn discard_current(&mut self) {
+        self.used = self.used.saturating_sub(1);
+    }
+}
+
+struct AuthBudget(bool);
+
+impl AuthBudget {
+    fn take(&mut self) -> bool {
+        if self.0 {
+            false
+        } else {
+            self.0 = true;
+            true
+        }
+    }
+}
+
+struct RedirectBudget {
+    used: u16,
+    limit: u8,
+}
+
+impl RedirectBudget {
+    fn follow(&mut self) -> Result<(), Error> {
+        self.used = self.used.saturating_add(1);
+        if self.used > u16::from(self.limit) {
+            Err(Error::RedirectLoop { hops: self.used })
+        } else {
+            Ok(())
+        }
+    }
+}
+
 /// Erased byte-chunk stream, as returned by `AccountNet::download_stream`.
 /// One element per chunk reqwest yields off the underlying socket;
 /// bandwidth metering wraps every chunk.
@@ -288,7 +434,7 @@ impl RequestBuilder {
         // straight body read. Apply the bandwidth meter to the read
         // so buffered receives feed the same counters and cap throttle
         // as streaming.
-        let mut body_stream = wrap_metered(internal.body, internal.account);
+        let mut body_stream = wrap_metered(internal.body, internal.account, internal.deadline);
         let mut accum: Vec<u8> = Vec::new();
         use futures::StreamExt;
         while let Some(chunk) = body_stream.next().await {
@@ -318,7 +464,7 @@ impl RequestBuilder {
         let internal = send_streaming_inner(self).await?;
         // Caller-facing streaming response wraps the body in the
         // bandwidth meter + cap adapter.
-        let metered = wrap_metered(internal.body, internal.account);
+        let metered = wrap_metered(internal.body, internal.account, internal.deadline);
         Ok(StreamingResponse {
             status: internal.status,
             headers: internal.headers,
@@ -388,6 +534,10 @@ pub(crate) struct InternalStreaming {
     pub(crate) headers: HeaderMap,
     pub(crate) body: ByteStream,
     pub(crate) account: AccountNet,
+    /// The total request deadline the retry loop computed. Carried out
+    /// so the body drain is bounded by the same deadline the dispatch
+    /// and retry waits were.
+    pub(crate) deadline: RequestDeadline,
 }
 
 /// Drive a request to a streamable response, running the retry loop
@@ -437,8 +587,9 @@ pub(crate) async fn send_streaming_inner(
     }
 
     let policy = retry.unwrap_or_else(|| account.default_retry().clone());
+    let retry_attempt_limit = policy.max_attempts;
     let redirect_policy = account.follow_redirects().clone();
-    let timeout = timeout.or_else(|| account.request_timeout());
+    let deadline = RequestDeadline::from_timeout(timeout.or_else(|| account.request_timeout()));
     if !headers.contains_key(reqwest::header::USER_AGENT) {
         let value = reqwest::header::HeaderValue::from_str(account.user_agent()).map_err(|e| {
             Error::InvalidRequest {
@@ -460,22 +611,29 @@ pub(crate) async fn send_streaming_inner(
     let mut host = host_from_url(&url);
     let mut cost_units = recompute_cost_units(account.net().governor(), host.as_deref(), cost);
 
-    let mut attempt: u32 = 0;
     let mut retry_after_history: Vec<Duration> = Vec::new();
     // Network retry budget is independent from the 401-recovery
     // budget. A 401 forces a token refresh + retry that must not
     // burn the network budget (otherwise a single stale cache hit
     // halves the retries left for transient 5xx). Cap 401 retries at
     // 1; the second 401 returns `Error::AuthLost`.
-    let mut auth_retries: u32 = 0;
-    const MAX_AUTH_RETRIES: u32 = 1;
+    let mut attempts = AttemptBudget::new(policy.max_attempts);
+    let mut auth_budget = AuthBudget(false);
     // Redirect hop count. Each redirect hop is a fresh logical
     // request - retry-budget zero, auth-budget zero, but one tick
     // against the configured `RedirectPolicy::max_hops`.
-    let mut redirect_hops: u16 = 0;
+    let redirect_limit = match &redirect_policy {
+        FollowRedirects::Disabled => 0,
+        FollowRedirects::Enabled(policy) => policy.max_hops,
+    };
+    let mut redirects = RedirectBudget {
+        used: 0,
+        limit: redirect_limit,
+    };
 
     'outer: loop {
-        attempt = attempt.saturating_add(1);
+        deadline.remaining()?;
+        let attempt = attempts.begin();
         // Resolved per attempt rather than once, because a redirect hop
         // can rewrite the method: RFC 7231 §6.4 turns a 301/302/303 on a
         // POST into a GET, and the GET that results is replayable even
@@ -487,7 +645,9 @@ pub(crate) async fn send_streaming_inner(
         // configuration bug, not a transient condition, so we do not
         // burn retry budget on it.
         if let Some(ref h) = host {
-            account.net().governor().acquire(h, cost_units).await?;
+            deadline
+                .bound(account.net().governor().acquire(h, cost_units))
+                .await??;
         }
         // Until the server acknowledges the request, cancellation or
         // any early return must restore the debited slot. Once a
@@ -516,7 +676,7 @@ pub(crate) async fn send_streaming_inner(
                     field: "bearer_auth",
                     detail: "bearer authentication requires an AccountSpec token source".to_owned(),
                 })?;
-            match source.current().await {
+            match deadline.bound(source.current()).await? {
                 Ok(t) => Some(t),
                 Err(e) => return Err(e),
             }
@@ -543,11 +703,18 @@ pub(crate) async fn send_streaming_inner(
             &headers,
             &body,
             token.as_ref(),
-            timeout,
+            deadline.remaining()?,
         );
 
         let dispatched = account.net().dispatch().send(request);
-        let dispatched = if let Some(limit) = account.connect_timeout() {
+        let headers_timeout = account.response_headers_timeout();
+        let dispatch_limit = match (headers_timeout, deadline.remaining()?) {
+            (Some(headers), Some(remaining)) => Some(headers.min(remaining)),
+            (Some(headers), None) => Some(headers),
+            (None, Some(remaining)) => Some(remaining),
+            (None, None) => None,
+        };
+        let dispatched = if let Some(limit) = dispatch_limit {
             match tokio::time::timeout(limit, dispatched).await {
                 Ok(result) => result,
                 Err(_) => Err(Error::Timeout {
@@ -566,11 +733,11 @@ pub(crate) async fn send_streaming_inner(
             }
             Err(e) => {
                 if policy.network_errors
-                    && attempt < policy.max_attempts
+                    && attempts.can_retry()
                     && transport_error_is_replayable(&e, replayable)
                 {
                     let delay = backoff_for(&policy, attempt);
-                    tokio::time::sleep(delay).await;
+                    deadline.sleep(delay).await?;
                     continue;
                 }
                 return Err(e);
@@ -593,7 +760,7 @@ pub(crate) async fn send_streaming_inner(
         // `attempt = attempt + 1` increment is undone here so a 401
         // recovery does not eat into the network attempts left.
         if auth_for_next_hop && status == StatusCode::UNAUTHORIZED {
-            if auth_retries >= MAX_AUTH_RETRIES {
+            if !auth_budget.take() {
                 let final_response =
                     final_response_from_response(response, account.read_timeout()).await;
                 return Err(Error::AuthLost {
@@ -601,22 +768,21 @@ pub(crate) async fn send_streaming_inner(
                     final_response: Some(final_response),
                 });
             }
-            auth_retries = auth_retries.saturating_add(1);
             drop(response);
             if let Some(ref h) = host {
                 account.net().governor().refund(h, cost_units);
             }
-            account
+            let rejected_token = token.expect("authenticated request minted a token");
+            let refresh = account
                 .token_source()
                 .expect("bearer-authenticated request validated its token source")
-                .refresh()
-                .await?;
-            // Undo the top-of-loop network-budget increment: 401 is
-            // its own one-shot recovery path tracked by
-            // `auth_retries`. `continue 'outer` re-enters the loop;
-            // the next `attempt = attempt + 1` brings us back to the
-            // pre-401 attempt count.
-            attempt = attempt.saturating_sub(1);
+                .refresh_if_unchanged(rejected_token);
+            deadline.bound(refresh).await??;
+            // Discard this attempt from the network budget. The 401
+            // recovery is owned by `AuthBudget`; re-entering the loop
+            // then begins the replacement-token attempt at the same
+            // network-budget position.
+            attempts.discard_current();
             continue 'outer;
         }
 
@@ -633,6 +799,7 @@ pub(crate) async fn send_streaming_inner(
                 headers: headers_out,
                 body: stream,
                 account,
+                deadline,
             });
         }
 
@@ -659,6 +826,7 @@ pub(crate) async fn send_streaming_inner(
                         headers: resp_headers,
                         body: stream,
                         account,
+                        deadline,
                     });
                 }
                 Some(policy) => {
@@ -689,15 +857,11 @@ pub(crate) async fn send_streaming_inner(
                                 headers: resp_headers,
                                 body: Box::pin(empty),
                                 account,
+                                deadline,
                             });
                         }
                         RedirectAction::Follow(step) => {
-                            redirect_hops = redirect_hops.saturating_add(1);
-                            if redirect_hops > u16::from(policy.max_hops) {
-                                return Err(Error::RedirectLoop {
-                                    hops: redirect_hops,
-                                });
-                            }
+                            redirects.follow()?;
                             // The next hop will issue a fresh request
                             // and debit anew, so refund the slot the
                             // 3xx debited. Otherwise a 10-hop chain
@@ -738,8 +902,8 @@ pub(crate) async fn send_streaming_inner(
                             // a redirect is a fresh logical request,
                             // its retries should not eat into the
                             // budget of the prior hop.
-                            attempt = 0;
-                            auth_retries = 0;
+                            attempts = AttemptBudget::new(retry_attempt_limit);
+                            auth_budget = AuthBudget(false);
                             continue 'outer;
                         }
                     }
@@ -825,7 +989,7 @@ pub(crate) async fn send_streaming_inner(
             if let Some(ref h) = host {
                 account.net().governor().refund(h, cost_units);
             }
-            tokio::time::sleep(wait).await;
+            deadline.sleep(wait).await?;
             continue;
         }
 
@@ -1466,11 +1630,12 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn account_connect_timeout_bounds_a_dispatch_that_never_answers() {
+    async fn response_headers_timeout_bounds_a_dispatch_that_never_answers() {
         let script = ScriptedDispatch::new([Canned::Pending]);
         let mut spec =
             crate::AccountSpec::new(Some(Arc::new(StaticTokenSource::new("test", None))));
-        spec.connect_timeout = Some(Duration::from_secs(7));
+        spec.connect_timeout = None;
+        spec.response_headers_timeout = Some(Duration::from_secs(7));
         spec.default_retry = RetryPolicy::disabled();
         let account = crate::test_support::scripted_net(&script, NetConfig::default())
             .attach_account(crate::AccountId("connect-timeout".to_owned()), spec);
@@ -1487,6 +1652,103 @@ mod tests {
             }
         ));
         assert_eq!(script.requests().len(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn total_deadline_bounds_retry_backoff() {
+        let mut headers = HeaderMap::new();
+        headers.insert(RETRY_AFTER, HeaderValue::from_static("30"));
+        let script = ScriptedDispatch::new([
+            canned_with_headers(StatusCode::SERVICE_UNAVAILABLE, headers, b"retry"),
+            canned(StatusCode::OK, b"too late"),
+        ]);
+        let account = scripted_account(&script, NetConfig::default(), Vec::new(), two_attempts());
+        let started = tokio::time::Instant::now();
+
+        let result = account
+            .get("https://deadline.test/retry")
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await;
+        let Err(error) = result else {
+            panic!("the total deadline must interrupt retry backoff");
+        };
+
+        assert!(matches!(error, Error::Timeout { .. }));
+        assert_eq!(started.elapsed(), Duration::from_secs(5));
+        assert_eq!(script.requests().len(), 1);
+    }
+
+    // The bandwidth-cap throttle sleeps inside the metering wrapper,
+    // which the retry loop never sees. A 4 KiB body under a 256 B/s cap
+    // owes sixteen seconds of throttle; the three-second total deadline
+    // must cut it off, and it must surface as a truncation error rather
+    // than as a short but successful body.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn total_deadline_bounds_the_bandwidth_throttle() {
+        const BODY: &[u8] = &[b'x'; 4096];
+        let script = ScriptedDispatch::new([canned(StatusCode::OK, BODY)]);
+        let account = scripted_account(
+            &script,
+            NetConfig::default(),
+            Vec::new(),
+            RetryPolicy::disabled(),
+        );
+        account.set_bandwidth_cap(Some(256));
+        let started = tokio::time::Instant::now();
+
+        let result = account
+            .get("https://throttle.test/blob")
+            .timeout(Duration::from_secs(3))
+            .send()
+            .await;
+        let Err(error) = result else {
+            panic!("a throttled body must not outlive the total deadline");
+        };
+
+        assert!(
+            matches!(
+                error,
+                Error::Timeout {
+                    transmission_state: TransmissionState::Acknowledged
+                }
+            ),
+            "mid-body deadline expiry is acknowledged truncation, got {error:?}"
+        );
+        assert_eq!(started.elapsed(), Duration::from_secs(3));
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn total_deadline_survives_a_redirect_budget_reset() {
+        let mut retry_headers = HeaderMap::new();
+        retry_headers.insert(RETRY_AFTER, HeaderValue::from_static("4"));
+        let mut redirect_headers = HeaderMap::new();
+        redirect_headers.insert(LOCATION, HeaderValue::from_static("/next"));
+        let script = ScriptedDispatch::new([
+            canned_with_headers(StatusCode::SERVICE_UNAVAILABLE, retry_headers, b"retry"),
+            canned_with_headers(StatusCode::TEMPORARY_REDIRECT, redirect_headers, b""),
+            Canned::Pending,
+        ]);
+        let mut spec =
+            crate::AccountSpec::new(Some(Arc::new(StaticTokenSource::new("test", None))));
+        spec.response_headers_timeout = Some(Duration::from_secs(30));
+        spec.default_retry = two_attempts();
+        let account = crate::test_support::scripted_net(&script, NetConfig::default())
+            .attach_account(crate::AccountId("redirect-deadline".to_owned()), spec);
+        let started = tokio::time::Instant::now();
+
+        let result = account
+            .get("https://deadline.test/start")
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await;
+        let Err(error) = result else {
+            panic!("a redirect must not reset the total deadline");
+        };
+
+        assert!(matches!(error, Error::Timeout { .. }));
+        assert_eq!(started.elapsed(), Duration::from_secs(5));
+        assert_eq!(script.requests().len(), 3);
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]

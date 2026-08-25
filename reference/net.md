@@ -36,9 +36,10 @@ let account = net.attach_account(account_id, spec);     // per-account
   explicitly.
 
 `NetConfig` contains only client-instance settings: pool sizing, keepalive,
-and TLS trust. `AccountSpec` contains request behavior: header and body
-timeouts, optional total timeout, User-Agent, buffered-body ceiling, redirect
-policy, token max-age, retry policy, token source, and rate declarations.
+connection setup timeout, and TLS trust. `AccountSpec` contains request behavior:
+response-header and body timeouts, optional total timeout, User-Agent,
+buffered-body ceiling, redirect policy, token max-age, retry policy, token source,
+and rate declarations.
 JMAP attaches every independently opened account to the shared transport
 selected by `Net::shared_for_tls` (see the TLS section), so its accounts share
 the client, governor, and meter within each trust class as advertised. The
@@ -109,13 +110,46 @@ drains the body through the same metering reader.
 
 ### Deadlines and the buffered ceiling
 
-`AccountSpec` carries the per-account bounds. `connect_timeout` bounds
-dispatch until response headers arrive, and `read_timeout` bounds inactivity
-between response body chunks. Both default to 10s and 30s respectively.
+`NetConfig::connect_timeout` bounds DNS, TCP, and TLS connection setup on the
+shared client and defaults to 10s. Because reqwest owns this timer, an expiry is
+classified `Unsent` and a POST can be replayed safely. Per account,
+`response_headers_timeout` bounds one dispatch until response headers arrive,
+and `read_timeout` bounds inactivity between response body chunks. The response
+header and body defaults are 10s and 30s respectively. The published
+`AccountSpec::connect_timeout` remains as a compatibility input for the response
+header bound; `response_headers_timeout`, when set, takes precedence.
 `RequestBuilder::timeout` remains the explicit total request deadline; an
 `AccountSpec::request_timeout` supplies its per-account default, and `None`
 means the pipeline invents no total deadline. This keeps a slow response that
 continues making progress distinct from a stalled response.
+
+The total deadline is computed once before the redirect walk. Every wire
+attempt receives only the time remaining, and rate-limit admission, token
+lookup or refresh, response-header waits, and retry sleeps are bounded by the
+same deadline. Redirects reset their per-hop retry and 401 budgets but never
+the deadline. Retry attempts, the one-shot 401 recovery, redirect hops, and the
+overall deadline are represented by separate budget types so their arithmetic
+cannot be reset or borrowed from one another. `RequestDeadline` owns all of its
+own arithmetic - no call site reads the underlying instant - because the
+per-attempt-versus-overall conflation is exactly the bug the split was made to
+prevent.
+
+The deadline reaches the response body as well as the retry loop, through
+`wrap_metered`. That matters because the bandwidth-cap throttle sleeps inside
+`ByteBucket::consume` are the one class of wait a request performs that the
+retry loop never observes: with a low cap, a buffered response could otherwise
+finish minutes after an explicit total timeout, and a streaming response could
+hand up an already-buffered chunk past it. Both are now bounded.
+
+Expiry before the response is `Timeout { Unsent }`; the replacement attempt had
+not been dispatched, so replay is safe for any method. Expiry *after* headers
+arrived is `Timeout { Acknowledged }`, which converts to
+`Protocol(PartialResponse)` - the same class an inactivity `read_timeout`
+mid-body produces, deriving to `Retry(SameRequest)` for an idempotent operation
+and `Reconcile(PartialCompletionSignal)` otherwise. The distinction is
+load-bearing: a body cut short by the deadline must reach the caller as an
+error, never as a clean end-of-stream, or `send()` would hand back a prefix of
+the payload as though it were the whole response.
 
 Because `read_timeout` is the only inactivity bound and it is per-account, every
 body drain must apply it. Terminal statuses go through
@@ -344,6 +378,13 @@ cause one refresh call per request. Token expiry overrides that delay.
 Forced refreshes after a target 401 and terminal token-endpoint
 authentication failures never use the fallback.
 
+The 401 path passes the token used by that request back to the refresher. A
+forced refresh starts only if that token is still cached. If another in-flight
+request already replaced it, the newer token is returned without another
+issuer call. The refresh driver is spawned independently of the requesting
+task, so cancellation of the request that first observed 401 neither poisons
+the state nor strands waiters.
+
 A failure with no usable fallback enters an error backoff. Calls during
 the quiet interval return the shared typed failure without contacting
 the issuer; at the boundary one caller drives the next single-flight
@@ -507,7 +548,9 @@ response-body reader. Chunks larger than the per-second cap are
 admitted after `(chunk_size / cap)` seconds of sleep (the cap is a
 smoothing throttle, not a hard ceiling on chunk size). `ByteBucket`
 also uses `tokio::time::Instant`, matching its Tokio sleep clock and
-allowing deterministic virtual-time tests.
+allowing deterministic virtual-time tests. Every throttle wait is bounded by
+the request's total deadline (see "Deadlines and the buffered ceiling"), so a
+low cap can slow a response but cannot carry it past an explicit total timeout.
 
 `set_bandwidth_cap(Some(0))` is **not** a sentinel for unlimited
 (that is `None`'s job). It is normalised to `Some(1)` with a

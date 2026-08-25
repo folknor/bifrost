@@ -9,35 +9,6 @@ Hunter note: read the crate end to end (`request.rs`, `net.rs`, `rate.rs`,
 account-error mapping table) against `reference/net.md`, and confirmed both
 cross-scope claims by grep.
 
-## N-1. There is no deadline over the whole request. `timeout` and `connect_timeout` are per attempt, and a redirect resets the attempt counter to zero
-
-**High confidence, high severity.** `request.rs` applies `connect_timeout` around
-each dispatch and hands `RequestBuilder::timeout` to reqwest per attempt.
-`max_attempts` multiplies both, backoff sleeps add on top, and the
-`RedirectAction::Follow` arm sets `attempt = 0` and `auth_retries = 0`. Worst case
-for a default policy with `max_hops = 10`: 10 hops x (3 network attempts + 1 forced
-401 retry) = 40 wire dispatches, each entitled to the full "total request deadline",
-plus up to 40 backoff sleeps capped at 60s each. `reference/net.md` calls
-`RequestBuilder::timeout` "the explicit total request deadline"; it is nothing of the
-sort. Google and Graph set no `request_timeout` at all, so nothing rescues this. The
-right shape is a single deadline computed once at the top of `send_streaming_inner`
-(`Instant::now() + total`), checked before every attempt and every sleep, with the
-per-attempt reqwest timeout derived as `min(remaining, per_attempt)`.
-
-## N-2. `connect_timeout` expiry is unconditionally classified `InFlight`, which silently disables retry for every POST
-
-**High confidence, medium-high severity.** `Err(_) => Err(Error::Timeout {
-transmission_state: InFlight })`. But this timer covers *dispatch until response
-headers*, which includes DNS and TCP/TLS connect - the case where nothing was
-transmitted. `transport_error_is_replayable` then refuses to replay a non-idempotent
-request, so a Gmail send that never got a socket is surfaced as
-`Reconcile(TransportDropAfterSend)` instead of being retried. Compounding it:
-`NetConfig` never sets reqwest's own `connect_timeout`, so reqwest's `is_connect() &&
-is_timeout()` -> `Unsent` classification (which `send_error_to_error` handles
-correctly) can only fire on connect errors that are not timeouts. The fix is to bound
-connect separately - set `ClientBuilder::connect_timeout` and let reqwest classify it
-- rather than wrapping the whole dispatch in one timer that has to guess.
-
 ## N-3. Inbound bandwidth accounting is blind on every non-2xx path
 
 **High confidence, medium severity.** Metering is attached only by `wrap_metered`,
@@ -52,25 +23,6 @@ throttled hard, or walking a long redirect chain, reads real bytes off the wire 
 headers excluded by design - and the OAuth token endpoint traffic driven by
 `OAuthRefresher` is not metered at all, because it goes through the caller's own
 `TokenSource`, not this pipeline.
-
-## N-4. A mass-401 produces one issuer round-trip per in-flight request, and each one throws away a valid token
-
-**High confidence, medium-high severity.** The 401 branch calls
-`token_source().refresh()` -> `force_refresh` -> `token_inner(force = true)`
-unconditionally. `force` sets `fallback: None` and does not short-circuit on a
-`Fresh` token, so it never asks "has the token I actually used already been
-replaced?". With N concurrent requests on one account hitting 401 simultaneously
-(revocation blip, clock skew, a scope error on one endpoint), each one that arrives
-after the previous refresh landed starts *another* single-flight refresh against the
-IdP. Worse, because `force` discards the fallback, one transient failure at the token
-endpoint during that cascade drops the state to `Backoff` and hard-fails the entire
-account locally for up to 60s - while a perfectly valid, unexpired token was in hand
-a moment earlier. The structural fix is a token generation counter: the request
-captures the generation of the token it sent, and `force_refresh(generation)`
-refreshes only if the cached generation still matches; otherwise it returns the
-already-refreshed token. This also makes "forced refreshes never use the fallback"
-safe, because the only forced refresh left is one where the token really was the
-failing one.
 
 ## N-5. `refund` is not generation-scoped, so a refund can credit a different account's bucket
 
@@ -113,18 +65,6 @@ mid-stream (the documented reason `cap_now` is re-read per chunk), the bucket be
 empty and the next chunk pays a full refill window it did not earn. Initialise lazily
 on first capped chunk instead.
 
-## N-9. The retry loop is a 430-line function with eight mutable loop variables and three interleaved budgets, and that is where the bugs above live
-
-N-1, N-2 and N-4 are all consequences of `attempt`, `auth_retries`, and
-`redirect_hops` being ad-hoc counters mutated in-place across three different
-`continue` arms of one `'outer` loop, with no object owning the request's overall
-lifetime. The shape it should have: an explicit `RequestAttempt` state carrying the
-deadline, the hop chain, and the per-hop budgets, with the redirect walk as the outer
-loop and the retry loop strictly inner - so "a hop is a fresh logical request" is
-expressed by constructing a new inner budget rather than by assigning `attempt = 0` in
-the middle of the body, and so a global deadline has one place to live. Worth the
-rewrite; not a tidying exercise.
-
 ## N-10. There is no per-request or per-batch byte accounting seam - only per-account cumulative counters. This is why the consumers hard-code `bytes_in: 0`
 
 **Answers cross-scope question 1. High confidence.** `bifrost-net` does know real
@@ -156,14 +96,6 @@ number for all of them. Gmail is the same shape (per-project *and* per-user quot
 The bucket key should be a caller-supplied scope - `(host, quota_scope)` where the
 consumer supplies the tenant/project/user discriminator - with the current host-only
 behaviour as the degenerate case where the scope is empty.
-
-## N-12. `AccountSpec::connect_timeout` is misnamed for what it bounds
-
-It is a response-header deadline covering the entire dispatch, not a connect
-deadline; reqwest's actual `connect_timeout` is never set. Renaming it
-`headers_timeout` (and adding a real connect bound on the client, per N-2) would make
-the three-timeout story - connect / headers / inactivity / total - actually say what
-it does.
 
 ## Cross-scope answers
 
