@@ -572,6 +572,15 @@ returning it, while a `StreamingResponse`'s counter is only as complete as the
 caller's draining. A caller that abandons a stream part-way holds a partial
 count, and the accessor documents that rather than pretending otherwise.
 
+`Response::bytes_in` exists only on the success path, but the bytes do not:
+non-2xx bodies, exhausted retries and repeated 401s are drained, metered and
+throttled before they become an `Error`. `RequestBuilder::count_bytes_into`
+takes a caller-owned `RequestByteCounter` and makes it the request's counter, so
+the caller can read the figure back after an `Err`. That is the counter every
+protocol-crate wire funnel records from, because the funnel's callers turn a
+failed request into per-item failures and still emit a batch; recording from the
+`Response` would report zero for exactly the batches that hit trouble.
+
 Above this, each protocol crate owns a batch-scoped accumulator - `ByteTally` in
 bifrost-google, bifrost-graph, and bifrost-jmap - because an engine batch
 routinely covers several requests: a list page plus a hydration fan-out, a

@@ -387,18 +387,28 @@ batch that made it. The record sits at both wire funnels (`execute_wire` and
 counted too. Each engine stream takes one accumulator and each emitted batch
 `take`s it.
 
+Both funnels record from the request-local `RequestByteCounter` they hand to
+`RequestBuilder::count_bytes_into`, not from the `Response`, so a FAILED request
+contributes its drained bytes as well. That is load-bearing rather than tidy:
+the hydration and mutation lanes convert a request error into per-item failures
+and still emit a batch, so a success-path-only record would report zero for
+exactly those batches. `RestResponse` consequently carries no byte count of its
+own.
+
 One batch is many requests here: a mutation chunk is the `$batch` submission
 plus one etag GET per id the preflight had to re-read, and a delta walk pages.
 The declaration also carries the engine `AccountId` as its `quota_scope`, so the
 Graph per-tenant bucket is per account rather than pooled process-wide.
 
-**Disclosed gap: the EWS arm is not counted.** `EwsClient` composes `AccountNet`
-directly rather than routing through `GraphClient`'s wire funnel, so no
-`GraphClient`-level accumulator can observe it. Public-folder inventory and
-changes therefore report `bytes_in: 0`, and a hydration chunk mixing
-public-folder ids with REST ids reports its REST half only. This under-reports
-rather than over-reports, and every such site says so at the call site. Closing
-it means giving `EwsClient` its own accounting seam.
+`EwsClient` composes `AccountNet` directly rather than routing through a Graph
+REST funnel. Its buffered `execute` funnel therefore accepts the metered
+account view's existing `ByteTally` and records each request's drained bytes
+there, on the success and error paths alike. Public-folder inventory, changes,
+and hydration consequently share the same batch accumulator as any REST half of
+the operation. The long-lived
+`GetStreamingEvents` funnel deliberately does not feed a batch tally: its
+streaming counter is complete only when fully drained, and push traffic is not
+an engine batch.
 
 Reopen is engine-delegated: on drop or after `close()`, the engine calls
 `GraphAccountFactory::open` again for a fresh `GraphAccount` (empty caches, fresh

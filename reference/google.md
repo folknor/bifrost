@@ -122,13 +122,17 @@ than nothing.
 ### Per-batch byte accounting
 
 `GmailClient` carries an optional `ByteTally`. `metered()` hands back a handle
-that is one `Arc` bump over the same client and reports every buffered
-response's request-local `bytes_in` into a fresh accumulator; each engine
+that is one `Arc` bump over the same client and reports every request's
+request-local `bytes_in` into a fresh accumulator; each engine
 stream takes one at construction and each emitted batch `take`s it, so
 consecutive batches partition the traffic. The record sits at `send_recorded`,
 the single point every buffered request leaves through, which is what keeps
 `delete`, `post_no_content` and caller-built `execute_builder` requests counted
-rather than free.
+rather than free. It records from the request-local counter, not from the
+`Response`, so a FAILED request contributes too: the mutation lane turns a
+refused `batchModify` / `batchDelete` into per-item failures and still emits a
+batch, and the `batchDelete` permission fallback's refused primary call is pure
+error-path traffic.
 
 This matters because one batch is routinely many requests: an inventory batch
 covers a `users.messages.list` page plus up to 32 concurrent

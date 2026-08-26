@@ -9,30 +9,9 @@ Hunter note: read the crate end to end (`request.rs`, `net.rs`, `rate.rs`,
 account-error mapping table) against `reference/net.md`, and confirmed both
 cross-scope claims by grep.
 
-**All findings in this document are closed.** Round 3 was the final round. What
-remains below is the disclosed residual: one specific call-site family that
-genuinely cannot use the accounting seam, with the reason. Everything durable
+**All findings and residuals in this document are closed.** Everything durable
 from this arc has reached `reference/net.md`, `reference/google.md`,
 `reference/graph.md` and `reference/jmap.md`.
-
-## Disclosed residual: the Graph EWS arm is not byte-counted
-
-`bifrost-graph`'s per-batch accounting seam is a `ByteTally` on `GraphClient`,
-recorded at that client's two wire funnels. `EwsClient` does not go through
-either: it composes `bifrost_net::AccountNet` directly, so no `GraphClient`-level
-accumulator can observe its traffic. Three sites are affected and each says so at
-the call site:
-
-- `graph/src/account/public_folder.rs` inventory - reports `bytes_in: 0`.
-- `graph/src/account/public_folder.rs` changes - reports `bytes_in: 0`.
-- `graph/src/account/get.rs` `fetch_batch` - a chunk mixing public-folder ids
-  with REST ids reports its REST half only.
-
-This under-reports, never over-reports, which is the safe direction: a consumer
-budgeting on these numbers sees less traffic than occurred rather than being told
-traffic happened that did not. Closing it means giving `EwsClient` its own
-accounting seam, which is a change to that client's shape rather than an
-adoption of the existing one, and was out of scope for this arc.
 
 Deliberately NOT residuals, because they are correct: three call sites report
 `bytes_in: 0` for batches that perform no request at all - Gmail's constant
@@ -54,14 +33,38 @@ N-12 and two mid-arc additions. Round 3 closed the rest:
   landed first (`Response::bytes_in`/`bytes_out`, `StreamingResponse`'s cloneable
   `RequestByteCounter`, one counter created before the retry and redirect loop so
   error drains, 401 recovery, redirects and retries all contribute). Round 3
-  finished consumer adoption: a batch-scoped `ByteTally` in each of
+  established consumer adoption with a batch-scoped `ByteTally` in each of
   bifrost-google, bifrost-graph and bifrost-jmap, taken by each engine stream and
-  cleared at each emitted batch. Every network-backed producer in
+  cleared at each emitted batch. Round 4 closed the two remaining holes. First,
+  the disclosed residual: Graph's buffered EWS funnel now enrolls in that same
+  tally, so public-folder inventory, public-folder changes and a hydration chunk
+  mixing EWS and REST ids all report real numbers instead of zero or a REST-only
+  half. Second, the general form of the round-4 cold reviewer's P2: every
+  consumer funnel recorded on the SUCCESS path only, while bifrost-net drains,
+  meters and throttles the bodies of non-2xx responses, exhausted retries and
+  repeated 401s before converting them to errors - and the Graph hydration and
+  mutation lanes and the Gmail mutation lane all turn such an error into per-item
+  failures while STILL emitting a batch. Those batches reported zero for traffic
+  that happened. `RequestBuilder::count_bytes_into` takes a caller-owned
+  `RequestByteCounter` and makes it the request's counter, which is the only way
+  to read the figure back after an `Err`; both Graph funnels, the EWS funnel and
+  Gmail's `send_recorded` now record from it. Every network-backed producer in
   `google/src/account/{scopes,inventory,changes,mutation}.rs`,
-  `graph/src/account/{mutate,scopes,inventory,changes,get}.rs` and
+  `graph/src/account/{mutate,scopes,inventory,changes,get,public_folder}.rs` and
   `jmap/src/sync/{mutation,discover,changes,inventory,hydrate}.rs` now reports
-  real numbers, except the EWS sites disclosed above. Deliberately not a delta
-  across the cumulative account meter: concurrency makes that race.
+  real numbers on both paths. Deliberately not a delta across the cumulative
+  account meter: concurrency makes that race.
+
+  Two deliberate exclusions, both of which report NOTHING rather than a wrong
+  number. The long-lived EWS `GetStreamingEvents` funnel does not feed a batch
+  tally: its counter is only as complete as the caller's draining, push traffic
+  is not an engine batch, and no consumer reaches public-folder data through the
+  streaming path - it carries notifications, and the data reads that follow go
+  through the buffered funnel. And bifrost-jmap needed no error-path change: it
+  was audited call site by call site, and every JMAP path that emits a batch
+  after an error emits it after a method-level error inside a successful HTTP
+  exchange, whose bytes are already recorded; a transport error there terminates
+  the stream without emitting a batch.
 - **N-11** - the governor could not represent per-tenant or per-user quotas.
   Buckets are now keyed by `(host, quota_scope)`, and - closing the cold
   reviewer's P1 - SELECTION carries the same two components, via

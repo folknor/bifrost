@@ -620,10 +620,9 @@ fn now_unix_secs() -> u64 {
 }
 
 pub(crate) fn ews_client(account: &GraphAccount) -> Option<EwsClient> {
-    account
-        .client
-        .account_net()
-        .map(|net| EwsClient::new(net, account.client.outlook_base()))
+    account.client.account_net().map(|net| {
+        EwsClient::new(net, account.client.outlook_base()).with_tally(account.client.batch_tally())
+    })
 }
 
 /// The result of walking a folder's `FindItem` pages.
@@ -988,6 +987,8 @@ pub(crate) fn public_folder_inventory_stream(
         };
         let owner = MailboxId(routing.anchor_mailbox.clone());
 
+        let (account, tally) = account.metered();
+
         let Some(ews) = ews_client(&account) else {
             let ctx = GraphErrorContext::ews(AccountOperation::SyncInventory)
                 .with_scope(ErrorScope::Cursor(scope.clone()));
@@ -1094,12 +1095,7 @@ pub(crate) fn public_folder_inventory_stream(
             bifrost_types::InventoryCoverageReport::complete(
                 bifrost_types::CoverageDomain::full(scope.clone()),
             ),
-            // The public-folder arm reads over EWS, and `EwsClient`
-            // composes `AccountNet` directly rather than routing through
-            // `GraphClient`'s wire funnel, so no `GraphClient`-level
-            // accumulator can observe its traffic. Reported as zero
-            // rather than guessed.
-            0,
+            tally.take(),
         );
         yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion::complete(
             bifrost_types::CoverageDomain::full(scope.clone()),
@@ -1324,6 +1320,8 @@ pub(crate) fn public_folder_changes_stream(
         let owner = MailboxId(pf.routing.anchor_mailbox.clone());
         let folder = FolderId(pf.folder_id.clone());
 
+        let (account, tally) = account.metered();
+
         let Some(ews) = ews_client(&account) else {
             let ctx = GraphErrorContext::ews(AccountOperation::SyncChanges)
                 .with_scope(ErrorScope::Cursor(scope.clone()));
@@ -1414,10 +1412,7 @@ pub(crate) fn public_folder_changes_stream(
                     }
                 };
                 let checkpoint = Checkpoint::Change(advanced.clone());
-                // EWS-served: see the inventory arm above - the byte
-                // accounting seam is on `GraphClient`, which this path
-                // does not use.
-                yield batch(changes, PageBoundary::Final, Some(advanced), 0);
+                yield batch(changes, PageBoundary::Final, Some(advanced), tally.take());
                 yield SyncEvent::Done(Some(checkpoint));
             }
         }
@@ -1428,6 +1423,103 @@ pub(crate) fn public_folder_changes_stream(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn metered_account_enrolls_buffered_ews_responses() {
+        use std::sync::Arc;
+
+        use bifrost_net::test_support::{Canned, ScriptedDispatch, scripted_account};
+        use bifrost_net::{NetConfig, RetryPolicy, StaticTokenSource, TokenSource};
+        use bytes::Bytes;
+
+        use super::super::{GraphAccount, PushMode};
+        use crate::client::GraphClient;
+
+        let response = "<Envelope/>";
+        let script = ScriptedDispatch::new([Canned::Response {
+            status: reqwest::StatusCode::OK,
+            headers: reqwest::header::HeaderMap::new(),
+            body: Bytes::from(response),
+        }]);
+        let token_source: Arc<dyn TokenSource> = Arc::new(StaticTokenSource::new("token", None));
+        let net = scripted_account(
+            &script,
+            NetConfig::default(),
+            Vec::new(),
+            Arc::clone(&token_source),
+            RetryPolicy::disabled(),
+        );
+        let client =
+            GraphClient::with_account_net(net, "https://graph.contoso.test/v1.0", token_source);
+        let account = GraphAccount::new_for_tests(client, PushMode::EwsStreaming);
+        let (account, tally) = account.metered();
+        let ews = ews_client(&account).expect("metered account has an EWS client");
+
+        assert_eq!(
+            ews.execute("<m:GetFolder/>", &crate::ews::EwsHeaders::default())
+                .await
+                .expect("scripted EWS response"),
+            response
+        );
+        assert_eq!(tally.take(), u64::try_from(response.len()).unwrap());
+        assert_eq!(
+            script.requests().len(),
+            1,
+            "the filtered test made a request"
+        );
+    }
+
+    // A terminal HTTP status is drained, metered and throttled by
+    // `bifrost-net` before it becomes an `Error`, and the hydration arm
+    // turns that error into per-item failures while STILL emitting a
+    // batch. If the tally were written only on the success path, such a
+    // batch would report zero bytes for traffic that really happened.
+    #[tokio::test]
+    async fn metered_account_enrolls_failed_ews_responses() {
+        use std::sync::Arc;
+
+        use bifrost_net::test_support::{Canned, ScriptedDispatch, scripted_account};
+        use bifrost_net::{NetConfig, RetryPolicy, StaticTokenSource, TokenSource};
+        use bytes::Bytes;
+
+        use super::super::{GraphAccount, PushMode};
+        use crate::client::GraphClient;
+
+        let body = "<fault-detail/>";
+        let script = ScriptedDispatch::new([Canned::Response {
+            status: reqwest::StatusCode::FORBIDDEN,
+            headers: reqwest::header::HeaderMap::new(),
+            body: Bytes::from(body),
+        }]);
+        let token_source: Arc<dyn TokenSource> = Arc::new(StaticTokenSource::new("token", None));
+        let net = scripted_account(
+            &script,
+            NetConfig::default(),
+            Vec::new(),
+            Arc::clone(&token_source),
+            RetryPolicy::disabled(),
+        );
+        let client =
+            GraphClient::with_account_net(net, "https://graph.contoso.test/v1.0", token_source);
+        let account = GraphAccount::new_for_tests(client, PushMode::EwsStreaming);
+        let (account, tally) = account.metered();
+        let ews = ews_client(&account).expect("metered account has an EWS client");
+
+        let result = ews
+            .execute("<m:GetItem/>", &crate::ews::EwsHeaders::default())
+            .await;
+        assert!(result.is_err(), "a 403 must surface as an EWS error");
+        assert_eq!(
+            tally.take(),
+            u64::try_from(body.len()).unwrap(),
+            "the drained error body counts toward the batch total"
+        );
+        assert_eq!(
+            script.requests().len(),
+            1,
+            "the filtered test made a request"
+        );
+    }
 
     // Discovery must project a folder it browsed successfully even when the
     // per-folder content-mailbox chain (PR_REPLICA_LIST -> Autodiscover) does

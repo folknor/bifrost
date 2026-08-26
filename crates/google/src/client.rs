@@ -419,12 +419,24 @@ impl GmailClient {
     /// at each typed wrapper is what keeps `delete`, `post_no_content`
     /// and the caller-built `execute_builder` requests counted: those
     /// discard or hand-decode the body and would otherwise be free.
+    ///
+    /// Recorded from the request-local counter rather than from
+    /// `Response`, so a FAILED request contributes too. `bifrost-net`
+    /// drains, meters and throttles the bodies of non-2xx responses,
+    /// exhausted retries and repeated 401s before converting them to an
+    /// error, and the mutation lane turns such an error into per-item
+    /// failures while still emitting a batch - so recording only on
+    /// success would report zero for exactly the batches that spent the
+    /// most quota. The Gmail `batchDelete` permission fallback is the
+    /// sharpest case: its refused primary call is pure error-path
+    /// traffic.
     async fn send_recorded(&self, builder: RequestBuilder) -> Result<Response> {
-        let response = builder.send().await.map_err(Error::from)?;
+        let counter = bifrost_net::RequestByteCounter::new();
+        let sent = builder.count_bytes_into(counter.clone()).send().await;
         if let Some(tally) = self.tally.as_ref() {
-            tally.add(response.bytes_in());
+            tally.add(counter.bytes_in());
         }
-        Ok(response)
+        sent.map_err(Error::from)
     }
 
     /// A handle over the same client that reports every buffered
@@ -710,6 +722,46 @@ mod tests {
             .expect("task joins")
             .expect("profile dispatches");
         assert_eq!(script.requests().len(), 2);
+    }
+
+    /// The mutation lane converts a refused `batchModify` / `batchDelete`
+    /// into per-item failures and STILL emits a batch, so the bytes of
+    /// the refusal must reach the accumulator. `bifrost-net` drains,
+    /// meters and throttles that body before turning it into an error,
+    /// so recording only on the success path would report zero for the
+    /// batch that actually spent the quota.
+    #[tokio::test]
+    async fn a_failed_request_still_reports_its_inbound_bytes() {
+        let body = "{\"error\":{\"code\":403}}";
+        let script = ScriptedDispatch::new([Canned::Response {
+            status: StatusCode::FORBIDDEN,
+            headers: reqwest::header::HeaderMap::new(),
+            body: Bytes::from(body),
+        }]);
+        let net = bifrost_net::test_support::scripted_account(
+            &script,
+            bifrost_net::NetConfig::default(),
+            Vec::new(),
+            Arc::new(StaticTokenSource::new("token", None)),
+            bifrost_net::RetryPolicy::disabled(),
+        );
+        let client = GmailClient::with_account_net("https://gmail.test", net);
+        let (client, tally) = client.metered();
+
+        let result = client
+            .execute(
+                "https://gmail.test/messages/batchModify",
+                "POST",
+                Some(&serde_json::json!({})),
+            )
+            .await;
+        assert!(result.is_err(), "a 403 must surface as an error");
+        assert_eq!(script.requests().len(), 1, "the request was dispatched");
+        assert_eq!(
+            tally.take(),
+            u64::try_from(body.len()).unwrap(),
+            "the drained error body counts toward the batch total"
+        );
     }
 
     #[tokio::test]

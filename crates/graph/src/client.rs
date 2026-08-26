@@ -80,7 +80,7 @@ struct ClientInner {
 pub(crate) struct ByteTally(Arc<std::sync::atomic::AtomicU64>);
 
 impl ByteTally {
-    fn add(&self, n: u64) {
+    pub(crate) fn add(&self, n: u64) {
         self.0.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
     }
 
@@ -94,11 +94,15 @@ impl ByteTally {
 /// production `bifrost_net::Response` (which is `#[non_exhaustive]`) into
 /// a shape this crate owns, so the helpers above the funnel destructure
 /// it freely.
+///
+/// It carries no byte count: the funnel attributes inbound bytes from
+/// the request-local counter instead, because that number also exists
+/// when the request ends in an error, and a response-carried count does
+/// not.
 pub(crate) struct RestResponse {
     pub(crate) status: reqwest::StatusCode,
     pub(crate) headers: reqwest::header::HeaderMap,
     pub(crate) body: Bytes,
-    pub(crate) bytes_in: u64,
 }
 
 impl From<bifrost_net::Response> for RestResponse {
@@ -107,7 +111,6 @@ impl From<bifrost_net::Response> for RestResponse {
             status: response.status(),
             headers: response.headers,
             body: response.body,
-            bytes_in: response.bytes_in,
         }
     }
 }
@@ -831,8 +834,11 @@ impl GraphClient {
             builder = builder.body(body.bytes);
         }
 
-        let response = builder.send().await.map_err(GraphError::Net)?;
-        Ok(self.record_bytes(RestResponse::from(response)))
+        let counter = bifrost_net::RequestByteCounter::new();
+        let sent = builder.count_bytes_into(counter.clone()).send().await;
+        self.record_bytes(&counter);
+        let response = sent.map_err(GraphError::Net)?;
+        Ok(RestResponse::from(response))
     }
 
     /// The one place the two NON-REST wire paths leave this crate: the
@@ -877,19 +883,33 @@ impl GraphClient {
         for (name, value) in headers {
             builder = builder.header(name, value);
         }
-        let response = builder.body(body).send().await.map_err(GraphError::Net)?;
-        Ok(self.record_bytes(RestResponse::from(response)))
+        let counter = bifrost_net::RequestByteCounter::new();
+        let sent = builder
+            .body(body)
+            .count_bytes_into(counter.clone())
+            .send()
+            .await;
+        self.record_bytes(&counter);
+        let response = sent.map_err(GraphError::Net)?;
+        Ok(RestResponse::from(response))
     }
 
-    /// Attribute one response's inbound bytes to this handle's batch
+    /// Attribute one request's inbound bytes to this handle's batch
     /// accumulator, if it has one. Applied at BOTH wire funnels: the
     /// pre-authenticated chunk PUT and the Autodiscover POST are real
     /// inbound traffic on the account and would otherwise be free.
-    fn record_bytes(&self, response: RestResponse) -> RestResponse {
+    ///
+    /// Takes the request-local counter rather than the `Response`, so
+    /// the bytes are attributed whether the request succeeded or
+    /// failed. `bifrost-net` drains non-2xx bodies, exhausted retries
+    /// and repeated 401s before converting them to an error, and the
+    /// mutation and hydration lanes turn such an error into a per-item
+    /// failure while still emitting a batch - so recording only on
+    /// success would under-report exactly the batches that hit trouble.
+    fn record_bytes(&self, counter: &bifrost_net::RequestByteCounter) {
         if let Some(tally) = self.tally.as_ref() {
-            tally.add(response.bytes_in);
+            tally.add(counter.bytes_in());
         }
-        response
     }
 
     /// A handle over the same client that reports every buffered
@@ -915,6 +935,14 @@ impl GraphClient {
             inner: Arc::clone(&self.inner),
             tally: Some(tally),
         }
+    }
+
+    /// The batch accumulator carried by this handle, when the caller is
+    /// operating on a metered account view. EWS composes `AccountNet`
+    /// directly, so its buffered funnel enrolls in the same accumulator
+    /// through this accessor rather than passing through a REST funnel.
+    pub(crate) fn batch_tally(&self) -> Option<ByteTally> {
+        self.tally.clone()
     }
 
     /// The one place a Graph blob byte stream is opened. Production is the

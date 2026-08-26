@@ -258,15 +258,8 @@ async fn fetch_batch(
     if ids.is_empty() {
         return Ok(Vec::new());
     }
-    // One hydration chunk is one `$batch` submission, and this
-    // accumulator carries its inbound bytes.
-    //
-    // The EWS arm below is NOT counted. `EwsClient` composes `AccountNet`
-    // directly rather than routing through `GraphClient`'s wire funnel,
-    // so no `GraphClient`-level seam can observe it. A chunk containing
-    // public-folder ids therefore reports its REST half only, which
-    // under-reports rather than over-reports. Closing it means giving
-    // the EWS client its own accounting seam.
+    // One hydration chunk is one logical batch. Both its Graph REST and
+    // buffered EWS responses enroll in this accumulator.
     let (metered, tally) = account.metered();
     let account = &metered;
     // Public-folder ids read over EWS; everything else over Graph REST.

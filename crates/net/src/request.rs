@@ -302,6 +302,12 @@ struct RequestBuilderInner {
     /// a later setter fails too, we keep the earliest one because
     /// that is what callers tend to debug first.
     pending_error: Option<Error>,
+    /// Caller-supplied counter to record this request's inbound body
+    /// bytes into. Present when the caller needs the number even if the
+    /// request ultimately returns `Err` - `Response::bytes_in` exists
+    /// only on the success path, but the bytes came off the wire either
+    /// way.
+    bytes_in: Option<RequestByteCounter>,
 }
 
 impl RequestBuilder {
@@ -323,8 +329,30 @@ impl RequestBuilder {
                 idempotent: None,
                 bearer_auth: true,
                 pending_error: None,
+                bytes_in: None,
             },
         }
+    }
+
+    /// Record this request's inbound body bytes into a caller-owned
+    /// counter, in addition to the count reported by `Response`.
+    ///
+    /// `Response::bytes_in` is final but only exists on the success
+    /// path. `bifrost-net` drains, meters and throttles the bodies of
+    /// non-2xx responses, exhausted retries and repeated 401s before
+    /// converting them to `Error`, so those bytes are real traffic that
+    /// a caller reporting per-batch totals must still be able to
+    /// collect. Passing a counter here is the only way to read the
+    /// number back after an `Err`.
+    ///
+    /// The counter is shared with the request, so read it only after
+    /// `send` / `send_streaming` has returned. For `send` the value is
+    /// then final; for `send_streaming` it advances as the body is
+    /// drained, exactly as `StreamingResponse::bytes_in` does.
+    #[must_use]
+    pub fn count_bytes_into(mut self, counter: RequestByteCounter) -> Self {
+        self.inner.bytes_in = Some(counter);
+        self
     }
 
     /// Set a header. Multiple calls with the same key append rather
@@ -586,7 +614,10 @@ impl Response {
 pub struct RequestByteCounter(Arc<AtomicU64>);
 
 impl RequestByteCounter {
-    pub(crate) fn new() -> Self {
+    /// A fresh zeroed counter, for passing to
+    /// `RequestBuilder::count_bytes_into`.
+    #[must_use]
+    pub fn new() -> Self {
         Self::default()
     }
     pub(crate) fn record(&self, n: u64) {
@@ -699,6 +730,7 @@ pub(crate) async fn send_streaming_inner(
         idempotent,
         bearer_auth,
         pending_error,
+        bytes_in: caller_bytes_in,
     } = builder.inner;
 
     // Surface any deferred error from a fluent setter (e.g. `json()`
@@ -744,7 +776,11 @@ pub(crate) async fn send_streaming_inner(
 
     let mut retry_after_history: Vec<Duration> = Vec::new();
     let mut bytes_out = 0_u64;
-    let bytes_in = RequestByteCounter::new();
+    // One counter for the whole request, so error drains, 401 recovery,
+    // redirects and retries all contribute. When the caller supplied one
+    // it IS that counter, which is what lets an `Err` return still carry
+    // the bytes that came off the wire.
+    let bytes_in = caller_bytes_in.unwrap_or_else(RequestByteCounter::new);
     // Network retry budget is independent from the 401-recovery
     // budget. A 401 forces a token refresh + retry that must not
     // burn the network budget (otherwise a single stale cache hit

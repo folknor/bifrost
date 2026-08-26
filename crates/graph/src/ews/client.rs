@@ -29,6 +29,9 @@ impl EwsExecute for EwsClient {
             .send_streaming()
             .await
             .map_err(EwsError::Transport)?;
+        // Do not enroll this long-lived stream in batch accounting. Its
+        // counter is only complete if the caller drains it, and publishing
+        // a partial count as a batch total would overstate its completeness.
         Ok(Box::pin(response.body.map_err(EwsError::Transport)))
     }
 }
@@ -41,7 +44,14 @@ impl EwsClient {
         Self {
             net,
             ews_url: ews_url(outlook_base),
+            tally: None,
         }
+    }
+
+    /// Enroll buffered SOAP responses in an existing batch accumulator.
+    pub(crate) fn with_tally(mut self, tally: Option<crate::client::ByteTally>) -> Self {
+        self.tally = tally;
+        self
     }
 
     /// Execute a raw EWS SOAP request. Wraps `body_xml` in the SOAP
@@ -67,11 +77,22 @@ impl EwsClient {
         for (name, value) in headers.pairs() {
             req = req.header(name, &value);
         }
-        let resp = req
+        // The counter is caller-owned so the bytes survive an `Err`.
+        // `AccountNet` drains non-2xx bodies, exhausted retries and
+        // repeated 401s before converting them to `Error`, and the
+        // hydration arm turns those errors into per-item failures while
+        // still emitting a batch - so a success-path-only tally write
+        // would report that batch's total as zero despite real traffic.
+        let counter = bifrost_net::RequestByteCounter::new();
+        let sent = req
             .body(bytes::Bytes::from(envelope))
+            .count_bytes_into(counter.clone())
             .send()
-            .await
-            .map_err(EwsError::Transport)?;
+            .await;
+        if let Some(tally) = self.tally.as_ref() {
+            tally.add(counter.bytes_in());
+        }
+        let resp = sent.map_err(EwsError::Transport)?;
 
         let status = resp.status();
         if !status.is_success() {

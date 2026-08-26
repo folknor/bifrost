@@ -174,6 +174,7 @@ impl SoapFaultCode {
 pub(crate) struct EwsClient {
     net: AccountNet,
     ews_url: String,
+    tally: Option<crate::client::ByteTally>,
 }
 
 /// A streaming EWS response body. GetStreamingEvents keeps one HTTP response
