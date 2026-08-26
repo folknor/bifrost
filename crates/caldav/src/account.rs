@@ -10,7 +10,7 @@ use jiff::{Timestamp, civil};
 
 use crate::capabilities::{caldav_capabilities, scheduling_available};
 use crate::client::{
-    CalDavClient, PutCondition, event_scope, missing_event_error, unsupported_error,
+    CalDavClient, PutCondition, event_scope, local_error, missing_event_error, unsupported_error,
     unsupported_scope_error,
 };
 use crate::ical::{
@@ -818,6 +818,10 @@ impl Account for CalDavAccount {
     ) -> AccountFuture<Result<Page<CalendarEvent>, AccountError>> {
         let client = Arc::clone(&self.client);
         Box::pin(async move {
+            let offset = decode_event_page_cursor(
+                range.page_cursor.clone(),
+                AccountOperation::EventsInRange,
+            )?;
             let calendar_url = client.resolve_url(&range.calendar_id.0);
             let (range_start, range_end) = caldav_query_range(&range.start, &range.end)?;
             let fetched = client
@@ -852,16 +856,7 @@ impl Account for CalDavAccount {
                 }
             }
             one_outcome_per_id(&mut failed, &materialized);
-            if let Some(limit) = range.limit.and_then(|limit| usize::try_from(limit).ok()) {
-                events.truncate(limit);
-            }
-            Ok(Page {
-                items: events,
-                next_cursor: None,
-                estimated_total: None,
-                failed_ids: failed,
-                skipped_scopes: Vec::new(),
-            })
+            Ok(event_page(events, offset, range.limit, failed, Vec::new()))
         })
     }
 
@@ -1047,6 +1042,10 @@ impl Account for CalDavAccount {
         let client = Arc::clone(&self.client);
         let default_calendar_url = self.default_calendar_url.clone();
         Box::pin(async move {
+            let offset = decode_event_page_cursor(
+                request.page_cursor.clone(),
+                AccountOperation::EventSearch,
+            )?;
             let calendar_url =
                 Self::calendar_url(&client, &default_calendar_url, request.calendar_id);
             let needle = request.query.to_lowercase();
@@ -1114,16 +1113,13 @@ impl Account for CalDavAccount {
                 }
             }
             one_outcome_per_id(&mut failed, &materialized);
-            if let Some(limit) = request.limit.and_then(|limit| usize::try_from(limit).ok()) {
-                events.truncate(limit);
-            }
-            Ok(Page {
-                items: events,
-                next_cursor: None,
-                estimated_total: None,
-                failed_ids: failed,
+            Ok(event_page(
+                events,
+                offset,
+                request.limit,
+                failed,
                 skipped_scopes,
-            })
+            ))
         })
     }
 
@@ -1153,6 +1149,72 @@ fn rsvp_email_from_config(config: &CalDavConfig) -> Option<String> {
             Some(username.to_ascii_lowercase())
         }
         _ => None,
+    }
+}
+
+fn decode_event_page_cursor(
+    cursor: Option<Vec<u8>>,
+    operation: AccountOperation,
+) -> Result<usize, AccountError> {
+    let Some(cursor) = cursor else {
+        return Ok(0);
+    };
+    let value =
+        String::from_utf8(cursor).map_err(|error| local_error(operation, error.to_string()))?;
+    value
+        .parse()
+        .map_err(|error| local_error(operation, format!("invalid CalDAV page cursor: {error}")))
+}
+
+/// Slice a materialized result set into one offset page.
+///
+/// Takes `Vec<CalendarEvent>` rather than being generic on purpose: the sort
+/// below is the load-bearing half of the offset contract, and a generic
+/// signature would let a caller page something with no stable key at all.
+///
+/// The offset is local, and each continuation re-runs the remote REPORT. DAV
+/// guarantees no ordering on a multistatus, so slicing raw response order
+/// would let an unchanged result set come back permuted between page one and
+/// page two: events the permutation moved behind the offset are SKIPPED and
+/// events it moved past the offset are served TWICE, with nothing to tell the
+/// consumer either happened. Sorting first is what makes the offset mean the
+/// same thing on both requests. The key is the recurrence-qualified `EventId`
+/// (resource href, plus `#RECURRENCE-ID` for an override instance), which is
+/// unique per emitted item and stable across polls because it is derived from
+/// the resource URL rather than from anything the server chose to order by.
+/// `bifrost-carddav::contact_search` already sorted by `native_id` for this
+/// reason; the two must not drift apart again.
+fn event_page(
+    mut items: Vec<CalendarEvent>,
+    offset: usize,
+    limit: Option<u32>,
+    failed_ids: Vec<String>,
+    skipped_scopes: Vec<SkippedScope>,
+) -> Page<CalendarEvent> {
+    items.sort_by(|left, right| left.id.0.cmp(&right.id.0));
+    let total = items.len();
+    let estimated_total = Some(u64::try_from(total).unwrap_or(u64::MAX));
+    // A zero limit is an exhausted page, not a page of nothing that still
+    // points at itself. Emitting the current offset again whenever results
+    // exist gives a consumer that follows `next_cursor` an infinite loop that
+    // never advances and never delivers an item.
+    if limit == Some(0) {
+        return Page {
+            items: Vec::new(),
+            next_cursor: None,
+            estimated_total,
+            failed_ids,
+            skipped_scopes,
+        };
+    }
+    let page_size = limit.map_or(total, |value| usize::try_from(value).unwrap_or(usize::MAX));
+    let end = offset.saturating_add(page_size).min(total);
+    Page {
+        items: items.into_iter().skip(offset).take(page_size).collect(),
+        next_cursor: (end < total).then(|| end.to_string().into_bytes()),
+        estimated_total,
+        failed_ids,
+        skipped_scopes,
     }
 }
 
@@ -1434,15 +1496,37 @@ async fn changes_from_cursor(
         let changes = apply_sync_report(&mut current, report.entries);
         return Ok((current, changes));
     }
-    let current = CalDavAccount::event_snapshot(
+    let mut current = CalDavAccount::event_snapshot(
         client,
         None,
         &previous.calendar_url,
         AccountOperation::SyncChanges,
     )
     .await?;
+    preserve_unobserved_event_entries(previous, &mut current);
     let changes = diff_event_snapshots(previous, &current);
     Ok((current, changes))
+}
+
+fn preserve_unobserved_event_entries(previous: &EventSnapshot, current: &mut EventSnapshot) {
+    if current.entries.is_empty() && !previous.entries.is_empty() {
+        current.entries.clone_from(&previous.entries);
+        return;
+    }
+    let failed: HashSet<&str> = current.failed_hrefs.iter().map(String::as_str).collect();
+    current.entries.extend(
+        previous
+            .entries
+            .iter()
+            .filter(|entry| failed.contains(entry.uri.as_str()))
+            .cloned(),
+    );
+    current
+        .entries
+        .sort_by(|left, right| left.uri.cmp(&right.uri));
+    current
+        .entries
+        .dedup_by(|left, right| left.uri == right.uri);
 }
 
 fn apply_sync_report(
@@ -2266,6 +2350,109 @@ mod tests {
         assert!(diff_event_snapshots(&previous, &empty).is_empty());
         assert!(diff_event_snapshots(&previous, &previous).is_empty());
         assert!(diff_event_snapshots(&empty, &empty).is_empty());
+    }
+
+    #[test]
+    fn empty_poll_checkpoint_preserves_snapshot_for_the_recovery_poll() {
+        let previous = event_snapshot_with(&["a.ics", "b.ics"]);
+        let mut empty = event_snapshot_with(&[]);
+        empty.sync_token = Some("refreshed".to_string());
+
+        preserve_unobserved_event_entries(&previous, &mut empty);
+        assert_eq!(empty.entries.len(), 2);
+        assert_eq!(empty.sync_token.as_deref(), Some("refreshed"));
+
+        let recovered = event_snapshot_with(&["a.ics", "b.ics"]);
+        assert!(diff_event_snapshots(&empty, &recovered).is_empty());
+    }
+
+    #[test]
+    fn event_page_emits_a_cursor_for_truncated_results() {
+        let first = event_page(
+            identified_events(&["a", "b", "c"]),
+            0,
+            Some(2),
+            Vec::new(),
+            Vec::new(),
+        );
+        assert_eq!(event_ids(&first), vec!["a", "b"]);
+        assert_eq!(first.next_cursor, Some(b"2".to_vec()));
+
+        let second = event_page(
+            identified_events(&["a", "b", "c"]),
+            2,
+            Some(2),
+            Vec::new(),
+            Vec::new(),
+        );
+        assert_eq!(event_ids(&second), vec!["c"]);
+        assert_eq!(second.next_cursor, None);
+    }
+
+    fn identified_events(ids: &[&str]) -> Vec<CalendarEvent> {
+        ids.iter()
+            .map(|id| {
+                let mut event = event("2026-01-01T09:00:00Z", "2026-01-01T10:00:00Z", false);
+                event.id = EventId((*id).to_string());
+                event.native_id = (*id).to_string();
+                event
+            })
+            .collect()
+    }
+
+    fn event_ids(page: &Page<CalendarEvent>) -> Vec<String> {
+        page.items.iter().map(|event| event.id.0.clone()).collect()
+    }
+
+    /// The offset is local and every continuation re-runs the REPORT, so an
+    /// unchanged result set returned in a DIFFERENT order across the two pages
+    /// must still yield each event exactly once. Against unsorted slicing page
+    /// two returns `a` again and `c` is never delivered at all.
+    #[test]
+    fn offset_pages_survive_a_reordered_second_report() {
+        let first = event_page(
+            identified_events(&["a", "b", "c"]),
+            0,
+            Some(2),
+            Vec::new(),
+            Vec::new(),
+        );
+        let first_ids = event_ids(&first);
+        assert_eq!(first_ids, vec!["a", "b"]);
+        let offset = String::from_utf8(first.next_cursor.expect("page one truncates"))
+            .expect("ascii cursor")
+            .parse::<usize>()
+            .expect("numeric cursor");
+
+        // Same three events, the order the server happened to answer with.
+        let second = event_page(
+            identified_events(&["c", "a", "b"]),
+            offset,
+            Some(2),
+            Vec::new(),
+            Vec::new(),
+        );
+        assert_eq!(event_ids(&second), vec!["c"]);
+
+        let mut delivered = first_ids;
+        delivered.extend(event_ids(&second));
+        delivered.sort();
+        assert_eq!(delivered, vec!["a", "b", "c"]);
+    }
+
+    /// A zero limit must terminate. Emitting the current offset again gives a
+    /// consumer that follows `next_cursor` an infinite non-advancing loop.
+    #[test]
+    fn a_zero_limit_is_an_exhausted_page_with_no_continuation() {
+        let page = event_page(
+            identified_events(&["a", "b", "c"]),
+            0,
+            Some(0),
+            Vec::new(),
+            Vec::new(),
+        );
+        assert!(page.items.is_empty());
+        assert_eq!(page.next_cursor, None);
     }
 
     #[test]

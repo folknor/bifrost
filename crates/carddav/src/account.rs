@@ -222,14 +222,18 @@ impl CardDavAccount {
         operation: AccountOperation,
     ) -> Result<SearchedContacts, AccountError> {
         let addressbook = Self::addressbook_url(client, default_addressbook_url, address_book);
-        let entries = client.list_contacts(&addressbook).await?;
-        let uris = entries
+        let listing = client
+            .list_contacts_listing(&addressbook, operation)
+            .await?;
+        let uris = listing
+            .entries
             .iter()
             .map(|entry| entry.uri.clone())
             .collect::<Vec<_>>();
         let fetch = client.fetch_vcards(&addressbook, &uris, operation).await?;
         let skipped_scopes = skipped_addressbook_scope(fetch.degraded);
         let (fetched, mut failed_ids) = resolved_report(fetch.report);
+        merge_listing_failures(&mut failed_ids, listing.failed_hrefs);
         let (cards, projection_failures) = partition_hydrated_vcards(&addressbook, fetched);
         failed_ids.extend(projection_failures);
         one_outcome_per_id(&mut failed_ids, &cards);
@@ -274,8 +278,18 @@ impl CardDavAccount {
         operation: AccountOperation,
     ) -> Result<Page<ContactCard>, AccountError> {
         let addressbook = Self::addressbook_url(client, default_addressbook_url, address_book);
-        let entries = client.list_contacts(&addressbook).await?;
-        let total = entries.len();
+        let listing = client
+            .list_contacts_listing(&addressbook, operation)
+            .await?;
+        let total = listing.entries.len();
+        // The offset is local and each page re-runs the depth-1 PROPFIND. DAV
+        // guarantees no ordering on a multistatus, so paging raw response
+        // order would let an unchanged collection come back permuted between
+        // pages, skipping the contacts the permutation moved behind the offset
+        // and serving twice the ones it moved past. The resolved href is the
+        // stable key that makes the offset mean the same thing on every page.
+        let mut entries = listing.entries;
+        entries.sort_by(|left, right| left.uri.cmp(&right.uri));
         let uris = entries
             .into_iter()
             .skip(offset)
@@ -285,6 +299,7 @@ impl CardDavAccount {
         let fetch = client.fetch_vcards(&addressbook, &uris, operation).await?;
         let skipped_scopes = skipped_addressbook_scope(fetch.degraded);
         let (fetched, mut failed_ids) = resolved_report(fetch.report);
+        merge_listing_failures(&mut failed_ids, listing.failed_hrefs);
         let (cards, projection_failures) = partition_hydrated_vcards(&addressbook, fetched);
         failed_ids.extend(projection_failures);
         one_outcome_per_id(&mut failed_ids, &cards);
@@ -559,7 +574,7 @@ impl Account for CardDavAccount {
                 // resolved, including `None`, which is exactly the value the
                 // old depth-1 path would have produced for a server that does
                 // not publish getctag.
-                let current = match Self::contact_snapshot(
+                let mut current = match Self::contact_snapshot(
                     &client,
                     CtagSource::Known(current_ctag),
                     &previous.addressbook_url,
@@ -573,6 +588,7 @@ impl Account for CardDavAccount {
                         return events;
                     }
                 };
+                preserve_unobserved_contact_entries(&previous, &mut current);
                 let checkpoint = cursor_from_snapshot(cursor.scope, &current);
                 let changes = diff_contact_snapshots(&previous, &current);
                 events.push(SyncEvent::Batch(bifrost_types::Batch {
@@ -1062,11 +1078,13 @@ impl Account for CardDavAccount {
                 .filter(|contact| contact_matches(contact, &needle))
                 .collect::<Vec<_>>();
             items.sort_by(|left, right| left.native_id.cmp(&right.native_id));
-            let page_size = request
-                .limit
-                .and_then(|limit| usize::try_from(limit).ok())
-                .unwrap_or(CONTACT_PAGE_SIZE)
-                .max(1);
+            // A zero limit is honored as an empty exhausted page, not clamped
+            // up to one. Clamping silently served a contact the caller had
+            // asked not to receive; `page_from_offset` is what makes the zero
+            // case terminate instead of pointing at itself.
+            let page_size = request.limit.map_or(CONTACT_PAGE_SIZE, |limit| {
+                usize::try_from(limit).unwrap_or(usize::MAX)
+            });
             Ok(page_from_offset(
                 items,
                 offset,
@@ -1360,6 +1378,27 @@ fn diff_contact_snapshots(previous: &ContactSnapshot, current: &ContactSnapshot)
     changes
 }
 
+fn preserve_unobserved_contact_entries(previous: &ContactSnapshot, current: &mut ContactSnapshot) {
+    if current.entries.is_empty() && !previous.entries.is_empty() {
+        current.entries.clone_from(&previous.entries);
+        return;
+    }
+    let failed: HashSet<&str> = current.failed_hrefs.iter().map(String::as_str).collect();
+    current.entries.extend(
+        previous
+            .entries
+            .iter()
+            .filter(|entry| failed.contains(entry.uri.as_str()))
+            .cloned(),
+    );
+    current
+        .entries
+        .sort_by(|left, right| left.uri.cmp(&right.uri));
+    current
+        .entries
+        .dedup_by(|left, right| left.uri == right.uri);
+}
+
 /// Emit `Destroyed` for `uri` unless the server reported that resource
 /// *failed* within the 207. A transiently-failed resource is preserved
 /// locally rather than treated as absent (brick 7).
@@ -1500,6 +1539,19 @@ fn page_from_offset<T>(
     skipped_scopes: Vec<SkippedScope>,
 ) -> Page<T> {
     let total = items.len();
+    // A zero page size is an exhausted page, not a page of nothing that still
+    // points at itself: emitting the current offset again whenever results
+    // exist gives a consumer that follows `next_cursor` an infinite loop that
+    // never advances and never delivers an item.
+    if page_size == 0 {
+        return Page {
+            items: Vec::new(),
+            next_cursor: None,
+            estimated_total: Some(estimated_total(total)),
+            failed_ids,
+            skipped_scopes,
+        };
+    }
     let end = offset.saturating_add(page_size).min(total);
     let page_items = items.into_iter().skip(offset).take(page_size).collect();
     Page {
@@ -1535,6 +1587,10 @@ fn one_outcome_per_id(failed_ids: &mut Vec<String>, cards: &[ContactCard]) {
     failed_ids.retain(|id| !materialized.contains(id.as_str()));
     failed_ids.sort_unstable();
     failed_ids.dedup();
+}
+
+fn merge_listing_failures(failed_ids: &mut Vec<String>, listing_failed_hrefs: Vec<String>) {
+    failed_ids.extend(listing_failed_hrefs);
 }
 
 /// Publish a partially-refused walk as a skipped scope.
@@ -1796,6 +1852,18 @@ mod tests {
         assert_eq!(tail.next_cursor, None);
     }
 
+    /// A zero page size must terminate. Emitting the current offset again
+    /// gives a consumer that follows `next_cursor` an infinite non-advancing
+    /// loop. The CalDAV twin pins the same rule for `limit: Some(0)`.
+    #[test]
+    fn a_zero_page_size_is_an_exhausted_page_with_no_continuation() {
+        let page = page_from_offset(vec![1, 2, 3, 4], 0, 0, Vec::new(), Vec::new());
+
+        assert!(page.items.is_empty());
+        assert_eq!(page.next_cursor, None);
+        assert_eq!(page.estimated_total, Some(4));
+    }
+
     #[test]
     fn a_materialized_resource_leaves_the_failure_lane() {
         let card = ContactCard {
@@ -2018,6 +2086,27 @@ mod tests {
         let same = diff_contact_snapshots(&previous, &previous);
         assert!(same.is_empty());
         assert!(diff_contact_snapshots(&empty, &empty).is_empty());
+    }
+
+    #[test]
+    fn empty_poll_checkpoint_preserves_snapshot_for_the_recovery_poll() {
+        let previous = snapshot_with(&["a.vcf", "b.vcf"]);
+        let mut empty = snapshot_with(&[]);
+        empty.ctag = Some("refreshed".to_string());
+
+        preserve_unobserved_contact_entries(&previous, &mut empty);
+        assert_eq!(empty.entries.len(), 2);
+        assert_eq!(empty.ctag.as_deref(), Some("refreshed"));
+
+        let recovered = snapshot_with(&["a.vcf", "b.vcf"]);
+        assert!(diff_contact_snapshots(&empty, &recovered).is_empty());
+    }
+
+    #[test]
+    fn listing_failures_survive_into_the_page_failure_lane() {
+        let mut failed_ids = vec!["multiget.vcf".to_string()];
+        merge_listing_failures(&mut failed_ids, vec!["listing.vcf".to_string()]);
+        assert_eq!(failed_ids, vec!["multiget.vcf", "listing.vcf"]);
     }
 
     #[test]

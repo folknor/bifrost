@@ -113,6 +113,8 @@ impl DavTransport for ReqwestDavTransport {
 /// big, hence a ceiling generous enough that only a pathological
 /// response reaches it, matching the buffered ceiling `bifrost-net`
 /// applies on its own `send` path.
+const RESPONSE_BODY_TOO_LARGE: &str = "DAV response body exceeded the buffered ceiling";
+
 async fn read_capped_body(response: reqwest::Response) -> Result<String, String> {
     use futures::StreamExt;
 
@@ -122,9 +124,7 @@ async fn read_capped_body(response: reqwest::Response) -> Result<String, String>
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|error| error.to_string())?;
         if buf.len() + chunk.len() > limit {
-            return Err(format!(
-                "DAV response body exceeded the {limit}-byte ceiling"
-            ));
+            return Err(format!("{RESPONSE_BODY_TOO_LARGE} ({limit} bytes)"));
         }
         buf.extend_from_slice(&chunk);
     }
@@ -312,17 +312,18 @@ impl CalDavClient {
         let mut degraded = None;
         for property in ["SUMMARY", "DESCRIPTION", "LOCATION", "ATTENDEE"] {
             let body = calendar_text_query_body(property, query);
-            let response = self
-                .report_raw(calendar_url, "1", &body, AccountOperation::EventSearch)
-                .await?;
-            let mut parsed = parse_multiget_report(&response.text).map_err(|error| {
-                parse_error(AccountOperation::EventSearch, format!("query: {error}"))
-            })?;
-            parsed.resolve_hrefs(&response.url);
-            if let Some(error) = multiget_failure(&parsed, AccountOperation::EventSearch) {
-                degraded = worse_recovery(degraded, error);
-            }
-            all_results.extend(parsed);
+            self.accumulate_leg(
+                MultigetLeg {
+                    url: calendar_url,
+                    depth: "1",
+                    body: &body,
+                    operation: AccountOperation::EventSearch,
+                    context: "query",
+                },
+                &mut all_results,
+                &mut degraded,
+            )
+            .await;
         }
         MultigetFetch::settle(all_results, degraded)
     }
@@ -352,16 +353,74 @@ impl CalDavClient {
   </D:prop>\n\
 {href_elements}</C:calendar-multiget>"
             );
-            let response = self.report_raw(calendar_url, "0", &body, operation).await?;
-            let mut parsed = parse_multiget_report(&response.text)
-                .map_err(|error| parse_error(operation, format!("multiget: {error}")))?;
-            parsed.resolve_hrefs(&response.url);
-            if let Some(error) = multiget_failure(&parsed, operation) {
-                degraded = worse_recovery(degraded, error);
-            }
-            all_results.extend(parsed);
+            self.accumulate_leg(
+                MultigetLeg {
+                    url: calendar_url,
+                    depth: "0",
+                    body: &body,
+                    operation,
+                    context: "multiget",
+                },
+                &mut all_results,
+                &mut degraded,
+            )
+            .await;
         }
         MultigetFetch::settle(all_results, degraded)
+    }
+
+    /// Run one REPORT leg of a multi-leg fetch and fold its outcome into the
+    /// caller's accumulators.
+    ///
+    /// This is the only way a leg result enters `all_results`, and it is what
+    /// makes the partial-result contract structural rather than a habit. A leg
+    /// can fail four ways - transport, a non-2xx status, a body that will not
+    /// parse, and a 207 that describes complete failure - and all four land in
+    /// `degraded` here. Routing only some of them (the shape this replaced
+    /// classified the HTTP failure but kept `?` on the parse) meant a malformed
+    /// body on chunk 3 of 40 threw away chunks 1 and 2, which is exactly the
+    /// loss the degraded lane exists to prevent. The function returns nothing,
+    /// so a leg added later has no unrouted path available to it.
+    ///
+    /// A malformed body is account-authored data, so it is classified and
+    /// survived, never asserted on. `MultigetFetch::settle` is what turns "every
+    /// leg failed and nothing materialized anywhere" back into an `Err` carrying
+    /// the worst recovery class seen.
+    async fn accumulate_leg(
+        &self,
+        leg: MultigetLeg<'_>,
+        all_results: &mut CalDavMultigetReport,
+        degraded: &mut Option<AccountError>,
+    ) {
+        let MultigetLeg {
+            url,
+            depth,
+            body,
+            operation,
+            context,
+        } = leg;
+        let response = match self.report_raw(url, depth, body, operation).await {
+            Ok(response) => response,
+            Err(error) => {
+                *degraded = worse_recovery(degraded.take(), error);
+                return;
+            }
+        };
+        let mut parsed = match parse_multiget_report(&response.text) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                *degraded = worse_recovery(
+                    degraded.take(),
+                    parse_error(operation, format!("{context}: {error}")),
+                );
+                return;
+            }
+        };
+        parsed.resolve_hrefs(&response.url);
+        if let Some(error) = multiget_failure(&parsed, operation) {
+            *degraded = worse_recovery(degraded.take(), error);
+        }
+        all_results.extend(parsed);
     }
 
     pub(crate) async fn sync_events(
@@ -614,7 +673,7 @@ impl CalDavClient {
                 .transport
                 .send(request)
                 .await
-                .map_err(|error| transport_error(operation, error))?;
+                .map_err(|error| response_read_error(operation, error))?;
             let redirect = matches!(
                 response.status,
                 StatusCode::MOVED_PERMANENTLY
@@ -974,6 +1033,16 @@ fn should_fallback_discovery(error: &AccountError) -> bool {
 /// classified where it happens, and the worst class survives to the
 /// caller in `degraded`, which the account layer publishes as a
 /// `Page::skipped_scopes` entry: the walk did not finish this collection.
+/// One REPORT leg of a multi-leg fetch, as handed to `accumulate_leg`.
+struct MultigetLeg<'a> {
+    url: &'a str,
+    depth: &'a str,
+    body: &'a str,
+    operation: AccountOperation,
+    /// Names the leg in a parse-failure message ("multiget", "query").
+    context: &'a str,
+}
+
 pub(crate) struct MultigetFetch {
     pub(crate) report: CalDavMultigetReport,
     pub(crate) degraded: Option<AccountError>,
@@ -1154,6 +1223,26 @@ pub(crate) fn transport_error(
     .operation(operation)
     .try_build()
     .expect("valid account error classification")
+}
+
+fn response_read_error(operation: AccountOperation, message: String) -> AccountError {
+    if !message.starts_with(RESPONSE_BODY_TOO_LARGE) {
+        return transport_error(operation, message);
+    }
+    AccountErrorBuilder::new(
+        AccountErrorKind::Protocol(ProtocolErrorKind::PartialResponse),
+        Cause::Wire(WireCause::MalformedResponse {
+            protocol: Protocol::CalDav,
+            detail: Some(DiagnosticText::support_only(message)),
+        }),
+    )
+    .push_cause(Cause::Attempt(bifrost_types::AttemptCause::new(
+        TransmissionState::Acknowledged,
+    )))
+    .protocol(Protocol::CalDav)
+    .operation(operation)
+    .try_build()
+    .expect("valid acknowledged response-overflow classification")
 }
 
 pub(crate) fn status_error(
@@ -2053,6 +2142,119 @@ mod tests {
             .expect("empty multistatus is usable");
 
         assert_eq!(script.requests()[0].headers["Depth"], "0");
+    }
+
+    #[tokio::test]
+    async fn chunked_multiget_keeps_prior_chunk_when_later_http_leg_fails() {
+        let good = DavResponse {
+            status: StatusCode::MULTI_STATUS,
+            headers: HeaderMap::new(),
+            body: "<D:multistatus xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\"><D:response><D:href>/cal/one.ics</D:href><D:propstat><D:prop><C:calendar-data>BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:one\nEND:VEVENT\nEND:VCALENDAR</C:calendar-data></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response></D:multistatus>".to_string(),
+            url: "https://dav.example.test/cal/".to_string(),
+        };
+        let refused = DavResponse {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            headers: HeaderMap::new(),
+            body: String::new(),
+            url: "https://dav.example.test/cal/".to_string(),
+        };
+        let script = ScriptedDavTransport::new([good, refused]);
+        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
+        let client = CalDavClient::with_transport("https://dav.example.test", transport);
+        let uris = (0..=MULTIGET_BATCH_SIZE)
+            .map(|index| format!("https://dav.example.test/cal/{index}.ics"))
+            .collect::<Vec<_>>();
+
+        let fetched = client
+            .fetch_events(
+                "https://dav.example.test/cal/",
+                &uris,
+                AccountOperation::EventSearch,
+            )
+            .await
+            .expect("the usable first chunk survives");
+
+        assert_eq!(fetched.report.events.len(), 1);
+        assert!(fetched.degraded.is_some());
+    }
+
+    /// The adjacent leg-failure path: a later chunk whose body will not parse
+    /// must degrade like a later chunk that returned 503, not discard the
+    /// chunks that already materialized. A malformed body is account-authored
+    /// data, so it is classified and survived rather than asserted on.
+    #[tokio::test]
+    async fn chunked_multiget_keeps_prior_chunk_when_later_body_is_malformed() {
+        let good = DavResponse {
+            status: StatusCode::MULTI_STATUS,
+            headers: HeaderMap::new(),
+            body: "<D:multistatus xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\"><D:response><D:href>/cal/one.ics</D:href><D:propstat><D:prop><C:calendar-data>BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:one\nEND:VEVENT\nEND:VCALENDAR</C:calendar-data></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response></D:multistatus>".to_string(),
+            url: "https://dav.example.test/cal/".to_string(),
+        };
+        let malformed = DavResponse {
+            status: StatusCode::MULTI_STATUS,
+            headers: HeaderMap::new(),
+            body: "<D:multistatus xmlns:D=\"DAV:\"><D:response></D:multistatus>".to_string(),
+            url: "https://dav.example.test/cal/".to_string(),
+        };
+        let script = ScriptedDavTransport::new([good, malformed]);
+        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
+        let client = CalDavClient::with_transport("https://dav.example.test", transport);
+        let uris = (0..=MULTIGET_BATCH_SIZE)
+            .map(|index| format!("https://dav.example.test/cal/{index}.ics"))
+            .collect::<Vec<_>>();
+
+        let fetched = client
+            .fetch_events(
+                "https://dav.example.test/cal/",
+                &uris,
+                AccountOperation::EventSearch,
+            )
+            .await
+            .expect("the usable first chunk survives a malformed later chunk");
+
+        assert_eq!(fetched.report.events.len(), 1);
+        assert!(fetched.degraded.is_some());
+    }
+
+    /// Nothing usable anywhere is still a failed call, malformed or not.
+    #[tokio::test]
+    async fn an_only_leg_that_will_not_parse_is_still_an_error() {
+        let malformed = DavResponse {
+            status: StatusCode::MULTI_STATUS,
+            headers: HeaderMap::new(),
+            body: "<D:multistatus xmlns:D=\"DAV:\"><D:response></D:multistatus>".to_string(),
+            url: "https://dav.example.test/cal/".to_string(),
+        };
+        let script = ScriptedDavTransport::new([malformed]);
+        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
+        let client = CalDavClient::with_transport("https://dav.example.test", transport);
+
+        let outcome = client
+            .fetch_events(
+                "https://dav.example.test/cal/",
+                &["https://dav.example.test/cal/one.ics".to_string()],
+                AccountOperation::EventSearch,
+            )
+            .await
+            .map(|fetched| fetched.report.events.len());
+        let Err(error) = outcome else {
+            panic!("no usable result anywhere must stay an error");
+        };
+        assert_eq!(error.operation(), Some(AccountOperation::EventSearch));
+    }
+
+    #[test]
+    fn response_overflow_after_mutation_is_acknowledged_and_reconciles() {
+        let error = response_read_error(
+            AccountOperation::EventDelete,
+            format!("{RESPONSE_BODY_TOO_LARGE} (1 bytes)"),
+        );
+        assert!(error.recovery().requires_reconciliation());
+        assert!(error.chain().iter().any(|cause| matches!(
+            cause,
+            Cause::Attempt(attempt)
+                if attempt.transmission_state == TransmissionState::Acknowledged
+        )));
     }
 
     #[test]

@@ -9,44 +9,6 @@ Hunter note: read `reference/caldav.md`, `reference/carddav.md`,
 `account.rs`/`client.rs`/`parse.rs` in both crates; skimmed `ical.rs`/`vcard.rs`
 only via the reference, since the note says that path was reworked.
 
-## 1. The empty-multistatus guard suppresses the deletes but *adopts the empty snapshot as the checkpoint*
-
-**Both crates. High confidence, real data-stranding.**
-
-`diff_event_snapshots` / `diff_contact_snapshots` return `Vec::new()` when
-`current.entries.is_empty() && !previous.entries.is_empty()` - the mass-delete
-suppression. But the caller does not roll back:
-
-```rust
-let (current, changes) = changes_from_cursor(&client, &previous).await?;   // current has 0 entries
-let checkpoint = cursor_from_snapshot(cursor.scope, &current);             // <- persists the EMPTY snapshot
-```
-
-(`caldav/src/account.rs` `changes_stream`; `carddav/src/account.rs`
-`changes_stream`, line ~572.)
-
-Two consequences, both bad:
-
-- A **genuine** empty-out (user deleted every event/contact, or the collection was
-  replaced) is never reported as `Destroyed` - not on this poll, and not on any later
-  poll, because the next `previous` is already empty. The consumer's rows are
-  stranded permanently. The comment claims "a genuine empty-out reconciles on the
-  next non-empty poll", which is false: after the empty snapshot is checkpointed the
-  diff is empty-vs-populated, which yields only `Created`.
-- A **transient** empty 207 causes every surviving resource to be re-emitted as
-  `Created` on the next poll - a full replay of the collection, which is the exact
-  cost the guard was written to avoid.
-
-CardDAV compounds this: on the empty poll the *new* ctag is also written into the
-checkpoint, so the next poll ctag-short-circuits and does not even re-observe.
-
-The fix that keeps the guard: when the guard fires, checkpoint `previous`
-(optionally with the refreshed sync-token/ctag) rather than `current`, and treat the
-poll as "no observation" end-to-end, not only in the change lane. The same shape
-applies to `failed_hrefs`: a preserved-failed href is dropped from
-`current.entries`, so its etag is lost and it re-emits as `Created` next poll; it
-should be carried forward from `previous` into the snapshot that gets encoded.
-
 ## 2. `inventory_stream` claims `CoverageDomain::full(Type(CalendarEvent))` while walking one collection
 
 **Both crates. High confidence.**
@@ -67,42 +29,6 @@ it is emitted once at open, not per walk.
 Minimum honest fix without reshaping the cursor model: report
 `CoverageCoordinate::ProviderRegion { namespace: "caldav", region: default_calendar_url }`
 instead of `Full`. The real fix is finding 7.
-
-## 3. A whole-leg HTTP failure in a chunked multiget still throws away every prior chunk
-
-**Both crates. High confidence.**
-
-`fetch_events` / `fetch_vcards` / `query_events_text` / `query_vcards_text` use
-`self.report_raw(...).await?`. `report_raw` classifies non-2xx into `Err`. So the
-entire `MultigetFetch::degraded` machinery - the whole point of which is "a leg that
-fails wholly after other legs returned events keeps those events" - only fires for
-**207 bodies that failed internally**. A 401, 503, or 429 on chunk 3 of 40 discards
-chunks 1 and 2 and returns `Err`, exactly the outcome the design says it avoids. Both
-`reference/caldav.md` and `reference/carddav.md` state the stronger property, so the
-docs are currently wrong about the code.
-
-Fix: classify the status inside the loop through `status_error` and route it into
-`worse_recovery(degraded, ...)` like the 207 path, letting `MultigetFetch::settle`
-decide.
-
-## 4. `contacts_list` and empty `contact_search` silently drop the listing's failed hrefs
-
-**CardDAV only. High confidence - textbook drift.**
-
-`hydrated_contacts_page` and `hydrated_contacts` call `client.list_contacts(...)`,
-which is `list_contacts_listing(...).entries` - `failed_hrefs` is discarded on the
-floor. CalDAV's `event_search` empty-query branch does exactly the opposite and
-explicitly says why:
-
-```rust
-fetched.report.failed.extend(listing.failed_hrefs.into_iter().map(...));   // caldav
-```
-
-So a contact the server refused inside the depth-1 207 is invisible to the consumer:
-not in `items`, not in `failed_ids`, indistinguishable from a remote deletion. The
-`list_contacts` / `list_contacts_listing` split is the mechanism that made this easy
-to get wrong - `list_contacts` exists only to throw the failure lane away, and should
-be deleted so callers have to handle it.
 
 ## 5. CardDAV's `contact_addressbook_url` is the bug CalDAV already fixed
 
@@ -158,11 +84,6 @@ spending the re-sync on, and everything in 2 is a workaround for not having made
    branches that return `Unsupported` come after. Both are account fields known at
    open. Move the guards above the fetch. (CalDAV, low.)
 
-9. **`read_capped_body` misclassifies a completed mutation.** Exceeding the ceiling
-   returns a `transport_error` with `Attempt(InFlight)`. For a `PUT`/`DELETE`/outbox
-   `POST`, the server already acted and the response is what overflowed - `InFlight`
-   tells the consumer it is safe to retry when it may not be. Both crates.
-
 10. **`MULTIGET_BATCH_SIZE` chunk loop is serial**, and CardDAV's text search runs 8
     REPORTs serially per search, re-run on every page of `contact_search`. A 3-page
     search is 24 round trips over the same result set. The per-page re-run is
@@ -193,15 +114,26 @@ spending the re-sync on, and everything in 2 is a workaround for not having made
     the file which uses the element-stack parent check. A nested `<status>` inside a
     property value would be read as the propstat status.
 
-15. **`events_in_range` truncates to `range.limit` with `next_cursor: None`.** Events
-    past the limit are dropped with no continuation handle and no signal that
-    truncation happened. Same in `event_search`.
-
 ## Out of scope, flagged
 
-- `reference/caldav.md` and `reference/carddav.md` both assert the property in finding
-  3 ("A leg that fails wholly after other legs returned events keeps those events") as
-  current behavior. Those paragraphs need correcting whichever way 3 is resolved.
+- **A GENUINE empty-out is still never reported, and now cannot be.** Finding 1 is
+  closed for the transient case: the empty-207 poll checkpoints the prior entries
+  and etags, so surviving resources are neither stranded nor replayed as `Created`.
+  What the guard cannot do is tell a transient empty 207 from a user who really
+  deleted every event/contact - the wire looks identical - so the mass delete is
+  suppressed in both cases and a real empty-out is never emitted as `Destroyed`, on
+  this poll or any later one. CardDAV compounds it: the refreshed ctag is
+  checkpointed too, so the next poll ctag-short-circuits and does not re-observe.
+  This is the deliberate trade the guard was written to make (silently deleting a
+  populated collection is far worse), but no document should claim the empty-out
+  reconciles later. Distinguishing the two needs a signal the depth-1 PROPFIND does
+  not carry - a second confirming observation, or a collection-level count.
+- `CardDavClient::list_contacts` and `list_contacts_for_operation` are now
+  `#[allow(dead_code)]`: every caller moved to `list_contacts_listing` so the
+  listing's failure lane cannot be dropped again (finding 4). Deleting them was
+  proposed and is refused - removing a published item is the repository owner's
+  call, not a fix pass's. If they stay unused they should be re-pointed at
+  `list_contacts_listing`'s failure-carrying shape rather than removed.
 - The `notes/dav-parsing-robustness-2026-06-17.md` claim that bifrost's DAV XML
   parsers are "stronger than ratatoskr's" still holds against what the hunter read -
   the 2xx commit gating and element-stack checks are genuinely solid. Findings

@@ -38,6 +38,9 @@ calendar primitives.
   parsed, so an error page can never decode as an authoritative empty
   report; `sync_events` alone reads the raw response, because it must see
   403 `valid-sync-token` and 410 as cursor invalidation rather than failure.
+  A response body exceeding the buffered ceiling is classified as
+  `Protocol(PartialResponse)` with `Attempt(Acknowledged)`, so a completed
+  non-idempotent mutation reconciles instead of replaying blindly.
   Credential-bearing requests are limited to the configured base origin plus
   calendar-home and scheduling origins delegated by an authenticated principal
   on that origin. Resource hrefs, consumer-provided native ids, and a
@@ -209,6 +212,16 @@ Supported calendar primitives:
   before a REPORT is sent, and the encoder preserves legal one-sided ranges.
   Query REPORTs use `Depth: 1`; `calendar-multiget` REPORTs enumerate their
   hrefs in the body and use `Depth: 0`.
+  Range and search results use local offset cursors: when `limit` truncates
+  the materialized set, `next_cursor` names the next offset. The offset is
+  local and every continuation re-runs the remote REPORT, so `event_page`
+  SORTS by the recurrence-qualified `EventId` before slicing. DAV guarantees
+  no ordering on a multistatus; slicing raw response order let an unchanged
+  result set come back permuted between pages, skipping the events the
+  permutation moved behind the offset and serving twice the ones it moved
+  past. A `limit` of zero is an exhausted page - no items and no
+  continuation - rather than an empty page that names its own offset again
+  and loops a cursor-following consumer forever.
   The local guard uses half-open overlap, matching CalDAV time-range and the
   exclusive all-day end contract. It is recurrence-aware: a recurring master
   whose own interval sits outside the
@@ -233,7 +246,13 @@ Supported calendar primitives:
   both would count it twice and treat a displayable event as lost.
 
   Multiget is chunked and search runs one REPORT per property, so each REPORT
-  is classified independently. A leg that fails wholly after other legs
+  is classified independently. Every leg goes through `accumulate_leg`, which
+  is the single funnel each leg result passes through: all four ways a leg can
+  fail - transport, a non-2xx status, a body that will not parse, and a 207
+  describing complete failure - are folded into `degraded` there, and the
+  function returns nothing, so a leg added later has no unrouted path
+  available to it. A malformed body is account-authored data, classified and
+  survived rather than asserted on. A leg that fails wholly after other legs
   returned events keeps those events, and the worst recovery class
   encountered rides `MultigetFetch::degraded` into `Page::skipped_scopes` as
   an `ErrorScope::Calendar` entry - `failed_ids` carries ids with no
@@ -355,7 +374,9 @@ fall back to polling snapshot diffs. The PROPFIND-snapshot diff (not the
 sync-token path) is hardened against destroy-everything failure modes: an
 empty multistatus against a populated prior snapshot suppresses the
 mass-delete, and any href in `current.failed_hrefs` is preserved rather
-than destroyed. `inventory_stream` emits event inventory entries with ETag
+than destroyed. The checkpoint preserves the prior entries and etags for
+both no-observation shapes while retaining a refreshed collection token.
+`inventory_stream` emits event inventory entries with ETag
 fingerprints for the same cursor scope.
 The CalDAV cursor payload is version 2. Version 2 records the request-relative
 native-id namespace; version 1 cursors are rejected so a namespace correction

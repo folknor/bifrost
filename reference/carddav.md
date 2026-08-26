@@ -34,6 +34,9 @@ its successful body does not identify a current-user principal.
   DAV still owns Basic auth and its redirect policy. Every request path
   classifies a non-2xx status before the body is parsed, so an error page
   can never decode as an authoritative empty report.
+  A response body exceeding the buffered ceiling is classified as
+  `Protocol(PartialResponse)` with `Attempt(Acknowledged)`, so a completed
+  non-idempotent mutation reconciles instead of replaying blindly.
   Credential-bearing requests are limited to the configured base origin plus
   an addressbook-home origin delegated by an authenticated principal on that
   origin. Resource hrefs, consumer-provided native ids, and a cross-origin
@@ -134,7 +137,9 @@ Supported contact primitives:
   (`an_empty_home_lists_no_address_books_rather_than_a_phantom` and its
   CalDAV twin).
 - `contacts_list` - `PROPFIND` depth 1 for vCard resources, local
-  offset-cursor slicing of hrefs, then batched `addressbook-multiget`
+  offset-cursor slicing of hrefs - sorted by resolved href first, because the
+  offset is local and every page re-runs the PROPFIND, and DAV guarantees no
+  multistatus ordering - then batched `addressbook-multiget`
   `REPORT` hydration for only the requested page. Multiget REPORTs enumerate
   hrefs in the body and use `Depth: 0`; `addressbook-query` uses `Depth: 1`.
   A hydrated vCard that
@@ -149,9 +154,18 @@ Supported contact primitives:
   any non-404/410 failure is routed through normal status classification
   rather than returned as an empty page; partial failures feed
   `Page::failed_ids`.
+  The depth-1 listing's own failed hrefs feed that lane too, including the
+  empty-query `contact_search` path.
 
   Multiget is chunked and text search runs one REPORT per property, so each
-  REPORT is classified independently. A leg that fails wholly after other
+  REPORT is classified independently. Every leg goes through `accumulate_leg`,
+  the single funnel each leg result passes through: all four ways a leg can
+  fail - transport, a non-2xx status, a body that will not parse, and a 207
+  describing complete failure - are folded into `degraded` there, and the
+  function returns nothing, so a leg added later has no unrouted path
+  available to it. A malformed body is account-authored data, classified and
+  survived rather than asserted on. The CalDAV twin is the same shape and the
+  two must not drift apart. A leg that fails wholly after other
   legs returned cards no longer aborts the call: the cards are kept, and the
   worst recovery class encountered rides `MultigetFetch::degraded` into
   `Page::skipped_scopes` as an `ErrorScope::ContactCollection` entry, because
@@ -180,7 +194,12 @@ Supported contact primitives:
   fields, including ADR postal addresses, then keep local filtering and
   offset-cursor paging as a
   defensive guard. Results are sorted by native id before slicing so page
-  order is stable while the remote result set is unchanged. Every page
+  order is stable while the remote result set is unchanged. A `limit` of zero
+  is honored as an exhausted page - no items, no continuation - rather than
+  clamped up to one (which served a contact the caller asked not to receive)
+  or emitted as an empty page naming its own offset again (which loops a
+  cursor-following consumer forever). The CalDAV twin pins the same rule.
+  Every page
   reruns the remote search, so `failed_ids` reports what that page's fetch
   observed - a resource that only starts failing on page three is news on
   page three, and one failing throughout is named on every page. The lane is
@@ -232,6 +251,8 @@ cursor that starts without one does not stay without one. The PROPFIND-snapshot 
 destroy-everything failure modes: an empty multistatus against a populated
 prior snapshot suppresses the mass-delete (treated as "no observation"),
 and any href in `current.failed_hrefs` is preserved rather than destroyed.
+The checkpoint preserves the prior entries and etags for both no-observation
+shapes while retaining the refreshed ctag.
 `inventory_stream` emits contact inventory entries with ETag fingerprints
 for the same contact scope.
 The CardDAV cursor payload is version 2. Version 2 records the request-relative
