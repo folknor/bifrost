@@ -19,6 +19,95 @@ rather than appending to it.
 - Refusing a finding with a reason is a good outcome. Two have been rejected on
   the merits so far, both recorded below.
 
+## From the `bugs-imap-sasl.md` arc (closed, 8c365f0..HEAD)
+
+Scope was `crates/imap/` plus `crates/sasl/`: the auth-dispatch and mutation
+cluster, then the change-strategy paging and baseline consolidation.
+
+Machinery later work may build on and must not break:
+
+- **STORE tagged-NO strictness is compiler-enforced.** `StoreConsumer::new`
+  takes the command's own `unchanged_since` and has no argument-less
+  constructor, so how a tagged `NO` is treated is a property of the command
+  sent, not a call-site choice. Conditional STOREs preserve `NO [MODIFIED ...]`
+  in `StoreResult::status`; unconditional STOREs keep erroring, which is what
+  stops `delete_messages` from EXPUNGEing after a refused `+FLAGS \Deleted`.
+  `StoreWireOutcome::from_store_result` takes the whole result so no caller can
+  keep the code and drop the status.
+- **Mutation error lanes follow transmission evidence**, not the loop that
+  caught the error: `InFlight` evidence is `Uncertain`, `Unsent`/`Acknowledged`
+  is `Failed`. Applies to grouped STORE, MOVE, and EXPUNGE paths, and to the
+  second half of a two-sided `FlagOp::Patch`.
+- **SCRAM finalize checks the tagged status before the state machine**, so a
+  bare tagged `NO` (legal under RFC 5802, no server-final) is an auth error
+  reaching `ReauthorizationRequired`; a tagged `OK` still requires server-final
+  verification.
+- **Baselines are exact everywhere.** A QRESYNC/CONDSTORE cursor with
+  `known_uids_complete == false` terminates with `CursorInvalid` deriving
+  `RestartScope` before any wire I/O - live `UID SEARCH ALL` seeding was
+  removed because it cannot reconstruct historical consumer state and produced
+  `Updated` for objects the consumer never had.
+- **Three-way Basic classification.** Every server-authored `changed_messages`
+  UID on a Basic run goes through `basic_updated_change`: baseline UID is
+  `Updated`, live-only UID is an arrival left to the diff's `Added` lane, a UID
+  in neither set invalidates the cursor. The live-only lane is the ordinary
+  case, not an edge - the `[NOMODSEQ]` downgrade hands Basic a QRESYNC SELECT's
+  FETCH data, which includes arrivals (RFC 7162 3.2.5).
+- **The UIDNEXT/EXISTS fast path.** Basic skips `UID SEARCH ALL` when SELECT
+  returns the cursor's unchanged nonzero UIDNEXT and EXISTS equals the baseline
+  count (an arrival strictly increases UIDNEXT; equal EXISTS then excludes
+  expunges). Every way either signal is absent, zero, or stale falls back to
+  the SEARCH, and the neither-set invalidation above is what makes the skip
+  safe, since there the live set is the baseline.
+- **The paging guarantee is by convention, not construction.** All three
+  strategies emit at most `BATCH_ITEMS` per page, but through separate loops:
+  `flush_page` owns the boundary for CONDSTORE and both Basic entries, QRESYNC
+  flushes inline (it must also track `flushed_qresync_changes`, because its
+  mid-stream CONDSTORE downgrade is legal only while no page has escaped -
+  SELECT-side flushes count). A new emission loop must page and must respect
+  that downgrade rule; nothing forces it to.
+- The CONDSTORE change loop drives its bounded FETCH receiver and command
+  future together like inventory and QRESYNC: the command future is
+  authoritative on `recv() -> None`, so a truncated FETCH cannot checkpoint.
+- `CompactUidSet::diff` is range-native subtraction in u64 arithmetic (the
+  `u32::MAX + 1` overflow is real), pinned by a differential test against
+  expand-and-compare over 400 dense generated pairs.
+- bifrost-sasl: CRAM-MD5 raw digest is zeroized; `xor_bytes` asserts equal
+  widths - acceptable because both operands are same-hash HMAC outputs, never
+  server-influenced lengths.
+
+Reasoned rejections - do not silently relitigate:
+
+- **`StoreResult` visibility**: the raw connection surface is crate-private, so
+  no external consumer can reach `uid_store` or need to name `StoreResult`.
+- **The `Strategy`-trait rewrite of `changes.rs`**: QRESYNC owns a mid-stream
+  downgrade legal only before any page escapes (with connection discard),
+  CONDSTORE has a fallible bounded stream but no VANISHED lane, Basic has no
+  change-source stream at all; a shared runner would own strategy-specific wire
+  policy. Consolidation happened at the narrower `flush_page` seam instead.
+- No consumer-side TODO for the unknown-`Updated` guarantee: bifrost-sync only
+  ever produces `ObjectChange` (`Created`) and never reconciles membership on
+  it, so the producer-side guard closes the hazard.
+
+Accepted residuals:
+
+- `flush_page`/`finish_changes` can end a run on `[Page, Page]` with no `Final`
+  batch when the residual is empty; `SyncEvent::Done(checkpoint)` is the
+  terminator, so nothing downstream may key on `Final`.
+- On a non-conformant server reporting the same UID in both VANISHED and FETCH,
+  a `Removed` that already escaped in a flushed page is followed by an `Added`
+  rather than rewritten into one `Updated` - a coherent remove/re-add for the
+  consumer, deliberately not suppressed.
+
+Testing traps this crate recorded:
+
+- The scripted driver-pair tests answer only the commands their script expects;
+  a code path that issues an extra command (e.g. an un-skipped `UID SEARCH`)
+  hangs until the command timeout rather than failing crisply - keep scripts
+  and wire expectations exactly in step.
+- The paging tests need 129 changes (`BATCH_ITEMS` is 128) to observe a page
+  boundary at all; a smaller fixture passes against a build with no paging.
+
 ## From the `bugs-smtp.md` arc (closed, 60d834c..8c365f0)
 
 This crate has both an async and a blocking transport half, both published and

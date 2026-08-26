@@ -124,7 +124,7 @@ driving a `(fetch_rx, fetch_fut)` pair through `tokio::select!` sees the
 item receiver close *before* the future resolves - the driver drops the
 consumer synchronously and only then answers the oneshot - so the two
 branches are both ready and the choice between them is random. Every such
-loop (`run_inventory`, `run_qresync`) therefore awaits `fetch_fut` on the
+loop (`run_inventory`, `run_qresync`, the CONDSTORE changes loop) therefore awaits `fetch_fut` on the
 `recv() -> None` arm and propagates its result unconditionally. Reading
 whatever `select!` happened to have stored would let a tagged NO, a read
 error, or a timeout break on the success path and checkpoint a truncated
@@ -248,7 +248,7 @@ Runtime downgrades:
 
 - The MODSEQ cache is populated from inventory, get, changes, mutation SELECT data, and push IDLE FETCH events; cleared by successful flag mutations, expunges, VANISHED, moves, and folder delete/rename. It is bounded per folder (50k entries, pruned back to 40k): inventory walks every UID in a mailbox, and an opportunistic cache must not grow with mailbox size. Eviction keeps the highest UIDs - arrival order is the cheap stand-in for "most likely to be mutated" - and a miss costs exactly what a cold cache costs, an unprotected STORE.
 - `bulk_destroy` partial-failure accounting separates conflicts (UNCHANGEDSINCE rejected) from expunge failures; an expunge failure applies only to that round's UIDs, not the whole batch.
-- A two-sided `FlagOp::Patch` (non-empty add and remove) is two STOREs, and every id is accounted per UID across both. The guard rides the first (add) STORE; UIDs it rejects with `MODIFIED` are `Failed(ConcurrencyConflict)` and are excluded from the second STORE. Only the add-applied subset receives the unguarded remove, and only that subset may report `Succeeded(Applied)` - a second STORE that errors or comes back non-applied leaves those ids `Uncertain`, never succeeded. A wire error on the first STORE is confined to its own MODSEQ group: outcomes already established for earlier groups survive it and are never downgraded by the folder-level uncertain path.
+- A two-sided `FlagOp::Patch` (non-empty add and remove) is two STOREs, and every id is accounted per UID across both. The guard rides the first (add) STORE; UIDs it rejects with `MODIFIED` are `Failed(ConcurrencyConflict)` and are excluded from the second STORE. Only the add-applied subset receives the unguarded remove, and only that subset may report `Succeeded(Applied)` - a second STORE that errors or comes back non-applied never reports success for those ids: transmission evidence decides the lane (`InFlight` evidence is `Uncertain`, an `Unsent` or server-acknowledged failure is `Failed`), per the mutation error-lane rule below. A wire error on the first STORE is confined to its own MODSEQ group: outcomes already established for earlier groups survive it and are never downgraded by the folder-level error path.
 - `bulk_move` validates the destination mailbox once, before any source folder is opened. An unusable destination is our own request fault, so every target fails `Request(Malformed)` rather than passing through the per-folder uncertain path.
 
 Capabilities advertise `MutationConcurrency::None`: the MODSEQ cache is opportunistic (cold cache = unprotected STORE), so `StateBased` would let the engine assume UNCHANGEDSINCE is always wired. The engine's read-back-after-retry path is the lost-update safety net.
@@ -460,7 +460,7 @@ Mutation error lanes follow transmission evidence. An `InFlight` attempt makes t
 
 ### Per-folder mutation failure contract
 
-`mutate::mutation_stream` emits no trailing global `SyncEvent::Terminated` when a folder fails mid-batch: a per-folder fatal after per-item emissions surfaces as `ItemOutcome::Uncertain` for every remaining target in that folder (carrying the classified `AccountError`), and the loop continues to the next folder. Stream-level `Terminated` is reserved for failures that prevent any further folder attempt (auth lost, schema/capability break); `stream_terminating` is the gate.
+`mutate::mutation_stream` emits no trailing global `SyncEvent::Terminated` when a folder fails mid-batch: a per-folder fatal after per-item emissions surfaces as a per-item outcome for every remaining target in that folder (carrying the classified `AccountError`; `Uncertain` on `InFlight` transmission evidence, `Failed` otherwise), and the loop continues to the next folder. Stream-level `Terminated` is reserved for failures that prevent any further folder attempt (auth lost, schema/capability break); `stream_terminating` is the gate.
 
 ### Output-channel-dropped contract
 
