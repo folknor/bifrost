@@ -161,41 +161,54 @@ impl CompactUidSet {
             .flat_map(|range| range.start..=range.end.unwrap_or(range.start))
     }
 
-    /// Linear merge of two sorted range lists. A CONDSTORE cycle diffs the
-    /// baseline against the live set once per run on mailboxes that can hold
-    /// hundreds of thousands of UIDs, so neither side is expanded into a
-    /// `BTreeSet` here.
+    /// Linear subtraction of two sorted range lists. Equal spans are skipped
+    /// as ranges, so work is proportional to the number of ranges plus the
+    /// UIDs that actually changed, not the total mailbox size.
     pub(crate) fn diff(&self, newer: &Self) -> UidSetDiff {
-        let mut old = self.iter().peekable();
-        let mut new = newer.iter().peekable();
-        let mut diff = UidSetDiff::default();
-        loop {
-            match (old.peek().copied(), new.peek().copied()) {
-                (Some(o), Some(n)) if o == n => {
-                    old.next();
-                    new.next();
-                }
-                (Some(o), Some(n)) if o < n => {
-                    diff.removed.push(o);
-                    old.next();
-                }
-                (Some(_), Some(n)) => {
-                    diff.added.push(n);
-                    new.next();
-                }
-                (Some(o), None) => {
-                    diff.removed.push(o);
-                    old.next();
-                }
-                (None, Some(n)) => {
-                    diff.added.push(n);
-                    new.next();
-                }
-                (None, None) => break,
-            }
+        UidSetDiff {
+            added: subtract_ranges(&newer.ranges, &self.ranges),
+            removed: subtract_ranges(&self.ranges, &newer.ranges),
         }
-        diff
     }
+}
+
+fn subtract_ranges(source: &[UidRange], cover: &[UidRange]) -> Vec<u32> {
+    let mut out = Vec::new();
+    let mut cover_index = 0;
+    for range in source {
+        let end = u64::from(range.end.unwrap_or(range.start));
+        let mut cursor = u64::from(range.start);
+        while cover_index < cover.len()
+            && u64::from(cover[cover_index].end.unwrap_or(cover[cover_index].start)) < cursor
+        {
+            cover_index += 1;
+        }
+        let mut index = cover_index;
+        while index < cover.len() && u64::from(cover[index].start) <= end {
+            let covered = cover[index];
+            let covered_start = u64::from(covered.start);
+            let covered_end = u64::from(covered.end.unwrap_or(covered.start));
+            if cursor < covered_start {
+                out.extend((cursor..covered_start.min(end + 1)).map(uid_from_wide));
+            }
+            cursor = cursor.max(covered_end + 1);
+            if cursor > end {
+                break;
+            }
+            index += 1;
+        }
+        if cursor <= end {
+            out.extend((cursor..=end).map(uid_from_wide));
+        }
+        cover_index = index;
+    }
+    out
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn uid_from_wide(uid: u64) -> u32 {
+    debug_assert!(uid <= u64::from(u32::MAX));
+    uid as u32
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -978,6 +991,56 @@ mod tests {
         let diff = disjoint.diff(&some);
         assert_eq!(diff.added, vec![4, 5, 9]);
         assert_eq!(diff.removed, vec![1, 6, 7]);
+    }
+
+    #[test]
+    fn compact_uid_set_diff_handles_max_uid_without_false_change() {
+        let max = CompactUidSet::from_uids([u32::MAX]);
+        assert_eq!(max.diff(&max), UidSetDiff::default());
+        assert_eq!(CompactUidSet::default().diff(&max).added, vec![u32::MAX]);
+        assert_eq!(max.diff(&CompactUidSet::default()).removed, vec![u32::MAX]);
+    }
+
+    /// `subtract_ranges` is hand-rolled range algebra whose whole point is to
+    /// never expand an unchanged span, so a handful of examples cannot pin it:
+    /// the interesting failures are partial overlaps, adjacency, and cover
+    /// ranges that straddle a source-range boundary and must stay available to
+    /// the next source range. Diff every pair against the obvious
+    /// expand-and-compare answer over deterministic pseudo-random membership.
+    #[test]
+    fn compact_uid_set_diff_matches_set_semantics_over_generated_pairs() {
+        fn naive(a: &CompactUidSet, b: &CompactUidSet) -> Vec<u32> {
+            let cover: std::collections::BTreeSet<u32> = b.iter().collect();
+            a.iter().filter(|uid| !cover.contains(uid)).collect()
+        }
+
+        let mut seed = 0x2545_F491_4F6C_DD1D_u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..400 {
+            let mut left = Vec::new();
+            let mut right = Vec::new();
+            // A small universe with dense, streaky membership is what produces
+            // long equal runs and boundary-straddling covers; uniform sparse
+            // picks would almost never generate either.
+            for uid in 1..=64_u32 {
+                if next() % 3 != 0 {
+                    left.push(uid);
+                }
+                if next() % 3 != 0 {
+                    right.push(uid);
+                }
+            }
+            let a = CompactUidSet::from_uids(left);
+            let b = CompactUidSet::from_uids(right);
+            let diff = a.diff(&b);
+            assert_eq!(diff.added, naive(&b, &a), "added: {a:?} -> {b:?}");
+            assert_eq!(diff.removed, naive(&a, &b), "removed: {a:?} -> {b:?}");
+        }
     }
 
     // The cache is opportunistic, so the bound must hold without an

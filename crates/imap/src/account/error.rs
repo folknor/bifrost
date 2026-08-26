@@ -297,6 +297,25 @@ pub(crate) fn modseq_reset(
     .expect("valid account error classification")
 }
 
+/// Build a recoverable cursor error when a legacy QRESYNC cursor has no exact
+/// membership baseline. Current server state cannot reconstruct past consumer
+/// state, so the engine must inventory the scope again.
+pub(crate) fn incomplete_uid_baseline(folder: &MailboxName) -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
+        Cause::State(StateCause::CursorInvalid),
+    )
+    .protocol(Protocol::Imap)
+    .operation(AccountOperation::SyncChanges)
+    .scope(ErrorScope::Cursor(super::folder_scope(folder)))
+    .text(DiagnosticText::support_only(format!(
+        "IMAP cursor for {} has no complete UID membership baseline",
+        folder.as_str(),
+    )))
+    .try_build()
+    .expect("valid account error classification")
+}
+
 /// Build a fatal-stream error for a terminal QRESYNC/CONDSTORE strategy
 /// downgrade that cannot be served on the current connection.
 ///

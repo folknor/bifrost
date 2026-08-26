@@ -830,15 +830,12 @@ async fn qresync_dedupes_vanished_against_fetch_and_checkpoints_the_live_set() {
     let _server = script.await.unwrap();
 }
 
-/// A QRESYNC cursor on a session where QRESYNC did not survive negotiation
-/// runs CONDSTORE instead, and says so with the specific negotiation reason
-/// rather than the generic fallback text. The cursor also lacks a complete UID
-/// baseline, so the CONDSTORE run seeds from `UID SEARCH ALL` *before* the
-/// CHANGEDSINCE FETCH and then reuses that snapshot as the live set: one
-/// SEARCH, not two, and no spurious added/removed churn on the seeding round.
+/// A legacy QRESYNC cursor without an exact UID baseline cannot be diffed.
+/// Current server membership cannot reconstruct what the consumer persisted,
+/// so the stream requests a scope restart before issuing any command.
 #[tokio::test]
-async fn qresync_cursor_without_negotiation_downgrades_to_condstore_and_seeds_the_baseline() {
-    let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1 CONDSTORE")).await;
+async fn incomplete_qresync_baseline_requests_inventory_restart_without_wire_io() {
+    let (conn, server) = driver_pair(&preauth_greeting("IMAP4rev1 CONDSTORE")).await;
     let account = scripted_sync_account(
         conn,
         1,
@@ -846,57 +843,6 @@ async fn qresync_cursor_without_negotiation_downgrades_to_condstore_and_seeds_th
         Some("server did not echo ENABLED QRESYNC".to_owned()),
         inbox_registry(),
     );
-
-    let script = tokio::spawn(async move {
-        let select = read_line(&mut server).await;
-        assert!(
-            select.contains("EXAMINE") && !select.contains("QRESYNC"),
-            "a downgraded session must not put QRESYNC on the wire, got {select}"
-        );
-        respond(
-            &mut server,
-            &format!(
-                "{SELECT_PREAMBLE}\
-                 * 3 EXISTS\r\n\
-                 * OK [UIDVALIDITY 5] ok\r\n\
-                 * OK [UIDNEXT 9] ok\r\n\
-                 * OK [HIGHESTMODSEQ 200] ok\r\n\
-                 {} OK [READ-ONLY] EXAMINE done\r\n",
-                tag_of(&select)
-            ),
-        )
-        .await;
-
-        let search = read_line(&mut server).await;
-        assert!(
-            search.contains("UID SEARCH ALL"),
-            "the partial baseline is seeded before the diff, got {search}"
-        );
-        respond(
-            &mut server,
-            &format!(
-                "* SEARCH 2 3 4\r\n{} OK UID SEARCH done\r\n",
-                tag_of(&search)
-            ),
-        )
-        .await;
-
-        let fetch = read_line(&mut server).await;
-        assert!(
-            fetch.contains("CHANGEDSINCE 100") && !fetch.contains("VANISHED"),
-            "CONDSTORE diffs with CHANGEDSINCE and no VANISHED modifier, got {fetch}"
-        );
-        respond(
-            &mut server,
-            &format!(
-                "* 3 FETCH (UID 4 FLAGS (\\Seen) MODSEQ (190))\r\n\
-                 {} OK UID FETCH done\r\n",
-                tag_of(&fetch)
-            ),
-        )
-        .await;
-        server
-    });
 
     let events = collect_changes(
         account,
@@ -909,44 +855,19 @@ async fn qresync_cursor_without_negotiation_downgrades_to_condstore_and_seeds_th
     )
     .await;
 
-    let warnings = warnings_of(&events);
-    assert_eq!(
-        warnings.len(),
-        2,
-        "expected downgrade + seeding, got {warnings:?}"
+    let Some(SyncEvent::Terminated(error)) = events.last() else {
+        panic!("incomplete baseline must terminate with a restart request: {events:?}");
+    };
+    assert!(matches!(
+        error.recovery(),
+        bifrost_types::RecoveryClass::Engine(bifrost_types::EngineDirective::RestartScope(_))
+    ));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, SyncEvent::Batch(_)))
     );
-    assert_eq!(warnings[0].kind, WarningKind::StrategyDowngraded);
-    assert_eq!(
-        warnings[0].message.as_str(),
-        "server did not echo ENABLED QRESYNC",
-        "the downgrade must name the actual negotiation failure, not the generic fallback"
-    );
-    assert_eq!(
-        warnings[0]
-            .protocol_detail
-            .as_ref()
-            .map(DiagnosticText::as_str),
-        Some(downgrade_detail(SyncStrategy::QResync, SyncStrategy::Condstore).as_str())
-    );
-    assert_eq!(warnings[1].kind, WarningKind::Other);
-
-    assert_eq!(
-        change_labels(&events),
-        vec![(id(5, 4), "updated")],
-        "the seeded snapshot is the baseline, so it must not diff against the stale known set"
-    );
-    match done_cursor(&events) {
-        FolderCursor::Condstore {
-            uidvalidity,
-            modseq,
-            known_uids,
-        } => {
-            assert_eq!((uidvalidity, modseq), (5, 200));
-            assert_eq!(known_uids.to_uids(), vec![2, 3, 4]);
-        }
-        other => panic!("a CONDSTORE run must checkpoint a CONDSTORE cursor, got {other:?}"),
-    }
-    let _server = script.await.unwrap();
+    drop(server);
 }
 
 /// CONDSTORE with a complete baseline: flags come from CHANGEDSINCE, expunges
@@ -1043,6 +964,68 @@ async fn condstore_cursor_diffs_changedsince_flags_against_a_uid_search_snapshot
         }
         other => panic!("expected a CONDSTORE checkpoint, got {other:?}"),
     }
+    let _server = script.await.unwrap();
+}
+
+#[tokio::test]
+async fn condstore_changes_crossing_batch_limit_are_paged() {
+    let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1 CONDSTORE")).await;
+    let account = scripted_sync_account(conn, 1, false, None, inbox_registry());
+    let script = tokio::spawn(async move {
+        let select = read_line(&mut server).await;
+        respond(
+            &mut server,
+            &format!(
+                "{SELECT_PREAMBLE}* 129 EXISTS\r\n* OK [UIDVALIDITY 7] ok\r\n\
+                 * OK [UIDNEXT 130] ok\r\n* OK [HIGHESTMODSEQ 60] ok\r\n\
+                 {} OK [READ-ONLY] EXAMINE done\r\n",
+                tag_of(&select)
+            ),
+        )
+        .await;
+        let fetch = read_line(&mut server).await;
+        let mut response = String::new();
+        for uid in 1..=129 {
+            response.push_str(&format!(
+                "* {uid} FETCH (UID {uid} FLAGS (\\Seen) MODSEQ (55))\r\n"
+            ));
+        }
+        response.push_str(&format!("{} OK UID FETCH done\r\n", tag_of(&fetch)));
+        respond(&mut server, &response).await;
+        let search = read_line(&mut server).await;
+        let ids = (1..=129)
+            .map(|uid| uid.to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        respond(
+            &mut server,
+            &format!(
+                "* SEARCH {ids}\r\n{} OK UID SEARCH done\r\n",
+                tag_of(&search)
+            ),
+        )
+        .await;
+        server
+    });
+
+    let events = collect_changes(
+        account,
+        cursor_for(&FolderCursor::Condstore {
+            uidvalidity: 7,
+            modseq: 50,
+            known_uids: CompactUidSet::from_uids(1..=129),
+        }),
+    )
+    .await;
+    let boundaries = events
+        .iter()
+        .filter_map(|event| match event {
+            SyncEvent::Batch(batch) => Some(batch.page_boundary),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(boundaries, vec![PageBoundary::Page, PageBoundary::Final]);
+    assert_eq!(change_labels(&events).len(), 129);
     let _server = script.await.unwrap();
 }
 
@@ -1231,6 +1214,41 @@ async fn basic_cursor_derives_both_lanes_from_a_uid_search_diff() {
     let _server = script.await.unwrap();
 }
 
+#[tokio::test]
+async fn basic_unchanged_uidnext_and_count_skip_uid_search() {
+    let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1")).await;
+    let account = scripted_sync_account(conn, 1, false, None, inbox_registry());
+    let script = tokio::spawn(async move {
+        let select = read_line(&mut server).await;
+        respond(
+            &mut server,
+            &format!(
+                "{SELECT_PREAMBLE}* 2 EXISTS\r\n* OK [UIDVALIDITY 3] ok\r\n\
+                 * OK [UIDNEXT 10] ok\r\n{} OK [READ-ONLY] EXAMINE done\r\n",
+                tag_of(&select)
+            ),
+        )
+        .await;
+        server
+    });
+    let events = collect_changes(
+        account,
+        cursor_for(&FolderCursor::Basic {
+            uidvalidity: 3,
+            uidnext: 10,
+            known_uids: CompactUidSet::from_uids([1, 2]),
+        }),
+    )
+    .await;
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, SyncEvent::Batch(_)))
+    );
+    assert_eq!(done_cursor(&events).known_uids().to_uids(), vec![1, 2]);
+    let _server = script.await.unwrap();
+}
+
 /// A mailbox that answers the CONDSTORE select with `[NOMODSEQ]` downgrades to
 /// Basic on the connection it already holds - two commands total, no second
 /// checkout - and checkpoints a Basic cursor so the next round does not ask
@@ -1309,6 +1327,67 @@ async fn nomodseq_mailbox_downgrades_condstore_to_basic_on_the_selected_connecti
         }
         other => panic!("a NOMODSEQ mailbox must checkpoint Basic, got {other:?}"),
     }
+    let _server = script.await.unwrap();
+}
+
+/// The `[NOMODSEQ]` SELECT carries changed-message FETCH data, and RFC 7162
+/// has the server include messages that arrived above the client's MODSEQ. The
+/// Basic run must report the pre-existing UID as `Updated` and the arrival as
+/// `Added` exactly once - never `Updated` for a UID the consumer has no
+/// membership record of, and never a scope restart, which would throw away the
+/// whole folder on ordinary traffic.
+#[tokio::test]
+async fn nomodseq_downgrade_splits_selected_fetches_between_updated_and_added() {
+    let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1 CONDSTORE")).await;
+    let account = scripted_sync_account(conn, 1, false, None, inbox_registry());
+
+    let script = tokio::spawn(async move {
+        let select = read_line(&mut server).await;
+        respond(
+            &mut server,
+            &format!(
+                "{SELECT_PREAMBLE}\
+                 * 2 EXISTS\r\n\
+                 * OK [UIDVALIDITY 9] ok\r\n\
+                 * OK [UIDNEXT 8] ok\r\n\
+                 * 1 FETCH (UID 1 FLAGS (\\Seen))\r\n\
+                 * 2 FETCH (UID 7 FLAGS (\\Recent))\r\n\
+                 * OK [NOMODSEQ] no mod-sequences\r\n\
+                 {} OK [READ-ONLY] EXAMINE done\r\n",
+                tag_of(&select)
+            ),
+        )
+        .await;
+        let search = read_line(&mut server).await;
+        respond(
+            &mut server,
+            &format!("* SEARCH 1 7\r\n{} OK UID SEARCH done\r\n", tag_of(&search)),
+        )
+        .await;
+        server
+    });
+
+    let events = collect_changes(
+        account,
+        cursor_for(&FolderCursor::Condstore {
+            uidvalidity: 9,
+            modseq: 40,
+            known_uids: CompactUidSet::from_uids([1]),
+        }),
+    )
+    .await;
+
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, SyncEvent::Terminated(_))),
+        "an arrival in the downgrade SELECT is routine, not a cursor fault: {events:?}"
+    );
+    assert_eq!(
+        change_labels(&events),
+        vec![(id(9, 1), "updated"), (id(9, 7), "added")],
+        "the arrival belongs to the Added lane alone"
+    );
     let _server = script.await.unwrap();
 }
 

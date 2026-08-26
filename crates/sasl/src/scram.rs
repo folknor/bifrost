@@ -362,6 +362,7 @@ where
 }
 
 fn xor_bytes(a: &[u8], b: &[u8]) -> Zeroizing<Vec<u8>> {
+    assert_eq!(a.len(), b.len(), "SCRAM digest widths must match");
     Zeroizing::new(a.iter().zip(b.iter()).map(|(a, b)| a ^ b).collect())
 }
 

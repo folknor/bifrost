@@ -176,9 +176,10 @@ Newtypes with explicit `::new` constructors. No `From<u32>`/`From<u64>` to preve
 
 Account cursors use `CompactUidSet`, a sorted, disjoint range list with
 range-native construction, membership, insertion, removal, and linear diff.
-QRESYNC mutates its live and fallback snapshots in that representation, and a
-seeded CONDSTORE cycle reuses the searched compact snapshot without expanding
-one allocation per UID. Because `UidRange::range(n, n)` and
+QRESYNC mutates its live and fallback snapshots in that representation.
+`CompactUidSet::diff` subtracts sorted ranges directly, so an unchanged large
+span is skipped without visiting each UID; only changed UIDs are expanded into
+the required output vectors. Because `UidRange::range(n, n)` and
 `UidRange::single(n)` are distinct values and `CompactUidSet` compares by its
 range vector, every construction and mutation path normalizes a one-element run
 to `single`. Two sets holding the same UIDs must compare equal and encode to
@@ -219,8 +220,14 @@ Submodules:
 `FolderCursor` has three variants and `changes_stream()` dispatches diff strategy by variant:
 
 - `QResync { uidvalidity, modseq, known_uids, known_uids_complete }`: change diff via `UID FETCH ... CHANGEDSINCE ... VANISHED` against the cached MODSEQ, plus SELECT-side VANISHED and changed-FETCH data.
-- `Condstore { uidvalidity, modseq, known_uids }`: flag diff via `CHANGEDSINCE`; expunge detection via UID-list diff against `known_uids`. `CHANGEDSINCE` returns arrivals as well as updates, so a UID absent from `known_uids` is not emitted as `Updated` - the baseline diff reports it as `Added`, once. The QRESYNC path guards the same hazard through `record_fetch_change` / `fetch_change_seen`.
-- `Basic { uidvalidity, uidnext, known_uids }`: neither extension; UID-list diff for both flags and expunges.
+- `Condstore { uidvalidity, modseq, known_uids }`: bounded streaming flag diff via `CHANGEDSINCE`; expunge detection via UID-list diff against `known_uids`. `CHANGEDSINCE` returns arrivals as well as updates, so a UID absent from `known_uids` is not emitted as `Updated` - the baseline diff reports it as `Added`, once. The QRESYNC path guards the same hazard through `record_fetch_change` / `fetch_change_seen`.
+- `Basic { uidvalidity, uidnext, known_uids }`: neither extension; UID-list diff for both additions and expunges. When SELECT returns the cursor's unchanged nonzero UIDNEXT and EXISTS still equals the baseline count, the exact snapshot is reused and `UID SEARCH ALL` is skipped. Server-authored `changed_messages` UIDs are classified against both sets before they can become changes: a UID in the baseline is `Updated`, a UID that is only in the live snapshot is an arrival and is left to the diff's `Added` lane so it is never announced twice, and a UID in neither set is contradictory and invalidates the cursor. The last case is also what makes the UIDNEXT/EXISTS skip safe, since there the live snapshot is the baseline.
+
+All three strategies emit at most `BATCH_ITEMS` changes per page. CONDSTORE
+drives its bounded FETCH receiver and command future together, and treats the
+receiver closing before the command result the same way as inventory and
+QRESYNC: the command future remains authoritative, so a failed or truncated
+FETCH cannot checkpoint success.
 
 Negotiation in `factory.rs`:
 
@@ -231,7 +238,8 @@ Negotiation in `factory.rs`:
 Runtime downgrades:
 
 - A QRESYNC SELECT response that fails to parse calls `disable_qresync_for_session()` (one-shot), discards the suspect pooled connection, and retries on CONDSTORE.
-- A QRESYNC or CONDSTORE cursor lacking a complete UID baseline (`known_uids_complete == false`) seeds via `UID SEARCH ALL` before the first diff and emits a benign downgrade warning.
+- A legacy QRESYNC cursor lacking a complete UID baseline (`known_uids_complete == false`) cannot be diffed against consumer state. It terminates with `CursorInvalid`, deriving `RestartScope`, so bifrost-sync deletes the cursor and re-establishes exact membership through inventory. Current server membership is never substituted for the missing historical baseline.
+- A mailbox that answers a QRESYNC or CONDSTORE SELECT with `[NOMODSEQ]` finishes as Basic on the connection it already holds. That SELECT carried changed-message FETCH data, so the Basic run consumes it under the classification above rather than discarding the flag updates it describes.
 - VANISHED and FETCH may report the same UID on non-conformant servers; the change stream de-duplicates so a message never surfaces as both expunge and update.
 
 ### Mutations

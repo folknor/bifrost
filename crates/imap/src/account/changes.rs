@@ -190,6 +190,15 @@ async fn run_changes(
         bifrost_types::AccountOperation::SyncChanges,
     )?;
     let cursor = decode_cursor(&change_cursor)?;
+    if matches!(
+        cursor,
+        FolderCursor::QResync {
+            known_uids_complete: false,
+            ..
+        }
+    ) {
+        return Err(super::error::incomplete_uid_baseline(&folder).into());
+    }
     let qresync_negotiation_warning = if matches!(cursor, FolderCursor::QResync { .. }) {
         account.take_qresync_negotiation_warning()
     } else {
@@ -244,8 +253,8 @@ async fn run_qresync(
     let FolderCursor::QResync {
         uidvalidity: expected_uidvalidity,
         modseq,
-        mut known_uids,
-        mut known_uids_complete,
+        known_uids,
+        known_uids_complete,
     } = cursor.clone()
     else {
         return Ok(());
@@ -290,17 +299,7 @@ async fn run_qresync(
     };
     let uidvalidity = selected_uidvalidity(&selected.mailbox)?;
     validate_uidvalidity(&folder, expected_uidvalidity, uidvalidity)?;
-    let seeded_qresync_baseline = !known_uids_complete;
-    if !known_uids_complete {
-        send_warning(
-            &tx,
-            WarningKind::Other,
-            "QRESYNC cursor did not carry a complete UID baseline; seeding from UID SEARCH ALL",
-        )
-        .await?;
-        known_uids = CompactUidSet::from_uids(search_all(&account, conn.connection()).await?);
-        known_uids_complete = true;
-    }
+    debug_assert!(known_uids_complete);
     if selected.mailbox.no_mod_seq || selected.mailbox.highest_mod_seq.is_none() {
         send_strategy_downgrade(
             &tx,
@@ -314,15 +313,13 @@ async fn run_qresync(
     }
     validate_modseq_not_reset(&folder, modseq, selected.mailbox.highest_mod_seq)?;
     let mut live_uids = known_uids.clone();
-    let mut fallback_known_uids = live_uids.clone();
+    let fallback_known_uids = live_uids.clone();
     let mut fetch_change_seen = BTreeSet::new();
     let mut removed_seen = BTreeSet::new();
     let mut changes = Vec::with_capacity(BATCH_ITEMS);
+    let mut pages_flushed = false;
     for range in selected.mailbox.vanished.clone() {
         for uid in expand_range(range) {
-            if seeded_qresync_baseline {
-                fallback_known_uids.insert(uid);
-            }
             record_removed_change(
                 &folder,
                 uidvalidity,
@@ -332,6 +329,10 @@ async fn run_qresync(
                 &mut changes,
             );
             account.folders.clear_modseqs(&folder, uidvalidity, &[uid]);
+            if changes.len() >= BATCH_ITEMS {
+                flush_page(&tx, &mut changes).await?;
+                pages_flushed = true;
+            }
         }
     }
     for fetch in selected.mailbox.changed_messages.clone() {
@@ -349,6 +350,10 @@ async fn run_qresync(
             &mut removed_seen,
             &mut changes,
         );
+        if changes.len() >= BATCH_ITEMS {
+            flush_page(&tx, &mut changes).await?;
+            pages_flushed = true;
+        }
     }
     let attrs = [FetchAttr::Uid, FetchAttr::Flags, FetchAttr::ModSeq];
     let all_uids = UidSet::all();
@@ -364,13 +369,13 @@ async fn run_qresync(
             modseq,
             account.command_timeout(),
         ) {
-        Err(err) => (Some(err), false),
+        Err(err) => (Some(err), pages_flushed),
         Ok((mut fetch_rx, fetch_fut)) => {
             tokio::pin!(fetch_fut);
 
             let mut fetch_result = None;
             let mut fallback_error = None;
-            let mut flushed_qresync_changes = false;
+            let mut flushed_qresync_changes = pages_flushed;
             loop {
                 tokio::select! {
                     result = &mut fetch_fut, if fetch_result.is_none() => {
@@ -394,9 +399,6 @@ async fn run_qresync(
                             }
                             Some(Ok(FetchStreamItem::VanishedEarlier(ranges))) => {
                                 for uid in ranges.into_iter().flat_map(expand_range) {
-                                    if seeded_qresync_baseline {
-                                        fallback_known_uids.insert(uid);
-                                    }
                                     record_removed_change(
                                         &folder,
                                         uidvalidity,
@@ -522,9 +524,7 @@ async fn run_condstore_with_baseline(
     tx: tokio::sync::mpsc::Sender<SyncEvent<Change>>,
 ) -> Result<(), ChangeError> {
     let FolderCursor::Condstore {
-        modseq,
-        mut known_uids,
-        ..
+        modseq, known_uids, ..
     } = cursor.clone()
     else {
         return Ok(());
@@ -536,15 +536,8 @@ async fn run_condstore_with_baseline(
         .map_err(|err| select_error(&account, &folder, err))?;
     let uidvalidity = selected_uidvalidity(&selected.mailbox)?;
     validate_uidvalidity(&folder, cursor.uidvalidity(), uidvalidity)?;
-    let seeded_baseline = !known_uids_complete;
-    if seeded_baseline {
-        send_warning(
-            &tx,
-            WarningKind::Other,
-            "CONDSTORE fallback received a partial UID baseline; seeding from UID SEARCH ALL",
-        )
-        .await?;
-        known_uids = CompactUidSet::from_uids(search_all(&account, conn.connection()).await?);
+    if !known_uids_complete {
+        return Err(super::error::incomplete_uid_baseline(&folder).into());
     }
     if selected.mailbox.no_mod_seq || selected.mailbox.highest_mod_seq.is_none() {
         send_strategy_downgrade(
@@ -560,50 +553,57 @@ async fn run_condstore_with_baseline(
     validate_modseq_not_reset(&folder, modseq, selected.mailbox.highest_mod_seq)?;
 
     let all_uids = UidSet::all();
-    let fetches = conn
-        .connection()
-        .uid_fetch_changed_since(
-            all_uids.as_sequence_set(),
-            &[FetchAttr::Uid, FetchAttr::Flags, FetchAttr::ModSeq],
-            modseq,
-            account.command_timeout(),
-        )
-        .await?;
-    let mut changes = Vec::new();
-    for fetch in fetches {
-        if let Some(uid) = fetch.uid {
-            if let Some(modseq) = fetch.mod_seq {
-                account
-                    .folders
-                    .record_modseq(&folder, uidvalidity, uid, modseq)?;
+    let (mut fetch_rx, fetch_fut) = conn.connection().uid_fetch_changed_since_stream(
+        all_uids.as_sequence_set(),
+        &[FetchAttr::Uid, FetchAttr::Flags, FetchAttr::ModSeq],
+        modseq,
+        account.command_timeout(),
+    )?;
+    tokio::pin!(fetch_fut);
+    let mut changes = Vec::with_capacity(BATCH_ITEMS);
+    let mut fetch_result = None;
+    loop {
+        tokio::select! {
+            result = &mut fetch_fut, if fetch_result.is_none() => {
+                fetch_result = Some(result);
             }
-            // CHANGEDSINCE returns everything with modseq > cursor, which
-            // includes messages that arrived after it. Those are not updates
-            // to anything the consumer knows about - the baseline diff below
-            // reports them as `Added`. Emitting both would announce every new
-            // message twice, `Updated` before it exists. The QRESYNC path
-            // guards the same hazard through `record_fetch_change`.
-            if known_uids.contains(uid) {
-                changes.push(updated_change(&folder, uidvalidity, uid));
+            item = fetch_rx.recv() => {
+                let Some(item) = item else {
+                    match fetch_result.take() {
+                        Some(result) => result?,
+                        None => (&mut fetch_fut).await?,
+                    }
+                    break;
+                };
+                let fetch = item?;
+                if let Some(uid) = fetch.uid {
+                    if let Some(modseq) = fetch.mod_seq {
+                        account
+                            .folders
+                            .record_modseq(&folder, uidvalidity, uid, modseq)?;
+                    }
+                    // CHANGEDSINCE also returns arrivals. Only a UID in the
+                    // complete prior baseline is an update; the live snapshot
+                    // diff below owns additions.
+                    if known_uids.contains(uid) {
+                        changes.push(updated_change(&folder, uidvalidity, uid));
+                        flush_page(&tx, &mut changes).await?;
+                    }
+                }
             }
         }
     }
-    // The first complete baseline has no prior snapshot to diff against. It
-    // is also the current UID snapshot, so issuing a second immediate SEARCH
-    // would only repeat the same work before we checkpoint it.
-    let live_set = if seeded_baseline {
-        known_uids.clone()
-    } else {
-        CompactUidSet::from_uids(search_all(&account, conn.connection()).await?)
-    };
+    let live_set = CompactUidSet::from_uids(search_all(&account, conn.connection()).await?);
     warn_if_uid_count_mismatch(&tx, &folder, selected.mailbox.exists, live_set.uid_count()).await?;
     let diff = known_uids.diff(&live_set);
     for uid in diff.added {
         changes.push(added_change(&folder, uidvalidity, uid));
+        flush_page(&tx, &mut changes).await?;
     }
     for uid in diff.removed {
         account.folders.clear_modseqs(&folder, uidvalidity, &[uid]);
         changes.push(removed_change(&folder, uidvalidity, uid));
+        flush_page(&tx, &mut changes).await?;
     }
     let next = FolderCursor::Condstore {
         uidvalidity,
@@ -620,6 +620,10 @@ async fn run_basic(
     tx: tokio::sync::mpsc::Sender<SyncEvent<Change>>,
 ) -> Result<(), ChangeError> {
     let known_uids = cursor.known_uids().clone();
+    let cursor_uidnext = match cursor {
+        FolderCursor::Basic { uidnext, .. } => uidnext,
+        _ => 0,
+    };
     let mut conn = account.checkout_for_folder(&folder).await?;
     let selected = account
         .select_folder(&mut conn, &folder, Some(&cursor), true)
@@ -627,11 +631,17 @@ async fn run_basic(
         .map_err(|err| select_error(&account, &folder, err))?;
     let uidvalidity = selected_uidvalidity(&selected.mailbox)?;
     validate_uidvalidity(&folder, cursor.uidvalidity(), uidvalidity)?;
-    let live = search_all(&account, conn.connection()).await?;
-    let live_set = CompactUidSet::from_uids(live);
+    let uidnext_unchanged = cursor_uidnext != 0
+        && selected.mailbox.uid_next == Some(cursor_uidnext)
+        && usize::try_from(selected.mailbox.exists).ok() == Some(known_uids.uid_count());
+    let live_set = if uidnext_unchanged {
+        known_uids.clone()
+    } else {
+        CompactUidSet::from_uids(search_all(&account, conn.connection()).await?)
+    };
     warn_if_uid_count_mismatch(&tx, &folder, selected.mailbox.exists, live_set.uid_count()).await?;
     let diff = known_uids.diff(&live_set);
-    let mut changes = Vec::new();
+    let mut changes = Vec::with_capacity(BATCH_ITEMS);
     for fetch in &selected.mailbox.changed_messages {
         if let Some(uid) = fetch.uid {
             if let Some(modseq) = fetch.mod_seq {
@@ -639,15 +649,22 @@ async fn run_basic(
                     .folders
                     .record_modseq(&folder, uidvalidity, uid, modseq)?;
             }
-            changes.push(updated_change(&folder, uidvalidity, uid));
+            if let Some(change) =
+                basic_updated_change(&folder, uidvalidity, uid, &known_uids, &live_set)?
+            {
+                changes.push(change);
+                flush_page(&tx, &mut changes).await?;
+            }
         }
     }
     for uid in diff.added {
         changes.push(added_change(&folder, uidvalidity, uid));
+        flush_page(&tx, &mut changes).await?;
     }
     for uid in diff.removed {
         account.folders.clear_modseqs(&folder, uidvalidity, &[uid]);
         changes.push(removed_change(&folder, uidvalidity, uid));
+        flush_page(&tx, &mut changes).await?;
     }
     let next = FolderCursor::Basic {
         uidvalidity,
@@ -670,13 +687,30 @@ async fn run_basic_from_selected(
     let live_set = CompactUidSet::from_uids(live);
     warn_if_uid_count_mismatch(&tx, &folder, selected.exists, live_set.uid_count()).await?;
     let diff = known_uids.diff(&live_set);
-    let mut changes = Vec::new();
+    let mut changes = Vec::with_capacity(BATCH_ITEMS);
+    for fetch in &selected.changed_messages {
+        if let Some(uid) = fetch.uid {
+            if let Some(modseq) = fetch.mod_seq {
+                account
+                    .folders
+                    .record_modseq(&folder, uidvalidity, uid, modseq)?;
+            }
+            if let Some(change) =
+                basic_updated_change(&folder, uidvalidity, uid, &known_uids, &live_set)?
+            {
+                changes.push(change);
+                flush_page(&tx, &mut changes).await?;
+            }
+        }
+    }
     for uid in diff.added {
         changes.push(added_change(&folder, uidvalidity, uid));
+        flush_page(&tx, &mut changes).await?;
     }
     for uid in diff.removed {
         account.folders.clear_modseqs(&folder, uidvalidity, &[uid]);
         changes.push(removed_change(&folder, uidvalidity, uid));
+        flush_page(&tx, &mut changes).await?;
     }
     let next = FolderCursor::Basic {
         uidvalidity,
@@ -714,6 +748,18 @@ async fn finish_changes(
         .await
         .map_err(|_| ChangeError::ChannelDropped)?;
     Ok(())
+}
+
+async fn flush_page(
+    tx: &tokio::sync::mpsc::Sender<SyncEvent<Change>>,
+    changes: &mut Vec<Change>,
+) -> Result<(), ChangeError> {
+    if changes.len() < BATCH_ITEMS {
+        return Ok(());
+    }
+    tx.send(batch(std::mem::take(changes), PageBoundary::Page, None))
+        .await
+        .map_err(|_| ChangeError::ChannelDropped)
 }
 
 fn record_fetch_change(
@@ -807,6 +853,34 @@ fn updated_change(folder: &MailboxName, uidvalidity: u32, uid: u32) -> Change {
         id: encode_object_id(folder, uidvalidity, uid),
         kind: ObjectChangeKind::Updated,
     })
+}
+
+/// Classify a server-authored `changed_messages` UID on a Basic run.
+///
+/// A UID in the prior baseline is a genuine `Updated`. A UID that is absent
+/// from the baseline but present in the live snapshot is an arrival: RFC 7162
+/// Section 3.2.5 has the server return changed-message FETCH data for every
+/// message above the client's MODSEQ, new ones included, so this is the common
+/// case on a mailbox that just downgraded out of QRESYNC/CONDSTORE. The
+/// baseline diff already reports it as `Added`, exactly once, and announcing
+/// `Updated` for an object the consumer has no membership record of is the
+/// hazard the CONDSTORE path guards. Emitting nothing here is therefore
+/// lossless. Only a UID in neither set is contradictory - the server described
+/// a message it does not list - and that invalidates the cursor.
+fn basic_updated_change(
+    folder: &MailboxName,
+    uidvalidity: u32,
+    uid: u32,
+    known_uids: &CompactUidSet,
+    live_uids: &CompactUidSet,
+) -> Result<Option<Change>, ChangeError> {
+    if known_uids.contains(uid) {
+        return Ok(Some(updated_change(folder, uidvalidity, uid)));
+    }
+    if live_uids.contains(uid) {
+        return Ok(None);
+    }
+    Err(super::error::incomplete_uid_baseline(folder).into())
 }
 
 fn validate_uidvalidity(
@@ -1210,6 +1284,36 @@ mod tests {
         );
         assert!(changes.is_empty());
         assert!(live_uids.is_empty());
+    }
+
+    #[test]
+    fn basic_server_update_is_classified_against_baseline_and_live_set() {
+        let folder = MailboxName::new("INBOX").expect("valid mailbox");
+        let known = CompactUidSet::from_uids([1, 2]);
+        let live = CompactUidSet::from_uids([1, 2, 3]);
+
+        assert!(
+            basic_updated_change(&folder, 7, 2, &known, &live)
+                .expect("a baseline UID is a plain update")
+                .is_some(),
+            "a UID the consumer already knows must surface as Updated"
+        );
+        assert!(
+            basic_updated_change(&folder, 7, 3, &known, &live)
+                .expect("an arrival is not a cursor fault")
+                .is_none(),
+            "an arrival is owned by the baseline diff's Added lane, not Updated"
+        );
+
+        let error = basic_updated_change(&folder, 7, 9, &known, &live)
+            .expect_err("a UID in neither set cannot be described at all");
+        let ChangeError::Account(error) = error else {
+            panic!("unknown Basic UID must be a cursor error");
+        };
+        assert!(matches!(
+            error.recovery(),
+            RecoveryClass::Engine(bifrost_types::EngineDirective::RestartScope(_))
+        ));
     }
 
     #[test]

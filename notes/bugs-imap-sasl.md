@@ -1,91 +1,40 @@
 # bifrost-imap and bifrost-sasl: hunt findings
 
-Scope: `crates/imap/` - driver-task model, cancellation safety, streaming FETCH,
-typed IDs, auth, and the account layer (QRESYNC / CONDSTORE / Basic cursor
-strategy, per-folder modseq cache, opportunistic `STORE UNCHANGEDSINCE`). Plus
-`crates/sasl/` in full.
-
-## 3. Seeded CONDSTORE/QRESYNC cycles announce new arrivals as `Updated`, never `Added`
-
-**Medium-high confidence.** `account/changes.rs`, `run_condstore_with_baseline` and
-`run_qresync`. When `known_uids_complete == false`, the baseline is seeded from a
-live `UID SEARCH ALL` - which already contains every message that arrived since the
-cursor's MODSEQ. The CHANGEDSINCE loop then guards with `if
-known_uids.contains(uid)`, which is now true for those arrivals, so they emit
-`updated_change` (an `ObjectChange`); and since `live_set = known_uids.clone()` on
-the seeded path, the baseline diff is empty and no `Added` `ScopeChange` is ever
-produced for them. The same shape holds in `run_qresync`: `live_uids.insert(uid)`
-returns false for a seeded arrival, so `record_fetch_change` takes the `Updated`
-branch.
-
-The consumer therefore receives an update for an object it has no membership record
-of. Whether that is lost data depends on how `bifrost-sync` handles
-`ObjectChange::Updated` for an unknown id - worth confirming against the sync
-findings - but the IMAP side is the producer that dropped the `Added`. The honest fix
-is that a cursor with no complete baseline cannot be diffed at all: emit
-`RestartScope` / force an inventory re-establish instead of manufacturing a baseline
-that is by construction indistinguishable from the consumer's state.
-
-## 4. The CONDSTORE and Basic paths buffer without bound; only QRESYNC pages
-
-**Medium confidence, structural.** `run_condstore_with_baseline` calls
-`uid_fetch_changed_since(ALL, .., modseq)` - the buffered, unbudgeted path - and
-collects every result into a `Vec`, then accumulates all changes into a single
-`Vec<Change>` that `finish_changes` emits as one `PageBoundary::Final` batch.
-`run_basic` and `run_basic_from_selected` do the same. A folder whose cursor MODSEQ
-is far behind (or a `Basic` folder of any size) materializes the whole mailbox twice
-- once as `FetchResponse`s, once as `Change`s - with no `BATCH_ITEMS` flush and no
-`FetchLimit` guard. `run_qresync` gets this right, streaming through
-`uid_fetch_vanished_stream` and flushing at `BATCH_ITEMS`. The three strategies
-should share one paging harness rather than each re-deriving the loop; that is also
-where finding 3 would be fixed once instead of twice.
+Scope: `crates/imap/` and `crates/sasl/`.
 
 ## Smaller / lower confidence
 
-- **`FolderCursor::Basic::uidnext` is write-only.** Encoded, decoded,
-  round-trip-tested, and never read: `run_basic` diffs `known_uids` against a fresh
-  `SEARCH ALL` and ignores `uidnext` entirely. Either use it (a cheap
-  `uidnext`-unchanged short-circuit that skips the full SEARCH would be a real win on
-  the Basic path) or drop the field.
-- **`run_basic` emits `updated_change` for `selected.mailbox.changed_messages` with
-  no `known_uids.contains` guard**, unlike the CONDSTORE path which added exactly that
-  guard for exactly this hazard. On a Basic cursor `changed_messages` should be empty,
-  so this is probably unreachable - but if a server ever populates it, a new arrival is
-  reported as both `Updated` and `Added`.
-- **`CompactUidSet::diff` expands both sides to individual UIDs** despite the type
-  existing to avoid exactly that; the doc comment claims it avoids expansion, but
-  `iter()` yields one `u32` per UID and `added`/`removed` are `Vec<u32>`. Cosmetic for
-  correctness, real for a 500k-UID mailbox.
-
-## bifrost-sasl
-
-No computation defect found. SCRAM matches the RFC 5802 and RFC 7677 vectors, nonce
-extension is strictly enforced, `i=` is bounded on both sides, duplicate attributes
-are rejected by both `scram_field` and `validate_scram_attributes`, verifier
-comparison is constant-time, and SASLprep runs on both username and password.
-
-The DER walk in `channel_binding.rs` is lenient about non-minimal long-form lengths
-and does not reject trailing bytes after the outer `Certificate` SEQUENCE - but since
-`family.digest(cert_der)` hashes the whole input buffer regardless, parse leniency
-cannot change the binding value, only the family selection, and every
-family-selection path that is ambiguous is already a hard error.
-
-Two cosmetic notes: `cram_md5_response` does not zeroize the raw HMAC digest bytes
-(it does zeroize the assembled response), and `xor_bytes` silently truncates on a
-length mismatch (unreachable today, since both inputs are always the same digest
-width).
+- **`StoreResult`'s visibility contradicts `Connection::uid_store`'s. Rejected.**
+  `ImapConnection`, its `connection` module, and the entire raw command surface
+  are crate-private. The public-looking method and result fields are internal
+  visibility within private modules, so no external consumer can reach
+  `uid_store` or need to name `StoreResult`. Re-exporting the result at the crate
+  root would expose one isolated wire type without making the command surface
+  usable and would contradict the intentionally small public account API in
+  `reference/imap.md`. No code change is warranted.
 
 ## Structural read
 
-The account layer's three change strategies are three hand-written loops that
-re-derive the same five decisions - select, validate UIDVALIDITY/MODSEQ,
-seed-or-diff the baseline, page the output, checkpoint. Every finding above except 1
-and 2 is a place where one of the three got a decision that the others did not
-(QRESYNC pages, the others do not; CONDSTORE guards arrivals, Basic does not; QRESYNC
-tracks baseline completeness, CONDSTORE's cursor variant has no field for it). The
-right shape is one strategy-parameterized runner with a `Strategy` trait supplying
-only the parts that genuinely differ - the change-source (VANISHED stream /
-CHANGEDSINCE fetch / nothing) and the next-cursor constructor - with paging, dedup,
-baseline handling, and checkpointing owned once. That is a rewrite of `changes.rs`,
-and given pre-1.0 and the correctness holes it would close, the hunter's call is that
-it is the right move rather than patching findings 3 and 4 in place.
+The proposed async `Strategy` runner was not adopted as stated. QRESYNC owns a
+mid-stream downgrade rule that is legal only before any page escapes, including
+connection discard and a retry on a separately checked-out CONDSTORE path.
+CONDSTORE has a fallible bounded FETCH stream but no VANISHED lane. Basic has no
+change-source stream at all and can avoid SEARCH when UIDNEXT and EXISTS prove
+the membership snapshot unchanged. Hiding those lifetimes and fallback states
+behind one async trait would make the runner own strategy-specific wire policy,
+not merely the two hooks the proposal allows.
+
+The shared policy was consolidated at the narrower stable seam instead:
+`flush_page` owns the `BATCH_ITEMS` boundary for CONDSTORE and both Basic entry
+paths, while QRESYNC uses the same boundary and its existing stream-specific
+dedup state. All three now page, all cursor variants require an exact baseline,
+and every Basic server-authored `changed_messages` UID is classified against
+both the prior baseline and the live snapshot before it can become `Updated`.
+The first cut of that guard failed the cursor whenever the UID was merely absent
+from the baseline, which is the ordinary case for an arrival on the `[NOMODSEQ]`
+downgrade path - a QRESYNC SELECT returns FETCH data for every message above the
+client's MODSEQ, new ones included - so it would have restarted the scope on
+routine traffic. Only a UID in neither set is contradictory. The remaining
+separate loops are
+therefore wire and downgrade orchestration, not three copies of baseline and
+buffering policy.

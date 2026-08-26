@@ -15,13 +15,13 @@ pub fn cram_md5_response(user: &str, pass: &str, challenge: &str) -> Result<Secr
     let mut mac = <hmac::Hmac<md5::Md5> as hmac::digest::KeyInit>::new_from_slice(pass.as_bytes())
         .map_err(|e| SaslError::Protocol(format!("invalid CRAM-MD5 key: {e}")))?;
     mac.update(&challenge);
-    let digest = mac.finalize().into_bytes();
+    let digest = zeroize::Zeroizing::new(mac.finalize().into_bytes().to_vec());
 
     let mut response =
         zeroize::Zeroizing::new(String::with_capacity(user.len() + 1 + digest.len() * 2));
     response.push_str(user);
     response.push(' ');
-    for byte in digest {
+    for byte in digest.iter() {
         let _ = write!(response, "{byte:02x}");
     }
 

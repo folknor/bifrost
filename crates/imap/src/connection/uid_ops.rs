@@ -67,6 +67,38 @@ impl ImapConnection {
         .await
     }
 
+    /// UID FETCH with CHANGEDSINCE as a bounded stream.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn uid_fetch_changed_since_stream<'a>(
+        &'a self,
+        sequence_set: &'a SequenceSet,
+        items: &'a [FetchAttr],
+        mod_seq: u64,
+        timeout: Duration,
+    ) -> Result<
+        (
+            tokio::sync::mpsc::Receiver<Result<FetchResponse, Error>>,
+            impl std::future::Future<Output = Result<(), Error>> + Send + 'a,
+        ),
+        Error,
+    > {
+        self.require_state(&[SessionState::Selected])?;
+        self.require_condstore()?;
+        self.validate_requested_fetch_items(items)?;
+        if sequence_set.as_str().contains('$') {
+            self.require_searchres()?;
+        }
+        let (tx, rx) = tokio::sync::mpsc::channel(DEFAULT_FETCH_STREAM_CAPACITY);
+        let cmd = Command::UidFetch {
+            sequence_set: sequence_set.clone(),
+            items: format_fetch_attrs(items),
+            changed_since: Some(mod_seq),
+            vanished: false,
+        };
+        let fut = self.fetch_stream_bounded_impl(cmd, tx, timeout);
+        Ok((rx, fut))
+    }
+
     /// Shared implementation for FETCH and UID FETCH (RFC 3501 Section 6.4.5).
     ///
     /// When `changed_since` is `Some`, validates that the server supports
