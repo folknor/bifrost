@@ -1259,6 +1259,111 @@ mod tests {
             pool
         }
 
+        /// The blocking mirror of `pool_max_size_bounds_checked_out_connections`.
+        /// With one slot and one connection checked out, a second checkout must
+        /// WAIT for the slot rather than dial past the bound. `transcript.invalid`
+        /// does not resolve, so a pool that dials past `max_size` fails this with
+        /// a connection error instead of handing back the recycled connection.
+        #[test]
+        fn pool_max_size_bounds_checked_out_connections() {
+            let transcript = Transcript::new("220 smtp.example\r\n")
+                .expect("EHLO client.example\r\n", "250 smtp.example\r\n");
+            let conn =
+                SmtpConnection::from_transcript(transcript.clone(), &hello(), Protocol::Smtp)
+                    .unwrap();
+            let pool = Pool::new(
+                PoolConfig::new().max_size(1).test_on_checkout(false),
+                SmtpClient {
+                    info: SmtpInfo::new("transcript.invalid", Protocol::Smtp),
+                },
+            );
+            pool.park_for_test(conn);
+
+            let first = pool.connection().expect("the parked connection");
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::scope(|scope| {
+                let waiter = {
+                    let pool = Arc::clone(&pool);
+                    scope.spawn(move || {
+                        tx.send(()).unwrap();
+                        pool.connection().map(|conn| {
+                            drop(conn);
+                        })
+                    })
+                };
+
+                rx.recv().unwrap();
+                drop(first);
+
+                waiter
+                    .join()
+                    .unwrap()
+                    .expect("the released slot must hand back the pooled connection, not a dial");
+            });
+            assert_eq!(pool.idle_count_for_test(), 1);
+            transcript.assert_exhausted();
+        }
+
+        /// The blocking mirror of the async shutdown wake-up. A checkout parked
+        /// on the condvar must not survive `shutdown()` as a live checkout, and
+        /// must not dial once woken: `transcript.invalid` does not resolve, so
+        /// a dial surfaces as a connection error rather than
+        /// `TransportShutdown`.
+        ///
+        /// What this does NOT pin is the pure hang: the blocking `recycle` also
+        /// notifies, so dropping the checked-out guard wakes the waiter even
+        /// with `shutdown()`'s `notify_all` ablated. Pinning the case where the
+        /// guard is never returned needs a bounded join, which means a
+        /// wall-clock wait, which is out of scope here. The `notify_all` in
+        /// `shutdown()` carries its own comment for that reason.
+        #[test]
+        fn shutdown_wakes_a_blocked_checkout_instead_of_letting_it_dial() {
+            let transcript = Transcript::new("220 smtp.example\r\n")
+                .expect("EHLO client.example\r\n", "250 smtp.example\r\n");
+            let conn =
+                SmtpConnection::from_transcript(transcript.clone(), &hello(), Protocol::Smtp)
+                    .unwrap();
+            let pool = Pool::new(
+                PoolConfig::new().max_size(1).test_on_checkout(false),
+                SmtpClient {
+                    info: SmtpInfo::new("transcript.invalid", Protocol::Smtp),
+                },
+            );
+            pool.park_for_test(conn);
+
+            let first = pool.connection().expect("the parked connection");
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::scope(|scope| {
+                let waiter = {
+                    let pool = Arc::clone(&pool);
+                    scope.spawn(move || {
+                        tx.send(()).unwrap();
+                        pool.connection().err().map(|error| {
+                            (
+                                matches!(
+                                    error.kind(),
+                                    crate::transport::smtp::error::ErrorKind::TransportShutdown
+                                ),
+                                error.to_string(),
+                            )
+                        })
+                    })
+                };
+
+                rx.recv().unwrap();
+                pool.shutdown();
+                drop(first);
+
+                let (is_shutdown, message) = waiter
+                    .join()
+                    .unwrap()
+                    .expect("a checkout must not succeed against a shut-down pool");
+                assert!(is_shutdown, "expected a shutdown error, got: {message}");
+            });
+            assert_eq!(pool.idle_count_for_test(), 0);
+            transcript.assert_exhausted();
+        }
+
         fn batch(addresses: &[&str]) -> Vec<BatchItem<crate::address::Address>> {
             addresses
                 .iter()

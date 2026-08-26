@@ -319,7 +319,7 @@ impl AsyncSmtpConnection {
     /// Transcript setup that goes through the same single setup deadline the
     /// real `connect` path uses, so banner and EHLO share one budget.
     #[cfg(test)]
-    async fn from_transcript_with_timeout(
+    pub(in crate::transport::smtp) async fn from_transcript_with_timeout(
         transcript: crate::transport::smtp::test_support::Transcript,
         hello_name: &ClientId,
         protocol: Protocol,
@@ -449,7 +449,7 @@ impl AsyncSmtpConnection {
                         )
                         .await?;
                     }
-                    self.stream.get_mut().set_state(ConnectionState::Ok);
+                    self.finish_reply_group()?;
                     return Err(Self::error_from_status(mail_response));
                 }
             }
@@ -463,7 +463,7 @@ impl AsyncSmtpConnection {
                     failure = Some(response);
                 }
             }
-            self.stream.get_mut().set_state(ConnectionState::Ok);
+            self.finish_reply_group()?;
             if let Some(response) = failure {
                 if self.command_accepting_status(Rset).await.is_err() {
                     self.abort().await;
@@ -652,7 +652,7 @@ impl AsyncSmtpConnection {
             })?;
 
         let mail_options = self
-            .mail_options_for_batch(from.as_ref(), email, options, false)
+            .mail_options_for_batch(from.as_ref(), &progress.recipients, email, options, false)
             .map_err(|e| {
                 (
                     e.with_attempt(SmtpTransmissionState::Unsent)
@@ -881,7 +881,14 @@ impl AsyncSmtpConnection {
                     }
                 }
             }
-            self.stream.get_mut().set_state(ConnectionState::Ok);
+            self.finish_reply_group().map_err(|error| {
+                (
+                    error
+                        .with_attempt(SmtpTransmissionState::Unsent)
+                        .with_phase(SmtpCommandPhase::RcptTo),
+                    progress.clone(),
+                )
+            })?;
         }
 
         let accepted = progress.recipients.iter().any(|r| {
@@ -979,7 +986,7 @@ impl AsyncSmtpConnection {
             })?;
 
         let mail_options = self
-            .mail_options_for_batch(from.as_ref(), email, options, false)
+            .mail_options_for_batch(from.as_ref(), &progress.recipients, email, options, false)
             .map_err(|e| {
                 (
                     e.with_attempt(SmtpTransmissionState::Unsent)
@@ -1092,6 +1099,14 @@ impl AsyncSmtpConnection {
         }
         progress.set_body_finished();
 
+        self.stream.get_ref().state().verify().map_err(|e| {
+            (
+                e.with_attempt(SmtpTransmissionState::InFlight)
+                    .with_phase(SmtpCommandPhase::LmtpFinalStatus),
+                progress.clone(),
+            )
+        })?;
+        self.stream.get_mut().set_state(ConnectionState::Broken);
         for i in 0..progress.recipients.len() {
             if !matches!(
                 progress.recipients[i].rcpt,
@@ -1099,7 +1114,10 @@ impl AsyncSmtpConnection {
             ) {
                 continue;
             }
-            match self.read_response_accepting_status().await {
+            match self
+                .read_response_with_budget_inner(self.per_operation_budget(), true, false)
+                .await
+            {
                 Ok(resp) => {
                     progress.record_lmtp_final(i, resp);
                 }
@@ -1177,6 +1195,7 @@ impl AsyncSmtpConnection {
     fn mail_options_for_batch(
         &self,
         from: Option<&Address>,
+        recipients: &[RecipientProgress],
         email: &[u8],
         options: &SendOptions,
         allow_binary_mime: bool,
@@ -1197,7 +1216,10 @@ impl AsyncSmtpConnection {
             .iter()
             .any(|parameter| matches!(parameter, MailParameter::Body(_)));
 
-        let has_non_ascii = from.is_some_and(|a| !AsRef::<str>::as_ref(a).is_ascii());
+        let has_non_ascii = from.is_some_and(|a| !AsRef::<str>::as_ref(a).is_ascii())
+            || recipients
+                .iter()
+                .any(|recipient| !AsRef::<str>::as_ref(&recipient.address).is_ascii());
         if has_non_ascii && !has_smtputf8 {
             if !self.server_info().supports_feature(Extension::SmtpUtfEight) {
                 return Err(error::invalid_input(
@@ -1533,6 +1555,20 @@ impl AsyncSmtpConnection {
     ) -> Result<(), Error> {
         if self.server_info.supports_feature(Extension::StartTls) {
             try_smtp!(self.command(Starttls).await, self);
+            // Belt and braces at the security boundary. The generic
+            // surplus-bytes check inside the reply read normally fires first,
+            // but `get_mut()` swaps only the INNER stream and leaves the
+            // `BufReader` buffer intact, so any pre-TLS byte still sitting here
+            // would be consumed as the first bytes of the TLS session - the
+            // classic STARTTLS response-injection. This gate is independent of
+            // whichever reply path produced the 220.
+            if !self.stream.buffer().is_empty() {
+                self.stream.get_mut().set_state(ConnectionState::Broken);
+                self.abort().await;
+                return Err(error::parse(
+                    "SMTP server sent an unsolicited reply before the STARTTLS upgrade",
+                ));
+            }
             self.stream
                 .get_mut()
                 .upgrade_tls(tls_parameters, self.timeout)
@@ -1583,7 +1619,13 @@ impl AsyncSmtpConnection {
     }
 
     pub(crate) async fn abort(&mut self) {
-        let _ = self.stream.shutdown().await;
+        self.stream.get_mut().set_state(ConnectionState::Broken);
+        let _ = with_timeout(
+            self.per_operation_budget(),
+            "SMTP shutdown timed out",
+            self.stream.shutdown(),
+        )
+        .await;
     }
 
     /// Tells if the underlying stream is currently encrypted
@@ -2154,6 +2196,9 @@ impl AsyncSmtpConnection {
             tracing::debug!("<< {}", escape_crlf(line));
             match parse_response(&buffer) {
                 Ok((_remaining, response)) => {
+                    if manage_state && !self.stream.buffer().is_empty() {
+                        return Err(error::parse("SMTP server sent an unsolicited reply"));
+                    }
                     if manage_state {
                         self.stream.get_mut().set_state(ConnectionState::Ok);
                     }
@@ -2175,6 +2220,14 @@ impl AsyncSmtpConnection {
         }
 
         Err(error::parse("incomplete response"))
+    }
+
+    fn finish_reply_group(&mut self) -> Result<(), Error> {
+        if !self.stream.buffer().is_empty() {
+            return Err(error::parse("SMTP server sent an unsolicited reply"));
+        }
+        self.stream.get_mut().set_state(ConnectionState::Ok);
+        Ok(())
     }
 }
 
@@ -2407,6 +2460,31 @@ mod transcript_tests {
     }
 
     #[tokio::test(crate = "tokio")]
+    async fn starttls_refuses_plaintext_bytes_buffered_after_the_reply() {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250-smtp.example\r\n250 STARTTLS\r\n")
+            .expect_coalesced(
+                "STARTTLS\r\n",
+                "220 go ahead\r\n250 attacker-controlled capabilities\r\n",
+            );
+        let mut connection =
+            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp)
+                .await
+                .unwrap();
+        let tls = super::TlsParameters::new("smtp.example".to_owned()).unwrap();
+
+        let error = connection
+            .starttls(tls, &hello)
+            .await
+            .expect_err("pre-TLS injected bytes must refuse the upgrade");
+
+        assert!(error.to_string().contains("unsolicited reply"));
+        assert!(connection.has_broken());
+        transcript.assert_exhausted();
+    }
+
+    #[tokio::test(crate = "tokio")]
     async fn advertised_starttls_writes_command_before_upgrade() {
         let hello = ClientId::Domain("client.example".to_owned());
         let transcript = Transcript::new("220 smtp.example\r\n")
@@ -2494,6 +2572,33 @@ mod transcript_tests {
         assert!(connection.has_broken());
     }
 
+    #[tokio::test(crate = "tokio", start_paused = true)]
+    async fn abort_is_bounded_when_tls_style_shutdown_never_completes() {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250 smtp.example\r\n")
+            .stall_shutdown();
+        let mut connection = AsyncSmtpConnection::from_transcript_with_timeout(
+            transcript,
+            &hello,
+            Protocol::Smtp,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+
+        let mut abort = Box::pin(connection.abort());
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(abort.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::time::timeout(Duration::ZERO, abort)
+            .await
+            .expect("abort must finish when its operation timeout expires");
+    }
+
     #[tokio::test(crate = "tokio")]
     async fn explicit_mail_parameters_are_not_duplicated() {
         let hello = ClientId::Domain("client.example".to_owned());
@@ -2531,6 +2636,36 @@ mod transcript_tests {
             .unwrap();
 
         assert!(response.has_code(250));
+        transcript.assert_exhausted();
+    }
+
+    #[tokio::test(crate = "tokio")]
+    async fn batch_eai_recipient_requires_smtputf8_before_mail_from() {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250 smtp.example\r\n")
+            .expect("NOOP\r\n", "250 noop ok\r\n");
+        let batch = vec![SmtpBatchRecipient {
+            id: BatchItemId("item-0".to_owned()),
+            address: crate::address::Address::new_dangerous("üser", "example.com"),
+        }];
+        let mut connection =
+            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp)
+                .await
+                .unwrap();
+
+        let (error, _) = connection
+            .send_smtp_batch(
+                Some("sender@example.com".parse().unwrap()),
+                batch,
+                b"body",
+                &SendOptions::default(),
+            )
+            .await
+            .expect_err("EAI recipient must be rejected before MAIL FROM");
+
+        assert!(error.to_string().contains("SMTPUTF8"));
+        assert!(connection.test_connected().await);
         transcript.assert_exhausted();
     }
 
@@ -3559,34 +3694,27 @@ mod transcript_tests {
         );
     }
 
-    /// An unsolicited reply arriving in the same segment as a legitimate one
-    /// is buffered and consumed as the NEXT command's answer. This pins the
-    /// observable consequence rather than pretending the desync cannot happen.
+    /// An unsolicited reply coalesced with a requested reply breaks the
+    /// connection before it can be mistaken for the next command's answer.
     #[tokio::test(crate = "tokio")]
-    async fn unsolicited_reply_coalesced_with_an_answer_desynchronizes_the_next_command() {
+    async fn unsolicited_reply_coalesced_with_an_answer_breaks_the_connection() {
         let hello = ClientId::Domain("client.example".to_owned());
         let transcript = Transcript::new("220 smtp.example\r\n")
             .expect(HELLO, "250 smtp.example\r\n")
-            .expect_coalesced("NOOP\r\n", "250 noop ok\r\n421 service closing\r\n")
-            .expect("RSET\r\n", "250 reset ok\r\n");
+            .expect_coalesced("NOOP\r\n", "250 noop ok\r\n421 service closing\r\n");
         let mut connection =
             AsyncSmtpConnection::from_transcript(transcript, &hello, Protocol::Smtp)
                 .await
                 .unwrap();
 
-        connection
+        let error = connection
             .command(Noop)
             .await
-            .expect("the NOOP reply itself is well formed");
-        let error = connection
-            .command(crate::transport::smtp::commands::Rset)
-            .await
-            .expect_err("the buffered 421 is consumed as the RSET reply");
+            .expect_err("the surplus reply must break the connection immediately");
         assert!(
-            error
-                .smtp_response()
-                .is_some_and(|response| response.has_code(421)),
-            "expected the stale 421 to surface, got: {error}"
+            error.to_string().contains("unsolicited reply"),
+            "expected a desynchronization error, got: {error}"
         );
+        assert!(connection.has_broken());
     }
 }

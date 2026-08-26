@@ -19,6 +19,51 @@ rather than appending to it.
 - Refusing a finding with a reason is a good outcome. Two have been rejected on
   the merits so far, both recorded below.
 
+## From the `bugs-jmap.md` arc (closed, 5407925..60d834c)
+
+Machinery later work may build on and must not break:
+
+- **The inventory walk is anchor-based** over a stable `queryState`; positional
+  partitions are refused and not advertised. Every error path is
+  yield-Terminated-then-return, so `Done(None)` is reachable from exactly one
+  place: an empty anchored page under an unchanged `queryState`. A partial walk
+  therefore cannot report complete coverage.
+- **A mid-walk `queryState` move, and a cursor-scoped `anchorNotFound`, both
+  classify `SyncState(CursorInvalid)` mapping to `RestartScope`** - deliberately
+  not a terminal `ContractViolation`, because one delivered message advances
+  `queryState`, and ordinary mail arriving during a backfill must not permanently
+  kill a scope. The non-cursor `anchorNotFound` arm stays `ContractViolation`.
+- **Push.** RFC 8887 `pushState` is captured off the wire, replayed after
+  reconnect, and carried across a reconfigure: subscribe and unsubscribe both
+  send the live value, and `commit_push_set` retains the position on reconfigure
+  while clearing it when the union goes empty. Subscription state commits only
+  after successful push configuration: the registry, `enabled` and `push_state`
+  guards are held across the single await in one uniform lock order
+  (`subscriptions -> enabled -> push_state`) with every commit after it, so a
+  cancelled subscribe future mutates nothing. `push_subscribe` reports
+  per-position outcomes, so repeated scopes stay distinct.
+- **Capability limits** go through a three-state `CallLimit`: `Unadvertised`,
+  `Invalid` (a server advertising `maxCallsInRequest: 0`, which RFC 8620
+  forbids), and `Advertised(NonZeroUsize)`. Only the third enforces. Absent and
+  zero are different states - conflating them bricked account opening once.
+  Enforcement lives in the single `Request::call` door.
+- Session divergence wakes lifecycle handling immediately via a watch channel
+  rather than waiting on the 300s poll.
+
+Disclosed residuals and rulings, deliberately left:
+
+- `reenable_current_push_set` reads `enabled` and `push_state` under separate
+  critical sections. The worst case is extra wire frames and a spurious
+  invalidation hint - never a missed change, since hints are over-approximate by
+  contract - and it self-heals. Closing it means holding a guard across
+  `set_push_data_types`, the lock-across-await teardown shape that has opened a
+  new hole every time this loop has tried it.
+- `refresh_session` stays published but unwired, disclosed in
+  `reference/jmap.md`. `terminated_contract_violation` is kept under a reasoned
+  `allow(dead_code)`.
+- EventSource push remains a documented deferral; it resumes via `Last-Event-ID`
+  rather than `pushState`, which is correct for that transport.
+
 ## From the `bugs-net.md` arc (closed, a2b5fb4..5407925)
 
 The arc's own signature defect, worth stating first because it fired in six

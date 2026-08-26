@@ -271,24 +271,28 @@ impl SmtpConnection {
                 commands.push_str(&recipient.to_string());
             }
             self.write(commands.as_bytes())?;
+            self.stream.get_ref().state().verify()?;
+            self.stream.get_mut().set_state(ConnectionState::Broken);
 
             if window_index == 0 {
-                let mail_response = self.read_response_accepting_status()?;
+                let mail_response = self.read_response_inner(true, false)?;
                 if !mail_response.is_positive() {
                     for _ in window {
-                        self.read_response_accepting_status()?;
+                        self.read_response_inner(true, false)?;
                     }
+                    self.finish_reply_group()?;
                     return Err(Self::error_from_status(mail_response));
                 }
             }
 
             let mut failure = None;
             for _ in window {
-                let response = self.read_response_accepting_status()?;
+                let response = self.read_response_inner(true, false)?;
                 if failure.is_none() && !response.is_positive() {
                     failure = Some(response);
                 }
             }
+            self.finish_reply_group()?;
             if let Some(response) = failure {
                 if self.command_accepting_status(Rset).is_err() {
                     self.abort();
@@ -476,7 +480,7 @@ impl SmtpConnection {
             })?;
 
         let mail_options = self
-            .mail_options_for_batch(from.as_ref(), email, options, false)
+            .mail_options_for_batch(from.as_ref(), &progress.recipients, email, options, false)
             .map_err(|e| {
                 (
                     e.with_attempt(SmtpTransmissionState::Unsent)
@@ -814,7 +818,7 @@ impl SmtpConnection {
             })?;
 
         let mail_options = self
-            .mail_options_for_batch(from.as_ref(), email, options, false)
+            .mail_options_for_batch(from.as_ref(), &progress.recipients, email, options, false)
             .map_err(|e| {
                 (
                     e.with_attempt(SmtpTransmissionState::Unsent)
@@ -932,6 +936,14 @@ impl SmtpConnection {
         progress.set_body_finished();
 
         // Read one final LMTP status per accepted recipient.
+        self.stream.get_ref().state().verify().map_err(|e| {
+            (
+                e.with_attempt(SmtpTransmissionState::InFlight)
+                    .with_phase(SmtpCommandPhase::LmtpFinalStatus),
+                progress.clone(),
+            )
+        })?;
+        self.stream.get_mut().set_state(ConnectionState::Broken);
         for i in 0..progress.recipients.len() {
             if !matches!(
                 progress.recipients[i].rcpt,
@@ -939,7 +951,7 @@ impl SmtpConnection {
             ) {
                 continue;
             }
-            match self.read_response_accepting_status() {
+            match self.read_response_inner(true, false) {
                 Ok(resp) => {
                     progress.record_lmtp_final(i, resp);
                 }
@@ -1017,6 +1029,7 @@ impl SmtpConnection {
     fn mail_options_for_batch(
         &self,
         from: Option<&Address>,
+        recipients: &[RecipientProgress],
         email: &[u8],
         options: &SendOptions,
         allow_binary_mime: bool,
@@ -1037,7 +1050,10 @@ impl SmtpConnection {
             .iter()
             .any(|parameter| matches!(parameter, MailParameter::Body(_)));
 
-        let has_non_ascii = from.is_some_and(|a| !AsRef::<str>::as_ref(a).is_ascii());
+        let has_non_ascii = from.is_some_and(|a| !AsRef::<str>::as_ref(a).is_ascii())
+            || recipients
+                .iter()
+                .any(|recipient| !AsRef::<str>::as_ref(&recipient.address).is_ascii());
         if has_non_ascii && !has_smtputf8 {
             if !self.server_info().supports_feature(Extension::SmtpUtfEight) {
                 return Err(error::invalid_input(
@@ -1365,6 +1381,20 @@ impl SmtpConnection {
     ) -> Result<(), Error> {
         if self.server_info.supports_feature(Extension::StartTls) {
             try_smtp!(self.command(Starttls), self);
+            // Belt and braces at the security boundary. The generic
+            // surplus-bytes check inside the reply read normally fires first,
+            // but `get_mut()` swaps only the INNER stream and leaves the
+            // `BufReader` buffer intact, so any pre-TLS byte still sitting here
+            // would be consumed as the first bytes of the TLS session - the
+            // classic STARTTLS response-injection. This gate is independent of
+            // whichever reply path produced the 220.
+            if !self.stream.buffer().is_empty() {
+                self.stream.get_mut().set_state(ConnectionState::Broken);
+                self.abort();
+                return Err(error::parse(
+                    "SMTP server sent an unsolicited reply before the STARTTLS upgrade",
+                ));
+            }
             self.stream.get_mut().upgrade_tls(tls_parameters)?;
             #[cfg(feature = "tracing")]
             tracing::debug!("connection encrypted");
@@ -1390,7 +1420,15 @@ impl SmtpConnection {
         Ok(())
     }
 
+    /// Close the connection.
+    ///
+    /// Unlike the async half this needs no timeout: `Shutdown::Both` on a
+    /// blocking socket is a syscall that returns immediately, where the async
+    /// half's `poll_shutdown` sends TLS `close_notify` and waits for the
+    /// peer's. The state transition is mirrored on both sides so an aborted
+    /// connection can never pass `state().verify()` again.
     pub(crate) fn abort(&mut self) {
+        self.stream.get_mut().set_state(ConnectionState::Broken);
         let _ = self.stream.get_mut().shutdown(std::net::Shutdown::Both);
     }
 
@@ -1706,13 +1744,16 @@ impl SmtpConnection {
         self.write_command(Bdat::last(message.len()))?;
         self.write(message)?;
 
+        self.stream.get_ref().state().verify()?;
+        self.stream.get_mut().set_state(ConnectionState::Broken);
         let mut responses = Vec::with_capacity(recipients);
         for _ in 0..recipients {
-            responses.push(self.read_response_accepting_status()?);
+            responses.push(self.read_response_inner(true, false)?);
         }
 
         self.finish_lmtp_final_drain()?;
 
+        self.stream.get_mut().set_state(ConnectionState::Ok);
         Ok(responses)
     }
 
@@ -1773,13 +1814,16 @@ impl SmtpConnection {
         }
         self.write(data_terminator(seen >= 2 && last_two == *b"\r\n"))?;
 
+        self.stream.get_ref().state().verify()?;
+        self.stream.get_mut().set_state(ConnectionState::Broken);
         let mut responses = Vec::with_capacity(recipients);
         for _ in 0..recipients {
-            responses.push(self.read_response_accepting_status()?);
+            responses.push(self.read_response_inner(true, false)?);
         }
 
         self.finish_lmtp_final_drain()?;
 
+        self.stream.get_mut().set_state(ConnectionState::Ok);
         Ok(responses)
     }
 
@@ -1855,16 +1899,22 @@ impl SmtpConnection {
 
     /// Gets the SMTP response
     pub(crate) fn read_response(&mut self) -> Result<Response, Error> {
-        self.read_response_inner(false)
+        self.read_response_inner(false, true)
     }
 
     fn read_response_accepting_status(&mut self) -> Result<Response, Error> {
-        self.read_response_inner(true)
+        self.read_response_inner(true, true)
     }
 
-    fn read_response_inner(&mut self, accept_negative: bool) -> Result<Response, Error> {
-        self.stream.get_ref().state().verify()?;
-        self.stream.get_mut().set_state(ConnectionState::Broken);
+    fn read_response_inner(
+        &mut self,
+        accept_negative: bool,
+        manage_state: bool,
+    ) -> Result<Response, Error> {
+        if manage_state {
+            self.stream.get_ref().state().verify()?;
+            self.stream.get_mut().set_state(ConnectionState::Broken);
+        }
 
         let mut buffer = String::with_capacity(100);
 
@@ -1893,7 +1943,12 @@ impl SmtpConnection {
             tracing::debug!("<< {}", escape_crlf(line));
             match parse_response(&buffer) {
                 Ok((_remaining, response)) => {
-                    self.stream.get_mut().set_state(ConnectionState::Ok);
+                    if manage_state && !self.stream.buffer().is_empty() {
+                        return Err(error::parse("SMTP server sent an unsolicited reply"));
+                    }
+                    if manage_state {
+                        self.stream.get_mut().set_state(ConnectionState::Ok);
+                    }
 
                     return if accept_negative || response.is_positive() {
                         Ok(response)
@@ -1912,6 +1967,14 @@ impl SmtpConnection {
         }
 
         Err(error::parse("incomplete response"))
+    }
+
+    fn finish_reply_group(&mut self) -> Result<(), Error> {
+        if !self.stream.buffer().is_empty() {
+            return Err(error::parse("SMTP server sent an unsolicited reply"));
+        }
+        self.stream.get_mut().set_state(ConnectionState::Ok);
+        Ok(())
     }
 }
 
@@ -2530,6 +2593,33 @@ mod transcript_tests {
     }
 
     #[test]
+    fn batch_eai_recipient_requires_smtputf8_before_mail_from() {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250 smtp.example\r\n")
+            .expect("NOOP\r\n", "250 noop ok\r\n");
+        let batch = vec![SmtpBatchRecipient {
+            id: BatchItemId("item-0".to_owned()),
+            address: crate::address::Address::new_dangerous("üser", "example.com"),
+        }];
+        let mut connection =
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp).unwrap();
+
+        let (error, _) = connection
+            .send_smtp_batch(
+                Some("sender@example.com".parse().unwrap()),
+                batch,
+                b"body",
+                &SendOptions::default(),
+            )
+            .expect_err("EAI recipient must be rejected before MAIL FROM");
+
+        assert!(error.to_string().contains("SMTPUTF8"));
+        assert!(connection.test_connected());
+        transcript.assert_exhausted();
+    }
+
+    #[test]
     fn hostile_unchecked_sender_never_reaches_the_wire() {
         // `is_err()` alone would hold even without the guard, because the
         // transcript has no expectation for the smuggled `MAIL FROM` and would
@@ -2793,6 +2883,28 @@ mod transcript_tests {
         transcript.assert_exhausted();
     }
 
+    #[test]
+    fn starttls_refuses_plaintext_bytes_buffered_after_the_reply() {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250-smtp.example\r\n250 STARTTLS\r\n")
+            .expect_coalesced(
+                "STARTTLS\r\n",
+                "220 go ahead\r\n250 attacker-controlled capabilities\r\n",
+            );
+        let mut connection =
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp).unwrap();
+        let tls = super::TlsParameters::new("smtp.example".to_owned()).unwrap();
+
+        let error = connection
+            .starttls(&tls, &hello)
+            .expect_err("pre-TLS injected bytes must refuse the upgrade");
+
+        assert!(error.to_string().contains("unsolicited reply"));
+        assert!(connection.has_broken());
+        transcript.assert_exhausted();
+    }
+
     /// The capability is advertised, so the driver must actually issue
     /// `STARTTLS` and only then attempt the upgrade. The transcript stream is
     /// not a TCP socket, so the upgrade stops at the handshake boundary: that
@@ -2896,34 +3008,25 @@ mod transcript_tests {
         assert!(connection.has_broken());
     }
 
-    /// A peer that pushes an unsolicited reply alongside the one the client
-    /// asked for leaves the stream one reply ahead. SMTP has no surplus check
-    /// outside the LMTP final-status drain, so the drift surfaces on the *next*
-    /// command, which reads the stale reply. Pinned so the exposure is visible:
-    /// the failure is loud (the stale status is reported), not a silent
-    /// mis-attribution of a later success.
+    /// An unsolicited reply coalesced with a requested reply breaks the
+    /// connection before it can be mistaken for the next command's answer.
     #[test]
-    fn unsolicited_reply_coalesced_with_an_answer_desynchronizes_the_next_command() {
+    fn unsolicited_reply_coalesced_with_an_answer_breaks_the_connection() {
         let hello = ClientId::Domain("client.example".to_owned());
         let transcript = Transcript::new("220 smtp.example\r\n")
             .expect(HELLO, "250 smtp.example\r\n")
-            .expect_coalesced("NOOP\r\n", "250 noop ok\r\n421 service closing\r\n")
-            .expect("RSET\r\n", "250 reset ok\r\n");
+            .expect_coalesced("NOOP\r\n", "250 noop ok\r\n421 service closing\r\n");
         let mut connection =
             SmtpConnection::from_transcript(transcript, &hello, Protocol::Smtp).unwrap();
 
-        connection
-            .command(crate::transport::smtp::commands::Noop)
-            .expect("the NOOP reply itself is well formed");
         let error = connection
-            .command(crate::transport::smtp::commands::Rset)
-            .expect_err("the buffered 421 is consumed as the RSET reply");
+            .command(crate::transport::smtp::commands::Noop)
+            .expect_err("the surplus reply must break the connection immediately");
         assert!(
-            error
-                .smtp_response()
-                .is_some_and(|response| response.has_code(421)),
-            "expected the stale 421 to surface, got: {error}"
+            error.to_string().contains("unsolicited reply"),
+            "expected a desynchronization error, got: {error}"
         );
+        assert!(connection.has_broken());
     }
 
     /// DSN RCPT parameters are refused before `MAIL FROM` when the server did

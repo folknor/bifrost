@@ -1385,15 +1385,6 @@ mod tests {
                 .collect()
         }
 
-        /// Async recycling runs in a spawned task, so drain the executor
-        /// before observing the pool. `yield_now` is enough on the
-        /// current-thread test runtime and keeps the test off the clock.
-        async fn settle() {
-            for _ in 0..8 {
-                tokio::task::yield_now().await;
-            }
-        }
-
         /// End-to-end counterpart to the connection-level `should_retire()`
         /// pin, on the async path: a completed LMTP delivery must leave the
         /// pool empty.
@@ -1428,8 +1419,6 @@ mod tests {
                 )
                 .await
                 .expect("the delivery completes with per-recipient outcomes");
-            settle().await;
-
             assert_eq!(outcome.succeeded().len(), 1);
             assert_eq!(outcome.failed().len(), 1);
             assert_eq!(
@@ -1506,7 +1495,6 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            settle().await;
             assert_eq!(outcome.succeeded().len(), 1);
 
             let sent = sink.bytes_out.load(Ordering::Relaxed);
@@ -1569,7 +1557,6 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            settle().await;
             assert_eq!(first.succeeded().len(), 1);
             assert_eq!(
                 pool.idle_count_for_test().await,
@@ -1586,9 +1573,111 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            settle().await;
             assert_eq!(second.succeeded().len(), 1);
             assert_eq!(pool.idle_count_for_test().await, 1);
+            transcript.assert_exhausted();
+        }
+
+        #[tokio::test(crate = "tokio")]
+        async fn pool_max_size_bounds_checked_out_connections() {
+            let transcript = Transcript::new("220 smtp.example\r\n")
+                .expect("EHLO client.example\r\n", "250 smtp.example\r\n");
+            let conn =
+                AsyncSmtpConnection::from_transcript(transcript.clone(), &hello(), Protocol::Smtp)
+                    .await
+                    .unwrap();
+            let pool = Pool::new(
+                PoolConfig::new().max_size(1).test_on_checkout(false),
+                AsyncSmtpClient::<TokioExecutor> {
+                    info: SmtpInfo::new("transcript.invalid", Protocol::Smtp),
+                    marker_: PhantomData,
+                },
+            );
+            pool.park_for_test(conn).await;
+
+            let first = pool.connection().await.unwrap();
+            let mut second = Box::pin(pool.connection());
+            std::future::poll_fn(|cx| {
+                assert!(
+                    std::future::Future::poll(second.as_mut(), cx).is_pending(),
+                    "a second checkout must wait while the only slot is checked out"
+                );
+                std::task::Poll::Ready(())
+            })
+            .await;
+
+            drop(first);
+            let second = second.await.expect("released slot wakes the next checkout");
+            drop(second);
+            assert_eq!(pool.idle_count_for_test().await, 1);
+            transcript.assert_exhausted();
+        }
+
+        /// `max_size` is enforced by a semaphore, so a checkout blocked on
+        /// admission is only reachable through that semaphore. `shutdown()`
+        /// must therefore close it: otherwise the waiter parks forever, and if
+        /// the checked-out connection is ever returned its released permit
+        /// hands the waiter a slot to dial a NEW connection through a pool that
+        /// is already closed. `transcript.invalid` does not resolve, so a dial
+        /// would surface as a connection error rather than a shutdown error -
+        /// which is what makes the assertion below discriminating.
+        #[tokio::test(crate = "tokio")]
+        async fn shutdown_wakes_a_blocked_checkout_instead_of_letting_it_dial() {
+            let transcript = Transcript::new("220 smtp.example\r\n")
+                .expect("EHLO client.example\r\n", "250 smtp.example\r\n");
+            let conn =
+                AsyncSmtpConnection::from_transcript(transcript.clone(), &hello(), Protocol::Smtp)
+                    .await
+                    .unwrap();
+            let pool = Pool::new(
+                PoolConfig::new().max_size(1).test_on_checkout(false),
+                AsyncSmtpClient::<TokioExecutor> {
+                    info: SmtpInfo::new("transcript.invalid", Protocol::Smtp),
+                    marker_: PhantomData,
+                },
+            );
+            pool.park_for_test(conn).await;
+
+            let first = pool.connection().await.unwrap();
+            let mut second = Box::pin(pool.connection());
+            std::future::poll_fn(|cx| {
+                assert!(
+                    std::future::Future::poll(second.as_mut(), cx).is_pending(),
+                    "a second checkout must wait while the only slot is checked out"
+                );
+                std::task::Poll::Ready(())
+            })
+            .await;
+
+            // `first` is deliberately still held. The only permit is checked
+            // out, so nothing will ever release it: if `shutdown()` does not
+            // close the admission semaphore, the waiter below stays parked
+            // forever. Polling to Ready rather than awaiting is what turns that
+            // hang into a deterministic failure.
+            pool.shutdown().await;
+
+            let outcome = std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(std::future::Future::poll(second.as_mut(), cx))
+            })
+            .await;
+            let std::task::Poll::Ready(result) = outcome else {
+                panic!("shutdown must wake a checkout parked on admission");
+            };
+            let error = result
+                .err()
+                .expect("a blocked checkout must fail once the pool is shut down");
+            assert!(
+                matches!(
+                    error.kind(),
+                    crate::transport::smtp::error::ErrorKind::TransportShutdown
+                ),
+                "expected a shutdown error, got: {error}"
+            );
+
+            // Returning the checked-out connection after shutdown releases its
+            // permit. That must not resurrect the pool.
+            drop(first);
+            assert_eq!(pool.idle_count_for_test().await, 0);
             transcript.assert_exhausted();
         }
 

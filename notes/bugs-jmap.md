@@ -50,6 +50,25 @@ Left alone because closing it means holding the `enabled` guard across the
 lock-across-await teardown change this arc has repeatedly seen open a new hole
 one layer up. Recorded so a future round does not have to rediscover it.
 
+## J13. Positional paging survives in the consumer-facing list and search paths
+
+Surfaced by the close pass of this document's arc, and left open deliberately
+rather than folded into it.
+
+`contacts.rs`, `calendar_ops.rs` and `pim.rs` still page by integer position over
+orders that are not total - the same unstable-order shape that J1 fixed for the
+inventory walk. The close pass judged, correctly, that this is not J1 reopened:
+those are consumer-driven page-cursor APIs rather than coverage-claiming walks,
+so churn-induced skip or duplication there is ordinary list-API behaviour and not
+silent data loss. Nothing reports complete coverage off them.
+
+It is still the weaker mechanism where a better one exists. The suggested shape:
+carry an anchor id on the page cursor, so a consumer paging through a churning
+list gets stable continuation rather than positional drift.
+
+**Confidence: high** that the paging is positional; **low** that it constitutes a
+defect. This is an improvement with a known better answer, not a bug.
+
 ## J11. Rejected: the first reader pass sends a disable frame
 
 `enabled` starts empty at `open()`, and `apply_push_set` maps an empty set to

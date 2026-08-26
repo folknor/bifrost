@@ -7,226 +7,28 @@ examples.
 Hunter note: baseline `brokkr check -p smtp` passes clean (exit 0). Every finding
 below is a defect in code that currently compiles and passes its own suite.
 
-## 1. STARTTLS plaintext-injection: buffered pre-TLS bytes survive the upgrade
+## Round 1 rulings (findings 1-7, landed)
 
-**Confidence: high. Both halves. Security.**
+Findings 1 through 7 are fixed and removed. Two things about that round are worth
+keeping, because they are not visible from the code alone:
 
-`AsyncSmtpConnection::starttls` (`client/async_connection.rs:1529`) and
-`SmtpConnection::starttls` (`client/connection.rs:1361`) do:
-
-```rust
-try_smtp!(self.command(Starttls).await, self);
-self.stream.get_mut().upgrade_tls(tls_parameters, self.timeout).await?;
-try_smtp!(self.hello(hello_name).await, self);
-```
-
-`self.stream` is a `BufReader<AsyncNetworkStream>`. `get_mut()` swaps the *inner*
-stream for the TLS stream and leaves the BufReader's buffer completely untouched.
-Nothing checks or discards it.
-
-The reply read for `220 Ready to start TLS` goes through `read_until` on the
-BufReader, which fills the buffer with whatever the socket had available -
-potentially more than that one line. A MITM (or a compromised/hostile relay) appends
-plaintext after the `220`; those bytes sit in the buffer across the upgrade and are
-then consumed as the *first bytes of the TLS session*. That includes the
-post-STARTTLS `EHLO` reply, which is what populates `ServerInfo` - so the attacker
-chooses the advertised extension set, the AUTH mechanism list, the SIZE limit, and
-DSN support, from outside TLS. This is the classic STARTTLS response-injection class
-(CVE-2011-0411 and the 2021 "NO STARTTLS" family), present here in textbook form.
-
-The fix is one line and the crate already has the primitive:
-`finish_lmtp_final_drain` uses `self.stream.buffer().is_empty()`. Assert the same
-thing immediately before `upgrade_tls` and hard-fail (mark `Broken`, abort) if it is
-non-empty. Both halves.
-
-Two aggravating details:
-
-- `try_smtp!(self.command(Starttls)...)` uses `command`, which reads via
-  `read_response_with_budget` -> `accept_negative: false`, so a negative reply errors
-  out. Good. But the buffer is still not checked on the success path.
-- The test `starttls_downgrade_is_refused_without_a_wire_command` and its siblings
-  stop at the handshake boundary by design (`reference/smtp.md` says so), which is
-  exactly why this was never observed - the transcript harness never gets to model a
-  post-220 injection. The harness *can* model it:
-  `expect_coalesced("STARTTLS\r\n", "220 go ahead\r\n250-attacker...\r\n")` plus a
-  buffer assertion is a hermetic regression test.
-
-## 2. Reply desynchronization is pinned as behavior instead of fixed - mail can be mis-attributed
-
-**Confidence: high. Both halves.**
-
-`async_connection.rs:3566`,
-`unsolicited_reply_coalesced_with_an_answer_desynchronizes_the_next_command`, whose
-own doc comment says: *"This pins the observable consequence rather than pretending
-the desync cannot happen."* The test asserts that a `421` coalesced behind a `250
-noop ok` is consumed as the *next* command's reply.
-
-That is not a harmless curiosity on a pooled connection. Once the stream is one reply
-ahead, every subsequent reply is mis-attributed by one command, and the connection is
-*recycled into the pool* because nothing marks it. Concretely, on the next send
-through that connection:
-
-- `MAIL FROM` reads the stale reply. If the stale reply was positive, `MAIL FROM`'s
-  real (possibly negative) reply is later read as the `RCPT TO` answer, and so on down
-  the chain.
-- The shift walks all the way to `DATA`-final. A stale `250` read as the DATA-final
-  acceptance means **`SendProgress` records a successful delivery for a message the
-  server never accepted** - silent mail loss reported as success. The mirrored case (a
-  stale negative shifted onto the final) produces a spurious failure for a message
-  that *was* accepted, which the engine will retry: **duplicate mail** on a
-  non-idempotent `Send`.
-
-LMTP already has the correct defense and the correct reasoning written down
-(`finish_lmtp_final_drain`, plus unconditional retirement). SMTP has neither. The fix
-is the same primitive: after every reply read completes, if `self.stream.buffer()` is
-non-empty, the peer has spoken out of turn - set `ConnectionState::Broken` and refuse
-to recycle. This costs one `is_empty()` per reply and closes the whole class. The
-pipelining drains would need the check deferred to the end of each window (where extra
-buffered replies are expected and counted), which the window loop already has a
-natural place for.
-
-The hunter classifies this as the single most consequential finding after the STARTTLS
-one, because it is the only one that can lose or duplicate mail *silently*.
-
-## 3. Batch send never checks recipients for non-ASCII - SMTPUTF8 is skipped for EAI recipients
-
-**Confidence: high. Both halves. Divergence between the two code paths.**
-
-`mail_options` (single-envelope) at `async_connection.rs:1280`:
-
-```rust
-if envelope.has_non_ascii_addresses() && !has_smtputf8 {
-```
-
-`has_non_ascii_addresses()` covers the reverse-path *and* every forward-path
-recipient.
-
-`mail_options_for_batch` at `async_connection.rs:1200` (and `connection.rs:1040`):
-
-```rust
-let has_non_ascii = from.is_some_and(|a| !AsRef::<str>::as_ref(a).is_ascii());
-if has_non_ascii && !has_smtputf8 {
-```
-
-Only the sender. The recipients are never examined, even though they are right there
-in `progress.recipients`.
-
-Consequences on the account-oriented batch path (which is the path `bifrost-sync`
-actually drives):
-
-- Against a server **without** SMTPUTF8: the guard that is supposed to refuse the send
-  never fires, and `RCPT TO:<üser@example.com>` goes on the wire raw. RFC 6531 section
-  3.4 forbids this. Real-world outcome is a `501` per recipient at best, silent
-  local-part mangling at worst.
-- Against a server **with** SMTPUTF8: the `SMTPUTF8` MAIL parameter is not emitted, so
-  a conforming server is entitled to reject the transaction it would otherwise have
-  accepted.
-
-Either way the single-envelope `send_raw*` path and the batch path give different
-answers for the same envelope, which is the strongest signal that this is an oversight
-rather than a decision. Fix: pass the recipient addresses into
-`mail_options_for_batch` and OR them into `has_non_ascii`.
-
-The reason this bug exists is the structural finding below: `mail_options` and
-`mail_options_for_batch` are near-verbatim 80-line copies, times two for sync/async -
-four copies, and the fix landed in two of them.
-
-## 4. `abort()` has no timeout and can hang the caller past every configured deadline
-
-**Confidence: medium-high. Both halves, worse on async.**
-
-```rust
-pub(crate) async fn abort(&mut self) {
-    let _ = self.stream.shutdown().await;
-}
-```
-
-For a `TokioNativeTls` stream, `poll_shutdown` sends `close_notify` and waits for the
-peer's. There is no `with_timeout` around it - unlike literally every other I/O in the
-connection driver, which all route through `with_timeout(budget, ...)`.
-
-`abort()` is awaited on the error arm of essentially every send path:
-`send_smtp_batch` (four sites), `send_smtp_batch_pipelined` (six sites),
-`send_lmtp_batch` (five sites), `auth_scram`, `auth_legacy`, `test_connected`, and the
-pool's checkout and recycle. A peer that accepts the TCP connection and then stops
-responding - precisely the case `Transcript::silent()` and `expect_then_stall` were
-built to model - makes `abort()` never return. The caller's per-operation timeout has
-already fired and been converted into an error; the code then awaits `abort()` on the
-way out and hangs *after* the timeout it was supposed to honor. From the caller's side
-this looks like the timeout not working at all.
-
-The same hang parks the pool: `Pool::recycle` and the cleanup worker both await
-`abort()`.
-
-Fix: wrap the shutdown in the per-operation budget and fall through to a hard drop on
-expiry. A close that the peer will not acknowledge is not worth waiting on.
-
-## 5. `abort_concurrent` is sequential - one hung peer blocks the whole pool
-
-**Confidence: high (trivially verifiable). Compounds 4.**
-
-`pool/async_impl.rs:370`:
-
-```rust
-async fn abort_concurrent<I>(iter: I) where I: Iterator<Item = AsyncSmtpConnection> {
-    for mut conn in iter { conn.abort().await; }
-}
-```
-
-A `for` loop awaiting each element in turn is the definition of *not* concurrent. The
-name is a lie, and combined with 4 it means one unresponsive peer stalls
-`Pool::shutdown()`, the `Drop` cleanup task, and every expiry sweep in the cleanup
-worker - head-of-line blocking across every other connection in the pool.
-
-Fix is `futures::future::join_all` / `FuturesUnordered`, or keep the loop and rename it
-honestly. Given 4 exists, fix the concurrency rather than the name.
-
-## 6. `PoolConfig::max_size` does not bound connections - only idle parking
-
-**Confidence: high.**
-
-`Pool::connection()` (`pool/async_impl.rs:159`) on an empty idle list goes straight to
-`self.client.connection().await?` with no admission control whatsoever. `max_size` is
-consulted in exactly one place - `recycle`, at line 251 - where it decides whether a
-*returning* connection is parked or aborted.
-
-So `max_size` is a cap on the idle set, not on live connections. A caller sending
-10 000 concurrent messages through a transport configured `max_size(4)` opens 10 000
-sockets, and 9 996 of them are aborted on the way back. The field reads as a
-connection limit - it is named `max_size` on a type called `PoolConfig` - and callers
-will configure it as one, against a relay that enforces per-client connection limits,
-and get their traffic refused or tarpitted with no indication why.
-
-This is the `MutationConfig::retry_queue_cap` shape from the standing lessons: a field
-that reads as a bound over something unbounded. Per that lesson, the fix that *keeps*
-the item is the right one - make `max_size` an actual semaphore-backed checkout bound,
-with `PooledConnection` releasing the permit on drop. Do not delete the field.
-
-Related, lower severity: the cleanup worker's replenish loop (`for _ in
-count..(min_idle as usize)`) counts only *parked* connections, so a busy pool dials
-`min_idle` fresh connections on top of everything currently checked out.
-
-## 7. `PooledConnection::drop` and `Pool::drop` spawn tasks - fire-and-forget teardown
-
-**Confidence: medium.**
-
-Both `Drop` impls call `E::spawn(...)` to do their work. Two consequences:
-
-- `tokio::spawn` **panics** if no runtime is active. Dropping an `AsyncSmtpTransport`
-  (or the last `PooledConnection`) outside a runtime context - during a shutdown
-  sequence, in a `Drop` chain that runs after `Runtime::shutdown`, in a synchronous
-  test teardown - panics in a destructor. Panicking in `Drop` during unwind aborts the
-  process.
-- Recycling is asynchronous and unordered relative to the caller. A caller that sends,
-  drops the guard, and immediately sends again may not see the connection back yet,
-  dials a second one, and the first arrives afterward. Correctness-neutral but it
-  defeats pooling under exactly the sequential-send pattern pooling exists for, and it
-  makes the pool's observable state untestable without sleeping.
-
-The structural fix is to stop doing I/O in `Drop`. Return the connection to a
-synchronous parking list under a `std::sync::Mutex` (the recycle decision -
-`has_broken() || should_retire()` - is pure and needs no await), and let the *next*
-checkout or the cleanup worker perform the aborts.
+- **Finding 4's blocking half was refused on the merits.** The finding said
+  "both halves, worse on async". Only the async half was a defect. The blocking
+  `abort()` is `Shutdown::Both` on a blocking socket - a syscall that returns
+  immediately - where the async `poll_shutdown` sends TLS `close_notify` and
+  waits for the peer's. There is nothing to bound on the blocking side and no
+  timeout was added there. `reference/smtp.md` now says so, so the "held in
+  step" claim stays true.
+- **A defect the round's own fix introduced, caught by the cold reviewer.** The
+  finding-6 fix made `max_size` a real bound with a semaphore, and the new
+  admission gate did not participate in `shutdown()`. That left a checkout
+  parked on admission unwakeable, and - once a pre-shutdown checkout was
+  returned and released its permit - able to dial a NEW connection through a
+  closed pool. Closed by `admission.close()` + `notify_waiters()` in
+  `shutdown()` plus a pool-state recheck after admission and before dialing.
+  The blocking pool's condvar equivalent was audited and was already correct;
+  it gained only a `notify_all()` for the case where the checked-out connection
+  is never returned at all.
 
 ## 8. Pipelined single-envelope send is systematically missing `SmtpCommandPhase` decoration
 

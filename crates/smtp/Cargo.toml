@@ -20,6 +20,7 @@ workspace = true
 [dependencies]
 email_address = { version = "0.2.1", default-features = false }
 nom = { workspace = true }
+futures = { workspace = true }
 idna = "1"
 
 bifrost-types = { path = "../types", optional = true }

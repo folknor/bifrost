@@ -27,6 +27,7 @@ struct TranscriptState {
     /// Reads then report EOF and writes fail the way a real closed socket
     /// does, so a driver cannot keep talking to a hung-up peer.
     closed: bool,
+    shutdown_stalled: bool,
 }
 
 #[derive(Debug)]
@@ -57,12 +58,22 @@ impl Transcript {
                 stalled,
                 coalesced: false,
                 closed: false,
+                shutdown_stalled: false,
             })),
         }
     }
 
     pub(super) fn expect(self, client: impl AsRef<[u8]>, server: impl AsRef<[u8]>) -> Self {
         self.push(client, server, false, false, false)
+    }
+
+    #[cfg(feature = "tokio")]
+    pub(super) fn stall_shutdown(self) -> Self {
+        self.shared
+            .lock()
+            .expect("transcript lock")
+            .shutdown_stalled = true;
+        self
     }
 
     /// A peer that answers with `server` and then hangs up.
@@ -293,7 +304,18 @@ impl tokio::io::AsyncWrite for AsyncTranscriptStream {
         self: std::pin::Pin<&mut Self>,
         _cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        std::task::Poll::Ready(Ok(()))
+        if self
+            .inner
+            .transcript
+            .shared
+            .lock()
+            .expect("transcript lock")
+            .shutdown_stalled
+        {
+            std::task::Poll::Pending
+        } else {
+            std::task::Poll::Ready(Ok(()))
+        }
     }
 }
 

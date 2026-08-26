@@ -39,7 +39,21 @@ greeting -> EHLO/LHLO -> [STARTTLS -> EHLO/LHLO] -> [AUTH -> EHLO/LHLO] -> ready
 
 EHLO is re-sent after STARTTLS and AUTH because capabilities can change.
 
-- `abort()` closes the connection. There is no live QUIT path; the Quit command builder is gone. If a graceful shutdown is wanted later it will need to be re-added with a real call site.
+STARTTLS upgrades are fail-closed at the buffered-reader boundary. If the peer
+coalesces any plaintext bytes after its positive STARTTLS reply, the connection
+is marked broken and the upgrade is refused. Pre-TLS bytes can never become a
+post-TLS reply.
+
+- `abort()` closes the connection and marks it `Broken` on both sides, so an
+  aborted connection can never pass `state().verify()` again. There is no live
+  QUIT path; the Quit command builder is gone. If a graceful shutdown is wanted
+  later it will need to be re-added with a real call site.
+- The async `abort()` is bounded by the per-operation timeout. `poll_shutdown`
+  on a TLS stream sends `close_notify` and waits for the peer's, so an
+  unresponsive peer would otherwise hang the caller *after* the timeout that
+  already fired. The blocking `abort()` needs no such bound: `Shutdown::Both`
+  on a blocking socket is a syscall that returns immediately. This is the one
+  place the two halves differ by design rather than by omission.
 
 ## Connection state and cancel-safety
 
@@ -50,6 +64,12 @@ LMTP final delivery-status loop holds `Broken` until every accepted recipient's 
 Surplus bytes that have not yet crossed into the `BufReader` - still in the socket or a TLS record - cannot be observed without a read that would block against a well-behaved peer, and native-tls exposes no nonblocking peek that would make such a probe honest. So cleanliness is never positively established: every LMTP final-status drain sets a retirement flag (`should_retire()`), and the pool discards those connections at recycle instead of parking them. The cost is one reconnect per LMTP transaction; LMTP is local delivery, so that is cheaper than recycling a possibly desynchronized stream. SMTP connections are unaffected and still pool normally.
 
 `test_connected()` (pooled NOOP probe) aborts on failure so a stale connection cannot be recycled.
+
+An ordinary SMTP reply must also end with an empty read buffer. Surplus bytes
+prove that the peer spoke out of turn, so the driver marks the connection broken
+and reports a parse error before another command can consume the stale reply.
+PIPELINING and LMTP final-status groups defer this check until their exact
+expected reply count has drained.
 
 Envelope commands are constructed, and therefore validated, before `MAIL FROM`
 is written. Every send path - sync and async, DATA and BDAT, SMTP and LMTP,
@@ -194,7 +214,25 @@ Canonicalization follows RFC 6376 for empty bodies and missing final CRLFs. Rela
 
 ## Pool
 
-`PoolConfig` configures min idle, max size, idle timeout, and the checkout NOOP probe. Recycling refuses connections that are `Broken` and connections flagged for retirement by an LMTP final-status drain (see "Connection state and cancel-safety"). `min_idle` defaults to 0: no background pool worker is started, and expired connections are discarded at checkout. A positive `min_idle` enables the worker that expires and replenishes warm connections. `test_on_checkout(false)` opts out of the default NOOP probe for callers willing to retry one stale idle connection; it does not permit a connection already marked `Broken` to be reused. It buys nothing for LMTP transports, whose connections are retired at recycle and therefore never checked out idle.
+`PoolConfig` configures min idle, max size, idle timeout, and the checkout NOOP probe. `max_size` bounds all live connections, checked out and idle, in both the blocking and async pools; checkout waits for a slot instead of dialing past the bound. Zero is rejected at checkout. Recycling refuses connections that are `Broken` and connections flagged for retirement by an LMTP final-status drain (see "Connection state and cancel-safety"). `min_idle` defaults to 0: no background pool worker is started, and expired connections are discarded at checkout. A positive `min_idle` enables the worker that expires and replenishes warm connections without exceeding `max_size`. `test_on_checkout(false)` opts out of the default NOOP probe for callers willing to retry one stale idle connection; it does not permit a connection already marked `Broken` to be reused. It buys nothing for LMTP transports, whose connections are retired at recycle and therefore never checked out idle.
+
+Async `Drop` performs no spawn and no I/O. A healthy checked-out connection is
+parked synchronously; a broken, retired, or shut-down connection is hard-dropped.
+Recycling therefore has no await point and no blocking call at all, which is why
+it is safe to run from `Drop`: there is no recycling future to be dropped before
+its first poll, and no close to block on an unresponsive peer. Explicit
+`shutdown()` owns graceful close work, runs closes concurrently, and each close
+is bounded by the connection's operation timeout.
+
+The admission gate participates in shutdown. Because `max_size` is enforced by a
+semaphore (async) and a live counter plus condvar (blocking), a checkout blocked
+on admission is reachable *only* through that gate: `shutdown()` closes the
+semaphore and wakes the availability waiters on the async side, and notifies the
+condvar on the blocking side. Async checkout additionally re-reads the pool state
+after winning admission and before dialing. Without both halves of this a
+checkout could park forever, or - once a connection checked out before shutdown
+was returned and released its permit - dial a NEW connection through a pool that
+was already closed.
 
 ## Bandwidth metering
 

@@ -1,7 +1,11 @@
 use std::{
     fmt::{self, Debug},
     ops::{Deref, DerefMut},
-    sync::{Arc, Mutex, TryLockError, mpsc},
+    sync::{
+        Arc, Condvar, Mutex, TryLockError,
+        atomic::{AtomicU32, Ordering},
+        mpsc,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -15,6 +19,8 @@ use crate::transport::smtp::{error, transport::SmtpClient};
 pub(crate) struct Pool {
     config: PoolConfig,
     connections: Mutex<Option<Vec<ParkedConnection>>>,
+    available: Condvar,
+    live: AtomicU32,
     thread_terminator: Option<mpsc::SyncSender<()>>,
     client: SmtpClient,
 }
@@ -41,6 +47,8 @@ impl Pool {
         let pool = Arc::new(Self {
             config,
             connections: Mutex::new(Some(Vec::new())),
+            available: Condvar::new(),
+            live: AtomicU32::new(0),
             thread_terminator,
             client,
         });
@@ -85,9 +93,13 @@ impl Pool {
                         #[cfg(feature = "tracing")]
                         let mut created = 0;
                         for _ in count..(min_idle as usize) {
+                            if !pool.try_reserve() {
+                                break;
+                            }
                             let conn = match pool.client.connection() {
                                 Ok(conn) => conn,
                                 Err(err) => {
+                                    pool.release_live();
                                     #[cfg(feature = "tracing")]
                                     tracing::warn!("couldn't create idle connection {}", err);
                                     #[cfg(not(feature = "tracing"))]
@@ -104,6 +116,9 @@ impl Pool {
                             };
 
                             connections.push(ParkedConnection::park(conn));
+                            // A replenished connection is a newly available
+                            // one, exactly like a recycled one.
+                            pool.available.notify_one();
 
                             #[cfg(feature = "tracing")]
                             {
@@ -123,6 +138,7 @@ impl Pool {
                             for conn in dropped {
                                 let mut conn = conn.unpark();
                                 conn.abort();
+                                pool.release_live();
                             }
                         }
 
@@ -147,6 +163,7 @@ impl Pool {
     /// and recycle without dialing anything.
     #[cfg(test)]
     pub(crate) fn park_for_test(&self, conn: SmtpConnection) {
+        assert!(self.try_reserve(), "test connection fits pool bound");
         self.connections
             .lock()
             .expect("connection pool lock")
@@ -170,8 +187,14 @@ impl Pool {
         if let Some(connections) = connections {
             for conn in connections {
                 conn.unpark().abort();
+                self.release_live();
             }
         }
+        // A waiter parked on `available` is only reachable through this
+        // notify. `recycle` also notifies, so a checked-out connection that is
+        // eventually returned would wake one - but a connection that is NEVER
+        // returned would leave the waiter parked forever without this.
+        self.available.notify_all();
 
         if let Some(thread_terminator) = &self.thread_terminator {
             _ = thread_terminator.try_send(());
@@ -179,17 +202,33 @@ impl Pool {
     }
 
     pub(crate) fn connection(self: &Arc<Self>) -> Result<PooledConnection, Error> {
+        if self.config.max_size == 0 {
+            return Err(error::invalid_input(
+                "pool max_size must be greater than zero",
+            ));
+        }
         loop {
-            let conn = {
+            let (conn, reserved) = {
                 let mut connections = self
                     .connections
                     .lock()
                     .map_err(|_| error::internal("connection pool lock poisoned"))?;
-                let Some(connections) = connections.as_mut() else {
+                if connections.is_none() {
                     // The transport was shut down
                     return Err(error::transport_shutdown());
-                };
-                connections.pop()
+                }
+                if let Some(conn) = connections.as_mut().expect("pool is open").pop() {
+                    (Some(conn), false)
+                } else if self.try_reserve() {
+                    (None, true)
+                } else {
+                    drop(
+                        self.available
+                            .wait(connections)
+                            .map_err(|_| error::internal("connection pool lock poisoned"))?,
+                    );
+                    continue;
+                }
             };
 
             match conn {
@@ -199,6 +238,7 @@ impl Pool {
                         tracing::debug!("dropping an expired connection");
 
                         conn.unpark().abort();
+                        self.release_live();
                         continue;
                     }
                     let mut conn = conn.unpark();
@@ -208,6 +248,7 @@ impl Pool {
                         tracing::debug!("dropping a broken connection");
 
                         conn.abort();
+                        self.release_live();
                         continue;
                     }
 
@@ -216,6 +257,7 @@ impl Pool {
                         tracing::debug!("dropping a broken connection");
 
                         conn.abort();
+                        self.release_live();
                         continue;
                     }
 
@@ -225,10 +267,17 @@ impl Pool {
                     return Ok(PooledConnection::wrap(conn, Arc::clone(self)));
                 }
                 None => {
+                    debug_assert!(reserved);
                     #[cfg(feature = "tracing")]
                     tracing::debug!("creating a new connection");
 
-                    let conn = self.client.connection()?;
+                    let conn = match self.client.connection() {
+                        Ok(conn) => conn,
+                        Err(error) => {
+                            self.release_live();
+                            return Err(error);
+                        }
+                    };
                     return Ok(PooledConnection::wrap(conn, Arc::clone(self)));
                 }
             }
@@ -246,6 +295,7 @@ impl Pool {
 
             conn.abort();
             drop(conn);
+            self.release_live();
         } else {
             #[cfg(feature = "tracing")]
             tracing::debug!("recycling connection");
@@ -256,16 +306,33 @@ impl Pool {
                 if connections.len() >= self.config.max_size as usize {
                     drop(connections_guard);
                     conn.abort();
+                    self.release_live();
                 } else {
                     let conn = ParkedConnection::park(conn);
                     connections.push(conn);
+                    self.available.notify_one();
                 }
             } else {
                 // The pool has already been shut down
                 drop(connections_guard);
                 conn.abort();
+                self.release_live();
             }
         }
+    }
+
+    fn try_reserve(&self) -> bool {
+        self.live
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |live| {
+                (live < self.config.max_size).then_some(live + 1)
+            })
+            .is_ok()
+    }
+
+    fn release_live(&self) {
+        let previous = self.live.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0);
+        self.available.notify_one();
     }
 }
 
@@ -300,8 +367,7 @@ impl Drop for Pool {
 
         if let Some(connections) = self.connections.get_mut().unwrap().take() {
             for conn in connections {
-                let mut conn = conn.unpark();
-                conn.abort();
+                drop(conn);
             }
         }
     }

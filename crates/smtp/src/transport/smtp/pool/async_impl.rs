@@ -1,11 +1,11 @@
 use std::{
     fmt::{self, Debug},
     ops::{Deref, DerefMut},
-    sync::{Arc, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant},
 };
 
-use tokio::sync::Mutex;
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
 use super::{
     super::{AsyncSmtpConnection, Error},
@@ -20,6 +20,8 @@ use crate::{
 pub(crate) struct Pool<E: Executor> {
     config: PoolConfig,
     connections: Mutex<Option<Vec<ParkedConnection>>>,
+    admission: Arc<Semaphore>,
+    available: Notify,
     client: AsyncSmtpClient<E>,
     handle: OnceLock<E::Handle>,
 }
@@ -27,20 +29,25 @@ pub(crate) struct Pool<E: Executor> {
 struct ParkedConnection {
     conn: AsyncSmtpConnection,
     since: Instant,
+    permit: OwnedSemaphorePermit,
 }
 
 pub(crate) struct PooledConnection<E: Executor> {
     conn: Option<AsyncSmtpConnection>,
     pool: Arc<Pool<E>>,
+    permit: Option<OwnedSemaphorePermit>,
 }
 
 impl<E: SmtpExecutor> Pool<E> {
     // Pool creation can dial replacement idle connections, so it needs the
     // private SMTP executor extension. Recycling only spawns cleanup work.
     pub(crate) fn new(config: PoolConfig, client: AsyncSmtpClient<E>) -> Arc<Self> {
+        let max_size = config.max_size;
         let pool = Arc::new(Self {
             config,
             connections: Mutex::new(Some(Vec::new())),
+            admission: Arc::new(Semaphore::new(max_size as usize)),
+            available: Notify::new(),
             client,
             handle: OnceLock::new(),
         });
@@ -61,7 +68,8 @@ impl<E: SmtpExecutor> Pool<E> {
                         Some(pool) => {
                             #[allow(clippy::needless_collect)]
                             let (count, dropped) = {
-                                let mut connections = pool.connections.lock().await;
+                                let mut connections =
+                                    pool.connections.lock().expect("connection pool lock");
                                 let Some(connections) = connections.as_mut() else {
                                     // The transport was shut down
                                     return;
@@ -85,6 +93,10 @@ impl<E: SmtpExecutor> Pool<E> {
                             #[cfg(feature = "tracing")]
                             let mut created = 0;
                             for _ in count..(min_idle as usize) {
+                                let Ok(permit) = Arc::clone(&pool.admission).try_acquire_owned()
+                                else {
+                                    break;
+                                };
                                 let conn = match pool.client.connection().await {
                                     Ok(conn) => conn,
                                     Err(err) => {
@@ -97,13 +109,17 @@ impl<E: SmtpExecutor> Pool<E> {
                                     }
                                 };
 
-                                let mut connections = pool.connections.lock().await;
+                                let mut connections =
+                                    pool.connections.lock().expect("connection pool lock");
                                 let Some(connections) = connections.as_mut() else {
                                     // The transport was shut down
                                     return;
                                 };
 
-                                connections.push(ParkedConnection::park(conn));
+                                connections.push(ParkedConnection::park(conn, permit));
+                                // A replenished connection is a newly available
+                                // one, exactly like a recycled one.
+                                pool.available.notify_one();
 
                                 #[cfg(feature = "tracing")]
                                 {
@@ -146,7 +162,24 @@ impl<E: SmtpExecutor> Pool<E> {
     }
 
     pub(crate) async fn shutdown(&self) {
-        let connections = { self.connections.lock().await.take() };
+        // Close the admission gate BEFORE taking the idle set. `max_size` is a
+        // semaphore, so a checkout parked in `acquire_owned` is only reachable
+        // through the semaphore itself: closing it fails those waits with
+        // `transport_shutdown` instead of leaving them parked until a permit
+        // that will never be released arrives. `notify_waiters` covers the
+        // other arm of the checkout `select!`. Without both, a checked-out
+        // connection returned after shutdown would release its permit, hand it
+        // to a waiter, and let that waiter dial a NEW connection against a pool
+        // that is already closed.
+        self.admission.close();
+        self.available.notify_waiters();
+
+        let connections = {
+            self.connections
+                .lock()
+                .expect("connection pool lock")
+                .take()
+        };
         if let Some(connections) = connections {
             abort_concurrent(connections.into_iter().map(ParkedConnection::unpark)).await;
         }
@@ -157,9 +190,15 @@ impl<E: SmtpExecutor> Pool<E> {
     }
 
     pub(crate) async fn connection(self: &Arc<Self>) -> Result<PooledConnection<E>, Error> {
+        if self.config.max_size == 0 {
+            return Err(error::invalid_input(
+                "pool max_size must be greater than zero",
+            ));
+        }
         loop {
+            let notified = self.available.notified();
             let conn = {
-                let mut connections = self.connections.lock().await;
+                let mut connections = self.connections.lock().expect("connection pool lock");
                 let Some(connections) = connections.as_mut() else {
                     // The transport was shut down
                     return Err(error::transport_shutdown());
@@ -173,16 +212,19 @@ impl<E: SmtpExecutor> Pool<E> {
                         #[cfg(feature = "tracing")]
                         tracing::debug!("dropping an expired connection");
 
-                        conn.unpark().abort().await;
+                        let (mut conn, parked_permit) = conn.unpark();
+                        conn.abort().await;
+                        drop(parked_permit);
                         continue;
                     }
-                    let mut conn = conn.unpark();
+                    let (mut conn, parked_permit) = conn.unpark();
 
                     if conn.has_broken() {
                         #[cfg(feature = "tracing")]
                         tracing::debug!("dropping a broken connection");
 
                         conn.abort().await;
+                        drop(parked_permit);
                         continue;
                     }
 
@@ -191,20 +233,56 @@ impl<E: SmtpExecutor> Pool<E> {
                         tracing::debug!("dropping a broken connection");
 
                         conn.abort().await;
+                        drop(parked_permit);
                         continue;
                     }
 
                     #[cfg(feature = "tracing")]
                     tracing::debug!("reusing a pooled connection");
 
-                    return Ok(PooledConnection::wrap(conn, Arc::clone(self)));
+                    return Ok(PooledConnection::wrap(
+                        conn,
+                        Arc::clone(self),
+                        parked_permit,
+                    ));
                 }
                 None => {
-                    #[cfg(feature = "tracing")]
-                    tracing::debug!("creating a new connection");
+                    tokio::select! {
+                        permit = Arc::clone(&self.admission).acquire_owned() => {
+                            let permit = permit.map_err(|_| error::transport_shutdown())?;
 
-                    let conn = self.client.connection().await?;
-                    return Ok(PooledConnection::wrap(conn, Arc::clone(self)));
+                            // Winning admission is not permission to dial. The
+                            // permit may have been released by a connection
+                            // recycled after `shutdown()` took the idle set, and
+                            // an idle connection may have been parked while this
+                            // checkout waited. Re-read the pool state under the
+                            // lock before touching the network.
+                            {
+                                let connections =
+                                    self.connections.lock().expect("connection pool lock");
+                                match connections.as_ref() {
+                                    None => {
+                                        drop(connections);
+                                        drop(permit);
+                                        return Err(error::transport_shutdown());
+                                    }
+                                    Some(parked) if !parked.is_empty() => {
+                                        drop(connections);
+                                        drop(permit);
+                                        continue;
+                                    }
+                                    Some(_) => {}
+                                }
+                            }
+
+                            #[cfg(feature = "tracing")]
+                            tracing::debug!("creating a new connection");
+
+                            let conn = self.client.connection().await?;
+                            return Ok(PooledConnection::wrap(conn, Arc::clone(self), permit));
+                        }
+                        () = notified => continue,
+                    }
                 }
             }
         }
@@ -216,21 +294,28 @@ impl<E: Executor> Pool<E> {
     /// and recycle without dialing anything.
     #[cfg(test)]
     pub(crate) async fn park_for_test(&self, conn: AsyncSmtpConnection) {
+        let permit = Arc::clone(&self.admission)
+            .try_acquire_owned()
+            .expect("test connection fits pool bound");
         self.connections
             .lock()
-            .await
+            .expect("connection pool lock")
             .as_mut()
             .expect("pool is not shut down")
-            .push(ParkedConnection::park(conn));
+            .push(ParkedConnection::park(conn, permit));
     }
 
     /// Number of connections currently parked as idle.
     #[cfg(test)]
     pub(crate) async fn idle_count_for_test(&self) -> usize {
-        self.connections.lock().await.as_ref().map_or(0, Vec::len)
+        self.connections
+            .lock()
+            .expect("connection pool lock")
+            .as_ref()
+            .map_or(0, Vec::len)
     }
 
-    async fn recycle(&self, mut conn: AsyncSmtpConnection) {
+    fn recycle(&self, conn: AsyncSmtpConnection, permit: OwnedSemaphorePermit) {
         // A connection that has served an LMTP final-status drain is retired
         // rather than recycled: a surplus final status below the read buffer
         // cannot be detected without a read that would block on a well-behaved
@@ -239,26 +324,20 @@ impl<E: Executor> Pool<E> {
             #[cfg(feature = "tracing")]
             tracing::debug!("dropping a broken or retired connection instead of recycling it");
 
-            conn.abort().await;
             drop(conn);
         } else {
             #[cfg(feature = "tracing")]
             tracing::debug!("recycling connection");
 
-            let mut connections_guard = self.connections.lock().await;
+            let mut connections_guard = self.connections.lock().expect("connection pool lock");
 
             if let Some(connections) = connections_guard.as_mut() {
-                if connections.len() >= self.config.max_size as usize {
-                    drop(connections_guard);
-                    conn.abort().await;
-                } else {
-                    let conn = ParkedConnection::park(conn);
-                    connections.push(conn);
-                }
+                connections.push(ParkedConnection::park(conn, permit));
+                self.available.notify_one();
             } else {
                 // The pool has already been shut down
                 drop(connections_guard);
-                conn.abort().await;
+                drop(conn);
             }
         }
     }
@@ -299,25 +378,22 @@ impl<E: Executor> Drop for Pool<E> {
         #[cfg(feature = "tracing")]
         tracing::debug!("dropping Pool");
 
-        let connections = self.connections.get_mut().take();
-        let handle = self.handle.take();
-        E::spawn(async move {
-            if let Some(handle) = handle {
-                handle.shutdown().await;
-            }
-
-            if let Some(connections) = connections {
-                abort_concurrent(connections.into_iter().map(ParkedConnection::unpark)).await;
-            }
-        });
+        self.admission.close();
+        let _ = self
+            .connections
+            .get_mut()
+            .expect("connection pool lock")
+            .take();
+        let _ = self.handle.take();
     }
 }
 
 impl ParkedConnection {
-    fn park(conn: AsyncSmtpConnection) -> Self {
+    fn park(conn: AsyncSmtpConnection, permit: OwnedSemaphorePermit) -> Self {
         Self {
             conn,
             since: Instant::now(),
+            permit,
         }
     }
 
@@ -325,16 +401,17 @@ impl ParkedConnection {
         self.since.elapsed()
     }
 
-    fn unpark(self) -> AsyncSmtpConnection {
-        self.conn
+    fn unpark(self) -> (AsyncSmtpConnection, OwnedSemaphorePermit) {
+        (self.conn, self.permit)
     }
 }
 
 impl<E: Executor> PooledConnection<E> {
-    fn wrap(conn: AsyncSmtpConnection, pool: Arc<Pool<E>>) -> Self {
+    fn wrap(conn: AsyncSmtpConnection, pool: Arc<Pool<E>>, permit: OwnedSemaphorePermit) -> Self {
         Self {
             conn: Some(conn),
             pool,
+            permit: Some(permit),
         }
     }
 }
@@ -360,18 +437,67 @@ impl<E: Executor> Drop for PooledConnection<E> {
             .take()
             .expect("AsyncSmtpConnection hasn't been taken yet");
         let pool = Arc::clone(&self.pool);
-
-        E::spawn(async move {
-            pool.recycle(conn).await;
-        });
+        let permit = self
+            .permit
+            .take()
+            .expect("pool permit hasn't been taken yet");
+        pool.recycle(conn, permit);
     }
 }
 
 async fn abort_concurrent<I>(iter: I)
 where
-    I: Iterator<Item = AsyncSmtpConnection>,
+    I: Iterator<Item = (AsyncSmtpConnection, OwnedSemaphorePermit)>,
 {
-    for mut conn in iter {
+    futures::future::join_all(iter.map(|(mut conn, _permit)| async move {
         conn.abort().await;
+    }))
+    .await;
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{sync::Arc, time::Duration};
+
+    use super::abort_concurrent;
+    use crate::transport::smtp::{
+        Protocol, client::AsyncSmtpConnection, extension::ClientId, test_support::Transcript,
+    };
+
+    #[tokio::test(crate = "tokio", start_paused = true)]
+    async fn abort_concurrent_does_not_serialize_shutdown_timeouts() {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let mut connections = Vec::new();
+        for _ in 0..2 {
+            let transcript = Transcript::new("220 smtp.example\r\n")
+                .expect("EHLO client.example\r\n", "250 smtp.example\r\n")
+                .stall_shutdown();
+            connections.push(
+                AsyncSmtpConnection::from_transcript_with_timeout(
+                    transcript,
+                    &hello,
+                    Protocol::Smtp,
+                    Duration::from_secs(5),
+                )
+                .await
+                .unwrap(),
+            );
+        }
+
+        let permits = Arc::new(tokio::sync::Semaphore::new(2));
+        let connections = connections.into_iter().map(|connection| {
+            let permit = Arc::clone(&permits).try_acquire_owned().unwrap();
+            (connection, permit)
+        });
+        let mut aborts = Box::pin(abort_concurrent(connections));
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(aborts.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::time::timeout(Duration::ZERO, aborts)
+            .await
+            .expect("all shutdown timeouts must elapse concurrently");
     }
 }
