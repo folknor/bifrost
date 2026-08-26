@@ -83,8 +83,15 @@ fn mutation_stream(
     kind: MutationKind,
     key: IdempotencyKey,
 ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
+    // One batch here is one `batchModify` / `batchDelete` call plus any
+    // label refresh and any per-id TRASH fallback the driver had to
+    // fall back on, so the accumulator is what makes those fallback
+    // requests visible rather than free.
+    let (client, tally) = client.metered();
+    let client = Arc::new(client);
     let state = MutationState {
         client,
+        tally,
         cache,
         targets,
         kind,
@@ -181,7 +188,7 @@ fn mutation_stream(
                             PageBoundary::Page
                         },
                         server_latency: started.elapsed(),
-                        bytes_in: 0,
+                        bytes_in: state.tally.take(),
                         checkpoint: None,
                     }),
                     state,
@@ -217,6 +224,7 @@ impl MutationKind {
 
 struct MutationState {
     client: Arc<GmailClient>,
+    tally: crate::client::ByteTally,
     cache: ScopeCache,
     targets: AccountStream<ObjectId>,
     kind: MutationKind,

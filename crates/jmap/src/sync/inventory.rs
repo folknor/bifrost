@@ -129,6 +129,10 @@ fn email_inventory_loop<T: HttpTransport>(
     window: InventoryWindow,
 ) -> AccountStream<SyncEvent<InventoryEntry>> {
     Box::pin(async_stream::stream! {
+        // One accumulator for the paged walk. Each page is a `Query` +
+        // `Get` pair in one `/jmap/api` POST, and each emitted batch
+        // takes and clears the accumulator.
+        let (mail, tally) = mail.metered();
         let (mut position, mut remaining, full_limit) = match window {
             InventoryWindow::Full { limit } => (0, None, limit),
             InventoryWindow::Page { from, to } if to <= from => {
@@ -282,7 +286,7 @@ fn email_inventory_loop<T: HttpTransport>(
                     items,
                     page_boundary: PageBoundary::Page,
                     server_latency: started.elapsed(),
-                    bytes_in: 0,
+                    bytes_in: tally.take(),
                     checkpoint: None,
                 });
             }
@@ -419,6 +423,7 @@ fn mailbox_inventory<T: HttpTransport>(
     mail: MailAccount<T>,
 ) -> AccountStream<SyncEvent<InventoryEntry>> {
     Box::pin(async_stream::stream! {
+        let (mail, tally) = mail.metered();
         let started = Instant::now();
         let response = mail
             .call(MailboxGet::new().properties(mailbox_inventory_properties()))
@@ -450,7 +455,7 @@ fn mailbox_inventory<T: HttpTransport>(
             items,
             page_boundary: PageBoundary::Final,
             server_latency: started.elapsed(),
-            bytes_in: 0,
+            bytes_in: tally.take(),
             checkpoint: None,
         });
         yield SyncEvent::Done(None);

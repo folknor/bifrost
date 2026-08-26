@@ -12,6 +12,32 @@ use std::time::Duration;
 use bifrost_net::error::Error;
 use bifrost_net::rate::{RateLimit, RateLimitGovernor};
 
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn quota_scopes_on_one_host_have_independent_buckets_and_generations() {
+    let governor = RateLimitGovernor::new();
+    governor.register(RateLimit::new("api.test", 0.001, 1, 1).with_quota_scope("tenant-a"));
+    governor.register(RateLimit::new("api.test", 0.001, 1, 1).with_quota_scope("tenant-b"));
+    let generation_a = governor
+        .acquire_generation_scoped("api.test", "tenant-a", 1)
+        .await
+        .unwrap()
+        .unwrap();
+    governor
+        .acquire_generation_scoped("api.test", "tenant-b", 1)
+        .await
+        .unwrap()
+        .unwrap();
+
+    governor.refund_scoped("api.test", "tenant-b", 1, generation_a);
+    let mut blocked = Box::pin(governor.acquire_generation_scoped("api.test", "tenant-b", 1));
+    assert!(
+        tokio::time::timeout(Duration::ZERO, &mut blocked)
+            .await
+            .is_err(),
+        "a generation from another scope refunded tenant-b"
+    );
+}
+
 /// Cancelling the head must hand the front to its successor, and the
 /// successor's own precedence must survive the handoff. The costs are
 /// deliberately uneven: with a queue, the expensive B blocks the cheap C

@@ -28,6 +28,8 @@ pub struct RateLimit {
     /// Host the limit applies to. Matched against `Url::host_str` for
     /// outbound requests.
     pub host: String,
+    /// Caller-defined quota scope. Empty preserves host-wide sharing.
+    pub quota_scope: String,
     /// Refill rate in units per second.
     pub quota_per_second: f64,
     /// Default per-request cost. Callers may override via
@@ -64,9 +66,34 @@ impl RateLimit {
     ) -> Self {
         Self {
             host: host.into(),
+            quota_scope: String::new(),
             quota_per_second,
             cost_default,
             burst,
+        }
+    }
+
+    /// Key this declaration by a provider quota discriminator in addition
+    /// to its host. Accounts with different non-empty scopes never share a
+    /// bucket; an empty scope retains the host-only compatibility behavior.
+    #[must_use]
+    pub fn with_quota_scope(mut self, scope: impl Into<String>) -> Self {
+        self.quota_scope = scope.into();
+        self
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct RateKey {
+    pub(crate) host: String,
+    pub(crate) quota_scope: String,
+}
+
+impl RateKey {
+    pub(crate) fn new(host: impl Into<String>, quota_scope: impl Into<String>) -> Self {
+        Self {
+            host: host.into(),
+            quota_scope: quota_scope.into(),
         }
     }
 }
@@ -85,7 +112,7 @@ pub struct RateLimitGovernor {
     /// takes the lock only to debit tokens, which is not held across
     /// `.await`. The `Notify` lives outside the `Mutex` so wake
     /// calls do not contend.
-    buckets: Arc<Mutex<HashMap<String, HostBucket>>>,
+    buckets: Arc<Mutex<HashMap<RateKey, HostBucket>>>,
 }
 
 /// Internal bucket state for one host. Public only inside the crate
@@ -158,7 +185,8 @@ impl RateLimitGovernor {
     /// host declaration was rejected as invalid.
     pub fn register(&self, limit: RateLimit) -> bool {
         let mut map = self.buckets.lock().expect("rate-governor lock poisoned");
-        match map.get_mut(&limit.host) {
+        let key = RateKey::new(limit.host.clone(), limit.quota_scope.clone());
+        match map.get_mut(&key) {
             Some(existing) => {
                 #[allow(clippy::float_cmp)]
                 let conflict = existing.refill_rate != limit.quota_per_second
@@ -197,7 +225,7 @@ impl RateLimitGovernor {
                     return false;
                 }
                 map.insert(
-                    limit.host.clone(),
+                    key,
                     HostBucket {
                         tokens: f64::from(limit.burst),
                         burst: f64::from(limit.burst),
@@ -221,8 +249,14 @@ impl RateLimitGovernor {
     /// keep the governor's map from growing without bound across
     /// account attach/detach cycles.
     pub fn unregister(&self, host: &str) {
+        self.unregister_scoped(host, "");
+    }
+
+    /// Decrement the attach count for one `(host, quota_scope)` bucket.
+    pub fn unregister_scoped(&self, host: &str, quota_scope: &str) {
         let mut map = self.buckets.lock().expect("rate-governor lock poisoned");
-        let drop_it = match map.get_mut(host) {
+        let key = RateKey::new(host, quota_scope);
+        let drop_it = match map.get_mut(&key) {
             Some(bucket) => {
                 bucket.attach_count = bucket.attach_count.saturating_sub(1);
                 bucket.attach_count == 0
@@ -232,7 +266,7 @@ impl RateLimitGovernor {
         // Waking the queue is what makes detach safe: a parked waiter
         // whose bucket just vanished must complete as unmetered rather
         // than sit on a `Notify` nothing will ever fire again.
-        if drop_it && let Some(bucket) = map.remove(host) {
+        if drop_it && let Some(bucket) = map.remove(&key) {
             for waiter in bucket.waiters {
                 waiter.notify.notify_one();
             }
@@ -245,8 +279,15 @@ impl RateLimitGovernor {
     /// not set a per-request cost via `.cost(n)`.
     #[must_use]
     pub fn cost_default_for(&self, host: &str) -> Option<u32> {
+        self.cost_default_for_scoped(host, "")
+    }
+
+    /// Look up the default cost for one `(host, quota_scope)` bucket.
+    #[must_use]
+    pub fn cost_default_for_scoped(&self, host: &str, quota_scope: &str) -> Option<u32> {
         let map = self.buckets.lock().expect("rate-governor lock poisoned");
-        map.get(host).map(|b| b.cost_default)
+        map.get(&RateKey::new(host, quota_scope))
+            .map(|b| b.cost_default)
     }
 
     /// Await enough tokens to debit `cost` from the host's bucket.
@@ -286,13 +327,29 @@ impl RateLimitGovernor {
                 + 'static,
         >,
     > {
+        self.acquire_generation_scoped(host, "", cost)
+    }
+
+    /// Acquire from one `(host, quota_scope)` bucket and return its generation.
+    pub fn acquire_generation_scoped(
+        &self,
+        host: &str,
+        quota_scope: &str,
+        cost: u32,
+    ) -> Pin<
+        Box<
+            dyn std::future::Future<Output = Result<Option<RateGeneration>, Error>>
+                + Send
+                + 'static,
+        >,
+    > {
         let buckets = Arc::clone(&self.buckets);
-        let host = host.to_owned();
+        let key = RateKey::new(host, quota_scope);
         let cost_f = f64::from(cost);
         Box::pin(async move {
             let (ticket, waiter_notify) = {
                 let mut map = buckets.lock().expect("rate-governor lock poisoned");
-                let Some(bucket) = map.get_mut(&host) else {
+                let Some(bucket) = map.get_mut(&key) else {
                     return Ok(None);
                 };
                 // Validate and enqueue under the same lock. Splitting
@@ -320,7 +377,7 @@ impl RateLimitGovernor {
             };
             let mut guard = WaiterGuard {
                 buckets: Arc::clone(&buckets),
-                host: host.clone(),
+                key: key.clone(),
                 ticket,
                 armed: true,
             };
@@ -337,7 +394,7 @@ impl RateLimitGovernor {
                     // Completing unmetered matches the documented
                     // detach behaviour; parking on a `Notify` nothing
                     // holds any more would strand the request forever.
-                    let Some(bucket) = map.get(&host).filter(|bucket| {
+                    let Some(bucket) = map.get(&key).filter(|bucket| {
                         bucket.generation == ticket.generation
                             && bucket.waiters.iter().any(|waiter| waiter.id == ticket.id)
                     }) else {
@@ -355,7 +412,7 @@ impl RateLimitGovernor {
                 let wait_for = {
                     let mut map = buckets.lock().expect("rate-governor lock poisoned");
                     let Some(bucket) = map
-                        .get_mut(&host)
+                        .get_mut(&key)
                         .filter(|bucket| bucket.generation == ticket.generation)
                     else {
                         // Host has no declared quota, or the bucket we
@@ -412,9 +469,20 @@ impl RateLimitGovernor {
     /// queue empty simply raises the token count for the next arrival.
     /// Refund a debit only if the same bucket generation is still installed.
     pub fn refund(&self, host: &str, cost: u32, generation: RateGeneration) {
+        self.refund_scoped(host, "", cost, generation);
+    }
+
+    /// Refund only the matching scoped bucket generation.
+    pub fn refund_scoped(
+        &self,
+        host: &str,
+        quota_scope: &str,
+        cost: u32,
+        generation: RateGeneration,
+    ) {
         let mut map = self.buckets.lock().expect("rate-governor lock poisoned");
         let Some(bucket) = map
-            .get_mut(host)
+            .get_mut(&RateKey::new(host, quota_scope))
             .filter(|bucket| bucket.generation == generation.0)
         else {
             return;
@@ -447,8 +515,8 @@ struct Ticket {
 }
 
 struct WaiterGuard {
-    buckets: Arc<Mutex<HashMap<String, HostBucket>>>,
-    host: String,
+    buckets: Arc<Mutex<HashMap<RateKey, HostBucket>>>,
+    key: RateKey,
     ticket: Ticket,
     armed: bool,
 }
@@ -465,7 +533,7 @@ impl Drop for WaiterGuard {
         // happens to hold the same recycled id, and hand its wake to
         // the wrong task.
         let Some(bucket) = map
-            .get_mut(&self.host)
+            .get_mut(&self.key)
             .filter(|bucket| bucket.generation == self.ticket.generation)
         else {
             return;

@@ -7,7 +7,35 @@ use bifrost_net::{
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use crate::{Error, Result};
+
+/// Inbound payload bytes attributed to one engine batch.
+///
+/// An engine batch routinely covers several concurrent HTTP requests -
+/// a list page plus a fan-out of hydration GETs - so per-response
+/// totals have to be summed somewhere. They are summed HERE, on an
+/// accumulator owned by one stream, rather than sampled off the
+/// account-cumulative bandwidth meter: that meter is shared by every
+/// concurrent request on the account, so a delta across it would
+/// attribute another scope's traffic to this batch.
+///
+/// `take` reads and resets, so consecutive batches from one stream
+/// partition the bytes rather than each reporting a running total.
+#[derive(Clone, Default)]
+pub(crate) struct ByteTally(Arc<AtomicU64>);
+
+impl ByteTally {
+    fn add(&self, n: u64) {
+        self.0.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Bytes recorded since the previous `take`.
+    pub(crate) fn take(&self) -> u64 {
+        self.0.swap(0, Ordering::Relaxed)
+    }
+}
 
 const GMAIL_API_BASE: &str = "https://www.googleapis.com/gmail/v1/users/me";
 const PEOPLE_API_BASE: &str = "https://people.googleapis.com/v1";
@@ -27,6 +55,13 @@ const PEOPLE_API_BURST: u32 = 30;
 #[derive(Clone)]
 pub(crate) struct GmailClient {
     inner: Arc<ClientInner>,
+    /// Where this handle reports request-local inbound bytes, if
+    /// anywhere. `None` on every ordinary client; a stream that needs
+    /// per-batch accounting takes a metered handle via `metered()`.
+    /// Keeping it OUTSIDE `ClientInner` is the point: a metered handle
+    /// is one `Arc` bump over the same connection state, so installing
+    /// accounting never forks the client's configuration.
+    tally: Option<ByteTally>,
 }
 
 struct ClientInner {
@@ -97,6 +132,7 @@ impl GmailClient {
     pub(crate) fn with_account_net(api_base: impl Into<String>, net: AccountNet) -> Self {
         let token_source: Arc<dyn TokenSource> = Arc::new(StaticTokenSource::new("token", None));
         Self {
+            tally: None,
             inner: Arc::new(ClientInner {
                 net: Some(net),
                 parent_net: Net::shared_default(),
@@ -139,6 +175,7 @@ impl GmailClient {
     ) -> Self {
         let parent_net = Net::shared_default();
         Self {
+            tally: None,
             inner: Arc::new(ClientInner {
                 net: None,
                 parent_net,
@@ -157,6 +194,7 @@ impl GmailClient {
     // base swapped.
     pub(crate) fn with_people_base(&self, people_base: impl Into<String>) -> Self {
         Self {
+            tally: None,
             inner: Arc::new(ClientInner {
                 net: self.inner.net.clone(),
                 parent_net: self.inner.parent_net.clone(),
@@ -175,6 +213,7 @@ impl GmailClient {
     // per client, so two accounts in one process can use two endpoints.
     pub(crate) fn with_calendar_base(&self, calendar_base: impl Into<String>) -> Self {
         Self {
+            tally: None,
             inner: Arc::new(ClientInner {
                 net: self.inner.net.clone(),
                 parent_net: self.inner.parent_net.clone(),
@@ -202,6 +241,7 @@ impl GmailClient {
             Arc::clone(&self.inner.token_source),
         );
         Self {
+            tally: None,
             inner: Arc::new(ClientInner {
                 net: Some(net),
                 parent_net: self.inner.parent_net.clone(),
@@ -347,7 +387,7 @@ impl GmailClient {
             builder = builder.json(b);
         }
 
-        builder.send().await.map_err(Error::from)
+        self.send_recorded(builder).await
     }
 
     /// Quota units this URL costs, when it resolves against the Gmail
@@ -370,7 +410,38 @@ impl GmailClient {
         // the account-side translation boundary can inspect transmission
         // state, retry-after, and other forensic evidence. Service
         // string is unused now that we no longer flatten errors here.
-        builder.send().await.map_err(Error::from)
+        self.send_recorded(builder).await
+    }
+
+    /// The single point every buffered Gmail/People/Calendar request
+    /// leaves through, and therefore the single point request-local
+    /// inbound bytes are recorded. Putting the record here rather than
+    /// at each typed wrapper is what keeps `delete`, `post_no_content`
+    /// and the caller-built `execute_builder` requests counted: those
+    /// discard or hand-decode the body and would otherwise be free.
+    async fn send_recorded(&self, builder: RequestBuilder) -> Result<Response> {
+        let response = builder.send().await.map_err(Error::from)?;
+        if let Some(tally) = self.tally.as_ref() {
+            tally.add(response.bytes_in());
+        }
+        Ok(response)
+    }
+
+    /// A handle over the same client that reports every buffered
+    /// response's inbound bytes into a fresh accumulator.
+    ///
+    /// One accumulator per stream, not per client: the returned handle
+    /// is the only one recording into it, so concurrent work on other
+    /// scopes cannot contaminate the total.
+    pub(crate) fn metered(&self) -> (Self, ByteTally) {
+        let tally = ByteTally::default();
+        (
+            Self {
+                inner: Arc::clone(&self.inner),
+                tally: Some(tally.clone()),
+            },
+            tally,
+        )
     }
 }
 
@@ -426,35 +497,45 @@ fn default_account_net(
     calendar_base: &str,
     token_source: Arc<dyn TokenSource>,
 ) -> AccountNet {
+    let quota_scope = account.0.clone();
     let gmail_host = host_of(gmail_base, "www.googleapis.com");
     let people_host = host_of(people_base, "people.googleapis.com");
     let calendar_host = host_of(calendar_base, "www.googleapis.com");
 
-    let mut hosts = vec![RateLimit::new(
-        gmail_host.clone(),
-        GOOGLE_API_QUOTA_PER_SECOND,
-        1,
-        GOOGLE_API_BURST,
-    )];
-    if people_host != gmail_host {
-        hosts.push(RateLimit::new(
-            people_host.clone(),
-            PEOPLE_API_QUOTA_PER_SECOND,
+    let mut hosts = vec![
+        RateLimit::new(
+            gmail_host.clone(),
+            GOOGLE_API_QUOTA_PER_SECOND,
             1,
-            PEOPLE_API_BURST,
-        ));
+            GOOGLE_API_BURST,
+        )
+        .with_quota_scope(quota_scope.clone()),
+    ];
+    if people_host != gmail_host {
+        hosts.push(
+            RateLimit::new(
+                people_host.clone(),
+                PEOPLE_API_QUOTA_PER_SECOND,
+                1,
+                PEOPLE_API_BURST,
+            )
+            .with_quota_scope(quota_scope.clone()),
+        );
     }
     // Calendar bills per request rather than in Gmail quota units, so it takes
     // the general Google bucket. Only registered when it is a host neither of
     // the other two already covers - the production case is exactly that
     // overlap, where Calendar rides the Gmail registration.
     if calendar_host != gmail_host && calendar_host != people_host {
-        hosts.push(RateLimit::new(
-            calendar_host,
-            GOOGLE_API_QUOTA_PER_SECOND,
-            1,
-            GOOGLE_API_BURST,
-        ));
+        hosts.push(
+            RateLimit::new(
+                calendar_host,
+                GOOGLE_API_QUOTA_PER_SECOND,
+                1,
+                GOOGLE_API_BURST,
+            )
+            .with_quota_scope(quota_scope),
+        );
     }
 
     let mut spec = AccountSpec::new(Some(token_source));

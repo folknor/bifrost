@@ -32,6 +32,13 @@ const CONCURRENCY_LIMIT: usize = 3;
 #[derive(Clone)]
 pub struct GraphClient {
     inner: Arc<ClientInner>,
+    /// Where this handle reports request-local inbound bytes, if
+    /// anywhere. `None` on every ordinary client; a stream that needs
+    /// per-batch accounting takes a metered handle via `metered()`.
+    /// Kept OUTSIDE `ClientInner` so installing accounting is one `Arc`
+    /// bump over the same transport, semaphore, and script rather than a
+    /// fork of the client's configuration.
+    tally: Option<ByteTally>,
 }
 
 struct ClientInner {
@@ -56,6 +63,33 @@ struct ClientInner {
     scripted: Arc<std::sync::Mutex<ScriptedRest>>,
 }
 
+/// Inbound payload bytes attributed to one engine batch.
+///
+/// An engine batch here routinely covers several requests - a `$delta`
+/// page plus its follow-ups, or a `$batch` submission plus the
+/// per-item retries it spawned - so per-response totals have to be
+/// summed somewhere. They are summed HERE, on an accumulator owned by
+/// one stream, rather than sampled off the account-cumulative
+/// bandwidth meter: that meter is shared by every concurrent request on
+/// the account, so a delta across it would attribute another scope's
+/// traffic to this batch.
+///
+/// `take` reads and resets, so consecutive batches from one stream
+/// partition the bytes rather than each reporting a running total.
+#[derive(Clone, Default)]
+pub(crate) struct ByteTally(Arc<std::sync::atomic::AtomicU64>);
+
+impl ByteTally {
+    fn add(&self, n: u64) {
+        self.0.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Bytes recorded since the previous `take`.
+    pub(crate) fn take(&self) -> u64 {
+        self.0.swap(0, std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
 /// Graph-owned response shape at the one REST funnel. Adapts the
 /// production `bifrost_net::Response` (which is `#[non_exhaustive]`) into
 /// a shape this crate owns, so the helpers above the funnel destructure
@@ -64,6 +98,7 @@ pub(crate) struct RestResponse {
     pub(crate) status: reqwest::StatusCode,
     pub(crate) headers: reqwest::header::HeaderMap,
     pub(crate) body: Bytes,
+    pub(crate) bytes_in: u64,
 }
 
 impl From<bifrost_net::Response> for RestResponse {
@@ -72,6 +107,7 @@ impl From<bifrost_net::Response> for RestResponse {
             status: response.status(),
             headers: response.headers,
             body: response.body,
+            bytes_in: response.bytes_in,
         }
     }
 }
@@ -359,6 +395,7 @@ impl GraphClient {
         let rate_limit_host = host_from_api_base(&api_base);
         let outlook_base = derive_outlook_base(&api_base);
         Self {
+            tally: None,
             inner: Arc::new(ClientInner {
                 net: Some(Net::shared_default()),
                 account_net: RwLock::new(None),
@@ -388,6 +425,7 @@ impl GraphClient {
         // host's.
         let rate_limit_host = host_from_api_base(&api_base);
         Self {
+            tally: None,
             inner: Arc::new(ClientInner {
                 net: None,
                 account_net: RwLock::new(Some(net)),
@@ -407,12 +445,10 @@ impl GraphClient {
         if let Some(net) = self.inner.net.as_ref() {
             let token_source = Arc::clone(&self.inner.token_source);
             let mut spec = AccountSpec::new(Some(token_source));
-            spec.hosts = vec![RateLimit::new(
-                self.inner.rate_limit_host.clone(),
-                10.0,
-                1,
-                10,
-            )];
+            spec.hosts = vec![
+                RateLimit::new(self.inner.rate_limit_host.clone(), 10.0, 1, 10)
+                    .with_quota_scope(account_id.0.clone()),
+            ];
             let account_net = net.attach_account(account_id, spec);
             // Install the replacement first, then tear down whatever
             // registration it displaced. `Net::attach_account` mints a
@@ -485,6 +521,7 @@ impl GraphClient {
     #[must_use]
     pub fn with_outlook_base(&self, outlook_base: impl Into<String>) -> Self {
         Self {
+            tally: self.tally.clone(),
             inner: Arc::new(ClientInner {
                 net: self.inner.net.clone(),
                 account_net: RwLock::new(self.account_net()),
@@ -521,6 +558,7 @@ impl GraphClient {
     // pub: shared-mailbox consumers derive a scoped client before building the factory.
     pub fn for_shared_mailbox(&self, mailbox_id: impl Into<String>) -> Self {
         Self {
+            tally: self.tally.clone(),
             inner: Arc::new(ClientInner {
                 net: self.inner.net.clone(),
                 account_net: RwLock::new(self.account_net()),
@@ -793,11 +831,8 @@ impl GraphClient {
             builder = builder.body(body.bytes);
         }
 
-        builder
-            .send()
-            .await
-            .map(RestResponse::from)
-            .map_err(GraphError::Net)
+        let response = builder.send().await.map_err(GraphError::Net)?;
+        Ok(self.record_bytes(RestResponse::from(response)))
     }
 
     /// The one place the two NON-REST wire paths leave this crate: the
@@ -842,12 +877,44 @@ impl GraphClient {
         for (name, value) in headers {
             builder = builder.header(name, value);
         }
-        builder
-            .body(body)
-            .send()
-            .await
-            .map(RestResponse::from)
-            .map_err(GraphError::Net)
+        let response = builder.body(body).send().await.map_err(GraphError::Net)?;
+        Ok(self.record_bytes(RestResponse::from(response)))
+    }
+
+    /// Attribute one response's inbound bytes to this handle's batch
+    /// accumulator, if it has one. Applied at BOTH wire funnels: the
+    /// pre-authenticated chunk PUT and the Autodiscover POST are real
+    /// inbound traffic on the account and would otherwise be free.
+    fn record_bytes(&self, response: RestResponse) -> RestResponse {
+        if let Some(tally) = self.tally.as_ref() {
+            tally.add(response.bytes_in);
+        }
+        response
+    }
+
+    /// A handle over the same client that reports every buffered
+    /// response's inbound bytes into a fresh accumulator.
+    ///
+    /// One accumulator per stream, not per client: the returned handle
+    /// is the only one recording into it, so concurrent work on other
+    /// scopes cannot contaminate the total. Clients DERIVED from this
+    /// handle (`for_shared_mailbox`, `with_outlook_base`) inherit it,
+    /// because in production those derivatives issue their requests
+    /// down the same transport on behalf of the same batch.
+    pub(crate) fn metered(&self) -> (Self, ByteTally) {
+        let tally = ByteTally::default();
+        (self.with_tally(tally.clone()), tally)
+    }
+
+    /// The same handle reporting into an EXISTING accumulator. Used to
+    /// enroll the shared-mailbox clients of one account into the batch
+    /// accumulator the primary client already carries, so a
+    /// foreign-mailbox request is attributed to the batch that made it.
+    pub(crate) fn with_tally(&self, tally: ByteTally) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            tally: Some(tally),
+        }
     }
 
     /// The one place a Graph blob byte stream is opened. Production is the

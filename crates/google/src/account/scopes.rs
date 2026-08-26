@@ -63,6 +63,8 @@ pub(crate) fn discover_cursor_scopes() -> AccountStream<SyncEvent<CursorScope>> 
         items: vec![CursorScope::Account],
         page_boundary: PageBoundary::Final,
         server_latency: Duration::ZERO,
+        // Synthetic: Gmail has exactly one cursor scope and it is a
+        // constant, so this batch performs no request at all.
         bytes_in: 0,
         checkpoint: None,
     };
@@ -79,6 +81,9 @@ pub(crate) fn discover_memberships(
     Box::pin(
         stream::once(async move {
             let started = Instant::now();
+            // A cache hit performs no request, and then the tally is
+            // legitimately zero - the batch cost no inbound bytes.
+            let (client, tally) = client.metered();
             match refresh_scope_snapshot(&client, &cache).await {
                 Ok(snapshot) => {
                     let items = snapshot
@@ -91,7 +96,7 @@ pub(crate) fn discover_memberships(
                         items,
                         page_boundary: PageBoundary::Final,
                         server_latency: started.elapsed(),
-                        bytes_in: 0,
+                        bytes_in: tally.take(),
                         checkpoint: None,
                     });
                     vec![batch, SyncEvent::Done(None)]

@@ -377,6 +377,29 @@ mailboxes always install.
   `public_folders_enabled` and the discovered `user_email`.
 - `set_priority` / `set_bandwidth_cap` delegate to `AccountNet`.
 
+### Per-batch byte accounting
+
+`GraphClient` carries an optional `ByteTally`, and `GraphAccount::metered()`
+hands back an account view whose primary client AND every shared-mailbox client
+report into one fresh accumulator - a foreign-mailbox request belongs to the
+batch that made it. The record sits at both wire funnels (`execute_wire` and
+`execute_aux`), so the pre-authenticated chunk PUT and the Autodiscover POST are
+counted too. Each engine stream takes one accumulator and each emitted batch
+`take`s it.
+
+One batch is many requests here: a mutation chunk is the `$batch` submission
+plus one etag GET per id the preflight had to re-read, and a delta walk pages.
+The declaration also carries the engine `AccountId` as its `quota_scope`, so the
+Graph per-tenant bucket is per account rather than pooled process-wide.
+
+**Disclosed gap: the EWS arm is not counted.** `EwsClient` composes `AccountNet`
+directly rather than routing through `GraphClient`'s wire funnel, so no
+`GraphClient`-level accumulator can observe it. Public-folder inventory and
+changes therefore report `bytes_in: 0`, and a hydration chunk mixing
+public-folder ids with REST ids reports its REST half only. This under-reports
+rather than over-reports, and every such site says so at the call site. Closing
+it means giving `EwsClient` its own accounting seam.
+
 Reopen is engine-delegated: on drop or after `close()`, the engine calls
 `GraphAccountFactory::open` again for a fresh `GraphAccount` (empty caches, fresh
 shutdown token); the factory holds the client, so the new account reads the

@@ -151,8 +151,8 @@ pub struct RequestSnapshot {
 /// assertions were about to be meaningless, and a silent fallthrough
 /// would let it reach a real socket.
 pub struct ScriptedDispatch {
-    steps: Mutex<VecDeque<Canned>>,
-    requests: Mutex<Vec<RequestSnapshot>>,
+    steps: Arc<Mutex<VecDeque<Canned>>>,
+    requests: Arc<Mutex<Vec<RequestSnapshot>>>,
 }
 
 impl ScriptedDispatch {
@@ -160,8 +160,8 @@ impl ScriptedDispatch {
     #[must_use]
     pub fn new(steps: impl IntoIterator<Item = Canned>) -> Arc<Self> {
         Arc::new(Self {
-            steps: Mutex::new(steps.into_iter().collect()),
-            requests: Mutex::new(Vec::new()),
+            steps: Arc::new(Mutex::new(steps.into_iter().collect())),
+            requests: Arc::new(Mutex::new(Vec::new())),
         })
     }
 
@@ -203,31 +203,29 @@ impl Dispatch for ScriptedDispatch {
         &self,
         request: reqwest::RequestBuilder,
     ) -> AccountFuture<Result<reqwest::Response, Error>> {
-        let request = match request.build() {
-            Ok(request) => request,
-            Err(error) => return Box::pin(async move { Err(send_error_to_error(error)) }),
-        };
-        let body = request
-            .body()
-            .and_then(reqwest::Body::as_bytes)
-            .map(Bytes::copy_from_slice);
-        self.requests
-            .lock()
-            .expect("scripted request lock poisoned")
-            .push(RequestSnapshot {
-                method: request.method().clone(),
-                url: request.url().clone(),
-                headers: request.headers().clone(),
-                body,
-                timeout: request.timeout().copied(),
-            });
-        let step = self
-            .steps
-            .lock()
-            .expect("scripted step lock poisoned")
-            .pop_front()
-            .expect("scripted dispatch exhausted");
+        let steps = Arc::clone(&self.steps);
+        let requests = Arc::clone(&self.requests);
         Box::pin(async move {
+            let request = request.build().map_err(send_error_to_error)?;
+            let body = request
+                .body()
+                .and_then(reqwest::Body::as_bytes)
+                .map(Bytes::copy_from_slice);
+            requests
+                .lock()
+                .expect("scripted request lock poisoned")
+                .push(RequestSnapshot {
+                    method: request.method().clone(),
+                    url: request.url().clone(),
+                    headers: request.headers().clone(),
+                    body,
+                    timeout: request.timeout().copied(),
+                });
+            let step = steps
+                .lock()
+                .expect("scripted step lock poisoned")
+                .pop_front()
+                .expect("scripted dispatch exhausted");
             match step {
                 Canned::Response {
                     status,
@@ -361,4 +359,19 @@ pub fn scripted_account(
             ..AccountSpec::new(Some(token_source))
         },
     )
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+
+    #[test]
+    fn unpolled_dispatch_future_consumes_neither_request_nor_step() {
+        let script = ScriptedDispatch::new([canned(StatusCode::OK, b"body")]);
+        let client = reqwest::Client::new();
+        let future = Dispatch::send(&*script, client.get("https://cancel.test/"));
+        drop(future);
+        assert_eq!(script.remaining(), 1);
+        assert!(script.requests().is_empty());
+    }
 }

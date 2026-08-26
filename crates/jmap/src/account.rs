@@ -40,6 +40,19 @@ impl<Tr: HttpTransport> Clone for Account<Tr> {
 }
 
 impl<Tr: HttpTransport> Account<Tr> {
+    /// An account view whose every `/jmap/api` call reports its inbound
+    /// payload bytes into a fresh batch accumulator.
+    pub(crate) fn metered(&self) -> (Self, crate::client::ByteTally) {
+        let (client, tally) = self.client.metered();
+        (
+            Self {
+                client,
+                account_id: self.account_id.clone(),
+            },
+            tally,
+        )
+    }
+
     /// Construct an `Account` directly. The account ID is not validated
     /// against the session; prefer [`Client::primary_account`] for
     /// capability-aware selection.

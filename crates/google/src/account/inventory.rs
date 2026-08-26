@@ -174,6 +174,14 @@ pub(crate) fn inventory_stream(
     }
 
     Box::pin(async_stream::stream! {
+        // Every request this walk makes - prelude, each list page, and
+        // the concurrent hydration fan-out - reports into one
+        // accumulator, and each emitted batch takes and clears it. The
+        // fan-out is exactly why the accumulator is needed: a single
+        // batch covers HYDRATE_BATCH_SIZE concurrent GETs plus its list
+        // page, so no per-response value could stand in for it.
+        let (client, tally) = client.metered();
+        let client = Arc::new(client);
         // Both preludes must complete before the first list page.
         //
         // The checkpoint anchors to the historyId sampled *before* the
@@ -248,7 +256,7 @@ pub(crate) fn inventory_stream(
                                 items: out,
                                 page_boundary: PageBoundary::Page,
                                 server_latency: started.elapsed(),
-                                bytes_in: 0,
+                                bytes_in: tally.take(),
                                 checkpoint: None,
                                 coverage: coverage_of(&scope, &obligations),
                             });
@@ -307,7 +315,7 @@ pub(crate) fn inventory_stream(
                     items,
                     page_boundary: PageBoundary::Final,
                     server_latency: started.elapsed(),
-                    bytes_in: 0,
+                    bytes_in: tally.take(),
                     checkpoint: checkpoint.clone(),
                     coverage: coverage_of(&scope, &obligations),
                 });
@@ -323,7 +331,7 @@ pub(crate) fn inventory_stream(
                     items,
                     page_boundary: PageBoundary::Page,
                     server_latency: started.elapsed(),
-                    bytes_in: 0,
+                    bytes_in: tally.take(),
                     checkpoint: None,
                     coverage: coverage_of(&scope, &obligations),
                 });
@@ -339,8 +347,14 @@ pub(crate) fn get_stream(
     ids: AccountStream<ObjectId>,
     projection: Projection,
 ) -> AccountStream<SyncEvent<ItemOutcome<HydratedObject>>> {
+    // Hydration batches are the clearest case for a batch-scoped
+    // accumulator: one emitted batch covers up to HYDRATE_BATCH_SIZE
+    // `users.messages.get` calls plus any label refresh they needed.
+    let (client, tally) = client.metered();
+    let client = Arc::new(client);
     let state = HydrateState {
         client,
+        tally,
         cache,
         ids,
         projection,
@@ -440,7 +454,7 @@ pub(crate) fn get_stream(
                     PageBoundary::Page
                 },
                 server_latency: started.elapsed(),
-                bytes_in: 0,
+                bytes_in: state.tally.take(),
                 checkpoint: None,
             }),
             state,
@@ -450,6 +464,7 @@ pub(crate) fn get_stream(
 
 struct HydrateState {
     client: Arc<GmailClient>,
+    tally: crate::client::ByteTally,
     cache: ScopeCache,
     ids: AccountStream<ObjectId>,
     projection: Projection,

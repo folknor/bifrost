@@ -146,6 +146,10 @@ fn email_changes<T: HttpTransport>(
     email_states: StateMap,
 ) -> AccountStream<SyncEvent<Change>> {
     Box::pin(async_stream::stream! {
+        // One accumulator for the whole paged walk; each emitted page
+        // takes and clears it, so consecutive pages partition the
+        // traffic instead of each restating a running total.
+        let (mail, tally) = mail.metered();
         let max_changes = nonzero(limits.max_objects_in_get);
         loop {
             let started = Instant::now();
@@ -193,7 +197,7 @@ fn email_changes<T: HttpTransport>(
                 items: changes,
                 page_boundary: PageBoundary::Page,
                 server_latency: started.elapsed(),
-                bytes_in: 0,
+                bytes_in: tally.take(),
                 checkpoint: Some(Checkpoint::Change(checkpoint.clone())),
             });
 
@@ -215,6 +219,8 @@ fn mailbox_changes<T: HttpTransport>(
     mailbox_states: StateMap,
 ) -> AccountStream<SyncEvent<Change>> {
     Box::pin(async_stream::stream! {
+        // See `email_changes`: one accumulator for the paged walk.
+        let (mail, tally) = mail.metered();
         let max_changes = nonzero(limits.max_objects_in_get);
         loop {
             let started = Instant::now();
@@ -257,7 +263,7 @@ fn mailbox_changes<T: HttpTransport>(
                 items: changes,
                 page_boundary: PageBoundary::Page,
                 server_latency: started.elapsed(),
-                bytes_in: 0,
+                bytes_in: tally.take(),
                 checkpoint: Some(Checkpoint::Change(checkpoint.clone())),
             });
 

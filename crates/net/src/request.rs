@@ -7,6 +7,8 @@
 
 use std::error::Error as StdError;
 use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use bifrost_types::{AccountFuture, TransmissionState};
@@ -200,6 +202,7 @@ impl Dispatch for ReqwestDispatch {
 struct RateDebit {
     governor: RateLimitGovernor,
     host: String,
+    quota_scope: String,
     cost: u32,
     generation: Option<RateGeneration>,
     armed: bool,
@@ -209,12 +212,14 @@ impl RateDebit {
     fn new(
         governor: RateLimitGovernor,
         host: String,
+        quota_scope: String,
         cost: u32,
         generation: Option<RateGeneration>,
     ) -> Self {
         Self {
             governor,
             host,
+            quota_scope,
             cost,
             generation,
             armed: true,
@@ -227,7 +232,8 @@ impl RateDebit {
 
     fn refund_acknowledged(&self) {
         if let Some(generation) = self.generation {
-            self.governor.refund(&self.host, self.cost, generation);
+            self.governor
+                .refund_scoped(&self.host, &self.quota_scope, self.cost, generation);
         }
     }
 }
@@ -237,7 +243,8 @@ impl Drop for RateDebit {
         if self.armed
             && let Some(generation) = self.generation
         {
-            self.governor.refund(&self.host, self.cost, generation);
+            self.governor
+                .refund_scoped(&self.host, &self.quota_scope, self.cost, generation);
         }
     }
 }
@@ -269,6 +276,12 @@ struct RequestBuilderInner {
     /// Optional per-request cost override; otherwise the host's
     /// default cost is used.
     cost: Option<u32>,
+    /// Optional per-request quota-scope override. `None` selects the
+    /// scope the account declared for the request host. An account may
+    /// declare several `(host, quota_scope)` buckets on one host, and
+    /// the declaration order alone cannot say which one a given request
+    /// belongs in; this is how the caller says.
+    quota_scope: Option<String>,
     /// Optional per-request retry policy override.
     retry: Option<RetryPolicy>,
     /// Optional per-request timeout override.
@@ -304,6 +317,7 @@ impl RequestBuilder {
                 headers: HeaderMap::new(),
                 body: None,
                 cost: None,
+                quota_scope: None,
                 retry: None,
                 timeout: None,
                 idempotent: None,
@@ -393,6 +407,21 @@ impl RequestBuilder {
         self
     }
 
+    /// Select which `(host, quota_scope)` bucket this request debits.
+    ///
+    /// Without it the request uses the scope the account declared for
+    /// the request host. Callers that declared more than one bucket on
+    /// a single host MUST use this, because host alone cannot name the
+    /// bucket and the account-level default resolves to only one of
+    /// them. An empty string selects the host-only compatibility
+    /// bucket. The scope is re-evaluated per redirect hop, since a hop
+    /// may land on a different host.
+    #[must_use]
+    pub fn quota_scope(mut self, scope: impl Into<String>) -> Self {
+        self.inner.quota_scope = Some(scope.into());
+        self
+    }
+
     /// Override the per-request retry policy.
     #[must_use]
     pub fn retry(mut self, policy: RetryPolicy) -> Self {
@@ -460,7 +489,12 @@ impl RequestBuilder {
         // straight body read. Apply the bandwidth meter to the read
         // so buffered receives feed the same counters and cap throttle
         // as streaming.
-        let mut body_stream = wrap_metered(internal.body, internal.account, internal.deadline);
+        let mut body_stream = wrap_metered(
+            internal.body,
+            internal.account,
+            internal.deadline,
+            internal.bytes_in.clone(),
+        );
         let mut accum: Vec<u8> = Vec::new();
         use futures::StreamExt;
         while let Some(chunk) = body_stream.next().await {
@@ -480,6 +514,8 @@ impl RequestBuilder {
             status: internal.status,
             headers: internal.headers,
             body: Bytes::from(accum),
+            bytes_in: internal.bytes_in.bytes_in(),
+            bytes_out: internal.bytes_out,
         })
     }
 
@@ -490,11 +526,18 @@ impl RequestBuilder {
         let internal = send_streaming_inner(self).await?;
         // Caller-facing streaming response wraps the body in the
         // bandwidth meter + cap adapter.
-        let metered = wrap_metered(internal.body, internal.account, internal.deadline);
+        let metered = wrap_metered(
+            internal.body,
+            internal.account,
+            internal.deadline,
+            internal.bytes_in.clone(),
+        );
         Ok(StreamingResponse {
             status: internal.status,
             headers: internal.headers,
             body: metered,
+            bytes_in: internal.bytes_in,
+            bytes_out: internal.bytes_out,
         })
     }
 }
@@ -508,6 +551,10 @@ pub struct Response {
     pub headers: HeaderMap,
     /// Buffered response body.
     pub body: Bytes,
+    /// Response-body bytes read for this request.
+    pub bytes_in: u64,
+    /// Payload bytes submitted across this request's wire attempts.
+    pub bytes_out: u64,
 }
 
 impl Response {
@@ -522,6 +569,34 @@ impl Response {
     pub fn headers(&self) -> &HeaderMap {
         &self.headers
     }
+
+    #[must_use]
+    pub fn bytes_in(&self) -> u64 {
+        self.bytes_in
+    }
+
+    #[must_use]
+    pub fn bytes_out(&self) -> u64 {
+        self.bytes_out
+    }
+}
+
+/// Shared request-local byte counter for a streaming response.
+#[derive(Clone, Default)]
+pub struct RequestByteCounter(Arc<AtomicU64>);
+
+impl RequestByteCounter {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+    pub(crate) fn record(&self, n: u64) {
+        self.0.fetch_add(n, Ordering::Relaxed);
+    }
+
+    #[must_use]
+    pub fn bytes_in(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
 }
 
 /// Streaming HTTP response. The body is a `ByteStream` so the caller
@@ -535,6 +610,10 @@ pub struct StreamingResponse {
     /// Response body as an erased byte stream. Increments the
     /// bandwidth meter on every chunk.
     pub body: ByteStream,
+    /// Shared counter whose value advances as `body` is drained.
+    pub bytes_in: RequestByteCounter,
+    /// Payload bytes submitted before response headers surfaced.
+    pub bytes_out: u64,
 }
 
 impl StreamingResponse {
@@ -548,6 +627,21 @@ impl StreamingResponse {
     #[must_use]
     pub fn headers(&self) -> &HeaderMap {
         &self.headers
+    }
+
+    #[must_use]
+    pub fn bytes_in(&self) -> u64 {
+        self.bytes_in.bytes_in()
+    }
+
+    #[must_use]
+    pub fn byte_counter(&self) -> RequestByteCounter {
+        self.bytes_in.clone()
+    }
+
+    #[must_use]
+    pub fn bytes_out(&self) -> u64 {
+        self.bytes_out
     }
 }
 
@@ -564,6 +658,8 @@ pub(crate) struct InternalStreaming {
     /// so the body drain is bounded by the same deadline the dispatch
     /// and retry waits were.
     pub(crate) deadline: RequestDeadline,
+    pub(crate) bytes_out: u64,
+    pub(crate) bytes_in: RequestByteCounter,
 }
 
 /// Drive a request to a streamable response, running the retry loop
@@ -597,6 +693,7 @@ pub(crate) async fn send_streaming_inner(
         mut headers,
         body,
         cost,
+        quota_scope: quota_scope_override,
         retry,
         timeout,
         idempotent,
@@ -636,9 +733,18 @@ pub(crate) async fn send_streaming_inner(
     let mut headers = headers;
     let mut auth_for_next_hop = bearer_auth;
     let mut host = host_from_url(&url);
-    let mut cost_units = recompute_cost_units(account.net().governor(), host.as_deref(), cost);
+    let mut quota_scope =
+        resolve_quota_scope(&account, host.as_deref(), quota_scope_override.as_deref());
+    let mut cost_units = recompute_cost_units(
+        account.net().governor(),
+        host.as_deref(),
+        &quota_scope,
+        cost,
+    );
 
     let mut retry_after_history: Vec<Duration> = Vec::new();
+    let mut bytes_out = 0_u64;
+    let bytes_in = RequestByteCounter::new();
     // Network retry budget is independent from the 401-recovery
     // budget. A 401 forces a token refresh + retry that must not
     // burn the network budget (otherwise a single stale cache hit
@@ -673,7 +779,11 @@ pub(crate) async fn send_streaming_inner(
         // burn retry budget on it.
         let rate_generation = if let Some(ref h) = host {
             deadline
-                .bound(account.net().governor().acquire_generation(h, cost_units))
+                .bound(account.net().governor().acquire_generation_scoped(
+                    h,
+                    &quota_scope,
+                    cost_units,
+                ))
                 .await??
         } else {
             None
@@ -687,6 +797,7 @@ pub(crate) async fn send_streaming_inner(
             RateDebit::new(
                 account.net().governor().clone(),
                 h.clone(),
+                quota_scope.clone(),
                 cost_units,
                 rate_generation,
             )
@@ -728,6 +839,7 @@ pub(crate) async fn send_streaming_inner(
         if let Some(ref b) = body {
             let out_n = u64::try_from(b.len()).unwrap_or(u64::MAX);
             account.meter().record_bytes_out(out_n);
+            bytes_out = bytes_out.saturating_add(out_n);
         }
 
         let request = build_reqwest(
@@ -796,13 +908,13 @@ pub(crate) async fn send_streaming_inner(
         if auth_for_next_hop && status == StatusCode::UNAUTHORIZED {
             if !auth_budget.take() {
                 let final_response =
-                    final_response_from_response(response, &account, deadline).await?;
+                    final_response_from_response(response, &account, deadline, &bytes_in).await?;
                 return Err(Error::AuthLost {
                     transmission_state: Some(TransmissionState::Acknowledged),
                     final_response: Some(final_response),
                 });
             }
-            let _ = read_capped_response_body(response, &account, deadline).await?;
+            let _ = read_capped_response_body(response, &account, deadline, &bytes_in).await?;
             if let Some(debit) = rate_debit.as_ref() {
                 debit.refund_acknowledged();
             }
@@ -834,6 +946,8 @@ pub(crate) async fn send_streaming_inner(
                 body: stream,
                 account,
                 deadline,
+                bytes_out,
+                bytes_in,
             });
         }
 
@@ -861,6 +975,8 @@ pub(crate) async fn send_streaming_inner(
                         body: stream,
                         account,
                         deadline,
+                        bytes_out,
+                        bytes_in,
                     });
                 }
                 Some(policy) => {
@@ -872,31 +988,36 @@ pub(crate) async fn send_streaming_inner(
                         })?;
                     match classify_redirect(policy, &method, &parsed_url, status, &resp_headers)? {
                         RedirectAction::PassThrough => {
-                            drop(response);
-                            // Build an empty byte stream so downstream
-                            // unwrap paths (e.g. send().drain) still
-                            // work. 304/305/306 carry no body the caller
-                            // cares about. This arm also covers a
-                            // followed-redirect status whose `Location`
-                            // is absent (notably Google Drive's `308
-                            // Resume Incomplete`): the consumer reads only
-                            // the status + headers (`Range`), so the
-                            // passed-through body is intentionally
-                            // discarded here. If a future passthrough
-                            // shape needs its body, classify_redirect must
-                            // stop folding it into PassThrough.
-                            let empty: futures::stream::Empty<Result<Bytes, Error>> =
-                                futures::stream::empty();
+                            // Hand the body up exactly as the
+                            // redirects-disabled arm above does. A
+                            // passed-through 3xx is a terminal response
+                            // from the caller's point of view, and the
+                            // caller - not this loop - decides whether
+                            // its body is interesting. 304/305/306
+                            // ordinarily carry nothing, and Drive's
+                            // header-only `308 Resume Incomplete` yields
+                            // an empty stream on its own; but a followed
+                            // status with no `Location` also lands here,
+                            // and that shape can carry a real explanatory
+                            // body. Discarding it made those bytes
+                            // invisible to the caller AND to the
+                            // request-local byte counter, which counts
+                            // only what a body reader actually reads.
+                            let stream = into_byte_stream(response, account.read_timeout());
                             return Ok(InternalStreaming {
                                 status,
                                 headers: resp_headers,
-                                body: Box::pin(empty),
+                                body: stream,
                                 account,
                                 deadline,
+                                bytes_out,
+                                bytes_in,
                             });
                         }
                         RedirectAction::Follow(step) => {
-                            let _ = read_capped_response_body(response, &account, deadline).await?;
+                            let _ =
+                                read_capped_response_body(response, &account, deadline, &bytes_in)
+                                    .await?;
                             redirects.follow()?;
                             // The next hop will issue a fresh request
                             // and debit anew, so refund the slot the
@@ -929,9 +1050,15 @@ pub(crate) async fn send_streaming_inner(
                                 headers.remove(AUTHORIZATION);
                             }
                             host = host_from_url(&url);
+                            quota_scope = resolve_quota_scope(
+                                &account,
+                                host.as_deref(),
+                                quota_scope_override.as_deref(),
+                            );
                             cost_units = recompute_cost_units(
                                 account.net().governor(),
                                 host.as_deref(),
+                                &quota_scope,
                                 cost,
                             );
                             // Reset retry counter for the next hop:
@@ -958,7 +1085,7 @@ pub(crate) async fn send_streaming_inner(
             // accounts carry no total request deadline to rescue it.
             // The capped reader also bounds memory, where `bytes()`
             // buffered the whole body before the cap was applied.
-            let body = read_capped_response_body(response, &account, deadline).await?;
+            let body = read_capped_response_body(response, &account, deadline, &bytes_in).await?;
             return Err(Error::Status {
                 code: status,
                 body,
@@ -987,7 +1114,7 @@ pub(crate) async fn send_streaming_inner(
                     retry_after_history.push(ra);
                 }
                 let final_response =
-                    final_response_from_response(response, &account, deadline).await?;
+                    final_response_from_response(response, &account, deadline, &bytes_in).await?;
                 if status == StatusCode::TOO_MANY_REQUESTS {
                     let last = retry_after_history.last().copied();
                     return Err(Error::RateLimited {
@@ -1014,7 +1141,7 @@ pub(crate) async fn send_streaming_inner(
             }
             // Discard the body so the underlying connection can be
             // returned to the pool.
-            let _ = read_capped_response_body(response, &account, deadline).await?;
+            let _ = read_capped_response_body(response, &account, deadline, &bytes_in).await?;
             // Refund the rate-limit slot on every retried failure: the
             // server did not consume real work on a 5xx or 429, so
             // burning a token across the retry would just starve other
@@ -1032,7 +1159,7 @@ pub(crate) async fn send_streaming_inner(
         // Anything else: surface as Status, no retry. Same reasoning
         // as the terminal-4xx drain above.
         let headers_out = response.headers().clone();
-        let body = read_capped_response_body(response, &account, deadline).await?;
+        let body = read_capped_response_body(response, &account, deadline, &bytes_in).await?;
         return Err(Error::Status {
             code: status,
             body,
@@ -1171,10 +1298,11 @@ async fn final_response_from_response(
     response: reqwest::Response,
     account: &AccountNet,
     deadline: RequestDeadline,
+    request_bytes: &RequestByteCounter,
 ) -> Result<FinalResponse, Error> {
     let status = response.status();
     let headers = response.headers().clone();
-    let body = read_capped_response_body(response, account, deadline).await?;
+    let body = read_capped_response_body(response, account, deadline, request_bytes).await?;
     Ok(FinalResponse {
         status,
         headers,
@@ -1186,6 +1314,7 @@ async fn read_capped_response_body(
     response: reqwest::Response,
     account: &AccountNet,
     deadline: RequestDeadline,
+    request_bytes: &RequestByteCounter,
 ) -> Result<Bytes, Error> {
     use futures::StreamExt;
 
@@ -1235,6 +1364,7 @@ async fn read_capped_response_body(
         // adding it to an error path cannot turn a failing request
         // into a hang.
         account.meter().record_bytes_in(n);
+        request_bytes.record(n);
         deadline.check_body()?;
         let cap_now = account.bandwidth_cap();
         if cap_now.is_some() {
@@ -1272,14 +1402,37 @@ fn host_from_url(url: &str) -> Option<String> {
 /// back to the governor's registered host default. Used at request
 /// start and recomputed on every redirect hop because a cross-host
 /// hop changes which host bucket the request debits against.
+/// Decide which quota scope a wire attempt debits.
+///
+/// An explicit `RequestBuilder::quota_scope` wins for every hop of the
+/// request. Otherwise the account's declared scope for this host
+/// applies; an account that declared no scope for the host falls back
+/// to the empty host-only bucket, which is also the only bucket an
+/// unregistered host could ever match.
+fn resolve_quota_scope(
+    account: &AccountNet,
+    host: Option<&str>,
+    override_: Option<&str>,
+) -> String {
+    match override_ {
+        Some(scope) => scope.to_owned(),
+        None => host
+            .map_or("", |host| account.rate_scope_for(host))
+            .to_owned(),
+    }
+}
+
 fn recompute_cost_units(
     governor: &crate::rate::RateLimitGovernor,
     host: Option<&str>,
+    quota_scope: &str,
     cost_override: Option<u32>,
 ) -> u32 {
     match cost_override {
         Some(n) => n,
-        None => host.and_then(|h| governor.cost_default_for(h)).unwrap_or(1),
+        None => host
+            .and_then(|h| governor.cost_default_for_scoped(h, quota_scope))
+            .unwrap_or(1),
     }
 }
 
@@ -1390,6 +1543,7 @@ mod tests {
             NetConfig::default(),
             vec![RateLimit {
                 host: "retry.test".to_string(),
+                quota_scope: String::new(),
                 quota_per_second: 0.0001,
                 cost_default: 1,
                 burst: 1,
@@ -2171,6 +2325,7 @@ mod tests {
         let governor = RateLimitGovernor::new();
         governor.register(RateLimit {
             host: "cancel.test".to_string(),
+            quota_scope: String::new(),
             quota_per_second: 0.0001,
             cost_default: 1,
             burst: 1,
@@ -2182,6 +2337,7 @@ mod tests {
         drop(RateDebit::new(
             governor.clone(),
             "cancel.test".to_string(),
+            String::new(),
             1,
             generation,
         ));
@@ -2200,6 +2356,7 @@ mod tests {
             NetConfig::default(),
             vec![RateLimit {
                 host: "cancel.test".to_string(),
+                quota_scope: String::new(),
                 quota_per_second: 0.0001,
                 cost_default: 1,
                 burst: 1,
@@ -2408,28 +2565,29 @@ mod tests {
         let governor = RateLimitGovernor::new();
         governor.register(RateLimit {
             host: "cost.test".to_owned(),
+            quota_scope: String::new(),
             quota_per_second: 10.0,
             cost_default: 5,
             burst: 50,
         });
 
         assert_eq!(
-            recompute_cost_units(&governor, Some("cost.test"), Some(9)),
+            recompute_cost_units(&governor, Some("cost.test"), "", Some(9)),
             9,
             "an explicit .cost(n) wins over the host default"
         );
         assert_eq!(
-            recompute_cost_units(&governor, Some("cost.test"), None),
+            recompute_cost_units(&governor, Some("cost.test"), "", None),
             5,
             "without an override the host's registered default applies"
         );
         assert_eq!(
-            recompute_cost_units(&governor, Some("unknown.test"), None),
+            recompute_cost_units(&governor, Some("unknown.test"), "", None),
             1,
             "an unregistered host falls back to one unit"
         );
         assert_eq!(
-            recompute_cost_units(&governor, None, None),
+            recompute_cost_units(&governor, None, "", None),
             1,
             "an unparseable URL has no host bucket and costs one unit"
         );

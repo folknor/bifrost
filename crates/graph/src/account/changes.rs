@@ -101,6 +101,10 @@ pub(crate) fn changes_stream(
             }
         };
 
+        // One accumulator for the delta walk; each emitted page takes
+        // and clears it, so consecutive pages partition the traffic.
+        let (client, tally) = client.metered();
+
         let scope = cursor.scope.clone();
         let mut current_url = payload.resume_url().to_string();
 
@@ -191,7 +195,7 @@ pub(crate) fn changes_stream(
                             return;
                         }
                     };
-                yield batch(changes, PageBoundary::Page, Some(checkpoint_cursor));
+                yield batch(changes, PageBoundary::Page, Some(checkpoint_cursor), tally.take());
                 current_url = next_link;
             } else if let Some(delta_link) = page.delta_link {
                 payload.delta_link = delta_link;
@@ -208,7 +212,7 @@ pub(crate) fn changes_stream(
                         }
                     };
                 let checkpoint = Checkpoint::Change(checkpoint_cursor.clone());
-                yield batch(changes, PageBoundary::Final, Some(checkpoint_cursor));
+                yield batch(changes, PageBoundary::Final, Some(checkpoint_cursor), tally.take());
                 yield SyncEvent::Done(Some(checkpoint));
                 return;
             } else {
@@ -220,7 +224,7 @@ pub(crate) fn changes_stream(
                 // poll forever. Terminate with a contract violation instead
                 // so the failure is visible rather than a silent live-lock.
                 if !changes.is_empty() {
-                    yield batch(changes, PageBoundary::Page, None);
+                    yield batch(changes, PageBoundary::Page, None, tally.take());
                 }
                 yield SyncEvent::Terminated(super::graph_error::protocol_violation(
                     bifrost_types::ProtocolErrorKind::ContractViolation,

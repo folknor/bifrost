@@ -21,7 +21,7 @@ use crate::auth::{DEFAULT_TOKEN_MAX_AGE, OAuthRefresher, TokenSource};
 use crate::bandwidth::{AccountMeter, BandwidthMeter};
 use crate::config::NetConfig;
 use crate::error::{Error, RangeFailureKind};
-use crate::rate::{RateLimit, RateLimitGovernor};
+use crate::rate::{RateKey, RateLimit, RateLimitGovernor};
 use crate::request::{
     ByteStream, Dispatch, InternalStreaming, RequestBuilder, ReqwestDispatch, send_streaming_inner,
 };
@@ -56,7 +56,7 @@ pub(crate) struct NetInner {
     pub(crate) meter: BandwidthMeter,
     /// Successfully registered hosts, indexed first by `AccountId`
     /// and then by the exact attachment token.
-    pub(crate) account_hosts: Mutex<HashMap<AccountId, HashMap<u64, Vec<String>>>>,
+    pub(crate) account_hosts: Mutex<HashMap<AccountId, HashMap<u64, Vec<RateKey>>>>,
     /// Monotone identity for each `attach_account` registration.
     /// AccountNet carries this token so teardown targets the exact
     /// attachment even when the same AccountId is reopened before an
@@ -211,7 +211,35 @@ impl Net {
         let mut registered_hosts = Vec::with_capacity(spec.hosts.len());
         for limit in &spec.hosts {
             if self.inner.governor.register(limit.clone()) {
-                registered_hosts.push(limit.host.clone());
+                registered_hosts.push(RateKey::new(&limit.host, &limit.quota_scope));
+            }
+        }
+        // Default scope selection for requests that do not name one.
+        // Built from the keys that actually registered, so a rejected
+        // declaration cannot point requests at a bucket that does not
+        // exist. Host alone cannot name a bucket once an account
+        // declares two scopes on one host, and silently letting the
+        // last declaration win would leave the other bucket registered,
+        // refcounted, and permanently unreachable. First declaration
+        // wins and the ambiguity is announced; reaching the others is
+        // what `RequestBuilder::quota_scope` is for.
+        let mut rate_scopes: HashMap<String, String> = HashMap::new();
+        for key in &registered_hosts {
+            match rate_scopes.get(&key.host) {
+                Some(existing) if existing == &key.quota_scope => {}
+                Some(existing) => {
+                    tracing::warn!(
+                        host = %key.host,
+                        default_scope = %existing,
+                        also_declared = %key.quota_scope,
+                        "account declares multiple quota scopes for one host; \
+                         requests that do not call RequestBuilder::quota_scope \
+                         will debit the first-declared scope",
+                    );
+                }
+                None => {
+                    rate_scopes.insert(key.host.clone(), key.quota_scope.clone());
+                }
             }
         }
         let registration_id = self
@@ -238,6 +266,7 @@ impl Net {
                     Arc::new(OAuthRefresher::new(source).with_max_age(spec.token_max_age))
                         as Arc<dyn TokenSource>
                 }),
+                rate_scopes,
                 default_retry: spec.default_retry,
                 request_timeout: spec.request_timeout,
                 response_headers_timeout: spec.response_headers_timeout.or(spec.connect_timeout),
@@ -290,8 +319,10 @@ impl Net {
             hosts
         };
         self.inner.meter.forget_account(id);
-        for host in hosts {
-            self.inner.governor.unregister(&host);
+        for key in hosts {
+            self.inner
+                .governor
+                .unregister_scoped(&key.host, &key.quota_scope);
         }
     }
 
@@ -356,6 +387,8 @@ pub(crate) struct AccountNetInner {
     pub(crate) meter: AccountMeter,
     /// Provider of OAuth bearer tokens for this account.
     pub(crate) token_source: Option<Arc<dyn TokenSource>>,
+    /// Quota discriminator selected for each registered request host.
+    pub(crate) rate_scopes: HashMap<String, String>,
     /// Default retry policy applied to every request unless the
     /// caller overrides via `RequestBuilder::retry`.
     pub(crate) default_retry: RetryPolicy,
@@ -403,6 +436,10 @@ impl Drop for AccountNetInner {
 }
 
 impl AccountNet {
+    pub(crate) fn rate_scope_for(&self, host: &str) -> &str {
+        self.inner.rate_scopes.get(host).map_or("", String::as_str)
+    }
+
     /// True when two account handles use the same process-wide client,
     /// governor, and meter.
     #[must_use]
@@ -505,6 +542,8 @@ impl AccountNet {
             body,
             account: _,
             deadline,
+            bytes_out: _,
+            bytes_in,
         } = send_streaming_inner(builder).await?;
 
         // Ranged-download safety: if the caller asked for a specific
@@ -539,7 +578,7 @@ impl AccountNet {
         }
 
         // Wrap the body in a metering + bandwidth-cap adapter.
-        let metered = wrap_metered(body, self.clone(), deadline);
+        let metered = wrap_metered(body, self.clone(), deadline, bytes_in);
         Ok(metered)
     }
 
@@ -742,6 +781,7 @@ impl AccountNet {
                 registration_id: self.inner.registration_id,
                 meter: account_meter,
                 token_source: self.inner.token_source.clone(),
+                rate_scopes: self.inner.rate_scopes.clone(),
                 default_retry: self.inner.default_retry.clone(),
                 request_timeout: self.inner.request_timeout,
                 response_headers_timeout: self.inner.response_headers_timeout,
@@ -963,6 +1003,7 @@ pub(crate) fn wrap_metered(
     body: ByteStream,
     account: AccountNet,
     deadline: crate::request::RequestDeadline,
+    request_bytes: crate::request::RequestByteCounter,
 ) -> ByteStream {
     let meter = account.meter();
     // Bucket carries its own state across chunks. Constructed full so
@@ -974,6 +1015,7 @@ pub(crate) fn wrap_metered(
         let meter = meter.clone();
         let bucket = bucket.clone();
         let cap_now = account.bandwidth_cap();
+        let request_bytes = request_bytes.clone();
         async move {
             let chunk = chunk?;
             let n = u64::try_from(chunk.len()).unwrap_or(u64::MAX);
@@ -981,6 +1023,7 @@ pub(crate) fn wrap_metered(
             // off the wire, whether or not we are still allowed to
             // hand them up.
             meter.record_bytes_in(n);
+            request_bytes.record(n);
             deadline.check_body()?;
             if cap_now.is_some() {
                 deadline.bound_body(bucket.consume(n, cap_now)).await?;
@@ -1146,7 +1189,7 @@ mod tests {
     };
     use crate::StaticTokenSource;
     use crate::config::NetConfig;
-    use crate::rate::RateLimit;
+    use crate::rate::{RateKey, RateLimit};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -1420,6 +1463,7 @@ mod tests {
         AccountSpec {
             hosts: vec![RateLimit {
                 host: host.to_string(),
+                quota_scope: String::new(),
                 quota_per_second: 1.0,
                 cost_default: 1,
                 burst: 1,
@@ -1428,7 +1472,7 @@ mod tests {
         }
     }
 
-    fn account_hosts_snapshot(net: &Net, id: &AccountId) -> Option<Vec<String>> {
+    fn account_hosts_snapshot(net: &Net, id: &AccountId) -> Option<Vec<RateKey>> {
         let map = net
             .inner
             .account_hosts
@@ -1556,7 +1600,7 @@ mod tests {
         let original = net.attach_account(old.clone(), build_spec("retag.example"));
         assert_eq!(original.account(), &old);
         let hosts_before = account_hosts_snapshot(&net, &old).expect("old id has hosts");
-        assert_eq!(hosts_before, vec!["retag.example".to_string()]);
+        assert_eq!(hosts_before, vec![RateKey::new("retag.example", "")]);
 
         let retagged = original.retag(new.clone());
 
@@ -1585,7 +1629,7 @@ mod tests {
         let hosts = account_hosts_snapshot(&net, &id).expect("id still has hosts");
         assert_eq!(
             hosts,
-            vec!["retag.example".to_string()],
+            vec![RateKey::new("retag.example", "")],
             "retag with same id must not drop the host registration",
         );
     }
@@ -1687,6 +1731,7 @@ mod tests {
             AccountSpec {
                 hosts: vec![RateLimit {
                     host: "shared.example".to_string(),
+                    quota_scope: String::new(),
                     quota_per_second: f64::NAN,
                     cost_default: 1,
                     burst: 1,

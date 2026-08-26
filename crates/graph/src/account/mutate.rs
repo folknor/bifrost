@@ -145,11 +145,20 @@ async fn submit_batch(
                 .collect(),
             page_boundary: PageBoundary::Page,
             server_latency: Duration::default(),
+            // Rejected locally, before the chunk reached the wire: the
+            // flag op is not expressible against Graph's PATCH surface,
+            // so no request was made and nothing was read.
             bytes_in: 0,
             checkpoint: None::<Checkpoint>,
         })]);
     }
 
+    // One mutation chunk is the `$batch` submission plus whatever the
+    // etag preflight had to re-read. `refresh_missing_etags` issues one
+    // GET per id whose etag was not cached, so leaving it out would
+    // under-report a cold chunk by most of its traffic.
+    let (metered, tally) = account.metered();
+    let account = &metered;
     let mut etags = HashMap::new();
     {
         let mut cache = account.etag_index.write().await;
@@ -247,7 +256,7 @@ async fn submit_batch(
         items: item_outcomes,
         page_boundary: PageBoundary::Page,
         server_latency: Duration::default(),
-        bytes_in: 0,
+        bytes_in: tally.take(),
         checkpoint: None::<Checkpoint>,
     })];
     Ok(events)

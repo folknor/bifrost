@@ -424,12 +424,6 @@ help, and hammering an IdP that is refusing is how an account gets
 throttled or blocked there. Forced refreshes are subject to the same
 quiet interval; the state, not the caller, decides.
 
-What this bounds is the ISSUER CALL RATE, not the number of failing requests.
-Every request arriving during a quiet interval still fails - locally, off the
-shared cached error. An earlier version of this document claimed the backoff
-"prevents one refresh call per request", which overclaims in the direction that
-matters; state it as a rate bound.
-
 Note what this does and does not promise. It bounds the issuer call
 RATE, not the number of failing requests: every request during the
 interval still fails, it just fails locally off the cached error.
@@ -474,8 +468,27 @@ swapped-in token.
 
 ## Rate-limit governor (`RateLimitGovernor`)
 
-Per-host token bucket behind `Arc<Mutex<HashMap<String,
-HostBucket>>>`. `acquire(host, cost)` joins a FIFO ticket queue. Only
+Buckets are keyed by `(host, quota_scope)`. `RateLimit::new` leaves the scope
+empty for host-only compatibility; provider clients use `with_quota_scope` for
+tenant or user quotas. `acquire(host, cost)` remains the empty-scope
+compatibility path.
+
+Selection carries the same two components as the key. Each request resolves a
+scope before its first wire attempt and again at every redirect hop, since a hop
+may land on a different host. `RequestBuilder::quota_scope(scope)` names it
+explicitly and wins for every hop of that request; without it the request uses
+the scope the account declared for the host. Keying registration by the pair
+while selecting by host alone was a half-wired dimension: an account declaring
+two scopes on one host registered two buckets, refcounted both, and could only
+ever debit one - the other was live and unreachable. `attach_account` builds the
+per-host default from the keys that actually REGISTERED (so a rejected
+declaration cannot point requests at a bucket that does not exist), takes the
+first declaration for each host, and `tracing::warn!`s when a host carries more
+than one, naming `quota_scope` as the way to reach the rest. An account that
+talks to one host under two quotas - the Gmail per-project and per-user shape -
+must say which per request; the declaration order cannot know.
+
+Scoped admission joins a FIFO ticket queue. Only
 the head may debit; admission wakes its successor, a refund wakes the
 head, and cancellation removes its ticket and hands off if necessary.
 Each waiter holds its own `Notify`, so every wake is addressed rather
@@ -513,16 +526,17 @@ therefore cannot panic, spin, park forever, or unbalance teardown.
 
 ### Cost defaults
 
-Each `RateLimit::cost_default` is stored on the host bucket at
-registration. `RequestBuilder::send_streaming_inner` consults it
-via `RateLimitGovernor::cost_default_for(host)` when the builder
-did not call `.cost(n)` explicitly; the precedence is
+Each `RateLimit::cost_default` is stored on the scoped host bucket at
+registration. `RequestBuilder::send_streaming_inner` consults it via
+`RateLimitGovernor::cost_default_for_scoped(host, scope)` - against the same
+resolved scope the debit will use - when the builder did not call `.cost(n)`
+explicitly; the precedence is
 `RequestBuilder::cost` > host `cost_default` > 1.
 
 ### Duplicate registrations
 
-The first registration of a host wins. A subsequent
-`register(RateLimit { ... })` for the same host with a different
+The first registration of a `(host, quota_scope)` key wins. A subsequent
+`register(RateLimit { ... })` for the same key with a different
 `quota_per_second`, `burst`, or `cost_default` is **not** silently
 dropped: the governor logs a `tracing::warn!` and keeps the
 existing bucket. Per-host attach counts are incremented on every
@@ -544,11 +558,40 @@ after dispatch would instead miss in-flight failures and cancellation
 after a partial write. Inbound metering is per-chunk on every response
 body the transport reads, including buffered and streaming successes, terminal
 errors, retry drains, 401 recovery, and followed redirects. The cumulative
-meter remains account-scoped; it does not expose per-request accounting.
+meter remains account-scoped. Buffered `Response` also exposes request-local
+`bytes_in` and `bytes_out`; `StreamingResponse` exposes the outbound total plus
+a cloneable `RequestByteCounter` that advances as its body is drained. These do
+not sample cumulative counters, so concurrent requests cannot contaminate one
+another.
 
-One inbound stream is outside this: the token-endpoint traffic `OAuthRefresher`
-drives goes through the caller's own `TokenSource`, not this pipeline, so it is
-neither metered nor capped. Closing that would change the `TokenSource` contract.
+One counter is created before the retry and redirect loop, so error-body drains,
+401 recovery, followed redirects, retries and the final success body all
+contribute to the same figure. Note the asymmetry the two shapes carry: a
+buffered `Response::bytes_in` is FINAL, because `send` drained the body before
+returning it, while a `StreamingResponse`'s counter is only as complete as the
+caller's draining. A caller that abandons a stream part-way holds a partial
+count, and the accessor documents that rather than pretending otherwise.
+
+Above this, each protocol crate owns a batch-scoped accumulator - `ByteTally` in
+bifrost-google, bifrost-graph, and bifrost-jmap - because an engine batch
+routinely covers several requests: a list page plus a hydration fan-out, a
+`$batch` submission plus its etag preflight, an `Email/set` plus its state
+probe and post-`stateMismatch` retry. A metered client handle is one `Arc` bump
+over the same transport and reports every buffered response into one stream's
+accumulator; each emitted batch takes and clears it, so consecutive batches
+partition the traffic rather than each restating a running total. Deliberately
+NOT a delta across the cumulative account meter: that meter is shared by every
+concurrent request on the account, so a delta would attribute another scope's
+traffic to this batch.
+
+### OAuth issuer traffic is an explicit exception
+
+Token-endpoint traffic driven by `OAuthRefresher` is not transport traffic owned
+by bifrost-net. `TokenSource` is shared by HTTP, IMAP, and SMTP and deliberately
+owns arbitrary provider exchange machinery. Bifrost-net therefore cannot count
+or cap its wire bytes without replacing that provider abstraction with an
+HTTP-specific request model. Issuer traffic is neither metered nor capped;
+target API traffic remains fully metered and capped.
 
 `AccountNet` caches its `AccountMeter` at attach or retag time, avoiding
 an account-id allocation and meter-map lookup on each request attempt.
@@ -686,13 +729,23 @@ response through `classify_redirect`:
 - 307 / 308: preserve method and body.
 - Any followed-redirect status whose `Location` header is **absent**:
   `PassThrough`. A redirect no one can follow is handed back as a
-  terminal status (status + headers) the same way a 304 is. This is
-  load-bearing for Google Drive resumable uploads: a `308 Resume
-  Incomplete` carries a `Range` header and no `Location`, and the
-  cloud chunk loop reads that status + `Range` itself. A
-  present-but-malformed `Location` (invalid encoding / unresolvable)
-  stays a hard `MalformedRedirect`; only the missing header passes
-  through.
+  terminal status the same way a 304 is. This is load-bearing for
+  Google Drive resumable uploads: a `308 Resume Incomplete` carries a
+  `Range` header and no `Location`, and the cloud chunk loop reads that
+  status + `Range` itself. A present-but-malformed `Location` (invalid
+  encoding / unresolvable) stays a hard `MalformedRedirect`; only the
+  missing header passes through.
+
+A passed-through 3xx hands its BODY up as well as its status and headers,
+through the same `into_byte_stream` the redirects-disabled arm uses. The arm
+used to drop the response and substitute an empty stream on the reasoning that
+304/305/306 carry nothing interesting - which is true of those three and of
+Drive's header-only 308, all of which simply yield an empty stream on their
+own. It is not true of the fourth shape folded into this arm: a followed status
+with no `Location` can carry a real explanatory document, and discarding it made
+those bytes invisible to the caller AND to the request-local byte counter, which
+counts only what a body reader actually reads. Whether a passed-through body is
+interesting is the caller's decision, not the redirect loop's.
 
 `same_origin` - the `keep_auth` / cross-host decision - compares all
 three RFC 6454 origin components: scheme, host (case-insensitively, per

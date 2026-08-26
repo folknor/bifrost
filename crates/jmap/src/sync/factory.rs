@@ -764,12 +764,16 @@ mod tests {
         ///
         /// - 2xx: the body reaches the protocol decoder.
         /// - 3xx: bifrost-net returns 304 / 305 / 306 and `Location`-less
-        ///   redirects as `Ok` with the body replaced by an empty stream
-        ///   (the redirect loop's `PassThrough` arm discards passthrough
-        ///   bodies), so `ReqwestTransport::handle_response` turns them
-        ///   into a body-less `TransportError` with no net evidence
-        ///   attached. The fixture drops any scripted body for the same
-        ///   reason: production cannot deliver one.
+        ///   redirects as `Ok`, and the redirect loop's `PassThrough` arm
+        ///   hands the BODY up rather than discarding it, so
+        ///   `ReqwestTransport::handle_response` turns them into a
+        ///   `TransportError` carrying that body and no net evidence.
+        ///   The fixture preserves the scripted body for the same
+        ///   reason: production can deliver one. It used to blank the
+        ///   body, matching an older `PassThrough` arm that dropped it -
+        ///   a double that keeps mirroring behavior the transport has
+        ///   stopped having makes every test built on it confidently
+        ///   wrong.
         /// - 401: the forced refresh retries once, and the second 401 is
         ///   `AuthLost` with acknowledged transmission evidence.
         /// - Retryable per `RetryPolicy::default()` - 429 plus the whole
@@ -794,10 +798,7 @@ mod tests {
                 return Ok(body);
             }
             if status.is_redirection() {
-                return Err(TransportError::with_body(
-                    format!("HTTP {status}"),
-                    Bytes::new(),
-                ));
+                return Err(TransportError::with_body(format!("HTTP {status}"), body));
             }
             let final_response = bifrost_net::FinalResponse {
                 status,

@@ -129,8 +129,34 @@ async fn a_scripted_2xx_reaches_the_caller_as_a_real_response() {
 
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response.body, bytes::Bytes::from_static(b"body"));
+    assert_eq!(response.bytes_in(), 4);
+    assert_eq!(response.bytes_out(), 0);
     assert_eq!(script.requests().len(), 1);
     assert_eq!(script.remaining(), 0);
+}
+
+#[tokio::test]
+async fn streaming_response_counter_advances_only_as_chunks_are_drained() {
+    use futures::StreamExt;
+    let script = ScriptedDispatch::new([Canned::Stream {
+        status: StatusCode::OK,
+        headers: HeaderMap::new(),
+        chunks: vec![
+            bytes::Bytes::from_static(b"abc"),
+            bytes::Bytes::from_static(b"defg"),
+        ],
+    }]);
+    let mut response = account(&script, no_retry())
+        .get("https://consumer.test/stream")
+        .send_streaming()
+        .await
+        .expect("stream opens");
+    let counter = response.byte_counter();
+    assert_eq!(counter.bytes_in(), 0);
+    response.body.next().await.unwrap().unwrap();
+    assert_eq!(counter.bytes_in(), 3);
+    response.body.next().await.unwrap().unwrap();
+    assert_eq!(counter.bytes_in(), 7);
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -358,4 +384,85 @@ async fn the_transport_injects_authorization_below_the_consumer() {
         .get(reqwest::header::AUTHORIZATION)
         .expect("the transport injected the bearer token");
     assert_eq!(auth, "Bearer token");
+}
+
+/// Two quota scopes on ONE host must both be reachable.
+///
+/// The scoped governor keyed buckets by `(host, quota_scope)` but
+/// selected by host alone, so a second declaration on the same host
+/// registered a bucket, held a refcount, and could never be debited.
+/// The fix makes scope part of the request.
+///
+/// The bite: the request names the scope whose bucket is exhausted while
+/// the account-default scope stays full. Under host-only selection both
+/// requests would debit the roomy default and neither would block.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_request_can_name_a_quota_scope_the_account_default_does_not_select() {
+    use bifrost_net::RateLimit;
+
+    let script = ScriptedDispatch::new([canned(StatusCode::OK, b"ok")]);
+    let net = bifrost_net::test_support::scripted_net(&script, NetConfig::default());
+    let mut spec = AccountSpec::new(Some(Arc::new(StaticTokenSource::new("token", None))));
+    spec.default_retry = no_retry();
+    // `project` is declared first and is therefore the account default;
+    // `user` is reachable only by naming it on the request. Deliberately
+    // uneven: the default is roomy, the named one holds a single token
+    // refilled far outside the test's virtual time.
+    spec.hosts = vec![
+        RateLimit::new("dual.test", 1000.0, 1, 100).with_quota_scope("project"),
+        RateLimit::new("dual.test", 0.000_000_1, 1, 1).with_quota_scope("user"),
+    ];
+    let account = net.attach_account(AccountId("dual".to_owned()), spec);
+
+    // Drain the `user` bucket's single token.
+    account
+        .get("https://dual.test/a")
+        .quota_scope("user")
+        .send()
+        .await
+        .expect("first user-scoped request admits");
+
+    // A second `user`-scoped request must now block. Selecting by host
+    // alone would debit `project`, which still holds 99 tokens, and this
+    // would complete immediately - consuming the script's only remaining
+    // step.
+    let mut blocked = Box::pin(
+        account
+            .get("https://dual.test/b")
+            .quota_scope("user")
+            .send(),
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_secs(30), &mut blocked)
+            .await
+            .is_err(),
+        "the second user-scoped request debited a different bucket",
+    );
+    assert_eq!(
+        script.remaining(),
+        0,
+        "only the admitted request dispatched"
+    );
+}
+
+/// A passed-through 3xx hands its body to the caller rather than
+/// discarding it.
+///
+/// A followed-redirect status with no `Location` lands in the
+/// `PassThrough` arm and can carry a real explanatory document. That
+/// body used to be dropped, which made it invisible to the caller AND
+/// to the request-local byte counter.
+#[tokio::test]
+async fn a_passthrough_redirect_body_reaches_the_caller_and_is_counted() {
+    let script = ScriptedDispatch::new([canned(StatusCode::PERMANENT_REDIRECT, b"resume-state")]);
+
+    let response = account(&script, no_retry())
+        .get("https://consumer.test/upload")
+        .send()
+        .await
+        .expect("a Location-less 308 passes through as Ok");
+
+    assert_eq!(response.status(), StatusCode::PERMANENT_REDIRECT);
+    assert_eq!(response.body, bytes::Bytes::from_static(b"resume-state"));
+    assert_eq!(response.bytes_in(), 12);
 }

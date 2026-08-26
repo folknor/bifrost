@@ -57,6 +57,9 @@ fn inventory_stream_from(
         // first one onward declares the gap.
         let mut obligations: Vec<bifrost_types::InventoryObligation> = Vec::new();
 
+        // One accumulator for the whole delta walk; each emitted page
+        // takes and clears it, so a page reports the bytes of the
+        // request that produced it rather than a running total.
         let client = match account.client_for_scope(&scope) {
             Ok(client) => client.clone(),
             Err(error) => {
@@ -89,6 +92,7 @@ fn inventory_stream_from(
                 }
             },
         };
+        let (client, tally) = client.metered();
         // A foreign (shared) scope tags every inventory item with its
         // owning mailbox so the consumer maps the item to its shared
         // owner and the foreign mailbox's native folder ids cannot be
@@ -220,7 +224,7 @@ fn inventory_stream_from(
                         return;
                     }
                 };
-                yield inventory_batch(entries, PageBoundary::Page, Some(checkpoint_cursor), coverage_of(&scope, &obligations));
+                yield inventory_batch(entries, PageBoundary::Page, Some(checkpoint_cursor), coverage_of(&scope, &obligations), tally.take());
                 current_url = next_link;
             } else if let Some(delta_link) = page.delta_link {
                 let cursor = match encode_cursor(
@@ -238,7 +242,7 @@ fn inventory_stream_from(
                     }
                 };
                 let checkpoint = Checkpoint::Change(cursor.clone());
-                yield inventory_batch(entries, PageBoundary::Final, Some(cursor), coverage_of(&scope, &obligations));
+                yield inventory_batch(entries, PageBoundary::Final, Some(cursor), coverage_of(&scope, &obligations), tally.take());
                 yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion { checkpoint: Some(checkpoint), coverage: coverage_of(&scope, &obligations) });
                 return;
             } else {
@@ -454,12 +458,13 @@ pub(crate) fn inventory_batch(
     page_boundary: PageBoundary,
     cursor: Option<ChangeCursor>,
     coverage: bifrost_types::InventoryCoverageReport,
+    bytes_in: u64,
 ) -> bifrost_types::InventoryEvent {
     bifrost_types::InventoryEvent::Batch(bifrost_types::InventoryBatch {
         items,
         page_boundary,
         server_latency: Duration::default(),
-        bytes_in: 0,
+        bytes_in,
         checkpoint: cursor.map(Checkpoint::Change),
         coverage,
     })
@@ -484,12 +489,13 @@ pub(crate) fn batch<T>(
     items: Vec<T>,
     page_boundary: PageBoundary,
     cursor: Option<ChangeCursor>,
+    bytes_in: u64,
 ) -> SyncEvent<T> {
     SyncEvent::Batch(Batch {
         items,
         page_boundary,
         server_latency: Duration::default(),
-        bytes_in: 0,
+        bytes_in,
         checkpoint: cursor.map(Checkpoint::Change),
     })
 }

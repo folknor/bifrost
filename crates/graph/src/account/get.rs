@@ -258,6 +258,17 @@ async fn fetch_batch(
     if ids.is_empty() {
         return Ok(Vec::new());
     }
+    // One hydration chunk is one `$batch` submission, and this
+    // accumulator carries its inbound bytes.
+    //
+    // The EWS arm below is NOT counted. `EwsClient` composes `AccountNet`
+    // directly rather than routing through `GraphClient`'s wire funnel,
+    // so no `GraphClient`-level seam can observe it. A chunk containing
+    // public-folder ids therefore reports its REST half only, which
+    // under-reports rather than over-reports. Closing it means giving
+    // the EWS client its own accounting seam.
+    let (metered, tally) = account.metered();
+    let account = &metered;
     // Public-folder ids read over EWS; everything else over Graph REST.
     let (ews_ids, rest_ids) = partition_ews_ids(account, ids).await;
     // The EWS-hydrated items ride in the same batch as the REST ones: the
@@ -292,7 +303,7 @@ async fn fetch_batch(
     if rest_ids.is_empty() {
         // Nothing left to ask Graph. An empty `requests` array is a 400,
         // and every id already holds an outcome.
-        return Ok(vec![hydration_batch(outcomes, is_final)]);
+        return Ok(vec![hydration_batch(outcomes, is_final, tally.take())]);
     }
     // The subrequest index is assigned AFTER the routing split, so it
     // indexes `rest_ids` and `reconcile_hydration_responses` can project
@@ -320,7 +331,7 @@ async fn fetch_batch(
         }
     }
 
-    Ok(vec![hydration_batch(outcomes, is_final)])
+    Ok(vec![hydration_batch(outcomes, is_final, tally.take())])
 }
 
 /// Wrap one chunk's accumulated outcomes in the `Batch` envelope, tagging
@@ -328,6 +339,7 @@ async fn fetch_batch(
 fn hydration_batch(
     items: Vec<ItemOutcome<HydratedObject>>,
     is_final: bool,
+    bytes_in: u64,
 ) -> SyncEvent<ItemOutcome<HydratedObject>> {
     SyncEvent::Batch(Batch {
         items,
@@ -337,7 +349,7 @@ fn hydration_batch(
             PageBoundary::Page
         },
         server_latency: std::time::Duration::default(),
-        bytes_in: 0,
+        bytes_in,
         checkpoint: None::<Checkpoint>,
     })
 }

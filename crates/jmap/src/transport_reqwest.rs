@@ -71,8 +71,26 @@ impl ReqwestTransport {
         body: Option<Bytes>,
         content_type: Option<&str>,
     ) -> Result<Bytes, TransportError> {
+        Ok(self.send_measured(method, url, body, content_type).await?.0)
+    }
+
+    /// `send`, also reporting bifrost-net's request-local inbound byte
+    /// count. That count is the real inbound total for the whole
+    /// request - retry drains, 401 recovery bodies and followed
+    /// redirects included - which the decoded body length cannot see.
+    async fn send_measured(
+        &self,
+        method: &str,
+        url: &str,
+        body: Option<Bytes>,
+        content_type: Option<&str>,
+    ) -> Result<(Bytes, u64), TransportError> {
         let response = self.send_once(method, url, body, content_type).await?;
-        Self::handle_response(response.status, response.body)
+        let bytes_in = response.bytes_in();
+        Ok((
+            Self::handle_response(response.status, response.body)?,
+            bytes_in,
+        ))
     }
 
     async fn send_once(
@@ -130,12 +148,11 @@ impl ReqwestTransport {
             // Only a passed-through 3xx reaches here: bifrost-net turns
             // every 4xx/5xx into a typed `Error` before `send` returns,
             // so `Ok(response)` with a non-2xx status means a 304 / 305 /
-            // 306 or a `Location`-less redirect. On the production stack
-            // `body` is always empty - the redirect loop's `PassThrough`
-            // arm replaces the body with an empty stream
-            // (`crates/net/src/request.rs`) - so the status is the whole
-            // evidence; the body is threaded through for shape, not
-            // because a problem document can arrive on it.
+            // 306 or a `Location`-less redirect. Such a body is normally
+            // empty, but the redirect loop hands the real body up rather
+            // than discarding it, so a `Location`-less redirect carrying
+            // an explanatory document arrives here intact and is
+            // preserved on the error.
             Err(TransportError::with_body(format!("HTTP {status}"), body))
         }
     }
@@ -144,6 +161,20 @@ impl ReqwestTransport {
 impl HttpTransport for ReqwestTransport {
     async fn api_request(&self, url: &str, body: Vec<u8>) -> Result<bytes::Bytes, TransportError> {
         self.send(
+            "POST",
+            url,
+            Some(Bytes::from(body)),
+            Some("application/json"),
+        )
+        .await
+    }
+
+    async fn api_request_measured(
+        &self,
+        url: &str,
+        body: Vec<u8>,
+    ) -> Result<(bytes::Bytes, u64), TransportError> {
+        self.send_measured(
             "POST",
             url,
             Some(Bytes::from(body)),

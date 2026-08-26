@@ -25,6 +25,9 @@ pub(crate) fn cursor_scopes(scopes: Vec<CursorScope>) -> AccountStream<SyncEvent
                 items: scopes,
                 page_boundary: PageBoundary::Final,
                 server_latency: Duration::ZERO,
+                // Synthetic: the scopes were derived from the session
+                // already in hand, so this batch performed no request
+                // and genuinely cost nothing.
                 bytes_in: 0,
                 checkpoint: None,
             });
@@ -38,6 +41,7 @@ pub(crate) fn memberships<T: HttpTransport>(
     foreign_owners: Vec<MembershipScope>,
 ) -> AccountStream<SyncEvent<MembershipScope>> {
     Box::pin(async_stream::stream! {
+        let (mail, tally) = mail.metered();
         let started = Instant::now();
         let response = mail
             .call(MailboxGet::new().properties([Property::Id]))
@@ -70,7 +74,7 @@ pub(crate) fn memberships<T: HttpTransport>(
                         items,
                         page_boundary: PageBoundary::Final,
                         server_latency: started.elapsed(),
-                        bytes_in: 0,
+                        bytes_in: tally.take(),
                         checkpoint: None,
                     });
                 }

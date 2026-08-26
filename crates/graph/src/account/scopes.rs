@@ -46,12 +46,16 @@ impl FolderTree {
 pub(crate) async fn discover_cursor_scope_events(
     account: GraphAccount,
 ) -> Vec<SyncEvent<CursorScope>> {
-    match discover_cursor_scopes_inner(&account).await {
+    // Discovery walks the folder tree with an unbounded number of
+    // requests - one per mailbox plus recursive child pages - all of
+    // which land in this single Final batch.
+    let (metered, tally) = account.metered();
+    match discover_cursor_scopes_inner(&metered).await {
         Ok((scopes, warnings)) => {
             account.cursor_index.write().await.replace(scopes.clone());
             let mut events: Vec<SyncEvent<CursorScope>> =
                 warnings.into_iter().map(SyncEvent::Warning).collect();
-            events.push(batch(scopes, Some(PageBoundary::Final)));
+            events.push(batch(scopes, Some(PageBoundary::Final), tally.take()));
             events.push(SyncEvent::Done(None));
             events
         }
@@ -62,9 +66,10 @@ pub(crate) async fn discover_cursor_scope_events(
 pub(crate) async fn discover_membership_events(
     account: GraphAccount,
 ) -> Vec<SyncEvent<MembershipScope>> {
-    match discover_memberships_inner(&account).await {
+    let (metered, tally) = account.metered();
+    match discover_memberships_inner(&metered).await {
         Ok(memberships) => vec![
-            batch(memberships, Some(PageBoundary::Final)),
+            batch(memberships, Some(PageBoundary::Final), tally.take()),
             SyncEvent::Done(None),
         ],
         Err(error) => vec![SyncEvent::Terminated(error), SyncEvent::Done(None)],
@@ -80,12 +85,16 @@ pub(crate) fn scope_lifecycle_events() -> Vec<ScopeLifecycle> {
     Vec::new()
 }
 
-pub(crate) fn batch<T>(items: Vec<T>, page_boundary: Option<PageBoundary>) -> SyncEvent<T> {
+pub(crate) fn batch<T>(
+    items: Vec<T>,
+    page_boundary: Option<PageBoundary>,
+    bytes_in: u64,
+) -> SyncEvent<T> {
     SyncEvent::Batch(Batch {
         items,
         page_boundary: page_boundary.unwrap_or(PageBoundary::Page),
         server_latency: Duration::default(),
-        bytes_in: 0,
+        bytes_in,
         checkpoint: None::<Checkpoint>,
     })
 }
@@ -294,6 +303,7 @@ mod tests {
         let event = batch(
             vec![MembershipScope::Folder(FolderId("f1".to_string()))],
             Some(PageBoundary::Final),
+            0,
         );
         assert!(matches!(
             event,

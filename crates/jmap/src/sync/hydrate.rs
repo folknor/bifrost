@@ -205,6 +205,11 @@ async fn fetch_batch<T: HttpTransport>(
     if requested.is_empty() {
         return Ok(None);
     }
+    // Exactly one `/jmap/api` POST per emitted batch on this path, so
+    // the accumulator is created and read within this call rather than
+    // hoisted to the stream: routing splits a chunk across the primary
+    // and each foreign account, and each of those emits its own batch.
+    let (mail, tally) = mail.metered();
     // The wire call takes the native id only when the batch runs against
     // the id's own foreign account; an unregistered-foreign id stays
     // literal on the primary route (see `wire_object_id`).
@@ -236,7 +241,7 @@ async fn fetch_batch<T: HttpTransport>(
         items,
         page_boundary: PageBoundary::Page,
         server_latency: started.elapsed(),
-        bytes_in: 0,
+        bytes_in: tally.take(),
         checkpoint: None,
     }))
 }

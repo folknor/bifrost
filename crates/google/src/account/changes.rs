@@ -28,8 +28,16 @@ pub(crate) fn changes_stream(
     profile: GmailProfile,
     cursor: bifrost_types::ChangeCursor,
 ) -> AccountStream<SyncEvent<Change>> {
+    // One accumulator for the life of this stream. Every request the
+    // walk makes - the identity probe as well as each history page -
+    // reports into it, and each emitted batch takes and clears it, so
+    // consecutive batches partition the traffic instead of each
+    // restating a running total.
+    let (client, tally) = client.metered();
+    let client = Arc::new(client);
     let state = ChangeState {
         client,
+        tally,
         profile,
         cursor: Some(cursor),
         page_token: None,
@@ -137,6 +145,7 @@ pub(crate) fn changes_stream(
             .await
         {
             Ok(response) => {
+                let bytes_in = state.tally.take();
                 let history_id = match response.history_id.parse::<u64>() {
                     Ok(history_id) => history_id,
                     Err(error) => {
@@ -169,7 +178,7 @@ pub(crate) fn changes_stream(
                             PageBoundary::Page
                         },
                         server_latency: started.elapsed(),
-                        bytes_in: 0,
+                        bytes_in,
                         checkpoint,
                     }),
                     state,
@@ -213,6 +222,7 @@ fn checkpoint_for_history_page(
 
 struct ChangeState {
     client: Arc<GmailClient>,
+    tally: crate::client::ByteTally,
     profile: GmailProfile,
     cursor: Option<bifrost_types::ChangeCursor>,
     page_token: Option<String>,

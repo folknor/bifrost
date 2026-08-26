@@ -133,6 +133,28 @@ pub(crate) trait HttpTransport: Send + Sync + 'static {
         body: Vec<u8>,
     ) -> impl Future<Output = Result<Bytes, TransportError>> + Send;
 
+    /// Send a JMAP API request, also reporting the inbound payload
+    /// bytes the transport read to produce the answer.
+    ///
+    /// Defaulted so no implementor is forced to grow a byte counter it
+    /// has no way to produce: the default reports the DECODED body
+    /// length, which is what a transport that hands back only `Bytes`
+    /// can honestly know. The production `reqwest` transport overrides
+    /// it with `bifrost_net`'s request-local counter, which is the real
+    /// inbound total across retries, redirects and 401 recovery - a
+    /// figure the decoded length cannot see.
+    fn api_request_measured(
+        &self,
+        url: &str,
+        body: Vec<u8>,
+    ) -> impl Future<Output = Result<(Bytes, u64), TransportError>> + Send {
+        async move {
+            let bytes = self.api_request(url, body).await?;
+            let measured = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+            Ok((bytes, measured))
+        }
+    }
+
     /// Upload a blob (POST with binary body).
     fn upload(
         &self,

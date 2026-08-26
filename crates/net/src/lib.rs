@@ -55,6 +55,8 @@ pub use http::Method;
 pub use net::{AccountNet, AccountSpec, Net};
 pub use rate::{RateGeneration, RateLimit, RateLimitGovernor, RequestCost};
 pub use redirect::{FollowRedirects, RedirectAction, RedirectPolicy, RedirectStep};
-pub use request::{ByteStream, RequestBuilder, Response, StreamingResponse, parse_retry_after};
+pub use request::{
+    ByteStream, RequestBuilder, RequestByteCounter, Response, StreamingResponse, parse_retry_after,
+};
 pub use retry::RetryPolicy;
 pub use status_line::{status_line_code, status_line_is_success};

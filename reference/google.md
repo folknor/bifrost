@@ -107,12 +107,37 @@ variable set after a client is built does not affect that client.
 
 Rate limits are registered against the hosts derived from these configured
 bases, not against literal production hostnames - a redirected base was
-otherwise completely unmetered. The same host is registered once: Gmail and
-Calendar share `www.googleapis.com` in production, and registering it twice
-would install a second bucket for one host so the effective limit became
-whichever registration won. A base that fails to parse falls back to the
-production host, so a malformed override meters the real host rather than
-nothing.
+otherwise completely unmetered. Each declaration carries the engine
+`AccountId` as its `quota_scope`, so Gmail's per-user quota is per account
+rather than pooled across every account in the process that happens to share
+`www.googleapis.com`. The same `(host, quota_scope)` key is registered once:
+Gmail and Calendar share `www.googleapis.com` in production, and registering it
+twice would install a second bucket for one key so the effective limit became
+whichever registration won. Because this account declares exactly one scope per
+host, its requests need no `RequestBuilder::quota_scope` override - the
+account-level default resolves unambiguously. A base that fails to parse falls
+back to the production host, so a malformed override meters the real host rather
+than nothing.
+
+### Per-batch byte accounting
+
+`GmailClient` carries an optional `ByteTally`. `metered()` hands back a handle
+that is one `Arc` bump over the same client and reports every buffered
+response's request-local `bytes_in` into a fresh accumulator; each engine
+stream takes one at construction and each emitted batch `take`s it, so
+consecutive batches partition the traffic. The record sits at `send_recorded`,
+the single point every buffered request leaves through, which is what keeps
+`delete`, `post_no_content` and caller-built `execute_builder` requests counted
+rather than free.
+
+This matters because one batch is routinely many requests: an inventory batch
+covers a `users.messages.list` page plus up to 32 concurrent
+`users.messages.get` calls, and a mutation batch covers `batchModify` plus any
+label refresh and per-id TRASH fallback. The two remaining zero-valued sites are
+genuinely synthetic - `discover_cursor_scopes` returns a constant, and a
+`discover_memberships` cache hit performs no request - and say so at the call
+site. Blob batches keep their own exact transferred size and do not use the
+accumulator.
 
 `GoogleAccountFactory` carries an `Arc<GmailClient>` and an optional
 `PubSubConfig`. `open(account_id)` asks the client for an
@@ -749,7 +774,9 @@ share a single `mutation_stream` driver:
     including the lane-preservation rule, are pinned by
     `the_destroy_trash_fallback_downgrades_only_what_it_trashed`. There is no
     hermetic end-to-end test of `apply_destroy` itself, because the crate has
-    no scripted-transport seam and the testing rules forbid a socket.
+    the scripted bifrost-net transport seam, which exercises the production
+    retry, redirect, rate-limit, metering, and token-refresh pipeline without a
+    socket.
 - The driver reads one item ahead at the 1000-item boundary. Every
   final mutation batch is marked `PageBoundary::Final`, including a
   stream whose item count is exactly divisible by 1000, followed by

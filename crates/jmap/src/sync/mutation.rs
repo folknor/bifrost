@@ -286,6 +286,9 @@ fn mutation_stream<T: HttpTransport>(
                                 items: rejected,
                                 page_boundary: PageBoundary::Page,
                                 server_latency: started.elapsed(),
+                                // Locally rejected before any wire call:
+                                // `apply_batch` returned `None` precisely
+                                // because it had nothing to send.
                                 bytes_in: 0,
                                 checkpoint: None,
                             });
@@ -384,6 +387,12 @@ async fn apply_batch<T: HttpTransport>(
         // state for it would spend a round trip to send nothing.
         return Ok(None);
     }
+    // One emitted batch here can cost up to four `/jmap/api` POSTs: a
+    // state probe, the `Email/set`, a re-probe after a `stateMismatch`,
+    // and the retried set. The accumulator is what makes the conflict
+    // path report its real cost instead of only the last call's.
+    let (mail, tally) = mail.metered();
+    let mail = &mail;
     let mut state = current_or_probe_state(mail, email_states, account_id).await?;
 
     let mut response = match send_set(mail, &state, &ids, kind, foreign_account).await {
@@ -408,7 +417,13 @@ async fn apply_batch<T: HttpTransport>(
                     // `Email/set` did cross the wire. Convert the
                     // method error into a per-item `Failed` lane so the
                     // engine drives `Retry::AfterStateRefresh` per id.
-                    return Ok(Some(state_mismatch_failed_batch(err, kind, ids, started)));
+                    return Ok(Some(state_mismatch_failed_batch(
+                        err,
+                        kind,
+                        ids,
+                        started,
+                        tally.take(),
+                    )));
                 }
                 Err(err) => return Err(err),
             }
@@ -437,7 +452,7 @@ async fn apply_batch<T: HttpTransport>(
         items: results,
         page_boundary: PageBoundary::Page,
         server_latency: started.elapsed(),
-        bytes_in: 0,
+        bytes_in: tally.take(),
         checkpoint: None,
     }))
 }
@@ -495,6 +510,7 @@ fn state_mismatch_failed_batch(
     kind: &MutationKind,
     ids: Vec<ObjectId>,
     started: Instant,
+    bytes_in: u64,
 ) -> Batch<ItemOutcome<MutationSuccess>> {
     let operation = operation_for_kind(kind);
     let mut results = Vec::with_capacity(ids.len());
@@ -522,7 +538,7 @@ fn state_mismatch_failed_batch(
         items: results,
         page_boundary: PageBoundary::Page,
         server_latency: started.elapsed(),
-        bytes_in: 0,
+        bytes_in,
         checkpoint: None,
     }
 }
@@ -800,7 +816,8 @@ mod tests {
         // classified `ConcurrencyConflict -> Retry::AfterStateRefresh`.
         let err = crate::Error::Method(state_mismatch_method_error());
         let ids = vec![ObjectId("m1".into()), ObjectId("m2".into())];
-        let batch = state_mismatch_failed_batch(err, &MutationKind::Destroy, ids, Instant::now());
+        let batch =
+            state_mismatch_failed_batch(err, &MutationKind::Destroy, ids, Instant::now(), 0);
 
         assert_eq!(batch.items.len(), 2);
         for (idx, item) in batch.items.iter().enumerate() {

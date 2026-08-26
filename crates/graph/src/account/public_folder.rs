@@ -1094,6 +1094,12 @@ pub(crate) fn public_folder_inventory_stream(
             bifrost_types::InventoryCoverageReport::complete(
                 bifrost_types::CoverageDomain::full(scope.clone()),
             ),
+            // The public-folder arm reads over EWS, and `EwsClient`
+            // composes `AccountNet` directly rather than routing through
+            // `GraphClient`'s wire funnel, so no `GraphClient`-level
+            // accumulator can observe its traffic. Reported as zero
+            // rather than guessed.
+            0,
         );
         yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion::complete(
             bifrost_types::CoverageDomain::full(scope.clone()),
@@ -1408,7 +1414,10 @@ pub(crate) fn public_folder_changes_stream(
                     }
                 };
                 let checkpoint = Checkpoint::Change(advanced.clone());
-                yield batch(changes, PageBoundary::Final, Some(advanced));
+                // EWS-served: see the inventory arm above - the byte
+                // accounting seam is on `GraphClient`, which this path
+                // does not use.
+                yield batch(changes, PageBoundary::Final, Some(advanced), 0);
                 yield SyncEvent::Done(Some(checkpoint));
             }
         }

@@ -168,12 +168,46 @@ pub(crate) struct ClientInner<T: HttpTransport = ReqwestTransport> {
 /// across tasks freely.
 pub(crate) struct Client<T: HttpTransport = ReqwestTransport> {
     inner: Arc<ClientInner<T>>,
+    /// Where this handle reports request-local inbound bytes, if
+    /// anywhere. `None` on every ordinary client; a sync stream that
+    /// needs per-batch accounting takes a metered handle via
+    /// `metered()`. Kept OUTSIDE `ClientInner` deliberately: forking
+    /// the inner would fork the session-state mutex, and two clients
+    /// with independent session state is a correctness bug, not an
+    /// accounting detail.
+    tally: Option<ByteTally>,
+}
+
+/// Inbound payload bytes attributed to one engine batch.
+///
+/// An engine batch here is one `/jmap/api` POST carrying several
+/// method calls, and a paged walk issues one per page, so the bytes
+/// are summed on an accumulator owned by one stream rather than
+/// sampled off the account-cumulative bandwidth meter - which is
+/// shared by every concurrent request on the account and would
+/// attribute another scope's traffic to this batch.
+///
+/// `take` reads and resets, so consecutive batches from one stream
+/// partition the bytes rather than each reporting a running total.
+#[derive(Clone, Default)]
+pub(crate) struct ByteTally(Arc<std::sync::atomic::AtomicU64>);
+
+impl ByteTally {
+    fn add(&self, n: u64) {
+        self.0.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Bytes recorded since the previous `take`.
+    pub(crate) fn take(&self) -> u64 {
+        self.0.swap(0, Ordering::Relaxed)
+    }
 }
 
 impl<T: HttpTransport> Clone for Client<T> {
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
+            tally: self.tally.clone(),
         }
     }
 }
@@ -289,6 +323,7 @@ impl ClientBuilder {
         let session: Session = serde_json::from_slice(&session_bytes)?;
 
         Ok(Client {
+            tally: None,
             inner: Arc::new(ClientInner {
                 state: std::sync::Mutex::new(Arc::new(SessionState::derive(session)?)),
                 session_url,
@@ -465,6 +500,7 @@ impl<T: HttpTransport> Client<T> {
             ));
         }
         Ok(Client {
+            tally: None,
             inner: Arc::new(ClientInner {
                 state: std::sync::Mutex::new(Arc::new(SessionState::derive(session)?)),
                 session_url,
@@ -520,12 +556,15 @@ impl<T: HttpTransport> Client<T> {
     ) -> crate::Result<response::Response> {
         let body = serde_json::to_vec(request).map_err(crate::Error::RequestEncode)?;
         let state = self.session_state();
-        let bytes = self
+        let (bytes, bytes_in) = self
             .inner
             .transport
-            .api_request(state.api_url(), body)
+            .api_request_measured(state.api_url(), body)
             .await
             .map_err(crate::Error::from)?;
+        if let Some(tally) = self.tally.as_ref() {
+            tally.add(bytes_in);
+        }
         let response: response::Response = serde_json::from_slice(&bytes)?;
         if response.session_state() != state.session().state() {
             self.inner.session_updated.store(false, Ordering::Release);
@@ -554,6 +593,24 @@ impl<T: HttpTransport> Client<T> {
 
     pub(crate) fn is_session_updated(&self) -> bool {
         self.inner.session_updated.load(Ordering::Acquire)
+    }
+
+    /// A handle over the same client - same transport, same session
+    /// state - that reports every `/jmap/api` response's inbound bytes
+    /// into a fresh accumulator.
+    ///
+    /// One accumulator per stream, not per client: the returned handle
+    /// is the only one recording into it, so concurrent work on other
+    /// scopes cannot contaminate the total.
+    pub(crate) fn metered(&self) -> (Self, ByteTally) {
+        let tally = ByteTally::default();
+        (
+            Self {
+                inner: Arc::clone(&self.inner),
+                tally: Some(tally.clone()),
+            },
+            tally,
+        )
     }
 
     /// Access the underlying transport.

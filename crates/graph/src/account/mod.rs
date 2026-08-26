@@ -250,6 +250,26 @@ impl EtagIndex {
 }
 
 impl GraphAccount {
+    /// An account view whose every request reports its inbound payload
+    /// bytes into a fresh batch accumulator.
+    ///
+    /// The shared-mailbox clients are enrolled in the SAME accumulator
+    /// rather than left unmetered: a scope served by a foreign mailbox
+    /// issues its requests through those handles, and leaving them out
+    /// would report every such batch as having cost nothing.
+    pub(crate) fn metered(&self) -> (Self, crate::client::ByteTally) {
+        let (client, tally) = self.client.metered();
+        let shared_clients = self
+            .shared_clients
+            .iter()
+            .map(|(key, client)| (key.clone(), client.with_tally(tally.clone())))
+            .collect();
+        let mut metered = self.clone();
+        metered.client = client;
+        metered.shared_clients = Arc::new(shared_clients);
+        (metered, tally)
+    }
+
     pub(crate) fn new(
         client: GraphClient,
         push_mode: PushMode,
