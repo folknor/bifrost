@@ -202,6 +202,12 @@ impl HttpTransport for ReqwestTransport {
     }
 }
 
+/// Ceiling on the passed-through 3xx body preserved by `open_sse`'s
+/// error path. Mirrors bifrost-net's own 4 KB status-body cap: enough
+/// for a provider's explanatory document, bounded against a hostile
+/// stream.
+const PASSTHROUGH_BODY_CAP: usize = 4096;
+
 impl SseTransport for ReqwestTransport {
     type ByteStream = ReqwestByteStream;
 
@@ -251,15 +257,29 @@ impl SseTransport for ReqwestTransport {
         // us is a passed-through redirect (304/305/306, or a
         // `Location`-less 3xx). Preserve its status and headers through
         // the same typed error boundary instead of discarding them
-        // behind a generic network error. The body is knowably empty:
-        // `ReqwestTransport` always rides bifrost-net's redirect loop,
-        // whose `PassThrough` arm deliberately replaces the body with
-        // an empty stream (`crates/net/src/request.rs`), so there is no
-        // problem-details document to capture here and this path does
-        // not pretend otherwise.
+        // behind a generic network error. The redirect loop hands the
+        // real body up rather than substituting an empty stream - a
+        // `Location`-less 3xx can carry an explanatory document - so
+        // drain a bounded prefix of it into the error the same way the
+        // buffered path preserves it. The read is bounded by the
+        // account's body inactivity timeout and by the cap below, so a
+        // hostile or stalled body cannot hang or bloat the failure
+        // path.
+        let mut body_stream = response.body;
+        let mut body: Vec<u8> = Vec::new();
+        use futures::StreamExt;
+        while let Some(chunk) = body_stream.next().await {
+            let Ok(chunk) = chunk else { break };
+            let remaining = PASSTHROUGH_BODY_CAP.saturating_sub(body.len());
+            if chunk.len() >= remaining {
+                body.extend_from_slice(&chunk[..remaining]);
+                break;
+            }
+            body.extend_from_slice(&chunk);
+        }
         Err(TransportError::from_net(bifrost_net::Error::Status {
             code: response.status,
-            body: Bytes::new(),
+            body: Bytes::from(body),
             headers: response.headers,
         }))
     }
@@ -374,5 +394,44 @@ mod tests {
             .expect("SSE headers succeed");
 
         assert_eq!(script.requests()[0].timeout, None);
+    }
+
+    /// The redirect loop hands a passed-through 3xx body up rather than
+    /// substituting an empty stream, and `open_sse`'s error path must
+    /// preserve it: a `Location`-less 3xx can carry the provider's
+    /// explanation of why the stream did not open.
+    #[tokio::test]
+    async fn sse_open_preserves_a_passed_through_3xx_body() {
+        let mut headers = header::HeaderMap::new();
+        headers.insert(
+            header::CONTENT_TYPE,
+            header::HeaderValue::from_static("application/json"),
+        );
+        let script = ScriptedDispatch::new([Canned::Stream {
+            status: reqwest::StatusCode::PERMANENT_REDIRECT,
+            headers,
+            chunks: vec![bytes::Bytes::from_static(b"{\"why\":\"gone\"}")],
+        }]);
+        let spec = AccountSpec::new(Some(Arc::new(StaticTokenSource::new("token", None))));
+        let account = scripted_net(&script, bifrost_net::NetConfig::default())
+            .attach_account(AccountId("sse-3xx-body".to_owned()), spec);
+        let transport = ReqwestTransport {
+            net: account,
+            headers: header::HeaderMap::new(),
+            authorization: Authorization::from_credentials_for_test(Credentials::basic(
+                "user", "secret",
+            )),
+            timeout: Duration::from_secs(30),
+        };
+
+        let err = match transport.open_sse("https://push.test/events", None).await {
+            Err(err) => err,
+            Ok(_) => panic!("a Location-less 308 cannot open a stream"),
+        };
+        assert_eq!(
+            err.body.as_deref(),
+            Some(&b"{\"why\":\"gone\"}"[..]),
+            "the passed-through body must reach the error"
+        );
     }
 }

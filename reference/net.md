@@ -256,10 +256,10 @@ payloads (used when `json()` is not the right encoding),
 default (see "Replay safety" below), and
 `without_bearer_auth()` for the pre-authenticated-URL and
 Basic-auth flows (Gmail upload URLs, JMAP Basic), which still want
-the shared retry / rate-limit / metering pipeline. The token-source
-short-circuit at `request.rs:375-390` skips `Authorization: Bearer`
-injection when `bearer_auth` is false; caller-provided headers go
-through unchanged.
+the shared retry / rate-limit / metering pipeline. The retry loop's
+token-source short-circuit skips `Authorization: Bearer` injection
+when `bearer_auth` is false; caller-provided headers go through
+unchanged.
 
 `AccountSpec::token_source` is optional. `Some` is wrapped in the
 single-flight refresher at attach time. `None` represents an account
