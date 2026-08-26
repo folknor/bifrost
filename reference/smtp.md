@@ -284,7 +284,10 @@ The admission gate participates in shutdown. Because `max_size` is enforced by a
 semaphore (async) and a live counter plus condvar (blocking), a checkout blocked
 on admission is reachable *only* through that gate: `shutdown()` closes the
 semaphore and wakes the availability waiters on the async side, and notifies the
-condvar on the blocking side. Async checkout additionally re-reads the pool state
+condvar on the blocking side. Blocking-side releases notify the condvar only
+while holding the pool mutex, because the checkout's failed reserve and its wait
+are atomic only against notifiers holding that mutex - a lock-free notify could
+land between the two and strand the waiter. Async checkout additionally re-reads the pool state
 after winning admission and before dialing. Without both halves of this a
 checkout could park forever, or - once a connection checked out before shutdown
 was returned and released its permit - dial a NEW connection through a pool that

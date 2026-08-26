@@ -332,6 +332,16 @@ impl Pool {
     fn release_live(&self) {
         let previous = self.live.fetch_sub(1, Ordering::AcqRel);
         debug_assert!(previous > 0);
+        // The notify must happen under the connections lock. A checkout's
+        // failed `try_reserve` and its `wait` are atomic only against
+        // notifiers holding the same mutex: notifying lock-free here could
+        // fire in the window between the two, and a Condvar notification is
+        // not sticky, so the waiter would park with nobody left to wake it.
+        // Every caller has already dropped the lock (recycle and shutdown
+        // drop their guards before releasing), so acquiring it here cannot
+        // deadlock. A poisoned lock still holds the mutex, which is all the
+        // notify ordering needs.
+        let _guard = self.connections.lock();
         self.available.notify_one();
     }
 }

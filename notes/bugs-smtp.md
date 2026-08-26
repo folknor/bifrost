@@ -26,9 +26,19 @@ keeping, because they are not visible from the code alone:
   returned and released its permit, able to dial a new connection through a
   closed pool. Closed by `admission.close()` plus `notify_waiters()` in
   `shutdown()` and a pool-state recheck after admission and before dialing.
-  The blocking pool's condvar equivalent was audited and was already correct;
+  The blocking pool's condvar equivalent was audited and ruled already correct;
   it gained only a `notify_all()` for the case where the checked-out connection
-  is never returned at all.
+  is never returned at all. The close pass found that ruling true for shutdown
+  but false for the routine release path: `release_live` notified the condvar
+  without holding the connections mutex, and a checkout's failed `try_reserve`
+  followed by `wait` is atomic only against notifiers holding that mutex, so a
+  broken connection dropped concurrently could fire its notify into the window
+  between the two and strand the waiter (a Condvar notification is not sticky;
+  the async `Notify` stores a permit, so only the blocking half was exposed).
+  Closed by taking the connections lock around the notify in `release_live`.
+  No hermetic test pins it - the window is between an atomic and a `wait`
+  inside `connection()` and cannot be instrumented without wall-clock waits,
+  the same limit the blocking shutdown test already records.
 
 ## Final round rulings
 
