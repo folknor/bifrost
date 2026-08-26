@@ -266,6 +266,10 @@ pub(crate) enum Error {
     /// request crosses the side-effect boundary. Maps to
     /// `Request(Malformed)` / `ClientBug` in the conversion boundary.
     RequestEncode(serde_json::Error),
+    /// A request would exceed the session's advertised
+    /// `maxCallsInRequest`. Raised before the extra method is added, so
+    /// the oversized batch cannot reach the wire.
+    RequestCallLimit { max: usize },
     /// Inbound JSON response decoding failure. Produced when the JMAP
     /// server's reply or session document cannot be parsed as the
     /// expected shape. Maps to `Protocol(ParseFailed)` /
@@ -417,6 +421,9 @@ impl Display for Error {
         match self {
             Error::Transport(e) => write!(f, "Transport error: {e}"),
             Error::RequestEncode(e) => write!(f, "Request encode error: {e}"),
+            Error::RequestCallLimit { max } => {
+                write!(f, "Request exceeds maxCallsInRequest ({max})")
+            }
             Error::ResponseDecode(e) => write!(f, "Response decode error: {e}"),
             Error::Problem { details, .. } => write!(f, "Problem: {details}"),
             Error::Method(e) => write!(f, "Method error: {e}"),

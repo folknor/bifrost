@@ -61,6 +61,51 @@ impl Serialize for RawMethodCall {
     }
 }
 
+/// What the open session says about `maxCallsInRequest` (RFC 8620 §2).
+///
+/// Three states, kept apart deliberately. Only the third is a bound this
+/// request may enforce; collapsing the first two into "the limit is zero"
+/// turns a malformed or capability-shifted session into a request that
+/// can never contain a single method call. That matters because account
+/// opening issues probe requests *before* `sync::capabilities::build`
+/// validates the session, so an enforced zero would fail the open as a
+/// client bug and the session would never reach the classification -
+/// `CapabilityChanged` for an absent core capability,
+/// `Protocol(ContractViolation)` for a zero-valued one - that tells the
+/// engine how to recover. Not enforcing here loses nothing: the
+/// capability validation is the gate for both bad states, and a server
+/// that advertised no usable limit has no limit for us to respect.
+#[derive(Debug, Clone, Copy)]
+enum CallLimit {
+    /// The session document carries no `urn:ietf:params:jmap:core`
+    /// capability, so no limit was advertised at all.
+    Unadvertised,
+    /// The core capability is present but advertises `maxCallsInRequest:
+    /// 0`, which the spec forbids. A limit was advertised and it is not
+    /// usable.
+    Invalid,
+    /// A usable advertised bound.
+    Advertised(std::num::NonZeroUsize),
+}
+
+impl CallLimit {
+    fn read(session: &super::session::Session) -> Self {
+        match session.core_capabilities() {
+            None => CallLimit::Unadvertised,
+            Some(core) => std::num::NonZeroUsize::new(core.max_calls_in_request())
+                .map_or(CallLimit::Invalid, CallLimit::Advertised),
+        }
+    }
+
+    /// The bound to enforce, if any. `None` for both unusable states.
+    fn enforced(self) -> Option<usize> {
+        match self {
+            CallLimit::Unadvertised | CallLimit::Invalid => None,
+            CallLimit::Advertised(max) => Some(max.get()),
+        }
+    }
+}
+
 /// A JMAP request batch.
 pub(crate) struct Request<'x, T: HttpTransport = crate::transport_reqwest::ReqwestTransport> {
     client: &'x Client<T>,
@@ -68,6 +113,7 @@ pub(crate) struct Request<'x, T: HttpTransport = crate::transport_reqwest::Reqwe
     pub(crate) using: Vec<&'static str>,
     pub(crate) method_calls: Vec<RawMethodCall>,
     pub(crate) created_ids: Option<std::collections::HashMap<String, String>>,
+    max_calls: CallLimit,
 }
 
 impl<T: HttpTransport> Serialize for Request<'_, T> {
@@ -85,12 +131,14 @@ impl<T: HttpTransport> Serialize for Request<'_, T> {
 
 impl<'x, T: HttpTransport> Request<'x, T> {
     pub(crate) fn new(client: &'x Client<T>) -> Self {
+        let max_calls = CallLimit::read(&client.session());
         Request {
             using: vec!["urn:ietf:params:jmap:core"],
             method_calls: Vec::new(),
             created_ids: None,
             account_id: client.default_account_id(),
             client,
+            max_calls,
         }
     }
 
@@ -115,6 +163,11 @@ impl<'x, T: HttpTransport> Request<'x, T> {
         &mut self,
         mut method: M,
     ) -> Result<CallHandle<M>, crate::Error> {
+        if let Some(max) = self.max_calls.enforced()
+            && self.method_calls.len() >= max
+        {
+            return Err(crate::Error::RequestCallLimit { max });
+        }
         let call_id = format!("s{}", self.method_calls.len());
 
         // Auto-add capability

@@ -277,31 +277,59 @@ fn reconcile_hydration(
     // native for the routed foreign owner, literal otherwise - so an
     // unregistered-foreign id can never be correlated with a primary
     // object that happens to share its native part.
-    let by_native: HashMap<&str, &ObjectId> = requested
+    let requested_native: HashSet<&str> = requested
         .iter()
-        .map(|id| (wire_object_id(id, owner), id))
+        .map(|id| wire_object_id(id, owner))
         .collect();
-    let mut answered: HashSet<&str> = HashSet::new();
-    let mut items = Vec::new();
-
+    // Index the answer by native id, keeping only objects that were
+    // actually asked for. An object with no `id`, or one the batch never
+    // submitted, cannot be correlated with anything and is dropped rather
+    // than minted into an outcome for something nobody requested; the
+    // submitted id it failed to answer is picked up by the sweep below.
+    // A server that echoes the same id twice supplies one object: first
+    // wins, so a duplicated answer cannot displace the correlated one.
+    let mut by_native = HashMap::new();
     for email in list {
         let Some(native) = email.id().map(ToString::to_string) else {
-            // An object with no `id` cannot be correlated with anything
-            // that was asked for. Dropping it leaves its requested id in
-            // the unanswered sweep below.
             continue;
         };
-        // Answer the id the CALLER submitted, not a re-encoding of the id
-        // the server echoed: an unrequested or duplicated id would
-        // otherwise mint an outcome for something never asked for while
-        // the real id stayed silent.
-        let Some((native, id)) = by_native.get_key_value(native.as_str()) else {
-            continue;
-        };
-        if !answered.insert(native) {
-            continue;
+        if requested_native.contains(native.as_str()) {
+            by_native.entry(native).or_insert(email);
         }
-        let id = (*id).clone();
+    }
+    let not_found: HashSet<&str> = not_found.iter().map(EmailId::as_str).collect();
+    let mut items = Vec::new();
+
+    // Drive from the submitted slice, including repeated ids. One server
+    // object therefore satisfies every occurrence of that submitted id,
+    // preserving the stream's one-outcome-per-submission contract.
+    for id in requested {
+        let native = wire_object_id(id, owner);
+        let Some(email) = by_native.get(native).cloned() else {
+            let error = if not_found.contains(native) {
+                super::error::get_id_not_found(
+                    id.0.clone(),
+                    super::error::JmapErrorContext::message(
+                        bifrost_types::AccountOperation::Hydrate,
+                        id.0.clone(),
+                    ),
+                )
+            } else {
+                super::error::get_id_unanswered(
+                    &id.0,
+                    super::error::JmapErrorContext::message(
+                        bifrost_types::AccountOperation::Hydrate,
+                        id.0.clone(),
+                    ),
+                )
+            };
+            items.push(ItemOutcome::Failed(bifrost_types::BatchFailure::new(
+                BatchItemId(id.0.clone()),
+                error,
+            )));
+            continue;
+        };
+        let id = id.clone();
         let kind = match projection {
             Projection::FlagsOnly => HydratedObjectKind::FlagsOnly(
                 email
@@ -341,43 +369,6 @@ fn reconcile_hydration(
             blobs: Vec::new(),
         };
         items.push(ItemOutcome::Succeeded(BatchSuccess::new(item_id, hydrated)));
-    }
-
-    for missing in not_found {
-        let native = missing.to_string();
-        let Some((native, id)) = by_native.get_key_value(native.as_str()) else {
-            continue;
-        };
-        if !answered.insert(native) {
-            continue;
-        }
-        items.push(ItemOutcome::Failed(bifrost_types::BatchFailure::new(
-            BatchItemId(id.0.clone()),
-            super::error::get_id_not_found(
-                id.0.clone(),
-                super::error::JmapErrorContext::message(
-                    bifrost_types::AccountOperation::Hydrate,
-                    id.0.clone(),
-                ),
-            ),
-        )));
-    }
-
-    for id in requested {
-        let native = wire_object_id(id, owner);
-        if !answered.insert(native) {
-            continue;
-        }
-        items.push(ItemOutcome::Failed(bifrost_types::BatchFailure::new(
-            BatchItemId(id.0.clone()),
-            super::error::get_id_unanswered(
-                &id.0,
-                super::error::JmapErrorContext::message(
-                    bifrost_types::AccountOperation::Hydrate,
-                    id.0.clone(),
-                ),
-            ),
-        )));
     }
 
     items
@@ -545,6 +536,27 @@ mod tests {
                 .expect("m1 is accounted for"),
             ItemOutcome::Succeeded(_)
         ));
+    }
+
+    #[test]
+    fn repeated_submitted_ids_each_receive_an_outcome() {
+        let requested = vec![ObjectId("m1".to_string()), ObjectId("m1".to_string())];
+        let outcomes = reconcile_hydration(
+            &requested,
+            vec![email("m1")],
+            &[],
+            Projection::FlagsOnly,
+            "s1",
+            None,
+        );
+
+        assert_eq!(outcomes.len(), 2);
+        assert!(
+            outcomes
+                .iter()
+                .all(|outcome| matches!(outcome, ItemOutcome::Succeeded(_)))
+        );
+        assert_eq!(reported_ids(&outcomes), vec!["m1", "m1"]);
     }
 
     /// Outcomes are keyed by the id the CALLER submitted. A foreign id is

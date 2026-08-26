@@ -3,98 +3,81 @@
 Scope: `crates/jmap/` - dispatch, transport, per-RFC module pattern, capability
 negotiation, error model, and the `Account` impl under `crates/jmap/src/sync/`.
 
-Hunter note: baseline was green (522 tests pass, clippy/gremlins clean), so
-everything below is a live gap the suite does not cover.
+Final round status: all accepted findings are resolved. Two entries below remain
+only because they were rejected on the merits, with the ruling preserved in
+full; one records a regression the round-2 cold review caught in the J8 fix, and
+the last is a residual observation left deliberately unfixed.
 
-## J7. Duplicate submitted ids collapse in hydration's closed accounting
+## J8 follow-up. The call-count guard read an absent limit as zero
 
-**MEDIUM confidence, low severity.** `hydrate::reconcile_hydration` builds
-`by_native: HashMap<&str, &ObjectId>` from the submitted slice. If the caller
-submits the same id twice in one batch, one entry is silently lost and the batch
-returns fewer outcomes than inputs - a hole in the "every submitted id leaves on
-exactly one lane" contract the module otherwise defends rigorously. Dedupe on
-entry (and document it) or key by index.
+The first cut of the J8 guard snapshotted `maxCallsInRequest` with
+`map_or(0, ..)`, so a session with no `urn:ietf:params:jmap:core` block produced
+`max_calls = 0` and every method call failed as `RequestCallLimit`. Account
+opening was the casualty: `seed_account_state` issues its probes before
+`sync::capabilities::build` validates the session, so a malformed or
+capability-shifted session terminated as `Request(Malformed)` / `ClientBug` and
+never reached `SyncState(CapabilityChanged)` / `RestartAccount` (absent core
+capability) or `Protocol(ContractViolation)` (zero-valued limit) - exactly the
+classifications those sessions depend on for recovery.
 
-## J8. `maxCallsInRequest` is enforced at exactly one call site
+Fixed by making the three states distinct in the type rather than in a comment.
+`CallLimit` is `Unadvertised`, `Invalid` (advertised zero, which RFC 8620
+forbids) or `Advertised(NonZeroUsize)`, and only the third enforces. Capability
+validation remains the single gate for both bad sessions. Two open-path tests in
+`sync::factory` pin it: each drives `seed_account_state` over the scripted
+transport for one of the bad sessions and asserts both that the probes still go
+out and that `capabilities::build` still yields the intended classification.
+Both were ablated against the `map_or(0, ..)` behaviour and failed with
+`RequestCallLimit { max: 0 }`.
 
-**MEDIUM confidence.** `Request::call` auto-appends to `using` and pushes calls
-with no count check. Only `batched_open_probes` consults the advertised call
-count; `send_methods_within` checks encoded *size* only. Multi-call flows built
-elsewhere (`send_message` with its result-referenced Email/set +
-EmailSubmission/set + onSuccessUpdateEmail, the tuple batches up to `M8`) can
-exceed a conservative server's `maxCallsInRequest` and take a whole-request
-`limit` rejection. The size guard was deliberately made a *required* argument so a
-call site "cannot forget the question" - the call-count guard deserves the same
-treatment, in `Request` itself rather than per-caller.
+## Residual, not fixed: `reenable_current_push_set` reads its two values non-atomically
 
-## J9. `bytes_in: 0` on all eleven `Batch` constructions in `sync/`
+The reader's reconnect replay takes the `enabled` guard, drops it, then takes
+the `push_state` guard, so the pair it replays is not read under one critical
+section. Every mutator (subscribe, unsubscribe) holds both guards across its
+apply and commits under them, so the worst observable outcome is replaying a
+data-type union with a position from a moment later - both individually valid,
+and the reconciler treats the reconnect as a full `Unknown` reconcile regardless.
+Left alone because closing it means holding the `enabled` guard across the
+`set_push_data_types` await in the reader, which introduces exactly the kind of
+lock-across-await teardown change this arc has repeatedly seen open a new hole
+one layer up. Recorded so a future round does not have to rediscover it.
 
-**MEDIUM confidence, systematic.** Every stream reports zero bytes received.
-`set_bandwidth_cap` delegates to `bifrost-net::AccountNet`, so caps may still
-function, but any engine-side metering, cost accounting, or per-scope bandwidth
-attribution reading `Batch::bytes_in` sees zero from this protocol. Either
-populate it (the transport returns `Bytes`; the length is right there) or the
-field is misleading.
+## J11. Rejected: the first reader pass sends a disable frame
 
-## J10. Push reconnect emits `Reconnected` with no invalidation
+`enabled` starts empty at `open()`, and `apply_push_set` maps an empty set to
+`client.disable_push_ws()`. The first reader pass therefore disables push on a
+connection nobody had enabled, then announces `Reconnected`.
 
-**LOW-MEDIUM confidence, contract question.** After a disconnect/reconnect cycle
-the reader emits `WatchEvent::Reconnected` and nothing else. If the engine does
-not treat `Reconnected` as an implicit full invalidation, everything that changed
-during the outage waits for the next poll. Given J2 (no `pushState` replay), the
-reconnect path has *no* mechanism at all for catching up. Emitting a
-`Coalesced`/`Unknown` invalidation alongside `Reconnected` would close it cheaply;
-the engine contract needs confirming against `crates/sync/`.
+This is not a contract defect. `WatchEvent::Reconnected` is explicitly a
+connection-health transition in `bifrost-types`, not proof that at least one
+scope is subscribed. The empty data-type set is the applied desired state, and
+the disable frame makes that state explicit on every newly opened connection.
+The sync reconciler deliberately turns every reconnect into a full `Unknown`
+reconcile, including this first connection, so suppressing the event or skipping
+the frame would create a second meaning for the same transition and make the
+reader's applied-state guarantee conditional. The extra frame is cosmetic wire
+traffic with no incorrect state or missing coverage, so it stays.
 
-## J11. Minor: the reader's first `reenable_current_push_set` sends a *disable* frame
+## Structural story. Rejected: collapse push state into one mutex-protected object
 
-**LOW confidence, cosmetic.** `enabled` starts empty at `open()`, and
-`apply_push_set` maps an empty set to `client.disable_push_ws()`. So the very
-first pass of the reader disables push on a connection nobody had enabled, then
-announces `Reconnected`. Harmless in practice but it makes the "Reconnected means
-a live connection whose subscription applied" invariant read oddly - an applied
-*empty* subscription is not push.
+The original argument treated `WsState.enabled`, the subscriptions registry,
+and the then-missing RFC 8887 `pushState` as three pieces of one object mutated
+by two actors under two locks with no transaction boundary. It proposed a
+single `PushSubscriptionState` mutex with apply as its only mutator.
 
-## The structural story
+That premise is now stale. `pushState` exists, and subscribe, unsubscribe, and
+the reader use one lock order. Subscribe and unsubscribe hold the registry,
+enabled-set, and push-position guards across the sole apply await, then commit
+all three only after success; cancellation and apply failure therefore mutate
+nothing. The reader can update the position only after acquiring the same final
+guard, so it cannot interleave a new position into an in-flight reconfigure.
 
-**The inventory walk should not be a position-paged loop at all.** Three
-parameterizations (primary / foreign / bounded page) share one loop, which is
-right, but the loop's contract with the server is the wrong one. JMAP gives you
-two stable mechanisms - anchored paging, and `Email/queryChanges` - and the crate
-uses neither, then hand-rolls a defensive overshoot rule (the `Some(0)` arm) to
-paper over one symptom of the instability while leaving the underlying skip open.
-The rewrite argued for: make the walk anchor-based, freeze the result set with a
-`before:` bound derived from open time, and delete the overshoot special-case
-entirely, because with a frozen anchored window a zero-entry partition genuinely
-does mean end-of-inventory. That is a real simplification, not just a fix.
-
-**Push state belongs in one place, and it currently lives in three.**
-`WsState.enabled`, the `subscriptions` registry, and the (missing) `pushState` are
-three pieces of one connection-level subscription object, mutated by two different
-actors (the `subscribe`/`unsubscribe` callers and the reader task) under two
-different locks with no transactional boundary. J2 and J3 are both symptoms of
-that. Collapse them into a single `PushSubscriptionState` behind one mutex with
-`apply(&self, client) -> Result` as the *only* mutator: register-then-apply
-becomes apply-then-commit by construction, and `pushState` has an obvious home.
-Small rewrite, real payoff.
-
-**The session-staleness signal is detected in the transport and consumed 300
-seconds later in a discovery poller.** That is a long wire for a one-bit fact. The
-detector should either drive the reopen directly (a watch channel the lifecycle
-stream selects on, so the reopen is prompt rather than paced by an unrelated poll
-interval) or `refresh_session` should be wired in for the cases where in-place
-refresh is genuinely sufficient. Right now the crate has both mechanisms and uses
-neither properly.
-
-**On what to keep:** the error translation boundary (`sync/error.rs`), the cursor
-envelope (`state.rs`), the foreign-account object-id codec, and
-`reconcile_hydration` are genuinely good - closed accounting, right recovery
-classes, well-pinned. Nothing there argues for restructuring.
-
-## Out-of-scope observations
-
-- `crates/types/`: `ScopeLifecycle::Renamed` carries two `MembershipScope`s and no
-  name, which makes a rename event uninformative for any protocol whose container
-  ids are stable across rename (JMAP, Graph, Gmail).
-- `crates/types/`: `Batch::bytes_in` - if no consumer reads it, it should go; if
-  one does, four protocol crates may be feeding it zeros (only JMAP verified).
+The three values also have deliberately different meanings and lifetimes. The
+registry is the requested handle set. `enabled` is the last wire-applied union.
+`pushState` is retained across a non-empty reconfigure but cleared when the
+union becomes empty. Combining their storage would reduce the number of mutex
+objects, but it would neither strengthen the existing transaction boundary nor
+encode those lifetime rules in a type. It would instead rewrite working,
+test-pinned cancellation and replay machinery with no surviving invariant gap.
+The current state is kept.

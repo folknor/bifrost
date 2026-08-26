@@ -30,6 +30,25 @@ pub(crate) trait JmapMethod: Serialize + Send {
 
 Adding a new method: define a struct, use `define_get_method!` / `define_set_method!` etc. Zero central files touched.
 
+`Request` snapshots the session's `maxCallsInRequest` when it is constructed and
+refuses the first call that would exceed it, before serializing or appending
+that method. The guard covers tuple batches, explicit result-reference flows,
+and WebSocket requests through the same `call` door, so no call site can
+accidentally put an oversized method batch on the wire.
+
+The snapshot is a three-state `CallLimit`, not a number: `Unadvertised` (no
+`urn:ietf:params:jmap:core` block), `Invalid` (the block advertises
+`maxCallsInRequest: 0`, which RFC 8620 forbids), and `Advertised`, which is the
+only state that enforces. Treating the first two as a limit of zero would make
+every request unable to hold a single call - and because open issues its probe
+requests through `seed_account_state` *before* `sync::capabilities::build`
+validates the session, that failure would land as `Request(Malformed)` /
+`ClientBug` and preempt the classifications the engine actually needs:
+`SyncState(CapabilityChanged)` / `RestartAccount` for an absent core capability,
+`Protocol(ContractViolation)` for a zero-valued one. Capability validation is
+the gate for both bad sessions; the request builder enforces only a limit the
+server actually advertised.
+
 The method-generation macros are crate-private. They are re-exported
 inside the crate root only so sibling modules can keep the existing
 `crate::define_*` call sites without exporting macro names to consumers.
@@ -300,7 +319,7 @@ The CAS is exact: an expected state advances only an entry containing that state
 
 `get_stream` (hydration) supports `Projection::FlagsOnly` and `Metadata` for Email; raw-MIME projections fatal-unsupported (whole-message raw is `open_raw_rfc822`: one `Email/get` for `blobId` then `client.download`). Batches size at `max_objects_in_get`. Hydrated emails emit `ItemOutcome::Succeeded`; locally-invalid ids or transport-drop ambiguity flow through `Failed` / `Uncertain` rather than terminating the stream. A foreign-qualified id's `Metadata` entry is qualified exactly as the foreign inventory mints it - memberships re-encoded `Folder(encode_foreign(accountId, mailboxId))` plus the `Mailbox(accountId)` owner tag, entry and blob ids in the object namespace. This is the attribution channel for foreign changes: the account-level change stream emits only qualified ids, and hydration is where the consumer learns which shared folder a message sits in.
 
-Each `Email/get` answer is reconciled against the ids the batch submitted (`hydrate::reconcile_hydration`, pure and unit-pinned), so every submitted id leaves on exactly one lane. `notFound` alone cannot carry that: an absent `notFound` decodes as empty (see "`/get` response leniency"), and a present one can still omit an id the server also left out of `list`. Outcomes are keyed by the id the CALLER submitted - a response object whose id was not requested, was already answered, or is missing entirely is discarded rather than minted into an outcome. Ids named in `notFound` emit `Failed` with `NotFound(Message)`; ids answered in neither list emit `Failed` with `Protocol(PartialResponse)` + `Attempt(Acknowledged)`, which the shared recovery mapping retries rather than dropping (a terminal contract violation would lose the id for a condition the next `Email/get` usually clears). `contacts::get_cards` reconciles the same way, routing both classes into `Page::failed_ids` so the consumer preserves the row instead of reading absence as a deletion.
+Each `Email/get` answer is reconciled against the ids the batch submitted (`hydrate::reconcile_hydration`, pure and unit-pinned), so every submitted id leaves on exactly one lane. Repeated submitted ids remain repeated submissions: reconciliation drives from the submitted slice, and one correlated response object supplies one outcome for every occurrence. `notFound` alone cannot carry that: an absent `notFound` decodes as empty (see "`/get` response leniency"), and a present one can still omit an id the server also left out of `list`. Outcomes are keyed by the id the CALLER submitted - a response object whose id was not requested, was already answered, or is missing entirely is discarded rather than minted into an outcome. Ids named in `notFound` emit `Failed` with `NotFound(Message)`; ids answered in neither list emit `Failed` with `Protocol(PartialResponse)` + `Attempt(Acknowledged)`, which the shared recovery mapping retries rather than dropping (a terminal contract violation would lose the id for a condition the next `Email/get` usually clears). `contacts::get_cards` reconciles the same way, routing both classes into `Page::failed_ids` so the consumer preserves the row instead of reading absence as a deletion.
 
 #### `/get` response leniency
 

@@ -2196,6 +2196,116 @@ mod tests {
         assert_eq!(requests[1]["methodCalls"][0][0], "Mailbox/get");
     }
 
+    /// A session document with no `urn:ietf:params:jmap:core` capability
+    /// block at all.
+    fn session_without_core_capability() -> Session {
+        serde_json::from_value(json!({
+            "capabilities": {"urn:ietf:params:jmap:mail": {}},
+            "accounts": {
+                "primary": {"name": "Primary", "isPersonal": true, "isReadOnly": false, "accountCapabilities": {"urn:ietf:params:jmap:mail": {}}}
+            },
+            "primaryAccounts": {"urn:ietf:params:jmap:mail": "primary"},
+            "username": "user@example.test",
+            "apiUrl": "https://example.test/jmap/api",
+            "downloadUrl": "https://example.test/download/{accountId}/{blobId}/{name}/{type}",
+            "uploadUrl": "https://example.test/upload/{accountId}",
+            "eventSourceUrl": "https://example.test/eventsource",
+            "state": "session-1"
+        }))
+        .expect("test session parses")
+    }
+
+    /// An absent core capability advertises no call limit, so the probes
+    /// must still go out - serially, since nothing licenses batching.
+    /// The request builder must NOT read "no advertised limit" as "the
+    /// limit is zero": open issues its probes before
+    /// `capabilities::build` validates the session, so a zero enforced
+    /// here would fail the open as a client bug and the session would
+    /// never reach `SyncState(CapabilityChanged)` / `RestartAccount`,
+    /// which is the classification that tells the engine to reopen.
+    #[tokio::test]
+    async fn an_absent_core_capability_still_probes_and_classifies_as_a_capability_change() {
+        let client = scripted_client_with_session(
+            session_without_core_capability(),
+            serial_open_replies("primary", "p"),
+        );
+        let primary = client
+            .primary_account::<capability::Mail>()
+            .expect("primary mail account");
+
+        let seed = seed_account_state(&primary)
+            .await
+            .expect("probes must not be refused for want of an advertised limit");
+
+        assert_eq!(seed.0, "email-p");
+        assert_eq!(client.transport().requests().len(), 2, "one per probe");
+
+        let error = crate::sync::capabilities::build(
+            &client.session(),
+            crate::sync::capabilities::PimSupport {
+                submission: false,
+                max_delayed_send: 0,
+                foreign_submission: false,
+                vacation: false,
+                quota: false,
+                sieve: false,
+                contacts: false,
+                calendar: false,
+            },
+        )
+        .expect_err("a session with no core capability is refused");
+        assert_eq!(
+            error.kind(),
+            &bifrost_types::AccountErrorKind::SyncState(
+                bifrost_types::SyncStateErrorKind::CapabilityChanged
+            )
+        );
+    }
+
+    /// `maxCallsInRequest: 0` is an advertised limit that is not usable.
+    /// It is a `Protocol(ContractViolation)` decided by
+    /// `capabilities::build`, and enforcing it in the request builder
+    /// would preempt that ruling with `Request(Malformed)` / `ClientBug`
+    /// raised from the probe.
+    #[tokio::test]
+    async fn a_zero_call_limit_still_probes_and_classifies_as_a_contract_violation() {
+        let client = scripted_client_with_session(
+            session_with_limits(0, 100_000),
+            serial_open_replies("primary", "p"),
+        );
+        let primary = client
+            .primary_account::<capability::Mail>()
+            .expect("primary mail account");
+
+        let seed = seed_account_state(&primary)
+            .await
+            .expect("a zero limit must not brick the probe");
+
+        assert_eq!(seed.1, "mailbox-p");
+        assert_eq!(client.transport().requests().len(), 2, "one per probe");
+
+        let error = crate::sync::capabilities::build(
+            &client.session(),
+            crate::sync::capabilities::PimSupport {
+                submission: false,
+                max_delayed_send: 0,
+                foreign_submission: false,
+                vacation: false,
+                quota: false,
+                sieve: false,
+                contacts: false,
+                calendar: false,
+            },
+        )
+        .expect_err("a zero-valued core limit is refused");
+        assert_eq!(
+            error.kind(),
+            &bifrost_types::AccountErrorKind::Protocol(
+                bifrost_types::ProtocolErrorKind::ContractViolation
+            )
+        );
+    }
+
     /// `maxSizeRequest` is the other hard limit, and it can fall between
     /// the individual probes and their batch - so the call-count check
     /// alone is not enough.

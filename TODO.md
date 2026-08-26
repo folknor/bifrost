@@ -4,6 +4,34 @@ Cross-crate work items surfaced by per-crate work but not fixable inside one
 crate. Each entry stands alone: symptom on the discovering side, what the other
 side would have to ship, what was done locally instead, and what remains wrong.
 
+## CalDAV and CardDAV sync batches do not report inbound bytes
+
+**Symptom (discovered while closing the bifrost-jmap byte-accounting audit).**
+`Batch::bytes_in` is consumed by the sync engine when it fuses inventory and
+change batches, and the field is part of the published protocol-neutral stream
+contract. JMAP, Google, and Graph now aggregate request-local transport counts,
+but every request-producing batch in `bifrost-caldav` and `bifrost-carddav`
+still sets `bytes_in: 0`. IMAP also has zero-valued account batches and needs a
+protocol-specific audit because its byte stream is not the shared HTTP seam.
+Those zeros make provider traffic invisible to engine-side per-scope accounting
+even though requests were performed.
+
+**What the other side would have to ship.** The DAV transport funnel needs a
+request-local inbound byte count covering success and any error path that later
+emits a batch, aggregated and cleared at each batch boundary. IMAP needs the
+equivalent count at its driver transcript boundary. Counts must describe bytes
+actually read, including retry and redirect traffic where applicable, rather
+than merely the decoded entity length.
+
+**What was done here instead.** JMAP was verified site by site. Its API batches
+use the existing `ByteTally`, blob batches report their downloaded body size,
+and its only zero-valued batches are local paths that perform no request. No
+other protocol crate was changed from inside the JMAP round.
+
+**What remains wrong.** CalDAV, CardDAV, and possibly IMAP still under-report
+real inbound traffic as zero. The published field must remain; the repair is to
+make it truthful, not remove it.
+
 ## bifrost-sync mutation retry storage is unbounded
 
 **Symptom (discovered in bifrost-sync).** A bulk mutation campaign retains its

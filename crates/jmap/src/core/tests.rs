@@ -473,6 +473,10 @@ mod envelope {
     /// request's account selection stays explicit, even though the generic
     /// client fallback is now stable.
     fn session(primary_accounts: Value) -> Session {
+        session_with_max_calls(primary_accounts, 8)
+    }
+
+    fn session_with_max_calls(primary_accounts: Value, max_calls: usize) -> Session {
         serde_json::from_value(json!({
             "capabilities": {
                 "urn:ietf:params:jmap:core": {
@@ -480,7 +484,7 @@ mod envelope {
                     "maxConcurrentUpload": 2,
                     "maxSizeRequest": 100_000,
                     "maxConcurrentRequests": 4,
-                    "maxCallsInRequest": 8,
+                    "maxCallsInRequest": max_calls,
                     "maxObjectsInGet": 256,
                     "maxObjectsInSet": 256,
                     "collationAlgorithms": []
@@ -507,6 +511,25 @@ mod envelope {
         let client = Client::with_transport(
             transport,
             session(primary_accounts),
+            "https://example.test/.well-known/jmap",
+        )
+        .expect("stub client builds");
+        Stub { client, sent }
+    }
+
+    fn stub_with_max_calls(
+        primary_accounts: Value,
+        max_calls: usize,
+        replies: impl IntoIterator<Item = String>,
+    ) -> Stub {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let transport = StubTransport {
+            sent: Arc::clone(&sent),
+            replies: Arc::new(Mutex::new(replies.into_iter().collect())),
+        };
+        let client = Client::with_transport(
+            transport,
+            session_with_max_calls(primary_accounts, max_calls),
             "https://example.test/.well-known/jmap",
         )
         .expect("stub client builds");
@@ -722,6 +745,30 @@ mod envelope {
 
         assert!(sent.is_none(), "an oversized batch reports no responses");
         assert_eq!(stub.request_count(), 0, "and sends nothing");
+    }
+
+    #[test]
+    fn request_construction_refuses_the_advertised_call_limit() {
+        let stub = stub_with_max_calls(mail_primary(), 1, []);
+        let mut request = stub.client.build();
+        request.call(TestGet::new()).expect("first call fits");
+
+        let error = match request.call(TestQuery::new()) {
+            Ok(_) => panic!("second call must exceed maxCallsInRequest"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, crate::Error::RequestCallLimit { max: 1 }));
+        assert_eq!(
+            request.method_calls.len(),
+            1,
+            "the rejected call is not added"
+        );
+        assert_eq!(
+            stub.request_count(),
+            0,
+            "construction never reaches the wire"
+        );
     }
 
     #[tokio::test]

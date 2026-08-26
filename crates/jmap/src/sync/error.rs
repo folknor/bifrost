@@ -117,6 +117,17 @@ pub(crate) fn into_account_error(error: crate::Error, ctx: JmapErrorContext) -> 
         )
         .try_build()
         .expect("valid account error classification"),
+        crate::Error::RequestCallLimit { max } => build(
+            AccountErrorKind::Request(RequestErrorKind::Malformed),
+            Cause::Request(RequestCause::Malformed {
+                detail: DiagnosticText::support_only(format!(
+                    "JMAP request exceeds maxCallsInRequest ({max})"
+                )),
+            }),
+            &ctx,
+        )
+        .try_build()
+        .expect("valid account error classification"),
         crate::Error::ResponseDecode(err) => build(
             AccountErrorKind::Protocol(ProtocolErrorKind::ParseFailed),
             Cause::Wire(WireCause::MalformedResponse {
