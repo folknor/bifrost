@@ -19,6 +19,66 @@ rather than appending to it.
 - Refusing a finding with a reason is a good outcome. Two have been rejected on
   the merits so far, both recorded below.
 
+## From the `bugs-smtp.md` arc (closed, 60d834c..8c365f0)
+
+This crate has both an async and a blocking transport half, both published and
+both load-bearing, and its central lesson is about them. `reference/smtp.md`
+carries a sentence that the halves are held in step deliberately, and the arc
+kept it true by recording exactly one asymmetry rather than letting a second
+appear. **Whatever changes in one half changes in the other**; the arc's own
+defects were repeatedly a fix landing in one half only.
+
+Machinery later work may build on and must not break:
+
+- **STARTTLS is defended in two layers in both halves**: the generic
+  surplus-bytes check after every state-managed reply parse, and an explicit
+  buffer gate before `upgrade_tls`. Layer 2 is defence in depth and is currently
+  shadowed by layer 1 on every reachable path - do not collapse them, and note
+  the first attempt's dedicated guard was unreachable while its test appeared to
+  pass, pinning a different fix entirely.
+- A surplus or unsolicited reply breaks the connection immediately, and a
+  connection carrying reply drift cannot be recycled. Both properties are pinned:
+  the stale reply surfaces loudly, and `has_broken()` blocks the recycle.
+- **The pool.** `PoolConfig::max_size` bounds live connections in both halves.
+  Async shutdown closes the admission semaphore and notifies waiters; async
+  checkout re-reads pool state after winning admission and before dialing. Async
+  recycle performs no I/O and has no await point, so there is no recycling future
+  to drop before its first poll and no blocking close in a `Drop`. The blocking
+  pool notifies `available` **while holding the connections mutex** - a condvar
+  notification is not sticky, so notifying outside the lock strands a waiter that
+  has just failed its `try_reserve`.
+- **The one deliberate asymmetry:** async `abort()` honours the operation
+  timeout, blocking `abort()` does not, because it is `Shutdown::Both`, a syscall
+  returning immediately, while only async `poll_shutdown` waits for the peer's
+  `close_notify`.
+- **Pipelined phase decoration is compiler-enforced.** `send_pipelined` is a
+  one-line funnel over `send_pipelined_inner`, whose error type `PhasedError` has
+  no `From<Error>` impl and no phase-less constructor, so `?` on an undecorated
+  SMTP result does not compile inside the driver. This replaced a call-site sweep
+  that had missed six negative-reply paths - the ones that actually run when a
+  relay rejects a recipient - and it immediately caught a seventh nobody had
+  listed. `SmtpError::phase()` is the sole phase authority;
+  `SmtpErrorContext` stores neither a phase nor a scope, so no call site can
+  attach a disagreeing one.
+- **Error scope.** Recipient-command transport failures carry NO `ErrorScope` in
+  either half. `ErrorScope`'s id-bearing variants take typed account-surface ids
+  and none can name an SMTP envelope address, so `ErrorScope::Account` falsely
+  located a single-transaction failure at the account. Correlation runs through
+  the batch item id.
+- All ten all-recipients-rejected early returns across both halves route through
+  one `reset_transaction` per half, keeping the connection on a positively
+  acknowledged RSET and aborting otherwise. A rejected `MAIL FROM` on the
+  pipelined path deliberately does not reset - it opened no transaction.
+
+Testing traps this crate recorded, worth carrying anywhere:
+
+- A `5.1.1` enhanced status classifies identically for every phase, so tests
+  written on it cannot distinguish what they appear to test. Reaching the
+  deciding branch took a bare `550` with no enhanced code.
+- Two `transcript.invalid` pool tests perform a DNS lookup **only on their
+  failure path**, which is the ablation path - so an ablation failure there can
+  look like a network flake when it is not.
+
 ## From the `bugs-jmap.md` arc (closed, 5407925..60d834c)
 
 Machinery later work may build on and must not break:

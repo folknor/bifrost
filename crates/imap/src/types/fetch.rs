@@ -334,7 +334,14 @@ pub struct StoreResult {
     ///
     /// Empty when `.SILENT` operations are used.
     pub fetches: Vec<FetchResponse>,
-    /// Response code from the tagged OK, if any.
+    /// Completion status from the tagged response.
+    ///
+    /// Always `Ok` for a STORE sent without `UNCHANGEDSINCE` - a tagged
+    /// `NO` there is a plain refusal and surfaces as `Error::No`. A
+    /// conditional STORE preserves tagged `NO` so callers can attribute a
+    /// `[MODIFIED ...]` rejection to the named messages.
+    pub status: super::response::StatusKind,
+    /// Response code from the tagged response, if any.
     ///
     /// When UNCHANGEDSINCE is used, this will be `Some(ResponseCode::Modified(...))`
     /// for messages that failed the precondition (RFC 7162 Section 3.1.3).

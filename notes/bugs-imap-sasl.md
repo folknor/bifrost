@@ -5,61 +5,6 @@ typed IDs, auth, and the account layer (QRESYNC / CONDSTORE / Basic cursor
 strategy, per-folder modseq cache, opportunistic `STORE UNCHANGEDSINCE`). Plus
 `crates/sasl/` in full.
 
-Hunter note: both primary findings verified against the code (grep confirms
-`tagged_ok: false` appears only inside `mod tests`; SCRAM `finalize` checks state
-before the tagged status).
-
-## 1. A SCRAM auth rejection is reported as a protocol error, not an auth failure
-
-**High confidence.** `crates/imap/src/connection/dispatch/auth.rs`, `impl Consumer
-for AuthenticateScramConsumer::finalize`. The state guard runs *before*
-`require_ok_auth(tagged)`:
-
-```rust
-if self.state != ScramState::Done {
-    return Err(Error::Protocol("SCRAM exchange ended before server-final verification".into()));
-}
-let tagged = require_ok_auth(tagged)?;
-```
-
-RFC 5802 lets a server reject client-final by simply returning a tagged `NO` with
-no server-final `+`. When it does, the consumer is in `AwaitServerFinal`, so a wrong
-password produces `Error::Protocol` instead of `Error::auth_with_code`. Per
-`reference/error-model.md` that lands on `Protocol(ParseFailed)` /
-`ProviderContractViolation` rather than the authentication lane, so the engine gets
-a contract violation instead of `ReauthorizationRequired` and never prompts for
-re-auth. `AuthenticatePlainConsumer` / `AuthenticateCramMd5Consumer` do not have
-this bug - they call `require_ok_auth` first. Fix that keeps the security property:
-match on `tagged.status` first, return the auth/bad error for `No`/`Bad`, and
-enforce `state == Done` only on the `Ok` arm (a server still cannot skip
-verification and claim success).
-
-## 2. The tagged-NO `[MODIFIED ...]` STORE lane is dead code, and the real path loses per-UID conflict attribution
-
-**High confidence.** `crates/imap/src/account/mutate.rs`. Both production call sites
-of `StoreWireOutcome::from_response_code` hardcode `tagged_ok = true` (line 360,
-line 742); `false` appears only in `mod tests`. `StoreConsumer::finalize`
-(`connection/dispatch/fetch.rs`) does `tagged.require_ok()?`, so a tagged NO never
-reaches `from_response_code` at all - it surfaces as `Err(Error::No)` and the group
-falls into `failed_all(account_error_with(err, ..))`.
-
-Consequences:
-
-- `StoreWireOutcome::PendingRetry` and `StoreWireOutcome::Failed` are unreachable in
-  production. The `pending_retry_conflict_is_failed_not_uncertain` test and the long
-  comment documenting that lane pass against code that never runs - the "audit new
-  tests for bite" failure mode in the standing lessons.
-- A server that rejects `STORE UNCHANGEDSINCE` with `NO [MODIFIED 1,3]` (legal under
-  RFC 7162 section 3.1.3) gets every UID in the group condemned with one generic
-  classification. The conflicting UIDs never get `ConcurrencyConflict` /
-  `Retry::AfterStateRefresh`, and the non-conflicting ones are indistinguishable from
-  them.
-
-Fix: `StoreConsumer` should return the tagged status alongside the code rather than
-erroring on `NO`, or (smaller) the mutate layer should inspect `err.response_code()`
-on `Error::No` before falling through to `failed_all`. Either restores the lane the
-code already documents.
-
 ## 3. Seeded CONDSTORE/QRESYNC cycles announce new arrivals as `Updated`, never `Added`
 
 **Medium-high confidence.** `account/changes.rs`, `run_condstore_with_baseline` and
@@ -95,34 +40,8 @@ is far behind (or a `Basic` folder of any size) materializes the whole mailbox t
 should share one paging harness rather than each re-deriving the loop; that is also
 where finding 3 would be fixed once instead of twice.
 
-## 5. A per-group STORE wire error is reported `Failed`, not `Uncertain`
-
-**Medium confidence.** `run_destroy_mutation_groups` (line 361) and
-`run_flag_mutation_groups` (line 461) both route `Err(err)` from `uid_store` into
-`failed_all`. A timeout or connection drop mid-STORE leaves the server state
-genuinely unknown, which is exactly what `ItemOutcome::Uncertain` exists for - and
-`flush_mutation_groups` already uses `uncertain_all` for the folder-level analogue.
-Reporting `Failed` tells the engine the mutation definitively did not happen. For
-flag ops the retry is idempotent so impact is low; for `bulk_destroy` the `\Deleted`
-mark may have landed and the engine will not reconcile it. The `Failed`/`Uncertain`
-split should be driven by the classified error's transmission state, not by which
-loop caught it.
-
 ## Smaller / lower confidence
 
-- **`ErrorScope::Mailbox` from folder producers.** `concurrency_conflict_error`,
-  `store_failed_error`, and `uidvalidity_changed_error` (`mutate.rs`) build
-  `.scope(ErrorScope::Mailbox { id })` directly. `reference/imap.md` states folder
-  producers use `with_folder_scope` -> `ErrorScope::Cursor(Folder(id))` and that
-  `with_mailbox` "is reached only from tests". Readers are documented to accept both
-  shapes, so this is currently benign, but it is the exact asymmetry that previously
-  made `ThrottleScope::Mailbox` unreachable. Low confidence of live impact, high
-  confidence it is a latent trap.
-- **`store_failed_error` is classified `Request(Malformed)`.** A STORE the server
-  refused is far more often an ACL denial or a server-side failure than a malformed
-  request, and `Request(Malformed)` derives a terminal, non-retryable class.
-  Currently unreachable (finding 2), so this only matters once that lane is revived -
-  but it should be fixed in the same change.
 - **`FolderCursor::Basic::uidnext` is write-only.** Encoded, decoded,
   round-trip-tested, and never read: `run_basic` diffs `known_uids` against a fresh
   `SEARCH ALL` and ignores `uidnext` entirely. Either use it (a cheap

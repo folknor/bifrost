@@ -435,19 +435,37 @@ impl StreamingConsumer for BoundedStreamingFetchVanishedConsumer {
 /// Accumulates the implicit FETCH responses that non-`.SILENT` STORE
 /// operations produce (RFC 3501 Section6.4.6: "the server SHOULD send an
 /// untagged FETCH response for each message whose flags were updated").
-/// Also extracts the tagged OK response code, which may contain
+/// Also captures the tagged response code, which may contain
 /// `[MODIFIED ...]` when UNCHANGEDSINCE was used (RFC 7162 Section3.1.3).
+///
+/// A tagged `NO` means two different things depending on the command, so the
+/// consumer is constructed from the command's own `unchanged_since` rather
+/// than from a per-call-site choice. Under `UNCHANGEDSINCE` a tagged `NO
+/// [MODIFIED ...]` is a legal, partially-successful CONDSTORE result whose
+/// per-UID conflict evidence the mutation layer needs, so it is preserved in
+/// `StoreResult::status`. Without `UNCHANGEDSINCE` a tagged `NO` is a plain
+/// refusal with nothing partial about it, and is surfaced as `Error::No` -
+/// callers of the unconditional STORE APIs read `Ok` as "the server accepted
+/// this", and at least one of them (`\Deleted` + EXPUNGE) would destroy mail
+/// if that stopped being true.
+///
+/// There is deliberately no argument-less constructor: strictness is a
+/// function of the command that was sent, so no construction site is in a
+/// position to get it wrong, and none can omit the decision.
 pub(crate) struct StoreConsumer {
     fetches: Vec<FetchResponse>,
     /// Non-FETCH responses routed here (classified as `Either`).
     buffered: Vec<UntaggedResponse>,
+    /// True when the command carried `UNCHANGEDSINCE` (RFC 7162 Section3.1.3).
+    conditional: bool,
 }
 
 impl StoreConsumer {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(unchanged_since: Option<u64>) -> Self {
         Self {
             fetches: Vec::new(),
             buffered: Vec::new(),
+            conditional: unchanged_since.is_some(),
         }
     }
 }
@@ -476,12 +494,21 @@ impl Consumer for StoreConsumer {
         tagged: TaggedResponse,
         _ctx: &ConsumerContext,
     ) -> Result<Finalized<StoreResult>, Error> {
-        let tagged = tagged.require_ok()?;
-        // RFC 7162 Section3.1.3: preserve [MODIFIED sequence-set] from
-        // tagged OK when UNCHANGEDSINCE was used.
+        let tagged = if self.conditional {
+            // RFC 7162 Section3.1.3: `NO [MODIFIED ...]` is a partial success
+            // whose per-UID evidence must reach the caller. `BAD` is still a
+            // command error.
+            if matches!(tagged.status, crate::types::response::StatusKind::Bad) {
+                return Err(Error::bad_with_code(tagged.text, tagged.code));
+            }
+            tagged
+        } else {
+            tagged.require_ok()?
+        };
         Ok(Finalized {
             output: StoreResult {
                 fetches: self.fetches,
+                status: tagged.status,
                 code: tagged.code,
             },
             reclassified_as_events: self.buffered,
@@ -608,5 +635,89 @@ impl Consumer for FetchVanishedConsumer {
             output: (self.fetches, self.vanished_uids),
             reclassified_as_events: self.buffered,
         })
+    }
+}
+
+#[cfg(test)]
+mod store_tests {
+    use super::*;
+    use crate::types::response::{StatusKind, UidRange};
+
+    fn context() -> ConsumerContext<'static> {
+        ConsumerContext {
+            capabilities: &[],
+            enabled: &[],
+            command_target: None,
+            command_tag: "A1",
+        }
+    }
+
+    fn tagged(status: StatusKind, code: Option<crate::types::ResponseCode>) -> TaggedResponse {
+        TaggedResponse {
+            tag: "A1".to_owned(),
+            status,
+            code,
+            text: "store rejected".to_owned(),
+        }
+    }
+
+    fn modified() -> Option<crate::types::ResponseCode> {
+        Some(crate::types::ResponseCode::Modified(vec![
+            UidRange::single(3),
+        ]))
+    }
+
+    #[test]
+    fn tagged_no_modified_reaches_the_store_result() {
+        let result = Box::new(StoreConsumer::new(Some(42)))
+            .finalize(tagged(StatusKind::No, modified()), &context())
+            .expect("tagged NO is a typed STORE result")
+            .output;
+        assert_eq!(result.status, StatusKind::No);
+        assert!(matches!(
+            result.code,
+            Some(crate::types::ResponseCode::Modified(_))
+        ));
+    }
+
+    #[test]
+    fn unconditional_store_tagged_no_is_an_error() {
+        // Callers of the unconditional STORE APIs read Ok as "accepted" and
+        // act on it (\Deleted followed by EXPUNGE). A refusal must not reach
+        // them as a StoreResult.
+        for code in [None, modified()] {
+            let err = match Box::new(StoreConsumer::new(None))
+                .finalize(tagged(StatusKind::No, code), &context())
+            {
+                Err(err) => err,
+                Ok(_) => panic!("unconditional STORE must not report a tagged NO as success"),
+            };
+            assert!(matches!(err, Error::No { .. }), "unexpected error: {err:?}");
+        }
+    }
+
+    #[test]
+    fn tagged_bad_is_an_error_on_both_paths() {
+        for unchanged_since in [None, Some(42)] {
+            let err = match Box::new(StoreConsumer::new(unchanged_since))
+                .finalize(tagged(StatusKind::Bad, None), &context())
+            {
+                Err(err) => err,
+                Ok(_) => panic!("tagged BAD is always a command error"),
+            };
+            assert!(
+                matches!(err, Error::Bad { .. }),
+                "unexpected error: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn conditional_store_tagged_ok_still_reports_ok() {
+        let result = Box::new(StoreConsumer::new(Some(42)))
+            .finalize(tagged(StatusKind::Ok, None), &context())
+            .expect("tagged OK is a STORE result")
+            .output;
+        assert_eq!(result.status, StatusKind::Ok);
     }
 }

@@ -324,7 +324,7 @@ impl<'conn, T> Pipeline<'conn, T> {
             unchanged_since: Option<u64>,
         ) -> StoreResult;
         command = Command::Store { sequence_set, operation, flags, unchanged_since };
-        consumer = dispatch::StoreConsumer::new();
+        consumer = dispatch::StoreConsumer::new(unchanged_since);
     }
 
     pipeline_method! {
@@ -413,7 +413,7 @@ impl<'conn, T> Pipeline<'conn, T> {
             unchanged_since: Option<u64>,
         ) -> StoreResult;
         command = Command::UidStore { sequence_set, operation, flags, unchanged_since };
-        consumer = dispatch::StoreConsumer::new();
+        consumer = dispatch::StoreConsumer::new(unchanged_since);
     }
 
     pipeline_method! {

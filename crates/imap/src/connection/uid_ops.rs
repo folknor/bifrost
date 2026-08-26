@@ -468,7 +468,7 @@ impl ImapConnection {
         }
         tokio::time::timeout(
             timeout,
-            self.submit_regular(cmd, dispatch::StoreConsumer::new()),
+            self.submit_regular(cmd, dispatch::StoreConsumer::new(unchanged_since)),
         )
         .await
         .map_err(|_| Error::timeout_inflight())?

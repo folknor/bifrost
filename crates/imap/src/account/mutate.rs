@@ -2,9 +2,10 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use bifrost_types::{
     AccountError, AccountErrorBuilder, AccountErrorKind, AccountOperation, AccountStream,
-    BatchFailure, BatchItemId, BatchSuccess, BatchUncertain, Cause, DiagnosticText, FlagOp,
-    IdempotencyKey, ItemOutcome, MembershipScope, MutationSuccess, PageBoundary, Protocol,
-    RequestCause, RequestErrorKind, StateCause, SyncEvent,
+    AttemptCause, BatchFailure, BatchItemId, BatchSuccess, BatchUncertain, Cause, DiagnosticText,
+    FlagOp, IdempotencyKey, ItemOutcome, MembershipScope, MutationSuccess, PageBoundary, Protocol,
+    RequestCause, RequestErrorKind, ServerCause, ServerErrorKind, StateCause, SyncEvent,
+    TransmissionState,
 };
 use futures::StreamExt;
 
@@ -326,7 +327,7 @@ async fn run_folder_mutation(
             account.folders.clear_modseqs(folder, uidvalidity, &uids);
             mutation_results(valid, outcome, mutation_operation(kind), folder)
         }
-        Err(err) => failed_all(
+        Err(err) => mutation_error_outcomes(
             valid,
             super::account_error_with(
                 err,
@@ -362,16 +363,14 @@ async fn run_destroy_mutation_groups(
             )
             .await;
         let outcome = match store {
-            Ok(result) => StoreWireOutcome::from_response_code(result.code.as_ref(), true),
+            Ok(result) => StoreWireOutcome::from_store_result(&result),
             Err(err) => {
-                results.extend(failed_all(
-                    ids,
-                    super::account_error_with(
-                        err,
-                        super::error::ImapErrorContext::operation(AccountOperation::BulkDestroy)
-                            .with_folder_scope(folder),
-                    ),
-                ));
+                let error = super::account_error_with(
+                    err,
+                    super::error::ImapErrorContext::operation(AccountOperation::BulkDestroy)
+                        .with_folder_scope(folder),
+                );
+                results.extend(mutation_error_outcomes(ids, error));
                 continue;
             }
         };
@@ -389,7 +388,7 @@ async fn run_destroy_mutation_groups(
             .await
         {
             let (expunging_ids, remaining_ids) = split_ids_by_uid(ids, &expunge_uids);
-            results.extend(failed_all(
+            results.extend(mutation_error_outcomes(
                 expunging_ids,
                 expunge_failed_after_delete_mark(folder, err),
             ));
@@ -467,14 +466,12 @@ async fn run_flag_mutation_groups(
                 if matches!(op, FlagOp::Patch { .. }) {
                     account.folders.clear_modseqs(folder, uidvalidity, &uids);
                 }
-                failed_all(
-                    ids,
-                    super::account_error_with(
-                        err,
-                        super::error::ImapErrorContext::operation(AccountOperation::UpdateFlags)
-                            .with_folder_scope(folder),
-                    ),
-                )
+                let error = super::account_error_with(
+                    err,
+                    super::error::ImapErrorContext::operation(AccountOperation::UpdateFlags)
+                        .with_folder_scope(folder),
+                );
+                mutation_error_outcomes(ids, error)
             }
         });
     }
@@ -557,14 +554,12 @@ fn patch_first_store_failure(
     err: crate::Error,
     folder: &MailboxName,
 ) -> Vec<ItemOutcome<MutationSuccess>> {
-    failed_all(
-        ids,
-        super::account_error_with(
-            err,
-            super::error::ImapErrorContext::operation(AccountOperation::UpdateFlags)
-                .with_folder_scope(folder),
-        ),
-    )
+    let error = super::account_error_with(
+        err,
+        super::error::ImapErrorContext::operation(AccountOperation::UpdateFlags)
+            .with_folder_scope(folder),
+    );
+    mutation_error_outcomes(ids, error)
 }
 
 fn patch_mutation_results(
@@ -601,11 +596,11 @@ fn patch_mutation_results(
             AccountOperation::UpdateFlags,
             folder,
         )),
-        Ok(_) => results.extend(uncertain_all(
+        Ok(_) => results.extend(failed_all(
             applied_ids,
             store_failed_error(AccountOperation::UpdateFlags, folder),
         )),
-        Err(error) => results.extend(uncertain_all(applied_ids, error)),
+        Err(error) => results.extend(mutation_error_outcomes(applied_ids, error)),
     }
     results
 }
@@ -744,10 +739,7 @@ async fn store_flags(
         .connection()
         .uid_store(set, operation, &flags, unchanged_since, timeout)
         .await?;
-    Ok(StoreWireOutcome::from_response_code(
-        result.code.as_ref(),
-        true,
-    ))
+    Ok(StoreWireOutcome::from_store_result(&result))
 }
 
 // protocol-specific: IMAP STORE can return MODIFIED before it maps to shared MutationOutcome.
@@ -760,8 +752,15 @@ enum StoreWireOutcome {
 }
 
 impl StoreWireOutcome {
-    fn from_response_code(code: Option<&ResponseCode>, tagged_ok: bool) -> Self {
-        match (tagged_ok, modified_uids(code)) {
+    /// Classify a completed STORE.
+    ///
+    /// Takes the whole [`StoreResult`] rather than a `(code, tagged_ok)` pair
+    /// on purpose: the tagged status is the half a caller silently drops, and
+    /// dropping it turns a refusal into `Applied`. There is no constructor
+    /// that lets a caller supply the code without the status.
+    fn from_store_result(result: &crate::types::StoreResult) -> Self {
+        let tagged_ok = matches!(result.status, crate::types::response::StatusKind::Ok);
+        match (tagged_ok, modified_uids(result.code.as_ref())) {
             (true, None) => Self::Applied,
             (true, Some(modified)) => Self::Modified(modified),
             (false, Some(modified)) => Self::PendingRetry(modified),
@@ -866,6 +865,24 @@ fn uncertain_all(
         .collect()
 }
 
+fn mutation_error_outcomes(
+    ids: Vec<DecodedObjectId>,
+    error: AccountError,
+) -> Vec<ItemOutcome<MutationSuccess>> {
+    let in_flight = error.chain().iter().any(|cause| {
+        matches!(
+            cause,
+            Cause::Attempt(attempt)
+                if attempt.transmission_state == TransmissionState::InFlight
+        )
+    });
+    if in_flight {
+        uncertain_all(ids, error)
+    } else {
+        failed_all(ids, error)
+    }
+}
+
 fn invalid_move_destination_error() -> AccountError {
     AccountErrorBuilder::new(
         AccountErrorKind::Request(RequestErrorKind::Malformed),
@@ -891,9 +908,9 @@ fn concurrency_conflict_error(operation: AccountOperation, folder: &MailboxName)
     )
     .protocol(Protocol::Imap)
     .operation(operation)
-    .scope(bifrost_types::ErrorScope::Mailbox {
-        id: folder.as_str().into(),
-    })
+    .scope(bifrost_types::ErrorScope::Cursor(
+        bifrost_types::CursorScope::Folder(bifrost_types::FolderId(folder.as_str().to_owned())),
+    ))
     .try_build()
     .expect("valid account error classification")
 }
@@ -908,30 +925,32 @@ fn uidvalidity_changed_error(operation: AccountOperation, folder: &MailboxName) 
     )
     .protocol(Protocol::Imap)
     .operation(operation)
-    .scope(bifrost_types::ErrorScope::Mailbox {
-        id: folder.as_str().into(),
-    })
+    .scope(bifrost_types::ErrorScope::Cursor(
+        bifrost_types::CursorScope::Folder(bifrost_types::FolderId(folder.as_str().to_owned())),
+    ))
     .try_build()
     .expect("valid account error classification")
 }
 
-/// Build a generic protocol error for a STORE command failure without a
+/// Build a generic server refusal for a STORE command failure without a
 /// specific per-item response code. Takes the caller's `AccountOperation`
 /// so move / destroy / flag mutations each carry their own op.
 fn store_failed_error(operation: AccountOperation, folder: &MailboxName) -> AccountError {
     AccountErrorBuilder::new(
-        AccountErrorKind::Request(RequestErrorKind::Malformed),
-        Cause::Request(RequestCause::Malformed {
-            detail: DiagnosticText::support_only(
-                "STORE command failed with no per-item response code",
-            ),
-        }),
+        AccountErrorKind::Server(ServerErrorKind::Error { status: None }),
+        Cause::Server(ServerCause::Error { status: None }),
     )
     .protocol(Protocol::Imap)
     .operation(operation)
-    .scope(bifrost_types::ErrorScope::Mailbox {
-        id: folder.as_str().into(),
-    })
+    .scope(bifrost_types::ErrorScope::Cursor(
+        bifrost_types::CursorScope::Folder(bifrost_types::FolderId(folder.as_str().to_owned())),
+    ))
+    .push_cause(Cause::Attempt(AttemptCause::new(
+        TransmissionState::Acknowledged,
+    )))
+    .text(DiagnosticText::support_only(
+        "STORE command failed with no per-item response code",
+    ))
     .try_build()
     .expect("valid account error classification")
 }
@@ -1062,16 +1081,30 @@ mod tests {
     #[test]
     fn modified_code_maps_per_uid_outcomes() {
         let code = ResponseCode::Modified(vec![UidRange::range(2, 3)]);
+        let result = |status, code: Option<ResponseCode>| crate::types::StoreResult {
+            fetches: Vec::new(),
+            status,
+            code,
+        };
         assert_eq!(
-            StoreWireOutcome::from_response_code(Some(&code), true),
+            StoreWireOutcome::from_store_result(&result(
+                crate::types::response::StatusKind::Ok,
+                Some(code.clone())
+            )),
             StoreWireOutcome::Modified(vec![2, 3])
         );
         assert_eq!(
-            StoreWireOutcome::from_response_code(Some(&code), false),
+            StoreWireOutcome::from_store_result(&result(
+                crate::types::response::StatusKind::No,
+                Some(code)
+            )),
             StoreWireOutcome::PendingRetry(vec![2, 3])
         );
         assert_eq!(
-            StoreWireOutcome::from_response_code(None, false),
+            StoreWireOutcome::from_store_result(&result(
+                crate::types::response::StatusKind::No,
+                None
+            )),
             StoreWireOutcome::Failed
         );
     }
@@ -1150,10 +1183,12 @@ mod tests {
         ] {
             let err = concurrency_conflict_error(op, &folder);
             assert_eq!(err.operation(), Some(op));
-            // Mailbox scope must thread too.
+            // Folder producers use the cursor-shaped folder scope.
             assert!(matches!(
                 err.scope(),
-                Some(bifrost_types::ErrorScope::Mailbox { .. })
+                Some(bifrost_types::ErrorScope::Cursor(
+                    bifrost_types::CursorScope::Folder(_)
+                ))
             ));
         }
     }
@@ -1165,7 +1200,13 @@ mod tests {
         assert_eq!(err.operation(), Some(AccountOperation::BulkDestroy));
         assert!(matches!(
             err.scope(),
-            Some(bifrost_types::ErrorScope::Mailbox { .. })
+            Some(bifrost_types::ErrorScope::Cursor(
+                bifrost_types::CursorScope::Folder(_)
+            ))
+        ));
+        assert!(matches!(
+            err.kind(),
+            AccountErrorKind::Server(ServerErrorKind::Error { status: None })
         ));
     }
 
@@ -1361,7 +1402,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_second_half_of_a_partially_applied_patch_is_uncertain() {
+    fn acknowledged_second_half_rejection_is_failed() {
         let outcomes = patch_mutation_results(
             ids(&[1, 2]),
             &[1, 2],
@@ -1372,7 +1413,7 @@ mod tests {
         assert!(
             outcomes
                 .iter()
-                .any(|outcome| matches!(outcome, ItemOutcome::Uncertain(_)))
+                .all(|outcome| matches!(outcome, ItemOutcome::Failed(_)))
         );
         assert!(outcomes.iter().any(|outcome| {
             matches!(outcome, ItemOutcome::Failed(failure) if matches!(
@@ -1484,6 +1525,27 @@ mod tests {
                 other => panic!("expected Failed, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn in_flight_mutation_error_is_uncertain_but_acknowledged_is_failed() {
+        let build = |state| {
+            AccountErrorBuilder::new(
+                AccountErrorKind::Server(ServerErrorKind::Unavailable),
+                Cause::Server(ServerCause::Unavailable { retry_hint: None }),
+            )
+            .protocol(Protocol::Imap)
+            .operation(AccountOperation::UpdateFlags)
+            .push_cause(Cause::Attempt(AttemptCause::new(state)))
+            .try_build()
+            .expect("valid mutation error")
+        };
+
+        let uncertain = mutation_error_outcomes(ids(&[4]), build(TransmissionState::InFlight));
+        assert!(matches!(uncertain.as_slice(), [ItemOutcome::Uncertain(_)]));
+
+        let failed = mutation_error_outcomes(ids(&[4]), build(TransmissionState::Acknowledged));
+        assert!(matches!(failed.as_slice(), [ItemOutcome::Failed(_)]));
     }
 
     #[test]

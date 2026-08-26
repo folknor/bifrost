@@ -486,6 +486,7 @@ fn store_result_provides_access_to_fetches() {
                 ..Default::default()
             },
         ],
+        status: crate::types::response::StatusKind::Ok,
         code: None,
     };
     // Access via .fetches field.
@@ -502,6 +503,7 @@ fn store_result_empty() {
     // RFC 3501 Section 6.4.6: STORE with .SILENT returns no FETCH responses.
     let result = StoreResult {
         fetches: vec![],
+        status: crate::types::response::StatusKind::Ok,
         code: None,
     };
     assert!(result.fetches.is_empty());

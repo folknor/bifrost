@@ -400,12 +400,12 @@ impl Consumer for AuthenticateScramConsumer {
         tagged: TaggedResponse,
         _ctx: &ConsumerContext,
     ) -> Result<Finalized<bool>, Error> {
+        let tagged = require_ok_auth(tagged)?;
         if self.state != ScramState::Done {
             return Err(Error::Protocol(
                 "SCRAM exchange ended before server-final verification".into(),
             ));
         }
-        let tagged = require_ok_auth(tagged)?;
         let caps_in_tagged = matches!(&tagged.code, Some(ResponseCode::Capability(_)));
         Ok(Finalized {
             output: self.caps_seen || caps_in_tagged,
@@ -468,6 +468,62 @@ mod tests {
     use base64::Engine;
 
     use super::*;
+
+    fn tagged(status: StatusKind) -> TaggedResponse {
+        TaggedResponse {
+            tag: "A1".to_owned(),
+            status,
+            code: None,
+            text: "authentication rejected".to_owned(),
+        }
+    }
+
+    fn context() -> ConsumerContext<'static> {
+        ConsumerContext {
+            capabilities: &[],
+            enabled: &[],
+            command_target: None,
+            command_tag: "A1",
+        }
+    }
+
+    #[test]
+    fn scram_rejection_before_server_final_is_an_auth_error() {
+        let consumer = AuthenticateScramConsumer::new(
+            ScramHash::Sha256,
+            "user".to_owned(),
+            "wrong".to_owned().into(),
+            "nonce123".to_owned(),
+            true,
+            ScramChannelBinding::None,
+        )
+        .unwrap();
+
+        let err = match Box::new(consumer).finalize(tagged(StatusKind::No), &context()) {
+            Err(err) => err,
+            Ok(_) => panic!("tagged NO must reject authentication"),
+        };
+        assert!(matches!(err, Error::Auth { .. }));
+    }
+
+    #[test]
+    fn scram_ok_before_server_final_is_still_a_protocol_error() {
+        let consumer = AuthenticateScramConsumer::new(
+            ScramHash::Sha256,
+            "user".to_owned(),
+            "pw".to_owned().into(),
+            "nonce123".to_owned(),
+            true,
+            ScramChannelBinding::None,
+        )
+        .unwrap();
+
+        let err = match Box::new(consumer).finalize(tagged(StatusKind::Ok), &context()) {
+            Err(err) => err,
+            Ok(_) => panic!("tagged OK must not bypass server-final verification"),
+        };
+        assert!(matches!(err, Error::Protocol(_)));
+    }
 
     fn decode_initial(consumer: &AuthenticateScramConsumer) -> String {
         let ir = consumer.initial_response();
