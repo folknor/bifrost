@@ -15,7 +15,8 @@ use super::escape_crlf;
 use super::metering::WireMetering;
 use super::{
     ClientCodec, ConnectionState, MAX_RESPONSE_BYTES, MAX_RESPONSE_LINE_BYTES, NetworkStream,
-    PIPELINING_RECIPIENT_WINDOW, TlsParameters, data_terminator, smtp_data_size,
+    PIPELINING_RECIPIENT_WINDOW, PhasedError, TlsParameters, data_terminator, merge_lmtp_statuses,
+    smtp_data_size,
 };
 use crate::{
     address::{Address, Envelope},
@@ -63,6 +64,20 @@ macro_rules! try_smtp (
             Err(err) => {
                 $client.abort();
                 return Err(From::from(err.with_phase($phase)))
+            },
+        }
+    });
+);
+
+/// `try_smtp!` for the phase-typed pipelined driver: aborts the connection and
+/// returns a `PhasedError`, which is the only error this driver can produce.
+macro_rules! try_phased (
+    ($err: expr, $client: ident, $phase: expr) => ({
+        match $err {
+            Ok(val) => val,
+            Err(err) => {
+                $client.abort();
+                return Err(PhasedError::new($phase, Error::from(err)))
             },
         }
     });
@@ -256,12 +271,28 @@ impl SmtpConnection {
         Ok(result)
     }
 
+    /// Phase-stamping funnel for the pipelined driver.
+    ///
+    /// `send_pipelined_inner` cannot return an undecorated error: its error
+    /// type is `PhasedError`, which has no `From<Error>` conversion, so `?`
+    /// on a plain SMTP result does not compile there. This is the one place
+    /// that turns a boundary failure back into an `Error`.
     fn send_pipelined(
         &mut self,
         email: &[u8],
         mail: Mail,
         recipients: Vec<Rcpt>,
     ) -> Result<Response, Error> {
+        self.send_pipelined_inner(email, mail, recipients)
+            .map_err(PhasedError::into_error)
+    }
+
+    fn send_pipelined_inner(
+        &mut self,
+        email: &[u8],
+        mail: Mail,
+        recipients: Vec<Rcpt>,
+    ) -> Result<Response, PhasedError> {
         for (window_index, window) in recipients.chunks(PIPELINING_RECIPIENT_WINDOW).enumerate() {
             let mut commands = String::new();
             if window_index == 0 {
@@ -270,46 +301,75 @@ impl SmtpConnection {
             for recipient in window {
                 commands.push_str(&recipient.to_string());
             }
-            self.write(commands.as_bytes())?;
-            self.stream.get_ref().state().verify()?;
+            let write_phase = if window_index == 0 {
+                SmtpCommandPhase::MailFrom
+            } else {
+                SmtpCommandPhase::RcptTo
+            };
+            try_phased!(self.write(commands.as_bytes()), self, write_phase);
+            try_phased!(self.stream.get_ref().state().verify(), self, write_phase);
             self.stream.get_mut().set_state(ConnectionState::Broken);
 
             if window_index == 0 {
-                let mail_response = self.read_response_inner(true, false)?;
+                let mail_response = try_phased!(
+                    self.read_response_inner(true, false),
+                    self,
+                    SmtpCommandPhase::MailFrom
+                );
                 if !mail_response.is_positive() {
                     for _ in window {
-                        self.read_response_inner(true, false)?;
+                        try_phased!(
+                            self.read_response_inner(true, false),
+                            self,
+                            SmtpCommandPhase::RcptTo
+                        );
                     }
-                    self.finish_reply_group()?;
-                    return Err(Self::error_from_status(mail_response));
+                    // No RSET: a rejected MAIL FROM opened no transaction, so
+                    // there is nothing to reset and the connection stays
+                    // reusable as it is.
+                    try_phased!(self.finish_reply_group(), self, SmtpCommandPhase::RcptTo);
+                    return Err(PhasedError::new(
+                        SmtpCommandPhase::MailFrom,
+                        error::status(mail_response),
+                    ));
                 }
             }
 
             let mut failure = None;
             for _ in window {
-                let response = self.read_response_inner(true, false)?;
+                let response = try_phased!(
+                    self.read_response_inner(true, false),
+                    self,
+                    SmtpCommandPhase::RcptTo
+                );
                 if failure.is_none() && !response.is_positive() {
                     failure = Some(response);
                 }
             }
-            self.finish_reply_group()?;
+            try_phased!(self.finish_reply_group(), self, SmtpCommandPhase::RcptTo);
             if let Some(response) = failure {
-                if self.command_accepting_status(Rset).is_err() {
-                    self.abort();
-                }
-                return Err(Self::error_from_status(response));
+                self.reset_transaction();
+                return Err(PhasedError::new(
+                    SmtpCommandPhase::RcptTo,
+                    error::status(response),
+                ));
             }
         }
 
-        let data_response = self.command_accepting_status(Data)?;
+        let data_response = try_phased!(
+            self.command_accepting_status(Data),
+            self,
+            SmtpCommandPhase::DataCommand
+        );
         if !data_response.is_positive() {
-            if self.command_accepting_status(Rset).is_err() {
-                self.abort();
-            }
-            return Err(Self::error_from_status(data_response));
+            self.reset_transaction();
+            return Err(PhasedError::new(
+                SmtpCommandPhase::DataCommand,
+                error::status(data_response),
+            ));
         }
 
-        let result = try_smtp!(self.message(email), self);
+        let result = try_phased!(self.message(email), self, SmtpCommandPhase::DataBody);
         Ok(result)
     }
 
@@ -361,27 +421,18 @@ impl SmtpConnection {
                 };
                 rejected.push(response);
             }
+            self.reset_transaction();
             return Ok(rejected);
         }
 
         try_smtp!(self.command(Data), self, SmtpCommandPhase::DataCommand);
-        let mut delivery_statuses = try_smtp!(
+        let delivery_statuses = try_smtp!(
             self.message_lmtp(email, accepted_recipients),
             self,
             SmtpCommandPhase::LmtpFinalStatus
-        )
-        .into_iter();
+        );
 
-        Ok(recipient_statuses
-            .into_iter()
-            .map(|response| {
-                response.unwrap_or_else(|| {
-                    delivery_statuses
-                        .next()
-                        .expect("server returned one status per accepted recipient")
-                })
-            })
-            .collect())
+        merge_lmtp_statuses(recipient_statuses, delivery_statuses)
     }
 
     pub(crate) fn send_lmtp_bdat_with_options(
@@ -430,22 +481,17 @@ impl SmtpConnection {
                 };
                 rejected.push(response);
             }
+            self.reset_transaction();
             return Ok(rejected);
         }
 
-        let mut delivery_statuses =
-            try_smtp!(self.message_lmtp_bdat(email, accepted_recipients), self).into_iter();
+        let delivery_statuses = try_smtp!(
+            self.message_lmtp_bdat(email, accepted_recipients),
+            self,
+            SmtpCommandPhase::LmtpFinalStatus
+        );
 
-        Ok(recipient_statuses
-            .into_iter()
-            .map(|response| {
-                response.unwrap_or_else(|| {
-                    delivery_statuses
-                        .next()
-                        .expect("server returned one status per accepted recipient")
-                })
-            })
-            .collect())
+        merge_lmtp_statuses(recipient_statuses, delivery_statuses)
     }
 
     /// Account-oriented SMTP multi-recipient send.
@@ -570,6 +616,7 @@ impl SmtpConnection {
             )
         });
         if !accepted {
+            self.reset_transaction();
             return Ok(progress);
         }
 
@@ -579,9 +626,7 @@ impl SmtpConnection {
             Ok(resp) => {
                 // DATA rejected before body: all accepted recipients failed with this response.
                 progress.mark_accepted_rejected_with_response(resp);
-                if let Err(_e) = self.command_accepting_status(Rset) {
-                    self.abort();
-                }
+                self.reset_transaction();
                 return Ok(progress);
             }
             Err(e) => {
@@ -720,9 +765,7 @@ impl SmtpConnection {
             )
         });
         if !accepted {
-            if self.command_accepting_status(Rset).is_err() {
-                self.abort();
-            }
+            self.reset_transaction();
             return Ok(progress);
         }
 
@@ -746,26 +789,7 @@ impl SmtpConnection {
         if !data_response.is_positive() {
             // DATA negative: all accepted recipients failed with this response.
             progress.mark_accepted_rejected_with_response(data_response);
-            if !accepted {
-                // No accepted recipients and DATA negative; clean up.
-                if let Err(_e) = self.command_accepting_status(Rset) {
-                    self.abort();
-                }
-            } else {
-                self.abort();
-            }
-            return Ok(progress);
-        }
-
-        if !accepted {
-            // No accepted recipients, DATA positive; send terminating dot to complete transaction.
-            if self
-                .write(b".\r\n")
-                .and_then(|_| self.read_response_accepting_status())
-                .is_err()
-            {
-                self.abort();
-            }
+            self.reset_transaction();
             return Ok(progress);
         }
 
@@ -884,6 +908,7 @@ impl SmtpConnection {
         }
 
         if accepted_count == 0 {
+            self.reset_transaction();
             return Ok(progress);
         }
 
@@ -896,9 +921,7 @@ impl SmtpConnection {
             Ok(resp) if resp.is_positive() => {}
             Ok(resp) => {
                 progress.mark_accepted_rejected_with_response(resp);
-                if let Err(_e) = self.command_accepting_status(Rset) {
-                    self.abort();
-                }
+                self.reset_transaction();
                 return Ok(progress);
             }
             Err(e) => {
@@ -1411,13 +1434,27 @@ impl SmtpConnection {
 
     /// Send EHLO or LHLO and update server info
     fn hello(&mut self, hello_name: &ClientId) -> Result<(), Error> {
-        hello_name.validate()?;
         let response = match self.protocol {
-            Protocol::Lmtp => try_smtp!(self.command(Lhlo::new(hello_name.clone())), self),
-            _ => try_smtp!(self.command(Ehlo::new(hello_name.clone())), self),
+            Protocol::Lmtp => {
+                let command = Lhlo::new(hello_name.clone())?;
+                try_smtp!(self.command(command), self)
+            }
+            _ => {
+                let command = Ehlo::new(hello_name.clone())?;
+                try_smtp!(self.command(command), self)
+            }
         };
         self.server_info = try_smtp!(ServerInfo::from_response(&response), self);
         Ok(())
+    }
+
+    /// Close the current mail transaction, or make the connection
+    /// unrecyclable if the server does not positively acknowledge the reset.
+    fn reset_transaction(&mut self) {
+        match self.command_accepting_status(Rset) {
+            Ok(response) if response.is_positive() => {}
+            Ok(_) | Err(_) => self.abort(),
+        }
     }
 
     /// Close the connection.
@@ -1875,10 +1912,6 @@ impl SmtpConnection {
         self.retire
     }
 
-    fn error_from_status(response: Response) -> Error {
-        error::status(response)
-    }
-
     /// Writes a string to the server
     fn write(&mut self, string: &[u8]) -> Result<(), Error> {
         Self::write_stream(&mut self.stream, string)
@@ -1998,6 +2031,152 @@ mod transcript_tests {
     use super::{SendOptions, SmtpConnection};
 
     const HELLO: &str = "EHLO client.example\r\n";
+
+    #[test]
+    fn all_recipient_rejection_resets_every_direct_and_batch_transaction() {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let envelope = Envelope::new(
+            Some("sender@example.com".parse().unwrap()),
+            vec!["recipient@example.com".parse().unwrap()],
+        )
+        .unwrap();
+
+        for chunking in [false, true] {
+            let greeting = if chunking {
+                "250-lmtp.example\r\n250 CHUNKING\r\n"
+            } else {
+                "250 lmtp.example\r\n"
+            };
+            let transcript = Transcript::new("220 lmtp.example\r\n")
+                .expect("LHLO client.example\r\n", greeting)
+                .expect("MAIL FROM:<sender@example.com>\r\n", "250 sender ok\r\n")
+                .expect(
+                    "RCPT TO:<recipient@example.com>\r\n",
+                    "550 recipient rejected\r\n",
+                )
+                .expect("RSET\r\n", "250 reset ok\r\n");
+            let mut connection =
+                SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Lmtp)
+                    .unwrap();
+            let statuses = if chunking {
+                connection
+                    .send_lmtp_bdat_with_options(&envelope, b"body", &Default::default())
+                    .unwrap()
+            } else {
+                connection.send_lmtp(&envelope, b"body").unwrap()
+            };
+            assert_eq!(statuses.len(), 1);
+            assert!(!statuses[0].is_positive());
+            assert!(!connection.has_broken());
+            transcript.assert_exhausted();
+        }
+
+        for protocol in [Protocol::Smtp, Protocol::Lmtp] {
+            let hello_command = if protocol == Protocol::Smtp {
+                "EHLO client.example\r\n"
+            } else {
+                "LHLO client.example\r\n"
+            };
+            let transcript = Transcript::new("220 server.example\r\n")
+                .expect(hello_command, "250 server.example\r\n")
+                .expect("MAIL FROM:<sender@example.com>\r\n", "250 sender ok\r\n")
+                .expect(
+                    "RCPT TO:<recipient@example.com>\r\n",
+                    "550 recipient rejected\r\n",
+                )
+                .expect("RSET\r\n", "250 reset ok\r\n");
+            let batch = vec![SmtpBatchRecipient {
+                id: BatchItemId("item-0".to_owned()),
+                address: "recipient@example.com".parse().unwrap(),
+            }];
+            let mut connection =
+                SmtpConnection::from_transcript(transcript.clone(), &hello, protocol).unwrap();
+            let progress = if protocol == Protocol::Smtp {
+                connection.send_smtp_batch(
+                    Some("sender@example.com".parse().unwrap()),
+                    batch,
+                    b"body",
+                    &Default::default(),
+                )
+            } else {
+                connection.send_lmtp_batch(
+                    Some("sender@example.com".parse().unwrap()),
+                    batch,
+                    b"body",
+                    &Default::default(),
+                )
+            }
+            .unwrap();
+            assert_eq!(progress.resolve().failed().len(), 1);
+            assert!(!connection.has_broken());
+            transcript.assert_exhausted();
+        }
+    }
+
+    #[test]
+    fn pipelined_server_rejections_carry_their_command_phase() {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let envelope = Envelope::new(
+            Some("sender@example.com".parse().unwrap()),
+            vec!["recipient@example.com".parse().unwrap()],
+        )
+        .unwrap();
+        let window = "MAIL FROM:<sender@example.com>\r\nRCPT TO:<recipient@example.com>\r\n";
+
+        // MAIL FROM rejected: no transaction was opened, so no RSET.
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250-smtp.example\r\n250 PIPELINING\r\n")
+            .expect(window, "550 sender rejected\r\n250 recipient ok\r\n");
+        let mut connection =
+            SmtpConnection::from_transcript(transcript, &hello, Protocol::Smtp).unwrap();
+        let error = connection.send(&envelope, b"body").unwrap_err();
+        assert_eq!(error.phase(), Some(super::SmtpCommandPhase::MailFrom));
+
+        // RCPT TO rejected.
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250-smtp.example\r\n250 PIPELINING\r\n")
+            .expect(window, "250 sender ok\r\n550 recipient rejected\r\n")
+            .expect("RSET\r\n", "250 reset ok\r\n");
+        let mut connection =
+            SmtpConnection::from_transcript(transcript, &hello, Protocol::Smtp).unwrap();
+        let error = connection.send(&envelope, b"body").unwrap_err();
+        assert_eq!(error.phase(), Some(super::SmtpCommandPhase::RcptTo));
+
+        // DATA rejected before the body.
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250-smtp.example\r\n250 PIPELINING\r\n")
+            .expect(window, "250 sender ok\r\n250 recipient ok\r\n")
+            .expect("DATA\r\n", "554 no data\r\n")
+            .expect("RSET\r\n", "250 reset ok\r\n");
+        let mut connection =
+            SmtpConnection::from_transcript(transcript, &hello, Protocol::Smtp).unwrap();
+        let error = connection.send(&envelope, b"body").unwrap_err();
+        assert_eq!(error.phase(), Some(super::SmtpCommandPhase::DataCommand));
+    }
+
+    #[test]
+    fn pipelined_body_failure_carries_data_body_phase() {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250-smtp.example\r\n250 PIPELINING\r\n")
+            .expect(
+                "MAIL FROM:<sender@example.com>\r\nRCPT TO:<recipient@example.com>\r\n",
+                "250 sender ok\r\n250 recipient ok\r\n",
+            )
+            .expect("DATA\r\n", "354 send body\r\n")
+            .expect_then_close("body", "");
+        let envelope = Envelope::new(
+            Some("sender@example.com".parse().unwrap()),
+            vec!["recipient@example.com".parse().unwrap()],
+        )
+        .unwrap();
+        let mut connection =
+            SmtpConnection::from_transcript(transcript, &hello, Protocol::Smtp).unwrap();
+
+        let error = connection.send(&envelope, b"body").unwrap_err();
+
+        assert_eq!(error.phase(), Some(super::SmtpCommandPhase::DataBody));
+    }
 
     fn recipients(count: usize) -> Vec<crate::address::Address> {
         (0..count)

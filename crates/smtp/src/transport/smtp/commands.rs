@@ -75,8 +75,9 @@ impl Display for Ehlo {
 
 impl Ehlo {
     /// Creates a EHLO command
-    pub(crate) fn new(client_id: ClientId) -> Ehlo {
-        Ehlo { client_id }
+    pub(crate) fn new(client_id: ClientId) -> Result<Ehlo, Error> {
+        client_id.validate()?;
+        Ok(Ehlo { client_id })
     }
 }
 
@@ -95,8 +96,9 @@ impl Display for Lhlo {
 
 impl Lhlo {
     /// Creates a LHLO command
-    pub(crate) fn new(client_id: ClientId) -> Lhlo {
-        Lhlo { client_id }
+    pub(crate) fn new(client_id: ClientId) -> Result<Lhlo, Error> {
+        client_id.validate()?;
+        Ok(Lhlo { client_id })
     }
 }
 
@@ -386,6 +388,14 @@ mod test {
     use crate::transport::smtp::extension::MailBodyParameter;
 
     #[test]
+    fn hello_constructors_reject_command_injection() {
+        let hostile = ClientId::Domain("client.example\r\nRSET".to_owned());
+
+        assert!(Ehlo::new(hostile.clone()).is_err());
+        assert!(Lhlo::new(hostile).is_err());
+    }
+
+    #[test]
     fn test_display() {
         let id = ClientId::Domain("localhost".to_owned());
         let email = Address::from_str("test@example.com").unwrap();
@@ -397,8 +407,11 @@ mod test {
             keyword: "TEST".to_owned(),
             value: Some("value".to_owned()),
         };
-        assert_eq!(format!("{}", Ehlo::new(id.clone())), "EHLO localhost\r\n");
-        assert_eq!(format!("{}", Lhlo::new(id)), "LHLO localhost\r\n");
+        assert_eq!(
+            format!("{}", Ehlo::new(id.clone()).unwrap()),
+            "EHLO localhost\r\n"
+        );
+        assert_eq!(format!("{}", Lhlo::new(id).unwrap()), "LHLO localhost\r\n");
         assert_eq!(
             format!("{}", Mail::new(Some(email.clone()), vec![]).unwrap()),
             "MAIL FROM:<test@example.com>\r\n"

@@ -17,8 +17,8 @@ use super::escape_crlf;
 use super::metering::WireMetering;
 use super::{
     ClientCodec, ConnectionState, MAX_RESPONSE_BYTES, MAX_RESPONSE_LINE_BYTES,
-    PIPELINING_RECIPIENT_WINDOW, TlsParameters, async_net::AsyncNetworkStream, data_terminator,
-    smtp_data_size,
+    PIPELINING_RECIPIENT_WINDOW, PhasedError, TlsParameters, async_net::AsyncNetworkStream,
+    data_terminator, merge_lmtp_statuses, smtp_data_size,
 };
 use crate::{
     Envelope,
@@ -65,6 +65,20 @@ macro_rules! try_smtp (
             Err(err) => {
                 $client.abort().await;
                 return Err(From::from(err.with_phase($phase)))
+            },
+        }
+    });
+);
+
+/// `try_smtp!` for the phase-typed pipelined driver: aborts the connection and
+/// returns a `PhasedError`, which is the only error this driver can produce.
+macro_rules! try_phased (
+    ($err: expr, $client: ident, $phase: expr) => ({
+        match $err {
+            Ok(val) => val,
+            Err(err) => {
+                $client.abort().await;
+                return Err(PhasedError::new($phase, Error::from(err)))
             },
         }
     });
@@ -414,12 +428,29 @@ impl AsyncSmtpConnection {
         Ok(result)
     }
 
+    /// Phase-stamping funnel for the pipelined driver.
+    ///
+    /// `send_pipelined_inner` cannot return an undecorated error: its error
+    /// type is `PhasedError`, which has no `From<Error>` conversion, so `?`
+    /// on a plain SMTP result does not compile there. This is the one place
+    /// that turns a boundary failure back into an `Error`.
     async fn send_pipelined(
         &mut self,
         email: &[u8],
         mail: Mail,
         recipients: Vec<Rcpt>,
     ) -> Result<Response, Error> {
+        self.send_pipelined_inner(email, mail, recipients)
+            .await
+            .map_err(PhasedError::into_error)
+    }
+
+    async fn send_pipelined_inner(
+        &mut self,
+        email: &[u8],
+        mail: Mail,
+        recipients: Vec<Rcpt>,
+    ) -> Result<Response, PhasedError> {
         for (window_index, window) in recipients.chunks(PIPELINING_RECIPIENT_WINDOW).enumerate() {
             let mut commands = String::new();
             if window_index == 0 {
@@ -428,59 +459,85 @@ impl AsyncSmtpConnection {
             for recipient in window {
                 commands.push_str(&recipient.to_string());
             }
-            self.write(commands.as_bytes()).await?;
-
             // Keep the stream broken while this whole window is outstanding.
             // If this future is cancelled after only part of the replies have
             // been drained, the pool must not reuse a misaligned connection.
-            self.stream.get_ref().state().verify()?;
+            let write_phase = if window_index == 0 {
+                SmtpCommandPhase::MailFrom
+            } else {
+                SmtpCommandPhase::RcptTo
+            };
+            try_phased!(self.write(commands.as_bytes()).await, self, write_phase);
+            try_phased!(self.stream.get_ref().state().verify(), self, write_phase);
             self.stream.get_mut().set_state(ConnectionState::Broken);
 
             if window_index == 0 {
-                let mail_response = self
-                    .read_response_with_budget_inner(self.per_operation_budget(), true, false)
-                    .await?;
+                let mail_response = try_phased!(
+                    self.read_response_with_budget_inner(self.per_operation_budget(), true, false)
+                        .await,
+                    self,
+                    SmtpCommandPhase::MailFrom
+                );
                 if !mail_response.is_positive() {
                     for _ in window {
-                        self.read_response_with_budget_inner(
-                            self.per_operation_budget(),
-                            true,
-                            false,
-                        )
-                        .await?;
+                        try_phased!(
+                            self.read_response_with_budget_inner(
+                                self.per_operation_budget(),
+                                true,
+                                false,
+                            )
+                            .await,
+                            self,
+                            SmtpCommandPhase::RcptTo
+                        );
                     }
-                    self.finish_reply_group()?;
-                    return Err(Self::error_from_status(mail_response));
+                    // No RSET: a rejected MAIL FROM opened no transaction, so
+                    // there is nothing to reset and the connection stays
+                    // reusable as it is.
+                    try_phased!(self.finish_reply_group(), self, SmtpCommandPhase::RcptTo);
+                    return Err(PhasedError::new(
+                        SmtpCommandPhase::MailFrom,
+                        error::status(mail_response),
+                    ));
                 }
             }
 
             let mut failure = None;
             for _ in window {
-                let response = self
-                    .read_response_with_budget_inner(self.per_operation_budget(), true, false)
-                    .await?;
+                let response = try_phased!(
+                    self.read_response_with_budget_inner(self.per_operation_budget(), true, false)
+                        .await,
+                    self,
+                    SmtpCommandPhase::RcptTo
+                );
                 if failure.is_none() && !response.is_positive() {
                     failure = Some(response);
                 }
             }
-            self.finish_reply_group()?;
+            try_phased!(self.finish_reply_group(), self, SmtpCommandPhase::RcptTo);
             if let Some(response) = failure {
-                if self.command_accepting_status(Rset).await.is_err() {
-                    self.abort().await;
-                }
-                return Err(Self::error_from_status(response));
+                self.reset_transaction().await;
+                return Err(PhasedError::new(
+                    SmtpCommandPhase::RcptTo,
+                    error::status(response),
+                ));
             }
         }
 
-        let data_response = self.command_accepting_status(Data).await?;
+        let data_response = try_phased!(
+            self.command_accepting_status(Data).await,
+            self,
+            SmtpCommandPhase::DataCommand
+        );
         if !data_response.is_positive() {
-            if self.command_accepting_status(Rset).await.is_err() {
-                self.abort().await;
-            }
-            return Err(Self::error_from_status(data_response));
+            self.reset_transaction().await;
+            return Err(PhasedError::new(
+                SmtpCommandPhase::DataCommand,
+                error::status(data_response),
+            ));
         }
 
-        let result = try_smtp!(self.message(email).await, self);
+        let result = try_phased!(self.message(email).await, self, SmtpCommandPhase::DataBody);
         Ok(result)
     }
 
@@ -533,6 +590,7 @@ impl AsyncSmtpConnection {
                 };
                 rejected.push(response);
             }
+            self.reset_transaction().await;
             return Ok(rejected);
         }
 
@@ -541,23 +599,13 @@ impl AsyncSmtpConnection {
             self,
             SmtpCommandPhase::DataCommand
         );
-        let mut delivery_statuses = try_smtp!(
+        let delivery_statuses = try_smtp!(
             self.message_lmtp(email, accepted_recipients).await,
             self,
             SmtpCommandPhase::LmtpFinalStatus
-        )
-        .into_iter();
+        );
 
-        Ok(recipient_statuses
-            .into_iter()
-            .map(|response| {
-                response.unwrap_or_else(|| {
-                    delivery_statuses
-                        .next()
-                        .expect("server returned one status per accepted recipient")
-                })
-            })
-            .collect())
+        merge_lmtp_statuses(recipient_statuses, delivery_statuses)
     }
 
     pub(crate) async fn send_lmtp_bdat_with_options(
@@ -606,25 +654,17 @@ impl AsyncSmtpConnection {
                 };
                 rejected.push(response);
             }
+            self.reset_transaction().await;
             return Ok(rejected);
         }
 
-        let mut delivery_statuses = try_smtp!(
+        let delivery_statuses = try_smtp!(
             self.message_lmtp_bdat(email, accepted_recipients).await,
-            self
-        )
-        .into_iter();
+            self,
+            SmtpCommandPhase::LmtpFinalStatus
+        );
 
-        Ok(recipient_statuses
-            .into_iter()
-            .map(|response| {
-                response.unwrap_or_else(|| {
-                    delivery_statuses
-                        .next()
-                        .expect("server returned one status per accepted recipient")
-                })
-            })
-            .collect())
+        merge_lmtp_statuses(recipient_statuses, delivery_statuses)
     }
 
     /// Async account-oriented SMTP multi-recipient send.
@@ -729,6 +769,7 @@ impl AsyncSmtpConnection {
             )
         });
         if !accepted {
+            self.reset_transaction().await;
             return Ok(progress);
         }
 
@@ -736,9 +777,7 @@ impl AsyncSmtpConnection {
             Ok(resp) if resp.is_positive() => {}
             Ok(resp) => {
                 progress.mark_accepted_rejected_with_response(resp);
-                if let Err(_e) = self.command_accepting_status(Rset).await {
-                    self.abort().await;
-                }
+                self.reset_transaction().await;
                 return Ok(progress);
             }
             Err(e) => {
@@ -898,9 +937,7 @@ impl AsyncSmtpConnection {
             )
         });
         if !accepted {
-            if self.command_accepting_status(Rset).await.is_err() {
-                self.abort().await;
-            }
+            self.reset_transaction().await;
             return Ok(progress);
         }
 
@@ -923,22 +960,7 @@ impl AsyncSmtpConnection {
 
         if !data_response.is_positive() {
             progress.mark_accepted_rejected_with_response(data_response);
-            if !accepted {
-                if let Err(_e) = self.command_accepting_status(Rset).await {
-                    self.abort().await;
-                }
-            } else {
-                self.abort().await;
-            }
-            return Ok(progress);
-        }
-
-        if !accepted {
-            if self.write(b".\r\n").await.is_ok() {
-                let _ = self.read_response_accepting_status().await;
-            } else {
-                self.abort().await;
-            }
+            self.reset_transaction().await;
             return Ok(progress);
         }
 
@@ -1052,6 +1074,7 @@ impl AsyncSmtpConnection {
         }
 
         if accepted_count == 0 {
+            self.reset_transaction().await;
             return Ok(progress);
         }
 
@@ -1064,9 +1087,7 @@ impl AsyncSmtpConnection {
             Ok(resp) if resp.is_positive() => {}
             Ok(resp) => {
                 progress.mark_accepted_rejected_with_response(resp);
-                if let Err(_e) = self.command_accepting_status(Rset).await {
-                    self.abort().await;
-                }
+                self.reset_transaction().await;
                 return Ok(progress);
             }
             Err(e) => {
@@ -1597,25 +1618,27 @@ impl AsyncSmtpConnection {
         hello_name: &ClientId,
         budget: TimeoutBudget,
     ) -> Result<(), Error> {
-        hello_name.validate()?;
         let response = match self.protocol {
             Protocol::Lmtp => {
-                try_smtp!(
-                    self.command_with_budget(Lhlo::new(hello_name.clone()), budget)
-                        .await,
-                    self
-                )
+                let command = Lhlo::new(hello_name.clone())?;
+                try_smtp!(self.command_with_budget(command, budget).await, self)
             }
             _ => {
-                try_smtp!(
-                    self.command_with_budget(Ehlo::new(hello_name.clone()), budget)
-                        .await,
-                    self
-                )
+                let command = Ehlo::new(hello_name.clone())?;
+                try_smtp!(self.command_with_budget(command, budget).await, self)
             }
         };
         self.server_info = try_smtp!(ServerInfo::from_response(&response), self);
         Ok(())
+    }
+
+    /// Close the current mail transaction, or make the connection
+    /// unrecyclable if the server does not positively acknowledge the reset.
+    async fn reset_transaction(&mut self) {
+        match self.command_accepting_status(Rset).await {
+            Ok(response) if response.is_positive() => {}
+            Ok(_) | Err(_) => self.abort().await,
+        }
     }
 
     pub(crate) async fn abort(&mut self) {
@@ -2092,10 +2115,6 @@ impl AsyncSmtpConnection {
         self.retire
     }
 
-    fn error_from_status(response: Response) -> Error {
-        error::status(response)
-    }
-
     /// Writes a string to the server
     async fn write(&mut self, string: &[u8]) -> Result<(), Error> {
         self.write_with_budget(string, self.per_operation_budget())
@@ -2254,6 +2273,168 @@ mod transcript_tests {
     use super::{AsyncSmtpConnection, SendOptions};
 
     const HELLO: &str = "EHLO client.example\r\n";
+
+    #[tokio::test(crate = "tokio")]
+    async fn all_recipient_rejection_resets_every_direct_and_batch_transaction() {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let envelope = Envelope::new(
+            Some("sender@example.com".parse().unwrap()),
+            vec!["recipient@example.com".parse().unwrap()],
+        )
+        .unwrap();
+
+        for chunking in [false, true] {
+            let greeting = if chunking {
+                "250-lmtp.example\r\n250 CHUNKING\r\n"
+            } else {
+                "250 lmtp.example\r\n"
+            };
+            let transcript = Transcript::new("220 lmtp.example\r\n")
+                .expect("LHLO client.example\r\n", greeting)
+                .expect("MAIL FROM:<sender@example.com>\r\n", "250 sender ok\r\n")
+                .expect(
+                    "RCPT TO:<recipient@example.com>\r\n",
+                    "550 recipient rejected\r\n",
+                )
+                .expect("RSET\r\n", "250 reset ok\r\n");
+            let mut connection =
+                AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Lmtp)
+                    .await
+                    .unwrap();
+            let statuses = if chunking {
+                connection
+                    .send_lmtp_bdat_with_options(&envelope, b"body", &Default::default())
+                    .await
+                    .unwrap()
+            } else {
+                connection.send_lmtp(&envelope, b"body").await.unwrap()
+            };
+            assert_eq!(statuses.len(), 1);
+            assert!(!statuses[0].is_positive());
+            assert!(!connection.has_broken());
+            transcript.assert_exhausted();
+        }
+
+        for protocol in [Protocol::Smtp, Protocol::Lmtp] {
+            let hello_command = if protocol == Protocol::Smtp {
+                "EHLO client.example\r\n"
+            } else {
+                "LHLO client.example\r\n"
+            };
+            let transcript = Transcript::new("220 server.example\r\n")
+                .expect(hello_command, "250 server.example\r\n")
+                .expect("MAIL FROM:<sender@example.com>\r\n", "250 sender ok\r\n")
+                .expect(
+                    "RCPT TO:<recipient@example.com>\r\n",
+                    "550 recipient rejected\r\n",
+                )
+                .expect("RSET\r\n", "250 reset ok\r\n");
+            let batch = vec![SmtpBatchRecipient {
+                id: BatchItemId("item-0".to_owned()),
+                address: "recipient@example.com".parse().unwrap(),
+            }];
+            let mut connection =
+                AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, protocol)
+                    .await
+                    .unwrap();
+            let progress = if protocol == Protocol::Smtp {
+                connection
+                    .send_smtp_batch(
+                        Some("sender@example.com".parse().unwrap()),
+                        batch,
+                        b"body",
+                        &Default::default(),
+                    )
+                    .await
+            } else {
+                connection
+                    .send_lmtp_batch(
+                        Some("sender@example.com".parse().unwrap()),
+                        batch,
+                        b"body",
+                        &Default::default(),
+                    )
+                    .await
+            }
+            .unwrap();
+            assert_eq!(progress.resolve().failed().len(), 1);
+            assert!(!connection.has_broken());
+            transcript.assert_exhausted();
+        }
+    }
+
+    #[tokio::test(crate = "tokio")]
+    async fn pipelined_server_rejections_carry_their_command_phase() {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let envelope = Envelope::new(
+            Some("sender@example.com".parse().unwrap()),
+            vec!["recipient@example.com".parse().unwrap()],
+        )
+        .unwrap();
+        let window = "MAIL FROM:<sender@example.com>\r\nRCPT TO:<recipient@example.com>\r\n";
+
+        // MAIL FROM rejected: no transaction was opened, so no RSET.
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250-smtp.example\r\n250 PIPELINING\r\n")
+            .expect(window, "550 sender rejected\r\n250 recipient ok\r\n");
+        let mut connection =
+            AsyncSmtpConnection::from_transcript(transcript, &hello, Protocol::Smtp)
+                .await
+                .unwrap();
+        let error = connection.send(&envelope, b"body").await.unwrap_err();
+        assert_eq!(error.phase(), Some(super::SmtpCommandPhase::MailFrom));
+
+        // RCPT TO rejected.
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250-smtp.example\r\n250 PIPELINING\r\n")
+            .expect(window, "250 sender ok\r\n550 recipient rejected\r\n")
+            .expect("RSET\r\n", "250 reset ok\r\n");
+        let mut connection =
+            AsyncSmtpConnection::from_transcript(transcript, &hello, Protocol::Smtp)
+                .await
+                .unwrap();
+        let error = connection.send(&envelope, b"body").await.unwrap_err();
+        assert_eq!(error.phase(), Some(super::SmtpCommandPhase::RcptTo));
+
+        // DATA rejected before the body.
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250-smtp.example\r\n250 PIPELINING\r\n")
+            .expect(window, "250 sender ok\r\n250 recipient ok\r\n")
+            .expect("DATA\r\n", "554 no data\r\n")
+            .expect("RSET\r\n", "250 reset ok\r\n");
+        let mut connection =
+            AsyncSmtpConnection::from_transcript(transcript, &hello, Protocol::Smtp)
+                .await
+                .unwrap();
+        let error = connection.send(&envelope, b"body").await.unwrap_err();
+        assert_eq!(error.phase(), Some(super::SmtpCommandPhase::DataCommand));
+    }
+
+    #[tokio::test(crate = "tokio")]
+    async fn pipelined_body_failure_carries_data_body_phase() {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250-smtp.example\r\n250 PIPELINING\r\n")
+            .expect(
+                "MAIL FROM:<sender@example.com>\r\nRCPT TO:<recipient@example.com>\r\n",
+                "250 sender ok\r\n250 recipient ok\r\n",
+            )
+            .expect("DATA\r\n", "354 send body\r\n")
+            .expect_then_close("body", "");
+        let envelope = Envelope::new(
+            Some("sender@example.com".parse().unwrap()),
+            vec!["recipient@example.com".parse().unwrap()],
+        )
+        .unwrap();
+        let mut connection =
+            AsyncSmtpConnection::from_transcript(transcript, &hello, Protocol::Smtp)
+                .await
+                .unwrap();
+
+        let error = connection.send(&envelope, b"body").await.unwrap_err();
+
+        assert_eq!(error.phase(), Some(super::SmtpCommandPhase::DataBody));
+    }
 
     #[tokio::test(crate = "tokio")]
     async fn data_terminator_preserves_exact_message_bytes() {

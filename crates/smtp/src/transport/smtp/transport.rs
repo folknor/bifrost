@@ -21,6 +21,7 @@ use super::{SUBMISSION_PORT, SUBMISSIONS_PORT, Tls, TlsParameters};
 use crate::address::Address;
 use crate::transport::smtp::account_error::SmtpErrorContext;
 use crate::transport::smtp::authentication::IntoSecretString;
+use crate::transport::smtp::error::SmtpCommandPhase;
 use crate::{Transport, address::Envelope};
 
 /// Synchronously send emails using the SMTP protocol
@@ -878,7 +879,10 @@ impl SmtpClient {
                 )?;
 
                 if let Some(credentials) = &self.info.credentials {
-                    self.info.ensure_can_authenticate(conn.is_encrypted())?;
+                    if let Err(error) = self.info.ensure_can_authenticate(conn.is_encrypted()) {
+                        conn.abort();
+                        return Err(error.with_phase(SmtpCommandPhase::Auth));
+                    }
                     conn.auth(&self.info.authentication, credentials)?;
                 }
                 return Ok(conn);
@@ -918,7 +922,10 @@ impl SmtpClient {
         }
 
         if let Some(credentials) = &self.info.credentials {
-            self.info.ensure_can_authenticate(conn.is_encrypted())?;
+            if let Err(error) = self.info.ensure_can_authenticate(conn.is_encrypted()) {
+                conn.abort();
+                return Err(error.with_phase(SmtpCommandPhase::Auth));
+            }
             conn.auth(&self.info.authentication, credentials)?;
         }
         Ok(conn)

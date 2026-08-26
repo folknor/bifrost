@@ -29,6 +29,7 @@ use crate::address::Address;
 use crate::executor::SmtpExecutor;
 use crate::transport::smtp::account_error::SmtpErrorContext;
 use crate::transport::smtp::authentication::IntoSecretString;
+use crate::transport::smtp::error::SmtpCommandPhase;
 use crate::{Envelope, Executor};
 
 /// Asynchronously sends emails using the SMTP protocol
@@ -1015,7 +1016,10 @@ where
         .await?;
 
         if let Some(credentials) = &self.info.credentials {
-            self.info.ensure_can_authenticate(conn.is_encrypted())?;
+            if let Err(error) = self.info.ensure_can_authenticate(conn.is_encrypted()) {
+                conn.abort().await;
+                return Err(error.with_phase(SmtpCommandPhase::Auth));
+            }
             conn.auth(&self.info.authentication, credentials).await?;
         }
         Ok(conn)

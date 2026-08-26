@@ -24,7 +24,7 @@
 #[cfg(feature = "serde")]
 use std::fmt::Debug;
 
-use crate::transport::smtp::{Error, error};
+use crate::transport::smtp::{Error, error, error::SmtpCommandPhase, response::Response};
 
 #[cfg(feature = "tokio")]
 pub(crate) use self::async_connection::AsyncSmtpConnection;
@@ -136,6 +136,69 @@ fn data_terminator(ends_with_crlf: bool) -> &'static [u8] {
     } else {
         b"\r\n.\r\n"
     }
+}
+
+/// A failure at a pipelined wire boundary, carrying the boundary it happened
+/// at.
+///
+/// This exists to make the phase decoration structural rather than a
+/// convention. The pipelined drivers run inside inner functions that return
+/// this type, and it deliberately has:
+///
+/// - no `From<Error>` impl, so `?` on an undecorated `Result<_, Error>` does
+///   not compile inside those functions, and
+/// - no constructor that does not take a `SmtpCommandPhase`.
+///
+/// So the only way out of a pipelined driver is through a phase. The outer
+/// wrapper is the single place that converts back to `Error`, which is where
+/// the phase is stamped. Adding a new boundary to the pipelined path cannot
+/// silently ship undecorated: it will not build.
+///
+/// Negative replies matter here as much as transport failures. A server
+/// rejecting `MAIL FROM`, a `RCPT TO` or `DATA` is a normal outcome whose
+/// phase feeds `classify_response`, including the recipient-lane split, so an
+/// undecorated rejection makes PIPELINING classify differently from the
+/// non-pipelined path for the same wire exchange.
+pub(super) struct PhasedError {
+    phase: SmtpCommandPhase,
+    error: Error,
+}
+
+impl PhasedError {
+    pub(super) fn new(phase: SmtpCommandPhase, error: Error) -> Self {
+        Self { phase, error }
+    }
+
+    pub(super) fn into_error(self) -> Error {
+        self.error.with_phase(self.phase)
+    }
+}
+
+/// Merge RCPT-time rejections with the final statuses for accepted LMTP
+/// recipients without trusting a server-controlled count at the call site.
+fn merge_lmtp_statuses(
+    recipient_statuses: Vec<Option<Response>>,
+    delivery_statuses: Vec<Response>,
+) -> Result<Vec<Response>, Error> {
+    let mut delivery_statuses = delivery_statuses.into_iter();
+    let mut statuses = Vec::with_capacity(recipient_statuses.len());
+
+    for response in recipient_statuses {
+        match response {
+            Some(response) => statuses.push(response),
+            None => statuses.push(delivery_statuses.next().ok_or_else(|| {
+                error::internal("server returned fewer LMTP statuses than accepted recipients")
+            })?),
+        }
+    }
+
+    if delivery_statuses.next().is_some() {
+        return Err(error::internal(
+            "server returned more LMTP statuses than accepted recipients",
+        ));
+    }
+
+    Ok(statuses)
 }
 
 #[derive(Debug, Copy, Clone)]

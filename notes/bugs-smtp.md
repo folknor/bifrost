@@ -4,9 +4,6 @@ Scope: `crates/smtp/` - transport types (async and blocking halves, both publish
 surface), connection pooling, PIPELINING, DSN, message builder, LMTP, TLS handling,
 examples.
 
-Hunter note: baseline `brokkr check -p smtp` passes clean (exit 0). Every finding
-below is a defect in code that currently compiles and passes its own suite.
-
 ## Round 1 rulings (findings 1-7, landed)
 
 Findings 1 through 7 are fixed and removed. Two things about that round are worth
@@ -22,338 +19,142 @@ keeping, because they are not visible from the code alone:
 - **A defect the round's own fix introduced, caught by the cold reviewer.** The
   finding-6 fix made `max_size` a real bound with a semaphore, and the new
   admission gate did not participate in `shutdown()`. That left a checkout
-  parked on admission unwakeable, and - once a pre-shutdown checkout was
-  returned and released its permit - able to dial a NEW connection through a
-  closed pool. Closed by `admission.close()` + `notify_waiters()` in
-  `shutdown()` plus a pool-state recheck after admission and before dialing.
+  parked on admission unwakeable, and, once a pre-shutdown checkout was
+  returned and released its permit, able to dial a new connection through a
+  closed pool. Closed by `admission.close()` plus `notify_waiters()` in
+  `shutdown()` and a pool-state recheck after admission and before dialing.
   The blocking pool's condvar equivalent was audited and was already correct;
   it gained only a `notify_all()` for the case where the checked-out connection
   is never returned at all.
 
-## 8. Pipelined single-envelope send is systematically missing `SmtpCommandPhase` decoration
+## Final round rulings
 
-**Confidence: high. Both halves.**
+Findings 8 through 13 are fixed and removed. Four things about how that landed
+are worth keeping, because they are not visible from the code alone.
 
-Compare `send_with_options`'s non-pipelined branch, where every step is tagged:
+**Finding 8 was fixed twice.** The first pass added `with_phase` at the
+pipelined call sites one by one and missed six of them plus a seventh
+asymmetry: the *negative reply* paths - a server rejecting `MAIL FROM`, a
+recipient or `DATA` - still returned a bare `error::status(response)` in both
+halves, and the sync `MAIL FROM` rejection path drained its reply group through
+an undecorated `?` where the async twin did not. Those are the paths that
+actually run when a real relay rejects a recipient, and their phase feeds
+`classify_response` including the recipient-lane split, so PIPELINING still
+classified an ordinary rejection differently from the non-pipelined path. The
+cold reviewer caught it; the round's own new tests only exercised a body
+transport failure.
 
-```rust
-try_smtp!(self.command(mail).await, self, SmtpCommandPhase::MailFrom);
-try_smtp!(self.command(recipient).await, self, SmtpCommandPhase::RcptTo);
-try_smtp!(self.command(Data).await, self, SmtpCommandPhase::DataCommand);
-try_smtp!(self.message(email).await, self, SmtpCommandPhase::DataBody);
-```
+The second fix is structural rather than another sweep of call sites, because a
+per-call-site fix is exactly what failed here. `send_pipelined` is now a
+one-line funnel over `send_pipelined_inner`, whose error type is `PhasedError`
+(`client/mod.rs`): no `From<Error>` impl, no phase-less constructor. `?` on an
+undecorated SMTP result does not compile inside the driver, so a boundary added
+later cannot ship undecorated. It also caught a site nobody had listed - the
+post-write `state().verify()` - which had been an undecorated `?` in both
+halves all along. Six assertions across two paired tests pin `MailFrom`,
+`RcptTo`, `DataCommand` and `DataBody`; all six were ablated and fail against
+the undecorated funnel.
 
-against `send_pipelined` (`async_connection.rs:417`), where:
+**Finding 9 was already closed by round 1, not by this round.** Round 1's
+surplus-reply work added the sync `Broken` bracket and `finish_reply_group` to
+`send_pipelined` in aa8ec44. The final round changed nothing there and should
+not have claimed to. The mirror was neither necessary nor harmful - it did not
+happen.
 
-- `self.write(commands.as_bytes()).await?` - bare `?`, no phase, no attempt state, no
-  abort.
-- every `read_response_with_budget_inner(...).await?` - bare `?`, no phase.
-- `self.command_accepting_status(Data).await?` - bare `?`.
-- `try_smtp!(self.message(email).await, self)` - two-arg form, **no phase**, where the
-  non-pipelined twin passes `DataBody`.
+**Finding 12's four sites are ten.** Counting both I/O halves there are five
+all-recipients-rejected early returns each: direct LMTP DATA and BDAT sends,
+`send_smtp_batch`, `send_smtp_batch_pipelined` (the one that was already
+correct) and `send_lmtp_batch`. All ten now route through one
+`reset_transaction` per half, which keeps the connection when the peer
+positively acknowledges the `RSET` and aborts it otherwise. A rejected `MAIL
+FROM` on the pipelined path deliberately does *not* reset: it opened no
+transaction.
 
-`reference/smtp.md` states that phase lives on `Error::Inner` *"so a missed
-`with_phase` decoration cannot silently degrade the classifier."* That guarantees the
-phase cannot be *lost*; it does not supply one that was never attached. Since
-`account_error.rs` reads `error.phase()` in preference to the context phase, and
-PIPELINING is advertised by essentially every modern relay, **the phase-aware routing
-is dark on the default production path for single-envelope sends.** A DATA-body
-transport drop and a MAIL FROM write failure arrive at the classifier
-indistinguishable.
+**Finding 11 was closed without an assert.** `merge_lmtp_statuses` returns
+`error::internal` on either a short or a surplus status count rather than
+`expect`-ing a server-controlled invariant, matching the sibling error four
+lines above it. No `debug_assert` accompanies it, and that is deliberate: the
+`batch.rs` `debug_assert`-plus-release-fallback idiom exists where a *lane* has
+to resolve to something, whereas this is an internal count invariant with a
+real error to return.
 
-The batch pipelined path (`send_smtp_batch_pipelined`) *is* decorated throughout,
-which confirms the decoration is meant to be there.
+The rest of the round:
 
-## 9. Sync `send_pipelined` does not hold `Broken` across the window drain
-
-**Confidence: high. Asymmetry the reference explicitly claims does not exist.**
-
-The async version brackets each window:
-
-```rust
-self.stream.get_ref().state().verify()?;
-self.stream.get_mut().set_state(ConnectionState::Broken);
-... drain replies ...
-self.stream.get_mut().set_state(ConnectionState::Ok);
-```
-
-The sync version (`connection.rs:259`) has none of it - it writes the window and
-drains with no state bracketing at all.
-
-`reference/smtp.md` says *"The two halves are held in step deliberately"* and *"the
-fifteen invariants that only the blocking tests had pinned are now covered on BOTH
-sides."* This invariant went the other way and is covered on neither. There is no
-future to cancel in the sync half, so the async motivation does not transfer directly
-- but a panic unwinding through the drain (a caller using `catch_unwind`, an
-allocation failure, a `debug_assert` in a callee) leaves the connection `Ok` with N
-undrained replies and hands it straight back to the pool. That is finding 2's failure
-mode reached by a different door.
-
-## 10. Dead branches in `send_smtp_batch_pipelined`, and a healthy connection thrown away
-
-**Confidence: high on the dead code, medium on the severity of the abort.**
-
-At `async_connection.rs:887-936`. The function computes `accepted`, and at line 893
-returns early if `!accepted`. Therefore `accepted == true` for the remainder. Yet:
-
-- line 919: `if !accepted { ... RSET ... } else { self.abort().await; }` - the `if` arm
-  is unreachable.
-- line 929: `if !accepted { self.write(b".\r\n") ... }` - an entire unreachable block
-  that writes a bare DATA terminator.
-
-Unreachable code that writes to the wire in a send driver is not a lint nit; it is a
-leftover from a control-flow change, and the reachable half of it is wrong. On a
-negative `DATA` reply the reachable branch is `self.abort().await` - but a negative
-DATA reply leaves the connection **perfectly reusable**; the transaction is closed by
-the rejection and an `RSET` restores it. The non-pipelined twin at line 739 does
-exactly that:
-
-```rust
-progress.mark_accepted_rejected_with_response(resp);
-if let Err(_e) = self.command_accepting_status(Rset).await { self.abort().await; }
-```
-
-So the pipelined batch path discards a healthy pooled connection on every DATA
-rejection while the non-pipelined path keeps it. Since PIPELINING is near-universal,
-the pipelined path is the one that runs.
-
-## 11. `.expect()` on a server-controlled invariant in the LMTP direct-send paths
-
-**Confidence: medium. Panic reachability is argued-away, not proven.**
-
-`send_lmtp_with_options` (`async_connection.rs:554`) and
-`send_lmtp_bdat_with_options` (line 622):
-
-```rust
-delivery_statuses.next().expect("server returned one status per accepted recipient")
-```
-
-This is safe *only* because `message_lmtp_iter` reads exactly `accepted_recipients`
-responses and errors otherwise. That is currently true. But the invariant being
-asserted is phrased as a fact about the server, in a library, on the delivery path, in
-code reachable from a public entry point - and it is held together by a count computed
-100 lines earlier in a different function. `error::internal(...)` is already used four
-lines above for the sibling invariant (`"recipient status invariant failed after all
-recipients were rejected"`), so the non-panicking idiom is right there in the same
-function.
-
-Note also that the `resolve()` path in `batch.rs` handles precisely this shape
-correctly - `debug_assert!` plus a release-mode `Uncertain` fallback. The direct-send
-path chose `expect`. Inconsistent treatment of the same hazard.
-
-## 12. LMTP `accepted_recipients == 0` early return leaves an open transaction
-
-**Confidence: medium.**
-
-`send_lmtp_with_options` at line 526 and `send_lmtp_bdat_with_options` at line 599:
-when every recipient was rejected, the function returns `Ok(rejected)` immediately -
-`MAIL FROM` was accepted, no `DATA` was issued, and **no `RSET` is sent**. The
-connection is returned to the pool with a half-open transaction. The next send through
-it issues `MAIL FROM` into an already-open transaction and gets a `503 Bad sequence of
-commands`.
-
-`send_smtp_batch` has the identical hole at line 731 (`if !accepted { return
-Ok(progress); }` - no RSET). The pipelined batch path at line 893 *does* RSET in this
-case, and `send_lmtp_batch` at line 1047 does not. So of the four places that handle
-"all recipients rejected", one gets it right.
-
-For LMTP this is masked by the unconditional retirement rule - but only for
-connections that reached a final-status drain, which this path by definition did not
-(`retire` is still `false`, so it *does* go back to the pool). Confidence is medium
-only because some servers implicitly reset on a fresh `MAIL FROM`; RFC 5321 section
-4.1.1.5 does not require them to.
-
-## 13. `AsyncSmtpClient::connection` drops a live connection without aborting on auth-policy refusal
-
-**Confidence: low-medium.**
-
-```rust
-if let Some(credentials) = &self.info.credentials {
-    self.info.ensure_can_authenticate(conn.is_encrypted())?;   // <- `?` drops conn
-    conn.auth(&self.info.authentication, credentials).await?;
-}
-```
-
-The `?` on `ensure_can_authenticate` drops `conn` without `abort()`. The socket closes
-on drop, so no FDs leak - but the connection is torn down without `close_notify` and,
-more to the point, this is the plaintext-AUTH refusal path, i.e. the one that fires
-when a caller has misconfigured TLS. Cosmetic against a real server; noted because the
-crate is otherwise scrupulous about aborting.
+- The proposed sans-I/O rewrite is refused for this bug-fix round. It is a
+  plausible future architecture, but replacing roughly 6,600 lines of mature
+  sync and async protocol drivers is not a bounded fix for the verified defects
+  and would put every lifecycle invariant at risk at once. This round instead
+  moved the repeated transaction cleanup behind one `reset_transaction` guard
+  per I/O half, moved LMTP status merging into one shared count-checked helper,
+  made EHLO/LHLO validation a constructor invariant, and made the pipelined
+  phase decoration a type-level guarantee. Paired transcript tests pin the
+  repaired behavior on both sides.
+- The pool redesign proposal is already superseded by round 1. `max_size` now
+  has admission control, async recycle has no I/O or await point, and shutdown
+  participates in admission. No further pool reshape remains from the argument.
+- Collapsing the repeated batch error-context blocks into `SendProgress` is a
+  reasonable refactor, not an open correctness defect. Phase-aware pipelined
+  single sends are now pinned directly. A broader refactor is declined here
+  because it would mix unrelated batch API reshaping into the final defect
+  pass. Note that the fifteen batch sites still write the phase twice per site
+  (once on the error, once on the context) with nothing enforcing they agree;
+  the `PhasedError` shape above is the pattern to reach for if that is ever
+  worked. This is the one piece of the document left open on purpose.
+- EHLO and LHLO validation now lives in their constructors, so a future command
+  call site cannot bypass it.
+- A fixed command-buffer reserve cannot close the documented zeroization gap:
+  OAuth tokens and authentication payloads are not bounded by such a reserve,
+  so an oversized command could still reallocate. Closing it structurally would
+  require a bounded credential contract or a different serialization design.
+  The proposed few-hundred-byte reserve would only move the threshold and is
+  refused as false closure. The accurate disclosure remains in
+  `reference/smtp.md`.
+- `PoolConfig::test_on_checkout` remains intentionally shared and inert for
+  LMTP. A debug assertion would reject valid shared configuration, while making
+  the config protocol-aware would reshape a published type for no behavioral
+  gain. The public documentation already states the LMTP behavior.
+- The cleanup worker's worst-case delayed FD release is not a protocol or
+  resource-retention defect: checkout enforces expiry, and shutdown releases
+  all parked connections. Tightening the sweep cadence would trade wakeups for
+  earlier best-effort cleanup without changing the contract, so it is declined.
+- The private `error_from_status` passthroughs were removed from both drivers.
+  Both were private one-line functions; no published item was removed, renamed
+  or narrowed anywhere in this round. `Ehlo::new` / `Lhlo::new` are
+  `pub(crate)`, so making them fallible is not a source break for consumers,
+  and `ClientId::validate` (also `pub(crate)`) is still called - from the
+  constructors rather than from `hello()`.
+- The durable reference assertions were corrected to describe the actual phase
+  enforcement and the repaired sync/async equivalence. `reference/smtp.md`
+  briefly asserted a closure that was not yet true; that is worse than an open
+  finding, because it stops anyone looking.
 
 ## Things checked that are correct
 
-Recorded so the next pass does not re-derive them:
+Recorded so a later pass does not re-derive them:
 
-- **Dot-stuffing** (`ClientCodec::encode`, `client/mod.rs:97`) is correct including the
-  awkward cases: bare LF treated as a line break (deliberate, tested), lone CR *not*
-  treated as one (the `(_, StartingNewLine)` arm precedes `(b'.', StartOfNewLine)`, so
-  `\r.` is not stuffed - right), state carried across chunk boundaries, and a dot at
-  byte 0 of the message stuffed.
-- **`smtp_data_size`** correctly excludes transparency dots and the terminator line per
-  RFC 1870 section 3, and correctly reuses an existing final CRLF. The `line\r` -> 7 and
-  `line\n` -> 7 cases are right.
-- **Header injection via header names** is closed by `is_ftext` (`header/mod.rs:189`),
-  and the comment explaining why is accurate.
-- **Header injection via header values** is closed, though not where the comment says.
-  `allowed_char` (line 394) excludes 0, 10, and 13, so any word containing CR or LF is
-  diverted into `encode_buf` and RFC 2047 encoded. `Subject`, `Comments`, `Keywords`
-  etc. accept unvalidated `String` through `text_header!`, and are safe only because of
-  this encoder property. That is load-bearing behavior with no test naming it as such -
-  a test asserting `Subject::from("x\r\nBcc: attacker@e.com")` round-trips to an
-  encoded-word would be cheap insurance.
-- **VRFY / EXPN / MAIL FROM / RCPT TO** all route through
-  `validate_single_line_argument` with `char::is_control`, covering the unchecked
-  `Address` constructor as the reference claims.
-- **`MailParameter::OtherRaw`** does validate its keyword and value
-  (`validate_esmtp_keyword` / `validate_esmtp_raw_value`) despite the "Raw" name.
-- **`Tls::Required`** genuinely cannot be stripped: it calls `conn.starttls(...)`
-  unconditionally, which errors if `Extension::StartTls` is not advertised.
-  `Tls::Opportunistic` is strippable by definition and is documented as such.
-- **`ServerInfo` is replaced** by the post-STARTTLS and post-AUTH EHLO, so pre-TLS
-  advertisements do not leak forward - *except* through the buffer hole in finding 1.
-- **LMTP per-recipient accounting** in `batch.rs` `SendProgress::resolve` is sound:
-  lane order follows input order, RCPT rejections are preserved at their original
-  index, `Pending` at resolve becomes `Uncertain` rather than vanishing, and the
-  `Accepted`-without-`Final` case has both a `debug_assert!` and a release fallback.
-- **The `Unsent` vs `Uncertain` split** is correct everywhere traced. Envelope-phase
-  failures resolve through `mark_unresolved_unsent`, including the later-pipelining
-  window write failure, and `Accepted` is rewritten alongside `Pending` for the reason
-  the comment gives. `InFlight` starts at `DATA`. This is the part of the crate in the
-  best shape.
+- **Dot-stuffing** is correct for bare LF, lone CR, chunk boundaries and a dot at
+  byte zero.
+- **`smtp_data_size`** excludes transparency dots and the terminator line and
+  reuses an existing final CRLF.
+- **Header injection via header names** is closed by `is_ftext`.
+- **Header injection via header values** is closed by the RFC 2047 encoder:
+  `allowed_char` excludes NUL, CR and LF, so hostile text cannot open another
+  field.
+- **VRFY, EXPN, MAIL FROM and RCPT TO** validate single-line arguments,
+  including values made with the unchecked address constructor.
+- **`MailParameter::OtherRaw`** validates its keyword and value.
+- **`Tls::Required`** cannot be stripped. `Tls::Opportunistic` is strippable by
+  definition.
+- **`ServerInfo` is replaced** after STARTTLS and AUTH, so pre-TLS capabilities
+  do not leak forward.
+- **LMTP per-recipient accounting** preserves original order and RCPT failures;
+  unresolved accepted recipients become uncertain.
+- **The `Unsent` versus `Uncertain` split** is correct on every traced envelope
+  and DATA boundary.
 
-## Structural story
+## Open
 
-### The central problem: `connection.rs` and `async_connection.rs` are a 6,600-line copy of each other
-
-3,053 lines and 3,592 lines, same module layout, same function names, same comments,
-same tests, differing only in `.await` and `Read`/`Write` versus
-`AsyncRead`/`AsyncWrite`. Together they are 22% of the crate.
-
-Five of the thirteen findings above are *directly caused by this*, in two shapes:
-
-- **The fix landed on one side only.** Finding 9 (sync pipelining has no `Broken`
-  bracket) is an async-side fix that never crossed. The reference document asserts the
-  two halves are in step; they are not, and nothing mechanically checks the claim.
-- **The fix landed on both sides but only in one of the two copies each side has.**
-  Finding 3 (SMTPUTF8 recipients) exists in `mail_options_for_batch` on both halves,
-  while `mail_options` - sitting 50 lines below it in the same file - is correct.
-  Finding 12 (missing RSET) is correct in one of four analogous sites.
-
-That second shape is the more damning one, because it says the duplication is not just
-sync-versus-async. Within each half there are already two copies of the option-building
-logic (single-envelope and batch) and two copies of the send driver (plain and
-pipelined), so the same rule is written four times per half and eight times across the
-crate. Every one of those eight has to be edited in lockstep, forever, by hand, with
-the reference doc as the only checker.
-
-Explicitly, given the history: **the hunter is not proposing removing the blocking
-half.** It is published API, it was deleted once on bad reasoning, and it must stay.
-The proposal is the opposite - it is precisely *because* both halves must be maintained
-indefinitely that maintaining them as two independent transcriptions is the wrong
-shape.
-
-The shape it would build instead:
-
-1. **Extract the SMTP protocol driver as a sans-I/O state machine.** One `SmtpDriver`
-   that owns `ServerInfo`, `ConnectionState`, the `retire` flag, `SendProgress`, the
-   pipelining window bookkeeping, the LMTP final-status accounting, all option
-   construction and validation, and all phase/attempt decoration. Its interface is `fn
-   step(&mut self, event: Event) -> Action`, where `Event` is `{ ReplyRead(Response),
-   WriteCompleted, Eof, Timeout }` and `Action` is `{ Write(Bytes), ReadReply, Abort,
-   Done(Outcome) }`. No `async`, no `Read`, no sockets. Every decision in findings 3, 8,
-   10, 12 lives here, once.
-2. **Two thin I/O pumps** - roughly 200 lines each, sync and async - that loop over
-   `step`, perform the requested `Write`/`ReadReply` against `NetworkStream` /
-   `AsyncNetworkStream` with the appropriate timeout budget, and feed the result back.
-   Cancellation safety becomes a property of the pump (~200 lines to audit), not of
-   3,600 lines of interleaved protocol-and-I/O.
-3. **The buffer-cleanliness invariant becomes a driver postcondition**, not something
-   each call site remembers. `ReadReply` returns "reply plus whether the buffer is now
-   empty," and the driver decides. Findings 1 and 2 both close structurally rather than
-   by remembering to add an `is_empty()` at N sites.
-4. **The `Transcript` harness tests the driver directly** - no I/O, no runtime, no
-   `start_paused` time. It becomes a pure `Vec<Event> -> Vec<Action>` comparison, which
-   is faster, more deterministic, and - critically - **tests both halves at once**,
-   because there is only one thing to test. The current 15-invariants-mirrored-on
-   both-sides test duplication, which the reference calls "the intended end state, not
-   debt to pay down," stops being necessary: the duplication exists to compensate for
-   the production duplication, and it disappears with its cause. The two pumps still
-   need their own small cancellation and timeout suites; that is the right amount of
-   duplicated testing.
-
-This is a large rewrite and the hunter recommends it directly. The payoff is not
-tidiness - it is that the class of bug that produced five of the thirteen findings
-stops being expressible.
-
-### Secondary: the pool is a parking lot, not a pool
-
-Findings 5, 6, and 7 are one design issue seen three ways. `Pool` has no admission
-control, does I/O in `Drop`, and calls a sequential loop "concurrent." What it actually
-implements is an idle-connection parking lot with an expiry sweeper.
-
-Reshape it as a real pool: a semaphore sized by `max_size` acquired at checkout and
-released by `PooledConnection`'s `Drop`; a synchronous parking list so `Drop` never
-spawns; and aborts batched and performed by whoever next touches the pool rather than
-by a detached task per connection. `min_idle > 0` keeps the warm-connection worker,
-which is fine as-is once the counting bug is fixed. This also makes the pool's state
-synchronously observable, so `idle_count_for_test` stops being a race.
-
-### Third: `SmtpErrorContext` reconstruction at every call site
-
-The batch drivers contain this, verbatim, at fifteen separate sites:
-
-```rust
-use crate::transport::smtp::account_error::{SmtpErrorContext, into_account_error};
-let ae = into_account_error(
-    e.with_attempt(SmtpTransmissionState::InFlight).with_phase(SmtpCommandPhase::DataBody),
-    SmtpErrorContext::send(Protocol::Smtp).with_phase(SmtpCommandPhase::DataBody),
-);
-let ae2 = ae.clone();
-progress.mark_uncertain_unresolved(|| ae2.clone());
-```
-
-including a function-body `use` statement repeated fifteen times, the phase written out
-twice per site, and a clone-into-a-closure dance to work around the `impl Fn()`
-signature. Every one of these is a place where the phase can be written inconsistently
-between the error and the context, and finding 8 is what happens when someone skips the
-block entirely. This wants to be `progress.fail(phase, attempt, e)` on `SendProgress`,
-taking the phase once. In the sans-I/O shape it disappears into the driver.
-
-## Lateral observations
-
-- **`Ehlo::new` / `Lhlo::new` do not validate their `ClientId`**; `hello_with_budget`
-  calls `hello_name.validate()?` first, so the live path is safe. Any future call site
-  that constructs `Ehlo` directly and hands it to `command()` would not be. Cheap to
-  move the validation into the constructor, where the other commands put it.
-- **`command_buffer` zeroization has a documented gap** (`reference/smtp.md`: a
-  `write!` that outgrows the allocation leaves one stale heap copy). Accurate.
-  `String::reserve` to a fixed high-water mark once at connection setup would close it,
-  at the cost of a few hundred bytes per connection.
-- **`test_on_checkout` is documented as buying nothing for LMTP** - correct, since LMTP
-  connections are retired at recycle and never checked out idle. But `PoolConfig` is
-  shared between the SMTP and LMTP transports with no way to express that, so an LMTP
-  caller can set a field that is silently inert. A `PoolConfig` that knows its protocol,
-  or a debug-assert, would be honest.
-- **`Pool::new`'s cleanup worker sleeps `idle_timeout` between sweeps**, so a
-  connection can sit up to `2 x idle_timeout` past expiry before the worker drops it.
-  Checkout catches it (`connection()` checks `idle_duration` first), so this only
-  affects when FDs are released, not correctness.
-- **`error_from_status` is a one-line passthrough** to `error::status` and adds
-  nothing. Trivial, but it is the kind of vestigial indirection that makes the two
-  halves look more different than they are when diffed.
-
-## Out of scope, flagged
-
-Nothing in `crates/types/` or `crates/net/` surfaced as suspect from the SMTP side.
-
-`reference/smtp.md` line 30 states the sync/async test duplication is "the intended end
-state, not debt to pay down." Finding 9 is a counterexample - the duplication did not
-catch a missing invariant on the sync side, because duplicated *tests* only help when
-the invariant was written down twice to begin with. If the sans-I/O reshape is not
-taken, the reference's claim should at least be downgraded, and something mechanical
-(even a script comparing function-name sets across the two files) should back it.
-
-`reference/smtp.md` lines 18-32 and 46-52 assert several invariants ("the two halves are
-held in step", phase decoration cannot degrade the classifier) that findings 3, 6 and 9
-contradict in the current code. That doc is in the durable, must-be-true tier, so it
-needs correcting alongside whichever fixes land.
+One item, stated above and repeated here so it is not lost: the fifteen batch
+`SmtpErrorContext` reconstruction sites still write the phase twice with
+nothing enforcing agreement. It is a refactor, not a known defect, and it is
+the natural next user of `PhasedError`.
