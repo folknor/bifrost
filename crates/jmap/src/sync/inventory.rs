@@ -76,11 +76,6 @@ pub(crate) fn stream_partition<T: HttpTransport>(
 ) -> AccountStream<SyncEvent<InventoryEntry>> {
     match partition {
         InventoryPartition::Full => stream(mail, limits, scope, owner),
-        InventoryPartition::Page { from, to }
-            if matches!(scope, CursorScope::Type(ObjectType::Email)) =>
-        {
-            email_inventory_page(mail, limits, from, to)
-        }
         _ => Box::pin(async_stream::stream! {
             yield super::error::terminated_unsupported(
                 bifrost_types::AccountOperation::SyncInventory,
@@ -118,7 +113,6 @@ enum InventoryOwner {
 
 enum InventoryWindow {
     Full { limit: usize },
-    Page { from: u32, to: u32 },
 }
 
 fn email_inventory_loop<T: HttpTransport>(
@@ -133,68 +127,30 @@ fn email_inventory_loop<T: HttpTransport>(
         // `Get` pair in one `/jmap/api` POST, and each emitted batch
         // takes and clears the accumulator.
         let (mail, tally) = mail.metered();
-        let (mut position, mut remaining, full_limit) = match window {
-            InventoryWindow::Full { limit } => (0, None, limit),
-            InventoryWindow::Page { from, to } if to <= from => {
-                yield SyncEvent::Done(None);
-                return;
-            }
-            InventoryWindow::Page { from, to } => {
-                let remaining = match usize::try_from(to - from) {
-                    Ok(window) if window != 0 => window,
-                    _ => {
-                        yield super::error::terminated_contract_violation(
-                            bifrost_types::AccountOperation::SyncInventory,
-                            Some(bifrost_types::ErrorScope::Cursor(scope.clone())),
-                            "JMAP inventory page range could not be converted to usize",
-                        );
-                        return;
-                    }
-                };
-                let position = match i32::try_from(from) {
-                    Ok(position) => position,
-                    Err(_) => {
-                        yield super::error::terminated_contract_violation(
-                            bifrost_types::AccountOperation::SyncInventory,
-                            Some(bifrost_types::ErrorScope::Cursor(scope.clone())),
-                            "JMAP inventory page position exceeded i32",
-                        );
-                        return;
-                    }
-                };
-                (position, Some(remaining), remaining)
-            }
-        };
+        let InventoryWindow::Full { limit: full_limit } = window;
 
-        let mut emitted_any = false;
+        let mut anchor: Option<String> = None;
+        let mut query_state: Option<String> = None;
         loop {
-            let limit = match remaining {
-                None => full_limit,
-                Some(0) if emitted_any => break,
-                // The requested window is full, but every id in it
-                // vanished between `Email/query` and `Email/get`. Ending
-                // here would hand the consumer a partition that yielded
-                // zero entries, which is exactly the signal a bounded
-                // backfill reads as end-of-inventory - a single
-                // concurrent deletion in the first window would then
-                // silently drop every later message. Keep walking past
-                // the window until we either produce an entry or the
-                // query itself runs dry, so a zero-entry partition means
-                // only "no more results". Overshooting re-reads
-                // positions the next partition also covers, and inventory
-                // entries are idempotent, so duplication is the safe side.
-                Some(0) => full_limit,
-                Some(n) => n,
-            };
             let started = Instant::now();
             let mut query = EmailQuery::new();
             if let Some(filter) = filter.clone() {
                 query = query.filter(filter);
             }
-            let query = query
+            query = query
                 .sort([query::Comparator::new(crate::email::query::Comparator::ReceivedAt).descending()])
-                .position(position)
-                .limit(limit);
+                .limit(full_limit);
+            // Anchoring on the previous page's last id resolves the next
+            // page's start server-side against the CURRENT result set, so a
+            // message deleted behind the cursor cannot shift an unread
+            // message into a position the walk already passed. Integer
+            // position over `receivedAt desc` - which is not a total order and
+            // has no RFC 8621 tiebreak - could and did.
+            if let Some(anchor) = anchor.as_ref() {
+                query = query.anchor(anchor.clone()).anchor_offset(1);
+            } else {
+                query = query.position(0);
+            }
             let query_response = mail.call(query).await;
 
             let query_response = match query_response {
@@ -224,15 +180,30 @@ fn email_inventory_loop<T: HttpTransport>(
                 }
             };
 
+            if let Some(expected) = query_state.as_ref() {
+                if query_response.query_state() != expected {
+                    // The anchor makes the walk robust to churn ahead of the
+                    // cursor, but not to an id being destroyed out from under
+                    // the anchor itself, so a moved `queryState` means this
+                    // walk's coverage is no longer provable. Ending here
+                    // WITHOUT a `Done` is the whole point: the engine restarts
+                    // the scope rather than recording a full walk that skipped.
+                    yield super::error::terminated_walk_superseded(
+                        bifrost_types::AccountOperation::SyncInventory,
+                        scope.clone(),
+                        "JMAP Email/query state changed during an inventory walk",
+                    );
+                    return;
+                }
+            } else {
+                query_state = Some(query_response.query_state().to_string());
+            }
+
             let ids = query_response.ids().to_vec();
             if ids.is_empty() {
                 break;
             }
-            // Position is in the query result space, not the hydrated
-            // result space. A server may cap Email/query below this request's
-            // limit, and an id can disappear between query and get.
-            let consumed = ids.len();
-
+            anchor = ids.last().map(ToString::to_string);
             let get_response = mail
                 .call(EmailGet::new().ids(ids).properties(inventory_properties()))
                 .await;
@@ -281,7 +252,6 @@ fn email_inventory_loop<T: HttpTransport>(
             }
 
             if !items.is_empty() {
-                emitted_any = true;
                 yield SyncEvent::Batch(Batch {
                     items,
                     page_boundary: PageBoundary::Page,
@@ -291,31 +261,6 @@ fn email_inventory_loop<T: HttpTransport>(
                 });
             }
 
-            if let Some(remaining) = &mut remaining {
-                *remaining = remaining.saturating_sub(consumed);
-            }
-            let advance = match i32::try_from(consumed) {
-                Ok(value) => value,
-                Err(_) => {
-                    yield super::error::terminated_contract_violation(
-                        bifrost_types::AccountOperation::SyncInventory,
-                        Some(bifrost_types::ErrorScope::Cursor(scope.clone())),
-                        "JMAP inventory page was too large to advance an i32 position",
-                    );
-                    return;
-                }
-            };
-            position = match position.checked_add(advance) {
-                Some(next) => next,
-                None => {
-                    yield super::error::terminated_contract_violation(
-                        bifrost_types::AccountOperation::SyncInventory,
-                        Some(bifrost_types::ErrorScope::Cursor(scope.clone())),
-                        "JMAP inventory position overflowed",
-                    );
-                    return;
-                }
-            };
         }
         yield SyncEvent::Done(None);
     })
@@ -386,21 +331,6 @@ fn email_inventory<T: HttpTransport>(
         InventoryWindow::Full {
             limit: limits.max_objects_in_get.max(1),
         },
-    )
-}
-
-fn email_inventory_page<T: HttpTransport>(
-    mail: MailAccount<T>,
-    _limits: CoreLimits,
-    from: u32,
-    to: u32,
-) -> AccountStream<SyncEvent<InventoryEntry>> {
-    email_inventory_loop(
-        mail,
-        CursorScope::Type(ObjectType::Email),
-        None,
-        InventoryOwner::Primary,
-        InventoryWindow::Page { from, to },
     )
 }
 

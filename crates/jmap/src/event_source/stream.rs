@@ -73,7 +73,7 @@ impl<T: HttpTransport + SseTransport> Client<T> {
                         Ok(event) => match event.event {
                             EventType::State => {
                                 match serde_json::from_slice::<PushObject>(&event.data) {
-                                    Ok(PushObject::StateChange { changed }) => {
+                                    Ok(PushObject::StateChange { changed, .. }) => {
                                         yield Ok(PushNotification::StateChange(Changes::new(
                                             if event.id.is_empty() { None } else { Some(String::from_utf8_lossy(&event.id).into_owned()) },
                                             changed,

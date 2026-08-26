@@ -109,6 +109,8 @@ enum WebSocketMessage_ {
     Response(WebSocketResponse),
     StateChange {
         changed: HashMap<String, HashMap<DataType, String>>,
+        #[serde(rename = "pushState", default)]
+        push_state: Option<String>,
     },
     #[cfg(feature = "calendars")]
     CalendarAlert(crate::CalendarAlert),
@@ -300,8 +302,8 @@ where
                                     Err(e) => yield Err(crate::Error::ResponseDecode(e)),
                                 }
                             }
-                            WebSocketMessage_::StateChange { changed } => {
-                                yield Ok(WebSocketMessage::PushNotification(PushObject::StateChange { changed }))
+                            WebSocketMessage_::StateChange { changed, push_state } => {
+                                yield Ok(WebSocketMessage::PushNotification(PushObject::StateChange { changed, push_state }))
                             }
                             #[cfg(feature = "calendars")]
                             WebSocketMessage_::CalendarAlert(alert) => {
@@ -414,17 +416,22 @@ mod tests {
     // would demand a second `@type` the wire never sends.
     #[test]
     fn deserializes_single_type_state_change_frame() {
-        let frame = r#"{"@type":"StateChange","changed":{"u1138":{"Mailbox":"f9a8d3"}}}"#;
+        let frame = r#"{"@type":"StateChange","changed":{"u1138":{"Mailbox":"f9a8d3"}},"pushState":"ps-9"}"#;
 
         let message: WebSocketMessage_ = serde_json::from_str(frame).unwrap();
 
-        let WebSocketMessage_::StateChange { changed } = message else {
+        let WebSocketMessage_::StateChange {
+            changed,
+            push_state,
+        } = message
+        else {
             panic!("expected StateChange variant, got {message:?}");
         };
 
         let by_type = changed.get("u1138").expect("account entry present");
         assert_eq!(by_type.len(), 1);
         assert_eq!(by_type.values().next().map(String::as_str), Some("f9a8d3"));
+        assert_eq!(push_state.as_deref(), Some("ps-9"));
     }
 
     /// Stub read half of a JMAP WebSocket. Same shape as the stub

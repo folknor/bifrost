@@ -260,6 +260,8 @@ fn diff_snapshots(old: &ScopeSnapshot, new: &ScopeSnapshot) -> Vec<ScopeLifecycl
             events.push(ScopeLifecycle::Renamed {
                 old: MembershipScope::Label(LabelId(label.id.clone())),
                 new: MembershipScope::Label(LabelId(label.id.clone())),
+                old_name: old_by_id[label.id.as_str()].to_string(),
+                new_name: label.name.clone(),
             });
         }
     }
@@ -371,9 +373,16 @@ mod tests {
         let old = snapshot_of(vec![label("Label_1", "Work", "user")]);
         let new = snapshot_of(vec![label("Label_1", "Renamed", "user")]);
         match &diff_snapshots(&old, &new)[0] {
-            ScopeLifecycle::Renamed { old, new } => {
+            ScopeLifecycle::Renamed {
+                old,
+                new,
+                old_name,
+                new_name,
+            } => {
                 assert_eq!(label_id(old), label_id(new));
                 assert_eq!(label_id(old), "Label_1");
+                assert_eq!(old_name, "Work");
+                assert_eq!(new_name, "Renamed");
             }
             other => panic!("expected Renamed, got {other:?}"),
         }

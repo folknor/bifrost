@@ -19,6 +19,72 @@ rather than appending to it.
 - Refusing a finding with a reason is a good outcome. Two have been rejected on
   the merits so far, both recorded below.
 
+## From the `bugs-net.md` arc (closed, a2b5fb4..5407925)
+
+The arc's own signature defect, worth stating first because it fired in six
+consecutive rounds and once more in the close pass: **a fix gets wired on the
+success path, or the path the finding named, and the error path or the adjacent
+path keeps the old behaviour.** A deadline that bounded every wait except the
+metering wrapper's; accounting that counted error-path bytes but never charged
+them against the cap; a governor that gained a key dimension at registration but
+not at selection; an EWS tally written only on success. Every one was caught by
+the cold reviewer, never by the fix pass that wrote it.
+
+Machinery later work may build on and must not break:
+
+- **RequestDeadline** is a genuine overall request deadline surviving retries and
+  redirects. Its instant is unreachable outside the impl; every wait routes
+  through `bound` or `bound_body`. Do not reintroduce raw instant arithmetic.
+  `AttemptBudget`, `AuthBudget` and `RedirectBudget` own their own arithmetic,
+  and the redirect arm resets by construction.
+- **The body-path ordering** is `record_bytes_in`, then `deadline.check_body`,
+  then `deadline.bound_body` around `ByteBucket::consume`. Metering happens
+  BEFORE the deadline check, deliberately: those bytes came off the wire whether
+  or not we may hand them up. Both `wrap_metered` and the error-path drains in
+  `read_capped_response_body` follow it, so every byte counted is also charged
+  against the per-account cap. A mid-body deadline expiry reports
+  `Timeout { Acknowledged }` mapping to `Protocol(PartialResponse)`, always as an
+  `Err`, so no prefix is returned as a complete body.
+- **Classification.** The header timeout returns `InFlight`, correctly, because
+  it can fire after the body was written; `connect_timeout` reaches the client
+  builder so `Unsent` comes from real evidence rather than a guess.
+- **Auth.** The 401 refresh is single-flight and cancellation-safe: there is no
+  await point between the `Refreshing` transition and the driver spawn, so a
+  dropped request future strands no waiter and poisons no state.
+- **The governor** is keyed on `(host, quota_scope)`.
+  `RequestBuilder::quota_scope` names the bucket per request and wins for every
+  hop; the account declaration is the default, first-wins with a warning naming
+  the override. Every ticket path checks bucket generation against ticket
+  generation, and a `RateDebit` captures its own host, scope and generation, so a
+  redirect cannot refund the wrong bucket. Registration rejects `burst = 0`.
+- **Per-request accounting.** A response carries the bytes actually read for that
+  request. `RequestBuilder::count_bytes_into` hands the caller its own
+  `RequestByteCounter`, which is the only way to read the number back after an
+  `Err` - use it rather than reading a count off a response that error paths
+  never produce. Consumers aggregate with a batch-scoped `ByteTally` per crate,
+  recorded at that crate's wire funnel and cleared per batch. JMAP reaches the
+  count through a defaulted `HttpTransport::api_request_measured`, which is why
+  its scripted doubles needed no change.
+- **Redirect passthrough** bodies reach the caller through `into_byte_stream` and
+  are counted. `ScriptedDispatch` defers its build, snapshot and step pop into
+  the async block, so an unpolled dispatch future no longer consumes a step.
+
+Disclosed exclusions, deliberately left:
+
+- OAuth issuer traffic through the caller's own `TokenSource` is neither metered
+  nor capped; closing it changes a published contract. `reference/net.md`
+  discloses it.
+- Long-lived EWS streaming and `StreamingResponse`'s counter stay out of batch
+  totals, because a stream's count is only as complete as the caller's draining
+  and a partial number must never be published as a total.
+- Three sites report `bytes_in: 0` correctly because they perform no request at
+  all: Gmail's constant `discover_cursor_scopes`, JMAP's session-derived
+  `cursor_scopes`, and the two locally-rejected mutation lanes. Each says so at
+  the call site.
+- `NetErrorContext` and `FinalResponse` are deliberately not `#[non_exhaustive]`:
+  the former is consumer-constructed with no constructor, the latter is
+  crate-produced evidence rather than configuration.
+
 ## From the `bugs-types.md` arc (closed, 2004c2c..a2b5fb4)
 
 Machinery later work may build on and must not break:

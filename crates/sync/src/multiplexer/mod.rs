@@ -521,7 +521,7 @@ impl Multiplexer {
                                         lifecycle_cursors.delete(&scope);
                                     }
                                 }
-                                ScopeLifecycle::Renamed { old, new } => {
+                                ScopeLifecycle::Renamed { old, new, .. } => {
                                     // Treat as delete + create: cancel the
                                     // old scope's poll task, drop the
                                     // cursor, then trigger a fresh

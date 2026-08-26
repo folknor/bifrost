@@ -211,6 +211,8 @@ impl Serialize for DataType {
 pub(crate) enum PushObject {
     StateChange {
         changed: HashMap<String, HashMap<DataType, String>>,
+        #[serde(rename = "pushState", default)]
+        push_state: Option<String>,
     },
     #[cfg(feature = "mail")]
     EmailPush {

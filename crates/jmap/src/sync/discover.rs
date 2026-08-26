@@ -117,10 +117,14 @@ pub(crate) async fn fetch_mailbox_names<T: HttpTransport>(
 /// ends the stream. Selecting on the token makes the end prompt by
 /// construction; every call site falls through to that check, which is
 /// where cancellation terminates the loop.
-async fn poll_pause(shutdown: &CancellationToken) {
+async fn poll_pause(
+    shutdown: &CancellationToken,
+    session_changes: &mut tokio::sync::watch::Receiver<u64>,
+) {
     tokio::select! {
         () = shutdown.cancelled() => {}
         () = tokio::time::sleep(POLL_INTERVAL) => {}
+        _ = session_changes.changed() => {}
     }
 }
 
@@ -136,6 +140,7 @@ pub(crate) fn scope_lifecycle<T: HttpTransport>(
     client: crate::client::Client<T>,
 ) -> AccountStream<ScopeLifecycleEvent> {
     Box::pin(async_stream::stream! {
+        let mut session_changes = client.session_changes();
         loop {
             if shutdown.is_cancelled() {
                 break;
@@ -151,7 +156,7 @@ pub(crate) fn scope_lifecycle<T: HttpTransport>(
             let since_state = state_cache::get(&mailbox_states, &account_id).await;
 
             let Some(since_state) = since_state else {
-                poll_pause(&shutdown).await;
+                poll_pause(&shutdown, &mut session_changes).await;
                 continue;
             };
 
@@ -190,7 +195,7 @@ pub(crate) fn scope_lifecycle<T: HttpTransport>(
                                 // Do not advance the changes state: retrying
                                 // this response is the only way to preserve
                                 // the created/renamed lifecycle event.
-                                poll_pause(&shutdown).await;
+                                poll_pause(&shutdown, &mut session_changes).await;
                                 continue;
                             }
                         }
@@ -227,6 +232,8 @@ pub(crate) fn scope_lifecycle<T: HttpTransport>(
                                 yield ScopeLifecycleEvent::Lifecycle(ScopeLifecycle::Renamed {
                                     old: scope.clone(),
                                     new: scope,
+                                    old_name: old_name.unwrap_or_default(),
+                                    new_name: name,
                                 });
                             }
                         }
@@ -245,7 +252,7 @@ pub(crate) fn scope_lifecycle<T: HttpTransport>(
                     state_cache::set(&mailbox_states, &account_id, new_state).await;
 
                     if !response.has_more_changes() {
-                        poll_pause(&shutdown).await;
+                        poll_pause(&shutdown, &mut session_changes).await;
                     }
                 }
                 Err(err) => {
@@ -271,7 +278,7 @@ pub(crate) fn scope_lifecycle<T: HttpTransport>(
                         yield ScopeLifecycleEvent::Terminated(acct);
                         break;
                     }
-                    poll_pause(&shutdown).await;
+                    poll_pause(&shutdown, &mut session_changes).await;
                 }
             }
         }
@@ -473,6 +480,17 @@ mod tests {
         CancellationToken,
         StateMap,
     ) {
+        lifecycle_stream_with_names(replies, HashMap::new())
+    }
+
+    fn lifecycle_stream_with_names(
+        replies: impl IntoIterator<Item = String>,
+        names: HashMap<String, String>,
+    ) -> (
+        AccountStream<ScopeLifecycleEvent>,
+        CancellationToken,
+        StateMap,
+    ) {
         let client = crate::client::Client::with_transport(
             ScriptTransport::new(replies),
             test_session(),
@@ -493,11 +511,51 @@ mod tests {
             },
             Arc::clone(&states),
             "primary".to_string(),
-            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(names)),
             shutdown.clone(),
             client,
         );
         (stream, shutdown, states)
+    }
+
+    #[tokio::test]
+    async fn a_mailbox_rename_carries_both_names_even_when_the_id_is_stable() {
+        let changes = serde_json::json!({
+            "sessionState": "session-1",
+            "methodResponses": [[
+                "Mailbox/changes",
+                {
+                    "accountId": "primary",
+                    "oldState": "mbx-1",
+                    "newState": "mbx-2",
+                    "hasMoreChanges": false,
+                    "created": [],
+                    "updated": ["mbx-1"],
+                    "destroyed": []
+                },
+                "s0"
+            ]]
+        })
+        .to_string();
+        let (mut stream, shutdown, _) = lifecycle_stream_with_names(
+            [changes, mailbox_get_reply("session-1", "mbx-1", "Renamed")],
+            HashMap::from([("mbx-1".to_string(), "Old".to_string())]),
+        );
+
+        match stream.next().await {
+            Some(ScopeLifecycleEvent::Lifecycle(ScopeLifecycle::Renamed {
+                old,
+                new,
+                old_name,
+                new_name,
+            })) => {
+                assert_eq!(old, new);
+                assert_eq!(old_name, "Old");
+                assert_eq!(new_name, "Renamed");
+            }
+            other => panic!("expected named rename event, got {other:?}"),
+        }
+        shutdown.cancel();
     }
 
     /// The engine drives the scope-lifecycle stream for the whole life
@@ -513,9 +571,15 @@ mod tests {
     async fn a_diverged_session_state_terminates_the_lifecycle_into_a_reopen() {
         // The server answers the first poll while claiming a session
         // the client has never read.
+        let started = tokio::time::Instant::now();
         let (stream, _shutdown, _states) =
             lifecycle_stream([mailbox_changes_reply("session-2", &[])]);
         let events: Vec<_> = stream.collect().await;
+        assert_eq!(
+            tokio::time::Instant::now(),
+            started,
+            "the response-boundary signal must wake lifecycle immediately"
+        );
 
         match events.as_slice() {
             [ScopeLifecycleEvent::Terminated(err)] => {

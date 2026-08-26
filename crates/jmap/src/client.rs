@@ -149,6 +149,7 @@ pub(crate) struct ClientInner<T: HttpTransport = ReqwestTransport> {
     state: std::sync::Mutex<Arc<SessionState>>,
     session_url: String,
     session_updated: AtomicBool,
+    session_changes: tokio::sync::watch::Sender<u64>,
 
     timeout: Duration,
     #[cfg(feature = "websockets")]
@@ -328,6 +329,7 @@ impl ClientBuilder {
                 state: std::sync::Mutex::new(Arc::new(SessionState::derive(session)?)),
                 session_url,
                 session_updated: true.into(),
+                session_changes: tokio::sync::watch::channel(0).0,
                 timeout: self.timeout,
                 transport,
                 #[cfg(feature = "websockets")]
@@ -505,6 +507,7 @@ impl<T: HttpTransport> Client<T> {
                 state: std::sync::Mutex::new(Arc::new(SessionState::derive(session)?)),
                 session_url,
                 session_updated: true.into(),
+                session_changes: tokio::sync::watch::channel(0).0,
                 timeout: Duration::from_millis(DEFAULT_TIMEOUT_MS),
                 transport,
                 #[cfg(feature = "websockets")]
@@ -568,6 +571,9 @@ impl<T: HttpTransport> Client<T> {
         let response: response::Response = serde_json::from_slice(&bytes)?;
         if response.session_state() != state.session().state() {
             self.inner.session_updated.store(false, Ordering::Release);
+            self.inner.session_changes.send_modify(|generation| {
+                *generation = generation.wrapping_add(1);
+            });
         }
         Ok(response)
     }
@@ -593,6 +599,11 @@ impl<T: HttpTransport> Client<T> {
 
     pub(crate) fn is_session_updated(&self) -> bool {
         self.inner.session_updated.load(Ordering::Acquire)
+    }
+
+    /// Subscribe to session-state divergence detected at the response boundary.
+    pub(crate) fn session_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.inner.session_changes.subscribe()
     }
 
     /// A handle over the same client - same transport, same session

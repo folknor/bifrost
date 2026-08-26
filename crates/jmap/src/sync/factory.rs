@@ -1429,14 +1429,90 @@ mod tests {
             stream.next().await,
             Some(bifrost_types::SyncEvent::Done(None))
         ));
-        assert_eq!(client.transport().requests().len(), 5);
+        let requests = client.transport().requests();
+        assert_eq!(requests.len(), 5);
+        assert_eq!(requests[0]["methodCalls"][0][1]["position"], 0);
+        assert_eq!(requests[2]["methodCalls"][0][1]["anchor"], "M1");
+        assert_eq!(requests[2]["methodCalls"][0][1]["anchorOffset"], 1);
+        assert!(requests[2]["methodCalls"][0][1].get("position").is_none());
+        assert_eq!(requests[4]["methodCalls"][0][1]["anchor"], "M2");
     }
 
-    /// A bounded partition may receive short server pages, but it must
-    /// fill exactly its requested query window and stop without probing
-    /// the following position.
+    /// A result set that moves mid-walk must end the walk WITHOUT a `Done`,
+    /// because a `Done` is a complete-coverage claim and the remaining pages
+    /// were never read. It must also not end terminally: one delivered
+    /// message advances `queryState`, so a terminal class here would let
+    /// ordinary mail delivery permanently kill the scope's inventory. The
+    /// honest answer is `SyncState(CursorInvalid)` on the cursor scope, which
+    /// the shared recovery table maps to `RestartScope`.
     #[tokio::test]
-    async fn page_inventory_fills_then_stops_at_its_explicit_window() {
+    async fn a_query_state_that_moves_mid_walk_restarts_the_scope_instead_of_claiming_done() {
+        let client = scripted_client([
+            method_reply(vec![json!([
+                "Email/query",
+                {"accountId": "primary", "queryState": "q1", "position": 0, "ids": ["M1"]},
+                "s0"
+            ])]),
+            method_reply(vec![json!([
+                "Email/get",
+                {"accountId": "primary", "state": "email-s", "list": [
+                    {"id": "M1", "blobId": "B1", "threadId": "T1", "size": 10,
+                     "mailboxIds": {"inbox": true}, "keywords": {}}
+                ], "notFound": []},
+                "s0"
+            ])]),
+            method_reply(vec![json!([
+                "Email/query",
+                {"accountId": "primary", "queryState": "q2", "position": 1, "ids": ["M2"]},
+                "s0"
+            ])]),
+        ]);
+        let primary = client
+            .primary_account::<capability::Mail>()
+            .expect("primary mail account");
+        let mut stream = crate::sync::inventory::stream(
+            primary,
+            super::capabilities::CoreLimits {
+                max_objects_in_get: 4,
+                max_objects_in_set: 4,
+            },
+            CursorScope::Type(ObjectType::Email),
+            None,
+        );
+
+        assert!(matches!(
+            stream.next().await,
+            Some(bifrost_types::SyncEvent::Batch(_))
+        ));
+        let scope = CursorScope::Type(ObjectType::Email);
+        match stream.next().await {
+            Some(bifrost_types::SyncEvent::Terminated(err)) => {
+                assert_eq!(
+                    err.kind(),
+                    &bifrost_types::AccountErrorKind::SyncState(
+                        bifrost_types::SyncStateErrorKind::CursorInvalid
+                    )
+                );
+                let recovery = err.recovery();
+                assert!(
+                    matches!(
+                        &recovery,
+                        bifrost_types::RecoveryClass::Engine(
+                            bifrost_types::EngineDirective::RestartScope(restarted)
+                        ) if *restarted == scope
+                    ),
+                    "a superseded walk must restart its scope, got {recovery:?}"
+                );
+            }
+            other => panic!("expected a superseded-walk termination, got {other:?}"),
+        }
+        assert!(stream.next().await.is_none());
+    }
+
+    /// A positional partition cannot inherit the preceding partition's
+    /// anchor, so accepting it would reopen the silent-skip window.
+    #[tokio::test]
+    async fn positional_page_inventory_is_refused_without_sending() {
         let client = scripted_client([
             method_reply(vec![json!([
                 "Email/query",
@@ -1484,26 +1560,26 @@ mod tests {
                 bifrost_types::SyncEvent::Batch(batch) => {
                     ids.extend(batch.items.into_iter().map(|entry| entry.id.0));
                 }
-                bifrost_types::SyncEvent::Done(None) => break,
+                bifrost_types::SyncEvent::Terminated(err) => {
+                    assert!(matches!(
+                        err.kind(),
+                        bifrost_types::AccountErrorKind::Unsupported(
+                            bifrost_types::AccountOperation::SyncInventory
+                        )
+                    ));
+                    break;
+                }
                 other => panic!("unexpected page inventory event: {other:?}"),
             }
         }
-        assert_eq!(ids, ["M3", "M4", "M5"]);
-        assert_eq!(client.transport().requests().len(), 4);
-        let requests = client.transport().requests();
-        assert_eq!(requests[0]["methodCalls"][0][1]["limit"], 3);
-        assert_eq!(requests[2]["methodCalls"][0][1]["limit"], 2);
+        assert!(ids.is_empty());
+        assert!(client.transport().requests().is_empty());
     }
 
-    /// A bounded partition that yields zero entries is the engine's
-    /// end-of-inventory signal, so the stream must never produce zero
-    /// entries while the scope still has results. If every id in the
-    /// requested window is deleted between `Email/query` and `Email/get`,
-    /// stopping at the window boundary would hand the engine a silent
-    /// "exhausted" and drop every later message. The stream has to walk
-    /// past the window until it produces something or the query runs dry.
+    /// Refusal is independent of the scripted response shape: no positional
+    /// partition may reach the wire and then claim complete coverage.
     #[tokio::test]
-    async fn page_inventory_walks_past_a_fully_vanished_window_rather_than_reading_as_exhausted() {
+    async fn a_vanished_positional_window_is_refused_without_sending() {
         let client = scripted_client([
             method_reply(vec![json!([
                 "Email/query",
@@ -1550,16 +1626,20 @@ mod tests {
                 bifrost_types::SyncEvent::Batch(batch) => {
                     ids.extend(batch.items.into_iter().map(|entry| entry.id.0));
                 }
-                bifrost_types::SyncEvent::Done(None) => break,
+                bifrost_types::SyncEvent::Terminated(err) => {
+                    assert!(matches!(
+                        err.kind(),
+                        bifrost_types::AccountErrorKind::Unsupported(
+                            bifrost_types::AccountOperation::SyncInventory
+                        )
+                    ));
+                    break;
+                }
                 other => panic!("unexpected page inventory event: {other:?}"),
             }
         }
-        assert_eq!(
-            ids,
-            ["M3"],
-            "a window emptied by concurrent deletion must not end the partition"
-        );
-        assert_eq!(client.transport().requests().len(), 4);
+        assert!(ids.is_empty());
+        assert!(client.transport().requests().is_empty());
     }
 
     /// The consolidated inventory loop must still qualify foreign ids,

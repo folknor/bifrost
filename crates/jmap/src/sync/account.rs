@@ -259,23 +259,14 @@ fn cursor_scopes_from_seeds<'a>(
     scopes
 }
 
-/// How backfill may partition a scope's inventory.
-///
-/// Only `Email` is partitionable: its inventory paginates `Email/query`,
-/// so a page window is meaningful. Every other scope (Mailbox, and the
-/// foreign account-level `Folder` scopes) enumerates in one pass and
-/// reports `Full` - a partitioned walk there would re-enumerate the same
-/// set per partition. `page_size` is the server's own
-/// `maxObjectsInGet`; a value that does not fit `u32` yields `None`
-/// (unbounded page) rather than a truncated cap.
-fn partitioning_for_scope(scope: &CursorScope, max_objects_in_get: usize) -> InventoryPartitioning {
-    match scope {
-        CursorScope::Type(bifrost_types::ObjectType::Email) => InventoryPartitioning::PageCount {
-            total: None,
-            page_size: u32::try_from(max_objects_in_get).ok(),
-        },
-        _ => InventoryPartitioning::Full,
-    }
+/// Every scope is one full walk. Email pages within that walk by anchor;
+/// splitting it into positional partitions would discard that anchor at
+/// every engine boundary and make deletion shifts lossy again.
+fn partitioning_for_scope(
+    _scope: &CursorScope,
+    _max_objects_in_get: usize,
+) -> InventoryPartitioning {
+    InventoryPartitioning::Full
 }
 
 /// Turn a scope's `open()`-time seed into a cursor establishment.
@@ -538,11 +529,34 @@ impl Account for JmapAccount {
             scopes.clone(),
             Arc::clone(&self.subscriptions),
             Arc::clone(&self.ws.enabled),
+            Arc::clone(&self.ws.push_state),
         );
         Box::pin(async move {
-            future
-                .await
-                .map(|handle| bifrost_types::PushSubscription::all_succeeded(handle, &scopes))
+            let (handle, accepted) = future.await?;
+            let expected = (0..scopes.len())
+                .map(|index| bifrost_types::BatchItemId(index.to_string()))
+                .collect::<Vec<_>>();
+            let mut outcomes = bifrost_types::BatchOutcomeBuilder::new();
+            for ((id, scope), accepted) in expected.iter().cloned().zip(scopes).zip(accepted) {
+                if accepted {
+                    outcomes.push_succeeded(id, scope);
+                } else {
+                    outcomes.push_failed(
+                        id,
+                        super::error::unsupported_error(
+                            AccountOperation::PushSubscribe,
+                            Some(bifrost_types::ErrorScope::Cursor(scope)),
+                            "JMAP push does not map this cursor scope to a data type",
+                        ),
+                    );
+                }
+            }
+            Ok(bifrost_types::PushSubscription::new(
+                Some(handle),
+                outcomes
+                    .finalize(&expected)
+                    .expect("every requested push scope is accounted for once"),
+            ))
         })
     }
 
@@ -555,6 +569,7 @@ impl Account for JmapAccount {
             handle,
             Arc::clone(&self.subscriptions),
             Arc::clone(&self.ws.enabled),
+            Arc::clone(&self.ws.push_state),
         )
     }
 
@@ -1504,18 +1519,12 @@ mod tests {
         assert!(cursor_scopes_from_seeds(std::iter::empty()).is_empty());
     }
 
-    /// Only `Email` paginates. Partitioning anything else would have each
-    /// partition re-enumerate the identical set.
+    /// A full inventory is one anchored walk. Splitting it into positional
+    /// page partitions would lose the anchor at every partition boundary.
     #[test]
-    fn only_the_email_scope_is_partitionable() {
-        assert!(matches!(
-            partitioning_for_scope(&CursorScope::Type(ObjectType::Email), 42),
-            bifrost_types::InventoryPartitioning::PageCount {
-                total: None,
-                page_size: Some(42)
-            }
-        ));
+    fn inventory_is_not_split_across_unstable_positional_boundaries() {
         for scope in [
+            CursorScope::Type(ObjectType::Email),
             CursorScope::Type(ObjectType::Mailbox),
             folder_scope("shared"),
             CursorScope::Account,
@@ -1528,23 +1537,6 @@ mod tests {
                 "{scope:?} enumerates in one pass"
             );
         }
-    }
-
-    /// A `maxObjectsInGet` that does not fit `u32` must degrade to an
-    /// unbounded page, never to a truncated one - a wrapped cap would
-    /// silently shrink every backfill page.
-    #[test]
-    fn an_oversized_page_limit_degrades_to_unbounded() {
-        assert!(matches!(
-            partitioning_for_scope(
-                &CursorScope::Type(ObjectType::Email),
-                usize::try_from(u64::from(u32::MAX) + 1).unwrap_or(usize::MAX),
-            ),
-            bifrost_types::InventoryPartitioning::PageCount {
-                page_size: None,
-                ..
-            }
-        ));
     }
 
     /// A seeded scope establishes ready, carrying the seed state and the

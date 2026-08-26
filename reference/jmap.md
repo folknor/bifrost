@@ -74,14 +74,14 @@ Session property change, so `refresh_session` republishes the whole derived set
 atomically; readers take one `session_state()` snapshot and build a whole URL
 from it, so a concurrent refresh cannot splice two sessions into one request.
 At the sync boundary, a method response whose `sessionState` differs marks the
-client stale. The always-driven scope lifecycle stream consumes that detector
-and terminates with `SyncState(CapabilityChanged)`, causing the engine to reopen
+client stale and advances a watch generation. The always-driven scope lifecycle
+stream selects on that generation and terminates promptly with
+`SyncState(CapabilityChanged)`, causing the engine to reopen
 the whole account. An in-place refresh is insufficient there because the
 existing `JmapAccount` has already frozen limits, capability flags, primary and
-foreign account routing, and push topology from the old session. The check sits
-at the top of the lifecycle poll loop, so the reopen is paced by the poll
-interval rather than issued the instant a response diverges: a server that
-churns `sessionState` costs one reopen per interval, not a reopen per request.
+foreign account routing, and push topology from the old session. The watch wakes
+the lifecycle poll pause immediately, so stale derived URLs are not used for
+another poll interval after divergence.
 `refresh_session` exists but no sync path calls it - the flag latches false for
 the life of a client, and a fresh client (with a freshly fetched session) is
 what clears it.
@@ -289,7 +289,7 @@ Validation rules in `state::decode`:
 
 Supported scopes for `inventory_stream` and `changes_stream`:
 
-- `CursorScope::Type(ObjectType::Email)` - inventory paginates `Email/query` (`receivedAt` desc) then `Email/get` with a fixed property set (Id, MailboxIds, ThreadId, BlobId, Size, Keywords, MessageId, References, InReplyTo, ReceivedAt). Changes use `Email/changes` emitting Created/Updated/Destroyed `ObjectChange`s. `inventory_partitioning` exposes `Page { from, to }` for Email only. The primary full walk, the foreign-account walk, and the bounded `Page` walk are one parameterized loop (`email_inventory_loop`, taking a filter, an owner, and a window); the owner parameter is what still routes foreign errors through `shared_scope_error` and applies the foreign id/membership qualification, and it is the only behavioral difference between them. Every inventory path advances its query position by ids consumed, rather than hydrated objects, and treats only an empty query page as end-of-inventory. This prevents a server query-page cap or a query-to-get deletion race from truncating a full or page-windowed backfill. A bounded `Page` window carries one further rule, and it is load-bearing: `bifrost-sync`'s open-page walker stops the whole scope when a partition yields zero entries, so a partition must yield zero entries ONLY when the scope has no results past `from`. A window whose ids all vanished between `Email/query` and `Email/get` is not end-of-inventory, so the loop keeps walking past the window until it produces an entry or the query returns an empty page. Without that, one concurrently deleted message in the first window silently drops every later message in the scope. Every inventory walk (Email and Mailbox alike) drops an object the server returned with no `id`, or an empty one, rather than minting `ObjectId("")`: an unidentifiable object is not an item under the crate's closed per-item accounting, and a bogus row qualifies into `"acct-9\u{1f}"` for a share and routes later reads at nothing. Hydration already drops the same shape so the submitted id falls through to the `PartialResponse` lane.
+- `CursorScope::Type(ObjectType::Email)` - inventory walks `Email/query` (`receivedAt` desc) then `Email/get` with the fixed inventory property set. The first query starts at position zero; every later page uses the previous page's last id as `anchor` with `anchorOffset: 1`. The walk also pins `queryState` across its pages: if it moves, the walk ends via `terminated_walk_superseded` (`SyncState(CursorInvalid)` -> `RestartScope`), never with `Done`, so a changing result set is neither reported as complete coverage nor treated as permanently fatal. Every other error path likewise ends the stream with a `Terminated` and no `Done`; `Done(None)` is reachable only from an anchored query that came back empty under an unchanged `queryState`. `inventory_partitioning` reports `Full`: a positional `PageCount` plan would lose the anchor between engine partition calls and reopen the deletion-shift skip at every boundary. Explicit page partitions are refused rather than claiming coverage. Primary and foreign-account inventory share this loop, with foreign errors and ids routed through the owner-aware path.
 - `CursorScope::Type(ObjectType::Mailbox)` - inventory is a single `Mailbox/get` (Id, Name, ParentId, Role, SortOrder, totals, unread counts, IsSubscribed). Changes use `Mailbox/changes`.
 - `CursorScope::Type(ObjectType::Thread)` and `CursorScope::Query(_)` are not discovered. A legacy cursor for either terminates unsupported: thread inventory derives from email inventory, and the v1 trait has no registered query definition to supply an `Email/queryChanges` filter/sort.
 - `CursorScope::Folder(FolderId(encode_foreign_account(account_id)))` - a foreign (shared/delegate) account, one account-level scope per share. Inventory paginates an UNFILTERED `Email/query` against the foreign account handle (one walk per share); changes use that account's `Email/changes`, which is account-wide and cannot be filtered by mailbox - which is exactly why the topology is one scope per account, never one per mailbox (a per-mailbox topology streamed the identical change set once per mailbox and fanned every foreign push out M ways). Per-mailbox membership is learned at hydration from the qualified `mailboxIds`, the same model the primary `Type(Email)` scope uses. A legacy per-mailbox `Folder` cursor still decodes and takes an `inMailbox`-filtered inventory walk, but is never seeded. See "Foreign (shared/delegate) accounts".
@@ -308,7 +308,7 @@ Each `Email/get` answer is reconciled against the ids the batch submitted (`hydr
 
 ### Push and reconnect
 
-Push runs through one reader task spawned at `open()` when the session advertises WebSocket push. It connects via `Client::connect_ws`, validates `Sec-WebSocket-Protocol: jmap`, re-applies the subscribed `DataType` union, emits `Reconnected`, and forwards `PushObject::StateChange` as `Invalidated` (`PushSource::JmapStateChange` + `HintPayload::SpecificCursorScope`). A foreign `Folder` scope subscribes as `DataType::Email`, because JMAP subscriptions are data-type-wide across every visible account. On the emit side, `StateChange.changed` is keyed by `accountId` (RFC 8620 s7.1) and the reader routes each entry through a `PushRouting` snapshot built at `open` from the seeded scopes: a primary entry maps its `DataType` to the matching `Type(_)` scope (unmapped types degrade to `Unknown`); a seeded foreign account's `Email` entry emits exactly ONE `SpecificCursorScope` hint - its account-level `Folder` scope (the routing map holds one scope per foreign account by construction, so a foreign push is one change-stream pass, not a per-mailbox fanout; the engine's reconciler resolves a `SpecificCursorScope` hint by exact cursor lookup and skips scopes with no registered cursor, so the routing needs no membership-index support and a hint for a quarantined scope is a no-op); a foreign `Mailbox`/`Thread` entry is dropped (no cursor tracks foreign mailbox/thread state, and count-only bumps ride alongside the Email entry that caused them); an unseeded accountId is dropped (JMAP state is per-(accountId, type), so no registered cursor moved). Stream errors emit `Disconnected` and fall to the reconnect loop.
+Push runs through one reader task spawned at `open()` when the session advertises WebSocket push. It connects via `Client::connect_ws`, validates `Sec-WebSocket-Protocol: jmap`, re-applies the subscribed `DataType` union together with the last observed RFC 8887 `pushState`, emits `Reconnected`, and forwards `PushObject::StateChange` as `Invalidated` (`PushSource::JmapStateChange` + `HintPayload::SpecificCursorScope`). A foreign `Folder` scope subscribes as `DataType::Email`, because JMAP subscriptions are data-type-wide across every visible account. On the emit side, `StateChange.changed` is keyed by `accountId` (RFC 8620 s7.1) and the reader routes each entry through a `PushRouting` snapshot built at `open` from the seeded scopes: a primary entry maps its `DataType` to the matching `Type(_)` scope (unmapped types degrade to `Unknown`); a seeded foreign account's `Email` entry emits exactly ONE `SpecificCursorScope` hint - its account-level `Folder` scope (the routing map holds one scope per foreign account by construction, so a foreign push is one change-stream pass, not a per-mailbox fanout; the engine's reconciler resolves a `SpecificCursorScope` hint by exact cursor lookup and skips scopes with no registered cursor, so the routing needs no membership-index support and a hint for a quarantined scope is a no-op); a foreign `Mailbox`/`Thread` entry is dropped (no cursor tracks foreign mailbox/thread state, and count-only bumps ride alongside the Email entry that caused them); an unseeded accountId is dropped (JMAP state is per-(accountId, type), so no registered cursor moved). Stream errors emit `Disconnected` and fall to the reconnect loop.
 
 `ReconnectPolicy { initial: 1s, max: 60s, connect_timeout: 30s, keepalive: 120s }` controls exponential backoff. The backoff resets only when a pass actually READ a message off the connection, never merely for having reached the read loop: the push-enable frame's only failure signal is an asynchronous `RequestError` on that stream, so a server that will never accept the subscription (unknown `dataTypes` value, capability withdrawn, quota) otherwise completes handshake and sink write, gets `Reconnected` announced, rejects, and repeats at `initial` forever - an unbounded 1 Hz handshake storm with a `Disconnected`/`Reconnected` pair per second on the broadcast channel. A frame the peer actually served (a pong counts) is the evidence; an error is not. Every reader exit error is classified through `into_account_error(_, PushStream)`: terminal classes emit `Terminated(AccountError)` and stop the reader for engine reopen; retry classes emit `Disconnected` and continue backoff.
 
@@ -316,9 +316,9 @@ Every await in the reader's lifecycle is cancellation-covered, so `close()` is p
 
 `push_stream` is a thin broadcast subscriber. A `Lagged` slot emits a coalesced `Invalidated { source: Coalesced, payload: Unknown }` so the engine full-repolls rather than losing notifications.
 
-`subscribe` and `unsubscribe` build the union of all live `SubscriptionHandle` -> `DataTypeSet` mappings and call `Client::enable_push_ws` / `disable_push_ws`. `WebSocketNotConnected` maps to `Error::Unsupported` to signal the engine that push is unavailable.
+`subscribe` and `unsubscribe` build the union of all live `SubscriptionHandle` -> `DataTypeSet` mappings and call `Client::enable_push_ws` / `disable_push_ws`. Registry and enabled-union state commit only after the frame send succeeds. Subscribe outcomes account for every submitted position, including repeated scopes; unmapped scopes occupy the failed lane. `WebSocketNotConnected` maps to `Error::Unsupported` to signal the engine that push is unavailable.
 
-`scope_lifecycle_stream` polls `Mailbox/changes` against the primary mailbox state, hydrating changed names before advancing its state cache, then emits `ScopeLifecycle::Created`/`Renamed`/`Deleted`. A transient name-hydration failure leaves the state unchanged for replay; terminal/engine classes emit `Terminated`. Renames emit only when the stored and hydrated names differ. The 300s poll pauses select on the shutdown token, so the stream ends promptly for a consumer still polling after `close()` (pull-based, so it cannot leak either way). Foreign-account mailbox lifecycle is not polled (see Foreign accounts).
+`scope_lifecycle_stream` polls `Mailbox/changes` against the primary mailbox state, hydrating changed names before advancing its state cache, then emits `ScopeLifecycle::Created`/`Renamed`/`Deleted`. A transient name-hydration failure leaves the state unchanged for replay; terminal/engine classes emit `Terminated`. Renames emit only when the stored and hydrated names differ and carry both names even when the stable scope id is unchanged. The 300s poll pauses select on the shutdown token, so the stream ends promptly for a consumer still polling after `close()` (pull-based, so it cannot leak either way). Foreign-account mailbox lifecycle is not polled (see Foreign accounts).
 
 ### Mutation pipeline
 
@@ -460,10 +460,19 @@ the only path to `JmapMethod::Unknown { code }`, carrying the actual wire
 code (no synthesized `"other"` literal; string-matching unknown
 vocabulary is forbidden by the gate-5 invariant).
 
-`sync/error.rs` exposes two stream terminators: `terminated_unsupported`
-(`Unsupported(op)`) and `terminated_contract_violation`
-(`Protocol(ContractViolation)`, for pagination overflows and
-response-shape mismatches). Both take the caller's `AccountOperation`.
+`sync/error.rs` exposes three stream terminators, each taking the caller's
+`AccountOperation`: `terminated_unsupported` (`Unsupported(op)`);
+`terminated_contract_violation` (`Protocol(ContractViolation)`, for
+response shapes the library cannot encode - terminal, so it is the wrong
+answer for anything a normal server does routinely, and it has no
+production caller since positional paging went away); and
+`terminated_walk_superseded` (`SyncState(CursorInvalid)` on the cursor
+scope, mapping to `EngineDirective::RestartScope`) for a walk whose result
+set moved underneath it. The last is what a mid-walk `Email/query`
+`queryState` change raises: one delivered message advances `queryState`,
+so a terminal class there would let ordinary mail delivery permanently
+kill a scope's inventory, while a `Done` would claim coverage the walk
+never achieved.
 
 ### Foreign (shared/delegate) accounts
 
@@ -541,9 +550,9 @@ pure given its inputs, each with its trait method reduced to a one-line
 delegation: `cursor_scopes_from_seeds` (discovery order - seeded `Type`
 scopes in a fixed order, then foreign `Folder` scopes SORTED, because
 `seed_states` is a `HashMap` and an unsorted lane would hand the engine a
-different scope order every run), `partitioning_for_scope` (only `Email`
-paginates; an oversized `maxObjectsInGet` degrades to an unbounded page
-rather than a truncated one), and `establishment_for_seed` (seeded ->
+different scope order every run), `partitioning_for_scope` (every scope is one
+`Full` walk, because Email pages by anchor and an engine partition
+boundary would discard it), and `establishment_for_seed` (seeded ->
 `Ready`, unseeded -> `Unsupported` carrying the cursor scope). Prefer this
 pattern over threading the transport generic through the sync layer: it
 costs one function and no API surface.
@@ -587,6 +596,8 @@ a whole new share still waits for reopen.
 - Raw-MIME projections unsupported; only `FlagsOnly` and `Metadata` work. Sync-layer push is WebSocket-subprotocol only; against a server without RFC 8887 the engine falls back to polling. The client-level EventSource API exists but is not wired in as a push fallback (deliberate; see `reference/jmap/DEFERRED.md`).
 - `BlobRangeSupport::No`; `open_blob_range` fatals `Error::Unsupported` even when the handle advertises range support (no transport `Range` hook). Its one non-capability refusal, a `range.start` past the known blob size, is `Request(Malformed)` (-> `ClientBug`) instead: that is a caller argument fault, and reporting it as `Unsupported` would tell the engine the protocol has no ranged read at all.
 - `MutationReplaySafety::None`; `IdempotencyKey` is a wire no-op (read-back guard is the only lost-update protection).
-- `bulk_move` only `MembershipScope::Mailbox`; `inventory_partitioning` only `Page { from, to }` for `Email`.
+- `bulk_move` only `MembershipScope::Mailbox`; `inventory_partitioning` is `Full` for every scope, and any explicit
+  `InventoryPartition` other than `Full` is refused as
+  `Unsupported(SyncInventory)` without sending a request.
 - Gmail labels, Graph categories/extended properties, and identity-default selection are unsupported. Attachment handles keep blob id + MIME but not uploaded filenames.
 - Typed filter-rule CRUD is unsupported; JMAP exposes literal Sieve scripts instead.

@@ -382,7 +382,19 @@ pub(crate) fn terminated_unsupported<T>(
 /// `Discover`-coded `Unsupported` was the wrong consumer-facing
 /// classification - the server is not refusing the operation; the
 /// library cannot encode the request shape.
+///
+/// Currently exercised only by its own classification test: the inventory
+/// walk's positional-overflow arms, its last production callers, went away
+/// with positional paging. It is kept because it is the crate's one correct
+/// terminator for a response the library cannot encode, and the next stream
+/// that meets one should reach for it rather than re-deriving the
+/// classification - which is exactly how `Discover`-coded `Unsupported` got
+/// onto inventory in the first place.
 #[must_use]
+#[allow(
+    dead_code,
+    reason = "classification helper retained for stream call sites"
+)]
 pub(crate) fn terminated_contract_violation<T>(
     operation: AccountOperation,
     scope: Option<ErrorScope>,
@@ -404,6 +416,36 @@ pub(crate) fn terminated_contract_violation<T>(
         builder
             .try_build()
             .expect("valid account error classification"),
+    )
+}
+
+/// Stream-side variant for "the set I was walking moved under me".
+///
+/// This is deliberately NOT `Protocol(ContractViolation)`. A server that
+/// advances `Email/query`'s `queryState` mid-walk is behaving correctly -
+/// one delivered message does it - and `ContractViolation` is terminal, so
+/// classifying it there would let ordinary mail delivery permanently kill a
+/// scope's inventory. `SyncState(CursorInvalid)` carrying the cursor scope
+/// maps to `EngineDirective::RestartScope`, which is the honest answer: this
+/// walk's coverage is not provable, so walk it again. What must never happen
+/// is the walk ending in `Done` as though it had covered the scope.
+#[must_use]
+pub(crate) fn terminated_walk_superseded<T>(
+    operation: AccountOperation,
+    scope: CursorScope,
+    message: impl Into<String>,
+) -> SyncEvent<T> {
+    terminated(
+        AccountErrorBuilder::new(
+            AccountErrorKind::SyncState(bifrost_types::SyncStateErrorKind::CursorInvalid),
+            Cause::State(bifrost_types::StateCause::CursorInvalid),
+        )
+        .protocol(Protocol::Jmap)
+        .operation(operation)
+        .scope(ErrorScope::Cursor(scope))
+        .text(DiagnosticText::support_only(message))
+        .try_build()
+        .expect("valid account error classification"),
     )
 }
 

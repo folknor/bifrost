@@ -153,6 +153,8 @@ pub enum ScopeLifecycle {
     Renamed {
         old: MembershipScope,
         new: MembershipScope,
+        old_name: String,
+        new_name: String,
     },
     Deleted(MembershipScope),
 }

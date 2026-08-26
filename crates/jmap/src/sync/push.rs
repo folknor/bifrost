@@ -58,6 +58,7 @@ impl PushRouting {
 pub(crate) struct WsState {
     pub(crate) tx: broadcast::Sender<WatchEvent>,
     pub(crate) enabled: Arc<Mutex<DataTypeSet>>,
+    pub(crate) push_state: Arc<Mutex<Option<String>>>,
     /// The spawned reader, kept so `close()` can prove it stopped.
     ///
     /// Dropping this handle detaches the task, which is what made
@@ -131,6 +132,7 @@ pub(crate) trait PushTransport: Send + Sync + 'static {
     fn set_push_data_types(
         &self,
         data_types: &DataTypeSet,
+        push_state: Option<String>,
     ) -> impl Future<Output = Result<(), AccountError>> + Send;
 
     /// Send a WebSocket ping on the current connection.
@@ -154,8 +156,9 @@ impl PushTransport for Client {
     fn set_push_data_types(
         &self,
         data_types: &DataTypeSet,
+        push_state: Option<String>,
     ) -> impl Future<Output = Result<(), AccountError>> + Send {
-        apply_push_set(self, data_types)
+        apply_push_set(self, data_types, push_state)
     }
 
     fn ping_push(&self) -> impl Future<Output = crate::Result<()>> + Send {
@@ -173,11 +176,13 @@ impl WsState {
     ) -> Self {
         let (tx, _) = broadcast::channel(256);
         let enabled = Arc::new(Mutex::new(HashSet::new()));
+        let push_state = Arc::new(Mutex::new(None));
         let reader = push_available.then(|| {
             tokio::spawn(reader_loop(
                 client,
                 tx.clone(),
                 Arc::clone(&enabled),
+                Arc::clone(&push_state),
                 shutdown,
                 policy,
                 routing,
@@ -187,6 +192,7 @@ impl WsState {
         Self {
             tx,
             enabled,
+            push_state,
             reader: Arc::new(Mutex::new(reader)),
             teardown_timeout: policy.connect_timeout,
         }
@@ -248,14 +254,15 @@ pub(crate) fn stream(
     })
 }
 
-pub(crate) fn subscribe(
-    client: Client,
+pub(crate) fn subscribe<T: PushTransport>(
+    client: T,
     push: PushCapability,
     handle: SubscriptionHandle,
     scopes: Vec<CursorScope>,
     subscriptions: Arc<Mutex<HashMap<SubscriptionHandle, DataTypeSet>>>,
     enabled: Arc<Mutex<DataTypeSet>>,
-) -> AccountFuture<Result<SubscriptionHandle, AccountError>> {
+    push_state: Arc<Mutex<Option<String>>>,
+) -> AccountFuture<Result<(SubscriptionHandle, Vec<bool>), AccountError>> {
     Box::pin(async move {
         if push != PushCapability::InProcess {
             return Err(super::error::unsupported_error(
@@ -265,6 +272,10 @@ pub(crate) fn subscribe(
             ));
         }
 
+        let accepted = scopes
+            .iter()
+            .map(|scope| data_type_for_scope(scope).is_some())
+            .collect::<Vec<_>>();
         let data_types = scopes
             .iter()
             .filter_map(data_type_for_scope)
@@ -278,34 +289,62 @@ pub(crate) fn subscribe(
             ));
         }
 
-        let union = {
-            let mut guard = subscriptions.lock().await;
-            guard.insert(handle.clone(), data_types);
-            union_data_types(&guard)
-        };
-
-        set_enabled_data_types(&enabled, union.clone()).await;
-        apply_push_set(&client, &union).await?;
-        Ok(handle)
+        // Lock order is subscriptions -> enabled -> push_state everywhere that
+        // takes more than one, and every commit happens after the frame send
+        // succeeds. Holding all three across the send is what makes a
+        // cancelled subscribe future commit nothing at all.
+        let mut subscriptions_guard = subscriptions.lock().await;
+        let mut enabled_guard = enabled.lock().await;
+        let mut push_state_guard = push_state.lock().await;
+        let mut prospective = subscriptions_guard.clone();
+        prospective.insert(handle.clone(), data_types.clone());
+        let union = union_data_types(&prospective);
+        client
+            .set_push_data_types(&union, push_state_guard.clone())
+            .await?;
+        subscriptions_guard.insert(handle.clone(), data_types);
+        commit_push_set(&mut enabled_guard, &mut push_state_guard, union);
+        Ok((handle, accepted))
     })
 }
 
-pub(crate) fn unsubscribe(
-    client: Client,
+pub(crate) fn unsubscribe<T: PushTransport>(
+    client: T,
     handle: SubscriptionHandle,
     subscriptions: Arc<Mutex<HashMap<SubscriptionHandle, DataTypeSet>>>,
     enabled: Arc<Mutex<DataTypeSet>>,
+    push_state: Arc<Mutex<Option<String>>>,
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
-        let union = {
-            let mut guard = subscriptions.lock().await;
-            guard.remove(&handle);
-            union_data_types(&guard)
-        };
-
-        set_enabled_data_types(&enabled, union.clone()).await;
-        apply_push_set(&client, &union).await
+        let mut subscriptions_guard = subscriptions.lock().await;
+        let mut enabled_guard = enabled.lock().await;
+        let mut push_state_guard = push_state.lock().await;
+        let mut prospective = subscriptions_guard.clone();
+        prospective.remove(&handle);
+        let union = union_data_types(&prospective);
+        client
+            .set_push_data_types(&union, push_state_guard.clone())
+            .await?;
+        subscriptions_guard.remove(&handle);
+        commit_push_set(&mut enabled_guard, &mut push_state_guard, union);
+        Ok(())
     })
+}
+
+/// Commit a newly applied data-type union.
+///
+/// The RFC 8887 `pushState` we hold is the last position the server
+/// acknowledged for a LIVE subscription. Reconfiguring the data-type set keeps
+/// that position - it is what stops changes around the reconfigure from being
+/// missed - but disabling push retires the subscription the position belongs
+/// to, so the cached value must be dropped. Keeping it would let a later
+/// re-enable replay a position minted under an abandoned configuration, which
+/// is a wrong replay rather than merely a cold start.
+fn commit_push_set(enabled: &mut DataTypeSet, push_state: &mut Option<String>, union: DataTypeSet) {
+    if union.is_empty() {
+        *push_state = None;
+    }
+    *enabled = union;
 }
 
 fn data_type_for_scope(scope: &CursorScope) -> Option<DataType> {
@@ -340,17 +379,16 @@ fn union_data_types(subscriptions: &HashMap<SubscriptionHandle, DataTypeSet>) ->
     union
 }
 
-async fn set_enabled_data_types(enabled: &Arc<Mutex<DataTypeSet>>, data_types: DataTypeSet) {
-    let mut guard = enabled.lock().await;
-    *guard = data_types;
-}
-
-async fn apply_push_set(client: &Client, data_types: &DataTypeSet) -> Result<(), AccountError> {
+async fn apply_push_set(
+    client: &Client,
+    data_types: &DataTypeSet,
+    push_state: Option<String>,
+) -> Result<(), AccountError> {
     let result = if data_types.is_empty() {
         client.disable_push_ws().await
     } else {
         let values = data_types.iter().cloned().collect::<Vec<_>>();
-        client.enable_push_ws(Some(values), None::<String>).await
+        client.enable_push_ws(Some(values), push_state).await
     };
 
     match result {
@@ -419,6 +457,7 @@ async fn reader_loop<T: PushTransport>(
     transport: T,
     tx: broadcast::Sender<WatchEvent>,
     enabled: Arc<Mutex<DataTypeSet>>,
+    push_state: Arc<Mutex<Option<String>>>,
     shutdown: CancellationToken,
     policy: ReconnectPolicy,
     routing: Arc<PushRouting>,
@@ -429,7 +468,17 @@ async fn reader_loop<T: PushTransport>(
             break;
         }
 
-        match reader_pass(&transport, &tx, &enabled, &shutdown, policy, &routing).await {
+        match reader_pass(
+            &transport,
+            &tx,
+            &enabled,
+            &push_state,
+            &shutdown,
+            policy,
+            &routing,
+        )
+        .await
+        {
             ReaderStep::Stop => break,
             ReaderStep::Terminal(err) => {
                 let _ = tx.send(WatchEvent::Terminated(err));
@@ -456,6 +505,7 @@ async fn reader_pass<T: PushTransport>(
     transport: &T,
     tx: &broadcast::Sender<WatchEvent>,
     enabled: &Arc<Mutex<DataTypeSet>>,
+    push_state: &Arc<Mutex<Option<String>>>,
     shutdown: &CancellationToken,
     policy: ReconnectPolicy,
     routing: &PushRouting,
@@ -499,7 +549,7 @@ async fn reader_pass<T: PushTransport>(
     match bounded(
         shutdown,
         policy.connect_timeout,
-        reenable_current_push_set(transport, enabled),
+        reenable_current_push_set(transport, enabled, push_state),
     )
     .await
     {
@@ -566,6 +616,7 @@ async fn reader_pass<T: PushTransport>(
             Ok(crate::client_ws::WebSocketMessage::PushNotification(push)) => {
                 saw_traffic = true;
                 awaiting_pong = false;
+                remember_push_state(&push, push_state).await;
                 emit_push(push, tx, routing);
             }
             Ok(
@@ -603,17 +654,33 @@ async fn reader_pass<T: PushTransport>(
 async fn reenable_current_push_set<T: PushTransport>(
     transport: &T,
     enabled: &Arc<Mutex<DataTypeSet>>,
+    push_state: &Arc<Mutex<Option<String>>>,
 ) -> Result<(), AccountError> {
     let current = {
         let guard = enabled.lock().await;
         guard.clone()
     };
-    transport.set_push_data_types(&current).await
+    let push_state = push_state.lock().await.clone();
+    transport.set_push_data_types(&current, push_state).await
+}
+
+async fn remember_push_state(push: &PushObject, state: &Arc<Mutex<Option<String>>>) {
+    if let Some(value) = last_push_state(push) {
+        *state.lock().await = Some(value.to_string());
+    }
+}
+
+fn last_push_state(push: &PushObject) -> Option<&str> {
+    match push {
+        PushObject::StateChange { push_state, .. } => push_state.as_deref(),
+        PushObject::Group { entries } => entries.iter().filter_map(last_push_state).next_back(),
+        _ => None,
+    }
 }
 
 fn emit_push(push: PushObject, tx: &broadcast::Sender<WatchEvent>, routing: &PushRouting) {
     match push {
-        PushObject::StateChange { changed } => {
+        PushObject::StateChange { changed, .. } => {
             // RFC 8620 s7.1: `changed` is keyed by `accountId`. Route each
             // entry to the cursor scopes that account actually drives
             // instead of collapsing every account onto the primary type
@@ -684,6 +751,7 @@ fn invalidated(payload: HintPayload) -> WatchEvent {
 mod tests {
     use super::*;
     use futures::StreamExt;
+    use std::sync::Mutex as StdMutex;
 
     fn drain(rx: &mut broadcast::Receiver<WatchEvent>) -> Vec<WatchEvent> {
         let mut events = Vec::new();
@@ -698,7 +766,10 @@ mod tests {
         let mut by_type = HashMap::new();
         by_type.insert(data_type, state.to_string());
         changed.insert(account_id.to_string(), by_type);
-        PushObject::StateChange { changed }
+        PushObject::StateChange {
+            changed,
+            push_state: None,
+        }
     }
 
     fn foreign_scope(account_id: &str) -> CursorScope {
@@ -906,6 +977,228 @@ mod tests {
         }
     }
 
+    type AppliedPushSets = Arc<StdMutex<Vec<(DataTypeSet, Option<String>)>>>;
+
+    struct RecordingPushTransport {
+        fail: bool,
+        applied: AppliedPushSets,
+    }
+
+    impl PushTransport for RecordingPushTransport {
+        type Stream = BoxedWsStream;
+
+        async fn connect_push(&self) -> crate::Result<Self::Stream> {
+            Ok(Box::pin(futures::stream::pending()))
+        }
+
+        async fn set_push_data_types(
+            &self,
+            data_types: &DataTypeSet,
+            push_state: Option<String>,
+        ) -> Result<(), AccountError> {
+            self.applied
+                .lock()
+                .expect("apply log")
+                .push((data_types.clone(), push_state));
+            if self.fail {
+                Err(super::super::error::unsupported_error(
+                    AccountOperation::PushSubscribe,
+                    None,
+                    "scripted push refusal",
+                ))
+            } else {
+                Ok(())
+            }
+        }
+
+        async fn ping_push(&self) -> crate::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_subscribe_commits_neither_handle_nor_enabled_union() {
+        let subscriptions = Arc::new(Mutex::new(HashMap::new()));
+        let enabled = Arc::new(Mutex::new(HashSet::new()));
+        let result = subscribe(
+            RecordingPushTransport {
+                fail: true,
+                applied: Arc::new(StdMutex::new(Vec::new())),
+            },
+            PushCapability::InProcess,
+            SubscriptionHandle("hidden".to_string()),
+            vec![CursorScope::Type(ObjectType::Email)],
+            Arc::clone(&subscriptions),
+            Arc::clone(&enabled),
+            Arc::new(Mutex::new(None)),
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(subscriptions.lock().await.is_empty());
+        assert!(enabled.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn subscribe_reports_each_supported_and_unsupported_position() {
+        let result = subscribe(
+            RecordingPushTransport {
+                fail: false,
+                applied: Arc::new(StdMutex::new(Vec::new())),
+            },
+            PushCapability::InProcess,
+            SubscriptionHandle("mixed".to_string()),
+            vec![
+                CursorScope::Type(ObjectType::Email),
+                CursorScope::Query(bifrost_types::QueryId("q1".to_string())),
+                CursorScope::Type(ObjectType::Email),
+            ],
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(HashSet::new())),
+            Arc::new(Mutex::new(None)),
+        )
+        .await
+        .expect("supported subset applies");
+
+        assert_eq!(result.1, vec![true, false, true]);
+    }
+
+    /// Reconfiguring the live data-type set must carry the last acknowledged
+    /// RFC 8887 position onto the new `WebSocketPushEnable`. Sending `None`
+    /// there abandons the position, so changes around the reconfigure are
+    /// never replayed - the same outage window the reconnect fix closes.
+    #[tokio::test]
+    async fn reconfiguring_the_data_type_set_preserves_the_push_position() {
+        let applied = Arc::new(StdMutex::new(Vec::new()));
+        let subscriptions = Arc::new(Mutex::new(HashMap::new()));
+        let enabled = Arc::new(Mutex::new([DataType::Email].into_iter().collect()));
+        let push_state = Arc::new(Mutex::new(Some("push-7".to_string())));
+
+        subscribe(
+            RecordingPushTransport {
+                fail: false,
+                applied: Arc::clone(&applied),
+            },
+            PushCapability::InProcess,
+            SubscriptionHandle("second".to_string()),
+            vec![CursorScope::Type(ObjectType::Mailbox)],
+            Arc::clone(&subscriptions),
+            Arc::clone(&enabled),
+            Arc::clone(&push_state),
+        )
+        .await
+        .expect("reconfigure applies");
+
+        assert_eq!(
+            applied.lock().expect("apply log")[0].1.as_deref(),
+            Some("push-7"),
+            "the reconfigure frame must carry the live position"
+        );
+        assert_eq!(push_state.lock().await.as_deref(), Some("push-7"));
+    }
+
+    /// The other half: once the last subscription goes away the frame is a
+    /// disable, the position it belonged to is retired, and a reconnect after
+    /// that must NOT replay it. Retaining the value here would make the
+    /// reconnect fix produce a wrong replay the original bug could not.
+    #[tokio::test]
+    async fn a_reconnect_after_the_last_unsubscribe_replays_no_stale_position() {
+        let applied = Arc::new(StdMutex::new(Vec::new()));
+        let handle = SubscriptionHandle("only".to_string());
+        let subscriptions = Arc::new(Mutex::new(HashMap::from([(
+            handle.clone(),
+            [DataType::Email].into_iter().collect::<DataTypeSet>(),
+        )])));
+        let enabled = Arc::new(Mutex::new([DataType::Email].into_iter().collect()));
+        let push_state = Arc::new(Mutex::new(Some("push-7".to_string())));
+
+        unsubscribe(
+            RecordingPushTransport {
+                fail: false,
+                applied: Arc::clone(&applied),
+            },
+            handle,
+            Arc::clone(&subscriptions),
+            Arc::clone(&enabled),
+            Arc::clone(&push_state),
+        )
+        .await
+        .expect("unsubscribe applies");
+
+        assert!(push_state.lock().await.is_none());
+
+        let transport = RecordingPushTransport {
+            fail: false,
+            applied: Arc::clone(&applied),
+        };
+        reenable_current_push_set(&transport, &enabled, &push_state)
+            .await
+            .expect("re-enable succeeds");
+        assert_eq!(
+            applied.lock().expect("apply log")[1].1,
+            None,
+            "a reconnect after the subscription was retired must start cold"
+        );
+    }
+
+    /// The replay is only as good as the capture. A frame carrying a
+    /// `pushState` must move the cached position, a frame without one must
+    /// leave it alone (RFC 8887 makes the property optional, and treating an
+    /// absent one as "reset to cold" would throw the position away on the
+    /// first server that omits it), and a `Group` reports its LAST member's
+    /// position rather than its first.
+    #[tokio::test]
+    async fn the_reader_captures_the_latest_push_state_and_never_unsets_it() {
+        let state = Arc::new(Mutex::new(None));
+
+        remember_push_state(&state_change("u1", DataType::Email, "s1"), &state).await;
+        assert!(state.lock().await.is_none(), "no pushState, nothing cached");
+
+        let mut with_state = state_change("u1", DataType::Email, "s1");
+        if let PushObject::StateChange { push_state, .. } = &mut with_state {
+            *push_state = Some("ps-1".to_string());
+        }
+        remember_push_state(&with_state, &state).await;
+        assert_eq!(state.lock().await.as_deref(), Some("ps-1"));
+
+        remember_push_state(&state_change("u1", DataType::Email, "s2"), &state).await;
+        assert_eq!(
+            state.lock().await.as_deref(),
+            Some("ps-1"),
+            "a frame without a pushState must not clear the position"
+        );
+
+        let mut later = state_change("u1", DataType::Mailbox, "s3");
+        if let PushObject::StateChange { push_state, .. } = &mut later {
+            *push_state = Some("ps-2".to_string());
+        }
+        let group = PushObject::Group {
+            entries: vec![with_state, later],
+        };
+        remember_push_state(&group, &state).await;
+        assert_eq!(state.lock().await.as_deref(), Some("ps-2"));
+    }
+
+    #[tokio::test]
+    async fn reconnect_replays_the_last_push_state() {
+        let applied = Arc::new(StdMutex::new(Vec::new()));
+        let transport = RecordingPushTransport {
+            fail: false,
+            applied: Arc::clone(&applied),
+        };
+        let enabled = Arc::new(Mutex::new([DataType::Email].into_iter().collect()));
+        let state = Arc::new(Mutex::new(Some("push-7".to_string())));
+
+        reenable_current_push_set(&transport, &enabled, &state)
+            .await
+            .expect("re-enable succeeds");
+
+        assert_eq!(
+            applied.lock().expect("apply log")[0].1.as_deref(),
+            Some("push-7")
+        );
+    }
+
     #[test]
     fn the_enabled_data_type_union_spans_every_live_subscription() {
         let mut subscriptions: HashMap<SubscriptionHandle, DataTypeSet> = HashMap::new();
@@ -987,6 +1280,7 @@ mod tests {
         fn set_push_data_types(
             &self,
             _data_types: &DataTypeSet,
+            _push_state: Option<String>,
         ) -> impl Future<Output = Result<(), AccountError>> + Send {
             let entered = Arc::clone(&self.entered);
             let hang = self.hang == Hang::Reenable;
@@ -1021,6 +1315,7 @@ mod tests {
             },
             tx,
             Arc::new(Mutex::new(HashSet::new())),
+            Arc::new(Mutex::new(None)),
             shutdown.clone(),
             ReconnectPolicy {
                 initial: Duration::from_secs(3600),
@@ -1074,6 +1369,7 @@ mod tests {
         fn set_push_data_types(
             &self,
             _data_types: &DataTypeSet,
+            _push_state: Option<String>,
         ) -> impl Future<Output = Result<(), AccountError>> + Send {
             let attempts = Arc::clone(&self.attempts);
             async move {
@@ -1107,6 +1403,7 @@ mod tests {
             },
             tx,
             Arc::new(Mutex::new(HashSet::new())),
+            Arc::new(Mutex::new(None)),
             shutdown.clone(),
             ReconnectPolicy::default(),
             Arc::new(routing()),
@@ -1147,6 +1444,7 @@ mod tests {
             },
             tx,
             Arc::new(Mutex::new(HashSet::new())),
+            Arc::new(Mutex::new(None)),
             shutdown.clone(),
             ReconnectPolicy {
                 initial: Duration::from_secs(1),
@@ -1180,7 +1478,11 @@ mod tests {
             Ok(stream)
         }
 
-        async fn set_push_data_types(&self, _data_types: &DataTypeSet) -> Result<(), AccountError> {
+        async fn set_push_data_types(
+            &self,
+            _data_types: &DataTypeSet,
+            _push_state: Option<String>,
+        ) -> Result<(), AccountError> {
             Ok(())
         }
 
@@ -1206,6 +1508,7 @@ mod tests {
             },
             tx,
             Arc::new(Mutex::new(HashSet::new())),
+            Arc::new(Mutex::new(None)),
             shutdown.clone(),
             ReconnectPolicy {
                 initial: Duration::from_secs(1),
@@ -1252,7 +1555,11 @@ mod tests {
             Ok(stream)
         }
 
-        async fn set_push_data_types(&self, _data_types: &DataTypeSet) -> Result<(), AccountError> {
+        async fn set_push_data_types(
+            &self,
+            _data_types: &DataTypeSet,
+            _push_state: Option<String>,
+        ) -> Result<(), AccountError> {
             Ok(())
         }
 
@@ -1277,6 +1584,7 @@ mod tests {
             },
             tx,
             Arc::new(Mutex::new(HashSet::new())),
+            Arc::new(Mutex::new(None)),
             shutdown.clone(),
             ReconnectPolicy {
                 initial: Duration::from_secs(1),

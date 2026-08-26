@@ -506,8 +506,13 @@ inventory page and the consumer ingests zero objects. The partitioner
 (`backfill/partitioner.rs::plan`) handles three strategies:
 `TimeWindowed` (boundaries plus a final open-ended partition),
 `UidRange` (newest-first chunking), and `PageCount` (page-size
-chunking). `Full` falls through as a single partition; JMAP
-Email currently advertises open-ended `PageCount`.
+chunking). `Full` falls through as a single partition. No protocol crate
+in this workspace currently advertises `PageCount`: JMAP Email used to,
+and now reports `Full`, because its inventory pages `Email/query` by
+`anchor` rather than by integer position and an engine partition
+boundary would discard that anchor (see `reference/jmap.md`). The
+`PageCount` strategy and the `OpenPages` plan it drives stay published
+for a protocol whose paging really is positionally stable.
 
 Every range partition in this workspace is HALF-OPEN, `[from, to)`, with no
 exceptions. `PartitionBounds::Time`, `PartitionBounds::Page`,
@@ -583,14 +588,16 @@ returned.
 This skip-on-complete signal is uniform across plan kinds; the difference
 is whether positional resume is also possible:
 
-- **`OpenPages`** (JMAP Email): the orchestrator runs the persisted
+- **`OpenPages`** (no current producer; see `PageCount` above): the
+  orchestrator runs the persisted
   checkpoint through the pure `open_pages_resume` decision - completion
   sentinel -> **skip entirely**; any other `page:F:T` -> resume the walk
   at `T` rather than page 0; no checkpoint or an unrecognised partition
   kind -> start fresh at 0. A SHORT page (`items_done < T - F`) is
   deliberately not read as exhaustion: a partition may emit fewer entries
   than its window width while the scope still has results (ids deleted
-  between `Email/query` and `Email/get`, id-less objects dropped), so
+  between the listing call and the hydration call, id-less objects
+  dropped), so
   only the completion marker proves exhaustion. Resuming at `T` after a
   genuinely final short page costs one empty probe query, which then
   lands the marker.
