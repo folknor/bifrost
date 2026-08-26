@@ -4,7 +4,8 @@ Scope: `crates/smtp/` - transport types (async and blocking halves, both publish
 surface), connection pooling, PIPELINING, DSN, message builder, LMTP, TLS handling,
 examples.
 
-All findings are closed. The final open refactor was completed in round 3.
+All findings are closed. The final open refactor was completed in round 3, and
+the two shape differences surfaced by that work were closed in round 4.
 
 ## Round 1 rulings (findings 1-7, landed)
 
@@ -82,6 +83,19 @@ real error to return.
 
 The rest of the round:
 
+- Round 4 aligned recipient-command transport failures on the scope-less async
+  shape. The failure is correlated through its batch item id and support-only
+  envelope-recipient text; `ErrorScope::Account` falsely located it at the
+  account, and no typed resource scope represents an SMTP envelope address.
+  The blocking half's inert context-level `Unsent` override and vestigial
+  discarded recipient-address binding were removed with the false scope.
+  Removing the last writer left `SmtpErrorContext::scope` permanently `None`
+  and its `apply_context` branch unreachable, so the field itself went too:
+  the crate now has one context constructor and no way to attach a scope, and
+  the halves agree by construction rather than by matching call sites. Both
+  halves pin the shape with a transcript test, each ablated by reinstating the
+  scope and observed to fail.
+
 - The proposed sans-I/O rewrite is refused for this bug-fix round. It is a
   plausible future architecture, but replacing roughly 6,600 lines of mature
   sync and async protocol drivers is not a bounded fix for the verified defects
@@ -98,7 +112,9 @@ The rest of the round:
   reshape. `SmtpErrorContext` no longer has a phase field or phase-decorating
   method. Low-level conversion reads the phase only from `SmtpError`, while a
   stored negative `Response` passes one explicit phase to its classifier. The
-  fifteen batch sites therefore cannot write two disagreeing phases. In both
+  batch conversion sites therefore cannot write two disagreeing phases (the
+  round-3 ledger said fifteen; the enumeration that round actually found twenty,
+  and a fixed count in a document nobody recounts is how that drift starts). In both
   I/O halves the duplication itself is closed at the type level, so that part
   admits no runtime ablation - the former bad state no longer compiles.
   What survives as behaviour is the one explicit phase argument a stored

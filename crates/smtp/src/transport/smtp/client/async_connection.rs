@@ -2560,6 +2560,55 @@ mod transcript_tests {
     }
 
     #[tokio::test(crate = "tokio")]
+    async fn rcpt_reply_read_failure_has_no_false_account_scope() {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let addresses: Vec<crate::address::Address> = [
+            "accepted@example.com",
+            "rejected@example.com",
+            "unanswered@example.com",
+        ]
+        .into_iter()
+        .map(str::parse)
+        .collect::<Result<_, _>>()
+        .unwrap();
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250 smtp.example\r\n")
+            .expect("MAIL FROM:<sender@example.com>\r\n", "250 sender ok\r\n")
+            .expect("RCPT TO:<accepted@example.com>\r\n", "250 accepted\r\n")
+            .expect("RCPT TO:<rejected@example.com>\r\n", "550 rejected\r\n")
+            .expect("RCPT TO:<unanswered@example.com>\r\n", "");
+        let batch = addresses
+            .into_iter()
+            .enumerate()
+            .map(|(index, address)| SmtpBatchRecipient {
+                id: BatchItemId(format!("item-{index}")),
+                address,
+            })
+            .collect();
+
+        let mut connection =
+            AsyncSmtpConnection::from_transcript(transcript, &hello, Protocol::Smtp)
+                .await
+                .unwrap();
+        let outcome = connection
+            .send_smtp_batch(
+                Some("sender@example.com".parse().unwrap()),
+                batch,
+                b"body",
+                &Default::default(),
+            )
+            .await
+            .unwrap()
+            .resolve();
+
+        assert!(outcome.uncertain().is_empty());
+        assert_eq!(outcome.failed().len(), 3);
+        assert_eq!(outcome.failed()[1].item.0, "item-1");
+        assert!(outcome.failed()[0].error.scope().is_none());
+        assert!(outcome.failed()[2].error.scope().is_none());
+    }
+
+    #[tokio::test(crate = "tokio")]
     async fn later_pipelining_window_write_failure_is_unsent() {
         let hello = ClientId::Domain("client.example".to_owned());
         let addresses: Vec<crate::address::Address> = (0..33)

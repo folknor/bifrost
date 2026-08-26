@@ -588,19 +588,15 @@ impl SmtpConnection {
                         .with_phase(SmtpCommandPhase::RcptTo);
                     {
                         let err_for_closure = err_clone.clone();
-                        let addr_str = progress.recipients[i].address.clone();
                         use crate::transport::smtp::account_error::{
                             SmtpErrorContext, into_account_error,
                         };
                         progress.mark_unresolved_unsent(|| {
                             into_account_error(
                                 err_for_closure.clone(),
-                                SmtpErrorContext::send(Protocol::Smtp)
-                                    .with_attempt(SmtpTransmissionState::Unsent)
-                                    .with_scope(bifrost_types::error::ErrorScope::Account),
+                                SmtpErrorContext::send(Protocol::Smtp),
                             )
                         });
-                        let _ = addr_str;
                     }
                     self.abort();
                     return Ok(progress);
@@ -2458,6 +2454,8 @@ mod transcript_tests {
         assert!(outcome.uncertain().is_empty());
         assert_eq!(outcome.failed().len(), 3);
         assert_eq!(outcome.failed()[1].item.0, "item-1");
+        assert!(outcome.failed()[0].error.scope().is_none());
+        assert!(outcome.failed()[2].error.scope().is_none());
     }
 
     #[test]

@@ -25,10 +25,10 @@ definition; "nothing calls it" established by grepping here is a fact about the
 workspace, not about who uses `SmtpTransport`.
 
 The two halves are held in step deliberately: the DATA-framing, auth-ladder,
-pipelining-state and transaction-reset invariants are mirrored into the
-blocking writers and pinned on both sides, as is the pipelined phase decoration
-described under "PIPELINING" and the single batch phase authority described
-alongside it. The one deliberate difference is the `abort()`
+pipelining-state, transaction-reset and batch error-scope invariants are mirrored
+into the blocking writers and pinned on both sides, as is the pipelined phase
+decoration described under "PIPELINING" and the single batch phase authority
+described alongside it. The one deliberate difference is the `abort()`
 timeout, recorded under "Connection lifecycle". The paired tests are intentional
 while the published sync and async I/O drivers remain separate. Any proposal
 to remove or reshape this surface is the owner's call - see the standing
@@ -112,6 +112,18 @@ the phase already attached to that value and cannot supply a second, disagreeing
 phase. Per-recipient negative replies, which have a `Response` rather than an
 `Error`, pass one explicit phase directly to the response classifier. This shape
 is identical in the blocking and async drivers.
+
+No SMTP-originated `AccountError` carries an `ErrorScope`, and that is
+structural rather than conventional: `SmtpErrorContext` has no scope field and
+one constructor, so no call site can attach one. `ErrorScope::Account` would
+claim an account-wide fault for what is a single transaction on a single
+connection, and the id-bearing variants take typed account-surface ids, none of
+which represents an SMTP envelope address. Batch lanes correlate through their
+`BatchItemId` and support-only envelope-recipient text instead. Every context
+construction in the crate goes through `SmtpErrorContext::send`, in equal
+numbers in the two driver halves, so the halves agree here by construction
+rather than by matching call sites; both pin the scope-less shape on the
+non-pipelined recipient path with a paired transcript test.
 
 That explicit argument is the part of the arrangement that is behaviour rather
 than a type property, and it is pinned by a bare-550 recipient rejection: with

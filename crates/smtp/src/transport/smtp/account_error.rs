@@ -14,7 +14,7 @@
 use bifrost_types::error::{
     AccessCause, AccessErrorKind, AccountError, AccountErrorBuilder, AccountErrorKind,
     AccountOperation, AttemptCause, AuthCause, AuthErrorKind, Cause, DiagnosticText,
-    EnhancedStatusCode as TypesEnhancedStatusCode, ErrorScope, MailboxUnavailableKind, Protocol,
+    EnhancedStatusCode as TypesEnhancedStatusCode, MailboxUnavailableKind, Protocol,
     ProtocolErrorKind, Provider, RequestCause, RequestErrorKind, ResourceKind, ServerCause,
     ServerErrorKind, ThrottleScope, TransmissionState, TransportCause, TransportErrorKind,
     TransportKind, WireCause,
@@ -36,10 +36,18 @@ fn finish(builder: AccountErrorBuilder) -> AccountError {
         .expect("valid account error classification")
 }
 
+/// Call-site evidence that is not carried on the low-level `SmtpError`.
+///
+/// There is deliberately no `scope` field. No `ErrorScope` variant can
+/// honestly locate an SMTP failure: the id-bearing variants take typed
+/// account-surface ids, and an SMTP envelope address is not one of them,
+/// while `ErrorScope::Account` would claim an account-wide fault for what
+/// is a single transaction on a single connection. Batch lanes correlate
+/// through their `BatchItemId` instead. Omitting the field is what keeps
+/// the blocking and async drivers in step here rather than convention.
 #[derive(Clone, Debug)]
 pub(crate) struct SmtpErrorContext {
     pub(crate) operation: Option<AccountOperation>,
-    pub(crate) scope: Option<ErrorScope>,
     pub(crate) provider: Option<Provider>,
     pub(crate) protocol: Protocol,
     pub(crate) idempotency_override: Option<bool>,
@@ -54,22 +62,11 @@ impl SmtpErrorContext {
         );
         Self {
             operation: Some(AccountOperation::Send),
-            scope: None,
             provider: None,
             protocol,
             idempotency_override: Some(false),
             transmission_state: None,
         }
-    }
-
-    pub(crate) fn with_scope(mut self, scope: ErrorScope) -> Self {
-        self.scope = Some(scope);
-        self
-    }
-
-    pub(crate) fn with_attempt(mut self, state: SmtpTransmissionState) -> Self {
-        self.transmission_state = Some(state);
-        self
     }
 }
 
@@ -256,9 +253,6 @@ fn build_transport(
 fn apply_context(mut builder: AccountErrorBuilder, ctx: &SmtpErrorContext) -> AccountErrorBuilder {
     if let Some(op) = ctx.operation {
         builder = builder.operation(op);
-    }
-    if let Some(scope) = ctx.scope.clone() {
-        builder = builder.scope(scope);
     }
     if let Some(provider) = ctx.provider {
         builder = builder.provider(provider);
