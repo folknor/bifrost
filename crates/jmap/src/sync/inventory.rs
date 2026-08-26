@@ -123,9 +123,10 @@ fn email_inventory_loop<T: HttpTransport>(
     window: InventoryWindow,
 ) -> AccountStream<SyncEvent<InventoryEntry>> {
     Box::pin(async_stream::stream! {
-        // One accumulator for the paged walk. Each page is a `Query` +
-        // `Get` pair in one `/jmap/api` POST, and each emitted batch
-        // takes and clears the accumulator.
+        // One accumulator for the paged walk. Each page is a `Query`
+        // POST followed by a `Get` POST, and each emitted batch takes
+        // and clears the accumulator, so a batch's `bytes_in` covers
+        // both requests of its page.
         let (mail, tally) = mail.metered();
         let InventoryWindow::Full { limit: full_limit } = window;
 

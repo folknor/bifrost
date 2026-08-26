@@ -35,9 +35,16 @@ Both were ablated against the `map_or(0, ..)` behaviour and failed with
 The reader's reconnect replay takes the `enabled` guard, drops it, then takes
 the `push_state` guard, so the pair it replays is not read under one critical
 section. Every mutator (subscribe, unsubscribe) holds both guards across its
-apply and commits under them, so the worst observable outcome is replaying a
-data-type union with a position from a moment later - both individually valid,
-and the reconciler treats the reconnect as a full `Unknown` reconcile regardless.
+apply and commits under them. The close pass sharpened the worst case beyond
+what was first recorded: if a mutator commits between the reader's two reads,
+the replay can re-apply a union the mutators have already superseded - after a
+racing final unsubscribe, the wire briefly carries a subscription the state
+says is empty, with a `None` position. The consequence is only extra push
+frames and spurious invalidation hints (never a missed change - hints are
+over-approximate by contract), it self-heals on the next reconnect or
+reconfigure because the mutators' own frames are sent under all three guards,
+and the reconciler treats the reconnect as a full `Unknown` reconcile
+regardless.
 Left alone because closing it means holding the `enabled` guard across the
 `set_push_data_types` await in the reader, which introduces exactly the kind of
 lock-across-await teardown change this arc has repeatedly seen open a new hole
