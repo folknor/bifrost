@@ -4,7 +4,7 @@
 //! errors and message-builder errors. All `AccountErrorBuilder::new` call sites
 //! for SMTP-originated failures live in this file; the rest of the crate keeps
 //! emitting the low-level `transport::smtp::Error` / `crate::error::Error`
-//! shapes and decorates them with attempt/phase context.
+//! shapes and decorates SMTP errors with attempt and phase evidence.
 //!
 //! Recovery is never constructed here. Every conversion funnels through
 //! `AccountErrorBuilder::try_build` (via `finish`; the infallible `build` is
@@ -44,7 +44,6 @@ pub(crate) struct SmtpErrorContext {
     pub(crate) protocol: Protocol,
     pub(crate) idempotency_override: Option<bool>,
     pub(crate) transmission_state: Option<SmtpTransmissionState>,
-    pub(crate) phase: Option<SmtpCommandPhase>,
 }
 
 impl SmtpErrorContext {
@@ -60,7 +59,6 @@ impl SmtpErrorContext {
             protocol,
             idempotency_override: Some(false),
             transmission_state: None,
-            phase: None,
         }
     }
 
@@ -73,21 +71,14 @@ impl SmtpErrorContext {
         self.transmission_state = Some(state);
         self
     }
-
-    pub(crate) fn with_phase(mut self, phase: SmtpCommandPhase) -> Self {
-        self.phase = Some(phase);
-        self
-    }
 }
 
 /// Convert a low-level SMTP transport `Error` into an `AccountError`.
 pub(crate) fn into_account_error(error: SmtpError, ctx: SmtpErrorContext) -> AccountError {
     let attempt_state = error.attempt().or(ctx.transmission_state);
-    // Phase carried on the error takes precedence over the context's phase:
-    // the value is where the wire-side knowledge actually lives. The context
-    // phase is a back-compat fallback for call sites that decorate the
-    // context but pass an error without a phase attached.
-    let phase = error.phase().or(ctx.phase);
+    // Wire-side phase knowledge has one carrier. Keeping a second phase on the
+    // context would let batch call sites construct disagreeing evidence.
+    let phase = error.phase();
     let diagnostic = error.diagnostic_text();
 
     match error.kind() {
@@ -1159,16 +1150,12 @@ mod tests {
     }
 
     #[test]
-    fn error_phase_takes_precedence_over_context_phase() {
-        // Phase carried on the error is the authoritative value (smtp-D4):
-        // a missed `with_phase` call cannot silently degrade because phase
-        // is part of the value, not a context-time decoration. When both
-        // are set, the error wins.
+    fn error_phase_drives_auth_classification() {
+        // Phase has one carrier: `SmtpErrorContext` cannot hold one, so batch
+        // conversion cannot construct disagreeing evidence.
         let err =
             crate::transport::smtp::error::invalid_input("x").with_phase(SmtpCommandPhase::Auth);
-        // Context says MailFrom; error says Auth - we must route as Auth.
-        let ctx = ctx_smtp_send().with_phase(SmtpCommandPhase::MailFrom);
-        let account = into_account_error(err, ctx);
+        let account = into_account_error(err, ctx_smtp_send());
         assert!(matches!(
             account.kind(),
             AccountErrorKind::Authorization(AccessErrorKind::PolicyBlocked)

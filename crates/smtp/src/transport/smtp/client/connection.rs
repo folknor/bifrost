@@ -597,7 +597,6 @@ impl SmtpConnection {
                                 err_for_closure.clone(),
                                 SmtpErrorContext::send(Protocol::Smtp)
                                     .with_attempt(SmtpTransmissionState::Unsent)
-                                    .with_phase(SmtpCommandPhase::RcptTo)
                                     .with_scope(bifrost_types::error::ErrorScope::Account),
                             )
                         });
@@ -635,8 +634,7 @@ impl SmtpConnection {
                 let ae = into_account_error(
                     e.with_attempt(SmtpTransmissionState::InFlight)
                         .with_phase(SmtpCommandPhase::DataCommand),
-                    SmtpErrorContext::send(Protocol::Smtp)
-                        .with_phase(SmtpCommandPhase::DataCommand),
+                    SmtpErrorContext::send(Protocol::Smtp),
                 );
                 let ae2 = ae.clone();
                 progress.mark_accepted_uncertain(|| ae2.clone());
@@ -658,7 +656,7 @@ impl SmtpConnection {
                 let ae = into_account_error(
                     e.with_attempt(SmtpTransmissionState::InFlight)
                         .with_phase(SmtpCommandPhase::DataBody),
-                    SmtpErrorContext::send(Protocol::Smtp).with_phase(SmtpCommandPhase::DataBody),
+                    SmtpErrorContext::send(Protocol::Smtp),
                 );
                 let ae2 = ae.clone();
                 progress.mark_uncertain_unresolved(|| ae2.clone());
@@ -704,7 +702,7 @@ impl SmtpConnection {
                 let ae = into_account_error(
                     e.with_attempt(SmtpTransmissionState::Unsent)
                         .with_phase(SmtpCommandPhase::RcptTo),
-                    SmtpErrorContext::send(Protocol::Smtp).with_phase(SmtpCommandPhase::RcptTo),
+                    SmtpErrorContext::send(Protocol::Smtp),
                 );
                 progress.mark_unresolved_unsent(|| ae.clone());
                 self.abort();
@@ -747,8 +745,7 @@ impl SmtpConnection {
                         let ae = into_account_error(
                             e.with_attempt(SmtpTransmissionState::Unsent)
                                 .with_phase(SmtpCommandPhase::RcptTo),
-                            SmtpErrorContext::send(Protocol::Smtp)
-                                .with_phase(SmtpCommandPhase::RcptTo),
+                            SmtpErrorContext::send(Protocol::Smtp),
                         );
                         progress.mark_unresolved_unsent(|| ae.clone());
                         self.abort();
@@ -776,8 +773,7 @@ impl SmtpConnection {
                 let ae = into_account_error(
                     e.with_attempt(SmtpTransmissionState::InFlight)
                         .with_phase(SmtpCommandPhase::DataCommand),
-                    SmtpErrorContext::send(Protocol::Smtp)
-                        .with_phase(SmtpCommandPhase::DataCommand),
+                    SmtpErrorContext::send(Protocol::Smtp),
                 );
                 let ae2 = ae.clone();
                 progress.mark_uncertain_unresolved(|| ae2.clone());
@@ -805,7 +801,7 @@ impl SmtpConnection {
                 let ae = into_account_error(
                     e.with_attempt(SmtpTransmissionState::InFlight)
                         .with_phase(SmtpCommandPhase::DataBody),
-                    SmtpErrorContext::send(Protocol::Smtp).with_phase(SmtpCommandPhase::DataBody),
+                    SmtpErrorContext::send(Protocol::Smtp),
                 );
                 let ae2 = ae.clone();
                 progress.mark_uncertain_unresolved(|| ae2.clone());
@@ -898,7 +894,7 @@ impl SmtpConnection {
                     let ae = into_account_error(
                         e.with_attempt(SmtpTransmissionState::Unsent)
                             .with_phase(SmtpCommandPhase::RcptTo),
-                        SmtpErrorContext::send(Protocol::Lmtp).with_phase(SmtpCommandPhase::RcptTo),
+                        SmtpErrorContext::send(Protocol::Lmtp),
                     );
                     progress.mark_unresolved_unsent(|| ae.clone());
                     self.abort();
@@ -932,8 +928,7 @@ impl SmtpConnection {
                 let ae = into_account_error(
                     e.with_attempt(SmtpTransmissionState::InFlight)
                         .with_phase(SmtpCommandPhase::DataCommand),
-                    SmtpErrorContext::send(Protocol::Lmtp)
-                        .with_phase(SmtpCommandPhase::DataCommand),
+                    SmtpErrorContext::send(Protocol::Lmtp),
                 );
                 let ae2 = ae.clone();
                 progress.mark_accepted_uncertain(|| ae2.clone());
@@ -949,7 +944,7 @@ impl SmtpConnection {
             let ae = into_account_error(
                 e.with_attempt(SmtpTransmissionState::InFlight)
                     .with_phase(SmtpCommandPhase::DataBody),
-                SmtpErrorContext::send(Protocol::Lmtp).with_phase(SmtpCommandPhase::DataBody),
+                SmtpErrorContext::send(Protocol::Lmtp),
             );
             let ae2 = ae.clone();
             progress.mark_uncertain_unresolved(|| ae2.clone());
@@ -985,8 +980,7 @@ impl SmtpConnection {
                     let ae = into_account_error(
                         e.with_attempt(SmtpTransmissionState::InFlight)
                             .with_phase(SmtpCommandPhase::LmtpFinalStatus),
-                        SmtpErrorContext::send(Protocol::Lmtp)
-                            .with_phase(SmtpCommandPhase::LmtpFinalStatus),
+                        SmtpErrorContext::send(Protocol::Lmtp),
                     );
                     let ae2 = ae.clone();
                     progress.mark_uncertain_unresolved(|| ae2.clone());

@@ -212,8 +212,7 @@ impl SendProgress {
                             // from a server-rejected final reply.
                             let err = response_to_account_error(
                                 resp,
-                                &SmtpErrorContext::send(protocol)
-                                    .with_phase(SmtpCommandPhase::DataFinal),
+                                &SmtpErrorContext::send(protocol),
                                 Some(SmtpCommandPhase::DataFinal),
                                 Some(SmtpTransmissionState::Acknowledged),
                             );
@@ -232,7 +231,7 @@ impl SendProgress {
                 RcptProgress::Rejected(resp) => {
                     let err = response_to_account_error(
                         &resp,
-                        &SmtpErrorContext::send(protocol).with_phase(SmtpCommandPhase::RcptTo),
+                        &SmtpErrorContext::send(protocol),
                         Some(SmtpCommandPhase::RcptTo),
                         Some(SmtpTransmissionState::Acknowledged),
                     );
@@ -244,8 +243,7 @@ impl SendProgress {
                     } else {
                         let err = response_to_account_error(
                             &resp,
-                            &SmtpErrorContext::send(protocol)
-                                .with_phase(SmtpCommandPhase::LmtpFinalStatus),
+                            &SmtpErrorContext::send(protocol),
                             Some(SmtpCommandPhase::LmtpFinalStatus),
                             Some(SmtpTransmissionState::Acknowledged),
                         );
@@ -375,6 +373,47 @@ mod tests {
             ),
             vec!["5.1.1 user unknown".to_owned()],
         )
+    }
+
+    /// Bare 550 with no enhanced status code, so classification is forced
+    /// through `classify_status` rather than the enhanced table. That is the
+    /// one arm where the command phase changes the answer.
+    fn rcpt_reject_bare_550() -> Response {
+        Response::new(
+            Code::new(
+                Severity::PermanentNegativeCompletion,
+                Category::MailSystem,
+                Detail::Zero,
+            ),
+            vec!["mailbox unavailable".to_owned()],
+        )
+    }
+
+    #[test]
+    fn rejected_recipient_classifies_in_the_recipient_lane() {
+        // `SmtpErrorContext` no longer carries a phase, so the only phase a
+        // stored negative `Response` gets is the explicit argument `resolve`
+        // passes to the classifier. That argument is behaviour, not a type
+        // guarantee, so pin it where it is observable: a bare 550 is
+        // `NotFound(Mailbox)` in the RcptTo lane and `PermissionDenied`
+        // anywhere else. Passing the wrong phase here - or dropping it -
+        // reports a mailbox rejection as an account-wide permission failure,
+        // which sends the consumer to reauth instead of to the address.
+        let mut progress = SendProgress::new(Protocol::Smtp, vec![recip("a", "a@x.com")]);
+        progress.record_rcpt_rejected(0, rcpt_reject_bare_550());
+
+        let outcome = progress.resolve();
+        assert_eq!(outcome.failed().len(), 1);
+        let err = &outcome.failed()[0].error;
+        assert!(
+            matches!(
+                err.kind(),
+                AccountErrorKind::NotFound(ResourceKind::Mailbox)
+            ),
+            "bare 550 on a rejected recipient must classify in the recipient \
+             lane, got {:?}",
+            err.kind()
+        );
     }
 
     #[test]
@@ -656,7 +695,7 @@ mod tests {
         );
         let err = response_to_account_error(
             &resp,
-            &SmtpErrorContext::send(Protocol::Smtp).with_phase(SmtpCommandPhase::DataCommand),
+            &SmtpErrorContext::send(Protocol::Smtp),
             Some(SmtpCommandPhase::DataCommand),
             Some(SmtpTransmissionState::Acknowledged),
         );
@@ -785,10 +824,7 @@ mod tests {
         )
         .with_attempt(SmtpTransmissionState::InFlight)
         .with_phase(SmtpCommandPhase::DataCommand);
-        let ae = into_account_error(
-            smtp_err,
-            SmtpErrorContext::send(Protocol::Lmtp).with_phase(SmtpCommandPhase::DataCommand),
-        );
+        let ae = into_account_error(smtp_err, SmtpErrorContext::send(Protocol::Lmtp));
         let ae2 = ae.clone();
         progress.mark_accepted_uncertain(|| ae2.clone());
 

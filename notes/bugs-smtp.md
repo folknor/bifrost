@@ -4,6 +4,8 @@ Scope: `crates/smtp/` - transport types (async and blocking halves, both publish
 surface), connection pooling, PIPELINING, DSN, message builder, LMTP, TLS handling,
 examples.
 
+All findings are closed. The final open refactor was completed in round 3.
+
 ## Round 1 rulings (findings 1-7, landed)
 
 Findings 1 through 7 are fixed and removed. Two things about that round are worth
@@ -92,14 +94,22 @@ The rest of the round:
 - The pool redesign proposal is already superseded by round 1. `max_size` now
   has admission control, async recycle has no I/O or await point, and shutdown
   participates in admission. No further pool reshape remains from the argument.
-- Collapsing the repeated batch error-context blocks into `SendProgress` is a
-  reasonable refactor, not an open correctness defect. Phase-aware pipelined
-  single sends are now pinned directly. A broader refactor is declined here
-  because it would mix unrelated batch API reshaping into the final defect
-  pass. Note that the fifteen batch sites still write the phase twice per site
-  (once on the error, once on the context) with nothing enforcing they agree;
-  the `PhasedError` shape above is the pattern to reach for if that is ever
-  worked. This is the one piece of the document left open on purpose.
+- Round 3 closed the batch phase duplication without a broader `SendProgress`
+  reshape. `SmtpErrorContext` no longer has a phase field or phase-decorating
+  method. Low-level conversion reads the phase only from `SmtpError`, while a
+  stored negative `Response` passes one explicit phase to its classifier. The
+  fifteen batch sites therefore cannot write two disagreeing phases. In both
+  I/O halves the duplication itself is closed at the type level, so that part
+  admits no runtime ablation - the former bad state no longer compiles.
+  What survives as behaviour is the one explicit phase argument a stored
+  negative `Response` still passes to `classify_response`, and that is now
+  pinned: `rejected_recipient_classifies_in_the_recipient_lane` drives a bare
+  550 with no enhanced status code, which is the only classification arm the
+  phase actually steers. It was ablated - flipping the argument to `DataFinal`
+  reports `Authorization(PermissionDenied)` instead of
+  `NotFound(Mailbox)`. The pre-existing recipient-rejection tests use a `5.1.1`
+  reply, which the enhanced table classifies the same way for every phase, so
+  they never bit on this.
 - EHLO and LHLO validation now lives in their constructors, so a future command
   call site cannot bypass it.
 - A fixed command-buffer reserve cannot close the documented zeroization gap:
@@ -151,10 +161,3 @@ Recorded so a later pass does not re-derive them:
   unresolved accepted recipients become uncertain.
 - **The `Unsent` versus `Uncertain` split** is correct on every traced envelope
   and DATA boundary.
-
-## Open
-
-One item, stated above and repeated here so it is not lost: the fifteen batch
-`SmtpErrorContext` reconstruction sites still write the phase twice with
-nothing enforcing agreement. It is a refactor, not a known defect, and it is
-the natural next user of `PhasedError`.

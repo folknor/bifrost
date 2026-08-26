@@ -43,8 +43,8 @@ struct Inner {
     ///
     /// Lives on the value (not on `SmtpErrorContext`) so a missed `with_phase`
     /// decoration cannot silently degrade the classifier's signal. Mapping
-    /// from low-level wire failures to `AccountErrorKind` reads `phase()` and
-    /// composes it with any phase the context separately supplies.
+    /// from low-level wire failures to `AccountErrorKind` reads only
+    /// `phase()`; the context has no second phase that could disagree.
     phase: Option<SmtpCommandPhase>,
 }
 

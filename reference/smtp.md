@@ -27,7 +27,8 @@ workspace, not about who uses `SmtpTransport`.
 The two halves are held in step deliberately: the DATA-framing, auth-ladder,
 pipelining-state and transaction-reset invariants are mirrored into the
 blocking writers and pinned on both sides, as is the pipelined phase decoration
-described under "PIPELINING". The one deliberate difference is the `abort()`
+described under "PIPELINING" and the single batch phase authority described
+alongside it. The one deliberate difference is the `abort()`
 timeout, recorded under "Connection lifecycle". The paired tests are intentional
 while the published sync and async I/O drivers remain separate. Any proposal
 to remove or reshape this surface is the owner's call - see the standing
@@ -104,6 +105,20 @@ constructor. So `?` on an undecorated SMTP result does not compile there, and
 the only exit is through a phase; the outer `send_pipelined` is the single place
 that stamps it back onto the `Error`. A boundary added later cannot ship
 undecorated - it will not build.
+
+Batch error translation also has one phase authority. `SmtpErrorContext` cannot
+carry a command phase, so a batch site converting a low-level `Error` must use
+the phase already attached to that value and cannot supply a second, disagreeing
+phase. Per-recipient negative replies, which have a `Response` rather than an
+`Error`, pass one explicit phase directly to the response classifier. This shape
+is identical in the blocking and async drivers.
+
+That explicit argument is the part of the arrangement that is behaviour rather
+than a type property, and it is pinned by a bare-550 recipient rejection: with
+no enhanced status code the reply is classified by status alone, where the
+`RcptTo` phase is what separates `NotFound(Mailbox)` from
+`Authorization(PermissionDenied)`. Enhanced-code rejections such as `5.1.1`
+classify identically for every phase, so a test built on one cannot pin this.
 
 This covers normal negative replies as well as transport failures, which is the
 case a per-call-site decoration missed: a server rejecting `MAIL FROM` is
@@ -312,7 +327,7 @@ Internal pipeline errors carry two value-side decorations the classifier reads:
 - `SmtpTransmissionState` (`Unsent` / `InFlight` / `Acknowledged`), attached via `with_attempt`.
 - `SmtpCommandPhase`, attached via `with_phase`. The 16 variants cover every wire boundary the driver crosses: `Connect`, `Greeting`, `Hello`, `StartTls`, `Auth`, `MailFrom`, `RcptTo`, `DataCommand`, `DataBody`, `DataFinal`, `BdatBody`, `LmtpFinalStatus`, `Noop`, `Vrfy`, `Expn`, `Rset`. `DataCommand` covers the `DATA` command write/read; `DataBody` covers body upload; `DataFinal` covers the final reply after the dot terminator. Phase lives on `Error::Inner`, and every send-driver wire boundary attaches it before returning - transport failures and server rejections alike. On the pipelined path that is a compile-time property of `PhasedError` rather than a convention (see "PIPELINING"). Paired transcript tests assert the value directly on both I/O halves for the `MailFrom`, `RcptTo`, `DataCommand` and `DataBody` boundaries, so the default PIPELINING path cannot silently lose the classifier input.
 
-`crates/smtp/src/transport/smtp/account_error.rs` is the single translation boundary into the shared `AccountError`. It funnels through `AccountErrorBuilder::try_build` (never the removed `.build()`), reads `error.phase()` in preference to the context phase, and routes `InvalidInput` + `SmtpCommandPhase::Auth` (e.g. "no compatible authentication mechanism") to `Authorization(PolicyBlocked)` so consumers see a reauth/policy-change UX instead of `Request(Malformed) -> ClientBug` (internal telemetry). It also maps `FeatureUnsupported` to `Unsupported(AccountOperation::Send)` (so the IMAP layer surfaces a stable `Unsupported(Send)` kind when a relay lacks FUTURERELEASE) and `ParameterOverLimit` to `Request(Malformed)` (the hold time is outside the allowed window). `message_error_to_account_error(MessageError, Protocol) -> AccountError` is the boundary for builder-side validation failures (`MissingFrom`, `MissingTo`, `EmailMissingAt`, ...); every variant maps to `Request(Malformed)`.
+`crates/smtp/src/transport/smtp/account_error.rs` is the single translation boundary into the shared `AccountError`. It funnels through `AccountErrorBuilder::try_build` (never the removed `.build()`), reads command phase only from `error.phase()`, and routes `InvalidInput` + `SmtpCommandPhase::Auth` (e.g. "no compatible authentication mechanism") to `Authorization(PolicyBlocked)` so consumers see a reauth/policy-change UX instead of `Request(Malformed) -> ClientBug` (internal telemetry). It also maps `FeatureUnsupported` to `Unsupported(AccountOperation::Send)` (so the IMAP layer surfaces a stable `Unsupported(Send)` kind when a relay lacks FUTURERELEASE) and `ParameterOverLimit` to `Request(Malformed)` (the hold time is outside the allowed window). `message_error_to_account_error(MessageError, Protocol) -> AccountError` is the boundary for builder-side validation failures (`MissingFrom`, `MissingTo`, `EmailMissingAt`, ...); every variant maps to `Request(Malformed)`.
 
 Evidence must match what actually crossed the wire. A transport failure in the envelope phase (`MAIL FROM` / `RCPT TO`), including a failed write of a later PIPELINING recipient window, is `Unsent` and resolves through `SendProgress::mark_unresolved_unsent`: `DATA` has not been issued, so no message content can have reached the peer and an `Uncertain` lane would falsely claim a possible delivery. RCPT rejections the server already gave are preserved; accepted and unanswered recipients are both rewritten (an accepted RCPT with no `DATA` would otherwise resolve as a delivery that never happened), into `failed` lanes that `RecoveryClass` derives as `Retry(SameRequest)`. `InFlight` is reserved for failures from the `DATA` command onward.
 
