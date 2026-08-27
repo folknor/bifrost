@@ -130,10 +130,15 @@ spending the re-sync on, and everything in 2 is a workaround for not having made
   not carry - a second confirming observation, or a collection-level count.
 - `CardDavClient::list_contacts` and `list_contacts_for_operation` are now
   `#[allow(dead_code)]`: every caller moved to `list_contacts_listing` so the
-  listing's failure lane cannot be dropped again (finding 4). Deleting them was
-  proposed and is refused - removing a published item is the repository owner's
-  call, not a fix pass's. If they stay unused they should be re-pointed at
-  `list_contacts_listing`'s failure-carrying shape rather than removed.
+  listing's failure lane cannot be dropped again (finding 4). **Round 1 refused to
+  delete them on the no-removal rule, and that refusal was an error of scope: both
+  are `pub(crate)`, so they are not published API and the rule does not reach
+  them.** They are crate-internal dead code held alive by an `allow`, which is the
+  smell the rule exists to avoid being confused with. Round 3 should either delete
+  them outright or re-point them at `list_contacts_listing`'s failure-carrying
+  shape; what it must not do is leave the `allow` standing. Note the no-removal
+  rule is about the *published* surface - applying it to crate-private items
+  launders ordinary cleanup into a prohibition.
 - The `notes/dav-parsing-robustness-2026-06-17.md` claim that bifrost's DAV XML
   parsers are "stronger than ratatoskr's" still holds against what the hunter read -
   the 2xx commit gating and element-stack checks are genuinely solid. Findings
