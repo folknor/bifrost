@@ -7,6 +7,7 @@ use crate::types::GmailLabel;
 const LABEL_UNREAD: &str = "UNREAD";
 const LABEL_STARRED: &str = "STARRED";
 const LABEL_DRAFT: &str = "DRAFT";
+const LABEL_SENT: &str = "SENT";
 const LABEL_IMPORTANT: &str = "IMPORTANT";
 
 /// Gmail's mutually exclusive display containers.
@@ -107,7 +108,7 @@ pub(crate) fn canonical_flags(label_ids: &[String], labels: &[GmailLabel]) -> Ca
         if [
             LABEL_UNREAD,
             LABEL_INBOX,
-            "SENT",
+            LABEL_SENT,
             LABEL_TRASH,
             LABEL_SPAM,
             "CHAT",
@@ -168,7 +169,7 @@ fn patch_for_set(flags: &HashSet<String>, labels: &[GmailLabel]) -> LabelPatch {
         remove.insert(FLAG_SEEN.to_string());
     }
 
-    for flag in [FLAG_FLAGGED, FLAG_DRAFT, FLAG_IMPORTANT] {
+    for flag in [FLAG_FLAGGED, FLAG_IMPORTANT] {
         if contains_flag(flags, flag) {
             add.insert(flag.to_string());
         } else {
@@ -205,7 +206,22 @@ fn patch_for_set(flags: &HashSet<String>, labels: &[GmailLabel]) -> LabelPatch {
     }
 
     for flag in flags {
-        if !is_known_flag(flag, labels) {
+        // Unknown flags land in `add` so the reverse translation reports
+        // them as unsupported. So do flags that ASSERT a read-only Gmail
+        // projection (`\Draft`, a crafted `$gmail-label:SENT:...`): Gmail
+        // refuses DRAFT and SENT in either label list, so an exact-set
+        // demanding them cannot be honoured and must say so rather than
+        // report a state it never reached.
+        //
+        // Their OMISSION from an exact set is deliberately not reported.
+        // Draft-ness and sent-ness are structural in Gmail, not toggles;
+        // an exact set that omits them is the ordinary case for every
+        // ordinary message, and reporting each one as partially applied
+        // would make `Applied` unreachable for `FlagOp::Set` forever
+        // while saying nothing a consumer could act on. The residual gap
+        // - a Set that omits `\Draft` against a message that really is a
+        // draft - needs a read-back the translation layer does not have.
+        if !is_known_flag(flag, labels) || asserts_read_only_state(flag, labels) {
             add.insert(flag.clone());
         }
     }
@@ -251,11 +267,15 @@ fn flag_to_add_label(flag: &str, labels: &[GmailLabel]) -> FlagTranslation {
     } else if eq_flag(flag, FLAG_FLAGGED) {
         FlagTranslation::Add(LABEL_STARRED.to_string())
     } else if eq_flag(flag, FLAG_DRAFT) {
-        FlagTranslation::Add(LABEL_DRAFT.to_string())
+        FlagTranslation::Unsupported(flag.to_string())
     } else if eq_flag(flag, FLAG_IMPORTANT) {
         FlagTranslation::Add(LABEL_IMPORTANT.to_string())
     } else if let Some(label_id) = user_label_id_from_flag(flag, labels) {
-        FlagTranslation::Add(label_id)
+        if is_read_only_label(&label_id) {
+            FlagTranslation::Unsupported(flag.to_string())
+        } else {
+            FlagTranslation::Add(label_id)
+        }
     } else {
         FlagTranslation::Unsupported(flag.to_string())
     }
@@ -267,14 +287,37 @@ fn flag_to_remove_label(flag: &str, labels: &[GmailLabel]) -> FlagTranslation {
     } else if eq_flag(flag, FLAG_FLAGGED) {
         FlagTranslation::Remove(LABEL_STARRED.to_string())
     } else if eq_flag(flag, FLAG_DRAFT) {
-        FlagTranslation::Remove(LABEL_DRAFT.to_string())
+        FlagTranslation::Unsupported(flag.to_string())
     } else if eq_flag(flag, FLAG_IMPORTANT) {
         FlagTranslation::Remove(LABEL_IMPORTANT.to_string())
     } else if let Some(label_id) = user_label_id_from_flag(flag, labels) {
-        FlagTranslation::Remove(label_id)
+        if is_read_only_label(&label_id) {
+            FlagTranslation::Unsupported(flag.to_string())
+        } else {
+            FlagTranslation::Remove(label_id)
+        }
     } else {
         FlagTranslation::Unsupported(flag.to_string())
     }
+}
+
+/// Gmail's `DRAFT` and `SENT` are read-only projections of a message's
+/// structure, not labels a client may attach or detach: `batchModify`
+/// answers 400 for either id in `addLabelIds` or in `removeLabelIds`.
+///
+/// They therefore never reach the wire. That is only half the answer -
+/// a flag we cannot send is a flag we did not apply, so the translation
+/// routes them into `unsupported_flags` rather than dropping them, and
+/// the mutation driver reports the incomplete result instead of a
+/// success it never achieved.
+fn is_read_only_label(label: &str) -> bool {
+    label.eq_ignore_ascii_case(LABEL_DRAFT) || label.eq_ignore_ascii_case(LABEL_SENT)
+}
+
+/// True when `flag` asserts that a read-only Gmail projection is present.
+fn asserts_read_only_state(flag: &str, labels: &[GmailLabel]) -> bool {
+    eq_flag(flag, FLAG_DRAFT)
+        || user_label_id_from_flag(flag, labels).is_some_and(|id| is_read_only_label(&id))
 }
 
 /// Resolve a `$gmail-label:<id>:<name>` flag back to its Gmail label id.
@@ -398,7 +441,6 @@ mod tests {
         assert_eq!(
             patch.remove_label_ids,
             vec![
-                LABEL_DRAFT.to_string(),
                 LABEL_IMPORTANT.to_string(),
                 LABEL_STARRED.to_string(),
                 LABEL_UNREAD.to_string()
@@ -476,10 +518,7 @@ mod tests {
             patch.add_label_ids,
             vec![LABEL_STARRED.to_string(), LABEL_UNREAD.to_string()]
         );
-        assert_eq!(
-            patch.remove_label_ids,
-            vec![LABEL_DRAFT.to_string(), LABEL_IMPORTANT.to_string()]
-        );
+        assert_eq!(patch.remove_label_ids, vec![LABEL_IMPORTANT.to_string()]);
     }
 
     fn work_label() -> Vec<GmailLabel> {
@@ -539,7 +578,6 @@ mod tests {
         assert_eq!(
             patch.remove_label_ids,
             vec![
-                LABEL_DRAFT.to_string(),
                 LABEL_IMPORTANT.to_string(),
                 "Label_1".to_string(),
                 LABEL_STARRED.to_string(),
@@ -624,8 +662,8 @@ mod tests {
         let patch = translate_flag_op(&FlagOp::Set(set(&[FLAG_SEEN])), &labels);
         assert_eq!(
             patch.remove_label_ids.len(),
-            50 + 4,
-            "every known user label, plus STARRED / DRAFT / IMPORTANT for the \
+            50 + 3,
+            "every known user label, plus STARRED / IMPORTANT for the \
              omitted canonical flags and UNREAD for the asserted \\Seen"
         );
     }

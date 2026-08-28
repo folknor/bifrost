@@ -778,6 +778,20 @@ share a single `mutation_stream` driver:
   is `bulk_move_from` with `source: None`.
 - Post the batch:
   - `SetFlags` / `Move` -> `users.messages.batchModify`.
+    A 404 from a multi-id request is ambiguous because Gmail rejects the whole
+    request when any one message is absent. The driver bisects the batch, keeping
+    successful sub-batches in the success lane and reducing 404 sub-batches to
+    singletons, so only genuinely absent ids receive `NotFound(Message)`. Bisection
+    is used instead of per-id replay because the common sparse-failure case takes
+    logarithmic rounds rather than one extra request per message.
+    Every non-404 sub-batch error inside the bisection goes back through
+    `mutation_error`, exactly as the unsplit call does, so a rate limit,
+    transport fault, auth loss, or engine directive arriving mid-bisection still
+    terminates the stream instead of being laundered into per-id failures. The
+    sub-batches already resolved when that happens are emitted as one final
+    non-final page ahead of `Terminated`, so no id the driver resolved loses its
+    lane; ids never transmitted stay unreported, which is what `Terminated` has
+    always meant.
   - `Destroy` -> `users.messages.batchDelete`. On a parsed 403 Gmail reason of
     `forbidden` or `insufficientPermissions` it falls
     back to a label patch that moves the messages into `TRASH`,
@@ -802,13 +816,10 @@ share a single `mutation_stream` driver:
     That helper is the crate's only producer of `Downgraded`, so removing the
     call site fails the build as dead code; the helper's own semantics,
     including the lane-preservation rule, are pinned by
-    `the_destroy_trash_fallback_downgrades_only_what_it_trashed`. There is no
-    hermetic end-to-end test of `apply_destroy` itself. That is an open coverage
-    gap, not a limitation: the crate has the scripted `bifrost-net` transport
-    seam (`bifrost_net::test_support::scripted_account`, used by `push.rs`,
-    `changes.rs`, and `inventory.rs`), which exercises the production retry,
-    redirect, rate-limit, metering, and token-refresh pipeline without a socket,
-    and `apply_destroy` can be driven through it.
+    `the_destroy_trash_fallback_downgrades_only_what_it_trashed`. The scripted
+    transport test `destroy_scope_failure_sends_trash_fallback_and_reports_downgraded`
+    drives the production 403 classification, asserts both request bodies, and
+    pins the downgraded outcome without a socket.
 - The driver reads one item ahead at the 1000-item boundary. Every
   final mutation batch is marked `PageBoundary::Final`, including a
   stream whose item count is exactly divisible by 1000, followed by
@@ -824,10 +835,21 @@ Result classification:
   `ItemOutcome::Succeeded` with `MutationSuccess::Downgraded { actual:
   MovedToContainer(TRASH) }` per
   successfully-trashed id (see the `Destroy` bullet above).
-- An unsupported flag or non-label move scope is malformed caller
-  input and produces `ItemOutcome::Failed` per id with a
-  `Request(Malformed)` account error. It is never reported as a
-  successful skip.
+- A non-label move scope is malformed caller input and produces
+  `ItemOutcome::Failed` per id with a `Request(Malformed)` account error.
+- Unsupported flags do not prevent representable flags in the same operation
+  from reaching Gmail. Successfully modified ids produce a
+  `MutationSuccess::Downgraded { actual: FlagsPartiallyApplied { unsupported } }`
+  outcome, preceded by a `WarningKind::StrategyDowngraded` warning. This replaces
+  the earlier deliberate all-or-nothing policy.
+- An operation with NO representable half sends no request and changes nothing,
+  so it takes no success lane at all: every id gets `ItemOutcome::Failed` with
+  `Unsupported(UpdateFlags)` -> `RecoveryClass::Unsupported`, alongside the same
+  warning. `Downgraded` is not available here - its published contract in
+  `crates/types/src/error/stream.rs` requires that the target actually changed,
+  and `bifrost-sync` files every downgrade as `PendingReadback`, which would
+  schedule a read-back for a mutation that never ran. `Skipped` is equally wrong:
+  it claims the target was already in the requested state.
 - A retry-class or auth-class error -> stream-level
   `SyncEvent::Terminated(AccountError)` so the engine can re-issue
   via `error.recovery()`. The driver does not split applied vs
@@ -852,7 +874,7 @@ Flag canonicalization in `flags.rs`:
   lookup deliberately does not filter on `labelType`, because
   canonicalization mints this spelling for system category labels
   too and a flag this crate itself produced has to translate back.
-- `Set` re-derives an add/remove patch over the canonical four flags
+- `Set` re-derives an add/remove patch over the writable canonical flags
   plus the *user* label vocabulary. Since the patch is built without
   knowing what the target messages currently carry, an exact set
   names every known user label it omits, so `remove_label_ids`
@@ -861,9 +883,21 @@ Flag canonicalization in `flags.rs`:
   re-derivation in both directions - Gmail's classifier owns them,
   so they resolve without poisoning the patch but are never added or
   removed by a `Set`.
-- Any unrecognized flag is added verbatim and any unknown `Set` flag
-  falls into `unsupported_flags`. The driver emits a failed per-id
-  outcome for a patch with non-empty `unsupported_flags`.
+- `DRAFT` and `SENT` are read-only projections: Gmail answers 400 for either id
+  in `addLabelIds` or in `removeLabelIds`, so neither ever reaches the wire from
+  any reverse translation path, including a crafted `$gmail-label:SENT:...`
+  spelling. Excluded from the wire is NOT the same as absent from the report,
+  though - a flag the driver cannot send is a flag it did not apply - so
+  `\Draft` and a read-only `$gmail-label:` flag land in `unsupported_flags` and
+  are reported through the partial-application path above rather than dropped.
+  Their OMISSION from a `FlagOp::Set` is deliberately not reported: draft-ness
+  and sent-ness are structural in Gmail rather than toggles, so every ordinary
+  exact set omits them, and reporting each one as partially applied would make
+  `Applied` unreachable for `Set` while telling a consumer nothing actionable.
+  The residual gap - a `Set` omitting `\Draft` against a message that really is
+  a draft - needs a read-back the translation layer does not have.
+- Any other unrecognized flag falls into `unsupported_flags`, while its
+  representable siblings are still applied as a downgraded mutation.
 - A canonical flag set is hashed (FNV-1a) into the
   `Fingerprint.flags_hash` field of an `InventoryEntry`.
 
@@ -951,10 +985,12 @@ Mapping highlights:
   variants produce `SyncState(SchemaIncompatible)` ->
   `Engine(SchemaIncompatible)` so the engine clears the cursor.
 
-`mutation_error(ids, error, ctx)` is the per-id fan-out for batched mutations:
+`mutation_error(ids, error, ctx)` is the ordinary per-id fan-out for batched mutations:
 it translates the crate-level error once via `into_account_error` and produces
 one `ItemOutcome::Failed(BatchFailure { error: account_error.clone(), .. })` per
-id - `AccountError` is `Arc<Inner>`-backed, so the clones share storage.
+id - `AccountError` is `Arc<Inner>`-backed, so the clones share storage. The
+mutation driver intercepts ambiguous multi-id `batchModify` 404s before this
+fan-out and isolates them by bisection.
 
 ## Known limitations
 

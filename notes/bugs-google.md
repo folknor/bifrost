@@ -26,43 +26,6 @@ snapshot in `LifecycleState` rather than reading the shared cache; sharing a cac
 for "current vocabulary" and for "previous state to diff against" is the structural
 mistake.
 
-### G4. A `batchModify`/`batchDelete` 404 marks all 1000 ids as failed
-
-**High confidence.** `error.rs::mutation_error` fans one `AccountError` out to every
-id in the batch, and `terminates_mutation_stream` deliberately lets `NotFound`
-through to that fan-out. But Gmail fails the whole batch when *one* id is missing.
-So one deleted message causes 999 live messages to report
-`Failed(NotFound(Message))` - their mutation was never applied and the engine is
-told the object is gone. This is the "reports a state it did not achieve" shape,
-inverted. It needs a fallback: on 404 for a `Move`/`SetFlags` batch, re-drive the
-batch as per-id `users.messages.modify` (or bisect) so only the genuinely absent
-ids take the `NotFound` lane.
-
-### G5. `FlagOp::Set` and `\Draft` always produce a Gmail-rejected patch
-
-**Medium-high confidence.** `flags.rs::patch_for_set` unconditionally puts `DRAFT`
-in either `add_label_ids` or `remove_label_ids` for every `Set` (see the `for flag
-in [FLAG_FLAGGED, FLAG_DRAFT, FLAG_IMPORTANT]` loop), and `flag_to_add_label` maps
-`\Draft` -> add `DRAFT`. Gmail's `messages.modify`/`batchModify` refuse `DRAFT` and
-`SENT` in both label lists and answer 400. So every `bulk_set_flags(FlagOp::Set(..))`
-against real Gmail fails the entire batch as a malformed request. The test suite
-never catches it because `translate_flag_op` is tested in isolation with no wire.
-`DRAFT` should be excluded from the reverse translation entirely (it is a read-only
-projection), the same way `CATEGORY_*` is already exempted from `Set` re-derivation.
-
-### G6. One unsupported flag poisons a 1000-message batch, permanently
-
-**High confidence, partly by design.** `apply_label_patch` fails every id when
-`patch.unsupported_flags` is non-empty, and the classification is
-`Request(Malformed)` -> `ClientBug` -> terminal. An IMAP-origin keyword the Gmail
-vocabulary cannot express (`$Junk`, `$Phishing`, any cross-provider keyword)
-therefore means the `\Seen` and `\Flagged` halves of that same op never reach Gmail
-either, forever, with no retry class that would ever fix it. The reference documents
-this as a decision, but the decision costs the *representable* part of the mutation.
-The better shape is to apply what translates and surface the untranslatable flags as
-a `Warning` plus a `Downgraded` lane - the machinery for exactly that already exists
-for the TRASH fallback.
-
 ### G7. Multi-page history walk can skip changes at the checkpoint
 
 **Medium confidence.** `changes.rs` checkpoints the *last* page's
@@ -122,15 +85,26 @@ straight out of that. Split them: the vocabulary stays a shared refresh-on-stale
 cache with single-flight; the lifecycle stream keeps a private `last_emitted:
 Option<ScopeSnapshot>` and never reads the shared one.
 
-Nothing here requires removing published API. G5 and G6 change wire behavior of
-`bulk_set_flags` but not its signature; G4 adds a fallback path rather than deleting
-one.
+Nothing here requires removing published API.
 
-## Out-of-scope observation
+## Carried forward from round 2
 
-`bifrost_net::test_support::scripted_account` gives this crate a perfectly good
-scripted-transport seam, yet `reference/google.md` asserts "the crate has no
-scripted-transport seam" as the reason `apply_destroy` has no end-to-end test. That
-claim is stale - `push.rs`, `changes.rs`, and `inventory.rs` all use exactly that
-seam - and it is currently being used to justify a gap in coverage of the TRASH
-fallback path.
+Round 2 landed G4, G5 and G6. Two residual items came out of it and are NOT
+defects the round left unfixed - they are known, bounded, and documented in
+`reference/google.md`. Recorded here so a later round does not rediscover them
+as bugs.
+
+- **A `FlagOp::Set` that OMITS `\Draft` against a message that really is a draft
+  reports success it did not achieve.** `\Draft` asserted in a Set now lands in
+  `unsupported_flags` and is reported through the partial-application path; its
+  omission is deliberately silent, because draft-ness is structural in Gmail and
+  every ordinary exact set omits it, so reporting each one would make
+  `MutationSuccess::Applied` unreachable for `Set` forever. Closing the residual
+  gap needs a read-back the translation layer in `flags.rs` does not have; it is
+  a `bifrost-sync` read-back question, not a translation question.
+- **A mid-bisection terminal error discards the sub-batches not yet attempted.**
+  `apply_label_patch_bisected` emits the ids it already resolved as one non-final
+  page and then `Terminated`. Ids never transmitted go unreported, which is what
+  `Terminated` has always meant on this driver, and the engine re-issues the
+  whole operation. Worth revisiting only if a checkpoint ever lets a mutation
+  stream resume mid-batch.

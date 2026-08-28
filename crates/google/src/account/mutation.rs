@@ -16,7 +16,7 @@ use std::time::Instant;
 use bifrost_types::{
     AccountError, AccountOperation, AccountStream, Batch, BatchFailure, BatchItemId, BatchSuccess,
     ContainerId, FlagOp, IdempotencyKey, ItemOutcome, LabelId, MembershipScope, MutationEffect,
-    MutationSuccess, ObjectId, PageBoundary, SyncEvent,
+    MutationSuccess, ObjectId, PageBoundary, SyncEvent, Warning, WarningKind,
 };
 use futures::{StreamExt, stream};
 use serde::Serialize;
@@ -100,9 +100,13 @@ fn mutation_stream(
         pending_target: None,
         finished: false,
         emitted_done: false,
+        pending_event: None,
     };
 
     Box::pin(stream::unfold(state, |mut state| async move {
+        if let Some(event) = state.pending_event.take() {
+            return Some((event, state));
+        }
         if state.finished {
             if state.emitted_done {
                 return None;
@@ -175,29 +179,50 @@ fn mutation_stream(
         };
 
         match event {
-            MutationApply::Batch(items) => {
+            MutationApply::Batch { items, warning } => {
                 if targets_exhausted {
                     state.finished = true;
                 }
+                let batch = SyncEvent::Batch(Batch {
+                    items,
+                    page_boundary: if targets_exhausted {
+                        PageBoundary::Final
+                    } else {
+                        PageBoundary::Page
+                    },
+                    server_latency: started.elapsed(),
+                    bytes_in: state.tally.take(),
+                    checkpoint: None,
+                });
+                if let Some(warning) = warning {
+                    state.pending_event = Some(batch);
+                    Some((SyncEvent::Warning(warning), state))
+                } else {
+                    Some((batch, state))
+                }
+            }
+            MutationApply::Terminate { accounted, error } => {
+                state.finished = true;
+                state.emitted_done = true;
+                if accounted.is_empty() {
+                    return Some((terminate_event(error), state));
+                }
+                // Ids the bisection already resolved get their lane
+                // before the stream ends. The boundary is `Page`, never
+                // `Final`: the operation did not complete, and claiming
+                // a final page would tell the engine the remaining
+                // targets were considered.
+                state.pending_event = Some(terminate_event(error));
                 Some((
                     SyncEvent::Batch(Batch {
-                        items,
-                        page_boundary: if targets_exhausted {
-                            PageBoundary::Final
-                        } else {
-                            PageBoundary::Page
-                        },
+                        items: accounted,
+                        page_boundary: PageBoundary::Page,
                         server_latency: started.elapsed(),
                         bytes_in: state.tally.take(),
                         checkpoint: None,
                     }),
                     state,
                 ))
-            }
-            MutationApply::Terminate(error) => {
-                state.finished = true;
-                state.emitted_done = true;
-                Some((terminate_event(error), state))
             }
         }
     }))
@@ -233,11 +258,35 @@ struct MutationState {
     pending_target: Option<ObjectId>,
     finished: bool,
     emitted_done: bool,
+    pending_event: Option<SyncEvent<ItemOutcome<MutationSuccess>>>,
 }
 
 enum MutationApply {
-    Batch(Vec<ItemOutcome<MutationSuccess>>),
-    Terminate(AccountError),
+    Batch {
+        items: Vec<ItemOutcome<MutationSuccess>>,
+        warning: Option<Warning>,
+    },
+    /// The stream must end. `accounted` carries the outcomes of ids the
+    /// driver had already transmitted and resolved before the terminal
+    /// error arrived - non-empty only on the bisection path, where a
+    /// rate limit or an engine directive can land after some sub-batches
+    /// have already succeeded. Those ids are emitted as one final batch
+    /// ahead of the `Terminated` event so no resolved id is silently
+    /// dropped; ids that were never transmitted stay unreported, which
+    /// is what `Terminated` has always meant.
+    Terminate {
+        accounted: Vec<ItemOutcome<MutationSuccess>>,
+        error: AccountError,
+    },
+}
+
+impl MutationApply {
+    fn terminate(error: AccountError) -> Self {
+        Self::Terminate {
+            accounted: Vec::new(),
+            error,
+        }
+    }
 }
 
 async fn apply_label_patch(
@@ -247,38 +296,170 @@ async fn apply_label_patch(
     key: &IdempotencyKey,
     operation: AccountOperation,
 ) -> MutationApply {
-    if !patch.unsupported_flags.is_empty() {
+    if operation == AccountOperation::BulkMove && !patch.unsupported_flags.is_empty() {
         let detail = format!(
-            "unsupported Gmail mutation flags or scope: {}",
+            "unsupported Gmail mutation scope: {}",
             patch.unsupported_flags.join(", ")
         );
         let error = account_error::into_account_error(
             GmailError::invalid_request(operation, detail),
             GmailErrorContext::mutation(operation),
         );
-        return MutationApply::Batch(
-            ids.iter()
-                .map(|id| {
-                    ItemOutcome::Failed(BatchFailure::new(BatchItemId(id.0.clone()), error.clone()))
-                })
-                .collect(),
-        );
+        return MutationApply::Batch {
+            items: failed_outcomes(ids, &error),
+            warning: None,
+        };
     }
     if patch.add_label_ids.is_empty() && patch.remove_label_ids.is_empty() {
-        return MutationApply::Batch(skipped_outcomes(ids));
+        if patch.unsupported_flags.is_empty() {
+            return MutationApply::Batch {
+                items: skipped_outcomes(ids),
+                warning: None,
+            };
+        }
+        // Nothing Gmail can express, so no request goes out and nothing
+        // changes. This is NOT a success of any flavour: `Skipped` claims
+        // the target was already in the requested state, and `Downgraded`
+        // claims the target changed into a weaker state - both are false
+        // here, and both are contract-load-bearing for the other protocol
+        // crates and for the engine's read-back guard. The honest lane is
+        // a per-id failure classified `Unsupported`, which the recovery
+        // table maps to a permanent no-retry outcome rather than to a
+        // ClientBug that would poison the rest of the operation.
+        let error = account_error::into_account_error(
+            GmailError::unsupported_with(
+                operation,
+                format!(
+                    "Gmail cannot represent any requested flag: {}",
+                    patch.unsupported_flags.join(", ")
+                ),
+            ),
+            GmailErrorContext::mutation(operation),
+        );
+        return MutationApply::Batch {
+            items: failed_outcomes(ids, &error),
+            warning: Some(unsupported_flags_warning(&patch.unsupported_flags)),
+        };
     }
     let body = BatchModifyRequest {
         ids: ids.iter().map(|id| id.0.clone()).collect(),
-        add_label_ids: patch.add_label_ids,
-        remove_label_ids: patch.remove_label_ids,
+        add_label_ids: patch.add_label_ids.clone(),
+        remove_label_ids: patch.remove_label_ids.clone(),
     };
     match post_empty_json(client, "/messages/batchModify", &body, key).await {
-        Ok(()) => MutationApply::Batch(applied_outcomes(ids)),
+        Ok(()) => MutationApply::Batch {
+            items: label_patch_successes(ids, &patch.unsupported_flags),
+            warning: (!patch.unsupported_flags.is_empty())
+                .then(|| unsupported_flags_warning(&patch.unsupported_flags)),
+        },
+        Err(error) if is_not_found(&error) && ids.len() > 1 => {
+            apply_label_patch_bisected(client, ids, &body, key, operation, &patch.unsupported_flags)
+                .await
+        }
         Err(error) => match mutation_error(ids, error, GmailErrorContext::mutation(operation)) {
-            Ok(outcomes) => MutationApply::Batch(outcomes),
-            Err(account_error) => MutationApply::Terminate(account_error),
+            Ok(outcomes) => MutationApply::Batch {
+                items: outcomes,
+                warning: None,
+            },
+            Err(account_error) => MutationApply::terminate(account_error),
         },
     }
+}
+
+/// Split a `batchModify` that answered 404 until every id is isolated as
+/// present or absent.
+///
+/// Gmail fails the WHOLE call when a single id in it is unknown, so the
+/// unsplit answer told the engine that every id in the batch was gone.
+/// Only a singleton that still answers 404 is genuinely absent.
+///
+/// Every sub-batch error goes back through `mutation_error`, exactly as
+/// the unsplit path does. That funnel is what decides whether a failure
+/// is a per-id lane or a stream terminator: a rate limit, a transport
+/// fault, auth loss or an engine directive arriving mid-bisection must
+/// end the stream so the engine backs off and retries, and must not be
+/// laundered into "these ids failed". Sub-batches already resolved are
+/// handed back with the terminator so their ids keep their lane.
+async fn apply_label_patch_bisected(
+    client: &GmailClient,
+    ids: &[ObjectId],
+    patch: &BatchModifyRequest,
+    key: &IdempotencyKey,
+    operation: AccountOperation,
+    unsupported: &[String],
+) -> MutationApply {
+    let midpoint = ids.len() / 2;
+    let mut pending = vec![ids[midpoint..].to_vec(), ids[..midpoint].to_vec()];
+    let mut outcomes = Vec::with_capacity(ids.len());
+    while let Some(part) = pending.pop() {
+        let body = BatchModifyRequest {
+            ids: part.iter().map(|id| id.0.clone()).collect(),
+            add_label_ids: patch.add_label_ids.clone(),
+            remove_label_ids: patch.remove_label_ids.clone(),
+        };
+        match post_empty_json(client, "/messages/batchModify", &body, key).await {
+            Ok(()) => outcomes.extend(label_patch_successes(&part, unsupported)),
+            Err(error) if is_not_found(&error) && part.len() > 1 => {
+                let midpoint = part.len() / 2;
+                pending.push(part[midpoint..].to_vec());
+                pending.push(part[..midpoint].to_vec());
+            }
+            Err(error) => {
+                match mutation_error(&part, error, GmailErrorContext::mutation(operation)) {
+                    Ok(failures) => outcomes.extend(failures),
+                    Err(account_error) => {
+                        return MutationApply::Terminate {
+                            accounted: outcomes,
+                            error: account_error,
+                        };
+                    }
+                }
+            }
+        }
+    }
+    MutationApply::Batch {
+        items: outcomes,
+        warning: (!unsupported.is_empty()).then(|| unsupported_flags_warning(unsupported)),
+    }
+}
+
+fn is_not_found(error: &GmailError) -> bool {
+    matches!(error, GmailError::Response(response) if response.status == 404)
+        || matches!(error, GmailError::Net(bifrost_net::Error::Status { code, .. }) if *code == reqwest::StatusCode::NOT_FOUND)
+}
+
+fn label_patch_successes(
+    ids: &[ObjectId],
+    unsupported: &[String],
+) -> Vec<ItemOutcome<MutationSuccess>> {
+    if unsupported.is_empty() {
+        return applied_outcomes(ids);
+    }
+    ids.iter()
+        .map(|id| {
+            ItemOutcome::Succeeded(BatchSuccess::new(
+                BatchItemId(id.0.clone()),
+                MutationSuccess::Downgraded {
+                    actual: MutationEffect::FlagsPartiallyApplied {
+                        unsupported: unsupported.to_vec(),
+                    },
+                },
+            ))
+        })
+        .collect()
+}
+
+fn failed_outcomes(ids: &[ObjectId], error: &AccountError) -> Vec<ItemOutcome<MutationSuccess>> {
+    ids.iter()
+        .map(|id| ItemOutcome::Failed(BatchFailure::new(BatchItemId(id.0.clone()), error.clone())))
+        .collect()
+}
+
+fn unsupported_flags_warning(unsupported: &[String]) -> Warning {
+    Warning::support_only(
+        WarningKind::StrategyDowngraded,
+        format!("Gmail could not apply flags: {}", unsupported.join(", ")),
+    )
 }
 
 async fn apply_destroy(
@@ -290,7 +471,10 @@ async fn apply_destroy(
         ids: ids.iter().map(|id| id.0.clone()).collect(),
     };
     match post_empty_json(client, "/messages/batchDelete", &body, key).await {
-        Ok(()) => MutationApply::Batch(applied_outcomes(ids)),
+        Ok(()) => MutationApply::Batch {
+            items: applied_outcomes(ids),
+            warning: None,
+        },
         Err(error) if is_batch_delete_scope_failure(&error) => {
             // Translate the primary failure once and consume
             // it. The original `Error` is not used after this point;
@@ -321,12 +505,17 @@ async fn apply_destroy(
                 // not a downgrade. Only ids the patch reported as SUCCEEDED
                 // become `Downgraded`; everything else keeps the lane the
                 // patch gave it.
-                MutationApply::Batch(outcomes) => {
-                    MutationApply::Batch(downgrade_succeeded_outcomes(outcomes))
-                }
-                MutationApply::Terminate(fallback_error) => {
-                    MutationApply::Terminate(merge_delete_fallback_error(fallback_error, &primary))
-                }
+                MutationApply::Batch { items, warning } => MutationApply::Batch {
+                    items: downgrade_succeeded_outcomes(items),
+                    warning,
+                },
+                MutationApply::Terminate {
+                    accounted,
+                    error: fallback_error,
+                } => MutationApply::Terminate {
+                    accounted: downgrade_succeeded_outcomes(accounted),
+                    error: merge_delete_fallback_error(fallback_error, &primary),
+                },
             }
         }
         Err(error) => match mutation_error(
@@ -334,8 +523,11 @@ async fn apply_destroy(
             error,
             GmailErrorContext::mutation(AccountOperation::BulkDestroy),
         ) {
-            Ok(outcomes) => MutationApply::Batch(outcomes),
-            Err(account_error) => MutationApply::Terminate(account_error),
+            Ok(outcomes) => MutationApply::Batch {
+                items: outcomes,
+                warning: None,
+            },
+            Err(account_error) => MutationApply::terminate(account_error),
         },
     }
 }
@@ -481,10 +673,338 @@ async fn post_empty_json<B: Serialize>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bifrost_net::RetryPolicy;
+    use bifrost_net::auth::StaticTokenSource;
+    use bifrost_net::test_support::{Canned, ScriptedDispatch};
+    use bifrost_net::{NetConfig, test_support};
     use bifrost_types::{FolderId, ProtocolSalt, RunId};
+    use bytes::Bytes;
+    use reqwest::StatusCode;
+    use std::collections::HashSet;
+    use std::time::Instant;
+
+    fn canned(status: StatusCode) -> Canned {
+        Canned::Response {
+            status,
+            headers: reqwest::header::HeaderMap::new(),
+            body: if status == StatusCode::NOT_FOUND {
+                Bytes::from_static(br#"{"error":{"code":404,"status":"NOT_FOUND"}}"#)
+            } else {
+                Bytes::new()
+            },
+        }
+    }
+
+    fn scripted_client(steps: Vec<Canned>) -> (Arc<GmailClient>, Arc<ScriptedDispatch>) {
+        let script = ScriptedDispatch::new(steps);
+        let net = test_support::scripted_account(
+            &script,
+            NetConfig::default(),
+            Vec::new(),
+            Arc::new(StaticTokenSource::new("token", None)),
+            RetryPolicy::disabled(),
+        );
+        (
+            Arc::new(GmailClient::with_account_net("https://gmail.test", net)),
+            script,
+        )
+    }
+
+    fn fresh_cache(labels: Vec<crate::types::GmailLabel>) -> ScopeCache {
+        Arc::new(std::sync::RwLock::new(
+            super::super::scopes::ScopeSnapshot {
+                labels,
+                fetched_at: Some(Instant::now()),
+            },
+        ))
+    }
+
+    fn test_key(sequence: u64) -> IdempotencyKey {
+        IdempotencyKey {
+            run_id: RunId("run".to_string()),
+            sequence,
+            protocol_salt: ProtocolSalt::Gmail("test".to_string()),
+        }
+    }
+
+    fn set(items: &[&str]) -> HashSet<String> {
+        items.iter().map(|item| (*item).to_string()).collect()
+    }
+
+    async fn collect_events(
+        mut stream: AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>>,
+    ) -> Vec<SyncEvent<ItemOutcome<MutationSuccess>>> {
+        let mut events = Vec::new();
+        while let Some(event) = stream.next().await {
+            events.push(event);
+        }
+        events
+    }
 
     fn label(id: &str) -> MembershipScope {
         MembershipScope::Label(LabelId(id.to_string()))
+    }
+
+    #[tokio::test]
+    async fn batch_modify_not_found_bisects_and_only_fails_the_absent_id() {
+        let (client, script) = scripted_client(vec![
+            canned(StatusCode::NOT_FOUND),
+            canned(StatusCode::NO_CONTENT),
+            canned(StatusCode::NOT_FOUND),
+            canned(StatusCode::NOT_FOUND),
+            canned(StatusCode::NO_CONTENT),
+        ]);
+        let targets = Box::pin(stream::iter(
+            ["live-1", "absent", "live-2"].map(|id| ObjectId(id.to_string())),
+        ));
+        let events = collect_events(bulk_move(
+            client,
+            fresh_cache(Vec::new()),
+            targets,
+            label("INBOX"),
+            None,
+            test_key(10),
+        ))
+        .await;
+
+        let SyncEvent::Batch(batch) = &events[0] else {
+            panic!("mutation must produce an accounted batch");
+        };
+        assert_eq!(batch.items.len(), 3);
+        assert!(
+            matches!(&batch.items[0], ItemOutcome::Succeeded(success) if success.item.0 == "live-1")
+        );
+        assert!(
+            matches!(&batch.items[1], ItemOutcome::Failed(failure) if failure.item.0 == "absent" && matches!(failure.error.kind(), bifrost_types::AccountErrorKind::NotFound(_)))
+        );
+        assert!(
+            matches!(&batch.items[2], ItemOutcome::Succeeded(success) if success.item.0 == "live-2")
+        );
+        let requests = script.requests();
+        assert_eq!(requests.len(), 5);
+        assert_eq!(
+            requests[1].body.as_deref(),
+            Some(
+                br#"{"ids":["live-1"],"addLabelIds":["INBOX"],"removeLabelIds":["SPAM","TRASH"]}"#
+                    .as_slice()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_set_never_sends_draft_or_sent_labels() {
+        let (client, script) = scripted_client(vec![canned(StatusCode::NO_CONTENT)]);
+        let labels = vec![crate::types::GmailLabel {
+            id: "SENT".to_string(),
+            name: "SENT".to_string(),
+            label_type: Some("system".to_string()),
+            color: None,
+        }];
+        let flags = set(&["\\Seen", "\\Draft", "$gmail-label:SENT:SENT"]);
+        let events = collect_events(bulk_set_flags(
+            client,
+            fresh_cache(labels),
+            Box::pin(stream::iter([ObjectId("m1".to_string())])),
+            FlagOp::Set(flags),
+            test_key(11),
+        ))
+        .await;
+
+        // Gmail answers 400 for DRAFT or SENT in either label list, so
+        // neither may reach the wire - but excluded-from-the-wire is not
+        // absent-from-the-report. The requested draft/sent state was not
+        // achieved, so both flags surface as unsupported and the id gets
+        // the partial-application lane rather than a plain success.
+        assert!(
+            matches!(&events[0], SyncEvent::Warning(warning) if warning.kind == WarningKind::StrategyDowngraded)
+        );
+        let SyncEvent::Batch(batch) = &events[1] else {
+            panic!("warning must be followed by the accounted mutation batch");
+        };
+        let [ItemOutcome::Succeeded(success)] = batch.items.as_slice() else {
+            panic!("the representable half of the set was applied");
+        };
+        let MutationSuccess::Downgraded {
+            actual: MutationEffect::FlagsPartiallyApplied { unsupported },
+        } = &success.output
+        else {
+            panic!("a set Gmail could only half-apply must not report Applied");
+        };
+        assert_eq!(
+            unsupported,
+            &vec!["$gmail-label:SENT:SENT".to_string(), "\\Draft".to_string()]
+        );
+        let body: serde_json::Value =
+            serde_json::from_slice(script.requests()[0].body.as_ref().expect("request body"))
+                .expect("JSON request");
+        assert_eq!(body["addLabelIds"], serde_json::json!([]));
+        assert_eq!(
+            body["removeLabelIds"],
+            serde_json::json!(["IMPORTANT", "STARRED", "UNREAD"])
+        );
+    }
+
+    /// `\Draft` alone leaves nothing Gmail can express, so no request is
+    /// made - and an operation that made no request must not report any
+    /// flavour of success. `Skipped` would claim the message was already
+    /// as asked and `Downgraded` would claim it changed; both are false,
+    /// and both are read by `bifrost-sync` and by five other protocol
+    /// crates. The honest lane is a per-id `Unsupported` failure.
+    #[tokio::test]
+    async fn a_draft_only_flag_op_makes_no_request_and_reports_no_success() {
+        let (client, script) = scripted_client(Vec::new());
+        let events = collect_events(bulk_set_flags(
+            client,
+            fresh_cache(Vec::new()),
+            Box::pin(stream::iter([ObjectId("m1".to_string())])),
+            FlagOp::Add(set(&["\\Draft"])),
+            test_key(14),
+        ))
+        .await;
+
+        assert!(
+            script.requests().is_empty(),
+            "no representable label means nothing to send"
+        );
+        assert!(
+            matches!(&events[0], SyncEvent::Warning(warning) if warning.kind == WarningKind::StrategyDowngraded)
+        );
+        let SyncEvent::Batch(batch) = &events[1] else {
+            panic!("every id must still land in a lane");
+        };
+        let [ItemOutcome::Failed(failure)] = batch.items.as_slice() else {
+            panic!("a no-op must not be reported as a success");
+        };
+        assert_eq!(failure.item.0, "m1");
+        assert!(matches!(
+            failure.error.kind(),
+            bifrost_types::AccountErrorKind::Unsupported(AccountOperation::UpdateFlags)
+        ));
+        assert!(matches!(
+            failure.error.recovery(),
+            bifrost_types::RecoveryClass::Unsupported(_)
+        ));
+    }
+
+    /// A terminal failure arriving mid-bisection must terminate the
+    /// stream, not be laundered into per-id failures.
+    ///
+    /// The bisection path was a new error path, and the first cut of it
+    /// converted every non-404 sub-batch error straight into
+    /// `ItemOutcome::Failed`. A 429 read to the engine as "these items
+    /// failed permanently" instead of "back off and retry" - a worse lie
+    /// than the whole-batch `NotFound` fanout the bisection exists to
+    /// fix. Sub-batches already resolved keep their lane in one last
+    /// non-final page ahead of the terminator.
+    #[tokio::test]
+    async fn a_rate_limit_during_bisection_terminates_and_keeps_resolved_lanes() {
+        let (client, script) = scripted_client(vec![
+            canned(StatusCode::NOT_FOUND),
+            canned(StatusCode::NO_CONTENT),
+            canned(StatusCode::TOO_MANY_REQUESTS),
+        ]);
+        let targets = Box::pin(stream::iter(
+            ["a", "b", "c", "d"].map(|id| ObjectId(id.to_string())),
+        ));
+        let events = collect_events(bulk_move(
+            client,
+            fresh_cache(Vec::new()),
+            targets,
+            label("INBOX"),
+            None,
+            test_key(15),
+        ))
+        .await;
+
+        let SyncEvent::Batch(batch) = &events[0] else {
+            panic!("the sub-batch that succeeded must keep its lane");
+        };
+        assert_eq!(batch.items.len(), 2);
+        assert!(batch.items.iter().all(|item| matches!(
+            item,
+            ItemOutcome::Succeeded(success) if success.output == MutationSuccess::Applied
+        )));
+        assert!(
+            matches!(batch.page_boundary, PageBoundary::Page),
+            "the operation did not complete, so no page is final"
+        );
+        let SyncEvent::Terminated(error) = &events[1] else {
+            panic!("a rate limit must terminate the stream, not fail the ids");
+        };
+        assert!(matches!(
+            error.recovery(),
+            bifrost_types::RecoveryClass::Retry(_)
+        ));
+        assert_eq!(events.len(), 2, "a terminated stream emits no Done");
+        assert_eq!(script.requests().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn unsupported_flag_downgrades_but_sends_representable_labels() {
+        let (client, script) = scripted_client(vec![canned(StatusCode::NO_CONTENT)]);
+        let flags = set(&["\\Seen", "\\Flagged", "$Junk"]);
+        let events = collect_events(bulk_set_flags(
+            client,
+            fresh_cache(Vec::new()),
+            Box::pin(stream::iter([ObjectId("m1".to_string())])),
+            FlagOp::Add(flags),
+            test_key(12),
+        ))
+        .await;
+
+        assert!(
+            matches!(&events[0], SyncEvent::Warning(warning) if warning.kind == WarningKind::StrategyDowngraded)
+        );
+        let SyncEvent::Batch(batch) = &events[1] else {
+            panic!("warning must be followed by the accounted mutation batch");
+        };
+        assert!(
+            matches!(batch.items.as_slice(), [ItemOutcome::Succeeded(success)] if matches!(&success.output, MutationSuccess::Downgraded { actual: MutationEffect::FlagsPartiallyApplied { unsupported } } if unsupported == &["$Junk".to_string()]))
+        );
+        let body: serde_json::Value =
+            serde_json::from_slice(script.requests()[0].body.as_ref().expect("request body"))
+                .expect("JSON request");
+        assert_eq!(body["addLabelIds"], serde_json::json!(["STARRED"]));
+        assert_eq!(body["removeLabelIds"], serde_json::json!(["UNREAD"]));
+    }
+
+    #[tokio::test]
+    async fn destroy_scope_failure_sends_trash_fallback_and_reports_downgraded() {
+        let forbidden = Canned::Response {
+            status: StatusCode::FORBIDDEN,
+            headers: reqwest::header::HeaderMap::new(),
+            body: Bytes::from_static(
+                br#"{"error":{"code":403,"errors":[{"reason":"forbidden"}]}}"#,
+            ),
+        };
+        let (client, script) = scripted_client(vec![forbidden, canned(StatusCode::NO_CONTENT)]);
+        let events = collect_events(bulk_destroy(
+            client,
+            fresh_cache(Vec::new()),
+            Box::pin(stream::iter([ObjectId("m1".to_string())])),
+            test_key(13),
+        ))
+        .await;
+
+        let SyncEvent::Batch(batch) = &events[0] else {
+            panic!("destroy fallback must produce an accounted batch");
+        };
+        assert!(
+            matches!(batch.items.as_slice(), [ItemOutcome::Succeeded(success)] if success.output == MutationSuccess::Downgraded {
+                actual: MutationEffect::MovedToContainer(ContainerId("TRASH".to_string())),
+            })
+        );
+        let requests = script.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].url.path(), "/messages/batchDelete");
+        assert_eq!(requests[1].url.path(), "/messages/batchModify");
+        assert_eq!(
+            requests[1].body.as_deref(),
+            Some(
+                br#"{"ids":["m1"],"addLabelIds":["TRASH"],"removeLabelIds":["INBOX","SPAM"]}"#
+                    .as_slice()
+            )
+        );
     }
 
     /// The trash fallback reports `Downgraded`, and only for ids it actually

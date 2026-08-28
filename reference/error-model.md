@@ -356,9 +356,23 @@ the destroy forever; reported `Skipped`, a real mutation would be
 hidden. `bifrost-sync` files it `PendingReadback` rather than trusting
 it, so the final accounting comes from observed state - a downgrade is
 the one success report whose own claim is known to be incomplete.
-Gmail reports `MovedToContainer(TRASH)`. It is deliberately NOT queued for
+Gmail reports `MovedToContainer(TRASH)`. A provider that applied only the
+representable subset of a flag operation reports
+`FlagsPartiallyApplied { unsupported }`, preserving the flags it could not
+apply for read-back and diagnostics. It is deliberately NOT queued for
 resubmission: a downgrade is not
 transient, and replaying it earns the same downgrade.
+
+"The target changed" is a precondition of `Downgraded`, not a description
+of it. An operation the provider could not perform at all - every
+requested flag unrepresentable, so no request is even sent - is not a
+downgrade and must not borrow the lane. It produces `ItemOutcome::Failed`
+per id with `Unsupported(operation)` -> `RecoveryClass::Unsupported`,
+which is permanent and not retried. This matters beyond tidiness:
+`bifrost-sync` files every `Downgraded` as `PendingReadback`, so a no-op
+wearing the downgrade lane schedules a read-back for a mutation that
+never happened, and spends the read-back budget of a real one. Protocol
+crates: if there is nothing you could do, say so in the failure lane.
 
 ## Diagnostics and consent tiers
 

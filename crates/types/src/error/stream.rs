@@ -30,6 +30,14 @@ pub enum MutationSuccess {
     /// `Applied` makes an engine believe a state it will keep re-observing as
     /// false, and claiming `Skipped` hides a mutation that really happened.
     ///
+    /// "The target DID change" is a precondition, not a description: an
+    /// operation a provider could not perform AT ALL is not a downgrade and
+    /// must not be reported here. A protocol crate that finds nothing it can
+    /// express owes the caller a failure lane, not the weakest available
+    /// success - `bifrost-sync` files every `Downgraded` as
+    /// `PendingReadback`, which schedules a read-back for a mutation that
+    /// never happened and lets a no-op consume the same budget as real work.
+    ///
     /// The motivating case is Gmail `bulk_destroy` under the `gmail.modify`
     /// OAuth scope, which does not permit permanent delete. `messages/batchDelete`
     /// answers 403 and the account falls back to a TRASH label patch: the
@@ -47,4 +55,14 @@ pub enum MutationSuccess {
 #[non_exhaustive]
 pub enum MutationEffect {
     MovedToContainer(ContainerId),
+    /// Only the provider-representable subset of a requested flag operation
+    /// was applied; the listed flags were not.
+    ///
+    /// Requires a non-empty representable subset that actually reached the
+    /// provider. An operation whose flags are ALL unrepresentable changed
+    /// nothing and belongs in the failure lane, classified
+    /// `Unsupported(operation)`, not here.
+    FlagsPartiallyApplied {
+        unsupported: Vec<String>,
+    },
 }

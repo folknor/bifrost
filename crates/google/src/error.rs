@@ -180,7 +180,7 @@ impl GmailErrorEnvelope {
 pub(crate) enum GmailLocalError {
     Unsupported {
         operation: AccountOperation,
-        detail: Option<&'static str>,
+        detail: Option<String>,
     },
     InvalidRequest {
         operation: AccountOperation,
@@ -313,10 +313,10 @@ impl Error {
         })
     }
 
-    pub(crate) fn unsupported_with(operation: AccountOperation, detail: &'static str) -> Self {
+    pub(crate) fn unsupported_with(operation: AccountOperation, detail: impl Into<String>) -> Self {
         Self::Local(GmailLocalError::Unsupported {
             operation,
-            detail: Some(detail),
+            detail: Some(detail.into()),
         })
     }
 
