@@ -620,6 +620,48 @@ mod tests {
         );
     }
 
+    /// A delta server echoing the walk's own resume URL back as its
+    /// `nextLink` would spin the changes walk forever - `PageWalk` must
+    /// refuse the repeat and project the refusal as `Terminated` rather
+    /// than fetching the same page again.
+    #[tokio::test]
+    async fn a_repeated_next_link_refuses_the_changes_delta_walk() {
+        let client = GraphClient::new("token");
+        client.script_rest([ScriptedRestResponse::json(
+            reqwest::StatusCode::OK,
+            json!({
+                "value": [{ "id": "m1", "changeKey": "ck1" }],
+                "@odata.nextLink": "https://graph.example/delta"
+            }),
+        )]);
+        let account = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
+        let payload = GraphCursorPayload::new(
+            kind_for_scope(&email_scope("inbox")).expect("email scope maps"),
+            "https://graph.example/delta".to_string(),
+            None,
+        );
+        let cursor = encode_cursor(email_scope("inbox"), payload).expect("cursor encodes");
+        let mut stream = changes_stream(account, cursor);
+        assert!(
+            matches!(stream.next().await, Some(SyncEvent::Batch(_))),
+            "the first page still delivers its changes"
+        );
+        let Some(SyncEvent::Terminated(error)) = stream.next().await else {
+            panic!("expected SyncEvent::Terminated on the echoed link");
+        };
+        assert!(matches!(
+            error.kind(),
+            AccountErrorKind::Protocol(bifrost_types::ProtocolErrorKind::ParseFailed)
+        ));
+        assert!(matches!(stream.next().await, Some(SyncEvent::Done(None))));
+        assert!(stream.next().await.is_none());
+        assert_eq!(
+            client.take_rest_requests().len(),
+            1,
+            "the echoed link is refused before a second fetch"
+        );
+    }
+
     #[tokio::test]
     async fn the_event_calendar_event_alias_is_accepted_at_the_changes_door() {
         // A cursor minted from a `CalendarEvent` scope must not be rejected

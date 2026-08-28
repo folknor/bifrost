@@ -19,6 +19,22 @@ rather than appending to it.
 - Refusing a finding with a reason is a good outcome. Two have been rejected on
   the merits so far, both recorded below.
 
+## From the `bugs-graph.md` arc (round 1 closed, dac58d3..)
+
+Testing traps this arc recorded, both caught only because the round after the
+fix pass went back and ablated:
+
+- **An assertion true of both the correct and the buggy value does not bite.**
+  The webhook renewal test asserted only "not the stale expiry", which the
+  locally computed expiry it was written to exclude also satisfied. Pin the
+  exact expected value when the defect is "stored the wrong one of two
+  plausible values".
+- **A codec round-trip is not a behaviour test.** The search-resume test
+  encoded and decoded the new page cursor without ever driving a search
+  against a page that over-delivers, so it passed with the resume logic
+  absent. The replacement drives `contacts::search` against a scripted page
+  and asserts the second call re-reads the SAME page URL.
+
 ## From the `bugs-dav.md` arc (closed, a65acb6..dac58d3)
 
 Scope was `crates/caldav/` and `crates/carddav/`, plus the IMAP composition seam.

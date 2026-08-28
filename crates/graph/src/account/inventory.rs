@@ -758,6 +758,67 @@ mod tests {
         assert_eq!(requests[1].url, "https://graph.example/next?page=2");
     }
 
+    /// A delta server that hands back a `nextLink` the walk has already
+    /// fetched would spin the inventory forever - `PageWalk` must refuse
+    /// the repeat and project the refusal as `Terminated`, exactly like the
+    /// folder-list walk (`a_repeated_next_link_refuses_the_folder_walk`).
+    #[tokio::test]
+    async fn a_repeated_next_link_refuses_the_inventory_delta_walk() {
+        let client = GraphClient::new("token");
+        client.script_rest([
+            ScriptedRestResponse::json(
+                reqwest::StatusCode::OK,
+                json!({
+                    "value": [{"id": "one", "changeKey": "ck-one"}],
+                    "@odata.nextLink": "https://graph.example/next?page=2"
+                }),
+            ),
+            ScriptedRestResponse::json(
+                reqwest::StatusCode::OK,
+                json!({
+                    "value": [{"id": "two", "changeKey": "ck-two"}],
+                    "@odata.nextLink": "https://graph.example/next?page=2"
+                }),
+            ),
+        ]);
+        let account = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
+        let scope = CursorScope::FolderType {
+            folder: FolderId("inbox".to_string()),
+            ty: ObjectType::Email,
+        };
+        let mut stream = inventory_stream(account, scope);
+        assert!(matches!(
+            stream.next().await,
+            Some(bifrost_types::InventoryEvent::Batch(_))
+        ));
+        assert!(matches!(
+            stream.next().await,
+            Some(bifrost_types::InventoryEvent::Batch(_))
+        ));
+        let bifrost_types::InventoryEvent::Terminated(error) =
+            stream.next().await.expect("repeated-link refusal")
+        else {
+            panic!("expected termination")
+        };
+        assert!(matches!(
+            error.kind(),
+            bifrost_types::AccountErrorKind::Protocol(
+                bifrost_types::ProtocolErrorKind::ParseFailed
+            )
+        ));
+        assert!(matches!(
+            stream.next().await,
+            Some(bifrost_types::InventoryEvent::Done(_))
+        ));
+        assert!(stream.next().await.is_none());
+        let requests = client.take_rest_requests();
+        assert_eq!(
+            requests.len(),
+            2,
+            "the repeated link is refused before a third fetch"
+        );
+    }
+
     #[tokio::test]
     async fn an_acked_inventory_page_resumes_at_its_next_link() {
         let scope = CursorScope::FolderType {
