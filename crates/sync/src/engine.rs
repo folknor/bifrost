@@ -878,6 +878,23 @@ impl SyncEngine {
             .map_err(|e| Error::Other(format!("ack writer dropped before persisting: {e}")))?
     }
 
+    /// Build the published backfill checkpoint helper on this account's single
+    /// durable writer. The helper cannot race the acknowledgement ledger.
+    pub fn backfill_checkpoint_writer(
+        &self,
+        account_id: &AccountId,
+    ) -> Result<crate::backfill::BackfillCheckpointWriter, Error> {
+        let tx = self
+            .ack_senders
+            .get(account_id)
+            .map(|entry| entry.value().clone())
+            .ok_or_else(|| Error::AccountNotAttached(account_id.clone()))?;
+        Ok(crate::backfill::BackfillCheckpointWriter::new(
+            account_id.clone(),
+            crate::backfill::BackfillCheckpointTarget::attached(tx),
+        ))
+    }
+
     /// Acknowledge an event publication that intentionally has no checkpoint.
     /// Repair notifications use this path so coverage debt is discharged only
     /// after the consumer has durably accepted the recovered object ids.
@@ -3136,9 +3153,12 @@ async fn run_backfill_orchestrator(
                         }
                     }
                     registry.mark(account_id.clone(), scope.clone(), BackfillState::Running);
-                    let mut completed = true;
-                    let mut total_seen = 0_u64;
-                    for partition in partitions {
+                    // The driver owns the sequence: a barrier stops the SCOPE,
+                    // not merely the partition that hit it, so a stopped walk
+                    // simply hands out no further partition. There is no flag
+                    // here to forget to check.
+                    let mut driver = crate::backfill::ScopeWalkDriver::fixed(partitions);
+                    while let Some(partition) = driver.next_partition() {
                         if shutdown.is_cancelled() {
                             return;
                         }
@@ -3161,14 +3181,9 @@ async fn run_backfill_orchestrator(
                         };
                         match result {
                             Ok(outcome) => {
-                                total_seen = total_seen.saturating_add(outcome.seen);
-                                if !outcome.complete {
-                                    // The partition finished but left coverage
-                                    // obligations open. Completion is about the
-                                    // enumeration space being exhausted, and it
-                                    // was not - writing the sentinel here would
-                                    // make the next attach skip the walk and
-                                    // turn a declared gap into a permanent one.
+                                let complete = outcome.complete;
+                                let step = driver.fold(&outcome);
+                                if !complete {
                                     tracing::warn!(
                                         target: "bifrost.sync.backfill",
                                         account = ?account_id,
@@ -3176,7 +3191,15 @@ async fn run_backfill_orchestrator(
                                         "backfill partition completed with unresolved coverage; \
                                          withholding the completion marker"
                                     );
-                                    completed = false;
+                                }
+                                if step == crate::backfill::ScopeWalkStep::StopScopeWalk {
+                                    tracing::warn!(
+                                        target: "bifrost.sync.backfill",
+                                        account = ?account_id,
+                                        scope = ?scope,
+                                        "backfill stopped at a barrier; refusing to walk any \
+                                         further partition of this scope"
+                                    );
                                 }
                             }
                             Err(err) => {
@@ -3186,11 +3209,11 @@ async fn run_backfill_orchestrator(
                                     error = %err,
                                     "backfill partition failed; leaving scope Pending"
                                 );
-                                completed = false;
-                                break;
+                                driver.fail();
                             }
                         }
                     }
+                    let completed = driver.completed();
                     // Persist a durable completion marker through the same
                     // consumer-ack path the page batches use. It is ordered
                     // behind every page, so a crash before its ack re-walks
@@ -3199,7 +3222,7 @@ async fn run_backfill_orchestrator(
                         && !emit_backfill_complete(
                             changes_tx.as_ref(),
                             &scope,
-                            total_seen,
+                            driver.total_seen(),
                             &control,
                             &shutdown,
                         )
@@ -3250,14 +3273,14 @@ async fn run_backfill_orchestrator(
                         }
                     }
                     registry.mark(account_id.clone(), scope.clone(), BackfillState::Running);
-                    let mut completed = true;
-                    let mut total_seen = 0_u64;
-                    loop {
+                    // Same rule as the fixed plan, and the same driver enforces
+                    // it: a barrier stops the scope, so the window past it is
+                    // never handed out.
+                    let mut driver = crate::backfill::ScopeWalkDriver::open_pages(from, chunk);
+                    while let Some(partition) = driver.next_partition() {
                         if shutdown.is_cancelled() {
                             return;
                         }
-                        let to = from.saturating_add(chunk);
-                        let partition = InventoryPartition::Page { from, to };
                         let Some(result) = run_backfill_partition_at_boundary(
                             &account,
                             &account_id,
@@ -3292,8 +3315,11 @@ async fn run_backfill_orchestrator(
                                 // would truncate the backfill; implementations are
                                 // required to keep walking past the window until they
                                 // produce an entry or the listing runs dry. Given
-                                // that, `seen == 0` is unambiguous here.
-                                if !outcome.complete {
+                                // that, `seen == 0` is unambiguous here, and the
+                                // driver applies it.
+                                let complete = outcome.complete;
+                                let step = driver.fold(&outcome);
+                                if !complete {
                                     // Same rule as the finite-partition walk:
                                     // an unresolved obligation means the
                                     // enumeration space was not exhausted, so
@@ -3305,13 +3331,16 @@ async fn run_backfill_orchestrator(
                                         "backfill page completed with unresolved coverage; \
                                          withholding the completion marker"
                                     );
-                                    completed = false;
                                 }
-                                if outcome.seen == 0 {
-                                    break;
+                                if step == crate::backfill::ScopeWalkStep::StopScopeWalk {
+                                    tracing::warn!(
+                                        target: "bifrost.sync.backfill",
+                                        account = ?account_id,
+                                        scope = ?scope,
+                                        "backfill stopped at a barrier; refusing to walk any \
+                                         further page window of this scope"
+                                    );
                                 }
-                                total_seen = total_seen.saturating_add(outcome.seen);
-                                from = to;
                             }
                             Err(err) => {
                                 tracing::warn!(
@@ -3320,16 +3349,16 @@ async fn run_backfill_orchestrator(
                                     error = %err,
                                     "backfill page partition failed; leaving scope Pending"
                                 );
-                                completed = false;
-                                break;
+                                driver.fail();
                             }
                         }
                     }
+                    let completed = driver.completed();
                     if completed
                         && !emit_backfill_complete(
                             changes_tx.as_ref(),
                             &scope,
-                            total_seen,
+                            driver.total_seen(),
                             &control,
                             &shutdown,
                         )
@@ -4127,6 +4156,19 @@ async fn ack_writer(
                         &account_id,
                         CheckpointTransition {
                             checkpoint: Checkpoint::Change(cursor),
+                            ledger: ledger.clone(),
+                        },
+                    )
+                    .await;
+                let _ = done.send(result);
+                continue;
+            }
+            WriterRequest::PersistBackfill { checkpoint, done } => {
+                let result = store
+                    .apply_transition(
+                        &account_id,
+                        CheckpointTransition {
+                            checkpoint: Checkpoint::Backfill(checkpoint),
                             ledger: ledger.clone(),
                         },
                     )

@@ -12,12 +12,16 @@
 pub mod checkpoint;
 pub mod partitioner;
 pub mod runner;
+pub mod scope_walk;
 
 use bifrost_types::{AccountId, CursorScope};
 
-pub use checkpoint::BackfillCheckpointWriter;
+pub use checkpoint::{BackfillCheckpointTarget, BackfillCheckpointWriter};
 pub use partitioner::{BackfillPolicy, BackfillStrategy, PartitionPlan, default_time_boundaries};
-pub use runner::{BackfillPartitionOutcome, BackfillRunner, LiveSupersedes};
+pub use runner::{
+    BackfillPartitionOutcome, BackfillRunner, BackfillScopeWalk, LiveSupersedes, ScopeWalkStep,
+};
+pub use scope_walk::ScopeWalkDriver;
 
 /// Backfill registry: tracks which account scopes are pending, running,
 /// or complete. Durable resume state lives in the checkpoint store.

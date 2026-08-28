@@ -32,30 +32,57 @@ Not defects, recorded so nobody re-opens them: `PendingCoverage::claim` and
 value-identified respectively. No engine path uses either; every engine path
 goes through the lane-checked and publication-identified forms.
 
+## Round 3 closure note (A2, A6, C2, E3, E7, F3, F1-residual)
+
+What landed, and the two holes the round's own fix opened one layer up - both
+found by cold review, not by the fix pass's tests. Same signature as rounds 1
+and 2.
+
+- **Both inventory front ends now share `InventoryWalk`** (`inventory_walk.rs`).
+  It owns the barrier decision and the last accepted resume checkpoint for
+  `BackfillRunner` and `InventoryFusion` alike, including a barrier carried by
+  the terminal `Done` (E3). The DIVERGENCE of the two walks was A2's cause, so
+  the rules can now only change for both at once.
+- **A barrier stops the SCOPE, not just the partition.** The first fix returned
+  `complete: false` from the partition and both orchestrator loops read that as
+  "degraded, carry on", requested the next fixed partition or page window, and
+  handed out checkpoints beyond the barrier - A2 recreated exactly, one layer up.
+  Partition sequencing now belongs to `backfill/scope_walk.rs`: the loop asks the
+  driver for the next partition and a stopped walk has none to give, so there is
+  no flag left for a loop to forget.
+- **A barrier the store refused is not a recorded barrier.** The first fix
+  checked only whether the oneshot sender was dropped, so `Ok(Err(store_error))`
+  counted as success: the walk announced a barrier that a restart forgets,
+  leaving nothing durable for E7's `block` to act on. `record_barriers` returns
+  `Result` and the runner refuses to announce over an `Err`. A DEPARTED writer
+  (detach, shutdown) stays non-fatal - there is nothing to persist to.
+- **A6** discharges by proof UNION and retains only proofs still load-bearing
+  for an open obligation or barrier.
+- **F1 residual** is closed: `BackfillCheckpointWriter` routes through the
+  account writer. Its `store` field changed shape, so a public
+  `BackfillCheckpointTarget::direct` and `BackfillCheckpointWriter::new` keep the
+  type constructible by external code with what it could already supply; the
+  direct route carries the read-modify-write race by construction and says so.
+
+**F3 landed only in part.** The shared piece is the barrier and resume state.
+Checkpoint MINTING (fusion takes the account's, backfill mints positional ones)
+and terminal-summary debt recording are still two implementations. The
+divergence that caused A2 is closed; the structural item is not, and is left
+open under F below.
+
+### Refuted, not fixed - do not re-open without new evidence
+
+- **C2. `drive_changes_stream` always emits `publication: None`.** Does not
+  reproduce. `drive_changes_stream`'s `publish` closure sets
+  `me.publication = Some(..)` whenever `control` is `Some` and `checkpoint` is
+  `Some`, and both production callers (`multiplexer/mod.rs` and
+  `push/reconciler.rs`) pass `Some(control)`. `emit_backfill_complete` publishes
+  unconditionally. The invariant was unpinned, which is probably how the finding
+  arose; it is pinned now by
+  `a_published_change_checkpoint_always_carries_its_publication_id` in
+  `tests/attach_schema_recovery.rs`.
+
 ## A. Correctness - lost data / lost debt
-
-### A2. `BackfillRunner` ignores the barrier protocol entirely
-
-**Confidence: high.** `InventoryFusion` honours a barrier: strip the checkpoint,
-deliver items, stop the walk. `BackfillRunner::run_partition` never calls
-`coverage.has_barrier()`, never reads `batch.checkpoint` (the field exists on
-`InventoryBatch` and is discarded), and mints its own `BackfillCheckpoint` from
-its own `seen_total` for every page unconditionally. So on the backfill path a
-provider cannot refuse a checkpoint: the `page:F:T` key lands, the consumer acks
-it, and `open_pages_resume` resumes at `T` - leaping the barrier region
-permanently. Only the *completion sentinel* is withheld (`complete=false`), which
-does not protect positional resume. This is the JMAP-Email / Gmail cold-start
-lane, i.e. the one where all hydration rides backfill.
-
-### A6. `DebtLedger::proved` is write-only
-
-**Confidence: high.** The field is pushed to in `record_proof` and never read. So
-(a) the documented union discharge - "debt raised under `30d..90d` is covered by
-the union of `7d..60d` and `60d..180d` and by neither alone" - is not implemented;
-discharge only ever tests one domain at a time at ingest. And (b) it is an
-unbounded `Vec` inside the per-account ledger that `apply_transition` rewrites
-wholesale on *every* acknowledged checkpoint. That is durable, unbounded, and on
-the hot path.
 
 ## B. Liveness / latency
 
@@ -91,13 +118,6 @@ workers, which the comment says always burns the whole `detach_timeout`.
 
 ## C. Contracts a consumer cannot honour
 
-### C2. `drive_changes_stream` always emits `publication: None`
-
-**Confidence: high.** `MultiplexerEvent::publication` is documented as "`Some`
-exactly when `checkpoint` is `Some`", and the live change path - the primary path -
-violates that on every batch. `emit_backfill_complete` does too. Consumers written
-to the documented invariant will assert or mis-branch.
-
 ### C3. Reference contradicts itself on `retry_queue_cap`
 
 **Confidence: high.** `reference/sync.md` says both "One resubmission is at most
@@ -132,10 +152,6 @@ contract.
   account's drive reports `ChangesEvent::Paused`; `handle_drive_outcome` then sets
   `exit: false` and the poll loop takes another lap before noticing the token.
   Cosmetic in practice, wrong in kind. **Confidence: high.**
-- **E3. Fusion loses the resume position for a `Done`-carried barrier.** The `Batch`
-  barrier arm passes `last_accepted` into `record_barriers`; the `Done` arm passes
-  `None`, discarding the prefix checkpoint a later walk would resume from.
-  **Confidence: medium-high.**
 - **E4. Per-item engine-blocked campaigns leave unseen ids in no bucket.** When
   `classify_item_outcome` returns an engine directive, `blocked_by_engine` breaks out
   of the attempt loop with no sweep of `remaining` ids the stream never resolved -
@@ -150,42 +166,24 @@ contract.
 - **E6. `Reconciler::reconcile` uses `?` on `drive_changes_stream`,** abandoning
   every remaining scope of a multi-scope hint on the first engine-level error, with
   only a `warn!`. **Confidence: high.**
-- **E7. `DebtLedger::block` does not reach barriers** while `waive` does - an
-  operator can waive a barrier but not block one. **Confidence: high.**
 - **E8. `MultiplexerHandle::cancel` is a child token nobody ever cancels** (the
   multiplexer is driven by `slot.shutdown`). Dead field that reads as a live control.
   **Confidence: high.**
 
 ## F. Structural - what shape this should have had
 
-1. **The durable-write path is a type now, but not everywhere.** PARTIALLY
-   RESOLVED in round 2. `RecoveryContext` holds a `WriterHandle` and can no
-   longer reach `Arc<DynCheckpointStore>`, which closes A5. The half that did
-   NOT land: the original finding also asked for `CheckpointStore` to be made
-   private to the writer module, and that is refused deliberately - it is a
-   published, consumer-implemented trait, and the standing rule is that a change
-   may reshape published API but never remove it.
-
-   **Confidence: high (residual is real, and unfixed).** `BackfillCheckpointWriter`
-   (`crates/sync/src/backfill/checkpoint.rs`) still holds an
-   `Arc<DynCheckpointStore>` and performs `get_ledger` + `apply_transition`
-   directly, and `run_backfill_orchestrator` in `engine.rs` is still handed the
-   store `Arc` to build it. So the backfill lane remains a second durable writer
-   for the account, outside the ack writer's ordering, with exactly the
-   read-modify-write ledger race the single-writer rule exists to prevent: the
-   orchestrator's `get_ledger` can be interleaved with an ack writer transition,
-   and its `apply_transition` then writes back a ledger missing whatever the ack
-   landed in between. `BackfillCheckpointWriter` is published, so this is a
-   REWIRE (route it through `WriterRequest`), never a deletion. Deferred out of
-   round 2 on scope grounds: it lands with the backfill-runner work in F3/A2,
-   which owns those files.
-
-3. **`BackfillRunner` and `InventoryFusion` are two implementations of one walk**
-   and have already diverged on the safety-critical rule (A2): barrier handling,
-   checkpoint minting, and terminal-summary debt are all handled differently. They
-   should be one driver parameterised by "who mints the checkpoint" - the fusion path
-   takes the account's, the backfill path mints positional ones - with
-   barrier/coverage handling in the shared body.
+3. **`BackfillRunner` and `InventoryFusion` are two implementations of one walk.**
+   PARTIALLY RESOLVED in round 3. The safety-critical half - barrier detection,
+   the resume checkpoint, and barrier-incident recording - is now the shared
+   `InventoryWalk` in `crates/sync/src/inventory_walk.rs`, which is what closed
+   A2 and E3. **Confidence: high (residual is real, and unfixed).** Still two
+   implementations: checkpoint MINTING (fusion forwards the account's checkpoint,
+   backfill mints a positional `page:F:T` from its own `seen_total`) and terminal
+   `Done` handling (backfill sends `RecordDebt` for a degraded summary and
+   `break`s, fusion `finalize`s the cursor). One driver parameterised by "who
+   mints the checkpoint" remains the shape this should have. Nothing here is
+   currently a lost-data path; it is the RE-DIVERGENCE risk that A2 already
+   charged the project for once.
 
 4. **The scope drive lease should be a scoped combinator.** Both call sites
    over-extend it (B1). `cursors.with_drive(&scope, |cursor, gen| async { ... }).await`
@@ -206,9 +204,12 @@ contract.
 
 - `bifrost-types`: `InventoryBatch::checkpoint` is `Option<Checkpoint>` with no way
   to distinguish "this page has no checkpoint" from "I stripped this checkpoint
-  because of a barrier". The barrier signal currently rides only in `coverage`, which
-  is why A2 was easy to miss. A dedicated `PageCheckpoint::{Advance(..), Withheld}`
-  would make the backfill runner's omission a compile error.
+  because of a barrier". The barrier signal rides only in `coverage`, which is why
+  A2 was easy to miss. A dedicated `PageCheckpoint::{Advance(..), Withheld}` would
+  make the omission a compile error. STILL OPEN after round 3: the shared
+  `InventoryWalk` makes both front ends read `coverage` the same way, but nothing
+  in the type system stops a third front end from ignoring it. `bifrost-types` was
+  not touched in this round.
 - `bifrost-types`: `AccountError` carries no tenant identity, so
   `ThrottleScope::Tenant` is unimplementable and always degrades - the engine
   documents this as blocked on types. Worth deciding, since `Tenant` degrading to

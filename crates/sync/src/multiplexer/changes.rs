@@ -320,6 +320,12 @@ pub enum WriterRequest {
         cursor: ChangeCursor,
         done: oneshot::Sender<Result<(), Error>>,
     },
+    /// Persist a standalone backfill checkpoint while preserving the writer's
+    /// authoritative in-memory debt ledger.
+    PersistBackfill {
+        checkpoint: bifrost_types::BackfillCheckpoint,
+        done: oneshot::Sender<Result<(), Error>>,
+    },
     /// Invalidate durable state for a scope as one writer-ordered operation.
     /// Pending publications for the affected lanes are retired before the
     /// rows are deleted, so a late acknowledgement cannot revive them.
@@ -417,6 +423,10 @@ impl std::fmt::Debug for WriterRequest {
             Self::PersistEstablished { cursor, .. } => f
                 .debug_struct("PersistEstablished")
                 .field("scope", &cursor.scope)
+                .finish(),
+            Self::PersistBackfill { checkpoint, .. } => f
+                .debug_struct("PersistBackfill")
+                .field("scope", &checkpoint.scope)
                 .finish(),
             Self::ResetScope {
                 scope,

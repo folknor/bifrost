@@ -248,6 +248,8 @@ struct HealAccount {
     /// a driver that merely logs the violation and re-polls would consume
     /// them without bound, so the count is the spin detector.
     bad_boundary_batches: Option<Arc<AtomicUsize>>,
+    /// Emit ONE well-formed `Final` batch carrying a change checkpoint.
+    live_checkpoint_batch: bool,
 }
 
 /// Test handle for pinning `detach` inside `Account::close()`.
@@ -339,6 +341,7 @@ impl AccountFactory for HealFactory {
                 degraded_contacts,
                 close_gate: Arc::clone(&close_gate),
                 bad_boundary_batches: None,
+                live_checkpoint_batch: false,
             });
             Ok(bifrost_types::OpenedAccount::complete(account))
         })
@@ -398,6 +401,7 @@ impl AccountFactory for RotatingFactory {
                 degraded_contacts: false,
                 close_gate: no_close_gate(),
                 bad_boundary_batches: None,
+                live_checkpoint_batch: false,
             });
             Ok(bifrost_types::OpenedAccount::complete(account))
         })
@@ -478,6 +482,16 @@ impl Account for HealAccount {
     }
 
     fn changes_stream(&self, cursor: ChangeCursor) -> AccountStream<SyncEvent<Change>> {
+        if self.live_checkpoint_batch {
+            let items = vec![SyncEvent::Batch(Batch {
+                items: Vec::new(),
+                page_boundary: PageBoundary::Final,
+                server_latency: std::time::Duration::ZERO,
+                bytes_in: 0,
+                checkpoint: Some(Checkpoint::Change(cursor)),
+            })];
+            return Box::pin(stream::iter(items));
+        }
         let Some(counter) = self.bad_boundary_batches.clone() else {
             return Box::pin(stream::empty());
         };
@@ -1654,6 +1668,7 @@ impl AccountFactory for GatingFactory {
                 degraded_contacts: false,
                 close_gate: no_close_gate(),
                 bad_boundary_batches: None,
+                live_checkpoint_batch: false,
             });
             Ok(bifrost_types::OpenedAccount::complete(account))
         })
@@ -2257,6 +2272,7 @@ impl AccountFactory for SkippingFactory {
                 degraded_contacts: false,
                 close_gate: no_close_gate(),
                 bad_boundary_batches: None,
+                live_checkpoint_batch: false,
             });
             Ok(bifrost_types::OpenedAccount {
                 account,
@@ -2363,6 +2379,7 @@ impl AccountFactory for ParkedReopenFactory {
                 degraded_contacts: false,
                 close_gate: no_close_gate(),
                 bad_boundary_batches: None,
+                live_checkpoint_batch: false,
             });
             Ok(bifrost_types::OpenedAccount::complete(account))
         })
@@ -2475,6 +2492,7 @@ impl AccountFactory for ExhaustingFactory {
                 degraded_contacts: false,
                 close_gate: no_close_gate(),
                 bad_boundary_batches: None,
+                live_checkpoint_batch: false,
             });
             Ok(bifrost_types::OpenedAccount::complete(account))
         })
@@ -2653,6 +2671,7 @@ async fn a_partial_batch_carrying_a_checkpoint_terminates_the_scope() {
         degraded_contacts: false,
         close_gate: no_close_gate(),
         bad_boundary_batches: Some(Arc::clone(&emitted)),
+        live_checkpoint_batch: false,
     };
 
     let (changes_tx, mut changes_rx) = tokio::sync::broadcast::channel(16);
@@ -2693,6 +2712,75 @@ async fn a_partial_batch_carrying_a_checkpoint_terminates_the_scope() {
         matches!(published.event.as_ref(), SyncEvent::Terminated(_)),
         "the published event must be the termination, got {:?}",
         published.event
+    );
+}
+
+/// Every checkpoint the live driver publishes must carry a publication id.
+///
+/// The acknowledgement path resolves coverage BY PUBLICATION, not by checkpoint
+/// equality - two backfill pages can produce byte-identical checkpoints, and
+/// fusion publishes its final checkpoint twice. A checkpoint broadcast without
+/// an id therefore cannot be acknowledged against its own claim: the writer
+/// either finds no claim at all or, worse, matches a neighbour's. The invariant
+/// held when it was audited, and this pins it, because nothing else did.
+#[tokio::test]
+async fn a_published_change_checkpoint_always_carries_its_publication_id() {
+    use bifrost_sync::cancel::Boundary;
+    use bifrost_sync::cursor::CursorRegistry;
+    use bifrost_sync::multiplexer::drive_changes_stream;
+
+    let scope = CursorScope::Account;
+    let account = HealAccount {
+        caps: caps(),
+        scopes: vec![scope.clone()],
+        established: Arc::new(Mutex::new(Vec::new())),
+        closed: Arc::new(AtomicUsize::new(0)),
+        generation: 0,
+        closed_generations: Arc::new(Mutex::new(Vec::new())),
+        subscribed: Arc::new(Mutex::new(Vec::new())),
+        unsubscribed: Arc::new(Mutex::new(Vec::new())),
+        unsubscribe_failures: Arc::new(AtomicUsize::new(0)),
+        lifecycle_calls: Arc::new(Mutex::new(Vec::new())),
+        lifecycle_script: Arc::new(Mutex::new(VecDeque::new())),
+        degraded_contacts: false,
+        close_gate: no_close_gate(),
+        bad_boundary_batches: None,
+        live_checkpoint_batch: true,
+    };
+
+    let (changes_tx, mut changes_rx) = tokio::sync::broadcast::channel(16);
+    let (boundary, _handle) = Boundary::new();
+    let (priority, _priority_rx) = tokio::sync::watch::channel(bifrost_types::Priority::Normal);
+    let (bandwidth, _bandwidth_rx) = tokio::sync::watch::channel(None);
+    let control = bifrost_sync::control::SyncControl::new(
+        AccountId("publishes-ids".into()),
+        boundary.clone(),
+        priority,
+        bandwidth,
+    );
+    drive_changes_stream(
+        &account,
+        scope.clone(),
+        cursor_for(&scope, b"live"),
+        Arc::new(CursorRegistry::new()),
+        AccountId("publishes-ids".into()),
+        changes_tx,
+        boundary.subscribe(),
+        Some(control),
+        None,
+        None,
+    )
+    .await
+    .expect("the stub stream completes cleanly");
+
+    let published = changes_rx.try_recv().expect("a batch reached subscribers");
+    assert!(
+        published.checkpoint.is_some(),
+        "the stub emits a checkpoint-bearing batch"
+    );
+    assert!(
+        published.publication.is_some(),
+        "a checkpoint published without an id cannot be acknowledged against its own claim"
     );
 }
 

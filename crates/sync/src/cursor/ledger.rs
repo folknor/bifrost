@@ -31,7 +31,7 @@
 use std::collections::BTreeMap;
 
 use bifrost_types::{
-    AccountError, CoverageDomain, InventoryCoverageReport, InventoryObligation,
+    AccountError, CoverageCoordinate, CoverageDomain, InventoryCoverageReport, InventoryObligation,
     InventoryRepairTarget, ObligationKey,
 };
 
@@ -370,6 +370,7 @@ impl DebtLedger {
 
     /// Record a domain proved complete, and discharge whatever it covers.
     fn record_proof(&mut self, domain: CoverageDomain, generation: u64) {
+        self.proved.push((generation, domain));
         for entry in self.entries.values_mut() {
             if !entry.is_open() {
                 continue;
@@ -378,18 +379,30 @@ impl DebtLedger {
             // report overwriting fresh state, but recency alone proves nothing
             // - a newer PARTIAL walk is still partial. The domain has to
             // actually contain the ground the gap was on.
-            if generation >= entry.generation && domain.covers(&entry.domain) {
+            if proof_union_covers(&self.proved, entry.generation, &entry.domain) {
                 entry.proof = ProofStatus::Discharged {
                     evidence: DischargeEvidence::CoveringWalk {
-                        domain: domain.clone(),
+                        domain: entry.domain.clone(),
                     },
                 };
             }
         }
         self.barriers.retain(|_, barrier| {
-            !(generation >= barrier.generation && domain.covers(&barrier.domain))
+            !proof_union_covers(&self.proved, barrier.generation, &barrier.domain)
         });
-        self.proved.push((generation, domain));
+        // A proof older than newly-raised debt cannot discharge it, so proofs
+        // are load-bearing only while they contribute to an obligation or
+        // barrier that is currently open. Drop everything else instead of
+        // rewriting an ever-growing history on every acknowledgement.
+        self.proved.retain(|(proof_generation, proof)| {
+            self.entries.values().any(|entry| {
+                entry.is_open()
+                    && *proof_generation >= entry.generation
+                    && domains_may_join(proof, &entry.domain)
+            }) || self.barriers.values().any(|barrier| {
+                *proof_generation >= barrier.generation && domains_may_join(proof, &barrier.domain)
+            })
+        });
     }
 
     /// Record a walk that stopped at a barrier.
@@ -639,14 +652,144 @@ impl DebtLedger {
 
     /// Operator action: stop automatic retries without accepting the loss.
     pub fn block(&mut self, key: &ObligationKey) -> bool {
-        match self.entries.get_mut(key) {
-            Some(entry) => {
-                entry.policy = PolicyStatus::OperatorBlocked;
-                true
-            }
-            None => false,
+        let mut blocked = false;
+        if let Some(entry) = self.entries.get_mut(key) {
+            entry.policy = PolicyStatus::OperatorBlocked;
+            blocked = true;
+        }
+        if let Some(barrier) = self.barriers.get_mut(key) {
+            barrier.policy = PolicyStatus::OperatorBlocked;
+            blocked = true;
+        }
+        blocked
+    }
+}
+
+fn domains_may_join(proof: &CoverageDomain, target: &CoverageDomain) -> bool {
+    if proof.scope != target.scope {
+        return false;
+    }
+    match (&proof.coordinate, &target.coordinate) {
+        (CoverageCoordinate::Full, _) => true,
+        (CoverageCoordinate::TimeRange { .. }, CoverageCoordinate::TimeRange { .. }) => true,
+        (
+            CoverageCoordinate::UidRange {
+                uid_validity: a, ..
+            },
+            CoverageCoordinate::UidRange {
+                uid_validity: b, ..
+            },
+        ) => a == b,
+        (CoverageCoordinate::PageRange { .. }, CoverageCoordinate::PageRange { .. }) => {
+            proof.snapshot.same_snapshot_as(&target.snapshot)
+        }
+        (CoverageCoordinate::ProviderRegion { .. }, CoverageCoordinate::ProviderRegion { .. }) => {
+            proof.covers(target)
+        }
+        _ => false,
+    }
+}
+
+fn proof_union_covers(
+    proofs: &[(u64, CoverageDomain)],
+    minimum_generation: u64,
+    target: &CoverageDomain,
+) -> bool {
+    if proofs
+        .iter()
+        .any(|(generation, proof)| *generation >= minimum_generation && proof.covers(target))
+    {
+        return true;
+    }
+
+    match &target.coordinate {
+        CoverageCoordinate::TimeRange {
+            from_unix_seconds,
+            to_unix_seconds,
+        } => interval_union_covers(
+            proofs.iter().filter_map(|(generation, proof)| {
+                if *generation < minimum_generation || !domains_may_join(proof, target) {
+                    return None;
+                }
+                match proof.coordinate {
+                    CoverageCoordinate::TimeRange {
+                        from_unix_seconds,
+                        to_unix_seconds,
+                    } => Some((from_unix_seconds, to_unix_seconds)),
+                    _ => None,
+                }
+            }),
+            *from_unix_seconds,
+            *to_unix_seconds,
+        ),
+        CoverageCoordinate::UidRange { from, to, .. } => finite_union_covers(
+            proofs.iter().filter_map(|(generation, proof)| {
+                if *generation < minimum_generation || !domains_may_join(proof, target) {
+                    return None;
+                }
+                match proof.coordinate {
+                    CoverageCoordinate::UidRange { from, to, .. } => Some((from, to)),
+                    _ => None,
+                }
+            }),
+            *from,
+            *to,
+        ),
+        CoverageCoordinate::PageRange { from, to } => finite_union_covers(
+            proofs.iter().filter_map(|(generation, proof)| {
+                if *generation < minimum_generation || !domains_may_join(proof, target) {
+                    return None;
+                }
+                match proof.coordinate {
+                    CoverageCoordinate::PageRange { from, to } => {
+                        Some((u64::from(from), u64::from(to)))
+                    }
+                    _ => None,
+                }
+            }),
+            u64::from(*from),
+            u64::from(*to),
+        ),
+        CoverageCoordinate::Full | CoverageCoordinate::ProviderRegion { .. } => false,
+        _ => false,
+    }
+}
+
+fn finite_union_covers(
+    intervals: impl Iterator<Item = (u64, u64)>,
+    target_from: u64,
+    target_to: u64,
+) -> bool {
+    let mut intervals: Vec<_> = intervals.collect();
+    intervals.sort_unstable();
+    let mut reached = target_from;
+    for (from, to) in intervals {
+        if to <= reached || from > reached {
+            continue;
+        }
+        reached = reached.max(to);
+        if reached >= target_to {
+            return true;
         }
     }
+    false
+}
+
+fn interval_union_covers(
+    intervals: impl Iterator<Item = (Option<i64>, Option<i64>)>,
+    target_from: Option<i64>,
+    target_to: Option<i64>,
+) -> bool {
+    let encode_lower = |value: Option<i64>| value.unwrap_or(i64::MIN);
+    let encode_upper = |value: Option<i64>| value.unwrap_or(i64::MAX);
+    let intervals = intervals.map(|(from, to)| {
+        let from = u64::from_be_bytes(encode_lower(from).to_be_bytes()) ^ (1_u64 << 63);
+        let to = u64::from_be_bytes(encode_upper(to).to_be_bytes()) ^ (1_u64 << 63);
+        (from, to)
+    });
+    let from = u64::from_be_bytes(encode_lower(target_from).to_be_bytes()) ^ (1_u64 << 63);
+    let to = u64::from_be_bytes(encode_upper(target_to).to_be_bytes()) ^ (1_u64 << 63);
+    finite_union_covers(intervals, from, to)
 }
 
 #[cfg(test)]
@@ -765,6 +908,40 @@ mod tests {
         assert!(!ledger.completion_permitted(&scope()));
     }
 
+    #[test]
+    fn adjacent_complete_walks_discharge_debt_only_by_their_union() {
+        let mut ledger = DebtLedger::new();
+        ledger.ingest(
+            &InventoryCoverageReport::degraded(time_domain(30, 90), vec![object("a")]),
+            4,
+            100,
+        );
+        ledger.ingest(
+            &InventoryCoverageReport::complete(time_domain(7, 60)),
+            5,
+            200,
+        );
+        assert!(
+            ledger
+                .entry(&ObligationKey(b"a".to_vec()))
+                .expect("entry")
+                .is_open()
+        );
+
+        ledger.ingest(
+            &InventoryCoverageReport::complete(time_domain(60, 180)),
+            6,
+            300,
+        );
+        assert!(matches!(
+            ledger
+                .entry(&ObligationKey(b"a".to_vec()))
+                .expect("entry")
+                .proof,
+            ProofStatus::Discharged { .. }
+        ));
+    }
+
     /// A stale report must not reverse newer proof.
     #[test]
     fn an_older_generation_cannot_discharge_newer_debt() {
@@ -875,6 +1052,28 @@ mod tests {
             ledger.completion_permitted(&scope()),
             "a waived barrier releases the scope; that is the only escape hatch it has"
         );
+    }
+
+    #[test]
+    fn an_operator_can_block_a_barrier_without_accepting_its_loss() {
+        let mut ledger = DebtLedger::new();
+        let key = ObligationKey(b"page-7".to_vec());
+        ledger.record_barrier(BarrierIncident {
+            key: key.clone(),
+            domain: CoverageDomain::full(scope()),
+            generation: 1,
+            failure_label: "unidentifiable-value".into(),
+            evidence: error(),
+            policy: PolicyStatus::Retrying { attempts: 0 },
+            resume_from: None,
+        });
+
+        assert!(ledger.block(&key));
+        assert_eq!(
+            ledger.barriers().next().expect("barrier").policy,
+            PolicyStatus::OperatorBlocked
+        );
+        assert!(!ledger.completion_permitted(&scope()));
     }
 
     fn region(key: &str, recovery: RegionRecovery) -> InventoryObligation {

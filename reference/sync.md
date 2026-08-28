@@ -324,11 +324,18 @@ hydration walk.
 
 `CheckpointStore` remains a published consumer-implemented trait; ownership is
 enforced by which internal engine type can reach its `Arc`, not by hiding the
-trait. That enforcement is not yet complete. `BackfillCheckpointWriter` still
-holds an `Arc<DynCheckpointStore>` and writes partition checkpoints outside the
-account writer, so the backfill lane remains a second durable path. It is a
-published type and its rewiring belongs with the backfill-runner work, not with
-the recovery paths.
+trait. `BackfillCheckpointWriter` is also published, but its `store` field is an
+account-owned `BackfillCheckpointTarget`, not a store `Arc`.
+`SyncEngine::backfill_checkpoint_writer` constructs it from the attached
+account's writer channel, and `persist` sends `WriterRequest::PersistBackfill`.
+The writer applies that checkpoint beside its authoritative in-memory ledger,
+so the helper cannot perform a read-modify-write outside writer ordering.
+
+The target is a shape change, not a removal: `BackfillCheckpointTarget::direct`
+takes exactly the `Arc<DynCheckpointStore>` the field used to be, so code that
+built the writer by hand still can, and `BackfillCheckpointWriter::new` gives it
+a constructor. That route performs the read-modify-write it always did and is
+documented as carrying the race; the attached route is the one without it.
 
 A public or engine-initiated reopen queues behind `Pause` and runs after
 resume: pause is a quiescence boundary, not permission to open a
@@ -721,10 +728,15 @@ only `add` writes - and eviction reclaims tombstone slots as they
 reach the front, so membership reconverges on `cap` with no scan.
 
 `BackfillCheckpointWriter` (in `backfill/checkpoint.rs`) is a
-thin wrapper over `CheckpointStore::put_backfill`. The runner no
-longer persists (the ack writer does), so the wrapper is unused on
-the hot path today; it remains as a typed helper for consumer-side
-store wiring.
+typed handle onto the attached account's single writer. The runner no longer
+persists (the ack writer does), so the wrapper is unused on the hot path today;
+consumers obtain one through `SyncEngine::backfill_checkpoint_writer` when they
+need the published helper, or build one over a bare store with
+`BackfillCheckpointTarget::direct`.
+
+Partition SEQUENCING is not the orchestrator's; `ScopeWalkDriver` in
+`backfill/scope_walk.rs` owns it, so a barrier stops the enclosing scope walk
+rather than only the partition that hit it. See "A barrier taints the walk".
 
 ## Push
 
@@ -1251,8 +1263,12 @@ snapshot are never the same snapshot, which is why `SnapshotIdentity` comparison
 is `same_snapshot_as` rather than `==`.
 
 Discharge needs BOTH a generation not older than the debt's AND a covering
-domain. Generation alone stops a stale report overwriting newer state; it proves
-nothing on its own, because a newer partial walk is still partial.
+domain or union of domains. Generation alone stops a stale report overwriting
+newer state; it proves nothing on its own, because a newer partial walk is still
+partial. The ledger retains only proofs that can still contribute to an open
+obligation or barrier. Proofs older than newly-raised debt cannot discharge it,
+and proofs whose load-bearing debt has closed are discarded, bounding the
+durable hot-path history without forgetting a partial union still in progress.
 
 ### Proof and policy are separate axes
 
@@ -1299,7 +1315,30 @@ stops. Checkpoints accepted EARLIER in that walk stand: each certifies a prefix
 ending before the barrier region begins. Barriers do not become ledger debt (no
 cursor advanced past them, so there is nothing durable to hang debt off); they
 are recorded as `BarrierIncident`, which is what gives a restart its memory and
-an operator something to waive.
+an operator something to waive or block. `InventoryFusion` and
+`BackfillRunner` both make this decision through the shared `InventoryWalk`
+state, including a barrier carried by terminal `Done`. The incident's
+`resume_from` is always the last checkpoint accepted before the barrier. The
+backfill front end therefore never mints or publishes a positional checkpoint
+for a refused page.
+
+**A barrier stops the SCOPE walk, not only the partition that hit it.** Every
+later partition or page window would carry a checkpoint certifying a prefix that
+crosses the blocked region, so stopping the partition alone reproduces the loss
+one layer up. The backfill orchestrator therefore does not sequence partitions
+itself: `ScopeWalkDriver` (`backfill/scope_walk.rs`) hands out the next partition
+and folds each `BackfillPartitionOutcome` back in, and a walk whose outcome
+carried `ScopeWalkStep::StopScopeWalk` produces no further partition. Both plan
+shapes - the fixed partition set and the open-ended page walk - go through it,
+and the completion sentinel is withheld for the scope.
+
+**An incident the store refused is not an incident.** `record_barriers` returns
+the writer's inner result, and a walk refuses to announce a barrier it could not
+persist: the partition fails, the scope stays `Pending`, and the walk is retried.
+Accepting the failure would announce a barrier that a restart forgets, leaving
+an operator with no durable object to block or waive. A writer that is GONE
+(detach, shutdown) is a different case and is not a failure - there is nothing to
+persist to and nothing to retry against.
 
 `bifrost-graph` reports its id-less-value case as `CheckpointBarrier`. The only
 token at page granularity is a continuation of that delta session, dead as soon
@@ -1405,8 +1444,9 @@ emphatically not that coverage is complete. An earlier revision had a convenienc
 of exactly that shape stamping `Complete` on every write, which is how a durable
 record ends up certifying coverage nothing proved.
 
-Two mutations have no cursor to ride and use `put_ledger`: a barrier incident
-(nothing advanced, by definition) and an operator decision.
+Two mutations have no cursor to ride: a barrier incident (nothing advanced, by
+definition) and an operator decision. Both go through the account writer and
+persist the writer-owned ledger without a checkpoint transition.
 
 Claims are applied when the CONSUMER acknowledges, never when the account emits.
 An unacknowledged report may describe entries the consumer never persisted, so it
@@ -1833,6 +1873,7 @@ crates/sync/src/
                           // live_account + hydration passthrough
   control.rs              // SyncControl + record_checkpoint hook
   error.rs                // engine Error wrapping AccountError + Warning
+  inventory_walk.rs       // shared inventory barrier and resume state
   types.rs                // EngineConfig, MultiplexerConfig,
                           // BackfillConfig, MutationConfig, PushConfig,
                           // SchedulerConfig, AccountSlot, WorkerTask
@@ -1858,6 +1899,8 @@ crates/sync/src/
                           // cap LIVE_SUPERSEDES_DEFAULT_CAP)
     partitioner.rs        // plan() for TimeWindowed / UidRange / PageCount
     checkpoint.rs         // BackfillCheckpointWriter wrapper
+    scope_walk.rs         // ScopeWalkDriver: partition sequencing;
+                          // a barrier stops the whole scope walk
   push/
     mod.rs                // InvalidationSinkInner
                           // (DashMap<AccountId, mpsc>) + coalesced_event

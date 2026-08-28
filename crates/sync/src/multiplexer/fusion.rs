@@ -27,6 +27,7 @@ use tokio::sync::broadcast;
 use crate::control::SyncControl;
 use crate::cursor::CursorRegistry;
 use crate::error::Error;
+use crate::inventory_walk::{InventoryWalk, WalkDecision};
 
 use super::MultiplexerEvent;
 
@@ -127,15 +128,17 @@ impl InventoryFusion {
         // The last checkpoint this walk published. If a later page turns out to
         // be a barrier, this is the position a future walk resumes from - it
         // certifies a prefix ending before the barrier region begins.
-        let mut last_accepted: Option<Checkpoint> = None;
+        let mut walk = InventoryWalk::default();
         while let Some(event) = stream.next().await {
             match event {
                 bifrost_types::InventoryEvent::Done(completion) => {
-                    if completion.coverage.has_barrier() {
+                    if let WalkDecision::StopAtBarrier { resume_from } =
+                        walk.inspect(&completion.coverage)
+                    {
                         // The walk ended on ground the cursor may not cross.
                         // Establishing here would advance past a region nothing
                         // can ever replay.
-                        self.record_barriers(&scope, &completion.coverage, None)
+                        self.record_barriers(&scope, &completion.coverage, resume_from)
                             .await;
                         Self::warn_degraded(&changes_tx, &scope, &completion.coverage);
                         return Ok(FusionOutcome::NoCursor);
@@ -221,8 +224,10 @@ impl InventoryFusion {
                     // walk stops here. Checkpoints already accepted earlier in
                     // this walk stand: each of them certifies a prefix that
                     // ends before this region begins.
-                    if batch.coverage.has_barrier() {
-                        self.record_barriers(&scope, &batch.coverage, last_accepted.clone())
+                    if let WalkDecision::StopAtBarrier { resume_from } =
+                        walk.inspect(&batch.coverage)
+                    {
+                        self.record_barriers(&scope, &batch.coverage, resume_from)
                             .await;
                         if let Some(tx) = &changes_tx {
                             let mut stripped = batch;
@@ -233,9 +238,7 @@ impl InventoryFusion {
                         return Ok(FusionOutcome::NoCursor);
                     }
                     validate_checkpoint_envelope(batch.checkpoint.as_ref())?;
-                    if batch.checkpoint.is_some() {
-                        last_accepted = batch.checkpoint.clone();
-                    }
+                    walk.accept(batch.checkpoint.clone());
                     if let Some(tx) = &changes_tx {
                         self.forward_inventory_batch(tx, &scope, &batch);
                     }
@@ -277,51 +280,21 @@ impl InventoryFusion {
         coverage: &bifrost_types::InventoryCoverageReport,
         resume_from: Option<Checkpoint>,
     ) {
-        let Some(writer) = &self.writer_tx else {
-            return;
-        };
-        for obligation in coverage.obligations() {
-            let bifrost_types::InventoryObligation::Region {
-                key,
-                failure_label,
-                error,
-                recovery,
-            } = obligation
-            else {
-                continue;
-            };
-            if !recovery.is_barrier() {
-                continue;
-            }
-            let incident = crate::cursor::BarrierIncident {
-                key: key.clone(),
-                domain: coverage.domain.clone(),
-                generation: self.generation,
-                failure_label: failure_label.clone(),
-                evidence: error.clone(),
-                policy: crate::cursor::PolicyStatus::Retrying { attempts: 0 },
-                resume_from: resume_from.clone(),
-            };
-            let (done_tx, done_rx) = tokio::sync::oneshot::channel();
-            if writer
-                .send(super::WriterRequest::RecordBarrier {
-                    incident,
-                    done: done_tx,
-                })
-                .await
-                .is_err()
-            {
-                return;
-            }
-            if let Ok(Err(error)) = done_rx.await {
-                tracing::error!(
-                    target: "bifrost.sync.inventory",
-                    account = ?self.account_id,
-                    scope = ?scope,
-                    error = %error,
-                    "failed to persist inventory barrier incident"
-                );
-            }
+        if let Err(error) = crate::inventory_walk::record_barriers(
+            self.writer_tx.as_ref(),
+            coverage,
+            self.generation,
+            resume_from,
+        )
+        .await
+        {
+            tracing::error!(
+                target: "bifrost.sync.inventory",
+                account = ?self.account_id,
+                scope = ?scope,
+                error = %error,
+                "failed to persist inventory barrier incident"
+            );
         }
     }
 

@@ -39,6 +39,7 @@ use tokio::sync::broadcast;
 
 use crate::control::SyncControl;
 use crate::error::Error;
+use crate::inventory_walk::{InventoryWalk, WalkDecision, record_barriers};
 use crate::multiplexer::MultiplexerEvent;
 
 use super::partitioner::partition_key;
@@ -216,8 +217,67 @@ impl LiveSupersedes {
 /// One partition's runner.
 pub struct BackfillRunner;
 
+/// Whether the ENCLOSING scope walk may ask for another partition.
+///
+/// A barrier is a property of the SCOPE, not of the partition that happened to
+/// hit it: the region cannot be represented and cannot be replayed, so every
+/// later partition or page window would carry a checkpoint that leaps over it.
+/// Reporting the stop as a plain "this partition was incomplete" flag was not
+/// enough - both orchestrator loops read that as a degraded partition and went
+/// on to request the next one, recreating the silent-loss bug the barrier stop
+/// exists to prevent one layer up. The verdict is therefore a `#[must_use]`
+/// value produced by `BackfillScopeWalk::admit`, so a loop that folds an
+/// outcome in cannot quietly discard the answer.
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ScopeWalkStep {
+    /// Nothing blocked the scope; the next partition may be requested.
+    RequestNextPartition,
+    /// The scope stopped on ground it may not cross. No further partition or
+    /// page window may be walked for this scope in this pass, and the
+    /// completion marker must be withheld.
+    StopScopeWalk,
+}
+
+/// Folds partition outcomes into the enclosing scope-walk decision.
+///
+/// The orchestrator loops own "do I request another partition?", so the rule
+/// lives here rather than being re-derived at each call site.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BackfillScopeWalk {
+    stopped: bool,
+}
+
+impl BackfillScopeWalk {
+    /// A walk that has not been stopped.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Fold one partition outcome in and answer whether the scope walk may
+    /// continue. Once stopped, a walk stays stopped.
+    pub fn admit(&mut self, outcome: &BackfillPartitionOutcome) -> ScopeWalkStep {
+        if outcome.scope_walk == ScopeWalkStep::StopScopeWalk {
+            self.stopped = true;
+        }
+        if self.stopped {
+            ScopeWalkStep::StopScopeWalk
+        } else {
+            ScopeWalkStep::RequestNextPartition
+        }
+    }
+
+    /// True once any partition has stopped the scope.
+    #[must_use]
+    pub fn stopped(&self) -> bool {
+        self.stopped
+    }
+}
+
 /// Outcome for one partition pass.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BackfillPartitionOutcome {
     /// Inventory entries observed before the live-supersedes filter.
     pub seen: u64,
@@ -232,6 +292,27 @@ pub struct BackfillPartitionOutcome {
     /// page materialized, so an object that never became an entry is not even
     /// in that total - the count cannot be used to detect this.
     pub complete: bool,
+    /// Whether the enclosing scope walk may request another partition.
+    ///
+    /// Distinct from `complete`: an incomplete partition leaves obligations the
+    /// ledger can chase later, whereas `StopScopeWalk` means no later partition
+    /// of this scope may even be requested, because its checkpoint would
+    /// certify a prefix that crosses a region nothing can replay.
+    pub scope_walk: ScopeWalkStep,
+}
+
+impl Default for BackfillPartitionOutcome {
+    /// Defaults are the SAFE answers: nothing counted, nothing complete, and
+    /// the scope walk stopped. A default that read as "continue" would let a
+    /// construction site that forgot the field advance past a barrier.
+    fn default() -> Self {
+        Self {
+            seen: 0,
+            kept: 0,
+            complete: false,
+            scope_walk: ScopeWalkStep::StopScopeWalk,
+        }
+    }
 }
 
 impl BackfillRunner {
@@ -266,9 +347,25 @@ impl BackfillRunner {
         let mut seen_total: u64 = 0;
         let mut kept_total: u64 = 0;
         let mut complete = true;
+        let mut scope_walk = ScopeWalkStep::RequestNextPartition;
+        let mut walk = InventoryWalk::default();
         while let Some(event) = stream.next().await {
             match event {
                 bifrost_types::InventoryEvent::Batch(batch) => {
+                    if batch.validate_boundary().is_err() {
+                        let error = crate::recovery::batch_boundary_violation(
+                            batch.checkpoint.as_ref(),
+                            bifrost_types::AccountOperation::SyncInventory,
+                            &scope,
+                        );
+                        if let Some(tx) = &changes_tx {
+                            let _ = tx.send(MultiplexerEvent::unacked(
+                                scope.clone(),
+                                Arc::new(SyncEvent::Terminated(error.clone())),
+                            ));
+                        }
+                        return Err(Error::Account(error));
+                    }
                     if !batch.coverage.is_complete() {
                         complete = false;
                     }
@@ -277,6 +374,47 @@ impl BackfillRunner {
                     let kept = filter_supersedes(&batch.items, live);
                     let kept_count = u64::try_from(kept.len()).unwrap_or(u64::MAX);
                     kept_total = kept_total.saturating_add(kept_count);
+
+                    if let WalkDecision::StopAtBarrier { resume_from } =
+                        walk.inspect(&batch.coverage)
+                    {
+                        // Announce nothing the writer could not durably record:
+                        // a barrier that only exists in this process is one a
+                        // restart forgets and no operator can act on. Failing
+                        // the partition instead leaves the scope Pending and
+                        // re-walks it, which is recoverable.
+                        record_barriers(writer_tx, &batch.coverage, generation, resume_from)
+                            .await?;
+                        if let Some(tx) = &changes_tx {
+                            let changes = kept
+                                .into_iter()
+                                .map(|entry| {
+                                    Change::ObjectChange(ObjectChange {
+                                        id: entry.id.clone(),
+                                        kind: ObjectChangeKind::Created,
+                                    })
+                                })
+                                .collect();
+                            let synthetic = Batch {
+                                items: changes,
+                                page_boundary: batch.page_boundary,
+                                server_latency: batch.server_latency,
+                                bytes_in: batch.bytes_in,
+                                checkpoint: None,
+                            };
+                            let _ = tx.send(MultiplexerEvent::unacked(
+                                scope.clone(),
+                                Arc::new(SyncEvent::Batch(synthetic)),
+                            ));
+                            warn_barrier(tx, &scope, &batch.coverage);
+                        }
+                        return Ok(BackfillPartitionOutcome {
+                            seen: seen_total,
+                            kept: kept_total,
+                            complete: false,
+                            scope_walk: ScopeWalkStep::StopScopeWalk,
+                        });
+                    }
 
                     // Forward the page as a synthetic Batch carrying a
                     // BackfillCheckpoint. Durable persistence awaits the
@@ -322,6 +460,7 @@ impl BackfillRunner {
                         // a scope-keyed claim would let partition B's report be
                         // persisted under partition A's acknowledgement.
                         let expected = Checkpoint::Backfill(bf);
+                        walk.accept(Some(expected.clone()));
                         let publication = control.map(|control| {
                             control.publish_checkpoint(
                                 expected.clone(),
@@ -356,6 +495,18 @@ impl BackfillRunner {
                     }
                 }
                 bifrost_types::InventoryEvent::Done(completion) => {
+                    if let WalkDecision::StopAtBarrier { resume_from } =
+                        walk.inspect(&completion.coverage)
+                    {
+                        complete = false;
+                        scope_walk = ScopeWalkStep::StopScopeWalk;
+                        record_barriers(writer_tx, &completion.coverage, generation, resume_from)
+                            .await?;
+                        if let Some(tx) = &changes_tx {
+                            warn_barrier(tx, &scope, &completion.coverage);
+                        }
+                        break;
+                    }
                     if !completion.coverage.is_complete() {
                         complete = false;
                         // The terminal summary has no checkpoint of its own to
@@ -405,8 +556,32 @@ impl BackfillRunner {
             seen: seen_total,
             kept: kept_total,
             complete,
+            scope_walk,
         })
     }
+}
+
+fn warn_barrier(
+    tx: &broadcast::Sender<MultiplexerEvent>,
+    scope: &CursorScope,
+    coverage: &bifrost_types::InventoryCoverageReport,
+) {
+    let count = coverage
+        .obligations()
+        .iter()
+        .filter(|obligation| obligation.is_barrier())
+        .count();
+    let warning = bifrost_types::Warning::user_safe(
+        bifrost_types::WarningKind::OperatorAttentionNeeded,
+        format!(
+            "inventory stopped at {count} region(s) it cannot represent and cannot replay; \
+             the scope cannot advance past them until an operator waives them"
+        ),
+    );
+    let _ = tx.send(MultiplexerEvent::unacked(
+        scope.clone(),
+        Arc::new(SyncEvent::Warning(warning)),
+    ));
 }
 
 fn filter_supersedes<'a>(

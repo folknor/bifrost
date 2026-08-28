@@ -31,6 +31,7 @@ pub mod control;
 pub mod cursor;
 pub mod engine;
 pub mod error;
+mod inventory_walk;
 pub mod multiplexer;
 pub mod mutation;
 pub mod push;
