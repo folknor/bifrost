@@ -8,45 +8,6 @@ Hunter note: read the full account layer (mod/changes/push/mutation/flags/scopes
 inventory/cursor, plus the mutation-error helpers and the calendar collection
 paths). Read-only, nothing edited.
 
-## Correctness defects
-
-### G1. `scope_lifecycle_stream` silently loses label Created/Deleted/Renamed events
-
-**High confidence.** `crates/google/src/account/scopes.rs`, the unfold body: each
-poll does `let old = snapshot(&state.cache)` and then `refresh_scope_snapshot(...)`,
-diffing against whatever is *currently* in the shared `ScopeCache`. But that cache
-is also written by `labels_for_flags` and `discover_memberships` - every flag
-mutation, every hydration batch, every inventory prelude refreshes it whenever it
-is older than five minutes. When any of those refresh between two 30-second
-lifecycle polls, the lifecycle stream's `old` already contains the new label set,
-`diff_snapshots` returns empty, and the create/delete/rename is never announced.
-The consumer's container list then silently diverges until something else forces a
-re-read. The fix is that the lifecycle stream must own its own last-emitted
-snapshot in `LifecycleState` rather than reading the shared cache; sharing a cache
-for "current vocabulary" and for "previous state to diff against" is the structural
-mistake.
-
-### G7. Multi-page history walk can skip changes at the checkpoint
-
-**Medium confidence.** `changes.rs` checkpoints the *last* page's
-`response.history_id`, which is the mailbox's current history record at the time of
-that request, not a marker for how far the walk actually read. Records created while
-pages 2..n were being fetched are past the snapshot `history.list` is serving but
-under the id being checkpointed, so they are in neither the emitted batches nor any
-future walk. On a busy mailbox with a multi-page backlog this is a silent skip. The
-safe value is the `historyId` observed on the *first* page of the walk (replay is
-idempotent; skip is not), or the schema bump to a page-token cursor the module doc
-already sketches.
-
-### G8. `events_in_range` cannot report cancelled instances
-
-**Medium confidence.** `calendar.rs`, line ~91:
-`singleEvents=true&orderBy=startTime` with no `showDeleted`. Google omits cancelled
-instances under that combination, so a consumer re-reading a range after an
-organizer cancels a single occurrence of a recurring event sees the instance simply
-absent from the page - indistinguishable from a page boundary - and has no signal to
-delete its local copy.
-
 ## Structural / performance
 
 - **G9. `get_stream` hydrates its batch serially.** `inventory.rs`, `for id in ids {
@@ -75,17 +36,97 @@ delete its local copy.
   `buffer_unordered` fan-out means N concurrent `labels.list` calls, each 1 quota
   unit, each racing to overwrite the cache.
 
-## Shape it should have had
+## G16. The paging guard covers a LIST walk and neither primary sync walk
 
-Two recurring root causes, worth naming above the individual bugs.
+Confidence: high (whole-crate enumeration, done in round 3). Round 3 fixed one
+half of this and deliberately left the rest; the residue is a live finding, not
+a closed one.
 
-First, **`ScopeCache` is doing two incompatible jobs** - "current label vocabulary
-for canonicalization" and "previous state for lifecycle diffing" - and G1 falls
-straight out of that. Split them: the vocabulary stays a shared refresh-on-stale
-cache with single-flight; the lifecycle stream keeps a private `last_emitted:
-Option<ScopeSnapshot>` and never reads the shared one.
+### Where this came from
 
-Nothing here requires removing published API.
+`notes/carry-forward.md` handed this document an open question out of the
+bugs-graph arc. `crates/graph/src/.../paging.rs` cites bifrost-google's
+`calendars_list` as having independently learned the paging lesson, and the
+question was whether Google's DELTA and HISTORY walks got the same guard or
+only its LIST walks. In graph the answer was a split: `PageWalk` bounded six
+incidental traversals and NEITHER of the two delta sync loops, which were the
+crate's PRIMARY sync loops - while `reference/graph.md` claimed the guard was
+universal. The same split exists here.
+
+### The enumeration
+
+Bounded, with repeated-token detection and a 10,000-page budget:
+
+- Calendar `calendars_list` (`calendar.rs`, `MAX_CALENDAR_LIST_PAGES`).
+- Gmail `changes_stream` (`changes.rs`, `MAX_HISTORY_PAGES`) - added by round 3,
+  see below.
+
+Unbounded - follows `nextPageToken` until the field is absent, with no budget
+and no repeated-token detection:
+
+- **Gmail `inventory_stream`** (`inventory.rs`). The crate's primary object
+  enumeration. Also has no durable mid-walk resume, so an interrupted pass
+  restarts from the beginning.
+- **People `address_books_list`** (`contacts.rs`, `contactGroups.list`).
+  Returns no partial result and no resume cursor, so a cycling token is an
+  unbounded loop that can never produce an answer.
+
+Page-resumable - one provider request per call, returning the provider token,
+so the caller bounds the walk:
+
+- Gmail `search` / `search_messages`.
+- People personal-contact list, other-contact list, contact search,
+  other-contact search, autocomplete, directory search. None clips an
+  over-delivered page, so none needs an intra-page offset.
+- Calendar `events_in_range`, and a search constrained to one calendar.
+
+Partly resumable:
+
+- Cross-calendar event search resumes by calendar id AND provider page token,
+  but NOT within an over-delivered page. It relies on Google honouring
+  `maxResults` and defensively clips a loose page, so an over-delivery is
+  discarded rather than resumed. Low severity; recorded so it is not
+  rediscovered as a hole.
+
+### What round 3 fixed, and what it did not
+
+Round 3 bounded `changes_stream` only, because `changes.rs` was already its own
+file (G7 rewrote the checkpointing there) and bounding a loop whose checkpoint
+semantics you just changed belongs in the same change. Refusal TERMINATES with
+`Protocol(ContractViolation)`; it does not truncate. This matters more than the
+bound: `changes_stream` checkpoints only on its final page, so stopping early
+and reporting normal completion would emit a checkpoint claiming coverage the
+walk never read. A `Terminated` costs a redone walk and claims nothing.
+
+**Gmail `inventory_stream` and People `address_books_list` are left to round 4,
+which owns `inventory.rs`.** Do not treat them as accepted. What a fix needs:
+
+- A page budget and a `HashSet` of seen tokens, as in `walk_refusal`
+  (`changes.rs`) and `calendars_list` (`calendar.rs`). The budget is a refusal
+  boundary, not a paging policy - set it far above any real account.
+- A refusal that classifies and terminates. For `inventory_stream` that is
+  `SyncEvent::Terminated`; for `address_books_list`, which returns a `Result`,
+  an `Err`. Neither may return a short list that reads as complete.
+- Care with `inventory_stream` specifically: it is the coverage-obligation
+  producer, so a truncated inventory that reports normally would understate
+  coverage debt - the same lie in a different currency.
+
+### Documentation
+
+`reference/google.md` carried no universal-guard claim (the false claim graph
+had); round 3 added an explicit per-site "Paging inventory" section stating that
+Google has no universal guard, and it is kept in step with the enumeration
+above. If a later round bounds inventory or contact groups, update that section
+in the same commit.
+
+### Lateral, not fixed
+
+`events_search_url` (`calendar.rs`) sends `singleEvents=true` with no
+`showDeleted`, exactly as `events_in_range` did before G8. Not filed as the same
+defect: a range reread is a coverage question, where a missing tombstone is
+indistinguishable from a page boundary, while a SEARCH returning cancelled
+instances is a product decision about what a query surface should answer. Worth
+a deliberate answer, not a reflex copy of the G8 fix.
 
 ## Carried forward from round 2
 

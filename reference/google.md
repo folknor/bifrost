@@ -160,7 +160,9 @@ account-scoped clone attached to `bifrost-net` under the engine
 - `pubsub: Arc<PubSubControl>` holding the watch actor command sender,
   shutdown token, and a `broadcast::Sender<WatchEvent>`. The actor task owns the
   optional config, lifecycle state, and active-handle set exclusively.
-- `scope_cache: Arc<RwLock<ScopeSnapshot>>` for the label list.
+- `scope_cache: Arc<RwLock<ScopeSnapshot>>` for the shared, refresh-on-stale
+  label vocabulary used by canonicalization. Lifecycle diff state is private to
+  each lifecycle stream and never reads this cache.
 - `shutdown: CancellationToken` for the watch actor and the
   lifecycle stream.
 - `set_priority` / `set_bandwidth_cap` delegate to the underlying `AccountNet`.
@@ -453,7 +455,17 @@ the complete `.` and `..` components, which the path encoder
 double-escapes so the URL parser cannot resolve a provider id as path
 navigation; in a query value dots carry no structural meaning. Cross-calendar
 search respects the requested `limit`, never over-fetching at a calendar
-boundary and clipping any loose provider page. Calendar update
+boundary and clipping any loose provider page. `events_in_range` requests
+`showDeleted=true` alongside `singleEvents=true`, so cancelled recurring
+instances remain visible as `EventStatus::Cancelled` instead of disappearing
+from a range reread. Google may return such tombstones with only
+`originalStartTime`; the projection uses that value for both required time
+fields so the stable instance id and cancelled status can cross the shared
+`CalendarEvent` surface. `is_all_day` is read off that EFFECTIVE start rather
+than off `event.start`, because a cancelled instance of an all-day recurrence
+carries only `originalStartTime.date` - reading `event.start` alone paired
+date-valued times with `is_all_day: false`, which the shared surface treats as
+a timed event. Calendar update
 uses `events.move` when `EventPatch.calendar_id` targets a different
 calendar, then applies any remaining field patch against the destination.
 Patch-local validation runs before the move, so a patch that could never
@@ -569,12 +581,28 @@ nothing cached, the operation fails rather than canonicalizing against
 an empty vocabulary; a populated stale cache stays usable when a later
 refresh fails.
 
-`scope_lifecycle_stream` treats a never-populated cache as a seeding
-state. Its first successful label fetch updates the cache and emits no
-Created events. Later polls diff populated snapshots. Rename events
+`scope_lifecycle_stream` owns a private `last_emitted: Option<ScopeSnapshot>`.
+Its first successful label fetch seeds that state and emits no Created events.
+Later polls diff only against the last snapshot observed by that stream, so a
+flag mutation, hydration batch, inventory prelude, or membership discovery that
+refreshes the shared vocabulary cannot consume lifecycle changes. Rename events
 carry the same stable label id in `old` and `new`; they are invalidation
 signals telling the consumer to re-read container metadata, not a
 carrier for the old and new display names.
+
+The poll cadence is a separate piece of state, `next_delay: Option<Duration>`,
+and NOT a function of `last_emitted`. `None` means no poll has been attempted
+yet and the first one runs immediately; every later attempt waits. Keying the
+delay off the baseline snapshot instead conflated "a poll has happened" with "a
+poll has succeeded", so a retryable `labels.list` failure before the first
+successful snapshot re-issued the request with no delay - an outage became a hot
+request loop. A retryable failure doubles the wait from
+`LIFECYCLE_POLL_INTERVAL` up to `LIFECYCLE_MAX_BACKOFF`; the reset happens only
+on a `labels.list` that actually completed, the same rule bifrost-graph's EWS
+reconnect backoff follows for the same reason. The wait is a `select!` against
+the shutdown token, so `close()` ends the stream where it happens rather than at
+the end of the backoff. Terminal and engine-action classes still end the stream
+with `ScopeLifecycleEvent::Terminated` instead of backing off.
 
 `get_stream` consumes a stream of `ObjectId`s in batches of 32
 and emits `AccountStream<SyncEvent<ItemOutcome<HydratedObject>>>`.
@@ -620,14 +648,15 @@ that account's history is mixed into the existing slot, and there is no
 token-source identity binding upstream to lean on. It comes out when that
 binding exists, not before; do not re-file it as free savings.
 
-With the identity
-confirmed, the stream pages `users.history.list` from
-`startHistoryId`. Intermediate pages emit `checkpoint: None`, because
-Gmail's opaque page token is not represented in the cursor and the
-response `historyId` is the mailbox-wide final position rather than a
-per-page resume marker. Only the final page emits
-`Checkpoint::Change(cursor_for_history(history_id, email))`, then the
-stream terminates with `SyncEvent::Done(None)`.
+With the identity confirmed, the stream pages `users.history.list` from
+`startHistoryId`. Intermediate pages emit `checkpoint: None`, because Gmail's
+opaque page token is not represented in the cursor. Each response `historyId`
+is the mailbox's current position when that page is requested, not a marker for
+how far the response snapshot has been consumed. The walk therefore retains the
+first page's `historyId` and uses that value for the final
+`Checkpoint::Change`. Records arriving while later pages are fetched may replay
+on the next walk, but cannot fall below a checkpoint the walk did not earn. The
+stream then terminates with `SyncEvent::Done(None)`.
 
 History entries map to `Change` variants in
 `changes_from_history`:
@@ -637,6 +666,44 @@ History entries map to `Change` variants in
 - `messagesDeleted` -> `ObjectChange::Destroyed`.
 - `labelsAdded` / `labelsRemoved` -> `ScopeChange` rows scoped
   per label.
+
+## Paging inventory
+
+Google has no universal paging guard. The production paging sites are:
+
+- Gmail `search` and `search_messages` each request one provider page and return
+  its `nextPageToken`. They are bounded by one request per call and resume at a
+  page boundary, not inside an over-delivered page.
+- Gmail `inventory_stream` traverses `users.messages.list` until the token is
+  absent. It has neither a page budget nor repeated-token detection and has no
+  durable mid-walk resume token; interruption restarts the inventory pass.
+- Gmail `changes_stream` traverses `users.history.list` with repeated-token
+  detection and a 10,000-page budget (`MAX_HISTORY_PAGES`). It cannot resume
+  mid-walk, and only its final batch checkpoints, using the first page's history
+  boundary as described above - so a refusal must terminate rather than truncate,
+  or the walk would emit a checkpoint for ground it never read. Both guards
+  therefore produce `SyncEvent::Terminated` carrying
+  `Protocol(ContractViolation)`, discarding the page in hand; the next walk
+  restarts from the same unchanged `startHistoryId`.
+- People `address_books_list` traverses `contactGroups.list` until the token is
+  absent. It has neither a page budget nor repeated-token detection and returns
+  no partial result or resume cursor.
+- People personal-contact list, other-contact list, contact search,
+  other-contact search, autocomplete, and directory search each request one
+  provider page and return its token. They are bounded by one request per call
+  and resume at page boundaries. None clips an over-delivered page, so none needs
+  an intra-page offset to preserve returned items.
+- Calendar `calendars_list` traverses the calendar list with repeated-token
+  detection and a 10,000-page budget. It returns only after the traversal, so it
+  cannot resume mid-walk.
+- Calendar `events_in_range` and a search constrained to one calendar each
+  request one provider page and return its token. They are bounded by one request
+  per call and resume at page boundaries.
+- Cross-calendar event search first runs the bounded `calendars_list`, then
+  walks the finite calendar vector until the requested result limit or a provider
+  page boundary. Its cursor records calendar id plus provider page token, so it
+  resumes at either boundary. It does not encode an intra-page offset; the code
+  relies on Google's `maxResults` contract and defensively clips a loose page.
 
 ## Repairing inventory coverage debt
 

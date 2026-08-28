@@ -88,7 +88,7 @@ pub(crate) fn events_in_range(
         let time_min = google_range_bound(&range.start, "timeMin")?;
         let time_max = google_range_bound(&range.end, "timeMax")?;
         let mut url = format!(
-            "{}/calendars/{encoded}/events?singleEvents=true&orderBy=startTime&timeMin={}&timeMax={}",
+            "{}/calendars/{encoded}/events?singleEvents=true&showDeleted=true&orderBy=startTime&timeMin={}&timeMax={}",
             client.calendar_base(),
             bifrost_net::url::encode_query_value(&time_min),
             bifrost_net::url::encode_query_value(&time_max)
@@ -473,16 +473,29 @@ fn event_from_google(
 ) -> Result<CalendarEvent, AccountError> {
     let event_id = event.id.unwrap_or_default();
     let native = join_event_id(&calendar_id, &event_id);
-    let is_all_day = event
-        .start
+    let cancelled_instance_time = (event.status.as_deref() == Some("cancelled"))
+        .then(|| event.original_start_time.clone())
+        .flatten();
+    // `is_all_day` must be read off the EFFECTIVE start, not `event.start`.
+    // A cancelled instance of an all-day recurrence arrives with no `start`
+    // at all and only `originalStartTime.date`, so deciding all-day-ness
+    // from `event.start` alone yields a date-valued start and end paired
+    // with `is_all_day: false` - a shape the shared surface treats as a
+    // timed event and renders at midnight.
+    let effective_start = event.start.or_else(|| cancelled_instance_time.clone());
+    let is_all_day = effective_start
         .as_ref()
         .is_some_and(|time| time.date.is_some() && time.date_time.is_none());
-    let start = event.start.map(event_time).ok_or_else(|| {
+    let start = effective_start.map(event_time).ok_or_else(|| {
         local_error_with_field(operation, "start", "Google event missing start".to_string())
     })?;
-    let end = event.end.map(event_time).ok_or_else(|| {
-        local_error_with_field(operation, "end", "Google event missing end".to_string())
-    })?;
+    let end = event
+        .end
+        .or(cancelled_instance_time)
+        .map(event_time)
+        .ok_or_else(|| {
+            local_error_with_field(operation, "end", "Google event missing end".to_string())
+        })?;
     Ok(CalendarEvent {
         id: EventId(native.clone()),
         calendar_id: CalendarId(calendar_id.clone()),
@@ -1184,6 +1197,88 @@ mod tests {
         .expect_err("missing start should fail");
 
         assert_eq!(error.operation(), Some(AccountOperation::EventGet));
+    }
+
+    #[tokio::test]
+    async fn events_in_range_requests_and_surfaces_cancelled_instances() {
+        let (client, script) = scripted_client(vec![canned_json(
+            StatusCode::OK,
+            json!({
+                "items": [{
+                    "id": "cancelled-instance",
+                    "status": "cancelled",
+                    "originalStartTime": {"dateTime": "2026-06-02T12:00:00Z"}
+                }]
+            }),
+        )]);
+        let range = EventRange {
+            calendar_id: CalendarId("primary".to_string()),
+            start: bifrost_types::EventTime {
+                value: "2026-06-01T00:00:00Z".to_string(),
+                timezone: None,
+            },
+            end: bifrost_types::EventTime {
+                value: "2026-06-03T00:00:00Z".to_string(),
+                timezone: None,
+            },
+            limit: None,
+            page_cursor: None,
+        };
+
+        let page = events_in_range(client, range).await.expect("range loads");
+
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].status, EventStatus::Cancelled);
+        assert!(
+            !page.items[0].is_all_day,
+            "a dateTime tombstone is a timed instance",
+        );
+        assert!(script.requests()[0].url.query().is_some_and(|query| {
+            query.contains("singleEvents=true") && query.contains("showDeleted=true")
+        }));
+    }
+
+    /// A cancelled instance of an ALL-DAY recurrence carries no `start`
+    /// and only `originalStartTime.date`. Reading all-day-ness off
+    /// `event.start` alone left `is_all_day: false` beside date-valued
+    /// start and end fields, which the shared surface reads as a timed
+    /// event at midnight.
+    #[tokio::test]
+    async fn a_cancelled_all_day_instance_stays_all_day() {
+        let (client, _script) = scripted_client(vec![canned_json(
+            StatusCode::OK,
+            json!({
+                "items": [{
+                    "id": "cancelled-all-day",
+                    "status": "cancelled",
+                    "originalStartTime": {"date": "2026-06-02"}
+                }]
+            }),
+        )]);
+        let range = EventRange {
+            calendar_id: CalendarId("primary".to_string()),
+            start: bifrost_types::EventTime {
+                value: "2026-06-01T00:00:00Z".to_string(),
+                timezone: None,
+            },
+            end: bifrost_types::EventTime {
+                value: "2026-06-03T00:00:00Z".to_string(),
+                timezone: None,
+            },
+            limit: None,
+            page_cursor: None,
+        };
+
+        let page = events_in_range(client, range).await.expect("range loads");
+
+        let event = &page.items[0];
+        assert_eq!(event.status, EventStatus::Cancelled);
+        assert_eq!(event.start.value, "2026-06-02");
+        assert_eq!(event.end.value, "2026-06-02");
+        assert!(
+            event.is_all_day,
+            "a date-valued tombstone must project as an all-day instance",
+        );
     }
 
     #[test]

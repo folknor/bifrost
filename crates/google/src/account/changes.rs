@@ -6,6 +6,7 @@
 //! account cursor scope, which the central recovery mapper resolves
 //! to `Engine(RestartScope(CursorScope::Account))`.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -22,6 +23,22 @@ use crate::types::{GmailHistoryItem, GmailMessage, GmailProfile};
 
 use super::cursor::{cursor_for_history, decode_gmail_state};
 use super::error as account_error;
+
+/// Upper bound on `users.history.list` pages in a single walk.
+///
+/// The walk had no bound at all: it followed `nextPageToken` until the
+/// field was absent, so a server that keeps handing one back - a bug, a
+/// misbehaving proxy, a token that echoes itself - spins forever issuing
+/// quota-bearing requests. The budget is deliberately far above any real
+/// mailbox (a history page carries up to 500 records, so this covers five
+/// million change records in one walk) because it is a refusal boundary,
+/// not a paging policy: it must never fire for a real account.
+///
+/// Refusal must TERMINATE, never truncate. `changes_stream` checkpoints
+/// only on its final page, so stopping early and reporting a normal
+/// completion would tell the engine the walk covered ground it never read;
+/// a `SyncEvent::Terminated` costs a redone walk and claims nothing.
+const MAX_HISTORY_PAGES: usize = 10_000;
 
 pub(crate) fn changes_stream(
     client: Arc<GmailClient>,
@@ -42,6 +59,9 @@ pub(crate) fn changes_stream(
         cursor: Some(cursor),
         page_token: None,
         start_history_id: None,
+        walk_history_id: None,
+        seen_page_tokens: HashSet::new(),
+        pages_walked: 0,
         finished: false,
         emitted_done: false,
         checked_profile: false,
@@ -161,10 +181,34 @@ pub(crate) fn changes_stream(
                         return Some((SyncEvent::Terminated(account_error), state));
                     }
                 };
+                state.pages_walked += 1;
+                if let Some(refusal) = walk_refusal(
+                    &mut state.seen_page_tokens,
+                    state.pages_walked,
+                    response.next_page_token.as_deref(),
+                ) {
+                    // The page just read is discarded on purpose. The walk
+                    // has emitted no checkpoint yet (only a final page
+                    // does), so the next walk restarts from the same
+                    // `startHistoryId` and re-reads it; keeping the page
+                    // would buy nothing and risk reading a partial walk as
+                    // progress.
+                    state.finished = true;
+                    state.emitted_done = true;
+                    let account_error = account_error::into_account_error(
+                        Error::Local(GmailLocalError::Internal { detail: refusal }),
+                        account_error::GmailErrorContext::changes(),
+                    );
+                    return Some((SyncEvent::Terminated(account_error), state));
+                }
                 let items = changes_from_history(&response.history);
                 let is_final = response.next_page_token.is_none();
-                let checkpoint =
-                    checkpoint_for_history_page(is_final, history_id, &state.profile.email_address);
+                let walk_history_id = *state.walk_history_id.get_or_insert(history_id);
+                let checkpoint = checkpoint_for_history_page(
+                    is_final,
+                    walk_history_id,
+                    &state.profile.email_address,
+                );
                 state.page_token = response.next_page_token;
                 if is_final {
                     state.finished = true;
@@ -197,12 +241,36 @@ pub(crate) fn changes_stream(
     }))
 }
 
+/// Decides whether the walk must refuse to follow `next_page_token`,
+/// returning the diagnostic detail for the terminating error.
+///
+/// Two independent guards, matching `calendars_list`: a repeated token
+/// means the server is cycling and no amount of further paging makes
+/// progress, and the page budget catches a server that hands out fresh
+/// tokens forever. `None` means the walk may continue (or stop normally,
+/// when there is no token at all).
+fn walk_refusal(
+    seen_page_tokens: &mut HashSet<String>,
+    pages_walked: usize,
+    next_page_token: Option<&str>,
+) -> Option<String> {
+    let token = next_page_token?;
+    if !seen_page_tokens.insert(token.to_string()) {
+        return Some("gmail users.history.list repeated a page token".to_string());
+    }
+    (pages_walked >= MAX_HISTORY_PAGES)
+        .then(|| format!("gmail users.history.list exceeded {MAX_HISTORY_PAGES} pages in one walk"))
+}
+
 /// Only the final page of a history walk may advance the durable cursor.
 ///
-/// `response.history_id` is the mailbox's *current* history record, so it
-/// is the same value on every page of the walk rather than a per-page
-/// resume marker, and `GmailChangeState` carries no page token to record
-/// how far into the walk we are. Checkpointing an intermediate page would
+/// `response.history_id` is the mailbox's current history record at the
+/// time each page is requested, not a per-page resume marker. Records can
+/// arrive while a multi-page response snapshot is being drained, so the
+/// final checkpoint uses the value observed on the first page. That can
+/// replay concurrent records on the next walk, but cannot skip them.
+/// `GmailChangeState` carries no page token to record how far into the walk
+/// we are. Checkpointing an intermediate page would
 /// therefore tell the engine "durably at 400" while pages two and three
 /// are still unread; a restart or a `pause()` landing on that batch
 /// resumes from 400 and those changes are gone for good, because Gmail
@@ -227,6 +295,9 @@ struct ChangeState {
     cursor: Option<bifrost_types::ChangeCursor>,
     page_token: Option<String>,
     start_history_id: Option<String>,
+    walk_history_id: Option<u64>,
+    seen_page_tokens: HashSet<String>,
+    pages_walked: usize,
     finished: bool,
     emitted_done: bool,
     checked_profile: bool,
@@ -308,6 +379,117 @@ mod tests {
             checkpoint_for_history_page(true, 400, "person@example.com"),
             Some(Checkpoint::Change(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn multi_page_walk_checkpoints_the_first_pages_history_boundary() {
+        let client = scripted_client(vec![
+            ok_json(json!({ "emailAddress": "person@example.com", "historyId": "100" })),
+            ok_json(json!({
+                "historyId": "200",
+                "history": [{"messagesAdded": [{"message": message("first", &[])}]}],
+                "nextPageToken": "page-2"
+            })),
+            ok_json(json!({
+                "historyId": "250",
+                "history": [{"messagesAdded": [{"message": message("second", &[])}]}]
+            })),
+        ]);
+        let profile = GmailProfile {
+            email_address: "person@example.com".to_string(),
+            history_id: "100".to_string(),
+        };
+
+        let events = changes_stream(
+            client,
+            profile,
+            cursor_for_history(100, "person@example.com"),
+        )
+        .collect::<Vec<_>>()
+        .await;
+
+        let SyncEvent::Batch(final_page) = &events[1] else {
+            panic!("second history response must be a batch");
+        };
+        let Some(Checkpoint::Change(cursor)) = &final_page.checkpoint else {
+            panic!("final history page must carry a change checkpoint");
+        };
+        let state = decode_gmail_state(&cursor.server_state).expect("checkpoint decodes");
+        assert_eq!(state.history_id, 200);
+    }
+
+    /// A server that keeps handing back the same page token makes no
+    /// progress, so the walk must stop. It must stop by TERMINATING:
+    /// reporting a normal completion would emit a final checkpoint for a
+    /// walk that never reached the end of the history, claiming coverage
+    /// it did not earn.
+    #[tokio::test]
+    async fn a_repeated_history_page_token_terminates_the_walk() {
+        let client = scripted_client(vec![
+            ok_json(json!({ "emailAddress": "person@example.com", "historyId": "100" })),
+            ok_json(json!({
+                "historyId": "200",
+                "history": [{"messagesAdded": [{"message": message("first", &[])}]}],
+                "nextPageToken": "stuck"
+            })),
+            ok_json(json!({
+                "historyId": "200",
+                "history": [{"messagesAdded": [{"message": message("second", &[])}]}],
+                "nextPageToken": "stuck"
+            })),
+        ]);
+        let profile = GmailProfile {
+            email_address: "person@example.com".to_string(),
+            history_id: "100".to_string(),
+        };
+
+        let events = changes_stream(
+            client,
+            profile,
+            cursor_for_history(100, "person@example.com"),
+        )
+        .collect::<Vec<_>>()
+        .await;
+
+        let SyncEvent::Batch(first) = &events[0] else {
+            panic!("the first history page is delivered normally");
+        };
+        assert!(matches!(first.page_boundary, PageBoundary::Page));
+        assert!(
+            first.checkpoint.is_none(),
+            "an intermediate page never checkpoints",
+        );
+        let SyncEvent::Terminated(error) = &events[1] else {
+            panic!("a cycling page token must terminate, not complete");
+        };
+        assert!(matches!(
+            error.kind(),
+            bifrost_types::AccountErrorKind::Protocol(
+                bifrost_types::ProtocolErrorKind::ContractViolation
+            )
+        ));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, SyncEvent::Done(_))),
+            "a refused walk must not report completion",
+        );
+    }
+
+    /// The budget is the second guard, for a server that cycles through
+    /// FRESH tokens forever - repeated-token detection never fires there.
+    #[test]
+    fn the_page_budget_refuses_a_walk_that_never_ends() {
+        let mut seen = HashSet::new();
+        assert!(
+            walk_refusal(&mut seen, MAX_HISTORY_PAGES - 1, Some("more")).is_none(),
+            "the last page inside the budget still follows its token",
+        );
+        assert!(walk_refusal(&mut seen, MAX_HISTORY_PAGES, Some("another")).is_some());
+        assert!(
+            walk_refusal(&mut seen, MAX_HISTORY_PAGES, None).is_none(),
+            "a walk that ends on the budget page ends normally",
+        );
     }
 
     fn history(value: serde_json::Value) -> Vec<GmailHistoryItem> {

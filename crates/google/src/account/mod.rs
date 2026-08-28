@@ -298,11 +298,7 @@ impl Account for GoogleAccount {
     }
 
     fn scope_lifecycle_stream(&self) -> AccountStream<ScopeLifecycleEvent> {
-        scopes::scope_lifecycle_stream(
-            Arc::clone(&self.client),
-            Arc::clone(&self.scope_cache),
-            self.shutdown.clone(),
-        )
+        scopes::scope_lifecycle_stream(Arc::clone(&self.client), self.shutdown.clone())
     }
 
     fn establish_initial_cursor(

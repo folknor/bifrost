@@ -15,6 +15,13 @@ use crate::types::GmailLabel;
 use super::error;
 
 const LIFECYCLE_POLL_INTERVAL: Duration = Duration::from_secs(30);
+/// Ceiling for the lifecycle poll's failure backoff.
+///
+/// A retryable `labels.list` failure doubles the wait rather than
+/// re-polling on the ordinary cadence, so a multi-hour outage costs a
+/// bounded trickle of requests and warnings instead of one every thirty
+/// seconds forever.
+const LIFECYCLE_MAX_BACKOFF: Duration = Duration::from_secs(480);
 pub(crate) const SCOPE_CACHE_STALE_AFTER: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Clone)]
@@ -52,10 +59,57 @@ pub(crate) type ScopeCache = Arc<RwLock<ScopeSnapshot>>;
 
 struct LifecycleState {
     client: Arc<GmailClient>,
-    cache: ScopeCache,
     shutdown: CancellationToken,
     pending: VecDeque<ScopeLifecycle>,
-    initialized: bool,
+    /// Diff baseline, private to this stream.
+    ///
+    /// Deliberately NOT the shared `ScopeCache`: that cache is also
+    /// written by `labels_for_flags` and `discover_memberships` whenever
+    /// it goes stale, so a refresh landing between two lifecycle polls
+    /// used to move the baseline forward and make the next diff empty -
+    /// the create, delete or rename was then never announced.
+    last_emitted: Option<ScopeSnapshot>,
+    /// How long to wait before the NEXT poll, or `None` when no poll has
+    /// been attempted yet.
+    ///
+    /// This is the attempt counter, not a baseline check. Keying the
+    /// delay off `last_emitted` instead conflates "a poll has happened"
+    /// with "a poll has SUCCEEDED", so a failing first poll looped with
+    /// no wait at all and turned an outage into a hot request loop.
+    next_delay: Option<Duration>,
+}
+
+impl LifecycleState {
+    /// Waits out the inter-poll delay, returning `false` if the stream
+    /// was cancelled while waiting.
+    async fn await_next_poll(&mut self) -> bool {
+        let Some(delay) = self.next_delay else {
+            // First attempt of the stream's life: poll immediately so a
+            // consumer gets its baseline without a cold-start stall.
+            self.next_delay = Some(LIFECYCLE_POLL_INTERVAL);
+            return true;
+        };
+        tokio::select! {
+            () = self.shutdown.cancelled() => false,
+            () = tokio::time::sleep(delay) => true,
+        }
+    }
+
+    fn note_poll_succeeded(&mut self) {
+        self.next_delay = Some(LIFECYCLE_POLL_INTERVAL);
+    }
+
+    /// Backs the cadence off after a retryable failure.
+    ///
+    /// Reset happens only in `note_poll_succeeded`, on a labels.list that
+    /// actually completed. `bifrost-graph` paid for the other design: its
+    /// EWS reconnect backoff has to reset on a completed read rather than
+    /// on a successful subscribe, because an appliance that accepts every
+    /// attempt and then fails it spins forever otherwise.
+    fn note_poll_failed(&mut self) {
+        let previous = self.next_delay.unwrap_or(LIFECYCLE_POLL_INTERVAL);
+        self.next_delay = Some(previous.saturating_mul(2).min(LIFECYCLE_MAX_BACKOFF));
+    }
 }
 
 pub(crate) fn discover_cursor_scopes() -> AccountStream<SyncEvent<CursorScope>> {
@@ -116,15 +170,14 @@ pub(crate) fn discover_memberships(
 
 pub(crate) fn scope_lifecycle_stream(
     client: Arc<GmailClient>,
-    cache: ScopeCache,
     shutdown: CancellationToken,
 ) -> AccountStream<ScopeLifecycleEvent> {
     let state = LifecycleState {
         client,
-        cache,
         shutdown,
         pending: VecDeque::new(),
-        initialized: false,
+        last_emitted: None,
+        next_delay: None,
     };
     Box::pin(stream::unfold(state, |mut state| async move {
         loop {
@@ -134,19 +187,14 @@ pub(crate) fn scope_lifecycle_stream(
             if state.shutdown.is_cancelled() {
                 return None;
             }
-            if state.initialized {
-                tokio::select! {
-                    () = state.shutdown.cancelled() => return None,
-                    () = tokio::time::sleep(LIFECYCLE_POLL_INTERVAL) => {}
-                }
-            } else {
-                state.initialized = true;
+            if !state.await_next_poll().await {
+                return None;
             }
 
-            let old = snapshot(&state.cache);
-            match refresh_scope_snapshot(&state.client, &state.cache).await {
+            match fetch_scope_snapshot(&state.client).await {
                 Ok(new) => {
-                    state.pending = lifecycle_diff(&old, &new).into();
+                    state.note_poll_succeeded();
+                    state.pending = record_lifecycle_snapshot(&mut state.last_emitted, new).into();
                 }
                 Err(error) => {
                     // Classify: terminal / engine-action -> emit
@@ -161,6 +209,7 @@ pub(crate) fn scope_lifecycle_stream(
                     if acct.recovery().is_terminal() || acct.recovery().requires_engine_action() {
                         return Some((ScopeLifecycleEvent::Terminated(acct), state));
                     }
+                    state.note_poll_failed();
                     tracing::warn!(
                         target: "bifrost.gmail.scope_lifecycle",
                         kind = ?acct.kind(),
@@ -173,12 +222,13 @@ pub(crate) fn scope_lifecycle_stream(
     }))
 }
 
-fn lifecycle_diff(old: &ScopeSnapshot, new: &ScopeSnapshot) -> Vec<ScopeLifecycle> {
-    if old.fetched_at.is_none() {
-        Vec::new()
-    } else {
-        diff_snapshots(old, new)
-    }
+fn record_lifecycle_snapshot(
+    last_emitted: &mut Option<ScopeSnapshot>,
+    new: ScopeSnapshot,
+) -> Vec<ScopeLifecycle> {
+    last_emitted
+        .replace(new.clone())
+        .map_or_else(Vec::new, |old| diff_snapshots(&old, &new))
 }
 
 /// The label vocabulary every flag-canonicalizing call site must go
@@ -221,15 +271,18 @@ pub(crate) async fn refresh_scope_snapshot(
     client: &GmailClient,
     cache: &ScopeCache,
 ) -> crate::Result<ScopeSnapshot> {
-    let labels = client.list_labels().await?;
-    let snapshot = ScopeSnapshot {
-        labels,
-        fetched_at: Some(Instant::now()),
-    };
+    let snapshot = fetch_scope_snapshot(client).await?;
     if let Ok(mut guard) = cache.write() {
         *guard = snapshot.clone();
     }
     Ok(snapshot)
+}
+
+async fn fetch_scope_snapshot(client: &GmailClient) -> crate::Result<ScopeSnapshot> {
+    Ok(ScopeSnapshot {
+        labels: client.list_labels().await?,
+        fetched_at: Some(Instant::now()),
+    })
 }
 
 fn diff_snapshots(old: &ScopeSnapshot, new: &ScopeSnapshot) -> Vec<ScopeLifecycle> {
@@ -277,7 +330,44 @@ fn diff_snapshots(old: &ScopeSnapshot, new: &ScopeSnapshot) -> Vec<ScopeLifecycl
 
 #[cfg(test)]
 mod tests {
+    use bifrost_net::test_support::{Canned, ScriptedDispatch};
+    use bifrost_net::{NetConfig, RetryPolicy, StaticTokenSource};
+    use bytes::Bytes;
+    use reqwest::StatusCode;
+    use serde_json::json;
+
     use super::*;
+
+    fn ok_json(value: serde_json::Value) -> Canned {
+        Canned::Response {
+            status: StatusCode::OK,
+            headers: reqwest::header::HeaderMap::new(),
+            body: Bytes::from(serde_json::to_vec(&value).expect("fixture serializes")),
+        }
+    }
+
+    fn scripted_client(steps: Vec<Canned>) -> (Arc<GmailClient>, Arc<ScriptedDispatch>) {
+        let script = ScriptedDispatch::new(steps);
+        let net = bifrost_net::test_support::scripted_account(
+            &script,
+            NetConfig::default(),
+            Vec::new(),
+            Arc::new(StaticTokenSource::new("token", None)),
+            RetryPolicy::disabled(),
+        );
+        (
+            Arc::new(GmailClient::with_account_net("https://gmail.test", net)),
+            script,
+        )
+    }
+
+    fn unavailable() -> Canned {
+        Canned::Response {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            headers: reqwest::header::HeaderMap::new(),
+            body: Bytes::new(),
+        }
+    }
 
     fn label(id: &str, name: &str, label_type: &str) -> GmailLabel {
         GmailLabel {
@@ -290,20 +380,20 @@ mod tests {
 
     #[test]
     fn first_successful_lifecycle_snapshot_seeds_without_created_events() {
-        let old = ScopeSnapshot::empty();
+        let mut last_emitted = None;
         let new = ScopeSnapshot {
             labels: vec![label("Label_1", "One", "user")],
             fetched_at: Some(Instant::now()),
         };
-        assert!(lifecycle_diff(&old, &new).is_empty());
+        assert!(record_lifecycle_snapshot(&mut last_emitted, new).is_empty());
     }
 
     #[test]
     fn populated_lifecycle_snapshot_still_emits_real_changes() {
-        let old = ScopeSnapshot {
+        let mut last_emitted = Some(ScopeSnapshot {
             labels: vec![label("Label_1", "One", "user")],
             fetched_at: Some(Instant::now()),
-        };
+        });
         let new = ScopeSnapshot {
             labels: vec![
                 label("Label_1", "One", "user"),
@@ -312,10 +402,125 @@ mod tests {
             fetched_at: Some(Instant::now()),
         };
         assert!(matches!(
-            lifecycle_diff(&old, &new).as_slice(),
+            record_lifecycle_snapshot(&mut last_emitted, new).as_slice(),
             [ScopeLifecycle::Created(MembershipScope::Label(LabelId(id)))]
                 if id == "Label_2"
         ));
+    }
+
+    /// The interfering writer is the whole bug. `discover_memberships`
+    /// refreshes the SHARED `ScopeCache` unconditionally, so while the
+    /// lifecycle diff read that cache, a membership discovery landing
+    /// between two polls moved the baseline forward and the next diff
+    /// came back empty - the label creation was never announced and the
+    /// consumer's container list silently diverged.
+    #[tokio::test(start_paused = true)]
+    async fn a_shared_cache_refresh_between_polls_does_not_swallow_creation() {
+        let (client, script) = scripted_client(vec![
+            ok_json(json!({
+                "labels": [{"id": "Label_1", "name": "One", "type": "user"}]
+            })),
+            ok_json(json!({
+                "labels": [
+                    {"id": "Label_1", "name": "One", "type": "user"},
+                    {"id": "Label_2", "name": "Two", "type": "user"}
+                ]
+            })),
+            ok_json(json!({
+                "labels": [
+                    {"id": "Label_1", "name": "One", "type": "user"},
+                    {"id": "Label_2", "name": "Two", "type": "user"}
+                ]
+            })),
+        ]);
+        let cache: ScopeCache = Arc::new(RwLock::new(ScopeSnapshot::empty()));
+        let shutdown = CancellationToken::new();
+        let mut lifecycle = scope_lifecycle_stream(Arc::clone(&client), shutdown);
+        let next_event = tokio::spawn(async move { lifecycle.next().await });
+        while script.requests().is_empty() {
+            tokio::task::yield_now().await;
+        }
+
+        let discovered = discover_memberships(Arc::clone(&client), Arc::clone(&cache))
+            .collect::<Vec<_>>()
+            .await;
+        assert!(matches!(discovered.first(), Some(SyncEvent::Batch(_))));
+        assert_eq!(
+            snapshot(&cache).labels.len(),
+            2,
+            "the interfering writer must have advanced the shared cache",
+        );
+
+        tokio::time::advance(LIFECYCLE_POLL_INTERVAL).await;
+        assert!(matches!(
+            next_event.await.expect("lifecycle task joins"),
+            Some(ScopeLifecycleEvent::Lifecycle(ScopeLifecycle::Created(
+                MembershipScope::Label(LabelId(id))
+            ))) if id == "Label_2"
+        ));
+    }
+
+    /// Before a baseline exists there is nothing to diff, but there is
+    /// still something to WAIT for. Keying the inter-poll delay off the
+    /// baseline snapshot made a failing first poll re-issue `labels.list`
+    /// with no delay at all, so an outage became a hot request loop. Two
+    /// failures must therefore cost strictly more wall time than two
+    /// successes, and the wait must observe the shutdown token.
+    #[tokio::test(start_paused = true)]
+    async fn repeated_initial_failures_back_off_instead_of_spinning() {
+        let (client, _script) = scripted_client(vec![
+            unavailable(),
+            unavailable(),
+            ok_json(json!({
+                "labels": [{"id": "Label_1", "name": "One", "type": "user"}]
+            })),
+            ok_json(json!({
+                "labels": [
+                    {"id": "Label_1", "name": "One", "type": "user"},
+                    {"id": "Label_2", "name": "Two", "type": "user"}
+                ]
+            })),
+        ]);
+        let started = tokio::time::Instant::now();
+        let mut lifecycle = scope_lifecycle_stream(client, CancellationToken::new());
+
+        let event = lifecycle.next().await;
+
+        assert!(matches!(
+            event,
+            Some(ScopeLifecycleEvent::Lifecycle(ScopeLifecycle::Created(
+                MembershipScope::Label(LabelId(id))
+            ))) if id == "Label_2"
+        ));
+        // t=0 fail, t=30+30 fail, t=+120 seed, t=+30 the Created above.
+        assert_eq!(started.elapsed(), Duration::from_secs(210));
+    }
+
+    /// The backoff wait is a `select!` against the shutdown token, not a
+    /// bare sleep, so `close()` during an outage ends the stream rather
+    /// than parking it for the whole backoff.
+    #[tokio::test(start_paused = true)]
+    async fn a_stream_cancelled_while_backing_off_ends_promptly() {
+        let (client, script) = scripted_client(vec![unavailable(), unavailable()]);
+        let shutdown = CancellationToken::new();
+        let started = tokio::time::Instant::now();
+        let mut lifecycle = scope_lifecycle_stream(client, shutdown.clone());
+        let drained = tokio::spawn(async move { lifecycle.next().await });
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        shutdown.cancel();
+
+        assert!(drained.await.expect("lifecycle task joins").is_none());
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_secs(1),
+            "cancellation must end the stream where it happens, not at the end of the backoff",
+        );
+        assert_eq!(
+            script.requests().len(),
+            1,
+            "a cancelled stream must not spend another request first",
+        );
     }
 
     fn snapshot_of(labels: Vec<GmailLabel>) -> ScopeSnapshot {
