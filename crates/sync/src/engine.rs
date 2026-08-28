@@ -414,11 +414,13 @@ impl SyncEngine {
         // Control handle shared between the SyncControl returned to
         // the consumer and the engine's spawned workers (so workers
         // can call `record_checkpoint`).
-        let control = SyncControl::new(
+        let pending_coverage = Arc::new(PendingCoverage::new());
+        let control = SyncControl::new_with_publications(
             account_id.clone(),
             boundary.clone(),
             priority_tx.clone(),
             bandwidth_cap_tx.clone(),
+            Arc::clone(&pending_coverage),
         );
 
         // Reopen channel: the multiplexer's per-scope tasks raise
@@ -444,7 +446,6 @@ impl SyncEngine {
         let ack_writer_control = control.clone();
         // Producers record what each enumeration proved; the single writer
         // reads it back when the matching acknowledgement arrives.
-        let pending_coverage = Arc::new(PendingCoverage::new());
         spawn(tokio::spawn(ack_writer(
             ack_writer_aid,
             ack_writer_store,
@@ -879,6 +880,27 @@ impl SyncEngine {
         complete_rx
             .await
             .map_err(|e| Error::Other(format!("ack writer dropped before persisting: {e}")))?
+    }
+
+    /// Acknowledge an event publication that intentionally has no checkpoint.
+    /// Repair notifications use this path so coverage debt is discharged only
+    /// after the consumer has durably accepted the recovered object ids.
+    pub async fn ack_publication(
+        &self,
+        account_id: &AccountId,
+        publication: crate::cursor::PublicationId,
+    ) -> Result<(), Error> {
+        let tx = self
+            .ack_senders
+            .get(account_id)
+            .map(|r| r.value().clone())
+            .ok_or_else(|| Error::AccountNotAttached(account_id.clone()))?;
+        let (done, wait) = oneshot::channel();
+        tx.send(WriterRequest::AcknowledgePublication { publication, done })
+            .await
+            .map_err(|e| Error::Other(format!("ack channel closed: {e}")))?;
+        wait.await
+            .map_err(|e| Error::Other(format!("ack writer dropped before acknowledging: {e}")))?
     }
 
     /// Everything this account still owes: obligations no walk has resolved and
@@ -3585,23 +3607,19 @@ async fn emit_backfill_complete(
         bytes_in: 0,
         checkpoint: Some(Checkpoint::Backfill(marker.clone())),
     };
+    let expected = Checkpoint::Backfill(marker);
+    // Register before publishing so a fast consumer ack cannot land
+    // before the entry exists and leave it outstanding forever.
+    let publication = control.publish_checkpoint_without_report(expected.clone(), 0);
     let event = MultiplexerEvent {
         scope: scope.clone(),
         event: Arc::new(SyncEvent::Batch(batch)),
-        checkpoint: Some(Checkpoint::Backfill(marker)),
-        publication: None,
+        checkpoint: Some(expected),
+        publication: Some(publication),
     };
-    // Register before publishing so a fast consumer ack cannot land
-    // before the entry exists and leave it outstanding forever.
-    let expected = event.checkpoint.clone();
-    if let Some(expected) = &expected {
-        control.expect_checkpoint(expected.clone());
-    }
     let delivered = tx.send(event).unwrap_or(0);
-    if !crate::multiplexer::delivered_to_real_subscriber(delivered)
-        && let Some(expected) = &expected
-    {
-        control.retire_checkpoint(expected);
+    if !crate::multiplexer::delivered_to_real_subscriber(delivered) {
+        control.retire_publication(publication);
     }
     true
 }
@@ -3909,6 +3927,11 @@ async fn ack_writer(
     // rather than pushed onto every `CheckpointStore` backend as a
     // compare-and-swap it could get subtly wrong.
     let mut provisional: HashSet<CursorScope> = HashSet::new();
+    let mut pending_repairs: HashMap<
+        crate::cursor::PublicationId,
+        Vec<crate::repair::RepairResolution>,
+    > = HashMap::new();
+    let mut acknowledged_publications: HashSet<crate::cursor::PublicationId> = HashSet::new();
     // The authoritative debt ledger for this account. Held here rather than
     // re-read per write because this task is the only thing that may mutate it,
     // which is what makes generation-aware conditional transitions possible
@@ -3975,15 +3998,72 @@ async fn ack_writer(
                 publication,
                 done,
             } => {
+                // A repair discharges only once the CONSUMER has acknowledged
+                // the batch of recovered ids. The acknowledgement can arrive
+                // either side of this request, so the resolutions park here
+                // until it does.
+                let acknowledged = match publication {
+                    Some(publication) => {
+                        if acknowledged_publications.remove(&publication) {
+                            true
+                        } else {
+                            park_pending_repair(
+                                &account_id,
+                                &mut pending_repairs,
+                                publication,
+                                resolutions,
+                            );
+                            let _ = done.send(Ok(()));
+                            continue;
+                        }
+                    }
+                    // Never published at all: nothing recovered may discharge.
+                    None => false,
+                };
                 let result = apply_repair_resolutions(
                     &account_id,
                     &store,
-                    &coverage,
                     &mut ledger,
                     resolutions,
-                    publication,
+                    acknowledged,
                 )
                 .await;
+                let _ = done.send(result);
+                continue;
+            }
+            WriterRequest::AcknowledgePublication { publication, done } => {
+                // The REPAIR lane specifically: a checkpoint publication's id
+                // resolves to `Unknown` here rather than being consumed, so a
+                // consumer cannot discharge a checkpoint through this path and
+                // leave the later `ack_checkpoint` short-circuiting as already
+                // persisted over a store write that never happened.
+                let result = match coverage.claim_repair(publication) {
+                    ClaimLookup::Apply(_) => {
+                        if let Some(resolutions) = pending_repairs.remove(&publication) {
+                            let outcome = apply_repair_resolutions(
+                                &account_id,
+                                &store,
+                                &mut ledger,
+                                resolutions,
+                                true,
+                            )
+                            .await;
+                            if outcome.is_ok() {
+                                coverage.settle_repair(publication);
+                            }
+                            outcome
+                        } else {
+                            acknowledged_publications.insert(publication);
+                            coverage.settle_repair(publication);
+                            Ok(())
+                        }
+                    }
+                    // Idempotent: this publication was already applied.
+                    ClaimLookup::AlreadyPersisted => Ok(()),
+                    ClaimLookup::Unknown => Err(Error::CheckpointStore(
+                        "acknowledgement names an unknown publication".into(),
+                    )),
+                };
                 let _ = done.send(result);
                 continue;
             }
@@ -4044,8 +4124,16 @@ async fn ack_writer(
             Ok(()) => {
                 // Notify pause / checkpoint_now waiters AFTER the
                 // durable write lands - the contract is that the
-                // returned checkpoint has been persisted.
-                control.record_checkpoint(req.checkpoint).await;
+                // returned checkpoint has been persisted. The
+                // watermark moves here for the same reason: a retried
+                // acknowledgement may only report "already persisted"
+                // for a write that actually landed.
+                if let Some(publication) = req.publication {
+                    coverage.settle_checkpoint(publication, &req.checkpoint);
+                }
+                control
+                    .record_publication(req.publication, req.checkpoint)
+                    .await;
                 if let Some(done) = req.complete {
                     let _ = done.send(Ok(()));
                 }
@@ -4065,8 +4153,14 @@ async fn ack_writer(
                 // never became durable. Leaving it outstanding would
                 // wedge every later pause / checkpoint_now on this
                 // account. The consumer learns about the store failure
-                // from `ack_checkpoint`'s own `Result`, below.
-                control.retire_checkpoint(&req.checkpoint);
+                // from `ack_checkpoint`'s own `Result`, below. The
+                // watermark deliberately does NOT move: a retry of
+                // this acknowledgement must report `Unknown` and fail
+                // again, never "already persisted" for a write that
+                // never landed.
+                if let Some(publication) = req.publication {
+                    control.retire_publication(publication);
+                }
                 if let Some(done) = req.complete {
                     let _ = done.send(Err(err));
                 }
@@ -4084,6 +4178,34 @@ async fn persist_ledger_only(
     store.put_ledger(account_id, ledger.clone()).await
 }
 
+/// Ceiling on repair passes parked waiting for a consumer acknowledgement.
+///
+/// A consumer that never acknowledges repair batches would otherwise
+/// accumulate one entry per pass for the life of the attachment. Evicting the
+/// oldest costs nothing durable: its obligations were never discharged, so they
+/// are still owed and a later pass retries them.
+const PARKED_REPAIR_CAP: usize = 64;
+
+fn park_pending_repair(
+    account_id: &AccountId,
+    parked: &mut HashMap<crate::cursor::PublicationId, Vec<crate::repair::RepairResolution>>,
+    publication: crate::cursor::PublicationId,
+    resolutions: Vec<crate::repair::RepairResolution>,
+) {
+    if parked.len() >= PARKED_REPAIR_CAP
+        && let Some(oldest) = parked.keys().min().copied()
+    {
+        parked.remove(&oldest);
+        tracing::warn!(
+            target: "bifrost.sync.repair",
+            account = ?account_id,
+            cap = PARKED_REPAIR_CAP,
+            "repair resolutions awaiting acknowledgement at capacity; the oldest pass stays owed"
+        );
+    }
+    parked.insert(publication, resolutions);
+}
+
 /// Fold one repair pass's outcomes into the ledger.
 ///
 /// The ordering that matters: a `Recovered` resolution discharges ONLY when the
@@ -4097,20 +4219,10 @@ async fn persist_ledger_only(
 async fn apply_repair_resolutions(
     account_id: &AccountId,
     store: &Arc<DynCheckpointStore>,
-    coverage: &PendingCoverage,
     ledger: &mut crate::cursor::DebtLedger,
     resolutions: Vec<crate::repair::RepairResolution>,
-    publication: Option<crate::cursor::PublicationId>,
+    published_and_acknowledged: bool,
 ) -> Result<(), Error> {
-    // Was the batch of recovered ids durably accepted? Only then may anything
-    // recovered be discharged.
-    let published_and_acknowledged = match publication {
-        Some(id) => matches!(
-            coverage.claim(id),
-            ClaimLookup::Apply(_) | ClaimLookup::AlreadyPersisted
-        ),
-        None => false,
-    };
     let now = jiff::Timestamp::now().as_second();
 
     for resolution in resolutions {
@@ -4256,7 +4368,10 @@ async fn persist_ack_request(
             .validate_envelope()
             .map_err(|_| Error::SchemaIncompatible)?;
     }
-    match req.publication.map(|id| coverage.claim(id)) {
+    match req
+        .publication
+        .map(|id| coverage.claim_checkpoint(id, &req.checkpoint))
+    {
         Some(ClaimLookup::Apply(claim)) => {
             let now = jiff::Timestamp::now().as_second();
             for report in &claim.reports {
@@ -5958,6 +6073,16 @@ mod tests {
         wait.await.expect("writer answered")
     }
 
+    /// Register a checkpoint publication the way a producer does, so the
+    /// acknowledgement resolves in the same lane the writer looks it up in.
+    fn register(
+        coverage: &crate::cursor::PendingCoverage,
+        checkpoint: &bifrost_types::Checkpoint,
+        claim: crate::cursor::CoverageClaim,
+    ) -> crate::cursor::PublicationId {
+        coverage.register(checkpoint.clone(), claim)
+    }
+
     /// An acknowledged DEGRADED backfill page must leave its obligations in the
     /// durable ledger.
     ///
@@ -5973,20 +6098,21 @@ mod tests {
     async fn an_acknowledged_degraded_page_persists_its_debt() {
         let (account, store, coverage, tx, writer) = writer_harness();
 
-        let publication = coverage.publish(crate::cursor::CoverageClaim::new(
-            bifrost_types::InventoryCoverageReport::degraded(
-                bifrost_types::CoverageDomain::full(email_scope()),
-                vec![unrepresentable("broken")],
+        let checkpoint = backfill_checkpoint(bifrost_types::Partition(b"page-0".to_vec()));
+        let publication = register(
+            &coverage,
+            &checkpoint,
+            crate::cursor::CoverageClaim::new(
+                bifrost_types::InventoryCoverageReport::degraded(
+                    bifrost_types::CoverageDomain::full(email_scope()),
+                    vec![unrepresentable("broken")],
+                ),
+                1,
             ),
-            1,
-        ));
-        ack(
-            &tx,
-            backfill_checkpoint(bifrost_types::Partition(b"page-0".to_vec())),
-            Some(publication),
-        )
-        .await
-        .expect("ack persisted");
+        );
+        ack(&tx, checkpoint, Some(publication))
+            .await
+            .expect("ack persisted");
 
         let ledger = store.get_ledger(&account).await.expect("ledger read");
         assert_eq!(
@@ -6013,28 +6139,32 @@ mod tests {
     async fn each_partition_acknowledges_its_own_coverage() {
         let (account, store, coverage, tx, writer) = writer_harness();
 
-        let first = coverage.publish(crate::cursor::CoverageClaim::new(
-            bifrost_types::InventoryCoverageReport::degraded(
-                bifrost_types::CoverageDomain::full(email_scope()),
-                vec![unrepresentable("from-partition-a")],
+        let page_a = backfill_checkpoint(bifrost_types::Partition(b"page-a".to_vec()));
+        let page_b = backfill_checkpoint(bifrost_types::Partition(b"page-b".to_vec()));
+        let first = register(
+            &coverage,
+            &page_a,
+            crate::cursor::CoverageClaim::new(
+                bifrost_types::InventoryCoverageReport::degraded(
+                    bifrost_types::CoverageDomain::full(email_scope()),
+                    vec![unrepresentable("from-partition-a")],
+                ),
+                1,
             ),
-            1,
-        ));
+        );
         // Partition B publishes AFTER A, and reports a clean walk.
-        let _second = coverage.publish(crate::cursor::CoverageClaim::new(
-            bifrost_types::InventoryCoverageReport::complete(bifrost_types::CoverageDomain::full(
-                email_scope(),
-            )),
-            1,
-        ));
+        let _second = register(
+            &coverage,
+            &page_b,
+            crate::cursor::CoverageClaim::new(
+                bifrost_types::InventoryCoverageReport::complete(
+                    bifrost_types::CoverageDomain::full(email_scope()),
+                ),
+                1,
+            ),
+        );
 
-        ack(
-            &tx,
-            backfill_checkpoint(bifrost_types::Partition(b"page-a".to_vec())),
-            Some(first),
-        )
-        .await
-        .expect("ack persisted");
+        ack(&tx, page_a, Some(first)).await.expect("ack persisted");
 
         let ledger = store.get_ledger(&account).await.expect("ledger read");
         assert_eq!(
@@ -6058,29 +6188,33 @@ mod tests {
     async fn the_completion_sentinel_is_withheld_over_open_debt() {
         let (account, store, coverage, tx, writer) = writer_harness();
 
-        let debt = coverage.publish(crate::cursor::CoverageClaim::new(
-            bifrost_types::InventoryCoverageReport::degraded(
-                bifrost_types::CoverageDomain::full(email_scope()),
-                vec![unrepresentable("broken")],
+        let page = backfill_checkpoint(bifrost_types::Partition(b"page-0".to_vec()));
+        let debt = register(
+            &coverage,
+            &page,
+            crate::cursor::CoverageClaim::new(
+                bifrost_types::InventoryCoverageReport::degraded(
+                    bifrost_types::CoverageDomain::full(email_scope()),
+                    vec![unrepresentable("broken")],
+                ),
+                1,
             ),
-            1,
-        ));
-        ack(
-            &tx,
-            backfill_checkpoint(bifrost_types::Partition(b"page-0".to_vec())),
-            Some(debt),
-        )
-        .await
-        .expect("ack persisted");
+        );
+        ack(&tx, page, Some(debt)).await.expect("ack persisted");
 
-        let sentinel = coverage.publish_without_report(1);
-        ack(
-            &tx,
-            backfill_checkpoint_at(crate::backfill::partitioner::completion_partition(), 99),
-            Some(sentinel),
-        )
-        .await
-        .expect("the acknowledgement itself still succeeds");
+        let completion =
+            backfill_checkpoint_at(crate::backfill::partitioner::completion_partition(), 99);
+        let sentinel = register(
+            &coverage,
+            &completion,
+            crate::cursor::CoverageClaim {
+                reports: Vec::new(),
+                generation: 1,
+            },
+        );
+        ack(&tx, completion, Some(sentinel))
+            .await
+            .expect("the acknowledgement itself still succeeds");
 
         assert!(
             store
@@ -6109,20 +6243,19 @@ mod tests {
     async fn a_waiver_releases_the_sentinel_without_claiming_proof() {
         let (account, store, coverage, tx, writer) = writer_harness();
 
-        let debt = coverage.publish(crate::cursor::CoverageClaim::new(
-            bifrost_types::InventoryCoverageReport::degraded(
-                bifrost_types::CoverageDomain::full(email_scope()),
-                vec![unrepresentable("broken")],
+        let page = backfill_checkpoint(bifrost_types::Partition(b"page-0".to_vec()));
+        let debt = register(
+            &coverage,
+            &page,
+            crate::cursor::CoverageClaim::new(
+                bifrost_types::InventoryCoverageReport::degraded(
+                    bifrost_types::CoverageDomain::full(email_scope()),
+                    vec![unrepresentable("broken")],
+                ),
+                1,
             ),
-            1,
-        ));
-        ack(
-            &tx,
-            backfill_checkpoint(bifrost_types::Partition(b"page-0".to_vec())),
-            Some(debt),
-        )
-        .await
-        .expect("ack persisted");
+        );
+        ack(&tx, page, Some(debt)).await.expect("ack persisted");
 
         let (done, wait) = oneshot::channel();
         tx.send(WriterRequest::OperatorDecision {
@@ -6186,20 +6319,21 @@ mod tests {
         coverage: &crate::cursor::PendingCoverage,
         key: &str,
     ) {
-        let publication = coverage.publish(crate::cursor::CoverageClaim::new(
-            bifrost_types::InventoryCoverageReport::degraded(
-                bifrost_types::CoverageDomain::full(email_scope()),
-                vec![unrepresentable(key)],
+        let page = backfill_checkpoint(bifrost_types::Partition(b"page-0".to_vec()));
+        let publication = register(
+            coverage,
+            &page,
+            crate::cursor::CoverageClaim::new(
+                bifrost_types::InventoryCoverageReport::degraded(
+                    bifrost_types::CoverageDomain::full(email_scope()),
+                    vec![unrepresentable(key)],
+                ),
+                1,
             ),
-            1,
-        ));
-        ack(
-            tx,
-            backfill_checkpoint(bifrost_types::Partition(b"page-0".to_vec())),
-            Some(publication),
-        )
-        .await
-        .expect("ack persisted");
+        );
+        ack(tx, page, Some(publication))
+            .await
+            .expect("ack persisted");
     }
 
     async fn apply_repair(
@@ -6267,6 +6401,24 @@ mod tests {
         )
         .await;
 
+        assert!(
+            store
+                .get_ledger(&account)
+                .await
+                .expect("ledger")
+                .entry(&key)
+                .expect("entry")
+                .is_open(),
+            "publishing alone must not discharge the recovery"
+        );
+        let (done, wait) = oneshot::channel();
+        tx.send(WriterRequest::AcknowledgePublication { publication, done })
+            .await
+            .expect("writer alive");
+        wait.await
+            .expect("writer answered")
+            .expect("publication acknowledged");
+
         let ledger = store.get_ledger(&account).await.expect("ledger");
         let entry = ledger.entry(&key).expect("entry");
         assert!(!entry.is_open(), "an acknowledged recovery discharges");
@@ -6277,6 +6429,71 @@ mod tests {
             }
         ));
         assert!(ledger.completion_permitted(&email_scope()));
+
+        drop(tx);
+        writer.await.expect("writer exits");
+    }
+
+    /// `ack_publication` is the REPAIR lane. Handed a checkpoint publication's
+    /// id it must refuse, and - this is the part that bites - must leave that
+    /// publication's claim intact.
+    ///
+    /// Consuming it would make the later, real `ack_checkpoint` resolve as
+    /// already persisted and return before writing anything, while the engine
+    /// went on to announce the checkpoint as a durable boundary. A cursor
+    /// position reported durable that no store ever accepted is the lying
+    /// record the whole publication ledger exists to prevent.
+    #[tokio::test]
+    async fn a_repair_acknowledgement_cannot_consume_a_checkpoint_publication() {
+        let (account, store, coverage, tx, writer) = writer_harness();
+
+        let checkpoint = backfill_checkpoint(bifrost_types::Partition(b"page-0".to_vec()));
+        let publication = register(
+            &coverage,
+            &checkpoint,
+            crate::cursor::CoverageClaim::new(
+                bifrost_types::InventoryCoverageReport::degraded(
+                    bifrost_types::CoverageDomain::full(email_scope()),
+                    vec![unrepresentable("broken")],
+                ),
+                1,
+            ),
+        );
+
+        let (done, wait) = oneshot::channel();
+        tx.send(WriterRequest::AcknowledgePublication { publication, done })
+            .await
+            .expect("writer alive");
+        assert!(
+            wait.await.expect("writer answered").is_err(),
+            "a repair acknowledgement must not resolve a checkpoint publication"
+        );
+
+        ack(&tx, checkpoint.clone(), Some(publication))
+            .await
+            .expect("the real acknowledgement still persists");
+
+        assert_eq!(
+            store
+                .get_backfill(&account, &email_scope())
+                .await
+                .expect("store read"),
+            match checkpoint {
+                bifrost_types::Checkpoint::Backfill(marker) => Some(marker),
+                _ => unreachable!("built as a backfill checkpoint"),
+            },
+            "the checkpoint must actually reach the store"
+        );
+        assert_eq!(
+            store
+                .get_ledger(&account)
+                .await
+                .expect("ledger read")
+                .open_debt()
+                .count(),
+            1,
+            "and its coverage claim must still have been ingested"
+        );
 
         drop(tx);
         writer.await.expect("writer exits");

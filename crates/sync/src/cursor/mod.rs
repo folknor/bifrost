@@ -23,7 +23,7 @@ use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 use bifrost_types::{ChangeCursor, CursorScope, MembershipScope};
 
-pub use coverage::{ClaimLookup, CoverageClaim, PendingCoverage, PublicationId};
+pub use coverage::{ClaimLookup, CoverageClaim, PendingCoverage, PublicationId, Publications};
 pub use envelope::{
     CursorEnvelope, ENGINE_VERSION, EnvelopeKind, MIN_MIGRATABLE, decode_envelope, encode_envelope,
 };

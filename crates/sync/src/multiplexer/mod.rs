@@ -65,7 +65,9 @@ pub struct MultiplexerEvent {
     /// Engine-issued identity for THIS publication of `checkpoint`, to be
     /// passed back to `Engine::ack_checkpoint`.
     ///
-    /// `Some` exactly when `checkpoint` is `Some`. It exists because
+    /// `Some` for every acknowledgeable publication. Checkpoint-bearing
+    /// events return it through `ack_checkpoint`; repair events carry no
+    /// checkpoint and return it through `ack_publication`. It exists because
     /// `Checkpoint` equality is value equality and cannot identify a
     /// publication: a backfill page whose content was entirely unrepresentable
     /// increments no item count and produces a checkpoint byte-identical to its

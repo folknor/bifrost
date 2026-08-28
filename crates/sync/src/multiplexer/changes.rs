@@ -156,7 +156,7 @@ pub async fn drive_changes_stream(
         } else {
             None
         };
-        let me = MultiplexerEvent {
+        let mut me = MultiplexerEvent {
             scope: scope.clone(),
             event: Arc::new(event),
             checkpoint: checkpoint.clone(),
@@ -170,11 +170,13 @@ pub async fn drive_changes_stream(
         // A consumer that receives, persists and acks between the send
         // and the registration would otherwise leave behind an entry
         // no ack can ever match, permanently wedging boundary waiters.
-        let publish = || {
+        let mut publish = || {
             let expected = match (&control, &checkpoint) {
                 (Some(control), Some(checkpoint)) => {
-                    control.expect_checkpoint(checkpoint.clone());
-                    Some(checkpoint.clone())
+                    let publication =
+                        control.publish_checkpoint_without_report(checkpoint.clone(), 0);
+                    me.publication = Some(publication);
+                    Some(publication)
                 }
                 _ => None,
             };
@@ -198,11 +200,11 @@ pub async fn drive_changes_stream(
             return Ok(ChangesEvent::Done);
         };
         if !super::delivered_to_real_subscriber(delivered)
-            && let (Some(control), Some(expected)) = (&control, &expected)
+            && let (Some(control), Some(expected)) = (&control, expected)
         {
             // Only the slot's sentinel receiver saw this batch, so no
             // consumer ack is coming for it.
-            control.retire_checkpoint(expected);
+            control.retire_publication(expected);
         }
         if let Some(outcome) = post_publish_boundary(boundary.peek(), checkpoint.is_some()) {
             return Ok(outcome);
@@ -343,6 +345,12 @@ pub enum WriterRequest {
         publication: Option<crate::cursor::PublicationId>,
         done: oneshot::Sender<Result<(), Error>>,
     },
+    /// Confirm that the consumer durably accepted a publication with no
+    /// checkpoint, such as a repair notification batch.
+    AcknowledgePublication {
+        publication: crate::cursor::PublicationId,
+        done: oneshot::Sender<Result<(), Error>>,
+    },
     /// Operator action on one obligation or barrier occurrence.
     ///
     /// `Waive` is the only path to accepted loss, and it exists only here:
@@ -387,6 +395,10 @@ impl std::fmt::Debug for WriterRequest {
             Self::ApplyRepair { resolutions, .. } => f
                 .debug_struct("ApplyRepair")
                 .field("resolutions", &resolutions.len())
+                .finish(),
+            Self::AcknowledgePublication { publication, .. } => f
+                .debug_struct("AcknowledgePublication")
+                .field("publication", publication)
                 .finish(),
             Self::RecordDebt { generation, .. } => f
                 .debug_struct("RecordDebt")

@@ -9,20 +9,30 @@ passthrough clusters), cross-checked every claim against `reference/sync.md`, an
 verified the load-bearing ones by grep (unused symbols, lease scopes, direct
 store writes).
 
+## Round 1 closure note (A1, A3, A4, D1, F2)
+
+Landed as the unified `Publications` ledger. Three things the cold review
+surfaced turned out to be consequences of the unification itself and were fixed
+in the same pass, and are recorded here because later rounds touch the same
+code:
+
+- Supersession is keyed by LANE, and the backfill lane now includes the
+  PARTITION. Keying it by scope alone (which is what `SyncControl::pending_key`
+  did) made acknowledging partition A resolve to an unknown publication once
+  sibling partition B published - a batch the consumer really received.
+- A superseded publication is still acknowledgeable. Its claim moved to the
+  survivor, so the acknowledgement persists the checkpoint and ingests nothing;
+  a per-lane `folded` watermark carries that, bounded.
+- Lag carry-forward is DEBT ONLY. Folding a `Complete` report into a later
+  publication would discharge obligations on the strength of a batch the ring
+  destroyed - the same silent loss A3 is about, arriving through A3's fix.
+
+Not defects, recorded so nobody re-opens them: `PendingCoverage::claim` and
+`SyncControl::record_checkpoint` remain published and remain kind- and
+value-identified respectively. No engine path uses either; every engine path
+goes through the lane-checked and publication-identified forms.
+
 ## A. Correctness - lost data / lost debt
-
-### A1. `PendingCoverage::supersede` is dead code, and `SyncControl::expect_checkpoint` supersedes without it
-
-**Confidence: high.** `expect_checkpoint` drops the older pending entry for a
-lane+scope. The coverage claim attached to that publication is not folded into the
-survivor - `supersede` has no production caller anywhere (only
-`cursor/coverage.rs` tests). Two backfill partitions of one scope are explicitly
-in flight together, and the reference explicitly sanctions coarse acking ("persist
-N batches, ack the last checkpoint"). Under either, partition A's `CoverageClaim`
-is never claimed: its obligations never reach the ledger, the entry leaks as
-`Pending` forever, and `completion_permitted` then lets the sentinel land over
-debt that was silently discarded. This is exactly the failure `supersede`'s doc
-comment describes, one layer away from where it was wired.
 
 ### A2. `BackfillRunner` ignores the barrier protocol entirely
 
@@ -36,32 +46,6 @@ it, and `open_pages_resume` resumes at `T` - leaping the barrier region
 permanently. Only the *completion sentinel* is withheld (`complete=false`), which
 does not protect positional resume. This is the JMAP-Email / Gmail cold-start
 lane, i.e. the one where all hydration rides backfill.
-
-### A3. Ring-overflow lag discards coverage debt
-
-**Confidence: high.** `ChangesReceiver::on_lag` calls
-`SyncControl::abandon_pending_checkpoints` but nothing retires the corresponding
-`PendingCoverage` publications. Their claims stay `Pending` forever (leak) and
-their obligations never reach the ledger. Under the model's own rule - under
-reporting debt costs objects nobody sees again - a degraded page destroyed by ring
-overflow is exactly the case that must produce debt, and it produces none.
-
-### A4. Repair discharge does not require a consumer acknowledgement, and cannot
-
-**Confidence: high.** `apply_repair_resolutions` tests acknowledgement with
-`coverage.claim(id)`, but `claim()` returns `Apply(_)` for a *pending, never
-acknowledged* publication (it is the consume operation, not a query). Since
-`run_repair_pass` sends `ApplyRepair` immediately after `publish_recovered`,
-`published_and_acknowledged` is true for every delivered batch. Worse,
-`publish_recovered` emits `checkpoint: None` with `publication: Some(_)`, and
-`ack_checkpoint` requires a `Checkpoint` - so there is no API by which a consumer
-*could* acknowledge a repair publication. `DischargeEvidence::RepairedAndPublished`
-therefore records a half-proof.
-
-The pinning test `a_recovery_discharges_only_after_the_consumer_acknowledges`
-(engine.rs ~6200) does not bite: it never acks anything, it just passes
-`Some(publication)` and asserts discharge. It demonstrates the bug it is named
-against.
 
 ### A5. Three recovery paths write durably outside the single writer
 
@@ -164,10 +148,6 @@ contract.
 
 ## D. Leaks
 
-- **D1.** `PendingCoverage` never removes `ClaimState::Persisted` entries. One
-  entry per acknowledged checkpoint accumulates for the whole attachment - on a 30s
-  poll that is ~2,900 entries/day/scope, plus every backfill page. `retire()` only
-  covers the undelivered case. **Confidence: high.**
 - **D2.** `CursorRegistry::drive_leases` is never pruned; `delete(&scope)` leaves
   the lease behind. Bounded by the scope identity space, so minor. **Confidence: high.**
 - **D3.** `ThrottleBucket::waits` under `ThrottleKey::Account` is deliberately never
@@ -219,17 +199,6 @@ contract.
    recovery paths a `WriterHandle` whose only methods are `WriterRequest` sends, and
    make `CheckpointStore` private to the writer module. That deletes an entire defect
    class rather than re-auditing for it.
-
-2. **Coverage claim lifetime is split across three owners that do not agree.**
-   `SyncControl` owns supersession, `PendingCoverage` owns folding, `ChangesReceiver`
-   owns lag abandonment, and none of them call each other (A1, A3, D1). These are one
-   object: a per-account *publication ledger* where registering a checkpoint, its
-   coverage claim, and its boundary-gating obligation are one operation with one
-   supersession rule and one retirement rule. Every one of A1/A3/D1 is a consequence
-   of the split. Given pre-1.0, collapse `expect_checkpoint`/`retire_checkpoint`/
-   `abandon_pending_checkpoints`/`publish`/`supersede`/`retire` into a single
-   `Publications` type and make `MultiplexerEvent` construction go through it, so a
-   publication cannot exist without both halves.
 
 3. **`BackfillRunner` and `InventoryFusion` are two implementations of one walk**
    and have already diverged on the safety-critical rule (A2): barrier handling,

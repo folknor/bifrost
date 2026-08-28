@@ -321,32 +321,36 @@ impl BackfillRunner {
                         // Two partitions of one scope are in flight at once, so
                         // a scope-keyed claim would let partition B's report be
                         // persisted under partition A's acknowledgement.
-                        let publication = coverage.map(|pending| {
-                            pending.publish(crate::cursor::CoverageClaim::new(
-                                batch.coverage.clone(),
-                                generation,
-                            ))
+                        let expected = Checkpoint::Backfill(bf);
+                        let publication = control.map(|control| {
+                            control.publish_checkpoint(
+                                expected.clone(),
+                                crate::cursor::CoverageClaim::new(
+                                    batch.coverage.clone(),
+                                    generation,
+                                ),
+                            )
                         });
                         let me = MultiplexerEvent {
                             scope: scope.clone(),
                             event: Arc::new(SyncEvent::Batch(synthetic)),
-                            checkpoint: Some(Checkpoint::Backfill(bf.clone())),
+                            checkpoint: Some(expected),
                             publication,
                         };
                         // Register before publishing so a fast consumer
                         // ack cannot land before the entry exists and
                         // leave it outstanding forever.
-                        let expected = Checkpoint::Backfill(bf);
-                        if let Some(control) = control {
-                            control.expect_checkpoint(expected.clone());
-                        }
                         let delivered = tx.send(me).unwrap_or(0);
                         if !crate::multiplexer::delivered_to_real_subscriber(delivered) {
-                            if let (Some(pending), Some(id)) = (coverage, publication) {
-                                pending.retire(id);
-                            }
-                            if let Some(control) = control {
-                                control.retire_checkpoint(&expected);
+                            match (control, coverage, publication) {
+                                // Through control when there is one: it
+                                // releases the boundary registration and the
+                                // claim together, which are one publication.
+                                (Some(control), _, Some(id)) => {
+                                    control.retire_publication(id);
+                                }
+                                (None, Some(pending), Some(id)) => pending.retire(id),
+                                _ => {}
                             }
                         }
                     }

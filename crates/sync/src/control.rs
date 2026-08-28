@@ -6,12 +6,11 @@
 //! per-generation checkpoint signal.
 
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bifrost_types::{
     AccountError, AccountErrorBuilder, AccountErrorKind, AccountId, Cause, Checkpoint, Control,
-    CursorScope, Priority, RequestCause, RequestErrorKind,
+    Priority, RequestCause, RequestErrorKind,
 };
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
@@ -54,13 +53,16 @@ struct SyncControlInner {
     /// reads the new generation before parking.
     generation: AtomicU64,
     active: AtomicU64,
-    /// Broadcast checkpoints awaiting a consumer ack, at most one per
-    /// `pending_key` (lane + scope). Every entry leaves through either
-    /// `record_checkpoint` (acked and durable), `retire_checkpoint`
-    /// (ack processed but not durable, or never delivered), or
-    /// supersession by a newer broadcast on the same key - so an
+    /// The per-account publication ledger: coverage claims, boundary
+    /// registrations, supersession, lag abandonment and retirement, in
+    /// one place under one lock. At most one boundary per LANE (a
+    /// scope's changes stream, or one backfill partition of a scope).
+    /// Every entry leaves through `record_publication` (acked and
+    /// durable), `retire_publication` (ack processed but not durable,
+    /// or never delivered), abandonment after a subscriber lag, or
+    /// supersession by a newer broadcast in the same lane - so an
     /// unacked batch can never wedge boundary waiters indefinitely.
-    pending_checkpoints: Mutex<Vec<Checkpoint>>,
+    publications: Arc<crate::cursor::Publications>,
     priority: watch::Sender<Priority>,
     bandwidth_cap: watch::Sender<Option<u64>>,
     bandwidth_observed: AtomicU64,
@@ -74,6 +76,22 @@ impl SyncControl {
         priority: watch::Sender<Priority>,
         bandwidth_cap: watch::Sender<Option<u64>>,
     ) -> Self {
+        Self::new_with_publications(
+            account,
+            boundary,
+            priority,
+            bandwidth_cap,
+            Arc::new(crate::cursor::Publications::new()),
+        )
+    }
+
+    pub(crate) fn new_with_publications(
+        account: AccountId,
+        boundary: Boundary,
+        priority: watch::Sender<Priority>,
+        bandwidth_cap: watch::Sender<Option<u64>>,
+        publications: Arc<crate::cursor::Publications>,
+    ) -> Self {
         let (checkpoint_tx, _rx) = watch::channel(CheckpointSnapshot {
             generation: 0,
             checkpoint: None,
@@ -86,7 +104,7 @@ impl SyncControl {
                 checkpoint_tx,
                 generation: AtomicU64::new(0),
                 active: AtomicU64::new(0),
-                pending_checkpoints: Mutex::new(Vec::new()),
+                publications,
                 priority,
                 bandwidth_cap,
                 bandwidth_observed: AtomicU64::new(0),
@@ -98,21 +116,37 @@ impl SyncControl {
     /// consumer ack. Removes the matching outstanding broadcast and
     /// refreshes the latest durable snapshot.
     ///
-    /// Removal is by exact identity, not by `pending_key`: acking an
-    /// older checkpoint says nothing about a newer outstanding one on
-    /// the same scope, and claiming otherwise would report a safe
-    /// boundary the consumer has not actually reached. Supersession in
-    /// `expect_checkpoint` is what keeps the set bounded.
+    /// Value-identified form, for a caller that holds only a
+    /// checkpoint. Engine paths call `record_publication` instead:
+    /// equal checkpoint VALUES legitimately describe different
+    /// publications, so a value search can release a boundary that
+    /// belongs to a different, still in-flight broadcast.
     pub async fn record_checkpoint(&self, checkpoint: Checkpoint) {
-        {
-            let mut pending = match self.inner.pending_checkpoints.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            if let Some(index) = pending.iter().position(|expected| expected == &checkpoint) {
-                pending.remove(index);
-            }
+        self.inner.publications.acknowledge_checkpoint(&checkpoint);
+        self.announce_durable(checkpoint);
+    }
+
+    /// Engine-side hook called after the checkpoint store accepts a
+    /// consumer ack, identifying the broadcast by PUBLICATION.
+    ///
+    /// Release is by publication identity, never by supersession key:
+    /// acking an older checkpoint says nothing about a newer
+    /// outstanding one on the same scope, and claiming otherwise would
+    /// report a safe boundary the consumer has not actually reached.
+    /// Supersession in `register` is what keeps the set bounded.
+    pub(crate) async fn record_publication(
+        &self,
+        publication: Option<crate::cursor::PublicationId>,
+        checkpoint: Checkpoint,
+    ) {
+        match publication {
+            Some(id) => self.inner.publications.acknowledge_publication(id),
+            None => self.inner.publications.acknowledge_checkpoint(&checkpoint),
         }
+        self.announce_durable(checkpoint);
+    }
+
+    fn announce_durable(&self, checkpoint: Checkpoint) {
         let generation = self.inner.generation.load(Ordering::SeqCst);
         let snapshot = CheckpointSnapshot {
             generation,
@@ -139,38 +173,45 @@ impl SyncControl {
         }
     }
 
-    /// Mark a broadcast checkpoint as outstanding BEFORE publishing
-    /// its batch. Quiescence cannot satisfy a boundary waiter until a
-    /// matching consumer ack reaches `record_checkpoint`, or the
-    /// broadcast is retired as never-acked.
+    /// Test shorthand for a boundary registration with no coverage
+    /// claim. Production paths use `publish_checkpoint`, so a
+    /// publication cannot exist with only one of its halves.
+    #[cfg(test)]
+    pub(crate) fn expect_checkpoint(&self, checkpoint: Checkpoint) -> crate::cursor::PublicationId {
+        self.publish_checkpoint_without_report(checkpoint, 0)
+    }
+
+    /// Atomically create both halves of a checkpoint publication:
+    /// the coverage claim and the boundary registration.
     ///
-    /// A newer broadcast on the same `pending_key` supersedes the
-    /// older one, so the set is bounded by the account's scope count
-    /// rather than by how many batches a consumer left unacked. A
-    /// consumer that persists several batches and acks only the last
-    /// checkpoint therefore still reaches a safe boundary.
-    pub(crate) fn expect_checkpoint(&self, checkpoint: Checkpoint) {
-        let mut pending = match self.inner.pending_checkpoints.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        if let Some(key) = pending_key(&checkpoint) {
-            pending.retain(|existing| pending_key(existing).as_ref() != Some(&key));
-        }
-        // Backstop for a future `Checkpoint` variant with no key: the
-        // set must never grow without bound, and a consumer with this
-        // many distinct outstanding broadcasts is already broken.
-        if pending.len() >= PENDING_CHECKPOINT_CAP {
-            let dropped = pending.remove(0);
-            tracing::warn!(
-                target: "bifrost.sync.control",
-                account = ?self.inner.account,
-                cap = PENDING_CHECKPOINT_CAP,
-                dropped = ?dropped,
-                "pending checkpoint set at capacity; dropping the oldest outstanding broadcast"
-            );
-        }
-        pending.push(checkpoint);
+    /// Called BEFORE broadcasting the batch. Quiescence cannot satisfy
+    /// a boundary waiter until a matching consumer ack reaches
+    /// `record_publication`, or the broadcast is retired as never-acked.
+    /// A newer broadcast in the same LANE supersedes the older one and
+    /// folds its claim in, so the set is bounded by the account's scope
+    /// and partition count rather than by how many batches a consumer
+    /// left unacked: a consumer that persists several batches and acks
+    /// only the last checkpoint still reaches a safe boundary.
+    pub(crate) fn publish_checkpoint(
+        &self,
+        checkpoint: Checkpoint,
+        claim: crate::cursor::CoverageClaim,
+    ) -> crate::cursor::PublicationId {
+        self.inner.publications.register(checkpoint, claim)
+    }
+
+    pub(crate) fn publish_checkpoint_without_report(
+        &self,
+        checkpoint: Checkpoint,
+        generation: u64,
+    ) -> crate::cursor::PublicationId {
+        self.inner.publications.register(
+            checkpoint,
+            crate::cursor::CoverageClaim {
+                reports: Vec::new(),
+                generation,
+            },
+        )
     }
 
     /// Engine-side hook for a broadcast that will never produce a
@@ -183,16 +224,13 @@ impl SyncControl {
     /// of the process. The durable snapshot is deliberately NOT
     /// advanced, because nothing new became durable; a consumer whose
     /// ack failed learns that from `ack_checkpoint`'s own `Result`.
-    pub(crate) fn retire_checkpoint(&self, checkpoint: &Checkpoint) {
-        {
-            let mut pending = match self.inner.pending_checkpoints.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            if let Some(index) = pending.iter().position(|expected| expected == checkpoint) {
-                pending.remove(index);
-            }
-        }
+    ///
+    /// Identified by PUBLICATION for the same reason acknowledgement
+    /// is: two publications can carry equal checkpoint values, and a
+    /// value search would retire the wrong one - releasing a boundary
+    /// still in flight, and taking its coverage claim with it.
+    pub(crate) fn retire_publication(&self, publication: crate::cursor::PublicationId) {
+        self.inner.publications.retire_publication(publication);
         let generation = self.inner.generation.load(Ordering::SeqCst);
         self.publish_quiescence(generation);
     }
@@ -201,8 +239,8 @@ impl SyncControl {
     /// per-account ring overwrote entries before this subscriber read
     /// them. Retire every outstanding broadcast registration.
     ///
-    /// This is not a nicety. `expect_checkpoint` is called before the
-    /// send, and an entry only leaves through the matching consumer
+    /// This is not a nicety. Registration happens before the send, and
+    /// an entry only leaves through the matching consumer
     /// ack. Batches destroyed by ring overflow are never delivered, so
     /// their acks can never arrive, and every later `pause` /
     /// `checkpoint_now` on this account would wait forever - trading
@@ -223,15 +261,7 @@ impl SyncControl {
     ///
     /// Returns how many registrations were abandoned, for the warning.
     pub(crate) fn abandon_pending_checkpoints(&self) -> usize {
-        let abandoned = {
-            let mut pending = match self.inner.pending_checkpoints.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            let abandoned = pending.len();
-            pending.clear();
-            abandoned
-        };
+        let abandoned = self.inner.publications.abandon_checkpoints();
         if abandoned > 0 {
             tracing::warn!(
                 target: "bifrost.sync.control",
@@ -292,11 +322,7 @@ impl SyncControl {
         if self.inner.active.load(Ordering::SeqCst) != 0 {
             return false;
         }
-        let pending = match self.inner.pending_checkpoints.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        pending.is_empty()
+        self.inner.publications.pending_checkpoints() == 0
     }
 
     fn publish_quiescence(&self, generation: u64) {
@@ -351,27 +377,6 @@ impl SyncControl {
                 .expect("valid account error classification"));
             }
         }
-    }
-}
-
-/// Hard ceiling on outstanding broadcast checkpoints. Reachable only
-/// through a `Checkpoint` variant `pending_key` does not recognise;
-/// keyed variants are already bounded by the account's scope count.
-const PENDING_CHECKPOINT_CAP: usize = 1024;
-
-/// Supersession identity of an outstanding broadcast: the lane (change
-/// cursor vs backfill) plus the scope it advances. Broadcasts within a
-/// lane+scope are produced by a single sequential task, so the newest
-/// one subsumes its predecessors - if the consumer acks it, everything
-/// before it on that scope is durable too.
-///
-/// `None` for a variant this revision does not know, which falls back
-/// to plain accumulation under `PENDING_CHECKPOINT_CAP`.
-fn pending_key(checkpoint: &Checkpoint) -> Option<(u8, CursorScope)> {
-    match checkpoint {
-        Checkpoint::Change(cursor) => Some((0, cursor.scope.clone())),
-        Checkpoint::Backfill(backfill) => Some((1, backfill.scope.clone())),
-        _ => None,
     }
 }
 
@@ -559,12 +564,7 @@ mod tests {
     }
 
     fn pending_len(control: &SyncControl) -> usize {
-        control
-            .inner
-            .pending_checkpoints
-            .lock()
-            .expect("pending lock")
-            .len()
+        control.inner.publications.pending_checkpoints()
     }
 
     /// A consumer that persists several batches and acks only the last
@@ -590,11 +590,14 @@ mod tests {
         );
     }
 
-    /// Supersession is per lane and per scope: concurrent work on
-    /// distinct scopes must each be tracked, or a pause would report a
-    /// safe boundary while another scope's batch is still unacked.
+    /// Supersession is per lane, per scope and - for backfill - per
+    /// PARTITION. Concurrent work on distinct scopes must each be
+    /// tracked, or a pause would report a safe boundary while another
+    /// scope's batch is still unacked. Two partitions of ONE scope are
+    /// in flight together by design and are equally distinct: neither
+    /// subsumes the other.
     #[test]
-    fn supersession_is_keyed_by_lane_and_scope() {
+    fn supersession_is_keyed_by_lane_scope_and_partition() {
         let control = control();
         let email = CursorScope::Type(bifrost_types::ObjectType::Email);
         control.expect_checkpoint(checkpoint(b"account-change"));
@@ -602,9 +605,18 @@ mod tests {
         control.expect_checkpoint(backfill_checkpoint(email.clone(), b"page:0:500"));
         assert_eq!(pending_len(&control), 3);
 
-        // Same lane, same scope, later window: replaces, does not add.
+        // A sibling partition of the same scope is its own registration.
+        control.expect_checkpoint(backfill_checkpoint(email.clone(), b"page:500:1000"));
+        assert_eq!(
+            pending_len(&control),
+            4,
+            "a sibling partition must not release its sibling's boundary"
+        );
+
+        // A later page of the SAME partition does replace its predecessor:
+        // one sequential task produced both.
         control.expect_checkpoint(backfill_checkpoint(email, b"page:500:1000"));
-        assert_eq!(pending_len(&control), 3);
+        assert_eq!(pending_len(&control), 4);
     }
 
     /// A checkpoint-store write failure leaves nothing durable, but the
@@ -614,10 +626,9 @@ mod tests {
     async fn a_failed_ack_retires_its_broadcast_without_advancing_the_snapshot() {
         let control = control();
         control.record_checkpoint(checkpoint(b"durable")).await;
-        let failed = checkpoint(b"never-persisted");
-        control.expect_checkpoint(failed.clone());
+        let failed = control.expect_checkpoint(checkpoint(b"never-persisted"));
 
-        control.retire_checkpoint(&failed);
+        control.retire_publication(failed);
 
         assert_eq!(pending_len(&control), 0);
         assert_eq!(
@@ -633,9 +644,8 @@ mod tests {
     #[tokio::test]
     async fn a_retracted_registration_does_not_gate_the_boundary() {
         let control = control();
-        let undelivered = checkpoint(b"no-subscriber");
-        control.expect_checkpoint(undelivered.clone());
-        control.retire_checkpoint(&undelivered);
+        let undelivered = control.expect_checkpoint(checkpoint(b"no-subscriber"));
+        control.retire_publication(undelivered);
 
         assert_eq!(control.pause().await.expect("pause"), None);
     }

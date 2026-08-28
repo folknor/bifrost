@@ -151,7 +151,15 @@ impl InventoryFusion {
                         // can acknowledge between the send and a later
                         // registration, and the writer would then find no claim
                         // for a checkpoint that carried one.
-                        let publication = self.publish_claim(&completion.coverage);
+                        let publication = self.control.as_ref().map(|control| {
+                            control.publish_checkpoint(
+                                cp.clone(),
+                                crate::cursor::CoverageClaim::new(
+                                    completion.coverage.clone(),
+                                    self.generation,
+                                ),
+                            )
+                        });
                         let me = MultiplexerEvent {
                             scope: scope.clone(),
                             event: Arc::new(SyncEvent::Done(Some(cp.clone()))),
@@ -161,18 +169,12 @@ impl InventoryFusion {
                         // Register before publishing so a fast consumer
                         // ack cannot land before the entry exists and
                         // leave it outstanding forever.
-                        if let Some(control) = &self.control {
-                            control.expect_checkpoint(cp.clone());
-                        }
                         let delivered = tx.send(me).unwrap_or(0);
                         if !super::delivered_to_real_subscriber(delivered) {
                             // Nothing can ever acknowledge it, so the claim
                             // would sit in the registry for the life of the
                             // attachment.
                             self.retire_claim(publication);
-                            if let Some(control) = &self.control {
-                                control.retire_checkpoint(&cp);
-                            }
                         }
                     }
                     return self.finalize(scope, checkpoint).await;
@@ -246,24 +248,18 @@ impl InventoryFusion {
         Ok(FusionOutcome::NoCursor)
     }
 
-    /// Register what this publication will make durable, and get its identity.
+    /// Release both halves of a publication nothing can ever acknowledge.
     ///
-    /// `None` when there is no writer behind this fusion, in which case nothing
-    /// can be acknowledged and nothing needs an identity.
-    fn publish_claim(
-        &self,
-        coverage: &bifrost_types::InventoryCoverageReport,
-    ) -> Option<crate::cursor::PublicationId> {
-        self.coverage.as_ref().map(|pending| {
-            pending.publish(crate::cursor::CoverageClaim::new(
-                coverage.clone(),
-                self.generation,
-            ))
-        })
-    }
-
+    /// Through `control` when there is one, because that also releases the
+    /// boundary registration - the two halves are one publication and must not
+    /// be retired separately.
     fn retire_claim(&self, publication: Option<crate::cursor::PublicationId>) {
-        if let (Some(pending), Some(id)) = (&self.coverage, publication) {
+        let Some(id) = publication else {
+            return;
+        };
+        if let Some(control) = &self.control {
+            control.retire_publication(id);
+        } else if let Some(pending) = &self.coverage {
             pending.retire(id);
         }
     }
@@ -401,25 +397,22 @@ impl InventoryFusion {
         // not just the terminal completion: Graph checkpoints per page, so
         // waiting for `Done` would let a page checkpoint become durable across
         // a gap it never declared.
-        let publication = batch
-            .checkpoint
-            .as_ref()
-            .and_then(|_| self.publish_claim(&batch.coverage));
+        let publication = match (&self.control, &batch.checkpoint) {
+            (Some(control), Some(checkpoint)) => Some(control.publish_checkpoint(
+                checkpoint.clone(),
+                crate::cursor::CoverageClaim::new(batch.coverage.clone(), self.generation),
+            )),
+            _ => None,
+        };
         let me = MultiplexerEvent {
             scope: scope.clone(),
             event: Arc::new(SyncEvent::Batch(synthetic)),
             checkpoint: batch.checkpoint.clone(),
             publication,
         };
-        if let (Some(control), Some(checkpoint)) = (&self.control, batch.checkpoint.as_ref()) {
-            control.expect_checkpoint(checkpoint.clone());
-        }
         let delivered = tx.send(me).unwrap_or(0);
         if !super::delivered_to_real_subscriber(delivered) {
             self.retire_claim(publication);
-            if let (Some(control), Some(checkpoint)) = (&self.control, batch.checkpoint.as_ref()) {
-                control.retire_checkpoint(checkpoint);
-            }
         }
     }
 

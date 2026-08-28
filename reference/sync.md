@@ -393,12 +393,20 @@ remain readable afterward. The engine cannot replay the overwritten
 batches in-session, but it never presents that loss as success.
 
 Observing a lag also abandons the account's outstanding checkpoint
-registrations (`SyncControl::abandon_pending_checkpoints`), and the
+publications through the per-account `Publications` ledger, and the
 warning's `next_action` reports how many. This is load-bearing, not
-tidy-up: `expect_checkpoint` runs before the send and an entry leaves
+tidy-up: registration runs before the send and an entry leaves
 only through a matching consumer ack, so a registration whose batch the
 ring destroyed can never be retired and would gate every later `pause` /
-`checkpoint_now` on the account forever. Surfacing lag without this
+`checkpoint_now` on the account forever. The ledger folds what every abandoned
+coverage claim OWED into the next publication rather than discarding it, so a
+degraded page lost to the ring still raises its durable debt when the consumer
+next acknowledges progress. What an abandoned claim proved CLEAN does not
+travel: a `Complete` report discharges obligations on the strength of an
+enumeration the consumer took delivery of, and folding it forward would
+discharge debt against a batch the ring destroyed. Under-reporting coverage
+costs a re-walk; over-reporting it loses objects nobody sees again.
+Surfacing lag without this
 would turn silent in-session loss into a permanent hang. The cost is
 bounded and disclosed: a registration whose batch is still in the ring
 is also abandoned, so a boundary wait taken between the lag and that
@@ -1068,38 +1076,44 @@ when activity reaches zero and that pending set is empty. This gives an
 idle account a completion source without claiming safety while a batch
 is still in flight.
 
-Every producer registers its checkpoint with `expect_checkpoint`
-BEFORE broadcasting the batch and retracts it with
-`retire_checkpoint` when the send reached only the slot's sentinel
-receiver. Registering after the send would let a consumer that acks
-in that window strand an entry no ack can match.
+Every producer registers its checkpoint and its coverage claim as ONE
+publication (`SyncControl::publish_checkpoint`) BEFORE broadcasting the
+batch, and retracts it with `retire_publication` when the send reached
+only the slot's sentinel receiver. Registering after the send would let
+a consumer that acks in that window strand an entry no ack can match,
+and registering the two halves separately would let a publication exist
+with only one of them.
 
 An entry leaves the pending set three ways, and every broadcast hits
 one of them:
 
-- `record_checkpoint`, fired by the ack writer after
+- `record_publication`, fired by the ack writer after
   `put_change_cursor` / `put_backfill` succeeds for an `AckRequest`.
-  Removes the entry by exact identity and refreshes the durable
-  snapshot. Both change-cursor and backfill paths are
+  Removes the entry by PUBLICATION identity and refreshes the durable
+  snapshot. (`record_checkpoint` is the value-identified form, for a
+  caller that holds only a checkpoint.) Both change-cursor and backfill paths are
   consumer-ack-deferred.
-- `retire_checkpoint`, fired when the ack was processed but produced
+- `retire_publication`, fired when the ack was processed but produced
   nothing durable (store write failed) or when no real subscriber
   received the batch. The entry stops gating waiters - it is no
   longer in flight - but the durable snapshot is NOT advanced, and
   the consumer learns of a failed write from `ack_checkpoint`'s own
   `Result`. Leaving it pending instead would wedge every later
   `pause` / `checkpoint_now` on the account for the process lifetime.
-- Supersession: a newer broadcast on the same lane + scope replaces
-  the older one. The shared per-scope drive lease makes polling and
-  push reconciliation one sequential producer, while `ScopeToken`
-  generation matching prevents duplicate poll tasks. Acking the newest
-  checkpoint therefore proves the earlier ones from that producer are
-  durable too. This bounds the set by the account's scope count
-  instead of by how many batches a consumer left unacked, and lets a
-  consumer that acks coarsely (persist N batches, ack the last
-  checkpoint) still reach a boundary. `record_checkpoint` removes by
-  exact identity rather than by key, so acking an OLD checkpoint
-  never retires a newer outstanding one.
+- Supersession: a newer broadcast on the same LANE replaces the older
+  one, folding its coverage claim in. A lane is one scope's changes
+  stream, or one backfill partition of one scope. The shared per-scope
+  drive lease makes polling and push reconciliation one sequential
+  producer, while `ScopeToken` generation matching prevents duplicate
+  poll tasks, so acking the newest checkpoint proves the earlier ones
+  from that producer are durable too. Sibling backfill partitions are
+  deliberately NOT one lane: they run concurrently and neither subsumes
+  the other. This bounds the set by the account's scope and partition
+  count instead of by how many batches a consumer left unacked, and lets
+  a consumer that acks coarsely (persist N batches, ack the last
+  checkpoint) still reach a boundary. `record_publication` removes by
+  publication identity rather than by lane or by checkpoint value, so
+  acking an OLD checkpoint never retires a newer outstanding one.
 
 The mutation pipeline records counters, not checkpoints; it does
 not call `record_checkpoint`.
@@ -1259,7 +1273,8 @@ operator waiver is load-bearing rather than a nicety.
 
 ### Publication identity
 
-Coverage reaches the durable record through `PendingCoverage`, keyed by an
+Coverage reaches the durable record through the per-account `Publications`
+ledger, keyed by an
 engine-issued `PublicationId`. It cannot ride `Checkpoint`, which is a published
 type crossing the broadcast channel and back through `ack_checkpoint`.
 
@@ -1277,15 +1292,53 @@ promised to identify a publication:
 - a later walk can produce the same cursor bytes as an earlier one while proving
   different coverage.
 
-`MultiplexerEvent::publication` therefore carries the identity to the consumer,
-and `ack_checkpoint` takes it back. A repeated acknowledgement of the same
+`MultiplexerEvent::publication` therefore carries the identity to the consumer.
+`ack_checkpoint` takes it back for checkpoint-bearing events;
+`ack_publication` acknowledges repair events, which intentionally carry no
+checkpoint because they advance no cursor. A repeated acknowledgement of the same
 publication is idempotent; an UNKNOWN one is refused. It is never defaulted to
 complete coverage - that is the original lying-record bug in another costume.
 
-Supersession FOLDS (`PendingCoverage::supersede`). When a newer publication
+Idempotency is carried by a per-lane watermark of the highest PERSISTED
+publication, not by a record per acknowledgement. Within a lane publications are
+sequential and supersession folds older claims into newer ones, so a persisted id
+at or above the one being retried means everything it proved is durable. That is
+one entry per lane - bounded by the account's scope count - where a tombstone per
+acknowledgement grew for the life of the attachment, and unlike a fixed-size ring
+it never forgets: a delayed consumer retry answers correctly however many
+acknowledgements have landed since.
+
+The watermark moves AFTER the store write lands, never before. A retried
+acknowledgement of a write that FAILED therefore reports unknown and is refused
+again, rather than reporting success for a checkpoint no store ever accepted.
+
+Checkpoint registration, its coverage claim, boundary gating, supersession,
+lag abandonment, retirement, and claim consumption are owned by that one
+ledger, under one lock. The whole registration transition - carry-forward,
+supersession lookup, removal, folding, and insertion of the survivor and its
+boundary - is atomic, because two backfill partitions of one scope are in flight
+together by design and any gap lets both leave a live entry for one key.
+
+A publication's LANE is its supersession key and its acknowledgement key. Lanes
+are one changes stream per scope, one backfill PARTITION per scope, and one
+repair lane. The partition belongs in the backfill key: sibling partitions of a
+scope neither subsume nor release each other. The lane is checked on
+acknowledgement, so `ack_publication` handed a checkpoint publication's id
+refuses instead of consuming it - consuming it would make the later, real
+`ack_checkpoint` short-circuit as already persisted and return before writing,
+while the engine announced a durable boundary the store never accepted.
+
+Boundary release and retirement identify the publication, never the checkpoint
+VALUE, for the same reason the claim does: equal values are routinely different
+publications, and a value search reaches into a sibling that is still in flight.
+
+Supersession FOLDS. When a newer publication
 supersedes an older outstanding one for acknowledgement purposes, the survivor
 absorbs the superseded claim; dropping it would stop the control path waiting for
-the older checkpoint while quietly discarding its obligations. Cumulative reports
+the older checkpoint while quietly discarding its obligations. A consumer may
+still acknowledge the superseded batch - it received it, and producers run ahead
+of consumers - and that acknowledgement persists its checkpoint while ingesting
+nothing, because its coverage now rides the survivor. Cumulative reports
 within one walk make this harmless duplication; across partitions it is the only
 thing keeping partition A's debt alive when B supersedes it.
 
@@ -1384,7 +1437,8 @@ obligation has healed; an id alone would only prove the object still exists. The
 engine validates it (one entry, matching id, right request kind), keeps the id,
 and drops the rest.
 
-Discharge happens on the consumer's acknowledgement of the repair publication,
+Discharge happens on the consumer's explicit `ack_publication` acknowledgement
+of the repair publication,
 and both halves are recorded as `DischargeEvidence::RepairedAndPublished`.
 Neither alone suffices: an account recovery nobody was told about leaves the
 consumer unaware, and a published id with no successful account result merely
