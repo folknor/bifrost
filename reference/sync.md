@@ -127,6 +127,17 @@ with `EngineConfig::detach_timeout` (default 5s) and aborts
 stragglers, removes the slot, unregisters the sink and ack
 sender.
 
+Worker awaits are two-phase and ORDERED: every stream worker first, the ack
+writer last. Each stream worker holds a clone of the writer's request sender,
+so the writer's channel only closes - and the writer only drains and persists
+what it already received - once they are all gone; waiting on the writer first
+burns the whole `detach_timeout` and then aborts it with unpersisted work. The
+writer is identified by `WorkerRole::AckWriter` through `take_ack_writer`, not
+by its spawn position. It IS spawned first, and the predecessor read
+`drained[0]` on that basis - an unannounced coupling between spawn order and
+teardown order that any reordering of the spawn block would have broken
+silently.
+
 The whole teardown runs under the same `lifecycle_inflight` guard
 `attach` takes, claimed together with the slot removal under one lock
 acquisition. The slot leaves `engine.accounts` at the top while the
@@ -387,12 +398,26 @@ poll iteration starts from the freshly-yielded cursor. It does
 NOT write to `CheckpointStore`. Durable persistence is consumer-
 ack-driven:
 
-Polling and push reconciliation claim the same async drive lease for
-each `CursorScope` before snapshotting its cursor and hold it through
-the stream drive. This makes lane + scope a single-producer channel:
+Polling and push reconciliation enter the same `CursorRegistry::with_drive`
+scope for each `CursorScope`. The combinator snapshots the cursor and registry
+generation under the lease, holds it through exactly one stream drive, and
+releases it before recovery handoff, retry delay, channel backpressure, or poll
+cadence sleep. This makes lane + scope a single-producer channel without
+letting an idle poll delay a push invalidation:
 the next producer starts from the cursor installed by the previous one,
 and checkpoint supersession cannot retire another producer's unacked
 batch.
+
+The narrowed extent is a contract, not an implementation detail: **only the
+drive is serialized.** Anything that reads a drive's effect must read it inside
+the combinator, because the other producer may start on the same scope the
+instant the callback returns - the poll loop measures whether its own drive
+advanced the cursor there, for exactly that reason, since measuring it after
+the fact would credit a push reconcile's progress to the poll and pin the
+cadence at `poll_min`. What protects durable state is not the lease but the
+registry generation: `publish_if_generation` refuses a publication whose
+generation the registry has moved past, and a deleted scope makes the next
+`with_drive` return `None` instead of driving an unowned cursor.
 
 1. Consumer subscribes via `account_changes_stream`, receives a
    `MultiplexerEvent { scope, event, checkpoint }`.
@@ -768,12 +793,30 @@ terminations retain their original classification.
 `push::reconciler` receives `WatchEvent::Invalidated { hint }`,
 calls `scopes_for_hint(&cursors, &hint.payload)` (which consults
 the membership index populated at attach), then drives
-`changes_stream` to completion for each affected scope. On
+`changes_stream` to completion for each affected scope.
+
+A drive that returns an ENGINE-INTERNAL error is logged for that scope and does
+not abandon the remaining scopes of the hint. A drive that returns
+`Error::Account` is NOT: an account error already carries a derived recovery
+verdict, so it is normalized onto the `Terminated(err)` path below, exactly as
+the poll loop's `handle_drive_outcome` does. Logging it instead would leave the
+offending cursor installed and stall the scope until an unrelated poll happened
+to reproduce the failure. The two properties hold together: the sweep survives
+one scope's failure, and the failing scope still reaches recovery.
+
+On
 `Terminated(err)`, the reconciler routes through
 `crate::recovery::plan_recovery` and forwards
 `RecoveryPlan::Engine(directive)` to the slot's reopen channel
 carrying the original account error; `Retry(advice)` sleeps for the
 duration derived from `advice.retry_hint`.
+
+`directive_target_scope` IS the blast radius, and the sweep obeys it:
+`Some(scope)` names one scope to reset, so the hint's remaining scopes are
+still swept after the handoff, while `None` (`RestartAccount`,
+`SchemaIncompatible`, `OperatorOverrideRequired`) is account-wide and ends the
+sweep, because driving further scopes into cursors the engine is about to
+discard only burns wire calls.
 
 `Disconnected` emits an account-scoped
 `WarningKind::Other` with message "push transport disconnected".
@@ -1342,16 +1385,25 @@ an operator with no durable object to block or waive. A writer that is GONE
 (detach, shutdown) is a different case and is not a failure - there is nothing to
 persist to and nothing to retry against.
 
-**The barrier waiver's escape hatch is only half built.** `DebtLedger::waive`
-on a barrier stops the incident from blocking the completion sentinel
-(`completion_permitted`), but no walk consults `DebtLedger::barrier_waived`, so
-a barrier-stopped scope never REACHES the sentinel: the walk stops at the same
-barrier on every retry, the driver reports not-completed, and the sentinel is
-never emitted. Waiving a barrier is therefore currently inert for releasing the
-scope; the crossing path - a walk that skips a waived barrier and atomically
-records an unresolved-but-waived ledger entry for the ground it crossed - is
-open work, tracked in `notes/bugs-sync.md`. Waiving an ordinary (non-barrier)
-obligation works as described.
+At a barrier hit, both inventory front ends ask the account writer whether
+EVERY barrier in that report is waived. The writer decides against its current
+ledger, not a walk-start snapshot, so a waiver or block racing the walk is
+ordered by the single writer. An all-waived report is atomically converted from
+barrier incidents into unresolved waived ledger entries and persisted before
+the writer authorizes the crossing. One unknown or unwaived key stops the whole
+report. A crossed barrier is accepted loss, never proof, and the scope may then
+reach its completion sentinel.
+
+An `OperatorBlocked` barrier parks the scope's backfill BEFORE any wire work:
+the orchestrator asks the writer (`WriterRequest::ScopeBarrierBlocked`) once
+per scan candidate and, when blocked, records the park through
+`BackfillScan::record_attempt` exactly as a failed walk would. That is
+deliberate. The check is cheap but it runs on the single account writer that
+also owns every durable mutation, and the rescan tick is one second: without
+recording the park, a blocked scope's retry deadline stays in the past and it
+re-asks the writer every second for as long as the block stands. Recording it
+puts the query on the same 5s-doubling-to-5min ramp, and a later waiver
+releases the scope on the next elapsed tick.
 
 `bifrost-graph` reports its id-less-value case as `CheckpointBarrier`. The only
 token at page granularity is a continuation of that delta session, dead as soon

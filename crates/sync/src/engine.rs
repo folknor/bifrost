@@ -432,8 +432,9 @@ impl SyncEngine {
 
         // Helper to track both the JoinHandle and a clone of its
         // AbortHandle so detach can fire `abort()` on timeout.
-        let mut spawn = |fut: tokio::task::JoinHandle<()>| {
+        let mut spawn = |role: crate::types::WorkerRole, fut: tokio::task::JoinHandle<()>| {
             workers.push(WorkerTask {
+                role,
                 abort: fut.abort_handle(),
                 join: fut,
             });
@@ -446,13 +447,16 @@ impl SyncEngine {
         let ack_writer_control = control.clone();
         // Producers record what each enumeration proved; the single writer
         // reads it back when the matching acknowledgement arrives.
-        spawn(tokio::spawn(ack_writer(
-            ack_writer_aid,
-            ack_writer_store,
-            ack_writer_control,
-            Arc::clone(&pending_coverage),
-            ack_rx,
-        )));
+        spawn(
+            crate::types::WorkerRole::AckWriter,
+            tokio::spawn(ack_writer(
+                ack_writer_aid,
+                ack_writer_store,
+                ack_writer_control,
+                Arc::clone(&pending_coverage),
+                ack_rx,
+            )),
+        );
 
         // Control applier: forwards priority and bandwidth-cap
         // changes to the currently-open protocol handle. Reopen also
@@ -462,40 +466,43 @@ impl SyncEngine {
             let control_shutdown = shutdown.clone();
             let mut priority_view = priority_rx.clone();
             let mut bandwidth_view = bandwidth_cap_rx.clone();
-            spawn(tokio::spawn(async move {
-                {
-                    let account = control_account.load_full();
-                    account
-                        .as_ref()
-                        .as_ref()
-                        .set_priority(*priority_view.borrow());
-                    account
-                        .as_ref()
-                        .as_ref()
-                        .set_bandwidth_cap(*bandwidth_view.borrow());
-                }
-                loop {
-                    tokio::select! {
-                        () = control_shutdown.cancelled() => return,
-                        changed = priority_view.changed() => {
-                            if changed.is_err() {
-                                return;
+            spawn(
+                crate::types::WorkerRole::Stream,
+                tokio::spawn(async move {
+                    {
+                        let account = control_account.load_full();
+                        account
+                            .as_ref()
+                            .as_ref()
+                            .set_priority(*priority_view.borrow());
+                        account
+                            .as_ref()
+                            .as_ref()
+                            .set_bandwidth_cap(*bandwidth_view.borrow());
+                    }
+                    loop {
+                        tokio::select! {
+                            () = control_shutdown.cancelled() => return,
+                            changed = priority_view.changed() => {
+                                if changed.is_err() {
+                                    return;
+                                }
+                                let priority = *priority_view.borrow();
+                                let account = control_account.load_full();
+                                account.as_ref().as_ref().set_priority(priority);
                             }
-                            let priority = *priority_view.borrow();
-                            let account = control_account.load_full();
-                            account.as_ref().as_ref().set_priority(priority);
-                        }
-                        changed = bandwidth_view.changed() => {
-                            if changed.is_err() {
-                                return;
+                            changed = bandwidth_view.changed() => {
+                                if changed.is_err() {
+                                    return;
+                                }
+                                let cap = *bandwidth_view.borrow();
+                                let account = control_account.load_full();
+                                account.as_ref().as_ref().set_bandwidth_cap(cap);
                             }
-                            let cap = *bandwidth_view.borrow();
-                            let account = control_account.load_full();
-                            account.as_ref().as_ref().set_bandwidth_cap(cap);
                         }
                     }
-                }
-            }));
+                }),
+            );
         }
 
         // Spawn push reconciler.
@@ -511,7 +518,10 @@ impl SyncEngine {
             reopen_tx: reopen_tx.clone(),
             throttles: Arc::clone(&throttles),
         };
-        spawn(tokio::spawn(reconciler.run(watch_rx)));
+        spawn(
+            crate::types::WorkerRole::Stream,
+            tokio::spawn(reconciler.run(watch_rx)),
+        );
 
         // Push forwarder: drain `Account::push_stream` into the
         // per-account mpsc. In-process accounts carry invalidations
@@ -523,97 +533,100 @@ impl SyncEngine {
             let tx = watch_tx.clone();
             let sd = shutdown.clone();
             let mut generation = account_generation_rx.clone();
-            spawn(tokio::spawn(async move {
-                let mut reconnect_delay = Duration::from_millis(50);
-                loop {
-                    if sd.is_cancelled() {
-                        return;
-                    }
-                    let acc_arc = acc.load_full();
-                    if acc_arc.capabilities().push == bifrost_types::PushCapability::None {
-                        tokio::select! {
-                            () = sd.cancelled() => return,
-                            changed = generation.changed() => {
-                                if changed.is_err() {
-                                    return;
-                                }
-                            }
-                        }
-                        continue;
-                    }
-                    let mut stream = acc_arc.push_stream();
-                    let mut received = false;
-                    let mut reopened = false;
+            spawn(
+                crate::types::WorkerRole::Stream,
+                tokio::spawn(async move {
+                    let mut reconnect_delay = Duration::from_millis(50);
                     loop {
-                        tokio::select! {
-                            () = sd.cancelled() => return,
-                            changed = generation.changed() => {
-                                if changed.is_err() {
-                                    return;
+                        if sd.is_cancelled() {
+                            return;
+                        }
+                        let acc_arc = acc.load_full();
+                        if acc_arc.capabilities().push == bifrost_types::PushCapability::None {
+                            tokio::select! {
+                                () = sd.cancelled() => return,
+                                changed = generation.changed() => {
+                                    if changed.is_err() {
+                                        return;
+                                    }
                                 }
-                                reopened = true;
-                                break;
                             }
-                            next = stream.next() => {
-                                let Some(event) = next else { break; };
-                                if !matches!(&event, WatchEvent::Terminated(_)) {
-                                    received = true;
+                            continue;
+                        }
+                        let mut stream = acc_arc.push_stream();
+                        let mut received = false;
+                        let mut reopened = false;
+                        loop {
+                            tokio::select! {
+                                () = sd.cancelled() => return,
+                                changed = generation.changed() => {
+                                    if changed.is_err() {
+                                        return;
+                                    }
+                                    reopened = true;
+                                    break;
                                 }
-                                match tx.try_send(event) {
-                                    Ok(()) => {}
-                                    Err(mpsc::error::TrySendError::Full(rejected)) => {
-                                        tracing::trace!(
-                                            target: "bifrost.sync.changes",
-                                            account = ?aid,
-                                            "in-process push: queue full, coalesced"
-                                        );
-                                        let lossless =
-                                            crate::push::requires_lossless_delivery(&rejected);
-                                        let delivery = if lossless {
-                                            rejected
-                                        } else {
-                                            crate::push::coalesced_event(rejected)
-                                        };
-                                        if lossless {
-                                            tokio::select! {
-                                                () = sd.cancelled() => return,
-                                                _ = tx.send(delivery) => {}
-                                            }
-                                        } else {
-                                            tokio::select! {
-                                                () = sd.cancelled() => return,
-                                                _ = tokio::time::timeout(
-                                                    Duration::from_millis(100),
-                                                    tx.send(delivery),
-                                                ) => {}
+                                next = stream.next() => {
+                                    let Some(event) = next else { break; };
+                                    if !matches!(&event, WatchEvent::Terminated(_)) {
+                                        received = true;
+                                    }
+                                    match tx.try_send(event) {
+                                        Ok(()) => {}
+                                        Err(mpsc::error::TrySendError::Full(rejected)) => {
+                                            tracing::trace!(
+                                                target: "bifrost.sync.changes",
+                                                account = ?aid,
+                                                "in-process push: queue full, coalesced"
+                                            );
+                                            let lossless =
+                                                crate::push::requires_lossless_delivery(&rejected);
+                                            let delivery = if lossless {
+                                                rejected
+                                            } else {
+                                                crate::push::coalesced_event(rejected)
+                                            };
+                                            if lossless {
+                                                tokio::select! {
+                                                    () = sd.cancelled() => return,
+                                                    _ = tx.send(delivery) => {}
+                                                }
+                                            } else {
+                                                tokio::select! {
+                                                    () = sd.cancelled() => return,
+                                                    _ = tokio::time::timeout(
+                                                        Duration::from_millis(100),
+                                                        tx.send(delivery),
+                                                    ) => {}
+                                                }
                                             }
                                         }
+                                        Err(mpsc::error::TrySendError::Closed(_)) => return,
                                     }
-                                    Err(mpsc::error::TrySendError::Closed(_)) => return,
                                 }
                             }
                         }
+                        if reopened {
+                            reconnect_delay = Duration::from_millis(50);
+                            continue;
+                        }
+                        if received {
+                            reconnect_delay = Duration::from_millis(50);
+                        }
+                        // push_stream ended; loop reloads the (possibly
+                        // reopened) handle and restarts. Exponential
+                        // backoff prevents an empty stream implementation
+                        // from reconstructing itself 20 times per second.
+                        tokio::select! {
+                            () = sd.cancelled() => return,
+                            () = tokio::time::sleep(reconnect_delay) => {}
+                        }
+                        reconnect_delay = reconnect_delay
+                            .saturating_mul(2)
+                            .min(Duration::from_secs(30));
                     }
-                    if reopened {
-                        reconnect_delay = Duration::from_millis(50);
-                        continue;
-                    }
-                    if received {
-                        reconnect_delay = Duration::from_millis(50);
-                    }
-                    // push_stream ended; loop reloads the (possibly
-                    // reopened) handle and restarts. Exponential
-                    // backoff prevents an empty stream implementation
-                    // from reconstructing itself 20 times per second.
-                    tokio::select! {
-                        () = sd.cancelled() => return,
-                        () = tokio::time::sleep(reconnect_delay) => {}
-                    }
-                    reconnect_delay = reconnect_delay
-                        .saturating_mul(2)
-                        .min(Duration::from_secs(30));
-                }
-            }));
+                }),
+            );
         }
 
         // Spawn the multiplexer.
@@ -632,7 +645,7 @@ impl SyncEngine {
             scope_tokens: Arc::new(std::sync::Mutex::new(HashMap::new())),
             throttles: Arc::clone(&throttles),
         };
-        spawn(tokio::spawn(mux.run()));
+        spawn(crate::types::WorkerRole::Stream, tokio::spawn(mux.run()));
 
         // Spawn the backfill orchestrator. It walks the registered
         // scopes and runs one `BackfillRunner::run_partition` per
@@ -662,26 +675,29 @@ impl SyncEngine {
             .iter()
             .map(|inventory| inventory.scope().clone())
             .collect();
-        spawn(tokio::spawn(async move {
-            run_backfill_orchestrator(
-                bf_account,
-                bf_account_id,
-                bf_cursors,
-                bf_live,
-                bf_store,
-                backfill_registry_handle,
-                bf_shutdown,
-                Some(bf_changes),
-                bf_subscriber_notify,
-                bf_config,
-                bf_control,
-                bf_throttles,
-                bf_excluded,
-                bf_coverage,
-                bf_writer_tx,
-            )
-            .await;
-        }));
+        spawn(
+            crate::types::WorkerRole::Stream,
+            tokio::spawn(async move {
+                run_backfill_orchestrator(
+                    bf_account,
+                    bf_account_id,
+                    bf_cursors,
+                    bf_live,
+                    bf_store,
+                    backfill_registry_handle,
+                    bf_shutdown,
+                    Some(bf_changes),
+                    bf_subscriber_notify,
+                    bf_config,
+                    bf_control,
+                    bf_throttles,
+                    bf_excluded,
+                    bf_coverage,
+                    bf_writer_tx,
+                )
+                .await;
+            }),
+        );
 
         // Deferred inventory establishment must happen after the slot
         // can be subscribed to. The worker waits for a real subscriber
@@ -706,30 +722,33 @@ impl SyncEngine {
             let inventory_open_skips = Arc::clone(&open_skips);
             let inventory_writer_tx = ack_tx.clone();
             let inventory_coverage = Arc::clone(&pending_coverage);
-            spawn(tokio::spawn(async move {
-                run_deferred_inventory_establishment(
-                    inventory_factory,
-                    inventory_account,
-                    inventory_cursors,
-                    inventory_changes,
-                    inventory_shutdown,
-                    inventory_aid,
-                    inventory_control,
-                    inventory_account_control_tx,
-                    inventory_throttles,
-                    inventory_notify,
-                    inventory_boundary_tx,
-                    inventory_capabilities,
-                    inventory_subscriptions,
-                    inventory_account_generation_tx,
-                    inventory_reopen_lock,
-                    inventory_open_skips,
-                    inventory_writer_tx,
-                    inventory_coverage,
-                    deferred_inventory_scopes,
-                )
-                .await;
-            }));
+            spawn(
+                crate::types::WorkerRole::Stream,
+                tokio::spawn(async move {
+                    run_deferred_inventory_establishment(
+                        inventory_factory,
+                        inventory_account,
+                        inventory_cursors,
+                        inventory_changes,
+                        inventory_shutdown,
+                        inventory_aid,
+                        inventory_control,
+                        inventory_account_control_tx,
+                        inventory_throttles,
+                        inventory_notify,
+                        inventory_boundary_tx,
+                        inventory_capabilities,
+                        inventory_subscriptions,
+                        inventory_account_generation_tx,
+                        inventory_reopen_lock,
+                        inventory_open_skips,
+                        inventory_writer_tx,
+                        inventory_coverage,
+                        deferred_inventory_scopes,
+                    )
+                    .await;
+                }),
+            );
         }
 
         // Spawn the reopen listener.
@@ -750,41 +769,44 @@ impl SyncEngine {
         let reopen_account_generation_tx = account_generation_tx.clone();
         let reopen_serial = Arc::clone(&reopen_lock);
         let reopen_open_skips = Arc::clone(&open_skips);
-        spawn(tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    () = reopen_shutdown.cancelled() => return,
-                    req = reopen_rx.recv() => {
-                        let Some(req) = req else { return; };
-                        match req {
-                            ReopenRequest::Recovery { scope, error } => {
-                                let writer = WriterHandle::new(reopen_writer_tx.clone());
-                                let ctx = RecoveryContext {
-                                    factory: &reopen_factory,
-                                    current: &reopen_current,
-                                    cursors: &reopen_cursors,
-                                    changes_tx: &reopen_changes,
-                                    account_id: &reopen_aid,
-                                    control: &reopen_control,
-                                    account_control_tx: &reopen_account_control_tx,
-                                    throttles: &reopen_throttles,
-                                    boundary_tx: &reopen_boundary_tx,
-                                    capabilities: &reopen_capabilities,
-                                    subscriptions: &reopen_subscriptions,
-                                    account_generation_tx: &reopen_account_generation_tx,
-                                    reopen_lock: &reopen_serial,
-                                    open_skips: &reopen_open_skips,
-                                    shutdown: &reopen_shutdown,
-                                    writer: &writer,
-                                    coverage: &reopen_coverage,
-                                };
-                                handle_account_error(&ctx, scope, error).await;
+        spawn(
+            crate::types::WorkerRole::Stream,
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        () = reopen_shutdown.cancelled() => return,
+                        req = reopen_rx.recv() => {
+                            let Some(req) = req else { return; };
+                            match req {
+                                ReopenRequest::Recovery { scope, error } => {
+                                    let writer = WriterHandle::new(reopen_writer_tx.clone());
+                                    let ctx = RecoveryContext {
+                                        factory: &reopen_factory,
+                                        current: &reopen_current,
+                                        cursors: &reopen_cursors,
+                                        changes_tx: &reopen_changes,
+                                        account_id: &reopen_aid,
+                                        control: &reopen_control,
+                                        account_control_tx: &reopen_account_control_tx,
+                                        throttles: &reopen_throttles,
+                                        boundary_tx: &reopen_boundary_tx,
+                                        capabilities: &reopen_capabilities,
+                                        subscriptions: &reopen_subscriptions,
+                                        account_generation_tx: &reopen_account_generation_tx,
+                                        reopen_lock: &reopen_serial,
+                                        open_skips: &reopen_open_skips,
+                                        shutdown: &reopen_shutdown,
+                                        writer: &writer,
+                                        coverage: &reopen_coverage,
+                                    };
+                                    handle_account_error(&ctx, scope, error).await;
+                                }
                             }
                         }
                     }
                 }
-            }
-        }));
+            }),
+        );
 
         // Bandwidth feed: optional periodic task that polls
         // `BandwidthMeter::account(id).observed_bps()` into the
@@ -794,18 +816,21 @@ impl SyncEngine {
             let bw_aid = account_id.clone();
             let bw_control = control.clone();
             let bw_shutdown = shutdown.clone();
-            spawn(tokio::spawn(async move {
-                let view = meter_handle.account(bw_aid);
-                loop {
-                    tokio::select! {
-                        () = bw_shutdown.cancelled() => return,
-                        () = tokio::time::sleep(Duration::from_secs(1)) => {
-                            let bps = view.observed_bps();
-                            bw_control.observe_bandwidth(bps);
+            spawn(
+                crate::types::WorkerRole::Stream,
+                tokio::spawn(async move {
+                    let view = meter_handle.account(bw_aid);
+                    loop {
+                        tokio::select! {
+                            () = bw_shutdown.cancelled() => return,
+                            () = tokio::time::sleep(Duration::from_secs(1)) => {
+                                let bps = view.observed_bps();
+                                bw_control.observe_bandwidth(bps);
+                            }
                         }
                     }
-                }
-            }));
+                }),
+            );
         }
 
         let multiplexer = MultiplexerHandle {
@@ -1138,15 +1163,11 @@ impl SyncEngine {
             let mut workers = slot.workers.lock().expect("worker list lock poisoned");
             workers.drain(..).collect()
         };
-        // The ack writer is spawned first. Wait for stream workers
-        // before the writer so final worker-held ack sender clones can
-        // close naturally and the writer can drain everything it
-        // received.
-        let ack_worker = if drained.is_empty() {
-            None
-        } else {
-            Some(drained.remove(0))
-        };
+        // Wait for stream workers before the writer so final worker-held ack
+        // sender clones can close naturally and the writer can drain
+        // everything it received. Identify the writer structurally: spawn
+        // order is not part of the teardown contract.
+        let ack_worker = take_ack_writer(&mut drained);
         let deadline = tokio::time::Instant::now() + timeout;
         for worker in drained {
             await_worker_until(deadline, worker).await;
@@ -3024,6 +3045,27 @@ fn scope_covers_membership(scope: &CursorScope, membership: &MembershipScope) ->
     }
 }
 
+/// Remove the account's single ack-writer worker from a drained worker list.
+///
+/// Detach must wait on the stream workers FIRST: every one of them holds a
+/// clone of the writer's `WriterRequest` sender, and the writer only sees its
+/// channel close (and only then drains and persists what it already received)
+/// once the last clone is gone. Waiting on the writer first therefore hits the
+/// detach timeout and aborts a writer with unpersisted work.
+///
+/// The writer is identified by ROLE, not by position. It happens to be
+/// spawned first, and the predecessor of this function read `drained[0]` on
+/// that basis - a coupling between spawn order and teardown order that
+/// nothing announced and that any future reordering of the spawn block would
+/// have silently broken, mistaking a stream worker for the writer and then
+/// waiting on the real writer in the wrong phase.
+fn take_ack_writer(workers: &mut Vec<WorkerTask>) -> Option<WorkerTask> {
+    workers
+        .iter()
+        .position(|worker| worker.role == crate::types::WorkerRole::AckWriter)
+        .map(|position| workers.remove(position))
+}
+
 async fn await_worker_until(deadline: tokio::time::Instant, worker: WorkerTask) {
     let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
     if remaining.is_zero() {
@@ -3120,6 +3162,26 @@ async fn run_backfill_orchestrator(
                 return;
             }
             let incarnation_key = (scope.clone(), incarnation);
+            if scope_barrier_blocked(&writer_tx, scope.clone()).await {
+                tracing::debug!(
+                    target: "bifrost.sync.backfill",
+                    account = ?account_id,
+                    scope = ?scope,
+                    "backfill parked at operator-blocked barrier"
+                );
+                // Record the park as an attempt so the incarnation rejoins
+                // the exponential rescan delay. Skipping this leaves the
+                // scope's `failed` deadline in the past, so the 1s rescan
+                // tick re-asks the single account writer about the same
+                // blocked scope every second for as long as the operator
+                // leaves the block in place - and the writer is the task
+                // that also owns every durable mutation. `select` already
+                // withholds a scope until its delay elapses, so reusing it
+                // here parks the query on the same 5s-to-5min ramp the walk
+                // itself would have used.
+                scan.record_attempt(incarnation_key, false);
+                continue;
+            }
             let acc_arc = account.load_full();
             let acc: &dyn Account = acc_arc.as_ref().as_ref();
             match backfill_plan_for(acc, &scope, config) {
@@ -3384,6 +3446,18 @@ async fn run_backfill_orchestrator(
             () = tokio::time::sleep(Duration::from_secs(1)) => {}
         }
     }
+}
+
+async fn scope_barrier_blocked(writer: &mpsc::Sender<WriterRequest>, scope: CursorScope) -> bool {
+    let (done, recv) = oneshot::channel();
+    if writer
+        .send(WriterRequest::ScopeBarrierBlocked { scope, done })
+        .await
+        .is_err()
+    {
+        return false;
+    }
+    recv.await.unwrap_or(false)
 }
 
 /// First retry delay for a scope incarnation whose backfill did not
@@ -4018,6 +4092,31 @@ async fn ack_writer(
                 // it. Persisted against the scope's existing durable position.
                 let result = persist_ledger_only(&account_id, &store, &ledger).await;
                 let _ = done.send(result);
+                continue;
+            }
+            WriterRequest::CrossWaivedBarriers {
+                report,
+                generation,
+                done,
+            } => {
+                let mut crossed = ledger.clone();
+                if !crossed.cross_waived_barriers(
+                    &report,
+                    generation,
+                    jiff::Timestamp::now().as_second(),
+                ) {
+                    let _ = done.send(Ok(false));
+                    continue;
+                }
+                let result = persist_ledger_only(&account_id, &store, &crossed).await;
+                if result.is_ok() {
+                    ledger = crossed;
+                }
+                let _ = done.send(result.map(|()| true));
+                continue;
+            }
+            WriterRequest::ScopeBarrierBlocked { scope, done } => {
+                let _ = done.send(ledger.scope_has_blocked_barrier(&scope));
                 continue;
             }
             WriterRequest::ApplyRepair {
@@ -6124,8 +6223,55 @@ mod tests {
         ack_writer, classify_item_outcome, mpsc, oneshot, queue_unresolved_for_retry,
         scope_covers_membership, should_forward_engine_recovery, unresolved_readback_ids,
     };
-    use super::{ChangeCursor, WriterHandle};
+    use super::{ChangeCursor, WriterHandle, take_ack_writer};
     use crate::cursor::store::CheckpointStore;
+    use crate::types::{WorkerRole, WorkerTask};
+
+    fn idle_worker(role: WorkerRole) -> WorkerTask {
+        let join = tokio::spawn(async {});
+        WorkerTask {
+            role,
+            abort: join.abort_handle(),
+            join,
+        }
+    }
+
+    /// Detach's writer-last ordering must survive a reordering of the spawn
+    /// block. The predecessor took `drained[0]`, which is only the writer
+    /// because it is spawned first.
+    #[tokio::test]
+    async fn the_ack_writer_is_taken_by_role_from_any_position() {
+        for writer_position in 0..3 {
+            let mut workers: Vec<WorkerTask> = (0..3)
+                .map(|index| {
+                    idle_worker(if index == writer_position {
+                        WorkerRole::AckWriter
+                    } else {
+                        WorkerRole::Stream
+                    })
+                })
+                .collect();
+            let taken = take_ack_writer(&mut workers).expect("the writer is present");
+            assert_eq!(taken.role, WorkerRole::AckWriter);
+            assert_eq!(workers.len(), 2, "only the writer is removed");
+            assert!(
+                workers.iter().all(|w| w.role == WorkerRole::Stream),
+                "the writer must not be left behind (position {writer_position})"
+            );
+        }
+    }
+
+    /// An empty or writer-free list must not silently promote a stream
+    /// worker into the writer's teardown phase.
+    #[tokio::test]
+    async fn taking_the_ack_writer_from_a_writerless_list_yields_none() {
+        let mut empty: Vec<WorkerTask> = Vec::new();
+        assert!(take_ack_writer(&mut empty).is_none());
+        let mut streams = vec![idle_worker(WorkerRole::Stream)];
+        assert!(take_ack_writer(&mut streams).is_none());
+        assert_eq!(streams.len(), 1, "a non-writer list is left intact");
+    }
+
     use crate::error::Error;
     use bifrost_types::{CursorScope, EngineDirective, FolderId, MembershipScope, ObjectType};
     use std::collections::HashSet;

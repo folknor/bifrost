@@ -107,6 +107,38 @@ pub(crate) async fn record_barriers(
     Ok(())
 }
 
+/// Ask the account writer whether every barrier in `coverage` is waived now.
+///
+/// The writer both decides and persists the conversion to unresolved waived
+/// debt before answering `true`. This deliberately happens at the barrier hit,
+/// not from a walk-start snapshot: an operator decision racing an in-flight
+/// walk is ordered against this request by the single writer.
+pub(crate) async fn cross_waived_barriers(
+    writer: Option<&tokio::sync::mpsc::Sender<crate::multiplexer::WriterRequest>>,
+    coverage: &InventoryCoverageReport,
+    generation: u64,
+) -> Result<bool, Error> {
+    let Some(writer) = writer else {
+        return Ok(false);
+    };
+    let (done, recv) = tokio::sync::oneshot::channel();
+    if writer
+        .send(crate::multiplexer::WriterRequest::CrossWaivedBarriers {
+            report: coverage.clone(),
+            generation,
+            done,
+        })
+        .await
+        .is_err()
+    {
+        return Ok(false);
+    }
+    match recv.await {
+        Ok(result) => result,
+        Err(_) => Ok(false),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

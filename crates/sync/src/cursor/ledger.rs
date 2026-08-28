@@ -186,13 +186,10 @@ impl LedgerEntry {
 /// between sessions, and there is no object for an operator to waive. So the
 /// blocked progress itself is the durable thing.
 ///
-/// A waived barrier is what is MEANT to later authorize a crossing checkpoint,
-/// and that crossing must atomically record an unresolved-but-waived ledger
-/// entry - the waiver converts blocked progress into declared accepted loss; it
-/// never makes the engine simply forget. The crossing itself is not built yet:
-/// no walk consults `DebtLedger::barrier_waived`, so today a waived barrier
-/// still stops every walk and the waiver only stops the incident from blocking
-/// the completion sentinel.
+/// A waived barrier authorizes a later walk to cross only through
+/// `cross_waived_barriers`, which atomically converts the incident into an
+/// unresolved-but-waived ledger entry. The waiver converts blocked progress
+/// into declared accepted loss; it never makes the engine simply forget.
 #[derive(Debug, Clone)]
 pub struct BarrierIncident {
     pub key: ObligationKey,
@@ -279,6 +276,77 @@ impl DebtLedger {
         self.barriers
             .get(key)
             .is_some_and(|barrier| barrier.policy.is_waived())
+    }
+
+    #[must_use]
+    pub fn scope_has_blocked_barrier(&self, scope: &bifrost_types::CursorScope) -> bool {
+        self.barriers.values().any(|barrier| {
+            barrier.domain.scope == *scope
+                && matches!(barrier.policy, PolicyStatus::OperatorBlocked)
+        })
+    }
+
+    /// Convert every barrier in `report` into ordinary accepted-loss debt.
+    ///
+    /// This is all-or-nothing. A checkpoint crosses the whole report domain,
+    /// so one unwaived or unknown barrier keeps the walk stopped. The account
+    /// writer calls this and persists the resulting ledger as one ordered
+    /// operation, making a waiver or block that races the walk resolve by
+    /// writer order rather than by a stale snapshot.
+    pub fn cross_waived_barriers(
+        &mut self,
+        report: &InventoryCoverageReport,
+        generation: u64,
+        now: i64,
+    ) -> bool {
+        let barriers: Vec<_> = report
+            .obligations()
+            .iter()
+            .filter(|obligation| obligation.is_barrier())
+            .collect();
+        if barriers.is_empty()
+            || barriers.iter().any(|obligation| {
+                let key = obligation.key();
+                !self.barrier_waived(key)
+                    && !self
+                        .entries
+                        .get(key)
+                        .is_some_and(|entry| entry.policy.is_waived())
+            })
+        {
+            return false;
+        }
+
+        for obligation in barriers {
+            let key = obligation.key().clone();
+            if let Some(incident) = self.barriers.remove(&key) {
+                self.entries.insert(
+                    key.clone(),
+                    LedgerEntry {
+                        key,
+                        domain: report.domain.clone(),
+                        generation,
+                        proof: ProofStatus::Unresolved,
+                        policy: incident.policy,
+                        target: None,
+                        parent: None,
+                        first_seen_unix_seconds: now,
+                        last_error: obligation.error().clone(),
+                    },
+                );
+            } else if let Some(entry) = self.entries.get_mut(&key) {
+                // Terminal reports are commonly cumulative with the final
+                // page. Repeating an already-crossed barrier must remain
+                // authorized by the same waiver rather than recreating a wall
+                // one event later.
+                entry.domain = report.domain.clone();
+                entry.generation = generation;
+                entry.proof = ProofStatus::Unresolved;
+                entry.target = None;
+                entry.last_error = obligation.error().clone();
+            }
+        }
+        true
     }
 
     /// Fold one ACCEPTED coverage report into the ledger.
@@ -1058,6 +1126,44 @@ mod tests {
     }
 
     #[test]
+    fn a_cumulative_report_keeps_an_already_crossed_barrier_waived() {
+        let mut ledger = DebtLedger::new();
+        let key = ObligationKey(b"page-7".to_vec());
+        let report = InventoryCoverageReport::degraded(
+            CoverageDomain::full(scope()),
+            vec![InventoryObligation::Region {
+                key: key.clone(),
+                failure_label: "unidentifiable-value".into(),
+                error: error(),
+                recovery: RegionRecovery::barrier(),
+            }],
+        );
+        ledger.record_barrier(BarrierIncident {
+            key: key.clone(),
+            domain: report.domain.clone(),
+            generation: 1,
+            failure_label: "unidentifiable-value".into(),
+            evidence: error(),
+            policy: PolicyStatus::Retrying { attempts: 0 },
+            resume_from: None,
+        });
+        assert!(ledger.waive(&key, "operator".into(), 500));
+
+        assert!(ledger.cross_waived_barriers(&report, 2, 600));
+        assert!(
+            ledger.cross_waived_barriers(&report, 2, 600),
+            "a cumulative Done report must not recreate the barrier crossed by its batch"
+        );
+        assert!(
+            ledger
+                .entry(&key)
+                .expect("accepted-loss entry")
+                .policy
+                .is_waived()
+        );
+    }
+
+    #[test]
     fn an_operator_can_block_a_barrier_without_accepting_its_loss() {
         let mut ledger = DebtLedger::new();
         let key = ObligationKey(b"page-7".to_vec());
@@ -1077,6 +1183,45 @@ mod tests {
             PolicyStatus::OperatorBlocked
         );
         assert!(!ledger.completion_permitted(&scope()));
+    }
+
+    /// The rescan park is keyed on `OperatorBlocked` alone. A retrying or a
+    /// waived barrier must NOT park the scope: retrying is the ordinary state
+    /// a barrier is recorded in, so parking on it would stop every
+    /// barrier-stopped scope from ever re-walking, and a waived one is
+    /// precisely the barrier the walk is now allowed to cross.
+    #[test]
+    fn only_an_operator_block_parks_a_scopes_rescan() {
+        let mut ledger = DebtLedger::new();
+        let key = ObligationKey(b"page-7".to_vec());
+        ledger.record_barrier(BarrierIncident {
+            key: key.clone(),
+            domain: CoverageDomain::full(scope()),
+            generation: 1,
+            failure_label: "unidentifiable-value".into(),
+            evidence: error(),
+            policy: PolicyStatus::Retrying { attempts: 0 },
+            resume_from: None,
+        });
+        assert!(
+            !ledger.scope_has_blocked_barrier(&scope()),
+            "a retrying barrier must keep the rescan running"
+        );
+
+        assert!(ledger.waive(&key, "operator".into(), 500));
+        assert!(
+            !ledger.scope_has_blocked_barrier(&scope()),
+            "a waived barrier is crossable, not a park"
+        );
+
+        assert!(ledger.block(&key));
+        assert!(ledger.scope_has_blocked_barrier(&scope()));
+
+        let other = bifrost_types::CursorScope::Type(bifrost_types::ObjectType::CalendarEvent);
+        assert!(
+            !ledger.scope_has_blocked_barrier(&other),
+            "one scope's block must not park a sibling scope"
+        );
     }
 
     fn region(key: &str, recovery: RegionRecovery) -> InventoryObligation {

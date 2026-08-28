@@ -93,7 +93,7 @@ pub async fn drive_changes_stream(
     let _activity = match &control {
         Some(control) => match control.begin_activity() {
             Some(activity) => Some(activity),
-            None => return Ok(ChangesEvent::Paused),
+            None => return Ok(refused_activity_outcome(boundary.peek())),
         },
         None => None,
     };
@@ -217,6 +217,27 @@ pub async fn drive_changes_stream(
         }
     }
     Ok(ChangesEvent::Done)
+}
+
+/// What a drive reports when `begin_activity` refuses to admit it.
+///
+/// The refusal only says "the boundary is not `Run`", so the boundary itself
+/// has to name the outcome. Reporting `Paused` under a `Stop` boundary told
+/// the poll loop to park and re-enter at the top of the next iteration, which
+/// is exactly the loop that a stopping account is trying to wind down; the
+/// task only exited once something else noticed. `Stopped` is the exit signal
+/// (`DriveRecovery::exit`), so it has to come from here.
+fn refused_activity_outcome(request: BoundaryRequest) -> ChangesEvent {
+    match request {
+        BoundaryRequest::Stop => ChangesEvent::Stopped,
+        // A drive refused under Pause / CheckpointNow / Run is a park: the
+        // poll loop's own boundary check owns what happens next. (Run is
+        // reachable here as a race - the boundary can flip between the
+        // refusal and this read.)
+        BoundaryRequest::Pause | BoundaryRequest::CheckpointNow | BoundaryRequest::Run => {
+            ChangesEvent::Paused
+        }
+    }
 }
 
 fn post_publish_boundary(request: BoundaryRequest, has_checkpoint: bool) -> Option<ChangesEvent> {
@@ -344,6 +365,18 @@ pub enum WriterRequest {
         incident: crate::cursor::BarrierIncident,
         done: oneshot::Sender<Result<(), Error>>,
     },
+    /// Re-check every barrier in a report against the writer's current ledger
+    /// and convert an all-waived set into accepted-loss debt before crossing.
+    CrossWaivedBarriers {
+        report: bifrost_types::InventoryCoverageReport,
+        generation: u64,
+        done: oneshot::Sender<Result<bool, Error>>,
+    },
+    /// Read whether operator policy currently parks this scope at a barrier.
+    ScopeBarrierBlocked {
+        scope: CursorScope,
+        done: oneshot::Sender<bool>,
+    },
     /// Record obligations from a report that has no acknowledgeable checkpoint
     /// of its own - a backfill partition's terminal summary, say.
     ///
@@ -453,6 +486,17 @@ impl std::fmt::Debug for WriterRequest {
                 .debug_struct("RecordBarrier")
                 .field("key", &incident.key)
                 .finish(),
+            Self::CrossWaivedBarriers {
+                report, generation, ..
+            } => f
+                .debug_struct("CrossWaivedBarriers")
+                .field("domain", &report.domain)
+                .field("generation", generation)
+                .finish(),
+            Self::ScopeBarrierBlocked { scope, .. } => f
+                .debug_struct("ScopeBarrierBlocked")
+                .field("scope", scope)
+                .finish(),
             Self::OperatorDecision { key, decision, .. } => f
                 .debug_struct("OperatorDecision")
                 .field("key", key)
@@ -472,8 +516,29 @@ fn checkpoint_for(event: &SyncEvent<Change>) -> Option<&Checkpoint> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ChangesEvent, post_publish_boundary};
+    use super::{ChangesEvent, post_publish_boundary, refused_activity_outcome};
     use crate::cancel::BoundaryRequest;
+
+    /// A drive refused admission under a `Stop` boundary must report
+    /// `Stopped`, not `Paused`: `Paused` keeps the poll task alive and
+    /// re-entering, so a stopping account never sheds its poll loops.
+    #[test]
+    fn a_drive_refused_under_stop_reports_stopped_not_paused() {
+        assert!(matches!(
+            refused_activity_outcome(BoundaryRequest::Stop),
+            ChangesEvent::Stopped
+        ));
+        for parked in [
+            BoundaryRequest::Pause,
+            BoundaryRequest::CheckpointNow,
+            BoundaryRequest::Run,
+        ] {
+            assert!(
+                matches!(refused_activity_outcome(parked), ChangesEvent::Paused),
+                "{parked:?} is a park, not an exit"
+            );
+        }
+    }
 
     /// The full boundary truth table for a published item. Pause and
     /// Stop are lifecycle boundaries and must be honoured whether or

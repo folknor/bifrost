@@ -39,7 +39,7 @@ use tokio::sync::broadcast;
 
 use crate::control::SyncControl;
 use crate::error::Error;
-use crate::inventory_walk::{InventoryWalk, WalkDecision, record_barriers};
+use crate::inventory_walk::{InventoryWalk, WalkDecision, cross_waived_barriers, record_barriers};
 use crate::multiplexer::MultiplexerEvent;
 
 use super::partitioner::partition_key;
@@ -366,17 +366,23 @@ impl BackfillRunner {
                         }
                         return Err(Error::Account(error));
                     }
-                    if !batch.coverage.is_complete() {
-                        complete = false;
-                    }
                     let seen = u64::try_from(batch.items.len()).unwrap_or(u64::MAX);
                     seen_total = seen_total.saturating_add(seen);
                     let kept = filter_supersedes(&batch.items, live);
                     let kept_count = u64::try_from(kept.len()).unwrap_or(u64::MAX);
                     kept_total = kept_total.saturating_add(kept_count);
 
-                    if let WalkDecision::StopAtBarrier { resume_from } =
-                        walk.inspect(&batch.coverage)
+                    let crossed = if batch.coverage.has_barrier() {
+                        cross_waived_barriers(writer_tx, &batch.coverage, generation).await?
+                    } else {
+                        false
+                    };
+                    if !batch.coverage.is_complete() && !crossed {
+                        complete = false;
+                    }
+                    if !crossed
+                        && let WalkDecision::StopAtBarrier { resume_from } =
+                            walk.inspect(&batch.coverage)
                     {
                         // Announce nothing the writer could not durably record:
                         // a barrier that only exists in this process is one a
@@ -495,8 +501,14 @@ impl BackfillRunner {
                     }
                 }
                 bifrost_types::InventoryEvent::Done(completion) => {
-                    if let WalkDecision::StopAtBarrier { resume_from } =
-                        walk.inspect(&completion.coverage)
+                    let crossed = if completion.coverage.has_barrier() {
+                        cross_waived_barriers(writer_tx, &completion.coverage, generation).await?
+                    } else {
+                        false
+                    };
+                    if !crossed
+                        && let WalkDecision::StopAtBarrier { resume_from } =
+                            walk.inspect(&completion.coverage)
                     {
                         complete = false;
                         scope_walk = ScopeWalkStep::StopScopeWalk;
@@ -507,7 +519,7 @@ impl BackfillRunner {
                         }
                         break;
                     }
-                    if !completion.coverage.is_complete() {
+                    if !completion.coverage.is_complete() && !crossed {
                         complete = false;
                         // The terminal summary has no checkpoint of its own to
                         // ride, so its obligations reach the ledger directly -

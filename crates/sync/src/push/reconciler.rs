@@ -211,27 +211,64 @@ impl Reconciler {
                     () = tokio::time::sleep(wait) => {}
                 }
             }
-            let drive = self.cursors.claim_drive(&scope).await;
-            let Some(cursor) = self.cursors.snapshot(&scope) else {
+            let driven = self
+                .cursors
+                .with_drive(&scope, |cursor, registry_generation| {
+                    let account_swap = self.account.load_full();
+                    let cursors = Arc::clone(&self.cursors);
+                    let account_id = self.account_id.clone();
+                    let changes_tx = self.changes_tx.clone();
+                    let boundary = self.boundary.clone();
+                    let control = self.control.clone();
+                    let ack_tx = self.ack_tx.clone();
+                    let scope = scope.clone();
+                    async move {
+                        let account: &dyn Account = account_swap.as_ref().as_ref();
+                        drive_changes_stream(
+                            account,
+                            scope,
+                            cursor,
+                            cursors,
+                            account_id,
+                            changes_tx,
+                            boundary,
+                            Some(control),
+                            ack_tx,
+                            Some(registry_generation),
+                        )
+                        .await
+                    }
+                })
+                .await;
+            let Some(outcome) = driven else {
                 continue;
             };
-            // Load the current account handle each iteration so a
-            // mid-reconcile reopen surfaces to the next scope.
-            let account_swap = self.account.load_full();
-            let account: &dyn Account = account_swap.as_ref().as_ref();
-            let outcome = drive_changes_stream(
-                account,
-                scope.clone(),
-                cursor,
-                Arc::clone(&self.cursors),
-                self.account_id.clone(),
-                self.changes_tx.clone(),
-                self.boundary.clone(),
-                Some(self.control.clone()),
-                self.ack_tx.clone(),
-                Some(drive.registry_generation()),
-            )
-            .await?;
+            let outcome = match outcome {
+                Ok(outcome) => outcome,
+                // An account error already carries a complete recovery
+                // verdict - an incompatible cursor envelope derives
+                // `Engine(SchemaIncompatible)`, which MUST reset state.
+                // Surviving the sibling scopes of a multi-scope hint must
+                // not cost the failing scope its recovery: logging this and
+                // moving on leaves the invalid cursor installed, so push
+                // re-terminates on every hint until some later poll happens
+                // to hit the same failure. Normalize onto the same path an
+                // account-authored `Terminated` takes, exactly as the poll
+                // loop's `handle_drive_outcome` does.
+                Err(Error::Account(error)) => ChangesEvent::Terminated(error),
+                // Engine-internal errors carry no recovery verdict and name
+                // nothing to reset. Log and keep sweeping.
+                Err(error) => {
+                    tracing::warn!(
+                        target: "bifrost.sync.reconcile",
+                        account = ?self.account_id,
+                        scope = ?scope,
+                        error = %error,
+                        "hinted scope drive failed; continuing remaining scopes"
+                    );
+                    continue;
+                }
+            };
             match outcome {
                 ChangesEvent::Advanced
                 | ChangesEvent::Done
@@ -276,6 +313,16 @@ impl Reconciler {
                         }
                         RecoveryPlan::Engine(directive) => {
                             let directive_scope = directive_target_scope(&directive);
+                            // `directive_target_scope` IS the blast radius:
+                            // `Some(scope)` names a single scope to reset, so
+                            // the rest of this hint's scopes are unaffected
+                            // and must still be swept; `None` is account-wide
+                            // (RestartAccount, SchemaIncompatible,
+                            // OperatorOverrideRequired), and driving further
+                            // scopes into a reset the engine is about to run
+                            // wastes wire calls against cursors it is about
+                            // to discard.
+                            let account_wide = directive_scope.is_none();
                             let _ = self
                                 .reopen_tx
                                 .send(ReopenRequest::Recovery {
@@ -283,7 +330,10 @@ impl Reconciler {
                                     error: original,
                                 })
                                 .await;
-                            return Ok(());
+                            if account_wide {
+                                return Ok(());
+                            }
+                            continue;
                         }
                         RecoveryPlan::Terminal(_) => {
                             return Ok(());

@@ -837,32 +837,55 @@ async fn spawn_scope_poll_inner(
                 () = tokio::time::sleep(wait) => {}
             }
         }
-        let drive = cursors.claim_drive(&scope).await;
-        let Some(cursor) = cursors.snapshot(&scope) else {
+        let driven = cursors
+            .with_drive(&scope, |cursor, registry_generation| {
+                let pre_advance_state = cursor.server_state.bytes.clone();
+                let acc_arc = account.load_full();
+                let drive_cursors = Arc::clone(&cursors);
+                let advance_cursors = Arc::clone(&cursors);
+                let advance_scope = scope.clone();
+                let scope = scope.clone();
+                let account_id = account_id.clone();
+                let changes_tx = changes_tx.clone();
+                let boundary = boundary.clone();
+                let control = control.clone();
+                let ack_tx = ack_tx.clone();
+                async move {
+                    let acc: &dyn Account = acc_arc.as_ref().as_ref();
+                    let outcome = drive_changes_stream(
+                        acc,
+                        scope,
+                        cursor,
+                        drive_cursors,
+                        account_id,
+                        changes_tx,
+                        boundary,
+                        Some(control),
+                        ack_tx,
+                        Some(registry_generation),
+                    )
+                    .await;
+                    // Read the post-drive cursor while the lease is still
+                    // held. The lease no longer covers the tail of the poll
+                    // iteration, so a push reconcile can advance this scope
+                    // the instant we return; comparing out there would credit
+                    // this drive with the reconciler's progress and hold the
+                    // cadence at `poll_min` on a scope this loop never moved.
+                    let advanced = advance_cursors
+                        .snapshot(&advance_scope)
+                        .is_some_and(|c| c.server_state.bytes != pre_advance_state);
+                    (advanced, outcome)
+                }
+            })
+            .await;
+        let Some((advanced, outcome)) = driven else {
             // Scope was removed from the registry; exit cleanly.
             return;
         };
-        let pre_advance_state = cursor.server_state.bytes.clone();
-        let acc_arc = account.load_full();
-        let acc: &dyn Account = acc_arc.as_ref().as_ref();
-        let outcome = drive_changes_stream(
-            acc,
-            scope.clone(),
-            cursor,
-            Arc::clone(&cursors),
-            account_id.clone(),
-            changes_tx.clone(),
-            boundary.clone(),
-            Some(control.clone()),
-            ack_tx.clone(),
-            Some(drive.registry_generation()),
-        )
-        .await;
         let recovered = handle_drive_outcome(
             &scope,
             outcome,
-            &cursors,
-            &pre_advance_state,
+            advanced,
             &reopen_tx,
             &account_id,
             &throttles,
@@ -916,8 +939,11 @@ struct DriveRecovery {
 async fn handle_drive_outcome(
     scope: &CursorScope,
     outcome: Result<ChangesEvent, Error>,
-    cursors: &CursorRegistry,
-    pre_advance_state: &[u8],
+    // `advanced`: whether this drive moved the scope's cursor, measured by
+    // the caller while it still held the drive lease. Deliberately not
+    // re-read here - the lease is already released by the time this runs, so
+    // a concurrent push reconcile could be credited to this drive.
+    advanced: bool,
     reopen_tx: &mpsc::Sender<ReopenRequest>,
     account_id: &AccountId,
     throttles: &StdMutex<crate::recovery::ThrottleBucket>,
@@ -930,32 +956,20 @@ async fn handle_drive_outcome(
         other => other,
     };
     match outcome {
-        Ok(ChangesEvent::Advanced | ChangesEvent::Done) => {
-            let advanced = cursors
-                .snapshot(scope)
-                .map(|c| c.server_state.bytes.as_slice() != pre_advance_state)
-                .unwrap_or(false);
-            DriveRecovery {
-                advanced,
-                exit: false,
-            }
-        }
+        Ok(ChangesEvent::Advanced | ChangesEvent::Done) => DriveRecovery {
+            advanced,
+            exit: false,
+        },
         Ok(ChangesEvent::Stopped) => DriveRecovery {
             advanced: false,
             exit: true,
         },
-        Ok(ChangesEvent::Paused) => {
-            // Pause is a temporary park; the poll loop's boundary
-            // check picks it up at the top of the next iteration.
-            let advanced = cursors
-                .snapshot(scope)
-                .map(|c| c.server_state.bytes.as_slice() != pre_advance_state)
-                .unwrap_or(false);
-            DriveRecovery {
-                advanced,
-                exit: false,
-            }
-        }
+        // Pause is a temporary park; the poll loop's boundary check picks it
+        // up at the top of the next iteration.
+        Ok(ChangesEvent::Paused) => DriveRecovery {
+            advanced,
+            exit: false,
+        },
         Ok(ChangesEvent::Terminated(error)) => {
             use crate::recovery::{
                 RecoveryPlan, directive_target_scope, plan_recovery, retry_delay,
@@ -1188,8 +1202,7 @@ mod tests {
         let recovery = handle_drive_outcome(
             &scope,
             Err(Error::Account(error.clone())),
-            &cursors,
-            b"unchanged",
+            false,
             &reopen_tx,
             &AccountId("routing".into()),
             &StdMutex::new(crate::recovery::ThrottleBucket::default()),

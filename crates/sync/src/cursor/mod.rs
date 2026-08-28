@@ -16,6 +16,7 @@ pub mod ledger;
 pub mod store;
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
@@ -247,6 +248,36 @@ impl CursorRegistry {
             _guard: guard,
             registry_generation: self.registry_generation.load(Ordering::SeqCst),
         }
+    }
+
+    /// Run exactly one change-stream drive while holding the scope lease.
+    ///
+    /// The callback receives the cursor snapshot and registry generation
+    /// captured under the lease. The lease is released before this method
+    /// returns, so callers cannot accidentally retain it across recovery,
+    /// channel backpressure, or cadence sleeps. A poll loop that held the
+    /// lease over its whole iteration made a push reconcile wait out the
+    /// cadence sleep and every recovery backoff before it could touch the
+    /// scope at all.
+    ///
+    /// The contract that buys is narrow and must not be widened back:
+    /// **only the drive is serialized**. Anything that reads the drive's
+    /// effect - the cursor it installed, above all - has to be measured
+    /// inside this callback, because the reconciler (or the poll loop) may
+    /// start its own drive on this scope the instant the future returns.
+    /// The engine-generation fence is what protects the durable side:
+    /// `publish_if_generation` refuses a publication whose generation the
+    /// registry has moved past, and a deleted scope makes the next
+    /// `with_drive` yield `None` rather than driving a cursor nobody owns.
+    pub async fn with_drive<T, F, Fut>(&self, scope: &CursorScope, drive: F) -> Option<T>
+    where
+        F: FnOnce(ChangeCursor, u64) -> Fut,
+        Fut: Future<Output = T>,
+    {
+        let guard = self.claim_drive(scope).await;
+        let cursor = self.snapshot(scope)?;
+        let generation = guard.registry_generation();
+        Some(drive(cursor, generation).await)
     }
 }
 

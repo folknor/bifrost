@@ -110,13 +110,14 @@ fix pass went back and ablated:
   absent. The replacement drives `contacts::search` against a scripted page
   and asserts the second call re-reads the SAME page URL.
 
-## From the `bugs-sync.md` arc, rounds 1-3 plus mid-arc close pass (776471d..HEAD, arc still open)
+## From the `bugs-sync.md` arc, rounds 1-4 plus mid-arc close pass (776471d..HEAD, arc still open)
 
-Scope is `crates/sync/`. Rounds 1-3 are landed and close-passed; rounds 4
-(lease/liveness: B1, B2, B3, E2, E6, F4) and 5 (the remainder, including the
-scheduler/BudgetGate F5) are still to run against the findings left in
-`notes/bugs-sync.md`. The three commits share one subject: who owns durable
-state, and what a durable boundary can honestly claim.
+Scope is `crates/sync/`. Rounds 1-4 are landed and close-passed; round 5 (the
+remainder, including the scheduler/BudgetGate F5) is still to run against the
+findings left in `notes/bugs-sync.md`. Rounds 1-3 share one subject: who owns
+durable state, and what a durable boundary can honestly claim. Round 4 is
+teardown, ordering and lifetimes - leases, sleeps, channel depth, detach
+ordering.
 
 Machinery later work may build on and must not break:
 
@@ -189,19 +190,67 @@ Machinery later work may build on and must not break:
   counter may produce `Waived` or `Discharged`; an expired budget is
   `OperatorBlocked`. Repair budgets accrue at the lineage ROOT.
 
-Open finding the close pass filed - the next high-value target in this crate:
+Machinery round 4 added - the lease contract above all, which round 5 must not
+undo:
 
-- **A8 in `notes/bugs-sync.md`: waiving a BARRIER never releases the scope.**
-  `DebtLedger::barrier_waived` has zero production callers; a barrier-stopped
-  scope never emits the sentinel, so `completion_permitted` (where the waiver
-  acts) is never consulted for it. The walk-crossing path - skip a waived
-  barrier, atomically record an unresolved-but-waived entry for the crossed
-  ground - is unbuilt. `reference/sync.md` and the `BarrierIncident` docs now
-  say so honestly. Related: a barrier-stopped scope re-walks on the rescan
-  backoff (5s doubling to 5min) forever, re-broadcasting its pre-barrier pages
-  each pass; nothing parks the rescan on an OperatorBlocked barrier.
+- **`CursorRegistry::with_drive` is the ONLY way a change drive is entered.**
+  It claims the per-scope lease, snapshots cursor and registry generation
+  under it, runs exactly one drive, and RELEASES before recovery handoff,
+  retry/reconcile sleeps, `reopen_tx` backpressure and the poll cadence sleep.
+  Both call sites had previously over-extended the lease across a whole poll
+  iteration, so a push invalidation waited out up to `poll_max` (30 min) of
+  idle sleep - push was strictly no better than polling. **Do not re-extend
+  it**, and do not reintroduce a bare `claim_drive` in a drive path
+  (`claim_drive` stays published and working, per the no-removal rule).
+  The contract the narrowing buys is narrow: **only the drive is serialized.**
+  Anything that reads a drive's EFFECT must read it inside the callback,
+  because the other producer can start on that scope the instant it returns.
+  The poll loop measures its own `advanced` inside the callback for exactly
+  this reason; measuring it after would credit a push reconcile's progress to
+  the poll and pin the cadence at `poll_min`. Durable state was never
+  lease-protected: `publish_if_generation` (the generation fence) and
+  `with_drive` returning `None` for a deleted scope do that, unchanged.
+- **A8 is built.** `DebtLedger::cross_waived_barriers` plus
+  `inventory_walk::cross_waived_barriers` (used by BOTH front ends, keeping
+  the A2 anti-divergence rule). The WRITER re-checks the waiver at the barrier
+  hit against its live ledger - never a walk-start snapshot - converts an
+  all-waived report from barrier incidents into unresolved WAIVED ledger
+  entries, persists, and only then answers `true`. All-or-nothing per report:
+  a checkpoint crosses the whole domain, so one unwaived or unknown key keeps
+  the walk stopped. A cumulative terminal report repeating an already-crossed
+  barrier stays authorized rather than rebuilding the wall one event later.
+  Crossing is accepted loss, never proof.
+- **An `OperatorBlocked` barrier parks the backfill rescan** via
+  `WriterRequest::ScopeBarrierBlocked`, checked before any wire work - and the
+  park is recorded through `BackfillScan::record_attempt`. That second half is
+  load-bearing: the rescan tick is one second and the query lands on the single
+  account writer that owns every durable mutation, so without recording it the
+  blocked scope's retry deadline stays in the past and it re-queries the writer
+  every second for as long as the block stands.
+- **Push reconciliation routes `Err(Error::Account)` through recovery**, the
+  same normalization `handle_drive_outcome` does. E6 (one failed hinted scope
+  must not abandon its siblings) and recovery routing must BOTH hold: the
+  round's first implementation logged every drive error and thereby turned an
+  incompatible cursor envelope - `Engine(SchemaIncompatible)`, which must reset
+  state - into a swallowed one. The sweep now ends only on an ACCOUNT-WIDE
+  directive; `directive_target_scope` is the blast radius (`Some(scope)` =
+  keep sweeping, `None` = stop).
+- **`take_ack_writer` selects the ack writer by `WorkerRole::AckWriter`.**
+  Detach waits on stream workers first (they hold the writer's sender clones)
+  and the writer last; the predecessor took `drained[0]`, coupling teardown
+  order to spawn order with nothing announcing it.
+- **`refused_activity_outcome`** names what a drive refused by
+  `begin_activity` reports: `Stop` -> `Stopped` (which is what sets
+  `DriveRecovery::exit`), everything else -> `Paused`.
 
 Reasoned rejections and refutations - do not silently relitigate:
+
+- **B2 was REFUSED in round 4, after B1 landed.** Its force was compounding:
+  poll tasks sent on the depth-16 `reopen_tx` *while holding the drive lease*.
+  With `with_drive`, every `reopen_tx.send().await` in both the poll loop and
+  the reconciler is outside the lease, and what remains is a bounded channel
+  doing its job - backpressure on the ORIGINATING poll task only. Bounded
+  channel + serial listener is not itself the defect.
 
 - **C2 was REFUTED with evidence, not fixed**: `drive_changes_stream` attaches
   `publication` whenever control and checkpoint are both present, both
@@ -256,6 +305,16 @@ Test seam rounds 4 and 5 should build on:
   (boundary-valid batches, envelope-valid cursors).
   `attach_schema_recovery.rs` still carries its own older `HealAccount` double;
   migrating it onto the seam is optional cleanup, not owed.
+- **`tests/push_poll_latency.rs` (round 4) is the second model consumer** and
+  the pattern round 5 should copy for anything push- or recovery-shaped: a
+  one-hour `poll_initial`/`poll_min`/`poll_max` config, so any drive observed
+  after attach's first pass provably came from the push path and not the poll
+  timer. Its recovery assertions key on `StubAccount::established`: schema
+  recovery re-establishes every scope and `RestartScope` re-establishes one, so
+  a fresh `establish_initial_cursor` call is the observable fingerprint of a
+  failure having REACHED recovery. That is what distinguishes "the scope was
+  driven" from "the scope was recovered"; the round's own first sibling test
+  counted drive attempts only and passed against the bug.
 
 Testing traps this arc recorded:
 

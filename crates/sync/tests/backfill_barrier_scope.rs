@@ -117,16 +117,10 @@ async fn a_barrier_stops_the_whole_scope_walk_through_the_real_orchestrator() {
             // The third partition must never be requested; answering
             // emptily keeps the failure observable in `walked` below
             // rather than crashing a detached engine task.
-            other => vec![InventoryEvent::Done(InventoryCompletion::complete(
+            _ => vec![InventoryEvent::Done(InventoryCompletion::complete(
                 CoverageDomain::full(scope.clone()),
                 None,
-            ))]
-            .into_iter()
-            .chain(std::iter::once(batch(
-                entries(&format!("leaked-{other:?}"), 1),
-                InventoryCoverageReport::complete(CoverageDomain::full(scope.clone())),
-            )))
-            .collect(),
+            ))],
         }
     }));
     let stub = Arc::new(stub);
@@ -221,6 +215,47 @@ async fn a_barrier_stops_the_whole_scope_walk_through_the_real_orchestrator() {
             .expect("store read succeeds")
             .is_none(),
         "no backfill checkpoint may become durable without a consumer ack"
+    );
+
+    assert!(
+        engine
+            .waive_obligation(
+                &account_id,
+                ObligationKey(b"blocked-page".to_vec()),
+                "test operator".to_owned(),
+            )
+            .await
+            .expect("waiver persists"),
+        "the recorded barrier is addressable by its obligation key"
+    );
+
+    // The next retry re-checks the waiver at the barrier hit, converts it to
+    // unresolved waived debt, crosses it, requests the later partition, and
+    // emits the completion sentinel. This is the end-to-end escape hatch A8
+    // was missing.
+    let released = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let event = events.recv().await.expect("broadcast stays open");
+            if matches!(
+                &event.checkpoint,
+                Some(Checkpoint::Backfill(checkpoint)) if checkpoint.partition.0 == b"complete"
+            ) {
+                break;
+            }
+        }
+    })
+    .await;
+    assert!(
+        released.is_ok(),
+        "a waived barrier must release the scope on its next retry; walked: {:?}",
+        stub.walked_partitions()
+    );
+
+    assert!(
+        stub.walked_partitions()
+            .iter()
+            .any(|(_, partition)| { *partition == InventoryPartition::Page { from: 20, to: 30 } }),
+        "crossing a waived barrier reaches the partition beyond it"
     );
 
     engine.detach(&account_id).await.expect("detach succeeds");

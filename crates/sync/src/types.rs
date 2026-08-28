@@ -232,6 +232,13 @@ pub(crate) struct AccountSlot {
 }
 
 pub(crate) struct WorkerTask {
+    pub role: WorkerRole,
     pub join: JoinHandle<()>,
     pub abort: AbortHandle,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WorkerRole {
+    AckWriter,
+    Stream,
 }

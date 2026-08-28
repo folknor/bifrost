@@ -132,8 +132,19 @@ impl InventoryFusion {
         while let Some(event) = stream.next().await {
             match event {
                 bifrost_types::InventoryEvent::Done(completion) => {
-                    if let WalkDecision::StopAtBarrier { resume_from } =
-                        walk.inspect(&completion.coverage)
+                    let crossed = if completion.coverage.has_barrier() {
+                        crate::inventory_walk::cross_waived_barriers(
+                            self.writer_tx.as_ref(),
+                            &completion.coverage,
+                            self.generation,
+                        )
+                        .await?
+                    } else {
+                        false
+                    };
+                    if !crossed
+                        && let WalkDecision::StopAtBarrier { resume_from } =
+                            walk.inspect(&completion.coverage)
                     {
                         // The walk ended on ground the cursor may not cross.
                         // Establishing here would advance past a region nothing
@@ -228,8 +239,19 @@ impl InventoryFusion {
                     // walk stops here. Checkpoints already accepted earlier in
                     // this walk stand: each of them certifies a prefix that
                     // ends before this region begins.
-                    if let WalkDecision::StopAtBarrier { resume_from } =
-                        walk.inspect(&batch.coverage)
+                    let crossed = if batch.coverage.has_barrier() {
+                        crate::inventory_walk::cross_waived_barriers(
+                            self.writer_tx.as_ref(),
+                            &batch.coverage,
+                            self.generation,
+                        )
+                        .await?
+                    } else {
+                        false
+                    };
+                    if !crossed
+                        && let WalkDecision::StopAtBarrier { resume_from } =
+                            walk.inspect(&batch.coverage)
                     {
                         self.record_barriers(&scope, &batch.coverage, resume_from)
                             .await?;
