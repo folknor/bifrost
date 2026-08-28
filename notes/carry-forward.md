@@ -110,6 +110,171 @@ fix pass went back and ablated:
   absent. The replacement drives `contacts::search` against a scripted page
   and asserts the second call re-reads the SAME page URL.
 
+## From the `bugs-sync.md` arc, rounds 1-3 plus mid-arc close pass (776471d..HEAD, arc still open)
+
+Scope is `crates/sync/`. Rounds 1-3 are landed and close-passed; rounds 4
+(lease/liveness: B1, B2, B3, E2, E6, F4) and 5 (the remainder, including the
+scheduler/BudgetGate F5) are still to run against the findings left in
+`notes/bugs-sync.md`. The three commits share one subject: who owns durable
+state, and what a durable boundary can honestly claim.
+
+Machinery later work may build on and must not break:
+
+- **One `Publications` ledger per account** (`cursor/coverage.rs`,
+  `PendingCoverage`, alias `Publications`) owns checkpoint registration,
+  coverage claims, boundary gating, supersession, lag abandonment, retirement
+  and claim consumption, under ONE lock. The LANE is both the supersession key
+  and the acknowledgement key: one changes stream per scope, one backfill
+  PARTITION per scope, one repair lane. Registration is a single atomic
+  transition; acknowledgement idempotency is a per-lane watermark of the
+  highest PERSISTED publication, moved only AFTER the store write lands.
+  Supersession FOLDS the superseded claim into the survivor; lag abandonment
+  carries DEBT ONLY forward, never what a lost batch proved clean. Boundary
+  release and retirement identify the PUBLICATION, never the checkpoint value -
+  equal values are routinely different publications.
+- **`PublicationId` is `(u64, Arc<PublicationReceipt>)`** - it lost `Copy`, by
+  design, and the receipt carries the exact checkpoint lane and coverage claim
+  so an acknowledgement can replay after the issuing writer restarts. An id's
+  high 32 bits are a per-`PendingCoverage`-instance segment, so a stale
+  pre-reattach id can never outrank a current one in the durable-lane ordering.
+- **One writer task per account owns every durable mutation**
+  (`WriterRequest` in `multiplexer/changes.rs`, served by `ack_writer` in
+  `engine.rs`). Recovery code only ever holds a `WriterHandle`; reattach
+  inserts are tracked PROVISIONAL until commit/abort, and an acknowledgement
+  discharges the provisional mark. The writer holds the authoritative in-memory
+  `DebtLedger`, loaded once at attach; `CheckpointStore::apply_transition`
+  writes checkpoint plus ledger as one operation. The `WriterHandle` names
+  reset intent per caller (`reset_scope_for_restart` / `_for_disable` /
+  `_for_schema_recovery`); only schema recovery deletes backfill state -
+  routine `RestartScope` deleting the completion marker was a round-2
+  regression against a documented contract, do not reintroduce it.
+- **Scope reset atomicity**: `invalidate_scope` retires the scope's
+  publications, extracts their degraded debt, and raises a per-scope
+  acknowledgement FENCE (exclusive bound against the mint counter) as one
+  operation under the ledger lock, BEFORE the first store await - and runs
+  AGAIN after the deletes land. There is no unfencing step; post-reset ids sit
+  above the fence. The fence is checked before the live-claim lookup in
+  `claim_in`, so a publication registered during the deletes is refused too.
+- **`DurableCheckpointSet`** (bifrost-types) replaced the single
+  `Option<Checkpoint>` for `pause` / `checkpoint_now`: one entry per change
+  scope and per (scope, partition) backfill lane, normalized in `new` so a
+  duplicate lane is unrepresentable, equality symmetric and order-insensitive,
+  and an older ack cannot move a lane backwards (`announce_durable` compares
+  publication ids).
+- **`InventoryWalk`** (`inventory_walk.rs`) is the shared barrier/resume state
+  both inventory front ends hold - the DIVERGENCE of the two walks was A2.
+  `record_barriers` returns the writer's inner result, and BOTH front ends
+  refuse to announce a barrier the store refused: the backfill partition fails
+  (scope stays Pending, re-walks), the fusion walk returns the error. A
+  DEPARTED writer (detach/shutdown) is deliberately non-fatal. The fusion half
+  of this rule was the close pass's fix - round 3 had it on the runner only,
+  the same divergence shape one call further up.
+- **`ScopeWalkDriver`** (`backfill/scope_walk.rs`) owns partition sequencing
+  for both plan shapes; a barrier stops the SCOPE - a stopped walk hands out no
+  further partition, so there is no flag for an orchestrator loop to forget.
+  `BackfillPartitionOutcome` carries a `#[must_use]` `ScopeWalkStep` and its
+  `Default` is the SAFE answer (stopped, not complete). The stop is enforced
+  twice (fold sets `exhausted`; `next_partition` also checks `walk.stopped()`) -
+  deliberate redundancy, both ablated.
+- **Sentinel eligibility is decided by the writer**, not the runner: the
+  completion sentinel's ack runs `DebtLedger::completion_permitted` against the
+  ledger as it stands and silently withholds the marker (persisting the ledger
+  only) when the scope owes anything unwaived. The runner's `complete` flag is
+  advisory.
+- **The `DebtLedger`** discharges by proof UNION (interval union over
+  time/uid/page coordinates, generation-gated, `domains_may_join` guards
+  UIDVALIDITY and snapshot identity) and retains only proofs still load-bearing
+  for an open obligation or barrier. Barriers are incidents, never ledger debt;
+  re-recording one is idempotent and preserves operator policy. No local
+  counter may produce `Waived` or `Discharged`; an expired budget is
+  `OperatorBlocked`. Repair budgets accrue at the lineage ROOT.
+
+Open finding the close pass filed - the next high-value target in this crate:
+
+- **A8 in `notes/bugs-sync.md`: waiving a BARRIER never releases the scope.**
+  `DebtLedger::barrier_waived` has zero production callers; a barrier-stopped
+  scope never emits the sentinel, so `completion_permitted` (where the waiver
+  acts) is never consulted for it. The walk-crossing path - skip a waived
+  barrier, atomically record an unresolved-but-waived entry for the crossed
+  ground - is unbuilt. `reference/sync.md` and the `BarrierIncident` docs now
+  say so honestly. Related: a barrier-stopped scope re-walks on the rescan
+  backoff (5s doubling to 5min) forever, re-broadcasting its pre-barrier pages
+  each pass; nothing parks the rescan on an OperatorBlocked barrier.
+
+Reasoned rejections and refutations - do not silently relitigate:
+
+- **C2 was REFUTED with evidence, not fixed**: `drive_changes_stream` attaches
+  `publication` whenever control and checkpoint are both present, both
+  production callers pass `Some(control)`, and `emit_backfill_complete`
+  publishes unconditionally. Pinned by
+  `a_published_change_checkpoint_always_carries_its_publication_id` (ablated by
+  the close pass; it bites). Do not re-open without new evidence.
+- `PendingCoverage::claim` (kind-agnostic) and `SyncControl::record_checkpoint`
+  (value-identified) stay published and stay unreachable from every engine
+  path; kept under the no-removal rule, documented as foot-guns. Every engine
+  path uses the lane-checked, publication-identified forms.
+- F1 is half-landed BY DESIGN: `CheckpointStore` stays published
+  (consumer-implemented; ownership is enforced by which internal type can reach
+  the `Arc`), and `BackfillCheckpointTarget::direct` keeps the old
+  read-modify-write semantics for external constructors, documenting the race.
+  A compare-and-swap on `CheckpointStore` is an owner-level trait-change
+  proposal, deliberately not taken.
+- Lag carry-forward is DEBT ONLY - folding a `Complete` report forward would
+  discharge obligations against a batch the ring destroyed.
+- A departed writer channel is non-fatal while a store error is fatal, so
+  detach/shutdown does not fail partitions.
+
+Accepted residuals:
+
+- `PublicationId` lost `Copy` (receipt behind an `Arc`); real ergonomic cost,
+  judged unavoidable.
+- F3 is only partially resolved: checkpoint MINTING (fusion forwards the
+  account's, backfill mints positional `page:F:T`) and terminal-`Done`
+  handling are still two implementations; the shared `InventoryWalk` covers
+  only the safety-critical barrier/resume half. Re-divergence risk, filed
+  under F3 in `notes/bugs-sync.md`.
+- Receipt-based ack replay is scoped to one `PendingCoverage` instance per
+  attachment; across a detach/re-attach a late ack of a prior incarnation's
+  publication replays from its receipt and can re-persist a stale row over a
+  freshly re-established one. Same class as the documented vanished-scope
+  late-ack leak: re-delivery, never loss. Noted, not fixed.
+
+Test seam rounds 4 and 5 should build on:
+
+- **`crates/sync/tests/common/mod.rs` now holds a reusable `Account` double**:
+  `StubAccount` (closure hooks for discovery, establishment, partitioning,
+  partitioned and whole-scope inventory, changes; `walked` / `established` /
+  `closed` recorders; everything else Unsupported or empty) plus
+  `StubFactory::queue`. Built by the close pass because round 3 could not
+  write an end-to-end orchestrator test without it.
+  `tests/backfill_barrier_scope.rs` is the model consumer: it drives attach ->
+  orchestrator -> runner -> broadcast against the stub and pins that the
+  partition past a barrier is never REQUESTED, the barrier page's checkpoint is
+  stripped, no sentinel is broadcast, and nothing becomes durable unacked
+  (ablated: reverting the driver stop fails it). Keep the double honest - hooks
+  must return only shapes production protocol crates can produce
+  (boundary-valid batches, envelope-valid cursors).
+  `attach_schema_recovery.rs` still carries its own older `HealAccount` double;
+  migrating it onto the seam is optional cleanup, not owed.
+
+Testing traps this arc recorded:
+
+- `brokkr test -p bifrost-sync <NAME>` - the package is `bifrost-sync`, not
+  `sync` (`-p sync` fails as outside the workspace). The filter is a substring
+  match and a filter matching nothing reports PASS - check the run count.
+- The orchestrator parks on `wait_for_real_subscriber`, so an end-to-end
+  cold-start test must subscribe via `account_changes_stream` after attach or
+  it hangs; conversely nothing is raced away before the subscribe.
+- A barrier-stopped or failed scope re-walks after `BACKFILL_RETRY_INITIAL`
+  (5s): assertions about "never walked again" are safe immediately after the
+  triggering event but not after multi-second waits, and paused-time
+  auto-advance can fast-forward through the backoff and make walk counts
+  flaky.
+- The engine-side pin for uniform-input traps: the FIFO/no-queue lesson from
+  earlier arcs held here too - the concurrency-shaped ledger tests
+  (`concurrent_registration_leaves_one_entry_per_lane`) use genuinely
+  concurrent registrars, keep that shape.
+
 ## From the `bugs-dav.md` arc (closed, a65acb6..dac58d3)
 
 Scope was `crates/caldav/` and `crates/carddav/`, plus the IMAP composition seam.
