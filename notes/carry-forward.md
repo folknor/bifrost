@@ -110,11 +110,18 @@ fix pass went back and ablated:
   absent. The replacement drives `contacts::search` against a scripted page
   and asserts the second call re-reads the SAME page URL.
 
-## From the `bugs-sync.md` arc, rounds 1-5 plus mid-arc close pass (776471d..HEAD)
+## From the `bugs-sync.md` arc (closed, 776471d..b29ba6d plus the final close pass)
 
-Scope is `crates/sync/`. All five rounds are landed; `notes/bugs-sync.md` has no
-open findings left, only closure notes, refusals and two carried out-of-scope
-`bifrost-types` observations. A Fable close pass reads this next.
+Scope was `crates/sync/`. Five rounds, a mid-arc close pass over rounds 1-3,
+and a final close pass over rounds 4-5 and the mid-arc pass's own commits.
+`notes/bugs-sync.md` has no open findings, only closure notes, refusals and two
+carried out-of-scope `bifrost-types` observations. The final pass re-ablated
+the round-5 admission tests mechanically (a queueless direct-semaphore admit
+and a priority-blind single lane both fail them), audited the dispatcher for
+deadlock, lost wakeups and shutdown, verified admission-before-lease ordering
+at every call site, and found no code defect; its only fixes were doc drift
+(`reference/sync.md`'s hydration section still claimed no production path
+passes through the scheduler, contradicting the round-5 scheduler section).
 Rounds 1-3 share one subject: who owns
 durable state, and what a durable boundary can honestly claim. Round 4 is
 teardown, ordering and lifetimes - leases, sleeps, channel depth, detach

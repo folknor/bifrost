@@ -1102,10 +1102,14 @@ Two deliberate properties:
   write surface and the reopen-snapshot discipline, so the engine does
   not - it forwards the read methods explicitly instead.
 
-These calls do not pass through the `Scheduler` / `BudgetGate` (neither
-does any production path today; see below). Consumer-driven hydration
-and engine-driven backfill share the same underlying client, where
-`bifrost-net` is the rate-limit chokepoint.
+These consumer-driven calls do not pass through the `Scheduler` /
+`BudgetGate` - unlike the engine's own wire paths, which are all
+admitted (see "Scheduler + budget" below). That asymmetry is
+deliberate: the budget bounds what the ENGINE spends on an account's
+behalf, while a consumer-initiated hydrate is the consumer spending
+its own latency budget. Consumer-driven hydration and engine-driven
+backfill still share the same underlying client, where `bifrost-net`
+is the rate-limit chokepoint.
 
 Alongside the read-only hydration cluster, the engine forwards sibling
 **direct passthrough** clusters that resolve through the same

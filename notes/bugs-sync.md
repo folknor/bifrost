@@ -71,8 +71,8 @@ and 2.
 **F3 landed only in part.** The shared piece is the barrier and resume state.
 Checkpoint MINTING (fusion takes the account's, backfill mints positional ones)
 and terminal-summary debt recording are still two implementations. The
-divergence that caused A2 is closed; the structural item is not, and is left
-open under F below.
+divergence that caused A2 is closed; the structural item is not, and is
+recorded as an accepted residual in the round 5 closure note below.
 
 ### Refuted, not fixed - do not re-open without new evidence
 
