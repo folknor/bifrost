@@ -19,7 +19,82 @@ rather than appending to it.
 - Refusing a finding with a reason is a good outcome. Two have been rejected on
   the merits so far, both recorded below.
 
-## From the `bugs-graph.md` arc (round 1 closed, dac58d3..)
+## From the `bugs-graph.md` arc (closed, dac58d3..8e607fd)
+
+Scope was `crates/graph/`. One round plus a close pass. Every finding in the
+document was worked in a single round; the cold review then found three defects
+in that round's own new code, all fixed structurally rather than by a corrected
+conditional.
+
+Machinery later work may build on and must not break:
+
+- **`PageWalk` now bounds the two delta walks**, which are the crate's primary
+  sync loops and previously had no `nextLink` bound at all while
+  `reference/graph.md` claimed the guard was universal. The reference now carries
+  an ENUMERATION, verified one-for-one against the eleven production
+  `PageWalk::new` sites; every remaining `next_link` use is a single-page-per-call
+  cursor API with no traversal loop. A refusal projects as
+  `InventoryEvent::Terminated` / `SyncEvent::Terminated` with
+  `Protocol(ParseFailed)`. If a new traversal loop appears, it must enter the walk
+  and the enumeration must be updated, or the reference goes false again.
+- **The public-folder cap is real by construction.** `capped_baseline` returns
+  ids, version map and degraded flag as ONE `Baseline`, so every per-item vector
+  empties together. The predecessor `apply_cap` computed the new `degraded` while
+  the caller cleared `live_versions` off the old one, so the first over-cap scan
+  persisted an unbounded `(id, change_key)` map behind a cursor advertised as
+  capped. The under-cap arm filters `live_versions` to the surviving id set, so no
+  orphan versions persist.
+- **Public-folder change detection exists at all now.** Fingerprints share the
+  canonical read/flag/category hashing with REST inventory through one shared
+  function, and full scans compare persisted change keys to emit `Updated` for
+  in-place edits. Before this, flag, category and read changes in a public folder
+  were permanently invisible - the incremental poll is a `DateTimeReceived`
+  restriction and the throttled full scan diffed only deletions.
+- **`resolve_batch_responses` is the single validated, first-response-only
+  projection**, consumed by BOTH the etag cache update and the outcome
+  reconciliation. Two paths reading the same wire data under different rules was
+  the defect: a `412` followed by a duplicate `200` installed an etag the accepted
+  outcome had rejected. The uncertain-lane accounting for unanswered ids survives
+  the reshape.
+- **Bulk mutations maintain the etag cache they consume.** A 2xx non-destroy
+  subresponse overwrites the entry from the subresponse etag and a 412 evicts, so
+  the retry actually refreshes. Previously the cache kept the pre-mutation
+  `changeKey` after every successful bulk write, and the `AfterStateRefresh` retry
+  re-read that same stale value - a 412 livelock. `bulk_move` was worse: Graph
+  mints a new message id, so the old key named a message that no longer existed.
+- **Webhook renewal stores the expiry Graph actually GRANTED**, deserialized from
+  the PATCH response like `create_subscription` already did. A locally computed
+  expiry silently outlives a server-clamped grant, and the subscription then dies
+  with the renewal worker seeing nothing due.
+- **`close()` is best-effort per subscription.** One failed DELETE no longer
+  abandons the remaining `server_id`s; nothing retries after close, so a `?` there
+  left live webhooks POSTing to the consumer's receiver for up to 24h.
+- **The EWS reconnect backoff resets ONLY on a completed long-poll read**
+  (`ReconnectBackoff::record_healthy_read`), never on a successful Subscribe. This
+  is load-bearing: a broken proxy or idle-timeout appliance produces an endless
+  subscribe-then-die loop in which every Subscribe succeeds, so a Subscribe-keyed
+  reset restores exactly the hot spin the backoff exists to stop.
+- Contact, directory and event searches use bounded walks and resume INSIDE an
+  over-delivered page. The three hand-copied loops previously truncated to `limit`
+  and set the cursor to the NEXT page, dropping every match past the limit on the
+  final page read.
+
+Accepted residuals:
+
+- A server that repeatedly answers EWS long-polls with an explicit resubscribe
+  directive exits via `StreamLoopExit::Resubscribe` with no backoff. Judged
+  defensible: each cycle is a full server-directed round trip rather than a
+  client-side hot spin, and honouring an explicit server instruction promptly is
+  reasonable. Flagged rather than changed.
+- `pim.rs` (4,795 lines) and `push.rs` (2,600) are a maintenance smell, low
+  confidence as defects. No round has judged the churn worth it. Still recorded in
+  `notes/bugs-graph.md`.
+
+Carried into the `bugs-google.md` arc, from this document's out-of-scope section:
+`bifrost-google`'s `calendars_list` is cited in `paging.rs` as having learned the
+paging lesson independently. **Check whether Google's delta/history walks got the
+guard or only its list walks** - the miss in graph was exactly that split, and it
+is the highest-value thing this arc can hand the next one.
 
 Testing traps this arc recorded, both caught only because the round after the
 fix pass went back and ablated:
