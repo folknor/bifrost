@@ -55,7 +55,11 @@ and 2.
   counted as success: the walk announced a barrier that a restart forgets,
   leaving nothing durable for E7's `block` to act on. `record_barriers` returns
   `Result` and the runner refuses to announce over an `Err`. A DEPARTED writer
-  (detach, shutdown) stays non-fatal - there is nothing to persist to.
+  (detach, shutdown) stays non-fatal - there is nothing to persist to. The
+  mid-arc close pass found the SAME hole still open on the fusion front end
+  (log-and-`NoCursor` over a refused write) and closed it: fusion now fails the
+  walk instead, pinned by
+  `a_store_refused_barrier_fails_the_fusion_walk_instead_of_announcing_it`.
 - **A6** discharges by proof UNION and retains only proofs still load-bearing
   for an open obligation or barrier.
 - **F1 residual** is closed: `BackfillCheckpointWriter` routes through the
@@ -83,6 +87,40 @@ open under F below.
   `tests/attach_schema_recovery.rs`.
 
 ## A. Correctness - lost data / lost debt
+
+### A8. Waiving a barrier never releases the scope: the crossing path is unbuilt
+
+**Confidence: high.** Found by the mid-arc close pass over rounds 1-3.
+`DebtLedger::barrier_waived` has ZERO production callers - neither
+`InventoryWalk::inspect` nor either front end consults it - so a walk stops at
+a waived barrier exactly as at an unwaived one. The only place the waiver has
+effect is `completion_permitted`, evaluated when the completion sentinel's
+acknowledgement reaches the writer (`persist_ack_request` in `engine.rs`); but
+a barrier-stopped scope never EMITS the sentinel, because `ScopeWalkDriver`
+reports `completed() == false` and both orchestrator arms skip
+`emit_backfill_complete`. Net effect: `SyncEngine::waive_obligation` on a
+barrier key is accepted, persisted, and inert. The operator escape hatch that
+`reference/sync.md` calls load-bearing ("declared loss beats permanent
+non-convergence") does not release anything.
+
+What the fix needs, and why it was not done in a close pass: the walk must
+learn which barrier keys are waived (a writer read, or a snapshot passed into
+`run_partition` / `run_stream`), skip the barrier decision for a report whose
+barrier obligations are ALL waived, and the crossing checkpoint must atomically
+record an unresolved-but-waived ledger entry for the crossed ground (the
+`BarrierIncident` doc in `cursor/ledger.rs` spells out the intended shape).
+Skipping only SOME of a report's barriers is not sound - the checkpoint still
+crosses the others. Watch the staleness race: a waiver landing mid-walk versus
+a walk that snapshotted before it; re-checking at the barrier hit (a writer
+round-trip per barrier, not per page) is the cheap sound point.
+
+Related liveness observation for the round-4 brief: a barrier-stopped scope
+stays `Pending` and re-walks on `BackfillScan`'s 5s-doubling-to-5min backoff
+FOREVER, re-broadcasting every pre-barrier page and re-recording the incident
+each pass (idempotent, but full wire cost). Nothing consults the durable
+ledger's `OperatorBlocked` policy to park the rescan. Bounded (one walk per
+5min per blocked scope) but permanent until an operator acts - and per this
+finding, `waive` does not currently stop it either.
 
 ## B. Liveness / latency
 

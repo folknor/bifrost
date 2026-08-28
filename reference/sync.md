@@ -1333,12 +1333,25 @@ shapes - the fixed partition set and the open-ended page walk - go through it,
 and the completion sentinel is withheld for the scope.
 
 **An incident the store refused is not an incident.** `record_barriers` returns
-the writer's inner result, and a walk refuses to announce a barrier it could not
-persist: the partition fails, the scope stays `Pending`, and the walk is retried.
+the writer's inner result, and BOTH front ends refuse to announce a barrier they
+could not persist: the backfill partition fails (the scope stays `Pending` and
+the walk is retried), and the fusion walk returns the error instead of
+`NoCursor`, so establishment retries under its ordinary error contract.
 Accepting the failure would announce a barrier that a restart forgets, leaving
 an operator with no durable object to block or waive. A writer that is GONE
 (detach, shutdown) is a different case and is not a failure - there is nothing to
 persist to and nothing to retry against.
+
+**The barrier waiver's escape hatch is only half built.** `DebtLedger::waive`
+on a barrier stops the incident from blocking the completion sentinel
+(`completion_permitted`), but no walk consults `DebtLedger::barrier_waived`, so
+a barrier-stopped scope never REACHES the sentinel: the walk stops at the same
+barrier on every retry, the driver reports not-completed, and the sentinel is
+never emitted. Waiving a barrier is therefore currently inert for releasing the
+scope; the crossing path - a walk that skips a waived barrier and atomically
+records an unresolved-but-waived ledger entry for the ground it crossed - is
+open work, tracked in `notes/bugs-sync.md`. Waiving an ordinary (non-barrier)
+obligation works as described.
 
 `bifrost-graph` reports its id-less-value case as `CheckpointBarrier`. The only
 token at page granularity is a continuation of that delta session, dead as soon

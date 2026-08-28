@@ -137,9 +137,13 @@ impl InventoryFusion {
                     {
                         // The walk ended on ground the cursor may not cross.
                         // Establishing here would advance past a region nothing
-                        // can ever replay.
+                        // can ever replay. Same rule as the backfill runner: a
+                        // barrier the store refused is announced to nobody -
+                        // the walk fails instead, so establishment is retried
+                        // rather than warning about an incident a restart
+                        // forgets and no operator can act on.
                         self.record_barriers(&scope, &completion.coverage, resume_from)
-                            .await;
+                            .await?;
                         Self::warn_degraded(&changes_tx, &scope, &completion.coverage);
                         return Ok(FusionOutcome::NoCursor);
                     }
@@ -228,7 +232,7 @@ impl InventoryFusion {
                         walk.inspect(&batch.coverage)
                     {
                         self.record_barriers(&scope, &batch.coverage, resume_from)
-                            .await;
+                            .await?;
                         if let Some(tx) = &changes_tx {
                             let mut stripped = batch;
                             stripped.checkpoint = None;
@@ -274,28 +278,36 @@ impl InventoryFusion {
     /// nothing at all would be worse than it sounds: every restart would forget
     /// the scope keeps hitting the same wall, and an operator would have no
     /// durable object to waive.
+    ///
+    /// An `Err` is a store write that FAILED, and it must propagate: a walk
+    /// that goes on to warn and return `NoCursor` over it announces a barrier
+    /// nothing durable records, which a restart forgets and no operator can
+    /// block or waive. The caller fails the walk instead, so establishment is
+    /// retried under its ordinary error contract. A departed writer (detach,
+    /// shutdown) is not a failure - there is nothing left to persist to.
     async fn record_barriers(
         &self,
         scope: &CursorScope,
         coverage: &bifrost_types::InventoryCoverageReport,
         resume_from: Option<Checkpoint>,
-    ) {
-        if let Err(error) = crate::inventory_walk::record_barriers(
+    ) -> Result<(), Error> {
+        let result = crate::inventory_walk::record_barriers(
             self.writer_tx.as_ref(),
             coverage,
             self.generation,
             resume_from,
         )
-        .await
-        {
+        .await;
+        if let Err(error) = &result {
             tracing::error!(
                 target: "bifrost.sync.inventory",
                 account = ?self.account_id,
                 scope = ?scope,
                 error = %error,
-                "failed to persist inventory barrier incident"
+                "failed to persist inventory barrier incident; failing the walk"
             );
         }
+        result
     }
 
     /// Surface degraded coverage to the consumer.
@@ -450,5 +462,100 @@ mod tests {
         assert!(inventory_resume_stream_checked(false, Some(empty_inventory_stream())).is_err());
         assert!(inventory_resume_stream_checked(false, None).is_ok());
         assert!(inventory_resume_stream_checked(true, Some(empty_inventory_stream())).is_ok());
+    }
+
+    fn barrier_coverage() -> bifrost_types::InventoryCoverageReport {
+        let error = bifrost_types::AccountErrorBuilder::new(
+            bifrost_types::AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed),
+            bifrost_types::Cause::Request(bifrost_types::RequestCause::Malformed {
+                detail: bifrost_types::DiagnosticText::support_only("barrier"),
+            }),
+        )
+        .try_build()
+        .expect("valid error");
+        bifrost_types::InventoryCoverageReport::degraded(
+            bifrost_types::CoverageDomain::full(CursorScope::Account),
+            vec![bifrost_types::InventoryObligation::Region {
+                key: bifrost_types::ObligationKey(b"blocked".to_vec()),
+                failure_label: "unidentifiable-value".into(),
+                error,
+                recovery: bifrost_types::RegionRecovery::barrier(),
+            }],
+        )
+    }
+
+    fn fusion_with_writer(
+        writer_tx: tokio::sync::mpsc::Sender<crate::multiplexer::WriterRequest>,
+    ) -> InventoryFusion {
+        InventoryFusion {
+            account_id: bifrost_types::AccountId("fusion-unit".into()),
+            cursors: Arc::new(CursorRegistry::new()),
+            control: None,
+            coverage: None,
+            writer_tx: Some(writer_tx),
+            generation: 1,
+        }
+    }
+
+    /// Same rule the backfill runner enforces, on the OTHER front end of the
+    /// shared walk: a barrier whose incident the store refused to persist is
+    /// announced to nobody. The walk fails so establishment retries; returning
+    /// `NoCursor` and warning instead would announce a barrier a restart
+    /// forgets and no operator can block or waive.
+    #[tokio::test]
+    async fn a_store_refused_barrier_fails_the_fusion_walk_instead_of_announcing_it() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let writer = tokio::spawn(async move {
+            while let Some(request) = rx.recv().await {
+                if let crate::multiplexer::WriterRequest::RecordBarrier { done, .. } = request {
+                    let _ = done.send(Err(Error::Other("store write failed".into())));
+                }
+            }
+        });
+        let fusion = fusion_with_writer(tx);
+        let stream: bifrost_types::AccountStream<bifrost_types::InventoryEvent> =
+            Box::pin(futures::stream::iter(vec![
+                bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion {
+                    checkpoint: None,
+                    coverage: barrier_coverage(),
+                }),
+            ]));
+        let (changes_tx, mut changes_rx) = tokio::sync::broadcast::channel(8);
+
+        let outcome = fusion
+            .run_stream(CursorScope::Account, stream, Some(changes_tx))
+            .await;
+        assert!(
+            outcome.is_err(),
+            "a barrier the store refused must fail the walk, not conclude it"
+        );
+        assert!(
+            changes_rx.try_recv().is_err(),
+            "nothing may be announced for an incident nothing durable records"
+        );
+        drop(fusion);
+        writer.await.expect("writer task");
+    }
+
+    /// The strictness stays honest: a writer that is GONE (detach, shutdown)
+    /// is not a failed write, and must not fail the walk.
+    #[tokio::test]
+    async fn a_departed_writer_does_not_fail_the_fusion_walk() {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        drop(rx);
+        let fusion = fusion_with_writer(tx);
+        let stream: bifrost_types::AccountStream<bifrost_types::InventoryEvent> =
+            Box::pin(futures::stream::iter(vec![
+                bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion {
+                    checkpoint: None,
+                    coverage: barrier_coverage(),
+                }),
+            ]));
+
+        let outcome = fusion
+            .run_stream(CursorScope::Account, stream, None)
+            .await
+            .expect("a departed writer is not a store failure");
+        assert!(matches!(outcome, FusionOutcome::NoCursor));
     }
 }

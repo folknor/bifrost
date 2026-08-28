@@ -173,9 +173,13 @@ pub enum InventoryPartitioning {
     /// folder open; the engine falls back to `Full` when it is absent.
     UidRange { max_uid: Option<u32> },
     /// Account can honor `InventoryPartition::Page` ranges. `total`
-    /// is optional; when absent, the engine walks pages until a short
-    /// page is observed. `page_size` lets the account cap engine
-    /// requests at a protocol-advertised per-page maximum.
+    /// is optional; when absent, the engine walks page windows until a
+    /// genuinely EMPTY one is observed - a merely short window is not
+    /// exhaustion, so a partition stream must fill its window (paging
+    /// internally past any server-side page cap) and yield zero entries
+    /// only when the scope has no more results. `page_size` lets the
+    /// account cap engine requests at a protocol-advertised per-page
+    /// maximum.
     PageCount {
         total: Option<u32>,
         page_size: Option<u32>,

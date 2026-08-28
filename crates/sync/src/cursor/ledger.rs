@@ -186,10 +186,13 @@ impl LedgerEntry {
 /// between sessions, and there is no object for an operator to waive. So the
 /// blocked progress itself is the durable thing.
 ///
-/// A waived barrier is what later authorizes a crossing checkpoint, and that
-/// crossing must atomically record an unresolved-but-waived ledger entry. The
-/// waiver converts blocked progress into declared accepted loss; it never makes
-/// the engine simply forget.
+/// A waived barrier is what is MEANT to later authorize a crossing checkpoint,
+/// and that crossing must atomically record an unresolved-but-waived ledger
+/// entry - the waiver converts blocked progress into declared accepted loss; it
+/// never makes the engine simply forget. The crossing itself is not built yet:
+/// no walk consults `DebtLedger::barrier_waived`, so today a waived barrier
+/// still stops every walk and the waiver only stops the incident from blocking
+/// the completion sentinel.
 #[derive(Debug, Clone)]
 pub struct BarrierIncident {
     pub key: ObligationKey,
