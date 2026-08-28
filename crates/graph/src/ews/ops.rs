@@ -175,6 +175,8 @@ fn find_items_body(folder_id: &str, since: Option<&str>, offset: u32, max_entrie
       <t:FieldURI FieldURI="message:From"/>
       <t:FieldURI FieldURI="item:Preview"/>
       <t:FieldURI FieldURI="message:IsRead"/>
+      <t:FieldURI FieldURI="item:Flag"/>
+      <t:FieldURI FieldURI="item:Categories"/>
       <t:FieldURI FieldURI="item:ItemClass"/>
     </t:AdditionalProperties>
   </m:ItemShape>

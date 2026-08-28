@@ -69,18 +69,19 @@ pub(crate) async fn renew_subscription(
     let minutes = expiration_minutes
         .unwrap_or(DEFAULT_EXPIRATION_MINUTES)
         .min(MAX_EXPIRATION_MINUTES);
-    let new_expiry = compute_expiry_iso8601(minutes);
+    let requested_expiry = compute_expiry_iso8601(minutes);
     let body = RenewSubscriptionRequest {
-        expiration_date_time: new_expiry.clone(),
+        expiration_date_time: requested_expiry,
     };
 
-    client
-        .patch(&format!("/subscriptions/{subscription_id}"), &body)
+    let response: SubscriptionResponse = client
+        .patch_json(&format!("/subscriptions/{subscription_id}"), &body)
         .await?;
     tracing::info!(
-        "[Graph webhooks] Renewed subscription {subscription_id} (new expiry: {new_expiry})"
+        "[Graph webhooks] Renewed subscription {subscription_id} (new expiry: {})",
+        response.expiration_date_time
     );
-    Ok(new_expiry)
+    Ok(response.expiration_date_time)
 }
 
 /// Did the server answer "this subscription no longer exists"?

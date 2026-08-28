@@ -3080,6 +3080,8 @@ mod tests {
             body_preview: Some("preview text".to_string()),
             body_html: Some("<p>preview text</p>".to_string()),
             is_read: true,
+            flag_status: None,
+            categories: Vec::new(),
             item_class: "IPM.Note".to_string(),
             to_recipients: vec![crate::ews::EwsRecipient {
                 email: "reader@contoso.com".to_string(),

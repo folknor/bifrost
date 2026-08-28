@@ -171,20 +171,7 @@ pub(crate) async fn search(
         .and_then(|limit| usize::try_from(limit).ok())
         .unwrap_or(250)
         .max(1);
-    let next_url = request
-        .page_cursor
-        .map(String::from_utf8)
-        .transpose()
-        .map_err(|error| {
-            graph_error::unsupported_account_error(AccountOperation::ContactSearch)
-                .into_builder()
-                .scope(ErrorScope::ContactCollection)
-                .text(bifrost_types::DiagnosticText::support_only(
-                    error.to_string(),
-                ))
-                .try_build()
-                .expect("valid account error classification")
-        })?;
+    let (next_url, mut skip) = crate::paging::decode_paged_cursor(request.page_cursor);
     let mut url = next_url.unwrap_or_else(|| {
         contact_search_url(
             &account,
@@ -195,26 +182,46 @@ pub(crate) async fn search(
     });
     let needle = request.query.to_ascii_lowercase();
     let mut items = Vec::new();
+    let mut walk = crate::paging::PageWalk::new("contact search");
     let next_cursor;
     loop {
+        walk.enter(&url).map_err(|error| {
+            graph_error::into_account_error(
+                error,
+                graph_error::GraphErrorContext::graph(AccountOperation::ContactSearch),
+            )
+        })?;
         let page: ODataCollection<GraphContact> =
             get_page(&account, &url, AccountOperation::ContactSearch).await?;
-        items.extend(
-            page.value
-                .into_iter()
-                .map(contact_from_graph)
-                .filter(|contact| contact_matches(contact, &needle)),
-        );
-        if items.len() >= limit {
-            items.truncate(limit);
-            next_cursor = page.next_link.map(String::into_bytes);
-            break;
+        let page_len = page.value.len();
+        for (index, value) in page.value.into_iter().enumerate().skip(skip) {
+            let contact = contact_from_graph(value);
+            if contact_matches(&contact, &needle) {
+                items.push(contact);
+                if items.len() == limit {
+                    let consumed = index + 1;
+                    next_cursor = if consumed < page_len {
+                        Some(crate::paging::encode_paged_cursor(url.clone(), consumed))
+                    } else {
+                        page.next_link
+                            .map(|next| crate::paging::encode_paged_cursor(next, 0))
+                    };
+                    return Ok(Page {
+                        items,
+                        next_cursor,
+                        estimated_total: None,
+                        failed_ids: Vec::new(),
+                        skipped_scopes: Vec::new(),
+                    });
+                }
+            }
         }
         let Some(next) = page.next_link else {
             next_cursor = None;
             break;
         };
         url = next;
+        skip = 0;
     }
     Ok(Page {
         items,
@@ -245,40 +252,52 @@ pub(crate) async fn directory_search(
         .and_then(|limit| usize::try_from(limit).ok())
         .unwrap_or(250)
         .max(1);
-    let next_url = page_cursor
-        .map(String::from_utf8)
-        .transpose()
-        .map_err(|error| {
-            graph_error::unsupported_account_error(AccountOperation::DirectorySearch)
-                .into_builder()
-                .scope(ErrorScope::ContactCollection)
-                .text(bifrost_types::DiagnosticText::support_only(
-                    error.to_string(),
-                ))
-                .try_build()
-                .expect("valid account error classification")
-        })?;
+    let (next_url, mut skip) = crate::paging::decode_paged_cursor(page_cursor);
     let mut url = next_url.unwrap_or_else(|| {
         let prefix = account.client.api_path_prefix();
         let top = top_for_limit(limit, 999);
         directory_search_path(&prefix, &query, top)
     });
     let mut items = Vec::new();
+    let mut walk = crate::paging::PageWalk::new("directory search");
     let next_cursor;
     loop {
+        walk.enter(&url).map_err(|error| {
+            graph_error::into_account_error(
+                error,
+                graph_error::GraphErrorContext::graph(AccountOperation::DirectorySearch),
+            )
+        })?;
         let page: ODataCollection<GraphDirectoryUser> =
             get_page(&account, &url, AccountOperation::DirectorySearch).await?;
-        items.extend(page.value.into_iter().filter_map(directory_user_to_card));
-        if items.len() >= limit_cap {
-            items.truncate(limit_cap);
-            next_cursor = page.next_link.map(String::into_bytes);
-            break;
+        let page_len = page.value.len();
+        for (index, value) in page.value.into_iter().enumerate().skip(skip) {
+            if let Some(card) = directory_user_to_card(value) {
+                items.push(card);
+                if items.len() == limit_cap {
+                    let consumed = index + 1;
+                    next_cursor = if consumed < page_len {
+                        Some(crate::paging::encode_paged_cursor(url.clone(), consumed))
+                    } else {
+                        page.next_link
+                            .map(|next| crate::paging::encode_paged_cursor(next, 0))
+                    };
+                    return Ok(Page {
+                        items,
+                        next_cursor,
+                        estimated_total: None,
+                        failed_ids: Vec::new(),
+                        skipped_scopes: Vec::new(),
+                    });
+                }
+            }
         }
         let Some(next) = page.next_link else {
             next_cursor = None;
             break;
         };
         url = next;
+        skip = 0;
     }
     Ok(Page {
         items,
@@ -866,6 +885,65 @@ mod tests {
         assert_eq!(top_for_limit(Some(10), 250), 10);
         assert_eq!(top_for_limit(Some(9999), 250), 250);
         assert_eq!(top_for_limit(None, 999), 250);
+    }
+
+    /// A page can over-deliver: Graph returns `$top` rows and several of
+    /// them match, so the limit is reached PART WAY through a page. The
+    /// walk used to hand back the page's `@odata.nextLink`, silently
+    /// dropping every later match in the page it had already read. The
+    /// resume cursor must point back INTO that page and the second call
+    /// must return the matches the first one stopped short of.
+    #[tokio::test]
+    async fn a_search_resumes_inside_an_over_delivered_page_without_losing_matches() {
+        fn row(id: &str) -> serde_json::Value {
+            serde_json::json!({ "id": id, "displayName": "Ada Match" })
+        }
+        let page = serde_json::json!({
+            "value": [row("c1"), row("c2"), row("c3")],
+            "@odata.nextLink": "https://graph.test/next"
+        });
+        let client = crate::client::GraphClient::new("token");
+        client.script_rest([
+            crate::client::ScriptedRestResponse::json(reqwest::StatusCode::OK, page.clone()),
+            crate::client::ScriptedRestResponse::json(reqwest::StatusCode::OK, page),
+        ]);
+        let account =
+            GraphAccount::new_for_tests(client.clone(), super::super::PushMode::GraphSubscriptions);
+
+        let first = search(
+            account.clone(),
+            ContactSearchRequest {
+                limit: Some(1),
+                ..ContactSearchRequest::new("ada")
+            },
+        )
+        .await
+        .expect("first page");
+        assert_eq!(first.items.len(), 1);
+        assert_eq!(first.items[0].id.0, "c1");
+        let cursor = first.next_cursor.expect("two matches remain in this page");
+
+        let second = search(
+            account,
+            ContactSearchRequest {
+                limit: Some(1),
+                page_cursor: Some(cursor),
+                ..ContactSearchRequest::new("ada")
+            },
+        )
+        .await
+        .expect("second page");
+        assert_eq!(
+            second.items[0].id.0, "c2",
+            "the resume picks up the match the first call stopped before, \
+             not the first row of the NEXT page"
+        );
+        let requests = client.take_rest_requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0].url, requests[1].url,
+            "the resume re-reads the same page rather than following nextLink"
+        );
     }
 
     #[test]

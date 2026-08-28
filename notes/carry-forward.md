@@ -19,6 +19,86 @@ rather than appending to it.
 - Refusing a finding with a reason is a good outcome. Two have been rejected on
   the merits so far, both recorded below.
 
+## From the `bugs-dav.md` arc (closed, a65acb6..dac58d3)
+
+Scope was `crates/caldav/` and `crates/carddav/`, plus the IMAP composition seam.
+Two rounds and a close pass. The arc's own signature: the recurring
+fix-opens-a-hole-one-layer-up shape fired in all three stages, and each time the
+new hole was in a CONSUMER of the changed thing rather than in the change.
+
+Machinery later work may build on and must not break:
+
+- **Well-known discovery is origin-rooted, through one helper.**
+  `bifrost_net::url::well_known_url` parses the base, clears query and fragment,
+  and replaces the path; `parent_collection_url` is the shared parent extraction
+  that replaced CardDAV's `rfind`. Both crates use both. The old
+  `format!("{}/.well-known/...", base)` was live in CardDAV and broke opens
+  against a path-bearing base - a server answering 401/403 for the bogus path
+  failed the open without the configured base ever being tried.
+- **Per-collection cursor scopes.** Both crates mint one `CursorScope::Folder`
+  per collection, so `CoverageDomain::full(Folder)` is a TRUE claim for a
+  whole-collection walk. The legacy type-scope lane survives with a
+  `ProviderRegion` coordinate that only self-covers, so it can no longer
+  discharge debt it did not earn. All three lanes are per-scope; the changes lane
+  resolves its collection from the cursor's own snapshot. The `unsynced_*_urls` /
+  `open_skipped_scopes` apparatus is gone because the skip lane is now empty by
+  construction - `calendars_beyond_the_first_are_reported_as_skipped_scopes` went
+  with it, correctly.
+- **`DavScopeIndex` is ownership by construction, not a membership check.**
+  Built once at open in `crates/imap/src/account/factory.rs` AFTER the folder
+  registry, so it is disjoint from the real mailbox set. `FolderId` carries no
+  protocol namespace and IMAP mailbox names are arbitrary strings, so raw string
+  membership let a DAV href steal a real IMAP mailbox and resolved CalDAV/CardDAV
+  collisions silently in favour of contacts. An href equal to a known mailbox, or
+  claimed by both sub-accounts, is never indexed; both exclusions warn on the
+  degraded-DAV lane. Namespacing `FolderId` was considered and rejected: it would
+  require rewriting the scope on delegation and back out of the minted
+  `ChangeCursor`, and every rewrite point is the hole-opening shape again.
+- **Every `Folder`-scope consumer must consult the index, not just the sync
+  lanes.** This is the arc's sharpest lesson. Round 2 routed the four sync lanes
+  correctly and missed `push_subscribe`, a fifth consumer: an href is a
+  syntactically valid mailbox name, so a DAV collection was admitted as an IDLE
+  mailbox watch - reported in the succeeded lane that bifrost-sync trusts, burning
+  one of four IDLE budget slots, and handing a worker a SELECT that can never
+  succeed. No data loss (polling is never suppressed on push coverage), but a
+  misreport, a burned slot and a doomed SELECT. A new consumer of `Folder` scopes
+  must be checked against the index.
+- **Empty means empty.** When collection discovery returns empty, the home URL is
+  NOT substituted as a scope. The parsers already return the home when it
+  genuinely is a collection, so an empty result means an empty backend, and
+  fabricating a scope there advertises a folder that 404s at cursor
+  establishment. Pinned by the `an_empty_home_lists_no_*_rather_than_a_phantom`
+  tests, which predate the arc and which round 2 contradicted in the sync path
+  while leaving intact.
+- Multiget fan-out is bounded at `MULTIGET_LEG_CONCURRENCY = 4` via ORDERED
+  `buffered`, not `buffer_unordered`: two existing chunked-multiget tests depend
+  on the merged report and surviving degraded error being deterministic.
+
+Accepted residuals:
+
+- A genuine empty-out (a user deleting every event/contact) is suppressed along
+  with the transient empty-207, because the wire looks identical. Both reference
+  docs now say plainly it is not reported on that poll OR a later one, with the
+  CardDAV ctag short-circuit caveat.
+- A scope excluded from `DavScopeIndex` is still ADVERTISED by discovery, since
+  sub-account scopes pass through `merge_scope_streams` verbatim. Mailbox
+  collisions resolve to the same scope value as the real mailbox; contested ones
+  fail loudly at establishment. Judged honest and sufficient, warned at open.
+- `default_calendar_url` / `default_addressbook_url` home fallback for PIM calls
+  is pre-existing published behaviour, untouched.
+
+Testing traps this arc recorded:
+
+- **The pre-existing well-known tests used a path-less base URL**, where the
+  buggy and correct constructions produce byte-identical output. A textbook
+  uniform-inputs failure: the tests existed, ran, and could not fail. Any test of
+  URL construction needs a path-bearing base, and a query or fragment is worth
+  pinning too.
+- A `pub(crate)` item held alive by `allow(dead_code)` is ordinary cleanup, NOT a
+  published-API removal. An earlier round refused to delete two such items on the
+  no-removal rule; that was an error of scope, and applying the rule to
+  crate-private items launders ordinary cleanup into a prohibition.
+
 ## From the `bugs-imap-sasl.md` arc (closed, 8c365f0..HEAD)
 
 Scope was `crates/imap/` plus `crates/sasl/`: the auth-dispatch and mutation

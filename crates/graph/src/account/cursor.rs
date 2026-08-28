@@ -152,6 +152,11 @@ pub(crate) struct PublicFolderCursor {
     /// skipped.
     #[serde(default)]
     pub(crate) live_ids: Vec<String>,
+    /// Change keys captured by the last complete scan. This is the
+    /// in-place-change baseline for items whose received timestamp does not
+    /// move when flags, categories, or read state change.
+    #[serde(default)]
+    pub(crate) live_versions: Vec<(String, String)>,
     /// Ids whose `received_at` equals the current `watermark`, captured
     /// on the last incremental poll. The incremental `FindItem`
     /// restriction is `>=` (so items sharing the boundary second are not
@@ -571,6 +576,7 @@ mod tests {
             watermark: Some("2026-03-01T10:00:00Z".to_string()),
             last_full_scan_at: Some(1_700_000_000),
             live_ids: vec!["a".to_string(), "b".to_string()],
+            live_versions: Vec::new(),
             boundary_ids: vec!["b".to_string()],
             degraded: false,
             warned_classes: vec!["Task".to_string()],

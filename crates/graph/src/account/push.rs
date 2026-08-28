@@ -417,14 +417,26 @@ pub(crate) async fn retire_all_graph_subscriptions(account: &GraphAccount) {
         .cloned()
         .collect();
     for handle in handles {
-        if let Err(error) = unsubscribe_graph(account.clone(), handle).await {
-            let telemetry = error.telemetry_fields();
-            tracing::warn!(
-                target: "bifrost_graph::push",
-                message_key = telemetry.message_key,
-                recovery = telemetry.recovery_discriminant,
-                "close() could not retire a Graph webhook subscription"
-            );
+        let Some(server_ids) = begin_graph_teardown(account, &handle).await else {
+            continue;
+        };
+        for server_id in server_ids {
+            match delete_subscription(&account.client, &server_id).await {
+                Ok(()) => remove_subscription_state(account, &handle, &server_id).await,
+                Err(error) => {
+                    let error = into_account_error(
+                        error,
+                        GraphErrorContext::graph(AccountOperation::PushUnsubscribe),
+                    );
+                    let telemetry = error.telemetry_fields();
+                    tracing::warn!(
+                        target: "bifrost_graph::push",
+                        message_key = telemetry.message_key,
+                        recovery = telemetry.recovery_discriminant,
+                        "close() could not retire a Graph webhook subscription"
+                    );
+                }
+            }
         }
     }
 }
@@ -1396,6 +1408,31 @@ mod tests {
         assert!(requests[1].url.ends_with("/subscriptions/two"));
     }
 
+    #[tokio::test]
+    async fn close_continues_after_one_subscription_delete_fails() {
+        let client = GraphClient::new("token");
+        client.script_rest([
+            ScriptedRestResponse::json(
+                reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+                serde_json::json!({"error":{"code":"InternalServerError","message":"failed"}}),
+            ),
+            ScriptedRestResponse::empty(reqwest::StatusCode::NO_CONTENT),
+        ]);
+        let account = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
+        let handle = SubscriptionHandle("h".to_string());
+        account.graph_subscriptions.write().await.insert(
+            handle,
+            GraphSubscriptionGroup::live(vec![
+                state("fails", "/me/messages"),
+                state("succeeds", "/me/events"),
+            ]),
+        );
+        retire_all_graph_subscriptions(&account).await;
+        let requests = client.take_rest_requests();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].url.ends_with("/subscriptions/succeeds"));
+    }
+
     /// A subscription Graph has already dropped must not fail teardown.
     /// `subscription_is_gone` used to read only `GraphError::Response`,
     /// which a REST call never produces - the transport converts a 404 into
@@ -2095,7 +2132,14 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_successful_renewal_updates_the_expiry_and_the_next_tick_finds_nothing_due() {
         let client = GraphClient::new("token");
-        client.script_rest([ScriptedRestResponse::empty(reqwest::StatusCode::OK)]);
+        client.script_rest([ScriptedRestResponse::json(
+            reqwest::StatusCode::OK,
+            serde_json::json!({
+                "id": "sub",
+                "resource": "/me/mailFolders/inbox/messages",
+                "expirationDateTime": "2099-01-01T00:00:00Z"
+            }),
+        )]);
         let account = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
         let mut events = account.push_tx.subscribe();
         let handle = SubscriptionHandle("h".to_string());
@@ -2117,10 +2161,15 @@ mod tests {
             let group = groups.get(&handle).expect("the handle stays registered");
             assert_eq!(group.subscriptions.len(), 1);
             assert_eq!(group.subscriptions[0].server_id, "sub", "renewed in place");
-            assert_ne!(
-                group.subscriptions[0].expires_at, "2000-01-01T00:00:00Z",
-                "the renewed expiry must replace the stale one, or every \
-                 tick re-renews forever"
+            // The expiry stored is the one Graph GRANTED, not the one we
+            // asked for. Graph may cap a renewal below the request, and a
+            // locally computed expiry then has the renewer believing it has
+            // coverage the server already dropped. Asserting only that the
+            // stale value was replaced passes against the computed value
+            // too, so this pins the granted string exactly.
+            assert_eq!(
+                group.subscriptions[0].expires_at, "2099-01-01T00:00:00Z",
+                "the stored expiry is the server-granted one"
             );
             assert!(!is_expiring_soon(
                 &group.subscriptions[0].expires_at,
@@ -2217,7 +2266,14 @@ mod tests {
                 reqwest::StatusCode::TOO_MANY_REQUESTS,
                 serde_json::json!({"error":{"code":"activityLimitReached","message":"slow down"}}),
             ),
-            ScriptedRestResponse::empty(reqwest::StatusCode::OK),
+            ScriptedRestResponse::json(
+                reqwest::StatusCode::OK,
+                serde_json::json!({
+                    "id": "sub",
+                    "resource": "/me/events",
+                    "expirationDateTime": "2099-01-01T00:00:00Z"
+                }),
+            ),
         ]);
         let account = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
         let mut events = account.push_tx.subscribe();

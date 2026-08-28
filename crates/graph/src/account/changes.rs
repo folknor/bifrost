@@ -107,8 +107,19 @@ pub(crate) fn changes_stream(
 
         let scope = cursor.scope.clone();
         let mut current_url = payload.resume_url().to_string();
+        let mut walk = crate::paging::PageWalk::new("changes delta");
 
         loop {
+            if let Err(error) = walk.enter(&current_url) {
+                let ctx = GraphErrorContext::graph(AccountOperation::SyncChanges)
+                    .with_scope(ErrorScope::Cursor(scope.clone()));
+                let owner = account.owner_of_scope(&scope);
+                yield SyncEvent::Terminated(super::graph_error::graph_shared_scope_error(
+                    error, &scope, owner.as_ref(), ctx,
+                ));
+                yield SyncEvent::Done(None);
+                return;
+            }
             let page = match fetch_delta_page(&client, &current_url).await {
                 Ok(page) => page,
                 Err(error) => {

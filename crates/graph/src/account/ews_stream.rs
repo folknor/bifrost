@@ -85,6 +85,7 @@ async fn run_worker<E: EwsExecute>(account: GraphAccount, ews: E) {
     // A transport failure was reported as `Disconnected`; the next
     // successful Subscribe owes a `Reconnected`.
     let mut disconnected = false;
+    let mut backoff = ReconnectBackoff::default();
     // A topology handoff abandoned a live subscription; the replacement owes
     // a `Reconnected` for the coverage gap, without any `Disconnected`
     // having been (correctly) emitted.
@@ -133,7 +134,15 @@ async fn run_worker<E: EwsExecute>(account: GraphAccount, ews: E) {
                     disconnected = false;
                     coverage_gap = false;
                 }
-                match run_get_events_loop(&ews, &account, &mut topology, &subscription_id).await {
+                match run_get_events_loop(
+                    &ews,
+                    &account,
+                    &mut topology,
+                    &subscription_id,
+                    &mut backoff,
+                )
+                .await
+                {
                     StreamLoopExit::Resubscribe => {
                         coverage_gap = true;
                         release_subscription(&ews, &subscription_id).await;
@@ -141,6 +150,8 @@ async fn run_worker<E: EwsExecute>(account: GraphAccount, ews: E) {
                     StreamLoopExit::Disconnected => {
                         disconnected = true;
                         release_subscription(&ews, &subscription_id).await;
+                        let failures = backoff.record_failure();
+                        wait_before_reconnect(&account, failures).await;
                     }
                     // Exchange holds streaming subscriptions against a
                     // per-mailbox quota and does not retire one because the
@@ -181,10 +192,59 @@ async fn run_worker<E: EwsExecute>(account: GraphAccount, ews: E) {
                     let _ = account.push_tx.send(WatchEvent::Disconnected);
                     disconnected = true;
                 }
-                tokio::time::sleep(Duration::from_secs(5)).await;
+                let failures = backoff.record_failure();
+                wait_before_reconnect(&account, failures).await;
             }
         }
     }
+}
+
+/// Reconnect backoff state for one worker lifetime.
+///
+/// The counter is raised by every failure exit and cleared ONLY by
+/// `record_healthy_read`, which `run_get_events_loop` calls where a
+/// `GetStreamingEvents` long poll completed a full response. A successful
+/// `Subscribe` is deliberately NOT the reset signal: a broken proxy or an
+/// idle-timeout appliance can produce an endless subscribe-then-die loop in
+/// which every Subscribe succeeds, and resetting there restores exactly the
+/// hot reconnect spin the backoff exists to stop. Without any reset the
+/// opposite failure appears - unrelated blips accumulate over hours of
+/// healthy operation until every later outage waits the full cap.
+#[derive(Default)]
+struct ReconnectBackoff {
+    failures: u32,
+}
+
+impl ReconnectBackoff {
+    /// A long poll returned a complete response: the connection is proven
+    /// healthy, so the next outage starts from the shortest delay again.
+    fn record_healthy_read(&mut self) {
+        self.failures = 0;
+    }
+
+    fn record_failure(&mut self) -> u32 {
+        self.failures = self.failures.saturating_add(1);
+        self.failures
+    }
+}
+
+async fn wait_before_reconnect(account: &GraphAccount, failures: u32) {
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos() as u64;
+    let delay = reconnect_delay(failures, seed);
+    tokio::select! {
+        () = account.shutdown.cancelled() => {}
+        () = tokio::time::sleep(delay) => {}
+    }
+}
+
+fn reconnect_delay(failures: u32, jitter_seed: u64) -> Duration {
+    let exponent = failures.saturating_sub(1).min(6);
+    let base = 5_u64.saturating_mul(1_u64 << exponent);
+    let jitter = jitter_seed % (base / 4 + 1);
+    Duration::from_secs(base.saturating_add(jitter))
 }
 
 /// Best-effort EWS `Unsubscribe` for a streaming subscription the worker is
@@ -423,6 +483,7 @@ async fn run_get_events_loop<E: EwsExecute>(
     account: &GraphAccount,
     topology: &mut watch::Receiver<u64>,
     subscription_id: &str,
+    backoff: &mut ReconnectBackoff,
 ) -> StreamLoopExit {
     // The subscription this loop polls is fixed for the lifetime of the
     // loop and lives nowhere else; the worker re-subscribes (minting a
@@ -454,7 +515,13 @@ async fn run_get_events_loop<E: EwsExecute>(
         };
         match result {
             Ok(stream) => match consume_streaming_events(stream, account, topology).await {
-                Ok(()) => continue,
+                Ok(()) => {
+                    // A long poll ran to a complete response. That, and not
+                    // a bare successful Subscribe, is what proves the
+                    // connection healthy, so it is the only reset point.
+                    backoff.record_healthy_read();
+                    continue;
+                }
                 Err(StreamLoopExit::Resubscribe) => return StreamLoopExit::Resubscribe,
                 Err(StreamLoopExit::Shutdown) => return StreamLoopExit::Shutdown,
                 Err(StreamLoopExit::Disconnected) => {
@@ -884,6 +951,45 @@ mod tests {
     use super::super::PushMode;
     use super::super::push::EwsSubscriptionState;
     use super::*;
+
+    #[test]
+    fn reconnect_backoff_grows_and_caps_with_bounded_jitter() {
+        assert_eq!(reconnect_delay(1, 0), Duration::from_secs(5));
+        assert_eq!(reconnect_delay(2, 0), Duration::from_secs(10));
+        assert_eq!(reconnect_delay(8, 0), Duration::from_secs(320));
+        assert_eq!(reconnect_delay(80, 0), Duration::from_secs(320));
+        assert!(reconnect_delay(3, u64::MAX) <= Duration::from_secs(25));
+    }
+
+    /// The backoff must be cleared by a demonstrated healthy long-poll
+    /// READ, not by a successful Subscribe. Without any reset, unrelated
+    /// blips accumulate over a worker's whole lifetime until every later
+    /// outage waits the full cap even after hours of healthy streaming.
+    #[tokio::test]
+    async fn a_healthy_long_poll_read_resets_the_reconnect_backoff() {
+        let account =
+            GraphAccount::new_for_tests(GraphClient::new("token"), PushMode::EwsStreaming);
+        let good = r#"<m:GetStreamingEventsResponseMessage ResponseClass="Success"><m:Notifications><t:Notification><t:SubscriptionId>sub-1</t:SubscriptionId><t:NewMailEvent><t:ItemId Id="item-1"/><t:ParentFolderId Id="folder-1"/></t:NewMailEvent></t:Notification></m:Notifications></m:GetStreamingEventsResponseMessage>"#;
+        let (scripted, _requests) = scripted(vec![
+            ScriptStep::Respond(good.to_string()),
+            ScriptStep::Respond(
+                r#"<m:GetStreamingEventsResponseMessage ResponseClass="Success"><m:Notifications>"#
+                    .to_string(),
+            ),
+        ]);
+        let (_topology_tx, mut topology) = watch::channel(0_u64);
+        let mut backoff = ReconnectBackoff { failures: 5 };
+        let exit =
+            run_get_events_loop(&scripted, &account, &mut topology, "sub-1", &mut backoff).await;
+        assert!(
+            matches!(exit, StreamLoopExit::Disconnected),
+            "the truncated second poll disconnects"
+        );
+        assert_eq!(
+            backoff.failures, 0,
+            "the completed first long poll cleared the accumulated failures"
+        );
+    }
     use crate::client::GraphClient;
 
     #[test]

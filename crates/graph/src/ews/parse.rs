@@ -59,6 +59,8 @@ pub(crate) struct EwsItem {
     pub(crate) body_preview: Option<String>,
     pub(crate) body_html: Option<String>,
     pub(crate) is_read: bool,
+    pub(crate) flag_status: Option<String>,
+    pub(crate) categories: Vec<String>,
     pub(crate) item_class: String,
     pub(crate) to_recipients: Vec<EwsRecipient>,
     pub(crate) cc_recipients: Vec<EwsRecipient>,
@@ -423,6 +425,9 @@ pub(crate) fn parse_find_items_response(xml: &str) -> Result<FindItemsResult, Ew
     let mut received_at: Option<String> = None;
     let mut body_preview: Option<String> = None;
     let mut is_read = false;
+    let mut flag_status: Option<String> = None;
+    let mut categories: Vec<String> = Vec::new();
+    let mut in_categories = false;
     let mut item_class = String::new();
 
     loop {
@@ -460,10 +465,15 @@ pub(crate) fn parse_find_items_response(xml: &str) -> Result<FindItemsResult, Ew
                     received_at = None;
                     body_preview = None;
                     is_read = false;
+                    flag_status = None;
+                    categories.clear();
                     item_class.clear();
                 }
                 if in_item && local == "From" {
                     in_from = true;
+                }
+                if in_item && local == "Categories" {
+                    in_categories = true;
                 }
                 if in_from && local == "Mailbox" {
                     in_mailbox = true;
@@ -526,6 +536,8 @@ pub(crate) fn parse_find_items_response(xml: &str) -> Result<FindItemsResult, Ew
                         "DateTimeReceived" => received_at = Some(trimmed.to_string()),
                         "Preview" => body_preview = Some(trimmed.to_string()),
                         "IsRead" => is_read = trimmed == "true",
+                        "FlagStatus" => flag_status = Some(trimmed.to_string()),
+                        "String" if in_categories => categories.push(trimmed.to_string()),
                         "ItemClass" => item_class = trimmed.to_string(),
                         _ => {}
                     }
@@ -533,6 +545,9 @@ pub(crate) fn parse_find_items_response(xml: &str) -> Result<FindItemsResult, Ew
 
                 if local == "From" {
                     in_from = false;
+                }
+                if local == "Categories" {
+                    in_categories = false;
                 }
                 if is_item_tag(local) && in_item && depth == item_depth {
                     if !item_id.is_empty() {
@@ -546,6 +561,8 @@ pub(crate) fn parse_find_items_response(xml: &str) -> Result<FindItemsResult, Ew
                             body_preview: body_preview.clone(),
                             body_html: None,
                             is_read,
+                            flag_status: flag_status.clone(),
+                            categories: categories.clone(),
                             item_class: default_item_class(&item_class),
                             to_recipients: Vec::new(),
                             cc_recipients: Vec::new(),
@@ -601,6 +618,9 @@ pub(crate) fn parse_get_item_response(xml: &str) -> Result<EwsItem, EwsError> {
     let mut received_at: Option<String> = None;
     let mut body_html: Option<String> = None;
     let mut is_read = false;
+    let mut flag_status: Option<String> = None;
+    let mut categories: Vec<String> = Vec::new();
+    let mut in_categories = false;
     let mut item_class = String::new();
     let mut to_recipients: Vec<EwsRecipient> = Vec::new();
     let mut cc_recipients: Vec<EwsRecipient> = Vec::new();
@@ -652,6 +672,7 @@ pub(crate) fn parse_get_item_response(xml: &str) -> Result<EwsItem, EwsError> {
                         "From" => in_from = true,
                         "ToRecipients" => in_to = true,
                         "CcRecipients" => in_cc = true,
+                        "Categories" => in_categories = true,
                         _ => {}
                     }
                 }
@@ -754,6 +775,8 @@ pub(crate) fn parse_get_item_response(xml: &str) -> Result<EwsItem, EwsError> {
                         "DateTimeReceived" => received_at = Some(trimmed.to_string()),
                         "Body" => body_html = Some(trimmed.to_string()),
                         "IsRead" => is_read = trimmed == "true",
+                        "FlagStatus" => flag_status = Some(trimmed.to_string()),
+                        "String" if in_categories => categories.push(trimmed.to_string()),
                         "ItemClass" => item_class = trimmed.to_string(),
                         _ => {}
                     }
@@ -763,6 +786,7 @@ pub(crate) fn parse_get_item_response(xml: &str) -> Result<EwsItem, EwsError> {
                     "From" => in_from = false,
                     "ToRecipients" => in_to = false,
                     "CcRecipients" => in_cc = false,
+                    "Categories" => in_categories = false,
                     "Attachments" => in_attachments = false,
                     _ => {}
                 }
@@ -802,6 +826,8 @@ pub(crate) fn parse_get_item_response(xml: &str) -> Result<EwsItem, EwsError> {
         body_preview: None,
         body_html,
         is_read,
+        flag_status,
+        categories,
         item_class: default_item_class(&item_class),
         to_recipients,
         cc_recipients,

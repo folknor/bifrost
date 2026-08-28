@@ -1543,6 +1543,7 @@ mod tests {
             watermark: Some("2026-03-01T10:00:00Z".to_string()),
             last_full_scan_at: None,
             live_ids: Vec::new(),
+            live_versions: Vec::new(),
             boundary_ids: Vec::new(),
             degraded: false,
             warned_classes: Vec::new(),

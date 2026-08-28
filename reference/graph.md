@@ -40,8 +40,9 @@ arrived with cursor envelope v2, which forces a reseed.
 - `foreign.rs` - foreign (shared/delegate) mailbox folder codec:
   `encode_foreign` / `parse_folder` / `ParsedFolder` / `owner_tag`.
 
-Crate root: `paging.rs` - `PageWalk`, the shared bound on every
-`@odata.nextLink` traversal (see "Bounded `nextLink` traversal").
+Crate root: `paging.rs` - `PageWalk`, the shared repeated-link and page-budget
+bound used by Graph collection traversals, plus the search cursor codec that
+resumes within an over-delivered page (see "Bounded `nextLink` traversal").
 - `inventory.rs` - initial `delta?$select=...` walk, page
   pagination, inventory entry projection from Graph JSON.
 - `changes.rs` - delta-token-driven change stream over the
@@ -355,7 +356,9 @@ mailboxes always install.
   and a `CancellationToken`.
 - A bounded LRU `etag_index` of change keys (powering `If-Match`; mutation
   preflight reads refresh recency, `MESSAGE_SELECT` explicitly requests
-  `changeKey`, and tombstones and confirmed destroys evict their keys). It is
+  `changeKey`, successful writes record a returned etag or evict when Graph
+  returns none, 412 responses evict before retry, and moves, tombstones, and
+  confirmed destroys evict their old-id keys). It is
   a `HashMap<Arc<str>, _>` paired with a `BTreeMap<u64, Arc<str>>` of recency
   tickets, so insert / hit / evict are each one hash lookup plus a couple of
   tree nodes and never a scan: the write lock is taken once per hydrated page
@@ -534,12 +537,15 @@ no version bump of its own (a reader of the previous version never wrote
 it). The payload IS the sync state:
 `folder_id`, `PublicFolderRouting` (the cold-resumable `X-AnchorMailbox` /
 `X-PublicFolderMailbox` pair), a `DateTimeReceived` `watermark`, the
-`last_full_scan_at` throttle clock, and a `live_ids` deletion baseline.
+`last_full_scan_at` throttle clock, a `live_ids` deletion baseline, and a
+`live_versions` change-key baseline.
 `public_folder_changes_stream`: incremental `find_items` since the
 watermark (emit `Updated` + `Folder` and `Mailbox(content)` `Added` scope
 changes, matching the inventory pass's dual membership), then a deletion
-reconcile throttled to `FULL_SCAN_INTERVAL_SECS` (3600) - a full IdOnly
-scan diffed against `live_ids` emits `Destroyed` for vanished ids.
+reconcile throttled to `FULL_SCAN_INTERVAL_SECS` (3600). The full item-shape
+scan emits `Updated` when a retained id's change key moved and `Destroyed` for
+ids absent from `live_ids`. The EWS item shape carries read state, flag status,
+and categories through the same canonical token hash used by REST inventory.
 `live_ids` is hard-capped at `PUBLIC_FOLDER_LIVE_IDS_CAP` (10_000); above
 it the snapshot empties and the folder degrades to additions-only with one
 scoped `Warning`. Dispatch: routing-map membership for `Folder` scopes
@@ -879,7 +885,8 @@ FALLIBLE. It drives the renewal tick, so an infallible parser that coerced an
 unreadable value to the epoch reported it as long-expired and PATCHed it on
 every tick indefinitely. `is_expiring_soon` still answers "renew" on a parse
 failure - that is the safe direction, and one successful renewal replaces the
-stored string with this module's own output - but it logs the bad value. There
+stored string with the expiry Graph actually granted in the PATCH response -
+but it logs the bad value. There
 is no hand-rolled civil-date arithmetic in the crate; `jiff` does it in both
 `webhooks.rs` and `inventory.rs`.
 
@@ -933,7 +940,9 @@ renewal path safe:
 worker: it subscribes to the union of active folders, long-polls
 `GetStreamingEvents`, maps notifications to cursor scopes, and emits
 `Invalidated`. Failures use `ews_error_to_account_error`
-(terminal terminates; transient emits `Disconnected`, sleeps, reconnects).
+(terminal terminates; transient emits `Disconnected`, then both Subscribe
+failures and broken long-polls share capped exponential reconnect backoff with
+jitter).
 The REST-id translation response is reconciled per requested scope. A stale or
 refused folder enters the failed lane with its scope and Graph code while valid
 siblings are retained in the EWS subscription. An all-refused request has no
@@ -1180,7 +1189,9 @@ searches keep the `$filter` path.
 `startswith(displayName,'q') or startswith(mail,'q')` (escaped + URL-encoded as
 a whole) - unlike `contact_search`, which scans client-side and only
 server-filters exact-email queries. Rows without `mail` are dropped;
-`additional_emails` is empty; `@odata.nextLink` pages. A tenant lacking
+`additional_emails` is empty; `@odata.nextLink` pages. Search cursors retain
+the current page URL and consumed server-row count, so an over-delivered page
+resumes within that page rather than dropping matches. A tenant lacking
 `User.ReadBasic.All` / `User.Read.All` 403s -> `NoPermission` (an unauthorized
 directory is an error, not an empty result).
 
@@ -1385,8 +1396,10 @@ Mapping highlights:
 `mutation_item_outcome` projects per-id `$batch` responses onto `ItemOutcome`:
 2xx -> `Succeeded(Applied)`, 404-on-destroy -> `Succeeded(Skipped)`, 412 ->
 `Failed(ConcurrencyConflict)`, 429/other -> `Failed` carrying `Protocol::Graph`
-+ `AttemptCause(Acknowledged)` + wire signal. Shared by `mutate.rs` `bulk_*`,
-`pim::submit_write_batch`, `get_stream`.
++ `AttemptCause(Acknowledged)` + wire signal. Before projection, bulk mutation
+responses update the etag cache: flag writes record the returned etag or evict
+when absent, moves and destroys evict the old id, and 412 evicts so retry must
+refresh. Shared by `mutate.rs` `bulk_*`, `pim::submit_write_batch`, `get_stream`.
 
 Cursor-decode failures (`CursorProtocolMismatch`, `CursorEnvelopeUnknown`,
 `SchemaIncompatible`, malformed payload) build an AccountError with
@@ -1439,8 +1452,9 @@ advance regardless, with a test pinning that as correct.
 Every Graph collection walk follows server-supplied `@odata.nextLink` values
 until the server stops sending them, which is an unbounded loop against a
 remote: a server that keeps emitting a link spins the walk forever while the
-accumulating `Vec` grows without limit. Six such loops existed with no bound of
-any kind - `list_mail_folders`, the `childFolders` descent,
+accumulating `Vec` grows without limit. `PageWalk` guards the delta inventory
+and changes walks, the contact, directory, and local event searches, and the
+collection helpers including `list_mail_folders`, the `childFolders` descent,
 `list_message_rules`, `calendars_list`, `address_books_list`, and
 `fetch_paged_values`.
 

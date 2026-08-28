@@ -19,6 +19,7 @@
 //! response did not match the documented contract", classifying as
 //! `Protocol(ParseFailed)` / `Wire(MalformedResponse)`.
 
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
 use crate::error::GraphError;
@@ -73,9 +74,37 @@ impl PageWalk {
     }
 }
 
+#[derive(Serialize, Deserialize)]
+struct PagedCursor {
+    url: String,
+    skip: usize,
+}
+
+pub(crate) fn decode_paged_cursor(cursor: Option<Vec<u8>>) -> (Option<String>, usize) {
+    let Some(cursor) = cursor else {
+        return (None, 0);
+    };
+    match serde_json::from_slice::<PagedCursor>(&cursor) {
+        Ok(cursor) => (Some(cursor.url), cursor.skip),
+        Err(_) => (Some(String::from_utf8_lossy(&cursor).into_owned()), 0),
+    }
+}
+
+pub(crate) fn encode_paged_cursor(url: String, skip: usize) -> Vec<u8> {
+    serde_json::to_vec(&PagedCursor { url, skip }).expect("search cursor is serializable")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{MAX_PAGES, PageWalk};
+    use super::{MAX_PAGES, PageWalk, decode_paged_cursor, encode_paged_cursor};
+
+    #[test]
+    fn search_cursor_resumes_inside_an_overdelivered_page() {
+        let encoded = encode_paged_cursor("https://graph.test/users?page=4".to_string(), 17);
+        let (url, skip) = decode_paged_cursor(Some(encoded));
+        assert_eq!(url.as_deref(), Some("https://graph.test/users?page=4"));
+        assert_eq!(skip, 17);
+    }
 
     #[test]
     fn a_repeated_link_is_refused() {

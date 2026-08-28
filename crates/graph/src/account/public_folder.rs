@@ -56,7 +56,7 @@
 //!   and for a timestamped item that first appears in the scan rather than
 //!   the poll). To stop it re-emitting next cycle it is folded into the
 //!   persisted baseline the SAME cycle: the untimestamped emissions of the
-//!   incremental poll are capped-and-folded (`extend_live_ids` + `apply_cap`)
+//!   incremental poll are capped-and-folded (`extend_live_ids` + `capped_baseline`)
 //!   when no scan runs, and the full scan folds its own authoritative set
 //!   otherwise; either way an established id does not re-emit. The
 //!   same-cycle `emitted` set prevents the poll and the scan double-emitting
@@ -69,7 +69,7 @@
 //!   `Warning` fires once, only on the transition into degraded mode. That
 //!   transition applies UNIFORMLY to whichever path grows the persisted
 //!   baseline past `PUBLIC_FOLDER_LIVE_IDS_CAP` - the full-scan reassignment
-//!   or the None-watermark incremental fold - through the shared `apply_cap`.
+//!   or the None-watermark incremental fold - through the shared `capped_baseline`.
 //!   Additions still flow while degraded: timestamped items via the
 //!   incremental poll, and (None watermark) new-to-baseline items via the
 //!   full scan. With an empty baseline the scan cannot dedupe, so it may
@@ -232,11 +232,10 @@ const PUBLIC_FOLDER_BROWSE_STEP_CAP: usize = 1_000;
 /// baseline once, then folds it into the persisted baseline so it does not
 /// re-emit next poll (see the module-level contract, condition b).
 ///
-/// Known poll-model limitation (all classes, Message included, NOT fixed
-/// here): `DateTimeReceived` is not a change watermark, so an in-place
-/// edit that bumps the change-key without moving the received time sits
-/// below the watermark and is never re-emitted. Closing that would mean
-/// switching the whole model off received-time; a separate change.
+/// `DateTimeReceived` is not a change watermark, so an in-place edit that
+/// bumps the change key without moving the received time sits below the
+/// incremental restriction. The complete scan compares `live_versions` and
+/// emits that edit, bounded by the scan interval rather than losing it.
 pub(crate) fn advance_watermark(prior: Option<String>, items: &[EwsItem]) -> Option<String> {
     let mut best = prior;
     let mut best_instant = best.as_deref().and_then(parse_received);
@@ -379,9 +378,9 @@ pub(crate) fn page_walk_step(
 /// - `watermark_none == false`: the restricted poll already bounds the
 ///   timestamped emissions, so the scan only needs to cover items the `>=`
 ///   restriction structurally cannot see - those lacking `received_at`.
-///   Timestamped items are the poll's responsibility and are left untouched
-///   (an in-place edit keeping `DateTimeReceived` is still NOT re-emitted -
-///   a known poll-model limitation shared by every class, Message included).
+///   Timestamped additions are the poll's responsibility and are left
+///   untouched. The scan's separate change-key comparison still emits
+///   in-place updates whose `DateTimeReceived` did not move.
 ///
 /// The same-cycle `emitted` set stops the scan double-emitting an id the
 /// incremental poll already emitted.
@@ -457,7 +456,7 @@ pub(crate) fn newly_unhandled(seen: &[String], already_warned: &[String]) -> Vec
 /// reconcile: an emitted id is genuinely live, so a later full scan that
 /// no longer sees it still diffs it out as `Destroyed`.
 ///
-/// The result is passed through `apply_cap` by the caller, so a fold that
+/// The result is passed through `capped_baseline` by the caller, so a fold that
 /// crosses `PUBLIC_FOLDER_LIVE_IDS_CAP` degrades exactly like the full-scan
 /// path rather than shipping an over-cap baseline with `degraded == false`.
 pub(crate) fn extend_live_ids(mut live: Vec<String>, added: &[String]) -> Vec<String> {
@@ -479,11 +478,64 @@ pub(crate) fn extend_live_ids(mut live: Vec<String>, added: &[String]) -> Vec<St
 /// true only if the folder was not already degraded. Shared by the full-scan
 /// reassignment and the None-watermark incremental fold so both honor the
 /// cap and the one-warning-on-transition rule identically.
-fn apply_cap(candidate: Vec<String>, was_degraded: bool) -> (Vec<String>, bool, bool) {
+///
+/// The whole persisted baseline is produced here - ids, the `(id, change
+/// key)` version map the full scan diffs against, and the `degraded` flag -
+/// because the cap is only a cap if EVERY per-item vector it bounds is
+/// emptied together. Returning the three separately let a caller clear the
+/// ids off the new `degraded` value while sizing the versions off the old
+/// one, so the first over-cap scan degraded the id set and persisted an
+/// unbounded version map beside it.
+fn capped_baseline(
+    candidate: Vec<String>,
+    versions: Vec<(String, String)>,
+    was_degraded: bool,
+) -> Baseline {
     match cap_live_ids(candidate, PUBLIC_FOLDER_LIVE_IDS_CAP) {
-        Some(set) => (set, false, false),
-        None => (Vec::new(), true, !was_degraded),
+        Some(set) => {
+            let live: std::collections::HashSet<&str> = set.iter().map(String::as_str).collect();
+            let live_versions = versions
+                .into_iter()
+                .filter(|(id, _)| live.contains(id.as_str()))
+                .collect();
+            Baseline {
+                live_ids: set,
+                live_versions,
+                degraded: false,
+                degrade_transition: false,
+            }
+        }
+        None => Baseline {
+            live_ids: Vec::new(),
+            live_versions: Vec::new(),
+            degraded: true,
+            degrade_transition: !was_degraded,
+        },
     }
+}
+
+/// The persisted public-folder baseline, produced only by `capped_baseline`.
+pub(crate) struct Baseline {
+    pub(crate) live_ids: Vec<String>,
+    pub(crate) live_versions: Vec<(String, String)>,
+    pub(crate) degraded: bool,
+    /// True when THIS call transitioned the folder into degraded mode, so
+    /// the caller warns exactly once.
+    pub(crate) degrade_transition: bool,
+}
+
+/// Collect the `(item id, change key)` pairs an item walk observed. Items
+/// without a change key contribute nothing: absence is not a version, and
+/// storing a placeholder would make the next scan report a spurious update.
+fn item_versions(items: &[EwsItem]) -> Vec<(String, String)> {
+    items
+        .iter()
+        .filter_map(|item| {
+            item.change_key
+                .clone()
+                .map(|key| (item.item_id.clone(), key))
+        })
+        .collect()
 }
 
 /// Project an `EwsItem` to an inventory entry, owner-tagged with both
@@ -514,7 +566,11 @@ pub(crate) fn item_to_inventory_entry(
                 .map(ServerVersion::ETag)
                 .unwrap_or(ServerVersion::Unavailable),
             size: None,
-            flags_hash: bifrost_types::canonical_flags_hash([format!("isread={}", item.is_read)]),
+            flags_hash: super::inventory::tracked_flags_hash(
+                Some(item.is_read),
+                item.flag_status.as_deref(),
+                item.categories.iter().map(String::as_str),
+            ),
         },
         thread_id: None,
         message_id: None,
@@ -1049,10 +1105,8 @@ pub(crate) fn public_folder_inventory_stream(
         // additions-only - emit the same one-warning-on-degrade the
         // changes path emits, rather than silently entering the degraded
         // mode (the documented one-warning-on-degrade contract).
-        let (live_ids, degraded) = match cap_live_ids(scan_set, PUBLIC_FOLDER_LIVE_IDS_CAP) {
-            Some(set) => (set, false),
-            None => (Vec::new(), true),
-        };
+        let baseline = capped_baseline(scan_set, item_versions(&items), false);
+        let degraded = baseline.degraded;
         if degraded {
             yield bifrost_types::InventoryEvent::Warning(Warning::support_only(
                 WarningKind::StrategyDowngraded,
@@ -1072,7 +1126,8 @@ pub(crate) fn public_folder_inventory_stream(
             routing: routing.clone(),
             watermark,
             last_full_scan_at: None,
-            live_ids,
+            live_ids: baseline.live_ids,
+            live_versions: baseline.live_versions,
             boundary_ids,
             degraded,
             warned_classes: unhandled.clone(),
@@ -1207,6 +1262,29 @@ fn reduce_public_folder_poll(
             }
         }
         let scan_set: Vec<String> = scan.items.iter().map(|i| i.item_id.clone()).collect();
+        let prior_versions: std::collections::HashMap<&str, &str> = pf
+            .live_versions
+            .iter()
+            .map(|(id, version)| (id.as_str(), version.as_str()))
+            .collect();
+        for item in &scan.items {
+            if emitted.contains(&item.item_id) {
+                continue;
+            }
+            let Some(change_key) = item.change_key.as_deref() else {
+                continue;
+            };
+            if prior_versions
+                .get(item.item_id.as_str())
+                .is_some_and(|prior| *prior != change_key)
+            {
+                changes.push(Change::ObjectChange(ObjectChange {
+                    id: super::foreign::encode_public_item_id(&folder, &item.item_id),
+                    kind: ObjectChangeKind::Updated,
+                }));
+                emitted.insert(item.item_id.clone());
+            }
+        }
         // A degraded (empty snapshot, was over cap) folder skips the
         // deletion diff and emits no Destroyed.
         if !pf.degraded {
@@ -1235,10 +1313,11 @@ fn reduce_public_folder_poll(
         // The full scan is authoritative for the baseline (it already
         // includes this cycle's incremental emissions), so reassign from the
         // scan set and cap/degrade uniformly.
-        let (live, degraded, warn) = apply_cap(scan_set, pf.degraded);
-        pf.live_ids = live;
-        pf.degraded = degraded;
-        degrade_transition = warn;
+        let baseline = capped_baseline(scan_set, item_versions(&scan.items), pf.degraded);
+        pf.live_ids = baseline.live_ids;
+        pf.live_versions = baseline.live_versions;
+        pf.degraded = baseline.degraded;
+        degrade_transition = baseline.degrade_transition;
         pf.last_full_scan_at = Some(now);
     } else if !pf.degraded && !untimestamped_emitted.is_empty() {
         // No scan this cycle: persist the untimestamped emissions into the
@@ -1247,10 +1326,15 @@ fn reduce_public_folder_poll(
         // path uses. Skipped while degraded (the baseline stays empty by
         // contract; only a full scan recovers from degraded).
         let candidate = extend_live_ids(std::mem::take(&mut pf.live_ids), &untimestamped_emitted);
-        let (live, degraded, warn) = apply_cap(candidate, pf.degraded);
-        pf.live_ids = live;
-        pf.degraded = degraded;
-        degrade_transition = warn;
+        let baseline = capped_baseline(
+            candidate,
+            std::mem::take(&mut pf.live_versions),
+            pf.degraded,
+        );
+        pf.live_ids = baseline.live_ids;
+        pf.live_versions = baseline.live_versions;
+        pf.degraded = baseline.degraded;
+        degrade_transition = baseline.degrade_transition;
     }
 
     // (d) Warn once per folder lifetime on newly-seen unhandled classes,
@@ -1578,6 +1662,8 @@ mod tests {
             body_preview: None,
             body_html: None,
             is_read,
+            flag_status: None,
+            categories: Vec::new(),
             item_class: "IPM.Note".to_string(),
             to_recipients: Vec::new(),
             cc_recipients: Vec::new(),
@@ -1607,6 +1693,7 @@ mod tests {
             watermark: watermark.map(str::to_string),
             last_full_scan_at: last_scan,
             live_ids: live.iter().map(|s| (*s).to_string()).collect(),
+            live_versions: Vec::new(),
             boundary_ids: Vec::new(),
             degraded: false,
             warned_classes: Vec::new(),
@@ -1689,6 +1776,51 @@ mod tests {
         assert_eq!(deleted_ids(&prior, &scan), vec!["b".to_string()]);
         // Nothing deleted -> empty.
         assert!(deleted_ids(&prior, &prior).is_empty());
+    }
+
+    #[test]
+    fn public_folder_fingerprint_tracks_read_flag_and_categories() {
+        let folder = FolderId("folder".to_string());
+        let base = item("same", None, false);
+        let base_hash = item_to_inventory_entry(&base, &folder, "owner")
+            .fingerprint
+            .flags_hash;
+        let mut changed = base.clone();
+        changed.flag_status = Some("Flagged".to_string());
+        changed.categories = vec!["Important".to_string()];
+        assert_ne!(
+            base_hash,
+            item_to_inventory_entry(&changed, &folder, "owner")
+                .fingerprint
+                .flags_hash
+        );
+    }
+
+    #[test]
+    fn full_scan_emits_an_in_place_change_key_update() {
+        let mut pf = cursor(Some("2026-03-05T12:00:00Z"), Some(0), &["same"]);
+        pf.live_versions = vec![("same".to_string(), "old-key".to_string())];
+        let poll = ItemWalk {
+            items: Vec::new(),
+            unhandled_classes: Vec::new(),
+            complete: true,
+        };
+        let scan = ItemWalk {
+            items: vec![item("same", Some("2026-01-01T00:00:00Z"), true)],
+            unhandled_classes: Vec::new(),
+            complete: true,
+        };
+        let PollOutcome::Apply {
+            changes, cursor, ..
+        } = reduce_public_folder_poll(pf, &poll, Some(&scan), 4_000)
+        else {
+            panic!("complete scan applies")
+        };
+        assert!(changes.iter().any(|change| matches!(change, Change::ObjectChange(change) if change.id == emitted_id("same") && change.kind == ObjectChangeKind::Updated)));
+        assert_eq!(
+            cursor.live_versions,
+            vec![("same".to_string(), "ck-same".to_string())]
+        );
     }
 
     #[test]
@@ -2019,6 +2151,7 @@ mod tests {
             watermark: None,
             last_full_scan_at: Some(2_000_000),
             live_ids: full,
+            live_versions: Vec::new(),
             boundary_ids: Vec::new(),
             degraded: false,
             warned_classes: Vec::new(),
@@ -2040,6 +2173,41 @@ mod tests {
         );
         // The addition still emitted before the fold degraded the folder.
         assert_eq!(count_object_change(&changes, "fresh", false), 1);
+    }
+
+    #[test]
+    fn scan_crossing_cap_empties_the_version_map_too() {
+        // The cap is only a cap if every per-item vector it bounds empties
+        // together. The first over-cap scan used to clear `live_ids` off the
+        // new `degraded` value while sizing `live_versions` off the old one,
+        // persisting a 10_001-entry version map behind a "capped" cursor.
+        let pf = PublicFolderCursor {
+            folder_id: "AAMkPF=".to_string(),
+            routing: PublicFolderRouting {
+                anchor_mailbox: "content@contoso.com".to_string(),
+                public_folder_mailbox: Some("pf@contoso.com".to_string()),
+            },
+            watermark: None,
+            last_full_scan_at: Some(0),
+            live_ids: vec!["id0".to_string()],
+            live_versions: vec![("id0".to_string(), "ck-id0".to_string())],
+            boundary_ids: Vec::new(),
+            degraded: false,
+            warned_classes: Vec::new(),
+        };
+        let over_cap: Vec<EwsItem> = (0..=PUBLIC_FOLDER_LIVE_IDS_CAP)
+            .map(|i| item(&format!("id{i}"), None, false))
+            .collect();
+        let poll = walk(Vec::new(), &[], true);
+        let scan = walk(over_cap, &[], true);
+        let (_changes, _warnings, cursor) =
+            unbox_apply(reduce_public_folder_poll(pf, &poll, Some(&scan), 9_000_000));
+        assert!(cursor.degraded, "over-cap scan degrades");
+        assert!(cursor.live_ids.is_empty(), "degraded baseline is empty");
+        assert!(
+            cursor.live_versions.is_empty(),
+            "a degraded cursor persists no version map either"
+        );
     }
 
     #[test]
@@ -2165,6 +2333,7 @@ mod tests {
             watermark: Some("2026-03-05T12:00:00Z".to_string()),
             last_full_scan_at: Some(2_000_000),
             live_ids: vec!["old".to_string()],
+            live_versions: Vec::new(),
             boundary_ids: vec!["edge".to_string()],
             degraded: false,
             warned_classes: Vec::new(),

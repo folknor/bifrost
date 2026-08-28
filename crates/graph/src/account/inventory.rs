@@ -109,8 +109,16 @@ fn inventory_stream_from(
                 return;
             }
         };
+        let mut walk = crate::paging::PageWalk::new("inventory delta");
 
         loop {
+            if let Err(error) = walk.enter(&current_url) {
+                yield bifrost_types::InventoryEvent::Terminated(super::graph_error::graph_shared_scope_error(
+                    error, &scope, owner.as_ref(), sync_ctx.clone(),
+                ));
+                yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion { checkpoint: None, coverage: coverage_of(&scope, &obligations) });
+                return;
+            }
             let page: ODataCollection<Value> = match fetch_page(&client, &current_url).await {
                 Ok(page) => page,
                 Err(error) => {
@@ -547,24 +555,37 @@ fn internet_header(value: &Value, name: &str) -> Option<String> {
 }
 
 fn flags_hash(value: &Value) -> u64 {
-    let mut flags = Vec::new();
-    if let Some(is_read) = value.get("isRead").and_then(Value::as_bool) {
-        flags.push(format!("isread={is_read}"));
-    }
-    if let Some(status) = value
+    let is_read = value.get("isRead").and_then(Value::as_bool);
+    let status = value
         .get("flag")
         .and_then(|flag| flag.get("flagStatus"))
-        .and_then(Value::as_str)
-    {
+        .and_then(Value::as_str);
+    let categories = value
+        .get("categories")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str);
+    tracked_flags_hash(is_read, status, categories)
+}
+
+pub(crate) fn tracked_flags_hash<'a>(
+    is_read: Option<bool>,
+    flag_status: Option<&str>,
+    categories: impl IntoIterator<Item = &'a str>,
+) -> u64 {
+    let mut flags = Vec::new();
+    if let Some(is_read) = is_read {
+        flags.push(format!("isread={is_read}"));
+    }
+    if let Some(status) = flag_status {
         flags.push(format!("flag={}", status.to_ascii_lowercase()));
     }
-    if let Some(categories) = value.get("categories").and_then(Value::as_array) {
-        for category in categories {
-            if let Some(category) = category.as_str() {
-                flags.push(format!("category={}", category.to_ascii_lowercase()));
-            }
-        }
-    }
+    flags.extend(
+        categories
+            .into_iter()
+            .map(|category| format!("category={}", category.to_ascii_lowercase())),
+    );
     bifrost_types::canonical_flags_hash(flags)
 }
 

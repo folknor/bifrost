@@ -241,15 +241,12 @@ async fn submit_batch(
             .client
             .post_batch(&BatchRequest { requests })
             .await?;
-        reconcile_mutation_responses(&request_ids, response.responses, kind, &mut item_outcomes);
-        if matches!(kind, MutationKind::Destroy) {
-            let mut cache = account.etag_index.write().await;
-            for outcome in &item_outcomes {
-                if let ItemOutcome::Succeeded(success) = outcome {
-                    cache.remove(&success.item.0);
-                }
-            }
-        }
+        // One validated projection of the wire data, consumed by both the
+        // etag cache and the outcome lanes. Two independent walks of the
+        // raw subresponses disagreed on malformed input.
+        let resolved = resolve_batch_responses(&request_ids, response.responses);
+        update_etag_cache_from_responses(account, &request_ids, &resolved, kind).await;
+        reconcile_mutation_responses(&request_ids, resolved, kind, &mut item_outcomes);
     }
 
     let events = vec![SyncEvent::Batch(Batch {
@@ -262,31 +259,23 @@ async fn submit_batch(
     Ok(events)
 }
 
-/// Project the `$batch` responses onto the submitted request ids,
-/// appending exactly one `ItemOutcome` per id to `item_outcomes`.
+/// Validate `$batch` subresponses against the submitted request ids.
 ///
-/// Pure over the decoded response so the accounting rules are
-/// unit-pinnable without a live `$batch` endpoint. A response id that does
-/// not parse as a submitted index, parses out of range, or repeats one
-/// already answered is DISCARDED - fabricating an id the caller never
-/// submitted would put a stranger on the lane while the real id stays
-/// unanswered.
-///
-/// An id Graph never answered lands on the UNCERTAIN lane. The `$batch`
-/// envelope decoded, which is evidence about the envelope and nothing
-/// else: a `move` or `DELETE` that committed and then lost its subresponse
-/// is byte-identical to one that never ran. The uncertain lane is exactly
-/// the lane for "this write may have landed, read it back rather than
-/// replay it". Reporting `Failed(ContractViolation)` instead classified
-/// terminal, so the engine recorded `failed_terminal` with no read-back
-/// and permanently mis-stated an applied mutation as a lost one.
-fn reconcile_mutation_responses(
+/// A response whose id does not parse as a submitted index, parses out of
+/// range, or repeats an index already answered is DISCARDED; the first
+/// response for an index wins. Both consumers of the wire data - the etag
+/// cache and the outcome projection - read this one resolved list, because
+/// they used to walk the raw subresponses independently and disagreed on
+/// malformed input: a `412` followed by a duplicate `200` for the same
+/// request left an etag installed while the accepted outcome was a
+/// concurrency conflict, so the retry re-sent against a version the caller
+/// had already been told was stale.
+fn resolve_batch_responses(
     request_ids: &[ObjectId],
     responses: Vec<crate::types::BatchResponseItem>,
-    kind: &MutationKind,
-    item_outcomes: &mut Vec<ItemOutcome<MutationSuccess>>,
-) {
+) -> Vec<(usize, crate::types::BatchResponseItem)> {
     let mut seen_indices: HashSet<usize> = HashSet::new();
+    let mut resolved = Vec::with_capacity(responses.len());
     for item in responses {
         let Some(index) = item
             .id
@@ -309,6 +298,75 @@ fn reconcile_mutation_responses(
             );
             continue;
         }
+        resolved.push((index, item));
+    }
+    resolved
+}
+
+async fn update_etag_cache_from_responses(
+    account: &GraphAccount,
+    request_ids: &[ObjectId],
+    responses: &[(usize, crate::types::BatchResponseItem)],
+    kind: &MutationKind,
+) {
+    let mut cache = account.etag_index.write().await;
+    for (index, response) in responses {
+        let Some(id) = request_ids.get(*index) else {
+            continue;
+        };
+        if response.status == 412
+            || ((200..300).contains(&response.status)
+                && matches!(kind, MutationKind::Move(_) | MutationKind::Destroy))
+        {
+            cache.remove(&id.0);
+            continue;
+        }
+        if (200..300).contains(&response.status) {
+            let etag = response
+                .headers
+                .as_ref()
+                .and_then(|headers| {
+                    headers
+                        .iter()
+                        .find(|(name, _)| name.eq_ignore_ascii_case("etag"))
+                        .map(|(_, value)| value.clone())
+                })
+                .or_else(|| response.body.as_ref().and_then(graph_etag));
+            match etag {
+                Some(etag) => cache.insert(id.0.clone(), etag),
+                None => cache.remove(&id.0),
+            }
+        }
+    }
+}
+
+/// Project the `$batch` responses onto the submitted request ids,
+/// appending exactly one `ItemOutcome` per id to `item_outcomes`.
+///
+/// Pure over the RESOLVED response list produced by
+/// `resolve_batch_responses`, which is where invalid and duplicate response
+/// ids are discarded - fabricating an id the caller never submitted would
+/// put a stranger on the lane while the real id stays unanswered. Taking
+/// the resolved list rather than the raw one is what keeps the etag cache
+/// and the outcome lanes reading the same subresponse for an id.
+///
+/// An id Graph never answered lands on the UNCERTAIN lane. The `$batch`
+/// envelope decoded, which is evidence about the envelope and nothing
+/// else: a `move` or `DELETE` that committed and then lost its subresponse
+/// is byte-identical to one that never ran. The uncertain lane is exactly
+/// the lane for "this write may have landed, read it back rather than
+/// replay it". Reporting `Failed(ContractViolation)` instead classified
+/// terminal, so the engine recorded `failed_terminal` with no read-back
+/// and permanently mis-stated an applied mutation as a lost one.
+fn reconcile_mutation_responses(
+    request_ids: &[ObjectId],
+    responses: Vec<(usize, crate::types::BatchResponseItem)>,
+    kind: &MutationKind,
+    item_outcomes: &mut Vec<ItemOutcome<MutationSuccess>>,
+) {
+    let mut seen_indices: HashSet<usize> = HashSet::new();
+    for (index, item) in responses {
+        seen_indices.insert(index);
         let id = request_ids[index].clone();
         let scope = ErrorScope::Message {
             id: (id.0.clone()).into(),
@@ -765,7 +823,7 @@ mod tests {
         let mut outcomes = Vec::new();
         reconcile_mutation_responses(
             &request_ids,
-            vec![ok_response("0")],
+            resolve_batch_responses(&request_ids, vec![ok_response("0")]),
             &MutationKind::Move(MembershipScope::Folder(FolderId("archive".to_string()))),
             &mut outcomes,
         );
@@ -817,12 +875,15 @@ mod tests {
         let mut outcomes = Vec::new();
         reconcile_mutation_responses(
             &request_ids,
-            vec![
-                ok_response("0"),
-                ok_response("0"),
-                ok_response("9"),
-                ok_response("nope"),
-            ],
+            resolve_batch_responses(
+                &request_ids,
+                vec![
+                    ok_response("0"),
+                    ok_response("0"),
+                    ok_response("9"),
+                    ok_response("nope"),
+                ],
+            ),
             &MutationKind::Destroy,
             &mut outcomes,
         );
@@ -830,6 +891,99 @@ mod tests {
         assert_eq!(outcomes.len(), 1);
         assert_eq!(outcome_item(&outcomes[0]), "m0");
         assert!(matches!(outcomes[0], ItemOutcome::Succeeded(_)));
+    }
+
+    #[tokio::test]
+    async fn mutation_responses_refresh_or_evict_consumed_etags() {
+        let account = shared_account();
+        account
+            .etag_index
+            .write()
+            .await
+            .insert("m0".to_string(), "old".to_string());
+        let responses = vec![crate::types::BatchResponseItem {
+            id: "0".to_string(),
+            status: 200,
+            headers: Some(HashMap::from([("ETag".to_string(), "new".to_string())])),
+            body: None,
+        }];
+        let ids = [ObjectId("m0".to_string())];
+        update_etag_cache_from_responses(
+            &account,
+            &ids,
+            &resolve_batch_responses(&ids, responses),
+            &MutationKind::SetFlags(FlagOp::Set(HashSet::new())),
+        )
+        .await;
+        assert_eq!(
+            account.etag_index.write().await.get("m0").as_deref(),
+            Some("new")
+        );
+
+        let conflict = vec![crate::types::BatchResponseItem {
+            id: "0".to_string(),
+            status: 412,
+            headers: None,
+            body: None,
+        }];
+        update_etag_cache_from_responses(
+            &account,
+            &ids,
+            &resolve_batch_responses(&ids, conflict),
+            &MutationKind::SetFlags(FlagOp::Set(HashSet::new())),
+        )
+        .await;
+        assert_eq!(account.etag_index.write().await.get("m0"), None);
+    }
+
+    /// A malformed `$batch` answering one request twice - a `412`
+    /// concurrency conflict followed by a duplicate `200` - must not leave
+    /// the etag cache and the outcome lanes disagreeing. The outcome
+    /// projection has always taken the FIRST response, so the cache must
+    /// too: installing the second response's etag would hand the retry a
+    /// version the caller was simultaneously told was stale.
+    #[tokio::test]
+    async fn a_duplicate_success_after_a_conflict_cannot_reinstall_an_etag() {
+        let account = shared_account();
+        account
+            .etag_index
+            .write()
+            .await
+            .insert("m0".to_string(), "old".to_string());
+        let ids = [ObjectId("m0".to_string())];
+        let resolved = resolve_batch_responses(
+            &ids,
+            vec![
+                crate::types::BatchResponseItem {
+                    id: "0".to_string(),
+                    status: 412,
+                    headers: None,
+                    body: None,
+                },
+                crate::types::BatchResponseItem {
+                    id: "0".to_string(),
+                    status: 200,
+                    headers: Some(HashMap::from([("ETag".to_string(), "new".to_string())])),
+                    body: None,
+                },
+            ],
+        );
+        let kind = MutationKind::SetFlags(FlagOp::Set(HashSet::new()));
+        update_etag_cache_from_responses(&account, &ids, &resolved, &kind).await;
+        let mut outcomes = Vec::new();
+        reconcile_mutation_responses(&ids, resolved, &kind, &mut outcomes);
+
+        assert_eq!(
+            account.etag_index.write().await.get("m0"),
+            None,
+            "the conflict evicted the etag and the duplicate did not reinstall it"
+        );
+        assert_eq!(outcomes.len(), 1, "one outcome per submitted id");
+        assert!(
+            matches!(outcomes[0], ItemOutcome::Failed(_)),
+            "the accepted outcome is the 412 conflict, got {:?}",
+            outcomes[0]
+        );
     }
 
     #[test]

@@ -816,6 +816,8 @@ mod tests {
             body_preview: None,
             body_html: Some("<p>Read this</p>".to_string()),
             is_read: true,
+            flag_status: None,
+            categories: Vec::new(),
             item_class: "IPM.Note".to_string(),
             to_recipients: Vec::new(),
             cc_recipients: Vec::new(),

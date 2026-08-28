@@ -282,11 +282,7 @@ async fn search_locally(
     let calendar_id = explicit_calendar_id
         .clone()
         .unwrap_or_else(|| CalendarId(DEFAULT_CALENDAR_ID.to_string()));
-    let next_url = request
-        .page_cursor
-        .map(String::from_utf8)
-        .transpose()
-        .map_err(|error| local_error(AccountOperation::EventSearch, error.to_string()))?;
+    let (next_url, mut skip) = crate::paging::decode_paged_cursor(request.page_cursor);
     let mut url = next_url.unwrap_or_else(|| {
         let prefix = account.client.api_path_prefix();
         format!(
@@ -302,26 +298,42 @@ async fn search_locally(
         .unwrap_or(250)
         .max(1);
     let mut items = Vec::new();
+    let mut walk = crate::paging::PageWalk::new("event search");
     let next_cursor;
     loop {
+        walk.enter(&url)
+            .map_err(|error| local_error(AccountOperation::EventSearch, format!("{error:?}")))?;
         let page: ODataCollection<GraphEvent> =
             get_event_page(&account, &url, AccountOperation::EventSearch).await?;
-        items.extend(
-            page.value
-                .into_iter()
-                .map(|event| event_from_graph(calendar_id.0.clone(), event))
-                .filter(|event| event_matches(event, &needle)),
-        );
-        if items.len() >= limit {
-            items.truncate(limit);
-            next_cursor = page.next_link.map(String::into_bytes);
-            break;
+        let page_len = page.value.len();
+        for (index, value) in page.value.into_iter().enumerate().skip(skip) {
+            let event = event_from_graph(calendar_id.0.clone(), value);
+            if event_matches(&event, &needle) {
+                items.push(event);
+                if items.len() == limit {
+                    let consumed = index + 1;
+                    next_cursor = if consumed < page_len {
+                        Some(crate::paging::encode_paged_cursor(url.clone(), consumed))
+                    } else {
+                        page.next_link
+                            .map(|next| crate::paging::encode_paged_cursor(next, 0))
+                    };
+                    return Ok(Page {
+                        items,
+                        next_cursor,
+                        estimated_total: None,
+                        failed_ids: Vec::new(),
+                        skipped_scopes: Vec::new(),
+                    });
+                }
+            }
         }
         let Some(next) = page.next_link else {
             next_cursor = None;
             break;
         };
         url = next;
+        skip = 0;
     }
     Ok(Page {
         items,
