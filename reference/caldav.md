@@ -368,8 +368,13 @@ Supported calendar primitives:
   defensive guard. Empty search lists the collection to preserve
   match-all behavior.
 
-Cursor support is calendar-event only. `discover_cursor_scopes` returns
-`CursorScope::Type(ObjectType::CalendarEvent)`. `establish_initial_cursor`
+Cursor support is calendar-event only. `discover_cursor_scopes` returns one
+`CursorScope::Folder(FolderId(collection_href))` per discovered calendar, and
+NOTHING when the calendar home holds no collections - the collection walk
+already returns the home itself when the home is a calendar, so an empty walk
+is an empty backend and fabricating a home scope would point every cursor and
+inventory request at a 404.
+`establish_initial_cursor`
 builds a hybrid cursor from the calendar URL, the collection
 `sync-token` when present, and a sorted href/etag snapshot.
 `changes_stream` uses WebDAV `sync-collection` when the cursor carries a
@@ -383,8 +388,14 @@ empty multistatus against a populated prior snapshot suppresses the
 mass-delete, and any href in `current.failed_hrefs` is preserved rather
 than destroyed. The checkpoint preserves the prior entries and etags for
 both no-observation shapes while retaining a refreshed collection token.
-`inventory_stream` emits event inventory entries with ETag
-fingerprints for the same cursor scope.
+This deliberately means a genuine delete-all is not reported on that poll or a
+later poll: the empty success is indistinguishable from the transient empty
+response the guard suppresses.
+`inventory_stream` emits event inventory entries with ETag fingerprints for
+the same cursor scope and reports full coverage of that one collection. Legacy
+`CursorScope::Type(CalendarEvent)` calls remain accepted for compatibility,
+target the default calendar, and report only a `caldav` provider region rather
+than falsely claiming whole-type coverage.
 The CalDAV cursor payload is version 2. Version 2 records the request-relative
 native-id namespace; version 1 cursors are rejected so a namespace correction
 cannot surface as a delete plus create during snapshot diffing. The rejection is
@@ -418,41 +429,22 @@ reqwest transport has no `AccountNet` or metered transport attachment. This
 also means DAV legs composed into an IMAP account are not included in that
 account's priority scheduling, bandwidth measurements, or bandwidth cap.
 
-## Sync covers ONE calendar collection; the rest are reported as skipped
+## Sync scope is per calendar collection
 
-`discover_cursor_scopes` yields a single `CursorScope::Type(CalendarEvent)`, and
-all three sync lanes - `establish_initial_cursor`, `inventory_stream`,
-`changes_stream` - read `default_calendar_url`, which is simply
-`collections.first()` from the calendar-home PROPFIND. **An account with three
-calendars syncs one.**
+All three sync lanes resolve their collection from the folder scope returned by
+discovery. An account with three calendars therefore has three independent
+cursors, inventories, and change streams. The default calendar URL remains the
+fallback for PIM calls that omit a calendar and for legacy type-scoped cursor
+calls; it no longer limits discovered sync coverage. Standalone and
+IMAP-composed opens consequently have no collection-limit skip entries.
 
-The PIM primitives are NOT limited this way, and the asymmetry is the whole
-hazard. `event_get` derives the collection from the event's own URL, and
-create / update / search route through `calendar_url` with the caller's
-`calendar_id`, so direct API access reaches every calendar. `calendars_list`
-enumerates every calendar too. So a consumer sees a complete account, can read
-and write any calendar by hand, and silently receives inventory and change
-events for exactly one of them.
-
-`CalDavAccount::unsynced_calendar_urls` records the uncovered collections at
-open, and `open_skipped_scopes` turns each into a `SkippedScope` carrying
-`ErrorScope::Calendar { id }` and an `Unsupported(DiscoverCursorScopes)` error.
-The factory returns those on `OpenedAccount::skipped_scopes` rather than
-`OpenedAccount::complete`. `Unsupported` is deliberate: this is a standing
-limitation of the cursor model, not a transient failure, so no reopen or retry
-heals it and it must not be classified as retryable.
-
-The composed path carries them too. `bifrost-imap`'s `classify_dav_open`
-previously assumed a successful DAV open always answered an empty skip lane and
-dropped `opened.skipped_scopes` on the floor; it now forwards them onto the
-composed account's own lane, so an unsynced calendar is visible whether the DAV
-account is standalone or composed into IMAP.
-
-The honest fix is a `CursorScope::Folder(href)` per collection, which reshapes
-the published cursor model, forces another envelope bump, and costs every DAV
-account a second full re-sync. That is the repository owner's call and is
-tracked in `notes/todo.md`; the skip reporting is what makes the current
-limitation legible in the meantime, not a substitute for it.
+Multi-leg calendar multiget and text-search REPORTs are dispatched
+concurrently, bounded to `MULTIGET_LEG_CONCURRENCY` in-flight legs. The bound
+lives at this call site because the multiget chunk count is input-sized and
+`bifrost-net` carries no concurrency governor; dispatch is ordered, so the
+merged report and the surviving degraded error do not depend on completion
+order. Offset continuations still re-run search so each page reflects a
+fresh server observation and carries that observation's failure lanes.
 
 ## This crate and bifrost-carddav are near-duplicates, and drift is the defect
 

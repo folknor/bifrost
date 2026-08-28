@@ -129,10 +129,9 @@ impl AccountFactory for CalDavAccountFactory {
             // primitives while producing no inventory or change events. Left
             // unreported, a three-calendar account looks fully synced and
             // silently is not.
-            let skipped_scopes = account.open_skipped_scopes();
             Ok(OpenedAccount {
                 account: Arc::new(account) as Arc<dyn Account>,
-                skipped_scopes,
+                skipped_scopes: Vec::new(),
             })
         })
     }

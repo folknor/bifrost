@@ -67,6 +67,7 @@ fn scripted_sync_account(
         bandwidth_cap,
         contacts: None,
         calendars: None,
+        dav_scopes: Default::default(),
         submission: None,
         dav_degraded: Vec::new(),
     })

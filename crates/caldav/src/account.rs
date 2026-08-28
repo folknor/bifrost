@@ -11,7 +11,6 @@ use jiff::{Timestamp, civil};
 use crate::capabilities::{caldav_capabilities, scheduling_available};
 use crate::client::{
     CalDavClient, PutCondition, event_scope, local_error, missing_event_error, unsupported_error,
-    unsupported_scope_error,
 };
 use crate::ical::{
     EventProjectionError, create_to_ical, event_from_ical, events_from_ical, new_uid,
@@ -30,28 +29,7 @@ pub(crate) struct CalDavAccount {
     capabilities: AccountCapabilities,
     calendar_home: String,
     default_calendar_url: String,
-    /// Calendar collections discovery found and the cursor lanes do NOT cover.
-    ///
-    /// The cursor model here is one scope for the whole account
-    /// (`CursorScope::Type(CalendarEvent)`), and all three sync lanes -
-    /// `establish_initial_cursor`, `inventory_stream`, `changes_stream` - read
-    /// `default_calendar_url`, which is just `collections.first()`. So an
-    /// account with three calendars syncs one. The PIM primitives are
-    /// unaffected: `event_get` derives the collection from the event's own URL,
-    /// and create/update/search route through `calendar_url` with the caller's
-    /// `calendar_id`, so direct API access reaches every calendar.
-    ///
-    /// That asymmetry is the hazard this field exists to expose.
-    /// `calendars_list` enumerates all of them, so a consumer sees a complete
-    /// account and silently receives changes for one calendar.
-    /// `open_skipped_scopes` turns each of these into a `SkippedScope`, which
-    /// is where a consumer already looks for a surface that opened degraded.
-    ///
-    /// The honest fix is a `CursorScope::Folder(href)` per collection; it
-    /// reshapes the published cursor model and forces another envelope bump and
-    /// full re-sync, so it is the repository owner's call and is tracked in
-    /// `notes/todo.md`.
-    unsynced_calendar_urls: Vec<String>,
+    calendar_urls: Vec<String>,
     rsvp_email: Option<String>,
     schedule_outbox_url: Option<String>,
 }
@@ -64,51 +42,26 @@ impl CalDavAccount {
     /// dominate a test that is about what a single call puts on the wire.
     #[cfg(test)]
     pub(crate) fn for_tests(client: Arc<CalDavClient>, default_calendar_url: &str) -> Self {
-        Self::for_tests_with_unsynced(client, default_calendar_url, Vec::new())
+        Self::for_tests_with_collections(client, default_calendar_url, Vec::new())
     }
 
     #[cfg(test)]
-    pub(crate) fn for_tests_with_unsynced(
+    pub(crate) fn for_tests_with_collections(
         client: Arc<CalDavClient>,
         default_calendar_url: &str,
-        unsynced_calendar_urls: Vec<String>,
+        additional_calendar_urls: Vec<String>,
     ) -> Self {
         Self {
             client,
             capabilities: crate::capabilities::caldav_capabilities(false),
             calendar_home: default_calendar_url.to_string(),
             default_calendar_url: default_calendar_url.to_string(),
-            unsynced_calendar_urls,
+            calendar_urls: std::iter::once(default_calendar_url.to_string())
+                .chain(additional_calendar_urls.iter().cloned())
+                .collect(),
             rsvp_email: None,
             schedule_outbox_url: None,
         }
-    }
-
-    /// One `SkippedScope` per calendar the cursor lanes do not cover.
-    ///
-    /// Empty for the common single-calendar account. The classification is
-    /// `Unsupported(DiscoverCursorScopes)`: it is a standing limitation of this
-    /// crate's cursor model, not a transient failure, so no reopen or retry
-    /// heals it and a consumer should treat the calendar as unsynced for as
-    /// long as it uses this account.
-    pub(crate) fn open_skipped_scopes(&self) -> Vec<SkippedScope> {
-        self.unsynced_calendar_urls
-            .iter()
-            .map(|url| SkippedScope {
-                scope: ErrorScope::Calendar {
-                    id: (url.clone()).into(),
-                },
-                error: unsupported_scope_error(
-                    AccountOperation::DiscoverCursorScopes,
-                    ErrorScope::Calendar {
-                        id: (url.clone()).into(),
-                    },
-                    "bifrost-caldav syncs only the first discovered calendar \
-                     collection; this calendar is reachable through the event \
-                     primitives but produces no inventory or change events",
-                ),
-            })
-            .collect()
     }
 
     pub(crate) async fn open(
@@ -136,20 +89,13 @@ impl CalDavAccount {
             .first()
             .map(|collection| collection.href.clone())
             .unwrap_or_else(|| client.resolve_url(&calendar_home));
-        // Every collection past the first is enumerated but NOT synced - see
-        // `unsynced_calendar_urls`. Recorded at open so the gap is reportable
-        // rather than invisible.
-        let unsynced_calendar_urls = collections
-            .iter()
-            .skip(1)
-            .map(|collection| collection.href.clone())
-            .collect();
+        let calendar_urls = discovered_collection_urls(&collections);
         Ok(Self {
             client: Arc::new(client),
             capabilities: caldav_capabilities(event_rsvp),
             calendar_home,
             default_calendar_url,
-            unsynced_calendar_urls,
+            calendar_urls,
             rsvp_email,
             schedule_outbox_url,
         })
@@ -277,9 +223,15 @@ impl Account for CalDavAccount {
     }
 
     fn discover_cursor_scopes(&self) -> AccountStream<SyncEvent<CursorScope>> {
+        let scopes = self
+            .calendar_urls
+            .iter()
+            .cloned()
+            .map(|url| CursorScope::Folder(FolderId(url)))
+            .collect();
         Box::pin(stream::iter([
             SyncEvent::Batch(Batch {
-                items: vec![CursorScope::Type(ObjectType::CalendarEvent)],
+                items: scopes,
                 page_boundary: PageBoundary::Final,
                 server_latency: Default::default(),
                 bytes_in: 0,
@@ -303,9 +255,16 @@ impl Account for CalDavAccount {
     ) -> AccountFuture<Result<CursorEstablishment, AccountError>> {
         let client = Arc::clone(&self.client);
         let home = self.calendar_home.clone();
-        let calendar = self.default_calendar_url.clone();
+        let default_calendar = self.default_calendar_url.clone();
+        let calendar_urls = self.calendar_urls.clone();
         Box::pin(async move {
             validate_event_scope(&scope, AccountOperation::EstablishCursor)?;
+            let calendar = collection_url_for_scope(
+                &scope,
+                &default_calendar,
+                &calendar_urls,
+                AccountOperation::EstablishCursor,
+            )?;
             let snapshot = Self::event_snapshot(
                 &client,
                 Some(&home),
@@ -322,8 +281,13 @@ impl Account for CalDavAccount {
     fn inventory_stream(&self, scope: CursorScope) -> AccountStream<InventoryEvent> {
         let client = Arc::clone(&self.client);
         let home = self.calendar_home.clone();
-        let calendar = self.default_calendar_url.clone();
+        let default_calendar = self.default_calendar_url.clone();
+        let calendar_urls = self.calendar_urls.clone();
         let coverage_scope = scope.clone();
+        let coverage_domain = collection_coverage_domain(
+            coverage_scope,
+            scope_collection_url(&scope, &default_calendar),
+        );
         // COMPLETE coverage is an accurate claim here: this walk terminates
         // wholesale on any failure, so it never advances a checkpoint across a
         // gap. A version that starts absorbing per-item failures must build
@@ -335,6 +299,18 @@ impl Account for CalDavAccount {
                     events.push(SyncEvent::Terminated(error));
                     return events;
                 }
+                let calendar = match collection_url_for_scope(
+                    &scope,
+                    &default_calendar,
+                    &calendar_urls,
+                    AccountOperation::SyncInventory,
+                ) {
+                    Ok(calendar) => calendar,
+                    Err(error) => {
+                        events.push(SyncEvent::Terminated(error));
+                        return events;
+                    }
+                };
                 let started = Instant::now();
                 let snapshot = match Self::event_snapshot(
                     &client,
@@ -367,9 +343,7 @@ impl Account for CalDavAccount {
                 events
             })
             .flat_map(stream::iter)
-            .map(bifrost_types::lift_complete_walk(
-                bifrost_types::CoverageDomain::full(coverage_scope),
-            )),
+            .map(bifrost_types::lift_complete_walk(coverage_domain)),
         )
     }
 
@@ -982,6 +956,12 @@ impl Account for CalDavAccount {
         let schedule_outbox_url = self.schedule_outbox_url.clone();
         Box::pin(async move {
             reject_recurrence_instance_id(&event, AccountOperation::EventRsvp)?;
+            let Some(rsvp_email) = rsvp_email else {
+                return Err(unsupported_error(AccountOperation::EventRsvp));
+            };
+            let Some(schedule_outbox_url) = schedule_outbox_url else {
+                return Err(unsupported_error(AccountOperation::EventRsvp));
+            };
             let current = Self::fetch_event_from_url(
                 Arc::clone(&client),
                 default_calendar_url,
@@ -990,12 +970,6 @@ impl Account for CalDavAccount {
                 AccountOperation::EventRsvp,
             )
             .await?;
-            let Some(rsvp_email) = rsvp_email else {
-                return Err(unsupported_error(AccountOperation::EventRsvp));
-            };
-            let Some(schedule_outbox_url) = schedule_outbox_url else {
-                return Err(unsupported_error(AccountOperation::EventRsvp));
-            };
             let reply = rsvp_reply_ical(&current, status, &rsvp_email)
                 .map_err(|_| unsupported_error(AccountOperation::EventRsvp))?;
             // Defensive on the success path: `rsvp_reply_ical` above
@@ -1393,13 +1367,70 @@ fn validate_event_scope(
     scope: &CursorScope,
     operation: AccountOperation,
 ) -> Result<(), AccountError> {
-    if matches!(scope, CursorScope::Type(ObjectType::CalendarEvent)) {
+    if matches!(
+        scope,
+        CursorScope::Type(ObjectType::CalendarEvent) | CursorScope::Folder(_)
+    ) {
         Ok(())
     } else {
         Err(crate::client::local_error(
             operation,
             "CalDAV only supports calendar-event cursor scopes",
         ))
+    }
+}
+
+/// The cursor-scope collection set: one entry per DISCOVERED calendar, and
+/// NOTHING when the home holds none.
+///
+/// `list_calendars` already returns the home itself when the home is genuinely
+/// a calendar collection, so an empty result means an empty backend rather
+/// than a discovery shape this crate has to paper over. Substituting the home
+/// URL here would advertise a folder that does not exist, and cursor
+/// establishment and inventory would then issue requests against it and
+/// commonly terminate with 404. It would also contradict the empty-home
+/// contract the listing APIs are pinned to.
+fn discovered_collection_urls(collections: &[crate::parse::CalendarCollection]) -> Vec<String> {
+    collections
+        .iter()
+        .map(|collection| collection.href.clone())
+        .collect()
+}
+
+fn collection_url_for_scope(
+    scope: &CursorScope,
+    default_url: &str,
+    collection_urls: &[String],
+    operation: AccountOperation,
+) -> Result<String, AccountError> {
+    match scope {
+        CursorScope::Type(ObjectType::CalendarEvent) => Ok(default_url.to_string()),
+        CursorScope::Folder(folder) if collection_urls.contains(&folder.0) => Ok(folder.0.clone()),
+        _ => Err(local_error(
+            operation,
+            "CalDAV cursor scope does not name a discovered calendar",
+        )),
+    }
+}
+
+fn scope_collection_url<'a>(scope: &'a CursorScope, default_url: &'a str) -> &'a str {
+    match scope {
+        CursorScope::Folder(folder) => &folder.0,
+        _ => default_url,
+    }
+}
+
+fn collection_coverage_domain(scope: CursorScope, collection_url: &str) -> CoverageDomain {
+    match scope {
+        CursorScope::Folder(_) => CoverageDomain::full(scope),
+        _ => CoverageDomain {
+            scope,
+            coordinate: CoverageCoordinate::ProviderRegion {
+                namespace: "caldav".to_string(),
+                region: collection_url.as_bytes().to_vec(),
+            },
+            snapshot: SnapshotIdentity::unstable(),
+        },
     }
 }
 
@@ -1858,6 +1889,41 @@ fn contains(value: &str, needle: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn collection(href: &str) -> crate::parse::CalendarCollection {
+        crate::parse::CalendarCollection {
+            href: href.to_string(),
+            display_name: None,
+            color: None,
+            can_edit: None,
+            sync_token: None,
+        }
+    }
+
+    /// An empty calendar home yields NO cursor scopes.
+    ///
+    /// The collection walk returns the home itself when the home is a calendar
+    /// collection, so an empty walk is an empty backend. Substituting the home
+    /// would advertise a folder that does not exist and drive every cursor and
+    /// inventory request for it into a 404.
+    #[test]
+    fn an_empty_home_produces_no_cursor_scope_collections() {
+        assert!(discovered_collection_urls(&[]).is_empty());
+    }
+
+    #[test]
+    fn every_discovered_calendar_becomes_a_cursor_scope_collection() {
+        assert_eq!(
+            discovered_collection_urls(&[
+                collection("https://dav.example.test/cal/work/"),
+                collection("https://dav.example.test/cal/home/"),
+            ]),
+            vec![
+                "https://dav.example.test/cal/work/".to_string(),
+                "https://dav.example.test/cal/home/".to_string(),
+            ]
+        );
+    }
 
     /// A CalDAV `CalendarId` IS the resolved collection href, on the listing
     /// surface as well as on the request-routing and `ErrorScope` surfaces.

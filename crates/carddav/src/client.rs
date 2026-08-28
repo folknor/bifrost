@@ -13,14 +13,25 @@ use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, ETAG, HeaderMap, HeaderValue}
 use reqwest::{Method, StatusCode, Url};
 
 use crate::parse::{
-    AddressBookCollection, CardDavContactEntry, CardDavContactListing, CardDavMultigetReport,
-    MultigetOutcome, extract_href_property, parse_addressbook_collections, parse_multiget_report,
+    AddressBookCollection, CardDavContactListing, CardDavMultigetReport, MultigetOutcome,
+    extract_href_property, parse_addressbook_collections, parse_multiget_report,
     parse_propfind_contacts, resolve_href,
 };
 use crate::{CardDavConfig, CardDavCredentials};
 
 const DAV_CLIENT_TIMEOUT: Duration = Duration::from_secs(30);
 const MULTIGET_BATCH_SIZE: usize = 50;
+
+/// In-flight REPORT legs a single multiget or text search may hold open.
+///
+/// The chunk count is driven by the caller's uri list, so an unbounded
+/// `join_all` over it lets one large collection launch hundreds of
+/// simultaneous REPORTs at a server that never agreed to that. `bifrost-net`
+/// has no concurrency governor, so the bound belongs here, at the call site
+/// that knows the fan-out is input-sized. Ordered (`buffered`, not
+/// `buffer_unordered`) so the merged report and the surviving degraded error
+/// stay deterministic regardless of completion order.
+const MULTIGET_LEG_CONCURRENCY: usize = 4;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum PutCondition<'a> {
@@ -242,15 +253,6 @@ impl CardDavClient {
         Ok(collections)
     }
 
-    #[allow(dead_code)]
-    pub(crate) async fn list_contacts(
-        &self,
-        addressbook_url: &str,
-    ) -> Result<Vec<CardDavContactEntry>, AccountError> {
-        self.list_contacts_for_operation(addressbook_url, AccountOperation::ContactsList)
-            .await
-    }
-
     /// Cheap depth-0 PROPFIND for the collection `getctag`. Returns
     /// `None` when the server omits it, so the caller falls through to a
     /// full snapshot + diff (brick 8 ctag short-circuit).
@@ -264,18 +266,6 @@ impl CardDavClient {
             .await?;
         crate::parse::parse_collection_ctag(&response.text)
             .map_err(|error| parse_error(operation, format!("collection ctag: {error}")))
-    }
-
-    #[allow(dead_code)]
-    pub(crate) async fn list_contacts_for_operation(
-        &self,
-        addressbook_url: &str,
-        operation: AccountOperation,
-    ) -> Result<Vec<CardDavContactEntry>, AccountError> {
-        Ok(self
-            .list_contacts_listing(addressbook_url, operation)
-            .await?
-            .entries)
     }
 
     /// Depth-1 contact PROPFIND returning both the committed entries and
@@ -304,16 +294,18 @@ impl CardDavClient {
     ) -> Result<MultigetFetch, AccountError> {
         let mut all_results = CardDavMultigetReport::default();
         let mut degraded = None;
-        for chunk in uris.chunks(MULTIGET_BATCH_SIZE) {
-            let mut href_elements = String::new();
-            for uri in chunk {
-                href_elements.push_str("  <D:href>");
-                href_elements.push_str(&escape_xml(uri));
-                href_elements.push_str("</D:href>\n");
-            }
+        let bodies = uris
+            .chunks(MULTIGET_BATCH_SIZE)
+            .map(|chunk| {
+                let mut href_elements = String::new();
+                for uri in chunk {
+                    href_elements.push_str("  <D:href>");
+                    href_elements.push_str(&escape_xml(uri));
+                    href_elements.push_str("</D:href>\n");
+                }
 
-            let body = format!(
-                "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
+                let body = format!(
+                    "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
 <C:addressbook-multiget xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:carddav\">\n\
   <D:prop>\n\
     <D:resourcetype/>\n\
@@ -321,19 +313,29 @@ impl CardDavClient {
     <C:address-data/>\n\
   </D:prop>\n\
 {href_elements}</C:addressbook-multiget>"
-            );
-            self.accumulate_leg(
-                MultigetLeg {
+                );
+                body
+            })
+            .collect::<Vec<_>>();
+        let legs: Vec<_> = bodies
+            .iter()
+            .map(|body| {
+                self.run_leg(MultigetLeg {
                     url: addressbook_url,
                     depth: "0",
-                    body: &body,
+                    body,
                     operation,
                     context: "multiget",
-                },
-                &mut all_results,
-                &mut degraded,
-            )
-            .await;
+                })
+            })
+            .collect();
+        let mut legs =
+            futures::StreamExt::buffered(futures::stream::iter(legs), MULTIGET_LEG_CONCURRENCY);
+        while let Some((report, error)) = futures::StreamExt::next(&mut legs).await {
+            all_results.extend(report);
+            if let Some(error) = error {
+                degraded = worse_recovery(degraded, error);
+            }
         }
         MultigetFetch::settle(all_results, degraded)
     }
@@ -394,6 +396,13 @@ impl CardDavClient {
         all_results.extend(parsed);
     }
 
+    async fn run_leg(&self, leg: MultigetLeg<'_>) -> (CardDavMultigetReport, Option<AccountError>) {
+        let mut report = CardDavMultigetReport::default();
+        let mut degraded = None;
+        self.accumulate_leg(leg, &mut report, &mut degraded).await;
+        (report, degraded)
+    }
+
     pub(crate) async fn query_vcards_text(
         &self,
         addressbook_url: &str,
@@ -401,20 +410,27 @@ impl CardDavClient {
     ) -> Result<MultigetFetch, AccountError> {
         let mut all_results = CardDavMultigetReport::default();
         let mut degraded = None;
-        for property in ["FN", "N", "EMAIL", "TEL", "ADR", "ORG", "TITLE", "NOTE"] {
-            let body = addressbook_text_query_body(property, query);
-            self.accumulate_leg(
-                MultigetLeg {
+        let bodies = ["FN", "N", "EMAIL", "TEL", "ADR", "ORG", "TITLE", "NOTE"]
+            .map(|property| addressbook_text_query_body(property, query));
+        let legs: Vec<_> = bodies
+            .iter()
+            .map(|body| {
+                self.run_leg(MultigetLeg {
                     url: addressbook_url,
                     depth: "1",
-                    body: &body,
+                    body,
                     operation: AccountOperation::ContactSearch,
                     context: "query",
-                },
-                &mut all_results,
-                &mut degraded,
-            )
-            .await;
+                })
+            })
+            .collect();
+        let mut legs =
+            futures::StreamExt::buffered(futures::stream::iter(legs), MULTIGET_LEG_CONCURRENCY);
+        while let Some((report, error)) = futures::StreamExt::next(&mut legs).await {
+            all_results.extend(report);
+            if let Some(error) = error {
+                degraded = worse_recovery(degraded, error);
+            }
         }
         MultigetFetch::settle(all_results, degraded)
     }
@@ -951,28 +967,6 @@ pub(crate) fn unsupported_error(operation: AccountOperation) -> AccountError {
     )
     .protocol(Protocol::CardDav)
     .operation(operation)
-    .try_build()
-    .expect("valid account error classification")
-}
-
-/// An `Unsupported` skip that names the scope it left behind.
-///
-/// Twin of bifrost-caldav's helper of the same name. Unlike
-/// `unsupported_error` it carries a scope and a diagnostic, because the whole
-/// value of the entry is WHICH collection went unsynced and why.
-pub(crate) fn unsupported_scope_error(
-    operation: AccountOperation,
-    scope: ErrorScope,
-    message: impl Into<String>,
-) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Unsupported(operation),
-        Cause::Request(RequestCause::Unsupported { operation }),
-    )
-    .protocol(Protocol::CardDav)
-    .operation(operation)
-    .scope(scope)
-    .text(DiagnosticText::support_only(message))
     .try_build()
     .expect("valid account error classification")
 }
@@ -1778,6 +1772,71 @@ mod tests {
                 .get(AUTHORIZATION)
                 .and_then(|value| value.to_str().ok()),
             Some("Bearer token")
+        );
+    }
+
+    /// A transport that records the HIGH-WATER MARK of simultaneously
+    /// in-flight requests. Twin of bifrost-caldav's probe: each send yields
+    /// once before answering, so every polled leg is genuinely in flight at
+    /// the same time and the mark reflects the caller's fan-out policy.
+    struct ConcurrencyProbeTransport {
+        body: String,
+        in_flight: Arc<std::sync::atomic::AtomicUsize>,
+        peak: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl DavTransport for ConcurrencyProbeTransport {
+        fn send(
+            &self,
+            _request: reqwest::RequestBuilder,
+        ) -> AccountFuture<Result<DavResponse, String>> {
+            let body = self.body.clone();
+            let in_flight = Arc::clone(&self.in_flight);
+            let peak = Arc::clone(&self.peak);
+            Box::pin(async move {
+                use std::sync::atomic::Ordering;
+                let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                tokio::task::yield_now().await;
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+                Ok(DavResponse {
+                    status: StatusCode::MULTI_STATUS,
+                    headers: HeaderMap::new(),
+                    body,
+                    url: "https://dav.example.test/book/".to_string(),
+                })
+            })
+        }
+    }
+
+    /// Multiget fan-out is bounded by `MULTIGET_LEG_CONCURRENCY`, not by the
+    /// caller's uri list: one large address book must not open hundreds of
+    /// simultaneous REPORTs, and no layer below this one bounds them.
+    #[tokio::test]
+    async fn multiget_never_holds_more_legs_open_than_the_concurrency_bound() {
+        let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let transport: Arc<dyn DavTransport> = Arc::new(ConcurrencyProbeTransport {
+            body: "<D:multistatus xmlns:D=\"DAV:\"></D:multistatus>".to_string(),
+            in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            peak: Arc::clone(&peak),
+        });
+        let client = CardDavClient::with_transport("https://dav.example.test", transport);
+        let uris = (0..MULTIGET_BATCH_SIZE * 10)
+            .map(|index| format!("https://dav.example.test/book/{index}.vcf"))
+            .collect::<Vec<_>>();
+
+        client
+            .fetch_vcards(
+                "https://dav.example.test/book/",
+                &uris,
+                AccountOperation::ContactsList,
+            )
+            .await
+            .expect("empty multistatus legs are usable");
+
+        assert_eq!(
+            peak.load(std::sync::atomic::Ordering::SeqCst),
+            MULTIGET_LEG_CONCURRENCY
         );
     }
 

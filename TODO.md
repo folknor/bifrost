@@ -223,3 +223,36 @@ JMAP accounts each probing at their own advertised limit can still put eighty
 requests in flight against ten different hosts, which is fine per-host and
 possibly not fine for the process. A `bifrost-net` governor would address both;
 the local fix addresses neither.
+
+## JMAP builds its well-known session URL by suffix concatenation, and pins that as correct
+
+**Symptom (surfaced while fixing the DAV crates).** RFC 6764 well-known
+discovery is rooted at the origin: for a configured base of
+`https://dav.example.test/service`, the probe belongs at
+`https://dav.example.test/.well-known/caldav`, not at
+`https://dav.example.test/service/.well-known/caldav`. Both DAV crates built the
+URL by appending the suffix to the whole configured base, so a path-bearing base
+produced a bogus endpoint. In CardDAV, which probes well-known first, that was
+the request deciding whether the account opened at all - a server answering 401
+or 403 for the nonexistent path failed the open without the valid base ever
+being tried. Both crates were fixed to route through
+`bifrost_net::url::well_known_url`, which parses the base, clears query and
+fragment, and replaces the path.
+
+`crates/jmap/src/client.rs:346` builds `well_known_session_url` by the same
+suffix concatenation, and its test at line 468 deliberately pins
+`https://example.test/jmap/.well-known/jmap` - the path-preserving spelling - as
+the expected result.
+
+**Why this is filed rather than fixed.** JMAP session-resource discovery
+(RFC 8620 §2.2) is a different contract from RFC 6764, and the pinned test reads
+as an intentional decision rather than the same oversight. Changing it would
+alter which endpoint every JMAP account with a path-bearing base probes at open,
+which is not a change to make as a side effect of a DAV round.
+
+**What remains to decide.** Whether that pin encodes a real reading of RFC 8620
+or is a copy of the same mistake the DAV crates just paid for. If the former, the
+test deserves a comment saying so, because it now sits beside a shared helper
+that does the opposite and will read as drift to the next person. If the latter,
+JMAP should adopt `well_known_url` too. Either way the current state is one
+crate doing the opposite of its sibling with nothing explaining why.

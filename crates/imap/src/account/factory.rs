@@ -182,6 +182,8 @@ impl AccountFactory for ImapAccountFactory {
             .await;
             let contacts = contacts.into_attached(&mut dav_degraded, &mut skipped_scopes);
             let calendars = calendars.into_attached(&mut dav_degraded, &mut skipped_scopes);
+            let contact_cursor_folders = dav_cursor_folders(contacts.as_ref()).await;
+            let calendar_cursor_folders = dav_cursor_folders(calendars.as_ref()).await;
             let submission = open_submission(&cfg, meter.clone(), Arc::clone(&bandwidth_cap))?;
             let caps = capabilities::build_capabilities(
                 &profile,
@@ -193,6 +195,20 @@ impl AccountFactory for ImapAccountFactory {
                 foreign_namespaces_advertised,
             );
             let registry = Arc::new(FolderRegistry::from_lists(folders, shared));
+            // Built AFTER the registry so the index can be made disjoint from
+            // the real mailbox set: a DAV collection whose href happens to be
+            // an IMAP mailbox name must not capture that mailbox's scope.
+            let imap_mailboxes: std::collections::HashSet<String> = registry
+                .entries()
+                .into_iter()
+                .map(|entry| entry.name.as_str().to_owned())
+                .collect();
+            let (dav_scopes, dav_scope_warnings) = super::DavScopeIndex::build(
+                contact_cursor_folders,
+                calendar_cursor_folders,
+                &imap_mailboxes,
+            );
+            dav_degraded.extend(dav_scope_warnings);
             let data_cap = cfg.pool_cap.saturating_sub(1).max(1);
             let pool = Arc::new(Pool::new(
                 Arc::clone(&cfg),
@@ -212,6 +228,7 @@ impl AccountFactory for ImapAccountFactory {
                 bandwidth_cap,
                 contacts,
                 calendars,
+                dav_scopes,
                 submission,
                 dav_degraded,
             });
@@ -221,6 +238,29 @@ impl AccountFactory for ImapAccountFactory {
             })
         })
     }
+}
+
+/// The `CursorScope::Folder` ids a composed sub-account discovers.
+///
+/// Kept as a `Vec` in discovery order so the ownership index's collision
+/// warnings come out in a deterministic order.
+async fn dav_cursor_folders(account: Option<&Arc<dyn Account>>) -> Vec<bifrost_types::FolderId> {
+    use futures::StreamExt as _;
+
+    let Some(account) = account else {
+        return Vec::new();
+    };
+    let mut folders = Vec::new();
+    let mut stream = account.discover_cursor_scopes();
+    while let Some(event) = stream.next().await {
+        if let bifrost_types::SyncEvent::Batch(batch) = event {
+            folders.extend(batch.items.into_iter().filter_map(|scope| match scope {
+                bifrost_types::CursorScope::Folder(folder) => Some(folder),
+                _ => None,
+            }));
+        }
+    }
+    folders
 }
 
 /// Outcome of attempting to attach a composed DAV sub-account. Never an

@@ -221,8 +221,12 @@ the vCard 3.0 `PHOTO;ENCODING=b` form and the vCard 4.0 `PHOTO:data:` URI
 form on read and emitting the form matching the card's version on write.
 CardDAV preserves inline PHOTO data on unrelated updates.
 
-Cursor support is contact-only. `discover_cursor_scopes` returns
-`CursorScope::Type(ObjectType::Contact)`. `establish_initial_cursor`
+Cursor support is contact-only. `discover_cursor_scopes` returns one
+`CursorScope::Folder(FolderId(collection_href))` per discovered address book,
+and NOTHING when the home holds no collections - an empty walk is an empty
+backend, and a fabricated home scope would point every cursor and inventory
+request at a 404.
+`establish_initial_cursor`
 builds a hybrid cursor from the address book URL, the collection
 `getctag` when present, and a sorted href/etag snapshot. `changes_stream`
 first runs a **ctag short-circuit**: a cheap depth-0 `getctag` PROPFIND
@@ -256,8 +260,13 @@ prior snapshot suppresses the mass-delete (treated as "no observation"),
 and any href in `current.failed_hrefs` is preserved rather than destroyed.
 The checkpoint preserves the prior entries and etags for both no-observation
 shapes while retaining the refreshed ctag.
-`inventory_stream` emits contact inventory entries with ETag fingerprints
-for the same contact scope.
+This deliberately means a genuine delete-all is not reported on that poll or a
+later poll. When the refreshed ctag is checkpointed, the next poll may also
+short-circuit without another listing.
+`inventory_stream` emits contact inventory entries with ETag fingerprints for
+the same collection scope and reports full coverage of that address book.
+Legacy `CursorScope::Type(Contact)` calls remain accepted for compatibility,
+target the default address book, and report only a `carddav` provider region.
 The CardDAV cursor payload is version 2. Version 2 records the request-relative
 native-id namespace; version 1 cursors are rejected so a namespace correction
 cannot surface as a delete plus create during snapshot diffing. The rejection is
@@ -279,25 +288,21 @@ reqwest transport has no `AccountNet` or metered transport attachment. This
 also means CardDAV legs composed into an IMAP account are not included in that
 account's priority scheduling, bandwidth measurements, or bandwidth cap.
 
-## Sync covers ONE address book; the rest are reported as skipped
+## Sync scope is per address book
 
-`discover_cursor_scopes` yields a single `CursorScope::Type(Contact)` and all
-three sync lanes read `default_addressbook_url`, which is `collections.first()`.
-**An account with three address books syncs one.** The contact primitives are
-not limited this way - they route through `addressbook_url` with the caller's
-`address_book_id` - and `address_books_list` enumerates every book, so a
-consumer sees a complete account and silently receives changes for one of them.
+All three sync lanes resolve their collection from the folder scope returned by
+discovery. An account with three address books therefore has three independent
+cursors, inventories, and change streams. The default address book URL remains
+the fallback for PIM calls that omit an address book and for legacy type-scoped
+cursor calls; it no longer limits discovered sync coverage. Standalone and
+IMAP-composed opens consequently have no collection-limit skip entries.
 
-`unsynced_addressbook_urls` records the uncovered collections at open and
-`open_skipped_scopes` turns each into a `SkippedScope` carrying
-`ErrorScope::Contact { id }` and an `Unsupported(DiscoverCursorScopes)` error,
-returned on `OpenedAccount::skipped_scopes`. `Unsupported` because no reopen
-heals a model limitation. `bifrost-imap`'s `classify_dav_open` forwards these
-onto the composed account's lane, so the gap is visible standalone or composed.
-
-This mirrors `bifrost-caldav` exactly, deliberately - see that document for the
-full reasoning and for the per-collection `CursorScope::Folder(href)` fix, which
-is the repository owner's call and tracked in `notes/todo.md`.
+Multi-leg addressbook multiget and the eight property-specific text-search
+REPORTs are dispatched concurrently, bounded to `MULTIGET_LEG_CONCURRENCY`
+in-flight legs and dispatched in order, for the reasons given in
+`reference/caldav.md`. Offset continuations still re-run search
+so each page reflects a fresh server observation and carries that observation's
+failure lanes.
 
 ## This crate and bifrost-caldav are near-duplicates, and drift is the defect
 

@@ -96,6 +96,8 @@ pub(crate) struct ImapAccountInner {
     pub(crate) push: push::PushState,
     pub(crate) contacts: Option<Arc<dyn Account>>,
     pub(crate) calendars: Option<Arc<dyn Account>>,
+    /// Collision-free ownership index for composed DAV folder scopes.
+    pub(crate) dav_scopes: DavScopeIndex,
     pub(crate) submission: Option<Arc<SubmissionTransport>>,
     /// Warnings recorded at open when a configured DAV sub-account could
     /// not be attached (brick 5 fail-soft). Drained once, on the first
@@ -115,6 +117,8 @@ pub(crate) struct ImapAccountParts {
     pub(crate) bandwidth_cap: Arc<AtomicU64>,
     pub(crate) contacts: Option<Arc<dyn Account>>,
     pub(crate) calendars: Option<Arc<dyn Account>>,
+    /// Collision-free ownership index for composed DAV folder scopes.
+    pub(crate) dav_scopes: DavScopeIndex,
     pub(crate) submission: Option<Arc<SubmissionTransport>>,
     pub(crate) dav_degraded: Vec<bifrost_types::Warning>,
 }
@@ -139,6 +143,7 @@ impl ImapAccount {
                 push,
                 contacts: parts.contacts,
                 calendars: parts.calendars,
+                dav_scopes: parts.dav_scopes,
                 submission: parts.submission,
                 dav_degraded: std::sync::Mutex::new(parts.dav_degraded),
             }),
@@ -999,6 +1004,94 @@ pub(crate) fn folder_from_scope(
     }
 }
 
+/// Which composed sub-account owns a composed `CursorScope::Folder`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DavScopeOwner {
+    Contacts,
+    Calendars,
+}
+
+/// Ownership index for the folder scopes the composed DAV sub-accounts mint.
+///
+/// `FolderId` carries no protocol namespace and an IMAP mailbox name is an
+/// arbitrary string, so "this folder id appears in the CardDAV href set" is
+/// NOT by itself evidence that the scope belongs to CardDAV: a mailbox named
+/// exactly like a collection href would be delegated away and never sync as
+/// mail. Rather than leave that to a membership test at every routing call,
+/// the index is built once at open and made unambiguous there:
+///
+/// - an id equal to a known IMAP mailbox name is NOT indexed, so the mailbox
+///   keeps its own scope and DAV can never steal it;
+/// - an id claimed by both sub-accounts is NOT indexed, so the tie is never
+///   resolved silently in favour of contacts.
+///
+/// Both exclusions are reported as open-time warnings, which surface through
+/// the first discovery stream alongside the other DAV degradations. A dropped
+/// entry therefore fails loudly - the scope routes to IMAP or to
+/// `Unsupported` - instead of syncing the wrong collection quietly.
+#[derive(Debug, Default)]
+pub(crate) struct DavScopeIndex {
+    owners: std::collections::HashMap<bifrost_types::FolderId, DavScopeOwner>,
+}
+
+impl DavScopeIndex {
+    pub(crate) fn build(
+        contact_folders: Vec<bifrost_types::FolderId>,
+        calendar_folders: Vec<bifrost_types::FolderId>,
+        imap_mailboxes: &std::collections::HashSet<String>,
+    ) -> (Self, Vec<bifrost_types::Warning>) {
+        let contested: std::collections::HashSet<&bifrost_types::FolderId> = contact_folders
+            .iter()
+            .filter(|folder| calendar_folders.contains(folder))
+            .collect();
+        let mut owners = std::collections::HashMap::new();
+        let mut warnings = Vec::new();
+        let candidates = contact_folders
+            .iter()
+            .map(|folder| (folder, DavScopeOwner::Contacts))
+            .chain(
+                calendar_folders
+                    .iter()
+                    .map(|folder| (folder, DavScopeOwner::Calendars)),
+            );
+        for (folder, owner) in candidates {
+            if imap_mailboxes.contains(&folder.0) {
+                warnings.push(bifrost_types::Warning::support_only(
+                    bifrost_types::WarningKind::OperatorAttentionNeeded,
+                    format!(
+                        "composed DAV collection {:?} has the same identity as an IMAP \
+                         mailbox; the IMAP mailbox keeps the scope and this collection \
+                         will not sync",
+                        folder.0
+                    ),
+                ));
+                continue;
+            }
+            if contested.contains(folder) {
+                // Emitted once, on the contacts pass, so the calendars pass
+                // does not duplicate it.
+                if owner == DavScopeOwner::Contacts {
+                    warnings.push(bifrost_types::Warning::support_only(
+                        bifrost_types::WarningKind::OperatorAttentionNeeded,
+                        format!(
+                            "composed DAV collection {:?} is claimed by both the CardDAV \
+                             and the CalDAV sub-account; neither will sync it",
+                            folder.0
+                        ),
+                    ));
+                }
+                continue;
+            }
+            owners.insert(folder.clone(), owner);
+        }
+        (Self { owners }, warnings)
+    }
+
+    pub(crate) fn owner(&self, folder: &bifrost_types::FolderId) -> Option<DavScopeOwner> {
+        self.owners.get(folder).copied()
+    }
+}
+
 /// Where a `CursorScope`'s sync work is serviced: IMAP itself for a
 /// folder scope, or a composed sub-account for a typed scope.
 pub(crate) enum ScopeHandler<'a> {
@@ -1022,6 +1115,28 @@ pub(crate) fn route_scope<'a>(
     scope: &CursorScope,
     op: bifrost_types::AccountOperation,
 ) -> Result<ScopeHandler<'a>, AccountError> {
+    if let CursorScope::Folder(folder) = scope {
+        // The index is disjoint from the IMAP mailbox set and from itself by
+        // construction (see `DavScopeIndex::build`), so a hit here can never
+        // be a real IMAP mailbox and can never be claimed by both sub-accounts.
+        match account.dav_scopes.owner(folder) {
+            Some(DavScopeOwner::Contacts) => {
+                return account
+                    .contacts
+                    .as_ref()
+                    .map(ScopeHandler::Delegate)
+                    .ok_or_else(|| error::unsupported(op));
+            }
+            Some(DavScopeOwner::Calendars) => {
+                return account
+                    .calendars
+                    .as_ref()
+                    .map(ScopeHandler::Delegate)
+                    .ok_or_else(|| error::unsupported(op));
+            }
+            None => {}
+        }
+    }
     route_typed_scope(
         scope,
         account.contacts.as_ref(),
@@ -1069,7 +1184,77 @@ mod router_tests {
     use bifrost_types::{AccountErrorKind, AccountOperation, CursorScope, FolderId, ObjectType};
 
     use super::test_support::{StubAccount, stub_arc};
-    use super::{ScopeHandler, route_typed_scope};
+    use super::{DavScopeIndex, DavScopeOwner, ScopeHandler, route_typed_scope};
+
+    fn folder(name: &str) -> FolderId {
+        FolderId(name.to_string())
+    }
+
+    fn mailboxes(names: &[&str]) -> std::collections::HashSet<String> {
+        names.iter().map(|name| (*name).to_string()).collect()
+    }
+
+    /// A DAV collection href that is ALSO an IMAP mailbox name never enters
+    /// the index, so the mailbox keeps its own scope.
+    ///
+    /// `FolderId` has no protocol namespace and IMAP mailbox names are
+    /// arbitrary strings, so without this exclusion a mailbox named exactly
+    /// like a collection href is delegated to DAV and its mail never syncs.
+    #[test]
+    fn a_dav_collection_never_captures_an_imap_mailbox_of_the_same_name() {
+        let contested = "https://dav.example.test/books/work/";
+        let (index, warnings) = DavScopeIndex::build(
+            vec![folder(contested)],
+            Vec::new(),
+            &mailboxes(&["INBOX", contested]),
+        );
+
+        assert_eq!(index.owner(&folder(contested)), None);
+        assert_eq!(warnings.len(), 1, "the drop must be reported, not silent");
+    }
+
+    /// A collection both sub-accounts claim is dropped rather than resolved
+    /// in favour of contacts.
+    #[test]
+    fn a_collection_claimed_by_both_sub_accounts_is_not_silently_given_to_contacts() {
+        let contested = "https://dav.example.test/shared/";
+        let (index, warnings) = DavScopeIndex::build(
+            vec![folder(contested), folder("https://dav.example.test/books/")],
+            vec![folder(contested), folder("https://dav.example.test/cal/")],
+            &mailboxes(&["INBOX"]),
+        );
+
+        assert_eq!(index.owner(&folder(contested)), None);
+        assert_eq!(
+            index.owner(&folder("https://dav.example.test/books/")),
+            Some(DavScopeOwner::Contacts)
+        );
+        assert_eq!(
+            index.owner(&folder("https://dav.example.test/cal/")),
+            Some(DavScopeOwner::Calendars)
+        );
+        assert_eq!(
+            warnings.len(),
+            1,
+            "the contested collection is reported exactly once"
+        );
+    }
+
+    #[test]
+    fn uncontested_dav_collections_index_cleanly() {
+        let (index, warnings) = DavScopeIndex::build(
+            vec![folder("https://dav.example.test/books/work/")],
+            vec![folder("https://dav.example.test/cal/work/")],
+            &mailboxes(&["INBOX", "Archive"]),
+        );
+
+        assert!(warnings.is_empty());
+        assert_eq!(
+            index.owner(&folder("https://dav.example.test/books/work/")),
+            Some(DavScopeOwner::Contacts)
+        );
+        assert_eq!(index.owner(&folder("INBOX")), None);
+    }
 
     #[test]
     fn route_scope_routes_folder_to_self() {

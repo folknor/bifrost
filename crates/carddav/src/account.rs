@@ -27,7 +27,6 @@ use crate::CardDavConfig;
 use crate::capabilities::carddav_capabilities;
 use crate::client::{
     CardDavClient, PutCondition, local_error, not_found_error, parse_error, unsupported_error,
-    unsupported_scope_error,
 };
 use crate::parse::{AddressBookCollection, CardDavFetchedVCard, CardDavMultigetReport};
 use crate::vcard::{VCardParseError, contact_from_vcard, vcard_from_create, vcard_from_patch};
@@ -43,21 +42,7 @@ pub(crate) struct CardDavAccount {
     capabilities: AccountCapabilities,
     addressbook_home: String,
     default_addressbook_url: String,
-    /// Address books discovery found and the cursor lanes do NOT cover.
-    ///
-    /// Same shape as bifrost-caldav's `unsynced_calendar_urls`, and kept in
-    /// step with it deliberately: the cursor model is one scope for the whole
-    /// account (`CursorScope::Type(Contact)`) and all three sync lanes read
-    /// `default_addressbook_url`, which is just `collections.first()`. An
-    /// account with three address books syncs one. The contact primitives are
-    /// unaffected - they route through `addressbook_url` with the caller's
-    /// `address_book_id` - so direct API access reaches every book while
-    /// inventory and changes cover one.
-    ///
-    /// `address_books_list` enumerates all of them, so without
-    /// `open_skipped_scopes` a consumer sees a complete account and silently
-    /// receives changes for one book.
-    unsynced_addressbook_urls: Vec<String>,
+    addressbook_urls: Vec<String>,
 }
 
 impl CardDavAccount {
@@ -72,7 +57,7 @@ impl CardDavAccount {
             capabilities: carddav_capabilities(),
             addressbook_home: addressbook_home.to_string(),
             default_addressbook_url: addressbook_home.to_string(),
-            unsynced_addressbook_urls: Vec::new(),
+            addressbook_urls: vec![addressbook_home.to_string()],
         }
     }
 
@@ -88,48 +73,14 @@ impl CardDavAccount {
             .first()
             .map(|collection| collection.href.clone())
             .unwrap_or_else(|| client.resolve_url(&addressbook_home));
-        // Every collection past the first is enumerated but NOT synced - see
-        // `unsynced_addressbook_urls`. Recorded at open so the gap is
-        // reportable rather than invisible.
-        let unsynced_addressbook_urls = collections
-            .iter()
-            .skip(1)
-            .map(|collection| collection.href.clone())
-            .collect();
+        let addressbook_urls = discovered_collection_urls(&collections);
         Ok(Self {
             client: Arc::new(client),
             capabilities: carddav_capabilities(),
             addressbook_home,
             default_addressbook_url,
-            unsynced_addressbook_urls,
+            addressbook_urls,
         })
-    }
-
-    /// One `SkippedScope` per address book the cursor lanes do not cover.
-    ///
-    /// Empty for the common single-book account. `Unsupported(...)` because it
-    /// is a standing limitation of this crate's cursor model, not a transient
-    /// failure: no reopen or retry heals it. Mirrors
-    /// `CalDavAccount::open_skipped_scopes`.
-    pub(crate) fn open_skipped_scopes(&self) -> Vec<SkippedScope> {
-        self.unsynced_addressbook_urls
-            .iter()
-            .map(|url| SkippedScope {
-                scope: ErrorScope::Contact {
-                    id: (url.clone()).into(),
-                },
-                error: unsupported_scope_error(
-                    AccountOperation::DiscoverCursorScopes,
-                    ErrorScope::Contact {
-                        id: (url.clone()).into(),
-                    },
-                    "bifrost-carddav syncs only the first discovered address \
-                     book collection; this address book is reachable through \
-                     the contact primitives but produces no inventory or \
-                     change events",
-                ),
-            })
-            .collect()
     }
 
     fn addressbook_url(
@@ -388,9 +339,15 @@ impl Account for CardDavAccount {
     }
 
     fn discover_cursor_scopes(&self) -> AccountStream<SyncEvent<CursorScope>> {
+        let scopes = self
+            .addressbook_urls
+            .iter()
+            .cloned()
+            .map(|url| CursorScope::Folder(bifrost_types::FolderId(url)))
+            .collect();
         Box::pin(stream::iter([
             SyncEvent::Batch(bifrost_types::Batch {
-                items: vec![CursorScope::Type(ObjectType::Contact)],
+                items: scopes,
                 page_boundary: PageBoundary::Final,
                 server_latency: Default::default(),
                 bytes_in: 0,
@@ -414,9 +371,16 @@ impl Account for CardDavAccount {
     ) -> AccountFuture<Result<CursorEstablishment, AccountError>> {
         let client = Arc::clone(&self.client);
         let home = self.addressbook_home.clone();
-        let addressbook = self.default_addressbook_url.clone();
+        let default_addressbook = self.default_addressbook_url.clone();
+        let addressbook_urls = self.addressbook_urls.clone();
         Box::pin(async move {
             validate_contact_scope(&scope, AccountOperation::EstablishCursor)?;
+            let addressbook = collection_url_for_scope(
+                &scope,
+                &default_addressbook,
+                &addressbook_urls,
+                AccountOperation::EstablishCursor,
+            )?;
             let snapshot = Self::contact_snapshot(
                 &client,
                 CtagSource::Home(&home),
@@ -433,8 +397,13 @@ impl Account for CardDavAccount {
     fn inventory_stream(&self, scope: CursorScope) -> AccountStream<InventoryEvent> {
         let client = Arc::clone(&self.client);
         let home = self.addressbook_home.clone();
-        let addressbook = self.default_addressbook_url.clone();
+        let default_addressbook = self.default_addressbook_url.clone();
+        let addressbook_urls = self.addressbook_urls.clone();
         let coverage_scope = scope.clone();
+        let coverage_domain = collection_coverage_domain(
+            coverage_scope,
+            scope_collection_url(&scope, &default_addressbook),
+        );
         // COMPLETE coverage is accurate here: the walk terminates wholesale on
         // any failure, so it never advances a checkpoint across a gap.
         Box::pin(
@@ -445,6 +414,18 @@ impl Account for CardDavAccount {
                     events.push(SyncEvent::Terminated(error));
                     return events;
                 }
+                let addressbook = match collection_url_for_scope(
+                    &scope,
+                    &default_addressbook,
+                    &addressbook_urls,
+                    AccountOperation::SyncInventory,
+                ) {
+                    Ok(addressbook) => addressbook,
+                    Err(error) => {
+                        events.push(SyncEvent::Terminated(error));
+                        return events;
+                    }
+                };
                 let started = Instant::now();
                 let snapshot = match Self::contact_snapshot(
                     &client,
@@ -477,9 +458,7 @@ impl Account for CardDavAccount {
                 events
             })
             .flat_map(stream::iter)
-            .map(bifrost_types::lift_complete_walk(
-                bifrost_types::CoverageDomain::full(coverage_scope),
-            )),
+            .map(bifrost_types::lift_complete_walk(coverage_domain)),
         )
     }
 
@@ -1283,13 +1262,72 @@ fn validate_contact_scope(
     scope: &CursorScope,
     operation: AccountOperation,
 ) -> Result<(), AccountError> {
-    if matches!(scope, CursorScope::Type(ObjectType::Contact)) {
+    if matches!(
+        scope,
+        CursorScope::Type(ObjectType::Contact) | CursorScope::Folder(_)
+    ) {
         Ok(())
     } else {
         Err(local_error(
             operation,
             "CardDAV only supports contact cursor scopes",
         ))
+    }
+}
+
+/// The cursor-scope collection set: one entry per DISCOVERED address book, and
+/// NOTHING when the home holds none.
+///
+/// Twin of bifrost-caldav's helper of the same name, and for the same reason:
+/// the collection walk already returns the home itself when the home is
+/// genuinely an address book, so an empty result means an empty backend.
+/// Substituting the home URL would advertise a folder that does not exist and
+/// point cursor establishment and inventory at a 404, and would contradict the
+/// empty-home contract the listing APIs are pinned to.
+fn discovered_collection_urls(collections: &[AddressBookCollection]) -> Vec<String> {
+    collections
+        .iter()
+        .map(|collection| collection.href.clone())
+        .collect()
+}
+
+fn collection_url_for_scope(
+    scope: &CursorScope,
+    default_url: &str,
+    collection_urls: &[String],
+    operation: AccountOperation,
+) -> Result<String, AccountError> {
+    match scope {
+        CursorScope::Type(ObjectType::Contact) => Ok(default_url.to_string()),
+        CursorScope::Folder(folder) if collection_urls.contains(&folder.0) => Ok(folder.0.clone()),
+        _ => Err(local_error(
+            operation,
+            "CardDAV cursor scope does not name a discovered address book",
+        )),
+    }
+}
+
+fn scope_collection_url<'a>(scope: &'a CursorScope, default_url: &'a str) -> &'a str {
+    match scope {
+        CursorScope::Folder(folder) => &folder.0,
+        _ => default_url,
+    }
+}
+
+fn collection_coverage_domain(
+    scope: CursorScope,
+    collection_url: &str,
+) -> bifrost_types::CoverageDomain {
+    match scope {
+        CursorScope::Folder(_) => bifrost_types::CoverageDomain::full(scope),
+        _ => bifrost_types::CoverageDomain {
+            scope,
+            coordinate: bifrost_types::CoverageCoordinate::ProviderRegion {
+                namespace: "carddav".to_string(),
+                region: collection_url.as_bytes().to_vec(),
+            },
+            snapshot: bifrost_types::SnapshotIdentity::unstable(),
+        },
     }
 }
 
@@ -1747,6 +1785,63 @@ fn contains(value: &str, needle: &str) -> bool {
 mod tests {
     use super::*;
     use bifrost_types::{AccountErrorKind, EngineDirective, RecoveryClass, SyncStateErrorKind};
+
+    fn collection(href: &str) -> AddressBookCollection {
+        AddressBookCollection {
+            href: href.to_string(),
+            display_name: None,
+            ctag: None,
+        }
+    }
+
+    /// An empty address book home yields NO cursor scopes. Twin of the CalDAV
+    /// assertion: an empty walk is an empty backend, and a fabricated home
+    /// scope would point cursor establishment and inventory at a 404.
+    #[test]
+    fn an_empty_home_produces_no_cursor_scope_collections() {
+        assert!(discovered_collection_urls(&[]).is_empty());
+    }
+
+    #[test]
+    fn every_discovered_address_book_becomes_a_cursor_scope_collection() {
+        assert_eq!(
+            discovered_collection_urls(&[
+                collection("https://dav.example.test/books/work/"),
+                collection("https://dav.example.test/books/personal/"),
+            ]),
+            vec![
+                "https://dav.example.test/books/work/".to_string(),
+                "https://dav.example.test/books/personal/".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn every_address_book_is_discovered_as_a_cursor_scope() {
+        let client = Arc::new(CardDavClient::for_base_url("https://dav.example.test"));
+        let account = CardDavAccount {
+            client,
+            capabilities: carddav_capabilities(),
+            addressbook_home: "https://dav.example.test/books/".to_string(),
+            default_addressbook_url: "https://dav.example.test/books/work/".to_string(),
+            addressbook_urls: vec![
+                "https://dav.example.test/books/work/".to_string(),
+                "https://dav.example.test/books/personal/".to_string(),
+            ],
+        };
+
+        let mut stream = account.discover_cursor_scopes();
+        let SyncEvent::Batch(batch) = stream.next().await.expect("scope batch") else {
+            panic!("expected scope batch");
+        };
+        assert_eq!(batch.items.len(), 2);
+        assert!(
+            batch
+                .items
+                .iter()
+                .all(|scope| matches!(scope, CursorScope::Folder(_)))
+        );
+    }
 
     #[tokio::test]
     async fn carddav_host_attachment_unsupported() {

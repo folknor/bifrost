@@ -23,6 +23,17 @@ use crate::{CalDavConfig, CalDavCredentials};
 const DAV_CLIENT_TIMEOUT: Duration = Duration::from_secs(30);
 const MULTIGET_BATCH_SIZE: usize = 50;
 
+/// In-flight REPORT legs a single multiget or text search may hold open.
+///
+/// The chunk count is driven by the caller's uri list, so an unbounded
+/// `join_all` over it lets one large collection launch hundreds of
+/// simultaneous REPORTs at a server that never agreed to that. `bifrost-net`
+/// has no concurrency governor, so the bound belongs here, at the call site
+/// that knows the fan-out is input-sized. Ordered (`buffered`, not
+/// `buffer_unordered`) so the merged report and the surviving degraded error
+/// stay deterministic regardless of completion order.
+const MULTIGET_LEG_CONCURRENCY: usize = 4;
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum PutCondition<'a> {
     IfNoneMatch,
@@ -321,20 +332,27 @@ impl CalDavClient {
     ) -> Result<MultigetFetch, AccountError> {
         let mut all_results = CalDavMultigetReport::default();
         let mut degraded = None;
-        for property in ["SUMMARY", "DESCRIPTION", "LOCATION", "ATTENDEE"] {
-            let body = calendar_text_query_body(property, query);
-            self.accumulate_leg(
-                MultigetLeg {
+        let bodies = ["SUMMARY", "DESCRIPTION", "LOCATION", "ATTENDEE"]
+            .map(|property| calendar_text_query_body(property, query));
+        let legs: Vec<_> = bodies
+            .iter()
+            .map(|body| {
+                self.run_leg(MultigetLeg {
                     url: calendar_url,
                     depth: "1",
-                    body: &body,
+                    body,
                     operation: AccountOperation::EventSearch,
                     context: "query",
-                },
-                &mut all_results,
-                &mut degraded,
-            )
-            .await;
+                })
+            })
+            .collect();
+        let mut legs =
+            futures::StreamExt::buffered(futures::stream::iter(legs), MULTIGET_LEG_CONCURRENCY);
+        while let Some((report, error)) = futures::StreamExt::next(&mut legs).await {
+            all_results.extend(report);
+            if let Some(error) = error {
+                degraded = worse_recovery(degraded, error);
+            }
         }
         MultigetFetch::settle(all_results, degraded)
     }
@@ -347,16 +365,18 @@ impl CalDavClient {
     ) -> Result<MultigetFetch, AccountError> {
         let mut all_results = CalDavMultigetReport::default();
         let mut degraded = None;
-        for chunk in uris.chunks(MULTIGET_BATCH_SIZE) {
-            let mut href_elements = String::new();
-            for uri in chunk {
-                href_elements.push_str("  <D:href>");
-                href_elements.push_str(&escape_xml(uri));
-                href_elements.push_str("</D:href>\n");
-            }
+        let bodies = uris
+            .chunks(MULTIGET_BATCH_SIZE)
+            .map(|chunk| {
+                let mut href_elements = String::new();
+                for uri in chunk {
+                    href_elements.push_str("  <D:href>");
+                    href_elements.push_str(&escape_xml(uri));
+                    href_elements.push_str("</D:href>\n");
+                }
 
-            let body = format!(
-                "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
+                let body = format!(
+                    "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
 <C:calendar-multiget xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\">\n\
   <D:prop>\n\
     <D:resourcetype/>\n\
@@ -364,19 +384,29 @@ impl CalDavClient {
     <C:calendar-data/>\n\
   </D:prop>\n\
 {href_elements}</C:calendar-multiget>"
-            );
-            self.accumulate_leg(
-                MultigetLeg {
+                );
+                body
+            })
+            .collect::<Vec<_>>();
+        let legs: Vec<_> = bodies
+            .iter()
+            .map(|body| {
+                self.run_leg(MultigetLeg {
                     url: calendar_url,
                     depth: "0",
-                    body: &body,
+                    body,
                     operation,
                     context: "multiget",
-                },
-                &mut all_results,
-                &mut degraded,
-            )
-            .await;
+                })
+            })
+            .collect();
+        let mut legs =
+            futures::StreamExt::buffered(futures::stream::iter(legs), MULTIGET_LEG_CONCURRENCY);
+        while let Some((report, error)) = futures::StreamExt::next(&mut legs).await {
+            all_results.extend(report);
+            if let Some(error) = error {
+                degraded = worse_recovery(degraded, error);
+            }
         }
         MultigetFetch::settle(all_results, degraded)
     }
@@ -433,6 +463,13 @@ impl CalDavClient {
             *degraded = worse_recovery(degraded.take(), error);
         }
         all_results.extend(parsed);
+    }
+
+    async fn run_leg(&self, leg: MultigetLeg<'_>) -> (CalDavMultigetReport, Option<AccountError>) {
+        let mut report = CalDavMultigetReport::default();
+        let mut degraded = None;
+        self.accumulate_leg(leg, &mut report, &mut degraded).await;
+        (report, degraded)
     }
 
     pub(crate) async fn sync_events(
@@ -1155,28 +1192,6 @@ pub(crate) fn unsupported_error(operation: AccountOperation) -> AccountError {
     .expect("valid account error classification")
 }
 
-/// An `Unsupported` skip that names the scope it left behind.
-///
-/// Used for collections this crate enumerates but does not sync. Unlike
-/// `unsupported_error` it carries a scope and a diagnostic, because the whole
-/// value of the entry is WHICH collection went unsynced and why.
-pub(crate) fn unsupported_scope_error(
-    operation: AccountOperation,
-    scope: ErrorScope,
-    message: impl Into<String>,
-) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Unsupported(operation),
-        Cause::Request(RequestCause::Unsupported { operation }),
-    )
-    .protocol(Protocol::CalDav)
-    .operation(operation)
-    .scope(scope)
-    .text(DiagnosticText::support_only(message))
-    .try_build()
-    .expect("valid account error classification")
-}
-
 pub(crate) fn missing_event_error(operation: AccountOperation, id: String) -> AccountError {
     AccountErrorBuilder::new(
         AccountErrorKind::NotFound(ResourceKind::Calendar),
@@ -1501,15 +1516,11 @@ mod tests {
         );
     }
 
-    /// Calendars past the first are reported as skipped, not silently unsynced.
-    ///
-    /// The cursor model covers one collection while `calendars_list`
-    /// enumerates all of them, so without this the account looks complete and
-    /// silently delivers changes for exactly one calendar. The skip is
-    /// `Unsupported` rather than a transient class because no reopen heals it,
-    /// and it names the collection so a consumer can act on it.
-    #[test]
-    fn calendars_beyond_the_first_are_reported_as_skipped_scopes() {
+    /// Every discovered calendar gets an independent cursor scope.
+    #[tokio::test]
+    async fn every_calendar_is_discovered_as_a_cursor_scope() {
+        use bifrost_types::account::Account as _;
+        use futures::StreamExt as _;
         let script = ScriptedDavTransport::new([]);
         let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
         let client = Arc::new(CalDavClient::with_transport(
@@ -1517,16 +1528,7 @@ mod tests {
             transport,
         ));
 
-        let single = crate::account::CalDavAccount::for_tests(
-            Arc::clone(&client),
-            "https://dav.example.test/cal/work/",
-        );
-        assert!(
-            single.open_skipped_scopes().is_empty(),
-            "the ordinary single-calendar account reports nothing"
-        );
-
-        let many = crate::account::CalDavAccount::for_tests_with_unsynced(
+        let many = crate::account::CalDavAccount::for_tests_with_collections(
             client,
             "https://dav.example.test/cal/work/",
             vec![
@@ -1534,18 +1536,41 @@ mod tests {
                 "https://dav.example.test/cal/holidays/".to_string(),
             ],
         );
-        let skipped = many.open_skipped_scopes();
-        assert_eq!(skipped.len(), 2);
-        for skip in &skipped {
-            assert!(
-                matches!(skip.scope, bifrost_types::ErrorScope::Calendar { .. }),
-                "the entry must name WHICH calendar went unsynced"
-            );
-            assert!(
-                !skip.error.recovery().is_retryable(),
-                "a standing model limitation must not look like a transient failure"
-            );
-        }
+        let mut stream = many.discover_cursor_scopes();
+        let bifrost_types::SyncEvent::Batch(batch) = stream.next().await.expect("scope batch")
+        else {
+            panic!("expected scope batch");
+        };
+        assert_eq!(batch.items.len(), 3);
+        assert!(
+            batch
+                .items
+                .iter()
+                .all(|scope| matches!(scope, CursorScope::Folder(_)))
+        );
+    }
+
+    #[tokio::test]
+    async fn unavailable_rsvp_is_rejected_before_reaching_the_wire() {
+        use bifrost_types::account::Account as _;
+
+        let script = ScriptedDavTransport::new([]);
+        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
+        let client = Arc::new(CalDavClient::with_transport(
+            "https://dav.example.test",
+            transport,
+        ));
+        let account =
+            crate::account::CalDavAccount::for_tests(client, "https://dav.example.test/cal/work/");
+
+        account
+            .event_rsvp(
+                bifrost_types::EventId("https://dav.example.test/cal/work/one.ics".to_string()),
+                bifrost_types::RsvpStatus::Accepted,
+            )
+            .await
+            .expect_err("scheduling-less accounts cannot RSVP");
+        assert!(script.requests().is_empty());
     }
 
     /// An empty calendar home lists NOTHING - no fabricated placeholder.
@@ -2309,6 +2334,79 @@ mod tests {
         let requests = script.requests();
         assert_eq!(requests[0].headers["Depth"], "0");
         assert!(requests[0].body.contains("<D:resourcetype/>"));
+    }
+
+    /// A transport that records the HIGH-WATER MARK of simultaneously
+    /// in-flight requests.
+    ///
+    /// Each send yields once before answering, so every leg the caller has
+    /// polled is genuinely in flight at the same time and the mark reflects
+    /// the caller's fan-out policy rather than scheduling luck.
+    struct ConcurrencyProbeTransport {
+        body: String,
+        in_flight: Arc<std::sync::atomic::AtomicUsize>,
+        peak: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl DavTransport for ConcurrencyProbeTransport {
+        fn send(
+            &self,
+            _request: reqwest::RequestBuilder,
+        ) -> AccountFuture<Result<DavResponse, String>> {
+            let body = self.body.clone();
+            let in_flight = Arc::clone(&self.in_flight);
+            let peak = Arc::clone(&self.peak);
+            Box::pin(async move {
+                use std::sync::atomic::Ordering;
+                let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                tokio::task::yield_now().await;
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+                Ok(DavResponse {
+                    status: StatusCode::MULTI_STATUS,
+                    headers: HeaderMap::new(),
+                    body,
+                    url: "https://dav.example.test/cal/".to_string(),
+                })
+            })
+        }
+    }
+
+    /// Multiget fan-out is bounded by `MULTIGET_LEG_CONCURRENCY`, not by the
+    /// caller's uri list.
+    ///
+    /// The chunk count is input-sized, so an unbounded dispatch lets one large
+    /// calendar open hundreds of simultaneous REPORTs against a server that
+    /// never agreed to that, and `bifrost-net` has no concurrency governor to
+    /// catch it downstream.
+    #[tokio::test]
+    async fn multiget_never_holds_more_legs_open_than_the_concurrency_bound() {
+        let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let transport: Arc<dyn DavTransport> = Arc::new(ConcurrencyProbeTransport {
+            body: "<D:multistatus xmlns:D=\"DAV:\"></D:multistatus>".to_string(),
+            in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            peak: Arc::clone(&peak),
+        });
+        let client = CalDavClient::with_transport("https://dav.example.test", transport);
+        // Ten chunks: comfortably more than the bound, so an unbounded
+        // dispatch is distinguishable from a bounded one.
+        let uris = (0..MULTIGET_BATCH_SIZE * 10)
+            .map(|index| format!("https://dav.example.test/cal/{index}.ics"))
+            .collect::<Vec<_>>();
+
+        client
+            .fetch_events(
+                "https://dav.example.test/cal/",
+                &uris,
+                AccountOperation::EventSearch,
+            )
+            .await
+            .expect("empty multistatus legs are usable");
+
+        assert_eq!(
+            peak.load(std::sync::atomic::Ordering::SeqCst),
+            MULTIGET_LEG_CONCURRENCY
+        );
     }
 
     #[tokio::test]
