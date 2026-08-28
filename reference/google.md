@@ -34,8 +34,8 @@ Internal modules:
   `scope_lifecycle_stream`, `ScopeCache` / `ScopeSnapshot`.
 - `inventory.rs` - inventory pass and `get_stream` hydration.
 - `changes.rs` - history-id driven change stream.
-- `push.rs` - Cloud Pub/Sub `watch`/`stop`, `PubSubConfig`,
-  `PubSubControl`, renewer task.
+- `push.rs` - Cloud Pub/Sub `watch`/`stop`, `PubSubConfig`, and the
+  `PubSubControl` watch actor.
 - `mutation.rs` - `bulk_set_flags`, `bulk_move`, `bulk_destroy`.
 - `pim.rs` - Phase 3.6 PIM primitives: message/thread label
   mutations, MIME send and drafts, search translation, container
@@ -157,11 +157,11 @@ account-scoped clone attached to `bifrost-net` under the engine
 - `seed_state: OpaqueChangeState` used by
   `establish_initial_cursor` to mint a cursor without a second
   network call.
-- `pubsub: Arc<PubSubControl>` holding the optional config, the
-  last-known watch `historyId` and `expiration`, a renewer
-  `JoinHandle`, the active-handle set, and a `broadcast::Sender<WatchEvent>`.
+- `pubsub: Arc<PubSubControl>` holding the watch actor command sender,
+  shutdown token, and a `broadcast::Sender<WatchEvent>`. The actor task owns the
+  optional config, lifecycle state, and active-handle set exclusively.
 - `scope_cache: Arc<RwLock<ScopeSnapshot>>` for the label list.
-- `shutdown: CancellationToken` for the renewer and the
+- `shutdown: CancellationToken` for the watch actor and the
   lifecycle stream.
 - `set_priority` / `set_bandwidth_cap` delegate to the underlying `AccountNet`.
 
@@ -181,7 +181,7 @@ client, so the new `GoogleAccount` carries a fresh
 `shutdown`/`pubsub`/`scope_cache` and reads the current profile at open.
 
 `close()` is idempotent and cancellation-safe. It marks `closed` and cancels
-`shutdown` synchronously, before the returned future exists, so the renewer
+`shutdown` synchronously, before the returned future exists, so the watch actor
 and the push and scope-lifecycle streams are retired whatever the caller does
 with that future. The future then makes a best-effort `users.stop` call for a
 locally active Gmail watch - it needs the transport, so it cannot precede the
@@ -193,8 +193,8 @@ failure is classified and logged but cannot keep a closing account alive. The
 one thing a dropped close future cannot guarantee is the remote half: Gmail
 may keep delivering until the 7-day watch expires.
 `Drop` also cancels and detaches as a fallback when a consumer omits
-`close()`. The renewer and `push_stream` both select on
-`shutdown.cancelled()` and exit cleanly.
+`close()`. The watch actor and `push_stream` both select on
+`shutdown.cancelled()` and retire cleanly.
 
 ## Capabilities
 
@@ -679,13 +679,15 @@ optional `label_ids` filter. Wiring is opt-in: an account opened
 without `with_pubsub_config` rejects `push_subscribe` with
 `AccountError::Unsupported`.
 
-`push_subscribe` issues `users.watch` with the configured
-topic, stores `(historyId, expiration)` on `PubSubControl`,
-emits `WatchEvent::Reconnected` on the broadcast channel, and
-spawns the renewer task. The returned `SubscriptionHandle` is a
+`push_subscribe` sends a command to the watch actor, which issues `users.watch`
+with the configured topic, atomically enters `Watched { history_id, expiration }`,
+and emits `WatchEvent::Reconnected` on the broadcast channel. The returned
+`SubscriptionHandle` is a
 JSON envelope `{ topic, history_id, expiration }`.
 
-The renewer task in `start_renewer`:
+One actor task owns the four-state lifecycle (`Unwatched`, `Watched`, `Renewing`,
+`Retired`), the active handles, subscription commands, renewal timing, and close.
+There is no renewer handle for another task to clear or restart. Its renewal arm:
 
 - Sleeps until `renewal_delay(expiration)` - one day before
   the expiration timestamp from Gmail, or `DEFAULT_RENEW_AFTER`
@@ -693,33 +695,57 @@ The renewer task in `start_renewer`:
   have a five-minute floor, including already-expired timestamps, so
   a short or unchanged watch expiration cannot create a successful
   hot renewal loop.
-- Re-issues `users.watch` and updates the stored expiration.
+- Re-issues `users.watch` and replaces history id and expiration together in one
+  state transition.
 - On failure: classifies via
   `error::into_account_error(_, GmailErrorContext::push_subscribe())`
   and routes on `RecoveryClass::is_terminal()`. Terminal classes
   (auth lost, policy block, account disabled, schema break) emit
-  `WatchEvent::Terminated(AccountError)` and exit the renewer so the
-  engine can take over. Transient classes emit a structured
+  `WatchEvent::Terminated(AccountError)` and returns to `Unwatched`, so a later
+  subscribe command starts a fresh watch and renewal schedule. Transient classes
+  emit a structured
   `WatchEvent::Warning` per failure (support-only text carrying the
   message key) plus `WatchEvent::Disconnected` (once) and retry after
   `RENEW_RETRY_AFTER` (five minutes); the next success emits
   `WatchEvent::Reconnected`. Every failure goes
   through the classifier first.
-- Selects on `shutdown.cancelled()` between every sleep and
-  every watch call, and rechecks it under the watch-lifecycle mutex before
-  issuing a renewal, so `close()` cuts the loop promptly and a renewal in
-  flight cannot resurrect a watch that close is retiring.
+- Selects on `shutdown.cancelled()` against the renewal sleep, biased so that a
+  cancelled account retires rather than renewing when both are ready in the same
+  poll. Cancellation moves the actor to `Retired`.
+- Deliberately does **not** race `shutdown.cancelled()` against the `users.watch`
+  request itself, on either the renewal or the subscribe path. An unbiased
+  `select!` between the token and the request can pick the completed request, and
+  any commit after that point installs a watch nobody renews and no `close()`
+  retires - the orphan-watch failure the shutdown check exists to prevent. The
+  request runs to completion and `commit_watched` decides afterwards whether we
+  are still allowed to own it. It is the single place a response becomes
+  `Watched`; if the account retired underneath the request it pins `Retired`,
+  issues a best-effort `users.stop` for the watch it just refused, and reports
+  failure. A check on the committed value cannot lose that race, where a check in
+  a `select!` arm can.
 
-`push_subscribe`, renewals, `push_unsubscribe`, and close serialize through one
-watch-lifecycle mutex, so a renewal cannot recreate a watch after a successful
-stop and a concurrent subscribe cannot be stopped by the preceding teardown.
+  Subscribe additionally checks shutdown before queueing the command and again on
+  entry to the actor, so the common post-close case costs no wire traffic at all.
+  The handle envelope is encoded before the commit: an encode failure after it
+  would leave `Watched` installed with no handle in the set, so `close()` would
+  skip `users.stop` and the renewer would keep the orphan alive.
+
+A successful subscribe clears the `Disconnected` latch so `Reconnected` stays
+edge-triggered, but deliberately does not clear the transient-failure
+`retry_after` damper: a backoff reset by a *subscribe* rather than by a completed
+request is how a subscribe-then-die loop escapes its backoff.
+
+`push_subscribe`, renewals, `push_unsubscribe`, and close are actor messages or
+actor-owned transitions, so no lifecycle state is assembled from independently
+locked fields. A renewal cannot recreate a watch after a successful stop, and a
+concurrent subscribe cannot be stopped by the preceding teardown.
 `push_unsubscribe` decodes the handle envelope and removes it from the
 active-handle set. A non-last known handle, or an unknown handle while other
 known handles remain, is a no-op. When the set is empty, including on a fresh
 process receiving a persisted handle, it calls `users.stop`. A failed stop for
-the last known handle re-inserts that handle and leaves the expiration,
-history-id, and renewer intact so the engine can retry. A successful stop
-clears those fields and aborts the renewer. The active-handle set lets multiple
+the last known handle re-inserts that handle and leaves the `Watched` state
+intact so the engine can retry. A successful stop
+enters `Unwatched`. The active-handle set lets multiple
 subscribers share one Gmail watch; correctness after restart does not depend on
 that in-memory set surviving.
 
@@ -777,10 +803,12 @@ share a single `mutation_stream` driver:
     call site fails the build as dead code; the helper's own semantics,
     including the lane-preservation rule, are pinned by
     `the_destroy_trash_fallback_downgrades_only_what_it_trashed`. There is no
-    hermetic end-to-end test of `apply_destroy` itself, because the crate has
-    the scripted bifrost-net transport seam, which exercises the production
-    retry, redirect, rate-limit, metering, and token-refresh pipeline without a
-    socket.
+    hermetic end-to-end test of `apply_destroy` itself. That is an open coverage
+    gap, not a limitation: the crate has the scripted `bifrost-net` transport
+    seam (`bifrost_net::test_support::scripted_account`, used by `push.rs`,
+    `changes.rs`, and `inventory.rs`), which exercises the production retry,
+    redirect, rate-limit, metering, and token-refresh pipeline without a socket,
+    and `apply_destroy` can be driven through it.
 - The driver reads one item ahead at the 1000-item boundary. Every
   final mutation batch is marked `PageBoundary::Final`, including a
   stream whose item count is exactly divisible by 1000, followed by

@@ -26,30 +26,6 @@ snapshot in `LifecycleState` rather than reading the shared cache; sharing a cac
 for "current vocabulary" and for "previous state to diff against" is the structural
 mistake.
 
-### G2. Renewer never restarts after a terminal renewal failure; the Gmail watch then lapses silently
-
-**High confidence.** `push.rs::start_renewer` bails on `if guard.is_some() {
-return; }`, but the stored `JoinHandle` is only cleared by `clear_watch_state`
-(successful `push_unsubscribe` or `close_watch`). The renewer's *terminal* exit
-path (`account_error.recovery().is_terminal()` -> `report_health(Terminated)` ->
-`return`) leaves a finished handle in `renewer`. A later `push_subscribe` - exactly
-what the engine does after recovering from `AuthLost` - issues `users.watch`,
-stores the new expiration, and then no-ops on the renewer. Seven days later the
-watch expires, push dies with no event, and the account degrades to poll-only with
-nothing reporting it. `guard.as_ref().is_some_and(|h| !h.is_finished())` is the
-minimal fix; the real fix is a renewer that owns its own restart rather than an
-ambient `Option<JoinHandle>` guarding a spawn.
-
-### G3. `push_subscribe` after `close()` creates an orphan watch
-
-**Medium-high confidence.** `push_subscribe` never checks `closed`/`shutdown`.
-Post-close it takes the lifecycle mutex, issues `users.watch`, and spawns a renewer
-whose very first `select!` arm is an already-cancelled token - so the renewer
-returns immediately. The result is a Gmail-side watch nobody renews, nobody stops,
-and no `close()` will ever retire (the handle set was cleared, and the account is
-done). It should reject with the same `Unsupported`/closed error path, under the
-lifecycle mutex.
-
 ### G4. A `batchModify`/`batchDelete` 404 marks all 1000 ids as failed
 
 **High confidence.** `error.rs::mutation_error` fans one `AccountError` out to every
@@ -132,10 +108,6 @@ delete its local copy.
   calling Gmail through a deregistered `AccountNet` - unmetered by the governor, and
   failing in a way that classifies as a transport error rather than "account closed".
   Only `push_stream` and `scope_lifecycle_stream` observe the token.
-- **G14. `store_watch_response` is two independent mutex acquisitions**, so
-  `renewal_delay` can read a new `history_id` against a stale `expiration`.
-  `PubSubControl` has five separate mutexes over what is one piece of state; a single
-  `Mutex<WatchState>` would remove that class of interleaving outright.
 - **G15. `labels_for_flags` has no single-flight.** A stale cache plus a wide
   `buffer_unordered` fan-out means N concurrent `labels.list` calls, each 1 quota
   unit, each racing to overwrite the cache.
@@ -149,15 +121,6 @@ for canonicalization" and "previous state for lifecycle diffing" - and G1 falls
 straight out of that. Split them: the vocabulary stays a shared refresh-on-stale
 cache with single-flight; the lifecycle stream keeps a private `last_emitted:
 Option<ScopeSnapshot>` and never reads the shared one.
-
-Second, **`PubSubControl` is an ambient bag of mutexes that the renewer, subscribe,
-unsubscribe, and close all poke at from outside**, and G2/G3/G14 are all
-consequences. The watch lifecycle is a state machine with four states (Unwatched /
-Watched{expiry} / Renewing / Retired) and it should be one owned actor task holding
-that state exclusively, with `subscribe`/`unsubscribe`/`close` as messages to it.
-That makes "did the renewer exit" unrepresentable rather than a `JoinHandle` someone
-has to remember to clear, and makes "subscribe after close" a rejected message
-rather than an unchecked path.
 
 Nothing here requires removing published API. G5 and G6 change wire behavior of
 `bulk_set_flags` but not its signature; G4 adds a fallback path rather than deleting

@@ -215,14 +215,19 @@ impl GoogleAccount {
             history_id,
             profile.email_address.clone(),
         ));
+        let shutdown = CancellationToken::new();
         Ok(Arc::new(Self {
-            client,
+            client: Arc::clone(&client),
             capabilities: gmail_capabilities(),
             profile,
             seed_state,
-            pubsub: Arc::new(PubSubControl::new(pubsub)),
+            pubsub: Arc::new(PubSubControl::new(
+                Arc::clone(&client),
+                pubsub,
+                shutdown.clone(),
+            )),
             scope_cache: Arc::new(std::sync::RwLock::new(ScopeSnapshot::empty())),
-            shutdown: CancellationToken::new(),
+            shutdown,
             closed: AtomicBool::new(false),
         }))
     }
@@ -359,12 +364,7 @@ impl Account for GoogleAccount {
         scopes: &[CursorScope],
     ) -> AccountFuture<Result<bifrost_types::PushSubscription, AccountError>> {
         let scopes = scopes.to_vec();
-        let future = push::push_subscribe(
-            Arc::clone(&self.client),
-            Arc::clone(&self.pubsub),
-            self.shutdown.clone(),
-            scopes.clone(),
-        );
+        let future = push::push_subscribe(Arc::clone(&self.pubsub), scopes.clone());
         Box::pin(async move {
             future
                 .await
@@ -376,7 +376,7 @@ impl Account for GoogleAccount {
         &self,
         handle: SubscriptionHandle,
     ) -> AccountFuture<Result<(), AccountError>> {
-        push::push_unsubscribe(Arc::clone(&self.client), Arc::clone(&self.pubsub), handle)
+        push::push_unsubscribe(Arc::clone(&self.pubsub), handle)
     }
 
     fn push_stream(&self) -> AccountStream<WatchEvent> {
@@ -938,7 +938,7 @@ impl Account for GoogleAccount {
         };
         Box::pin(async move {
             let _detach = detach;
-            push::close_watch(&client, &pubsub).await;
+            push::close_watch(&pubsub).await;
             Ok(())
         })
     }
@@ -961,20 +961,22 @@ mod tests {
         spec.hosts = vec![RateLimit::new(TEST_HOST, 100.0, 1, 100)];
         spec.default_retry = RetryPolicy::disabled();
         let account_net = net.attach_account(AccountId("close-test".to_owned()), spec);
+        let client = Arc::new(GmailClient::with_account_net(
+            format!("https://{TEST_HOST}"),
+            account_net,
+        ));
+        let shutdown = CancellationToken::new();
         let account = Arc::new(GoogleAccount {
-            client: Arc::new(GmailClient::with_account_net(
-                format!("https://{TEST_HOST}"),
-                account_net,
-            )),
+            client: Arc::clone(&client),
             capabilities: gmail_capabilities(),
             profile: GmailProfile {
                 email_address: "user@gmail.test".to_owned(),
                 history_id: "1".to_owned(),
             },
             seed_state: encode_gmail_state(&GmailChangeState::new(1, "user@gmail.test".to_owned())),
-            pubsub: Arc::new(PubSubControl::new(None)),
+            pubsub: Arc::new(PubSubControl::new(client, None, shutdown.clone())),
             scope_cache: Arc::new(std::sync::RwLock::new(ScopeSnapshot::empty())),
-            shutdown: CancellationToken::new(),
+            shutdown,
             closed: AtomicBool::new(false),
         });
         (account, net)

@@ -8,8 +8,7 @@ use bifrost_types::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio::sync::{Mutex, broadcast};
-use tokio::task::JoinHandle;
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::client::GmailClient;
@@ -59,13 +58,42 @@ impl PubSubConfig {
 }
 
 pub(crate) struct PubSubControl {
-    config: Option<PubSubConfig>,
-    last_history_id: Mutex<Option<String>>,
-    expiration: Mutex<Option<SystemTime>>,
-    renewer: Mutex<Option<JoinHandle<()>>>,
-    active_handles: Mutex<HashSet<String>>,
-    watch_lifecycle: Mutex<()>,
+    commands: mpsc::Sender<WatchCommand>,
     health_tx: broadcast::Sender<WatchEvent>,
+    shutdown: CancellationToken,
+}
+
+enum WatchCommand {
+    Subscribe {
+        reply: oneshot::Sender<Result<SubscriptionHandle, AccountError>>,
+    },
+    Unsubscribe {
+        handle: SubscriptionHandle,
+        reply: oneshot::Sender<Result<(), AccountError>>,
+    },
+    Close {
+        reply: oneshot::Sender<()>,
+    },
+    #[cfg(test)]
+    SeedHandle {
+        handle: SubscriptionHandle,
+        reply: oneshot::Sender<()>,
+    },
+    #[cfg(test)]
+    HasHandles {
+        reply: oneshot::Sender<bool>,
+    },
+}
+
+#[derive(Debug)]
+enum WatchLifecycle {
+    Unwatched,
+    Watched {
+        history_id: String,
+        expiration: Option<SystemTime>,
+    },
+    Renewing,
+    Retired,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -76,70 +104,45 @@ enum HandleRemoval {
 }
 
 impl PubSubControl {
-    pub(crate) fn new(config: Option<PubSubConfig>) -> Self {
+    pub(crate) fn new(
+        client: Arc<GmailClient>,
+        config: Option<PubSubConfig>,
+        shutdown: CancellationToken,
+    ) -> Self {
         let (health_tx, _) = broadcast::channel(32);
-        Self {
+        let (commands, receiver) = mpsc::channel(16);
+        tokio::spawn(watch_actor(
+            client,
             config,
-            last_history_id: Mutex::new(None),
-            expiration: Mutex::new(None),
-            renewer: Mutex::new(None),
-            active_handles: Mutex::new(HashSet::new()),
-            watch_lifecycle: Mutex::new(()),
+            shutdown.clone(),
+            health_tx.clone(),
+            receiver,
+        ));
+        Self {
+            commands,
             health_tx,
+            shutdown,
         }
     }
 
-    pub(crate) fn config(&self) -> Option<&PubSubConfig> {
-        self.config.as_ref()
-    }
-
-    async fn store_watch_response(&self, response: &GmailWatchResponse) {
-        *self.last_history_id.lock().await = Some(response.history_id.clone());
-        *self.expiration.lock().await = response.expiration.as_deref().and_then(parse_expiration);
-    }
-
-    pub(crate) async fn abort_renewer(&self) {
-        if let Some(handle) = self.renewer.lock().await.take() {
-            handle.abort();
-        }
-    }
-
+    #[cfg(test)]
     pub(crate) async fn insert_handle(&self, handle: &SubscriptionHandle) {
-        self.active_handles.lock().await.insert(handle.0.clone());
+        let (reply, response) = oneshot::channel();
+        let _ = self
+            .commands
+            .send(WatchCommand::SeedHandle {
+                handle: handle.clone(),
+                reply,
+            })
+            .await;
+        let _ = response.await;
     }
 
-    async fn remove_handle(&self, handle: &SubscriptionHandle) -> HandleRemoval {
-        let mut handles = self.active_handles.lock().await;
-        if !handles.remove(&handle.0) {
-            return HandleRemoval::NotPresent;
-        }
-        if handles.is_empty() {
-            HandleRemoval::Last
-        } else {
-            HandleRemoval::Remaining
-        }
-    }
-
-    async fn restore_handle(&self, handle: &SubscriptionHandle) {
-        self.active_handles.lock().await.insert(handle.0.clone());
-    }
-
+    #[cfg(test)]
     pub(crate) async fn has_handles(&self) -> bool {
-        !self.active_handles.lock().await.is_empty()
-    }
-
-    async fn clear_watch_state(&self) {
-        *self.expiration.lock().await = None;
-        *self.last_history_id.lock().await = None;
-        self.abort_renewer().await;
-    }
-
-    async fn clear_handles(&self) {
-        self.active_handles.lock().await.clear();
-    }
-
-    fn report_health(&self, event: WatchEvent) {
-        let _ = self.health_tx.send(event);
+        let (reply, response) = oneshot::channel();
+        let _ = self.commands.send(WatchCommand::HasHandles { reply }).await;
+        response.await.unwrap_or(false)
     }
 }
 
@@ -158,9 +161,7 @@ struct GmailSubscriptionHandle {
 }
 
 pub(crate) fn push_subscribe(
-    client: Arc<GmailClient>,
     pubsub: Arc<PubSubControl>,
-    shutdown: CancellationToken,
     scopes: Vec<CursorScope>,
 ) -> AccountFuture<Result<SubscriptionHandle, AccountError>> {
     Box::pin(async move {
@@ -174,103 +175,48 @@ pub(crate) fn push_subscribe(
                 error::GmailErrorContext::push_subscribe(),
             ));
         }
-        let Some(config) = pubsub.config().cloned() else {
-            return Err(error::into_account_error(
-                crate::error::Error::unsupported_with(
-                    AccountOperation::PushSubscribe,
-                    "no Pub/Sub topic configured",
-                ),
-                error::GmailErrorContext::push_subscribe(),
-            ));
-        };
-        let _lifecycle = pubsub.watch_lifecycle.lock().await;
-        let response = watch_once(&client, &config).await.map_err(|error| {
-            error::into_account_error(error, error::GmailErrorContext::push_subscribe())
-        })?;
-        pubsub.store_watch_response(&response).await;
-        pubsub.report_health(WatchEvent::Reconnected);
-        start_renewer(
-            Arc::clone(&client),
-            Arc::clone(&pubsub),
-            config.clone(),
-            shutdown,
-        )
-        .await;
-        let handle = GmailSubscriptionHandle {
-            topic: config.topic,
-            history_id: response.history_id,
-            expiration: response.expiration,
-        };
-        let handle = serde_json::to_string(&handle)
-            .map(SubscriptionHandle)
-            .map_err(|error| {
-                error::into_account_error(
-                    crate::error::Error::invalid_request(
-                        AccountOperation::PushSubscribe,
-                        format!("subscription handle encode failed: {error}"),
-                    ),
-                    error::GmailErrorContext::push_subscribe(),
-                )
-            })?;
-        pubsub.insert_handle(&handle).await;
-        Ok(handle)
+        if pubsub.shutdown.is_cancelled() {
+            return Err(closed_error(AccountOperation::PushSubscribe));
+        }
+        let (reply, response) = oneshot::channel();
+        pubsub
+            .commands
+            .send(WatchCommand::Subscribe { reply })
+            .await
+            .map_err(|_| closed_error(AccountOperation::PushSubscribe))?;
+        response
+            .await
+            .unwrap_or_else(|_| Err(closed_error(AccountOperation::PushSubscribe)))
     })
 }
 
 pub(crate) fn push_unsubscribe(
-    client: Arc<GmailClient>,
     pubsub: Arc<PubSubControl>,
     handle: SubscriptionHandle,
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
-        let _decoded: GmailSubscriptionHandle =
-            serde_json::from_str(&handle.0).map_err(|error| {
-                error::into_account_error(
-                    crate::error::Error::invalid_request(
-                        AccountOperation::PushUnsubscribe,
-                        format!("invalid gmail subscription handle: {error}"),
-                    ),
-                    error::GmailErrorContext::push_unsubscribe(),
-                )
-            })?;
-        let _lifecycle = pubsub.watch_lifecycle.lock().await;
-        let removal = pubsub.remove_handle(&handle).await;
-        match removal {
-            HandleRemoval::Last => {}
-            HandleRemoval::Remaining => return Ok(()),
-            HandleRemoval::NotPresent if pubsub.has_handles().await => return Ok(()),
-            HandleRemoval::NotPresent => {}
-        }
-        if let Err(error) = stop_watch(&client).await {
-            if removal == HandleRemoval::Last {
-                pubsub.restore_handle(&handle).await;
-            }
-            return Err(error::into_account_error(
-                error,
-                error::GmailErrorContext::push_unsubscribe(),
-            ));
-        }
-        pubsub.clear_watch_state().await;
-        Ok(())
+        let (reply, response) = oneshot::channel();
+        pubsub
+            .commands
+            .send(WatchCommand::Unsubscribe { handle, reply })
+            .await
+            .map_err(|_| closed_error(AccountOperation::PushUnsubscribe))?;
+        response
+            .await
+            .unwrap_or_else(|_| Err(closed_error(AccountOperation::PushUnsubscribe)))
     })
 }
 
-pub(crate) async fn close_watch(client: &GmailClient, pubsub: &PubSubControl) {
-    let _lifecycle = pubsub.watch_lifecycle.lock().await;
-    if pubsub.has_handles().await
-        && let Err(error) = stop_watch(client).await
+pub(crate) async fn close_watch(pubsub: &PubSubControl) {
+    let (reply, response) = oneshot::channel();
+    if pubsub
+        .commands
+        .send(WatchCommand::Close { reply })
+        .await
+        .is_ok()
     {
-        let account_error =
-            error::into_account_error(error, error::GmailErrorContext::push_unsubscribe());
-        tracing::warn!(
-            target: "bifrost_google::push",
-            message_key = account_error.message_key(),
-            recovery = ?account_error.recovery(),
-            "close() could not retire the Gmail watch",
-        );
+        let _ = response.await;
     }
-    pubsub.clear_handles().await;
-    pubsub.clear_watch_state().await;
 }
 
 pub(crate) fn push_stream(
@@ -297,99 +243,315 @@ pub(crate) fn push_stream(
     ))
 }
 
-async fn start_renewer(
+async fn watch_actor(
     client: Arc<GmailClient>,
-    pubsub: Arc<PubSubControl>,
-    config: PubSubConfig,
+    config: Option<PubSubConfig>,
     shutdown: CancellationToken,
+    health_tx: broadcast::Sender<WatchEvent>,
+    mut commands: mpsc::Receiver<WatchCommand>,
 ) {
-    let mut guard = pubsub.renewer.lock().await;
-    if guard.is_some() {
-        return;
-    }
-    let control = Arc::clone(&pubsub);
-    *guard = Some(tokio::spawn(async move {
-        let mut disconnected = false;
-        let mut retry_after = None;
-        loop {
-            let delay = match retry_after.take() {
-                Some(delay) => delay,
-                None => {
-                    let expiration = *control.expiration.lock().await;
-                    renewal_delay(expiration)
+    let mut lifecycle = WatchLifecycle::Unwatched;
+    let mut handles = HashSet::new();
+    let mut disconnected = false;
+    let mut retry_after = None;
+    loop {
+        let delay = match &lifecycle {
+            WatchLifecycle::Watched { expiration, .. } => Some(
+                retry_after
+                    .take()
+                    .unwrap_or_else(|| renewal_delay(*expiration)),
+            ),
+            _ => None,
+        };
+        tokio::select! {
+            biased;
+            command = commands.recv() => {
+                let Some(command) = command else { return; };
+                match command {
+                    WatchCommand::Subscribe { reply } => {
+                        let result = actor_subscribe(
+                            &client, config.as_ref(), &shutdown, &health_tx,
+                            &mut lifecycle, &mut handles,
+                        ).await;
+                        if result.is_ok() {
+                            // A completed subscribe is a completed request,
+                            // so the Disconnected latch is cleared here to
+                            // keep Reconnected edge-triggered. It does NOT
+                            // clear `retry_after`: a transient-failure
+                            // damper reset by a *subscribe* is how an
+                            // endless subscribe-then-die loop escapes its
+                            // backoff.
+                            disconnected = false;
+                        }
+                        let _ = reply.send(result);
+                    }
+                    WatchCommand::Unsubscribe { handle, reply } => {
+                        let result = actor_unsubscribe(
+                            &client, handle, &mut lifecycle, &mut handles,
+                        ).await;
+                        let _ = reply.send(result);
+                    }
+                    WatchCommand::Close { reply } => {
+                        actor_close(&client, &mut lifecycle, &mut handles).await;
+                        let _ = reply.send(());
+                    }
+                    #[cfg(test)]
+                    WatchCommand::SeedHandle { handle, reply } => {
+                        handles.insert(handle.0);
+                        let _ = reply.send(());
+                    }
+                    #[cfg(test)]
+                    WatchCommand::HasHandles { reply } => {
+                        let _ = reply.send(!handles.is_empty());
+                    }
                 }
-            };
-            tokio::select! {
-                () = shutdown.cancelled() => return,
-                () = tokio::time::sleep(delay) => {}
             }
-            let watch_result = {
-                let _lifecycle = control.watch_lifecycle.lock().await;
-                // Re-check under the lifecycle lock. The select above can
-                // have been won before `close()` cancelled the token, and
-                // renewing a watch that close is about to retire - or has
-                // just retired - would resurrect Gmail-side delivery for
-                // another seven days.
-                if shutdown.is_cancelled() {
-                    return;
-                }
-                let result = watch_once(&client, &config).await;
-                if let Ok(response) = &result {
-                    control.store_watch_response(response).await;
-                }
-                result
-            };
-            match watch_result {
-                Ok(_) => {
-                    retry_after = None;
-                    if disconnected {
-                        control.report_health(WatchEvent::Reconnected);
-                        disconnected = false;
+            () = shutdown.cancelled(), if !matches!(lifecycle, WatchLifecycle::Retired) => {
+                lifecycle = WatchLifecycle::Retired;
+                retry_after = None;
+            }
+            () = async { tokio::time::sleep(delay.expect("guarded renewal delay")).await }, if delay.is_some() => {
+                let WatchLifecycle::Watched { history_id, expiration } = &lifecycle else {
+                    continue;
+                };
+                let previous_history_id = history_id.clone();
+                let previous_expiration = *expiration;
+                lifecycle = WatchLifecycle::Renewing;
+                let Some(config) = config.as_ref() else {
+                    lifecycle = WatchLifecycle::Unwatched;
+                    continue;
+                };
+                // Deliberately NOT raced against `shutdown.cancelled()`.
+                // An unbiased select between the token and the request can
+                // pick the completed request, and every commit after that
+                // point would install a watch nobody will ever renew or
+                // stop. The request runs to completion and the decision to
+                // keep its result is made by `commit_watched`, which cannot
+                // lose that race because it reads the token after the
+                // response is already in hand.
+                let result = watch_once(&client, config).await;
+                match result {
+                    Ok(response) => {
+                        if !commit_watched(&client, &shutdown, &mut lifecycle, &response).await {
+                            retry_after = None;
+                            continue;
+                        }
+                        retry_after = None;
+                        if disconnected {
+                            let _ = health_tx.send(WatchEvent::Reconnected);
+                            disconnected = false;
+                        }
                     }
-                }
-                Err(err) => {
-                    // Classify every error through the
-                    // central translator and route on
-                    // `is_terminal()`. Terminal classes (auth lost,
-                    // policy, scope, account disabled, schema break)
-                    // emit `WatchEvent::Terminated(AccountError)` and
-                    // exit the renewer loop. Transient classes emit
-                    // `Disconnected` once and retry on
-                    // `RENEW_RETRY_AFTER`.
-                    let account_error =
-                        error::into_account_error(err, error::GmailErrorContext::push_subscribe());
-                    if account_error.recovery().is_terminal() {
-                        tracing::warn!(
-                            target: "bifrost_google::push",
-                            kind = ?account_error.kind(),
-                            message_key = account_error.message_key(),
-                            "gmail Pub/Sub watch renewal terminal failure",
+                    Err(err) => {
+                        let account_error = error::into_account_error(
+                            err, error::GmailErrorContext::push_subscribe(),
                         );
-                        control.report_health(WatchEvent::Terminated(account_error));
-                        return;
+                        if account_error.recovery().is_terminal() {
+                            let _ = health_tx.send(WatchEvent::Terminated(account_error));
+                            lifecycle = WatchLifecycle::Unwatched;
+                            retry_after = None;
+                            disconnected = false;
+                            continue;
+                        }
+                        let warning = bifrost_types::Warning::support_only(
+                            bifrost_types::WarningKind::OperatorAttentionNeeded,
+                            format!("gmail Pub/Sub renewal transient failure: {}", account_error.message_key()),
+                        ).with_retry_count(1);
+                        let _ = health_tx.send(WatchEvent::Warning(warning));
+                        if !disconnected {
+                            let _ = health_tx.send(WatchEvent::Disconnected);
+                            disconnected = true;
+                        }
+                        if shutdown.is_cancelled() {
+                            lifecycle = WatchLifecycle::Retired;
+                            retry_after = None;
+                            continue;
+                        }
+                        lifecycle = WatchLifecycle::Watched {
+                            history_id: previous_history_id,
+                            expiration: previous_expiration,
+                        };
+                        retry_after = Some(RENEW_RETRY_AFTER);
                     }
-                    // gmail-F2: emit a structured Warning alongside
-                    // the Disconnected health signal so consumers see
-                    // a typed transient-failure event instead of a
-                    // bare tracing log.
-                    let warning = bifrost_types::Warning::support_only(
-                        bifrost_types::WarningKind::OperatorAttentionNeeded,
-                        format!(
-                            "gmail Pub/Sub renewal transient failure: {}",
-                            account_error.message_key(),
-                        ),
-                    )
-                    .with_retry_count(1);
-                    control.report_health(WatchEvent::Warning(warning));
-                    if !disconnected {
-                        control.report_health(WatchEvent::Disconnected);
-                        disconnected = true;
-                    }
-                    retry_after = Some(RENEW_RETRY_AFTER);
                 }
             }
         }
-    }));
+    }
+}
+
+async fn actor_subscribe(
+    client: &GmailClient,
+    config: Option<&PubSubConfig>,
+    shutdown: &CancellationToken,
+    health_tx: &broadcast::Sender<WatchEvent>,
+    lifecycle: &mut WatchLifecycle,
+    handles: &mut HashSet<String>,
+) -> Result<SubscriptionHandle, AccountError> {
+    if shutdown.is_cancelled() || matches!(lifecycle, WatchLifecycle::Retired) {
+        return Err(closed_error(AccountOperation::PushSubscribe));
+    }
+    let Some(config) = config else {
+        return Err(error::into_account_error(
+            crate::error::Error::unsupported_with(
+                AccountOperation::PushSubscribe,
+                "no Pub/Sub topic configured",
+            ),
+            error::GmailErrorContext::push_subscribe(),
+        ));
+    };
+    // Deliberately NOT raced against `shutdown.cancelled()` - see the
+    // matching note on the renewal path. Racing the two lets a completed
+    // `users.watch` be committed by the arm that won, leaving a Gmail-side
+    // watch that no renewer refreshes and no `close()` retires. The request
+    // runs to completion and `commit_watched` decides afterwards.
+    let response = watch_once(client, config).await.map_err(|error| {
+        error::into_account_error(error, error::GmailErrorContext::push_subscribe())
+    })?;
+    // Encode before committing. An encode failure after the commit would
+    // leave `Watched` installed with no handle in the set, so `close()`
+    // would skip `users.stop` and the renewer would keep the orphan alive.
+    let handle = GmailSubscriptionHandle {
+        topic: config.topic.clone(),
+        history_id: response.history_id.clone(),
+        expiration: response.expiration.clone(),
+    };
+    let handle = match serde_json::to_string(&handle).map(SubscriptionHandle) {
+        Ok(handle) => handle,
+        Err(error) => {
+            let _ = stop_watch(client).await;
+            return Err(error::into_account_error(
+                crate::error::Error::invalid_request(
+                    AccountOperation::PushSubscribe,
+                    format!("subscription handle encode failed: {error}"),
+                ),
+                error::GmailErrorContext::push_subscribe(),
+            ));
+        }
+    };
+    if !commit_watched(client, shutdown, lifecycle, &response).await {
+        return Err(closed_error(AccountOperation::PushSubscribe));
+    }
+    handles.insert(handle.0.clone());
+    let _ = health_tx.send(WatchEvent::Reconnected);
+    Ok(handle)
+}
+
+async fn actor_unsubscribe(
+    client: &GmailClient,
+    handle: SubscriptionHandle,
+    lifecycle: &mut WatchLifecycle,
+    handles: &mut HashSet<String>,
+) -> Result<(), AccountError> {
+    let _decoded: GmailSubscriptionHandle = serde_json::from_str(&handle.0).map_err(|error| {
+        error::into_account_error(
+            crate::error::Error::invalid_request(
+                AccountOperation::PushUnsubscribe,
+                format!("invalid gmail subscription handle: {error}"),
+            ),
+            error::GmailErrorContext::push_unsubscribe(),
+        )
+    })?;
+    let removal = remove_handle(handles, &handle);
+    match removal {
+        HandleRemoval::Last => {}
+        HandleRemoval::Remaining => return Ok(()),
+        HandleRemoval::NotPresent if !handles.is_empty() => return Ok(()),
+        HandleRemoval::NotPresent => {}
+    }
+    if let Err(error) = stop_watch(client).await {
+        if removal == HandleRemoval::Last {
+            handles.insert(handle.0);
+        }
+        return Err(error::into_account_error(
+            error,
+            error::GmailErrorContext::push_unsubscribe(),
+        ));
+    }
+    *lifecycle = WatchLifecycle::Unwatched;
+    Ok(())
+}
+
+async fn actor_close(
+    client: &GmailClient,
+    lifecycle: &mut WatchLifecycle,
+    handles: &mut HashSet<String>,
+) {
+    if !handles.is_empty()
+        && let Err(error) = stop_watch(client).await
+    {
+        let account_error =
+            error::into_account_error(error, error::GmailErrorContext::push_unsubscribe());
+        tracing::warn!(
+            target: "bifrost_google::push",
+            message_key = account_error.message_key(),
+            recovery = ?account_error.recovery(),
+            "close() could not retire the Gmail watch",
+        );
+    }
+    handles.clear();
+    *lifecycle = WatchLifecycle::Retired;
+}
+
+fn remove_handle(handles: &mut HashSet<String>, handle: &SubscriptionHandle) -> HandleRemoval {
+    if !handles.remove(&handle.0) {
+        return HandleRemoval::NotPresent;
+    }
+    if handles.is_empty() {
+        HandleRemoval::Last
+    } else {
+        HandleRemoval::Remaining
+    }
+}
+
+/// The only place a `users.watch` response is turned into `Watched`.
+///
+/// Both request paths run `watch_once` to completion rather than racing it
+/// against the shutdown token, so by the time control reaches here a remote
+/// watch definitely exists and the only open question is whether we are
+/// still allowed to own it. Retirement is decided *after* the response is in
+/// hand, which is what makes this unlosable: a check inside a `select!` arm
+/// can be beaten by the request arm, a check on the committed value cannot.
+///
+/// Returns `false` when the account retired underneath the request. In that
+/// case the freshly created remote watch is retired best-effort - leaving it
+/// is the orphan-watch failure this guard exists to prevent - and the
+/// lifecycle is pinned to `Retired` so no later transition can revive it.
+///
+/// The history id and the expiration move together, as one transition on one
+/// owned value: there is no window in which a new history id is visible
+/// against a stale expiration.
+async fn commit_watched(
+    client: &GmailClient,
+    shutdown: &CancellationToken,
+    lifecycle: &mut WatchLifecycle,
+    response: &GmailWatchResponse,
+) -> bool {
+    if shutdown.is_cancelled() || matches!(lifecycle, WatchLifecycle::Retired) {
+        *lifecycle = WatchLifecycle::Retired;
+        if let Err(error) = stop_watch(client).await {
+            let account_error =
+                error::into_account_error(error, error::GmailErrorContext::push_unsubscribe());
+            tracing::warn!(
+                target: "bifrost_google::push",
+                message_key = account_error.message_key(),
+                recovery = ?account_error.recovery(),
+                "could not retire a Gmail watch that completed after close()",
+            );
+        }
+        return false;
+    }
+    *lifecycle = WatchLifecycle::Watched {
+        history_id: response.history_id.clone(),
+        expiration: response.expiration.as_deref().and_then(parse_expiration),
+    };
+    true
+}
+
+fn closed_error(operation: AccountOperation) -> AccountError {
+    error::into_account_error(
+        crate::error::Error::unsupported_with(operation, "account is closed"),
+        error::GmailErrorContext::push_subscribe(),
+    )
 }
 
 async fn watch_once(
@@ -601,28 +763,28 @@ mod tests {
 
     #[tokio::test]
     async fn handle_removal_distinguishes_unknown_remaining_and_last() {
-        let control = PubSubControl::new(None);
+        let mut handles = HashSet::new();
         let first = SubscriptionHandle("first".to_string());
         let second = SubscriptionHandle("second".to_string());
         let unknown = SubscriptionHandle("unknown".to_string());
 
         assert_eq!(
-            control.remove_handle(&unknown).await,
+            remove_handle(&mut handles, &unknown),
             HandleRemoval::NotPresent
         );
-        control.insert_handle(&first).await;
-        control.insert_handle(&second).await;
+        handles.insert(first.0.clone());
+        handles.insert(second.0.clone());
         assert_eq!(
-            control.remove_handle(&unknown).await,
+            remove_handle(&mut handles, &unknown),
             HandleRemoval::NotPresent
         );
         assert_eq!(
-            control.remove_handle(&first).await,
+            remove_handle(&mut handles, &first),
             HandleRemoval::Remaining
         );
-        assert_eq!(control.remove_handle(&second).await, HandleRemoval::Last);
+        assert_eq!(remove_handle(&mut handles, &second), HandleRemoval::Last);
         assert_eq!(
-            control.remove_handle(&second).await,
+            remove_handle(&mut handles, &second),
             HandleRemoval::NotPresent
         );
     }
@@ -630,9 +792,10 @@ mod tests {
     #[tokio::test]
     async fn persisted_handle_after_restart_still_stops_the_watch() {
         let (client, script) = scripted_client([canned(StatusCode::NO_CONTENT)]);
-        let control = Arc::new(PubSubControl::new(None));
+        let shutdown = CancellationToken::new();
+        let control = Arc::new(PubSubControl::new(Arc::clone(&client), None, shutdown));
 
-        push_unsubscribe(client, control, encoded_handle())
+        push_unsubscribe(control, encoded_handle())
             .await
             .expect("persisted handle stops watch");
 
@@ -648,12 +811,13 @@ mod tests {
             canned(StatusCode::FORBIDDEN),
             canned(StatusCode::NO_CONTENT),
         ]);
-        let control = Arc::new(PubSubControl::new(None));
+        let shutdown = CancellationToken::new();
+        let control = Arc::new(PubSubControl::new(Arc::clone(&client), None, shutdown));
         let handle = encoded_handle();
         control.insert_handle(&handle).await;
 
         assert!(
-            push_unsubscribe(Arc::clone(&client), Arc::clone(&control), handle.clone())
+            push_unsubscribe(Arc::clone(&control), handle.clone())
                 .await
                 .is_err()
         );
@@ -662,7 +826,7 @@ mod tests {
             "failed stop must remain retryable"
         );
 
-        push_unsubscribe(client, Arc::clone(&control), handle)
+        push_unsubscribe(Arc::clone(&control), handle)
             .await
             .expect("retry stops watch");
         assert!(!control.has_handles().await);
@@ -676,10 +840,11 @@ mod tests {
     #[tokio::test]
     async fn close_stops_a_locally_active_watch_before_clearing_state() {
         let (client, script) = scripted_client([canned(StatusCode::NO_CONTENT)]);
-        let control = Arc::new(PubSubControl::new(None));
+        let shutdown = CancellationToken::new();
+        let control = Arc::new(PubSubControl::new(Arc::clone(&client), None, shutdown));
         control.insert_handle(&encoded_handle()).await;
 
-        close_watch(&client, &control).await;
+        close_watch(&control).await;
 
         assert!(!control.has_handles().await);
         let requests = script.requests();
@@ -687,72 +852,91 @@ mod tests {
         assert_eq!(requests[0].url.path(), "/stop");
     }
 
-    /// The renewer's shutdown select can be won before `close()` cancels
-    /// the token; without the second check under the lifecycle mutex the
-    /// renewal then re-issues `users.watch` and resurrects Gmail-side
-    /// delivery for seven days after the account closed. The test wins
-    /// that race deliberately: it holds the lifecycle mutex, lets the
-    /// paused clock fire the renewal sleep, cancels the token while the
-    /// renewer is parked on the mutex, and then releases it.
     #[tokio::test(start_paused = true)]
-    async fn renewer_parked_on_the_lifecycle_mutex_does_not_resurrect_a_closed_watch() {
+    async fn terminal_renewal_then_resubscribe_has_a_live_renewer() {
         let now_millis = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock after epoch")
             .as_millis();
-        let watch_body = format!("{{\"historyId\":\"1\",\"expiration\":\"{now_millis}\"}}");
+        let watch_body = |history_id| {
+            format!("{{\"historyId\":\"{history_id}\",\"expiration\":\"{now_millis}\"}}")
+        };
+        let stable_expiration = now_millis + Duration::from_secs(7 * 24 * 60 * 60).as_millis();
         let (client, script) = scripted_client([
             Canned::Response {
                 status: StatusCode::OK,
                 headers: reqwest::header::HeaderMap::new(),
-                body: Bytes::from(watch_body.clone().into_bytes()),
+                body: Bytes::from(watch_body("1").into_bytes()),
             },
-            // Consumed only by the bug: a renewal that fires anyway.
+            canned(StatusCode::FORBIDDEN),
             Canned::Response {
                 status: StatusCode::OK,
                 headers: reqwest::header::HeaderMap::new(),
-                body: Bytes::from(watch_body.into_bytes()),
+                body: Bytes::from(watch_body("2").into_bytes()),
+            },
+            Canned::Response {
+                status: StatusCode::OK,
+                headers: reqwest::header::HeaderMap::new(),
+                body: Bytes::from(
+                    format!("{{\"historyId\":\"3\",\"expiration\":\"{stable_expiration}\"}}")
+                        .into_bytes(),
+                ),
             },
         ]);
-        let pubsub = Arc::new(PubSubControl::new(Some(PubSubConfig::new(
-            "projects/p/topics/t",
-        ))));
         let shutdown = CancellationToken::new();
-
-        push_subscribe(
+        let pubsub = Arc::new(PubSubControl::new(
             Arc::clone(&client),
-            Arc::clone(&pubsub),
-            shutdown.clone(),
-            vec![CursorScope::Account],
-        )
-        .await
-        .expect("subscribe issues the watch");
-        assert_eq!(script.requests().len(), 1);
+            Some(PubSubConfig::new("projects/p/topics/t")),
+            shutdown,
+        ));
+        let mut health = pubsub.health_tx.subscribe();
 
-        // Park the renewer: hold the lifecycle mutex, then let the paused
-        // clock auto-advance through the renewal delay while this task is
-        // itself blocked on time.
-        let lifecycle = pubsub.watch_lifecycle.lock().await;
-        tokio::time::sleep(MIN_RENEW_DELAY + Duration::from_secs(1)).await;
-        tokio::task::yield_now().await;
-
-        // The close-side ordering: token cancelled while the renewer is
-        // already past its select, then the mutex released.
-        shutdown.cancel();
-        drop(lifecycle);
-        for _ in 0..16 {
-            tokio::task::yield_now().await;
+        push_subscribe(Arc::clone(&pubsub), vec![CursorScope::Account])
+            .await
+            .expect("subscribe issues the watch");
+        tokio::time::advance(MIN_RENEW_DELAY + Duration::from_secs(1)).await;
+        loop {
+            if matches!(
+                health.recv().await.expect("health event"),
+                WatchEvent::Terminated(_)
+            ) {
+                break;
+            }
         }
 
+        push_subscribe(Arc::clone(&pubsub), vec![CursorScope::Account])
+            .await
+            .expect("subscribe after terminal renewal restarts the lifecycle");
+        tokio::time::advance(MIN_RENEW_DELAY + Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        pubsub.shutdown.cancel();
         assert_eq!(
             script.requests().len(),
-            1,
-            "a renewal in flight at close must not re-issue users.watch",
+            4,
+            "the replacement watch must itself renew",
         );
-        let renewer = pubsub.renewer.lock().await.take();
-        if let Some(handle) = renewer {
-            handle.await.expect("the renewer must have exited cleanly");
-        }
+    }
+
+    #[tokio::test]
+    async fn subscribe_after_shutdown_is_rejected_without_a_wire_call() {
+        let (client, script) = scripted_client([]);
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        let pubsub = Arc::new(PubSubControl::new(
+            client,
+            Some(PubSubConfig::new("projects/p/topics/t")),
+            shutdown,
+        ));
+
+        let error = push_subscribe(pubsub, vec![CursorScope::Account])
+            .await
+            .expect_err("closed accounts reject push subscribe");
+
+        assert!(matches!(
+            error.kind(),
+            bifrost_types::AccountErrorKind::Unsupported(_)
+        ));
+        assert!(script.requests().is_empty());
     }
 
     #[test]
@@ -766,6 +950,150 @@ mod tests {
         let no_expiry: GmailWatchResponse =
             serde_json::from_str(r#"{"historyId":"987"}"#).expect("expiration is optional");
         assert!(no_expiry.expiration.is_none());
+    }
+
+    /// gmail-G14: the history id and the expiration are one transition on
+    /// one owned value. The assertion pins the EXACT expected pair rather
+    /// than "not the stale one" - a test that only excludes the stale
+    /// expiration is also satisfied by any other wrong value.
+    #[tokio::test]
+    async fn commit_watched_moves_history_id_and_expiration_together() {
+        let (client, script) = scripted_client([]);
+        let shutdown = CancellationToken::new();
+        let mut lifecycle = WatchLifecycle::Watched {
+            history_id: "stale-history".to_owned(),
+            expiration: Some(UNIX_EPOCH + Duration::from_millis(1_600_000_000_000)),
+        };
+        let response = GmailWatchResponse {
+            history_id: "new-history".to_owned(),
+            expiration: Some("1700000000000".to_owned()),
+        };
+
+        assert!(commit_watched(&client, &shutdown, &mut lifecycle, &response).await);
+
+        let WatchLifecycle::Watched {
+            history_id,
+            expiration,
+        } = &lifecycle
+        else {
+            panic!("watch response must enter Watched");
+        };
+        assert_eq!(history_id, "new-history");
+        assert_eq!(
+            *expiration,
+            Some(UNIX_EPOCH + Duration::from_millis(1_700_000_000_000)),
+            "the exact server-granted expiration, not a locally computed one",
+        );
+        assert!(
+            script.requests().is_empty(),
+            "committing a live watch issues no wire traffic"
+        );
+    }
+
+    /// gmail-G3, the half a `select!` cannot hold. Both request paths run
+    /// `users.watch` to completion, so a close that lands while the request
+    /// is in flight finds a *created* remote watch. Committing it would leave
+    /// a Gmail-side watch nobody renews and no `close()` retires - G3's exact
+    /// failure mode surviving G3's fix. The guard must refuse the commit AND
+    /// retire the watch it refused.
+    #[tokio::test]
+    async fn a_watch_that_completes_after_close_is_retired_not_installed() {
+        let (client, script) = scripted_client([canned(StatusCode::NO_CONTENT)]);
+        let shutdown = CancellationToken::new();
+        let mut lifecycle = WatchLifecycle::Renewing;
+        let response = GmailWatchResponse {
+            history_id: "9".to_owned(),
+            expiration: Some("1700000000000".to_owned()),
+        };
+
+        shutdown.cancel();
+        let committed = commit_watched(&client, &shutdown, &mut lifecycle, &response).await;
+
+        assert!(!committed, "a cancelled account must not install Watched");
+        assert!(
+            matches!(lifecycle, WatchLifecycle::Retired),
+            "the refused commit pins Retired so nothing can revive it, got {lifecycle:?}",
+        );
+        let requests = script.requests();
+        assert_eq!(
+            requests.len(),
+            1,
+            "the orphan watch must be retired on the wire"
+        );
+        assert_eq!(requests[0].url.path(), "/stop");
+    }
+
+    /// A lifecycle already `Retired` refuses the commit even with a live
+    /// token, so the actor's own state - not only the token - is what makes
+    /// the guard unlosable.
+    #[tokio::test]
+    async fn a_retired_lifecycle_refuses_a_commit_even_with_a_live_token() {
+        let (client, script) = scripted_client([canned(StatusCode::NO_CONTENT)]);
+        let shutdown = CancellationToken::new();
+        let mut lifecycle = WatchLifecycle::Retired;
+        let response = GmailWatchResponse {
+            history_id: "9".to_owned(),
+            expiration: None,
+        };
+
+        assert!(!commit_watched(&client, &shutdown, &mut lifecycle, &response).await);
+        assert!(matches!(lifecycle, WatchLifecycle::Retired));
+        assert_eq!(script.requests()[0].url.path(), "/stop");
+    }
+
+    /// Restores the coverage the actor rewrite dropped: the pre-actor suite
+    /// pinned "a renewal in flight at close must not re-issue `users.watch`"
+    /// by parking the renewer on the lifecycle mutex. There is no mutex to
+    /// park on any more, so the same behaviour is pinned through the actor's
+    /// own scheduling: the shutdown arm is biased ahead of the renewal timer,
+    /// so a cancelled account retires instead of renewing even when both are
+    /// ready in the same poll.
+    #[tokio::test(start_paused = true)]
+    async fn a_cancelled_account_retires_instead_of_renewing() {
+        let now_millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_millis();
+        let (client, script) = scripted_client([
+            Canned::Response {
+                status: StatusCode::OK,
+                headers: reqwest::header::HeaderMap::new(),
+                body: Bytes::from(
+                    format!("{{\"historyId\":\"1\",\"expiration\":\"{now_millis}\"}}").into_bytes(),
+                ),
+            },
+            // Consumed only by the bug: a renewal that fires anyway.
+            Canned::Response {
+                status: StatusCode::OK,
+                headers: reqwest::header::HeaderMap::new(),
+                body: Bytes::from(
+                    format!("{{\"historyId\":\"2\",\"expiration\":\"{now_millis}\"}}").into_bytes(),
+                ),
+            },
+        ]);
+        let shutdown = CancellationToken::new();
+        let pubsub = Arc::new(PubSubControl::new(
+            Arc::clone(&client),
+            Some(PubSubConfig::new("projects/p/topics/t")),
+            shutdown.clone(),
+        ));
+
+        push_subscribe(Arc::clone(&pubsub), vec![CursorScope::Account])
+            .await
+            .expect("subscribe issues the watch");
+        assert_eq!(script.requests().len(), 1);
+
+        shutdown.cancel();
+        tokio::time::advance(MIN_RENEW_DELAY + Duration::from_secs(1)).await;
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(
+            script.requests().len(),
+            1,
+            "a renewal due at close must not re-issue users.watch",
+        );
     }
 
     // ---- config builder -------------------------------------------------
