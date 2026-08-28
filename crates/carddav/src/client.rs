@@ -149,27 +149,38 @@ impl CardDavClient {
     }
 
     pub(crate) async fn discover_addressbook_home(&self) -> Result<String, AccountError> {
-        let well_known_url = format!("{}/.well-known/carddav", self.base_url);
-        let dav_root = match self
-            .propfind_raw(
-                &well_known_url,
-                "0",
-                PROPFIND_PRINCIPAL,
-                AccountOperation::Discover,
-            )
-            .await
-        {
-            Ok(response) => match extract_href_property(&response.text, "current-user-principal")
-                .map_err(|error| parse_error(AccountOperation::Discover, error))?
-                .map(|href| resolve_href(&response.url, &href))
+        // Well-known discovery lives at the ORIGIN root (RFC 6764), so a
+        // configured base carrying a path must not have the well-known
+        // suffix appended to it: the resulting URL is not a discovery
+        // endpoint, and a deployment answering it with 401/403 rather
+        // than 404 would fail the open before the configured base was
+        // ever tried.
+        let well_known_url = bifrost_net::url::well_known_url(&self.base_url, "carddav");
+        let dav_root = match well_known_url {
+            None => self.base_url.clone(),
+            Some(well_known_url) => match self
+                .propfind_raw(
+                    &well_known_url,
+                    "0",
+                    PROPFIND_PRINCIPAL,
+                    AccountOperation::Discover,
+                )
+                .await
             {
-                Some(principal) => {
-                    return self.addressbook_home_for_principal(principal).await;
+                Ok(response) => {
+                    match extract_href_property(&response.text, "current-user-principal")
+                        .map_err(|error| parse_error(AccountOperation::Discover, error))?
+                        .map(|href| resolve_href(&response.url, &href))
+                    {
+                        Some(principal) => {
+                            return self.addressbook_home_for_principal(principal).await;
+                        }
+                        None => self.base_url.clone(),
+                    }
                 }
-                None => self.base_url.clone(),
+                Err(error) if should_fallback_discovery(&error) => self.base_url.clone(),
+                Err(error) => return Err(error),
             },
-            Err(error) if should_fallback_discovery(&error) => self.base_url.clone(),
-            Err(error) => return Err(error),
         };
 
         let response = self
@@ -305,6 +316,7 @@ impl CardDavClient {
                 "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
 <C:addressbook-multiget xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:carddav\">\n\
   <D:prop>\n\
+    <D:resourcetype/>\n\
     <D:getetag/>\n\
     <C:address-data/>\n\
   </D:prop>\n\
@@ -605,7 +617,7 @@ impl CardDavClient {
                     local_error(operation, format!("unresolvable redirect target: {error}"))
                 })?;
             hops += 1;
-            if hops >= max_hops {
+            if hops > max_hops {
                 return Err(local_error(operation, "too many redirects"));
             }
             let Some(replay) = replay else {
@@ -786,6 +798,7 @@ fn addressbook_text_query_body(property: &str, query: &str) -> String {
         "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
 <C:addressbook-query xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:carddav\">\n\
   <D:prop>\n\
+    <D:resourcetype/>\n\
     <D:getetag/>\n\
     <C:address-data/>\n\
   </D:prop>\n\
@@ -1164,6 +1177,7 @@ mod tests {
         method: Method,
         url: String,
         headers: HeaderMap,
+        body: String,
     }
 
     struct ScriptedDavTransport {
@@ -1203,6 +1217,12 @@ mod tests {
                     method: request.method().clone(),
                     url: request.url().to_string(),
                     headers: request.headers().clone(),
+                    body: request
+                        .body()
+                        .and_then(reqwest::Body::as_bytes)
+                        .map_or_else(String::new, |body| {
+                            String::from_utf8_lossy(body).into_owned()
+                        }),
                 });
             let mut response = self
                 .responses
@@ -1433,6 +1453,54 @@ mod tests {
         );
     }
 
+    /// RFC 6764 puts well-known discovery at the origin root. A base URL
+    /// carrying a path is the only input that distinguishes an
+    /// origin-rooted construction from suffix concatenation, and getting
+    /// it wrong is not merely a wasted request: only the crate's
+    /// not-found classification falls back, so a deployment answering
+    /// the bogus path with 401/403 would fail the open outright.
+    #[tokio::test]
+    async fn well_known_probe_is_origin_rooted_for_a_path_bearing_base() {
+        let response = |body: &str| DavResponse {
+            status: StatusCode::MULTI_STATUS,
+            headers: HeaderMap::new(),
+            body: body.to_string(),
+            url: String::new(),
+        };
+        let script = ScriptedDavTransport::new([
+            response("<D:multistatus xmlns:D=\"DAV:\"/>"),
+            response(
+                "<D:current-user-principal xmlns:D=\"DAV:\"><D:href>/principals/ada/</D:href></D:current-user-principal>",
+            ),
+            response(
+                "<C:addressbook-home-set xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:carddav\"><D:href>/books/ada/</D:href></C:addressbook-home-set>",
+            ),
+        ]);
+        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
+        let client = CardDavClient::with_transport("https://dav.example.test/service", transport);
+
+        let home = client
+            .discover_addressbook_home()
+            .await
+            .expect("base fallback discovers home");
+
+        assert_eq!(home, "https://dav.example.test/books/ada/");
+        let urls = script
+            .requests()
+            .into_iter()
+            .map(|request| request.url)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            urls,
+            vec![
+                "https://dav.example.test/.well-known/carddav".to_string(),
+                "https://dav.example.test/service".to_string(),
+                "https://dav.example.test/principals/ada/".to_string(),
+            ],
+            "the well-known probe is rooted at the origin, and only the fallback uses the configured path"
+        );
+    }
+
     fn discovery_script(home_href: &str) -> Arc<ScriptedDavTransport> {
         let response = |body: String| DavResponse {
             status: StatusCode::MULTI_STATUS,
@@ -1566,6 +1634,41 @@ mod tests {
             .expect_err("an unadmitted redirect target is refused");
 
         assert_eq!(script.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn manual_redirect_walk_allows_the_configured_hop_count() {
+        let max_hops = usize::from(bifrost_net::RedirectPolicy::default().max_hops);
+        let mut responses = Vec::new();
+        for _ in 0..max_hops {
+            let mut headers = HeaderMap::new();
+            headers.insert(reqwest::header::LOCATION, HeaderValue::from_static("/next"));
+            responses.push(DavResponse {
+                status: StatusCode::TEMPORARY_REDIRECT,
+                headers,
+                body: String::new(),
+                url: String::new(),
+            });
+        }
+        responses.push(DavResponse {
+            status: StatusCode::OK,
+            headers: HeaderMap::new(),
+            body: "ok".to_string(),
+            url: String::new(),
+        });
+        let script = ScriptedDavTransport::new(responses);
+        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
+        let client = CardDavClient::with_transport("https://dav.example.test", transport);
+
+        client
+            .delete_vcard(
+                "https://dav.example.test/start",
+                AccountOperation::ContactDelete,
+            )
+            .await
+            .expect("the configured number of redirects is allowed");
+
+        assert_eq!(script.requests().len(), max_hops + 1);
     }
 
     /// RFC 4918 resolves a relative href against the EFFECTIVE request URI.
@@ -1905,6 +2008,7 @@ mod tests {
         let body = addressbook_text_query_body("EMAIL", "ada & team");
 
         assert!(body.contains("<C:addressbook-query"));
+        assert!(body.contains("<D:resourcetype/>"));
         assert!(body.contains("<C:address-data/>"));
         assert!(body.contains("<C:prop-filter name=\"EMAIL\">"));
         assert!(body.contains("ada &amp; team"));
@@ -1936,7 +2040,9 @@ mod tests {
             .await
             .expect("empty multistatus is usable");
 
-        assert_eq!(script.requests()[0].headers["Depth"], "0");
+        let requests = script.requests();
+        assert_eq!(requests[0].headers["Depth"], "0");
+        assert!(requests[0].body.contains("<D:resourcetype/>"));
     }
 
     #[test]

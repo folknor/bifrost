@@ -1276,16 +1276,7 @@ fn append_path(base: &str, path: &str) -> String {
 /// all, and which then travels onward as `calendar_id` and `calendar_native`.
 /// Query and fragment are dropped before the final path segment is removed.
 fn event_calendar_url(event_url: &str) -> Option<String> {
-    let mut url = reqwest::Url::parse(event_url).ok()?;
-    url.set_query(None);
-    url.set_fragment(None);
-    {
-        let mut segments = url.path_segments_mut().ok()?;
-        segments.pop_if_empty();
-        segments.pop();
-        segments.push("");
-    }
-    Some(url.to_string())
+    bifrost_net::url::parent_collection_url(event_url)
 }
 
 /// Reduce the failure lane to one outcome per resource id.

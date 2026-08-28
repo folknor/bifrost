@@ -1210,11 +1210,33 @@ fn append_path(base: &str, path: &str) -> String {
 
 fn contact_addressbook_url(client: &CardDavClient, contact: &ContactId) -> Option<String> {
     let resolved = client.resolve_url(&contact.0);
-    let trimmed = resolved.trim_end_matches('/');
-    trimmed
-        .rfind('/')
-        .map(|index| trimmed[..=index].to_string())
-        .filter(|url| !url.is_empty())
+    bifrost_net::url::parent_collection_url(&resolved)
+}
+
+#[cfg(test)]
+mod collection_url_tests {
+    use super::*;
+
+    #[test]
+    fn contact_addressbook_url_ignores_query_and_fragment_slashes() {
+        let client = CardDavClient::for_base_url("https://dav.example.test");
+        assert_eq!(
+            contact_addressbook_url(
+                &client,
+                &ContactId("https://dav.example.test/books/work/one.vcf?next=/x".to_string())
+            )
+            .as_deref(),
+            Some("https://dav.example.test/books/work/")
+        );
+        assert_eq!(
+            contact_addressbook_url(
+                &client,
+                &ContactId("https://dav.example.test/books/work/one.vcf#a/b".to_string())
+            )
+            .as_deref(),
+            Some("https://dav.example.test/books/work/")
+        );
+    }
 }
 
 fn same_collection_url(left: &str, right: &str) -> bool {

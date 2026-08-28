@@ -505,7 +505,7 @@ pub(crate) fn parse_sync_collection_report(xml: &str) -> Result<CalDavSyncReport
         sync_token: None,
         entries: Vec::new(),
     };
-    let mut current = ResponseParts::default();
+    let mut current = SyncResponseParts::default();
     let mut stack = Vec::new();
     let mut text = String::new();
 
@@ -514,7 +514,7 @@ pub(crate) fn parse_sync_collection_report(xml: &str) -> Result<CalDavSyncReport
             Ok(Event::Start(element)) => {
                 let name = local_name(element.name().as_ref());
                 if name == "response" {
-                    current = ResponseParts::default();
+                    current = SyncResponseParts::default();
                     current.in_response = true;
                 }
                 stack.push(name);
@@ -531,9 +531,9 @@ pub(crate) fn parse_sync_collection_report(xml: &str) -> Result<CalDavSyncReport
                 if current.in_response {
                     match (parent, name.as_str()) {
                         (Some("response"), "href") => current.href = trimmed(&text),
-                        (Some("response"), "status") => current.status = trimmed(&text),
+                        (Some("response"), "status") => current.response_status = trimmed(&text),
                         (Some("prop"), "getetag") => current.etag = normalize_etag(&text),
-                        (Some("propstat"), "status") => current.staged.status = trimmed(&text),
+                        (Some("propstat"), "status") => current.propstat_status = trimmed(&text),
                         _ => {}
                     }
                 } else if matches!(parent, Some("multistatus")) && name == "sync-token" {
@@ -656,7 +656,8 @@ pub(crate) fn extract_href_properties(
                         hrefs.push(href);
                     }
                 }
-                if name == "status" && stack.iter().any(|tag| tag == "propstat") {
+                let parent = stack.iter().rev().nth(1).map(String::as_str);
+                if name == "status" && matches!(parent, Some("propstat")) {
                     propstat_success = Some(
                         trimmed(&text)
                             .as_deref()
@@ -757,6 +758,29 @@ struct ResponseParts {
     /// document order. Drives failure classification.
     failed_statuses: Vec<u16>,
     staged: PropStat,
+}
+
+#[derive(Default)]
+struct SyncResponseParts {
+    in_response: bool,
+    href: Option<String>,
+    etag: Option<String>,
+    response_status: Option<String>,
+    propstat_status: Option<String>,
+}
+
+impl SyncResponseParts {
+    fn as_sync_entry(&self) -> Option<CalDavSyncEntry> {
+        Some(CalDavSyncEntry {
+            uri: self.href.as_ref()?.clone(),
+            etag: self.etag.clone(),
+            status: self
+                .response_status
+                .as_deref()
+                .and_then(status_line_code)
+                .or_else(|| self.propstat_status.as_deref().and_then(status_line_code)),
+        })
+    }
 }
 
 impl ResponseParts {
@@ -913,19 +937,6 @@ impl ResponseParts {
         }
         self.href.clone()
     }
-
-    fn as_sync_entry(&self) -> Option<CalDavSyncEntry> {
-        let href = self.href.as_ref()?;
-        Some(CalDavSyncEntry {
-            uri: href.clone(),
-            etag: self.etag.clone(),
-            status: self
-                .status
-                .as_deref()
-                .and_then(status_line_code)
-                .or_else(|| self.staged.status.as_deref().and_then(status_line_code)),
-        })
-    }
 }
 
 #[cfg(test)]
@@ -938,6 +949,17 @@ mod tests {
             resolve_href("https://cal.example.test/homes/ada/", "team/one.ics"),
             "https://cal.example.test/homes/ada/team/one.ics"
         );
+    }
+
+    #[test]
+    fn nested_property_status_does_not_refuse_href_property() {
+        let hrefs = extract_href_properties(
+            r#"<D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav"><D:response><D:propstat><D:status>HTTP/1.1 200 OK</D:status><D:prop><C:calendar-user-address-set><D:href>mailto:right@example.test</D:href><C:extension><D:status>HTTP/1.1 404 Not Found</D:status></C:extension></C:calendar-user-address-set></D:prop></D:propstat></D:response></D:multistatus>"#,
+            "calendar-user-address-set",
+        )
+        .expect("valid property");
+
+        assert_eq!(hrefs, vec!["mailto:right@example.test".to_string()]);
     }
 
     /// The migration to request-URI resolution must not respell ids that

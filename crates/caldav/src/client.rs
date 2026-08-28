@@ -175,29 +175,41 @@ impl CalDavClient {
     }
 
     pub(crate) async fn discover_account(&self) -> Result<CalDavDiscovery, AccountError> {
-        let base = self.base_url.clone();
-        match self.discover_account_from_root(&base).await {
-            Ok(discovery) => Ok(discovery),
-            Err(error) if should_fallback_discovery(&error) => {
-                let well_known = format!("{}/.well-known/caldav", self.base_url);
-                self.discover_account_from_root(&well_known).await
-            }
-            Err(error) => Err(error),
-        }
+        // Well-known discovery lives at the ORIGIN root (RFC 6764), so a
+        // configured base carrying a path must not have the well-known
+        // suffix appended to it: the resulting URL is not a discovery
+        // endpoint, and a deployment answering it with 401/403 rather
+        // than 404 would fail the open before the configured base was
+        // ever tried.
+        let from_well_known = match bifrost_net::url::well_known_url(&self.base_url, "caldav") {
+            Some(well_known) => match self.discover_principal(&well_known).await {
+                Ok(principal) => principal,
+                Err(error) if should_fallback_discovery(&error) => None,
+                Err(error) => return Err(error),
+            },
+            None => None,
+        };
+        let principal = match from_well_known {
+            Some(principal) => principal,
+            None => self.discover_principal_from_base().await?,
+        };
+        self.discover_account_for_principal(&principal).await
     }
 
-    async fn discover_account_from_root(
+    async fn discover_principal_from_base(&self) -> Result<String, AccountError> {
+        self.discover_principal(&self.base_url)
+            .await?
+            .ok_or_else(|| {
+                parse_error(AccountOperation::Discover, "missing current-user-principal")
+            })
+    }
+
+    async fn discover_account_for_principal(
         &self,
-        root: &str,
+        principal: &str,
     ) -> Result<CalDavDiscovery, AccountError> {
-        let principal = self.discover_principal(root).await?;
         let response = self
-            .propfind_raw(
-                &principal,
-                "0",
-                PROPFIND_ACCOUNT,
-                AccountOperation::Discover,
-            )
+            .propfind_raw(principal, "0", PROPFIND_ACCOUNT, AccountOperation::Discover)
             .await?;
         let body = response.text;
         let base = response.url;
@@ -218,16 +230,15 @@ impl CalDavClient {
         })
     }
 
-    async fn discover_principal(&self, root: &str) -> Result<String, AccountError> {
+    async fn discover_principal(&self, root: &str) -> Result<Option<String>, AccountError> {
         let response = self
             .propfind_raw(root, "0", PROPFIND_PRINCIPAL, AccountOperation::Discover)
             .await?;
-        extract_href_property(&response.text, "current-user-principal")
-            .map_err(|error| parse_error(AccountOperation::Discover, error))?
-            .map(|href| resolve_href(&response.url, &href))
-            .ok_or_else(|| {
-                parse_error(AccountOperation::Discover, "missing current-user-principal")
-            })
+        Ok(
+            extract_href_property(&response.text, "current-user-principal")
+                .map_err(|error| parse_error(AccountOperation::Discover, error))?
+                .map(|href| resolve_href(&response.url, &href)),
+        )
     }
 
     pub(crate) async fn list_calendars(
@@ -348,6 +359,7 @@ impl CalDavClient {
                 "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
 <C:calendar-multiget xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\">\n\
   <D:prop>\n\
+    <D:resourcetype/>\n\
     <D:getetag/>\n\
     <C:calendar-data/>\n\
   </D:prop>\n\
@@ -703,7 +715,7 @@ impl CalDavClient {
                     local_error(operation, format!("unresolvable redirect target: {error}"))
                 })?;
             hops += 1;
-            if hops >= max_hops {
+            if hops > max_hops {
                 return Err(local_error(operation, "too many redirects"));
             }
             let Some(replay) = replay else {
@@ -912,6 +924,7 @@ fn calendar_query_body(start: Option<&str>, end: Option<&str>) -> String {
         "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
 <C:calendar-query xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\">\n\
   <D:prop>\n\
+    <D:resourcetype/>\n\
     <D:getetag/>\n\
     <C:calendar-data/>\n\
   </D:prop>\n\
@@ -930,6 +943,7 @@ fn calendar_text_query_body(property: &str, query: &str) -> String {
         "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
 <C:calendar-query xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\">\n\
   <D:prop>\n\
+    <D:resourcetype/>\n\
     <D:getetag/>\n\
     <C:calendar-data/>\n\
   </D:prop>\n\
@@ -1373,6 +1387,7 @@ mod tests {
         method: Method,
         url: String,
         headers: HeaderMap,
+        body: String,
     }
 
     struct ScriptedDavTransport {
@@ -1412,6 +1427,12 @@ mod tests {
                     method: request.method().clone(),
                     url: request.url().to_string(),
                     headers: request.headers().clone(),
+                    body: request
+                        .body()
+                        .and_then(reqwest::Body::as_bytes)
+                        .map_or_else(String::new, |body| {
+                            String::from_utf8_lossy(body).into_owned()
+                        }),
                 });
             let mut response = self
                 .responses
@@ -1695,6 +1716,116 @@ mod tests {
         ])
     }
 
+    #[tokio::test]
+    async fn discovery_falls_back_to_base_after_empty_well_known_response() {
+        let response = |body: &str| DavResponse {
+            status: StatusCode::MULTI_STATUS,
+            headers: HeaderMap::new(),
+            body: body.to_string(),
+            url: String::new(),
+        };
+        let script = ScriptedDavTransport::new([
+            response("<D:multistatus xmlns:D=\"DAV:\"/>"),
+            response(
+                "<D:current-user-principal xmlns:D=\"DAV:\"><D:href>/principals/ada/</D:href></D:current-user-principal>",
+            ),
+            response(
+                "<C:calendar-home-set xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\"><D:href>/cal/ada/</D:href></C:calendar-home-set>",
+            ),
+        ]);
+        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
+        let client = CalDavClient::with_transport("https://dav.example.test", transport);
+
+        let discovery = client.discover_account().await.expect("fallback succeeds");
+
+        assert_eq!(discovery.calendar_home, "https://dav.example.test/cal/ada/");
+        let urls = script
+            .requests()
+            .into_iter()
+            .map(|request| request.url)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            urls,
+            vec![
+                "https://dav.example.test/.well-known/caldav".to_string(),
+                "https://dav.example.test/".to_string(),
+                "https://dav.example.test/principals/ada/".to_string(),
+            ]
+        );
+    }
+
+    /// RFC 6764 puts well-known discovery at the origin root. A base URL
+    /// carrying a path is the only input that distinguishes an
+    /// origin-rooted construction from suffix concatenation, and getting
+    /// it wrong is not merely a wasted request: only the crate's
+    /// not-found classification falls back, so a deployment answering
+    /// the bogus path with 401/403 would fail the open outright.
+    #[tokio::test]
+    async fn well_known_probe_is_origin_rooted_for_a_path_bearing_base() {
+        let response = |body: &str| DavResponse {
+            status: StatusCode::MULTI_STATUS,
+            headers: HeaderMap::new(),
+            body: body.to_string(),
+            url: String::new(),
+        };
+        let script = ScriptedDavTransport::new([
+            response("<D:multistatus xmlns:D=\"DAV:\"/>"),
+            response(
+                "<D:current-user-principal xmlns:D=\"DAV:\"><D:href>/principals/ada/</D:href></D:current-user-principal>",
+            ),
+            response(
+                "<C:calendar-home-set xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\"><D:href>/cal/ada/</D:href></C:calendar-home-set>",
+            ),
+        ]);
+        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
+        let client = CalDavClient::with_transport("https://dav.example.test/service", transport);
+
+        let discovery = client.discover_account().await.expect("fallback succeeds");
+
+        assert_eq!(discovery.calendar_home, "https://dav.example.test/cal/ada/");
+        let urls = script
+            .requests()
+            .into_iter()
+            .map(|request| request.url)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            urls,
+            vec![
+                "https://dav.example.test/.well-known/caldav".to_string(),
+                "https://dav.example.test/service".to_string(),
+                "https://dav.example.test/principals/ada/".to_string(),
+            ],
+            "the well-known probe is rooted at the origin, and only the fallback uses the configured path"
+        );
+    }
+
+    #[tokio::test]
+    async fn principal_404_does_not_restart_discovery_at_base() {
+        let script = ScriptedDavTransport::new([
+            DavResponse {
+                status: StatusCode::MULTI_STATUS,
+                headers: HeaderMap::new(),
+                body: "<D:current-user-principal xmlns:D=\"DAV:\"><D:href>/principals/ada/</D:href></D:current-user-principal>".to_string(),
+                url: String::new(),
+            },
+            DavResponse {
+                status: StatusCode::NOT_FOUND,
+                headers: HeaderMap::new(),
+                body: String::new(),
+                url: String::new(),
+            },
+        ]);
+        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
+        let client = CalDavClient::with_transport("https://dav.example.test", transport);
+
+        client
+            .discover_account()
+            .await
+            .expect_err("principal failure is terminal");
+
+        assert_eq!(script.requests().len(), 2);
+    }
+
     /// The legitimate deployment the origin allowlist must not break: the
     /// calendar home lives on a different host than the principal. It is
     /// discovered over HTTPS, so it is credential-bearing.
@@ -1810,6 +1941,38 @@ mod tests {
             .expect_err("an unadmitted redirect target is refused");
 
         assert_eq!(script.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn manual_redirect_walk_allows_the_configured_hop_count() {
+        let max_hops = usize::from(bifrost_net::RedirectPolicy::default().max_hops);
+        let mut responses = Vec::new();
+        for _ in 0..max_hops {
+            let mut headers = HeaderMap::new();
+            headers.insert(reqwest::header::LOCATION, HeaderValue::from_static("/next"));
+            responses.push(DavResponse {
+                status: StatusCode::TEMPORARY_REDIRECT,
+                headers,
+                body: String::new(),
+                url: String::new(),
+            });
+        }
+        responses.push(DavResponse {
+            status: StatusCode::OK,
+            headers: HeaderMap::new(),
+            body: "ok".to_string(),
+            url: String::new(),
+        });
+        let script = ScriptedDavTransport::new(responses);
+        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
+        let client = CalDavClient::with_transport("https://dav.example.test", transport);
+
+        client
+            .get_event("https://dav.example.test/start", AccountOperation::EventGet)
+            .await
+            .expect("the configured number of redirects is allowed");
+
+        assert_eq!(script.requests().len(), max_hops + 1);
     }
 
     /// RFC 4918 resolves a relative href against the EFFECTIVE request URI.
@@ -2090,6 +2253,7 @@ mod tests {
         let body = calendar_query_body(Some("20260602T000000Z"), Some("20260603T000000Z"));
 
         assert!(body.contains("<C:calendar-query"));
+        assert!(body.contains("<D:resourcetype/>"));
         assert!(body.contains("<C:calendar-data/>"));
         assert!(
             body.contains("<C:time-range start=\"20260602T000000Z\" end=\"20260603T000000Z\"/>")
@@ -2117,6 +2281,7 @@ mod tests {
         let body = calendar_text_query_body("SUMMARY", "plan & meet");
 
         assert!(body.contains("<C:prop-filter name=\"SUMMARY\">"));
+        assert!(body.contains("<D:resourcetype/>"));
         assert!(body.contains("<C:text-match collation=\"i;unicode-casemap\">"));
         assert!(body.contains("plan &amp; meet"));
     }
@@ -2141,7 +2306,9 @@ mod tests {
             .await
             .expect("empty multistatus is usable");
 
-        assert_eq!(script.requests()[0].headers["Depth"], "0");
+        let requests = script.requests();
+        assert_eq!(requests[0].headers["Depth"], "0");
+        assert!(requests[0].body.contains("<D:resourcetype/>"));
     }
 
     #[tokio::test]

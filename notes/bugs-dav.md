@@ -30,41 +30,6 @@ Minimum honest fix without reshaping the cursor model: report
 `CoverageCoordinate::ProviderRegion { namespace: "caldav", region: default_calendar_url }`
 instead of `Full`. The real fix is finding 7.
 
-## 5. CardDAV's `contact_addressbook_url` is the bug CalDAV already fixed
-
-**High confidence, narrow blast radius.**
-
-```rust
-fn contact_addressbook_url(client: &CardDavClient, contact: &ContactId) -> Option<String> {
-    let trimmed = client.resolve_url(&contact.0);
-    let trimmed = trimmed.trim_end_matches('/');
-    trimmed.rfind('/').map(|index| trimmed[..=index].to_string())...
-}
-```
-
-CalDAV's `event_calendar_url` carries a nine-line comment explaining precisely why
-this is wrong (a slash in the query or fragment) and does a real `Url` parse instead.
-CardDAV never got the fix. For `https://dav/ab/c.vcf?next=/x` it yields
-`https://dav/ab/c.vcf?next=/`, which then travels as the `AddressBookId` stamped on
-the returned card and as the left side of the `same_collection_url` move check - so a
-legitimate restated `address_book_id` is refused as a cross-book move. This is the
-fifth instance of the exact drift class both reference docs warn about.
-
-## 6. CalDAV/CardDAV discovery fallback logic has drifted in shape and in trigger
-
-**Medium confidence on impact.**
-
-- CardDAV tries `.well-known/carddav` **first**, falls back to base; CalDAV tries base
-  **first**, falls back to `.well-known/caldav`. Nothing explains why they differ.
-- CardDAV falls back both on a not-found error *and* when a 200 body names no
-  principal. CalDAV's `should_fallback_discovery` only matches `NotFound(Calendar)` -
-  a CalDAV server that answers `.well-known`-less base URLs with a 200 containing no
-  `current-user-principal` fails the open outright rather than retrying well-known.
-- `should_fallback_discovery` keying on `NotFound(ResourceKind::Calendar)` is fragile
-  in a second way: `status_error` maps *every* 404 to `NotFound(Calendar)`, so the
-  fallback trigger is "any 404 anywhere in the two-request discovery", including a 404
-  on the principal PROPFIND.
-
 ## 7. Structural: one `CursorScope` per account is the root cause of 2, and of the whole `unsynced_*_urls` apparatus
 
 Both crates carry ~40 lines of doc comment, a `Vec<String>` field, an
@@ -90,29 +55,6 @@ spending the re-sync on, and everything in 2 is a workaround for not having made
     documented as deliberate (so `failed_ids` is per-page news) but the cost is not
     acknowledged; caching the search result behind the offset cursor would give both
     properties.
-
-11. **`is_collection` is effectively dead in the multiget path.** `mark_collection`
-    requires `resourcetype` on the element stack, but neither the multiget nor the
-    calendar-query/addressbook-query prop request asks for `resourcetype` - only the
-    depth-1 PROPFIND does. So the guard in `as_fetched_event` /
-    `as_failed_multiget_resource` / `as_missing_multiget_data` fires only if a server
-    volunteers the property. Any collection self-response in a query 207 lands in
-    `missing_data` -> `failed_ids`. Cheap fix: add `<D:resourcetype/>` to the
-    multiget/query `<D:prop>`.
-
-12. **`as_sync_entry` reads `self.staged.status`**, which only survives because
-    `parse_sync_collection_report` is the one parser that never calls
-    `begin_propstat`/`commit_propstat`. Adding propstat handling there - an obvious
-    future edit - silently blanks per-entry statuses, and a blanked 404 becomes an
-    `Updated` instead of a `Destroyed`. Land-mine, not a live bug.
-
-13. **`send_raw_request` hop cap is off by one** (`hops += 1` before `if hops >=
-    max_hops`), so it permits one fewer manual hop than `max_hops`. Both crates.
-
-14. **`extract_href_properties`'s status detection is not parent-scoped** (`name ==
-    "status" && stack.iter().any(|t| t == "propstat")`), unlike every other parser in
-    the file which uses the element-stack parent check. A nested `<status>` inside a
-    property value would be read as the propstat status.
 
 ## Out of scope, flagged
 

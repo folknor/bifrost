@@ -486,7 +486,8 @@ pub(crate) fn extract_href_property(
                         return Ok(Some(href));
                     }
                 }
-                if name == "status" && stack.iter().any(|tag| tag == "propstat") {
+                let parent = stack.iter().rev().nth(1).map(String::as_str);
+                if name == "status" && matches!(parent, Some("propstat")) {
                     propstat_success = Some(
                         trimmed(&text)
                             .as_deref()
@@ -1131,6 +1132,17 @@ END:VCARD</C:address-data>
 
         let href = extract_href_property(xml, "current-user-principal").expect("valid XML");
         assert_eq!(href.as_deref(), Some("/principals/user/"));
+    }
+
+    #[test]
+    fn nested_property_status_does_not_refuse_href_property() {
+        let href = extract_href_property(
+            r#"<D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:carddav"><D:response><D:propstat><D:status>HTTP/1.1 200 OK</D:status><D:prop><C:addressbook-home-set><D:href>/right/</D:href><C:extension><D:status>HTTP/1.1 404 Not Found</D:status></C:extension></C:addressbook-home-set></D:prop></D:propstat></D:response></D:multistatus>"#,
+            "addressbook-home-set",
+        )
+        .expect("valid property");
+
+        assert_eq!(href.as_deref(), Some("/right/"));
     }
 
     #[test]

@@ -24,6 +24,12 @@ inside an `OpenedAccount` whose skip lane is always empty
 The raw DAV client, XML parser, and iCalendar projection stay
 crate-private; consumers use only the factory and the shared `Account`
 calendar primitives.
+Discovery tries `/.well-known/caldav` first - built from the ORIGIN of the
+configured base URL via `bifrost_net::url::well_known_url`, never by appending
+the suffix to a configured path - and falls back to the configured
+base URL only when that initial principal lookup is not found or its successful
+body names no principal. A failure after the principal is identified is not a
+root-discovery fallback trigger.
 
 ## Module layout
 
@@ -73,8 +79,9 @@ calendar primitives.
   the 207), so the snapshot
   diff preserves a transiently-failed resource instead of destroying it.
   Resource identification does not depend on an `.ics` suffix or a returned
-  content type. The depth-1 listing requests `resourcetype` and excludes
-  collections; `sync-collection` accepts every returned member href because
+  content type. Depth-1 listing, calendar-query, text-query, and multiget
+  requests include `resourcetype` and exclude collection self-responses;
+  `sync-collection` accepts every returned member href because
   that REPORT supplies neither content type nor a naming convention. The
   `collection` marker obeys the same commit-on-success rule as every other
   property: seen inside a `propstat` it is staged and promoted only if that

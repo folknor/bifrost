@@ -5,8 +5,10 @@ Current architecture of the shared HTTP transport crate.
 Scope: HTTP/2 connection pool, OAuth bearer-token refresh, retry
 budget, per-host rate limiting, per-account bandwidth metering,
 native-tls, W3C `traceparent` injection, URL component-encoding
-helpers shared by the HTTP protocol crates. Used by `bifrost-jmap`,
-`bifrost-google`, `bifrost-graph`. Not used by `bifrost-imap` or
+helpers, resource-parent extraction, and origin-rooted well-known URL
+construction shared by the HTTP protocol crates. Used by `bifrost-jmap`,
+`bifrost-google`, `bifrost-graph`, and - for the URL helpers -
+`bifrost-caldav` and `bifrost-carddav`. Not used by `bifrost-imap` or
 `bifrost-smtp` (those carry their own TCP/TLS stacks); IMAP/SMTP
 report bytes-in/out through `MeterSink` for unified bandwidth
 accounting.
@@ -954,6 +956,23 @@ meaning there. The HTTP protocol crates name the grammar at every call
 site, preventing path hardening from corrupting search and filter
 values.
 
+`url::parent_collection_url(resource_url)` returns the parent
+collection of an absolute resource URL. It drops query and fragment
+before popping the final path segment, so a slash in either cannot be
+mistaken for a path separator. Both DAV crates use it rather than
+carrying a private copy each.
+
+`url::well_known_url(base_url, service)` builds the RFC 6764 discovery
+endpoint by replacing the base URL's path with `/.well-known/<service>`
+and clearing query and fragment. Well-known discovery is defined at the
+ORIGIN root, so appending the suffix to a path-bearing configured base
+is wrong: it addresses a resource that is not a discovery endpoint, and
+because only a not-found classification triggers the base fallback, a
+deployment answering that path with 401 or 403 would fail the open
+before the configured base was ever tried. `None` means the base does
+not parse or cannot carry a path; callers go straight to the configured
+base.
+
 ## File map
 
 ```
@@ -979,5 +998,6 @@ crates/net/src/
                   // MeterSinkHandle
   error.rs        // Error + cap_status_body
   trace.rs        // traceparent injection (current: uuid trace id)
-  url.rs          // distinct path-component and query-value encoders
+  url.rs          // distinct path-component and query-value encoders;
+                  // parent_collection_url; origin-rooted well_known_url
 ```

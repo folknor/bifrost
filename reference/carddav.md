@@ -19,7 +19,9 @@ addressbook home, caches the default address book URL, and returns an
 `Arc<dyn Account>` inside an `OpenedAccount` whose skip lane is always
 empty (single-principal surface). The raw DAV client and parser modules stay
 crate-private; consumers use only the factory and the shared `Account`
-contact primitives. Discovery tries `.well-known/carddav` first and falls
+contact primitives. Discovery tries `/.well-known/carddav` first - built from the ORIGIN of the
+configured base URL via `bifrost_net::url::well_known_url`, never by appending
+the suffix to a configured path - and falls
 back to the configured base URL both when that request is not found and when
 its successful body does not identify a current-user principal.
 
@@ -77,7 +79,8 @@ its successful body does not identify a current-user principal.
   URL back on every response, because the redirect policy follows admitted-origin hops
   and RFC 4918 resolves against the URI that actually served the body.
   Resource identification does not depend on a `.vcf` suffix or a returned
-  content type. The contact PROPFIND requests `resourcetype`, and both its
+  content type. Contact PROPFIND, addressbook-query, and multiget request
+  `resourcetype`, and all of their
   success and failure lanes exclude responses known to be collections. The
   `collection` marker obeys the same commit-on-success rule as every other
   property: seen inside a `propstat` it is staged and promoted only if that
