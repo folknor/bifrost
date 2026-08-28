@@ -143,6 +143,15 @@ async fn run_worker<E: EwsExecute>(account: GraphAccount, ews: E) {
                 )
                 .await
                 {
+                    // No backoff on this arm, deliberately. A server that
+                    // repeatedly answers long polls with an explicit
+                    // resubscribe directive will spin this loop, and that was
+                    // examined and judged defensible rather than fixed: each
+                    // cycle is a full server-directed round trip, not a
+                    // client-side hot spin, and honouring an explicit server
+                    // instruction promptly is the right response to it. The
+                    // `Disconnected` arm below is where an unhealthy peer
+                    // lands, and that one does back off. Flagged, not changed.
                     StreamLoopExit::Resubscribe => {
                         coverage_gap = true;
                         release_subscription(&ews, &subscription_id).await;

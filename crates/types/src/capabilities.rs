@@ -148,6 +148,26 @@ pub enum QuotaSignal {
 /// flag set to decide whether to dispatch into a primitive or return
 /// unsupported. New flags are added with `false` defaults so growing
 /// the trait surface stays additive.
+///
+/// Structural weakness, known and recorded rather than open: this is a
+/// hand-maintained MIRROR of the trait surface with no mechanical link to it.
+/// Nothing checks that a `false` flag implies the method returns `Unsupported`,
+/// or that a `true` flag implies it does not, and the mirror is already
+/// incomplete - `send_raw_message`, `repair_inventory`, `bulk_move_from` and
+/// `open_blob_range` have documented gating with no flag here, or a flag on a
+/// different struct. Across six protocol crates that is several hundred
+/// hand-maintained facts, each able to be wrong in a way no test catches, and
+/// consumers must consult this AND handle `Unsupported` regardless.
+///
+/// Two remedies, tracked in `notes/todo.md` as types-B1. The structural one
+/// replaces the struct with a runtime `supports(&self, op: AccountOperation)`
+/// query defaulted from a per-impl operation set, so the capability answer and
+/// the error answer become one value read twice and a new trait method defaults
+/// to unsupported instead of needing a bool nobody remembers to set - but that
+/// DELETES a published struct, so it is the repository owner's call and must
+/// not be actioned without one. The cheap one needs no ruling: a test in each
+/// protocol crate driving every gated method and asserting the flag agrees with
+/// the result.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PimMethodSupport {
     /// Read Outlook master category definitions.

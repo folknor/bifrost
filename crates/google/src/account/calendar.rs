@@ -313,6 +313,14 @@ pub(crate) fn search(
             // limit. Any clipped tail is recoverable: the page carried a
             // next_cursor only when more remained, and the boundary cursor
             // re-enters this calendar otherwise.
+            //
+            // Accepted residual, not an open defect: resume here is by
+            // calendar id AND provider page token, but NOT by position
+            // WITHIN an over-delivered page - a page Google delivers longer
+            // than `maxResults` has its tail discarded rather than resumed.
+            // Adding an intra-page offset would mean minting a third cursor
+            // coordinate for a case that requires the provider to violate
+            // its own documented cap. Low severity, deliberately left.
             let next_token = page.next_cursor;
             for item in page.items {
                 if items.len() >= limit {
@@ -352,6 +360,17 @@ pub(crate) fn search(
     })
 }
 
+/// Note the query deliberately sends `singleEvents=true` with NO
+/// `showDeleted`, which is what the range walk above did before it was
+/// corrected to carry tombstones.
+///
+/// That is not the same omission and must not be "fixed" by copying the range
+/// walk's parameters. A range reread is a COVERAGE question - a missing
+/// tombstone there is indistinguishable from a page boundary, so the walk can
+/// silently under-report deletions. A search is a query surface, and whether it
+/// should answer with cancelled instances is a PRODUCT decision about what the
+/// consumer asked for. It wants a deliberate ruling (tracked in `notes/todo.md`
+/// as google-B13), not a reflex copy.
 async fn search_one_calendar(
     client: &GmailClient,
     calendar_id: String,

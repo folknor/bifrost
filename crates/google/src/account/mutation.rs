@@ -486,6 +486,14 @@ async fn apply_label_patch(
 /// end the stream so the engine backs off and retries, and must not be
 /// laundered into "these ids failed". Sub-batches already resolved are
 /// handed back with the terminator so their ids keep their lane.
+///
+/// Accepted residual, deliberately left: a terminal error mid-walk DISCARDS
+/// the sub-batches not yet attempted. Their ids were never transmitted, so
+/// they go unreported - which is exactly what `Terminated` has always meant on
+/// this driver - and the engine re-issues the whole operation. Revisit only if
+/// a checkpoint ever lets a mutation stream resume mid-batch; until then there
+/// is no lane a never-sent id could honestly occupy, and inventing one would
+/// claim knowledge the walk does not have.
 async fn apply_label_patch_bisected(
     client: &GmailClient,
     ids: &[ObjectId],

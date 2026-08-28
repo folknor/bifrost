@@ -291,6 +291,19 @@ impl std::error::Error for BatchBoundaryError {}
 /// terminal completion because Graph and `BackfillRunner` both advance
 /// per page - waiting for `Done` would let a page checkpoint become durable
 /// across a gap it never declared.
+///
+/// Known shape weakness, recorded so it is understood rather than
+/// rediscovered: `checkpoint` is `Option<Checkpoint>`, so it cannot
+/// distinguish "this page has no checkpoint" from "this checkpoint was
+/// STRIPPED because of a barrier". The barrier signal rides only in
+/// `coverage`, which is exactly why a consumer once read a barrier page as
+/// ordinary and advanced past it. The fix that would make the omission a
+/// compile error is a dedicated `PageCheckpoint::{Advance(..), Withheld}`;
+/// that reshapes a published field, so it is the repository owner's call and
+/// is tracked in `notes/todo.md` as types-B2. Until then, both `bifrost-sync`
+/// inventory front ends read `coverage` through one shared module so they
+/// cannot diverge - but nothing in the type system stops a third front end
+/// from ignoring it.
 #[derive(Debug, Clone)]
 pub struct InventoryBatch {
     pub items: Vec<InventoryEntry>,

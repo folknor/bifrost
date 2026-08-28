@@ -48,6 +48,16 @@ impl BackfillCheckpointTarget {
     /// Prefer `SyncEngine::backfill_checkpoint_writer`: this route cannot see
     /// the writer task's in-memory ledger and can therefore overwrite debt the
     /// writer raised concurrently.
+    ///
+    /// The race is disclosed rather than closed, on purpose. Every engine path
+    /// routes through the single account writer; this constructor exists so
+    /// external code can still build the type from what it can actually
+    /// supply: a `CheckpointStore` is consumer-implemented, so an outside
+    /// caller holds a store and nothing else. Closing the race properly means
+    /// a compare-and-swap on the `CheckpointStore` TRAIT, which is a change to
+    /// a published consumer-implemented interface and therefore the repository
+    /// owner's call, not a fix to make here. Do not re-file the
+    /// read-modify-write as an unnoticed defect.
     #[must_use]
     pub fn direct(store: Arc<DynCheckpointStore>) -> Self {
         Self {

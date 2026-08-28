@@ -63,6 +63,20 @@ pub struct PublicationReceipt {
 /// The first field is retained as the compact identity consumers may log and
 /// key on. The receipt is the durable meaning of that identity and must be
 /// retained with it across writer restarts.
+///
+/// This type is `Clone` and NOT `Copy`, which it once was. The ergonomic cost
+/// is real and was judged unavoidable: carrying the receipt behind an `Arc` is
+/// what lets an acknowledgement replay after the issuing writer restarts, and
+/// a bare `u64` cannot. Accepted residual, not a regression to undo.
+///
+/// The id's high 32 bits are a per-`PendingCoverage`-instance segment, so a
+/// stale pre-reattach id can never outrank a current one in the durable-lane
+/// ordering. That leaves one known and accepted hole: receipt-based ack replay
+/// is scoped to a single `PendingCoverage` instance per attachment, so across a
+/// detach and re-attach a late ack of a PRIOR incarnation's publication can
+/// replay from its receipt and re-persist a stale row over a freshly
+/// re-established one. Same class as the documented vanished-scope late-ack
+/// case: re-delivery, never loss.
 #[derive(Debug, Clone)]
 pub struct PublicationId(pub u64, pub std::sync::Arc<PublicationReceipt>);
 
@@ -690,6 +704,15 @@ impl PendingCoverage {
     /// [`PendingCoverage::claim_checkpoint`] or
     /// [`PendingCoverage::claim_repair`], which refuse an id from the wrong
     /// lane instead of consuming it.
+    ///
+    /// Documented foot-gun, kept on purpose: no engine path reaches this, and
+    /// none should. It is published, so it is not removable, and an audit that
+    /// finds it unreachable has found the intended state rather than dead
+    /// code. The same standing applies to
+    /// [`crate::SyncControl::record_checkpoint`], which identifies a
+    /// publication by checkpoint VALUE where equal values are routinely
+    /// different publications. Both stay; every engine path uses the
+    /// lane-checked, publication-identified forms.
     pub fn claim(&self, id: PublicationId) -> ClaimLookup {
         let lane = self.guard().claims.get(&id).map(|p| p.lane.clone());
         match lane {

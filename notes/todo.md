@@ -1444,6 +1444,109 @@ Listed so they are not re-filed as untouched work. Each has its reasoning in the
 - IMAP's NOTIFY-runtime-rejection misreport: a folder admitted to the IDLE budget
   whose `NOTIFY SET` is rejected at runtime was already reported as pushed.
 
+## Open items folded in from the second bug-hunt wave (2026-08-29)
+
+The nine `notes/bugs-*.md` ledgers and `notes/carry-forward.md` of the
+August 2026 arcs (`bugs-types`, `bugs-net`, `bugs-jmap`, `bugs-smtp`,
+`bugs-imap-sasl`, `bugs-dav`, `bugs-sync`, `bugs-graph`, `bugs-google`,
+`bugs-cross-cutting`) were closed out and deleted on 2026-08-29, the same
+convention as the 2026-08-23 close-out above. Everything durable from them -
+machinery invariants, refutations, accepted residuals, testing traps - moved
+to `reference/*.md` or to inline comments at the code it describes.
+Everything still open is below.
+
+Every one of those arcs closed with no open findings in its own document, so
+this list is short by construction: it is the deferred tail, not a defect
+backlog. The same category labels and the PUBLISHED SURFACE fence apply.
+
+- **sync-F3 (residual, structural).** `BackfillRunner` and `InventoryFusion`
+  share the safety-critical barrier and resume state through `InventoryWalk`
+  (`crates/sync/src/inventory_walk.rs`), which is what closed the A2
+  divergence. Checkpoint MINTING and terminal-`Done` handling are still two
+  implementations, because the shapes genuinely differ - fusion forwards the
+  account's checkpoint, backfill mints a positional `page:F:T`. No current
+  loss path was found across five rounds and two close passes, so this is a
+  re-divergence RISK, not a defect. Close it only if a third inventory front
+  end appears, or if a defect is ever traced to the split.
+
+- **jmap-J13. Positional paging in the consumer-facing list and search
+  paths.** [C3] `crates/jmap/src/contacts.rs`, `calendar_ops.rs` and `pim.rs`
+  page by integer position over orders that are not total - the same
+  unstable-order shape J1 fixed for the inventory walk. Deliberately NOT J1
+  reopened: those are consumer-driven page-cursor APIs, not coverage-claiming
+  walks, so churn-induced skip or duplication is ordinary list-API behaviour
+  and nothing reports complete coverage off them. High confidence the paging
+  is positional, LOW confidence it is a defect. The better mechanism exists
+  and is known: carry an anchor id on the page cursor, as the inventory walk
+  does, so a consumer paging a churning list gets stable continuation instead
+  of positional drift.
+
+- **types-B1. `PimMethodSupport` is a hand-maintained mirror of the trait
+  surface.** [C3, PUBLISHED SURFACE] `crates/types/src/capabilities.rs`. Sixty
+  bools with no mechanical link to the 94-method `Account` trait: nothing
+  checks that a `false` flag implies `Unsupported`, or that a `true` flag
+  implies it does not. The mirror is already incomplete - `send_raw_message`,
+  `repair_inventory`, `bulk_move_from` and `open_blob_range` have documented
+  gating with no flag, or a flag on a different struct. Six protocol crates x
+  sixty bools is ~360 hand-maintained facts that can each be wrong in a way no
+  test catches, and consumers must consult the mirror AND handle `Unsupported`
+  anyway.
+
+  Two shapes, and only the second is actionable without the owner. The
+  rewrite: one runtime query `fn supports(&self, op: AccountOperation) -> bool`
+  defaulted from a per-impl `AccountOperation` set, so the capability answer
+  and the error answer are the same value read twice, and a new trait method
+  defaults to unsupported instead of needing a bool nobody sets. That DELETES
+  a published struct, so it is the owner's call. The keep-it version needs no
+  ruling: a `#[test]` in each protocol crate driving every gated method and
+  asserting the flag agrees with the result. Mechanical to generate, and it
+  would have caught the graph fingerprint split.
+
+- **types-B2. `InventoryBatch::checkpoint` cannot express a withheld
+  checkpoint.** [C2, PUBLISHED SURFACE] It is `Option<Checkpoint>`, with no way
+  to distinguish "this page has no checkpoint" from "I stripped this
+  checkpoint because of a barrier". The barrier signal rides only in
+  `coverage`, which is precisely why the A2 divergence was easy to miss. A
+  dedicated `PageCheckpoint::{Advance(..), Withheld}` would make the omission
+  a compile error. The shared `InventoryWalk` makes both CURRENT front ends
+  read `coverage` the same way, but nothing in the type system stops a third
+  from ignoring it - which is the same risk sync-F3 records, one layer down
+  and closable by a type. Carried out of the sync arc; `bifrost-types` was not
+  touched there.
+
+- **types-B3. The `Reconcile` advice lane lacks the fields `Retry` has.** [C3]
+  Both `retry_hint` and `throttle_scope` describe WHEN a failure applies and
+  HOW WIDELY, regardless of which lane it lands in, so the two advice types
+  want a shared carrier rather than one of them carrying the pair. Coupled to
+  types-B1: the audit's premise that optional lanes have defaults is what
+  makes the capability mirror necessary, so solving the capability problem is
+  what would eventually make a narrower handle possible - not a supertrait
+  split of the 94-method trait, which was considered and rejected on its own
+  merits.
+
+- **google-B13. `events_search_url` sends `singleEvents=true` with no
+  `showDeleted`.** [C4] `crates/google/src/account/calendar.rs`, exactly as
+  `events_in_range` did before G8. Deliberately NOT filed as the same defect,
+  and a reflex copy of the G8 fix is the wrong move: a range reread is a
+  COVERAGE question, where a missing tombstone is indistinguishable from a
+  page boundary, whereas a SEARCH returning cancelled instances is a PRODUCT
+  decision about what a query surface should answer. Wants a deliberate
+  answer.
+
+- **graph-B1. `pim.rs` and `push.rs` are oversized.** [C3] 4,795 and 2,600
+  lines. Low confidence as defects, high as maintenance risk. `pim.rs` holds
+  message writes, drafts, send-as, search plus its own versioned cursor codec,
+  folder CRUD, identities, vacation, and typed hydration in one file; the
+  search cursor logic alone is a self-contained subsystem with its own wire
+  format. No round has judged the churn worth it. Same standing as sync-B1 and
+  the rest of the refactor backlog: it does not misbehave, and it must not
+  become a prerequisite for a local fix.
+
+- **sync-B7. `attach_schema_recovery.rs` still carries its own `HealAccount`
+  double.** [C3] The reusable `StubAccount` seam now lives in
+  `crates/sync/tests/common/mod.rs` and is the model for new tests. Migrating
+  the older test onto it is optional cleanup, explicitly not owed.
+
 ## Rules for agents working bug-hunt items
 
 These earned their keep during the 2026 fix slices - keep applying them

@@ -1,7 +1,7 @@
 //! Reusable in-crate `Account` double for bifrost-sync integration tests.
 //!
 //! The `Account` trait is wide enough (~60 methods) that every integration
-//! test used to re-implement a full stub, and the round-3 bugs-sync arc could
+//! test used to re-implement a full stub, and a whole bug-hunt round could
 //! not write an end-to-end orchestrator test at all for that reason. This is
 //! the seam: `StubAccount` answers every method the engine never drives with
 //! `Unsupported` (exactly what a protocol crate returns for an operation it

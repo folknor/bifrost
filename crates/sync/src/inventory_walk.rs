@@ -5,6 +5,25 @@
 //! the walk at a barrier while the other kept accepting checkpoints past it.
 //! Both now hold an `InventoryWalk` and route every barrier decision through
 //! this module, so a rule can only be changed for both at once.
+//!
+//! What is shared here is the SAFETY-CRITICAL half only: the barrier decision
+//! and the last accepted resume checkpoint. Checkpoint MINTING and terminal
+//! `Done` handling remain two implementations, because the shapes genuinely
+//! differ - fusion forwards the account's own checkpoint, backfill mints a
+//! positional `page:F:T` from partition coordinates the account never sees.
+//! That is an accepted structural residual, not an oversight, and no loss path
+//! has been found through it across five rounds and two close passes; it is
+//! tracked in `notes/todo.md` as sync-F3. The re-divergence risk is real but
+//! bounded by the fact that a THIRD front end would have to appear for it to
+//! bite, and a third front end is the trigger to revisit.
+//!
+//! Both front ends must refuse to announce a barrier the store REFUSED - the
+//! backfill partition fails so the scope stays Pending and re-walks, the
+//! fusion walk returns the error. A DEPARTED writer (detach or shutdown) is
+//! deliberately non-fatal, because there is nothing left to persist to; a
+//! store error is fatal, because there is. Getting this onto one front end and
+//! not the other is exactly the divergence this module exists to prevent, and
+//! it happened once already.
 
 use bifrost_types::{Checkpoint, InventoryCoverageReport};
 

@@ -727,6 +727,12 @@ async fn search_all(
     Ok(conn.uid_search("ALL", account.command_timeout()).await?.ids)
 }
 
+/// A run whose residual is empty ends on `[Page, Page]` with no `Final` batch
+/// at all - the `changes.is_empty()` guard below skips it. That is accepted,
+/// not a boundary bug: `SyncEvent::Done(checkpoint)` is the terminator of this
+/// stream, and nothing downstream may key on seeing a `Final`. Emitting an
+/// empty final batch purely to decorate the boundary would publish a page that
+/// carries nothing.
 async fn finish_changes(
     account: ImapAccount,
     folder: MailboxName,
@@ -750,6 +756,21 @@ async fn finish_changes(
     Ok(())
 }
 
+/// The at-most-`BATCH_ITEMS`-per-page guarantee holds by CONVENTION here, not
+/// by construction. All three strategies honour it, but through separate loops:
+/// this helper owns the boundary for CONDSTORE and both Basic entries, while
+/// QRESYNC flushes inline because it must also track
+/// `flushed_qresync_changes`: its mid-stream downgrade to CONDSTORE is legal
+/// only while no page has yet escaped, and SELECT-side flushes count toward
+/// that. A new emission loop must page AND respect the downgrade rule, and
+/// nothing in the types forces either.
+///
+/// Consolidating the three behind a `Strategy` trait was proposed and rejected:
+/// QRESYNC owns that mid-stream downgrade (with connection discard), CONDSTORE
+/// has a fallible bounded stream but no VANISHED lane, and Basic has no
+/// change-source stream at all, so a shared runner would end up owning
+/// strategy-specific wire policy. The consolidation was taken at this narrower
+/// seam instead, which is the part that is genuinely common.
 async fn flush_page(
     tx: &tokio::sync::mpsc::Sender<SyncEvent<Change>>,
     changes: &mut Vec<Change>,
@@ -762,6 +783,15 @@ async fn flush_page(
         .map_err(|_| ChangeError::ChannelDropped)
 }
 
+/// A non-conformant server may name the same UID in both VANISHED and FETCH.
+/// While both are still buffered this retracts the removal into a single
+/// update, but once the `Removed` has ESCAPED in a flushed page it cannot be
+/// retracted, and the UID re-`Add`s instead.
+///
+/// That remove-then-re-add pair is deliberate and is not suppressed. It is a
+/// coherent sequence for the consumer - the object left and came back - and the
+/// alternative would be rewriting history a page after it was published, which
+/// the stream has no mechanism for and no right to do. Accepted, not open.
 fn record_fetch_change(
     folder: &MailboxName,
     uidvalidity: u32,

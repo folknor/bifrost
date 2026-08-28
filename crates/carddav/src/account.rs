@@ -1400,6 +1400,14 @@ fn diff_contact_snapshots(previous: &ContactSnapshot, current: &ContactSnapshot)
     // hrefs against a populated local snapshot would emit a Destroyed for
     // every contact and wipe the consumer's store. Treat
     // empty-vs-nonempty as "no observation," not "everything deleted."
+    //
+    // Accepted cost, stated plainly because it is easy to re-file as a bug:
+    // a REAL empty-out - a user deleting every contact - is suppressed along
+    // with the transient empty-207, on this poll AND on later ones, because
+    // on the wire the two are identical. `reference/carddav.md` says so, with
+    // the ctag short-circuit caveat. `bifrost-caldav`'s event snapshot diff
+    // makes the same trade; these two crates are near-duplicates and a change
+    // to one of them must be checked against the other.
     if current.entries.is_empty() && !previous.entries.is_empty() {
         return Vec::new();
     }

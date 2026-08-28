@@ -176,6 +176,21 @@ pub(crate) fn inventory_stream(
     inventory_stream_cancellable(client, cache, scope, CancellationToken::new())
 }
 
+/// Two properties here are load-bearing and were each paid for; do not relax
+/// either while "simplifying" the walk.
+///
+/// A refused or cancelled walk claims NOTHING. Every exit short of a genuine
+/// completion emits only `Terminated` - never `Done`, never a final page
+/// boundary, never a checkpoint, never a coverage report - so a truncated
+/// enumeration can never advance a cursor past objects it did not list. The
+/// page budget and repeated-token guard below run BEFORE hydration or emission
+/// of the page in hand, for exactly this reason.
+///
+/// Accepted residual: there is no durable mid-walk resume token, so
+/// cancellation restarts the pass and the hydrated items of an unfinished page
+/// are discarded with it. That is wasted work, never wrong work - the
+/// alternative is a positional resume coordinate over a list Gmail does not
+/// promise is stable, which trades cheap repetition for silent skips.
 pub(crate) fn inventory_stream_cancellable(
     client: Arc<GmailClient>,
     cache: ScopeCache,

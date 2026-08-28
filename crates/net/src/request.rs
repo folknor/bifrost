@@ -632,6 +632,13 @@ impl RequestByteCounter {
 
 /// Streaming HTTP response. The body is a `ByteStream` so the caller
 /// can apply backpressure and avoid buffering large attachments.
+///
+/// This counter is deliberately kept OUT of consumers' per-batch byte tallies,
+/// long-lived EWS streaming included. A stream's count is only ever as complete
+/// as the caller's draining, and a partial number published as a batch total is
+/// worse than no number: it looks authoritative and is systematically low.
+/// Reporting nothing here is the considered choice, disclosed in
+/// `reference/net.md`.
 #[non_exhaustive]
 pub struct StreamingResponse {
     /// HTTP status code of the final attempt.

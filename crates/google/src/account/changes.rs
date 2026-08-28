@@ -283,6 +283,13 @@ fn walk_refusal(
 
 /// Only the final page of a history walk may advance the durable cursor.
 ///
+/// State the promise precisely, because the weaker reading looks like a bug
+/// and is not: this checkpoint means "every history record at or below this id
+/// has been delivered at least once". It does NOT mean "caught up at this id".
+/// Retaining the FIRST page's `historyId` across the walk is what makes the
+/// weaker claim true, and the weaker claim is the one that is safe - it can
+/// replay, and replay is what the engine is built to absorb.
+///
 /// `response.history_id` is the mailbox's current history record at the
 /// time each page is requested, not a per-page resume marker. Records can
 /// arrive while a multi-page response snapshot is being drained, so the

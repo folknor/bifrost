@@ -426,6 +426,20 @@ impl SyncEngine {
         // Reopen channel: the multiplexer's per-scope tasks raise
         // requests when a stream ends with an `EngineDirective`-class
         // recovery, carrying the originating `AccountError`.
+        //
+        // Depth 16 with a serial listener, and that pairing was examined and
+        // kept. The finding it was raised against ("a full channel wedges
+        // every scope") had real force only while poll tasks sent on it WHILE
+        // HOLDING THE DRIVE LEASE: a slow reopen then blocked recovery
+        // reporting, which blocked the poll task, which blocked push
+        // reconciliation for that scope. `CursorRegistry::with_drive` released
+        // the lease before that send, and what remains is a bounded channel
+        // doing its job - backpressure on the ORIGINATING poll task, and
+        // nowhere else. Keep every `reopen_tx.send().await` outside the lease
+        // and this stays true. Re-open the question only on evidence that the
+        // backpressure crosses into a scope the sender does not own; the bare
+        // observation that the channel is bounded and the listener is serial
+        // is not that evidence.
         let (reopen_tx, mut reopen_rx) = mpsc::channel::<ReopenRequest>(16);
 
         let mut workers: Vec<WorkerTask> = Vec::new();

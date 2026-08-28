@@ -55,8 +55,31 @@ impl PushRouting {
     }
 }
 
+/// Push state is three values under three locks, and collapsing them into one
+/// mutex-protected object was proposed and rejected. Keep the shape.
+///
+/// The argument for collapsing rested on there being no transaction boundary,
+/// and that premise is stale. Subscribe and unsubscribe hold the subscriptions
+/// registry, the enabled set and the push position across their sole apply
+/// await in ONE lock order (`subscriptions -> enabled -> push_state`) and
+/// commit all three only after it succeeds, so cancellation and apply failure
+/// mutate nothing; the reader can update the position only after taking that
+/// same final guard, so it cannot interleave a new position into an in-flight
+/// reconfigure.
+///
+/// The three also have deliberately different meanings and lifetimes, which a
+/// single object would blur rather than encode: the registry is the REQUESTED
+/// handle set, `enabled` is the last wire-APPLIED union, and `push_state` is
+/// the RFC 8887 position, retained across a non-empty reconfigure and cleared
+/// when the union goes empty. Merging their storage would reduce the mutex
+/// count without strengthening the existing boundary or capturing those rules
+/// in a type, at the price of rewriting test-pinned cancellation and replay
+/// machinery with no invariant gap left to close.
 pub(crate) struct WsState {
     pub(crate) tx: broadcast::Sender<WatchEvent>,
+    /// The last union actually applied to the wire. Starts EMPTY at `open()`,
+    /// which is why the first reader pass sends a disable frame; see
+    /// `apply_push_set`, where that behaviour is explained and ruled correct.
     pub(crate) enabled: Arc<Mutex<DataTypeSet>>,
     pub(crate) push_state: Arc<Mutex<Option<String>>>,
     /// The spawned reader, kept so `close()` can prove it stopped.
@@ -379,6 +402,21 @@ fn union_data_types(subscriptions: &HashMap<SubscriptionHandle, DataTypeSet>) ->
     union
 }
 
+/// An empty set maps to a disable frame, including on the FIRST reader pass,
+/// where `enabled` is still empty from `open()` and nobody had enabled push.
+/// So a freshly opened connection sends a disable nobody asked for and then
+/// announces `Reconnected`. That is intended and was rejected as a defect;
+/// leave it.
+///
+/// `WatchEvent::Reconnected` is defined in `bifrost-types` as a connection
+/// HEALTH transition, not as proof that any scope is subscribed, and the empty
+/// set is the applied desired state - the frame makes that state explicit on
+/// every newly opened connection rather than leaving it implied. The sync
+/// reconciler deliberately turns every reconnect, this first one included,
+/// into a full `Unknown` reconcile, so suppressing the event or skipping the
+/// frame would give the same transition a second meaning and make the reader's
+/// applied-state guarantee conditional on which pass it is. What remains is
+/// one frame of cosmetic wire traffic with no incorrect state behind it.
 async fn apply_push_set(
     client: &Client,
     data_types: &DataTypeSet,
@@ -651,6 +689,27 @@ async fn reader_pass<T: PushTransport>(
     }
 }
 
+/// The `enabled` and `push_state` guards are taken in SEPARATE critical
+/// sections here, and that is a known, examined residual rather than an
+/// oversight. Do not "fix" it by holding the first guard across the
+/// `set_push_data_types` await.
+///
+/// The mutators (subscribe, unsubscribe) hold the registry, enabled-set and
+/// push-position guards across their sole apply await and commit all three
+/// only on success, in one lock order, so a cancelled mutator mutates nothing.
+/// The reader is the only non-atomic pair, and its worst case is bounded: if a
+/// mutator commits between the two reads, the replay can re-apply a union the
+/// mutators have already superseded - after a racing final unsubscribe, the
+/// wire briefly carries a subscription the state says is empty, with a `None`
+/// position. That costs extra push frames and spurious invalidation hints and
+/// nothing else. It can never MISS a change, because hints are
+/// over-approximate by contract and the sync reconciler treats every reconnect
+/// as a full `Unknown` reconcile regardless; and it self-heals on the next
+/// reconnect or reconfigure, whose frames go out under all three guards.
+///
+/// Closing it means a lock held across an await in teardown-adjacent code,
+/// which is the exact shape that has opened a new hole every time it has been
+/// attempted here. The cost of the fix exceeds the cost of the residual.
 async fn reenable_current_push_set<T: PushTransport>(
     transport: &T,
     enabled: &Arc<Mutex<DataTypeSet>>,

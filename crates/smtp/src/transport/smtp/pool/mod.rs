@@ -58,6 +58,12 @@ impl PoolConfig {
     /// This buys nothing for LMTP transports: every LMTP delivery retires its
     /// connection at recycle, so each transaction starts on a fresh
     /// connection that is never probed anyway.
+    ///
+    /// Being inert for LMTP is intentional and stays. A `debug_assert` here
+    /// would reject a valid shared configuration - one `PoolConfig` is meant to
+    /// serve both protocols - and making the config protocol-aware would
+    /// reshape a published type for no behavioural gain. The LMTP behaviour is
+    /// stated above, which is the whole remedy this needs.
     pub fn test_on_checkout(mut self, test_on_checkout: bool) -> Self {
         self.test_on_checkout = test_on_checkout;
         self

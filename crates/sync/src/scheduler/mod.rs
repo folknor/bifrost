@@ -30,7 +30,24 @@
 //! class present in the lanes at once, not just the head. A single-head
 //! dispatcher would block the whole engine behind one account whose
 //! per-account sub-pool is exhausted, which is exactly the cross-account
-//! starvation `BudgetGate`'s per-account layer exists to prevent.
+//! starvation `BudgetGate`'s per-account layer exists to prevent. It re-plans
+//! on a strictly better lane or a newly present class, and deliberately NOT on
+//! an arrival that is neither - restarting the in-flight acquisitions on every
+//! submission starves them.
+//!
+//! The invariant that keeps all of the above true, stated so it is not
+//! undone by a later simplification: **nothing may park on the `BudgetGate`
+//! semaphore except the dispatcher.** An `admit` caller that awaits the
+//! semaphore itself relocates the unboundedness rather than removing it and
+//! restores arrival order in place of priority - which is precisely the
+//! implementation this design replaced.
+//!
+//! A refused admission is TRANSIENT, never terminal: `admit` errors when its
+//! lane is full or the scheduler is stopping, and both clear by themselves. A
+//! caller must back off (the poll loop steps its cadence) or skip just that
+//! scope (the push sweep). Returning from a poll loop on an admission error
+//! retires that scope's polling forever for a condition that heals, which was
+//! a real regression here.
 
 pub mod budget;
 pub mod lanes;
@@ -268,6 +285,13 @@ impl Scheduler {
     /// empty. Workers normally pair this with a notification source
     /// so they wake on `submit`. [`Scheduler::pull_next`] is the
     /// waiting form.
+    ///
+    /// This signature is deliberate and was restored after being changed.
+    /// Making `pull` `async fn pull(&self) -> WorkItem` was tried and reverted:
+    /// it removes the non-blocking "is there work right now?" answer, which is
+    /// a lost CAPABILITY rather than a reshaped one, and this crate's standing
+    /// rule permits reshaping a published item but not removing one. Keep the
+    /// three-way split - `pull`/`try_pull` synchronous, `pull_next` waiting.
     pub fn pull(&self) -> Option<WorkItem> {
         self.try_pull()
     }

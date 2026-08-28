@@ -66,6 +66,15 @@ fn failed_refresh_delay(consecutive: u32, terminal: bool) -> Duration {
 ///
 /// `current()` returns the cached token; `refresh()` forces a network
 /// round-trip and returns the freshly minted token.
+///
+/// Traffic an implementation performs against the OAuth issuer is neither
+/// METERED nor CAPPED by this crate, and that is a disclosed exclusion rather
+/// than a hole. A `TokenSource` is shared by the HTTP, IMAP and SMTP paths and
+/// owns arbitrary provider-specific exchange machinery, so bifrost-net cannot
+/// count its wire bytes without replacing this abstraction with an
+/// HTTP-specific request model - which changes a published consumer-implemented
+/// contract. `reference/net.md` states the exclusion; do not re-file it as
+/// missing coverage.
 pub trait TokenSource: Send + Sync + 'static {
     /// Return the currently cached access token. Implementations must
     /// be cheap; a hot path through `RequestBuilder::send` may call

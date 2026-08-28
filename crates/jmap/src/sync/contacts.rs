@@ -837,6 +837,22 @@ fn first_feature(value: Option<&Value>) -> Option<String> {
         .find_map(|(key, value)| value.as_bool().unwrap_or(false).then(|| key.clone()))
 }
 
+/// Paging here is POSITIONAL, over a query order that is not total. That is
+/// the same unstable-order shape the inventory walk was moved off, and it is
+/// deliberately not treated as the same defect - do not re-file it as one.
+///
+/// The inventory walk claims COVERAGE: it tells the engine a scope was fully
+/// enumerated, so positional drift there is silent data loss and it was
+/// rebuilt anchor-based over a stable `queryState`. These are consumer-driven
+/// page-cursor APIs. Nothing reports complete coverage off them, so
+/// churn-induced skip or duplication is ordinary list-API behaviour of the
+/// kind every paged list surface has.
+///
+/// It is still the weaker mechanism where a better one is known, and the
+/// better one is written down: carry an anchor id on the page cursor, as the
+/// inventory walk does, so a consumer paging a churning list gets a stable
+/// continuation instead of positional drift. Tracked in `notes/todo.md` as
+/// jmap-J13 - an improvement with a known answer, not a bug.
 fn decode_position(
     page_cursor: Option<Vec<u8>>,
     operation: AccountOperation,

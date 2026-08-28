@@ -375,6 +375,19 @@ impl ThrottleBucket {
 ///   blocked on that types-level identity channel.
 /// - `Provider` uses `AccountError::provider()`, degrading to
 ///   `Account` when absent.
+///
+/// The asymmetry in that list is deliberate and is the whole design. A BROADER
+/// scope may degrade toward the account key, because the account is a SUBSET
+/// of what it describes and pausing it is conservative. A NARROWER one may not:
+/// widening a per-mailbox 429 to the account key converts one mailbox's
+/// throttle into an account-wide stall, so a mailbox scope whose error names no
+/// mailbox stays operation-local instead. Do not "complete" the match by
+/// giving it an account fallback.
+///
+/// `Account`-keyed deadlines also deliberately survive a detach until they
+/// expire. They describe the stable account IDENTITY, not the connection
+/// incarnation, so clearing them on detach would let a detach-plus-reattach
+/// bypass a provider wait. Growth is bounded by expiry pruning.
 #[must_use]
 pub(crate) fn resolve_throttle_key(
     scope: ThrottleScope,

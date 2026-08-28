@@ -243,7 +243,9 @@ fn patch_for_set(flags: &HashSet<String>, labels: &[GmailLabel]) -> LabelPatch {
         // would make `Applied` unreachable for `FlagOp::Set` forever
         // while saying nothing a consumer could act on. The residual gap
         // - a Set that omits `\Draft` against a message that really is a
-        // draft - needs a read-back the translation layer does not have.
+        // draft - needs a read-back the translation layer does not have,
+        // which makes it a `bifrost-sync` question rather than a Gmail
+        // translation one. Accepted, not open.
         if !is_known_flag(flag, labels) || asserts_read_only_state(flag, labels) {
             add.insert(flag.clone());
         }

@@ -1029,6 +1029,27 @@ pub(crate) enum DavScopeOwner {
 /// the first discovery stream alongside the other DAV degradations. A dropped
 /// entry therefore fails loudly - the scope routes to IMAP or to
 /// `Unsupported` - instead of syncing the wrong collection quietly.
+///
+/// **EVERY `CursorScope::Folder` consumer must consult this index**, not only
+/// the four sync lanes. That is the sharpest lesson this seam has paid for: a
+/// round routed the sync lanes correctly and missed `push_subscribe`, a fifth
+/// consumer, so a DAV collection href - a syntactically valid mailbox name -
+/// was admitted as an IDLE mailbox watch. It cost no data (polling is never
+/// suppressed on push coverage) but it was reported in the succeeded lane that
+/// `bifrost-sync` trusts, it burned one of four IDLE budget slots, and it
+/// handed a worker a SELECT that can never succeed. A NEW consumer of `Folder`
+/// scopes must be checked against this index before it ships.
+///
+/// Namespacing `FolderId` instead was considered and rejected: it would force
+/// a rewrite of the scope on delegation and back out of the minted
+/// `ChangeCursor`, and every one of those rewrite points is another place the
+/// fix can open a hole.
+///
+/// Accepted residual: an excluded scope is still ADVERTISED by discovery,
+/// because sub-account scopes pass through `merge_scope_streams` verbatim. A
+/// mailbox collision resolves to the same scope value as the real mailbox, and
+/// a contested id fails loudly at establishment. Judged honest and sufficient,
+/// and warned at open.
 #[derive(Debug, Default)]
 pub(crate) struct DavScopeIndex {
     owners: std::collections::HashMap<bifrost_types::FolderId, DavScopeOwner>,

@@ -38,6 +38,13 @@ pub(crate) const STATUS_BODY_CONNECTION_MARKER: &[u8] = b" ... (body read failed
 /// Final HTTP response evidence preserved for retry-budget,
 /// rate-limit, and repeated-auth failures. `body` is capped with the
 /// same policy as `Error::Status`.
+///
+/// Deliberately NOT `#[non_exhaustive]`: this is crate-produced EVIDENCE that
+/// consumers read, not configuration they build, so sealing it would only stop
+/// a consumer from pattern-matching what this crate handed them.
+/// `NetErrorContext` is likewise unsealed for the mirror-image reason - it is
+/// consumer-constructed and has no constructor. Both are considered; an audit
+/// that flags either as a missing seal has found the intended state.
 #[derive(Clone, Debug)]
 pub struct FinalResponse {
     pub status: StatusCode,

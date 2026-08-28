@@ -144,6 +144,11 @@ impl SyncControl {
     /// equal checkpoint VALUES legitimately describe different
     /// publications, so a value search can release a boundary that
     /// belongs to a different, still in-flight broadcast.
+    ///
+    /// Documented foot-gun, kept on purpose, and unreachable from every engine
+    /// path by design. An audit finding it unused has found the intended state,
+    /// not dead code; it is published and so not removable. Same standing as
+    /// [`crate::cursor::PendingCoverage::claim`].
     pub async fn record_checkpoint(&self, checkpoint: Checkpoint) {
         self.inner.publications.acknowledge_checkpoint(&checkpoint);
         self.announce_durable(None, checkpoint);

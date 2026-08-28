@@ -1454,6 +1454,13 @@ impl SmtpConnection {
     /// half's `poll_shutdown` sends TLS `close_notify` and waits for the
     /// peer's. The state transition is mirrored on both sides so an aborted
     /// connection can never pass `state().verify()` again.
+    ///
+    /// This is the ONE deliberate asymmetry between the blocking and async
+    /// transport halves, which are otherwise held in step on purpose - a fix
+    /// landing in one half only has been this crate's recurring defect. An
+    /// audit finding "the async abort honours the operation timeout and this
+    /// one does not" has found the intended state; there is nothing here to
+    /// bound.
     pub(crate) fn abort(&mut self) {
         self.stream.get_mut().set_state(ConnectionState::Broken);
         let _ = self.stream.get_mut().shutdown(std::net::Shutdown::Both);

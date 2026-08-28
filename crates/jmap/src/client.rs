@@ -583,6 +583,11 @@ impl<T: HttpTransport> Client<T> {
     /// The derived endpoints and default account are replaced together
     /// with the `Session` itself; a partial swap would leave requests
     /// routed by a session no caller can observe.
+    ///
+    /// Currently unwired: session divergence is handled by the lifecycle path,
+    /// which wakes on a watch channel rather than polling. Kept and disclosed
+    /// in `reference/jmap.md` rather than deleted - an audit finding it
+    /// uncalled has found a recorded state, not dead code.
     pub(crate) async fn refresh_session(&self) -> crate::Result<()> {
         let bytes = self
             .inner

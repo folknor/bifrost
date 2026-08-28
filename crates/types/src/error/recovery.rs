@@ -160,6 +160,15 @@ pub enum RetryDisposition {
     AfterAuthRefresh,
 }
 
+/// The sealing here is deliberate and has been the state of this file since
+/// the original error-model commit, in both directions: the ADVICE structs
+/// (`ReconcileAdvice`, [`RetryAdvice`]) carry `#[non_exhaustive]`, while the
+/// nested [`ReconcileGuidance`] is a plain public struct with a public field
+/// and so is genuinely constructible downstream. An explicit seal on the
+/// advice plus a real constructor path for the guidance is the intended
+/// posture, not an accident - a finding asserting the reverse arrangement
+/// rested on an inverted reading of this code and has been filed twice. Read
+/// the derives before re-filing it a third time.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct ReconcileAdvice {

@@ -77,6 +77,16 @@ pub enum ChangesEvent {
 /// broadcast a change is not evidence the consumer received it, so it
 /// is not a sound basis for suppressing the object's inventory copy;
 /// see the `LiveSupersedes` type docs for the full argument.
+///
+/// A published change checkpoint always carries its `PublicationId`. The claim
+/// that it does not was raised and REFUTED with evidence, so do not re-file it:
+/// the `publish` closure sets the publication whenever `control` and
+/// `checkpoint` are both present, both production callers
+/// (`multiplexer/mod.rs` and `push/reconciler.rs`) pass `Some(control)`, and
+/// `emit_backfill_complete` publishes unconditionally. The invariant is now
+/// pinned by `a_published_change_checkpoint_always_carries_its_publication_id`
+/// (ablated - it bites), which is what makes it enforced rather than merely
+/// observed. New evidence, not a re-reading, is what would reopen this.
 #[allow(clippy::too_many_arguments)]
 pub async fn drive_changes_stream(
     account: &dyn Account,

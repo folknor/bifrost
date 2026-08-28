@@ -1601,6 +1601,16 @@ fn diff_event_snapshots(previous: &EventSnapshot, current: &EventSnapshot) -> Ve
     // A genuine empty-out reconciles on the next non-empty poll or via
     // the sync-token path (apply_sync_report), which is not exposed to a
     // bare empty multistatus.
+    //
+    // Accepted cost, stated plainly because it is easy to re-file as a bug:
+    // a REAL empty-out - a user deleting every event in the collection - is
+    // suppressed along with the transient empty-207, on this poll AND on
+    // later ones, because on the wire the two are identical. There is no
+    // signal that separates them, so the choice is between never wrongly
+    // wiping a consumer's store and never missing a genuine mass delete;
+    // this crate takes the first. `reference/caldav.md` says so, with the
+    // ctag short-circuit caveat, and `bifrost-carddav` makes the same trade
+    // in its own snapshot diff - change one and change the other.
     if current.entries.is_empty() && !previous.entries.is_empty() {
         return Vec::new();
     }

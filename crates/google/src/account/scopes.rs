@@ -257,6 +257,12 @@ fn record_lifecycle_snapshot(
 /// `Skipped`. A refresh failure with nothing cached therefore propagates
 /// as an error - a stale-but-populated vocabulary is degraded, an empty
 /// one is unusable.
+///
+/// The refresh is single-flight under `ScopeCache::refresh`, with staleness
+/// re-checked after the lock, and that is load-bearing rather than tidy:
+/// hydration runs 32 concurrent `users.messages.get` calls, so without it a
+/// single batch issued 32 `labels.list` refreshes against the same stale
+/// snapshot. Do not replace the lock with a bare staleness test.
 pub(crate) async fn labels_for_flags(
     client: &Arc<GmailClient>,
     cache: &ScopeCache,

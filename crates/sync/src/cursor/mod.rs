@@ -286,6 +286,14 @@ impl CursorRegistry {
     /// Claim exclusive ownership of a scope's change cursor drive.
     /// Polling and push reconciliation use the same lease, so no two
     /// producers can start from and advance one scope concurrently.
+    ///
+    /// Published and working, but NOT the door a drive path may use:
+    /// [`CursorRegistry::with_drive`] is, because it bounds the lease to the
+    /// drive itself. Both call sites here once held a bare claim across a whole
+    /// poll iteration, which made a push invalidation wait out up to `poll_max`
+    /// of idle sleep - push was then strictly no better than polling. Do not
+    /// reintroduce a bare claim in a drive path; this stays only because
+    /// removing a published item is not this crate's call.
     pub async fn claim_drive(&self, scope: &CursorScope) -> ScopeDriveGuard {
         let lease = {
             let mut leases = self.drive_leases.write().expect("poisoned");

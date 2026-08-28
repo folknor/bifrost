@@ -327,6 +327,12 @@ pub enum StoreOperation {
 /// the precondition check (RFC 7162 Section 3.1.3). `STORE` uses message
 /// sequence numbers, while `UID STORE` uses UIDs. This struct preserves that
 /// information so callers can detect partial failures.
+///
+/// Its public visibility was questioned and kept: the raw connection surface
+/// that produces it (`uid_store`) is crate-private, so no external consumer can
+/// reach a call that returns one or needs to name the type. Nothing is leaked
+/// by it being `pub`, and narrowing a published item is not a change to make on
+/// a visibility audit's say-so.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Default, Hash)]
 pub struct StoreResult {

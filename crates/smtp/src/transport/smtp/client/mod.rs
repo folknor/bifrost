@@ -176,6 +176,13 @@ impl PhasedError {
 
 /// Merge RCPT-time rejections with the final statuses for accepted LMTP
 /// recipients without trusting a server-controlled count at the call site.
+///
+/// Both count mismatches return `error::internal` and neither carries a
+/// `debug_assert`, deliberately. The `batch.rs` assert-plus-release-fallback
+/// idiom exists where a LANE has to resolve to something and the fallback is a
+/// guess; this is an internal count invariant with a real error to return, and
+/// the count is server-controlled, so asserting on it would panic the process
+/// over a peer's malformed reply.
 fn merge_lmtp_statuses(
     recipient_statuses: Vec<Option<Response>>,
     delivery_statuses: Vec<Response>,

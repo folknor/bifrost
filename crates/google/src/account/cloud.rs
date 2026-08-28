@@ -17,6 +17,15 @@
 //! and NO `Location`, and without the passthrough the default redirect-follower
 //! converts it to `MalformedRedirect` and every multi-chunk upload fails on the
 //! first incomplete chunk.
+//!
+//! Byte accounting: these are the only Gmail-crate requests that do NOT go
+//! through `GmailClient::send_recorded`, so they are not enrolled in the
+//! per-batch `ByteTally` the sync and mutation streams publish. That
+//! under-reports nothing, because Drive uploads are a PIM call and feed no
+//! `bytes_in` field at all - they are not an engine batch. Recorded here so a
+//! byte-accounting audit does not re-file it as a metering hole; the general
+//! claim that every request-bearing lane is metered is about the batch-emitting
+//! producers, which this is not.
 
 use std::sync::Arc;
 
