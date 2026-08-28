@@ -123,10 +123,11 @@ and `read_timeout` bounds inactivity between response body chunks. The response
 header and body defaults are 10s and 30s respectively. The published
 `AccountSpec::connect_timeout` remains as a compatibility input for the response
 header bound; `response_headers_timeout`, when set, takes precedence.
-`RequestBuilder::timeout` remains the explicit total request deadline; an
-`AccountSpec::request_timeout` supplies its per-account default, and `None`
-means the pipeline invents no total deadline. This keeps a slow response that
-continues making progress distinct from a stalled response.
+`RequestBuilder::timeout` is the per-request override for the total request
+deadline. When it is absent, `AccountSpec::request_timeout` supplies the
+per-account default; when both are `None`, the pipeline invents no total
+deadline. This keeps a slow response that continues making progress distinct
+from a stalled response.
 
 The total deadline is computed once before the redirect walk. Every wire
 attempt receives only the time remaining, and rate-limit admission, token
