@@ -255,12 +255,18 @@ async fn watch_actor(
     let mut disconnected = false;
     let mut retry_after = None;
     loop {
+        // Computed WITHOUT consuming `retry_after`. This runs on every trip
+        // around the loop, including trips that end in a command rather than
+        // in the renewal timer, and a `take()` here let any command arriving
+        // during the five-minute failure backoff erase the damper - for a
+        // watch with no expiration the next computation then fell back to
+        // the six-day default, stretching a transient-failure retry into six
+        // days of dead push. The damper is cleared where the timer actually
+        // fires, and on the paths that install a fresh lifecycle state.
         let delay = match &lifecycle {
-            WatchLifecycle::Watched { expiration, .. } => Some(
-                retry_after
-                    .take()
-                    .unwrap_or_else(|| renewal_delay(*expiration)),
-            ),
+            WatchLifecycle::Watched { expiration, .. } => {
+                Some(retry_after.unwrap_or_else(|| renewal_delay(*expiration)))
+            }
             _ => None,
         };
         tokio::select! {
@@ -311,6 +317,8 @@ async fn watch_actor(
                 retry_after = None;
             }
             () = async { tokio::time::sleep(delay.expect("guarded renewal delay")).await }, if delay.is_some() => {
+                // The wait this damper asked for has now been served.
+                retry_after = None;
                 let WatchLifecycle::Watched { history_id, expiration } = &lifecycle else {
                     continue;
                 };
@@ -451,6 +459,15 @@ async fn actor_unsubscribe(
             error::GmailErrorContext::push_unsubscribe(),
         )
     })?;
+    // `Retired` is absorbing. `close()` (or the shutdown token) has already
+    // stopped the watch and cleared the handle set, so there is nothing left
+    // for this handle to release and no wire call to make - and the
+    // fall-through below would both issue a post-close `users.stop` and
+    // overwrite `Retired` with `Unwatched`, reviving a lifecycle the guard
+    // in `commit_watched` promises can never come back.
+    if matches!(lifecycle, WatchLifecycle::Retired) {
+        return Ok(());
+    }
     let removal = remove_handle(handles, &handle);
     match removal {
         HandleRemoval::Last => {}
@@ -914,6 +931,91 @@ mod tests {
             script.requests().len(),
             4,
             "the replacement watch must itself renew",
+        );
+    }
+
+    /// The failure damper must survive unrelated actor traffic. The delay is
+    /// recomputed on every loop trip, and consuming `retry_after` during that
+    /// computation meant any command landing inside the five-minute backoff
+    /// erased it - for a watch with no expiration the next computation fell
+    /// back to `DEFAULT_RENEW_AFTER`, turning a transient renewal failure
+    /// into six days of dead push. The renewal must still fire on the
+    /// five-minute cadence after a command interrupts the wait.
+    #[tokio::test(start_paused = true)]
+    async fn a_command_during_the_renewal_backoff_does_not_erase_the_damper() {
+        let (client, script) = scripted_client([
+            // Subscribe: a watch with NO expiration, so the fallback delay
+            // is the six-day default - the value the erased damper falls
+            // back to.
+            Canned::Response {
+                status: StatusCode::OK,
+                headers: reqwest::header::HeaderMap::new(),
+                body: Bytes::from_static(br#"{"historyId":"1"}"#),
+            },
+            // First renewal: transient failure, arming the damper.
+            canned(StatusCode::SERVICE_UNAVAILABLE),
+            // The damped retry, five minutes later.
+            Canned::Response {
+                status: StatusCode::OK,
+                headers: reqwest::header::HeaderMap::new(),
+                body: Bytes::from_static(br#"{"historyId":"2"}"#),
+            },
+        ]);
+        let shutdown = CancellationToken::new();
+        let pubsub = Arc::new(PubSubControl::new(
+            Arc::clone(&client),
+            Some(PubSubConfig::new("projects/p/topics/t")),
+            shutdown.clone(),
+        ));
+
+        push_subscribe(Arc::clone(&pubsub), vec![CursorScope::Account])
+            .await
+            .expect("subscribe issues the watch");
+        tokio::time::advance(DEFAULT_RENEW_AFTER + Duration::from_secs(1)).await;
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(script.requests().len(), 2, "the failing renewal ran");
+
+        // Unrelated actor traffic inside the backoff window.
+        let _ = pubsub.has_handles().await;
+
+        tokio::time::advance(RENEW_RETRY_AFTER + Duration::from_secs(1)).await;
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        shutdown.cancel();
+        assert_eq!(
+            script.requests().len(),
+            3,
+            "the damped retry must fire five minutes after the failure, \
+             not six days after a command recomputed the delay",
+        );
+    }
+
+    /// `Retired` is absorbing: an unsubscribe arriving after `close()` has
+    /// nothing left to release, so it succeeds locally with no wire call.
+    /// The fall-through used to issue a post-close `users.stop` AND
+    /// overwrite `Retired` with `Unwatched`.
+    #[tokio::test]
+    async fn unsubscribe_after_close_is_a_local_no_op() {
+        let (client, script) = scripted_client([canned(StatusCode::NO_CONTENT)]);
+        let shutdown = CancellationToken::new();
+        let control = Arc::new(PubSubControl::new(Arc::clone(&client), None, shutdown));
+
+        close_watch(&control).await;
+        assert!(
+            script.requests().is_empty(),
+            "no handle, so close sends nothing"
+        );
+
+        push_unsubscribe(Arc::clone(&control), encoded_handle())
+            .await
+            .expect("unsubscribing a retired watch is idempotent teardown");
+
+        assert!(
+            script.requests().is_empty(),
+            "a retired actor must not issue users.stop for a late unsubscribe",
         );
     }
 

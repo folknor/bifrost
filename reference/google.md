@@ -549,9 +549,23 @@ format under `buffer_unordered` concurrency of 32. Page boundaries are
 for the last batch. The final batch is emitted even when it has no items,
 so an empty mailbox or a terminal page whose listed messages all vanished
 still exposes the boundary and checkpoint. A message-level
-`NotFound(Message)` during hydration is absorbed as the ordinary
-list/get deletion race; every other classified hydration failure terminates
-the inventory stream.
+`NotFound(Message)` during hydration is discharged as the ordinary list/get
+deletion race - the id came from this walk's own listing and the cursor is
+anchored before the walk, so absence is the correct inventory state. Every
+OTHER classified hydration failure becomes an
+`InventoryObligation::Object` (key `gmail:message:<id>`, stable across
+walks so the same unreadable message re-raises the same key; no
+provider-native repair token, since a Gmail message is re-readable from
+its id alone) and the walk CONTINUES. Terminating instead used to discard
+every page already emitted for one unreadable object, then hit the same
+object on the retry, forever. Each emitted batch and the terminal
+completion carry an `InventoryCoverageReport` over
+`CoverageDomain::full(scope)`: complete while no obligation exists,
+degraded and naming every unresolved obligation from the first one onward
+- a checkpoint certifies the results before it, so a page checkpoint
+claiming `Complete` would let the cursor advance past an object nothing
+recorded. A LIST-page failure (as opposed to a per-object hydration
+failure) still terminates the walk.
 
 The checkpoint that final batch and the terminal `Done` carry is
 derived from the pre-walk profile sample, and **the engine does not
@@ -835,14 +849,24 @@ There is no renewer handle for another task to clear or restart. Its renewal arm
 A successful subscribe clears the `Disconnected` latch so `Reconnected` stays
 edge-triggered, but deliberately does not clear the transient-failure
 `retry_after` damper: a backoff reset by a *subscribe* rather than by a completed
-request is how a subscribe-then-die loop escapes its backoff.
+request is how a subscribe-then-die loop escapes its backoff. The damper also
+survives unrelated actor traffic: the per-loop delay computation reads it
+without consuming it, and it is cleared only where the renewal timer actually
+fires or a fresh lifecycle state is installed. Consuming it during the
+computation let any command landing inside the five-minute backoff erase it,
+and for a watch with no expiration the recomputed delay then fell back to the
+six-day default.
 
 `push_subscribe`, renewals, `push_unsubscribe`, and close are actor messages or
 actor-owned transitions, so no lifecycle state is assembled from independently
 locked fields. A renewal cannot recreate a watch after a successful stop, and a
 concurrent subscribe cannot be stopped by the preceding teardown.
-`push_unsubscribe` decodes the handle envelope and removes it from the
-active-handle set. A non-last known handle, or an unknown handle while other
+`push_unsubscribe` decodes the handle envelope, and on a `Retired` lifecycle
+returns `Ok(())` with no wire call - `Retired` is absorbing, `close()` has
+already stopped the watch and cleared the handle set, so a late unsubscribe is
+idempotent teardown rather than a reason to issue a post-close `users.stop` or
+to overwrite `Retired` with `Unwatched`. Otherwise it removes the handle from
+the active-handle set. A non-last known handle, or an unknown handle while other
 known handles remain, is a no-op. When the set is empty, including on a fresh
 process receiving a persisted handle, it calls `users.stop`. A failed stop for
 the last known handle re-inserts that handle and leaves the `Watched` state
@@ -1176,11 +1200,10 @@ these are decisions, not gaps.
   partial batch until one more id arrives. `bifrost-sync` reads `Final` in no
   hydration path, so the boundary is advisory; losing it on one alignment is far
   cheaper than a stall.
-- **Inventory absorbs the list/get deletion race and nothing else.** A precisely
-  classified `NotFound(Message)` from `users.messages.get` is routine on a large
-  mailbox and no longer terminates the whole backfill partition (which used to
-  discard every page already emitted). Every other classified failure still
-  terminates and still discards emitted progress; there is deliberately no
-  per-item failed lane, because `Account::inventory_stream` returns
-  `AccountStream<SyncEvent<InventoryEntry>>` with no `ItemOutcome` wrapper and
-  adding one is a published trait change.
+- **Inventory has no per-item failed lane; unreadable objects travel as
+  coverage debt instead.** `InventoryEvent` carries no `ItemOutcome` wrapper.
+  The list/get deletion race (`NotFound(Message)`) is discharged outright, and
+  every other classified hydration failure is recorded as an
+  `InventoryObligation` on the batch and completion coverage reports (see the
+  inventory section above) and repaid through `repair_inventory` - not
+  surfaced per item, and no longer a reason to terminate the walk.

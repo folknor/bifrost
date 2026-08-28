@@ -29,12 +29,18 @@ tests, that caught it.
 Machinery later work may build on and must not break:
 
 - **`PubSubControl` is one owned actor with a four-state lifecycle**
-  (`Unwatched` / `Pending` / `Watched` / `Retired`), `Retired` absorbing.
+  (`Unwatched` / `Watched` / `Renewing` / `Retired`), `Retired` absorbing.
   `commit_watched` is the SINGLE point where a provider response becomes
   `Watched`, and the handle is encoded before that commit: committing first
   would install a watch nobody renews and no `close()` retires. Subscribe
   deliberately does NOT race the shutdown token against the `users.watch` round
-  trip for the same reason.
+  trip for the same reason. The close pass added two guards the arc missed:
+  an unsubscribe reaching a `Retired` actor is a local `Ok(())` no-op (the
+  fall-through used to issue a post-close `users.stop` and overwrite `Retired`
+  with `Unwatched`), and the renewal-failure `retry_after` damper is read
+  without being consumed by the per-loop delay computation (consuming it let
+  any command during the five-minute backoff erase it; with no watch
+  expiration the recomputed delay was the six-day default).
 - **Mutation bisection routes batch 404s through `mutation_error`.** Gmail
   fails a whole `batchModify` when one id is absent, so an unsplit 404 claimed
   every id was gone. The bisection is ordered, and a terminal error mid-walk
@@ -195,11 +201,10 @@ Accepted residuals:
   confidence as defects. No round has judged the churn worth it. Still recorded in
   `notes/bugs-graph.md`.
 
-Carried into the `bugs-google.md` arc, from this document's out-of-scope section:
-`bifrost-google`'s `calendars_list` is cited in `paging.rs` as having learned the
-paging lesson independently. **Check whether Google's delta/history walks got the
-guard or only its list walks** - the miss in graph was exactly that split, and it
-is the highest-value thing this arc can hand the next one.
+Carried into the `bugs-google.md` arc and ANSWERED there (G16): the same split
+existed - Google's history walk was bounded in round 3 and its inventory and
+address-book walks in round 4 - and `reference/google.md` now carries the
+per-site paging enumeration. Nothing remains open from this pointer.
 
 Testing traps this arc recorded, both caught only because the round after the
 fix pass went back and ablated:
