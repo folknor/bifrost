@@ -40,6 +40,26 @@ fn scripted_sync_account(
     qresync_negotiation_warning: Option<String>,
     folders: FolderRegistry,
 ) -> ImapAccount {
+    scripted_dav_account(
+        conn,
+        pool_cap,
+        qresync_enabled,
+        qresync_negotiation_warning,
+        folders,
+        Default::default(),
+    )
+}
+
+/// `scripted_sync_account` with a composed-DAV ownership index, for pinning
+/// how the mail lanes treat scopes a DAV sub-account owns.
+fn scripted_dav_account(
+    conn: crate::ImapConnection,
+    pool_cap: usize,
+    qresync_enabled: bool,
+    qresync_negotiation_warning: Option<String>,
+    folders: FolderRegistry,
+    dav_scopes: super::DavScopeIndex,
+) -> ImapAccount {
     let config = Arc::new(ImapAccountConfig {
         pool_cap,
         ..ImapAccountConfig::new(
@@ -67,7 +87,7 @@ fn scripted_sync_account(
         bandwidth_cap,
         contacts: None,
         calendars: None,
-        dav_scopes: Default::default(),
+        dav_scopes,
         submission: None,
         dav_degraded: Vec::new(),
     })
@@ -444,6 +464,50 @@ async fn a_folder_scope_with_an_unsendable_name_is_refused_not_misreported() {
             .any(|text| text.contains("invalid mailbox name")),
         "the refusal names the cause",
     );
+    drop(server);
+    account.close().await.unwrap();
+}
+
+/// A composed DAV collection scope is a syntactically valid mailbox name but
+/// names no mailbox. Push admission must refuse it per-item: admitting it
+/// would report the collection as pushed (a misreport bifrost-sync trusts,
+/// while the DAV sub-accounts have no push lane at all) and burn an IDLE
+/// budget slot on a folder no worker can ever SELECT, displacing a real
+/// mailbox later in the same request.
+#[tokio::test]
+async fn a_composed_dav_collection_scope_is_refused_by_push_admission() {
+    use bifrost_types::{Account, CursorScope, FolderId};
+
+    let collection = "https://dav.example.test/books/work/";
+    let (dav_scopes, warnings) = super::DavScopeIndex::build(
+        vec![FolderId(collection.to_owned())],
+        Vec::new(),
+        &std::collections::HashSet::new(),
+    );
+    assert!(warnings.is_empty());
+    let (conn, server) = driver_pair(&preauth_greeting("IMAP4rev1")).await;
+    let account = scripted_dav_account(conn, 1, false, None, FolderRegistry::default(), dav_scopes);
+    let scopes = vec![
+        CursorScope::Folder(FolderId(collection.to_owned())),
+        CursorScope::Folder(FolderId("INBOX".to_owned())),
+    ];
+    let result = account
+        .push_subscribe(&scopes)
+        .await
+        .expect("a refused scope is a failed item, never a whole-request Err");
+    let succeeded: Vec<_> = result
+        .outcomes
+        .succeeded()
+        .iter()
+        .map(|item| item.item.0.clone())
+        .collect();
+    assert_eq!(
+        succeeded,
+        vec!["1"],
+        "the DAV collection must not be reported as pushed, and must not block the mail sibling",
+    );
+    assert_eq!(result.outcomes.failed().len(), 1);
+    assert_eq!(result.outcomes.failed()[0].item.0, "0");
     drop(server);
     account.close().await.unwrap();
 }

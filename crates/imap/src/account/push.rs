@@ -100,6 +100,18 @@ pub(crate) fn push_subscribe(
                     outcomes.push_failed(item, unsupported_push_scope_error());
                     continue;
                 };
+                // A composed DAV collection scope is a syntactically valid
+                // mailbox NAME but names no mailbox. Admitting it would
+                // report the collection as pushed (a misreport bifrost-sync
+                // trusts) and burn a budget slot on a folder no IDLE worker
+                // can ever SELECT. The DAV sub-accounts have no push lane,
+                // so the honest per-item answer is the same refusal a typed
+                // DAV scope has always received; the collection keeps
+                // polling.
+                if account.dav_scopes.owner(folder).is_some() {
+                    outcomes.push_failed(item, unsupported_push_scope_error());
+                    continue;
+                }
                 // Admission must accept exactly what the worker assignment
                 // can watch: `subscribed_idle_folders` parses each stored
                 // scope through `MailboxName::new`, which rejects NUL/CR/LF.

@@ -123,12 +123,9 @@ impl AccountFactory for CalDavAccountFactory {
         let config = self.config.clone();
         Box::pin(async move {
             let account = account::CalDavAccount::open(account_id, config).await?;
-            // Not `complete`: this crate's cursor model covers ONE calendar
-            // collection, so every further calendar discovery found is
-            // enumerated by `calendars_list` and reachable through the event
-            // primitives while producing no inventory or change events. Left
-            // unreported, a three-calendar account looks fully synced and
-            // silently is not.
+            // Empty by construction: discovery mints one folder cursor scope
+            // per calendar collection, so there is no collection the sync
+            // lanes leave behind and nothing for the skip lane to report.
             Ok(OpenedAccount {
                 account: Arc::new(account) as Arc<dyn Account>,
                 skipped_scopes: Vec::new(),
