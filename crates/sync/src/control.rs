@@ -5,12 +5,13 @@
 //! the priority watch sender, the bandwidth meters, and the
 //! per-generation checkpoint signal.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bifrost_types::{
     AccountError, AccountErrorBuilder, AccountErrorKind, AccountId, Cause, Checkpoint, Control,
-    Priority, RequestCause, RequestErrorKind,
+    CursorScope, DurableCheckpointSet, Partition, Priority, RequestCause, RequestErrorKind,
 };
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
@@ -36,10 +37,29 @@ struct CheckpointSnapshot {
     /// Generation at which this checkpoint was recorded.
     generation: u64,
     /// The checkpoint itself, if any has been recorded yet.
-    checkpoint: Option<Checkpoint>,
+    checkpoints: DurableCheckpointSet,
     /// No engine stream operation is active and every broadcast
     /// checkpoint has been consumer-acked.
     quiescent: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum DurableLane {
+    Change(CursorScope),
+    Backfill(CursorScope, Partition),
+    Unkeyed,
+}
+
+impl DurableLane {
+    fn of(checkpoint: &Checkpoint) -> Self {
+        match checkpoint {
+            Checkpoint::Change(cursor) => Self::Change(cursor.scope.clone()),
+            Checkpoint::Backfill(backfill) => {
+                Self::Backfill(backfill.scope.clone(), backfill.partition.clone())
+            }
+            _ => Self::Unkeyed,
+        }
+    }
 }
 
 struct SyncControlInner {
@@ -48,6 +68,8 @@ struct SyncControlInner {
     /// Watch channel carrying the latest persisted checkpoint and the
     /// generation in which quiescence was observed.
     checkpoint_tx: watch::Sender<CheckpointSnapshot>,
+    durable:
+        std::sync::Mutex<HashMap<DurableLane, (Option<crate::cursor::PublicationId>, Checkpoint)>>,
     /// Monotonic generation counter; bumped by `pause` /
     /// `checkpoint_now` BEFORE flipping the boundary so the waiter
     /// reads the new generation before parking.
@@ -94,7 +116,7 @@ impl SyncControl {
     ) -> Self {
         let (checkpoint_tx, _rx) = watch::channel(CheckpointSnapshot {
             generation: 0,
-            checkpoint: None,
+            checkpoints: DurableCheckpointSet::default(),
             quiescent: true,
         });
         Self {
@@ -102,6 +124,7 @@ impl SyncControl {
                 account,
                 boundary,
                 checkpoint_tx,
+                durable: std::sync::Mutex::new(HashMap::new()),
                 generation: AtomicU64::new(0),
                 active: AtomicU64::new(0),
                 publications,
@@ -123,7 +146,7 @@ impl SyncControl {
     /// belongs to a different, still in-flight broadcast.
     pub async fn record_checkpoint(&self, checkpoint: Checkpoint) {
         self.inner.publications.acknowledge_checkpoint(&checkpoint);
-        self.announce_durable(checkpoint);
+        self.announce_durable(None, checkpoint);
     }
 
     /// Engine-side hook called after the checkpoint store accepts a
@@ -139,18 +162,46 @@ impl SyncControl {
         publication: Option<crate::cursor::PublicationId>,
         checkpoint: Checkpoint,
     ) {
-        match publication {
+        match publication.clone() {
             Some(id) => self.inner.publications.acknowledge_publication(id),
             None => self.inner.publications.acknowledge_checkpoint(&checkpoint),
         }
-        self.announce_durable(checkpoint);
+        self.announce_durable(publication, checkpoint);
     }
 
-    fn announce_durable(&self, checkpoint: Checkpoint) {
+    fn announce_durable(
+        &self,
+        publication: Option<crate::cursor::PublicationId>,
+        checkpoint: Checkpoint,
+    ) {
+        let checkpoints = {
+            let mut durable = self
+                .inner
+                .durable
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let lane = DurableLane::of(&checkpoint);
+            let replace =
+                durable
+                    .get(&lane)
+                    .is_none_or(|(current, _)| match (&publication, current) {
+                        (Some(next), Some(previous)) => next >= previous,
+                        _ => true,
+                    });
+            if replace {
+                durable.insert(lane, (publication, checkpoint));
+            }
+            DurableCheckpointSet::new(
+                durable
+                    .values()
+                    .map(|(_, checkpoint)| checkpoint.clone())
+                    .collect(),
+            )
+        };
         let generation = self.inner.generation.load(Ordering::SeqCst);
         let snapshot = CheckpointSnapshot {
             generation,
-            checkpoint: Some(checkpoint),
+            checkpoints,
             quiescent: self.is_quiescent(),
         };
         self.inner.checkpoint_tx.send_replace(snapshot);
@@ -329,10 +380,10 @@ impl SyncControl {
         if !self.is_quiescent() {
             return;
         }
-        let checkpoint = self.inner.checkpoint_tx.borrow().checkpoint.clone();
+        let checkpoints = self.inner.checkpoint_tx.borrow().checkpoints.clone();
         self.inner.checkpoint_tx.send_replace(CheckpointSnapshot {
             generation,
-            checkpoint,
+            checkpoints,
             quiescent: true,
         });
     }
@@ -352,7 +403,7 @@ impl SyncControl {
     async fn wait_for_checkpoint_at_or_after(
         &self,
         generation: u64,
-    ) -> Result<Option<Checkpoint>, AccountError> {
+    ) -> Result<DurableCheckpointSet, AccountError> {
         // Subscribe to a fresh receiver. The current value is the
         // last recorded snapshot; if it already matches the
         // generation we return immediately.
@@ -361,7 +412,7 @@ impl SyncControl {
             {
                 let snap = rx.borrow();
                 if snap.generation >= generation && snap.quiescent {
-                    return Ok(snap.checkpoint.clone());
+                    return Ok(snap.checkpoints.clone());
                 }
             }
             if rx.changed().await.is_err() {
@@ -416,7 +467,11 @@ impl Control for SyncControl {
     fn pause(
         &self,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Option<Checkpoint>, AccountError>> + Send + '_>,
+        Box<
+            dyn std::future::Future<Output = Result<DurableCheckpointSet, AccountError>>
+                + Send
+                + '_,
+        >,
     > {
         Box::pin(async move {
             // Bump the generation BEFORE flipping the boundary so
@@ -434,7 +489,11 @@ impl Control for SyncControl {
     fn checkpoint_now(
         &self,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Option<Checkpoint>, AccountError>> + Send + '_>,
+        Box<
+            dyn std::future::Future<Output = Result<DurableCheckpointSet, AccountError>>
+                + Send
+                + '_,
+        >,
     > {
         Box::pin(async move {
             let gen_id = self.inner.generation.fetch_add(1, Ordering::SeqCst) + 1;
@@ -512,6 +571,10 @@ mod tests {
         })
     }
 
+    fn durable(checkpoint: Checkpoint) -> bifrost_types::DurableCheckpointSet {
+        bifrost_types::DurableCheckpointSet::new(vec![checkpoint])
+    }
+
     #[tokio::test]
     async fn pause_waits_for_active_work_to_reach_a_boundary() {
         let control = control();
@@ -522,7 +585,10 @@ mod tests {
         assert!(!waiter.is_finished());
 
         drop(activity);
-        assert_eq!(waiter.await.expect("waiter task").expect("pause"), None);
+        assert_eq!(
+            waiter.await.expect("waiter task").expect("pause"),
+            bifrost_types::DurableCheckpointSet::default()
+        );
         assert!(
             control.begin_activity().is_none(),
             "paused accounts must refuse every new engine activity registration"
@@ -549,7 +615,7 @@ mod tests {
         control.record_checkpoint(expected.clone()).await;
         assert_eq!(
             waiter.await.expect("waiter task").expect("pause"),
-            Some(expected)
+            durable(expected)
         );
     }
 
@@ -586,7 +652,7 @@ mod tests {
         control.record_checkpoint(checkpoint(b"three")).await;
         assert_eq!(
             control.pause().await.expect("pause"),
-            Some(checkpoint(b"three"))
+            durable(checkpoint(b"three"))
         );
     }
 
@@ -619,6 +685,54 @@ mod tests {
         assert_eq!(pending_len(&control), 4);
     }
 
+    #[tokio::test]
+    async fn out_of_order_distinct_scope_acks_preserve_the_complete_boundary() {
+        let control = control();
+        let account_checkpoint = checkpoint(b"account-newer");
+        let type_checkpoint = Checkpoint::Change(bifrost_types::ChangeCursor {
+            scope: CursorScope::Type(bifrost_types::ObjectType::Email),
+            server_state: OpaqueChangeState {
+                protocol: ProtocolKind::Imap,
+                envelope_version: 1,
+                bytes: b"type-older".to_vec(),
+            },
+            advanced_through: None,
+            envelope_version: 1,
+        });
+        let account_publication = control.expect_checkpoint(account_checkpoint.clone());
+        let type_publication = control.expect_checkpoint(type_checkpoint.clone());
+
+        control
+            .record_publication(Some(account_publication), account_checkpoint.clone())
+            .await;
+        control
+            .record_publication(Some(type_publication), type_checkpoint.clone())
+            .await;
+
+        let boundary = control.pause().await.expect("pause");
+        assert_eq!(boundary.checkpoints().len(), 2);
+        assert!(boundary.checkpoints().contains(&account_checkpoint));
+        assert!(boundary.checkpoints().contains(&type_checkpoint));
+    }
+
+    #[tokio::test]
+    async fn an_older_ack_cannot_move_one_lane_backwards() {
+        let control = control();
+        let older = checkpoint(b"older");
+        let newer = checkpoint(b"newer");
+        let older_publication = control.expect_checkpoint(older.clone());
+        let newer_publication = control.expect_checkpoint(newer.clone());
+
+        control
+            .record_publication(Some(newer_publication), newer.clone())
+            .await;
+        control
+            .record_publication(Some(older_publication), older)
+            .await;
+
+        assert_eq!(control.pause().await.expect("pause"), durable(newer));
+    }
+
     /// A checkpoint-store write failure leaves nothing durable, but the
     /// batch is no longer in flight. Retiring it keeps the boundary
     /// primitive usable; the durable snapshot must NOT advance.
@@ -633,7 +747,7 @@ mod tests {
         assert_eq!(pending_len(&control), 0);
         assert_eq!(
             control.pause().await.expect("pause"),
-            Some(checkpoint(b"durable")),
+            durable(checkpoint(b"durable")),
             "a failed ack must not be reported as the durable checkpoint"
         );
     }
@@ -647,7 +761,10 @@ mod tests {
         let undelivered = control.expect_checkpoint(checkpoint(b"no-subscriber"));
         control.retire_publication(undelivered);
 
-        assert_eq!(control.pause().await.expect("pause"), None);
+        assert_eq!(
+            control.pause().await.expect("pause"),
+            bifrost_types::DurableCheckpointSet::default()
+        );
     }
 
     /// A `checkpoint_now` that does not run to completion must still
@@ -691,7 +808,7 @@ mod tests {
         assert_eq!(pending_len(&control), 0);
         assert_eq!(
             control.pause().await.expect("pause"),
-            None,
+            bifrost_types::DurableCheckpointSet::default(),
             "abandonment must not invent a durable checkpoint"
         );
     }
@@ -713,7 +830,7 @@ mod tests {
 
         assert_eq!(
             waiter.await.expect("waiter task").expect("checkpoint"),
-            None
+            bifrost_types::DurableCheckpointSet::default()
         );
         assert_eq!(control.inner.boundary.snapshot(), BoundaryRequest::Pause);
     }

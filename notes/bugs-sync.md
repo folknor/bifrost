@@ -47,19 +47,6 @@ permanently. Only the *completion sentinel* is withheld (`complete=false`), whic
 does not protect positional resume. This is the JMAP-Email / Gmail cold-start
 lane, i.e. the one where all hydration rides backfill.
 
-### A5. Three recovery paths write durably outside the single writer
-
-**Confidence: high.** `restart_scope`, `disable_scope`, and
-`handle_schema_incompatible` call `ctx.store.delete_change_cursor` /
-`delete_backfill` directly (engine.rs 4580, 4589, 4621, 4630, 4654). The reference
-states "One writer per account owns every durable mutation" and explains at length
-why direct writes race acknowledged ones. An in-flight consumer ack for that scope,
-ordered behind the delete in the writer, re-persists the stale cursor that
-`restart_scope` deleted precisely to force re-establishment - the account then
-resumes from an invalid cursor and re-enters the same recovery loop. Same shape as
-the reattach race that motivated `WriterRequest`. They also bypass the ledger,
-leaving debt hanging off a cursor that no longer exists.
-
 ### A6. `DebtLedger::proved` is write-only
 
 **Confidence: high.** The field is pushed to in `record_proof` and never read. So
@@ -69,16 +56,6 @@ discharge only ever tests one domain at a time at ingest. And (b) it is an
 unbounded `Vec` inside the per-account ledger that `apply_transition` rewrites
 wholesale on *every* acknowledged checkpoint. That is durable, unbounded, and on
 the hot path.
-
-### A7. `record_checkpoint` moves the durable snapshot backwards, and the snapshot is account-global
-
-**Confidence: high.** The snapshot is a single `Option<Checkpoint>` overwritten by
-whichever ack arrives last, with no ordering check and no per-scope keying.
-`pause()` on a multi-scope account returns the checkpoint of an arbitrary scope; an
-out-of-order ack of an older checkpoint publishes it as "the latest durable
-checkpoint". `Control::pause() -> Option<Checkpoint>` is structurally unable to
-describe a boundary for an account with more than one cursor scope - the right
-shape is a per-scope map (or a monotonic boundary token), not one slot.
 
 ## B. Liveness / latency
 
@@ -113,17 +90,6 @@ that. Reordering a spawn silently makes detach await the writer before the strea
 workers, which the comment says always burns the whole `detach_timeout`.
 
 ## C. Contracts a consumer cannot honour
-
-### C1. `PublicationId` is not durable, but an unknown publication is a hard error
-
-**Confidence: high.** `persist_ack_request` returns `Err(CheckpointStore("unknown
-publication"))` for `ClaimLookup::Unknown`. The documented consumer flow is
-"persist (items, checkpoint) atomically, then ack". A consumer that persists a
-checkpoint, crashes, and acks after restart passes a publication id that no longer
-exists - its ack is permanently refused, so the durable cursor never advances.
-Passing `None` "works" but silently means *no coverage claim*, which is the lying
-record failure mode in the other direction. There is no correct choice available to
-the consumer.
 
 ### C2. `drive_changes_stream` always emits `publication: None`
 
@@ -192,13 +158,27 @@ contract.
 
 ## F. Structural - what shape this should have had
 
-1. **The durable-write path should be a type, not a convention.** "One writer per
-   account owns every durable mutation" is enforced by nothing:
-   `Arc<DynCheckpointStore>` is handed to `RecoveryContext`, and three paths use it
-   (A5). The store handle should not be reachable outside `ack_writer` at all - hand
-   recovery paths a `WriterHandle` whose only methods are `WriterRequest` sends, and
-   make `CheckpointStore` private to the writer module. That deletes an entire defect
-   class rather than re-auditing for it.
+1. **The durable-write path is a type now, but not everywhere.** PARTIALLY
+   RESOLVED in round 2. `RecoveryContext` holds a `WriterHandle` and can no
+   longer reach `Arc<DynCheckpointStore>`, which closes A5. The half that did
+   NOT land: the original finding also asked for `CheckpointStore` to be made
+   private to the writer module, and that is refused deliberately - it is a
+   published, consumer-implemented trait, and the standing rule is that a change
+   may reshape published API but never remove it.
+
+   **Confidence: high (residual is real, and unfixed).** `BackfillCheckpointWriter`
+   (`crates/sync/src/backfill/checkpoint.rs`) still holds an
+   `Arc<DynCheckpointStore>` and performs `get_ledger` + `apply_transition`
+   directly, and `run_backfill_orchestrator` in `engine.rs` is still handed the
+   store `Arc` to build it. So the backfill lane remains a second durable writer
+   for the account, outside the ack writer's ordering, with exactly the
+   read-modify-write ledger race the single-writer rule exists to prevent: the
+   orchestrator's `get_ledger` can be interleaved with an ack writer transition,
+   and its `apply_transition` then writes back a ledger missing whatever the ack
+   landed in between. `BackfillCheckpointWriter` is published, so this is a
+   REWIRE (route it through `WriterRequest`), never a deletion. Deferred out of
+   round 2 on scope grounds: it lands with the backfill-runner work in F3/A2,
+   which owns those files.
 
 3. **`BackfillRunner` and `InventoryFusion` are two implementations of one walk**
    and have already diverged on the safety-critical rule (A2): barrier handling,
@@ -221,9 +201,6 @@ contract.
    plainly that `bifrost-net` is the only chokepoint. Per the standing rule the delete
    option is filed as a finding, not a mandate - and the keep-it fix is real work, not
    a rename.
-
-6. **`Control::pause()`'s return type is wrong for the domain** (A7). One checkpoint
-   cannot describe a multi-scope account.
 
 ## Out-of-scope observations
 

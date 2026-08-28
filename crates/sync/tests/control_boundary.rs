@@ -78,14 +78,17 @@ async fn idle_checkpoint_request_returns_the_latest_durable_checkpoint() {
         .checkpoint_now()
         .await
         .expect("idle checkpoint request");
-    assert_eq!(checkpoint, Some(sample_checkpoint(b"stale")));
+    assert_eq!(
+        checkpoint,
+        bifrost_types::DurableCheckpointSet::new(vec![sample_checkpoint(b"stale")])
+    );
 }
 
 #[tokio::test]
 async fn pause_with_no_checkpoint_traffic_returns_none() {
     let h = make_control();
     let result = h.control.pause().await.expect("idle pause");
-    assert_eq!(result, None);
+    assert_eq!(result, bifrost_types::DurableCheckpointSet::default());
     assert_eq!(h.boundary.snapshot(), BoundaryRequest::Pause);
 }
 
@@ -99,9 +102,8 @@ async fn checkpoint_now_returns_a_previously_recorded_checkpoint() {
         .control
         .checkpoint_now()
         .await
-        .expect("checkpoint request")
-        .expect("latest checkpoint");
-    let Checkpoint::Change(cursor) = checkpoint else {
+        .expect("checkpoint request");
+    let Some(Checkpoint::Change(cursor)) = checkpoint.checkpoints().first() else {
         panic!("expected the Change checkpoint back");
     };
     assert_eq!(cursor.server_state.bytes, b"fresh".to_vec());
@@ -209,7 +211,7 @@ async fn sequential_idle_checkpoint_requests_share_the_latest_snapshot() {
     let first = h.control.checkpoint_now().await.expect("first request");
     let second = h.control.checkpoint_now().await.expect("second request");
     assert_eq!(first, second);
-    let Some(Checkpoint::Change(cursor)) = second else {
+    let Some(Checkpoint::Change(cursor)) = second.checkpoints().first() else {
         panic!("expected Change checkpoint");
     };
     assert_eq!(cursor.server_state.bytes, b"one".to_vec());

@@ -1263,7 +1263,10 @@ mod tests {
         let released = tokio::time::timeout(std::time::Duration::from_secs(5), pause)
             .await
             .expect("a lost batch's registration must stop gating the boundary");
-        assert_eq!(released.expect("pause task").expect("pause"), None);
+        assert_eq!(
+            released.expect("pause task").expect("pause"),
+            bifrost_types::DurableCheckpointSet::default()
+        );
         drop(sentinel);
     }
 

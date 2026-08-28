@@ -15,7 +15,6 @@ use tokio_util::sync::CancellationToken;
 use crate::cancel::BoundaryRequest;
 use crate::control::SyncControl;
 use crate::cursor::CursorRegistry;
-use crate::cursor::store::DynCheckpointStore;
 use crate::multiplexer::MultiplexerHandle;
 use crate::scheduler::budget::ConcurrencyBudget;
 
@@ -189,7 +188,6 @@ pub(crate) struct AccountSlot {
     /// acknowledgement that makes it durable. Shared with the account's single
     /// writer, which reads it back to build one atomic checkpoint record.
     pub coverage: Arc<crate::cursor::PendingCoverage>,
-    pub checkpoints: Arc<DynCheckpointStore>,
     pub boundary_tx: watch::Sender<BoundaryRequest>,
     pub shutdown: CancellationToken,
     pub control: SyncControl,

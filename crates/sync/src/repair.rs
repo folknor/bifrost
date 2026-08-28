@@ -355,7 +355,7 @@ fn publish_recovered(
         scope,
         event: Arc::new(SyncEvent::Batch(batch)),
         checkpoint: None,
-        publication: Some(publication),
+        publication: Some(publication.clone()),
     };
     let delivered = tx.send(event).unwrap_or(0);
     if crate::multiplexer::delivered_to_real_subscriber(delivered) {

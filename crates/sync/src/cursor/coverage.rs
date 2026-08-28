@@ -46,11 +46,47 @@ use bifrost_types::{Checkpoint, CursorScope, InventoryCoverageReport};
 
 /// Engine-issued identity for one checkpoint publication.
 ///
-/// Monotonic within an attached account. Not durable: it identifies a
-/// publication within the lifetime of the writer that issued it, and a
-/// duplicate acknowledgement from a previous process cannot reach that writer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct PublicationId(pub u64);
+/// Monotonic identity plus the immutable receipt needed to acknowledge after
+/// the issuing writer has restarted. Consumers persist the whole value beside
+/// the batch, not only its numeric field.
+#[derive(Debug, Clone)]
+pub struct PublicationReceipt {
+    /// The exact checkpoint lane this receipt may acknowledge. `None` is the
+    /// repair lane, which intentionally has no checkpoint.
+    pub checkpoint: Option<Checkpoint>,
+    /// The coverage evidence that must land atomically with the checkpoint.
+    pub claim: CoverageClaim,
+}
+
+/// Engine-issued acknowledgement token.
+///
+/// The first field is retained as the compact identity consumers may log and
+/// key on. The receipt is the durable meaning of that identity and must be
+/// retained with it across writer restarts.
+#[derive(Debug, Clone)]
+pub struct PublicationId(pub u64, pub std::sync::Arc<PublicationReceipt>);
+
+impl PartialEq for PublicationId {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+impl Eq for PublicationId {}
+impl std::hash::Hash for PublicationId {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.hash(state);
+    }
+}
+impl PartialOrd for PublicationId {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for PublicationId {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.cmp(&other.0)
+    }
+}
 
 /// What a publication will make durable once acknowledged.
 #[derive(Debug, Clone)]
@@ -156,6 +192,20 @@ impl Lane {
     fn supersedes(&self) -> bool {
         matches!(self, Self::Change(_) | Self::Backfill(..))
     }
+
+    /// The cursor scope whose durable rows this lane writes, if any. Repair and
+    /// unkeyed lanes write no scope-owned row and are therefore never fenced by
+    /// a scope reset.
+    fn scope(&self) -> Option<&CursorScope> {
+        match self {
+            Self::Change(scope) | Self::Backfill(scope, _) => Some(scope),
+            Self::UnkeyedCheckpoint | Self::Repair => None,
+        }
+    }
+
+    fn belongs_to(&self, scope: &CursorScope) -> bool {
+        self.scope() == Some(scope)
+    }
 }
 
 /// One live publication.
@@ -201,6 +251,16 @@ struct Ledger {
     /// Publications whose checkpoint the control path is still waiting on, in
     /// publication order.
     boundaries: Vec<(PublicationId, Lane, Checkpoint)>,
+    /// Per-scope acknowledgement fence installed by a durable scope reset.
+    ///
+    /// Holds the mint counter as of the moment the reset closed. Every
+    /// publication id at or below it names a batch published against durable
+    /// rows the reset has since deleted, so acknowledging one would re-create
+    /// the very cursor the reset dropped to force re-establishment. Ids minted
+    /// after the reset closed - i.e. by the re-establish that follows - are
+    /// above the fence and unaffected, so no unfencing step exists to be
+    /// forgotten. One entry per scope, so it stays bounded.
+    fenced: HashMap<CursorScope, u64>,
 }
 
 /// Hard ceiling on outstanding boundary registrations. Reachable only through a
@@ -209,11 +269,23 @@ struct Ledger {
 const PENDING_BOUNDARY_CAP: usize = 1024;
 
 /// Per-account publication registry.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct PendingCoverage {
     ledger: Mutex<Ledger>,
     next: AtomicU64,
     next_generation: AtomicU64,
+}
+
+static NEXT_LEDGER_ID: AtomicU64 = AtomicU64::new(0);
+
+impl Default for PendingCoverage {
+    fn default() -> Self {
+        Self {
+            ledger: Mutex::new(Ledger::default()),
+            next: AtomicU64::new(NEXT_LEDGER_ID.fetch_add(1, Ordering::Relaxed) << 32),
+            next_generation: AtomicU64::new(0),
+        }
+    }
 }
 
 /// What the writer should do with an acknowledgement.
@@ -253,8 +325,11 @@ impl PendingCoverage {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn mint(&self) -> PublicationId {
-        PublicationId(self.next.fetch_add(1, Ordering::Relaxed))
+    fn mint(&self, receipt: PublicationReceipt) -> PublicationId {
+        PublicationId(
+            self.next.fetch_add(1, Ordering::Relaxed),
+            std::sync::Arc::new(receipt),
+        )
     }
 
     /// Issue an identity for a REPAIR publication that carries no coverage
@@ -279,9 +354,12 @@ impl PendingCoverage {
     /// what keeps the two halves of a checkpoint publication - the claim and
     /// the boundary registration - from ever existing separately.
     pub fn publish(&self, claim: CoverageClaim) -> PublicationId {
-        let id = self.mint();
+        let id = self.mint(PublicationReceipt {
+            checkpoint: None,
+            claim: claim.clone(),
+        });
         self.guard().claims.insert(
-            id,
+            id.clone(),
             Publication {
                 lane: Lane::Repair,
                 claim,
@@ -300,7 +378,10 @@ impl PendingCoverage {
     /// after which one acknowledgement discharges only one of them.
     pub fn register(&self, checkpoint: Checkpoint, claim: CoverageClaim) -> PublicationId {
         let lane = Lane::of(&checkpoint);
-        let id = self.mint();
+        let id = self.mint(PublicationReceipt {
+            checkpoint: Some(checkpoint.clone()),
+            claim: claim.clone(),
+        });
         let mut claim = claim;
         let mut ledger = self.guard();
 
@@ -321,7 +402,10 @@ impl PendingCoverage {
             // second, empty acknowledgement on the strength of this fold.
             if let Some(old) = ledger.claims.remove(&superseded) {
                 claim.absorb(old.claim);
-                let mark = ledger.folded.entry(lane.clone()).or_insert(superseded);
+                let mark = ledger
+                    .folded
+                    .entry(lane.clone())
+                    .or_insert(superseded.clone());
                 if *mark < superseded {
                     *mark = superseded;
                 }
@@ -344,13 +428,13 @@ impl PendingCoverage {
         }
 
         ledger.claims.insert(
-            id,
+            id.clone(),
             Publication {
                 lane: lane.clone(),
                 claim,
             },
         );
-        ledger.boundaries.push((id, lane, checkpoint));
+        ledger.boundaries.push((id.clone(), lane, checkpoint));
         id
     }
 
@@ -427,6 +511,45 @@ impl PendingCoverage {
         count
     }
 
+    /// Retire every checkpoint publication for one scope, fence late
+    /// acknowledgements of them, and return the debt that must survive the
+    /// invalidation - as ONE operation under the ledger lock.
+    ///
+    /// Atomicity is the point. Snapshotting the debt, awaiting the store
+    /// deletes, and retiring afterwards leaves a window in which a still-running
+    /// scope registers a further publication: the later retirement drops it, but
+    /// its debt was never in the snapshot the writer persisted, so the coverage
+    /// obligation is lost silently. The writer therefore calls this BEFORE its
+    /// first await and persists what it returns.
+    pub(crate) fn invalidate_scope(&self, scope: &CursorScope) -> CoverageClaim {
+        let mut ledger = self.guard();
+        let ids: Vec<_> = ledger
+            .boundaries
+            .iter()
+            .filter(|(_, lane, _)| lane.belongs_to(scope))
+            .map(|(id, _, _)| id.clone())
+            .collect();
+        ledger
+            .boundaries
+            .retain(|(_, lane, _)| !lane.belongs_to(scope));
+        let mut carried = CoverageClaim {
+            reports: Vec::new(),
+            generation: 0,
+        };
+        for id in ids {
+            if let Some(publication) = ledger.claims.remove(&id) {
+                carried.absorb(publication.claim.clone().debt_only());
+            }
+        }
+        Self::fence_in(&mut ledger, scope, self.next.load(Ordering::Relaxed));
+        carried
+    }
+
+    fn fence_in(ledger: &mut Ledger, scope: &CursorScope, watermark: u64) {
+        let entry = ledger.fenced.entry(scope.clone()).or_insert(watermark);
+        *entry = (*entry).max(watermark);
+    }
+
     #[must_use]
     pub fn pending_checkpoints(&self) -> usize {
         self.guard().boundaries.len()
@@ -473,6 +596,24 @@ impl PendingCoverage {
 
     fn claim_in(&self, id: PublicationId, lane: &Lane) -> ClaimLookup {
         let mut ledger = self.guard();
+        // The fence is checked before the live claims, not only after them: a
+        // publication registered DURING a scope reset's store deletes is still
+        // live in `claims`, and applying it would re-create the cursor row the
+        // reset deleted to force re-establishment. The fence is an exclusive
+        // bound - it holds the mint counter, whose current value is the id the
+        // next, post-reset publication will take.
+        if let Some(scope) = lane.scope()
+            && ledger
+                .fenced
+                .get(scope)
+                .is_some_and(|watermark| *watermark > id.0)
+        {
+            // Nothing is dropped here: `invalidate_scope` runs twice around the
+            // deletes and has already retired these publications and carried
+            // their degraded debt into the persisted ledger. This arm only
+            // refuses the acknowledgement.
+            return ClaimLookup::Unknown;
+        }
         match ledger.claims.get(&id) {
             Some(publication) if publication.lane == *lane => {
                 let publication = ledger
@@ -506,6 +647,14 @@ impl PendingCoverage {
                     // nothing, or the successor's acknowledgement would ingest
                     // the same reports a second time.
                     ClaimLookup::Apply(claim)
+                } else if id
+                    .1
+                    .checkpoint
+                    .as_ref()
+                    .is_some_and(|saved| Lane::of(saved) == *lane)
+                    || (*lane == Lane::Repair && id.1.checkpoint.is_none())
+                {
+                    ClaimLookup::Apply(id.1.claim.clone())
                 } else {
                     ClaimLookup::Unknown
                 }
@@ -530,7 +679,7 @@ impl PendingCoverage {
 
     fn settle_in(&self, id: PublicationId, lane: Lane) {
         let mut ledger = self.guard();
-        let watermark = ledger.persisted.entry(lane).or_insert(id);
+        let watermark = ledger.persisted.entry(lane).or_insert(id.clone());
         if *watermark < id {
             *watermark = id;
         }
@@ -659,11 +808,13 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_acknowledgement_is_never_treated_as_complete() {
-        let pending = PendingCoverage::new();
+    fn a_restart_crossing_acknowledgement_carries_its_claim() {
+        let first_writer = PendingCoverage::new();
+        let id = first_writer.publish(CoverageClaim::new(degraded("restart"), 1));
+        let restarted_writer = PendingCoverage::new();
         assert!(matches!(
-            pending.claim(super::PublicationId(42)),
-            ClaimLookup::Unknown
+            restarted_writer.claim_repair(id),
+            ClaimLookup::Apply(_)
         ));
     }
 
@@ -696,10 +847,10 @@ mod tests {
         let id = pending.register(cp.clone(), CoverageClaim::new(degraded("a"), 1));
 
         assert!(matches!(
-            pending.claim_checkpoint(id, &cp),
+            pending.claim_checkpoint(id.clone(), &cp),
             ClaimLookup::Apply(_)
         ));
-        pending.settle_checkpoint(id, &cp);
+        pending.settle_checkpoint(id.clone(), &cp);
         assert!(matches!(
             pending.claim_checkpoint(id, &cp),
             ClaimLookup::AlreadyPersisted
@@ -719,15 +870,15 @@ mod tests {
         let first_cp = checkpoint(b"first");
         let first = pending.register(first_cp.clone(), CoverageClaim::new(degraded("a"), 1));
         assert!(matches!(
-            pending.claim_checkpoint(first, &first_cp),
+            pending.claim_checkpoint(first.clone(), &first_cp),
             ClaimLookup::Apply(_)
         ));
-        pending.settle_checkpoint(first, &first_cp);
+        pending.settle_checkpoint(first.clone(), &first_cp);
 
         for round in 0..1024u32 {
             let cp = checkpoint(&round.to_be_bytes());
             let id = pending.register(cp.clone(), CoverageClaim::new(degraded("later"), 2));
-            let _ = pending.claim_checkpoint(id, &cp);
+            let _ = pending.claim_checkpoint(id.clone(), &cp);
             pending.settle_checkpoint(id, &cp);
         }
 
@@ -749,16 +900,31 @@ mod tests {
     /// gets `Unknown` - refused - rather than `AlreadyPersisted`, which would
     /// make the engine announce a durable boundary that does not exist.
     #[test]
-    fn a_failed_write_is_not_reported_as_already_persisted() {
+    fn a_failed_write_can_retry_from_its_receipt() {
         let pending = PendingCoverage::new();
         let cp = checkpoint(b"a");
         let id = pending.register(cp.clone(), CoverageClaim::new(degraded("a"), 1));
 
         assert!(matches!(
-            pending.claim_checkpoint(id, &cp),
+            pending.claim_checkpoint(id.clone(), &cp),
             ClaimLookup::Apply(_)
         ));
         // No `settle_checkpoint`: the store write failed.
+        assert!(matches!(
+            pending.claim_checkpoint(id, &cp),
+            ClaimLookup::Apply(_)
+        ));
+    }
+
+    #[test]
+    fn scope_invalidation_refuses_a_late_pre_reset_acknowledgement() {
+        let pending = PendingCoverage::new();
+        let cp = checkpoint(b"stale");
+        let id = pending.register(cp.clone(), CoverageClaim::new(degraded("owed"), 1));
+
+        let carried = pending.invalidate_scope(&scope());
+
+        assert_eq!(carried.reports.len(), 1);
         assert!(matches!(
             pending.claim_checkpoint(id, &cp),
             ClaimLookup::Unknown
@@ -775,7 +941,10 @@ mod tests {
         let cp = checkpoint(b"a");
         let id = pending.register(cp.clone(), CoverageClaim::new(degraded("a"), 1));
 
-        assert!(matches!(pending.claim_repair(id), ClaimLookup::Unknown));
+        assert!(matches!(
+            pending.claim_repair(id.clone()),
+            ClaimLookup::Unknown
+        ));
         assert!(
             matches!(pending.claim_checkpoint(id, &cp), ClaimLookup::Apply(_)),
             "the checkpoint acknowledgement must still find its claim intact"
@@ -790,7 +959,7 @@ mod tests {
         let repair = pending.publish_without_report(0);
 
         assert!(matches!(
-            pending.claim_checkpoint(repair, &checkpoint(b"a")),
+            pending.claim_checkpoint(repair.clone(), &checkpoint(b"a")),
             ClaimLookup::Unknown
         ));
         assert!(matches!(
@@ -807,11 +976,11 @@ mod tests {
         let pending = PendingCoverage::new();
         let cp = checkpoint(b"a");
         let id = pending.register(cp.clone(), CoverageClaim::new(degraded("a"), 1));
-        let _ = pending.claim_checkpoint(id, &cp);
+        let _ = pending.claim_checkpoint(id.clone(), &cp);
         pending.settle_checkpoint(id, &cp);
 
         assert!(matches!(
-            pending.claim_checkpoint(super::PublicationId(9999), &cp),
+            pending.claim_checkpoint(pending.publish_without_report(0), &cp),
             ClaimLookup::Unknown
         ));
     }
@@ -938,7 +1107,7 @@ mod tests {
         let older = pending.publish(CoverageClaim::new(degraded("a"), 1));
         let newer = pending.publish(CoverageClaim::new(degraded("b"), 2));
 
-        pending.supersede(older, newer);
+        pending.supersede(older.clone(), newer.clone());
 
         assert!(matches!(pending.claim(older), ClaimLookup::Unknown));
         let ClaimLookup::Apply(claim) = pending.claim(newer) else {
@@ -970,9 +1139,9 @@ mod tests {
         let pending = PendingCoverage::new();
         let older = pending.publish(CoverageClaim::new(degraded("a"), 1));
         let newer = pending.publish(CoverageClaim::new(degraded("b"), 2));
-        let _ = pending.claim(newer);
+        let _ = pending.claim(newer.clone());
 
-        pending.supersede(older, newer);
+        pending.supersede(older.clone(), newer);
         assert!(matches!(pending.claim(older), ClaimLookup::Apply(_)));
     }
 
@@ -1043,7 +1212,7 @@ mod tests {
         let pending = PendingCoverage::new();
         let id = pending.publish(CoverageClaim::new(degraded("a"), 1));
         assert_eq!(pending.outstanding(), 1);
-        pending.retire(id);
+        pending.retire(id.clone());
         assert_eq!(pending.outstanding(), 0);
         assert!(matches!(pending.claim(id), ClaimLookup::Unknown));
     }

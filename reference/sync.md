@@ -290,6 +290,46 @@ A compare-and-swap primitive on `CheckpointStore` would remove the class
 outright. It was considered and deliberately not taken - it is a published trait
 change, so it is an owner-level proposal rather than hardening work.
 
+The same boundary covers recovery. `RecoveryContext` holds a `WriterHandle`,
+not `Arc<DynCheckpointStore>`. Scope restart, disable, schema reset, established
+cursor persistence, vanished-scope cleanup, and reattach compensation are all
+writer requests. A reset first retires the scope's live publications, folds
+their degraded debt into the writer-owned ledger, persists that ledger, and
+then deletes the rows.
+
+Retiring the publications and extracting their debt is ONE operation under the
+ledger lock, taken BEFORE the first store await. Snapshotting the debt and
+retiring afterwards leaves an await window in which a still-draining scope
+registers a further publication: the later retirement drops it, its debt was
+never in the snapshot the writer persisted, and the coverage obligation is lost
+silently. The reset therefore runs the same operation a SECOND time once its
+deletes have landed, folding in whatever was published during them.
+
+Each pass also raises a per-scope acknowledgement fence to the current
+publication mint counter. Any publication at or below the fence names a batch
+published against rows the reset has since deleted, so acknowledging it would
+recreate the very cursor the reset dropped to force re-establishment; the claim
+lookup refuses it before it can reach a live claim. The fence is an exclusive
+bound against a monotonic counter, so ids minted after the reset closed - which
+is to say by the re-establish that follows it - are above it and acknowledge
+normally. There is no unfencing step to forget.
+
+`RestartScope` and `DisableScope` preserve backfill state; only schema recovery
+deletes it. The `WriterHandle` names that choice per caller
+(`reset_scope_for_restart`, `reset_scope_for_disable`,
+`reset_scope_for_schema_recovery`) rather than passing a bare boolean, because
+getting it wrong is silent: deleting the completion marker on ordinary cursor
+invalidation turns every recovery into a full historical inventory and
+hydration walk.
+
+`CheckpointStore` remains a published consumer-implemented trait; ownership is
+enforced by which internal engine type can reach its `Arc`, not by hiding the
+trait. That enforcement is not yet complete. `BackfillCheckpointWriter` still
+holds an `Arc<DynCheckpointStore>` and writes partition checkpoints outside the
+account writer, so the backfill lane remains a second durable path. It is a
+published type and its rewiring belongs with the backfill-runner work, not with
+the recovery paths.
+
 A public or engine-initiated reopen queues behind `Pause` and runs after
 resume: pause is a quiescence boundary, not permission to open a
 replacement connection in the background. The activity registration that
@@ -353,13 +393,14 @@ batch.
    own store.
 3. Consumer calls `SyncEngine::ack_checkpoint(account, scope,
    checkpoint)`.
-4. The per-account `ack_writer` task (one per slot, fed by an
+4. The per-account writer task (one per slot, fed by an
    mpsc kept in `engine.ack_senders`) receives an `AckRequest`,
    writes to `CheckpointStore`, then fires
    `SyncControl::record_checkpoint` to wake `pause` /
-   `checkpoint_now` waiters. A returned `Some(checkpoint)` is
-   durable; `None` means the account is safely idle without any
-   durable checkpoint yet.
+   `checkpoint_now` waiters. The returned `DurableCheckpointSet`
+   contains the latest durable checkpoint for every change scope and
+   backfill partition; it is empty when the account is safely idle
+   without any durable checkpoint yet.
 
 On restart the engine reads the last-acked cursor from the store
 and re-runs `changes_stream` from there; items the consumer
@@ -1068,9 +1109,14 @@ until then. See `scheduler/mod.rs` module docs.
 `SyncControl` carries the priority hint, bandwidth-observed
 counter, pause/resume token, and the boundary channel.
 `pause().await` and `checkpoint_now().await` return
-`Result<Option<Checkpoint>, AccountError>`. The value is the latest
-durable checkpoint, or `None` when an idle account has never produced
-one. `SyncControl` tracks active stream operations plus every broadcast
+`Result<DurableCheckpointSet, AccountError>`. The set contains one latest
+durable checkpoint per change scope and per backfill partition, and is empty
+when an idle account has never produced one. Older acknowledgements cannot
+replace a newer snapshot in the same lane. `DurableCheckpointSet::new`
+normalizes to one entry per lane, keeping the last, so a repeated lane is not
+representable; equality is order-insensitive and symmetric, which a one-way
+containment check over a duplicate-bearing vector is not. `SyncControl` tracks active stream
+operations plus every broadcast
 checkpoint awaiting a consumer ack. A boundary waiter resolves only
 when activity reaches zero and that pending set is empty. This gives an
 idle account a completion source without claiming safety while a batch
@@ -1292,12 +1338,17 @@ promised to identify a publication:
 - a later walk can produce the same cursor bytes as an earlier one while proving
   different coverage.
 
-`MultiplexerEvent::publication` therefore carries the identity to the consumer.
+`MultiplexerEvent::publication` therefore carries a restart-safe token to the consumer.
+The token contains the immutable checkpoint lane and coverage receipt as well as
+its compact numeric identity. A consumer persists the whole token beside the
+batch. If the writer restarts before the acknowledgement, the new writer can
+apply the exact original claim; accepting the number with an empty claim would
+advance the cursor while silently discarding degraded coverage.
 `ack_checkpoint` takes it back for checkpoint-bearing events;
 `ack_publication` acknowledges repair events, which intentionally carry no
 checkpoint because they advance no cursor. A repeated acknowledgement of the same
-publication is idempotent; an UNKNOWN one is refused. It is never defaulted to
-complete coverage - that is the original lying-record bug in another costume.
+publication is idempotent. A token whose receipt names the wrong lane is refused
+without consuming any live claim. It is never defaulted to complete coverage.
 
 Idempotency is carried by a per-lane watermark of the highest PERSISTED
 publication, not by a record per acknowledgement. Within a lane publications are
@@ -1309,8 +1360,8 @@ it never forgets: a delayed consumer retry answers correctly however many
 acknowledgements have landed since.
 
 The watermark moves AFTER the store write lands, never before. A retried
-acknowledgement of a write that FAILED therefore reports unknown and is refused
-again, rather than reporting success for a checkpoint no store ever accepted.
+acknowledgement of a write that failed replays from its receipt; it is never
+reported already persisted for a checkpoint no store accepted.
 
 Checkpoint registration, its coverage claim, boundary gating, supersession,
 lag abandonment, retirement, and claim consumption are owned by that one

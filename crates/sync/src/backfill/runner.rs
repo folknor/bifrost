@@ -335,7 +335,7 @@ impl BackfillRunner {
                             scope: scope.clone(),
                             event: Arc::new(SyncEvent::Batch(synthetic)),
                             checkpoint: Some(expected),
-                            publication,
+                            publication: publication.clone(),
                         };
                         // Register before publishing so a fast consumer
                         // ack cannot land before the entry exists and

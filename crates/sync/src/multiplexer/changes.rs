@@ -175,7 +175,7 @@ pub async fn drive_changes_stream(
                 (Some(control), Some(checkpoint)) => {
                     let publication =
                         control.publish_checkpoint_without_report(checkpoint.clone(), 0);
-                    me.publication = Some(publication);
+                    me.publication = Some(publication.clone());
                     Some(publication)
                 }
                 _ => None,
@@ -310,6 +310,24 @@ pub enum WriterRequest {
     ReattachAbort { done: oneshot::Sender<()> },
     /// The reattach cut over: its rows are now ordinary durable state.
     ReattachCommit,
+    /// Read one cursor through the same account-owned boundary used for writes.
+    GetChangeCursor {
+        scope: CursorScope,
+        done: oneshot::Sender<Result<Option<ChangeCursor>, Error>>,
+    },
+    /// Persist an established live cursor without making a coverage claim.
+    PersistEstablished {
+        cursor: ChangeCursor,
+        done: oneshot::Sender<Result<(), Error>>,
+    },
+    /// Invalidate durable state for a scope as one writer-ordered operation.
+    /// Pending publications for the affected lanes are retired before the
+    /// rows are deleted, so a late acknowledgement cannot revive them.
+    ResetScope {
+        scope: CursorScope,
+        delete_backfill: bool,
+        done: oneshot::Sender<Result<(), Error>>,
+    },
     /// Record a walk that stopped at a region the cursor may not cross.
     ///
     /// Has no checkpoint of its own by definition - nothing advanced - so it
@@ -392,6 +410,23 @@ impl std::fmt::Debug for WriterRequest {
                 .finish(),
             Self::ReattachAbort { .. } => f.write_str("ReattachAbort"),
             Self::ReattachCommit => f.write_str("ReattachCommit"),
+            Self::GetChangeCursor { scope, .. } => f
+                .debug_struct("GetChangeCursor")
+                .field("scope", scope)
+                .finish(),
+            Self::PersistEstablished { cursor, .. } => f
+                .debug_struct("PersistEstablished")
+                .field("scope", &cursor.scope)
+                .finish(),
+            Self::ResetScope {
+                scope,
+                delete_backfill,
+                ..
+            } => f
+                .debug_struct("ResetScope")
+                .field("scope", scope)
+                .field("delete_backfill", delete_backfill)
+                .finish(),
             Self::ApplyRepair { resolutions, .. } => f
                 .debug_struct("ApplyRepair")
                 .field("resolutions", &resolutions.len())

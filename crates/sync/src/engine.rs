@@ -691,7 +691,6 @@ impl SyncEngine {
             let inventory_factory = Arc::clone(&factory);
             let inventory_account = Arc::clone(&current);
             let inventory_cursors = Arc::clone(&cursors);
-            let inventory_store = Arc::clone(&self.checkpoints);
             let inventory_changes = changes_tx.clone();
             let inventory_shutdown = shutdown.clone();
             let inventory_aid = account_id.clone();
@@ -712,7 +711,6 @@ impl SyncEngine {
                     inventory_factory,
                     inventory_account,
                     inventory_cursors,
-                    inventory_store,
                     inventory_changes,
                     inventory_shutdown,
                     inventory_aid,
@@ -743,7 +741,6 @@ impl SyncEngine {
         let reopen_shutdown = shutdown.clone();
         let reopen_writer_tx = ack_tx.clone();
         let reopen_coverage = Arc::clone(&pending_coverage);
-        let reopen_store = Arc::clone(&self.checkpoints);
         let reopen_control = control.clone();
         let reopen_account_control_tx = account_control_tx.clone();
         let reopen_throttles = Arc::clone(&throttles);
@@ -761,11 +758,11 @@ impl SyncEngine {
                         let Some(req) = req else { return; };
                         match req {
                             ReopenRequest::Recovery { scope, error } => {
+                                let writer = WriterHandle::new(reopen_writer_tx.clone());
                                 let ctx = RecoveryContext {
                                     factory: &reopen_factory,
                                     current: &reopen_current,
                                     cursors: &reopen_cursors,
-                                    store: &reopen_store,
                                     changes_tx: &reopen_changes,
                                     account_id: &reopen_aid,
                                     control: &reopen_control,
@@ -778,7 +775,7 @@ impl SyncEngine {
                                     reopen_lock: &reopen_serial,
                                     open_skips: &reopen_open_skips,
                                     shutdown: &reopen_shutdown,
-                                    writer_tx: &reopen_writer_tx,
+                                    writer: &writer,
                                     coverage: &reopen_coverage,
                                 };
                                 handle_account_error(&ctx, scope, error).await;
@@ -824,7 +821,6 @@ impl SyncEngine {
             multiplexer,
             cursors: Arc::clone(&cursors),
             coverage: Arc::clone(&pending_coverage),
-            checkpoints: Arc::clone(&self.checkpoints),
             boundary_tx: boundary.sender(),
             shutdown: shutdown.clone(),
             control: control.clone(),
@@ -896,9 +892,12 @@ impl SyncEngine {
             .map(|r| r.value().clone())
             .ok_or_else(|| Error::AccountNotAttached(account_id.clone()))?;
         let (done, wait) = oneshot::channel();
-        tx.send(WriterRequest::AcknowledgePublication { publication, done })
-            .await
-            .map_err(|e| Error::Other(format!("ack channel closed: {e}")))?;
+        tx.send(WriterRequest::AcknowledgePublication {
+            publication: publication.clone(),
+            done,
+        })
+        .await
+        .map_err(|e| Error::Other(format!("ack channel closed: {e}")))?;
         wait.await
             .map_err(|e| Error::Other(format!("ack writer dropped before acknowledging: {e}")))?
     }
@@ -1203,11 +1202,11 @@ impl SyncEngine {
             .get(account_id)
             .map(|r| r.value().clone())
             .ok_or_else(|| Error::AccountNotAttached(account_id.clone()))?;
+        let writer = WriterHandle::new(writer_tx);
         let ctx = RecoveryContext {
             factory: &slot.factory,
             current: &slot.current,
             cursors: &slot.cursors,
-            store: &slot.checkpoints,
             changes_tx: &slot.multiplexer.changes_tx,
             account_id,
             control: &slot.control,
@@ -1220,7 +1219,7 @@ impl SyncEngine {
             reopen_lock: &slot.reopen_lock,
             open_skips: &slot.open_skips,
             shutdown: &slot.shutdown,
-            writer_tx: &writer_tx,
+            writer: &writer,
             coverage: &slot.coverage,
         };
         loop {
@@ -3615,7 +3614,7 @@ async fn emit_backfill_complete(
         scope: scope.clone(),
         event: Arc::new(SyncEvent::Batch(batch)),
         checkpoint: Some(expected),
-        publication: Some(publication),
+        publication: Some(publication.clone()),
     };
     let delivered = tx.send(event).unwrap_or(0);
     if !crate::multiplexer::delivered_to_real_subscriber(delivered) {
@@ -3704,7 +3703,6 @@ async fn run_deferred_inventory_establishment(
     factory: Arc<dyn AccountFactory>,
     account: Arc<ArcSwap<Arc<dyn Account>>>,
     cursors: Arc<CursorRegistry>,
-    store: Arc<DynCheckpointStore>,
     changes_tx: broadcast::Sender<MultiplexerEvent>,
     shutdown: CancellationToken,
     account_id: AccountId,
@@ -3807,11 +3805,11 @@ async fn run_deferred_inventory_establishment(
                 );
             }
             Ok(crate::multiplexer::FusionOutcome::Terminated(error)) => {
+                let writer = WriterHandle::new(writer_tx.clone());
                 let ctx = RecoveryContext {
                     factory: &factory,
                     current: &account,
                     cursors: &cursors,
-                    store: &store,
                     changes_tx: &changes_tx,
                     account_id: &account_id,
                     control: &control,
@@ -3824,7 +3822,7 @@ async fn run_deferred_inventory_establishment(
                     reopen_lock: &reopen_lock,
                     open_skips: &open_skips,
                     shutdown: &shutdown,
-                    writer_tx: &writer_tx,
+                    writer: &writer,
                     coverage: &coverage,
                 };
                 handle_account_error(&ctx, Some(scope.clone()), error).await;
@@ -4037,7 +4035,7 @@ async fn ack_writer(
                 // consumer cannot discharge a checkpoint through this path and
                 // leave the later `ack_checkpoint` short-circuiting as already
                 // persisted over a store write that never happened.
-                let result = match coverage.claim_repair(publication) {
+                let result = match coverage.claim_repair(publication.clone()) {
                     ClaimLookup::Apply(_) => {
                         if let Some(resolutions) = pending_repairs.remove(&publication) {
                             let outcome = apply_repair_resolutions(
@@ -4049,11 +4047,11 @@ async fn ack_writer(
                             )
                             .await;
                             if outcome.is_ok() {
-                                coverage.settle_repair(publication);
+                                coverage.settle_repair(publication.clone());
                             }
                             outcome
                         } else {
-                            acknowledged_publications.insert(publication);
+                            acknowledged_publications.insert(publication.clone());
                             coverage.settle_repair(publication);
                             Ok(())
                         }
@@ -4118,6 +4116,76 @@ async fn ack_writer(
                 provisional.clear();
                 continue;
             }
+            WriterRequest::GetChangeCursor { scope, done } => {
+                let result = store.get_change_cursor(&account_id, &scope).await;
+                let _ = done.send(result);
+                continue;
+            }
+            WriterRequest::PersistEstablished { cursor, done } => {
+                let result = store
+                    .apply_transition(
+                        &account_id,
+                        CheckpointTransition {
+                            checkpoint: Checkpoint::Change(cursor),
+                            ledger: ledger.clone(),
+                        },
+                    )
+                    .await;
+                let _ = done.send(result);
+                continue;
+            }
+            WriterRequest::ResetScope {
+                scope,
+                delete_backfill,
+                done,
+            } => {
+                provisional.remove(&scope);
+                // Retiring the scope's publications and extracting their debt
+                // is ONE ledger operation, and it happens BEFORE the first
+                // await. Snapshotting the debt first and invalidating after the
+                // store writes left an await window in which a still-running
+                // scope could register a further publication: invalidation
+                // would then retire it, but its debt was never in the
+                // persisted snapshot, so the obligation vanished.
+                let mut debt = coverage.invalidate_scope(&scope);
+                let now = jiff::Timestamp::now().as_second();
+                for report in &debt.reports {
+                    ledger.ingest_debt_only(report, debt.generation, now);
+                }
+                let result = async {
+                    persist_ledger_only(&account_id, &store, &ledger).await?;
+                    if delete_backfill {
+                        store.delete_backfill(&account_id, &scope).await?;
+                    }
+                    store.delete_change_cursor(&account_id, &scope).await?;
+                    Ok(())
+                }
+                .await;
+                // Second pass, closing the window the deletes just opened.
+                // Anything the still-draining scope published while they were
+                // in flight is retired here, its debt carried, and the fence
+                // moved past it - so a late acknowledgement cannot re-create
+                // the cursor row this reset deleted. Ids minted after this
+                // point (the re-establish) sit above the fence.
+                debt = coverage.invalidate_scope(&scope);
+                if !debt.reports.is_empty() {
+                    let now = jiff::Timestamp::now().as_second();
+                    for report in &debt.reports {
+                        ledger.ingest_debt_only(report, debt.generation, now);
+                    }
+                    if let Err(error) = persist_ledger_only(&account_id, &store, &ledger).await {
+                        tracing::warn!(
+                            target: "bifrost.sync.changes",
+                            account = ?account_id,
+                            scope = ?scope,
+                            error = %error,
+                            "scope reset could not persist debt published during its deletes"
+                        );
+                    }
+                }
+                let _ = done.send(result);
+                continue;
+            }
         };
         let result = persist_ack_request(&account_id, &store, &coverage, &mut ledger, &req).await;
         match result {
@@ -4128,7 +4196,7 @@ async fn ack_writer(
                 // watermark moves here for the same reason: a retried
                 // acknowledgement may only report "already persisted"
                 // for a write that actually landed.
-                if let Some(publication) = req.publication {
+                if let Some(publication) = req.publication.clone() {
                     coverage.settle_checkpoint(publication, &req.checkpoint);
                 }
                 control
@@ -4169,6 +4237,112 @@ async fn ack_writer(
     }
 }
 
+/// The only handle recovery code receives for durable state. It can request
+/// reads and mutations, but cannot reach the consumer's store implementation.
+#[derive(Clone)]
+pub(crate) struct WriterHandle {
+    tx: mpsc::Sender<WriterRequest>,
+}
+
+impl WriterHandle {
+    fn new(tx: mpsc::Sender<WriterRequest>) -> Self {
+        Self { tx }
+    }
+
+    async fn get_change_cursor(&self, scope: CursorScope) -> Result<Option<ChangeCursor>, Error> {
+        let (done, recv) = oneshot::channel();
+        self.tx
+            .send(WriterRequest::GetChangeCursor { scope, done })
+            .await
+            .map_err(|error| Error::Other(format!("writer channel closed: {error}")))?;
+        recv.await
+            .map_err(|error| Error::Other(format!("writer dropped before reading: {error}")))?
+    }
+
+    async fn persist_established(&self, cursor: ChangeCursor) -> Result<(), Error> {
+        let (done, recv) = oneshot::channel();
+        self.tx
+            .send(WriterRequest::PersistEstablished { cursor, done })
+            .await
+            .map_err(|error| Error::Other(format!("writer channel closed: {error}")))?;
+        recv.await
+            .map_err(|error| Error::Other(format!("writer dropped before persisting: {error}")))?
+    }
+
+    /// Routine cursor invalidation: drop the change cursor so the next
+    /// establish re-runs, and PRESERVE backfill state.
+    ///
+    /// The completion marker is what stops the next attach from re-walking and
+    /// re-hydrating the scope's entire history. Deleting it on every cursor
+    /// invalidation - which is what `RestartScope` is - would make an ordinary
+    /// recovery cost a full historical inventory pass for no schema reason.
+    /// The naming exists so that choice is stated at the call site instead of
+    /// riding on a bare boolean.
+    async fn reset_scope_for_restart(&self, scope: CursorScope) -> Result<(), Error> {
+        self.reset_scope(scope, false).await
+    }
+
+    /// A scope being taken out of service. Same durable footprint as a restart;
+    /// nothing re-establishes afterwards.
+    async fn reset_scope_for_disable(&self, scope: CursorScope) -> Result<(), Error> {
+        self.reset_scope(scope, false).await
+    }
+
+    /// Schema recovery: drop the backfill rows too, completion marker included.
+    /// The re-walk is the point - it re-mints ids under the new encoding, and
+    /// the marker would make the next attach skip it.
+    async fn reset_scope_for_schema_recovery(&self, scope: CursorScope) -> Result<(), Error> {
+        self.reset_scope(scope, true).await
+    }
+
+    async fn reset_scope(&self, scope: CursorScope, delete_backfill: bool) -> Result<(), Error> {
+        let (done, recv) = oneshot::channel();
+        self.tx
+            .send(WriterRequest::ResetScope {
+                scope,
+                delete_backfill,
+                done,
+            })
+            .await
+            .map_err(|error| Error::Other(format!("writer channel closed: {error}")))?;
+        recv.await
+            .map_err(|error| Error::Other(format!("writer dropped before reset: {error}")))?
+    }
+
+    fn sender(&self) -> mpsc::Sender<WriterRequest> {
+        self.tx.clone()
+    }
+
+    async fn reattach_insert(&self, cursor: ChangeCursor) -> Result<(), Error> {
+        let (done, recv) = oneshot::channel();
+        self.tx
+            .send(WriterRequest::ReattachInsert { cursor, done })
+            .await
+            .map_err(|error| Error::Other(format!("writer channel closed: {error}")))?;
+        recv.await
+            .map_err(|error| Error::Other(format!("writer dropped before persisting: {error}")))?
+    }
+
+    async fn reattach_abort(&self) {
+        let (done, recv) = oneshot::channel();
+        if self
+            .tx
+            .send(WriterRequest::ReattachAbort { done })
+            .await
+            .is_ok()
+        {
+            let _ = recv.await;
+        }
+    }
+
+    async fn reattach_commit(&self) -> Result<(), Error> {
+        self.tx
+            .send(WriterRequest::ReattachCommit)
+            .await
+            .map_err(|error| Error::Other(format!("writer channel closed: {error}")))
+    }
+}
+
 /// Write the ledger with no checkpoint advance.
 async fn persist_ledger_only(
     account_id: &AccountId,
@@ -4193,7 +4367,7 @@ fn park_pending_repair(
     resolutions: Vec<crate::repair::RepairResolution>,
 ) {
     if parked.len() >= PARKED_REPAIR_CAP
-        && let Some(oldest) = parked.keys().min().copied()
+        && let Some(oldest) = parked.keys().min().cloned()
     {
         parked.remove(&oldest);
         tracing::warn!(
@@ -4370,6 +4544,7 @@ async fn persist_ack_request(
     }
     match req
         .publication
+        .clone()
         .map(|id| coverage.claim_checkpoint(id, &req.checkpoint))
     {
         Some(ClaimLookup::Apply(claim)) => {
@@ -4431,7 +4606,6 @@ pub(crate) struct RecoveryContext<'a> {
     pub factory: &'a Arc<dyn AccountFactory>,
     pub current: &'a Arc<ArcSwap<Arc<dyn Account>>>,
     pub cursors: &'a Arc<CursorRegistry>,
-    pub store: &'a Arc<DynCheckpointStore>,
     pub changes_tx: &'a broadcast::Sender<MultiplexerEvent>,
     pub account_id: &'a AccountId,
     pub control: &'a SyncControl,
@@ -4455,7 +4629,7 @@ pub(crate) struct RecoveryContext<'a> {
     /// replacement's inventory pass broadcasts checkpoint-bearing batches
     /// before the cutover: a direct write racing the ack writer let an aborted
     /// reattach delete a cursor a consumer had already acknowledged.
-    pub writer_tx: &'a mpsc::Sender<WriterRequest>,
+    pub writer: &'a WriterHandle,
     /// Where inventory walks record what they proved, read back by the writer.
     pub coverage: &'a Arc<PendingCoverage>,
 }
@@ -4712,22 +4886,13 @@ async fn handle_schema_incompatible(ctx: &RecoveryContext<'_>) {
     let scopes: Vec<CursorScope> = ctx.cursors.all_scopes();
     for s in &scopes {
         ctx.cursors.delete(s);
-        if let Err(err) = ctx.store.delete_change_cursor(ctx.account_id, s).await {
+        if let Err(err) = ctx.writer.reset_scope_for_schema_recovery(s.clone()).await {
             tracing::warn!(
                 target: "bifrost.sync.changes",
                 account = ?ctx.account_id,
                 scope = ?s,
                 error = %err,
-                "SchemaIncompatible: delete_change_cursor failed"
-            );
-        }
-        if let Err(err) = ctx.store.delete_backfill(ctx.account_id, s).await {
-            tracing::warn!(
-                target: "bifrost.sync.changes",
-                account = ?ctx.account_id,
-                scope = ?s,
-                error = %err,
-                "SchemaIncompatible: delete_backfill failed"
+                "SchemaIncompatible: durable scope reset failed"
             );
         }
     }
@@ -4753,22 +4918,13 @@ const REOPEN_BACKOFF_CAP: Duration = Duration::from_secs(5 * 60);
 /// (sync-D6, sync-D7)
 async fn restart_scope(ctx: &RecoveryContext<'_>, scope: CursorScope) {
     ctx.cursors.delete(&scope);
-    if let Err(err) = ctx.store.delete_change_cursor(ctx.account_id, &scope).await {
+    if let Err(err) = ctx.writer.reset_scope_for_restart(scope.clone()).await {
         tracing::warn!(
             target: "bifrost.sync.changes",
             account = ?ctx.account_id,
             scope = ?scope,
             error = %err,
-            "RestartScope: delete_change_cursor failed"
-        );
-    }
-    if let Err(err) = ctx.store.delete_backfill(ctx.account_id, &scope).await {
-        tracing::warn!(
-            target: "bifrost.sync.changes",
-            account = ?ctx.account_id,
-            scope = ?scope,
-            error = %err,
-            "RestartScope: delete_backfill failed"
+            "RestartScope: durable scope reset failed"
         );
     }
     re_establish_scope_with_backoff(ctx, scope).await;
@@ -4786,13 +4942,13 @@ async fn restart_scope(ctx: &RecoveryContext<'_>, scope: CursorScope) {
 /// Siblings are untouched.
 async fn disable_scope(ctx: &RecoveryContext<'_>, scope: CursorScope) {
     ctx.cursors.delete(&scope);
-    if let Err(err) = ctx.store.delete_change_cursor(ctx.account_id, &scope).await {
+    if let Err(err) = ctx.writer.reset_scope_for_disable(scope.clone()).await {
         tracing::warn!(
             target: "bifrost.sync.changes",
             account = ?ctx.account_id,
             scope = ?scope,
             error = %err,
-            "DisableScope: delete_change_cursor failed"
+            "DisableScope: durable scope reset failed"
         );
     }
     broadcast_warning(
@@ -4822,11 +4978,10 @@ async fn re_establish_scope_with_backoff(ctx: &RecoveryContext<'_>, scope: Curso
             acc,
             scope.clone(),
             Arc::clone(ctx.cursors),
-            Arc::clone(ctx.store),
+            ctx.writer,
             ctx.changes_tx.clone(),
             Some(ctx.control),
             Arc::clone(ctx.coverage),
-            ctx.writer_tx.clone(),
             true,
         )
         .await
@@ -4982,23 +5137,7 @@ async fn unwind_replacement_subscriptions(
 /// then faithfully destroy it. The provisional set is what makes this a
 /// conditional delete.
 async fn rollback_reattach_inserts(ctx: &RecoveryContext<'_>) {
-    let (done_tx, done_rx) = oneshot::channel();
-    if ctx
-        .writer_tx
-        .send(WriterRequest::ReattachAbort { done: done_tx })
-        .await
-        .is_err()
-    {
-        tracing::error!(
-            target: "bifrost.sync.reopen",
-            account = ?ctx.account_id,
-            "writer channel closed before replacement cursors could be rolled back"
-        );
-        return;
-    }
-    // Wait for the compensation to run: returning early would let the caller
-    // proceed to teardown while the deletes are still queued behind it.
-    let _ = done_rx.await;
+    ctx.writer.reattach_abort().await;
 }
 
 /// Promote this reattach's provisional rows to ordinary durable state.
@@ -5007,12 +5146,7 @@ async fn rollback_reattach_inserts(ctx: &RecoveryContext<'_>) {
 /// Without it the scopes stay marked provisional and the NEXT reattach's abort
 /// would delete cursors belonging to a reattach that succeeded.
 async fn commit_reattach_inserts(ctx: &RecoveryContext<'_>) {
-    if ctx
-        .writer_tx
-        .send(WriterRequest::ReattachCommit)
-        .await
-        .is_err()
-    {
+    if ctx.writer.reattach_commit().await.is_err() {
         tracing::error!(
             target: "bifrost.sync.reopen",
             account = ?ctx.account_id,
@@ -5106,11 +5240,10 @@ async fn reattach_account(
                 next.as_ref(),
                 scope.clone(),
                 Arc::clone(&staged),
-                Arc::clone(ctx.store),
+                ctx.writer,
                 ctx.changes_tx.clone(),
                 None,
                 Arc::clone(ctx.coverage),
-                ctx.writer_tx.clone(),
                 false,
             )
             .await
@@ -5208,17 +5341,7 @@ async fn reattach_account(
         // an abort deletes only rows no acknowledgement has claimed.
         let durable_result = async {
             for cursor in &newly_established {
-                let (done_tx, done_rx) = oneshot::channel();
-                ctx.writer_tx
-                    .send(WriterRequest::ReattachInsert {
-                        cursor: cursor.clone(),
-                        done: done_tx,
-                    })
-                    .await
-                    .map_err(|e| Error::Other(format!("writer channel closed: {e}")))?;
-                done_rx.await.map_err(|e| {
-                    Error::Other(format!("writer dropped before persisting: {e}"))
-                })??;
+                ctx.writer.reattach_insert(cursor.clone()).await?;
             }
             Ok::<(), Error>(())
         }
@@ -5310,9 +5433,7 @@ async fn reattach_account(
         // send, and the lifecycle reader is waiting on that watch to resubscribe
         // to the replacement handle - no await belongs between the topology swap
         // and the bump that publishes it.
-        if false {
-            commit_reattach_inserts(ctx).await;
-        }
+        commit_reattach_inserts(ctx).await;
 
         // Delete vanished-scope rows only now that the cutover is committed.
         // Nothing after this point can abort the swap, so no compensation is
@@ -5322,7 +5443,7 @@ async fn reattach_account(
         // can likewise re-persist such a row after this delete - the same
         // benign leak, never data loss.
         for scope in &vanished {
-            if let Err(error) = ctx.store.delete_change_cursor(ctx.account_id, scope).await {
+            if let Err(error) = ctx.writer.reset_scope_for_disable(scope.clone()).await {
                 tracing::warn!(
                     target: "bifrost.sync.reopen",
                     account = ?ctx.account_id,
@@ -5553,18 +5674,17 @@ async fn run_establish(
     account: &dyn Account,
     scope: CursorScope,
     cursors: Arc<CursorRegistry>,
-    store: Arc<DynCheckpointStore>,
+    writer: &WriterHandle,
     changes_tx: broadcast::Sender<MultiplexerEvent>,
     control: Option<&SyncControl>,
     coverage: Arc<PendingCoverage>,
-    writer_tx: mpsc::Sender<WriterRequest>,
     persist_ready: bool,
 ) -> Result<EstablishOrigin, Error> {
     let _activity = match control {
         Some(control) => Some(control.begin_activity().ok_or(Error::Paused)?),
         None => None,
     };
-    match store.get_change_cursor(account_id, &scope).await {
+    match writer.get_change_cursor(scope.clone()).await {
         Ok(Some(existing)) if existing.validate_envelope().is_ok() => {
             // A stored cursor may be a mid-inventory page position rather
             // than a live changes cursor. Putting one into the registry
@@ -5577,7 +5697,7 @@ async fn run_establish(
                     cursors: Arc::clone(&cursors),
                     control: control.cloned(),
                     coverage: Some(Arc::clone(&coverage)),
-                    writer_tx: Some(writer_tx.clone()),
+                    writer_tx: Some(writer.sender()),
                     generation: coverage.next_generation(),
                 };
                 return match fusion
@@ -5623,16 +5743,7 @@ async fn run_establish(
             if persist_ready {
                 // No coverage report: preserve the ledger rather than
                 // asserting completeness a cursor establishment never proved.
-                let ledger = store.get_ledger(account_id).await?;
-                store
-                    .apply_transition(
-                        account_id,
-                        CheckpointTransition {
-                            checkpoint: Checkpoint::Change(cursor.clone()),
-                            ledger,
-                        },
-                    )
-                    .await?;
+                writer.persist_established(cursor.clone()).await?;
             }
             cursors.put(cursor);
             Ok(EstablishOrigin::CreatedFresh)
@@ -5643,7 +5754,7 @@ async fn run_establish(
                 cursors: Arc::clone(&cursors),
                 control: control.cloned(),
                 coverage: Some(Arc::clone(&coverage)),
-                writer_tx: Some(writer_tx.clone()),
+                writer_tx: Some(writer.sender()),
                 generation: coverage.next_generation(),
             };
             match fusion
@@ -5971,6 +6082,7 @@ mod tests {
         ack_writer, classify_item_outcome, mpsc, oneshot, queue_unresolved_for_retry,
         scope_covers_membership, should_forward_engine_recovery, unresolved_readback_ids,
     };
+    use super::{ChangeCursor, WriterHandle};
     use crate::cursor::store::CheckpointStore;
     use crate::error::Error;
     use bifrost_types::{CursorScope, EngineDirective, FolderId, MembershipScope, ObjectType};
@@ -6008,8 +6120,159 @@ mod tests {
         (account, inner, coverage, tx, writer)
     }
 
+    /// Same writer, but over a caller-supplied store so a test can observe or
+    /// stall an individual durable call.
+    fn writer_harness_over(
+        store: Arc<DynCheckpointStore>,
+    ) -> (
+        bifrost_types::AccountId,
+        Arc<crate::cursor::PendingCoverage>,
+        mpsc::Sender<WriterRequest>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let account = bifrost_types::AccountId("acct".into());
+        let coverage = Arc::new(crate::cursor::PendingCoverage::new());
+        let (tx, rx) = mpsc::channel::<WriterRequest>(16);
+        let (boundary, _view) = crate::cancel::Boundary::new();
+        let (priority, _p) = tokio::sync::watch::channel(bifrost_types::Priority::Normal);
+        let (bandwidth, _b) = tokio::sync::watch::channel(None);
+        let control =
+            crate::control::SyncControl::new(account.clone(), boundary, priority, bandwidth);
+        let writer = tokio::spawn(ack_writer(
+            account.clone(),
+            store,
+            control,
+            Arc::clone(&coverage),
+            rx,
+        ));
+        std::mem::forget((_view, _p, _b));
+        (account, coverage, tx, writer)
+    }
+
+    /// Wraps a store and parks inside `delete_change_cursor` until released, so
+    /// a test can act inside the writer's await window rather than around it.
+    struct GatedDeleteStore {
+        inner: Arc<crate::cursor::InMemoryCheckpointStore>,
+        entered: tokio::sync::Semaphore,
+        release: tokio::sync::Semaphore,
+    }
+
+    impl GatedDeleteStore {
+        fn new(inner: Arc<crate::cursor::InMemoryCheckpointStore>) -> Self {
+            Self {
+                inner,
+                entered: tokio::sync::Semaphore::new(0),
+                release: tokio::sync::Semaphore::new(0),
+            }
+        }
+    }
+
+    impl CheckpointStore for GatedDeleteStore {
+        fn apply_transition<'a>(
+            &'a self,
+            account: &'a bifrost_types::AccountId,
+            transition: crate::cursor::store::CheckpointTransition,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send + 'a>>
+        {
+            self.inner.apply_transition(account, transition)
+        }
+
+        fn get_change_cursor<'a>(
+            &'a self,
+            account: &'a bifrost_types::AccountId,
+            scope: &'a CursorScope,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Option<ChangeCursor>, Error>> + Send + 'a>,
+        > {
+            self.inner.get_change_cursor(account, scope)
+        }
+
+        fn get_backfill<'a>(
+            &'a self,
+            account: &'a bifrost_types::AccountId,
+            scope: &'a CursorScope,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<Option<bifrost_types::BackfillCheckpoint>, Error>,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            self.inner.get_backfill(account, scope)
+        }
+
+        fn put_ledger<'a>(
+            &'a self,
+            account: &'a bifrost_types::AccountId,
+            ledger: crate::cursor::DebtLedger,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send + 'a>>
+        {
+            self.inner.put_ledger(account, ledger)
+        }
+
+        fn get_ledger<'a>(
+            &'a self,
+            account: &'a bifrost_types::AccountId,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<crate::cursor::DebtLedger, Error>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            self.inner.get_ledger(account)
+        }
+
+        fn delete_change_cursor<'a>(
+            &'a self,
+            account: &'a bifrost_types::AccountId,
+            scope: &'a CursorScope,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send + 'a>>
+        {
+            Box::pin(async move {
+                self.entered.add_permits(1);
+                let permit = self.release.acquire().await.expect("gate open");
+                permit.forget();
+                self.inner.delete_change_cursor(account, scope).await
+            })
+        }
+
+        fn delete_backfill<'a>(
+            &'a self,
+            account: &'a bifrost_types::AccountId,
+            scope: &'a CursorScope,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send + 'a>>
+        {
+            self.inner.delete_backfill(account, scope)
+        }
+    }
+
     fn email_scope() -> CursorScope {
         CursorScope::Type(ObjectType::Email)
+    }
+
+    fn change_cursor(bytes: &[u8]) -> ChangeCursor {
+        ChangeCursor {
+            scope: email_scope(),
+            server_state: bifrost_types::OpaqueChangeState {
+                protocol: bifrost_types::ProtocolKind::Imap,
+                envelope_version: crate::cursor::ENGINE_VERSION,
+                bytes: bytes.to_vec(),
+            },
+            advanced_through: None,
+            envelope_version: crate::cursor::ENGINE_VERSION,
+        }
+    }
+
+    fn degraded_claim(key: &str) -> crate::cursor::CoverageClaim {
+        crate::cursor::CoverageClaim::new(
+            bifrost_types::InventoryCoverageReport::degraded(
+                bifrost_types::CoverageDomain::full(email_scope()),
+                vec![unrepresentable(key)],
+            ),
+            1,
+        )
     }
 
     fn unrepresentable(key: &str) -> bifrost_types::InventoryObligation {
@@ -6123,6 +6386,152 @@ mod tests {
         assert!(
             !ledger.completion_permitted(&email_scope()),
             "a scope with open debt must not be eligible for a completion sentinel"
+        );
+
+        drop(tx);
+        writer.await.expect("writer exits");
+    }
+
+    /// Routine cursor invalidation must NOT drop backfill state.
+    ///
+    /// `delete_backfill` drops the completion marker, and that marker is the
+    /// only thing that stops the next attach from re-walking and re-hydrating
+    /// the scope's whole history. `RestartScope` fires on every ordinary cursor
+    /// invalidation, so deleting it there turns each one into a full historical
+    /// inventory pass for no schema reason.
+    #[tokio::test]
+    async fn a_restart_reset_preserves_completed_backfill() {
+        let inner = Arc::new(crate::cursor::InMemoryCheckpointStore::new());
+        let store: Arc<DynCheckpointStore> = Arc::clone(&inner) as Arc<DynCheckpointStore>;
+        let (account, _coverage, tx, writer) = writer_harness_over(store);
+
+        let bifrost_types::Checkpoint::Backfill(marker) =
+            backfill_checkpoint_at(bifrost_types::Partition(b"done".to_vec()), 99)
+        else {
+            panic!("backfill checkpoint");
+        };
+        inner
+            .put_backfill(&account, marker)
+            .await
+            .expect("backfill row seeded");
+        inner
+            .put_change_cursor(&account, change_cursor(b"live"))
+            .await
+            .expect("cursor seeded");
+
+        WriterHandle::new(tx.clone())
+            .reset_scope_for_restart(email_scope())
+            .await
+            .expect("restart reset");
+
+        assert!(
+            inner
+                .get_change_cursor(&account, &email_scope())
+                .await
+                .expect("cursor read")
+                .is_none(),
+            "a restart must drop the change cursor so the next establish re-runs"
+        );
+        assert!(
+            inner
+                .get_backfill(&account, &email_scope())
+                .await
+                .expect("backfill read")
+                .is_some(),
+            "a restart must PRESERVE backfill completion; only schema recovery deletes it"
+        );
+
+        drop(tx);
+        writer.await.expect("writer exits");
+    }
+
+    /// The other half of the same contract: schema recovery really does delete
+    /// backfill, because the re-walk is what re-mints ids under the new
+    /// encoding and the completion marker would make the next attach skip it.
+    #[tokio::test]
+    async fn a_schema_recovery_reset_deletes_backfill() {
+        let inner = Arc::new(crate::cursor::InMemoryCheckpointStore::new());
+        let store: Arc<DynCheckpointStore> = Arc::clone(&inner) as Arc<DynCheckpointStore>;
+        let (account, _coverage, tx, writer) = writer_harness_over(store);
+
+        let bifrost_types::Checkpoint::Backfill(marker) =
+            backfill_checkpoint_at(bifrost_types::Partition(b"done".to_vec()), 99)
+        else {
+            panic!("backfill checkpoint");
+        };
+        inner
+            .put_backfill(&account, marker)
+            .await
+            .expect("backfill row seeded");
+
+        WriterHandle::new(tx.clone())
+            .reset_scope_for_schema_recovery(email_scope())
+            .await
+            .expect("schema reset");
+
+        assert!(
+            inner
+                .get_backfill(&account, &email_scope())
+                .await
+                .expect("backfill read")
+                .is_none(),
+            "schema recovery must drop the completion marker so the re-walk happens"
+        );
+
+        drop(tx);
+        writer.await.expect("writer exits");
+    }
+
+    /// A scope that is still running while its reset is in flight registers a
+    /// further degraded publication. That publication's coverage debt must
+    /// survive the reset.
+    ///
+    /// The publication is registered INSIDE the writer's `delete_change_cursor`
+    /// await, which is the whole point: a reset that snapshots debt first and
+    /// retires publications after its store calls sees an empty snapshot for
+    /// this one, retires it anyway, and drops its obligations on the floor.
+    #[tokio::test]
+    async fn debt_published_during_a_scope_reset_survives_it() {
+        let inner = Arc::new(crate::cursor::InMemoryCheckpointStore::new());
+        let gate = Arc::new(GatedDeleteStore::new(Arc::clone(&inner)));
+        let store: Arc<DynCheckpointStore> = Arc::clone(&gate) as Arc<DynCheckpointStore>;
+        let (account, coverage, tx, writer) = writer_harness_over(store);
+
+        // Registered before the reset: the easy half.
+        let before = bifrost_types::Checkpoint::Change(change_cursor(b"before"));
+        let _early = coverage.register(before, degraded_claim("before-reset"));
+
+        let handle = WriterHandle::new(tx.clone());
+        let reset =
+            tokio::spawn(async move { handle.reset_scope_for_restart(email_scope()).await });
+
+        // Wait until the writer is genuinely parked mid-reset.
+        gate.entered
+            .acquire()
+            .await
+            .expect("writer reached the delete")
+            .forget();
+        let during = bifrost_types::Checkpoint::Change(change_cursor(b"during"));
+        let late = coverage.register(during.clone(), degraded_claim("during-reset"));
+        gate.release.add_permits(1);
+
+        reset.await.expect("reset task").expect("reset");
+
+        let ledger = inner.get_ledger(&account).await.expect("ledger read");
+        assert_eq!(
+            ledger.open_debt().count(),
+            2,
+            "debt registered during the reset's awaits must reach the durable ledger"
+        );
+
+        // And the same publication must not be able to re-create the cursor
+        // row the reset just deleted.
+        assert!(
+            matches!(
+                coverage.claim_checkpoint(late, &during),
+                crate::cursor::ClaimLookup::Unknown
+            ),
+            "a publication issued against rows the reset deleted must be fenced"
         );
 
         drop(tx);
@@ -6302,7 +6711,7 @@ mod tests {
         let result = ack(
             &tx,
             backfill_checkpoint(bifrost_types::Partition(b"page-0".to_vec())),
-            Some(crate::cursor::PublicationId(9999)),
+            Some(crate::cursor::PendingCoverage::new().publish_without_report(0)),
         )
         .await;
         assert!(
@@ -6397,7 +6806,7 @@ mod tests {
                 attempt: bifrost_types::RepairAttemptId(2),
                 generation: 1,
             }],
-            Some(publication),
+            Some(publication.clone()),
         )
         .await;
 
@@ -6412,9 +6821,12 @@ mod tests {
             "publishing alone must not discharge the recovery"
         );
         let (done, wait) = oneshot::channel();
-        tx.send(WriterRequest::AcknowledgePublication { publication, done })
-            .await
-            .expect("writer alive");
+        tx.send(WriterRequest::AcknowledgePublication {
+            publication: publication.clone(),
+            done,
+        })
+        .await
+        .expect("writer alive");
         wait.await
             .expect("writer answered")
             .expect("publication acknowledged");
@@ -6461,9 +6873,12 @@ mod tests {
         );
 
         let (done, wait) = oneshot::channel();
-        tx.send(WriterRequest::AcknowledgePublication { publication, done })
-            .await
-            .expect("writer alive");
+        tx.send(WriterRequest::AcknowledgePublication {
+            publication: publication.clone(),
+            done,
+        })
+        .await
+        .expect("writer alive");
         assert!(
             wait.await.expect("writer answered").is_err(),
             "a repair acknowledgement must not resolve a checkpoint publication"

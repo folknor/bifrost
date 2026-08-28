@@ -27,6 +27,94 @@ pub enum Checkpoint {
     Backfill(BackfillCheckpoint),
 }
 
+/// Complete durable checkpoint boundary for one account.
+///
+/// One account may have several cursor scopes and several concurrently driven
+/// backfill partitions. A single [`Checkpoint`] cannot describe that state, so
+/// control boundaries return this collection instead. There is at most one
+/// entry for each change scope and each `(scope, partition)` backfill lane -
+/// [`DurableCheckpointSet::new`] enforces that, so a duplicate lane is not
+/// representable and equality cannot depend on which side of the comparison a
+/// repeated entry landed on.
+#[derive(Debug, Clone, Default)]
+pub struct DurableCheckpointSet {
+    checkpoints: Vec<Checkpoint>,
+}
+
+/// Identity of the durable slot a checkpoint occupies. Two checkpoints with the
+/// same lane describe the same durable row, so only the later one is retained.
+///
+/// `Checkpoint` is `#[non_exhaustive]` to its consumers, but this match is
+/// deliberately exhaustive in the defining crate: adding a variant must be a
+/// compile error here, so a new checkpoint kind cannot silently acquire another
+/// variant's lane and evict its durable entry.
+#[derive(PartialEq)]
+enum CheckpointLane<'a> {
+    Change(&'a CursorScope),
+    Backfill(&'a CursorScope, &'a Partition),
+}
+
+impl<'a> CheckpointLane<'a> {
+    fn of(checkpoint: &'a Checkpoint) -> Self {
+        match checkpoint {
+            Checkpoint::Change(cursor) => Self::Change(&cursor.scope),
+            Checkpoint::Backfill(backfill) => Self::Backfill(&backfill.scope, &backfill.partition),
+        }
+    }
+}
+
+impl PartialEq for DurableCheckpointSet {
+    /// Order-insensitive, and symmetric because it compares multiplicities in
+    /// both directions rather than one-way containment.
+    fn eq(&self, other: &Self) -> bool {
+        fn count(haystack: &[Checkpoint], needle: &Checkpoint) -> usize {
+            haystack.iter().filter(|entry| *entry == needle).count()
+        }
+        self.checkpoints.len() == other.checkpoints.len()
+            && self
+                .checkpoints
+                .iter()
+                .all(|entry| count(&self.checkpoints, entry) == count(&other.checkpoints, entry))
+    }
+}
+
+impl Eq for DurableCheckpointSet {}
+
+impl DurableCheckpointSet {
+    /// Normalizes to at most one entry per durable lane, keeping the last
+    /// occurrence of each - callers build the vector in publication order, so
+    /// the last one is the most recently made durable.
+    #[must_use]
+    pub fn new(checkpoints: Vec<Checkpoint>) -> Self {
+        let mut normalized: Vec<Checkpoint> = Vec::with_capacity(checkpoints.len());
+        for checkpoint in checkpoints {
+            let existing = {
+                let lane = CheckpointLane::of(&checkpoint);
+                normalized
+                    .iter()
+                    .position(|candidate| CheckpointLane::of(candidate) == lane)
+            };
+            match existing {
+                Some(slot) => normalized[slot] = checkpoint,
+                None => normalized.push(checkpoint),
+            }
+        }
+        Self {
+            checkpoints: normalized,
+        }
+    }
+
+    #[must_use]
+    pub fn checkpoints(&self) -> &[Checkpoint] {
+        &self.checkpoints
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.checkpoints.is_empty()
+    }
+}
+
 /// Backfill checkpoint. Partition-aware, finite. The engine's
 /// backfill scheduler partitions newest-first so foreground mail is
 /// hydrated before deep history.
@@ -558,8 +646,8 @@ pub trait InvalidationSink: Send + Sync + 'static {
 ///
 /// `pause` and `checkpoint_now` are async because they must wait for
 /// "stream is at a safe boundary, here is the latest checkpoint if
-/// one exists, you can now drop." An idle account that has never
-/// produced a checkpoint returns `None`. `resume`, `priority`,
+/// one exists, you can now drop." The returned set is empty when an idle
+/// account has never produced a checkpoint. `resume`, `priority`,
 /// `bandwidth_cap`, and
 /// `bandwidth_observed` stay synchronous (fire-and-forget signals or
 /// pure reads).
@@ -567,12 +655,20 @@ pub trait Control: Send + Sync {
     fn pause(
         &self,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Option<Checkpoint>, AccountError>> + Send + '_>,
+        Box<
+            dyn std::future::Future<Output = Result<DurableCheckpointSet, AccountError>>
+                + Send
+                + '_,
+        >,
     >;
     fn checkpoint_now(
         &self,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Option<Checkpoint>, AccountError>> + Send + '_>,
+        Box<
+            dyn std::future::Future<Output = Result<DurableCheckpointSet, AccountError>>
+                + Send
+                + '_,
+        >,
     >;
     fn resume(&self);
     fn priority(&self, p: Priority);
@@ -639,6 +735,66 @@ mod tests {
         ProtocolKind, ServerVersion,
     };
     use std::time::Duration;
+
+    fn cursor(scope: CursorScope, bytes: &[u8]) -> Checkpoint {
+        Checkpoint::Change(ChangeCursor {
+            scope,
+            server_state: OpaqueChangeState {
+                protocol: ProtocolKind::Imap,
+                envelope_version: 1,
+                bytes: bytes.to_vec(),
+            },
+            advanced_through: None,
+            envelope_version: 1,
+        })
+    }
+
+    /// A set built from a repeated lane must not compare equal to one built
+    /// from two distinct lanes, in EITHER order.
+    ///
+    /// The first implementation compared equal lengths and then checked one-way
+    /// containment, which made `[a, a] == [a, b]` while `[a, b] != [a, a]` - an
+    /// asymmetric `PartialEq`, which is undefined behaviour as far as every
+    /// generic container that relies on the contract is concerned.
+    #[test]
+    fn a_repeated_lane_is_never_equal_to_two_distinct_lanes() {
+        let a = cursor(CursorScope::Account, b"a");
+        let b = cursor(CursorScope::Type(crate::ObjectType::Email), b"b");
+
+        let repeated = super::DurableCheckpointSet::new(vec![a.clone(), a.clone()]);
+        let distinct = super::DurableCheckpointSet::new(vec![a.clone(), b]);
+
+        assert_ne!(repeated, distinct);
+        assert_ne!(distinct, repeated);
+        assert_eq!(
+            repeated,
+            super::DurableCheckpointSet::new(vec![a]),
+            "a repeated lane normalizes to a single entry"
+        );
+    }
+
+    /// Order is not part of the value: the same lanes in either order are the
+    /// same durable boundary.
+    #[test]
+    fn lane_order_does_not_change_the_boundary() {
+        let a = cursor(CursorScope::Account, b"a");
+        let b = cursor(CursorScope::Type(crate::ObjectType::Email), b"b");
+        assert_eq!(
+            super::DurableCheckpointSet::new(vec![a.clone(), b.clone()]),
+            super::DurableCheckpointSet::new(vec![b, a])
+        );
+    }
+
+    /// The later entry for a lane wins: callers build the vector in publication
+    /// order, so keeping the earlier one would report a superseded checkpoint as
+    /// the durable boundary.
+    #[test]
+    fn the_last_entry_for_a_lane_is_the_one_retained() {
+        let older = cursor(CursorScope::Account, b"older");
+        let newer = cursor(CursorScope::Account, b"newer");
+        let set = super::DurableCheckpointSet::new(vec![older, newer.clone()]);
+        assert_eq!(set.checkpoints(), &[newer]);
+    }
 
     #[test]
     fn partial_batch_rejects_checkpoint() {

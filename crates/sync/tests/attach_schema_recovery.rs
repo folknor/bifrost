@@ -2695,3 +2695,90 @@ async fn a_partial_batch_carrying_a_checkpoint_terminates_the_scope() {
         published.event
     );
 }
+
+/// A reattach that COMMITS must clear the provisional set, or the NEXT
+/// reattach's abort deletes cursors belonging to a reattach that succeeded.
+///
+/// The rollback path is a conditional delete driven by the provisional set:
+/// only rows the current reattach inserted may be destroyed. If the commit that
+/// promotes those rows to ordinary durable state never runs, the set carries
+/// them forward, and the following abort - a routine outcome, since teardown of
+/// the outgoing handle is allowed to fail - takes the earlier reattach's work
+/// with it. The account then resumes with a scope whose durable cursor silently
+/// vanished, and re-establishes it by re-walking inventory.
+#[tokio::test]
+async fn a_committed_reattach_is_not_rolled_back_by_the_next_aborted_one() {
+    let account_id = AccountId("reattach-commit-clears-provisional".to_owned());
+    let live = CursorScope::Account;
+    let second = CursorScope::Type(bifrost_types::ObjectType::Email);
+    let third = CursorScope::Type(bifrost_types::ObjectType::Contact);
+    let unsubscribe_failures = Arc::new(AtomicUsize::new(0));
+    let factory = Arc::new(RotatingFactory {
+        scopes: Mutex::new(VecDeque::from([
+            vec![live.clone()],
+            vec![live.clone(), second.clone()],
+            vec![live.clone(), third.clone()],
+        ])),
+        established: Arc::new(Mutex::new(Vec::new())),
+        closed: Arc::new(AtomicUsize::new(0)),
+        closed_generations: Arc::new(Mutex::new(Vec::new())),
+        subscribed: Arc::new(Mutex::new(Vec::new())),
+        unsubscribed: Arc::new(Mutex::new(Vec::new())),
+        unsubscribe_failures: Arc::clone(&unsubscribe_failures),
+        lifecycle_calls: Arc::new(Mutex::new(Vec::new())),
+        opens: AtomicUsize::new(0),
+    });
+    let store = Arc::new(InMemoryCheckpointStore::new());
+    let engine = SyncEngine::builder()
+        .checkpoints(Arc::clone(&store) as Arc<dyn CheckpointStore>)
+        .build()
+        .expect("default engine config is valid");
+    let factory_trait: Arc<dyn AccountFactory> = Arc::clone(&factory) as Arc<dyn AccountFactory>;
+
+    engine
+        .attach(account_id.clone(), factory_trait)
+        .await
+        .expect("initial attach");
+    engine
+        .subscribe_push(&account_id, std::slice::from_ref(&live))
+        .await
+        .expect("initial push subscription");
+
+    // First reopen succeeds: `second` becomes ordinary durable state.
+    engine.reopen(&account_id).await.expect("first reattach");
+    assert!(
+        store
+            .get_change_cursor(&account_id, &second)
+            .await
+            .expect("second scope lookup")
+            .is_some(),
+        "a successful reattach must leave the scope it discovered durable"
+    );
+
+    // Second reopen aborts on old-handle teardown. Its rollback may destroy
+    // only what IT inserted.
+    unsubscribe_failures.store(1, Ordering::SeqCst);
+    assert!(
+        matches!(engine.reopen(&account_id).await, Err(Error::Account(_))),
+        "the old-handle teardown failure must abort the second swap"
+    );
+
+    assert!(
+        store
+            .get_change_cursor(&account_id, &second)
+            .await
+            .expect("second scope lookup")
+            .is_some(),
+        "an aborted reattach must not delete a cursor a COMMITTED reattach created"
+    );
+    assert!(
+        store
+            .get_change_cursor(&account_id, &third)
+            .await
+            .expect("third scope lookup")
+            .is_none(),
+        "the aborted reattach must still destroy the rows it created itself"
+    );
+
+    engine.detach(&account_id).await.expect("detach");
+}

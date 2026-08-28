@@ -164,7 +164,7 @@ impl InventoryFusion {
                             scope: scope.clone(),
                             event: Arc::new(SyncEvent::Done(Some(cp.clone()))),
                             checkpoint: Some(cp.clone()),
-                            publication,
+                            publication: publication.clone(),
                         };
                         // Register before publishing so a fast consumer
                         // ack cannot land before the entry exists and
@@ -408,7 +408,7 @@ impl InventoryFusion {
             scope: scope.clone(),
             event: Arc::new(SyncEvent::Batch(synthetic)),
             checkpoint: batch.checkpoint.clone(),
-            publication,
+            publication: publication.clone(),
         };
         let delivered = tx.send(me).unwrap_or(0);
         if !super::delivered_to_real_subscriber(delivered) {
