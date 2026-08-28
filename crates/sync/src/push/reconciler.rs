@@ -35,6 +35,7 @@ pub struct Reconciler {
     /// deadlines before driving a hinted scope and records deadlines
     /// its own Retry outcomes carry.
     pub throttles: Arc<std::sync::Mutex<crate::recovery::ThrottleBucket>>,
+    pub scheduler: crate::scheduler::Scheduler,
 }
 
 impl Reconciler {
@@ -211,6 +212,27 @@ impl Reconciler {
                     () = tokio::time::sleep(wait) => {}
                 }
             }
+            let _admission = tokio::select! {
+                () = self.shutdown.cancelled() => return Ok(()),
+                permit = self.scheduler.admit(
+                    self.account_id.clone(),
+                    self.control.priority_snapshot(),
+                    crate::scheduler::WorkKind::Sync,
+                ) => match permit {
+                    Ok(permit) => permit,
+                    Err(error) => {
+                        // Same rule as E6: one scope's failure must not
+                        // abandon its siblings in this sweep.
+                        tracing::warn!(
+                            target: "bifrost.sync.scheduler",
+                            scope = ?scope,
+                            %error,
+                            "push admission refused; skipping this scope for the sweep"
+                        );
+                        continue;
+                    }
+                },
+            };
             let driven = self
                 .cursors
                 .with_drive(&scope, |cursor, registry_generation| {
@@ -240,6 +262,7 @@ impl Reconciler {
                     }
                 })
                 .await;
+            drop(_admission);
             let Some(outcome) = driven else {
                 continue;
             };

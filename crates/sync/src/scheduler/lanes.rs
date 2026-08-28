@@ -1,6 +1,6 @@
 //! Per-lane FIFO queue primitive.
 //!
-//! Each lane is an independent unbounded `Mutex<VecDeque>`. The
+//! Each lane is an independent bounded `Mutex<VecDeque>`. The
 //! scheduler's strict-priority `pull` walks the four lanes in priority
 //! order, with the starvation floor diverting one pull to the lower
 //! lanes every N pulls.

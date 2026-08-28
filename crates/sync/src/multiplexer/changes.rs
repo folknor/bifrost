@@ -88,7 +88,7 @@ pub async fn drive_changes_stream(
     boundary: BoundaryView,
     control: Option<SyncControl>,
     _ack_tx: Option<mpsc::Sender<WriterRequest>>,
-    registry_generation: Option<u64>,
+    registry_generation: Option<crate::cursor::DriveGeneration>,
 ) -> Result<ChangesEvent, Error> {
     let _activity = match &control {
         Some(control) => match control.begin_activity() {
@@ -187,7 +187,9 @@ pub async fn drive_changes_stream(
             _ => None,
         };
         let published = match registry_generation {
-            Some(generation) => cursors.publish_if_generation(change_cursor, generation, publish),
+            Some(generation) => {
+                cursors.publish_if_drive_generation(change_cursor, &scope, generation, publish)
+            }
             None => {
                 let result = publish();
                 if let Some(cursor) = change_cursor {

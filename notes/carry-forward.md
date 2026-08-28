@@ -110,11 +110,12 @@ fix pass went back and ablated:
   absent. The replacement drives `contacts::search` against a scripted page
   and asserts the second call re-reads the SAME page URL.
 
-## From the `bugs-sync.md` arc, rounds 1-4 plus mid-arc close pass (776471d..HEAD, arc still open)
+## From the `bugs-sync.md` arc, rounds 1-5 plus mid-arc close pass (776471d..HEAD)
 
-Scope is `crates/sync/`. Rounds 1-4 are landed and close-passed; round 5 (the
-remainder, including the scheduler/BudgetGate F5) is still to run against the
-findings left in `notes/bugs-sync.md`. Rounds 1-3 share one subject: who owns
+Scope is `crates/sync/`. All five rounds are landed; `notes/bugs-sync.md` has no
+open findings left, only closure notes, refusals and two carried out-of-scope
+`bifrost-types` observations. A Fable close pass reads this next.
+Rounds 1-3 share one subject: who owns
 durable state, and what a durable boundary can honestly claim. Round 4 is
 teardown, ordering and lifetimes - leases, sleeps, channel depth, detach
 ordering.
@@ -243,6 +244,56 @@ undo:
   `begin_activity` reports: `Stop` -> `Stopped` (which is what sets
   `DriveRecovery::exit`), everything else -> `Paused`.
 
+Machinery round 5 added - the admission contract above all:
+
+- **Admission is a SEPARATE path from `submit`/`pull`.** `Scheduler::admit`
+  queues into its own four priority lanes; ONE dispatcher task per `Scheduler`
+  (spawned lazily on the first `admit`, stopped when the last handle drops)
+  grants a `BudgetPermit` only when the budget can actually be granted. The
+  first implementation ran admission THROUGH `submit`/`pull` and had every
+  admit caller drive the scheduler, so a request dequeued and then parked on
+  the semaphore - which relocated the unboundedness rather than removing it
+  (a parked request no longer counts against `lane_capacity`) and destroyed
+  preemption (the semaphore's order is arrival order). **Nothing may park on
+  the `BudgetGate` semaphore except the dispatcher.** The dispatcher races one
+  acquisition per distinct `(account, kind)` class, never only the head:
+  head-only blocks the entire engine behind one account whose per-account
+  sub-pool is exhausted. It re-plans on a strictly better lane or a new class,
+  and deliberately NOT on an arrival that is neither, because restarting the
+  in-flight acquisitions on every submission starves them.
+- **`Scheduler::pull` kept its synchronous non-blocking signature**;
+  `pull_next().await` is the waiting form and `try_pull` an alias. Round 5's
+  first pass made `pull` async, and the cold review's objection was upheld:
+  losing the non-blocking empty check REMOVES a capability rather than
+  reshaping one. Five earlier shape objections in this arc were overruled; this
+  is the line between the two. `DriveGeneration` carries a `new` constructor
+  for the same reason - `#[non_exhaustive]` on a type a published function
+  takes would make it unconstructible, which is removal in substance.
+- **Every wire path is admitted**: poll and push change drives, backfill
+  partitions, the separately-admitted operator-barrier writer query, mutation
+  attempts, the mutation READ-BACK guard, and deferred inventory fusion. The
+  last two were the paths round 5's first pass missed while the reference had
+  already been edited to claim read-back was covered. Admission is acquired
+  OUTSIDE `with_drive` and released before recovery handoff and cadence sleeps;
+  round 4's narrow lease extent is intact.
+- **A refused admission is transient.** `admit` errors when its lane is full or
+  the scheduler is stopping. The poll loop backs off one cadence step (the
+  first pass RETURNED, retiring the scope's polling forever), and the push
+  sweep skips only that scope, per E6's blast-radius rule.
+- **The publication fence is a PAIR, `DriveGeneration { registry, scope }`.**
+  `registry` moves only on wholesale topology replacement; `scope` is bumped by
+  `delete`. An account-wide bump on delete fenced every SIBLING scope's
+  in-flight drive, which then discarded valid results and re-walked from its
+  old cursor. `publish_if_drive_generation` is the form every drive path uses;
+  `publish_if_generation` stays published for account-wide-only callers.
+- **`delete` KEEPS the scope's drive lease entry.** D2 asked for the lease to be
+  pruned on delete, and pruning it is what broke exclusive drive: a
+  re-established scope minted a DIFFERENT mutex and ran its protocol stream
+  concurrently with the still-running old drive. The generation fence stops the
+  stale publication, never the concurrent wire work. Growth is bounded by
+  pruning entries no drive holds, which is safe because a held lease keeps a
+  second `Arc` alive and `claim_drive` clones it under the same write lock.
+
 Reasoned rejections and refutations - do not silently relitigate:
 
 - **B2 was REFUSED in round 4, after B1 landed.** Its force was compounding:
@@ -288,6 +339,18 @@ Accepted residuals:
   freshly re-established one. Same class as the documented vanished-scope
   late-ack leak: re-delivery, never loss. Noted, not fixed.
 
+Accepted residuals round 5 added:
+
+- `ThrottleKey::Account` deadlines deliberately survive detach until expiry:
+  they describe the stable account identity, not the connection incarnation, so
+  detach-plus-reattach cannot bypass a provider wait. Bounded by expiry pruning.
+- A mailbox throttle whose error names no mailbox stays operation-local rather
+  than degrading to the account key: degrading it WIDENS a per-mailbox 429 into
+  an account-wide stall. Broader (provider, tenant) scopes still degrade toward
+  the account key, which is a subset of what they describe.
+- `ThrottleScope::Tenant` remains unenforceable across siblings; filed in
+  `notes/todo.md` as a `bifrost-types` identity-channel item.
+
 Test seam rounds 4 and 5 should build on:
 
 - **`crates/sync/tests/common/mod.rs` now holds a reusable `Account` double**:
@@ -315,6 +378,17 @@ Test seam rounds 4 and 5 should build on:
   failure having REACHED recovery. That is what distinguishes "the scope was
   driven" from "the scope was recovered"; the round's own first sibling test
   counted drive attempts only and passed against the bug.
+
+- **`tests/scheduler_admission.rs` (round 5) is the third model consumer** and
+  the pattern for anything budget-shaped. `ConcurrencyBudget { per_account: 2,
+  mutation_share 1/2 }` gives an account exactly ONE sync and ONE mutation
+  permit, which is what makes contention observable at all. The overtake test
+  queues the Background requests FIRST and asserts the resulting ORDER, because
+  a symmetric priority test cannot distinguish lane selection from the
+  semaphore's arrival order - the uniform-inputs trap in its concurrency form.
+  `SyncEngine::scheduler()` hands a test the live handle, but a permit must be
+  taken AFTER `attach`: `BudgetGate::register` installs fresh per-account
+  semaphores, so one taken earlier is against an orphan and gates nothing.
 
 Testing traps this arc recorded:
 

@@ -1,5 +1,17 @@
 # TODO
 
+- **sync tenant throttle identity.** `ThrottleScope::Tenant` cannot be enforced
+  across sibling accounts because `AccountError` carries no tenant identity.
+  `bifrost-sync` can key mailbox throttles from `ErrorScope::Mailbox` and
+  provider throttles from `AccountError::provider`, but tenant errors always
+  fall back to the reporting account. This silently under-throttles siblings
+  when a provider issues a tenant-wide 429. `bifrost-types` would need a
+  bounded, non-secret tenant identity on `AccountError` or its throttle advice,
+  protocol error translators would need to populate it, and sync could then
+  enroll accounts under `ThrottleKey::Tenant`. Round 5 stopped widening a
+  mailbox throttle with no mailbox identity to the whole account; tenant scope
+  remains account-local until that cross-crate identity channel exists.
+
 - **graph move concurrency verification.** `bulk_move` refreshes every missing
   message etag with a GET and sends `If-Match` on
   `POST /messages/{id}/move`, while Graph advertises

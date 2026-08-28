@@ -517,6 +517,7 @@ impl SyncEngine {
             ack_tx: Some(ack_tx.clone()),
             reopen_tx: reopen_tx.clone(),
             throttles: Arc::clone(&throttles),
+            scheduler: self.scheduler.clone(),
         };
         spawn(
             crate::types::WorkerRole::Stream,
@@ -630,6 +631,7 @@ impl SyncEngine {
         }
 
         // Spawn the multiplexer.
+        let multiplexer_cancel = shutdown.child_token();
         let mux = Multiplexer {
             account_id: account_id.clone(),
             account: Arc::clone(&current),
@@ -639,11 +641,12 @@ impl SyncEngine {
             boundary: boundary_view.clone(),
             changes_tx: changes_tx.clone(),
             control: control.clone(),
-            shutdown: shutdown.clone(),
+            shutdown: multiplexer_cancel.clone(),
             reopen_tx: reopen_tx.clone(),
             ack_tx: Some(ack_tx.clone()),
             scope_tokens: Arc::new(std::sync::Mutex::new(HashMap::new())),
             throttles: Arc::clone(&throttles),
+            scheduler: self.scheduler.clone(),
         };
         spawn(crate::types::WorkerRole::Stream, tokio::spawn(mux.run()));
 
@@ -671,6 +674,7 @@ impl SyncEngine {
         let bf_throttles = Arc::clone(&throttles);
         let bf_coverage = Arc::clone(&pending_coverage);
         let bf_writer_tx = ack_tx.clone();
+        let bf_scheduler = self.scheduler.clone();
         let bf_excluded: HashSet<CursorScope> = deferred_inventory_scopes
             .iter()
             .map(|inventory| inventory.scope().clone())
@@ -694,6 +698,7 @@ impl SyncEngine {
                     bf_excluded,
                     bf_coverage,
                     bf_writer_tx,
+                    bf_scheduler,
                 )
                 .await;
             }),
@@ -722,6 +727,7 @@ impl SyncEngine {
             let inventory_open_skips = Arc::clone(&open_skips);
             let inventory_writer_tx = ack_tx.clone();
             let inventory_coverage = Arc::clone(&pending_coverage);
+            let inventory_scheduler = self.scheduler.clone();
             spawn(
                 crate::types::WorkerRole::Stream,
                 tokio::spawn(async move {
@@ -744,6 +750,7 @@ impl SyncEngine {
                         inventory_open_skips,
                         inventory_writer_tx,
                         inventory_coverage,
+                        inventory_scheduler,
                         deferred_inventory_scopes,
                     )
                     .await;
@@ -834,10 +841,11 @@ impl SyncEngine {
         }
 
         let multiplexer = MultiplexerHandle {
-            cancel: shutdown.child_token(),
+            cancel: multiplexer_cancel,
             changes_tx: changes_tx.clone(),
         };
         let slot = Arc::new(AccountSlot {
+            scheduler: self.scheduler.clone(),
             factory,
             current,
             account_generation_tx,
@@ -1622,7 +1630,7 @@ impl SyncEngine {
             // this campaign's previous attempt, a poll, or a sibling
             // account via a shared key) before submitting. Re-checked
             // after waking: a longer deadline can land mid-sleep.
-            let _activity = loop {
+            let (_activity, _admission) = loop {
                 if !slot.control.wait_until_running(&slot.shutdown).await {
                     return Err(Error::ShuttingDown);
                 }
@@ -1637,8 +1645,16 @@ impl SyncEngine {
                     }
                     continue;
                 }
+                let admission = tokio::select! {
+                    () = slot.shutdown.cancelled() => return Err(Error::ShuttingDown),
+                    permit = slot.scheduler.admit(
+                        account_id.clone(),
+                        slot.control.priority_snapshot(),
+                        crate::scheduler::WorkKind::Mutation,
+                    ) => permit?,
+                };
                 if let Some(activity) = slot.control.begin_activity() {
-                    break activity;
+                    break (activity, admission);
                 }
             };
 
@@ -1799,6 +1815,19 @@ impl SyncEngine {
             }
 
             if blocked_by_engine {
+                for id in &remaining {
+                    if !matches!(
+                        outcomes.get(id),
+                        Some(
+                            MutationBucket::Applied
+                                | MutationBucket::Skipped
+                                | MutationBucket::FailedTerminal
+                                | MutationBucket::BlockedByEngine
+                        )
+                    ) {
+                        outcomes.insert(id.clone(), MutationBucket::BlockedByEngine);
+                    }
+                }
                 break;
             }
 
@@ -1861,12 +1890,25 @@ impl SyncEngine {
         }
         let readback_ids = unresolved_readback_ids(&outcomes);
         if !readback_ids.is_empty() {
-            let _activity = loop {
+            // The read-back guard hydrates over the wire, and the
+            // campaign's own admission permit was released when the
+            // attempt loop broke. Re-admit rather than running unbudgeted
+            // work: an oversized campaign otherwise leaves the caps
+            // behind exactly where its heaviest fan-out begins.
+            let (_activity, _readback_admission) = loop {
                 if !slot.control.wait_until_running(&slot.shutdown).await {
                     return Err(Error::ShuttingDown);
                 }
+                let admission = tokio::select! {
+                    () = slot.shutdown.cancelled() => return Err(Error::ShuttingDown),
+                    permit = slot.scheduler.admit(
+                        account_id.clone(),
+                        slot.control.priority_snapshot(),
+                        crate::scheduler::WorkKind::Mutation,
+                    ) => permit?,
+                };
                 if let Some(activity) = slot.control.begin_activity() {
-                    break activity;
+                    break (activity, admission);
                 }
             };
             let account = slot.current.load_full();
@@ -3125,6 +3167,7 @@ async fn run_backfill_orchestrator(
     fusion_owned_scopes: HashSet<CursorScope>,
     coverage: Arc<PendingCoverage>,
     writer_tx: mpsc::Sender<WriterRequest>,
+    scheduler: Scheduler,
 ) {
     // Cold-start backfill pages broadcast onto the per-account channel
     // during `attach`, but a consumer can only call
@@ -3162,6 +3205,21 @@ async fn run_backfill_orchestrator(
                 return;
             }
             let incarnation_key = (scope.clone(), incarnation);
+            let barrier_admission = tokio::select! {
+                () = shutdown.cancelled() => return,
+                permit = scheduler.admit(
+                    account_id.clone(),
+                    control.priority_snapshot(),
+                    crate::scheduler::WorkKind::Sync,
+                ) => match permit {
+                    Ok(permit) => permit,
+                    Err(error) => {
+                        tracing::warn!(target: "bifrost.sync.scheduler", %error, "backfill admission failed");
+                        scan.record_attempt(incarnation_key, false);
+                        continue;
+                    }
+                },
+            };
             if scope_barrier_blocked(&writer_tx, scope.clone()).await {
                 tracing::debug!(
                     target: "bifrost.sync.backfill",
@@ -3182,6 +3240,7 @@ async fn run_backfill_orchestrator(
                 scan.record_attempt(incarnation_key, false);
                 continue;
             }
+            drop(barrier_admission);
             let acc_arc = account.load_full();
             let acc: &dyn Account = acc_arc.as_ref().as_ref();
             match backfill_plan_for(acc, &scope, config) {
@@ -3236,6 +3295,7 @@ async fn run_backfill_orchestrator(
                             &throttles,
                             &coverage,
                             &writer_tx,
+                            &scheduler,
                         )
                         .await
                         else {
@@ -3355,6 +3415,7 @@ async fn run_backfill_orchestrator(
                             &throttles,
                             &coverage,
                             &writer_tx,
+                            &scheduler,
                         )
                         .await
                         else {
@@ -3557,6 +3618,7 @@ async fn run_backfill_partition_at_boundary(
     throttles: &std::sync::Mutex<crate::recovery::ThrottleBucket>,
     coverage: &Arc<PendingCoverage>,
     writer_tx: &mpsc::Sender<WriterRequest>,
+    scheduler: &Scheduler,
 ) -> Option<Result<crate::backfill::BackfillPartitionOutcome, Error>> {
     // One generation per partition pass, so a re-walk's proof is ordered after
     // the debt an earlier pass raised.
@@ -3589,6 +3651,17 @@ async fn run_backfill_partition_at_boundary(
             }
             continue;
         }
+        let admission = tokio::select! {
+            () = shutdown.cancelled() => return None,
+            permit = scheduler.admit(
+                account_id.clone(),
+                control.priority_snapshot(),
+                crate::scheduler::WorkKind::Sync,
+            ) => match permit {
+                Ok(permit) => permit,
+                Err(error) => return Some(Err(error)),
+            },
+        };
         let current = account.load_full();
         let result = BackfillRunner::run_partition(
             current.as_ref().as_ref(),
@@ -3603,6 +3676,7 @@ async fn run_backfill_partition_at_boundary(
             generation,
         )
         .await;
+        drop(admission);
         if matches!(result, Err(Error::Paused)) {
             continue;
         }
@@ -3821,6 +3895,7 @@ async fn run_deferred_inventory_establishment(
     open_skips: Arc<std::sync::Mutex<Vec<SkippedScope>>>,
     writer_tx: mpsc::Sender<WriterRequest>,
     coverage: Arc<PendingCoverage>,
+    scheduler: Scheduler,
     scopes: Vec<DeferredInventory>,
 ) {
     if !wait_for_real_subscriber(&changes_tx, &subscriber_notify, &shutdown).await {
@@ -3857,6 +3932,34 @@ async fn run_deferred_inventory_establishment(
                 }
                 continue;
             }
+            // Deferred fusion is one of the heaviest cold-start walks in
+            // the engine, so it takes a permit like every other protocol
+            // path. Held only for the walk itself; the throttle wait and
+            // the recovery handling below run outside it.
+            let admission = tokio::select! {
+                () = shutdown.cancelled() => return,
+                permit = scheduler.admit(
+                    account_id.clone(),
+                    control.priority_snapshot(),
+                    crate::scheduler::WorkKind::Sync,
+                ) => match permit {
+                    Ok(permit) => permit,
+                    Err(error) => {
+                        tracing::warn!(
+                            target: "bifrost.sync.scheduler",
+                            account = ?account_id,
+                            scope = ?scope,
+                            %error,
+                            "deferred inventory admission refused; retrying"
+                        );
+                        tokio::select! {
+                            () = shutdown.cancelled() => return,
+                            () = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+                        }
+                        continue;
+                    }
+                },
+            };
             let acc_arc = account.load_full();
             let acc: &dyn Account = acc_arc.as_ref().as_ref();
             let fusion = crate::multiplexer::InventoryFusion {
@@ -3879,6 +3982,7 @@ async fn run_deferred_inventory_establishment(
                         .await
                 }
             };
+            drop(admission);
             if matches!(result, Err(Error::Paused)) {
                 continue;
             }

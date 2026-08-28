@@ -56,9 +56,9 @@ async fn foreground_preempts_background() {
         20,
     );
 
-    let first = scheduler.pull().expect("first item");
+    let first = scheduler.pull_next().await;
     assert_eq!(first.priority, Priority::Foreground);
-    let second = scheduler.pull().expect("second item");
+    let second = scheduler.pull_next().await;
     assert_eq!(second.priority, Priority::Background);
 }
 
@@ -84,7 +84,8 @@ async fn strict_priority_walks_lanes_in_order() {
     );
 
     let mut order = Vec::new();
-    while let Some(item) = scheduler.pull() {
+    for _ in 0..4 {
+        let item = scheduler.pull_next().await;
         order.push(item.priority);
     }
 
@@ -125,12 +126,11 @@ async fn starvation_floor_diverts_to_lower_lane_after_n_pulls() {
     );
 
     let mut saw_background_at: Option<u32> = None;
-    let mut step: u32 = 0;
-    while let Some(item) = scheduler.pull() {
+    for step in 0..(floor + 6) {
+        let item = scheduler.pull_next().await;
         if item.priority == Priority::Background && saw_background_at.is_none() {
             saw_background_at = Some(step);
         }
-        step += 1;
     }
 
     let pos = saw_background_at.expect("background must surface");
@@ -143,9 +143,32 @@ async fn starvation_floor_diverts_to_lower_lane_after_n_pulls() {
 }
 
 #[tokio::test]
-async fn empty_scheduler_pulls_none() {
+async fn pull_wakes_when_work_is_submitted() {
     let scheduler = make_scheduler(64);
-    assert!(scheduler.pull().is_none());
+    let waiter = tokio::spawn({
+        let scheduler = scheduler.clone();
+        async move { scheduler.pull_next().await }
+    });
+    tokio::task::yield_now().await;
+    let marker = Arc::new(AtomicU64::new(0));
+    submit(&scheduler, "a", Priority::Normal, marker, 1);
+    let item = waiter.await.expect("pull task");
+    assert_eq!(item.account, AccountId("a".into()));
+}
+
+#[test]
+fn pull_stays_synchronous_and_answers_the_empty_question() {
+    // The non-blocking emptiness check is a published capability: a
+    // consumer must be able to ask "is there work right now?" without
+    // committing to a wait. `pull_next` is the waiting form.
+    let scheduler = make_scheduler(64);
+    let marker = Arc::new(AtomicU64::new(0));
+    assert!(scheduler.pull().is_none(), "empty scheduler yields None");
+    submit(&scheduler, "a", Priority::Normal, Arc::clone(&marker), 7);
+    let item = scheduler.pull().expect("submitted item is available");
+    (item.run)();
+    assert_eq!(marker.load(Ordering::Relaxed), 7);
+    assert!(scheduler.try_pull().is_none(), "drained scheduler is empty");
 }
 
 #[tokio::test]
@@ -156,8 +179,8 @@ async fn account_isolation_does_not_reorder_lanes() {
     submit(&scheduler, "a", Priority::Normal, Arc::clone(&marker), 1);
     submit(&scheduler, "b", Priority::Normal, Arc::clone(&marker), 2);
 
-    let first = scheduler.pull().expect("first");
-    let second = scheduler.pull().expect("second");
+    let first = scheduler.pull_next().await;
+    let second = scheduler.pull_next().await;
     assert_eq!(first.account, AccountId("a".into()));
     assert_eq!(second.account, AccountId("b".into()));
 }

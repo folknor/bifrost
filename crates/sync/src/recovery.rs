@@ -362,15 +362,13 @@ impl ThrottleBucket {
 }
 
 /// Resolve the `ThrottleKey` a `ThrottleScope` maps to, given the
-/// identities the classified error actually carries. Falls back toward
-/// the account key rather than dropping the deadline: the throttle
-/// applies to at least this account, so an `Account` entry is a subset
-/// of the provider-documented scope - never wider - and a recorded
-/// subset beats an unrecorded truth.
+/// identities the classified error actually carries. Broader provider and
+/// tenant scopes may conservatively fall back to the account key. Mailbox
+/// scope cannot: an account key is wider than the producer's throttle.
 ///
 /// - `CurrentOperation` never enters the bucket (per-call hint).
 /// - `Mailbox` uses the error's `ErrorScope::Mailbox` identity; an
-///   error that names no mailbox degrades to `Account`.
+///   error that names no mailbox remains local to the current operation.
 /// - `Tenant` ALWAYS degrades to `Account` today: the error contract
 ///   carries no tenant identity, so there is nothing to key a
 ///   cross-account tenant bucket on. Cross-account tenant pausing is
@@ -386,13 +384,13 @@ pub(crate) fn resolve_throttle_key(
     let account_key = || ThrottleKey::Account(account.clone());
     match scope {
         ThrottleScope::CurrentOperation => None,
-        ThrottleScope::Mailbox => Some(match error.scope() {
-            Some(ErrorScope::Mailbox { id }) => ThrottleKey::Mailbox {
+        ThrottleScope::Mailbox => match error.scope() {
+            Some(ErrorScope::Mailbox { id }) => Some(ThrottleKey::Mailbox {
                 account: account.clone(),
                 mailbox: id.clone(),
-            },
-            _ => account_key(),
-        }),
+            }),
+            _ => None,
+        },
         ThrottleScope::Account | ThrottleScope::Tenant => Some(account_key()),
         ThrottleScope::Provider => Some(
             error
@@ -862,11 +860,10 @@ mod tests {
     }
 
     #[test]
-    fn resolve_throttle_key_degrades_toward_the_account_key() {
-        // A throttle whose documented scope cannot be keyed still
-        // applies to at least this account; recording the subset beats
-        // dropping the deadline. Tenant always degrades today (no
-        // tenant identity channel in the error contract).
+    fn broader_throttle_keys_degrade_toward_the_account_key() {
+        // Tenant always degrades today because the error contract has no
+        // tenant identity channel. A provider throttle with no provider
+        // identity follows the same conservative subset rule.
         let account = AccountId("a".into());
         let bare = throttled_error(None, None);
         let account_key = Some(ThrottleKey::Account(account.clone()));
@@ -876,7 +873,7 @@ mod tests {
         );
         assert_eq!(
             resolve_throttle_key(ThrottleScope::Mailbox, &account, &bare),
-            account_key
+            None
         );
         assert_eq!(
             resolve_throttle_key(ThrottleScope::Provider, &account, &bare),

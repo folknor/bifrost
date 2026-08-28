@@ -1,7 +1,7 @@
 //! `IdempotencyKey` vending.
 //!
-//! Each mutation campaign mints a `RunId` once and persists it via the
-//! `CheckpointStore` under a campaign-scoped key. `IdempotencyVendor`
+//! Each mutation campaign uses a consumer-supplied `RunId`. The consumer owns
+//! persistence across process restarts; `IdempotencyVendor`
 //! then mints `IdempotencyKey`s with monotonically increasing
 //! `sequence` numbers; the engine threads them through the protocol
 //! crate's `bulk_*` surface for engine-side correlation.

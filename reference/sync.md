@@ -415,9 +415,27 @@ instant the callback returns - the poll loop measures whether its own drive
 advanced the cursor there, for exactly that reason, since measuring it after
 the fact would credit a push reconcile's progress to the poll and pin the
 cadence at `poll_min`. What protects durable state is not the lease but the
-registry generation: `publish_if_generation` refuses a publication whose
+generation fence: `publish_if_drive_generation` refuses a publication whose
 generation the registry has moved past, and a deleted scope makes the next
 `with_drive` return `None` instead of driving an unowned cursor.
+
+The fence is a PAIR, `DriveGeneration { registry, scope }`. `registry` moves
+only when reattach replaces topology wholesale; `scope` is a per-scope counter
+that `delete` bumps. Splitting them is load-bearing in both directions: a
+single account-wide counter bumped on delete fenced every SIBLING scope's
+in-flight drive, which then discarded valid results and repeated its walk from
+its old cursor, while a registry-only fence could not see a delete at all.
+`publish_if_generation` (account-wide only) stays published for callers that
+hold just that value.
+
+Deleting a scope does NOT remove its drive lease. The lease entry outlives the
+scope so a re-established incarnation waits for the previous incarnation's
+drive to finish: dropping the entry lets the new drive mint a different mutex
+and run its protocol stream concurrently with the old one, and the generation
+fence stops the stale publication but not the concurrent wire work. Lease
+entries no drive holds are pruned on the same call, which is safe precisely
+because a held lease keeps a second `Arc` alive and `claim_drive` clones it
+under the same write lock.
 
 1. Consumer subscribes via `account_changes_stream`, receives a
    `MultiplexerEvent { scope, event, checkpoint }`.
@@ -1008,7 +1026,8 @@ move landed, and does not separately re-verify absence from `source`.
 
 `IdempotencyKey` is `{ run_id, sequence, protocol_salt }`. `run_id`
 is consumer-minted and consumer-persisted across process restarts
-so retries from a previous process correlate.
+so retries from a previous process correlate. `IdempotencyVendor` does not
+persist it; the consumer supplies the durable value.
 
 Before every wire submission, including read-back, the campaign waits
 through `SyncControl::wait_until_running` and registers an activity
@@ -1020,10 +1039,10 @@ settled; any retry then parks before resubmission. Detach cancellation
 interrupts retry delays, throttle waits, mutation streams, and read-back
 and returns `Error::ShuttingDown` instead of parking.
 
-The retry candidate list is an unbounded `Vec<ObjectId>`. No engine
-configuration field caps it - `MutationConfig::retry_queue_cap` is inert
-and does not bound this vector - so consumers must bound campaign input
-if retaining every unresolved id is too costly.
+The initial retry candidate list may be as wide as the campaign input, so
+consumers must still bound campaign input if retaining every unresolved id is
+too costly. `MutationConfig::retry_queue_cap` bounds each resubmission as
+described above; excess ids remain accounted as pending and enter read-back.
 
 `mutation::fanout::partition_by_account` is a cross-account
 fanout helper: given an input stream of `(AccountId, T)` and a
@@ -1120,9 +1139,8 @@ This is a library crate: its consumers are outside the workspace by definition,
 so a workspace-wide grep establishes nothing about who uses a published item, and
 "documented as deliberately unwired, with no dated plan" describes somebody's
 plan rather than evidence of abandonment. Where one of these reads as unfinished,
-the fix is to finish it - see `MutationConfig::retry_queue_cap` in
-`notes/todo.md`, which bounds nothing today and should be made to bound the
-queue rather than dropped. Removing or renaming any published item here is the
+the fix is to finish it rather than drop the published surface. Removing or
+renaming any published item here is the
 owner's call; the standing lessons in `AGENTS.md` carry the full account.
 
 `Scheduler` is a strict-priority gate (not an executor) with four
@@ -1150,14 +1168,53 @@ constructor still floors the global semaphore at one permit, because direct
 construction bypasses builder validation and must not create a permanently
 blocked gate from `global: 0`.
 
-**Status (v1):** the scheduler and budget gate are intentionally
-NOT WIRED into the engine's production work paths. Multiplexer,
-backfill, and mutation tasks acquire from `Account::*_stream`
-directly. The scheduler exists as infrastructure for a follow-up
-pass that threads every protocol call through
-`Scheduler::submit` and `BudgetGate::acquire`; `Scheduler` and
-`BudgetGate` are deliberately absent from `lib.rs` re-exports
-until then. See `scheduler/mod.rs` module docs.
+`Scheduler::pull` stays synchronous and non-blocking, returning
+`Option<WorkItem>`, so a consumer can ask whether work is available without
+committing to a wait; `pull_next().await` is the waiting form and wakes
+directly from `submit`, and `try_pull` is a name-symmetric alias of `pull`.
+
+**Admission is a separate path from `submit`/`pull`.** `Scheduler::admit`
+queues the request in its own four priority lanes and a single dispatcher task
+grants it a `BudgetPermit`, held for the complete protocol operation. The
+ordering constraint is the whole point: a request is dequeued only when its
+budget can actually be granted, so nothing ever parks on the semaphore itself.
+Two properties follow, and neither survives an implementation that hands the
+waiter to `BudgetGate::acquire` directly:
+
+- A blocked request counts against `lane_capacity` for its entire wait.
+  Requests parked in the semaphore's queue are invisible to the lane bound,
+  which makes the bound vacuous.
+- A `Foreground` request that arrives after a queued `Background` one still
+  runs first. The semaphore's own order is arrival order, so preemption is
+  lost the moment a request reaches it.
+
+The dispatcher races one acquisition per distinct `(account, kind)` class
+present in the lanes rather than only the head class. A single-head dispatcher
+blocks the whole engine behind one account whose per-account sub-pool is
+exhausted, which is exactly the cross-account starvation the per-account layer
+exists to prevent. It re-plans when a strictly more preferred lane gains work
+or when a class appears that it is not already racing; an arrival that changes
+neither does not restart the in-flight acquisitions. `admission_snapshot`
+reports the waiting depths.
+
+Every wire path is admitted: poll and push change drives, backfill partitions,
+the backfill operator-barrier writer query (admitted separately, so a large
+scope never holds one sync permit across its whole multi-partition walk),
+mutation attempts, the mutation READ-BACK guard (which runs after the attempt
+loop released the campaign's permit and would otherwise hydrate unbudgeted),
+and deferred inventory fusion. Admission for a change drive happens before
+`CursorRegistry::with_drive`, so a queued task never owns a scope lease, and
+the permit is released before recovery handoff and cadence sleeps.
+
+`admit` returns `Error::Other` when its lane is at capacity - the incoming
+request is refused rather than displacing an older waiter. Repeating work paths
+treat that as transient: the poll loop backs off one cadence step and re-enters
+rather than retiring the scope, and the push sweep skips that scope only, which
+is the same blast radius rule the sweep uses for a failed drive.
+
+`Scheduler`, `BudgetGate`, and their configuration are publicly re-exported now
+that the engine uses them, and `SyncEngine::scheduler()` hands out the live
+handle.
 
 ## Control
 
@@ -1884,10 +1941,10 @@ observe comes from `recovery::retry_delay` /
 `recovery::reconcile_delay`, which honor the carried `RetryHint` and
 otherwise fall back to one second. Both recorders resolve the key from the
 identities the classified error actually carries
-(`ErrorScope::Mailbox`, `AccountError::provider()`) and degrades
-toward the `Account` key rather than dropping the deadline - the
-throttle applies to at least this account, so recording the subset
-beats an unrecorded truth. `Tenant` ALWAYS degrades today: the
+(`ErrorScope::Mailbox`, `AccountError::provider()`). A mailbox throttle without
+a mailbox identity remains local to the current operation: degrading it to the
+account key would widen a per-mailbox 429 into an account-wide stall. Broader
+provider scope may degrade to the account key. `Tenant` ALWAYS degrades today: the
 error contract carries no tenant identity string, so cross-account
 tenant pausing is blocked on that types-level channel. Reading: the poll loop (before each drive), the
 reconciler (before each hinted scope), and the mutation campaigns
@@ -1898,9 +1955,12 @@ land mid-sleep. The backfill partition runner and the
 deferred-inventory worker consult it too, at the same boundary as
 their pause checks: cold-start hydration is the heaviest request
 lane the engine drives, so it must not barrel through a Retry-After
-that paused the polls. `detach` forgets the account's
-memberships so a reattached id cannot inherit a previous life's
-provider enrollment.
+that paused the polls. `detach` forgets the account's shared-key memberships so
+a reattached id cannot inherit a previous life's provider enrollment. Its own
+`Account` deadline is deliberately retained until expiry: it describes the
+stable account identity, not the connection incarnation, and prevents detach
+plus immediate reattach from bypassing a provider wait. Expired waits are
+pruned opportunistically, so retained entries are time-bounded.
 
 Two documented limits on the cross-account reach. Enrollment is
 lazy - an account joins a shared key only when its own error stream
@@ -1983,7 +2043,7 @@ crates/sync/src/
     store.rs              // CheckpointStore trait (6 methods) +
                           // InMemoryCheckpointStore
   scheduler/
-    mod.rs                // four-lane Scheduler (NOT WIRED into work paths)
+    mod.rs                // four-lane Scheduler + admission dispatcher
     lanes.rs              // bounded LaneQueue + LaneShedPolicy
                           // (DropOldest default / DropNewest)
     budget.rs             // BudgetGate (DashMap entry/or_insert_with)
@@ -1995,11 +2055,7 @@ crates/sync/tests/
   envelope_roundtrip.rs       // cursor envelope encode/decode tests
   partition_planner.rs        // backfill partitioner unit tests
   readback_guard.rs           // mutation readback reconciliation
-  scheduler_priority.rs       // lane ordering and starvation guard
+  scheduler_priority.rs       // lane ordering, starvation guard, pull shape
+  scheduler_admission.rs      // admission queueing, preemption, cross-account
+                              // liveness, single-permit engine end-to-end
 ```
-
-## Open follow-ups (post-Phase-2 hardening)
-
-- Scheduler / `BudgetGate` not yet wired into multiplexer,
-  backfill, or mutation acquisition paths; tracked in
-  `scheduler/mod.rs` module docs.

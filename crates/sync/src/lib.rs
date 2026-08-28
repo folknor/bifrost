@@ -74,7 +74,7 @@ pub use repair::{DEFAULT_REPAIR_BUDGET, RepairResolution, run_repair_pass};
 pub use backfill::{BackfillPolicy, BackfillStrategy};
 
 // Engine configuration knobs.
-pub use scheduler::{ConcurrencyBudget, WorkKind};
+pub use scheduler::{BudgetGate, ConcurrencyBudget, Scheduler, WorkKind};
 pub use types::{
     BackfillConfig, EngineConfig, MultiplexerConfig, MutationConfig, PushConfig, SchedulerConfig,
 };

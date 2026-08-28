@@ -16,6 +16,7 @@ use crate::cancel::BoundaryRequest;
 use crate::control::SyncControl;
 use crate::cursor::CursorRegistry;
 use crate::multiplexer::MultiplexerHandle;
+use crate::scheduler::Scheduler;
 use crate::scheduler::budget::ConcurrencyBudget;
 
 /// Top-level engine configuration. Cloned into every `AccountSlot`.
@@ -174,6 +175,7 @@ impl Default for MutationConfig {
 /// backfill, mutation) at their next iteration without re-spawning.
 /// Workers load with `current.load_full()`.
 pub(crate) struct AccountSlot {
+    pub scheduler: Scheduler,
     pub factory: Arc<dyn AccountFactory>,
     pub current: Arc<ArcSwap<Arc<dyn Account>>>,
     /// Monotonic signal bumped after a successful handle swap. Long-

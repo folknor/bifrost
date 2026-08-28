@@ -47,6 +47,12 @@ struct RegistryState {
     cursors: HashMap<CursorScope, ChangeCursor>,
     membership_index: HashMap<MembershipScope, Vec<CursorScope>>,
     incarnations: HashMap<CursorScope, u64>,
+    /// Per-scope publication fence, bumped by `delete`. Kept separate
+    /// from the account-wide `registry_generation` so deleting one scope
+    /// does not invalidate in-flight drives of every OTHER scope, which
+    /// would make them discard valid results and repeat their work from
+    /// the cursors they started at.
+    scope_generations: HashMap<CursorScope, u64>,
 }
 
 #[derive(Debug, Default)]
@@ -59,13 +65,43 @@ pub struct CursorRegistry {
 
 pub struct ScopeDriveGuard {
     _guard: OwnedMutexGuard<()>,
-    registry_generation: u64,
+    generation: DriveGeneration,
 }
 
 impl ScopeDriveGuard {
     #[must_use]
     pub fn registry_generation(&self) -> u64 {
-        self.registry_generation
+        self.generation.registry
+    }
+
+    /// The full fence this drive must publish under: the account-wide
+    /// registry generation plus the scope's own delete counter.
+    #[must_use]
+    pub fn drive_generation(&self) -> DriveGeneration {
+        self.generation
+    }
+}
+
+/// The generation pair a drive publishes under.
+///
+/// `registry` moves when account topology is replaced wholesale;
+/// `scope` moves when THIS scope is deleted. Splitting them is what
+/// stops one scope's deletion from fencing every sibling drive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DriveGeneration {
+    pub registry: u64,
+    pub scope: u64,
+}
+
+impl DriveGeneration {
+    /// Construct a fence pair. The type is `#[non_exhaustive]`, so this
+    /// is how a consumer outside the crate names one - `drive_changes_stream`
+    /// takes it, and a caller driving that surface directly needs to be
+    /// able to build one.
+    #[must_use]
+    pub fn new(registry: u64, scope: u64) -> Self {
+        Self { registry, scope }
     }
 }
 
@@ -139,6 +175,22 @@ impl CursorRegistry {
         state
             .membership_index
             .retain(|_, scopes| !scopes.is_empty());
+        // Fence any drive already in flight for THIS scope: its
+        // publication is refused, and a later incarnation starts from a
+        // generation it cannot match. Sibling scopes are untouched.
+        *state.scope_generations.entry(scope.clone()).or_default() += 1;
+        drop(state);
+        // The lease entry deliberately SURVIVES the delete. Removing it
+        // would let a re-established scope mint a second, different
+        // mutex and drive the same scope concurrently with a drive still
+        // running against the old one - the generation fence stops the
+        // stale publication, but not the concurrent protocol stream, and
+        // exclusive drive is the documented invariant. Entries no drive
+        // holds are pruned instead, which is safe precisely because a
+        // held lease keeps a second `Arc` alive and `claim_drive` clones
+        // it under this same write lock.
+        let mut leases = self.drive_leases.write().expect("poisoned");
+        leases.retain(|_, lease| Arc::strong_count(lease) > 1);
     }
 
     /// Read a snapshot of the cursor for a scope.
@@ -246,8 +298,47 @@ impl CursorRegistry {
         let guard = lease.lock_owned().await;
         ScopeDriveGuard {
             _guard: guard,
-            registry_generation: self.registry_generation.load(Ordering::SeqCst),
+            generation: self.drive_generation(scope),
         }
+    }
+
+    /// Current fence pair for a scope.
+    #[must_use]
+    pub fn drive_generation(&self, scope: &CursorScope) -> DriveGeneration {
+        let state = self.state.read().expect("poisoned");
+        DriveGeneration {
+            registry: self.registry_generation.load(Ordering::SeqCst),
+            scope: state.scope_generations.get(scope).copied().unwrap_or(0),
+        }
+    }
+
+    /// Publish one drive result while BOTH its account generation and
+    /// its scope generation are still current.
+    ///
+    /// This is the form every drive path uses.
+    /// [`CursorRegistry::publish_if_generation`] remains available and
+    /// unchanged for callers that only hold the account-wide value; it
+    /// cannot see a per-scope delete, so a drive that has one should
+    /// prefer this.
+    pub fn publish_if_drive_generation<R>(
+        &self,
+        cursor: Option<ChangeCursor>,
+        scope: &CursorScope,
+        generation: DriveGeneration,
+        publish: impl FnOnce() -> R,
+    ) -> Option<R> {
+        let mut guard = self.state.write().expect("poisoned");
+        if self.registry_generation.load(Ordering::SeqCst) != generation.registry {
+            return None;
+        }
+        if guard.scope_generations.get(scope).copied().unwrap_or(0) != generation.scope {
+            return None;
+        }
+        let result = publish();
+        if let Some(cursor) = cursor {
+            self.put_locked(&mut guard, cursor);
+        }
+        Some(result)
     }
 
     /// Run exactly one change-stream drive while holding the scope lease.
@@ -265,18 +356,20 @@ impl CursorRegistry {
     /// effect - the cursor it installed, above all - has to be measured
     /// inside this callback, because the reconciler (or the poll loop) may
     /// start its own drive on this scope the instant the future returns.
-    /// The engine-generation fence is what protects the durable side:
-    /// `publish_if_generation` refuses a publication whose generation the
-    /// registry has moved past, and a deleted scope makes the next
-    /// `with_drive` yield `None` rather than driving a cursor nobody owns.
+    /// The generation fence is what protects the durable side:
+    /// `publish_if_drive_generation` refuses a publication whose registry OR
+    /// scope generation has moved past the one captured here, and a deleted
+    /// scope makes the next `with_drive` yield `None` rather than driving a
+    /// cursor nobody owns. The lease entry itself survives a delete, so a
+    /// re-established scope still waits for this drive to finish.
     pub async fn with_drive<T, F, Fut>(&self, scope: &CursorScope, drive: F) -> Option<T>
     where
-        F: FnOnce(ChangeCursor, u64) -> Fut,
+        F: FnOnce(ChangeCursor, DriveGeneration) -> Fut,
         Fut: Future<Output = T>,
     {
         let guard = self.claim_drive(scope).await;
         let cursor = self.snapshot(scope)?;
-        let generation = guard.registry_generation();
+        let generation = guard.drive_generation();
         Some(drive(cursor, generation).await)
     }
 }
@@ -401,5 +494,127 @@ mod tests {
                 .bytes,
             b"before"
         );
+    }
+
+    /// A delete fences the deleted scope's own in-flight drive.
+    #[tokio::test]
+    async fn a_deleted_scope_refuses_its_in_flight_drives_publication() {
+        let registry = CursorRegistry::new();
+        let scope = CursorScope::Account;
+        registry.put(cursor(scope.clone(), b"before"));
+        let drive = registry.claim_drive(&scope).await;
+
+        registry.delete(&scope);
+        let published = registry.publish_if_drive_generation(
+            Some(cursor(scope.clone(), b"stale")),
+            &scope,
+            drive.drive_generation(),
+            || (),
+        );
+
+        assert!(published.is_none(), "a deleted scope must reject its drive");
+        assert!(registry.snapshot(&scope).is_none());
+    }
+
+    /// ...but it must not fence anybody ELSE. An account-wide generation
+    /// bump on delete made every unrelated scope discard a completed
+    /// drive's result and repeat the work from its old cursor.
+    #[tokio::test]
+    async fn deleting_one_scope_does_not_fence_a_sibling_drive() {
+        let registry = CursorRegistry::new();
+        let mine = CursorScope::Type(ObjectType::Email);
+        let other = CursorScope::Type(ObjectType::CalendarEvent);
+        registry.put(cursor(mine.clone(), b"before"));
+        registry.put(cursor(other.clone(), b"before"));
+        let drive = registry.claim_drive(&mine).await;
+
+        registry.delete(&other);
+
+        let published = registry.publish_if_drive_generation(
+            Some(cursor(mine.clone(), b"advanced")),
+            &mine,
+            drive.drive_generation(),
+            || (),
+        );
+        assert!(
+            published.is_some(),
+            "an unrelated scope's delete must not invalidate this drive"
+        );
+        assert_eq!(
+            registry
+                .snapshot(&mine)
+                .expect("sibling cursor")
+                .server_state
+                .bytes,
+            b"advanced"
+        );
+    }
+
+    /// The exclusive-drive invariant has to survive delete plus
+    /// re-establish. Pruning the lease on delete let the new incarnation
+    /// mint a second mutex and run concurrently with the old drive's
+    /// still-open protocol stream; the generation fence stops the stale
+    /// publication but not the concurrent wire work.
+    #[tokio::test]
+    async fn a_recreated_scope_waits_for_the_previous_incarnations_drive() {
+        let registry = Arc::new(CursorRegistry::new());
+        let scope = CursorScope::Account;
+        registry.put(cursor(scope.clone(), b"first"));
+        let first = registry.claim_drive(&scope).await;
+
+        // The scope is deleted and immediately re-established while the
+        // first drive is still running.
+        registry.delete(&scope);
+        registry.put(cursor(scope.clone(), b"second"));
+
+        let (started_tx, started_rx) = oneshot::channel();
+        let (acquired_tx, mut acquired_rx) = oneshot::channel();
+        let contender_registry = Arc::clone(&registry);
+        let contender_scope = scope.clone();
+        let contender = tokio::spawn(async move {
+            started_tx.send(()).expect("test receiver remains live");
+            let _guard = contender_registry.claim_drive(&contender_scope).await;
+            acquired_tx.send(()).expect("test receiver remains live");
+        });
+
+        started_rx.await.expect("contender reached the claim");
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert!(
+            acquired_rx.try_recv().is_err(),
+            "the re-established scope drove concurrently with the previous \
+             incarnation's still-open drive"
+        );
+        drop(first);
+        acquired_rx.await.expect("contender acquires after release");
+        contender.await.expect("contender task completes");
+    }
+
+    /// The lease map must not grow without bound just because entries
+    /// survive a delete: an entry nobody holds is pruned, which is safe
+    /// exactly because a held lease keeps a second `Arc` alive.
+    #[tokio::test]
+    async fn unheld_leases_are_pruned_on_delete() {
+        let registry = CursorRegistry::new();
+        let stale = CursorScope::Type(ObjectType::Email);
+        let live = CursorScope::Type(ObjectType::CalendarEvent);
+        registry.put(cursor(stale.clone(), b"a"));
+        registry.put(cursor(live.clone(), b"b"));
+        drop(registry.claim_drive(&stale).await);
+        let held = registry.claim_drive(&live).await;
+
+        registry.delete(&stale);
+
+        let leases = registry.drive_leases.read().expect("poisoned");
+        assert!(
+            !leases.contains_key(&stale),
+            "an unheld lease is pruned rather than retained forever"
+        );
+        assert!(
+            leases.contains_key(&live),
+            "a held lease survives, whichever scope was deleted"
+        );
+        drop(leases);
+        drop(held);
     }
 }

@@ -150,90 +150,104 @@ in every round of this arc, by cold review rather than by the fix pass's tests.
   `DriveRecovery::exit`), everything else parks.
 - **B3**: `take_ack_writer` selects by `WorkerRole::AckWriter`, not `drained[0]`.
 
-## C. Contracts a consumer cannot honour
+## Round 5 closure note (C3, C4, D2, D3, E1, E4, E5, E8, F5)
 
-### C3. Reference contradicts itself on `retry_queue_cap`
+The round's first pass landed all nine findings; its cold review then found four
+defects in that pass's own code, three of them in F5 and one in D2. Same
+signature as every earlier round of this arc, and the D2 case is the cleanest
+instance yet of a fix opening a hole one layer up: the finding asked for the
+lease to be pruned on delete, and pruning it is exactly what broke exclusive
+drive. All four are fixed below, in the same commit.
 
-**Confidence: high.** `reference/sync.md` says both "One resubmission is at most
-`MutationConfig::retry_queue_cap` targets wide" and "`MutationConfig::retry_queue_cap`
-is inert and does not bound this vector". The code implements the first. The second
-paragraph is stale and should go.
+- **F5 admission control is real, not relocated.** The first pass routed
+  admission through `submit`/`pull` and then had every admit caller run the
+  scheduler itself, so a request could dequeue and immediately park on the
+  `BudgetGate` semaphore. That defeated both scheduler properties: a dequeued
+  request no longer counted against `lane_capacity` (so the bound was vacuous),
+  and once parked on the semaphore its order was arrival order, so a later
+  `Foreground` request could not preempt an earlier `Background` one. Admission
+  is now a separate path with its own four lanes and ONE dispatcher task that
+  grants a request only when its budget can actually be granted. The dispatcher
+  races one acquisition per distinct `(account, kind)` class rather than only
+  the head class - a single-head dispatcher reintroduces the cross-account
+  starvation `BudgetGate`'s per-account layer exists to prevent, which is
+  pinned by `one_saturated_account_does_not_stall_another` (it failed against
+  the first dispatcher written here).
+- **Every wire path is admitted, including the two the first pass missed.** The
+  mutation READ-BACK guard hydrates after the attempt loop released the
+  campaign's permit, and deferred inventory fusion - one of the heaviest
+  cold-start walks - had no admission at all, while `reference/sync.md` had
+  already been edited to claim read-back was admitted. Both now admit; the
+  reference says what the code does.
+- **Change-drive admission is outside `with_drive`**, and the permit is
+  released before recovery handoff and cadence sleeps. Round 4's narrowed lease
+  extent is untouched: keeping a lease ENTRY alive past a delete is not the same
+  as widening a lease EXTENT.
+- **A refused admission is transient, not terminal.** The first pass returned
+  from the poll loop on an admission error, which retires a scope's polling
+  permanently for a condition that clears by itself. The poll loop now backs off
+  one cadence step; the push sweep skips only that scope, per E6.
+- Per-item engine recovery now sweeps every unresolved campaign id into
+  `blocked_by_engine`. The real campaign test was ablated and fell from three
+  accounted ids to one.
+- **D2 as landed, after its own correction.** A deleted scope KEEPS its drive
+  lease entry, so a re-established incarnation waits for the previous
+  incarnation's drive rather than minting a second mutex and running a
+  concurrent protocol stream against the same scope; the generation fence stops
+  the stale publication but never stopped the concurrent wire work. Unbounded
+  growth is answered by pruning entries no drive holds, which is safe because a
+  held lease keeps a second `Arc` alive and `claim_drive` clones it under the
+  same write lock. The fence itself became a PAIR (`DriveGeneration`): the first
+  pass bumped the account-wide registry generation on every delete, which fenced
+  unrelated scopes' in-flight drives and made them discard valid results and
+  re-walk from their old cursors. Lifecycle token cancellation retires by
+  generation, and `MultiplexerHandle::cancel` is the actual token driving the
+  multiplexer task.
+- Mailbox throttles without mailbox identity remain operation-local instead of
+  widening to the account. Tenant-wide enforcement remains blocked on a tenant
+  identity in `bifrost-types` and is filed as a standalone cross-crate item in
+  `notes/todo.md`.
+- Account-key throttle deadlines deliberately survive detach until their deadline:
+  they describe the stable account, prevent reattach from bypassing a provider
+  wait, and are time-bounded by expiry cleanup. The durable reference now states
+  that decision.
+- The stale `retry_queue_cap` and `IdempotencyVendor` claims were removed. The
+  durable scheduler section now describes the wired system.
+- F3 remains an accepted structural residual, not an open defect: both inventory
+  front ends share the safety-critical `InventoryWalk`; checkpoint minting differs
+  by protocol shape and no current lost-data path was found.
 
-### C4. `IdempotencyVendor` doc claims a `CheckpointStore` campaign key that does not exist
+### The `pull` API question - kept, not reshaped
 
-**Confidence: high.** The module doc says `run_id` "is persisted via the
-`CheckpointStore` under a campaign-scoped key"; the trait has no such method and
-nothing does it. The vendor is consumer-supplied, which is the real (and fine)
-contract.
+The first pass changed `Scheduler::pull` from `fn pull(&self) -> Option<WorkItem>`
+to `async fn pull(&self) -> WorkItem`. Five earlier cold-review objections in
+this arc were pure SHAPE changes and were overruled on standing precedent; this
+one was not the same, and the reviewer was right. Losing the non-blocking
+"is there work right now?" answer removes a CAPABILITY, not a shape - and it
+removes it from the exact subsystem whose deletion-as-dead-code was once
+reverted at the owner's instruction.
 
-## D. Leaks
+So `pull` keeps its original signature and semantics, `try_pull` is a
+name-symmetric alias, and the waiting form is the new `pull_next().await`.
+`DriveGeneration` is `#[non_exhaustive]` but carries a `new` constructor for the
+same reason: `drive_changes_stream` takes one, and a published type an external
+caller cannot construct is removed in substance.
 
-- **D2.** `CursorRegistry::drive_leases` is never pruned; `delete(&scope)` leaves
-  the lease behind. Bounded by the scope identity space, so minor. **Confidence: high.**
-- **D3.** `ThrottleBucket::waits` under `ThrottleKey::Account` is deliberately never
-  forgotten on detach; combined with D2 it is bounded, noted only for completeness.
+## Out-of-scope observations (carried, not fixed)
 
-## E. Smaller correctness items
+Restored here rather than dropped with round 5's edits - neither is resolved.
 
-- **E1. Mailbox throttle degrades *wider*, not narrower.** `resolve_throttle_key`
-  maps `ThrottleScope::Mailbox` to `ThrottleKey::Account` when the error names no
-  mailbox, and `wait_for_account` includes the `Account` key. The comment claims the
-  fallback "is a subset - never wider"; for `Mailbox` the fallback is strictly wider,
-  so a per-mailbox 429 stalls the entire account. The doc elsewhere says the exact
-  opposite is intended. **Confidence: high.**
-- **E4. Per-item engine-blocked campaigns leave unseen ids in no bucket.** When
-  `classify_item_outcome` returns an engine directive, `blocked_by_engine` breaks out
-  of the attempt loop with no sweep of `remaining` ids the stream never resolved -
-  unlike the stream-level `Engine`/`Reconcile` arms, which do sweep. Those ids are
-  counted in no lane, i.e. the campaign reports success for work that never happened.
-  Same defect the `retry_queue_cap` truncation comment describes at length, in a
-  sibling path. **Confidence: medium.**
-- **E5. `ScopeLifecycle::Deleted`/`Renamed` remove scope tokens by key, not by
-  generation** - the exact eviction hazard `retire_scope_token` exists to prevent. It
-  cancels first, so it is much less dangerous, but the asymmetry is an accident
-  waiting for a delete/recreate race. **Confidence: medium.**
-- **E8. `MultiplexerHandle::cancel` is a child token nobody ever cancels** (the
-  multiplexer is driven by `slot.shutdown`). Dead field that reads as a live control.
-  **Confidence: high.**
-
-## F. Structural - what shape this should have had
-
-3. **`BackfillRunner` and `InventoryFusion` are two implementations of one walk.**
-   PARTIALLY RESOLVED in round 3. The safety-critical half - barrier detection,
-   the resume checkpoint, and barrier-incident recording - is now the shared
-   `InventoryWalk` in `crates/sync/src/inventory_walk.rs`, which is what closed
-   A2 and E3. **Confidence: high (residual is real, and unfixed).** Still two
-   implementations: checkpoint MINTING (fusion forwards the account's checkpoint,
-   backfill mints a positional `page:F:T` from its own `seen_total`) and terminal
-   `Done` handling (backfill sends `RecordDebt` for a degraded summary and
-   `break`s, fusion `finalize`s the cursor). One driver parameterised by "who
-   mints the checkpoint" remains the shape this should have. Nothing here is
-   currently a lost-data path; it is the RE-DIVERGENCE risk that A2 already
-   charged the project for once.
-
-5. **The scheduler and `BudgetGate` are an entire dead subsystem.** Nothing in any
-   work path calls `submit`/`pull`/`acquire`; `Scheduler::pull` is not even
-   async-wakeup-capable (callers must supply their own notification). Meanwhile the
-   engine has *no* admission control: N per-scope poll tasks, a reconciler, a backfill
-   orchestrator, and unbounded mutation campaigns all hit one connection concurrently,
-   throttled only by whatever `bifrost-net` does. Either wire it (which means the lane
-   queues need a real wakeup source and `pull` needs to be async) or delete it and say
-   plainly that `bifrost-net` is the only chokepoint. Per the standing rule the delete
-   option is filed as a finding, not a mandate - and the keep-it fix is real work, not
-   a rename.
-
-## Out-of-scope observations
-
-- `bifrost-types`: `InventoryBatch::checkpoint` is `Option<Checkpoint>` with no way
-  to distinguish "this page has no checkpoint" from "I stripped this checkpoint
-  because of a barrier". The barrier signal rides only in `coverage`, which is why
-  A2 was easy to miss. A dedicated `PageCheckpoint::{Advance(..), Withheld}` would
-  make the omission a compile error. STILL OPEN after round 3: the shared
-  `InventoryWalk` makes both front ends read `coverage` the same way, but nothing
-  in the type system stops a third front end from ignoring it. `bifrost-types` was
-  not touched in this round.
+- `bifrost-types`: `InventoryBatch::checkpoint` is `Option<Checkpoint>` with no
+  way to distinguish "this page has no checkpoint" from "I stripped this
+  checkpoint because of a barrier". The barrier signal rides only in `coverage`,
+  which is why A2 was easy to miss. A dedicated
+  `PageCheckpoint::{Advance(..), Withheld}` would make the omission a compile
+  error. The shared `InventoryWalk` makes both current front ends read
+  `coverage` the same way, but nothing in the type system stops a third front
+  end from ignoring it. `bifrost-types` was not touched in this arc.
 - `bifrost-types`: `AccountError` carries no tenant identity, so
-  `ThrottleScope::Tenant` is unimplementable and always degrades - the engine
-  documents this as blocked on types. Worth deciding, since `Tenant` degrading to
-  `Account` has the same widening problem as E1 in reverse (it silently under
-  throttles siblings).
+  `ThrottleScope::Tenant` is unimplementable and always degrades to the account
+  key, silently under-throttling siblings under a tenant-wide 429. Filed as a
+  standalone cross-crate item in `notes/todo.md`.
+
+Round 5 leaves no open findings in this document.

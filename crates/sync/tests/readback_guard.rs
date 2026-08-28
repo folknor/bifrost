@@ -7,7 +7,7 @@
 use std::collections::HashSet;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use bifrost_sync::{Error, IdempotencyVendor, SyncEngine, run_readback_guard};
 use bifrost_types::{
@@ -56,8 +56,17 @@ struct FlagsAccount {
 
 #[derive(Default)]
 struct CampaignState {
+    engine_block_first: AtomicBool,
+    gate_first_campaign: AtomicBool,
+    release_first_campaign: tokio::sync::Notify,
     submissions: AtomicUsize,
     submitted: tokio::sync::Notify,
+    /// Gate the FIRST read-back hydration, so a test can observe what the
+    /// engine allows to start while a read-back is in flight.
+    gate_readback: AtomicBool,
+    readbacks: AtomicUsize,
+    readback_started: tokio::sync::Notify,
+    release_readback: tokio::sync::Notify,
     keys: std::sync::Mutex<Vec<IdempotencyKey>>,
     /// How many targets each successive submission actually carried, so a
     /// test can observe the width of a resubmission rather than only its
@@ -161,9 +170,18 @@ impl Account for FlagsAccount {
     ) -> AccountStream<SyncEvent<ItemOutcome<HydratedObject>>> {
         assert_eq!(projection, Projection::FlagsOnly);
         let table = self.flag_table.clone();
+        let gate = self.campaign.as_ref().and_then(|campaign| {
+            (campaign.gate_readback.load(Ordering::SeqCst)
+                && campaign.readbacks.fetch_add(1, Ordering::SeqCst) == 0)
+                .then(|| Arc::clone(campaign))
+        });
         let collected: Pin<Box<dyn futures::Future<Output = Vec<ObjectId>> + Send>> =
             Box::pin(async move { ids.collect::<Vec<_>>().await });
         let s = async move {
+            if let Some(campaign) = gate {
+                campaign.readback_started.notify_one();
+                campaign.release_readback.notified().await;
+            }
             let ids: Vec<ObjectId> = collected.await;
             let items: Vec<ItemOutcome<HydratedObject>> = ids
                 .into_iter()
@@ -245,6 +263,51 @@ impl Account for FlagsAccount {
         campaign.keys.lock().expect("keys lock").push(key);
         let attempt = campaign.submissions.fetch_add(1, Ordering::SeqCst);
         campaign.submitted.notify_one();
+        if campaign.gate_first_campaign.load(Ordering::SeqCst) && attempt == 0 {
+            let campaign = Arc::clone(campaign);
+            return Box::pin(stream::once(async move {
+                campaign.release_first_campaign.notified().await;
+                let items = targets
+                    .map(|id| {
+                        ItemOutcome::Succeeded(bifrost_types::BatchSuccess::new(
+                            bifrost_types::BatchItemId(id.0),
+                            MutationSuccess::Applied,
+                        ))
+                    })
+                    .collect()
+                    .await;
+                SyncEvent::Batch(Batch {
+                    items,
+                    page_boundary: PageBoundary::Final,
+                    server_latency: std::time::Duration::ZERO,
+                    bytes_in: 0,
+                    checkpoint: None,
+                })
+            }));
+        }
+        if campaign.engine_block_first.load(Ordering::SeqCst) && attempt == 0 {
+            return Box::pin(stream::once(async move {
+                let mut ids: Vec<ObjectId> = targets.collect().await;
+                let first = ids.remove(0);
+                let error = AccountErrorBuilder::new(
+                    AccountErrorKind::SyncState(bifrost_types::SyncStateErrorKind::CursorInvalid),
+                    Cause::State(bifrost_types::StateCause::CursorInvalid),
+                )
+                .scope(bifrost_types::ErrorScope::Cursor(CursorScope::Account))
+                .try_build()
+                .expect("valid engine-blocked error");
+                SyncEvent::Batch(Batch {
+                    items: vec![ItemOutcome::Failed(bifrost_types::BatchFailure::new(
+                        bifrost_types::BatchItemId(first.0),
+                        error,
+                    ))],
+                    page_boundary: PageBoundary::Final,
+                    server_latency: std::time::Duration::ZERO,
+                    bytes_in: 0,
+                    checkpoint: None,
+                })
+            }));
+        }
         if attempt == 0 {
             // Drain first so the submission width is recorded, then terminate
             // retryably without emitting any per-item outcome. Whether the
@@ -1001,6 +1064,179 @@ async fn retry_queue_cap_bounds_a_resubmission_without_losing_the_excess() {
         accounted, 5,
         "every submitted target must land in exactly one lane: {counters:?}"
     );
+    engine.detach(&account_id).await.expect("detach");
+}
+
+#[tokio::test]
+async fn per_item_engine_block_accounts_for_unseen_campaign_ids() {
+    let state = Arc::new(CampaignState::default());
+    state.engine_block_first.store(true, Ordering::SeqCst);
+    let engine = SyncEngine::builder().build().expect("engine");
+    let account_id = AccountId("per-item-engine-block".into());
+    engine
+        .attach(
+            account_id.clone(),
+            Arc::new(FlagsFactory(campaign_account(state))),
+        )
+        .await
+        .expect("attach");
+
+    let counters = engine
+        .bulk_set_flags(
+            &account_id,
+            vec![
+                ObjectId("one".into()),
+                ObjectId("two".into()),
+                ObjectId("three".into()),
+            ],
+            FlagOp::Add(set(&["\\Seen"])),
+            &vendor(),
+            ProtocolKind::Imap,
+        )
+        .await
+        .expect("campaign");
+
+    assert_eq!(counters.blocked_by_engine, 3);
+    engine.detach(&account_id).await.expect("detach");
+}
+
+#[tokio::test]
+async fn mutation_campaigns_use_engine_admission_on_the_real_path() {
+    let state = Arc::new(CampaignState::default());
+    state.gate_first_campaign.store(true, Ordering::SeqCst);
+    let config = bifrost_sync::EngineConfig {
+        budget: bifrost_sync::ConcurrencyBudget {
+            per_account: 2,
+            global: 2,
+            mutation_share_num: 1,
+            mutation_share_den: 2,
+        },
+        ..bifrost_sync::EngineConfig::default()
+    };
+    let engine = Arc::new(
+        SyncEngine::builder()
+            .config(config)
+            .build()
+            .expect("engine"),
+    );
+    let account_id = AccountId("mutation-admission".into());
+    engine
+        .attach(
+            account_id.clone(),
+            Arc::new(FlagsFactory(campaign_account(Arc::clone(&state)))),
+        )
+        .await
+        .expect("attach");
+
+    let spawn_campaign = |id: &'static str| {
+        let engine = Arc::clone(&engine);
+        let account_id = account_id.clone();
+        tokio::spawn(async move {
+            engine
+                .bulk_set_flags(
+                    &account_id,
+                    vec![ObjectId(id.into())],
+                    FlagOp::Add(set(&["\\Seen"])),
+                    &vendor(),
+                    ProtocolKind::Imap,
+                )
+                .await
+        })
+    };
+    let first = spawn_campaign("one");
+    state.submitted.notified().await;
+    let second = spawn_campaign("two");
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+    assert_eq!(state.submissions.load(Ordering::SeqCst), 1);
+
+    state.release_first_campaign.notify_one();
+    first.await.expect("first task").expect("first campaign");
+    second.await.expect("second task").expect("second campaign");
+    assert_eq!(state.submissions.load(Ordering::SeqCst), 2);
+    engine.detach(&account_id).await.expect("detach");
+}
+
+/// The read-back guard hydrates over the wire, and it runs AFTER the
+/// attempt loop released the campaign's admission permit. Left unadmitted
+/// it is protocol work outside both the per-account and the global cap -
+/// on exactly the path (an oversized campaign's unresolved tail) where the
+/// fan-out is widest.
+///
+/// The observable is a second campaign: with one mutation permit for the
+/// account, it can only submit while the first campaign holds nothing. If
+/// the read-back is admitted, its submission waits for the read-back to
+/// finish.
+#[tokio::test]
+async fn a_read_back_holds_admission_against_a_second_campaign() {
+    let state = Arc::new(CampaignState::default());
+    state.gate_readback.store(true, Ordering::SeqCst);
+    let config = bifrost_sync::EngineConfig {
+        budget: bifrost_sync::ConcurrencyBudget {
+            per_account: 2,
+            global: 8,
+            mutation_share_num: 1,
+            mutation_share_den: 2,
+        },
+        // One attempt only, so the campaign's single target ends in the
+        // pending-retry lane and reaches the read-back guard.
+        mutation_max_retries: 1,
+        ..bifrost_sync::EngineConfig::default()
+    };
+    let engine = Arc::new(
+        SyncEngine::builder()
+            .config(config)
+            .build()
+            .expect("engine"),
+    );
+    let account_id = AccountId("readback-admission".into());
+    engine
+        .attach(
+            account_id.clone(),
+            Arc::new(FlagsFactory(campaign_account(Arc::clone(&state)))),
+        )
+        .await
+        .expect("attach");
+
+    let spawn_campaign = |id: &'static str| {
+        let engine = Arc::clone(&engine);
+        let account_id = account_id.clone();
+        tokio::spawn(async move {
+            engine
+                .bulk_set_flags(
+                    &account_id,
+                    vec![ObjectId(id.into())],
+                    FlagOp::Add(set(&["\\Seen"])),
+                    &vendor(),
+                    ProtocolKind::Imap,
+                )
+                .await
+        })
+    };
+
+    let first = spawn_campaign("one");
+    state.readback_started.notified().await;
+    assert_eq!(
+        state.submissions.load(Ordering::SeqCst),
+        1,
+        "the first campaign submitted once and is now in its read-back"
+    );
+
+    let second = spawn_campaign("two");
+    for _ in 0..16 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        state.submissions.load(Ordering::SeqCst),
+        1,
+        "a second campaign must not reach the wire while the in-flight \
+         read-back holds the account's only mutation permit"
+    );
+
+    state.release_readback.notify_one();
+    first.await.expect("first task").expect("first campaign");
+    second.await.expect("second task").expect("second campaign");
+    assert_eq!(state.submissions.load(Ordering::SeqCst), 2);
     engine.detach(&account_id).await.expect("detach");
 }
 

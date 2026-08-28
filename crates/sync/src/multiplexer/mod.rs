@@ -302,6 +302,7 @@ pub struct Multiplexer {
     /// scope (or a sibling account) pauses the others; the Retry arm
     /// records deadlines it observes.
     pub throttles: Arc<StdMutex<crate::recovery::ThrottleBucket>>,
+    pub scheduler: crate::scheduler::Scheduler,
 }
 
 impl Multiplexer {
@@ -362,6 +363,7 @@ impl Multiplexer {
             ack_tx,
             scope_tokens,
             throttles,
+            scheduler,
         } = self;
 
         // Snapshot the known scopes from the registry; the engine has
@@ -379,6 +381,7 @@ impl Multiplexer {
             ack_tx.clone(),
             Arc::clone(&scope_tokens),
             Arc::clone(&throttles),
+            scheduler.clone(),
         );
 
         // Drive scope_lifecycle in the background. `Created` asks the
@@ -515,11 +518,7 @@ impl Multiplexer {
                                 ScopeLifecycle::Deleted(membership) => {
                                     let scopes = lifecycle_cursors.scopes_for_membership(&membership);
                                     for scope in scopes {
-                                        if let Some(token) =
-                                            lifecycle_tokens.lock().expect("poisoned").remove(&scope)
-                                        {
-                                            token.cancel();
-                                        }
+                                        cancel_scope_token(&lifecycle_tokens, &scope);
                                         lifecycle_cursors.delete(&scope);
                                     }
                                 }
@@ -531,11 +530,7 @@ impl Multiplexer {
                                     let old_scopes =
                                         lifecycle_cursors.scopes_for_membership(&old);
                                     for scope in old_scopes {
-                                        if let Some(token) =
-                                            lifecycle_tokens.lock().expect("poisoned").remove(&scope)
-                                        {
-                                            token.cancel();
-                                        }
+                                        cancel_scope_token(&lifecycle_tokens, &scope);
                                         lifecycle_cursors.delete(&scope);
                                     }
                                     for scope in membership_to_cursor_scopes(&lifecycle_cursors, &new) {
@@ -600,6 +595,7 @@ impl Multiplexer {
                         ack_tx.clone(),
                         Arc::clone(&scope_tokens),
                         Arc::clone(&throttles),
+                        scheduler.clone(),
                     );
                 }
             }
@@ -674,6 +670,7 @@ fn spawn_and_track_scope_poll(
     ack_tx: Option<mpsc::Sender<WriterRequest>>,
     scope_tokens: ScopeTokens,
     throttles: Arc<StdMutex<crate::recovery::ThrottleBucket>>,
+    scheduler: crate::scheduler::Scheduler,
     scope: CursorScope,
 ) {
     let scope_cancel = shutdown.child_token();
@@ -701,6 +698,7 @@ fn spawn_and_track_scope_poll(
             reopen_tx,
             ack_tx,
             throttles,
+            scheduler,
             scope,
         )
         .await;
@@ -723,6 +721,14 @@ fn retire_scope_token(tokens: &ScopeTokens, scope: &CursorScope, generation: u64
     }
 }
 
+fn cancel_scope_token(tokens: &ScopeTokens, scope: &CursorScope) {
+    let current = tokens.lock().expect("poisoned").get(scope).cloned();
+    if let Some(entry) = current {
+        entry.token.cancel();
+        retire_scope_token(tokens, scope, entry.generation);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_missing_scope_polls(
     account_id: AccountId,
@@ -737,6 +743,7 @@ fn spawn_missing_scope_polls(
     ack_tx: Option<mpsc::Sender<WriterRequest>>,
     scope_tokens: ScopeTokens,
     throttles: Arc<StdMutex<crate::recovery::ThrottleBucket>>,
+    scheduler: crate::scheduler::Scheduler,
 ) {
     for scope in cursors.all_scopes() {
         let should_spawn = {
@@ -764,6 +771,7 @@ fn spawn_missing_scope_polls(
                 ack_tx.clone(),
                 Arc::clone(&scope_tokens),
                 Arc::clone(&throttles),
+                scheduler.clone(),
                 scope,
             );
         }
@@ -788,6 +796,7 @@ async fn spawn_scope_poll_inner(
     reopen_tx: mpsc::Sender<ReopenRequest>,
     ack_tx: Option<mpsc::Sender<WriterRequest>>,
     throttles: Arc<StdMutex<crate::recovery::ThrottleBucket>>,
+    scheduler: crate::scheduler::Scheduler,
     scope: CursorScope,
 ) {
     let mut cadence = AdaptiveCadence {
@@ -837,6 +846,36 @@ async fn spawn_scope_poll_inner(
                 () = tokio::time::sleep(wait) => {}
             }
         }
+        let _admission = tokio::select! {
+            () = shutdown.cancelled() => return,
+            () = scope_cancel.cancelled() => return,
+            permit = scheduler.admit(
+                account_id.clone(),
+                control.priority_snapshot(),
+                crate::scheduler::WorkKind::Sync,
+            ) => match permit {
+                Ok(permit) => permit,
+                Err(error) => {
+                    // A refused admission is transient (a full lane, or a
+                    // scheduler shutting down). Exiting here would retire
+                    // the scope's poll loop permanently for a condition
+                    // that clears on its own, so back off one cadence
+                    // step and re-enter instead.
+                    tracing::warn!(
+                        target: "bifrost.sync.scheduler",
+                        scope = ?scope,
+                        %error,
+                        "poll admission refused; retrying at the next cadence"
+                    );
+                    tokio::select! {
+                        () = shutdown.cancelled() => return,
+                        () = scope_cancel.cancelled() => return,
+                        () = tokio::time::sleep(cadence.interval) => {}
+                    }
+                    continue;
+                }
+            },
+        };
         let driven = cursors
             .with_drive(&scope, |cursor, registry_generation| {
                 let pre_advance_state = cursor.server_state.bytes.clone();
@@ -878,6 +917,7 @@ async fn spawn_scope_poll_inner(
                 }
             })
             .await;
+        drop(_admission);
         let Some((advanced, outcome)) = driven else {
             // Scope was removed from the registry; exit cleanly.
             return;
@@ -1425,6 +1465,54 @@ mod tests {
         };
         let next = Multiplexer::updated_cadence(c, false, ms(100), ms(30_000));
         assert_eq!(next.interval, ms(30_000));
+    }
+
+    /// A lifecycle delete cancels the scope's poll task AND retires its
+    /// registry entry. Cancelling without retiring leaves a cancelled
+    /// token behind, and `spawn_missing_scope_polls` then sees an entry
+    /// for the scope and never respawns it if the scope comes back.
+    #[test]
+    fn cancelling_a_scope_token_also_retires_its_entry() {
+        let tokens: ScopeTokens = Arc::new(StdMutex::new(HashMap::new()));
+        let scope = CursorScope::Account;
+        let token = CancellationToken::new();
+        tokens.lock().expect("poisoned").insert(
+            scope.clone(),
+            ScopeToken {
+                generation: 7,
+                token: token.clone(),
+            },
+        );
+
+        cancel_scope_token(&tokens, &scope);
+
+        assert!(token.is_cancelled(), "the poll task must be cancelled");
+        assert!(
+            !tokens.lock().expect("poisoned").contains_key(&scope),
+            "a cancelled scope must leave no entry blocking a later respawn"
+        );
+    }
+
+    /// Retirement is generation-checked, so a late retirement from a
+    /// previous incarnation cannot delete a freshly spawned task's entry.
+    #[test]
+    fn a_stale_retirement_leaves_the_current_entry_alone() {
+        let tokens: ScopeTokens = Arc::new(StdMutex::new(HashMap::new()));
+        let scope = CursorScope::Account;
+        tokens.lock().expect("poisoned").insert(
+            scope.clone(),
+            ScopeToken {
+                generation: 9,
+                token: CancellationToken::new(),
+            },
+        );
+
+        retire_scope_token(&tokens, &scope, 8);
+
+        assert!(
+            tokens.lock().expect("poisoned").contains_key(&scope),
+            "an older generation must not retire the current entry"
+        );
     }
 
     #[test]
