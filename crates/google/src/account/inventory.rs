@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -10,11 +11,14 @@ use bifrost_types::{
 use bytes::Bytes;
 use futures::{StreamExt, stream};
 use serde::Deserialize;
+use tokio_util::sync::CancellationToken;
 
 use crate::client::GmailClient;
 use crate::encoding::decode_base64url_nopad;
 use crate::headers::find_header_value_case_insensitive;
-use crate::types::{GmailHeader, GmailLabel, GmailMessage, GmailProfile};
+#[cfg(test)]
+use crate::types::GmailLabel;
+use crate::types::{GmailHeader, GmailMessage, GmailProfile};
 
 use super::blobs;
 use super::cursor::cursor_for_history;
@@ -24,6 +28,7 @@ use super::scopes::{ScopeCache, labels_for_flags};
 
 const LIST_PAGE_SIZE: u32 = 500;
 const HYDRATE_BATCH_SIZE: usize = 32;
+const MAX_INVENTORY_PAGES: usize = 10_000;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -89,6 +94,7 @@ pub(crate) fn repair_inventory(
                 return;
             }
         };
+        let label_names = Arc::new(flags::label_name_index(labels.as_slice()));
 
         let mut requests = requests;
         while let Some(request) = requests.next().await {
@@ -109,7 +115,10 @@ pub(crate) fn repair_inventory(
                     // Rebuilding the entry IS the proof: the obligation was
                     // raised because this object could not be represented, so
                     // re-reading it is only half the answer.
-                    let entry = inventory_entry_from_message(&message, labels.as_slice());
+                    let entry = inventory_entry_from_message_indexed(
+                        &message,
+                        &label_names,
+                    );
                     bifrost_types::InventoryRepairOutcome::ObjectRecovered {
                         attempt,
                         entry: Box::new(entry),
@@ -158,10 +167,20 @@ pub(crate) fn repair_inventory(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn inventory_stream(
     client: Arc<GmailClient>,
     cache: ScopeCache,
     scope: CursorScope,
+) -> AccountStream<bifrost_types::InventoryEvent> {
+    inventory_stream_cancellable(client, cache, scope, CancellationToken::new())
+}
+
+pub(crate) fn inventory_stream_cancellable(
+    client: Arc<GmailClient>,
+    cache: ScopeCache,
+    scope: CursorScope,
+    shutdown: CancellationToken,
 ) -> AccountStream<bifrost_types::InventoryEvent> {
     if !matches!(scope, CursorScope::Account) {
         let account_error = error::into_account_error(
@@ -174,6 +193,9 @@ pub(crate) fn inventory_stream(
     }
 
     Box::pin(async_stream::stream! {
+        if shutdown.is_cancelled() {
+            return;
+        }
         // Every request this walk makes - prelude, each list page, and
         // the concurrent hydration fan-out - reports into one
         // accumulator, and each emitted batch takes and clears it. The
@@ -197,7 +219,11 @@ pub(crate) fn inventory_stream(
             let labels = labels_for_flags(&client, &cache).await?;
             Ok::<_, crate::Error>((checkpoint, Arc::new(labels)))
         };
-        let (checkpoint, labels) = match prelude.await {
+        let prelude = tokio::select! {
+            () = shutdown.cancelled() => return,
+            result = prelude => result,
+        };
+        let (checkpoint, labels) = match prelude {
             Ok(prelude) => prelude,
             Err(error) => {
                 let account_error = error::into_account_error(
@@ -208,7 +234,10 @@ pub(crate) fn inventory_stream(
                 return;
             }
         };
+        let label_names = Arc::new(flags::label_name_index(labels.as_slice()));
         let mut page_token = None;
+        let mut pages_walked = 0;
+        let mut seen_page_tokens = HashSet::new();
         // Objects this walk discovered but could not represent. Once non-empty
         // every later checkpoint declares DEGRADED coverage, because a
         // checkpoint must name every unresolved obligation preceding it.
@@ -216,7 +245,11 @@ pub(crate) fn inventory_stream(
 
         loop {
             let started = Instant::now();
-            let page = match list_messages_page(&client, page_token.as_deref()).await {
+            let page_result = tokio::select! {
+                () = shutdown.cancelled() => return,
+                result = list_messages_page(&client, page_token.as_deref()) => result,
+            };
+            let page = match page_result {
                 Ok(page) => page,
                 Err(error) => {
                     let account_error = error::into_account_error(
@@ -228,39 +261,55 @@ pub(crate) fn inventory_stream(
                 }
             };
 
+            pages_walked += 1;
+            if let Some(refusal) = inventory_walk_refusal(
+                &mut seen_page_tokens,
+                pages_walked,
+                page.next_page_token.as_deref(),
+            ) {
+                // Discard this page. No checkpoint has been emitted, so a
+                // retry starts from the pre-walk history id and no partial
+                // enumeration can be mistaken for complete coverage.
+                let account_error = error::into_account_error(
+                    crate::error::Error::Local(crate::error::GmailLocalError::Internal {
+                        detail: refusal,
+                    }),
+                    error::GmailErrorContext::inventory(),
+                );
+                yield bifrost_types::InventoryEvent::Terminated(account_error);
+                return;
+            }
+
             let final_page = page.next_page_token.is_none();
             // The id travels with its result: a per-item failure has to NAME
             // the object it could not represent, or the obligation is a region
             // with nothing to retry against.
             let mut hydrated = stream::iter(page.messages.into_iter().map(|stub| {
                 let client = Arc::clone(&client);
-                let labels = Arc::clone(&labels);
+                let label_names = Arc::clone(&label_names);
                 async move {
                     let outcome = client
                         .get_message(&stub.id, "metadata")
                         .await
-                        .map(|message| inventory_entry_from_message(&message, labels.as_slice()));
+                        .map(|message| inventory_entry_from_message_indexed(
+                            &message,
+                            &label_names,
+                        ));
                     (stub.id, outcome)
                 }
             }))
             .buffer_unordered(HYDRATE_BATCH_SIZE);
 
             let mut items = Vec::with_capacity(HYDRATE_BATCH_SIZE);
-            while let Some((id, result)) = hydrated.next().await {
+            loop {
+                let next = tokio::select! {
+                    () = shutdown.cancelled() => return,
+                    next = hydrated.next() => next,
+                };
+                let Some((id, result)) = next else { break; };
                 match result {
                     Ok(item) => {
                         items.push(item);
-                        if items.len() >= HYDRATE_BATCH_SIZE {
-                            let out = std::mem::take(&mut items);
-                            yield bifrost_types::InventoryEvent::Batch(bifrost_types::InventoryBatch {
-                                items: out,
-                                page_boundary: PageBoundary::Page,
-                                server_latency: started.elapsed(),
-                                bytes_in: tally.take(),
-                                checkpoint: None,
-                                coverage: coverage_of(&scope, &obligations),
-                            });
-                        }
                     }
                     Err(error) => {
                         let account_error = error::into_account_error(
@@ -341,11 +390,22 @@ pub(crate) fn inventory_stream(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn get_stream(
     client: Arc<GmailClient>,
     cache: ScopeCache,
     ids: AccountStream<ObjectId>,
     projection: Projection,
+) -> AccountStream<SyncEvent<ItemOutcome<HydratedObject>>> {
+    get_stream_cancellable(client, cache, ids, projection, CancellationToken::new())
+}
+
+pub(crate) fn get_stream_cancellable(
+    client: Arc<GmailClient>,
+    cache: ScopeCache,
+    ids: AccountStream<ObjectId>,
+    projection: Projection,
+    shutdown: CancellationToken,
 ) -> AccountStream<SyncEvent<ItemOutcome<HydratedObject>>> {
     // Hydration batches are the clearest case for a batch-scoped
     // accumulator: one emitted batch covers up to HYDRATE_BATCH_SIZE
@@ -358,11 +418,15 @@ pub(crate) fn get_stream(
         cache,
         ids,
         projection,
+        shutdown,
         finished: false,
         emitted_done: false,
     };
 
     Box::pin(stream::unfold(state, |mut state| async move {
+        if state.shutdown.is_cancelled() {
+            return None;
+        }
         if state.finished {
             if state.emitted_done {
                 return None;
@@ -383,7 +447,11 @@ pub(crate) fn get_stream(
         // one alignment is strictly cheaper than a stall.
         let mut final_batch = false;
         while ids.len() < HYDRATE_BATCH_SIZE {
-            match state.ids.next().await {
+            let next = tokio::select! {
+                () = state.shutdown.cancelled() => return None,
+                next = state.ids.next() => next,
+            };
+            match next {
                 Some(id) => ids.push(id),
                 None => {
                     final_batch = true;
@@ -403,7 +471,11 @@ pub(crate) fn get_stream(
         // Resolved after the id drain, not before it: `labels_for_flags`
         // can hit the network, and the poll that discovers an exhausted
         // id stream has no hydration to canonicalize for.
-        let labels = match labels_for_flags(&state.client, &state.cache).await {
+        let labels_result = tokio::select! {
+            () = state.shutdown.cancelled() => return None,
+            result = labels_for_flags(&state.client, &state.cache) => result,
+        };
+        let labels = match labels_result {
             Ok(labels) => labels,
             Err(error) => {
                 state.finished = true;
@@ -417,15 +489,34 @@ pub(crate) fn get_stream(
         };
 
         let started = Instant::now();
-        let mut items: Vec<ItemOutcome<HydratedObject>> = Vec::with_capacity(ids.len());
-        for id in ids {
-            // Clone the id so a failing hydrate can attach
-            // `ErrorScope::Message { id }` to the resulting
-            // `AccountError` (and so the per-item lane carries it as
-            // a `BatchItemId`); moved into `hydrate_one`, the error
-            // scope would carry an empty string.
-            let id_for_error = id.0.clone();
-            match hydrate_one(&state.client, &labels, id, state.projection).await {
+        let label_names = Arc::new(flags::label_name_index(&labels));
+        let hydrate_client = Arc::clone(&state.client);
+        let projection = state.projection;
+        let mut hydrated = stream::iter(ids.into_iter().map(move |id| {
+            let client = Arc::clone(&hydrate_client);
+            let label_names = Arc::clone(&label_names);
+            async move {
+                // Clone the id so a failing hydrate can attach
+                // `ErrorScope::Message { id }` to the resulting
+                // `AccountError` (and so the per-item lane carries it as
+                // a `BatchItemId`); moved into `hydrate_one`, the error
+                // scope would carry an empty string.
+                let id_for_error = id.0.clone();
+                let result = hydrate_one(&client, &label_names, id, projection).await;
+                (id_for_error, result)
+            }
+        }))
+        .buffer_unordered(HYDRATE_BATCH_SIZE);
+        let mut items: Vec<ItemOutcome<HydratedObject>> = Vec::new();
+        loop {
+            let next = tokio::select! {
+                () = state.shutdown.cancelled() => return None,
+                next = hydrated.next() => next,
+            };
+            let Some((id_for_error, result)) = next else {
+                break;
+            };
+            match result {
                 Ok(hydrated) => {
                     items.push(ItemOutcome::Succeeded(BatchSuccess::new(
                         BatchItemId(id_for_error),
@@ -444,6 +535,7 @@ pub(crate) fn get_stream(
                 }
             }
         }
+        drop(hydrated);
 
         Some((
             SyncEvent::Batch(Batch {
@@ -470,6 +562,22 @@ struct HydrateState {
     projection: Projection,
     finished: bool,
     emitted_done: bool,
+    shutdown: CancellationToken,
+}
+
+fn inventory_walk_refusal(
+    seen_page_tokens: &mut HashSet<String>,
+    pages_walked: usize,
+    next_page_token: Option<&str>,
+) -> Option<String> {
+    let token = next_page_token?;
+    if pages_walked >= MAX_INVENTORY_PAGES {
+        return Some(format!(
+            "gmail users.messages.list exceeded {MAX_INVENTORY_PAGES} pages in one walk"
+        ));
+    }
+    (!seen_page_tokens.insert(token.to_string()))
+        .then(|| format!("gmail users.messages.list repeated page token {token:?}"))
 }
 
 async fn list_messages_page(
@@ -502,7 +610,7 @@ fn inventory_checkpoint(profile: &GmailProfile) -> crate::Result<Option<Checkpoi
 
 async fn hydrate_one(
     client: &GmailClient,
-    labels: &[GmailLabel],
+    label_names: &flags::LabelNameIndex,
     id: ObjectId,
     projection: Projection,
 ) -> crate::Result<HydratedObject> {
@@ -511,7 +619,10 @@ async fn hydrate_one(
             let message = client.get_message(&id.0, "minimal").await?;
             Ok(HydratedObject {
                 id,
-                kind: HydratedObjectKind::FlagsOnly(flags::flag_set(&message.label_ids, labels)),
+                kind: HydratedObjectKind::FlagsOnly(flags::flag_set_indexed(
+                    &message.label_ids,
+                    label_names,
+                )),
                 blobs: Vec::new(),
             })
         }
@@ -519,7 +630,10 @@ async fn hydrate_one(
             let message = client.get_message(&id.0, "metadata").await?;
             Ok(HydratedObject {
                 id,
-                kind: HydratedObjectKind::Metadata(inventory_entry_from_message(&message, labels)),
+                kind: HydratedObjectKind::Metadata(inventory_entry_from_message_indexed(
+                    &message,
+                    label_names,
+                )),
                 blobs: Vec::new(),
             })
         }
@@ -544,7 +658,10 @@ async fn hydrate_one(
             let message = client.get_message(&id.0, "metadata").await?;
             Ok(HydratedObject {
                 id,
-                kind: HydratedObjectKind::Metadata(inventory_entry_from_message(&message, labels)),
+                kind: HydratedObjectKind::Metadata(inventory_entry_from_message_indexed(
+                    &message,
+                    label_names,
+                )),
                 blobs: Vec::new(),
             })
         }
@@ -559,12 +676,21 @@ pub(crate) fn raw_bytes(message: &GmailMessage) -> crate::Result<Bytes> {
     Ok(Bytes::from(bytes))
 }
 
+#[cfg(test)]
 pub(crate) fn inventory_entry_from_message(
     message: &GmailMessage,
     labels: &[GmailLabel],
 ) -> InventoryEntry {
+    let label_names = flags::label_name_index(labels);
+    inventory_entry_from_message_indexed(message, &label_names)
+}
+
+fn inventory_entry_from_message_indexed(
+    message: &GmailMessage,
+    label_names: &flags::LabelNameIndex,
+) -> InventoryEntry {
     let size = non_negative_u64(message.size_estimate);
-    let canonical = flags::canonical_flags(&message.label_ids, labels);
+    let canonical = flags::canonical_flags_indexed(&message.label_ids, label_names);
     InventoryEntry {
         id: ObjectId(message.id.clone()),
         memberships: message
@@ -870,6 +996,112 @@ mod tests {
     }
 
     #[test]
+    fn inventory_page_guard_refuses_repetition_and_budget_exhaustion() {
+        let mut seen = HashSet::new();
+        assert!(inventory_walk_refusal(&mut seen, 1, Some("next")).is_none());
+        assert!(
+            inventory_walk_refusal(&mut seen, 2, Some("next"))
+                .expect("repeated token must refuse")
+                .contains("repeated page token")
+        );
+        let mut fresh = HashSet::new();
+        assert!(
+            inventory_walk_refusal(&mut fresh, MAX_INVENTORY_PAGES, Some("fresh"))
+                .expect("budget must refuse")
+                .contains("exceeded")
+        );
+        assert!(inventory_walk_refusal(&mut fresh, MAX_INVENTORY_PAGES, None).is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn get_stream_starts_a_full_hydration_batch_concurrently_and_cancels_promptly() {
+        let mut steps = vec![ok_json(json!({ "labels": [] }))];
+        steps.extend((0..HYDRATE_BATCH_SIZE).map(|_| Canned::Pending));
+        let script = ScriptedDispatch::new(steps);
+        let token_source = Arc::new(StaticTokenSource::new("token", None));
+        let net = bifrost_net::test_support::scripted_account(
+            &script,
+            NetConfig::default(),
+            Vec::new(),
+            token_source,
+            RetryPolicy::disabled(),
+        );
+        let client = Arc::new(GmailClient::with_account_net("https://gmail.test", net));
+        let ids = (0..HYDRATE_BATCH_SIZE).map(|index| ObjectId(format!("m{index}")));
+        let shutdown = CancellationToken::new();
+        let mut events = get_stream_cancellable(
+            client,
+            Arc::new(super::super::scopes::ScopeCacheState::new(
+                super::super::scopes::ScopeSnapshot::empty(),
+            )),
+            Box::pin(stream::iter(ids)),
+            Projection::Metadata,
+            shutdown.clone(),
+        );
+        let started = tokio::time::Instant::now();
+        let next = tokio::spawn(async move { events.next().await });
+        for _ in 0..100 {
+            if script.requests().len() == HYDRATE_BATCH_SIZE + 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            script.requests().len(),
+            HYDRATE_BATCH_SIZE + 1,
+            "all hydration requests must overlap after the one label refresh"
+        );
+        shutdown.cancel();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), next)
+                .await
+                .expect("cancellation must beat the one-second deadline")
+                .expect("hydration task joins")
+                .is_none()
+        );
+        assert_eq!(started.elapsed(), std::time::Duration::ZERO);
+        assert_eq!(script.requests().len(), HYDRATE_BATCH_SIZE + 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn inventory_cancellation_stops_an_inflight_request_without_an_extra_call() {
+        let script = ScriptedDispatch::new(vec![Canned::Pending, Canned::Pending]);
+        let token_source = Arc::new(StaticTokenSource::new("token", None));
+        let net = bifrost_net::test_support::scripted_account(
+            &script,
+            NetConfig::default(),
+            Vec::new(),
+            token_source,
+            RetryPolicy::disabled(),
+        );
+        let client = Arc::new(GmailClient::with_account_net("https://gmail.test", net));
+        let shutdown = CancellationToken::new();
+        let mut events = inventory_stream_cancellable(
+            client,
+            Arc::new(super::super::scopes::ScopeCacheState::new(
+                super::super::scopes::ScopeSnapshot::empty(),
+            )),
+            CursorScope::Account,
+            shutdown.clone(),
+        );
+        let started = tokio::time::Instant::now();
+        let next = tokio::spawn(async move { events.next().await });
+        while script.requests().is_empty() {
+            tokio::task::yield_now().await;
+        }
+        shutdown.cancel();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), next)
+                .await
+                .expect("cancellation must beat the one-second deadline")
+                .expect("inventory task joins")
+                .is_none()
+        );
+        assert_eq!(started.elapsed(), std::time::Duration::ZERO);
+        assert_eq!(script.requests().len(), 1);
+    }
+
+    #[test]
     fn inventory_lists_spam_and_trash_and_encodes_its_page_token() {
         assert_eq!(
             inventory_list_path(None),
@@ -931,7 +1163,7 @@ mod tests {
 
         let events = inventory_stream(
             client,
-            Arc::new(std::sync::RwLock::new(
+            Arc::new(super::super::scopes::ScopeCacheState::new(
                 super::super::scopes::ScopeSnapshot::empty(),
             )),
             CursorScope::Account,
@@ -982,6 +1214,54 @@ mod tests {
         assert!(!batch.coverage.is_complete());
     }
 
+    /// The guard is only worth anything wired into the walk. A provider
+    /// that hands back the same `nextPageToken` twice must end the
+    /// stream with `Terminated` alone: no `Done`, no final boundary and
+    /// no checkpoint, because a truncated enumeration published as
+    /// coverage advances the cursor past objects it never listed.
+    #[tokio::test]
+    async fn a_repeated_inventory_page_token_terminates_without_claiming_coverage() {
+        let client = scripted_client(vec![
+            ok_json(json!({ "emailAddress": "person@example.com", "historyId": "100" })),
+            ok_json(json!({ "labels": [] })),
+            ok_json(json!({ "messages": [{ "id": "a" }], "nextPageToken": "loop" })),
+            ok_json(json!({ "id": "a", "threadId": "thread-a" })),
+            ok_json(json!({ "messages": [{ "id": "b" }], "nextPageToken": "loop" })),
+        ]);
+
+        let events = inventory_stream(
+            client,
+            Arc::new(super::super::scopes::ScopeCacheState::new(
+                super::super::scopes::ScopeSnapshot::empty(),
+            )),
+            CursorScope::Account,
+        )
+        .collect::<Vec<_>>()
+        .await;
+
+        let last = events.last().expect("events");
+        assert!(
+            matches!(last, bifrost_types::InventoryEvent::Terminated(_)),
+            "a looping walk must terminate: {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, bifrost_types::InventoryEvent::Done(_))),
+            "a refused walk must never report completion: {events:?}"
+        );
+        assert!(
+            events.iter().all(|event| match event {
+                bifrost_types::InventoryEvent::Batch(batch) => {
+                    batch.checkpoint.is_none()
+                        && !matches!(batch.page_boundary, PageBoundary::Final)
+                }
+                _ => true,
+            }),
+            "no batch of a refused walk may checkpoint or close the page run: {events:?}"
+        );
+    }
+
     #[tokio::test]
     async fn inventory_absorbs_a_list_get_not_found_race_and_finishes() {
         let client = scripted_client(vec![
@@ -997,7 +1277,7 @@ mod tests {
 
         let events = inventory_stream(
             client,
-            Arc::new(std::sync::RwLock::new(
+            Arc::new(super::super::scopes::ScopeCacheState::new(
                 super::super::scopes::ScopeSnapshot::empty(),
             )),
             CursorScope::Account,
@@ -1028,7 +1308,7 @@ mod tests {
 
         let events = inventory_stream(
             client,
-            Arc::new(std::sync::RwLock::new(
+            Arc::new(super::super::scopes::ScopeCacheState::new(
                 super::super::scopes::ScopeSnapshot::empty(),
             )),
             CursorScope::Account,
@@ -1063,7 +1343,7 @@ mod tests {
 
         let events = get_stream(
             client,
-            Arc::new(std::sync::RwLock::new(
+            Arc::new(super::super::scopes::ScopeCacheState::new(
                 super::super::scopes::ScopeSnapshot::empty(),
             )),
             ids,
@@ -1102,7 +1382,7 @@ mod tests {
 
         let mut events = get_stream(
             scripted_client(script),
-            Arc::new(std::sync::RwLock::new(
+            Arc::new(super::super::scopes::ScopeCacheState::new(
                 super::super::scopes::ScopeSnapshot::empty(),
             )),
             id_stream,

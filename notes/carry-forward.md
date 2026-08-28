@@ -19,6 +19,111 @@ rather than appending to it.
 - Refusing a finding with a reason is a good outcome. Two have been rejected on
   the merits so far, both recorded below.
 
+## From the `bugs-google.md` arc (closed, four rounds ending at HEAD)
+
+Scope was `crates/google/`. Four rounds. The failure pattern fired in EVERY one
+of them - a fix opening a new hole one layer up, in a consumer of what it
+changed - and in all four it was the cold review, never the fix pass's own
+tests, that caught it.
+
+Machinery later work may build on and must not break:
+
+- **`PubSubControl` is one owned actor with a four-state lifecycle**
+  (`Unwatched` / `Pending` / `Watched` / `Retired`), `Retired` absorbing.
+  `commit_watched` is the SINGLE point where a provider response becomes
+  `Watched`, and the handle is encoded before that commit: committing first
+  would install a watch nobody renews and no `close()` retires. Subscribe
+  deliberately does NOT race the shutdown token against the `users.watch` round
+  trip for the same reason.
+- **Mutation bisection routes batch 404s through `mutation_error`.** Gmail
+  fails a whole `batchModify` when one id is absent, so an unsplit 404 claimed
+  every id was gone. The bisection is ordered, and a terminal error mid-walk
+  returns `Terminate { accounted, error }` so sub-batches already resolved are
+  emitted as a `PageBoundary::Page` batch BEFORE the terminator. Ids never
+  transmitted stay unreported; that is what `Terminated` means on this driver.
+- **`DRAFT` and `SENT` are read-only projections.** Asserted in a `FlagOp` they
+  enter `unsupported_flags`; an unsupported-only op reports
+  `Failed(Unsupported)` and never a success lane, because `bifrost-sync` files
+  every `Downgraded` as `PendingReadback`.
+- **The Gmail history checkpoint promises "every record at or below this id
+  delivered at least once", NOT "caught up at this id".** It is the FIRST
+  page's `historyId`, retained across the walk. The walk is bounded
+  (`MAX_HISTORY_PAGES`) and a breach terminates with
+  `Protocol(ContractViolation)` rather than truncating. The lifecycle backoff is
+  cancellation-aware and resets ONLY on a `labels.list` that completed.
+- **Every internally traversed paging walk is bounded** - Gmail
+  `changes_stream`, Gmail `inventory_stream`, People `address_books_list`,
+  Calendar `calendars_list` - each with repeated-token detection and a
+  10,000-page budget. This closed the split bifrost-graph paid for, where the
+  incidental LIST walks got the guard and the primary sync loops did not.
+  `reference/google.md` carries a per-site ENUMERATION; a new traversal loop
+  must enter the guard and the enumeration, or that reference goes false.
+- **A refused or cancelled READ walk claims nothing.** Inventory emits only
+  `Terminated` - never `Done`, a final page boundary, a checkpoint, or a
+  coverage report - so a truncated enumeration can never advance a cursor past
+  objects it did not list.
+- **A mutation batch already dispatched when `close()` fires reports every id
+  `Uncertain`, not nothing and not `Failed`.** This was the round-4 cold review
+  finding (G17), created by round 4's own cancellation fix. The lane follows the
+  TRANSMISSION EVIDENCE: bytes left the process and the answer was never read,
+  which is `InFlight`, so the ids queue for reconciliation. Two consumers moved
+  with it and must stay moved - the stream head drains its pending-event slot
+  BEFORE testing the shutdown token (otherwise the terminator parked behind the
+  uncertain lanes is swallowed by the token that produced it), and the `select!`
+  is `biased` toward the request so an answer already in hand is classified
+  normally. Cancellation before dispatch still ends the stream silently.
+- **`labels_for_flags` is single-flight** under a `tokio::sync::Mutex` in
+  `ScopeCacheState`, with staleness re-checked after the lock. Hydration runs 32
+  concurrent `users.messages.get` calls, so without it a batch issued 32
+  `labels.list` refreshes.
+
+Reasoned refutations - do not relitigate without new evidence:
+
+- **G12 ("`bytes_in: 0`") is REFUTED, twice, independently.** The bifrost-net
+  arc's `ByteTally` / `send_recorded` / `count_bytes_into` already cover every
+  request-bearing lane, and recording sits at the single buffered-request exit
+  point so FAILED requests count too. The remaining literal zeros are
+  no-request paths where zero is the true answer: `discover_cursor_scopes` is a
+  constant, and a `discover_memberships` cache hit performs no call. The Drive
+  resumable upload in `cloud.rs` bypasses `send_recorded` but feeds no
+  `bytes_in` field, so it under-reports nothing.
+- **The "scripted seam is unusable here" claim is REFUTED.**
+  `bifrost_net::test_support::scripted_account` drives this crate's streams
+  end-to-end, including `Canned::Pending` for cancellation and concurrency
+  tests. Round 2 of this arc exists precisely because a defect hid behind
+  isolated unit tests; prefer the seam.
+
+Accepted residuals, recorded so they are not refiled as defects:
+
+- A `FlagOp::Set` that OMITS `\Draft` against a real draft reports a success it
+  did not achieve. Closing it needs a read-back the translation layer does not
+  have; it is a `bifrost-sync` question, not a Gmail translation question.
+- A mid-bisection terminal error discards sub-batches never attempted; the
+  engine re-issues the whole operation. Revisit only if a checkpoint ever lets a
+  mutation stream resume mid-batch.
+- Cross-calendar event search resumes by calendar id and page token but not
+  within an over-delivered page, which it defensively clips.
+- `events_search_url` sends `singleEvents=true` with no `showDeleted`. This is a
+  PRODUCT decision about what a search surface should answer, not the coverage
+  defect G8 fixed in `events_in_range`, and it wants a deliberate answer rather
+  than a reflex copy of that fix.
+- Inventory has no durable mid-walk resume token, so cancellation restarts the
+  pass, and hydrated items of an unfinished page are discarded with it.
+
+Testing traps this arc paid for:
+
+- **A cancellation test can pass against a bare sleep.** Under `start_paused`
+  the runtime auto-advances, so "the stream eventually ended" is true whether or
+  not the token is observed. Only ELAPSED TIME and REQUEST COUNT distinguish
+  them - assert both. And for a mutation, assert the OUTCOMES, not merely that
+  the stream ended: ending is exactly the bug.
+- **A test can pass for the wrong reason via a setup side effect.** Round 3's
+  G1 test caught the pre-fix code through a cache-staleness accident rather than
+  the defect. When you ablate, read the failure MESSAGE and confirm it names the
+  intended cause.
+- **`brokkr test -p X <NAME>` is a substring match**, and a filter matching
+  nothing reports PASS. Confirm the run's test count before believing it.
+
 ## From the `bugs-graph.md` arc (closed, dac58d3..8e607fd)
 
 Scope was `crates/graph/`. One round plus a close pass. Every finding in the

@@ -141,7 +141,9 @@ label refresh and per-id TRASH fallback. The two remaining zero-valued sites are
 genuinely synthetic - `discover_cursor_scopes` returns a constant, and a
 `discover_memberships` cache hit performs no request - and say so at the call
 site. Blob batches keep their own exact transferred size and do not use the
-accumulator.
+accumulator. The Drive resumable-upload session in `cloud.rs` builds its own
+requests off `account_net()` and so sits outside the accumulator; it feeds no
+`bytes_in` field, so no lane reports a number it did not measure.
 
 `GoogleAccountFactory` carries an `Arc<GmailClient>` and an optional
 `PubSubConfig`. `open(account_id)` asks the client for an
@@ -160,9 +162,11 @@ account-scoped clone attached to `bifrost-net` under the engine
 - `pubsub: Arc<PubSubControl>` holding the watch actor command sender,
   shutdown token, and a `broadcast::Sender<WatchEvent>`. The actor task owns the
   optional config, lifecycle state, and active-handle set exclusively.
-- `scope_cache: Arc<RwLock<ScopeSnapshot>>` for the shared, refresh-on-stale
-  label vocabulary used by canonicalization. Lifecycle diff state is private to
-  each lifecycle stream and never reads this cache.
+- `scope_cache: Arc<ScopeCacheState>` for the shared, refresh-on-stale label
+  vocabulary used by canonicalization: an `RwLock<ScopeSnapshot>` for the
+  snapshot plus a `tokio::sync::Mutex` that makes the refresh single-flight.
+  Lifecycle diff state is private to each lifecycle stream and never reads this
+  cache.
 - `shutdown: CancellationToken` for the watch actor and the
   lifecycle stream.
 - `set_priority` / `set_bandwidth_cap` delegate to the underlying `AccountNet`.
@@ -630,6 +634,34 @@ dispatch per `Projection` is:
   `HydratedObjectKind::RawMime`.
 - Any other variant falls back to `format=metadata`.
 
+A hydration batch is issued CONCURRENTLY at width 32 (`buffer_unordered`),
+matching the fan-out `inventory_stream` already used, and each future carries
+its own id alongside its result so a per-item failure still names the object it
+could not represent. The label vocabulary is resolved once per batch and
+projected into a `LabelNameIndex` (id -> name) once, rather than rebuilt inside
+`canonical_flags` for every message; `flags::canonical_flags` and
+`flags::flag_set` remain as the by-slice entry points over the same index.
+`labels_for_flags` is single-flight: a stale cache is refreshed under a
+`tokio::sync::Mutex` in `ScopeCacheState`, with the staleness re-checked after
+the lock, so 32 concurrent hydrations issue one `labels.list` rather than 32.
+
+### Shutdown observation
+
+`inventory_stream`, `get_stream`, `changes_stream` and the mutation driver all
+take the account's `CancellationToken` and select on it around every provider
+call and every wait on an input stream. Without it, a stream that outlived
+`close()` kept calling Gmail through a deregistered `AccountNet` - unmetered,
+and reporting the result as a transport fault rather than as a closed account.
+
+The rule for the READ streams is that cancellation ends them SILENTLY: they
+return without a `Done`, a `PageBoundary::Final`, a checkpoint or a coverage
+report. A dropped in-flight read loses nothing, and the one thing that would be
+unsafe - a partial walk published as complete - is exactly what is excluded.
+Hydrated items already collected for an unfinished page are discarded with it.
+
+The mutation driver cannot follow that rule, and does not; see the mutation
+pipeline below.
+
 `changes_stream` decodes the cursor, re-verifies
 `profile_email`, then `users.getProfile`-checks that the open
 account still matches the cursor's recorded identity. A drift
@@ -669,14 +701,17 @@ History entries map to `Change` variants in
 
 ## Paging inventory
 
-Google has no universal paging guard. The production paging sites are:
+Google has no universal paging helper, but every internally traversed walk has
+its own repeated-token detection and 10,000-page refusal budget. The production
+paging sites are:
 
 - Gmail `search` and `search_messages` each request one provider page and return
   its `nextPageToken`. They are bounded by one request per call and resume at a
   page boundary, not inside an over-delivered page.
-- Gmail `inventory_stream` traverses `users.messages.list` until the token is
-  absent. It has neither a page budget nor repeated-token detection and has no
-  durable mid-walk resume token; interruption restarts the inventory pass.
+- Gmail `inventory_stream` traverses `users.messages.list` with repeated-token
+  detection and a 10,000-page budget. It has no durable mid-walk resume token;
+  cancellation or refusal terminates without `Done`, a final boundary, or a
+  checkpoint, so partial enumeration can never claim full or degraded coverage.
 - Gmail `changes_stream` traverses `users.history.list` with repeated-token
   detection and a 10,000-page budget (`MAX_HISTORY_PAGES`). It cannot resume
   mid-walk, and only its final batch checkpoints, using the first page's history
@@ -685,9 +720,9 @@ Google has no universal paging guard. The production paging sites are:
   therefore produce `SyncEvent::Terminated` carrying
   `Protocol(ContractViolation)`, discarding the page in hand; the next walk
   restarts from the same unchanged `startHistoryId`.
-- People `address_books_list` traverses `contactGroups.list` until the token is
-  absent. It has neither a page budget nor repeated-token detection and returns
-  no partial result or resume cursor.
+- People `address_books_list` traverses `contactGroups.list` with repeated-token
+  detection and a 10,000-page budget. It returns `Err` on refusal, never the
+  accumulated prefix as a complete address-book list.
 - People personal-contact list, other-contact list, contact search,
   other-contact search, autocomplete, and directory search each request one
   provider page and return its token. They are bounded by one request per call
@@ -859,6 +894,26 @@ share a single `mutation_stream` driver:
     non-final page ahead of `Terminated`, so no id the driver resolved loses its
     lane; ids never transmitted stay unreported, which is what `Terminated` has
     always meant.
+
+Shutdown of a mutation stream follows the TRANSMISSION EVIDENCE, not the loop
+that caught it. Before dispatch, cancellation ends the stream silently: no byte
+has crossed the side-effect boundary for the batch in hand, so nothing is owed.
+Once `batchModify` / `batchDelete` has been dispatched, dropping the future
+would lose writes Gmail may already have applied, and reporting the ids
+`Failed` would assert they did not land. The driver instead emits every id of
+that batch as `ItemOutcome::Uncertain`, on a `PageBoundary::Page` batch (never
+`Final` - the operation did not complete), followed by `SyncEvent::Terminated`
+carrying `Transport(Network)` with a secondary
+`AttemptCause(TransmissionState::InFlight)`. That is the same rule
+`bifrost-imap` applies to an `InFlight` drop, and it is what routes a
+non-idempotent mutation to reconciliation rather than to a blind retry. The
+select is `biased` toward the request so an answer that has already arrived is
+classified normally even when the token fires in the same poll, and the
+driver's pending-event slot is drained BEFORE the shutdown check so the
+terminator parked behind the uncertain lanes cannot be swallowed by the token
+that produced it. A mid-bisection shutdown reports every id of the batch as
+`Uncertain`, including sub-batches already resolved - an over-approximation on
+the safe side, since `Uncertain` queues for read-back.
   - `Destroy` -> `users.messages.batchDelete`. On a parsed 403 Gmail reason of
     `forbidden` or `insufficientPermissions` it falls
     back to a label patch that moves the messages into `TRASH`,

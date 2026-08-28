@@ -90,11 +90,24 @@ pub(crate) struct CanonicalFlags {
     pub(crate) hash: u64,
 }
 
-pub(crate) fn canonical_flags(label_ids: &[String], labels: &[GmailLabel]) -> CanonicalFlags {
-    let names_by_id = labels
+pub(crate) type LabelNameIndex = HashMap<String, String>;
+
+pub(crate) fn label_name_index(labels: &[GmailLabel]) -> LabelNameIndex {
+    labels
         .iter()
-        .map(|label| (label.id.as_str(), label.name.as_str()))
-        .collect::<HashMap<_, _>>();
+        .map(|label| (label.id.clone(), label.name.clone()))
+        .collect()
+}
+
+pub(crate) fn canonical_flags(label_ids: &[String], labels: &[GmailLabel]) -> CanonicalFlags {
+    let names_by_id = label_name_index(labels);
+    canonical_flags_indexed(label_ids, &names_by_id)
+}
+
+pub(crate) fn canonical_flags_indexed(
+    label_ids: &[String],
+    names_by_id: &LabelNameIndex,
+) -> CanonicalFlags {
     let mut flags = Vec::new();
 
     if !label_ids
@@ -127,7 +140,7 @@ pub(crate) fn canonical_flags(label_ids: &[String], labels: &[GmailLabel]) -> Ca
         } else {
             let name = names_by_id
                 .get(label_id.as_str())
-                .copied()
+                .map(String::as_str)
                 .unwrap_or(label_id);
             flags.push(format!("$gmail-label:{label_id}:{name}"));
         }
@@ -137,6 +150,16 @@ pub(crate) fn canonical_flags(label_ids: &[String], labels: &[GmailLabel]) -> Ca
     flags.dedup();
     let hash = bifrost_types::canonical_flags_hash(&flags);
     CanonicalFlags { flags, hash }
+}
+
+pub(crate) fn flag_set_indexed(
+    label_ids: &[String],
+    names_by_id: &LabelNameIndex,
+) -> HashSet<String> {
+    canonical_flags_indexed(label_ids, names_by_id)
+        .flags
+        .into_iter()
+        .collect()
 }
 
 pub(crate) fn flag_set(label_ids: &[String], labels: &[GmailLabel]) -> HashSet<String> {

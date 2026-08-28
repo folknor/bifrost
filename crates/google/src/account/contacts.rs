@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use base64::Engine;
@@ -25,6 +26,7 @@ const PERSON_FIELDS: &str = "names,emailAddresses,phoneNumbers,addresses,organiz
 /// `otherContacts.list` supports only this read-mask subset (no
 /// addresses / organizations / photos / biographies / memberships).
 const OTHER_CONTACTS_READ_MASK: &str = "names,emailAddresses,phoneNumbers,metadata";
+const MAX_ADDRESS_BOOK_PAGES: usize = 10_000;
 
 pub(crate) fn address_books_list(
     client: Arc<GmailClient>,
@@ -49,6 +51,8 @@ pub(crate) fn address_books_list(
             other_contacts_address_book(),
         ];
         let mut page_token = None;
+        let mut pages_walked = 0;
+        let mut seen_page_tokens = HashSet::new();
         loop {
             let response: ContactGroupsResponse = client
                 .get(&contact_groups_url(
@@ -64,13 +68,37 @@ pub(crate) fn address_books_list(
                     .into_iter()
                     .filter_map(address_book_from_group),
             );
+            pages_walked += 1;
             let Some(next) = response.next_page_token else {
                 break;
             };
+            if let Some(detail) =
+                address_book_walk_refusal(&mut seen_page_tokens, pages_walked, &next)
+            {
+                return Err(local_error(AccountOperation::AddressBooksList, detail));
+            }
             page_token = Some(next);
         }
         Ok(books)
     })
+}
+
+fn address_book_walk_refusal(
+    seen_page_tokens: &mut HashSet<String>,
+    pages_walked: usize,
+    next_page_token: &str,
+) -> Option<String> {
+    if pages_walked >= MAX_ADDRESS_BOOK_PAGES {
+        Some(format!(
+            "google contactGroups.list exceeded {MAX_ADDRESS_BOOK_PAGES} pages in one walk"
+        ))
+    } else if !seen_page_tokens.insert(next_page_token.to_string()) {
+        Some(format!(
+            "google contactGroups.list repeated page token {next_page_token:?}"
+        ))
+    } else {
+        None
+    }
 }
 
 pub(crate) fn list(
@@ -1211,6 +1239,20 @@ struct ContactGroupMembership {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn address_book_page_guard_refuses_repetition_and_budget_exhaustion() {
+        let mut seen = HashSet::new();
+        assert!(address_book_walk_refusal(&mut seen, 1, "next").is_none());
+        let repeated =
+            address_book_walk_refusal(&mut seen, 2, "next").expect("repeated token must refuse");
+        assert!(repeated.contains("repeated page token"));
+
+        let mut fresh = HashSet::new();
+        let exhausted = address_book_walk_refusal(&mut fresh, MAX_ADDRESS_BOOK_PAGES, "fresh")
+            .expect("budget must refuse");
+        assert!(exhausted.contains("exceeded"));
+    }
 
     #[test]
     fn person_maps_to_contact_card() {

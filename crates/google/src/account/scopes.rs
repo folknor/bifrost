@@ -7,6 +7,7 @@ use bifrost_types::{
     ScopeLifecycleEvent, SyncEvent,
 };
 use futures::{StreamExt, stream};
+use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::client::GmailClient;
@@ -55,7 +56,21 @@ impl ScopeSnapshot {
     }
 }
 
-pub(crate) type ScopeCache = Arc<RwLock<ScopeSnapshot>>;
+pub(crate) struct ScopeCacheState {
+    snapshot: RwLock<ScopeSnapshot>,
+    refresh: Mutex<()>,
+}
+
+impl ScopeCacheState {
+    pub(crate) fn new(snapshot: ScopeSnapshot) -> Self {
+        Self {
+            snapshot: RwLock::new(snapshot),
+            refresh: Mutex::new(()),
+        }
+    }
+}
+
+pub(crate) type ScopeCache = Arc<ScopeCacheState>;
 
 struct LifecycleState {
     client: Arc<GmailClient>,
@@ -250,6 +265,11 @@ pub(crate) async fn labels_for_flags(
     if !current.is_stale() {
         return Ok(current.labels);
     }
+    let _refresh = cache.refresh.lock().await;
+    let current = snapshot(cache);
+    if !current.is_stale() {
+        return Ok(current.labels);
+    }
     match refresh_scope_snapshot(client, cache).await {
         Ok(snapshot) => Ok(snapshot.labels),
         Err(error) if current.fetched_at.is_some() => {
@@ -262,6 +282,7 @@ pub(crate) async fn labels_for_flags(
 
 pub(crate) fn snapshot(cache: &ScopeCache) -> ScopeSnapshot {
     cache
+        .snapshot
         .read()
         .map(|guard| guard.clone())
         .unwrap_or_else(|_| ScopeSnapshot::empty())
@@ -272,7 +293,7 @@ pub(crate) async fn refresh_scope_snapshot(
     cache: &ScopeCache,
 ) -> crate::Result<ScopeSnapshot> {
     let snapshot = fetch_scope_snapshot(client).await?;
-    if let Ok(mut guard) = cache.write() {
+    if let Ok(mut guard) = cache.snapshot.write() {
         *guard = snapshot.clone();
     }
     Ok(snapshot)
@@ -378,6 +399,30 @@ mod tests {
         }
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_stale_vocabulary_reads_share_one_refresh() {
+        let (client, script) = scripted_client(vec![Canned::Pending, Canned::Pending]);
+        let cache: ScopeCache = Arc::new(ScopeCacheState::new(ScopeSnapshot::empty()));
+        let first_client = Arc::clone(&client);
+        let first_cache = Arc::clone(&cache);
+        let first =
+            tokio::spawn(async move { labels_for_flags(&first_client, &first_cache).await });
+        while script.requests().is_empty() {
+            tokio::task::yield_now().await;
+        }
+        let second = tokio::spawn(async move { labels_for_flags(&client, &cache).await });
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            script.requests().len(),
+            1,
+            "a waiter on the stale cache must not issue its own labels.list"
+        );
+        first.abort();
+        second.abort();
+    }
+
     #[test]
     fn first_successful_lifecycle_snapshot_seeds_without_created_events() {
         let mut last_emitted = None;
@@ -433,7 +478,7 @@ mod tests {
                 ]
             })),
         ]);
-        let cache: ScopeCache = Arc::new(RwLock::new(ScopeSnapshot::empty()));
+        let cache: ScopeCache = Arc::new(ScopeCacheState::new(ScopeSnapshot::empty()));
         let shutdown = CancellationToken::new();
         let mut lifecycle = scope_lifecycle_stream(Arc::clone(&client), shutdown);
         let next_event = tokio::spawn(async move { lifecycle.next().await });
@@ -696,7 +741,7 @@ mod tests {
 
     #[test]
     fn snapshot_reads_the_cache_under_the_lock() {
-        let cache: ScopeCache = Arc::new(RwLock::new(snapshot_of(vec![label(
+        let cache: ScopeCache = Arc::new(ScopeCacheState::new(snapshot_of(vec![label(
             "Label_1", "Work", "user",
         )])));
         assert_eq!(snapshot(&cache).labels.len(), 1);

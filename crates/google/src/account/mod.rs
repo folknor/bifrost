@@ -48,7 +48,7 @@ use self::cursor::{
     GmailChangeState, cursor_from_state, decode_gmail_state_for_profile, encode_gmail_state,
 };
 use self::push::PubSubControl;
-use self::scopes::{ScopeCache, ScopeSnapshot};
+use self::scopes::{ScopeCache, ScopeCacheState, ScopeSnapshot};
 
 fn non_empty<T>(iter: impl Iterator<Item = T>) -> Option<Vec<T>> {
     let values = iter.collect::<Vec<_>>();
@@ -226,7 +226,7 @@ impl GoogleAccount {
                 pubsub,
                 shutdown.clone(),
             )),
-            scope_cache: Arc::new(std::sync::RwLock::new(ScopeSnapshot::empty())),
+            scope_cache: Arc::new(ScopeCacheState::new(ScopeSnapshot::empty())),
             shutdown,
             closed: AtomicBool::new(false),
         }))
@@ -320,10 +320,11 @@ impl Account for GoogleAccount {
     fn inventory_stream(&self, scope: CursorScope) -> AccountStream<InventoryEvent> {
         // Emits real coverage: this walk records an unreadable object as an
         // obligation and keeps going rather than discarding the partition.
-        inventory::inventory_stream(
+        inventory::inventory_stream_cancellable(
             Arc::clone(&self.client),
             Arc::clone(&self.scope_cache),
             scope,
+            self.shutdown.clone(),
         )
     }
 
@@ -343,16 +344,22 @@ impl Account for GoogleAccount {
         ids: AccountStream<ObjectId>,
         projection: Projection,
     ) -> AccountStream<SyncEvent<ItemOutcome<HydratedObject>>> {
-        inventory::get_stream(
+        inventory::get_stream_cancellable(
             Arc::clone(&self.client),
             Arc::clone(&self.scope_cache),
             ids,
             projection,
+            self.shutdown.clone(),
         )
     }
 
     fn changes_stream(&self, cursor: ChangeCursor) -> AccountStream<SyncEvent<Change>> {
-        changes::changes_stream(Arc::clone(&self.client), self.profile.clone(), cursor)
+        changes::changes_stream_cancellable(
+            Arc::clone(&self.client),
+            self.profile.clone(),
+            cursor,
+            self.shutdown.clone(),
+        )
     }
 
     fn push_subscribe(
@@ -401,12 +408,13 @@ impl Account for GoogleAccount {
         op: FlagOp,
         key: IdempotencyKey,
     ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
-        mutation::bulk_set_flags(
+        mutation::bulk_set_flags_cancellable(
             Arc::clone(&self.client),
             Arc::clone(&self.scope_cache),
             targets,
             op,
             key,
+            self.shutdown.clone(),
         )
     }
 
@@ -416,13 +424,14 @@ impl Account for GoogleAccount {
         destination: MembershipScope,
         key: IdempotencyKey,
     ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
-        mutation::bulk_move(
+        mutation::bulk_move_cancellable(
             Arc::clone(&self.client),
             Arc::clone(&self.scope_cache),
             targets,
             destination,
             None,
             key,
+            self.shutdown.clone(),
         )
     }
 
@@ -437,13 +446,14 @@ impl Account for GoogleAccount {
         source: Option<MembershipScope>,
         key: IdempotencyKey,
     ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
-        mutation::bulk_move(
+        mutation::bulk_move_cancellable(
             Arc::clone(&self.client),
             Arc::clone(&self.scope_cache),
             targets,
             destination,
             source,
             key,
+            self.shutdown.clone(),
         )
     }
 
@@ -452,11 +462,12 @@ impl Account for GoogleAccount {
         targets: AccountStream<ObjectId>,
         key: IdempotencyKey,
     ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
-        mutation::bulk_destroy(
+        mutation::bulk_destroy_cancellable(
             Arc::clone(&self.client),
             Arc::clone(&self.scope_cache),
             targets,
             key,
+            self.shutdown.clone(),
         )
     }
 
@@ -971,7 +982,7 @@ mod tests {
             },
             seed_state: encode_gmail_state(&GmailChangeState::new(1, "user@gmail.test".to_owned())),
             pubsub: Arc::new(PubSubControl::new(client, None, shutdown.clone())),
-            scope_cache: Arc::new(std::sync::RwLock::new(ScopeSnapshot::empty())),
+            scope_cache: Arc::new(ScopeCacheState::new(ScopeSnapshot::empty())),
             shutdown,
             closed: AtomicBool::new(false),
         });

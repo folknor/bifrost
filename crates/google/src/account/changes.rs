@@ -16,6 +16,7 @@ use bifrost_types::{
     SyncEvent,
 };
 use futures::stream;
+use tokio_util::sync::CancellationToken;
 
 use crate::client::GmailClient;
 use crate::error::{Error, GmailLocalError};
@@ -40,10 +41,20 @@ use super::error as account_error;
 /// a `SyncEvent::Terminated` costs a redone walk and claims nothing.
 const MAX_HISTORY_PAGES: usize = 10_000;
 
+#[cfg(test)]
 pub(crate) fn changes_stream(
     client: Arc<GmailClient>,
     profile: GmailProfile,
     cursor: bifrost_types::ChangeCursor,
+) -> AccountStream<SyncEvent<Change>> {
+    changes_stream_cancellable(client, profile, cursor, CancellationToken::new())
+}
+
+pub(crate) fn changes_stream_cancellable(
+    client: Arc<GmailClient>,
+    profile: GmailProfile,
+    cursor: bifrost_types::ChangeCursor,
+    shutdown: CancellationToken,
 ) -> AccountStream<SyncEvent<Change>> {
     // One accumulator for the life of this stream. Every request the
     // walk makes - the identity probe as well as each history page -
@@ -65,9 +76,13 @@ pub(crate) fn changes_stream(
         finished: false,
         emitted_done: false,
         checked_profile: false,
+        shutdown,
     };
 
     Box::pin(stream::unfold(state, |mut state| async move {
+        if state.shutdown.is_cancelled() {
+            return None;
+        }
         if state.finished {
             if state.emitted_done {
                 return None;
@@ -116,7 +131,11 @@ pub(crate) fn changes_stream(
                 );
                 return Some((SyncEvent::Terminated(account_error), state));
             }
-            match state.client.get_profile().await {
+            let profile = tokio::select! {
+                () = state.shutdown.cancelled() => return None,
+                result = state.client.get_profile() => result,
+            };
+            match profile {
                 Ok(current)
                     if current
                         .email_address
@@ -159,11 +178,11 @@ pub(crate) fn changes_stream(
             return Some((SyncEvent::Terminated(account_error), state));
         };
 
-        match state
-            .client
-            .get_history(start_history_id, state.page_token.as_deref())
-            .await
-        {
+        let history = tokio::select! {
+            () = state.shutdown.cancelled() => return None,
+            result = state.client.get_history(start_history_id, state.page_token.as_deref()) => result,
+        };
+        match history {
             Ok(response) => {
                 let bytes_in = state.tally.take();
                 let history_id = match response.history_id.parse::<u64>() {
@@ -301,6 +320,7 @@ struct ChangeState {
     finished: bool,
     emitted_done: bool,
     checked_profile: bool,
+    shutdown: CancellationToken,
 }
 
 fn changes_from_history(history: &[GmailHistoryItem]) -> Vec<Change> {
@@ -379,6 +399,45 @@ mod tests {
             checkpoint_for_history_page(true, 400, "person@example.com"),
             Some(Checkpoint::Change(_))
         ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn change_cancellation_stops_an_inflight_request_without_an_extra_call() {
+        let script = ScriptedDispatch::new(vec![Canned::Pending, Canned::Pending]);
+        let net = bifrost_net::test_support::scripted_account(
+            &script,
+            NetConfig::default(),
+            Vec::new(),
+            Arc::new(StaticTokenSource::new("token", None)),
+            RetryPolicy::disabled(),
+        );
+        let client = Arc::new(GmailClient::with_account_net("https://gmail.test", net));
+        let profile = GmailProfile {
+            email_address: "person@example.com".to_string(),
+            history_id: "100".to_string(),
+        };
+        let shutdown = CancellationToken::new();
+        let mut events = changes_stream_cancellable(
+            client,
+            profile,
+            cursor_for_history(100, "person@example.com"),
+            shutdown.clone(),
+        );
+        let started = tokio::time::Instant::now();
+        let next = tokio::spawn(async move { events.next().await });
+        while script.requests().is_empty() {
+            tokio::task::yield_now().await;
+        }
+        shutdown.cancel();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), next)
+                .await
+                .expect("cancellation must beat the one-second deadline")
+                .expect("change task joins")
+                .is_none()
+        );
+        assert_eq!(started.elapsed(), std::time::Duration::ZERO);
+        assert_eq!(script.requests().len(), 1);
     }
 
     #[tokio::test]

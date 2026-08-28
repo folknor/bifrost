@@ -20,6 +20,7 @@ use bifrost_types::{
 };
 use futures::{StreamExt, stream};
 use serde::Serialize;
+use tokio_util::sync::CancellationToken;
 
 use crate::client::GmailClient;
 use crate::error::Error as GmailError;
@@ -34,6 +35,7 @@ use super::flags;
 use super::flags::{LABEL_TRASH, LabelPatch, translate_flag_op};
 use super::scopes::{ScopeCache, labels_for_flags};
 
+#[cfg(test)]
 pub(crate) fn bulk_set_flags(
     client: Arc<GmailClient>,
     cache: ScopeCache,
@@ -41,12 +43,31 @@ pub(crate) fn bulk_set_flags(
     op: FlagOp,
     key: IdempotencyKey,
 ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
+    bulk_set_flags_cancellable(client, cache, targets, op, key, CancellationToken::new())
+}
+
+pub(crate) fn bulk_set_flags_cancellable(
+    client: Arc<GmailClient>,
+    cache: ScopeCache,
+    targets: AccountStream<ObjectId>,
+    op: FlagOp,
+    key: IdempotencyKey,
+    shutdown: CancellationToken,
+) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
     if let Err(error) = op.validate_for_account(bifrost_types::Protocol::Gmail) {
         return Box::pin(stream::once(async move { SyncEvent::Terminated(error) }));
     }
-    mutation_stream(client, cache, targets, MutationKind::SetFlags(op), key)
+    mutation_stream(
+        client,
+        cache,
+        targets,
+        MutationKind::SetFlags(op),
+        key,
+        shutdown,
+    )
 }
 
+#[cfg(test)]
 pub(crate) fn bulk_move(
     client: Arc<GmailClient>,
     cache: ScopeCache,
@@ -54,6 +75,26 @@ pub(crate) fn bulk_move(
     destination: MembershipScope,
     source: Option<MembershipScope>,
     key: IdempotencyKey,
+) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
+    bulk_move_cancellable(
+        client,
+        cache,
+        targets,
+        destination,
+        source,
+        key,
+        CancellationToken::new(),
+    )
+}
+
+pub(crate) fn bulk_move_cancellable(
+    client: Arc<GmailClient>,
+    cache: ScopeCache,
+    targets: AccountStream<ObjectId>,
+    destination: MembershipScope,
+    source: Option<MembershipScope>,
+    key: IdempotencyKey,
+    shutdown: CancellationToken,
 ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
     mutation_stream(
         client,
@@ -64,16 +105,28 @@ pub(crate) fn bulk_move(
             source,
         },
         key,
+        shutdown,
     )
 }
 
+#[cfg(test)]
 pub(crate) fn bulk_destroy(
     client: Arc<GmailClient>,
     cache: ScopeCache,
     targets: AccountStream<ObjectId>,
     key: IdempotencyKey,
 ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
-    mutation_stream(client, cache, targets, MutationKind::Destroy, key)
+    bulk_destroy_cancellable(client, cache, targets, key, CancellationToken::new())
+}
+
+pub(crate) fn bulk_destroy_cancellable(
+    client: Arc<GmailClient>,
+    cache: ScopeCache,
+    targets: AccountStream<ObjectId>,
+    key: IdempotencyKey,
+    shutdown: CancellationToken,
+) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
+    mutation_stream(client, cache, targets, MutationKind::Destroy, key, shutdown)
 }
 
 fn mutation_stream(
@@ -82,6 +135,7 @@ fn mutation_stream(
     targets: AccountStream<ObjectId>,
     kind: MutationKind,
     key: IdempotencyKey,
+    shutdown: CancellationToken,
 ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
     // One batch here is one `batchModify` / `batchDelete` call plus any
     // label refresh and any per-id TRASH fallback the driver had to
@@ -101,11 +155,20 @@ fn mutation_stream(
         finished: false,
         emitted_done: false,
         pending_event: None,
+        shutdown,
     };
 
     Box::pin(stream::unfold(state, |mut state| async move {
+        // The pending event is drained BEFORE the shutdown check.
+        // Cancellation of a dispatched batch parks a `Terminated` here
+        // behind the uncertain lanes; testing the token first would
+        // swallow it and turn the very evidence this stream owes the
+        // engine back into a silent disappearance.
         if let Some(event) = state.pending_event.take() {
             return Some((event, state));
+        }
+        if state.shutdown.is_cancelled() {
+            return None;
         }
         if state.finished {
             if state.emitted_done {
@@ -118,7 +181,11 @@ fn mutation_stream(
         if state.patch.is_none() {
             match &state.kind {
                 MutationKind::SetFlags(op) => {
-                    let labels = match labels_for_flags(&state.client, &state.cache).await {
+                    let labels_result = tokio::select! {
+                        () = state.shutdown.cancelled() => return None,
+                        result = labels_for_flags(&state.client, &state.cache) => result,
+                    };
+                    let labels = match labels_result {
                         Ok(labels) => labels,
                         Err(error) => {
                             state.finished = true;
@@ -148,7 +215,11 @@ fn mutation_stream(
         }
         let mut targets_exhausted = false;
         while ids.len() < GMAIL_BATCH_MODIFY_LIMIT {
-            match state.targets.next().await {
+            let next = tokio::select! {
+                () = state.shutdown.cancelled() => return None,
+                next = state.targets.next() => next,
+            };
+            match next {
                 Some(id) => ids.push(id),
                 None => {
                     targets_exhausted = true;
@@ -157,7 +228,11 @@ fn mutation_stream(
             }
         }
         if !targets_exhausted && ids.len() == GMAIL_BATCH_MODIFY_LIMIT {
-            match state.targets.next().await {
+            let next = tokio::select! {
+                () = state.shutdown.cancelled() => return None,
+                next = state.targets.next() => next,
+            };
+            match next {
                 Some(id) => state.pending_target = Some(id),
                 None => targets_exhausted = true,
             }
@@ -170,11 +245,40 @@ fn mutation_stream(
 
         let operation = state.kind.operation();
         let started = Instant::now();
-        let event = match &state.kind {
-            MutationKind::Destroy => apply_destroy(&state.client, &ids, &state.key).await,
-            MutationKind::SetFlags(_) | MutationKind::Move { .. } => {
-                let patch = state.patch.clone().unwrap_or_default();
-                apply_label_patch(&state.client, &ids, patch, &state.key, operation).await
+        // Last preemption point that costs nothing: no byte has crossed
+        // the side-effect boundary for this batch yet, so ending here
+        // reports nothing and loses nothing.
+        if state.shutdown.is_cancelled() {
+            return None;
+        }
+        let operation_future = async {
+            match &state.kind {
+                MutationKind::Destroy => apply_destroy(&state.client, &ids, &state.key).await,
+                MutationKind::SetFlags(_) | MutationKind::Move { .. } => {
+                    let patch = state.patch.clone().unwrap_or_default();
+                    apply_label_patch(&state.client, &ids, patch, &state.key, operation).await
+                }
+            }
+        };
+        let event = tokio::select! {
+            // Biased so a request that has already answered is
+            // classified normally even when the token fires in the same
+            // poll; cancellation must never discard a completed answer.
+            biased;
+            event = operation_future => event,
+            () = state.shutdown.cancelled() => {
+                // Dispatch had begun, so Gmail may have applied some or
+                // all of these writes and we will never read the answer.
+                // Dropping the future here without a lane would lose
+                // writes silently during `close()`; `Failed` would
+                // assert they did not land. `Uncertain` is the only
+                // honest answer, and it is what queues the ids for
+                // read-back.
+                let error = account_error::shutdown_inflight_error(operation);
+                MutationApply::Terminate {
+                    accounted: account_error::uncertain_outcomes(&ids, &error),
+                    error,
+                }
             }
         };
 
@@ -259,6 +363,7 @@ struct MutationState {
     finished: bool,
     emitted_done: bool,
     pending_event: Option<SyncEvent<ItemOutcome<MutationSuccess>>>,
+    shutdown: CancellationToken,
 }
 
 enum MutationApply {
@@ -268,9 +373,10 @@ enum MutationApply {
     },
     /// The stream must end. `accounted` carries the outcomes of ids the
     /// driver had already transmitted and resolved before the terminal
-    /// error arrived - non-empty only on the bisection path, where a
-    /// rate limit or an engine directive can land after some sub-batches
-    /// have already succeeded. Those ids are emitted as one final batch
+    /// error arrived - non-empty on the bisection path, where a rate
+    /// limit or an engine directive can land after some sub-batches have
+    /// already succeeded, and on shutdown of a dispatched batch, where
+    /// every id in it is `Uncertain`. Those ids are emitted as one batch
     /// ahead of the `Terminated` event so no resolved id is silently
     /// dropped; ids that were never transmitted stay unreported, which
     /// is what `Terminated` has always meant.
@@ -695,6 +801,94 @@ mod tests {
         }
     }
 
+    /// A batch already on the wire when `close()` fires must not vanish.
+    /// Gmail may have applied it, so every consumed id owes the engine an
+    /// `Uncertain` lane plus a terminator carrying `InFlight` evidence.
+    #[tokio::test(start_paused = true)]
+    async fn mutation_cancelled_mid_flight_reports_uncertain_for_every_dispatched_id() {
+        let (client, script) = scripted_client(vec![Canned::Pending, Canned::Pending]);
+        let shutdown = CancellationToken::new();
+        let mut events = bulk_destroy_cancellable(
+            client,
+            fresh_cache(Vec::new()),
+            Box::pin(stream::iter([
+                ObjectId("m1".to_string()),
+                ObjectId("m2".to_string()),
+            ])),
+            test_key(99),
+            shutdown.clone(),
+        );
+        let started = tokio::time::Instant::now();
+        let collected = tokio::spawn(async move {
+            let mut out = Vec::new();
+            while let Some(event) = events.next().await {
+                out.push(event);
+            }
+            out
+        });
+        while script.requests().is_empty() {
+            tokio::task::yield_now().await;
+        }
+        shutdown.cancel();
+        let events = tokio::time::timeout(std::time::Duration::from_secs(1), collected)
+            .await
+            .expect("cancellation must beat the one-second deadline")
+            .expect("mutation task joins");
+        // Elapsed time and request count are what separate an observed
+        // token from a stream that merely ran out of scripted answers.
+        assert_eq!(started.elapsed(), std::time::Duration::ZERO);
+        assert_eq!(script.requests().len(), 1);
+
+        assert_eq!(events.len(), 2, "expected one batch then a terminator");
+        let SyncEvent::Batch(batch) = &events[0] else {
+            panic!("expected the uncertain batch first, got {:?}", events[0]);
+        };
+        assert_eq!(
+            batch.page_boundary,
+            PageBoundary::Page,
+            "an abandoned batch must never claim a final page"
+        );
+        let uncertain = batch
+            .items
+            .iter()
+            .map(|item| match item {
+                ItemOutcome::Uncertain(entry) => entry.item.0.clone(),
+                other => panic!("dispatched ids must be Uncertain, got {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(uncertain, vec!["m1".to_string(), "m2".to_string()]);
+        let ItemOutcome::Uncertain(entry) = &batch.items[0] else {
+            unreachable!()
+        };
+        assert!(
+            entry.error.chain().iter().any(|cause| matches!(
+                cause,
+                bifrost_types::Cause::Attempt(attempt)
+                    if attempt.transmission_state == bifrost_types::TransmissionState::InFlight
+            )),
+            "the uncertain lane must carry InFlight transmission evidence"
+        );
+        assert!(matches!(&events[1], SyncEvent::Terminated(_)));
+    }
+
+    /// The mirror case: cancellation BEFORE any byte crosses the
+    /// side-effect boundary owes nothing and reports nothing.
+    #[tokio::test(start_paused = true)]
+    async fn mutation_cancelled_before_dispatch_reports_nothing() {
+        let (client, script) = scripted_client(vec![Canned::Pending]);
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        let mut events = bulk_destroy_cancellable(
+            client,
+            fresh_cache(Vec::new()),
+            Box::pin(stream::iter([ObjectId("m1".to_string())])),
+            test_key(99),
+            shutdown,
+        );
+        assert!(events.next().await.is_none());
+        assert!(script.requests().is_empty());
+    }
+
     fn scripted_client(steps: Vec<Canned>) -> (Arc<GmailClient>, Arc<ScriptedDispatch>) {
         let script = ScriptedDispatch::new(steps);
         let net = test_support::scripted_account(
@@ -711,7 +905,7 @@ mod tests {
     }
 
     fn fresh_cache(labels: Vec<crate::types::GmailLabel>) -> ScopeCache {
-        Arc::new(std::sync::RwLock::new(
+        Arc::new(super::super::scopes::ScopeCacheState::new(
             super::super::scopes::ScopeSnapshot {
                 labels,
                 fetched_at: Some(Instant::now()),
@@ -1171,7 +1365,7 @@ mod tests {
         let targets: AccountStream<ObjectId> = Box::pin(stream::iter([ObjectId("m1".to_string())]));
         let mut events = bulk_move(
             client,
-            Arc::new(std::sync::RwLock::new(
+            Arc::new(super::super::scopes::ScopeCacheState::new(
                 super::super::scopes::ScopeSnapshot::empty(),
             )),
             targets,
@@ -1202,7 +1396,7 @@ mod tests {
         ));
         let mut events = bulk_move(
             client,
-            Arc::new(std::sync::RwLock::new(
+            Arc::new(super::super::scopes::ScopeCacheState::new(
                 super::super::scopes::ScopeSnapshot::empty(),
             )),
             targets,

@@ -20,7 +20,7 @@ use bifrost_types::{
     Provider, RequestCause, RequestErrorKind, ResourceKind, RetryHint, ServerCause,
     ServerErrorKind, StateCause, SyncStateErrorKind, ThrottleScope, TransmissionState, WireCause,
 };
-use bifrost_types::{BatchFailure, BatchItemId, BatchSuccess};
+use bifrost_types::{BatchFailure, BatchItemId, BatchSuccess, BatchUncertain, TransportErrorKind};
 
 use crate::error::{
     Error, GmailCursorFailure, GmailErrorEnvelope, GmailLocalError, GmailResponseError,
@@ -345,6 +345,53 @@ pub(crate) fn mutation_error(
         })
         .collect();
     Ok(outcomes)
+}
+
+/// The terminal error for a mutation batch whose request had already
+/// been dispatched when the account shut down.
+///
+/// The lane follows the EVIDENCE, not the loop that caught the error:
+/// the bytes left this process and the answer was never read, which is
+/// `TransmissionState::InFlight`, so the central mapping routes a
+/// non-idempotent mutation to reconciliation rather than to a blind
+/// retry. Reporting these ids `Failed` would assert the write did not
+/// land, which we cannot know, and dropping them would lose the write
+/// silently.
+pub(crate) fn shutdown_inflight_error(operation: AccountOperation) -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::Transport(TransportErrorKind::Network),
+        Cause::Transport(bifrost_types::TransportCause::new(
+            bifrost_types::TransportKind::Network,
+            Some(DiagnosticText::support_only(
+                "google account closed while a mutation request was in flight",
+            )),
+        )),
+    )
+    .provider(Provider::Gmail)
+    .protocol(Protocol::Gmail)
+    .operation(operation)
+    .push_cause(Cause::Attempt(AttemptCause::new(
+        TransmissionState::InFlight,
+    )))
+    .native_code("account_closed_in_flight")
+    .try_build()
+    .expect("valid account error classification")
+}
+
+/// Build per-id `ItemOutcome::Uncertain` lanes for ids whose request was
+/// dispatched and whose answer we never read.
+pub(crate) fn uncertain_outcomes(
+    ids: &[ObjectId],
+    error: &AccountError,
+) -> Vec<ItemOutcome<MutationSuccess>> {
+    ids.iter()
+        .map(|id| {
+            ItemOutcome::Uncertain(BatchUncertain::new(
+                BatchItemId(id.0.clone()),
+                error.clone(),
+            ))
+        })
+        .collect()
 }
 
 /// Build per-id `MutationSuccess::Applied` outcomes for a fully

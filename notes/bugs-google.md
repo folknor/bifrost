@@ -8,39 +8,90 @@ Hunter note: read the full account layer (mod/changes/push/mutation/flags/scopes
 inventory/cursor, plus the mutation-error helpers and the calendar collection
 paths). Read-only, nothing edited.
 
-## Structural / performance
+## Round 4 closure
 
-- **G9. `get_stream` hydrates its batch serially.** `inventory.rs`, `for id in ids {
-  hydrate_one(...).await }` - 32 sequential round trips per batch, on the engine's
-  primary hydration path, while `inventory_stream` right above it uses
-  `buffer_unordered(32)` for the identical work. The single largest throughput defect
-  in the crate; the fix is mechanical.
-- **G10. `canonical_flags` rebuilds the whole label `HashMap` per message.**
-  `flags.rs` line 96. Called once per message in inventory (500/page), once per
-  hydration, once per repair. The vocabulary is already an `Arc<Vec<GmailLabel>>` at
-  every call site; the index should be built beside it, once.
-- **G11. Inventory obligations are O(n^2).** `coverage_of(&scope, &obligations)` is
-  called for every 32-item sub-batch and clones the entire growing obligation vector.
-  A mailbox with a few thousand unreadable messages makes the walk quadratic in
-  obligations and holds every `AccountError` for the whole pass.
-- **G12. `bytes_in: 0` everywhere.** changes, mutation, inventory, get_stream, scopes
-  all hard-code zero. The engine's byte accounting and any bandwidth cap derived from
-  it are blind for this provider. `blobs.rs` is the only place that populates it.
-- **G13. Streams are not wired to `shutdown`.** `changes_stream`, `inventory_stream`,
-  `get_stream`, and the mutation driver take no `CancellationToken`. After `close()`
-  the transport is detached by `DetachOnDrop` but any in-flight sync stream keeps
-  calling Gmail through a deregistered `AccountNet` - unmetered by the governor, and
-  failing in a way that classifies as a transport error rather than "account closed".
-  Only `push_stream` and `scope_lifecycle_stream` observe the token.
-- **G15. `labels_for_flags` has no single-flight.** A stale cache plus a wide
-  `buffer_unordered` fan-out means N concurrent `labels.list` calls, each 1 quota
-  unit, each racing to overwrite the cache.
+G9, G10, G11, G13, G15 and the remainder of G16 were resolved in the final
+round. Hydration now overlaps a full 32-item batch while retaining each id on
+its result. Inventory builds its label-name index once per vocabulary snapshot
+and emits one coverage report per provider page, rather than rebuilding the
+index and cloning a growing obligation ledger for every 32-item sub-batch.
+Every long-running sync and mutation stream observes the account shutdown token
+around provider and input waits. Shared stale label refresh is single-flight.
+Both remaining internally driven paging walks refuse repeated tokens and a
+10,000-page budget breach; inventory emits only `Terminated`, while People
+returns `Err`, so neither can publish a truncated prefix as complete.
 
-## G16. The paging guard covers a LIST walk and neither primary sync walk
+The cold review of that work found G17 below, which the same round fixed: a
+mutation batch already on the wire when shutdown fires now reports every
+consumed id `Uncertain` instead of vanishing.
 
-Confidence: high (whole-crate enumeration, done in round 3). Round 3 fixed one
-half of this and deliberately left the rest; the residue is a live finding, not
-a closed one.
+**Status: no open findings.** Every entry in this document is fixed, refuted
+with its evidence, or recorded as an accepted residual with the reason it is not
+a defect. The durable content lives in `reference/google.md`; the machinery,
+refutations and testing traps a later arc must not relitigate are summarized in
+`notes/carry-forward.md`.
+
+## G17: the round-4 cancellation fix lost in-flight mutation evidence
+
+Found by the round-4 cold review; the round's own fix created it, which is the
+arc's recurring shape (a fix opening a hole one layer up, in a consumer of what
+it changed). G13 asked the mutation driver to observe shutdown, and the fix
+wrapped the DISPATCHED `batchModify` / `batchDelete` in a `select!` whose
+cancellation arm returned `None`. Gmail may have accepted some or all of those
+writes; the stream ended reporting the consumed ids in no lane at all, so
+`close()` could silently lose writes.
+
+Fixed by following the transmission evidence rather than the loop that caught
+the error. Cancellation still preempts freely BEFORE dispatch (nothing was
+transmitted, nothing is owed). Once dispatch has begun, the driver emits every
+id of the batch as `ItemOutcome::Uncertain` on a `PageBoundary::Page` batch and
+then `Terminated` with `Transport(Network)` plus a secondary
+`AttemptCause(InFlight)` - the same rule bifrost-imap already applies, and the
+lane that queues for read-back rather than asserting the write did not land.
+
+Two consumers of that fix had to move with it:
+
+- The stream head tested the shutdown token BEFORE draining `pending_event`, so
+  the terminator parked behind the uncertain lanes would have been swallowed by
+  the very token that produced it. The drain now comes first.
+- The `select!` is `biased` toward the operation, so a request that has already
+  answered is classified normally when the token fires in the same poll.
+
+The other three stream families wired this round were checked for the same
+shape and do NOT have it: a dropped in-flight READ loses no writes, and every
+cancellation arm in `inventory_stream`, `get_stream` and `changes_stream`
+returns before yielding anything, so none can emit `Done`, a final page
+boundary, a checkpoint or a coverage report on the way out.
+
+## G12 refuted: byte accounting was already repaired by the net arc
+
+The finding no longer reproduces. `changes_stream`, `inventory_stream`,
+`get_stream`, membership discovery, and the mutation driver each use
+`GmailClient::metered` and publish `ByteTally::take()` per emitted batch.
+`GmailClient::send_recorded` attaches `RequestBuilder::count_bytes_into`, so
+failed requests and caller-built batch requests are included too. The remaining
+literal zero in `discover_cursor_scopes` is correct because that stream is a
+constant and performs no request. Locally rejected mutation lanes likewise make
+no request and emit no fabricated traffic.
+
+Re-verified independently in round 4 by enumerating every `bytes_in` site in
+`crates/google/src`. Three shapes exist and all three are honest: `tally.take()`
+fed from `send_recorded`'s request-local `count_bytes_into` counter (changes,
+inventory, hydration, membership discovery, mutation), the exact transferred
+size in `blobs.rs`, and two documented no-request constants
+(`discover_cursor_scopes`, and a `discover_memberships` cache hit). The only
+requests that bypass `send_recorded` are the two Drive resumable-upload calls in
+`cloud.rs`, built directly off `account_net()` - they feed no `bytes_in` field
+at all, so they under-report nothing; recorded in `reference/google.md` so it is
+not rediscovered as a hole. G12 stays refuted.
+
+## G16 closure evidence
+
+Round 3 bounded history paging. Round 4 bounded Gmail inventory and People
+address-book paging with unit-testable refusal helpers, repeated-token tests,
+and budget tests. The inventory guard runs before hydration or emission of the
+page in hand and therefore cannot emit `Done`, `PageBoundary::Final`, a
+checkpoint, or a coverage claim for refused work.
 
 ### Where this came from
 
@@ -53,23 +104,15 @@ incidental traversals and NEITHER of the two delta sync loops, which were the
 crate's PRIMARY sync loops - while `reference/graph.md` claimed the guard was
 universal. The same split exists here.
 
-### The enumeration
+### Final enumeration
 
-Bounded, with repeated-token detection and a 10,000-page budget:
+Internally traversed and bounded, with repeated-token detection and a
+10,000-page budget:
 
 - Calendar `calendars_list` (`calendar.rs`, `MAX_CALENDAR_LIST_PAGES`).
-- Gmail `changes_stream` (`changes.rs`, `MAX_HISTORY_PAGES`) - added by round 3,
-  see below.
-
-Unbounded - follows `nextPageToken` until the field is absent, with no budget
-and no repeated-token detection:
-
-- **Gmail `inventory_stream`** (`inventory.rs`). The crate's primary object
-  enumeration. Also has no durable mid-walk resume, so an interrupted pass
-  restarts from the beginning.
-- **People `address_books_list`** (`contacts.rs`, `contactGroups.list`).
-  Returns no partial result and no resume cursor, so a cycling token is an
-  unbounded loop that can never produce an answer.
+- Gmail `changes_stream` (`changes.rs`, `MAX_HISTORY_PAGES`).
+- Gmail `inventory_stream` (`inventory.rs`, `MAX_INVENTORY_PAGES`).
+- People `address_books_list` (`contacts.rs`, `MAX_ADDRESS_BOOK_PAGES`).
 
 Page-resumable - one provider request per call, returning the provider token,
 so the caller bounds the walk:
@@ -88,36 +131,10 @@ Partly resumable:
   discarded rather than resumed. Low severity; recorded so it is not
   rediscovered as a hole.
 
-### What round 3 fixed, and what it did not
-
-Round 3 bounded `changes_stream` only, because `changes.rs` was already its own
-file (G7 rewrote the checkpointing there) and bounding a loop whose checkpoint
-semantics you just changed belongs in the same change. Refusal TERMINATES with
-`Protocol(ContractViolation)`; it does not truncate. This matters more than the
-bound: `changes_stream` checkpoints only on its final page, so stopping early
-and reporting normal completion would emit a checkpoint claiming coverage the
-walk never read. A `Terminated` costs a redone walk and claims nothing.
-
-**Gmail `inventory_stream` and People `address_books_list` are left to round 4,
-which owns `inventory.rs`.** Do not treat them as accepted. What a fix needs:
-
-- A page budget and a `HashSet` of seen tokens, as in `walk_refusal`
-  (`changes.rs`) and `calendars_list` (`calendar.rs`). The budget is a refusal
-  boundary, not a paging policy - set it far above any real account.
-- A refusal that classifies and terminates. For `inventory_stream` that is
-  `SyncEvent::Terminated`; for `address_books_list`, which returns a `Result`,
-  an `Err`. Neither may return a short list that reads as complete.
-- Care with `inventory_stream` specifically: it is the coverage-obligation
-  producer, so a truncated inventory that reports normally would understate
-  coverage debt - the same lie in a different currency.
-
 ### Documentation
 
-`reference/google.md` carried no universal-guard claim (the false claim graph
-had); round 3 added an explicit per-site "Paging inventory" section stating that
-Google has no universal guard, and it is kept in step with the enumeration
-above. If a later round bounds inventory or contact groups, update that section
-in the same commit.
+`reference/google.md` carries an explicit per-site "Paging inventory" section,
+kept in step with the final enumeration above.
 
 ### Lateral, not fixed
 
