@@ -21,6 +21,8 @@
 mod dispatch;
 mod error;
 mod etag;
+#[cfg(feature = "test-support")]
+pub mod test_support;
 mod transport;
 mod xml;
 
@@ -32,9 +34,7 @@ pub use error::{
 };
 pub use etag::{PutCondition, normalize_http_etag, prepare_if_match, response_etag};
 pub use transport::{
-    DAV_CLIENT_TIMEOUT, DavBody, DavResponse, DavTransport, ReqwestDavTransport,
-    dav_redirect_policy, origin_is_secure, read_capped_body, settle_body, transport_failure,
-    url_origin,
+    DAV_CLIENT_TIMEOUT, DavBody, DavRequest, DavResponse, origin_is_secure, settle_body, url_origin,
 };
 pub use xml::{
     append_path, escape_xml, local_name, normalize_etag, push_text, resolve_href, trimmed,

@@ -143,14 +143,10 @@ any item; some may already be obsolete.
 
 ## bifrost-caldav / bifrost-carddav
 
-- **dav-F5-transport.** The `DavTransport` / `DavResponse` test seam is
-  duplicated in `caldav` and `carddav` rather than shared via
-  `bifrost-net`, because net keeps its dispatcher crate-private and both
-  DAV clients still own Basic auth and their own redirect policy - a
-  shared seam would have to grow those first. Revisit when these clients
-  move onto `AccountNet` (see dav-B9). The parser half of this item is
-  done: `bifrost_net::status_line` owns `status_line_code` /
-  `status_line_is_success` and both crates call it.
+- **dav-F5-transport. RESOLVED 2026-08-29 by dav-B9.** Kept only to stop it
+  being re-filed. The `DavTransport` seam is deleted, not shared: both crates
+  now script at `bifrost_net::test_support`, below retry, rate limiting and the
+  meter, through the DAV-shaped front in `bifrost_dav_core::test_support`.
 - **caldav-J1.** (residual of the chrono -> jiff migration) chrono and
   chrono-tz are still in the dependency tree, reached only through
   `caldata` 0.16, which depends on both. No bifrost code names either
@@ -852,16 +848,20 @@ confirm against the code before working any of them.
   documented `close()`-dropped-mid-`users.stop` residual. Resume-on-reopen is
   also out: the session URI is per-call state that no `HostAttachment` request
   carries back in, so resumption needs a published surface change.
-- **dav-B9. All DAV traffic bypasses `bifrost-net`.** [C2] Both crates run their
-  own `ReqwestDavTransport` behind the `DavTransport` seam, so DAV legs get no
-  retry, no rate limiting, no bandwidth metering and no observability, and
-  `set_priority` / `set_bandwidth_cap` are silent no-ops in both. An IMAP account
-  composed `with_caldav` / `with_carddav` and given a `BandwidthMeter` silently
-  does not meter or cap its DAV legs. The two enablers shipped in the
-  `bifrost-net` round-1 work (`AccountNet::request(Method, &str)` and an optional
-  `AccountSpec::token_source`) deliberately without the migration; `Dispatch`
-  staying crate-private was assessed and is correct. `reference/net.md` scopes
-  the sharing claim to exclude these two crates rather than overclaiming.
+- **dav-B9. DONE 2026-08-29.** Kept only to stop it being re-filed. DAV traffic
+  rides `AccountNet` through `bifrost-dav-core`'s `DavDispatch`; the doors are
+  pinned by `the_priority_and_bandwidth_doors_reach_the_transport` in both
+  crates, which fails against the old no-op bodies. Two things stayed DAV-local
+  ON PURPOSE, and both are recorded at the code: credentials, because the
+  origin gate has to admit an origin before a credential is minted for it
+  (hence `AccountSpec::token_source = None` plus `without_bearer_auth` on every
+  request), and redirects, because net strips `Authorization` cross-origin with
+  no way to restore it and its allowlist is host-only where the DAV gate
+  compares scheme, host and port. What changed for consumers: a DAV 5xx or 429
+  is now retried before it surfaces, and the DAV status ladder classifies the
+  final response exactly as before, so only the request count moved. One
+  narrowing: a reconstituted error body is capped at `STATUS_BODY_CAP` where the
+  old transport buffered to 64 MiB.
 
 ### Cross-crate shaping questions
 

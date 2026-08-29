@@ -8,17 +8,17 @@
 //!
 //! **Coverage here is one-directional, by necessity, not oversight.** A `false`
 //! flag must make the method return `Unsupported` BEFORE it does any wire work,
-//! which is exactly what a transport that panics on use can prove. A `true`
-//! flag means the method will reach the network, and CalDAV's `DavTransport`
-//! seam can script that - but a scripted success proves a transcript, not the
-//! capability contract, and the crate's per-method wire tests already own that
-//! ground. So the true direction is deliberately left to those tests, and this
-//! file pins the half that no other test pins: nothing advertised `false` may
-//! quietly work, and nothing advertised `false` may reach the wire to find out.
+//! which is exactly what a wire seam that panics on use can prove. A `true`
+//! flag means the method will reach the network, and the scripted seam can
+//! script that - but a scripted success proves a transcript, not the capability
+//! contract, and the crate's per-method wire tests already own that ground. So
+//! the true direction is deliberately left to those tests, and this file pins
+//! the half that no other test pins: nothing advertised `false` may quietly
+//! work, and nothing advertised `false` may reach the wire to find out.
 //!
-//! The transport double is the load-bearing part: it panics if any method
-//! reaches it, so a refusal that happens only after a round trip fails here
-//! rather than passing.
+//! The empty script is the load-bearing part: an exhausted script panics rather
+//! than reaching a socket, so a refusal that happens only after a round trip
+//! fails here rather than passing.
 
 #![cfg(test)]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -26,39 +26,25 @@
 use std::sync::Arc;
 
 use bifrost_types::{
-    Account, AccountError, AccountErrorKind, AccountFuture, AccountOperation, CloudUploadMeta,
-    ContactCreate, ContactId, ContactPatch, ContainerId, ContainerKind, DirectoryGroupId,
-    DraftHandle, DraftPatch, EventCreate, EventId, EventPatch, EventRange, EventRecurrence,
-    EventSearchRequest, EventStatus, EventTime, FilterScriptCreate, HydrationProjection,
-    Importance, MutationTarget, ObjectId, ScriptLanguage, SearchRequest, SendRequest,
-    ServerFilterCreate, ServerFilterId, ServerFilterPatch, ShareScope, SyncEvent, ThreadId,
-    VacationConfig,
+    Account, AccountError, AccountErrorKind, AccountOperation, CloudUploadMeta, ContactCreate,
+    ContactId, ContactPatch, ContainerId, ContainerKind, DirectoryGroupId, DraftHandle, DraftPatch,
+    EventCreate, EventId, EventPatch, EventRange, EventRecurrence, EventSearchRequest, EventStatus,
+    EventTime, FilterScriptCreate, HydrationProjection, Importance, MutationTarget, ObjectId,
+    ScriptLanguage, SearchRequest, SendRequest, ServerFilterCreate, ServerFilterId,
+    ServerFilterPatch, ShareScope, SyncEvent, ThreadId, VacationConfig,
 };
 use futures::StreamExt as _;
 
 use crate::account::CalDavAccount;
-use crate::client::{CalDavClient, DavResponse, DavTransport};
+use bifrost_dav_core::test_support::{dav_script_empty, scripted_dav_net};
 
-/// A transport that fails the test if anything reaches it.
-///
-/// Every call driven below is one the capability snapshot says is
-/// unsupported, so the refusal must be decided locally. A transport that
-/// merely returned an error would let a method that DID try the wire still
-/// surface an error and look like a pass.
-struct NeverCalledTransport;
-
-impl DavTransport for NeverCalledTransport {
-    fn send(
-        &self,
-        _request: reqwest::RequestBuilder,
-    ) -> AccountFuture<Result<DavResponse, String>> {
-        panic!("an unsupported CalDAV method reached the wire");
-    }
-}
+use crate::client::CalDavClient;
 
 fn account() -> CalDavAccount {
-    let client =
-        CalDavClient::with_transport("https://dav.example.test", Arc::new(NeverCalledTransport));
+    let client = CalDavClient::with_account_net(
+        "https://dav.example.test",
+        scripted_dav_net(&dav_script_empty()),
+    );
     CalDavAccount::for_tests(Arc::new(client), "https://dav.example.test/cals/")
 }
 

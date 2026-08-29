@@ -1,19 +1,12 @@
 use std::fmt;
-#[cfg(test)]
-use std::sync::Arc;
 
 pub(crate) use bifrost_dav_core::PutCondition;
-#[cfg(test)]
-use bifrost_dav_core::ReqwestDavTransport;
 use bifrost_dav_core::escape_xml;
 use bifrost_dav_core::{
-    DavDispatch, DavProtocol, normalize_http_etag, prepare_if_match, worse_recovery,
+    DavDispatch, DavProtocol, DavRequest, normalize_http_etag, prepare_if_match, worse_recovery,
 };
-#[cfg(test)]
-pub(crate) use bifrost_dav_core::{DavResponse, DavTransport};
+use bifrost_net::{AccountId, AccountNet};
 use bifrost_types::{AccountError, AccountErrorKind, AccountOperation, ErrorScope, ResourceKind};
-#[cfg(test)]
-use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 use reqwest::header::{CONTENT_TYPE, ETAG};
 use reqwest::{Method, StatusCode};
 
@@ -59,10 +52,32 @@ impl fmt::Debug for CardDavClient {
 }
 
 impl CardDavClient {
-    pub(crate) fn new(config: &CardDavConfig) -> Result<Self, AccountError> {
-        Ok(Self {
-            dav: DavDispatch::new(&config.base_url, config.credentials.to_shared(), DAV)?,
-        })
+    pub(crate) fn new(account_id: AccountId, config: &CardDavConfig) -> Self {
+        Self {
+            dav: DavDispatch::new(
+                account_id,
+                &config.base_url,
+                config.credentials.to_shared(),
+                DAV,
+            ),
+        }
+    }
+
+    /// The account handle carrying this account's meter, priority and cap.
+    pub(crate) fn net(&self) -> &AccountNet {
+        self.dav.net()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_account_net(base_url: &str, net: AccountNet) -> Self {
+        Self {
+            dav: DavDispatch::with_account_net(
+                net,
+                base_url,
+                crate::CardDavCredentials::bearer("token").to_shared(),
+                DAV,
+            ),
+        }
     }
 
     pub(crate) async fn discover_addressbook_home(&self) -> Result<String, AccountError> {
@@ -410,7 +425,7 @@ impl CardDavClient {
     /// every CardDAV write reports.
     async fn send_status_request(
         &self,
-        request: reqwest::RequestBuilder,
+        request: DavRequest,
         operation: AccountOperation,
     ) -> Result<Option<String>, AccountError> {
         let response = self.dav.send_raw_request(request, operation).await?;
@@ -423,25 +438,6 @@ impl CardDavClient {
             Ok(etag)
         } else {
             Err(status_error(operation, response.status, response.body))
-        }
-    }
-
-    /// A client that only knows its base URL, for tests that exercise
-    /// href resolution without touching the network.
-    #[cfg(test)]
-    pub(crate) fn for_base_url(base_url: &str) -> Self {
-        Self::with_transport(base_url, Arc::new(ReqwestDavTransport))
-    }
-
-    #[cfg(test)]
-    pub(crate) fn with_transport(base_url: &str, transport: Arc<dyn DavTransport>) -> Self {
-        Self {
-            dav: DavDispatch::with_transport(
-                base_url,
-                transport,
-                crate::CardDavCredentials::bearer("token").to_shared(),
-                DAV,
-            ),
         }
     }
 
@@ -638,7 +634,7 @@ const PROPFIND_CONTACTS: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
 mod tests {
     use super::*;
 
-    use bifrost_types::{AccountFuture, Protocol, ProtocolErrorKind, RecoveryClass};
+    use bifrost_types::{Protocol, ProtocolErrorKind, RecoveryClass};
 
     /// Every error this crate mints is stamped CardDAV, and names contacts.
     ///
@@ -682,76 +678,15 @@ mod tests {
             "a CardDAV 404 names a contact, not a calendar: {missing:?}"
         );
     }
-    use std::collections::VecDeque;
-    use std::sync::Mutex;
+    use bifrost_dav_core::DavResponse;
+    use bifrost_dav_core::test_support::{
+        dav_redirect, dav_retried, dav_script, dav_script_empty, dav_script_yielding,
+        scripted_dav_net, transcripts,
+    };
+    use bifrost_net::test_support::{Canned, ScriptedDispatch};
+    use std::sync::Arc;
 
-    #[derive(Debug, Clone)]
-    struct RequestTranscript {
-        method: Method,
-        url: String,
-        headers: HeaderMap,
-        body: String,
-    }
-
-    struct ScriptedDavTransport {
-        responses: Mutex<VecDeque<DavResponse>>,
-        requests: Mutex<Vec<RequestTranscript>>,
-    }
-
-    impl ScriptedDavTransport {
-        fn new(responses: impl IntoIterator<Item = DavResponse>) -> Arc<Self> {
-            Arc::new(Self {
-                responses: Mutex::new(responses.into_iter().collect()),
-                requests: Mutex::new(Vec::new()),
-            })
-        }
-
-        fn requests(&self) -> Vec<RequestTranscript> {
-            self.requests
-                .lock()
-                .expect("scripted DAV request lock poisoned")
-                .clone()
-        }
-    }
-
-    impl DavTransport for ScriptedDavTransport {
-        fn send(
-            &self,
-            request: reqwest::RequestBuilder,
-        ) -> AccountFuture<Result<DavResponse, String>> {
-            let request = match request.build() {
-                Ok(request) => request,
-                Err(error) => return Box::pin(async move { Err(error.to_string()) }),
-            };
-            self.requests
-                .lock()
-                .expect("scripted DAV request lock poisoned")
-                .push(RequestTranscript {
-                    method: request.method().clone(),
-                    url: request.url().to_string(),
-                    headers: request.headers().clone(),
-                    body: request
-                        .body()
-                        .and_then(reqwest::Body::as_bytes)
-                        .map_or_else(String::new, |body| {
-                            String::from_utf8_lossy(body).into_owned()
-                        }),
-                });
-            let mut response = self
-                .responses
-                .lock()
-                .expect("scripted DAV response lock poisoned")
-                .pop_front()
-                .expect("scripted DAV transport exhausted");
-            // A scripted response with no effective URL models the ordinary
-            // no-redirect case: reqwest reports the submitted URI back. A
-            // script that sets one models a followed redirect.
-            if response.url.is_empty() {
-                response.url = request.url().to_string();
-            }
-            Box::pin(async move { Ok(response) })
-        }
-    }
+    use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 
     #[tokio::test]
     async fn credentials_never_reach_a_resource_href_origin() {
@@ -764,9 +699,9 @@ mod tests {
             body: String::new(),
             url: String::new(),
         };
-        let script = ScriptedDavTransport::new([deleted(), deleted()]);
-        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
-        let client = CardDavClient::with_transport("https://dav.example.test", transport);
+        let script = dav_script([deleted(), deleted()]);
+        let client =
+            CardDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
 
         client
             .delete_vcard(
@@ -783,7 +718,7 @@ mod tests {
             .await
             .expect_err("foreign resource origin is rejected");
 
-        let requests = script.requests();
+        let requests = transcripts(&script);
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].url, "https://dav.example.test/book/one.vcf");
         assert_eq!(
@@ -817,7 +752,7 @@ mod tests {
         // Only two responses are scripted. A regression that re-lists the home
         // starves the script and fails loudly here rather than silently
         // spending a third request.
-        let script = ScriptedDavTransport::new([multistatus(
+        let script = dav_script([multistatus(
             r#"<D:multistatus xmlns:D="DAV:" xmlns:CS="http://calendarserver.org/ns/">
   <D:response>
     <D:href>/books/ada/personal/</D:href>
@@ -828,8 +763,8 @@ mod tests {
   </D:response>
 </D:multistatus>"#,
         )]);
-        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
-        let client = CardDavClient::with_transport("https://dav.example.test", transport);
+        let client =
+            CardDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
 
         let ctag = client
             .collection_ctag(
@@ -840,7 +775,7 @@ mod tests {
             .expect("ctag resolves");
         assert_eq!(ctag.as_deref(), Some("ctag-7"));
 
-        let script = ScriptedDavTransport::new([multistatus(
+        let script = dav_script([multistatus(
             r#"<D:multistatus xmlns:D="DAV:">
   <D:response>
     <D:href>/books/ada/personal/one.vcf</D:href>
@@ -851,8 +786,8 @@ mod tests {
   </D:response>
 </D:multistatus>"#,
         )]);
-        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
-        let client = CardDavClient::with_transport("https://dav.example.test", transport);
+        let client =
+            CardDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
 
         let snapshot = crate::account::CardDavAccount::contact_snapshot(
             &client,
@@ -866,7 +801,7 @@ mod tests {
         // The known ctag survived into the snapshot without being refetched.
         assert_eq!(snapshot.ctag.as_deref(), Some("ctag-7"));
 
-        let requests = script.requests();
+        let requests = transcripts(&script);
         assert_eq!(
             requests.len(),
             1,
@@ -902,16 +837,15 @@ mod tests {
     async fn an_empty_home_lists_no_address_books_rather_than_a_phantom() {
         use bifrost_types::account::Account as _;
 
-        let script = ScriptedDavTransport::new([DavResponse {
+        let script = dav_script([DavResponse {
             status: StatusCode::MULTI_STATUS,
             headers: HeaderMap::new(),
             body: "<D:multistatus xmlns:D=\"DAV:\"/>".to_string(),
             url: String::new(),
         }]);
-        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
-        let client = Arc::new(CardDavClient::with_transport(
+        let client = Arc::new(CardDavClient::with_account_net(
             "https://dav.example.test",
-            transport,
+            scripted_dav_net(&script),
         ));
         let account = crate::account::CardDavAccount::for_tests(
             client,
@@ -936,8 +870,8 @@ mod tests {
     #[tokio::test]
     async fn an_empty_discovery_opens_an_account_with_no_default_address_book() {
         let script = discovery_script("/books/ada/");
-        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
-        let client = CardDavClient::with_transport("https://dav.example.test", transport);
+        let client =
+            CardDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
 
         let account = crate::account::CardDavAccount::open_with_client(client)
             .await
@@ -969,11 +903,10 @@ mod tests {
     async fn an_empty_backend_refuses_collection_less_calls_before_the_wire() {
         use bifrost_types::account::Account as _;
 
-        let script = ScriptedDavTransport::new([]);
-        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
-        let client = Arc::new(CardDavClient::with_transport(
+        let script = dav_script_empty();
+        let client = Arc::new(CardDavClient::with_account_net(
             "https://dav.example.test",
-            transport,
+            scripted_dav_net(&script),
         ));
         let account = crate::account::CardDavAccount::for_tests_without_collections(
             client,
@@ -995,7 +928,7 @@ mod tests {
         // unreachable in practice.
 
         assert!(
-            script.requests().is_empty(),
+            transcripts(&script).is_empty(),
             "an unroutable call must reach no transport at all"
         );
     }
@@ -1008,7 +941,7 @@ mod tests {
             body: body.to_string(),
             url: String::new(),
         };
-        let script = ScriptedDavTransport::new([
+        let script = dav_script([
             response("<D:multistatus xmlns:D=\"DAV:\"/>"),
             response(
                 "<D:current-user-principal xmlns:D=\"DAV:\"><D:href>/principals/ada/</D:href></D:current-user-principal>",
@@ -1017,8 +950,8 @@ mod tests {
                 "<C:addressbook-home-set xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:carddav\"><D:href>/books/ada/</D:href></C:addressbook-home-set>",
             ),
         ]);
-        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
-        let client = CardDavClient::with_transport("https://dav.example.test", transport);
+        let client =
+            CardDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
 
         let home = client
             .discover_addressbook_home()
@@ -1026,8 +959,7 @@ mod tests {
             .expect("base fallback discovers home");
 
         assert_eq!(home, "https://dav.example.test/books/ada/");
-        let urls = script
-            .requests()
+        let urls = transcripts(&script)
             .into_iter()
             .map(|request| request.url)
             .collect::<Vec<_>>();
@@ -1055,7 +987,7 @@ mod tests {
             body: body.to_string(),
             url: String::new(),
         };
-        let script = ScriptedDavTransport::new([
+        let script = dav_script([
             response("<D:multistatus xmlns:D=\"DAV:\"/>"),
             response(
                 "<D:current-user-principal xmlns:D=\"DAV:\"><D:href>/principals/ada/</D:href></D:current-user-principal>",
@@ -1064,8 +996,10 @@ mod tests {
                 "<C:addressbook-home-set xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:carddav\"><D:href>/books/ada/</D:href></C:addressbook-home-set>",
             ),
         ]);
-        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
-        let client = CardDavClient::with_transport("https://dav.example.test/service", transport);
+        let client = CardDavClient::with_account_net(
+            "https://dav.example.test/service",
+            scripted_dav_net(&script),
+        );
 
         let home = client
             .discover_addressbook_home()
@@ -1073,8 +1007,7 @@ mod tests {
             .expect("base fallback discovers home");
 
         assert_eq!(home, "https://dav.example.test/books/ada/");
-        let urls = script
-            .requests()
+        let urls = transcripts(&script)
             .into_iter()
             .map(|request| request.url)
             .collect::<Vec<_>>();
@@ -1089,14 +1022,14 @@ mod tests {
         );
     }
 
-    fn discovery_script(home_href: &str) -> Arc<ScriptedDavTransport> {
+    fn discovery_script(home_href: &str) -> Arc<ScriptedDispatch> {
         let response = |body: String| DavResponse {
             status: StatusCode::MULTI_STATUS,
             headers: HeaderMap::new(),
             body,
             url: String::new(),
         };
-        ScriptedDavTransport::new([
+        dav_script([
             response(
                 "<D:current-user-principal xmlns:D=\"DAV:\"><D:href>/principals/ada/</D:href></D:current-user-principal>"
                     .to_string(),
@@ -1114,8 +1047,8 @@ mod tests {
     #[tokio::test]
     async fn discovered_cross_origin_https_home_receives_credentials() {
         let script = discovery_script("https://books.example.test/homes/ada/");
-        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
-        let mut client = CardDavClient::with_transport("https://dav.example.test", transport);
+        let mut client =
+            CardDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
 
         let home = client
             .discover_addressbook_home()
@@ -1128,7 +1061,7 @@ mod tests {
             .await
             .expect("cross-origin home is credential-bearing");
 
-        let requests = script.requests();
+        let requests = transcripts(&script);
         assert_eq!(requests.len(), 3);
         assert_eq!(requests[2].url, "https://books.example.test/homes/ada/");
         assert_eq!(
@@ -1153,7 +1086,7 @@ mod tests {
             reqwest::header::LOCATION,
             HeaderValue::from_static("https://books.example.test/dav/homes/ada/"),
         );
-        let script = ScriptedDavTransport::new([
+        let script = dav_script([
             DavResponse {
                 status: StatusCode::MOVED_PERMANENTLY,
                 headers: redirect_headers,
@@ -1167,8 +1100,8 @@ mod tests {
                 url: String::new(),
             },
         ]);
-        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
-        let mut client = CardDavClient::with_transport("https://dav.example.test", transport);
+        let mut client =
+            CardDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
         client.admit_discovered_urls(std::iter::once(
             "https://books.example.test/homes/ada/".to_string(),
         ));
@@ -1178,7 +1111,7 @@ mod tests {
             .await
             .expect("cross-origin redirect is followed with credentials");
 
-        let requests = script.requests();
+        let requests = transcripts(&script);
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[1].url, "https://books.example.test/dav/homes/ada/");
         assert_eq!(
@@ -1207,21 +1140,21 @@ mod tests {
             reqwest::header::LOCATION,
             HeaderValue::from_static("https://evil.test/dav/"),
         );
-        let script = ScriptedDavTransport::new([DavResponse {
+        let script = dav_script([DavResponse {
             status: StatusCode::FOUND,
             headers: redirect_headers,
             body: String::new(),
             url: String::new(),
         }]);
-        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
-        let client = CardDavClient::with_transport("https://dav.example.test", transport);
+        let client =
+            CardDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
 
         client
             .list_addressbooks("https://dav.example.test/books/ada/")
             .await
             .expect_err("an unadmitted redirect target is refused");
 
-        assert_eq!(script.requests().len(), 1);
+        assert_eq!(transcripts(&script).len(), 1);
     }
 
     #[tokio::test]
@@ -1244,9 +1177,9 @@ mod tests {
             body: "ok".to_string(),
             url: String::new(),
         });
-        let script = ScriptedDavTransport::new(responses);
-        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
-        let client = CardDavClient::with_transport("https://dav.example.test", transport);
+        let script = dav_script(responses);
+        let client =
+            CardDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
 
         client
             .delete_vcard(
@@ -1256,24 +1189,34 @@ mod tests {
             .await
             .expect("the configured number of redirects is allowed");
 
-        assert_eq!(script.requests().len(), max_hops + 1);
+        assert_eq!(transcripts(&script).len(), max_hops + 1);
     }
 
     /// RFC 4918 resolves a relative href against the EFFECTIVE request URI.
-    /// `dav_redirect_policy` follows same-host hops, so a PROPFIND submitted
-    /// to `/addressbook` can be served from `/dav/users/ada/addressbook/`.
+    /// The dispatcher follows same-origin hops, so a PROPFIND submitted to
+    /// `/addressbook` can be served from `/dav/users/ada/addressbook/`.
     /// Resolving `one.vcf` against the submitted URI mints `/one.vcf` - a
     /// native id that does not exist, and a follow-up GET that 404s.
+    ///
+    /// Twin of bifrost-caldav's. The hop is scripted as the 301 it is, so the
+    /// walk that produces the effective URI is on the path under test.
     #[tokio::test]
     async fn contact_hrefs_resolve_against_the_post_redirect_url() {
-        let script = ScriptedDavTransport::new([DavResponse {
-            status: StatusCode::MULTI_STATUS,
-            headers: HeaderMap::new(),
-            body: "<D:multistatus xmlns:D=\"DAV:\"><D:response><D:href>one.vcf</D:href><D:propstat><D:prop><D:getetag>\"e1\"</D:getetag></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response></D:multistatus>".to_string(),
-            url: "https://dav.example.test/dav/users/ada/addressbook/".to_string(),
-        }]);
-        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
-        let client = CardDavClient::with_transport("https://dav.example.test", transport);
+        let script = dav_script([
+            dav_redirect(
+                StatusCode::MOVED_PERMANENTLY,
+                "https://dav.example.test/dav/users/ada/addressbook/",
+            ),
+            DavResponse {
+                status: StatusCode::MULTI_STATUS,
+                headers: HeaderMap::new(),
+                body: "<D:multistatus xmlns:D=\"DAV:\"><D:response><D:href>one.vcf</D:href><D:propstat><D:prop><D:getetag>\"e1\"</D:getetag></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response></D:multistatus>".to_string(),
+                url: String::new(),
+            }
+            .into(),
+        ]);
+        let client =
+            CardDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
 
         let listing = client
             .list_contacts_listing(
@@ -1296,8 +1239,8 @@ mod tests {
     #[tokio::test]
     async fn discovered_plaintext_home_never_receives_credentials() {
         let script = discovery_script("http://books.example.test/homes/ada/");
-        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
-        let mut client = CardDavClient::with_transport("https://dav.example.test", transport);
+        let mut client =
+            CardDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
 
         let home = client
             .discover_addressbook_home()
@@ -1310,7 +1253,7 @@ mod tests {
             .await
             .expect_err("a downgraded discovered origin is refused");
 
-        let requests = script.requests();
+        let requests = transcripts(&script);
         assert_eq!(requests.len(), 2);
         assert!(
             requests
@@ -1349,7 +1292,7 @@ mod tests {
         };
 
         // A move: multiget the current resource, then MOVE it.
-        let script = ScriptedDavTransport::new([
+        let script = dav_script([
             multiget("/books/work/one.vcf"),
             DavResponse {
                 status: StatusCode::CREATED,
@@ -1358,10 +1301,9 @@ mod tests {
                 url: String::new(),
             },
         ]);
-        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
-        let client = Arc::new(CardDavClient::with_transport(
+        let client = Arc::new(CardDavClient::with_account_net(
             "https://dav.example.test",
-            transport,
+            scripted_dav_net(&script),
         ));
         let account = crate::account::CardDavAccount::for_tests(
             client,
@@ -1371,7 +1313,7 @@ mod tests {
             .contact_update(contact(), patch_to("https://dav.example.test/books/home/"))
             .await
             .expect("a move between address books is performed");
-        let requests = script.requests();
+        let requests = transcripts(&script);
         assert_eq!(
             requests.len(),
             2,
@@ -1396,7 +1338,7 @@ mod tests {
         );
 
         // Restating the contact's own address book is not a move.
-        let script = ScriptedDavTransport::new([
+        let script = dav_script([
             multiget("/books/work/one.vcf"),
             DavResponse {
                 status: StatusCode::NO_CONTENT,
@@ -1405,10 +1347,9 @@ mod tests {
                 url: String::new(),
             },
         ]);
-        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
-        let client = Arc::new(CardDavClient::with_transport(
+        let client = Arc::new(CardDavClient::with_account_net(
             "https://dav.example.test",
-            transport,
+            scripted_dav_net(&script),
         ));
         let account = crate::account::CardDavAccount::for_tests(
             client,
@@ -1418,8 +1359,7 @@ mod tests {
             .contact_update(contact(), patch_to("https://dav.example.test/books/work/"))
             .await
             .expect("restating the current address book is not a move");
-        let methods = script
-            .requests()
+        let methods = transcripts(&script)
             .into_iter()
             .map(|request| request.method.as_str().to_string())
             .collect::<Vec<_>>();
@@ -1439,7 +1379,7 @@ mod tests {
             body: body.to_string(),
             url: String::new(),
         };
-        let script = ScriptedDavTransport::new([
+        let script = dav_script([
             DavResponse {
                 status: StatusCode::MULTI_STATUS,
                 headers: HeaderMap::new(),
@@ -1448,12 +1388,19 @@ mod tests {
             },
             response(StatusCode::METHOD_NOT_ALLOWED, ""),
             response(StatusCode::CREATED, ""),
-            response(StatusCode::INTERNAL_SERVER_ERROR, "boom"),
-        ]);
-        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
-        let client = Arc::new(CardDavClient::with_transport(
+        ]
+        .into_iter()
+        .map(Canned::from)
+        // The DELETE of the original 500s, and a 500 is now retried to
+        // exhaustion before it surfaces.
+        .chain(dav_retried(response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "boom",
+        )))
+        .collect::<Vec<_>>());
+        let client = Arc::new(CardDavClient::with_account_net(
             "https://dav.example.test",
-            transport,
+            scripted_dav_net(&script),
         ));
         let account = crate::account::CardDavAccount::for_tests(
             client,
@@ -1480,25 +1427,27 @@ mod tests {
             ),
             "a copied-but-not-removed contact is a partial response: {error:?}"
         );
-        let methods = script
-            .requests()
+        let methods = transcripts(&script)
             .into_iter()
             .map(|request| request.method.as_str().to_string())
             .collect::<Vec<_>>();
-        assert_eq!(methods, vec!["REPORT", "MOVE", "PUT", "DELETE"]);
+        // The trailing DELETEs are the retry budget being spent on the 500.
+        assert_eq!(
+            methods,
+            vec!["REPORT", "MOVE", "PUT", "DELETE", "DELETE", "DELETE"]
+        );
     }
 
     #[tokio::test]
     async fn fetch_vcards_uses_scripted_report_transcript() {
-        let script = ScriptedDavTransport::new([DavResponse {
+        let script = dav_script([DavResponse {
             status: StatusCode::MULTI_STATUS,
             headers: HeaderMap::new(),
             body: "<D:multistatus xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:carddav\"><D:response><D:href>/book/one.vcf</D:href><D:propstat><D:prop><C:address-data>BEGIN:VCARD\nVERSION:4.0\nFN:One\nEND:VCARD</C:address-data></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response></D:multistatus>".to_string(),
             url: String::new(),
         }]);
-        let concrete_transport = Arc::clone(&script);
-        let transport: Arc<dyn DavTransport> = concrete_transport;
-        let client = CardDavClient::with_transport("https://dav.example.test", transport);
+        let client =
+            CardDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
 
         let fetched = client
             .fetch_vcards(
@@ -1513,7 +1462,7 @@ mod tests {
             fetched.report.cards[0].uri,
             "https://dav.example.test/book/one.vcf"
         );
-        let requests = script.requests();
+        let requests = transcripts(&script);
         assert_eq!(requests.len(), 1);
         assert_eq!(
             requests[0].method,
@@ -1536,53 +1485,25 @@ mod tests {
         );
     }
 
-    /// A transport that records the HIGH-WATER MARK of simultaneously
-    /// in-flight requests. Twin of bifrost-caldav's probe: each send yields
-    /// once before answering, so every polled leg is genuinely in flight at
-    /// the same time and the mark reflects the caller's fan-out policy.
-    struct ConcurrencyProbeTransport {
-        body: String,
-        in_flight: Arc<std::sync::atomic::AtomicUsize>,
-        peak: Arc<std::sync::atomic::AtomicUsize>,
-    }
-
-    impl DavTransport for ConcurrencyProbeTransport {
-        fn send(
-            &self,
-            _request: reqwest::RequestBuilder,
-        ) -> AccountFuture<Result<DavResponse, String>> {
-            let body = self.body.clone();
-            let in_flight = Arc::clone(&self.in_flight);
-            let peak = Arc::clone(&self.peak);
-            Box::pin(async move {
-                use std::sync::atomic::Ordering;
-                let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
-                peak.fetch_max(now, Ordering::SeqCst);
-                tokio::task::yield_now().await;
-                in_flight.fetch_sub(1, Ordering::SeqCst);
-                Ok(DavResponse {
-                    status: StatusCode::MULTI_STATUS,
-                    headers: HeaderMap::new(),
-                    body,
-                    url: "https://dav.example.test/book/".to_string(),
-                })
-            })
-        }
-    }
-
     /// Multiget fan-out is bounded by `MULTIGET_LEG_CONCURRENCY`, not by the
     /// caller's uri list: one large address book must not open hundreds of
     /// simultaneous REPORTs, and no layer below this one bounds them.
+    ///
+    /// Twin of bifrost-caldav's bound. The probe sits at the wire: the yielding
+    /// script raises its in-flight count for each outstanding dispatch, so the
+    /// mark measures what the net pipeline holds open.
     #[tokio::test]
     async fn multiget_never_holds_more_legs_open_than_the_concurrency_bound() {
-        let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let transport: Arc<dyn DavTransport> = Arc::new(ConcurrencyProbeTransport {
+        let chunks = 10;
+        let script = dav_script_yielding((0..chunks).map(|_| DavResponse {
+            status: StatusCode::MULTI_STATUS,
+            headers: HeaderMap::new(),
             body: "<D:multistatus xmlns:D=\"DAV:\"></D:multistatus>".to_string(),
-            in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            peak: Arc::clone(&peak),
-        });
-        let client = CardDavClient::with_transport("https://dav.example.test", transport);
-        let uris = (0..MULTIGET_BATCH_SIZE * 10)
+            url: String::new(),
+        }));
+        let client =
+            CardDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
+        let uris = (0..MULTIGET_BATCH_SIZE * chunks)
             .map(|index| format!("https://dav.example.test/book/{index}.vcf"))
             .collect::<Vec<_>>();
 
@@ -1595,10 +1516,7 @@ mod tests {
             .await
             .expect("empty multistatus legs are usable");
 
-        assert_eq!(
-            peak.load(std::sync::atomic::Ordering::SeqCst),
-            MULTIGET_LEG_CONCURRENCY
-        );
+        assert_eq!(script.peak_in_flight(), MULTIGET_LEG_CONCURRENCY);
     }
 
     #[tokio::test]
@@ -1613,11 +1531,16 @@ mod tests {
             status: StatusCode::SERVICE_UNAVAILABLE,
             headers: HeaderMap::new(),
             body: String::new(),
-            url: "https://dav.example.test/book/".to_string(),
+            url: String::new(),
         };
-        let script = ScriptedDavTransport::new([good, refused]);
-        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
-        let client = CardDavClient::with_transport("https://dav.example.test", transport);
+        // The refused leg burns the whole retry budget before it degrades.
+        let script = dav_script(
+            std::iter::once(Canned::from(good))
+                .chain(dav_retried(refused))
+                .collect::<Vec<_>>(),
+        );
+        let client =
+            CardDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
         let uris = (0..=MULTIGET_BATCH_SIZE)
             .map(|index| format!("https://dav.example.test/book/{index}.vcf"))
             .collect::<Vec<_>>();
@@ -1652,9 +1575,9 @@ mod tests {
             body: "<D:multistatus xmlns:D=\"DAV:\"><D:response></D:multistatus>".to_string(),
             url: "https://dav.example.test/book/".to_string(),
         };
-        let script = ScriptedDavTransport::new([good, malformed]);
-        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
-        let client = CardDavClient::with_transport("https://dav.example.test", transport);
+        let script = dav_script([good, malformed]);
+        let client =
+            CardDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
         let uris = (0..=MULTIGET_BATCH_SIZE)
             .map(|index| format!("https://dav.example.test/book/{index}.vcf"))
             .collect::<Vec<_>>();
@@ -1681,9 +1604,9 @@ mod tests {
             body: "<D:multistatus xmlns:D=\"DAV:\"><D:response></D:multistatus>".to_string(),
             url: "https://dav.example.test/book/".to_string(),
         };
-        let script = ScriptedDavTransport::new([malformed]);
-        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
-        let client = CardDavClient::with_transport("https://dav.example.test", transport);
+        let script = dav_script([malformed]);
+        let client =
+            CardDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
 
         let outcome = client
             .fetch_vcards(
@@ -1704,15 +1627,14 @@ mod tests {
     /// result treated as truth is a downstream deletion.
     #[tokio::test]
     async fn unauthorized_report_classifies_as_reauthorization() {
-        let script = ScriptedDavTransport::new([DavResponse {
+        let script = dav_script([DavResponse {
             status: StatusCode::UNAUTHORIZED,
             headers: HeaderMap::new(),
             body: "<html><body>401 Unauthorized</body></html>".to_string(),
             url: String::new(),
         }]);
-        let concrete_transport = Arc::clone(&script);
-        let transport: Arc<dyn DavTransport> = concrete_transport;
-        let client = CardDavClient::with_transport("https://dav.example.test", transport);
+        let client =
+            CardDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
 
         let Err(error) = client
             .fetch_vcards(
@@ -1735,7 +1657,8 @@ mod tests {
 
     #[test]
     fn resolve_url_fallback_preserves_separator() {
-        let client = CardDavClient::for_base_url("not a url");
+        let client =
+            CardDavClient::with_account_net("not a url", scripted_dav_net(&dav_script_empty()));
 
         assert_eq!(
             client.resolve_url("addressbook/one.vcf"),
@@ -1783,14 +1706,14 @@ mod tests {
 
     #[tokio::test]
     async fn addressbook_multiget_uses_depth_zero() {
-        let script = ScriptedDavTransport::new([DavResponse {
+        let script = dav_script([DavResponse {
             status: StatusCode::MULTI_STATUS,
             headers: HeaderMap::new(),
             body: "<D:multistatus xmlns:D=\"DAV:\"/>".to_string(),
             url: String::new(),
         }]);
-        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
-        let client = CardDavClient::with_transport("https://dav.example.test", transport);
+        let client =
+            CardDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
 
         client
             .fetch_vcards(
@@ -1801,7 +1724,7 @@ mod tests {
             .await
             .expect("empty multistatus is usable");
 
-        let requests = script.requests();
+        let requests = transcripts(&script);
         assert_eq!(requests[0].headers["Depth"], "0");
         assert!(requests[0].body.contains("<D:resourcetype/>"));
     }

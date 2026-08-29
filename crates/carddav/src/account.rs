@@ -84,10 +84,10 @@ impl CardDavAccount {
     }
 
     pub(crate) async fn open(
-        _account_id: AccountId,
+        account_id: AccountId,
         config: CardDavConfig,
     ) -> Result<Self, AccountError> {
-        let client = CardDavClient::new(&config)?;
+        let client = CardDavClient::new(account_id, &config);
         Self::open_with_client(client).await
     }
 
@@ -427,9 +427,13 @@ impl Account for CardDavAccount {
         &self.capabilities
     }
 
-    fn set_priority(&self, _priority: Priority) {}
+    fn set_priority(&self, priority: Priority) {
+        self.client.net().set_priority(priority);
+    }
 
-    fn set_bandwidth_cap(&self, _bps: Option<u64>) {}
+    fn set_bandwidth_cap(&self, bps: Option<u64>) {
+        self.client.net().set_bandwidth_cap(bps);
+    }
 
     fn describe_cursor(&self, _cursor: &ChangeCursor) -> CursorDescriptor {
         CursorDescriptor {
@@ -1368,10 +1372,14 @@ fn contact_addressbook_url(client: &CardDavClient, contact: &ContactId) -> Optio
 #[cfg(test)]
 mod collection_url_tests {
     use super::*;
+    use bifrost_dav_core::test_support::{dav_script_empty, scripted_dav_net};
 
     #[test]
     fn contact_addressbook_url_ignores_query_and_fragment_slashes() {
-        let client = CardDavClient::for_base_url("https://dav.example.test");
+        let client = CardDavClient::with_account_net(
+            "https://dav.example.test",
+            scripted_dav_net(&dav_script_empty()),
+        );
         assert_eq!(
             contact_addressbook_url(
                 &client,
@@ -2002,7 +2010,34 @@ fn contains(value: &str, needle: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bifrost_dav_core::test_support::{dav_script_empty, scripted_dav_net};
     use bifrost_types::{AccountErrorKind, EngineDirective, RecoveryClass, SyncStateErrorKind};
+
+    /// `set_priority` and `set_bandwidth_cap` reach the account's transport.
+    ///
+    /// Twin of bifrost-caldav's; keep them in step. Both were silent no-ops for
+    /// as long as this crate ran its own reqwest client, so an IMAP-shaped
+    /// account composed `with_carddav` and given a bandwidth cap did not cap its
+    /// DAV legs. This is the door dav-B9 exists to open.
+    #[tokio::test]
+    async fn the_priority_and_bandwidth_doors_reach_the_transport() {
+        let net = scripted_dav_net(&dav_script_empty());
+        let client = CardDavClient::with_account_net("https://dav.example.test", net.clone());
+        let account =
+            CardDavAccount::for_tests(Arc::new(client), "https://dav.example.test/books/");
+
+        account.set_bandwidth_cap(Some(4_096));
+        assert_eq!(net.bandwidth_cap(), Some(4_096));
+        account.set_priority(Priority::Background);
+        assert_eq!(net.priority(), Priority::Background);
+
+        // And back off again, so a test that only ever sets a value cannot
+        // pass against a door wired to a constant.
+        account.set_bandwidth_cap(None);
+        assert_eq!(net.bandwidth_cap(), None);
+        account.set_priority(Priority::Foreground);
+        assert_eq!(net.priority(), Priority::Foreground);
+    }
 
     fn collection(href: &str) -> AddressBookCollection {
         AddressBookCollection {
@@ -2057,7 +2092,10 @@ mod tests {
 
     #[tokio::test]
     async fn every_address_book_is_discovered_as_a_cursor_scope() {
-        let client = Arc::new(CardDavClient::for_base_url("https://dav.example.test"));
+        let client = Arc::new(CardDavClient::with_account_net(
+            "https://dav.example.test",
+            scripted_dav_net(&dav_script_empty()),
+        ));
         let account = CardDavAccount {
             client,
             capabilities: carddav_capabilities(),

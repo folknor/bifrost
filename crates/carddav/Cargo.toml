@@ -30,4 +30,6 @@ reqwest = { workspace = true, features = ["native-tls"] }
 uuid = { workspace = true }
 
 [dev-dependencies]
+bifrost-dav-core = { path = "../dav-core", features = ["test-support"] }
+bifrost-net = { path = "../net", features = ["test-support"] }
 tokio = { workspace = true, features = ["macros", "rt"] }

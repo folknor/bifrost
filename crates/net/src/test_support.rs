@@ -29,6 +29,7 @@
 //! ```
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bifrost_types::{AccountFuture, AccountId};
@@ -153,6 +154,9 @@ pub struct RequestSnapshot {
 pub struct ScriptedDispatch {
     steps: Arc<Mutex<VecDeque<Canned>>>,
     requests: Arc<Mutex<Vec<RequestSnapshot>>>,
+    in_flight: Arc<AtomicUsize>,
+    peak_in_flight: Arc<AtomicUsize>,
+    yield_before_answering: bool,
 }
 
 impl ScriptedDispatch {
@@ -162,7 +166,39 @@ impl ScriptedDispatch {
         Arc::new(Self {
             steps: Arc::new(Mutex::new(steps.into_iter().collect())),
             requests: Arc::new(Mutex::new(Vec::new())),
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            peak_in_flight: Arc::new(AtomicUsize::new(0)),
+            yield_before_answering: false,
         })
+    }
+
+    /// A dispatcher that yields once before answering each request, so a
+    /// caller's concurrent legs are genuinely in flight together and
+    /// [`Self::peak_in_flight`] measures the caller's fan-out policy rather
+    /// than scheduling luck.
+    ///
+    /// Separate from [`Self::new`] because the yield is observable: it changes
+    /// completion interleaving for every test that uses it, and most tests want
+    /// the deterministic immediate answer.
+    #[must_use]
+    pub fn yielding(steps: impl IntoIterator<Item = Canned>) -> Arc<Self> {
+        Arc::new(Self {
+            steps: Arc::new(Mutex::new(steps.into_iter().collect())),
+            requests: Arc::new(Mutex::new(Vec::new())),
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            peak_in_flight: Arc::new(AtomicUsize::new(0)),
+            yield_before_answering: true,
+        })
+    }
+
+    /// The high-water mark of simultaneously in-flight dispatches.
+    ///
+    /// Meaningful only on a [`Self::yielding`] dispatcher: without the yield an
+    /// answer is produced before the next leg is polled, so the mark is 1
+    /// whatever the caller's fan-out.
+    #[must_use]
+    pub fn peak_in_flight(&self) -> usize {
+        self.peak_in_flight.load(Ordering::SeqCst)
     }
 
     /// Append further outcomes to the end of the script.
@@ -205,6 +241,9 @@ impl Dispatch for ScriptedDispatch {
     ) -> AccountFuture<Result<reqwest::Response, Error>> {
         let steps = Arc::clone(&self.steps);
         let requests = Arc::clone(&self.requests);
+        let in_flight = Arc::clone(&self.in_flight);
+        let peak_in_flight = Arc::clone(&self.peak_in_flight);
+        let yield_before_answering = self.yield_before_answering;
         Box::pin(async move {
             let request = request.build().map_err(send_error_to_error)?;
             let body = request
@@ -221,6 +260,10 @@ impl Dispatch for ScriptedDispatch {
                     body,
                     timeout: request.timeout().copied(),
                 });
+            let _in_flight = InFlightGuard::enter(&in_flight, &peak_in_flight);
+            if yield_before_answering {
+                tokio::task::yield_now().await;
+            }
             let step = steps
                 .lock()
                 .expect("scripted step lock poisoned")
@@ -277,6 +320,28 @@ impl Dispatch for ScriptedDispatch {
                 Canned::Pending => futures::future::pending().await,
             }
         })
+    }
+}
+
+/// Raises the in-flight count for as long as one dispatch is outstanding, and
+/// records the high-water mark.
+///
+/// A guard rather than a bare increment/decrement pair because a dispatch can
+/// leave by any of several paths - a scripted `Error`, a cancelled future - and
+/// a leaked increment silently inflates every later reading.
+struct InFlightGuard(Arc<AtomicUsize>);
+
+impl InFlightGuard {
+    fn enter(in_flight: &Arc<AtomicUsize>, peak: &Arc<AtomicUsize>) -> Self {
+        let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        peak.fetch_max(now, Ordering::SeqCst);
+        Self(Arc::clone(in_flight))
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 

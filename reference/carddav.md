@@ -30,10 +30,13 @@ its successful body does not identify a current-user principal.
 - `lib.rs` - public config / credentials / factory.
 - `account.rs` - crate-private contact-only `Account` impl.
 - `client.rs` - crate-private CardDAV client: discovery, `PROPFIND`,
-  `REPORT`, `PUT`, and `DELETE`. A local `DavTransport` seam keeps reqwest
-  dispatch in production while scripted request transcripts exercise DAV
-  flows without a listener. `bifrost-net`'s dispatcher is crate-private, and
-  DAV still owns Basic auth and its redirect policy. Every request path
+  `REPORT`, `PUT`, and `DELETE`. Wire traffic rides `bifrost-net` through
+  `bifrost-dav-core`'s `DavDispatch` (see `reference/caldav.md`, "The shared
+  layer"), so DAV legs share the retry budget, per-host rate limiting,
+  bandwidth metering and observability with every other HTTP protocol crate;
+  scripted transcripts exercise DAV flows at the wire, below all of it, without
+  a listener. DAV still mints its own credentials and walks its own redirects.
+  Every request path
   classifies a non-2xx status before the body is parsed, so an error page
   can never decode as an authoritative empty report.
   A response body exceeding the buffered ceiling is classified as

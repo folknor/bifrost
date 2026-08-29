@@ -7,7 +7,7 @@ budget, per-host rate limiting, per-account bandwidth metering,
 native-tls, W3C `traceparent` injection, URL component-encoding
 helpers, resource-parent extraction, and origin-rooted well-known URL
 construction shared by the HTTP protocol crates. Used by `bifrost-jmap`,
-`bifrost-google`, `bifrost-graph`, and - for the URL helpers -
+`bifrost-google`, `bifrost-graph`, and - through `bifrost-dav-core` -
 `bifrost-caldav` and `bifrost-carddav`. Not used by `bifrost-imap` or
 `bifrost-smtp` (those carry their own TCP/TLS stacks); IMAP/SMTP
 report bytes-in/out through `MeterSink` for unified bandwidth
@@ -48,9 +48,11 @@ start from their constructors or defaults and then assign supported fields.
 JMAP attaches every independently opened account to the shared transport
 selected by `Net::shared_for_tls` (see the TLS section), so its accounts share
 the client, governor, and meter within each trust class as advertised. The
-CalDAV and CardDAV clients still run their own reqwest transport and are not
-covered by this claim; `AccountNet::request(Method, ..)` and the optional token
-source exist so they can migrate.
+CalDAV and CardDAV clients ride `AccountNet` too, through
+`bifrost-dav-core`'s `DavDispatch`: `AccountNet::request(Method, ..)` is what
+carries their WebDAV extension verbs, and they attach with no token source
+because their credential-origin gate mints the `Authorization` header itself and
+every request opts out with `without_bearer_auth`.
 
 Every `attach_account` receives a monotone registration token carried
 by its `AccountNet`. `AccountNet::detach()` removes that exact
@@ -201,9 +203,9 @@ mis-routed blob URL, or a hostile response OOMs the process; the error
 path already had a 4 KB cap in `read_capped_response_body` and the
 success path had nothing. `None` disables the check.
 `send_streaming` is uncapped by design - the caller owns backpressure
-there. The CalDAV and CardDAV clients, which run their own transport,
-apply the same constant in their `read_capped_body` rather than
-`reqwest::Response::text()`.
+there. The CalDAV and CardDAV clients take this ceiling from `send` like
+everyone else; `Error::ResponseTooLarge` is what their dispatcher converts into
+the `Protocol(PartialResponse)` an acknowledged-but-unreadable DAV body wants.
 
 The loop sends through a crate-private `Dispatch` seam. Production
 dispatch delegates to reqwest. Tests install a scripted dispatcher
@@ -248,6 +250,14 @@ pinned in `tests/test_support_seam.rs`:
 - An exhausted script panics rather than falling through to the
   network, so an under-scripted test fails loudly instead of dialing
   a real socket.
+
+`ScriptedDispatch::yielding` is the same double with one yield inserted before
+each answer, paired with `peak_in_flight()` for measuring a caller's fan-out
+bound. The yield is what makes concurrent legs genuinely outstanding together
+rather than each completing before the next is polled, and it is a separate
+constructor because that interleaving change is observable - most tests want the
+deterministic immediate answer. Both DAV crates use it to pin their multiget leg
+concurrency; ablating the bound reads 10 against a bound of 4.
 
 `AccountNet` exposes `get`, `post`, `put`, `patch`, `delete`, plus
 `request(http::Method, url)` for extension methods such as WebDAV's
@@ -800,13 +810,12 @@ pipeline are not part of this bare-client path. A hop outside the
 allowlist is stopped (the 3xx surfaces as a terminal status);
 exceeding `max_hops` errors. The DAV crates need their redirect gate to
 match their stricter credential gate, which compares scheme, host, and
-effective port - and reqwest strips `Authorization` on any origin change
-with no way for a policy to restore it, so an in-reqwest cross-origin
-follow would arrive unauthenticated. They therefore build a local
-same-origin-only reqwest policy (hop cap sourced from
-`RedirectPolicy::default`) and re-dispatch cross-origin hops manually
-with fresh credentials, gated by the origin set authenticated discovery
-admitted.
+effective port - and this crate strips `Authorization` on any origin change
+with no way to restore it, so a followed cross-origin hop would arrive
+unauthenticated. They therefore attach with `FollowRedirects::Disabled` and walk
+every hop themselves in `DavDispatch::send_raw_request`, re-minting credentials
+for each target origin against the set authenticated discovery admitted, with
+the hop cap still sourced from `RedirectPolicy::default`.
 
 `FollowRedirects::Disabled` skips the loop entirely; 3xx surfaces
 to the caller exactly as it did before the loop landed. Redirects are

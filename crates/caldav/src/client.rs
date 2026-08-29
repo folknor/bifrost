@@ -1,21 +1,14 @@
 use std::fmt;
-#[cfg(test)]
-use std::sync::Arc;
 
 pub(crate) use bifrost_dav_core::PutCondition;
-#[cfg(test)]
-use bifrost_dav_core::ReqwestDavTransport;
 use bifrost_dav_core::{
     DavDispatch, DavProtocol, escape_xml, prepare_if_match, response_etag, worse_recovery,
 };
-#[cfg(test)]
-pub(crate) use bifrost_dav_core::{DavResponse, DavTransport};
+use bifrost_net::{AccountId, AccountNet};
 use bifrost_types::{
     AccountError, AccountErrorBuilder, AccountErrorKind, AccountOperation, Cause, CursorScope,
     DiagnosticText, ErrorScope, ObjectType, Protocol, ResourceKind, StateCause, SyncStateErrorKind,
 };
-#[cfg(test)]
-use reqwest::header::{AUTHORIZATION, HeaderMap};
 use reqwest::header::{CONTENT_TYPE, HeaderValue};
 use reqwest::{Method, StatusCode};
 
@@ -85,27 +78,32 @@ impl CalDavClient {
         self.dav.move_resource(from, to, operation).await
     }
 
-    pub(crate) fn new(config: &CalDavConfig) -> Result<Self, AccountError> {
-        Ok(Self {
-            dav: DavDispatch::new(&config.base_url, config.credentials.to_shared(), DAV)?,
-        })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn with_transport(base_url: &str, transport: Arc<dyn DavTransport>) -> Self {
+    pub(crate) fn new(account_id: AccountId, config: &CalDavConfig) -> Self {
         Self {
-            dav: DavDispatch::with_transport(
-                base_url,
-                transport,
-                crate::CalDavCredentials::bearer("token").to_shared(),
+            dav: DavDispatch::new(
+                account_id,
+                &config.base_url,
+                config.credentials.to_shared(),
                 DAV,
             ),
         }
     }
 
+    /// The account handle carrying this account's meter, priority and cap.
+    pub(crate) fn net(&self) -> &AccountNet {
+        self.dav.net()
+    }
+
     #[cfg(test)]
-    pub(crate) fn for_base_url(base_url: &str) -> Self {
-        Self::with_transport(base_url, Arc::new(ReqwestDavTransport))
+    pub(crate) fn with_account_net(base_url: &str, net: AccountNet) -> Self {
+        Self {
+            dav: DavDispatch::with_account_net(
+                net,
+                base_url,
+                crate::CalDavCredentials::bearer("token").to_shared(),
+                DAV,
+            ),
+        }
     }
 
     pub(crate) async fn discover_account(&self) -> Result<CalDavDiscovery, AccountError> {
@@ -799,10 +797,16 @@ const PROPFIND_SYNC_TOKEN: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::VecDeque;
-    use std::sync::Mutex;
+    use std::sync::Arc;
 
-    use bifrost_types::{AccountFuture, ProtocolErrorKind, RecoveryClass, ServerErrorKind};
+    use bifrost_dav_core::DavResponse;
+    use bifrost_dav_core::test_support::{
+        dav_redirect, dav_retried, dav_script, dav_script_empty, dav_script_yielding,
+        scripted_dav_net, transcripts,
+    };
+    use bifrost_net::test_support::{Canned, ScriptedDispatch};
+    use bifrost_types::{ProtocolErrorKind, RecoveryClass, ServerErrorKind};
+    use reqwest::header::{AUTHORIZATION, HeaderMap};
 
     /// Every error this crate mints is stamped CalDAV, and names calendars.
     ///
@@ -845,74 +849,6 @@ mod tests {
         );
     }
 
-    #[derive(Debug, Clone)]
-    struct RequestTranscript {
-        method: Method,
-        url: String,
-        headers: HeaderMap,
-        body: String,
-    }
-
-    struct ScriptedDavTransport {
-        responses: Mutex<VecDeque<DavResponse>>,
-        requests: Mutex<Vec<RequestTranscript>>,
-    }
-
-    impl ScriptedDavTransport {
-        fn new(responses: impl IntoIterator<Item = DavResponse>) -> Arc<Self> {
-            Arc::new(Self {
-                responses: Mutex::new(responses.into_iter().collect()),
-                requests: Mutex::new(Vec::new()),
-            })
-        }
-
-        fn requests(&self) -> Vec<RequestTranscript> {
-            self.requests
-                .lock()
-                .expect("scripted DAV request lock poisoned")
-                .clone()
-        }
-    }
-
-    impl DavTransport for ScriptedDavTransport {
-        fn send(
-            &self,
-            request: reqwest::RequestBuilder,
-        ) -> AccountFuture<Result<DavResponse, String>> {
-            let request = match request.build() {
-                Ok(request) => request,
-                Err(error) => return Box::pin(async move { Err(error.to_string()) }),
-            };
-            self.requests
-                .lock()
-                .expect("scripted DAV request lock poisoned")
-                .push(RequestTranscript {
-                    method: request.method().clone(),
-                    url: request.url().to_string(),
-                    headers: request.headers().clone(),
-                    body: request
-                        .body()
-                        .and_then(reqwest::Body::as_bytes)
-                        .map_or_else(String::new, |body| {
-                            String::from_utf8_lossy(body).into_owned()
-                        }),
-                });
-            let mut response = self
-                .responses
-                .lock()
-                .expect("scripted DAV response lock poisoned")
-                .pop_front()
-                .expect("scripted DAV transport exhausted");
-            // A scripted response with no effective URL models the ordinary
-            // no-redirect case: reqwest reports the submitted URI back. A
-            // script that sets one models a followed redirect.
-            if response.url.is_empty() {
-                response.url = request.url().to_string();
-            }
-            Box::pin(async move { Ok(response) })
-        }
-    }
-
     /// A recurrence-instance `EventId` is refused before anything is sent.
     ///
     /// `events_from_ical` mints `"{uri}#{recurrence_id}"` for override VEVENTs,
@@ -929,11 +865,10 @@ mod tests {
     async fn recurrence_instance_ids_are_refused_before_reaching_the_wire() {
         use bifrost_types::account::Account as _;
 
-        let script = ScriptedDavTransport::new([]);
-        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
-        let client = Arc::new(CalDavClient::with_transport(
+        let script = dav_script_empty();
+        let client = Arc::new(CalDavClient::with_account_net(
             "https://dav.example.test",
-            transport,
+            scripted_dav_net(&script),
         ));
         let account =
             crate::account::CalDavAccount::for_tests(client, "https://dav.example.test/calendar/");
@@ -959,7 +894,7 @@ mod tests {
             .expect_err("answering for one occurrence must not answer for the series");
 
         assert!(
-            script.requests().is_empty(),
+            transcripts(&script).is_empty(),
             "a refused instance id must reach no transport at all"
         );
     }
@@ -974,8 +909,8 @@ mod tests {
     #[tokio::test]
     async fn an_empty_discovery_opens_an_account_with_no_default_calendar() {
         let script = discovery_script("/cal/ada/");
-        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
-        let client = CalDavClient::with_transport("https://dav.example.test", transport);
+        let client =
+            CalDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
 
         let account = crate::account::CalDavAccount::open_with_client(client, None)
             .await
@@ -1005,11 +940,10 @@ mod tests {
     async fn an_empty_backend_refuses_collection_less_calls_before_the_wire() {
         use bifrost_types::account::Account as _;
 
-        let script = ScriptedDavTransport::new([]);
-        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
-        let client = Arc::new(CalDavClient::with_transport(
+        let script = dav_script_empty();
+        let client = Arc::new(CalDavClient::with_account_net(
             "https://dav.example.test",
-            transport,
+            scripted_dav_net(&script),
         ));
         let account = crate::account::CalDavAccount::for_tests_without_collections(
             client,
@@ -1039,7 +973,7 @@ mod tests {
         );
 
         assert!(
-            script.requests().is_empty(),
+            transcripts(&script).is_empty(),
             "an unroutable call must reach no transport at all"
         );
     }
@@ -1049,11 +983,10 @@ mod tests {
     async fn every_calendar_is_discovered_as_a_cursor_scope() {
         use bifrost_types::account::Account as _;
         use futures::StreamExt as _;
-        let script = ScriptedDavTransport::new([]);
-        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
-        let client = Arc::new(CalDavClient::with_transport(
+        let script = dav_script_empty();
+        let client = Arc::new(CalDavClient::with_account_net(
             "https://dav.example.test",
-            transport,
+            scripted_dav_net(&script),
         ));
 
         let many = crate::account::CalDavAccount::for_tests_with_collections(
@@ -1082,11 +1015,10 @@ mod tests {
     async fn unavailable_rsvp_is_rejected_before_reaching_the_wire() {
         use bifrost_types::account::Account as _;
 
-        let script = ScriptedDavTransport::new([]);
-        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
-        let client = Arc::new(CalDavClient::with_transport(
+        let script = dav_script_empty();
+        let client = Arc::new(CalDavClient::with_account_net(
             "https://dav.example.test",
-            transport,
+            scripted_dav_net(&script),
         ));
         let account =
             crate::account::CalDavAccount::for_tests(client, "https://dav.example.test/cal/work/");
@@ -1098,7 +1030,7 @@ mod tests {
             )
             .await
             .expect_err("scheduling-less accounts cannot RSVP");
-        assert!(script.requests().is_empty());
+        assert!(transcripts(&script).is_empty());
     }
 
     /// An empty calendar home lists NOTHING - no fabricated placeholder.
@@ -1112,16 +1044,15 @@ mod tests {
     async fn an_empty_home_lists_no_calendars_rather_than_a_phantom() {
         use bifrost_types::account::Account as _;
 
-        let script = ScriptedDavTransport::new([DavResponse {
+        let script = dav_script([DavResponse {
             status: StatusCode::MULTI_STATUS,
             headers: HeaderMap::new(),
             body: "<D:multistatus xmlns:D=\"DAV:\"/>".to_string(),
             url: String::new(),
         }]);
-        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
-        let client = Arc::new(CalDavClient::with_transport(
+        let client = Arc::new(CalDavClient::with_account_net(
             "https://dav.example.test",
-            transport,
+            scripted_dav_net(&script),
         ));
         let account =
             crate::account::CalDavAccount::for_tests(client, "https://dav.example.test/cal/ada/");
@@ -1155,19 +1086,27 @@ mod tests {
             body: body.to_string(),
             url: String::new(),
         };
-        let script = ScriptedDavTransport::new([
-            response(StatusCode::OK, ics),
-            // MOVE unimplemented.
-            response(StatusCode::METHOD_NOT_ALLOWED, ""),
-            // PUT to the destination succeeds.
-            response(StatusCode::CREATED, ""),
-            // DELETE of the original fails.
-            response(StatusCode::INTERNAL_SERVER_ERROR, "boom"),
-        ]);
-        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
-        let client = Arc::new(CalDavClient::with_transport(
+        let script = dav_script(
+            [
+                response(StatusCode::OK, ics),
+                // MOVE unimplemented.
+                response(StatusCode::METHOD_NOT_ALLOWED, ""),
+                // PUT to the destination succeeds.
+                response(StatusCode::CREATED, ""),
+            ]
+            .into_iter()
+            .map(Into::into)
+            // DELETE of the original fails, and a 500 is now retried to
+            // exhaustion before it surfaces.
+            .chain(dav_retried(response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "boom",
+            )))
+            .collect::<Vec<_>>(),
+        );
+        let client = Arc::new(CalDavClient::with_account_net(
             "https://dav.example.test",
-            transport,
+            scripted_dav_net(&script),
         ));
         let account =
             crate::account::CalDavAccount::for_tests(client, "https://dav.example.test/cal/work/");
@@ -1192,12 +1131,15 @@ mod tests {
             ),
             "a copied-but-not-removed event is a partial response: {error:?}"
         );
-        let methods = script
-            .requests()
+        let methods = transcripts(&script)
             .into_iter()
             .map(|request| request.method.as_str().to_string())
             .collect::<Vec<_>>();
-        assert_eq!(methods, vec!["GET", "MOVE", "PUT", "DELETE"]);
+        // The trailing DELETEs are the retry budget being spent on the 500.
+        assert_eq!(
+            methods,
+            vec!["GET", "MOVE", "PUT", "DELETE", "DELETE", "DELETE"]
+        );
     }
 
     /// A cross-calendar `event_update` MOVES the resource, and a restated
@@ -1231,7 +1173,7 @@ mod tests {
 
         // A move: GET the current resource, then MOVE it. The destination keeps
         // the resource's own file name.
-        let script = ScriptedDavTransport::new([
+        let script = dav_script([
             DavResponse {
                 status: StatusCode::OK,
                 headers: HeaderMap::new(),
@@ -1245,10 +1187,9 @@ mod tests {
                 url: String::new(),
             },
         ]);
-        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
-        let client = Arc::new(CalDavClient::with_transport(
+        let client = Arc::new(CalDavClient::with_account_net(
             "https://dav.example.test",
-            transport,
+            scripted_dav_net(&script),
         ));
         let account =
             crate::account::CalDavAccount::for_tests(client, "https://dav.example.test/cal/work/");
@@ -1256,7 +1197,7 @@ mod tests {
             .event_update(event(), patch_to("https://dav.example.test/cal/personal/"))
             .await
             .expect("a move between calendars is performed");
-        let requests = script.requests();
+        let requests = transcripts(&script);
         assert_eq!(
             requests.len(),
             2,
@@ -1285,7 +1226,7 @@ mod tests {
         );
 
         // Restating the event's own calendar is not a move, and still updates.
-        let script = ScriptedDavTransport::new([
+        let script = dav_script([
             DavResponse {
                 status: StatusCode::OK,
                 headers: HeaderMap::new(),
@@ -1299,10 +1240,9 @@ mod tests {
                 url: String::new(),
             },
         ]);
-        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
-        let client = Arc::new(CalDavClient::with_transport(
+        let client = Arc::new(CalDavClient::with_account_net(
             "https://dav.example.test",
-            transport,
+            scripted_dav_net(&script),
         ));
         let account =
             crate::account::CalDavAccount::for_tests(client, "https://dav.example.test/cal/work/");
@@ -1311,7 +1251,7 @@ mod tests {
             .await
             .expect("restating the current calendar is not a move");
         assert_eq!(
-            script.requests().len(),
+            transcripts(&script).len(),
             2,
             "an ordinary update is still a GET plus a PUT"
         );
@@ -1328,9 +1268,9 @@ mod tests {
             body: "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:one\nEND:VEVENT\nEND:VCALENDAR".to_string(),
             url: String::new(),
         };
-        let script = ScriptedDavTransport::new([event(), event()]);
-        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
-        let client = CalDavClient::with_transport("https://dav.example.test", transport);
+        let script = dav_script([event(), event()]);
+        let client =
+            CalDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
 
         client
             .get_event(
@@ -1344,7 +1284,7 @@ mod tests {
             .await
             .expect_err("foreign resource origin is rejected");
 
-        let requests = script.requests();
+        let requests = transcripts(&script);
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].url, "https://dav.example.test/calendar/one.ics");
         assert_eq!(
@@ -1356,14 +1296,14 @@ mod tests {
         );
     }
 
-    fn discovery_script(home_href: &str) -> Arc<ScriptedDavTransport> {
+    fn discovery_script(home_href: &str) -> Arc<ScriptedDispatch> {
         let response = |body: String| DavResponse {
             status: StatusCode::MULTI_STATUS,
             headers: HeaderMap::new(),
             body,
             url: String::new(),
         };
-        ScriptedDavTransport::new([
+        dav_script([
             response(
                 "<D:current-user-principal xmlns:D=\"DAV:\"><D:href>/principals/ada/</D:href></D:current-user-principal>"
                     .to_string(),
@@ -1383,7 +1323,7 @@ mod tests {
             body: body.to_string(),
             url: String::new(),
         };
-        let script = ScriptedDavTransport::new([
+        let script = dav_script([
             response("<D:multistatus xmlns:D=\"DAV:\"/>"),
             response(
                 "<D:current-user-principal xmlns:D=\"DAV:\"><D:href>/principals/ada/</D:href></D:current-user-principal>",
@@ -1392,14 +1332,13 @@ mod tests {
                 "<C:calendar-home-set xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\"><D:href>/cal/ada/</D:href></C:calendar-home-set>",
             ),
         ]);
-        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
-        let client = CalDavClient::with_transport("https://dav.example.test", transport);
+        let client =
+            CalDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
 
         let discovery = client.discover_account().await.expect("fallback succeeds");
 
         assert_eq!(discovery.calendar_home, "https://dav.example.test/cal/ada/");
-        let urls = script
-            .requests()
+        let urls = transcripts(&script)
             .into_iter()
             .map(|request| request.url)
             .collect::<Vec<_>>();
@@ -1427,7 +1366,7 @@ mod tests {
             body: body.to_string(),
             url: String::new(),
         };
-        let script = ScriptedDavTransport::new([
+        let script = dav_script([
             response("<D:multistatus xmlns:D=\"DAV:\"/>"),
             response(
                 "<D:current-user-principal xmlns:D=\"DAV:\"><D:href>/principals/ada/</D:href></D:current-user-principal>",
@@ -1436,14 +1375,15 @@ mod tests {
                 "<C:calendar-home-set xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\"><D:href>/cal/ada/</D:href></C:calendar-home-set>",
             ),
         ]);
-        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
-        let client = CalDavClient::with_transport("https://dav.example.test/service", transport);
+        let client = CalDavClient::with_account_net(
+            "https://dav.example.test/service",
+            scripted_dav_net(&script),
+        );
 
         let discovery = client.discover_account().await.expect("fallback succeeds");
 
         assert_eq!(discovery.calendar_home, "https://dav.example.test/cal/ada/");
-        let urls = script
-            .requests()
+        let urls = transcripts(&script)
             .into_iter()
             .map(|request| request.url)
             .collect::<Vec<_>>();
@@ -1460,7 +1400,7 @@ mod tests {
 
     #[tokio::test]
     async fn principal_404_does_not_restart_discovery_at_base() {
-        let script = ScriptedDavTransport::new([
+        let script = dav_script([
             DavResponse {
                 status: StatusCode::MULTI_STATUS,
                 headers: HeaderMap::new(),
@@ -1474,15 +1414,15 @@ mod tests {
                 url: String::new(),
             },
         ]);
-        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
-        let client = CalDavClient::with_transport("https://dav.example.test", transport);
+        let client =
+            CalDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
 
         client
             .discover_account()
             .await
             .expect_err("principal failure is terminal");
 
-        assert_eq!(script.requests().len(), 2);
+        assert_eq!(transcripts(&script).len(), 2);
     }
 
     /// The legitimate deployment the origin allowlist must not break: the
@@ -1491,8 +1431,8 @@ mod tests {
     #[tokio::test]
     async fn discovered_cross_origin_https_home_receives_credentials() {
         let script = discovery_script("https://cal.example.test/homes/ada/");
-        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
-        let mut client = CalDavClient::with_transport("https://dav.example.test", transport);
+        let mut client =
+            CalDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
 
         let home = client
             .discover_account()
@@ -1506,7 +1446,7 @@ mod tests {
             .await
             .expect("cross-origin home is credential-bearing");
 
-        let requests = script.requests();
+        let requests = transcripts(&script);
         assert_eq!(requests.len(), 3);
         assert_eq!(requests[2].url, "https://cal.example.test/homes/ada/");
         assert_eq!(
@@ -1531,7 +1471,7 @@ mod tests {
             reqwest::header::LOCATION,
             HeaderValue::from_static("https://cal.example.test/dav/homes/ada/"),
         );
-        let script = ScriptedDavTransport::new([
+        let script = dav_script([
             DavResponse {
                 status: StatusCode::MOVED_PERMANENTLY,
                 headers: redirect_headers,
@@ -1545,8 +1485,8 @@ mod tests {
                 url: String::new(),
             },
         ]);
-        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
-        let mut client = CalDavClient::with_transport("https://dav.example.test", transport);
+        let mut client =
+            CalDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
         client.admit_discovered_urls(std::iter::once(
             "https://cal.example.test/homes/ada/".to_string(),
         ));
@@ -1556,7 +1496,7 @@ mod tests {
             .await
             .expect("cross-origin redirect is followed with credentials");
 
-        let requests = script.requests();
+        let requests = transcripts(&script);
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[1].url, "https://cal.example.test/dav/homes/ada/");
         assert_eq!(
@@ -1585,21 +1525,21 @@ mod tests {
             reqwest::header::LOCATION,
             HeaderValue::from_static("https://evil.test/dav/"),
         );
-        let script = ScriptedDavTransport::new([DavResponse {
+        let script = dav_script([DavResponse {
             status: StatusCode::FOUND,
             headers: redirect_headers,
             body: String::new(),
             url: String::new(),
         }]);
-        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
-        let client = CalDavClient::with_transport("https://dav.example.test", transport);
+        let client =
+            CalDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
 
         client
             .list_calendars("https://dav.example.test/calendars/ada/")
             .await
             .expect_err("an unadmitted redirect target is refused");
 
-        assert_eq!(script.requests().len(), 1);
+        assert_eq!(transcripts(&script).len(), 1);
     }
 
     #[tokio::test]
@@ -1622,33 +1562,45 @@ mod tests {
             body: "ok".to_string(),
             url: String::new(),
         });
-        let script = ScriptedDavTransport::new(responses);
-        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
-        let client = CalDavClient::with_transport("https://dav.example.test", transport);
+        let script = dav_script(responses);
+        let client =
+            CalDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
 
         client
             .get_event("https://dav.example.test/start", AccountOperation::EventGet)
             .await
             .expect("the configured number of redirects is allowed");
 
-        assert_eq!(script.requests().len(), max_hops + 1);
+        assert_eq!(transcripts(&script).len(), max_hops + 1);
     }
 
     /// RFC 4918 resolves a relative href against the EFFECTIVE request URI.
-    /// `dav_redirect_policy` follows same-host hops, so a PROPFIND submitted
-    /// to `/calendar` can be served from `/dav/users/ada/calendar/`. Resolving
+    /// The dispatcher follows same-origin hops, so a PROPFIND submitted to
+    /// `/calendar` can be served from `/dav/users/ada/calendar/`. Resolving
     /// `one.ics` against the submitted URI mints `/one.ics` - a native id that
     /// does not exist, and a follow-up GET that 404s.
+    ///
+    /// The hop is scripted as the 301 it is, so the walk that produces the
+    /// effective URI is on the path under test. Previously the transport double
+    /// was handed the post-redirect URI directly, which asserted that href
+    /// resolution uses whatever URI it is given - true, and not the question.
     #[tokio::test]
     async fn event_hrefs_resolve_against_the_post_redirect_url() {
-        let script = ScriptedDavTransport::new([DavResponse {
-            status: StatusCode::MULTI_STATUS,
-            headers: HeaderMap::new(),
-            body: "<D:multistatus xmlns:D=\"DAV:\"><D:response><D:href>one.ics</D:href><D:propstat><D:prop><D:getetag>\"e1\"</D:getetag></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response></D:multistatus>".to_string(),
-            url: "https://dav.example.test/dav/users/ada/calendar/".to_string(),
-        }]);
-        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
-        let client = CalDavClient::with_transport("https://dav.example.test", transport);
+        let script = dav_script([
+            dav_redirect(
+                StatusCode::MOVED_PERMANENTLY,
+                "https://dav.example.test/dav/users/ada/calendar/",
+            ),
+            DavResponse {
+                status: StatusCode::MULTI_STATUS,
+                headers: HeaderMap::new(),
+                body: "<D:multistatus xmlns:D=\"DAV:\"><D:response><D:href>one.ics</D:href><D:propstat><D:prop><D:getetag>\"e1\"</D:getetag></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response></D:multistatus>".to_string(),
+                url: String::new(),
+            }
+            .into(),
+        ]);
+        let client =
+            CalDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
 
         let listing = client
             .list_events_listing(
@@ -1671,8 +1623,8 @@ mod tests {
     #[tokio::test]
     async fn discovered_plaintext_home_never_receives_credentials() {
         let script = discovery_script("http://cal.example.test/homes/ada/");
-        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
-        let mut client = CalDavClient::with_transport("https://dav.example.test", transport);
+        let mut client =
+            CalDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
 
         let home = client
             .discover_account()
@@ -1686,7 +1638,7 @@ mod tests {
             .await
             .expect_err("a downgraded discovered origin is refused");
 
-        let requests = script.requests();
+        let requests = transcripts(&script);
         assert_eq!(requests.len(), 2);
         assert!(
             requests
@@ -1705,7 +1657,7 @@ mod tests {
             body: body.to_string(),
             url: String::new(),
         };
-        let script = ScriptedDavTransport::new([
+        let script = dav_script([
             response(
                 "<D:current-user-principal xmlns:D=\"DAV:\"><D:href>/principals/ada/</D:href></D:current-user-principal>",
             ),
@@ -1713,8 +1665,8 @@ mod tests {
                 "<D:multistatus xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\"><C:calendar-home-set><D:href>/cal/</D:href></C:calendar-home-set><C:calendar-user-address-set><D:href>mailto:ada@example.test</D:href></C:calendar-user-address-set><C:schedule-outbox-URL><D:href>/outbox/</D:href></C:schedule-outbox-URL></D:multistatus>",
             ),
         ]);
-        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
-        let client = CalDavClient::with_transport("https://dav.example.test", transport);
+        let client =
+            CalDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
 
         let discovery = client.discover_account().await.expect("discovery succeeds");
 
@@ -1727,19 +1679,21 @@ mod tests {
             discovery.schedule_outbox_url.as_deref(),
             Some("https://dav.example.test/outbox/")
         );
-        assert_eq!(script.requests().len(), 2);
+        assert_eq!(transcripts(&script).len(), 2);
     }
 
     #[tokio::test]
     async fn scheduling_discovery_failure_is_not_downgraded_to_no_capability() {
-        let script = ScriptedDavTransport::new([DavResponse {
+        // A 503 is retried to exhaustion first; the surviving classification
+        // is still the server's own status, not a transport error.
+        let script = dav_script(dav_retried(DavResponse {
             status: StatusCode::SERVICE_UNAVAILABLE,
             headers: HeaderMap::new(),
             body: "try later".to_string(),
             url: String::new(),
-        }]);
-        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
-        let client = CalDavClient::with_transport("https://dav.example.test", transport);
+        }));
+        let client =
+            CalDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
 
         let error = client
             .discover_account()
@@ -1754,7 +1708,7 @@ mod tests {
 
     #[tokio::test]
     async fn sync_events_uses_depth_zero_report_transcript() {
-        let script = ScriptedDavTransport::new([DavResponse {
+        let script = dav_script([DavResponse {
             status: StatusCode::MULTI_STATUS,
             headers: HeaderMap::new(),
             body:
@@ -1762,9 +1716,8 @@ mod tests {
                     .to_string(),
             url: String::new(),
         }]);
-        let concrete_transport = Arc::clone(&script);
-        let transport: Arc<dyn DavTransport> = concrete_transport;
-        let client = CalDavClient::with_transport("https://dav.example.test", transport);
+        let client =
+            CalDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
 
         let report = client
             .sync_events("https://dav.example.test/calendar/", "previous")
@@ -1776,7 +1729,7 @@ mod tests {
             report.entries[0].uri,
             "https://dav.example.test/calendar/one.ics"
         );
-        let requests = script.requests();
+        let requests = transcripts(&script);
         assert_eq!(requests.len(), 1);
         assert_eq!(
             requests[0].method,
@@ -1805,15 +1758,14 @@ mod tests {
     /// a consumer treats "no events" as truth.
     #[tokio::test]
     async fn unauthorized_report_classifies_as_reauthorization() {
-        let script = ScriptedDavTransport::new([DavResponse {
+        let script = dav_script([DavResponse {
             status: StatusCode::UNAUTHORIZED,
             headers: HeaderMap::new(),
             body: "<html><body>401 Unauthorized</body></html>".to_string(),
             url: String::new(),
         }]);
-        let concrete_transport = Arc::clone(&script);
-        let transport: Arc<dyn DavTransport> = concrete_transport;
-        let client = CalDavClient::with_transport("https://dav.example.test", transport);
+        let client =
+            CalDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
 
         let error = client
             .query_events_in_range(
@@ -1833,7 +1785,8 @@ mod tests {
 
     #[test]
     fn resolve_url_fallback_preserves_separator() {
-        let client = CalDavClient::for_base_url("not a url");
+        let client =
+            CalDavClient::with_account_net("not a url", scripted_dav_net(&dav_script_empty()));
 
         assert_eq!(
             client.resolve_url("calendar/one.ics"),
@@ -1902,14 +1855,14 @@ mod tests {
 
     #[tokio::test]
     async fn calendar_multiget_uses_depth_zero() {
-        let script = ScriptedDavTransport::new([DavResponse {
+        let script = dav_script([DavResponse {
             status: StatusCode::MULTI_STATUS,
             headers: HeaderMap::new(),
             body: "<D:multistatus xmlns:D=\"DAV:\"/>".to_string(),
             url: String::new(),
         }]);
-        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
-        let client = CalDavClient::with_transport("https://dav.example.test", transport);
+        let client =
+            CalDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
 
         client
             .fetch_events(
@@ -1920,45 +1873,9 @@ mod tests {
             .await
             .expect("empty multistatus is usable");
 
-        let requests = script.requests();
+        let requests = transcripts(&script);
         assert_eq!(requests[0].headers["Depth"], "0");
         assert!(requests[0].body.contains("<D:resourcetype/>"));
-    }
-
-    /// A transport that records the HIGH-WATER MARK of simultaneously
-    /// in-flight requests.
-    ///
-    /// Each send yields once before answering, so every leg the caller has
-    /// polled is genuinely in flight at the same time and the mark reflects
-    /// the caller's fan-out policy rather than scheduling luck.
-    struct ConcurrencyProbeTransport {
-        body: String,
-        in_flight: Arc<std::sync::atomic::AtomicUsize>,
-        peak: Arc<std::sync::atomic::AtomicUsize>,
-    }
-
-    impl DavTransport for ConcurrencyProbeTransport {
-        fn send(
-            &self,
-            _request: reqwest::RequestBuilder,
-        ) -> AccountFuture<Result<DavResponse, String>> {
-            let body = self.body.clone();
-            let in_flight = Arc::clone(&self.in_flight);
-            let peak = Arc::clone(&self.peak);
-            Box::pin(async move {
-                use std::sync::atomic::Ordering;
-                let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
-                peak.fetch_max(now, Ordering::SeqCst);
-                tokio::task::yield_now().await;
-                in_flight.fetch_sub(1, Ordering::SeqCst);
-                Ok(DavResponse {
-                    status: StatusCode::MULTI_STATUS,
-                    headers: HeaderMap::new(),
-                    body,
-                    url: "https://dav.example.test/cal/".to_string(),
-                })
-            })
-        }
     }
 
     /// Multiget fan-out is bounded by `MULTIGET_LEG_CONCURRENCY`, not by the
@@ -1968,18 +1885,25 @@ mod tests {
     /// calendar open hundreds of simultaneous REPORTs against a server that
     /// never agreed to that, and `bifrost-net` has no concurrency governor to
     /// catch it downstream.
+    ///
+    /// The probe now sits at the wire rather than above the transport: the
+    /// yielding script raises its in-flight count for each dispatch that is
+    /// actually outstanding, so the mark measures what the net pipeline holds
+    /// open, not what the caller handed to a double.
     #[tokio::test]
     async fn multiget_never_holds_more_legs_open_than_the_concurrency_bound() {
-        let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let transport: Arc<dyn DavTransport> = Arc::new(ConcurrencyProbeTransport {
-            body: "<D:multistatus xmlns:D=\"DAV:\"></D:multistatus>".to_string(),
-            in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            peak: Arc::clone(&peak),
-        });
-        let client = CalDavClient::with_transport("https://dav.example.test", transport);
         // Ten chunks: comfortably more than the bound, so an unbounded
         // dispatch is distinguishable from a bounded one.
-        let uris = (0..MULTIGET_BATCH_SIZE * 10)
+        let chunks = 10;
+        let script = dav_script_yielding((0..chunks).map(|_| DavResponse {
+            status: StatusCode::MULTI_STATUS,
+            headers: HeaderMap::new(),
+            body: "<D:multistatus xmlns:D=\"DAV:\"></D:multistatus>".to_string(),
+            url: String::new(),
+        }));
+        let client =
+            CalDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
+        let uris = (0..MULTIGET_BATCH_SIZE * chunks)
             .map(|index| format!("https://dav.example.test/cal/{index}.ics"))
             .collect::<Vec<_>>();
 
@@ -1992,10 +1916,7 @@ mod tests {
             .await
             .expect("empty multistatus legs are usable");
 
-        assert_eq!(
-            peak.load(std::sync::atomic::Ordering::SeqCst),
-            MULTIGET_LEG_CONCURRENCY
-        );
+        assert_eq!(script.peak_in_flight(), MULTIGET_LEG_CONCURRENCY);
     }
 
     #[tokio::test]
@@ -2010,11 +1931,16 @@ mod tests {
             status: StatusCode::SERVICE_UNAVAILABLE,
             headers: HeaderMap::new(),
             body: String::new(),
-            url: "https://dav.example.test/cal/".to_string(),
+            url: String::new(),
         };
-        let script = ScriptedDavTransport::new([good, refused]);
-        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
-        let client = CalDavClient::with_transport("https://dav.example.test", transport);
+        // The refused leg burns the whole retry budget before it degrades.
+        let script = dav_script(
+            std::iter::once(Canned::from(good))
+                .chain(dav_retried(refused))
+                .collect::<Vec<_>>(),
+        );
+        let client =
+            CalDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
         let uris = (0..=MULTIGET_BATCH_SIZE)
             .map(|index| format!("https://dav.example.test/cal/{index}.ics"))
             .collect::<Vec<_>>();
@@ -2050,9 +1976,9 @@ mod tests {
             body: "<D:multistatus xmlns:D=\"DAV:\"><D:response></D:multistatus>".to_string(),
             url: "https://dav.example.test/cal/".to_string(),
         };
-        let script = ScriptedDavTransport::new([good, malformed]);
-        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
-        let client = CalDavClient::with_transport("https://dav.example.test", transport);
+        let script = dav_script([good, malformed]);
+        let client =
+            CalDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
         let uris = (0..=MULTIGET_BATCH_SIZE)
             .map(|index| format!("https://dav.example.test/cal/{index}.ics"))
             .collect::<Vec<_>>();
@@ -2079,9 +2005,9 @@ mod tests {
             body: "<D:multistatus xmlns:D=\"DAV:\"><D:response></D:multistatus>".to_string(),
             url: "https://dav.example.test/cal/".to_string(),
         };
-        let script = ScriptedDavTransport::new([malformed]);
-        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
-        let client = CalDavClient::with_transport("https://dav.example.test", transport);
+        let script = dav_script([malformed]);
+        let client =
+            CalDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
 
         let outcome = client
             .fetch_events(

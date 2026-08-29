@@ -18,9 +18,14 @@ workspace = true
 base64 = { workspace = true }
 bifrost-net = { path = "../net" }
 bifrost-types = { path = "../types" }
+bytes = { workspace = true }
 futures = { workspace = true }
 quick-xml = "0.41.0"
 reqwest = { workspace = true, features = ["native-tls"] }
+
+[features]
+# Scripted DAV wire seam for the CalDAV and CardDAV test suites.
+test-support = ["bifrost-net/test-support"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }

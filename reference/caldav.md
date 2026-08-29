@@ -36,10 +36,13 @@ root-discovery fallback trigger.
 - `lib.rs` - public config / credentials / factory.
 - `account.rs` - crate-private calendar-only `Account` impl.
 - `client.rs` - crate-private CalDAV client: discovery, `PROPFIND`,
-  `REPORT`, `GET`, `PUT`, and `DELETE`. A local `DavTransport` seam keeps
-  reqwest dispatch in production while scripted request transcripts exercise
-  DAV flows without a listener. `bifrost-net`'s dispatcher is crate-private,
-  and DAV still owns Basic auth and its redirect policy. Every request path
+  `REPORT`, `GET`, `PUT`, and `DELETE`. Wire traffic rides `bifrost-net`
+  through `bifrost-dav-core`'s `DavDispatch`, so DAV legs share the retry
+  budget, per-host rate limiting, bandwidth metering and observability with
+  every other HTTP protocol crate; scripted transcripts exercise DAV flows at
+  the wire, below all of it, without a listener. DAV still mints its own
+  credentials and walks its own redirects, for the reasons in "The shared
+  layer" below. Every request path
   except `sync_events` classifies a non-2xx status before the body is
   parsed, so an error page can never decode as an authoritative empty
   report; `sync_events` alone reads the raw response, because it must see
@@ -502,18 +505,16 @@ shared crate on the `bifrost-sasl` precedent. Nothing published moved:
 `CalDavConfig`, `CalDavCredentials`, `CalDavAccountFactory` and the `Account`
 impl are exactly what they were, and consumers see no change.
 
-What moved: the `DavTransport` seam and `ReqwestDavTransport`, `DavResponse` /
-`DavBody`, the capped body reader, `settle_body`, `dav_redirect_policy`,
+What moved: `DavRequest` / `DavResponse` / `DavBody`, `settle_body`,
 `url_origin`, `origin_is_secure`, the etag helpers (`response_etag`,
 `normalize_http_etag`, `prepare_if_match`) and `PutCondition`, the whole
 status-to-`AccountError` ladder with its five constructors, and
 `worse_recovery` / `recovery_rank`.
 
-Then the whole request dispatcher, as `DavDispatch`: the HTTP client, the
-transport handle, the credential store, the admitted-origin set, the credential
-gate (`auth_headers` / `is_trusted_url` / `admit_discovered_urls`),
-`resolve_url`, the manual cross-origin redirect walk in `send_raw_request`, and
-the generic verbs `propfind_raw`, `report_raw`, `report_raw_response`,
+Then the whole request dispatcher, as `DavDispatch`: the `AccountNet` handle,
+the credential store, the admitted-origin set, the credential gate
+(`auth_headers` / `is_trusted_url` / `admit_discovered_urls`), `resolve_url`,
+the redirect walk in `send_raw_request`, and the generic verbs `propfind_raw`, `report_raw`, `report_raw_response`,
 `delete_resource` and `move_resource`. `CalDavClient` is now a newtype over it
 plus the CalDAV-specific bodies and parsers. This was the security-sensitive
 half: the credential gate, the HTTPS-downgrade refusal and the redirect walk
@@ -566,14 +567,12 @@ consumers receive - so both stayed local.
 
 ## This crate and bifrost-carddav are near-duplicates, and drift is the defect
 
-Roughly 1500 lines are hand-mirrored between the two: the `DavTransport` seam
-and `ReqwestDavTransport`, `dav_redirect_policy`, `auth_headers`, `escape_xml`,
-etag normalization and `prepare_if_match`, the raw request helpers, the
-~120-line `status_error` ladder (identical but for `ResourceKind` and
-`Protocol`), the whole `ResponseParts` propstat state machine, href resolution,
-multiget classification, the cursor codec, the snapshot diff, `put_condition`,
-URL comparison, and the `Unsupported` stubs each crate carries for the other's
-domain.
+The transport, credential and error halves are now shared through
+`bifrost-dav-core` and can no longer drift. What remains hand-mirrored between
+the two crates is the layer above it: the whole `ResponseParts` propstat state
+machine, href resolution, multiget classification, the cursor codec, the
+snapshot diff, `put_condition`, URL comparison, and the `Unsupported` stubs each
+crate carries for the other's domain.
 
 Nothing compares the two copies, so divergence is silent. Five separate defects
 in one hardening arc were exactly that: `escape_xml` quoting, the immediate

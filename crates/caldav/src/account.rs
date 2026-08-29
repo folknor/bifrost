@@ -89,10 +89,10 @@ impl CalDavAccount {
     }
 
     pub(crate) async fn open(
-        _account_id: AccountId,
+        account_id: AccountId,
         config: CalDavConfig,
     ) -> Result<Self, AccountError> {
-        let client = CalDavClient::new(&config)?;
+        let client = CalDavClient::new(account_id, &config);
         Self::open_with_client(client, rsvp_email_from_config(&config)).await
     }
 
@@ -319,9 +319,13 @@ impl Account for CalDavAccount {
         &self.capabilities
     }
 
-    fn set_priority(&self, _priority: Priority) {}
+    fn set_priority(&self, priority: Priority) {
+        self.client.net().set_priority(priority);
+    }
 
-    fn set_bandwidth_cap(&self, _bps: Option<u64>) {}
+    fn set_bandwidth_cap(&self, bps: Option<u64>) {
+        self.client.net().set_bandwidth_cap(bps);
+    }
 
     fn describe_cursor(&self, _cursor: &ChangeCursor) -> CursorDescriptor {
         CursorDescriptor {
@@ -2089,6 +2093,33 @@ fn contains(value: &str, needle: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bifrost_dav_core::test_support::{dav_script_empty, scripted_dav_net};
+
+    /// `set_priority` and `set_bandwidth_cap` reach the account's transport.
+    ///
+    /// Both were silent no-ops for as long as this crate ran its own reqwest
+    /// client: an IMAP-shaped account composed `with_caldav` and given a
+    /// bandwidth cap did not cap its DAV legs, and nothing said so. This is the
+    /// door dav-B9 exists to open, so it is pinned at the door rather than
+    /// inferred from the transport swap.
+    #[tokio::test]
+    async fn the_priority_and_bandwidth_doors_reach_the_transport() {
+        let net = scripted_dav_net(&dav_script_empty());
+        let client = CalDavClient::with_account_net("https://dav.example.test", net.clone());
+        let account = CalDavAccount::for_tests(Arc::new(client), "https://dav.example.test/cal/");
+
+        account.set_bandwidth_cap(Some(4_096));
+        assert_eq!(net.bandwidth_cap(), Some(4_096));
+        account.set_priority(Priority::Background);
+        assert_eq!(net.priority(), Priority::Background);
+
+        // And back off again, so a test that only ever sets a value cannot
+        // pass against a door wired to a constant.
+        account.set_bandwidth_cap(None);
+        assert_eq!(net.bandwidth_cap(), None);
+        account.set_priority(Priority::Foreground);
+        assert_eq!(net.priority(), Priority::Foreground);
+    }
 
     fn collection(href: &str) -> crate::parse::CalendarCollection {
         crate::parse::CalendarCollection {
@@ -2158,7 +2189,10 @@ mod tests {
     /// `CalendarId` and the mismatch would be silent.
     #[test]
     fn a_listed_calendar_id_is_the_absolute_href_error_scopes_carry() {
-        let client = CalDavClient::for_base_url("https://dav.example.com/dav/");
+        let client = CalDavClient::with_account_net(
+            "https://dav.example.com/dav/",
+            scripted_dav_net(&dav_script_empty()),
+        );
         let mut collection = CalendarCollection {
             href: "work/".to_string(),
             display_name: Some("Work".to_string()),

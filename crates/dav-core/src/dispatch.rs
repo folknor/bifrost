@@ -1,24 +1,41 @@
 //! The shared DAV request dispatcher: credentials, the origin trust gate, the
-//! manual cross-origin redirect walk, and the generic WebDAV verbs.
+//! redirect walk, and the generic WebDAV verbs.
 //!
 //! This is the security-sensitive half of the duplication. Both crates carried
 //! `send_raw_request`, `auth_headers`, `admit_discovered_urls`, `is_trusted_url`
 //! and `resolve_url` byte for byte - the credential gate, the downgrade refusal
 //! and the redirect walk included. A divergence here is a credential leak or a
 //! silent downgrade, which is the worst possible place to keep two copies.
+//!
+//! Wire traffic goes through `bifrost-net`, so DAV legs share the retry budget,
+//! per-host rate limiting, bandwidth metering and observability with every other
+//! HTTP protocol crate. Two deliberate departures from the net defaults:
+//!
+//! - Redirects are DISABLED on the account spec and walked here instead. The
+//!   net redirect loop strips `Authorization` on any cross-origin hop and cannot
+//!   restore it, and its allowlist compares hosts where this gate compares
+//!   scheme, host and effective port. Walking here means every hop - same-origin
+//!   or not - is re-credentialed for the origin it actually addresses, and an
+//!   origin discovery never admitted is refused locally.
+//! - Bearer injection is opted out with `without_bearer_auth`. The credential
+//!   has to pass the origin gate before it is minted, which is a decision this
+//!   crate makes and the transport cannot.
 
 use std::sync::Arc;
 
 use base64::Engine as _;
-use bifrost_net::TokenSource;
-use bifrost_types::{AccountError, AccountOperation};
+use bifrost_net::{
+    AccountNet, AccountSpec, Error as NetError, FollowRedirects, Net, NetErrorContext, TokenSource,
+    into_account_error,
+};
+use bifrost_types::{AccountError, AccountId, AccountOperation};
+use bytes::Bytes;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use reqwest::{Method, StatusCode, Url};
 
-use crate::error::{DavProtocol, local_error, status_error, transport_error};
+use crate::error::{DavProtocol, local_error, response_read_error, status_error, transport_error};
 use crate::transport::{
-    DAV_CLIENT_TIMEOUT, DavBody, DavResponse, DavTransport, ReqwestDavTransport,
-    dav_redirect_policy, origin_is_secure, settle_body, transport_failure, url_origin,
+    DAV_CLIENT_TIMEOUT, DavBody, DavRequest, DavResponse, origin_is_secure, settle_body, url_origin,
 };
 
 /// Credentials as the dispatcher needs them.
@@ -32,12 +49,24 @@ pub enum DavCredentials {
     Bearer { token_source: Arc<dyn TokenSource> },
 }
 
-/// A DAV client's transport half: HTTP client, seam, credentials, and the set
+/// The account spec every DAV account attaches under.
+///
+/// `token_source` stays `None` and every request opts out of bearer injection:
+/// the origin gate decides whether a credential may be minted at all, and the
+/// transport cannot make that call. Redirects are disabled because the walk
+/// below owns them.
+fn dav_account_spec() -> AccountSpec {
+    let mut spec = AccountSpec::new(None);
+    spec.request_timeout = Some(DAV_CLIENT_TIMEOUT);
+    spec.follow_redirects = FollowRedirects::Disabled;
+    spec
+}
+
+/// A DAV client's transport half: the account handle, credentials, and the set
 /// of origins those credentials may reach.
 #[derive(Clone)]
 pub struct DavDispatch {
-    http: reqwest::Client,
-    transport: Arc<dyn DavTransport>,
+    net: AccountNet,
     base_url: String,
     credentials: DavCredentials,
     trusted_origins: Vec<String>,
@@ -45,50 +74,40 @@ pub struct DavDispatch {
 }
 
 impl DavDispatch {
-    pub fn new(
-        base_url: &str,
-        credentials: DavCredentials,
-        protocol: DavProtocol,
-    ) -> Result<Self, AccountError> {
-        let http = reqwest::Client::builder()
-            .redirect(dav_redirect_policy())
-            .timeout(DAV_CLIENT_TIMEOUT)
-            .build()
-            .map_err(|error| {
-                local_error(AccountOperation::Discover, error.to_string(), protocol)
-            })?;
-        Ok(Self::around(
-            http,
-            Arc::new(ReqwestDavTransport),
-            base_url,
-            credentials,
-            protocol,
-        ))
-    }
-
-    /// A dispatcher over a scripted transport, for tests.
+    /// Attach a DAV account to the process-wide shared transport.
     ///
-    /// Takes credentials rather than defaulting them: the transcript tests
-    /// assert on the exact `Authorization` header that reaches each origin, so
-    /// what the caller configures has to be what goes out.
-    pub fn with_transport(
+    /// The shared `Net` is the same one the other HTTP protocol crates use, so a
+    /// DAV leg joins the existing per-host rate-limit buckets and connection
+    /// pool rather than opening a private client beside them.
+    #[must_use]
+    pub fn new(
+        account_id: AccountId,
         base_url: &str,
-        transport: Arc<dyn DavTransport>,
         credentials: DavCredentials,
         protocol: DavProtocol,
     ) -> Self {
-        Self::around(
-            reqwest::Client::new(),
-            transport,
-            base_url,
-            credentials,
-            protocol,
-        )
+        let net = Net::shared_default().attach_account(account_id, dav_account_spec());
+        Self::around(net, base_url, credentials, protocol)
+    }
+
+    /// Build over a caller-supplied `AccountNet`.
+    ///
+    /// Two callers: an account composed into an IMAP-shaped account, which hands
+    /// down the handle carrying that account's bandwidth meter and priority so
+    /// the DAV legs are metered and capped with the rest of it; and tests, which
+    /// hand down a handle attached to a scripted wire dispatcher.
+    #[must_use]
+    pub fn with_account_net(
+        net: AccountNet,
+        base_url: &str,
+        credentials: DavCredentials,
+        protocol: DavProtocol,
+    ) -> Self {
+        Self::around(net, base_url, credentials, protocol)
     }
 
     fn around(
-        http: reqwest::Client,
-        transport: Arc<dyn DavTransport>,
+        net: AccountNet,
         base_url: &str,
         credentials: DavCredentials,
         protocol: DavProtocol,
@@ -96,8 +115,7 @@ impl DavDispatch {
         let base_url = base_url.trim_end_matches('/').to_string();
         let trusted_origins = url_origin(&base_url).into_iter().collect();
         Self {
-            http,
-            transport,
+            net,
             base_url,
             credentials,
             trusted_origins,
@@ -115,9 +133,17 @@ impl DavDispatch {
         &self.base_url
     }
 
+    /// The account handle, for the priority and bandwidth-cap doors the
+    /// `Account` impls forward onto it.
+    #[must_use]
+    pub fn net(&self) -> &AccountNet {
+        &self.net
+    }
+
     /// Start a request the caller will finish with its own headers and body.
-    pub fn request(&self, method: Method, url: &str) -> reqwest::RequestBuilder {
-        self.http.request(method, url)
+    #[must_use]
+    pub fn request(&self, method: Method, url: &str) -> DavRequest {
+        DavRequest::new(method, url)
     }
 
     #[must_use]
@@ -212,31 +238,120 @@ impl DavDispatch {
         Ok(headers)
     }
 
-    /// Send a request, following cross-origin redirects by hand.
+    /// One wire attempt through `bifrost-net`, with its status-bearing failures
+    /// turned back into responses.
     ///
-    /// Same-origin hops are followed inside reqwest, which preserves the
-    /// `Authorization` header when scheme, host, and effective port are all
-    /// unchanged. A cross-origin hop cannot ride that path: reqwest strips
-    /// `Authorization` on any origin change and its redirect policy has no way
-    /// to restore it, so a followed hop would reach the destination
-    /// unauthenticated. Cross-origin 3xx responses are therefore stopped by the
-    /// policy and re-dispatched here with fresh `auth_headers` for the new
-    /// origin, which refuses locally when that origin was never admitted.
+    /// DAV reads statuses as data, not only as failure: `sync-collection` reads
+    /// 403 and 410 as cursor invalidation, `MOVE` reads 405 and 501 as "no MOVE
+    /// here, fall back to copy-then-delete", and a conditional PUT reads 412.
+    /// The net retry loop turns every 4xx and 5xx into `Err` before a response
+    /// surfaces, so a terminal `Error::Status` is reconstituted here rather than
+    /// classified. Everything else - an exhausted retry budget, a rate limit
+    /// past its budget, a transport failure - is left to
+    /// `bifrost_net::into_account_error`, which classifies with the retry hints
+    /// and transmission evidence the DAV status ladder does not carry.
+    ///
+    /// One narrowing worth knowing: a reconstituted body is capped at
+    /// `bifrost_net::STATUS_BODY_CAP`, where the previous DAV transport buffered
+    /// error bodies to the full 64 MiB ceiling. Every status DAV reads as data
+    /// carries a short precondition document, so the cap does not bite; a
+    /// diagnostic body longer than the cap now arrives truncated.
+    async fn dispatch_once(
+        &self,
+        request: &DavRequest,
+        operation: AccountOperation,
+    ) -> Result<DavResponse, AccountError> {
+        let mut builder = self
+            .net
+            .request(request.method.clone(), &request.url)
+            .without_bearer_auth();
+        for (name, value) in &request.headers {
+            if let Ok(value) = value.to_str() {
+                builder = builder.header(name.as_str(), value);
+            }
+        }
+        if let Some(idempotent) = request.idempotent {
+            builder = builder.idempotent(idempotent);
+        }
+        if let Some(body) = &request.body {
+            builder = builder.body(body.clone());
+        }
+        match builder.send().await {
+            Ok(response) => Ok(DavResponse {
+                status: response.status,
+                headers: response.headers,
+                body: decode_body(&response.body),
+                url: request.url.clone(),
+            }),
+            Err(NetError::Status {
+                code,
+                body,
+                headers,
+            }) => Ok(DavResponse {
+                status: code,
+                headers,
+                body: decode_body(&body),
+                url: request.url.clone(),
+            }),
+            // A retry budget spent against a status-bearing response, or a 429
+            // past its budget, still ends in a response the server sent. The
+            // DAV ladder classifies it exactly as it did before this crate had
+            // any retry at all - the difference is only that the server got
+            // asked more than once first, which is the capability dav-B9 was
+            // about. A budget exhausted with no final response (every attempt
+            // failed below the status line) has nothing to classify and falls
+            // through to the transport mapping.
+            Err(
+                NetError::RetryBudgetExhausted {
+                    final_response: Some(final_response),
+                    ..
+                }
+                | NetError::RateLimited { final_response, .. },
+            ) => Ok(DavResponse {
+                status: final_response.status,
+                headers: final_response.headers,
+                body: decode_body(&final_response.body),
+                url: request.url.clone(),
+            }),
+            // A body past the buffered ceiling is acknowledged but unreadable:
+            // the request reached the server and may have taken effect, so a
+            // non-idempotent mutation must reconcile rather than replay.
+            Err(NetError::ResponseTooLarge { limit }) => Err(response_read_error(
+                operation,
+                format!("DAV response body exceeded the buffered ceiling ({limit} bytes)"),
+                self.protocol,
+            )),
+            Err(error) => Err(into_account_error(
+                error,
+                NetErrorContext {
+                    provider: None,
+                    protocol: self.protocol.protocol(),
+                    operation,
+                    scope: None,
+                },
+            )),
+        }
+    }
+
+    /// Send a request, following every redirect hop by hand.
+    ///
+    /// Redirects are disabled in the transport, so both same-origin and
+    /// cross-origin hops arrive here. Each hop re-mints `auth_headers` for the
+    /// origin it is about to address, which refuses locally when that origin was
+    /// never admitted by discovery. Doing this for same-origin hops too costs
+    /// nothing - the credential is the same one - and removes the previous
+    /// split, where reqwest followed same-origin hops internally and only
+    /// cross-origin hops were walked.
     pub async fn send_raw_request(
         &self,
-        request: reqwest::RequestBuilder,
+        request: DavRequest,
         operation: AccountOperation,
     ) -> Result<DavResponse, AccountError> {
         let max_hops = usize::from(bifrost_net::RedirectPolicy::default().max_hops);
         let mut request = request;
         let mut hops = 0usize;
         loop {
-            let replay = request.try_clone();
-            let response = self
-                .transport
-                .send(request)
-                .await
-                .map_err(|error| transport_failure(operation, error, self.protocol))?;
+            let response = self.dispatch_once(&request, operation).await?;
             let redirect = matches!(
                 response.status,
                 StatusCode::MOVED_PERMANENTLY
@@ -274,38 +389,27 @@ impl DavDispatch {
             if hops > max_hops {
                 return Err(local_error(operation, "too many redirects", self.protocol));
             }
-            let Some(replay) = replay else {
-                return Err(local_error(
-                    operation,
-                    "redirected DAV request cannot be replayed",
-                    self.protocol,
-                ));
-            };
-            let previous = replay
-                .build()
-                .map_err(|error| local_error(operation, error.to_string(), self.protocol))?;
             // Fresh credentials for the target origin; refused locally when
             // the origin was never admitted by discovery.
             let auth = self.auth_headers(next.as_str(), operation).await?;
-            let mut headers = previous.headers().clone();
+            let mut headers = request.headers.clone();
             headers.remove(AUTHORIZATION);
             for (name, value) in &auth {
                 headers.insert(name, value.clone());
             }
-            let mut rebuilt = self
-                .http
-                .request(previous.method().clone(), next)
-                .headers(headers);
-            if let Some(body) = previous.body().and_then(reqwest::Body::as_bytes) {
-                rebuilt = rebuilt.body(body.to_vec());
-            }
-            request = rebuilt;
+            request = DavRequest {
+                method: request.method,
+                url: next.to_string(),
+                headers,
+                body: request.body,
+                idempotent: request.idempotent,
+            };
         }
     }
 
     pub async fn send_body_request(
         &self,
-        request: reqwest::RequestBuilder,
+        request: DavRequest,
         operation: AccountOperation,
     ) -> Result<DavBody, AccountError> {
         let response = self.send_raw_request(request, operation).await?;
@@ -314,7 +418,7 @@ impl DavDispatch {
 
     pub async fn send_status_request(
         &self,
-        request: reqwest::RequestBuilder,
+        request: DavRequest,
         operation: AccountOperation,
     ) -> Result<(), AccountError> {
         let response = self.send_raw_request(request, operation).await?;
@@ -339,12 +443,12 @@ impl DavDispatch {
     ) -> Result<DavBody, AccountError> {
         let method = Method::from_bytes(b"PROPFIND")
             .map_err(|error| local_error(operation, error.to_string(), self.protocol))?;
-        let request = self
-            .http
-            .request(method, url)
+        let request = DavRequest::new(method, url)
             .header(CONTENT_TYPE, "application/xml; charset=utf-8")
             .header("Depth", depth)
             .headers(self.auth_headers(url, operation).await?)
+            // A read: replaying after a dropped connection cannot change state.
+            .idempotent(true)
             .body(body.to_string());
         self.send_body_request(request, operation).await
     }
@@ -362,12 +466,11 @@ impl DavDispatch {
     ) -> Result<DavResponse, AccountError> {
         let method = Method::from_bytes(b"REPORT")
             .map_err(|error| local_error(operation, error.to_string(), self.protocol))?;
-        let request = self
-            .http
-            .request(method, url)
+        let request = DavRequest::new(method, url)
             .header(CONTENT_TYPE, "application/xml; charset=utf-8")
             .header("Depth", depth)
             .headers(self.auth_headers(url, operation).await?)
+            .idempotent(true)
             .body(body.to_string());
         self.send_raw_request(request, operation).await
     }
@@ -390,9 +493,8 @@ impl DavDispatch {
         url: &str,
         operation: AccountOperation,
     ) -> Result<(), AccountError> {
-        let request = self
-            .request(Method::DELETE, url)
-            .headers(self.auth_headers(url, operation).await?);
+        let request =
+            DavRequest::new(Method::DELETE, url).headers(self.auth_headers(url, operation).await?);
         self.send_status_request(request, operation).await
     }
 
@@ -428,8 +530,7 @@ impl DavDispatch {
             .map_err(|error| local_error(operation, error.to_string(), self.protocol))?;
         let destination = HeaderValue::from_str(to)
             .map_err(|error| local_error(operation, error.to_string(), self.protocol))?;
-        let request = self
-            .request(method, from)
+        let request = DavRequest::new(method, from)
             .header("Destination", destination)
             .header("Overwrite", "F")
             .headers(self.auth_headers(from, operation).await?);
@@ -450,6 +551,15 @@ impl DavDispatch {
             self.protocol,
         ))
     }
+}
+
+/// Decode a DAV response body.
+///
+/// RFC 4918 bodies are XML, whose declared default encoding is UTF-8. Lossy
+/// rather than strict keeps a malformed byte behaving as it always has - a
+/// replacement character, not a failed request.
+fn decode_body(body: &Bytes) -> String {
+    String::from_utf8_lossy(body).into_owned()
 }
 
 impl std::fmt::Debug for DavDispatch {

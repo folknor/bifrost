@@ -1,33 +1,36 @@
-//! The DAV transport seam, its redirect policy, and origin comparison.
+//! The DAV request record, response shape, and origin comparison.
 //!
-//! `bifrost-net`'s dispatcher is deliberately crate-private and the DAV clients
-//! still own Basic auth and their own redirect policy, so the seam lives here
-//! rather than riding an `AccountNet`. Moving these clients onto `AccountNet` is
-//! tracked separately (dav-B9); this crate unifies the two copies without
-//! prejudging that.
+//! DAV traffic rides `bifrost-net` like every other HTTP protocol crate, so the
+//! retry budget, per-host rate limiting, bandwidth metering and observability
+//! are the shared ones rather than a second implementation. What DAV keeps for
+//! itself is the credential-origin gate and the redirect walk that enforces it:
+//! `AccountNet` strips `Authorization` on a cross-origin hop with no way to
+//! restore it, and its trusted-host allowlist compares hosts where the DAV gate
+//! compares scheme, host and effective port. Redirects are therefore disabled on
+//! the account spec and walked here, one hop at a time, each with credentials
+//! minted for the origin actually being addressed.
 
 use std::time::Duration;
 
-use bifrost_types::{AccountError, AccountFuture, AccountOperation};
-use reqwest::header::HeaderMap;
-use reqwest::{StatusCode, Url};
+use bifrost_types::{AccountError, AccountOperation};
+use bytes::Bytes;
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+use reqwest::{Method, StatusCode, Url};
 
-use crate::error::{DavProtocol, response_read_error};
+use crate::error::DavProtocol;
 
 /// Wall-clock ceiling on a single DAV request.
 pub const DAV_CLIENT_TIMEOUT: Duration = Duration::from_secs(30);
-
-const RESPONSE_BODY_TOO_LARGE: &str = "DAV response body exceeded the buffered ceiling";
 
 #[derive(Debug, Clone)]
 pub struct DavResponse {
     pub status: StatusCode,
     pub headers: HeaderMap,
     pub body: String,
-    /// Effective request URI, after any redirects the client followed.
+    /// Effective request URI, after any redirects the walk followed.
     ///
     /// RFC 4918 relative hrefs in a Multi-Status resolve against the effective
-    /// request URI, not the URI the caller submitted. The DAV redirect policy
+    /// request URI, not the URI the caller submitted. The DAV redirect walk
     /// permits same-origin hops, so a PROPFIND on `/calendar` that lands on
     /// `/dav/users/ada/calendar/` is a real deployment shape; resolving
     /// `one.ics` against the submitted URI there mints a wrong native id and a
@@ -43,63 +46,85 @@ pub struct DavBody {
     pub url: String,
 }
 
-/// Local DAV transport boundary.
+/// A DAV request as an owned record rather than a builder.
 ///
-/// Production dispatch is `ReqwestDavTransport`; tests install a scripted
-/// double, which is what lets DAV flows be exercised byte for byte with no
-/// listener and no socket.
-pub trait DavTransport: Send + Sync {
-    fn send(&self, request: reqwest::RequestBuilder) -> AccountFuture<Result<DavResponse, String>>;
+/// The redirect walk re-dispatches the same logical request against a new
+/// origin, with the credential for that origin swapped in. A `reqwest`-style
+/// builder cannot express that: it is consumed on send and only conditionally
+/// cloneable, so the previous walk replayed through `try_clone` and gave up
+/// with a local error when a body made the request unclonable. An owned record
+/// is rebuildable per hop by construction.
+#[derive(Debug, Clone)]
+pub struct DavRequest {
+    pub(crate) method: Method,
+    pub(crate) url: String,
+    pub(crate) headers: HeaderMap,
+    pub(crate) body: Option<Bytes>,
+    /// Whether replaying this request cannot change server state.
+    ///
+    /// `bifrost-net` derives replay safety from the method and treats every
+    /// extension method as unsafe, which is right for `MOVE` and wrong for
+    /// `PROPFIND` and `REPORT` - both are reads, and refusing to retry them
+    /// after a dropped connection loses resilience for nothing.
+    pub(crate) idempotent: Option<bool>,
 }
 
-pub struct ReqwestDavTransport;
-
-impl DavTransport for ReqwestDavTransport {
-    fn send(&self, request: reqwest::RequestBuilder) -> AccountFuture<Result<DavResponse, String>> {
-        Box::pin(async move {
-            let response = request.send().await.map_err(|error| error.to_string())?;
-            let status = response.status();
-            let headers = response.headers().clone();
-            let url = response.url().to_string();
-            let body = read_capped_body(response).await?;
-            Ok(DavResponse {
-                status,
-                headers,
-                body,
-                url,
-            })
-        })
-    }
-}
-
-/// Read a DAV response body with a ceiling.
-///
-/// `response.text()` buffers without one, so a provider returning a runaway
-/// 207, an error page, or a mis-routed blob URL OOMs the process. A Multi-Status
-/// body for a large collection is legitimately big, hence a ceiling generous
-/// enough that only a pathological response reaches it, matching the buffered
-/// ceiling `bifrost-net` applies on its own `send` path.
-pub async fn read_capped_body(response: reqwest::Response) -> Result<String, String> {
-    use futures::StreamExt as _;
-
-    let limit = bifrost_net::DEFAULT_MAX_BUFFERED_RESPONSE;
-    let mut stream = response.bytes_stream();
-    let mut buf: Vec<u8> = Vec::new();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|error| error.to_string())?;
-        if buf.len() + chunk.len() > limit {
-            return Err(format!("{RESPONSE_BODY_TOO_LARGE} ({limit} bytes)"));
+impl DavRequest {
+    #[must_use]
+    pub fn new(method: Method, url: impl Into<String>) -> Self {
+        Self {
+            method,
+            url: url.into(),
+            headers: HeaderMap::new(),
+            body: None,
+            idempotent: None,
         }
-        buf.extend_from_slice(&chunk);
     }
-    // `.text()` decodes per the `charset` Content-Type parameter and falls back
-    // to lossy UTF-8. This decodes lossily unconditionally, which narrows
-    // behaviour for a server that declares a non-UTF-8 charset - RFC 4918
-    // bodies are XML, whose declared default is UTF-8, so that case was already
-    // outside what the parsers handle. Lossy rather than strict keeps a
-    // malformed byte behaving as it did before (a replacement character, not a
-    // failed request).
-    Ok(String::from_utf8_lossy(&buf).into_owned())
+
+    /// Set one header.
+    ///
+    /// A name or value the HTTP grammar rejects is dropped rather than raised.
+    /// Every call site passes either a `HeaderName` constant or a value it has
+    /// already validated, so a rejection here is unreachable in practice; the
+    /// previous builder silently skipped the same cases, and preserving that
+    /// keeps the migration behaviour-neutral.
+    #[must_use]
+    pub fn header<K, V>(mut self, name: K, value: V) -> Self
+    where
+        K: TryInto<HeaderName>,
+        V: TryInto<HeaderValue>,
+    {
+        if let (Ok(name), Ok(value)) = (name.try_into(), value.try_into()) {
+            self.headers.insert(name, value);
+        }
+        self
+    }
+
+    #[must_use]
+    pub fn headers(mut self, headers: HeaderMap) -> Self {
+        for (name, value) in &headers {
+            self.headers.insert(name, value.clone());
+        }
+        self
+    }
+
+    #[must_use]
+    pub fn body(mut self, body: impl Into<Bytes>) -> Self {
+        self.body = Some(body.into());
+        self
+    }
+
+    /// Override the method-derived replay-safety default.
+    #[must_use]
+    pub fn idempotent(mut self, idempotent: bool) -> Self {
+        self.idempotent = Some(idempotent);
+        self
+    }
+
+    #[must_use]
+    pub fn url(&self) -> &str {
+        &self.url
+    }
 }
 
 /// Classify a completed DAV response and keep the effective URI attached to the
@@ -116,16 +141,13 @@ pub fn settle_body(
             url: response.url,
         })
     } else {
-        Err(status_error_for(response, operation, protocol))
+        Err(crate::error::status_error(
+            operation,
+            response.status,
+            response.body,
+            protocol,
+        ))
     }
-}
-
-fn status_error_for(
-    response: DavResponse,
-    operation: AccountOperation,
-    protocol: DavProtocol,
-) -> AccountError {
-    crate::error::status_error(operation, response.status, response.body, protocol)
 }
 
 /// Whether a URL's scheme carries an authenticated, encrypted transport.
@@ -148,51 +170,6 @@ pub fn url_origin(value: &str) -> Option<String> {
         host,
         url.port_or_known_default()?
     ))
-}
-
-/// Hardened redirect policy for the DAV `reqwest::Client`.
-///
-/// Follows a hop only when the next URL keeps the exact origin (scheme, host,
-/// effective port) of the URL that issued the redirect; reqwest preserves
-/// `Authorization` precisely under that condition, and strips it on any origin
-/// change with no way for a policy to restore it. Every cross-origin hop is
-/// stopped so the 3xx surfaces to the caller's `send_raw_request`, which
-/// re-dispatches it with fresh credentials against the admitted origin set. The
-/// hop cap comes from `bifrost-net`.
-#[must_use]
-pub fn dav_redirect_policy() -> reqwest::redirect::Policy {
-    let max_hops = usize::from(bifrost_net::RedirectPolicy::default().max_hops);
-    reqwest::redirect::Policy::custom(move |attempt| {
-        if attempt.previous().len() >= max_hops {
-            return attempt.error("too many redirects");
-        }
-        let same_origin = attempt
-            .previous()
-            .last()
-            .and_then(|previous| url_origin(previous.as_str()))
-            .zip(url_origin(attempt.url().as_str()))
-            .is_some_and(|(previous, next)| previous == next);
-        if same_origin {
-            attempt.follow()
-        } else {
-            attempt.stop()
-        }
-    })
-}
-
-/// Wrap a transport-layer failure string, mapping the body-ceiling refusal onto
-/// its own classification.
-#[must_use]
-pub fn transport_failure(
-    operation: AccountOperation,
-    message: String,
-    protocol: DavProtocol,
-) -> AccountError {
-    if message.starts_with(RESPONSE_BODY_TOO_LARGE) {
-        response_read_error(operation, message, protocol)
-    } else {
-        crate::error::transport_error(operation, message, protocol)
-    }
 }
 
 #[cfg(test)]
@@ -218,5 +195,20 @@ mod tests {
         assert!(!origin_is_secure("http://dav.example.test"));
         // Fails closed rather than open.
         assert!(!origin_is_secure("not a url"));
+    }
+
+    /// A body no longer makes a request unreplayable. The previous walk held a
+    /// `reqwest::RequestBuilder` and called `try_clone`, which returns `None`
+    /// for a streaming body, so a redirected PUT failed locally with
+    /// "redirected DAV request cannot be replayed" rather than following.
+    #[test]
+    fn a_request_carrying_a_body_survives_being_rebuilt() {
+        let request = DavRequest::new(Method::PUT, "https://dav.example.test/one.ics")
+            .header(reqwest::header::CONTENT_TYPE, "text/calendar")
+            .body("BEGIN:VCALENDAR");
+        let replayed = request.clone();
+        assert_eq!(replayed.body, request.body);
+        assert_eq!(replayed.headers, request.headers);
+        assert_eq!(replayed.method, Method::PUT);
     }
 }
