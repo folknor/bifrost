@@ -796,10 +796,17 @@ without `with_pubsub_config` rejects `push_subscribe` with
 `AccountError::Unsupported`.
 
 `push_subscribe` sends a command to the watch actor, which issues `users.watch`
-with the configured topic, atomically enters `Watched { history_id, expiration }`,
-and emits `WatchEvent::Reconnected` on the broadcast channel. The returned
-`SubscriptionHandle` is a
+with the configured topic and atomically enters
+`Watched { history_id, expiration }`. The returned `SubscriptionHandle` is a
 JSON envelope `{ topic, history_id, expiration }`.
+
+A subscribe emits `WatchEvent::Reconnected` only when the actor's
+`disconnected` latch is set - that is, only when it genuinely reconnects.
+A FIRST subscribe is silent: it is the consumer's opening act, so
+announcing a reconnect from there published an event before any consumer
+could hold a `push_stream()` receiver, and `broadcast` drops messages with
+no receivers, making the stream's first observable state a function of
+task scheduling rather than of the watch.
 
 One actor task owns the four-state lifecycle (`Unwatched`, `Watched`, `Renewing`,
 `Retired`), the active handles, subscription commands, renewal timing, and close.
@@ -824,7 +831,10 @@ There is no renewer handle for another task to clear or restart. Its renewal arm
   message key) plus `WatchEvent::Disconnected` (once) and retry after
   `RENEW_RETRY_AFTER` (five minutes); the next success emits
   `WatchEvent::Reconnected`. Every failure goes
-  through the classifier first.
+  through the classifier first. The warning's `retry_count` is the number
+  of CONSECUTIVE renewal failures, cleared by any completed request
+  (subscribe or renewal) and by a terminal classification, so an operator
+  reading the lane can tell one stumble from a sustained outage.
 - Selects on `shutdown.cancelled()` against the renewal sleep, biased so that a
   cancelled account retires rather than renewing when both are ready in the same
   poll. Cancellation moves the actor to `Retired`.

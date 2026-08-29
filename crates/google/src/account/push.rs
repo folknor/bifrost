@@ -253,6 +253,11 @@ async fn watch_actor(
     let mut lifecycle = WatchLifecycle::Unwatched;
     let mut handles = HashSet::new();
     let mut disconnected = false;
+    // Consecutive failed renewal attempts, so the transient-failure
+    // `Warning` reports how deep the failure run is instead of a
+    // constant 1. Cleared by any completed request (subscribe or
+    // renewal), which is the same edge the `disconnected` latch uses.
+    let mut consecutive_renewal_failures: u32 = 0;
     let mut retry_after = None;
     loop {
         // Computed WITHOUT consuming `retry_after`. This runs on every trip
@@ -276,7 +281,7 @@ async fn watch_actor(
                 match command {
                     WatchCommand::Subscribe { reply } => {
                         let result = actor_subscribe(
-                            &client, config.as_ref(), &shutdown, &health_tx,
+                            &client, config.as_ref(), &shutdown,
                             &mut lifecycle, &mut handles,
                         ).await;
                         if result.is_ok() {
@@ -287,7 +292,11 @@ async fn watch_actor(
                             // damper reset by a *subscribe* is how an
                             // endless subscribe-then-die loop escapes its
                             // backoff.
+                            if disconnected {
+                                let _ = health_tx.send(WatchEvent::Reconnected);
+                            }
                             disconnected = false;
+                            consecutive_renewal_failures = 0;
                         }
                         let _ = reply.send(result);
                     }
@@ -345,6 +354,7 @@ async fn watch_actor(
                             continue;
                         }
                         retry_after = None;
+                        consecutive_renewal_failures = 0;
                         if disconnected {
                             let _ = health_tx.send(WatchEvent::Reconnected);
                             disconnected = false;
@@ -359,12 +369,15 @@ async fn watch_actor(
                             lifecycle = WatchLifecycle::Unwatched;
                             retry_after = None;
                             disconnected = false;
+                            consecutive_renewal_failures = 0;
                             continue;
                         }
+                        consecutive_renewal_failures =
+                            consecutive_renewal_failures.saturating_add(1);
                         let warning = bifrost_types::Warning::support_only(
                             bifrost_types::WarningKind::OperatorAttentionNeeded,
                             format!("gmail Pub/Sub renewal transient failure: {}", account_error.message_key()),
-                        ).with_retry_count(1);
+                        ).with_retry_count(consecutive_renewal_failures);
                         let _ = health_tx.send(WatchEvent::Warning(warning));
                         if !disconnected {
                             let _ = health_tx.send(WatchEvent::Disconnected);
@@ -387,11 +400,19 @@ async fn watch_actor(
     }
 }
 
+/// Install a Gmail watch and return its handle.
+///
+/// Emits no health event of its own. `WatchEvent::Reconnected` is
+/// edge-triggered off the actor's `disconnected` latch by the caller: a
+/// subscribe is the consumer's FIRST act, so announcing a reconnect from
+/// here published an event before any consumer could hold a
+/// `push_stream()` receiver, and `broadcast` drops messages with no
+/// receivers - making the stream's first observable state depend on
+/// scheduling rather than on the watch.
 async fn actor_subscribe(
     client: &GmailClient,
     config: Option<&PubSubConfig>,
     shutdown: &CancellationToken,
-    health_tx: &broadcast::Sender<WatchEvent>,
     lifecycle: &mut WatchLifecycle,
     handles: &mut HashSet<String>,
 ) -> Result<SubscriptionHandle, AccountError> {
@@ -440,7 +461,6 @@ async fn actor_subscribe(
         return Err(closed_error(AccountOperation::PushSubscribe));
     }
     handles.insert(handle.0.clone());
-    let _ = health_tx.send(WatchEvent::Reconnected);
     Ok(handle)
 }
 
@@ -990,6 +1010,70 @@ mod tests {
             3,
             "the damped retry must fire five minutes after the failure, \
              not six days after a command recomputed the delay",
+        );
+    }
+
+    /// Two health-lane properties that used to be wrong in opposite
+    /// directions.
+    ///
+    /// `Reconnected` is edge-triggered off the `disconnected` latch, so the
+    /// FIRST subscribe announces nothing. It used to fire unconditionally
+    /// from inside `actor_subscribe`, before any consumer could hold a
+    /// `push_stream()` receiver - and `broadcast` drops messages with no
+    /// receivers, so whether the stream opened on `Reconnected` or on
+    /// nothing depended on scheduling.
+    ///
+    /// The transient-failure `Warning` counts consecutive failures instead
+    /// of reporting a constant 1, so an operator reading the lane can tell
+    /// one stumble from a sustained outage.
+    #[tokio::test(start_paused = true)]
+    async fn renewal_failures_escalate_the_warning_count_and_first_subscribe_is_silent() {
+        let (client, _script) = scripted_client([
+            // Subscribe: no expiration, so renewal falls back to the default.
+            Canned::Response {
+                status: StatusCode::OK,
+                headers: reqwest::header::HeaderMap::new(),
+                body: Bytes::from_static(br#"{"historyId":"1"}"#),
+            },
+            canned(StatusCode::SERVICE_UNAVAILABLE),
+            canned(StatusCode::SERVICE_UNAVAILABLE),
+        ]);
+        let shutdown = CancellationToken::new();
+        let pubsub = Arc::new(PubSubControl::new(
+            Arc::clone(&client),
+            Some(PubSubConfig::new("projects/p/topics/t")),
+            shutdown.clone(),
+        ));
+        let mut health = pubsub.health_tx.subscribe();
+
+        push_subscribe(Arc::clone(&pubsub), vec![CursorScope::Account])
+            .await
+            .expect("subscribe issues the watch");
+        assert!(
+            health.try_recv().is_err(),
+            "a first subscribe has nothing to reconnect FROM, so it must be silent",
+        );
+
+        let mut counts = Vec::new();
+        tokio::time::advance(DEFAULT_RENEW_AFTER + Duration::from_secs(1)).await;
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(RENEW_RETRY_AFTER + Duration::from_secs(1)).await;
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        shutdown.cancel();
+        while let Ok(event) = health.try_recv() {
+            if let WatchEvent::Warning(warning) = event {
+                counts.push(warning.retry_count);
+            }
+        }
+
+        assert_eq!(
+            counts,
+            vec![1, 2],
+            "consecutive renewal failures must escalate the reported count",
         );
     }
 

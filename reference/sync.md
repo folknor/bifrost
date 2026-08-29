@@ -174,7 +174,24 @@ with `capabilities().reopen_discovers_foreign_namespaces`: when that
 flag is true, a share granted after the last open surfaces only through
 this rediscovery, and the scheduling cadence (how often the reattach's
 wire cost is worth paying) is consumer policy - the engine does not
-schedule speculative reopens on its own. A generation watch wakes
+schedule speculative reopens on its own.
+
+That flag is advisory TO THE CONSUMER, not a promise the engine keeps.
+Nothing in `bifrost-sync` reads it: it is not an input to any engine
+decision, and no internal caller of `reopen` exists at all. It reports
+reopen-time discovery POTENTIAL (IMAP derives it from NAMESPACE, JMAP is
+constitutively true), and a consumer that wants shares granted after open
+to appear must read it and drive `SyncEngine::reopen` on its own clock.
+The engine will not grow a rediscovery timer: the right interval depends
+on things it cannot see - whether the app is foregrounded, whether the
+connection is metered, whether shares are common in the deployment - and
+a reopen is a full staged reattach with real wire cost, so an interval on
+the consumer's side is both cheaper and better informed. An
+`EngineConfig` interval was rejected (default-off would go unused,
+default-on would be wrong for most deployments); an
+`accounts_awaiting_rediscovery()` accessor that exposes the candidate set
+without owning the clock is the alternative to revisit first if consumer
+footwork turns out to be the problem. A generation watch wakes
 the push and lifecycle readers even when their old streams never end.
 
 Cursor and membership topology live under one registry state lock, so

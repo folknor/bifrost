@@ -753,20 +753,16 @@ async fn post_empty_json<B: Serialize>(
 ) -> crate::Result<()> {
     // Gmail messages endpoints accept no documented client-mintable
     // replay token, so the Account idempotency key stays engine-side.
-    let url = if path.starts_with('/') {
-        format!("{}{}", client.api_base(), path)
-    } else {
-        format!("{}/{}", client.api_base(), path)
-    };
+    // URL assembly is `GmailClient::api_url`'s job, not this function's.
+    // Restating the join here let the raw-builder path drift from the
+    // typed one; the absolute-URL case in particular was missing.
+    let url = client.api_url(path);
     // Built through `account_net()` rather than `GmailClient::execute`,
     // so the per-method quota cost has to be applied by hand here - the
     // batch endpoints are 50 units each, and billing them as one would
     // hand the batch lane a free ride on the shared per-user budget.
-    let mut request = client
-        .account_net()
-        .post(&url)
-        .header("Content-Type", "application/json")
-        .json(body);
+    // `json` supplies the JSON content type.
+    let mut request = client.account_net().post(&url).json(body);
     if let Some(cost) = client.gmail_quota_cost(&url, "POST") {
         request = request.cost(cost);
     }

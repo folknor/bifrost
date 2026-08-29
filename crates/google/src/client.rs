@@ -377,12 +377,14 @@ impl GmailClient {
             other => unreachable!("GmailClient::execute called with unsupported method {other}"),
         };
 
-        builder = builder.header("Content-Type", "application/json");
-
         if let Some(cost) = self.gmail_quota_cost(url, method) {
             builder = builder.cost(cost);
         }
 
+        // `json` sets `Content-Type: application/json` itself, so the
+        // header is not set here. Setting it unconditionally announced a
+        // JSON body on bodyless GET and DELETE requests, which is a
+        // claim about a payload that does not exist.
         if let Some(b) = body {
             builder = builder.json(b);
         }
