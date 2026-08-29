@@ -732,8 +732,16 @@ confirm against the code before working any of them.
 
 ### Fenced for the repository owner (published surface)
 
-- **dav-B5. The CalDAV/CardDAV duplication.** [C4] **Deliberately left open on
-  2026-08-23; not resolved, and not to be acted on without the owner.**
+- **dav-B5. RESOLVED 2026-08-29 as option B.** Kept only to stop it being
+  re-filed. The protocol-neutral half now lives in the private
+  `bifrost-dav-core`; both published surfaces are untouched. What was
+  deliberately NOT extracted - the propstat parsers, the cursor codecs, the
+  snapshot diffs - is recorded with its reasoning in `reference/caldav.md`
+  under "The shared layer", along with the two behavioural divergences that
+  were preserved rather than flattened. The drift rule below still governs
+  what stayed behind.
+
+  Original entry, for the reasoning that led here:
 
   Roughly 1500 duplicated lines across `client.rs` (transport, redirect policy,
   `auth_headers`, `escape_xml`, etag handling, the raw request helpers, the
