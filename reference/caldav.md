@@ -524,6 +524,26 @@ were all duplicated, and a divergence there is a credential leak. Ablating
 the dispatcher's `DavCredentials`, cloning the `Arc` so a bearer token is still
 read live from the shared source at every request.
 
+Finally the XML decoding primitives, in `bifrost_dav_core::xml`: `local_name`,
+`normalize_etag`, `resolve_href`, `push_text`, `trimmed`, plus `escape_xml` and
+`append_path`. All were byte-identical.
+
+**Where the extraction stops, and why.** The parsers ABOVE those primitives are
+NOT shared and are not candidates for it. `PropStat`, `ResponseParts` and
+`parse_multiget_report` differ in real content, not in spelling: they carry
+different property sets and different entry types (`calendar-data` and
+`CalDavEventEntry` against `address-data` and `CardDavContactEntry`), and CalDAV
+additionally has the whole `sync-collection` lane that CardDAV has no analogue
+for. Unifying them would mean parameterizing the parser over the resource kind,
+which is a redesign of both crates rather than a move - the shape option A was
+proposed as, and a different decision from the one taken here. The same is true
+of the cursor codecs and the snapshot diffs in each `account.rs`: they are
+similar in outline and different in substance.
+
+So the rule from the next section still applies to everything that stayed
+behind. What changed is that the code most likely to drift, and most damaging
+when it does, no longer can.
+
 Also NOT moved, and for the same reason as `not_found_error`:
 `bifrost-carddav` has its own `send_status_request` that returns the response
 ETag, where CalDAV's discards it. CardDAV's `put_vcard` and `delete_vcard`

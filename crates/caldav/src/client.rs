@@ -5,7 +5,9 @@ use std::sync::Arc;
 pub(crate) use bifrost_dav_core::PutCondition;
 #[cfg(test)]
 use bifrost_dav_core::ReqwestDavTransport;
-use bifrost_dav_core::{DavDispatch, DavProtocol, prepare_if_match, response_etag, worse_recovery};
+use bifrost_dav_core::{
+    DavDispatch, DavProtocol, escape_xml, prepare_if_match, response_etag, worse_recovery,
+};
 #[cfg(test)]
 pub(crate) use bifrost_dav_core::{DavResponse, DavTransport};
 use bifrost_types::{
@@ -531,15 +533,6 @@ impl CalDavClient {
             .send_status_request(request, AccountOperation::EventRsvp)
             .await
     }
-}
-
-fn escape_xml(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
 }
 
 fn mailto_email(href: &str) -> Option<String> {

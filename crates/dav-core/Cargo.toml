@@ -19,6 +19,7 @@ base64 = { workspace = true }
 bifrost-net = { path = "../net" }
 bifrost-types = { path = "../types" }
 futures = { workspace = true }
+quick-xml = "0.41.0"
 reqwest = { workspace = true, features = ["native-tls"] }
 
 [dev-dependencies]

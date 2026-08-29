@@ -1,8 +1,8 @@
+pub(crate) use bifrost_dav_core::resolve_href;
+use bifrost_dav_core::{local_name, normalize_etag, push_text, trimmed};
 use bifrost_net::{status_line_code, status_line_is_success};
 use quick_xml::Reader;
-use quick_xml::escape::unescape;
 use quick_xml::events::Event;
-use reqwest::Url;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CardDavContactEntry {
@@ -116,25 +116,6 @@ impl CardDavMultigetReport {
         for href in &mut self.missing_data {
             *href = resolve_href(request_url, href);
         }
-    }
-}
-
-/// Rebase a DAV response href against its request URI at the XML decoding
-/// boundary. Client callers never expose parsed relative hrefs to the account
-/// layer.
-pub(crate) fn resolve_href(request_url: &str, href: &str) -> String {
-    if href.starts_with("http://") || href.starts_with("https://") {
-        return href.to_string();
-    }
-    if let Ok(base) = Url::parse(request_url)
-        && let Ok(resolved) = base.join(href)
-    {
-        return resolved.to_string();
-    }
-    if request_url.ends_with('/') || href.starts_with('/') {
-        format!("{request_url}{href}")
-    } else {
-        format!("{request_url}/{href}")
     }
 }
 
@@ -511,43 +492,6 @@ pub(crate) fn extract_href_property(
     }
 
     Ok(None)
-}
-
-fn push_text(target: &mut String, raw: &[u8]) -> Result<(), String> {
-    let raw =
-        std::str::from_utf8(raw).map_err(|error| format!("XML text is not UTF-8: {error}"))?;
-    let text = unescape(raw).map_err(|error| format!("XML text escape error: {error}"))?;
-    target.push_str(&text);
-    Ok(())
-}
-
-fn trimmed(text: &str) -> Option<String> {
-    let value = text.trim();
-    if value.is_empty() {
-        None
-    } else {
-        Some(value.to_string())
-    }
-}
-
-fn normalize_etag(text: &str) -> Option<String> {
-    trimmed(text).map(|value| {
-        value
-            .get(..2)
-            .filter(|prefix| prefix.eq_ignore_ascii_case("W/"))
-            .map_or_else(
-                || value.trim_matches('"').to_string(),
-                |_| format!("W/{}", value[2..].trim()),
-            )
-    })
-}
-
-fn local_name(raw: &[u8]) -> String {
-    let full = String::from_utf8_lossy(raw);
-    match full.rfind(':') {
-        Some(index) => full[index + 1..].to_string(),
-        None => full.to_string(),
-    }
 }
 
 /// Properties read from the `propstat` currently being parsed, held apart

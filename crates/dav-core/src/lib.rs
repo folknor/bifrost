@@ -22,6 +22,7 @@ mod dispatch;
 mod error;
 mod etag;
 mod transport;
+mod xml;
 
 pub use dispatch::{DavCredentials, DavDispatch};
 
@@ -34,4 +35,7 @@ pub use transport::{
     DAV_CLIENT_TIMEOUT, DavBody, DavResponse, DavTransport, ReqwestDavTransport,
     dav_redirect_policy, origin_is_secure, read_capped_body, settle_body, transport_failure,
     url_origin,
+};
+pub use xml::{
+    append_path, escape_xml, local_name, normalize_etag, push_text, resolve_href, trimmed,
 };

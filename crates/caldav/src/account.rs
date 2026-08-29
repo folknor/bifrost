@@ -1,3 +1,4 @@
+use bifrost_dav_core::append_path;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
@@ -1392,14 +1393,6 @@ fn unsupported_stream<T: Send + 'static>(
         SyncEvent::Terminated(unsupported_error(operation)),
         SyncEvent::Done(None),
     ]))
-}
-
-fn append_path(base: &str, path: &str) -> String {
-    if base.ends_with('/') {
-        format!("{base}{path}")
-    } else {
-        format!("{base}/{path}")
-    }
 }
 
 /// Derive the parent collection URL of an event resource URL.

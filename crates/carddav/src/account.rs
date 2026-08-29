@@ -1,3 +1,4 @@
+use bifrost_dav_core::append_path;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
@@ -1357,14 +1358,6 @@ fn resource_file_name(url: &str) -> String {
                 .map(str::to_string)
         })
         .unwrap_or_else(|| format!("{}.vcf", Uuid::new_v4()))
-}
-
-fn append_path(base: &str, path: &str) -> String {
-    if base.ends_with('/') {
-        format!("{base}{path}")
-    } else {
-        format!("{base}/{path}")
-    }
 }
 
 fn contact_addressbook_url(client: &CardDavClient, contact: &ContactId) -> Option<String> {

@@ -5,6 +5,7 @@ use std::sync::Arc;
 pub(crate) use bifrost_dav_core::PutCondition;
 #[cfg(test)]
 use bifrost_dav_core::ReqwestDavTransport;
+use bifrost_dav_core::escape_xml;
 use bifrost_dav_core::{
     DavDispatch, DavProtocol, normalize_http_etag, prepare_if_match, worse_recovery,
 };
@@ -457,15 +458,6 @@ impl CardDavClient {
 ///
 /// Only `https` qualifies; an unparseable URL is treated as insecure so the
 /// downgrade check fails closed.
-fn escape_xml(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
-}
-
 fn addressbook_text_query_body(property: &str, query: &str) -> String {
     format!(
         "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
