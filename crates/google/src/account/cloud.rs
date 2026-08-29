@@ -12,6 +12,39 @@
 //! both steps succeed; a stray uploaded-but-unlinked file is the worst failure
 //! mode, so a failed link step after a successful upload is still an `Err`.
 //!
+//! The UPLOAD step has an equivalent, and it is handled here rather than left to
+//! the consumer. A resumable session is server-side state created before the
+//! first byte is sent, and Drive holds an incomplete one for about a week. Any
+//! failure between `create_upload_session` and a completed upload therefore
+//! leaves a partial upload behind, so the upload step cancels its own session on
+//! the way out (`DELETE` against the session URI) before returning the original
+//! error. Cancellation is one bounded, un-retried request whose own failure is
+//! swallowed: it must never replace or delay the error the caller actually needs.
+//!
+//! Two things this deliberately does NOT do. It does not reclassify the failure
+//! as `Protocol(PartialResponse)` / `Acknowledged` the way the cross-calendar
+//! event move does - that vocabulary says "the first leg landed and a consumer
+//! can go look at the target", and here there is no target: Drive publishes no
+//! file until the upload completes, so a `CheckTarget` / `DedupeByClientId`
+//! directive would send a consumer looking for something that provably does not
+//! exist, and would demote a transient transport failure out of the retry lane
+//! it belongs in. It also does not resume the session on a later call: the
+//! session URI is per-call state that no `HostAttachment` request carries back
+//! in, so resumption would require a published surface change.
+//!
+//! Where cancellation itself fails, the returned `AccountError` is decorated
+//! with support-only text saying the session was left behind, so a support
+//! export can tell "cleaned up" from "expires in a week". The decoration goes
+//! through `into_builder`, which preserves the kind and hence the recovery
+//! class. The session URI is pre-authenticated and is deliberately NOT written
+//! into that text.
+//!
+//! Residual, accepted: a caller who drops the returned future mid-upload gets no
+//! cancellation at all, because a `Drop` impl cannot await. The alternative - a
+//! guard that spawns the DELETE from `drop` - trades an expiring server-side
+//! session for a detached task outliving the account handle, which is a worse
+//! leak in a crate whose shutdown story is the caller dropping the future.
+//!
 //! The chunk loop's 308 Resume Incomplete handling depends on bifrost-net's
 //! 308-without-Location passthrough: a resumable 308 carries a `Range` header
 //! and NO `Location`, and without the passthrough the default redirect-follower
@@ -28,9 +61,11 @@
 //! producers, which this is not.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use bifrost_types::{
-    AccountError, AccountFuture, AccountOperation, CloudUploadMeta, HostedAttachment, ShareScope,
+    AccountError, AccountFuture, AccountOperation, CloudUploadMeta, DiagnosticText,
+    HostedAttachment, ShareScope,
 };
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
@@ -45,6 +80,17 @@ const GDRIVE_CHUNK_ALIGN: usize = 256 * 1024;
 /// Default chunk size: 5 MiB. Must be a multiple of `GDRIVE_CHUNK_ALIGN`.
 const GDRIVE_CHUNK_SIZE: usize = 5 * 1024 * 1024;
 const GDRIVE_MAX_EXTRA_CHUNK_ATTEMPTS: usize = 8;
+
+/// Wall-clock bound on the session-cancel request. The account default request
+/// timeout is `None`, so without an explicit bound a cleanup DELETE against an
+/// unresponsive host would hold the caller's already-failed upload open
+/// indefinitely. Cleanup is allowed to fail; it is not allowed to hang.
+const GDRIVE_CANCEL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Support-only marker recorded when an upload failed AND the session cancel
+/// also failed, so Drive keeps the partial upload until it expires.
+const ABANDONED_SESSION_TEXT: &str = "google drive resumable upload session could not be cancelled after the upload failed; \
+     the partial upload remains on the drive until Drive expires it (about one week)";
 
 const SESSION_URL: &str = "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable";
 
@@ -90,15 +136,43 @@ pub(crate) fn host_attachment(
     Box::pin(async move { run(&client, &account_email, bytes, meta).await })
 }
 
+/// What became of the resumable session on a failing path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionDisposition {
+    /// No session was open when the failure happened - it had not been created
+    /// yet, or the upload had already completed and closed it.
+    NotOpen,
+    /// The session was open and the cancel request was accepted, so no partial
+    /// upload is left on the drive.
+    Cancelled,
+    /// The session was open and could not be cancelled. Drive holds the partial
+    /// upload until it expires.
+    Abandoned,
+}
+
 async fn run(
     client: &GmailClient,
     account_email: &str,
     bytes: Bytes,
     meta: CloudUploadMeta,
 ) -> Result<HostedAttachment, AccountError> {
-    upload_and_link(client, account_email, bytes, meta)
-        .await
-        .map_err(|e| into_account_error(e, ctx()))
+    match upload_and_link(client, account_email, bytes, meta).await {
+        Ok(hosted) => Ok(hosted),
+        Err((error, disposition)) => {
+            let error = into_account_error(error, ctx());
+            Err(match disposition {
+                SessionDisposition::NotOpen | SessionDisposition::Cancelled => error,
+                // Decoration, not reclassification: the kind and primary cause
+                // ride through unchanged, so `recovery` derives to exactly what
+                // it would have without the note.
+                SessionDisposition::Abandoned => error
+                    .into_builder()
+                    .text(DiagnosticText::support_only(ABANDONED_SESSION_TEXT))
+                    .try_build()
+                    .expect("decorating an existing classification preserves its invariants"),
+            })
+        }
+    }
 }
 
 fn ctx() -> GmailErrorContext {
@@ -110,23 +184,78 @@ async fn upload_and_link(
     account_email: &str,
     bytes: Bytes,
     meta: CloudUploadMeta,
-) -> Result<HostedAttachment, Error> {
+) -> Result<HostedAttachment, (Error, SessionDisposition)> {
     if meta.size != bytes.len() as u64 {
-        return Err(Error::invalid_request(
-            AccountOperation::HostAttachment,
-            format!(
-                "declared size {} does not match payload length {}",
-                meta.size,
-                bytes.len()
+        return Err((
+            Error::invalid_request(
+                AccountOperation::HostAttachment,
+                format!(
+                    "declared size {} does not match payload length {}",
+                    meta.size,
+                    bytes.len()
+                ),
             ),
+            SessionDisposition::NotOpen,
         ));
     }
 
-    let upload_url = create_upload_session(client, &meta).await?;
-    let file_id = upload_file_chunked(client, &upload_url, bytes, GDRIVE_CHUNK_SIZE).await?;
-    let share_url = create_sharing_permission(client, &file_id, meta.scope, account_email).await?;
+    let upload_url = create_upload_session(client, &meta)
+        .await
+        .map_err(|e| (e, SessionDisposition::NotOpen))?;
+
+    // From here until the upload completes there is server-side state to clean
+    // up, so every exit on this leg goes through the cancel.
+    let file_id = match upload_file_chunked(client, &upload_url, bytes, GDRIVE_CHUNK_SIZE).await {
+        Ok(file_id) => file_id,
+        Err(error) => {
+            let disposition = cancel_upload_session(client, &upload_url).await;
+            return Err((error, disposition));
+        }
+    };
+
+    // The session closed itself when the final chunk was accepted; a failure
+    // from here leaves an uploaded-but-unlinked file, not a partial session,
+    // and the DELETE below would not address it.
+    let share_url = create_sharing_permission(client, &file_id, meta.scope, account_email)
+        .await
+        .map_err(|e| (e, SessionDisposition::NotOpen))?;
 
     Ok(HostedAttachment::new(share_url, file_id))
+}
+
+/// Cancel an abandoned resumable session so Drive does not hold the partial
+/// upload for a week.
+///
+/// Deliberately one un-retried, deadline-bounded request against the
+/// pre-authenticated session URI, and deliberately infallible from the caller's
+/// point of view: this runs on a path that already has an error to report, and
+/// the cleanup must neither replace that error nor extend the failure by a
+/// retry budget's worth of backoff.
+///
+/// Google answers an accepted cancel with `499 Client Closed Request`, which
+/// bifrost-net's retry loop surfaces as `Err(Status)` rather than
+/// `Ok(Response)` - a 4xx never arrives as a success here. A `404`/`410` means
+/// the session is already gone, which is the outcome we wanted. Anything else
+/// is reported as abandoned.
+async fn cancel_upload_session(client: &GmailClient, upload_url: &str) -> SessionDisposition {
+    let outcome = client
+        .account_net()
+        .delete(upload_url)
+        .without_bearer_auth()
+        .retry(bifrost_net::RetryPolicy::disabled())
+        .timeout(GDRIVE_CANCEL_TIMEOUT)
+        .send()
+        .await;
+
+    match outcome {
+        Ok(_) => SessionDisposition::Cancelled,
+        Err(bifrost_net::Error::Status { code, .. })
+            if matches!(code.as_u16(), 404 | 410 | 499) =>
+        {
+            SessionDisposition::Cancelled
+        }
+        Err(_) => SessionDisposition::Abandoned,
+    }
 }
 
 /// Create a resumable upload session. Returns the pre-authenticated upload URL
@@ -352,6 +481,44 @@ mod tests {
 
     use super::*;
 
+    fn session_created() -> Canned {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "location",
+            "https://upload.test/session/abc"
+                .parse()
+                .expect("valid URL"),
+        );
+        Canned::Response {
+            status: reqwest::StatusCode::OK,
+            headers,
+            body: Bytes::new(),
+        }
+    }
+
+    fn network_failure() -> Canned {
+        Canned::Error(bifrost_net::Error::Network {
+            message: "connection reset mid-chunk".to_owned(),
+            transmission_state: bifrost_types::TransmissionState::InFlight,
+            source: None,
+        })
+    }
+
+    fn scripted_client(script: &Arc<ScriptedDispatch>) -> GmailClient {
+        let net = bifrost_net::test_support::scripted_account(
+            script,
+            NetConfig::default(),
+            Vec::new(),
+            Arc::new(StaticTokenSource::new("token", None)),
+            RetryPolicy::disabled(),
+        );
+        GmailClient::with_account_net("https://gmail.test", net)
+    }
+
+    fn upload_meta() -> CloudUploadMeta {
+        CloudUploadMeta::new("report.pdf", "application/pdf", 7, ShareScope::Anyone)
+    }
+
     fn resume_response(last_byte: usize) -> Canned {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(
@@ -528,6 +695,176 @@ mod tests {
             script.requests().len(),
             9,
             "attempt ten must fail before dispatch"
+        );
+    }
+
+    /// A `Net` failure mid-upload must not walk away from the resumable
+    /// session: Drive would hold the partial upload for about a week.
+    #[tokio::test]
+    async fn net_failure_mid_upload_cancels_the_resumable_session() {
+        let script = ScriptedDispatch::new([
+            session_created(),
+            network_failure(),
+            Canned::Response {
+                status: reqwest::StatusCode::OK,
+                headers: reqwest::header::HeaderMap::new(),
+                body: Bytes::new(),
+            },
+        ]);
+        let client = scripted_client(&script);
+
+        let error = run(
+            &client,
+            "user@example.com",
+            Bytes::from_static(b"payload"),
+            upload_meta(),
+        )
+        .await
+        .expect_err("a dropped connection mid-chunk fails the upload");
+
+        let requests = script.requests();
+        assert_eq!(
+            requests.len(),
+            3,
+            "session create, the failing chunk PUT, and the cancel DELETE"
+        );
+        assert_eq!(
+            requests[2].method,
+            reqwest::Method::DELETE,
+            "the session is cancelled with a DELETE"
+        );
+        assert_eq!(
+            requests[2].url.as_str(),
+            "https://upload.test/session/abc",
+            "the cancel targets the session URI, not the create endpoint"
+        );
+        assert_eq!(script.remaining(), 0, "the whole script was consumed");
+        assert!(
+            !requests[2]
+                .headers
+                .contains_key(reqwest::header::AUTHORIZATION),
+            "the session URI is pre-authenticated, like the chunk PUT"
+        );
+
+        let consented = error.support_consented();
+        assert!(
+            !consented.support_text.contains(&ABANDONED_SESSION_TEXT),
+            "a session that was cancelled must not be reported as abandoned"
+        );
+    }
+
+    /// The cancel is best-effort. When it fails too, the original error is
+    /// still what the caller gets - decorated so a support export can tell a
+    /// cleaned-up failure from one that left a partial upload behind.
+    #[tokio::test]
+    async fn a_failed_cancel_is_recorded_as_an_abandoned_session() {
+        let script =
+            ScriptedDispatch::new([session_created(), network_failure(), network_failure()]);
+        let client = scripted_client(&script);
+
+        let error = run(
+            &client,
+            "user@example.com",
+            Bytes::from_static(b"payload"),
+            upload_meta(),
+        )
+        .await
+        .expect_err("the upload still failed");
+
+        assert_eq!(script.requests().len(), 3, "the cancel was attempted once");
+        let consented = error.support_consented();
+        assert!(
+            consented.support_text.contains(&ABANDONED_SESSION_TEXT),
+            "an uncancellable session must be recorded, got {:?}",
+            consented.support_text
+        );
+        assert!(
+            !consented
+                .support_text
+                .iter()
+                .any(|text| text.contains("upload.test/session")),
+            "the pre-authenticated session URI must not reach a support export"
+        );
+    }
+
+    /// Drive answers an accepted cancel with 499, which bifrost-net's retry
+    /// loop surfaces as `Err(Status)` and never as `Ok(Response)`. Reading that
+    /// as a failed cancel would report every successful cleanup as abandoned.
+    #[tokio::test]
+    async fn a_499_cancel_response_counts_as_a_cancelled_session() {
+        let script = ScriptedDispatch::new([
+            session_created(),
+            network_failure(),
+            Canned::Response {
+                status: reqwest::StatusCode::from_u16(499).expect("valid status"),
+                headers: reqwest::header::HeaderMap::new(),
+                body: Bytes::new(),
+            },
+        ]);
+        let client = scripted_client(&script);
+
+        let error = run(
+            &client,
+            "user@example.com",
+            Bytes::from_static(b"payload"),
+            upload_meta(),
+        )
+        .await
+        .expect_err("the upload still failed");
+
+        assert!(
+            !error
+                .support_consented()
+                .support_text
+                .contains(&ABANDONED_SESSION_TEXT),
+            "499 Client Closed Request is Drive accepting the cancel"
+        );
+    }
+
+    /// The cancel must not touch the recovery classification. A transport drop
+    /// on a non-idempotent upload reconciles; adding cleanup text to it must
+    /// leave that answer exactly where it was.
+    #[tokio::test]
+    async fn cleanup_does_not_change_the_recovery_class() {
+        let cancelled = ScriptedDispatch::new([
+            session_created(),
+            network_failure(),
+            Canned::Response {
+                status: reqwest::StatusCode::OK,
+                headers: reqwest::header::HeaderMap::new(),
+                body: Bytes::new(),
+            },
+        ]);
+        let abandoned =
+            ScriptedDispatch::new([session_created(), network_failure(), network_failure()]);
+
+        let a = run(
+            &scripted_client(&cancelled),
+            "user@example.com",
+            Bytes::from_static(b"payload"),
+            upload_meta(),
+        )
+        .await
+        .expect_err("upload failed");
+        let b = run(
+            &scripted_client(&abandoned),
+            "user@example.com",
+            Bytes::from_static(b"payload"),
+            upload_meta(),
+        )
+        .await
+        .expect_err("upload failed");
+
+        assert_eq!(a.kind(), b.kind(), "decoration must not reclassify");
+        assert_eq!(
+            a.message_key(),
+            b.message_key(),
+            "decoration must not move the telemetry key"
+        );
+        assert_eq!(
+            format!("{:?}", a.recovery()),
+            format!("{:?}", b.recovery()),
+            "decoration must not change what the engine does next"
         );
     }
 }

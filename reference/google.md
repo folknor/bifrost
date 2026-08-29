@@ -59,6 +59,27 @@ Internal modules:
   `permissions` POST (`type: anyone` / `type: domain` + account domain)
   and a `webViewLink` GET. The 308 reaches the loop only via
   bifrost-net's missing-`Location` passthrough.
+  A resumable session is server-side state that Drive holds for about a
+  week, so any failure of the upload leg cancels its own session on the
+  way out: one un-retried `DELETE` against the session URI, bounded by a
+  30s deadline, whose own failure is swallowed rather than replacing the
+  error the caller needs. Google's accepted-cancel status is `499`, which
+  bifrost-net surfaces as `Err(Status)` and not `Ok`; `499`, `404` and
+  `410` all count as cancelled. When the cancel fails, the original
+  `AccountError` is decorated through `into_builder` with support-only
+  text recording the abandoned session - decoration only, so kind,
+  message key and `RecoveryClass` are unchanged, and the pre-authenticated
+  session URI is deliberately kept out of that text. The failure is NOT
+  reclassified to `Protocol(PartialResponse)` / `Acknowledged` the way the
+  cross-calendar event move is: Drive publishes no file until the upload
+  completes, so there is no target for a `CheckTarget` /
+  `DedupeByClientId` directive to name, and the reclassification would
+  demote a transient transport drop out of its retry lane. A link-step
+  failure after a completed upload leaves an uploaded-but-unlinked file
+  and no session, so it takes no cleanup path. Accepted residual: a caller
+  who drops the future mid-upload gets no cancel, because `Drop` cannot
+  await, and spawning the DELETE from `drop` would trade an expiring
+  session for a detached task outliving the account handle.
 - `error.rs` - translation boundary from `crate::Error` to
   `AccountError` via the central `AccountErrorBuilder`.
 

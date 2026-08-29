@@ -843,13 +843,18 @@ confirm against the code before working any of them.
 
 ### Open defects
 
-- **google-B2. The Drive resumable session is abandoned on a mid-upload `Net`
-  error.** [C2] `upload_file_chunked` now rejects stalled, backward and
-  impossible resume offsets under a finite attempt budget, so it cannot hang. But
-  a `Net` error mid-upload aborts the function and abandons the resumable
-  session; Drive keeps the partial upload for a week. There is no cleanup and no
-  resume-on-reopen. The module doc acknowledges "a stray uploaded-but-unlinked
-  file is the worst failure mode" for the link step but not for the upload step.
+- **google-B2-residual. Drive session cleanup does not survive a dropped
+  future.** [C2] The mid-upload abandonment is fixed (2026-08-29): every exit
+  between `create_upload_session` and a completed upload now cancels the
+  session, and a cancel that itself fails decorates the error as an abandoned
+  session. What remains is the cancellation case - if the caller's future is
+  dropped mid-upload, no cancel runs and Drive holds the partial for a week.
+  A `Drop` guard is deliberately NOT the answer: `Drop` cannot await, and
+  spawning the DELETE from `drop` trades an expiring server-side session for a
+  detached task outliving the account handle. This is the same shape as the
+  documented `close()`-dropped-mid-`users.stop` residual. Resume-on-reopen is
+  also out: the session URI is per-call state that no `HostAttachment` request
+  carries back in, so resumption needs a published surface change.
 - **dav-B9. All DAV traffic bypasses `bifrost-net`.** [C2] Both crates run their
   own `ReqwestDavTransport` behind the `DavTransport` seam, so DAV legs get no
   retry, no rate limiting, no bandwidth metering and no observability, and
