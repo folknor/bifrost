@@ -904,22 +904,6 @@ prerequisite for the small local fixes above.
   only the helpers while the dispatch stays in `engine.rs`, so the split is in
   the wrong place. `reference/sync.md`'s file map already describes the intended
   layout aspirationally and the code does not match it.
-- **sync-B2.** [PUBLISHED SURFACE - needs an owner ruling] `drive_changes_stream`
-  still takes `_account_id` and `_ack_tx` and threads them from four call sites
-  through `spawn_scope_poll_inner`. Dead parameters that obscure the actual data
-  flow.
-
-  Verified 2026-08-29, and it is larger than "delete two parameters".
-  `bifrost-sync` declares `pub mod multiplexer`, so both
-  `drive_changes_stream` and the `Multiplexer` struct are published items.
-  `ack_tx` is threaded from `Multiplexer`'s own `pub ack_tx` field for the
-  sole purpose of reaching the dead parameter - nothing else in
-  `spawn_scope_poll_inner` reads it - so the honest fix removes a published
-  field and reshapes a published function signature. That is the
-  repository owner's call under the standing lesson, not a refactor to
-  power through. `account_id` is cheaper: it is live in the poll loop (the
-  throttle wait and the scheduler admission both use it) and only its
-  clone into `drive_changes_stream` is dead.
 - **google-B6.** `inventory.rs::hydrate_one` issues both `get_message(id, "raw")`
   and `get_message(id, "full")` for `Projection::FullWithBlobs`. For a message
   with a 20 MB attachment that is ~40 MB of transfer and 10 quota units to obtain

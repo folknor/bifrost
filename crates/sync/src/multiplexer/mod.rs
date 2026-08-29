@@ -293,7 +293,6 @@ pub struct Multiplexer {
     pub control: SyncControl,
     pub shutdown: CancellationToken,
     pub reopen_tx: mpsc::Sender<ReopenRequest>,
-    pub ack_tx: Option<mpsc::Sender<WriterRequest>>,
     /// Per-scope cancellation tokens keyed by membership-id so
     /// `ScopeLifecycle::Deleted` can stop the matching poll task.
     pub scope_tokens: ScopeTokens,
@@ -360,7 +359,6 @@ impl Multiplexer {
             control,
             shutdown,
             reopen_tx,
-            ack_tx,
             scope_tokens,
             throttles,
             scheduler,
@@ -378,7 +376,6 @@ impl Multiplexer {
             control.clone(),
             shutdown.clone(),
             reopen_tx.clone(),
-            ack_tx.clone(),
             Arc::clone(&scope_tokens),
             Arc::clone(&throttles),
             scheduler.clone(),
@@ -592,7 +589,6 @@ impl Multiplexer {
                         control.clone(),
                         shutdown.clone(),
                         reopen_tx.clone(),
-                        ack_tx.clone(),
                         Arc::clone(&scope_tokens),
                         Arc::clone(&throttles),
                         scheduler.clone(),
@@ -667,7 +663,6 @@ fn spawn_and_track_scope_poll(
     control: SyncControl,
     shutdown: CancellationToken,
     reopen_tx: mpsc::Sender<ReopenRequest>,
-    ack_tx: Option<mpsc::Sender<WriterRequest>>,
     scope_tokens: ScopeTokens,
     throttles: Arc<StdMutex<crate::recovery::ThrottleBucket>>,
     scheduler: crate::scheduler::Scheduler,
@@ -696,7 +691,6 @@ fn spawn_and_track_scope_poll(
             shutdown,
             scope_cancel,
             reopen_tx,
-            ack_tx,
             throttles,
             scheduler,
             scope,
@@ -740,7 +734,6 @@ fn spawn_missing_scope_polls(
     control: SyncControl,
     shutdown: CancellationToken,
     reopen_tx: mpsc::Sender<ReopenRequest>,
-    ack_tx: Option<mpsc::Sender<WriterRequest>>,
     scope_tokens: ScopeTokens,
     throttles: Arc<StdMutex<crate::recovery::ThrottleBucket>>,
     scheduler: crate::scheduler::Scheduler,
@@ -768,7 +761,6 @@ fn spawn_missing_scope_polls(
                 control.clone(),
                 shutdown.clone(),
                 reopen_tx.clone(),
-                ack_tx.clone(),
                 Arc::clone(&scope_tokens),
                 Arc::clone(&throttles),
                 scheduler.clone(),
@@ -794,7 +786,6 @@ async fn spawn_scope_poll_inner(
     shutdown: CancellationToken,
     scope_cancel: CancellationToken,
     reopen_tx: mpsc::Sender<ReopenRequest>,
-    ack_tx: Option<mpsc::Sender<WriterRequest>>,
     throttles: Arc<StdMutex<crate::recovery::ThrottleBucket>>,
     scheduler: crate::scheduler::Scheduler,
     scope: CursorScope,
@@ -884,11 +875,9 @@ async fn spawn_scope_poll_inner(
                 let advance_cursors = Arc::clone(&cursors);
                 let advance_scope = scope.clone();
                 let scope = scope.clone();
-                let account_id = account_id.clone();
                 let changes_tx = changes_tx.clone();
                 let boundary = boundary.clone();
                 let control = control.clone();
-                let ack_tx = ack_tx.clone();
                 async move {
                     let acc: &dyn Account = acc_arc.as_ref().as_ref();
                     let outcome = drive_changes_stream(
@@ -896,11 +885,9 @@ async fn spawn_scope_poll_inner(
                         scope,
                         cursor,
                         drive_cursors,
-                        account_id,
                         changes_tx,
                         boundary,
                         Some(control),
-                        ack_tx,
                         Some(registry_generation),
                     )
                     .await;

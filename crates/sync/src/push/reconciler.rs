@@ -17,9 +17,7 @@ use crate::cancel::BoundaryView;
 use crate::control::SyncControl;
 use crate::cursor::CursorRegistry;
 use crate::error::{Error, Warning};
-use crate::multiplexer::{
-    ChangesEvent, MultiplexerEvent, ReopenRequest, WriterRequest, drive_changes_stream,
-};
+use crate::multiplexer::{ChangesEvent, MultiplexerEvent, ReopenRequest, drive_changes_stream};
 
 pub struct Reconciler {
     pub account_id: AccountId,
@@ -29,7 +27,6 @@ pub struct Reconciler {
     pub boundary: BoundaryView,
     pub shutdown: CancellationToken,
     pub control: SyncControl,
-    pub ack_tx: Option<mpsc::Sender<WriterRequest>>,
     pub reopen_tx: mpsc::Sender<ReopenRequest>,
     /// Engine-wide throttle bucket. The reconciler honors account-wide
     /// deadlines before driving a hinted scope and records deadlines
@@ -238,11 +235,9 @@ impl Reconciler {
                 .with_drive(&scope, |cursor, registry_generation| {
                     let account_swap = self.account.load_full();
                     let cursors = Arc::clone(&self.cursors);
-                    let account_id = self.account_id.clone();
                     let changes_tx = self.changes_tx.clone();
                     let boundary = self.boundary.clone();
                     let control = self.control.clone();
-                    let ack_tx = self.ack_tx.clone();
                     let scope = scope.clone();
                     async move {
                         let account: &dyn Account = account_swap.as_ref().as_ref();
@@ -251,11 +246,9 @@ impl Reconciler {
                             scope,
                             cursor,
                             cursors,
-                            account_id,
                             changes_tx,
                             boundary,
                             Some(control),
-                            ack_tx,
                             Some(registry_generation),
                         )
                         .await

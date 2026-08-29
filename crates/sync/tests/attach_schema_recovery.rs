@@ -2681,10 +2681,8 @@ async fn a_partial_batch_carrying_a_checkpoint_terminates_the_scope() {
         scope.clone(),
         cursor_for(&scope, b"live"),
         Arc::new(CursorRegistry::new()),
-        AccountId("bad-boundary".into()),
         changes_tx,
         boundary.subscribe(),
-        None,
         None,
         None,
     )
@@ -2763,11 +2761,9 @@ async fn a_published_change_checkpoint_always_carries_its_publication_id() {
         scope.clone(),
         cursor_for(&scope, b"live"),
         Arc::new(CursorRegistry::new()),
-        AccountId("publishes-ids".into()),
         changes_tx,
         boundary.subscribe(),
         Some(control),
-        None,
         None,
     )
     .await

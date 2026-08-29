@@ -412,8 +412,10 @@ carries no tag yields `Protocol::Unknown` rather than a guess.
 optional `Checkpoint`) onto the per-account broadcast channel and
 advances the in-memory `CursorRegistry` immediately so the next
 poll iteration starts from the freshly-yielded cursor. It does
-NOT write to `CheckpointStore`. Durable persistence is consumer-
-ack-driven:
+NOT write to `CheckpointStore`, and it holds no handle on the writer
+channel - the driver has no way to persist even if a future edit wanted
+it to, which is what makes the consumer-ack rule structural rather than
+conventional. Durable persistence is consumer-ack-driven:
 
 Polling and push reconciliation enter the same `CursorRegistry::with_drive`
 scope for each `CursorScope`. The combinator snapshots the cursor and registry

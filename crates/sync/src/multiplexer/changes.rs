@@ -31,10 +31,10 @@
 use std::sync::Arc;
 
 use bifrost_types::{
-    Account, AccountError, AccountId, Change, ChangeCursor, Checkpoint, CursorScope, SyncEvent,
+    Account, AccountError, Change, ChangeCursor, Checkpoint, CursorScope, SyncEvent,
 };
 use futures::stream::StreamExt;
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, oneshot};
 
 use crate::cancel::{BoundaryRequest, BoundaryView};
 use crate::control::SyncControl;
@@ -93,11 +93,9 @@ pub async fn drive_changes_stream(
     scope: CursorScope,
     cursor: ChangeCursor,
     cursors: Arc<CursorRegistry>,
-    _account_id: AccountId,
     changes_tx: broadcast::Sender<MultiplexerEvent>,
     boundary: BoundaryView,
     control: Option<SyncControl>,
-    _ack_tx: Option<mpsc::Sender<WriterRequest>>,
     registry_generation: Option<crate::cursor::DriveGeneration>,
 ) -> Result<ChangesEvent, Error> {
     let _activity = match &control {
