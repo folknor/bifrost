@@ -269,8 +269,27 @@ impl InventoryFusion {
                         self.forward_inventory_batch(tx, &scope, &batch);
                     }
                 }
-                bifrost_types::InventoryEvent::Progress(_)
-                | bifrost_types::InventoryEvent::Warning(_) => {}
+                // A producer-emitted warning is forwarded, not absorbed. Graph
+                // announces its public-folder over-cap degrade this way (past
+                // the cap the folder silently becomes additions-only, so
+                // deletions stop propagating), and IMAP announces a QRESYNC ->
+                // CONDSTORE strategy downgrade. Dropping them here was worse
+                // than losing a message in the IMAP case: that warning sits
+                // behind a one-shot `AtomicBool` shared with the changes path,
+                // so whichever lane reached it first consumed it, and the
+                // other could never re-emit.
+                bifrost_types::InventoryEvent::Warning(warning) => {
+                    if let Some(tx) = &changes_tx {
+                        let me = MultiplexerEvent {
+                            scope: scope.clone(),
+                            event: Arc::new(SyncEvent::Warning(warning)),
+                            checkpoint: None,
+                            publication: None,
+                        };
+                        let _ = tx.send(me);
+                    }
+                }
+                bifrost_types::InventoryEvent::Progress(_) => {}
                 _ => {}
             }
         }
@@ -517,6 +536,53 @@ mod tests {
             writer_tx: Some(writer_tx),
             generation: 1,
         }
+    }
+
+    /// A producer's own inventory warning must reach the consumer.
+    ///
+    /// Both engine inventory front ends used to absorb `InventoryEvent::Warning`
+    /// in the same arm as `Progress`, one arm below the `Terminated` case that
+    /// forwards. Two live producers announce a DEGRADE that way and nothing
+    /// else: Graph's public-folder over-cap switch to additions-only, where
+    /// deletions silently stop propagating, and IMAP's QRESYNC -> CONDSTORE
+    /// strategy downgrade. The IMAP case is why absorbing it is worse than
+    /// losing an ordinary message - the warning sits behind a one-shot
+    /// `AtomicBool` shared with the changes path, so whichever lane arrives
+    /// first consumes it and the other can never re-emit.
+    #[tokio::test]
+    async fn an_inventory_warning_reaches_the_change_stream() {
+        let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel(4);
+        let fusion = fusion_with_writer(writer_tx);
+        let warning = bifrost_types::Warning::support_only(
+            bifrost_types::WarningKind::StrategyDowngraded,
+            "QResync->Condstore",
+        );
+        let stream: bifrost_types::AccountStream<bifrost_types::InventoryEvent> =
+            Box::pin(futures::stream::iter(vec![
+                bifrost_types::InventoryEvent::Warning(warning),
+                bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion {
+                    checkpoint: None,
+                    coverage: bifrost_types::InventoryCoverageReport::complete(
+                        bifrost_types::CoverageDomain::full(CursorScope::Account),
+                    ),
+                }),
+            ]));
+        let (changes_tx, mut changes_rx) = tokio::sync::broadcast::channel(8);
+
+        fusion
+            .run_stream(CursorScope::Account, stream, Some(changes_tx))
+            .await
+            .expect("a clean walk carrying a warning still completes");
+
+        let announced = changes_rx
+            .try_recv()
+            .expect("the producer's warning must be forwarded, not absorbed");
+        assert!(
+            matches!(announced.event.as_ref(), SyncEvent::Warning(w)
+                if w.kind == bifrost_types::WarningKind::StrategyDowngraded),
+            "the forwarded event must be the producer's own warning, got {:?}",
+            announced.event
+        );
     }
 
     /// Same rule the backfill runner enforces, on the OTHER front end of the

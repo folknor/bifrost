@@ -16,19 +16,15 @@
 //! true direction is deliberately left to those tests, and this file pins the
 //! half nothing else pins: nothing advertised `false` may quietly work.
 //!
-//! Three IMAP flags are deliberately NOT driven here, because the flag and the
-//! method genuinely disagree today and pinning the wrong side would be worse
-//! than pinning nothing:
-//!
-//! - `remove_from_container` and `draft_discard` go false when the server
-//!   offers neither UIDPLUS nor IMAP4rev2 (no UID EXPUNGE), but neither method
-//!   consults the flag; both decode their target and proceed toward the wire.
-//! - `thread_hydrate` goes false without `THREAD=REFERENCES`, and
-//!   `pim::thread_hydrate` likewise never reads the flag.
-//!
-//! Whether the fix is the flag or the method is a call for the repository
-//! owner, so this file states the gap and leaves it uncommitted rather than
-//! encoding either answer.
+//! Writing this file immediately found three flags that did not gate their
+//! methods at all: `remove_from_container` and `draft_discard` (both false
+//! when the server offers neither UIDPLUS nor IMAP4rev2, so no UID EXPUNGE)
+//! and `thread_hydrate` (false without `THREAD=REFERENCES`). All three decoded
+//! their target and proceeded toward the wire regardless of the flag, while
+//! `search`, `draft_create` and `quota_get` in the same module read theirs
+//! correctly. The methods were fixed to match the flags - the capability is
+//! derived from a server capability string, so the flag was the true half -
+//! and all three are now driven below like everything else.
 
 #![cfg(test)]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -42,7 +38,7 @@ use bifrost_types::{
     EventCreate, EventId, EventPatch, EventRange, EventRecurrence, EventSearchRequest, EventStatus,
     EventTime, FilterScriptCreate, HydrationProjection, Importance, MutationTarget, ObjectId,
     ScriptLanguage, SearchRequest, SendRequest, ServerFilterCreate, ServerFilterId,
-    ServerFilterPatch, ShareScope, SyncEvent, VacationConfig,
+    ServerFilterPatch, ShareScope, SyncEvent, ThreadId, VacationConfig,
 };
 use futures::StreamExt as _;
 
@@ -252,7 +248,12 @@ async fn every_false_pim_flag_refuses_without_touching_the_wire() {
         AccountOperation::AddToContainer,
         account.add_to_container(target(), ContainerId("c".to_string()))
     );
-    // `remove_from_container` is intentionally absent - see the module doc.
+    refuses!(
+        caps,
+        remove_from_container,
+        AccountOperation::RemoveFromContainer,
+        account.remove_from_container(target(), ContainerId("c".to_string()))
+    );
     refuses!(
         caps,
         set_keyword,
@@ -327,7 +328,12 @@ async fn every_false_pim_flag_refuses_without_touching_the_wire() {
         AccountOperation::DraftUpdate,
         account.draft_update(DraftHandle("d1".to_string()), DraftPatch::default())
     );
-    // `draft_discard` is intentionally absent - see the module doc.
+    refuses!(
+        caps,
+        draft_discard,
+        AccountOperation::DraftDiscard,
+        account.draft_discard(DraftHandle("d1".to_string()))
+    );
     refuses!(
         caps,
         draft_send,
@@ -435,7 +441,12 @@ async fn every_false_pim_flag_refuses_without_touching_the_wire() {
     );
 
     // Hydration.
-    // `thread_hydrate` is intentionally absent - see the module doc.
+    refuses!(
+        caps,
+        thread_hydrate,
+        AccountOperation::HydrateThread,
+        account.thread_hydrate(ThreadId("t1".to_string()))
+    );
     refuses!(
         caps,
         message_hydrate,

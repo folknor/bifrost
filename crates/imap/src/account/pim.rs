@@ -79,6 +79,11 @@ pub(crate) fn remove_from_container(
     container: ContainerId,
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
+        if !account.capabilities.pim_methods.remove_from_container {
+            return Err(super::error::unsupported(
+                AccountOperation::RemoveFromContainer,
+            ));
+        }
         let source = folder_from_container(&container)?;
         let ids = decoded_targets(&target)?
             .into_iter()
@@ -771,6 +776,9 @@ pub(crate) fn draft_discard(
     draft: DraftHandle,
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
+        if !account.capabilities.pim_methods.draft_discard {
+            return Err(super::error::unsupported(AccountOperation::DraftDiscard));
+        }
         let id = decode_object_id(&ObjectId(draft.0))?;
         delete_messages(&account, vec![id], AccountOperation::DraftDiscard).await
     })
@@ -1044,6 +1052,9 @@ pub(crate) fn thread_hydrate(
     thread: ThreadId,
 ) -> AccountFuture<Result<ThreadHydration, AccountError>> {
     Box::pin(async move {
+        if !account.capabilities.pim_methods.thread_hydrate {
+            return Err(super::error::unsupported(AccountOperation::HydrateThread));
+        }
         let decoded = decode_thread_id(&thread)?;
         let messages = hydrate_decoded(
             &account,

@@ -1909,6 +1909,34 @@ than writing to any built-in queue or dashboard. Any operator-notification
 queue is the consumer's to build off the broadcast
 `SyncEvent::Terminated`.
 
+### Producer-emitted inventory warnings are forwarded, not absorbed
+
+Both inventory front ends - `InventoryFusion::run_stream` and
+`BackfillRunner::run_partition` - forward `InventoryEvent::Warning` onto
+the account change stream as a `SyncEvent::Warning`, the same way they
+forward `Terminated`. Only `Progress` is absorbed.
+
+This matters because for two live producers the warning is the ONLY
+announcement of a degrade the consumer would otherwise have to infer.
+Graph's public-folder walk emits one when a folder passes
+`PUBLIC_FOLDER_LIVE_IDS_CAP` and drops to additions-only, at which point
+deletions stop propagating for that folder; `reference/graph.md` describes
+that degrade as announced. IMAP emits one for a QRESYNC -> CONDSTORE
+strategy downgrade.
+
+The IMAP case is why absorbing these was worse than dropping an ordinary
+message: `take_qresync_negotiation_warning` is a ONE-SHOT guarded by an
+`AtomicBool` shared with the changes path. Backfill and deferred inventory
+both reach it at attach, racing the multiplexer, so whichever lane arrived
+first consumed the flag - and if that lane discarded the warning, the
+changes path could never re-emit it. The consumer never learned the
+account was running on a downgraded sync strategy.
+
+Note this is distinct from the warnings the engine SYNTHESIZES
+(`warn_degraded` for incomplete coverage, `announce_page_loss` for page
+lanes). Those describe what the engine concluded; these carry what the
+protocol crate observed.
+
 The reopen listener never sleeps for a bare `RecoveryPlan::Retry`.
 The originating poll, push, or mutation path owns an actionable retry;
 the listener only records shared throttle deadlines and stays
@@ -1964,9 +1992,16 @@ observe comes from `recovery::retry_delay` /
 `recovery::reconcile_delay`, which honor the carried `RetryHint` and
 otherwise fall back to one second. Both recorders resolve the key from the
 identities the classified error actually carries
-(`ErrorScope::Mailbox`, `AccountError::provider()`). A mailbox throttle without
-a mailbox identity remains local to the current operation: degrading it to the
-account key would widen a per-mailbox 429 into an account-wide stall. Broader
+(the error's mailbox scope, `AccountError::provider()`). The mailbox identity is
+read in BOTH shapes it is produced in - `ErrorScope::Mailbox { id }` and
+`ErrorScope::Cursor(CursorScope::Folder(id))` - because every production folder
+producer builds the latter, via `with_folder_scope`, and IMAP's
+`mailbox_throttle` (the only production emitter of `ThrottleScope::Mailbox`)
+fires for either. Reading only the former made `ThrottleKey::Mailbox`
+unreachable in production while its test passed against the synthetic shape.
+A mailbox throttle carrying no mailbox identity at all remains local to the
+current operation: degrading it to the account key would widen a per-mailbox 429
+into an account-wide stall. Broader
 provider scope may degrade to the account key. `Tenant` ALWAYS degrades today: the
 error contract carries no tenant identity string, so cross-account
 tenant pausing is blocked on that types-level channel. Reading: the poll loop (before each drive), the

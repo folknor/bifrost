@@ -559,8 +559,24 @@ impl BackfillRunner {
                     }
                     return Err(Error::Account(err));
                 }
-                bifrost_types::InventoryEvent::Progress(_)
-                | bifrost_types::InventoryEvent::Warning(_) => {}
+                // Forwarded for the same reason the fusion walk forwards it:
+                // a producer-emitted warning is the only announcement of a
+                // degrade the consumer would otherwise have to infer (Graph's
+                // public-folder additions-only mode, IMAP's QRESYNC ->
+                // CONDSTORE downgrade), and the IMAP one is a one-shot that
+                // cannot be re-emitted once a lane has consumed it.
+                bifrost_types::InventoryEvent::Warning(warning) => {
+                    if let Some(tx) = &changes_tx {
+                        let me = MultiplexerEvent {
+                            scope: scope.clone(),
+                            event: Arc::new(SyncEvent::Warning(warning)),
+                            checkpoint: None,
+                            publication: None,
+                        };
+                        let _ = tx.send(me);
+                    }
+                }
+                bifrost_types::InventoryEvent::Progress(_) => {}
                 _ => {}
             }
         }

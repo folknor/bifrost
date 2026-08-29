@@ -367,8 +367,11 @@ impl ThrottleBucket {
 /// scope cannot: an account key is wider than the producer's throttle.
 ///
 /// - `CurrentOperation` never enters the bucket (per-call hint).
-/// - `Mailbox` uses the error's `ErrorScope::Mailbox` identity; an
-///   error that names no mailbox remains local to the current operation.
+/// - `Mailbox` uses the error's mailbox identity in EITHER shape it is
+///   produced in - `ErrorScope::Mailbox { id }` or
+///   `ErrorScope::Cursor(CursorScope::Folder(id))`, the latter being what
+///   every production folder producer actually builds. An error that names
+///   no mailbox at all remains local to the current operation.
 /// - `Tenant` ALWAYS degrades to `Account` today: the error contract
 ///   carries no tenant identity, so there is nothing to key a
 ///   cross-account tenant bucket on. Cross-account tenant pausing is
@@ -397,10 +400,23 @@ pub(crate) fn resolve_throttle_key(
     let account_key = || ThrottleKey::Account(account.clone());
     match scope {
         ThrottleScope::CurrentOperation => None,
+        // BOTH mailbox shapes must be accepted here. Folder producers build
+        // `ErrorScope::Cursor(Folder(id))`, not `ErrorScope::Mailbox { id }` -
+        // and IMAP's `mailbox_throttle`, the only production emitter of
+        // `ThrottleScope::Mailbox` in the workspace, fires for either. Matching
+        // only the latter made `ThrottleKey::Mailbox` unreachable in
+        // production: every real per-folder `[LIMIT]` recorded no deadline at
+        // all, so the poll loop, push reconciler and backfill runner kept
+        // driving that folder at full cadence and re-earned the 429. The
+        // synthetic `Mailbox { .. }` shape is built only by tests.
         ThrottleScope::Mailbox => match error.scope() {
             Some(ErrorScope::Mailbox { id }) => Some(ThrottleKey::Mailbox {
                 account: account.clone(),
                 mailbox: id.clone(),
+            }),
+            Some(ErrorScope::Cursor(CursorScope::Folder(folder))) => Some(ThrottleKey::Mailbox {
+                account: account.clone(),
+                mailbox: bifrost_types::MailboxId(folder.0.clone()),
             }),
             _ => None,
         },
@@ -869,6 +885,36 @@ mod tests {
         assert_eq!(
             resolve_throttle_key(ThrottleScope::Provider, &account, &provider_err),
             Some(ThrottleKey::Provider(Provider::Microsoft))
+        );
+    }
+
+    /// The shape production actually produces.
+    ///
+    /// The test above builds `ErrorScope::Mailbox { .. }`, which only tests
+    /// construct: IMAP's `with_mailbox` is annotated production-dead, and every
+    /// real folder producer goes through `with_folder_scope`, yielding
+    /// `Cursor(Folder(_))`. IMAP's `mailbox_throttle` is the only production
+    /// emitter of `ThrottleScope::Mailbox` anywhere in the workspace and it
+    /// fires for both shapes, so a reader accepting only the synthetic one
+    /// degraded on every real per-folder throttle and on none of the tested
+    /// ones - the bucket entry was simply never recorded.
+    #[test]
+    fn a_folder_scoped_throttle_keys_the_mailbox_bucket() {
+        let account = AccountId("a".into());
+        let folder_err = throttled_error(
+            Some(ErrorScope::Cursor(CursorScope::Folder(
+                bifrost_types::FolderId("INBOX/shared".into()),
+            ))),
+            None,
+        );
+        assert_eq!(
+            resolve_throttle_key(ThrottleScope::Mailbox, &account, &folder_err),
+            Some(ThrottleKey::Mailbox {
+                account,
+                mailbox: MailboxId("INBOX/shared".into()),
+            }),
+            "a folder-scoped per-mailbox throttle must record a mailbox bucket \
+             entry, not fall through to no entry at all"
         );
     }
 
