@@ -28,8 +28,13 @@ pub(crate) struct CalDavAccount {
     client: Arc<CalDavClient>,
     capabilities: AccountCapabilities,
     calendar_home: String,
-    default_calendar_url: String,
-    calendar_urls: Vec<String>,
+    /// The collection a call that names no calendar routes to, and `None` when
+    /// the home enumerated no collections.
+    ///
+    /// Deliberately not the calendar home in that case. See
+    /// `no_default_calendar`.
+    pub(crate) default_calendar_url: Option<String>,
+    pub(crate) calendar_urls: Vec<String>,
     rsvp_email: Option<String>,
     schedule_outbox_url: Option<String>,
 }
@@ -45,6 +50,23 @@ impl CalDavAccount {
         Self::for_tests_with_collections(client, default_calendar_url, Vec::new())
     }
 
+    /// An account whose calendar home enumerated no collections.
+    ///
+    /// The shape `open` produces against an empty backend: no default, and no
+    /// discovered collection to fall back on.
+    #[cfg(test)]
+    pub(crate) fn for_tests_without_collections(client: Arc<CalDavClient>, home: &str) -> Self {
+        Self {
+            client,
+            capabilities: crate::capabilities::caldav_capabilities(false),
+            calendar_home: home.to_string(),
+            default_calendar_url: None,
+            calendar_urls: Vec::new(),
+            rsvp_email: None,
+            schedule_outbox_url: None,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn for_tests_with_collections(
         client: Arc<CalDavClient>,
@@ -55,7 +77,7 @@ impl CalDavAccount {
             client,
             capabilities: crate::capabilities::caldav_capabilities(false),
             calendar_home: default_calendar_url.to_string(),
-            default_calendar_url: default_calendar_url.to_string(),
+            default_calendar_url: Some(default_calendar_url.to_string()),
             calendar_urls: std::iter::once(default_calendar_url.to_string())
                 .chain(additional_calendar_urls.iter().cloned())
                 .collect(),
@@ -68,9 +90,22 @@ impl CalDavAccount {
         _account_id: AccountId,
         config: CalDavConfig,
     ) -> Result<Self, AccountError> {
-        let mut client = CalDavClient::new(&config)?;
+        let client = CalDavClient::new(&config)?;
+        Self::open_with_client(client, rsvp_email_from_config(&config)).await
+    }
+
+    /// The whole of `open` after the client exists.
+    ///
+    /// Split out so the discovery-to-account path can be driven against a
+    /// scripted transport: `open` itself builds its client from a `CalDavConfig`
+    /// and so cannot take one. Everything `open` decides - the default
+    /// collection, the cursor-scope set, the RSVP capability - is decided here.
+    pub(crate) async fn open_with_client(
+        mut client: CalDavClient,
+        configured_rsvp_email: Option<String>,
+    ) -> Result<Self, AccountError> {
         let discovery = client.discover_account().await?;
-        let rsvp_email = rsvp_email_from_config(&config).or(discovery.calendar_user_email);
+        let rsvp_email = configured_rsvp_email.or(discovery.calendar_user_email);
         let schedule_outbox_url = discovery.schedule_outbox_url;
         client.admit_discovered_urls(
             std::iter::once(discovery.calendar_home.clone())
@@ -85,10 +120,7 @@ impl CalDavAccount {
             scheduling_available(rsvp_email.as_deref(), schedule_outbox_url.as_deref());
         let calendar_home = discovery.calendar_home;
         let collections = client.list_calendars(&calendar_home).await?;
-        let default_calendar_url = collections
-            .first()
-            .map(|collection| collection.href.clone())
-            .unwrap_or_else(|| client.resolve_url(&calendar_home));
+        let default_calendar_url = default_collection_url(&collections);
         let calendar_urls = discovered_collection_urls(&collections);
         Ok(Self {
             client: Arc::new(client),
@@ -103,13 +135,16 @@ impl CalDavAccount {
 
     fn calendar_url(
         client: &CalDavClient,
-        default_calendar_url: &str,
+        default_calendar_url: Option<&str>,
         calendar: Option<CalendarId>,
-    ) -> String {
+        operation: AccountOperation,
+    ) -> Result<String, AccountError> {
         if let Some(id) = calendar {
-            return client.resolve_url(&id.0);
+            return Ok(client.resolve_url(&id.0));
         }
-        default_calendar_url.to_string()
+        default_calendar_url
+            .map(str::to_string)
+            .ok_or_else(|| no_default_calendar(operation))
     }
 
     fn map_calendar(collection: CalendarCollection) -> Calendar {
@@ -138,16 +173,21 @@ impl CalDavAccount {
 
     async fn fetch_event_from_url(
         client: Arc<CalDavClient>,
-        default_calendar_url: String,
+        default_calendar_url: Option<String>,
         calendar: Option<CalendarId>,
         event: EventId,
         operation: AccountOperation,
     ) -> Result<CalendarEvent, AccountError> {
         let url = client.resolve_url(&event.0);
-        let calendar_url = calendar.map_or_else(
-            || event_calendar_url(&url).unwrap_or(default_calendar_url),
-            |calendar| client.resolve_url(&calendar.0),
-        );
+        // The event's own collection is the first answer and almost always
+        // available; the default is only reached for a native id whose parent
+        // cannot be derived, and an account with no collections has none.
+        let calendar_url = match calendar {
+            Some(calendar) => client.resolve_url(&calendar.0),
+            None => event_calendar_url(&url)
+                .or(default_calendar_url)
+                .ok_or_else(|| no_default_calendar(operation))?,
+        };
         let fetched = client.get_event(&url, operation).await.map_err(|error| {
             error
                 .clone()
@@ -261,7 +301,7 @@ impl Account for CalDavAccount {
             validate_event_scope(&scope, AccountOperation::EstablishCursor)?;
             let calendar = collection_url_for_scope(
                 &scope,
-                &default_calendar,
+                default_calendar.as_deref(),
                 &calendar_urls,
                 AccountOperation::EstablishCursor,
             )?;
@@ -286,7 +326,7 @@ impl Account for CalDavAccount {
         let coverage_scope = scope.clone();
         let coverage_domain = collection_coverage_domain(
             coverage_scope,
-            scope_collection_url(&scope, &default_calendar),
+            scope_collection_url(&scope, default_calendar.as_deref()),
         );
         // COMPLETE coverage is an accurate claim here: this walk terminates
         // wholesale on any failure, so it never advances a checkpoint across a
@@ -301,7 +341,7 @@ impl Account for CalDavAccount {
                 }
                 let calendar = match collection_url_for_scope(
                     &scope,
-                    &default_calendar,
+                    default_calendar.as_deref(),
                     &calendar_urls,
                     AccountOperation::SyncInventory,
                 ) {
@@ -856,9 +896,10 @@ impl Account for CalDavAccount {
         Box::pin(async move {
             let calendar_url = Self::calendar_url(
                 &client,
-                &default_calendar_url,
+                default_calendar_url.as_deref(),
                 Some(event.calendar_id.clone()),
-            );
+                AccountOperation::EventCreate,
+            )?;
             let uid = new_uid();
             let path = format!("{uid}.ics");
             let url = append_path(&calendar_url, &path);
@@ -1020,8 +1061,12 @@ impl Account for CalDavAccount {
                 request.page_cursor.clone(),
                 AccountOperation::EventSearch,
             )?;
-            let calendar_url =
-                Self::calendar_url(&client, &default_calendar_url, request.calendar_id);
+            let calendar_url = Self::calendar_url(
+                &client,
+                default_calendar_url.as_deref(),
+                request.calendar_id,
+                AccountOperation::EventSearch,
+            )?;
             let needle = request.query.to_lowercase();
             let fetched = if needle.is_empty() {
                 // The match-all path lists first, then multigets. Both
@@ -1397,14 +1442,45 @@ fn discovered_collection_urls(collections: &[crate::parse::CalendarCollection]) 
         .collect()
 }
 
+/// A call that names no calendar cannot be routed, because the calendar home
+/// enumerated no collections.
+///
+/// The alternative - falling back to the calendar home URL - is what this
+/// replaces. The home is not itself a collection in that case (`list_calendars`
+/// already returns the home when it genuinely is one, so an empty result means
+/// an empty backend), so every such request went to a resource a spec-correct
+/// server 404s, and reported it as a remote failure rather than as the local
+/// routing failure it is. It also contradicted the empty-home contract
+/// `calendars_list` is pinned to.
+fn no_default_calendar(operation: AccountOperation) -> AccountError {
+    local_error(
+        operation,
+        "CalDAV account has no calendar collection to route a call that names none",
+    )
+}
+
+/// The collection a call that names no calendar routes to: the first
+/// discovered one, and `None` when the home enumerated none.
+///
+/// Deliberately has no access to the calendar home, so the fallback this
+/// replaced cannot be reintroduced here without also changing the signature.
+/// See `no_default_calendar` for why the home is the wrong answer.
+fn default_collection_url(collections: &[crate::parse::CalendarCollection]) -> Option<String> {
+    collections
+        .first()
+        .map(|collection| collection.href.clone())
+}
+
 fn collection_url_for_scope(
     scope: &CursorScope,
-    default_url: &str,
+    default_url: Option<&str>,
     collection_urls: &[String],
     operation: AccountOperation,
 ) -> Result<String, AccountError> {
     match scope {
-        CursorScope::Type(ObjectType::CalendarEvent) => Ok(default_url.to_string()),
+        CursorScope::Type(ObjectType::CalendarEvent) => default_url
+            .map(str::to_string)
+            .ok_or_else(|| no_default_calendar(operation)),
         CursorScope::Folder(folder) if collection_urls.contains(&folder.0) => Ok(folder.0.clone()),
         _ => Err(local_error(
             operation,
@@ -1413,21 +1489,26 @@ fn collection_url_for_scope(
     }
 }
 
-fn scope_collection_url<'a>(scope: &'a CursorScope, default_url: &'a str) -> &'a str {
+fn scope_collection_url<'a>(
+    scope: &'a CursorScope,
+    default_url: Option<&'a str>,
+) -> Option<&'a str> {
     match scope {
-        CursorScope::Folder(folder) => &folder.0,
+        CursorScope::Folder(folder) => Some(&folder.0),
         _ => default_url,
     }
 }
 
-fn collection_coverage_domain(scope: CursorScope, collection_url: &str) -> CoverageDomain {
+fn collection_coverage_domain(scope: CursorScope, collection_url: Option<&str>) -> CoverageDomain {
     match scope {
         CursorScope::Folder(_) => CoverageDomain::full(scope),
+        // An unroutable legacy scope still needs a domain to carry the
+        // terminating stream; the walk fails before the region is read.
         _ => CoverageDomain {
             scope,
             coordinate: CoverageCoordinate::ProviderRegion {
                 namespace: "caldav".to_string(),
-                region: collection_url.as_bytes().to_vec(),
+                region: collection_url.unwrap_or_default().as_bytes().to_vec(),
             },
             snapshot: SnapshotIdentity::unstable(),
         },
@@ -1919,6 +2000,27 @@ mod tests {
     #[test]
     fn an_empty_home_produces_no_cursor_scope_collections() {
         assert!(discovered_collection_urls(&[]).is_empty());
+    }
+
+    /// An empty home leaves the account with NO default calendar, rather than
+    /// the calendar home standing in for one.
+    ///
+    /// This is the `open`-side half of
+    /// `an_empty_backend_refuses_collection_less_calls_before_the_wire`, which
+    /// pins what a `None` default does but constructs it directly. Without this
+    /// assertion, restoring the home fallback here would leave that test
+    /// passing. Twin of the CardDAV assertion; keep them in step.
+    #[test]
+    fn an_empty_home_leaves_no_default_calendar() {
+        assert_eq!(default_collection_url(&[]), None);
+        assert_eq!(
+            default_collection_url(&[
+                collection("https://dav.example.test/cal/work/"),
+                collection("https://dav.example.test/cal/personal/"),
+            ])
+            .as_deref(),
+            Some("https://dav.example.test/cal/work/")
+        );
     }
 
     #[test]

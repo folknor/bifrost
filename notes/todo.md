@@ -732,45 +732,6 @@ confirm against the code before working any of them.
 
 ### Fenced for the repository owner (published surface)
 
-- **dav-B2. Cursor sync only ever covers one collection.** [C1] **Partly
-  addressed 2026-08-23; the model fix itself is still open and still fenced.**
-  `establish_initial_cursor` / `inventory_stream` / `changes_stream` all read
-  `default_calendar_url` (CalDAV) or `default_addressbook_url` (CardDAV), and
-  `discover_cursor_scopes` yields a single `CursorScope::Type(CalendarEvent)` /
-  `Type(Contact)`. An account with three calendars enumerates all three in
-  `calendars_list` but syncs only the first: objects in the others never appear
-  in inventory or changes and never get an update or a delete. Note the PIM
-  primitives are unaffected - they route by the caller's `calendar_id` /
-  `address_book_id`, and `event_get` derives the collection from the event's own
-  URL - so it is specifically SYNC that is single-collection.
-
-  What landed: the uncovered collections are now reported at open as
-  `SkippedScope` entries (`ErrorScope::Calendar`/`Contact` plus an
-  `Unsupported(DiscoverCursorScopes)` error), in both crates and through
-  `bifrost-imap`'s composed path, which previously discarded a successful DAV
-  open's skip lane outright. That removes the "looks complete, silently is not"
-  trap without touching the cursor model.
-
-  What remains: the honest model is a `CursorScope::Folder(href)` per
-  collection, so every calendar and address book actually syncs. That reshapes
-  the published cursor model and the stored envelope, forces an envelope bump,
-  and costs every DAV account a second full re-sync (after the v1 -> v2 href
-  correction). Owner's call. It must land in both crates together or it becomes
-  another drift entry.
-- **dav-B10. `default_*_url` falls back to the collection home.** [C2] Split out
-  of dav-B3, whose list-side phantom was removed 2026-08-23. This is the
-  symmetric half and it is present in BOTH crates: when discovery finds zero
-  collections, `default_calendar_url` / `default_addressbook_url` fall back to
-  `client.resolve_url(&home)`, so the cursor, inventory and changes lanes target
-  the home collection - the same phantom by another name, one layer down. A
-  spec-correct server 404s those queries.
-
-  It is not simply removable the way the list phantom was: the field is not an
-  `Option`, and the lanes need an answer for "no collection exists". The likely
-  shape is an open-time `SkippedScope` (the machinery now exists, see dav-B2)
-  plus empty inventory and change streams, which is enough design to deserve its
-  own decision rather than riding along with a one-line deletion. Fix both
-  crates together.
 - **dav-B11. Implement cross-collection moves in the DAV crates.** [C4, feature]
   Split out of dav-B4, whose silent-drop half was fixed 2026-08-23: CalDAV now
   refuses a cross-calendar `event_update` the way CardDAV already refused a

@@ -297,6 +297,27 @@ the fallback for PIM calls that omit an address book and for legacy type-scoped
 cursor calls; it no longer limits discovered sync coverage. Standalone and
 IMAP-composed opens consequently have no collection-limit skip entries.
 
+The default is `Option<String>`, and it is `None` when the addressbook home
+enumerated no collections. It is deliberately NOT the addressbook home in that
+case, for the reasons `reference/caldav.md` gives for its twin: an empty walk
+means an empty backend, and addressing the home would send every
+collection-less call to a resource a spec-correct server 404s. A call that names
+no address book against such an account fails locally with `Request(Malformed)`
+-> `ClientBug` before any I/O.
+
+Only the doors taking an `Option<AddressBookId>` reach the default at all -
+`contacts_list`, `contact_create` and `contact_search`. `contact_get` and
+`contact_update` derive the collection from the resource's own URL via
+`bifrost_net::url::parent_collection_url`, which answers for every id that
+resolves absolute, so their fallback to the default is unreachable in practice
+and kept only as a total match arm.
+
+`open` delegates to `open_with_client` so the whole discovery-to-account path
+can be driven against a scripted transport. Both halves are pinned -
+`an_empty_home_leaves_no_default_address_book` and
+`an_empty_discovery_opens_an_account_with_no_default_address_book`, the latter
+being the one that bites if the home fallback is reintroduced at the call site.
+
 Multi-leg addressbook multiget and the eight property-specific text-search
 REPORTs are dispatched concurrently, bounded to `MULTIGET_LEG_CONCURRENCY`
 in-flight legs and dispatched in order, for the reasons given in

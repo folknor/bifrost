@@ -1406,6 +1406,81 @@ mod tests {
         );
     }
 
+    /// A discovery that enumerates no address books leaves the OPENED account
+    /// with no default, rather than the addressbook home standing in for one.
+    ///
+    /// Drives the real discovery-to-account path, so it bites where a pure test
+    /// of the selection helper cannot: reintroducing the old
+    /// `unwrap_or_else(|| resolve_url(&home))` at the `open` call site is
+    /// invisible to a test that constructs the `None` itself. Twin of the
+    /// CalDAV assertion; keep them in step.
+    #[tokio::test]
+    async fn an_empty_discovery_opens_an_account_with_no_default_address_book() {
+        let script = discovery_script("/books/ada/");
+        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
+        let client = CardDavClient::with_transport("https://dav.example.test", transport);
+
+        let account = crate::account::CardDavAccount::open_with_client(client)
+            .await
+            .expect("discovery succeeds against an empty backend");
+
+        assert_eq!(
+            account.default_addressbook_url, None,
+            "an empty addressbook home must leave no default, not the home itself"
+        );
+        assert!(
+            account.addressbook_urls.is_empty(),
+            "an empty addressbook home advertises no collections"
+        );
+    }
+
+    /// An empty backend refuses a collection-less call locally instead of
+    /// addressing the addressbook home.
+    ///
+    /// Twin of `bifrost-caldav`'s
+    /// `an_empty_backend_refuses_collection_less_calls_before_the_wire`; keep
+    /// them in step. The home is not a collection when the walk came back empty
+    /// (`list_addressbooks` returns the home itself when it genuinely is one),
+    /// so the old `unwrap_or_else(|| resolve_url(&home))` default sent every one
+    /// of these to a resource a spec-correct server 404s - reporting a local
+    /// routing failure as a remote `NotFound`. The empty script is the bite:
+    /// restore the fallback and these calls reach the transport and panic on
+    /// exhaustion rather than failing quietly.
+    #[tokio::test]
+    async fn an_empty_backend_refuses_collection_less_calls_before_the_wire() {
+        use bifrost_types::account::Account as _;
+
+        let script = ScriptedDavTransport::new([]);
+        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
+        let client = Arc::new(CardDavClient::with_transport(
+            "https://dav.example.test",
+            transport,
+        ));
+        let account = crate::account::CardDavAccount::for_tests_without_collections(
+            client,
+            "https://dav.example.test/books/",
+        );
+
+        account
+            .contacts_list(None, None)
+            .await
+            .expect_err("a listing naming no address book has nothing to list");
+        account
+            .contact_create(bifrost_types::ContactCreate::default())
+            .await
+            .expect_err("a create naming no address book has nowhere to write");
+        // Only the doors taking an `Option<AddressBookId>` route through the
+        // default. `contact_get` / `contact_update` derive the collection from
+        // the resource's own URL, and `bifrost_net::url::parent_collection_url`
+        // answers for every id that resolves absolute, so their fallback is
+        // unreachable in practice.
+
+        assert!(
+            script.requests().is_empty(),
+            "an unroutable call must reach no transport at all"
+        );
+    }
+
     #[tokio::test]
     async fn discovery_falls_back_to_base_after_empty_well_known_response() {
         let response = |body: &str| DavResponse {

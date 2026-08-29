@@ -41,8 +41,13 @@ pub(crate) struct CardDavAccount {
     client: Arc<CardDavClient>,
     capabilities: AccountCapabilities,
     addressbook_home: String,
-    default_addressbook_url: String,
-    addressbook_urls: Vec<String>,
+    /// The collection a call that names no address book routes to, and `None`
+    /// when the home enumerated no collections.
+    ///
+    /// Deliberately not the addressbook home in that case. See
+    /// `no_default_addressbook`.
+    pub(crate) default_addressbook_url: Option<String>,
+    pub(crate) addressbook_urls: Vec<String>,
 }
 
 impl CardDavAccount {
@@ -56,8 +61,23 @@ impl CardDavAccount {
             client,
             capabilities: carddav_capabilities(),
             addressbook_home: addressbook_home.to_string(),
-            default_addressbook_url: addressbook_home.to_string(),
+            default_addressbook_url: Some(addressbook_home.to_string()),
             addressbook_urls: vec![addressbook_home.to_string()],
+        }
+    }
+
+    /// An account whose addressbook home enumerated no collections.
+    ///
+    /// The shape `open` produces against an empty backend: no default, and no
+    /// discovered collection to fall back on.
+    #[cfg(test)]
+    pub(crate) fn for_tests_without_collections(client: Arc<CardDavClient>, home: &str) -> Self {
+        Self {
+            client,
+            capabilities: carddav_capabilities(),
+            addressbook_home: home.to_string(),
+            default_addressbook_url: None,
+            addressbook_urls: Vec::new(),
         }
     }
 
@@ -65,14 +85,21 @@ impl CardDavAccount {
         _account_id: AccountId,
         config: CardDavConfig,
     ) -> Result<Self, AccountError> {
-        let mut client = CardDavClient::new(&config)?;
+        let client = CardDavClient::new(&config)?;
+        Self::open_with_client(client).await
+    }
+
+    /// The whole of `open` after the client exists.
+    ///
+    /// Split out so the discovery-to-account path can be driven against a
+    /// scripted transport: `open` itself builds its client from a
+    /// `CardDavConfig` and so cannot take one. Twin of
+    /// `bifrost-caldav`'s `open_with_client`.
+    pub(crate) async fn open_with_client(mut client: CardDavClient) -> Result<Self, AccountError> {
         let addressbook_home = client.discover_addressbook_home().await?;
         client.admit_discovered_urls(std::iter::once(addressbook_home.clone()));
         let collections = client.list_addressbooks(&addressbook_home).await?;
-        let default_addressbook_url = collections
-            .first()
-            .map(|collection| collection.href.clone())
-            .unwrap_or_else(|| client.resolve_url(&addressbook_home));
+        let default_addressbook_url = default_collection_url(&collections);
         let addressbook_urls = discovered_collection_urls(&collections);
         Ok(Self {
             client: Arc::new(client),
@@ -85,13 +112,16 @@ impl CardDavAccount {
 
     fn addressbook_url(
         client: &CardDavClient,
-        default_addressbook_url: &str,
+        default_addressbook_url: Option<&str>,
         address_book: Option<AddressBookId>,
-    ) -> String {
+        operation: AccountOperation,
+    ) -> Result<String, AccountError> {
         if let Some(id) = address_book {
-            return client.resolve_url(&id.0);
+            return Ok(client.resolve_url(&id.0));
         }
-        default_addressbook_url.to_string()
+        default_addressbook_url
+            .map(str::to_string)
+            .ok_or_else(|| no_default_addressbook(operation))
     }
 
     fn map_addressbook(collection: AddressBookCollection) -> AddressBook {
@@ -119,15 +149,19 @@ impl CardDavAccount {
 
     async fn fetch_contact_from_url(
         client: Arc<CardDavClient>,
-        default_addressbook_url: String,
+        default_addressbook_url: Option<String>,
         address_book: Option<AddressBookId>,
         contact: ContactId,
         operation: AccountOperation,
     ) -> Result<ContactCard, AccountError> {
-        let addressbook = if let Some(address_book) = address_book {
-            client.resolve_url(&address_book.0)
-        } else {
-            contact_addressbook_url(&client, &contact).unwrap_or(default_addressbook_url)
+        // The contact's own collection is the first answer and almost always
+        // available; the default is only reached for a native id whose parent
+        // cannot be derived, and an account with no collections has none.
+        let addressbook = match address_book {
+            Some(address_book) => client.resolve_url(&address_book.0),
+            None => contact_addressbook_url(&client, &contact)
+                .or(default_addressbook_url)
+                .ok_or_else(|| no_default_addressbook(operation))?,
         };
         let card = Self::fetch_contact_resource(&client, &addressbook, &contact, operation).await?;
         contact_from_vcard(
@@ -168,11 +202,12 @@ impl CardDavAccount {
 
     async fn hydrated_contacts(
         client: &CardDavClient,
-        default_addressbook_url: &str,
+        default_addressbook_url: Option<&str>,
         address_book: Option<AddressBookId>,
         operation: AccountOperation,
     ) -> Result<SearchedContacts, AccountError> {
-        let addressbook = Self::addressbook_url(client, default_addressbook_url, address_book);
+        let addressbook =
+            Self::addressbook_url(client, default_addressbook_url, address_book, operation)?;
         let listing = client
             .list_contacts_listing(&addressbook, operation)
             .await?;
@@ -197,11 +232,13 @@ impl CardDavAccount {
 
     async fn searched_contacts(
         client: &CardDavClient,
-        default_addressbook_url: &str,
+        default_addressbook_url: Option<&str>,
         address_book: Option<AddressBookId>,
         query: &str,
+        operation: AccountOperation,
     ) -> Result<SearchedContacts, AccountError> {
-        let addressbook = Self::addressbook_url(client, default_addressbook_url, address_book);
+        let addressbook =
+            Self::addressbook_url(client, default_addressbook_url, address_book, operation)?;
         let mut seen = HashSet::new();
         let fetch = client.query_vcards_text(&addressbook, query).await?;
         let skipped_scopes = skipped_addressbook_scope(fetch.degraded);
@@ -222,13 +259,14 @@ impl CardDavAccount {
 
     async fn hydrated_contacts_page(
         client: &CardDavClient,
-        default_addressbook_url: &str,
+        default_addressbook_url: Option<&str>,
         address_book: Option<AddressBookId>,
         offset: usize,
         page_size: usize,
         operation: AccountOperation,
     ) -> Result<Page<ContactCard>, AccountError> {
-        let addressbook = Self::addressbook_url(client, default_addressbook_url, address_book);
+        let addressbook =
+            Self::addressbook_url(client, default_addressbook_url, address_book, operation)?;
         let listing = client
             .list_contacts_listing(&addressbook, operation)
             .await?;
@@ -377,7 +415,7 @@ impl Account for CardDavAccount {
             validate_contact_scope(&scope, AccountOperation::EstablishCursor)?;
             let addressbook = collection_url_for_scope(
                 &scope,
-                &default_addressbook,
+                default_addressbook.as_deref(),
                 &addressbook_urls,
                 AccountOperation::EstablishCursor,
             )?;
@@ -402,7 +440,7 @@ impl Account for CardDavAccount {
         let coverage_scope = scope.clone();
         let coverage_domain = collection_coverage_domain(
             coverage_scope,
-            scope_collection_url(&scope, &default_addressbook),
+            scope_collection_url(&scope, default_addressbook.as_deref()),
         );
         // COMPLETE coverage is accurate here: the walk terminates wholesale on
         // any failure, so it never advances a checkpoint across a gap.
@@ -416,7 +454,7 @@ impl Account for CardDavAccount {
                 }
                 let addressbook = match collection_url_for_scope(
                     &scope,
-                    &default_addressbook,
+                    default_addressbook.as_deref(),
                     &addressbook_urls,
                     AccountOperation::SyncInventory,
                 ) {
@@ -913,7 +951,7 @@ impl Account for CardDavAccount {
             let offset = decode_offset_cursor(page_cursor, AccountOperation::ContactsList)?;
             Self::hydrated_contacts_page(
                 &client,
-                &default_addressbook_url,
+                default_addressbook_url.as_deref(),
                 address_book,
                 offset,
                 CONTACT_PAGE_SIZE,
@@ -947,9 +985,10 @@ impl Account for CardDavAccount {
         Box::pin(async move {
             let addressbook = Self::addressbook_url(
                 &client,
-                &default_addressbook_url,
+                default_addressbook_url.as_deref(),
                 contact.address_book_id.clone(),
-            );
+                AccountOperation::ContactCreate,
+            )?;
             let id = format!("{}.vcf", Uuid::new_v4());
             let url = append_path(&addressbook, &id);
             let data = vcard_from_create(&contact, &id);
@@ -973,9 +1012,17 @@ impl Account for CardDavAccount {
         let client = Arc::clone(&self.client);
         let default_addressbook_url = self.default_addressbook_url.clone();
         Box::pin(async move {
-            let addressbook = contact_addressbook_url(&client, &contact).unwrap_or(
-                Self::addressbook_url(&client, &default_addressbook_url, None),
-            );
+            // The contact's own collection is the first answer; the default is
+            // only reached for a native id whose parent cannot be derived.
+            let addressbook = match contact_addressbook_url(&client, &contact) {
+                Some(addressbook) => addressbook,
+                None => Self::addressbook_url(
+                    &client,
+                    default_addressbook_url.as_deref(),
+                    None,
+                    AccountOperation::ContactUpdate,
+                )?,
+            };
             if let Some(target) = patch.address_book_id.as_ref() {
                 let target = client.resolve_url(&target.0);
                 if !same_collection_url(&target, &addressbook) {
@@ -1037,7 +1084,7 @@ impl Account for CardDavAccount {
             let searched = if needle.is_empty() {
                 Self::hydrated_contacts(
                     &client,
-                    &default_addressbook_url,
+                    default_addressbook_url.as_deref(),
                     request.address_book_id.clone(),
                     AccountOperation::ContactSearch,
                 )
@@ -1045,9 +1092,10 @@ impl Account for CardDavAccount {
             } else {
                 Self::searched_contacts(
                     &client,
-                    &default_addressbook_url,
+                    default_addressbook_url.as_deref(),
                     request.address_book_id.clone(),
                     &request.query,
+                    AccountOperation::ContactSearch,
                 )
                 .await?
             };
@@ -1291,14 +1339,46 @@ fn discovered_collection_urls(collections: &[AddressBookCollection]) -> Vec<Stri
         .collect()
 }
 
+/// A call that names no address book cannot be routed, because the addressbook
+/// home enumerated no collections.
+///
+/// The alternative - falling back to the addressbook home URL - is what this
+/// replaces. The home is not itself a collection in that case
+/// (`list_addressbooks` already returns the home when it genuinely is one, so
+/// an empty result means an empty backend), so every such request went to a
+/// resource a spec-correct server 404s, and reported it as a remote failure
+/// rather than as the local routing failure it is. It also contradicted the
+/// empty-home contract `address_books_list` is pinned to. Twin of
+/// `bifrost-caldav`'s `no_default_calendar`.
+fn no_default_addressbook(operation: AccountOperation) -> AccountError {
+    local_error(
+        operation,
+        "CardDAV account has no address book collection to route a call that names none",
+    )
+}
+
+/// The collection a call that names no address book routes to: the first
+/// discovered one, and `None` when the home enumerated none.
+///
+/// Deliberately has no access to the addressbook home, so the fallback this
+/// replaced cannot be reintroduced here without also changing the signature.
+/// See `no_default_addressbook` for why the home is the wrong answer.
+fn default_collection_url(collections: &[AddressBookCollection]) -> Option<String> {
+    collections
+        .first()
+        .map(|collection| collection.href.clone())
+}
+
 fn collection_url_for_scope(
     scope: &CursorScope,
-    default_url: &str,
+    default_url: Option<&str>,
     collection_urls: &[String],
     operation: AccountOperation,
 ) -> Result<String, AccountError> {
     match scope {
-        CursorScope::Type(ObjectType::Contact) => Ok(default_url.to_string()),
+        CursorScope::Type(ObjectType::Contact) => default_url
+            .map(str::to_string)
+            .ok_or_else(|| no_default_addressbook(operation)),
         CursorScope::Folder(folder) if collection_urls.contains(&folder.0) => Ok(folder.0.clone()),
         _ => Err(local_error(
             operation,
@@ -1307,24 +1387,29 @@ fn collection_url_for_scope(
     }
 }
 
-fn scope_collection_url<'a>(scope: &'a CursorScope, default_url: &'a str) -> &'a str {
+fn scope_collection_url<'a>(
+    scope: &'a CursorScope,
+    default_url: Option<&'a str>,
+) -> Option<&'a str> {
     match scope {
-        CursorScope::Folder(folder) => &folder.0,
+        CursorScope::Folder(folder) => Some(&folder.0),
         _ => default_url,
     }
 }
 
 fn collection_coverage_domain(
     scope: CursorScope,
-    collection_url: &str,
+    collection_url: Option<&str>,
 ) -> bifrost_types::CoverageDomain {
     match scope {
         CursorScope::Folder(_) => bifrost_types::CoverageDomain::full(scope),
+        // An unroutable legacy scope still needs a domain to carry the
+        // terminating stream; the walk fails before the region is read.
         _ => bifrost_types::CoverageDomain {
             scope,
             coordinate: bifrost_types::CoverageCoordinate::ProviderRegion {
                 namespace: "carddav".to_string(),
-                region: collection_url.as_bytes().to_vec(),
+                region: collection_url.unwrap_or_default().as_bytes().to_vec(),
             },
             snapshot: bifrost_types::SnapshotIdentity::unstable(),
         },
@@ -1810,6 +1895,27 @@ mod tests {
         assert!(discovered_collection_urls(&[]).is_empty());
     }
 
+    /// An empty home leaves the account with NO default address book, rather
+    /// than the addressbook home standing in for one.
+    ///
+    /// This is the `open`-side half of
+    /// `an_empty_backend_refuses_collection_less_calls_before_the_wire`, which
+    /// pins what a `None` default does but constructs it directly. Without this
+    /// assertion, restoring the home fallback here would leave that test
+    /// passing. Twin of the CalDAV assertion; keep them in step.
+    #[test]
+    fn an_empty_home_leaves_no_default_address_book() {
+        assert_eq!(default_collection_url(&[]), None);
+        assert_eq!(
+            default_collection_url(&[
+                collection("https://dav.example.test/books/work/"),
+                collection("https://dav.example.test/books/personal/"),
+            ])
+            .as_deref(),
+            Some("https://dav.example.test/books/work/")
+        );
+    }
+
     #[test]
     fn every_discovered_address_book_becomes_a_cursor_scope_collection() {
         assert_eq!(
@@ -1831,7 +1937,7 @@ mod tests {
             client,
             capabilities: carddav_capabilities(),
             addressbook_home: "https://dav.example.test/books/".to_string(),
-            default_addressbook_url: "https://dav.example.test/books/work/".to_string(),
+            default_addressbook_url: Some("https://dav.example.test/books/work/".to_string()),
             addressbook_urls: vec![
                 "https://dav.example.test/books/work/".to_string(),
                 "https://dav.example.test/books/personal/".to_string(),

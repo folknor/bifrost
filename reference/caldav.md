@@ -438,6 +438,30 @@ fallback for PIM calls that omit a calendar and for legacy type-scoped cursor
 calls; it no longer limits discovered sync coverage. Standalone and
 IMAP-composed opens consequently have no collection-limit skip entries.
 
+The default is `Option<String>`, and it is `None` when the calendar home
+enumerated no collections. It is deliberately NOT the calendar home in that
+case: `list_calendars` already returns the home when the home is genuinely a
+calendar collection, so an empty walk means an empty backend, and addressing the
+home would send every collection-less call to a resource a spec-correct server
+404s - reporting a local routing failure as a remote `NotFound`, and
+contradicting the empty-home contract `calendars_list` is pinned to. A call that
+names no calendar against such an account fails locally with
+`Request(Malformed)` -> `ClientBug` before any I/O.
+
+Only the doors taking an `Option<CalendarId>` reach the default at all -
+`event_search`, `event_create` and the legacy type-scoped cursor calls.
+`event_get`, `event_update` and `event_rsvp` derive the collection from the
+resource's own URL via `bifrost_net::url::parent_collection_url`, which answers
+for every id that resolves absolute, so their fallback to the default is
+unreachable in practice and kept only as a total match arm.
+
+`open` delegates to `open_with_client` so the whole discovery-to-account path
+can be driven against a scripted transport; `open` itself builds its client from
+a `CalDavConfig` and so cannot take one. Both halves are pinned - the selection
+by `an_empty_home_leaves_no_default_calendar`, and the opened account by
+`an_empty_discovery_opens_an_account_with_no_default_calendar`, which is the one
+that bites if the home fallback is reintroduced at the call site.
+
 Multi-leg calendar multiget and text-search REPORTs are dispatched
 concurrently, bounded to `MULTIGET_LEG_CONCURRENCY` in-flight legs. The bound
 lives at this call site because the multiget chunk count is input-sized and

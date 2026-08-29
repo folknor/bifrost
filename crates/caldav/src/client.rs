@@ -1516,6 +1516,86 @@ mod tests {
         );
     }
 
+    /// A discovery that enumerates no calendars leaves the OPENED account with
+    /// no default, rather than the calendar home standing in for one.
+    ///
+    /// Drives the real discovery-to-account path, so it bites where a pure test
+    /// of the selection helper cannot: reintroducing the old
+    /// `unwrap_or_else(|| resolve_url(&home))` at the `open` call site is
+    /// invisible to a test that constructs the `None` itself.
+    #[tokio::test]
+    async fn an_empty_discovery_opens_an_account_with_no_default_calendar() {
+        let script = discovery_script("/cal/ada/");
+        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
+        let client = CalDavClient::with_transport("https://dav.example.test", transport);
+
+        let account = crate::account::CalDavAccount::open_with_client(client, None)
+            .await
+            .expect("discovery succeeds against an empty backend");
+
+        assert_eq!(
+            account.default_calendar_url, None,
+            "an empty calendar home must leave no default, not the home itself"
+        );
+        assert!(
+            account.calendar_urls.is_empty(),
+            "an empty calendar home advertises no collections"
+        );
+    }
+
+    /// An empty backend refuses a collection-less call locally instead of
+    /// addressing the calendar home.
+    ///
+    /// The home is not a collection when the walk came back empty
+    /// (`list_calendars` returns the home itself when it genuinely is one), so
+    /// the old `unwrap_or_else(|| resolve_url(&home))` default sent every one
+    /// of these to a resource a spec-correct server 404s - reporting a local
+    /// routing failure as a remote `NotFound`. The empty script is the bite:
+    /// restore the fallback and these calls reach the transport and panic on
+    /// exhaustion rather than failing quietly.
+    #[tokio::test]
+    async fn an_empty_backend_refuses_collection_less_calls_before_the_wire() {
+        use bifrost_types::account::Account as _;
+
+        let script = ScriptedDavTransport::new([]);
+        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
+        let client = Arc::new(CalDavClient::with_transport(
+            "https://dav.example.test",
+            transport,
+        ));
+        let account = crate::account::CalDavAccount::for_tests_without_collections(
+            client,
+            "https://dav.example.test/cal/",
+        );
+
+        account
+            .event_search(bifrost_types::EventSearchRequest::new("standup"))
+            .await
+            .expect_err("a search naming no calendar has nothing to search");
+        // Only the doors taking an `Option<CalendarId>` route through the
+        // default. `event_get` / `event_update` / `event_rsvp` derive the
+        // collection from the resource's own URL, and
+        // `bifrost_net::url::parent_collection_url` answers for every id that
+        // resolves absolute, so their fallback is unreachable in practice.
+
+        let mut scopes = account.discover_cursor_scopes();
+        let mut discovered = Vec::new();
+        while let Some(event) = futures::StreamExt::next(&mut scopes).await {
+            if let bifrost_types::SyncEvent::Batch(batch) = event {
+                discovered.extend(batch.items);
+            }
+        }
+        assert!(
+            discovered.is_empty(),
+            "an empty backend advertises no cursor scope, so none can be established"
+        );
+
+        assert!(
+            script.requests().is_empty(),
+            "an unroutable call must reach no transport at all"
+        );
+    }
+
     /// Every discovered calendar gets an independent cursor scope.
     #[tokio::test]
     async fn every_calendar_is_discovered_as_a_cursor_scope() {
