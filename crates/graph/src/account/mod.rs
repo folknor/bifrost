@@ -3,6 +3,8 @@ mod batch_routing;
 mod blob;
 mod calendar;
 mod capabilities;
+#[cfg(test)]
+mod capability_contract_tests;
 mod categories;
 mod changes;
 mod cloud;

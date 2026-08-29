@@ -3,6 +3,8 @@
 
 mod account;
 mod capabilities;
+#[cfg(test)]
+mod capability_contract_tests;
 mod client;
 mod ical;
 mod parse;

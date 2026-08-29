@@ -1,6 +1,8 @@
 mod blobs;
 mod calendar;
 mod capabilities;
+#[cfg(test)]
+mod capability_contract_tests;
 mod changes;
 mod cloud;
 mod contacts;

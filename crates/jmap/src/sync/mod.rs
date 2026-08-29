@@ -9,6 +9,8 @@ mod account;
 mod blob;
 mod calendar_ops;
 mod capabilities;
+#[cfg(test)]
+mod capability_contract_tests;
 mod changes;
 mod contacts;
 mod discover;

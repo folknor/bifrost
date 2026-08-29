@@ -668,9 +668,104 @@ blocking; each is a real defect or a real decision, not a cleanup.
   measured at 105 and 195 warnings, overwhelmingly legitimate unused
   protocol surface.
 
-  Not scheduled, no blast radius bound yet - sizing is part of the job.
-  Deliverable is a findings list triaged bug / gap / smell / nit, not a
-  fix wave; fixes get scheduled per finding.
+  TELL 2 IS DONE (2026-08-29). Result: two live defects (sweep-2a, sweep-2b
+  below), three bookkeeping items. Thin, but not empty, and both defects are
+  ones a consumer loses something real to. Most cross-crate scope readers
+  already enumerate every variant explicitly rather than falling through, and
+  several carry comments naming the exact hazard - the sweep found the two that
+  do not. The whole of sweep-1 is now closed except the fixes below.
+
+- **sweep-2a (sync + imap, BUG). `resolve_throttle_key` drops the only
+  mailbox identity IMAP produces.** `crates/sync/src/recovery.rs`,
+  the `ThrottleScope::Mailbox` arm, matches only
+  `Some(ErrorScope::Mailbox { id })` and otherwise falls to `_ => None`.
+  But `crates/imap/src/account/error.rs`'s `mailbox_throttle` - the ONLY
+  production emitter of `ThrottleScope::Mailbox` in the workspace - fires for
+  `ErrorScope::Mailbox { .. } | ErrorScope::Cursor(CursorScope::Folder(_))`,
+  and `with_mailbox` is production-dead (annotated as such), so every real
+  folder-scoped `[LIMIT]` arrives carrying `Cursor(Folder(id))`. The engine
+  reads a shape production never builds, records no bucket entry, and
+  `ThrottleKey::Mailbox` is unreachable in production.
+
+  What a consumer loses: a per-folder IMAP throttle produces no shared
+  deadline, so the poll loop, push reconciler, backfill runner and mutation
+  campaigns - all of which gate on `account_throttle_wait` - keep driving that
+  folder at full cadence and re-earn the 429.
+
+  This is the calibration defect one layer up. The IMAP-side fix repaired
+  `id_from_scope` / `mailbox_throttle` and left a comment naming the hazard;
+  nobody checked the engine's reader of the same identity. Its test passes
+  because it builds the synthetic `ErrorScope::Mailbox` shape that only tests
+  construct. NOT a contract contradiction: `reference/sync.md` forbids WIDENING
+  a mailbox throttle when the error names no mailbox - here the error names one.
+
+- **sweep-2b (sync + graph + imap, BUG). Both engine inventory readers
+  discard `InventoryEvent::Warning`.** `backfill/runner.rs` (`run_partition`)
+  and `multiplexer/fusion.rs` (`run_stream` / `run_with_broadcast`) both end
+  `Progress(_) | Warning(_) => {}`, while the neighbouring arm wraps
+  `Terminated` into a `MultiplexerEvent` and sends it on `changes_tx`. The
+  forwarding mechanism is literally the arm next door.
+
+  Two live producers. `crates/graph/src/account/public_folder.rs` yields
+  `InventoryEvent::Warning` for unhandled item classes and for the
+  over-`PUBLIC_FOLDER_LIVE_IDS_CAP` degrade - whose own comment calls it "the
+  documented one-warning-on-degrade contract", and `reference/graph.md`
+  describes the degrade as announced. So a public folder past the cap silently
+  drops to additions-only, deletions stop propagating, and the consumer's
+  stream says nothing.
+
+  `crates/imap/src/account/inventory.rs` is worse than a dropped message: it
+  sends a `StrategyDowngraded` `SyncEvent::Warning` (lifted to
+  `InventoryEvent::Warning` by `bifrost_types::lift_complete_walk`) behind
+  `take_qresync_negotiation_warning`, a ONE-SHOT guarded by an `AtomicBool`
+  shared with the changes path. If the inventory stream reaches it first -
+  which backfill and deferred-inventory both do at attach, racing the
+  multiplexer - the flag is consumed, the engine discards the warning, and the
+  changes path can never re-emit it. The consumer never learns the account is
+  running on a downgraded sync strategy.
+
+  `reference/sync.md` documents which warnings the engine SYNTHESIZES but makes
+  no claim that protocol-emitted inventory warnings are dropped, so this
+  contradicts no contract.
+
+- **sweep-2c (types + sync, gap). `ProtocolSalt` never followed
+  `ProtocolKind::CalDav`.** `mutation/idempotency.rs`'s `default_salt_factory`
+  enumerates Jmap / Gmail / Graph / Imap / CardDav then `_ => ProtocolSalt::Imap`,
+  but `ProtocolKind` carries `CalDav` and caldav is a live account crate. The
+  sibling `CardDav` got a salt variant and CalDAV did not. No observable
+  consequence today - the salt is engine-internal and `IdempotencyKey` is
+  separated by `run_id` plus a monotonic sequence - so it is correct by luck,
+  with a catch-all absorbing a LIVE protocol rather than a hypothetical future
+  one. Closing it adds a variant to a published enum, so it wants owner sign-off.
+
+- **sweep-2d (sync, gap). `HintPayload::SpecificMembership` has no production
+  producer.** `push/reconciler.rs`'s `scopes_for_hint` routes it through
+  `CursorRegistry::scopes_for_membership`, but every push hint built in imap,
+  jmap and graph is `Unknown` or `SpecificCursorScope`. Inverted polarity of the
+  calibration case - the READER arm is dead, not the producer - so nothing is
+  lost and the `Unknown` fallback is safe. Recorded because the membership index
+  carries maintenance cost (reopen rebuild, lifecycle updates, `forget_account`)
+  for one live consumer only, and a future reader could reasonably assume the
+  push path exercises it.
+
+- **sweep-2e (graph, nit). `resource_from_scope` / `id_from_scope` return
+  `None` for `Cursor(_)`.** `account/graph_error.rs` enumerates it explicitly
+  rather than falling through, so it is a decision, not drift - but Graph builds
+  `ErrorScope::Cursor(CursorScope::{Folder,FolderType})` on essentially every
+  changes, inventory, push and public-folder path, so a Graph 403 on a shared or
+  public folder derives `NoPermission { resource: None }` and names no id in the
+  support export, where the same failure on IMAP names the mailbox. Flagged only
+  as an asymmetry with IMAP's reader, which handles both shapes.
+
+- **sweep-2f (sync + google, nit). The mutation campaign drops
+  `SyncEvent::Warning`.** `engine.rs`'s campaign stream reader discards it;
+  `crates/google/src/account/mutation.rs` deliberately interleaves a
+  `StrategyDowngraded` warning ahead of its batch (pinned by three tests) when
+  Gmail cannot represent a requested flag. Same shape as sweep-2b but much lower
+  stakes: `MutationSuccess::Downgraded { actual: FlagsPartiallyApplied { .. } }`
+  is the structural channel and `error-model.md` names it as the one carrying
+  the unsupported flags, so the warning is duplicate signal rather than the only
+  copy.
 
 ## Open items folded in from the bug-hunt ledgers (2026-08-23)
 
@@ -1056,24 +1151,59 @@ backlog. The same category labels and the PUBLISHED SURFACE fence apply.
 
 - **types-B1. `PimMethodSupport` is a hand-maintained mirror of the trait
   surface.** [C3, PUBLISHED SURFACE] `crates/types/src/capabilities.rs`. Sixty
-  bools with no mechanical link to the 94-method `Account` trait: nothing
-  checks that a `false` flag implies `Unsupported`, or that a `true` flag
-  implies it does not. The mirror is already incomplete - `send_raw_message`,
-  `repair_inventory`, `bulk_move_from` and `open_blob_range` have documented
-  gating with no flag, or a flag on a different struct. Six protocol crates x
-  sixty bools is ~360 hand-maintained facts that can each be wrong in a way no
-  test catches, and consumers must consult the mirror AND handle `Unsupported`
-  anyway.
+  bools with no mechanical link to the 94-method `Account` trait. Six protocol
+  crates x sixty bools is ~360 hand-maintained facts that can each be wrong in
+  a way no test catches, and consumers must consult the mirror AND handle
+  `Unsupported` anyway.
 
-  Two shapes, and only the second is actionable without the owner. The
-  rewrite: one runtime query `fn supports(&self, op: AccountOperation) -> bool`
-  defaulted from a per-impl `AccountOperation` set, so the capability answer
-  and the error answer are the same value read twice, and a new trait method
-  defaults to unsupported instead of needing a bool nobody sets. That DELETES
-  a published struct, so it is the owner's call. The keep-it version needs no
-  ruling: a `#[test]` in each protocol crate driving every gated method and
-  asserting the flag agrees with the result. Mechanical to generate, and it
-  would have caught the graph fingerprint split.
+  The keep-it half LANDED 2026-08-29: `capability_contract_tests.rs` in all six
+  protocol crates drives every gated entry point and asserts the flag agrees.
+  Coverage is FALSE-DIRECTION ONLY, by necessity rather than by choice - a
+  `true` flag means the method reaches the network, and the test proves no wire
+  contact by installing a seam that panics if reached (a never-called
+  `DavTransport`, an empty script, a dropped connection half). Each file says so
+  in its own doc comment. jmap is the hardest case and documents it: the
+  `MailAccount = Account<ReqwestTransport>` alias means no scripted seam exists
+  at the `Account` level at all (see `jmap-O2-residual`).
+
+  The REWRITE half is still fenced and still the owner's call: one runtime
+  `fn supports(&self, op: AccountOperation) -> bool` defaulted from a per-impl
+  `AccountOperation` set, so the capability answer and the error answer become
+  the same value read twice, and a new trait method defaults to unsupported
+  instead of needing a bool nobody sets. That DELETES a published struct.
+
+- **types-B1a (imap, bug). Three capability flags do not gate their
+  methods.** Found by the types-B1 tests, which exclude them and name them.
+  `remove_from_container` and `draft_discard` both go `false` without
+  UIDPLUS/IMAP4rev2, and `thread_hydrate` goes `false` without
+  `THREAD=REFERENCES` - but none of the three `pim::` implementations reads its
+  flag. `pim::remove_from_container` and `pim::draft_discard` filter ids and
+  proceed to `delete_messages`; `pim::thread_hydrate` proceeds regardless. A
+  consumer that trusts the capability gets the method attempted anyway against a
+  server that does not support it. Note the pattern EXISTS and these three
+  missed it: `pim::search`, `pim::draft_create` and `pim::quota_get` all read
+  their flag correctly. Fix is to gate the three, then delete their exclusion
+  from `capability_contract_tests.rs`.
+
+- **types-B1b. `send_as` gates a request FIELD, not a method, and the crates
+  disagree.** imap and google reject a `send_as` request with
+  `Unsupported(Send)`; jmap's `route_send_as` answers `Request(Malformed)` for
+  an unknown foreign id and `Unsupported(Send)` only for a known-but-not-
+  submission-capable one. Not asserted anywhere and not expressible in the
+  types-B1 test, which drives methods. Decide whether the uniform answer is
+  worth it, or document the split. Related: c3-2.
+
+- **types-B1c (carddav, smell). Three existing tests assert against a helper,
+  not the account.** `carddav_host_attachment_unsupported`,
+  `carddav_directory_search_unsupported` and
+  `carddav_open_raw_rfc822_unsupported` in `crates/carddav/src/account.rs` call
+  `unsupported_future` / `unsupported_stream` directly and assert those helpers
+  return what they were told to return. They never call the `Account` method, so
+  they pass regardless of what the impl does. A textbook sweep-1 instance that
+  survived the sweep-1 tell-3 pass. The new `capability_contract_tests.rs`
+  covers the same ground for real, so these are now redundant as well as
+  vacuous; deleting them is safe but is a deliberate test deletion, so it wants
+  a nod. Worth checking the other five crates for the same shape.
 
 - **types-B2. `InventoryBatch::checkpoint` cannot express a withheld
   checkpoint.** [C2, PUBLISHED SURFACE] It is `Option<Checkpoint>`, with no way

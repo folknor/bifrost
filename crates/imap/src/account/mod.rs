@@ -31,6 +31,8 @@ use crate::types::{MailboxName, SyncSelectOptions, SyncSelectResult, UidSet, Uid
 
 mod blob;
 mod capabilities;
+#[cfg(test)]
+mod capability_contract_tests;
 mod changes;
 mod close;
 mod envelope;
