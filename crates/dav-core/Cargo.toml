@@ -1,15 +1,12 @@
 [package]
-name = "bifrost-carddav"
-description = "CardDAV Account implementation for bifrost"
+name = "bifrost-dav-core"
+description = "Private shared WebDAV layer for the bifrost CalDAV and CardDAV clients"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-authors.workspace = true
 license.workspace = true
 repository.workspace = true
-homepage = "https://github.com/folknor/bifrost"
-keywords = ["contacts", "carddav", "vcard", "webdav"]
-categories = ["email", "network-programming", "asynchronous"]
+authors.workspace = true
 
 [lib]
 doctest = false
@@ -19,15 +16,10 @@ workspace = true
 
 [dependencies]
 base64 = { workspace = true }
-bifrost-dav-core = { path = "../dav-core" }
 bifrost-net = { path = "../net" }
 bifrost-types = { path = "../types" }
-bytes = { workspace = true }
-caldata = { workspace = true }
 futures = { workspace = true }
-quick-xml = "0.41.0"
 reqwest = { workspace = true, features = ["native-tls"] }
-uuid = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }

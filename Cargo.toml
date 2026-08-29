@@ -2,6 +2,7 @@
 members = [
     "crates/caldav",
     "crates/carddav",
+    "crates/dav-core",
     "crates/google",
     "crates/graph",
     "crates/imap",

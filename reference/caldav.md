@@ -495,6 +495,34 @@ merged report and the surviving degraded error do not depend on completion
 order. Offset continuations still re-run search so each page reflects a
 fresh server observation and carries that observation's failure lanes.
 
+## The shared layer: bifrost-dav-core
+
+The protocol-neutral half of this crate lives in `bifrost-dav-core`, a PRIVATE
+shared crate on the `bifrost-sasl` precedent. Nothing published moved:
+`CalDavConfig`, `CalDavCredentials`, `CalDavAccountFactory` and the `Account`
+impl are exactly what they were, and consumers see no change.
+
+What moved: the `DavTransport` seam and `ReqwestDavTransport`, `DavResponse` /
+`DavBody`, the capped body reader, `settle_body`, `dav_redirect_policy`,
+`url_origin`, `origin_is_secure`, the etag helpers (`response_etag`,
+`normalize_http_etag`, `prepare_if_match`) and `PutCondition`, the whole
+status-to-`AccountError` ladder with its five constructors, and
+`worse_recovery` / `recovery_rank`.
+
+The two dialects differed in exactly three values - the `ResourceKind` a 404 and
+a 403 name, the `Protocol` stamp, and the `field` label on a local argument
+error - so those became a `DavProtocol` parameter, and this crate binds it once
+as `const DAV: DavProtocol = DavProtocol::CalDav`. That binding is load-bearing
+for the crate's entire error surface, so
+`every_error_this_crate_mints_is_stamped_caldav` pins it; ablating the constant
+before that test existed failed exactly one unrelated assertion.
+
+What deliberately did NOT move: `not_found_error` differs between the crates.
+CardDAV's attaches an `ErrorScope` for the contact, CalDAV's
+`missing_event_error` carries the id in the cause instead. That is a real
+behavioural difference, not drift, and flattening it would have changed what
+consumers receive - so both stayed local.
+
 ## This crate and bifrost-carddav are near-duplicates, and drift is the defect
 
 Roughly 1500 lines are hand-mirrored between the two: the `DavTransport` seam

@@ -1,14 +1,13 @@
 use std::fmt;
 use std::sync::Arc;
-use std::time::Duration;
 
 use base64::Engine;
-use bifrost_types::{
-    AccountError, AccountErrorBuilder, AccountErrorKind, AccountFuture, AccountOperation, Cause,
-    DiagnosticText, ErrorScope, Protocol, ProtocolErrorKind, RecoveryClass, RequestCause,
-    RequestErrorKind, ResourceKind, ServerCause, ServerErrorKind, StateCause, TransmissionState,
-    TransportCause, TransportErrorKind, TransportKind, WireCause,
+use bifrost_dav_core::{
+    DAV_CLIENT_TIMEOUT, DavProtocol, ReqwestDavTransport, dav_redirect_policy, normalize_http_etag,
+    origin_is_secure, prepare_if_match, settle_body, transport_failure, url_origin, worse_recovery,
 };
+pub(crate) use bifrost_dav_core::{DavBody, DavResponse, DavTransport, PutCondition};
+use bifrost_types::{AccountError, AccountErrorKind, AccountOperation, ErrorScope, ResourceKind};
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, ETAG, HeaderMap, HeaderValue};
 use reqwest::{Method, StatusCode, Url};
 
@@ -19,7 +18,6 @@ use crate::parse::{
 };
 use crate::{CardDavConfig, CardDavCredentials};
 
-const DAV_CLIENT_TIMEOUT: Duration = Duration::from_secs(30);
 const MULTIGET_BATCH_SIZE: usize = 50;
 
 /// In-flight REPORT legs a single multiget or text search may hold open.
@@ -33,12 +31,11 @@ const MULTIGET_BATCH_SIZE: usize = 50;
 /// stay deterministic regardless of completion order.
 const MULTIGET_LEG_CONCURRENCY: usize = 4;
 
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum PutCondition<'a> {
-    IfNoneMatch,
-    IfMatch(&'a str),
-    None,
-}
+/// This crate's dialect binding for the shared DAV layer.
+///
+/// Every shared constructor takes it, so a CardDAV error can never be stamped
+/// with a CalDAV `Protocol` or name a `ResourceKind::Calendar`.
+const DAV: DavProtocol = DavProtocol::CardDav;
 
 #[derive(Clone)]
 pub(crate) struct CardDavClient {
@@ -56,88 +53,6 @@ impl fmt::Debug for CardDavClient {
             .field("credentials", &self.credentials)
             .finish_non_exhaustive()
     }
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct DavResponse {
-    status: StatusCode,
-    headers: HeaderMap,
-    body: String,
-    /// Effective request URI, after any redirects the client followed.
-    ///
-    /// RFC 4918 relative hrefs in a Multi-Status resolve against the
-    /// effective request URI, not the URI the caller submitted. The DAV
-    /// redirect policy permits same-host hops, so a PROPFIND on
-    /// `/addressbook` that lands on `/dav/users/ada/addressbook/` is a
-    /// real deployment shape; resolving `one.vcf` against the submitted
-    /// URI there mints a wrong native id and a wrong follow-up request.
-    url: String,
-}
-
-/// A DAV response body paired with the effective URI that produced it,
-/// so href resolution has the base RFC 4918 requires.
-struct DavBody {
-    text: String,
-    url: String,
-}
-
-/// Local DAV transport boundary. `bifrost-net` keeps its dispatcher private,
-/// while this client still owns Basic auth and DAV redirect policy.
-pub(crate) trait DavTransport: Send + Sync {
-    fn send(&self, request: reqwest::RequestBuilder) -> AccountFuture<Result<DavResponse, String>>;
-}
-
-struct ReqwestDavTransport;
-
-impl DavTransport for ReqwestDavTransport {
-    fn send(&self, request: reqwest::RequestBuilder) -> AccountFuture<Result<DavResponse, String>> {
-        Box::pin(async move {
-            let response = request.send().await.map_err(|error| error.to_string())?;
-            let status = response.status();
-            let headers = response.headers().clone();
-            let url = response.url().to_string();
-            let body = read_capped_body(response).await?;
-            Ok(DavResponse {
-                status,
-                headers,
-                body,
-                url,
-            })
-        })
-    }
-}
-
-/// Read a DAV response body with a ceiling.
-///
-/// `response.text()` buffers without one, so a provider returning a
-/// runaway 207, an error page, or a mis-routed blob URL OOMs the
-/// process. A Multi-Status body for a large address book is
-/// legitimately big, hence a ceiling generous enough that only a
-/// pathological response reaches it, matching the buffered ceiling
-/// `bifrost-net` applies on its own `send` path.
-const RESPONSE_BODY_TOO_LARGE: &str = "DAV response body exceeded the buffered ceiling";
-
-async fn read_capped_body(response: reqwest::Response) -> Result<String, String> {
-    use futures::StreamExt;
-
-    let limit = bifrost_net::DEFAULT_MAX_BUFFERED_RESPONSE;
-    let mut stream = response.bytes_stream();
-    let mut buf: Vec<u8> = Vec::new();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|error| error.to_string())?;
-        if buf.len() + chunk.len() > limit {
-            return Err(format!("{RESPONSE_BODY_TOO_LARGE} ({limit} bytes)"));
-        }
-        buf.extend_from_slice(&chunk);
-    }
-    // `.text()` decodes per the `charset` Content-Type parameter and
-    // falls back to lossy UTF-8. This decodes lossily unconditionally,
-    // which narrows behaviour for a server that declares a non-UTF-8
-    // charset - RFC 4918 bodies are XML, whose declared default is
-    // UTF-8, so that case was already outside what the parsers here
-    // handle. Lossy rather than strict keeps a malformed byte behaving
-    // as it did before (a replacement character, not a failed request).
-    Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
 impl CardDavClient {
@@ -593,7 +508,7 @@ impl CardDavClient {
         operation: AccountOperation,
     ) -> Result<DavBody, AccountError> {
         let response = self.send_raw_request(request, operation).await?;
-        settle_body(response, operation)
+        settle_body(response, operation, DAV)
     }
 
     async fn send_status_request(
@@ -643,7 +558,7 @@ impl CardDavClient {
                 .transport
                 .send(request)
                 .await
-                .map_err(|error| response_read_error(operation, error))?;
+                .map_err(|error| transport_failure(operation, error, DAV))?;
             let redirect = matches!(
                 response.status,
                 StatusCode::MOVED_PERMANENTLY
@@ -779,67 +694,6 @@ impl CardDavClient {
 ///
 /// Only `https` qualifies; an unparseable URL is treated as insecure so the
 /// downgrade check fails closed.
-/// Classify a completed DAV response and keep the effective URI attached
-/// to the body, so the caller resolves hrefs against the URI that actually
-/// served the Multi-Status rather than the one it submitted.
-fn settle_body(
-    response: DavResponse,
-    operation: AccountOperation,
-) -> Result<DavBody, AccountError> {
-    if response.status.is_success() {
-        Ok(DavBody {
-            text: response.body,
-            url: response.url,
-        })
-    } else {
-        Err(status_error(operation, response.status, response.body))
-    }
-}
-
-fn origin_is_secure(value: &str) -> bool {
-    Url::parse(value).is_ok_and(|url| url.scheme().eq_ignore_ascii_case("https"))
-}
-
-fn url_origin(value: &str) -> Option<String> {
-    let url = Url::parse(value).ok()?;
-    let host = url.host_str()?.to_ascii_lowercase();
-    Some(format!(
-        "{}://{}:{}",
-        url.scheme().to_ascii_lowercase(),
-        host,
-        url.port_or_known_default()?
-    ))
-}
-
-/// Hardened redirect policy for the DAV `reqwest::Client`.
-///
-/// Follows a hop only when the next URL keeps the exact origin (scheme,
-/// host, effective port) of the URL that issued the redirect; reqwest
-/// preserves `Authorization` precisely under that condition, and strips it
-/// on any origin change with no way for a policy to restore it. Every
-/// cross-origin hop is stopped so the 3xx surfaces to `send_raw_request`,
-/// which re-dispatches it with fresh credentials against the admitted
-/// origin set. The hop cap comes from `bifrost-net`.
-fn dav_redirect_policy() -> reqwest::redirect::Policy {
-    let max_hops = usize::from(bifrost_net::RedirectPolicy::default().max_hops);
-    reqwest::redirect::Policy::custom(move |attempt| {
-        if attempt.previous().len() >= max_hops {
-            return attempt.error("too many redirects");
-        }
-        let same_origin = attempt
-            .previous()
-            .last()
-            .and_then(|previous| url_origin(previous.as_str()))
-            .zip(url_origin(attempt.url().as_str()))
-            .is_some_and(|(previous, next)| previous == next);
-        if same_origin {
-            attempt.follow()
-        } else {
-            attempt.stop()
-        }
-    })
-}
-
 fn escape_xml(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -867,31 +721,6 @@ fn addressbook_text_query_body(property: &str, query: &str) -> String {
         property,
         escape_xml(query)
     )
-}
-
-fn normalize_http_etag(value: &str) -> String {
-    let value = value.trim();
-    if value
-        .get(..2)
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("W/"))
-    {
-        format!("W/{}", value[2..].trim())
-    } else {
-        value.trim_matches('"').to_string()
-    }
-}
-
-fn prepare_if_match(etag: &str) -> Option<String> {
-    if etag
-        .get(..2)
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("W/"))
-    {
-        None
-    } else if etag.starts_with('"') {
-        Some(etag.to_string())
-    } else {
-        Some(format!("\"{etag}\""))
-    }
 }
 
 fn should_fallback_discovery(error: &AccountError) -> bool {
@@ -945,39 +774,6 @@ impl MultigetFetch {
 
 /// Keep whichever failure demands the more drastic recovery, so a 503 on
 /// one chunk cannot hide a 401 on another.
-pub(crate) fn worse_recovery(
-    current: Option<AccountError>,
-    candidate: AccountError,
-) -> Option<AccountError> {
-    match current {
-        Some(existing)
-            if recovery_rank(existing.recovery()) >= recovery_rank(candidate.recovery()) =>
-        {
-            Some(existing)
-        }
-        _ => Some(candidate),
-    }
-}
-
-fn recovery_rank(class: &RecoveryClass) -> u8 {
-    match class {
-        RecoveryClass::AuthLost => 4,
-        RecoveryClass::NeedsAdminConsent { .. }
-        | RecoveryClass::NeedsPolicyChange
-        | RecoveryClass::NoPermission { .. } => 3,
-        RecoveryClass::Retry(_) => 0,
-        RecoveryClass::Reconcile(_) | RecoveryClass::Engine(_) => 1,
-        RecoveryClass::Unsupported(_)
-        | RecoveryClass::ClientBug
-        | RecoveryClass::ProviderContractViolation
-        | RecoveryClass::ProviderRefused
-        | RecoveryClass::UnknownPermanent => 2,
-        // RecoveryClass is non-exhaustive. An unknown future class must win
-        // rather than being silently ranked below a known terminal failure.
-        _ => u8::MAX,
-    }
-}
-
 fn multiget_failure(
     report: &CardDavMultigetReport,
     operation: AccountOperation,
@@ -1001,150 +797,30 @@ fn multiget_failure(
 }
 
 pub(crate) fn unsupported_error(operation: AccountOperation) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Unsupported(operation),
-        Cause::Request(RequestCause::Unsupported { operation }),
-    )
-    .protocol(Protocol::CardDav)
-    .operation(operation)
-    .try_build()
-    .expect("valid account error classification")
+    bifrost_dav_core::unsupported_error(operation, DAV)
 }
 
 pub(crate) fn local_error(operation: AccountOperation, message: impl Into<String>) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Request(RequestErrorKind::Malformed),
-        Cause::Request(RequestCause::InvalidArgument {
-            field: Some("carddav"),
-            message: Some(DiagnosticText::support_only(message)),
-        }),
-    )
-    .protocol(Protocol::CardDav)
-    .operation(operation)
-    .try_build()
-    .expect("valid account error classification")
+    bifrost_dav_core::local_error(operation, message, DAV)
 }
 
 pub(crate) fn parse_error(operation: AccountOperation, message: impl Into<String>) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Protocol(ProtocolErrorKind::ParseFailed),
-        Cause::Wire(WireCause::MalformedResponse {
-            protocol: Protocol::CardDav,
-            detail: Some(DiagnosticText::support_only(message)),
-        }),
-    )
-    .protocol(Protocol::CardDav)
-    .operation(operation)
-    .try_build()
-    .expect("valid account error classification")
+    bifrost_dav_core::parse_error(operation, message, DAV)
 }
 
 pub(crate) fn transport_error(
     operation: AccountOperation,
     message: impl Into<String>,
 ) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Transport(TransportErrorKind::Network),
-        Cause::Transport(TransportCause::new(
-            TransportKind::Network,
-            Some(DiagnosticText::support_only(message)),
-        )),
-    )
-    .push_cause(Cause::Attempt(bifrost_types::AttemptCause::new(
-        TransmissionState::InFlight,
-    )))
-    .protocol(Protocol::CardDav)
-    .operation(operation)
-    .try_build()
-    .expect("valid account error classification")
-}
-
-fn response_read_error(operation: AccountOperation, message: String) -> AccountError {
-    if !message.starts_with(RESPONSE_BODY_TOO_LARGE) {
-        return transport_error(operation, message);
-    }
-    AccountErrorBuilder::new(
-        AccountErrorKind::Protocol(ProtocolErrorKind::PartialResponse),
-        Cause::Wire(WireCause::MalformedResponse {
-            protocol: Protocol::CardDav,
-            detail: Some(DiagnosticText::support_only(message)),
-        }),
-    )
-    .push_cause(Cause::Attempt(bifrost_types::AttemptCause::new(
-        TransmissionState::Acknowledged,
-    )))
-    .protocol(Protocol::CardDav)
-    .operation(operation)
-    .try_build()
-    .expect("valid acknowledged response-overflow classification")
+    bifrost_dav_core::transport_error(operation, message, DAV)
 }
 
 pub(crate) fn status_error(
     operation: AccountOperation,
-    status: StatusCode,
+    status: reqwest::StatusCode,
     body: String,
 ) -> AccountError {
-    let kind = if status == StatusCode::UNAUTHORIZED {
-        AccountErrorKind::Authentication(bifrost_types::AuthErrorKind::ReauthorizationRequired)
-    } else if status == StatusCode::FORBIDDEN {
-        AccountErrorKind::Authorization(bifrost_types::AccessErrorKind::PermissionDenied)
-    } else if status == StatusCode::NOT_FOUND {
-        AccountErrorKind::NotFound(ResourceKind::Contact)
-    } else if status == StatusCode::CONFLICT
-        || status == StatusCode::PRECONDITION_FAILED
-        || status == StatusCode::LOCKED
-    {
-        AccountErrorKind::ConcurrencyConflict
-    } else if status == StatusCode::TOO_MANY_REQUESTS {
-        AccountErrorKind::Server(ServerErrorKind::RateLimited)
-    } else if status == StatusCode::SERVICE_UNAVAILABLE {
-        AccountErrorKind::Server(ServerErrorKind::Unavailable)
-    } else if status == StatusCode::INSUFFICIENT_STORAGE {
-        AccountErrorKind::Server(ServerErrorKind::QuotaExhausted)
-    } else {
-        AccountErrorKind::Server(ServerErrorKind::Error {
-            status: Some(status.as_u16()),
-        })
-    };
-    let cause = if status == StatusCode::UNAUTHORIZED {
-        Cause::Auth(bifrost_types::AuthCause::ReauthorizationRequired)
-    } else if status == StatusCode::FORBIDDEN {
-        Cause::Access(bifrost_types::AccessCause::PermissionDenied {
-            resource: Some(ResourceKind::Contact),
-        })
-    } else if status == StatusCode::NOT_FOUND {
-        Cause::Request(RequestCause::NotFound {
-            what: ResourceKind::Contact,
-            id: None,
-        })
-    } else if status == StatusCode::CONFLICT
-        || status == StatusCode::PRECONDITION_FAILED
-        || status == StatusCode::LOCKED
-    {
-        Cause::State(StateCause::ConcurrencyConflict)
-    } else if status == StatusCode::TOO_MANY_REQUESTS {
-        Cause::Server(ServerCause::RateLimited { retry_hint: None })
-    } else if status == StatusCode::SERVICE_UNAVAILABLE {
-        Cause::Server(ServerCause::Unavailable { retry_hint: None })
-    } else if status == StatusCode::INSUFFICIENT_STORAGE {
-        Cause::Server(ServerCause::QuotaExhausted { retry_hint: None })
-    } else {
-        Cause::Server(ServerCause::Error {
-            status: Some(status.as_u16()),
-        })
-    };
-
-    let mut builder = AccountErrorBuilder::new(kind, cause)
-        .protocol(Protocol::CardDav)
-        .operation(operation)
-        .status(Some(status.as_u16()));
-    let body = body.trim();
-    if !body.is_empty() {
-        builder = builder.text(DiagnosticText::support_only(body.to_string()));
-    }
-    builder
-        .try_build()
-        .expect("valid account error classification")
+    bifrost_dav_core::status_error(operation, status, body, DAV)
 }
 
 pub(crate) fn contact_scope(id: impl Into<String>) -> ErrorScope {
@@ -1203,6 +879,51 @@ const PROPFIND_CONTACTS: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use bifrost_types::{AccountFuture, Protocol, ProtocolErrorKind, RecoveryClass};
+
+    /// Every error this crate mints is stamped CardDAV, and names contacts.
+    ///
+    /// The shared ladder in `bifrost-dav-core` is parameterized by `DAV`, so a
+    /// wrong binding here would silently restamp the whole crate's error
+    /// surface as CalDAV - a consumer routing on `Protocol` or `ResourceKind`
+    /// would misfile every failure. Ablating `DAV` to `CalDav` before this
+    /// existed failed exactly one unrelated test, which is not the coverage
+    /// that mistake deserves.
+    #[test]
+    fn every_error_this_crate_mints_is_stamped_carddav() {
+        let errors = [
+            status_error(
+                AccountOperation::ContactGet,
+                StatusCode::NOT_FOUND,
+                String::new(),
+            ),
+            local_error(AccountOperation::ContactGet, "bad"),
+            parse_error(AccountOperation::ContactGet, "bad"),
+            transport_error(AccountOperation::ContactGet, "bad"),
+            unsupported_error(AccountOperation::ContactGet),
+            not_found_error(AccountOperation::ContactGet, "one.vcf"),
+        ];
+        for error in errors {
+            assert_eq!(
+                error.protocol(),
+                Some(Protocol::CardDav),
+                "a CardDAV error must not be stamped otherwise: {error:?}"
+            );
+        }
+        let missing = status_error(
+            AccountOperation::ContactGet,
+            StatusCode::NOT_FOUND,
+            String::new(),
+        );
+        assert!(
+            matches!(
+                missing.kind(),
+                AccountErrorKind::NotFound(ResourceKind::Contact)
+            ),
+            "a CardDAV 404 names a contact, not a calendar: {missing:?}"
+        );
+    }
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
@@ -2220,20 +1941,6 @@ mod tests {
         assert_eq!(error.operation(), Some(AccountOperation::ContactsList));
     }
 
-    #[test]
-    fn response_overflow_after_mutation_is_acknowledged_and_reconciles() {
-        let error = response_read_error(
-            AccountOperation::ContactDelete,
-            format!("{RESPONSE_BODY_TOO_LARGE} (1 bytes)"),
-        );
-        assert!(error.recovery().requires_reconciliation());
-        assert!(error.chain().iter().any(|cause| matches!(
-            cause,
-            Cause::Attempt(attempt)
-                if attempt.transmission_state == TransmissionState::Acknowledged
-        )));
-    }
-
     /// Shared-shape guard against the CalDAV regression: a non-2xx REPORT must
     /// classify, never decode into an authoritative empty multiget. An empty
     /// result treated as truth is a downstream deletion.
@@ -2265,51 +1972,6 @@ mod tests {
             &AccountErrorKind::Authentication(
                 bifrost_types::AuthErrorKind::ReauthorizationRequired
             )
-        );
-    }
-
-    #[test]
-    fn status_error_maps_write_conflicts() {
-        for status in [
-            StatusCode::CONFLICT,
-            StatusCode::PRECONDITION_FAILED,
-            StatusCode::LOCKED,
-        ] {
-            let error = status_error(AccountOperation::ContactUpdate, status, String::new());
-            assert_eq!(error.kind(), &AccountErrorKind::ConcurrencyConflict);
-        }
-    }
-
-    #[test]
-    fn status_error_maps_transient_and_quota_statuses() {
-        let rate_limited = status_error(
-            AccountOperation::ContactUpdate,
-            StatusCode::TOO_MANY_REQUESTS,
-            String::new(),
-        );
-        assert_eq!(
-            rate_limited.kind(),
-            &AccountErrorKind::Server(ServerErrorKind::RateLimited)
-        );
-
-        let unavailable = status_error(
-            AccountOperation::ContactUpdate,
-            StatusCode::SERVICE_UNAVAILABLE,
-            String::new(),
-        );
-        assert_eq!(
-            unavailable.kind(),
-            &AccountErrorKind::Server(ServerErrorKind::Unavailable)
-        );
-
-        let quota = status_error(
-            AccountOperation::ContactUpdate,
-            StatusCode::INSUFFICIENT_STORAGE,
-            String::new(),
-        );
-        assert_eq!(
-            quota.kind(),
-            &AccountErrorKind::Server(ServerErrorKind::QuotaExhausted)
         );
     }
 
@@ -2384,13 +2046,6 @@ mod tests {
         let requests = script.requests();
         assert_eq!(requests[0].headers["Depth"], "0");
         assert!(requests[0].body.contains("<D:resourcetype/>"));
-    }
-
-    #[test]
-    fn weak_etag_is_never_sent_in_if_match() {
-        assert_eq!(normalize_http_etag("W/\"abc\""), "W/\"abc\"");
-        assert_eq!(prepare_if_match("W/\"abc\""), None);
-        assert_eq!(prepare_if_match("abc").as_deref(), Some("\"abc\""));
     }
 
     #[test]
@@ -2475,94 +2130,5 @@ mod tests {
             .expect("nothing usable came back");
 
         assert_eq!(error.recovery(), &RecoveryClass::AuthLost);
-    }
-
-    /// Pins the whole known ladder, not just the 401-vs-503 pair the test
-    /// below covers. The two DAV crates carry byte-identical copies of this
-    /// function and have drifted before, so the ordering is asserted
-    /// explicitly in each.
-    ///
-    /// The `_ =>` arm cannot be pinned hermetically: `RecoveryClass` is
-    /// `#[non_exhaustive]` and lives in `bifrost-types`, so no test in this
-    /// crate can name a variant this `match` does not already list. What is
-    /// pinnable is that every variant we CAN name ranks strictly below the
-    /// sentinel, which is what makes an unknown one win by construction.
-    #[test]
-    fn recovery_ranks_order_from_retryable_up_to_auth_lost() {
-        use bifrost_types::{EngineDirective, RetryAdvice, RetryDisposition, RetryReason};
-
-        let retry = RecoveryClass::Retry(RetryAdvice::new(
-            RetryDisposition::SameRequest,
-            None,
-            RetryReason::Transport,
-            None,
-        ));
-        let engine = RecoveryClass::Engine(EngineDirective::RestartAccount);
-        let terminal = [
-            RecoveryClass::Unsupported(AccountOperation::ContactSearch),
-            RecoveryClass::ClientBug,
-            RecoveryClass::ProviderContractViolation,
-            RecoveryClass::ProviderRefused,
-            RecoveryClass::UnknownPermanent,
-        ];
-        let consent = [
-            RecoveryClass::NeedsAdminConsent { needed: "scope" },
-            RecoveryClass::NeedsPolicyChange,
-            RecoveryClass::NoPermission { resource: None },
-        ];
-
-        assert!(recovery_rank(&retry) < recovery_rank(&engine));
-        for class in &terminal {
-            assert!(
-                recovery_rank(&engine) < recovery_rank(class),
-                "{class:?} must outrank an engine directive"
-            );
-            for stronger in &consent {
-                assert!(
-                    recovery_rank(class) < recovery_rank(stronger),
-                    "{stronger:?} must outrank {class:?}"
-                );
-            }
-        }
-        for class in &consent {
-            assert!(
-                recovery_rank(class) < recovery_rank(&RecoveryClass::AuthLost),
-                "AuthLost must outrank {class:?}"
-            );
-            // Every named variant sits below the catch-all sentinel, so an
-            // unknown future class escalates rather than being buried.
-            assert!(recovery_rank(class) < u8::MAX);
-        }
-        assert!(recovery_rank(&RecoveryClass::AuthLost) < u8::MAX);
-    }
-
-    #[test]
-    fn the_worst_recovery_class_wins_whatever_the_chunk_order() {
-        let auth = || {
-            status_error(
-                AccountOperation::ContactSearch,
-                StatusCode::UNAUTHORIZED,
-                "refused".to_string(),
-            )
-        };
-        let transient = || {
-            status_error(
-                AccountOperation::ContactSearch,
-                StatusCode::SERVICE_UNAVAILABLE,
-                "later".to_string(),
-            )
-        };
-
-        let auth_first = worse_recovery(Some(auth()), transient());
-        let transient_first = worse_recovery(Some(transient()), auth());
-
-        assert_eq!(
-            auth_first.expect("kept").recovery(),
-            &RecoveryClass::AuthLost
-        );
-        assert_eq!(
-            transient_first.expect("kept").recovery(),
-            &RecoveryClass::AuthLost
-        );
     }
 }

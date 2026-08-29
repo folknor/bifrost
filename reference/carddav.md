@@ -339,6 +339,20 @@ in-flight legs and dispatched in order, for the reasons given in
 so each page reflects a fresh server observation and carries that observation's
 failure lanes.
 
+## The shared layer: bifrost-dav-core
+
+The protocol-neutral half of this crate lives in `bifrost-dav-core`, a private
+shared crate. Nothing published moved. See `reference/caldav.md` for the full
+inventory of what was extracted and why the two dialects reduce to a single
+`DavProtocol` parameter; this crate binds it as
+`const DAV: DavProtocol = DavProtocol::CardDav`, pinned by
+`every_error_this_crate_mints_is_stamped_carddav`.
+
+One thing deliberately stayed local: this crate's `not_found_error` attaches an
+`ErrorScope` naming the contact, where CalDAV's `missing_event_error` puts the id
+in the cause. That difference is behavioural, so it was not flattened into the
+shared constructor.
+
 ## This crate and bifrost-caldav are near-duplicates, and drift is the defect
 
 The two crates hand-mirror roughly 1500 lines of DAV machinery. Nothing compares
