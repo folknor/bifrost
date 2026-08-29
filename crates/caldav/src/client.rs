@@ -1,25 +1,28 @@
 use std::fmt;
+#[cfg(test)]
 use std::sync::Arc;
 
-use base64::Engine;
-use bifrost_dav_core::{
-    DAV_CLIENT_TIMEOUT, DavProtocol, ReqwestDavTransport, dav_redirect_policy, origin_is_secure,
-    prepare_if_match, response_etag, settle_body, transport_failure, url_origin, worse_recovery,
-};
-pub(crate) use bifrost_dav_core::{DavBody, DavResponse, DavTransport, PutCondition};
+pub(crate) use bifrost_dav_core::PutCondition;
+#[cfg(test)]
+use bifrost_dav_core::ReqwestDavTransport;
+use bifrost_dav_core::{DavDispatch, DavProtocol, prepare_if_match, response_etag, worse_recovery};
+#[cfg(test)]
+pub(crate) use bifrost_dav_core::{DavResponse, DavTransport};
 use bifrost_types::{
     AccountError, AccountErrorBuilder, AccountErrorKind, AccountOperation, Cause, CursorScope,
     DiagnosticText, ErrorScope, ObjectType, Protocol, ResourceKind, StateCause, SyncStateErrorKind,
 };
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
-use reqwest::{Method, StatusCode, Url};
+#[cfg(test)]
+use reqwest::header::{AUTHORIZATION, HeaderMap};
+use reqwest::header::{CONTENT_TYPE, HeaderValue};
+use reqwest::{Method, StatusCode};
 
+use crate::CalDavConfig;
 use crate::parse::{
     CalDavFetchedEvent, CalDavMultigetReport, CalDavSyncReport, CalendarCollection,
     MultigetOutcome, extract_href_properties, extract_href_property, parse_calendar_collections,
     parse_multiget_report, parse_propfind_events, parse_sync_collection_report, resolve_href,
 };
-use crate::{CalDavConfig, CalDavCredentials};
 
 const MULTIGET_BATCH_SIZE: usize = 50;
 
@@ -42,11 +45,9 @@ const DAV: DavProtocol = DavProtocol::CalDav;
 
 #[derive(Clone)]
 pub(crate) struct CalDavClient {
-    http: reqwest::Client,
-    transport: Arc<dyn DavTransport>,
-    base_url: String,
-    credentials: CalDavCredentials,
-    trusted_origins: Vec<String>,
+    /// Transport, credentials, origin gate and the generic WebDAV verbs, all
+    /// shared with `bifrost-carddav` through `bifrost-dav-core`.
+    dav: DavDispatch,
 }
 
 #[derive(Debug)]
@@ -59,40 +60,44 @@ pub(crate) struct CalDavDiscovery {
 impl fmt::Debug for CalDavClient {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CalDavClient")
-            .field("base_url", &self.base_url)
-            .field("credentials", &self.credentials)
+            .field("dav", &self.dav)
             .finish_non_exhaustive()
     }
 }
 
 impl CalDavClient {
-    pub(crate) fn new(config: &CalDavConfig) -> Result<Self, AccountError> {
-        let http = reqwest::Client::builder()
-            .redirect(dav_redirect_policy())
-            .timeout(DAV_CLIENT_TIMEOUT)
-            .build()
-            .map_err(|error| local_error(AccountOperation::Discover, error.to_string()))?;
+    pub(crate) fn resolve_url(&self, href: &str) -> String {
+        self.dav.resolve_url(href)
+    }
 
-        let base_url = config.base_url.trim_end_matches('/').to_string();
-        let trusted_origins = url_origin(&base_url).into_iter().collect::<Vec<_>>();
+    pub(crate) fn admit_discovered_urls(&mut self, urls: impl IntoIterator<Item = String>) {
+        self.dav.admit_discovered_urls(urls);
+    }
+
+    pub(crate) async fn move_resource(
+        &self,
+        from: &str,
+        to: &str,
+        operation: AccountOperation,
+    ) -> Result<bool, AccountError> {
+        self.dav.move_resource(from, to, operation).await
+    }
+
+    pub(crate) fn new(config: &CalDavConfig) -> Result<Self, AccountError> {
         Ok(Self {
-            http,
-            transport: Arc::new(ReqwestDavTransport),
-            trusted_origins,
-            base_url,
-            credentials: config.credentials.clone(),
+            dav: DavDispatch::new(&config.base_url, config.credentials.to_shared(), DAV)?,
         })
     }
 
     #[cfg(test)]
     pub(crate) fn with_transport(base_url: &str, transport: Arc<dyn DavTransport>) -> Self {
-        let trusted_origins = url_origin(base_url).into_iter().collect::<Vec<_>>();
         Self {
-            http: reqwest::Client::new(),
-            transport,
-            base_url: base_url.trim_end_matches('/').to_string(),
-            credentials: CalDavCredentials::bearer("token"),
-            trusted_origins,
+            dav: DavDispatch::with_transport(
+                base_url,
+                transport,
+                crate::CalDavCredentials::bearer("token").to_shared(),
+                DAV,
+            ),
         }
     }
 
@@ -108,7 +113,8 @@ impl CalDavClient {
         // endpoint, and a deployment answering it with 401/403 rather
         // than 404 would fail the open before the configured base was
         // ever tried.
-        let from_well_known = match bifrost_net::url::well_known_url(&self.base_url, "caldav") {
+        let from_well_known = match bifrost_net::url::well_known_url(self.dav.base_url(), "caldav")
+        {
             Some(well_known) => match self.discover_principal(&well_known).await {
                 Ok(principal) => principal,
                 Err(error) if should_fallback_discovery(&error) => None,
@@ -124,7 +130,7 @@ impl CalDavClient {
     }
 
     async fn discover_principal_from_base(&self) -> Result<String, AccountError> {
-        self.discover_principal(&self.base_url)
+        self.discover_principal(self.dav.base_url())
             .await?
             .ok_or_else(|| {
                 parse_error(AccountOperation::Discover, "missing current-user-principal")
@@ -136,6 +142,7 @@ impl CalDavClient {
         principal: &str,
     ) -> Result<CalDavDiscovery, AccountError> {
         let response = self
+            .dav
             .propfind_raw(principal, "0", PROPFIND_ACCOUNT, AccountOperation::Discover)
             .await?;
         let body = response.text;
@@ -159,6 +166,7 @@ impl CalDavClient {
 
     async fn discover_principal(&self, root: &str) -> Result<Option<String>, AccountError> {
         let response = self
+            .dav
             .propfind_raw(root, "0", PROPFIND_PRINCIPAL, AccountOperation::Discover)
             .await?;
         Ok(
@@ -182,6 +190,7 @@ impl CalDavClient {
         operation: AccountOperation,
     ) -> Result<Vec<CalendarCollection>, AccountError> {
         let response = self
+            .dav
             .propfind_raw(home_url, "1", PROPFIND_CALENDARS, operation)
             .await?;
         let mut collections = parse_calendar_collections(&response.text)
@@ -202,6 +211,7 @@ impl CalDavClient {
         operation: AccountOperation,
     ) -> Result<crate::parse::CalDavEventListing, AccountError> {
         let response = self
+            .dav
             .propfind_raw(calendar_url, "1", PROPFIND_EVENTS, operation)
             .await?;
         let mut listing =
@@ -218,6 +228,7 @@ impl CalDavClient {
         operation: AccountOperation,
     ) -> Result<Option<String>, AccountError> {
         let response = self
+            .dav
             .propfind_raw(calendar_url, "0", PROPFIND_SYNC_TOKEN, operation)
             .await?;
         crate::parse::parse_collection_sync_token(&response.text)
@@ -232,6 +243,7 @@ impl CalDavClient {
     ) -> Result<CalDavMultigetReport, AccountError> {
         let body = calendar_query_body(start, end);
         let response = self
+            .dav
             .report_raw(calendar_url, "1", &body, AccountOperation::EventsInRange)
             .await?;
         let mut parsed = parse_multiget_report(&response.text).map_err(|error| {
@@ -357,7 +369,7 @@ impl CalDavClient {
             operation,
             context,
         } = leg;
-        let response = match self.report_raw(url, depth, body, operation).await {
+        let response = match self.dav.report_raw(url, depth, body, operation).await {
             Ok(response) => response,
             Err(error) => {
                 *degraded = worse_recovery(degraded.take(), error);
@@ -396,7 +408,8 @@ impl CalDavClient {
         let body = sync_collection_body(sync_token);
         let operation = AccountOperation::SyncChanges;
         let response = self
-            .report_raw_with_depth(calendar_url, "0", &body, operation)
+            .dav
+            .report_raw_response(calendar_url, "0", &body, operation)
             .await?;
         let status = response.status;
         let effective_url = response.url;
@@ -423,10 +436,10 @@ impl CalDavClient {
         operation: AccountOperation,
     ) -> Result<CalDavFetchedEvent, AccountError> {
         let request = self
-            .http
+            .dav
             .request(Method::GET, url)
-            .headers(self.auth_headers(url, operation).await?);
-        let response = self.send_raw_request(request, operation).await?;
+            .headers(self.dav.auth_headers(url, operation).await?);
+        let response = self.dav.send_raw_request(request, operation).await?;
         let status = response.status;
         let etag = response_etag(&response.headers);
         let body = response.body;
@@ -449,10 +462,10 @@ impl CalDavClient {
         operation: AccountOperation,
     ) -> Result<Option<String>, AccountError> {
         let mut request = self
-            .http
+            .dav
             .request(Method::PUT, url)
             .header(CONTENT_TYPE, "text/calendar; charset=utf-8")
-            .headers(self.auth_headers(url, operation).await?)
+            .headers(self.dav.auth_headers(url, operation).await?)
             .body(body);
         match condition {
             PutCondition::IfNoneMatch => {
@@ -465,7 +478,7 @@ impl CalDavClient {
             }
             PutCondition::None => {}
         }
-        let response = self.send_raw_request(request, operation).await?;
+        let response = self.dav.send_raw_request(request, operation).await?;
         let status = response.status;
         let etag = response_etag(&response.headers);
         let body = response.body;
@@ -482,60 +495,10 @@ impl CalDavClient {
         operation: AccountOperation,
     ) -> Result<(), AccountError> {
         let request = self
-            .http
+            .dav
             .request(Method::DELETE, url)
-            .headers(self.auth_headers(url, operation).await?);
-        self.send_status_request(request, operation).await
-    }
-
-    /// WebDAV `MOVE` of one resource into another collection.
-    ///
-    /// `Overwrite: F` so a name collision at the destination is refused rather
-    /// than silently destroying whatever already sits there. `Destination` must
-    /// be an absolute URI (RFC 4918 s10.3).
-    ///
-    /// The destination is gated by the same admitted-origin set as the source:
-    /// `Destination` is a URL this client asks the server to write to, and a
-    /// consumer-supplied `CalendarId` must not be able to steer it anywhere the
-    /// credential gate would refuse.
-    ///
-    /// `Ok(false)` means the server does not implement MOVE, so the caller can
-    /// fall back to copy-then-delete. Every other non-2xx is a real error - in
-    /// particular 412 (the destination is occupied) and 502 (the server refuses
-    /// the destination) are failures, not fallback triggers.
-    pub(crate) async fn move_resource(
-        &self,
-        from: &str,
-        to: &str,
-        operation: AccountOperation,
-    ) -> Result<bool, AccountError> {
-        if !self.is_trusted_url(to) {
-            return Err(local_error(
-                operation,
-                format!("refusing to name an untrusted DAV move destination: {to}"),
-            ));
-        }
-        let method = Method::from_bytes(b"MOVE")
-            .map_err(|error| local_error(operation, error.to_string()))?;
-        let destination =
-            HeaderValue::from_str(to).map_err(|error| local_error(operation, error.to_string()))?;
-        let request = self
-            .http
-            .request(method, from)
-            .header("Destination", destination)
-            .header("Overwrite", "F")
-            .headers(self.auth_headers(from, operation).await?);
-        let response = self.send_raw_request(request, operation).await?;
-        if response.status.is_success() {
-            return Ok(true);
-        }
-        if matches!(
-            response.status,
-            StatusCode::METHOD_NOT_ALLOWED | StatusCode::NOT_IMPLEMENTED
-        ) {
-            return Ok(false);
-        }
-        Err(status_error(operation, response.status, response.body))
+            .headers(self.dav.auth_headers(url, operation).await?);
+        self.dav.send_status_request(request, operation).await
     }
 
     pub(crate) async fn post_schedule_reply(
@@ -549,11 +512,12 @@ impl CalDavClient {
         // replying calendar user) and `Recipient` (the organizer) headers;
         // servers reject the POST without them.
         let mut request = self
-            .http
+            .dav
             .request(Method::POST, outbox_url)
             .header(CONTENT_TYPE, "text/calendar; charset=utf-8")
             .headers(
-                self.auth_headers(outbox_url, AccountOperation::EventRsvp)
+                self.dav
+                    .auth_headers(outbox_url, AccountOperation::EventRsvp)
                     .await?,
             );
         if let Ok(value) = HeaderValue::from_str(&schedule_address(originator)) {
@@ -563,267 +527,12 @@ impl CalDavClient {
             request = request.header("Recipient", value);
         }
         let request = request.body(body);
-        self.send_status_request(request, AccountOperation::EventRsvp)
+        self.dav
+            .send_status_request(request, AccountOperation::EventRsvp)
             .await
-    }
-
-    pub(crate) fn resolve_url(&self, href: &str) -> String {
-        if href.starts_with("http://") || href.starts_with("https://") {
-            return href.to_string();
-        }
-        if let Ok(base) = Url::parse(&self.base_url)
-            && let Ok(resolved) = base.join(href)
-        {
-            return resolved.to_string();
-        }
-        if self.base_url.ends_with('/') || href.starts_with('/') {
-            format!("{}{href}", self.base_url)
-        } else {
-            format!("{}/{href}", self.base_url)
-        }
-    }
-
-    async fn propfind_raw(
-        &self,
-        url: &str,
-        depth: &str,
-        body: &str,
-        operation: AccountOperation,
-    ) -> Result<DavBody, AccountError> {
-        let method = Method::from_bytes(b"PROPFIND")
-            .map_err(|error| local_error(operation, error.to_string()))?;
-        let request = self
-            .http
-            .request(method, url)
-            .header(CONTENT_TYPE, "application/xml; charset=utf-8")
-            .header("Depth", depth)
-            .headers(self.auth_headers(url, operation).await?)
-            .body(body.to_string());
-        self.send_body_request(request, operation).await
-    }
-
-    async fn report_raw(
-        &self,
-        url: &str,
-        depth: &str,
-        body: &str,
-        operation: AccountOperation,
-    ) -> Result<DavBody, AccountError> {
-        // Ordinary REPORTs get the same status classification as any other
-        // body request; only `sync_events` takes the raw-response path,
-        // because it has to inspect 403/410 before they become errors.
-        let response = self
-            .report_raw_with_depth(url, depth, body, operation)
-            .await?;
-        settle_body(response, operation, DAV)
-    }
-
-    async fn report_raw_with_depth(
-        &self,
-        url: &str,
-        depth: &str,
-        body: &str,
-        operation: AccountOperation,
-    ) -> Result<DavResponse, AccountError> {
-        let method = Method::from_bytes(b"REPORT")
-            .map_err(|error| local_error(operation, error.to_string()))?;
-        let request = self
-            .http
-            .request(method, url)
-            .header(CONTENT_TYPE, "application/xml; charset=utf-8")
-            .header("Depth", depth)
-            .headers(self.auth_headers(url, operation).await?)
-            .body(body.to_string());
-        self.send_raw_request(request, operation).await
-    }
-
-    async fn send_body_request(
-        &self,
-        request: reqwest::RequestBuilder,
-        operation: AccountOperation,
-    ) -> Result<DavBody, AccountError> {
-        let response = self.send_raw_request(request, operation).await?;
-        settle_body(response, operation, DAV)
-    }
-
-    async fn send_status_request(
-        &self,
-        request: reqwest::RequestBuilder,
-        operation: AccountOperation,
-    ) -> Result<(), AccountError> {
-        let response = self.send_raw_request(request, operation).await?;
-        if response.status.is_success() {
-            Ok(())
-        } else {
-            Err(status_error(operation, response.status, response.body))
-        }
-    }
-
-    /// Send a request, following cross-origin redirects by hand.
-    ///
-    /// Same-origin hops are followed inside reqwest, which preserves the
-    /// `Authorization` header when scheme, host, and effective port are all
-    /// unchanged. A cross-origin hop cannot ride that path: reqwest strips
-    /// `Authorization` on any origin change and its redirect policy has no
-    /// way to restore it, so a followed hop would reach the destination
-    /// unauthenticated. Cross-origin 3xx responses are therefore stopped by
-    /// the policy and re-dispatched here with fresh `auth_headers` for the
-    /// target - and `auth_headers` refuses any origin discovery did not
-    /// admit, so a server-controlled `Location` can never widen trust, only
-    /// spend trust that authenticated discovery already granted. The method
-    /// and body are preserved on 301/302/307/308; DAV verbs have no useful
-    /// GET rewrite, and RFC 7231 permits preserving them. A 303 is not
-    /// followed and classifies as a terminal status downstream.
-    async fn send_raw_request(
-        &self,
-        request: reqwest::RequestBuilder,
-        operation: AccountOperation,
-    ) -> Result<DavResponse, AccountError> {
-        let max_hops = usize::from(bifrost_net::RedirectPolicy::default().max_hops);
-        let mut request = request;
-        let mut hops = 0usize;
-        loop {
-            let replay = request.try_clone();
-            let response = self
-                .transport
-                .send(request)
-                .await
-                .map_err(|error| transport_failure(operation, error, DAV))?;
-            let redirect = matches!(
-                response.status,
-                StatusCode::MOVED_PERMANENTLY
-                    | StatusCode::FOUND
-                    | StatusCode::TEMPORARY_REDIRECT
-                    | StatusCode::PERMANENT_REDIRECT
-            );
-            let location = response
-                .headers
-                .get(reqwest::header::LOCATION)
-                .and_then(|value| value.to_str().ok());
-            let Some(location) = location.filter(|_| redirect) else {
-                if !self.is_trusted_url(&response.url) {
-                    return Err(local_error(
-                        operation,
-                        format!(
-                            "response arrived from an untrusted DAV origin: {}",
-                            response.url
-                        ),
-                    ));
-                }
-                return Ok(response);
-            };
-            let next = Url::parse(&response.url)
-                .and_then(|base| base.join(location))
-                .map_err(|error| {
-                    local_error(operation, format!("unresolvable redirect target: {error}"))
-                })?;
-            hops += 1;
-            if hops > max_hops {
-                return Err(local_error(operation, "too many redirects"));
-            }
-            let Some(replay) = replay else {
-                return Err(local_error(
-                    operation,
-                    "redirected DAV request cannot be replayed",
-                ));
-            };
-            let previous = replay
-                .build()
-                .map_err(|error| local_error(operation, error.to_string()))?;
-            // Fresh credentials for the target origin; refused locally when
-            // the origin was never admitted by discovery.
-            let auth = self.auth_headers(next.as_str(), operation).await?;
-            let mut headers = previous.headers().clone();
-            headers.remove(AUTHORIZATION);
-            for (name, value) in &auth {
-                headers.insert(name, value.clone());
-            }
-            let mut rebuilt = self
-                .http
-                .request(previous.method().clone(), next)
-                .headers(headers);
-            if let Some(body) = previous.body().and_then(reqwest::Body::as_bytes) {
-                rebuilt = rebuilt.body(body.to_vec());
-            }
-            request = rebuilt;
-        }
-    }
-
-    /// Build the per-request auth headers. The bearer token is read from
-    /// the shared source on every call, so a token rotated mid-sync is
-    /// honored on the next DAV request without reopening the account.
-    async fn auth_headers(
-        &self,
-        url: &str,
-        operation: AccountOperation,
-    ) -> Result<HeaderMap, AccountError> {
-        if !self.is_trusted_url(url) {
-            return Err(local_error(
-                operation,
-                format!("refusing to send DAV credentials to untrusted URL: {url}"),
-            ));
-        }
-        let mut headers = HeaderMap::new();
-        match &self.credentials {
-            CalDavCredentials::Basic { username, password } => {
-                let credentials = base64::engine::general_purpose::STANDARD
-                    .encode(format!("{username}:{password}"));
-                if let Ok(value) = HeaderValue::from_str(&format!("Basic {credentials}")) {
-                    headers.insert(AUTHORIZATION, value);
-                }
-            }
-            CalDavCredentials::Bearer { token_source } => {
-                let token = token_source.current().await.map_err(|error| {
-                    transport_error(
-                        operation,
-                        format!("failed to read OAuth access token: {error}"),
-                    )
-                })?;
-                if let Ok(value) = HeaderValue::from_str(&format!("Bearer {}", token.as_str())) {
-                    headers.insert(AUTHORIZATION, value);
-                }
-            }
-        }
-        Ok(headers)
-    }
-
-    /// Admit successfully discovered DAV origins to the credential gate.
-    ///
-    /// Discovery is server-steered: the calendar home and scheduling outbox
-    /// come out of the principal's own PROPFIND response, so a compromised or
-    /// hostile server picks these origins. Two rules bound what it can pick.
-    /// A discovered origin must parse, and it must never weaken the transport
-    /// guarantee the configured base URL already established - an
-    /// HTTPS-configured account never trusts a plaintext discovered home,
-    /// because that would turn discovery into a downgrade channel for the
-    /// account credential. A cross-origin HTTPS home is still admitted; that
-    /// is a real deployment shape, where the principal and the calendar home
-    /// live on different hosts of the same service. Admission happens only
-    /// after the complete authenticated discovery result is available,
-    /// before the account is shared or a home request can be in flight.
-    pub(crate) fn admit_discovered_urls(&mut self, urls: impl IntoIterator<Item = String>) {
-        for url in urls {
-            let Some(origin) = url_origin(&url) else {
-                continue;
-            };
-            if origin_is_secure(&self.base_url) && !origin_is_secure(&url) {
-                continue;
-            }
-            if !self.trusted_origins.contains(&origin) {
-                self.trusted_origins.push(origin);
-            }
-        }
-    }
-
-    fn is_trusted_url(&self, url: &str) -> bool {
-        url_origin(url).is_some_and(|origin| self.trusted_origins.contains(&origin))
     }
 }
 
-/// Whether a URL's scheme carries an authenticated, encrypted transport.
-///
-/// Only `https` qualifies; an unparseable URL is treated as insecure so the
-/// downgrade check fails closed.
 fn escape_xml(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -1027,6 +736,9 @@ pub(crate) fn parse_error(operation: AccountOperation, message: impl Into<String
     bifrost_dav_core::parse_error(operation, message, DAV)
 }
 
+/// Only the account layer's tests mint one directly now; production transport
+/// failures come back already classified from `DavDispatch`.
+#[cfg(test)]
 pub(crate) fn transport_error(
     operation: AccountOperation,
     message: impl Into<String>,

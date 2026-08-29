@@ -53,6 +53,24 @@ impl CardDavCredentials {
         }
     }
 
+    /// Project onto the shared dispatcher's credential type.
+    ///
+    /// Twin of `bifrost-caldav`'s `to_shared`. The published enum stays exactly
+    /// as it is; `bifrost-dav-core` needs one shape it can serve both DAV
+    /// crates with. Bearer clones the `Arc`, so the token is still read live
+    /// from the shared source at every request.
+    pub(crate) fn to_shared(&self) -> bifrost_dav_core::DavCredentials {
+        match self {
+            Self::Basic { username, password } => bifrost_dav_core::DavCredentials::Basic {
+                username: username.clone(),
+                password: password.clone(),
+            },
+            Self::Bearer { token_source } => bifrost_dav_core::DavCredentials::Bearer {
+                token_source: Arc::clone(token_source),
+            },
+        }
+    }
+
     /// Read the bearer token the DAV request builder would present right
     /// now. Same per-request read point, so a value swapped on the
     /// shared source between two reads proves the token is read live

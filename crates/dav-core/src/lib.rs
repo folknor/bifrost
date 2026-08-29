@@ -18,9 +18,12 @@
 //! one side has (CalDAV's `sync-collection` and scheduling, CardDAV's
 //! `getctag`).
 
+mod dispatch;
 mod error;
 mod etag;
 mod transport;
+
+pub use dispatch::{DavCredentials, DavDispatch};
 
 pub use error::{
     DavProtocol, local_error, not_found_error, parse_error, recovery_rank, response_read_error,

@@ -509,6 +509,27 @@ What moved: the `DavTransport` seam and `ReqwestDavTransport`, `DavResponse` /
 status-to-`AccountError` ladder with its five constructors, and
 `worse_recovery` / `recovery_rank`.
 
+Then the whole request dispatcher, as `DavDispatch`: the HTTP client, the
+transport handle, the credential store, the admitted-origin set, the credential
+gate (`auth_headers` / `is_trusted_url` / `admit_discovered_urls`),
+`resolve_url`, the manual cross-origin redirect walk in `send_raw_request`, and
+the generic verbs `propfind_raw`, `report_raw`, `report_raw_response`,
+`delete_resource` and `move_resource`. `CalDavClient` is now a newtype over it
+plus the CalDAV-specific bodies and parsers. This was the security-sensitive
+half: the credential gate, the HTTPS-downgrade refusal and the redirect walk
+were all duplicated, and a divergence there is a credential leak. Ablating
+`is_trusted_url` in the shared crate fails three tests in each crate.
+
+`CalDavCredentials` stays published and unchanged; `to_shared` projects it onto
+the dispatcher's `DavCredentials`, cloning the `Arc` so a bearer token is still
+read live from the shared source at every request.
+
+Also NOT moved, and for the same reason as `not_found_error`:
+`bifrost-carddav` has its own `send_status_request` that returns the response
+ETag, where CalDAV's discards it. CardDAV's `put_vcard` and `delete_vcard`
+report the new validator to their callers and CalDAV's equivalents do not, so
+collapsing the two would have dropped an etag on every CardDAV write.
+
 The two dialects differed in exactly three values - the `ResourceKind` a 404 and
 a 403 name, the `Protocol` stamp, and the `field` label on a local argument
 error - so those became a `DavProtocol` parameter, and this crate binds it once

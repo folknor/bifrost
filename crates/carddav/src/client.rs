@@ -1,22 +1,27 @@
 use std::fmt;
+#[cfg(test)]
 use std::sync::Arc;
 
-use base64::Engine;
+pub(crate) use bifrost_dav_core::PutCondition;
+#[cfg(test)]
+use bifrost_dav_core::ReqwestDavTransport;
 use bifrost_dav_core::{
-    DAV_CLIENT_TIMEOUT, DavProtocol, ReqwestDavTransport, dav_redirect_policy, normalize_http_etag,
-    origin_is_secure, prepare_if_match, settle_body, transport_failure, url_origin, worse_recovery,
+    DavDispatch, DavProtocol, normalize_http_etag, prepare_if_match, worse_recovery,
 };
-pub(crate) use bifrost_dav_core::{DavBody, DavResponse, DavTransport, PutCondition};
+#[cfg(test)]
+pub(crate) use bifrost_dav_core::{DavResponse, DavTransport};
 use bifrost_types::{AccountError, AccountErrorKind, AccountOperation, ErrorScope, ResourceKind};
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, ETAG, HeaderMap, HeaderValue};
-use reqwest::{Method, StatusCode, Url};
+#[cfg(test)]
+use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
+use reqwest::header::{CONTENT_TYPE, ETAG};
+use reqwest::{Method, StatusCode};
 
+use crate::CardDavConfig;
 use crate::parse::{
     AddressBookCollection, CardDavContactListing, CardDavMultigetReport, MultigetOutcome,
     extract_href_property, parse_addressbook_collections, parse_multiget_report,
     parse_propfind_contacts, resolve_href,
 };
-use crate::{CardDavConfig, CardDavCredentials};
 
 const MULTIGET_BATCH_SIZE: usize = 50;
 
@@ -39,38 +44,23 @@ const DAV: DavProtocol = DavProtocol::CardDav;
 
 #[derive(Clone)]
 pub(crate) struct CardDavClient {
-    http: reqwest::Client,
-    transport: Arc<dyn DavTransport>,
-    base_url: String,
-    credentials: CardDavCredentials,
-    trusted_origins: Vec<String>,
+    /// Transport, credentials, origin gate and the generic WebDAV verbs, all
+    /// shared with `bifrost-caldav` through `bifrost-dav-core`.
+    dav: DavDispatch,
 }
 
 impl fmt::Debug for CardDavClient {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CardDavClient")
-            .field("base_url", &self.base_url)
-            .field("credentials", &self.credentials)
+            .field("dav", &self.dav)
             .finish_non_exhaustive()
     }
 }
 
 impl CardDavClient {
     pub(crate) fn new(config: &CardDavConfig) -> Result<Self, AccountError> {
-        let http = reqwest::Client::builder()
-            .redirect(dav_redirect_policy())
-            .timeout(DAV_CLIENT_TIMEOUT)
-            .build()
-            .map_err(|error| local_error(AccountOperation::Discover, error.to_string()))?;
-
-        let base_url = config.base_url.trim_end_matches('/').to_string();
-        let trusted_origins = url_origin(&base_url).into_iter().collect::<Vec<_>>();
         Ok(Self {
-            http,
-            transport: Arc::new(ReqwestDavTransport),
-            trusted_origins,
-            base_url,
-            credentials: config.credentials.clone(),
+            dav: DavDispatch::new(&config.base_url, config.credentials.to_shared(), DAV)?,
         })
     }
 
@@ -81,10 +71,11 @@ impl CardDavClient {
         // endpoint, and a deployment answering it with 401/403 rather
         // than 404 would fail the open before the configured base was
         // ever tried.
-        let well_known_url = bifrost_net::url::well_known_url(&self.base_url, "carddav");
+        let well_known_url = bifrost_net::url::well_known_url(self.dav.base_url(), "carddav");
         let dav_root = match well_known_url {
-            None => self.base_url.clone(),
+            None => self.dav.base_url().to_string(),
             Some(well_known_url) => match self
+                .dav
                 .propfind_raw(
                     &well_known_url,
                     "0",
@@ -101,15 +92,16 @@ impl CardDavClient {
                         Some(principal) => {
                             return self.addressbook_home_for_principal(principal).await;
                         }
-                        None => self.base_url.clone(),
+                        None => self.dav.base_url().to_string(),
                     }
                 }
-                Err(error) if should_fallback_discovery(&error) => self.base_url.clone(),
+                Err(error) if should_fallback_discovery(&error) => self.dav.base_url().to_string(),
                 Err(error) => return Err(error),
             },
         };
 
         let response = self
+            .dav
             .propfind_raw(
                 &dav_root,
                 "0",
@@ -131,6 +123,7 @@ impl CardDavClient {
         principal: String,
     ) -> Result<String, AccountError> {
         let response = self
+            .dav
             .propfind_raw(
                 &principal,
                 "0",
@@ -158,6 +151,7 @@ impl CardDavClient {
         operation: AccountOperation,
     ) -> Result<Vec<AddressBookCollection>, AccountError> {
         let response = self
+            .dav
             .propfind_raw(home_url, "1", PROPFIND_ADDRESSBOOKS, operation)
             .await?;
         let mut collections = parse_addressbook_collections(&response.text)
@@ -177,6 +171,7 @@ impl CardDavClient {
         operation: AccountOperation,
     ) -> Result<Option<String>, AccountError> {
         let response = self
+            .dav
             .propfind_raw(addressbook_url, "0", PROPFIND_CTAG, operation)
             .await?;
         crate::parse::parse_collection_ctag(&response.text)
@@ -193,6 +188,7 @@ impl CardDavClient {
         operation: AccountOperation,
     ) -> Result<CardDavContactListing, AccountError> {
         let response = self
+            .dav
             .propfind_raw(addressbook_url, "1", PROPFIND_CONTACTS, operation)
             .await?;
         let mut listing = parse_propfind_contacts(&response.text)
@@ -287,7 +283,7 @@ impl CardDavClient {
             operation,
             context,
         } = leg;
-        let response = match self.report_raw(url, depth, body, operation).await {
+        let response = match self.dav.report_raw(url, depth, body, operation).await {
             Ok(response) => response,
             Err(error) => {
                 *degraded = worse_recovery(degraded.take(), error);
@@ -358,10 +354,10 @@ impl CardDavClient {
         operation: AccountOperation,
     ) -> Result<Option<String>, AccountError> {
         let mut request = self
-            .http
+            .dav
             .request(Method::PUT, url)
             .header(CONTENT_TYPE, "text/vcard; charset=utf-8")
-            .headers(self.auth_headers(url, operation).await?)
+            .headers(self.dav.auth_headers(url, operation).await?)
             .body(body);
         match condition {
             PutCondition::IfNoneMatch => {
@@ -388,33 +384,7 @@ impl CardDavClient {
         to: &str,
         operation: AccountOperation,
     ) -> Result<bool, AccountError> {
-        if !self.is_trusted_url(to) {
-            return Err(local_error(
-                operation,
-                format!("refusing to name an untrusted DAV move destination: {to}"),
-            ));
-        }
-        let method = Method::from_bytes(b"MOVE")
-            .map_err(|error| local_error(operation, error.to_string()))?;
-        let destination =
-            HeaderValue::from_str(to).map_err(|error| local_error(operation, error.to_string()))?;
-        let request = self
-            .http
-            .request(method, from)
-            .header("Destination", destination)
-            .header("Overwrite", "F")
-            .headers(self.auth_headers(from, operation).await?);
-        let response = self.send_raw_request(request, operation).await?;
-        if response.status.is_success() {
-            return Ok(true);
-        }
-        if matches!(
-            response.status,
-            StatusCode::METHOD_NOT_ALLOWED | StatusCode::NOT_IMPLEMENTED
-        ) {
-            return Ok(false);
-        }
-        Err(status_error(operation, response.status, response.body))
+        self.dav.move_resource(from, to, operation).await
     }
 
     pub(crate) async fn delete_vcard(
@@ -423,100 +393,26 @@ impl CardDavClient {
         operation: AccountOperation,
     ) -> Result<Option<String>, AccountError> {
         let request = self
-            .http
+            .dav
             .request(Method::DELETE, url)
-            .headers(self.auth_headers(url, operation).await?);
+            .headers(self.dav.auth_headers(url, operation).await?);
         self.send_status_request(request, operation).await
     }
 
-    /// A client that only knows its base URL, for tests that exercise
-    /// href resolution without touching the network.
-    #[cfg(test)]
-    pub(crate) fn for_base_url(base_url: &str) -> Self {
-        Self::with_transport(base_url, Arc::new(ReqwestDavTransport))
-    }
-
-    #[cfg(test)]
-    pub(crate) fn with_transport(base_url: &str, transport: Arc<dyn DavTransport>) -> Self {
-        let trusted_origins = url_origin(base_url).into_iter().collect::<Vec<_>>();
-        Self {
-            http: reqwest::Client::new(),
-            transport,
-            base_url: base_url.trim_end_matches('/').to_string(),
-            credentials: CardDavCredentials::bearer("token"),
-            trusted_origins,
-        }
-    }
-
-    pub(crate) fn resolve_url(&self, href: &str) -> String {
-        if href.starts_with("http://") || href.starts_with("https://") {
-            return href.to_string();
-        }
-        if let Ok(base) = Url::parse(&self.base_url)
-            && let Ok(resolved) = base.join(href)
-        {
-            return resolved.to_string();
-        }
-        if self.base_url.ends_with('/') || href.starts_with('/') {
-            format!("{}{href}", self.base_url)
-        } else {
-            format!("{}/{href}", self.base_url)
-        }
-    }
-
-    async fn propfind_raw(
-        &self,
-        url: &str,
-        depth: &str,
-        body: &str,
-        operation: AccountOperation,
-    ) -> Result<DavBody, AccountError> {
-        let method = Method::from_bytes(b"PROPFIND")
-            .map_err(|error| local_error(operation, error.to_string()))?;
-        let request = self
-            .http
-            .request(method, url)
-            .header(CONTENT_TYPE, "application/xml; charset=utf-8")
-            .header("Depth", depth)
-            .headers(self.auth_headers(url, operation).await?)
-            .body(body.to_string());
-        self.send_body_request(request, operation).await
-    }
-
-    async fn report_raw(
-        &self,
-        url: &str,
-        depth: &str,
-        body: &str,
-        operation: AccountOperation,
-    ) -> Result<DavBody, AccountError> {
-        let method = Method::from_bytes(b"REPORT")
-            .map_err(|error| local_error(operation, error.to_string()))?;
-        let request = self
-            .http
-            .request(method, url)
-            .header(CONTENT_TYPE, "application/xml; charset=utf-8")
-            .header("Depth", depth)
-            .headers(self.auth_headers(url, operation).await?)
-            .body(body.to_string());
-        self.send_body_request(request, operation).await
-    }
-
-    async fn send_body_request(
-        &self,
-        request: reqwest::RequestBuilder,
-        operation: AccountOperation,
-    ) -> Result<DavBody, AccountError> {
-        let response = self.send_raw_request(request, operation).await?;
-        settle_body(response, operation, DAV)
-    }
-
+    /// A status-only request that also hands back the response ETag.
+    ///
+    /// Deliberately NOT `DavDispatch::send_status_request`, which discards the
+    /// response. This is a real divergence from `bifrost-caldav` rather than
+    /// drift: CardDAV's `put_vcard` and `delete_vcard` return the new validator
+    /// to their callers, and CalDAV's equivalents return `()`. Collapsing the
+    /// two during the dav-core extraction would have silently dropped the etag
+    /// every CardDAV write reports.
     async fn send_status_request(
         &self,
         request: reqwest::RequestBuilder,
         operation: AccountOperation,
     ) -> Result<Option<String>, AccountError> {
-        let response = self.send_raw_request(request, operation).await?;
+        let response = self.dav.send_raw_request(request, operation).await?;
         let etag = response
             .headers
             .get(ETAG)
@@ -529,164 +425,31 @@ impl CardDavClient {
         }
     }
 
-    /// Send a request, following cross-origin redirects by hand.
-    ///
-    /// Same-origin hops are followed inside reqwest, which preserves the
-    /// `Authorization` header when scheme, host, and effective port are all
-    /// unchanged. A cross-origin hop cannot ride that path: reqwest strips
-    /// `Authorization` on any origin change and its redirect policy has no
-    /// way to restore it, so a followed hop would reach the destination
-    /// unauthenticated. Cross-origin 3xx responses are therefore stopped by
-    /// the policy and re-dispatched here with fresh `auth_headers` for the
-    /// target - and `auth_headers` refuses any origin discovery did not
-    /// admit, so a server-controlled `Location` can never widen trust, only
-    /// spend trust that authenticated discovery already granted. The method
-    /// and body are preserved on 301/302/307/308; DAV verbs have no useful
-    /// GET rewrite, and RFC 7231 permits preserving them. A 303 is not
-    /// followed and classifies as a terminal status downstream.
-    async fn send_raw_request(
-        &self,
-        request: reqwest::RequestBuilder,
-        operation: AccountOperation,
-    ) -> Result<DavResponse, AccountError> {
-        let max_hops = usize::from(bifrost_net::RedirectPolicy::default().max_hops);
-        let mut request = request;
-        let mut hops = 0usize;
-        loop {
-            let replay = request.try_clone();
-            let response = self
-                .transport
-                .send(request)
-                .await
-                .map_err(|error| transport_failure(operation, error, DAV))?;
-            let redirect = matches!(
-                response.status,
-                StatusCode::MOVED_PERMANENTLY
-                    | StatusCode::FOUND
-                    | StatusCode::TEMPORARY_REDIRECT
-                    | StatusCode::PERMANENT_REDIRECT
-            );
-            let location = response
-                .headers
-                .get(reqwest::header::LOCATION)
-                .and_then(|value| value.to_str().ok());
-            let Some(location) = location.filter(|_| redirect) else {
-                if !self.is_trusted_url(&response.url) {
-                    return Err(local_error(
-                        operation,
-                        format!(
-                            "response arrived from an untrusted DAV origin: {}",
-                            response.url
-                        ),
-                    ));
-                }
-                return Ok(response);
-            };
-            let next = Url::parse(&response.url)
-                .and_then(|base| base.join(location))
-                .map_err(|error| {
-                    local_error(operation, format!("unresolvable redirect target: {error}"))
-                })?;
-            hops += 1;
-            if hops > max_hops {
-                return Err(local_error(operation, "too many redirects"));
-            }
-            let Some(replay) = replay else {
-                return Err(local_error(
-                    operation,
-                    "redirected DAV request cannot be replayed",
-                ));
-            };
-            let previous = replay
-                .build()
-                .map_err(|error| local_error(operation, error.to_string()))?;
-            // Fresh credentials for the target origin; refused locally when
-            // the origin was never admitted by discovery.
-            let auth = self.auth_headers(next.as_str(), operation).await?;
-            let mut headers = previous.headers().clone();
-            headers.remove(AUTHORIZATION);
-            for (name, value) in &auth {
-                headers.insert(name, value.clone());
-            }
-            let mut rebuilt = self
-                .http
-                .request(previous.method().clone(), next)
-                .headers(headers);
-            if let Some(body) = previous.body().and_then(reqwest::Body::as_bytes) {
-                rebuilt = rebuilt.body(body.to_vec());
-            }
-            request = rebuilt;
+    /// A client that only knows its base URL, for tests that exercise
+    /// href resolution without touching the network.
+    #[cfg(test)]
+    pub(crate) fn for_base_url(base_url: &str) -> Self {
+        Self::with_transport(base_url, Arc::new(ReqwestDavTransport))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_transport(base_url: &str, transport: Arc<dyn DavTransport>) -> Self {
+        Self {
+            dav: DavDispatch::with_transport(
+                base_url,
+                transport,
+                crate::CardDavCredentials::bearer("token").to_shared(),
+                DAV,
+            ),
         }
     }
 
-    /// Build the per-request auth headers. The bearer token is read from
-    /// the shared source on every call, so a token rotated mid-sync is
-    /// honored on the next DAV request without reopening the account.
-    async fn auth_headers(
-        &self,
-        url: &str,
-        operation: AccountOperation,
-    ) -> Result<HeaderMap, AccountError> {
-        if !self.is_trusted_url(url) {
-            return Err(local_error(
-                operation,
-                format!("refusing to send DAV credentials to untrusted URL: {url}"),
-            ));
-        }
-        let mut headers = HeaderMap::new();
-        match &self.credentials {
-            CardDavCredentials::Basic { username, password } => {
-                let credentials = base64::engine::general_purpose::STANDARD
-                    .encode(format!("{username}:{password}"));
-                if let Ok(value) = HeaderValue::from_str(&format!("Basic {credentials}")) {
-                    headers.insert(AUTHORIZATION, value);
-                }
-            }
-            CardDavCredentials::Bearer { token_source } => {
-                let token = token_source.current().await.map_err(|error| {
-                    transport_error(
-                        operation,
-                        format!("failed to read OAuth access token: {error}"),
-                    )
-                })?;
-                if let Ok(value) = HeaderValue::from_str(&format!("Bearer {}", token.as_str())) {
-                    headers.insert(AUTHORIZATION, value);
-                }
-            }
-        }
-        Ok(headers)
+    pub(crate) fn resolve_url(&self, href: &str) -> String {
+        self.dav.resolve_url(href)
     }
 
-    /// Admit successfully discovered DAV origins to both trust gates.
-    ///
-    /// Discovery is server-steered: the address book home comes out of the
-    /// principal's own PROPFIND response, so a compromised or hostile server
-    /// picks the origin. Two rules bound what it can pick. A discovered
-    /// origin must parse, and it must never weaken the transport guarantee
-    /// the configured base URL already established - an HTTPS-configured
-    /// account never trusts a plaintext discovered home, because that would
-    /// turn discovery into a downgrade channel for the account credential. A
-    /// cross-origin HTTPS home is still admitted; that is a real deployment
-    /// shape, where the principal and the address book home live on different
-    /// hosts of the same service. Admission happens only after the complete
-    /// authenticated discovery result is available, before the account is
-    /// shared or a home request can be in flight.
     pub(crate) fn admit_discovered_urls(&mut self, urls: impl IntoIterator<Item = String>) {
-        for url in urls {
-            let Some(origin) = url_origin(&url) else {
-                continue;
-            };
-            if origin_is_secure(&self.base_url) && !origin_is_secure(&url) {
-                continue;
-            }
-            if !self.trusted_origins.contains(&origin) {
-                self.trusted_origins.push(origin);
-            }
-        }
-    }
-
-    fn is_trusted_url(&self, url: &str) -> bool {
-        url_origin(url).is_some_and(|origin| self.trusted_origins.contains(&origin))
+        self.dav.admit_discovered_urls(urls);
     }
 }
 
@@ -808,6 +571,9 @@ pub(crate) fn parse_error(operation: AccountOperation, message: impl Into<String
     bifrost_dav_core::parse_error(operation, message, DAV)
 }
 
+/// Only the account layer's tests mint one directly now; production transport
+/// failures come back already classified from `DavDispatch`.
+#[cfg(test)]
 pub(crate) fn transport_error(
     operation: AccountOperation,
     message: impl Into<String>,

@@ -348,10 +348,21 @@ inventory of what was extracted and why the two dialects reduce to a single
 `const DAV: DavProtocol = DavProtocol::CardDav`, pinned by
 `every_error_this_crate_mints_is_stamped_carddav`.
 
-One thing deliberately stayed local: this crate's `not_found_error` attaches an
-`ErrorScope` naming the contact, where CalDAV's `missing_event_error` puts the id
-in the cause. That difference is behavioural, so it was not flattened into the
-shared constructor.
+`CardDavClient` is a newtype over the shared `DavDispatch`, which owns the HTTP
+client, credentials, the admitted-origin credential gate, the manual
+cross-origin redirect walk and the generic WebDAV verbs.
+`CardDavCredentials` stays published and unchanged; `to_shared` projects it onto
+the dispatcher's `DavCredentials`.
+
+TWO things deliberately stayed local, both behavioural differences rather than
+drift, and both of which the extraction would otherwise have silently flattened:
+
+- `not_found_error` attaches an `ErrorScope` naming the contact, where CalDAV's
+  `missing_event_error` puts the id in the cause.
+- `send_status_request` returns the response ETag. `put_vcard` and
+  `delete_vcard` hand that validator back to their callers; the CalDAV
+  equivalents return `()`. Using the shared `DavDispatch::send_status_request`
+  here would have dropped the etag on every CardDAV write.
 
 ## This crate and bifrost-caldav are near-duplicates, and drift is the defect
 
