@@ -832,6 +832,19 @@ fn parse_retry_after_header(headers: &HeaderMap) -> Option<RetryHint> {
     parse_retry_after(Some(value)).map(RetryHint::After)
 }
 
+/// Note the deliberate asymmetry with IMAP, which DOES read a folder id out of
+/// `ErrorScope::Cursor(Folder(_))` in its own `resource_from_scope`.
+///
+/// Graph builds `Cursor(Folder(_))` / `Cursor(FolderType(_))` on essentially
+/// every changes, inventory, push and public-folder path, so honouring it here
+/// would name the folder in more diagnostics - a real if minor gain. It is not
+/// a free change, though, and that is why it has not been made: this function
+/// gates the `NotFound` classification above, so returning `Some(Mailbox)` for
+/// a cursor scope silently converts every folder-scoped Graph 404 from a
+/// generic server error into `NotFound(Mailbox)`, with a different recovery
+/// class behind it. That is a behaviour change for consumers, not a
+/// diagnostics improvement, and it wants deciding on its own terms rather than
+/// riding along with a tidy-up.
 fn resource_from_scope(scope: Option<&ErrorScope>) -> Option<ResourceKind> {
     match scope? {
         ErrorScope::Message { .. } => Some(ResourceKind::Message),

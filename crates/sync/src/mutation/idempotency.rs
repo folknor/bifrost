@@ -85,9 +85,16 @@ pub fn default_salt_factory() -> Box<dyn Fn(ProtocolKind) -> ProtocolSalt + Send
         ProtocolKind::Graph => ProtocolSalt::Graph(String::new()),
         ProtocolKind::Imap => ProtocolSalt::Imap,
         ProtocolKind::CardDav => ProtocolSalt::CardDav,
+        ProtocolKind::CalDav => ProtocolSalt::CalDav,
         // `ProtocolKind` is `#[non_exhaustive]`; fall back to the IMAP
-        // salt for unknown future protocols. The salt is engine
+        // salt for unknown FUTURE protocols. The salt is engine
         // bookkeeping; it never travels on the wire so this is safe.
+        //
+        // Every protocol that exists today is named above, deliberately:
+        // CalDAV used to reach this arm, so the catch-all was absorbing a
+        // live protocol rather than a hypothetical one, which is the state
+        // that stops being harmless the moment the salt acquires meaning.
+        // Keep it that way - a new `ProtocolKind` gets an arm here.
         _ => ProtocolSalt::Imap,
     })
 }
@@ -112,5 +119,28 @@ mod tests {
         let b = v.next(ProtocolKind::Imap);
         assert_eq!(a.run_id, RunId("fixed".into()));
         assert_eq!(b.run_id, RunId("fixed".into()));
+    }
+
+    /// Every protocol that EXISTS gets its own salt; the catch-all is reserved
+    /// for protocols that do not exist yet. CalDAV used to fall through to the
+    /// IMAP salt, so a live account crate was sharing another protocol's tag.
+    #[test]
+    fn every_live_protocol_has_its_own_salt() {
+        let factory = default_salt_factory();
+        let live = [
+            (ProtocolKind::Jmap, ProtocolSalt::Jmap(String::new())),
+            (ProtocolKind::Gmail, ProtocolSalt::Gmail(String::new())),
+            (ProtocolKind::Graph, ProtocolSalt::Graph(String::new())),
+            (ProtocolKind::Imap, ProtocolSalt::Imap),
+            (ProtocolKind::CardDav, ProtocolSalt::CardDav),
+            (ProtocolKind::CalDav, ProtocolSalt::CalDav),
+        ];
+        for (kind, expected) in live {
+            assert_eq!(
+                factory(kind),
+                expected,
+                "{kind:?} must map to its own salt, not fall through the catch-all"
+            );
+        }
     }
 }

@@ -197,6 +197,15 @@ pub enum ProtocolSalt {
     /// CardDAV carries no replay token; consumers use etags where
     /// available and the engine keeps idempotency local.
     CardDav,
+    /// CalDAV carries no replay token, on the same terms as CardDAV.
+    ///
+    /// Present because `ProtocolKind::CalDav` is a live protocol with a live
+    /// account crate. Without it, `default_salt_factory`'s catch-all silently
+    /// handed CalDAV the IMAP salt - harmless while the salt is engine-internal
+    /// bookkeeping separated by `RunId` plus a monotonic sequence, but a
+    /// catch-all absorbing a REAL protocol rather than a hypothetical future
+    /// one stops being harmless the moment the salt acquires meaning.
+    CalDav,
 }
 
 /// Bulk flag mutation. Carries both the operation and the flag set

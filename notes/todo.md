@@ -694,44 +694,28 @@ blocking; each is a real defect or a real decision, not a cleanup.
   a second left behind - and in both cases a sibling arm in the very same match
   showed the correct treatment.
 
-- **sweep-2c (types + sync, gap). `ProtocolSalt` never followed
-  `ProtocolKind::CalDav`.** `mutation/idempotency.rs`'s `default_salt_factory`
-  enumerates Jmap / Gmail / Graph / Imap / CardDav then `_ => ProtocolSalt::Imap`,
-  but `ProtocolKind` carries `CalDav` and caldav is a live account crate. The
-  sibling `CardDav` got a salt variant and CalDAV did not. No observable
-  consequence today - the salt is engine-internal and `IdempotencyKey` is
-  separated by `run_id` plus a monotonic sequence - so it is correct by luck,
-  with a catch-all absorbing a LIVE protocol rather than a hypothetical future
-  one. Closing it adds a variant to a published enum, so it wants owner sign-off.
+  The bookkeeping tail is also closed (2026-08-29). `ProtocolSalt::CalDav`
+  exists and `default_salt_factory` names it, so the catch-all is reserved for
+  protocols that do not exist yet rather than absorbing a live one - pinned by
+  `every_live_protocol_has_its_own_salt`, which fails with `Imap` against
+  `CalDav` when the arm is removed. The mutation campaign forwards
+  `SyncEvent::Warning` instead of dropping it, on the same channel the engine
+  already uses for its own campaign warnings. `scopes_for_hint`'s
+  `SpecificMembership` arm is annotated as having no production producer, so it
+  is not read as evidence that the push path exercises the membership index.
+  Only sweep-2e was left, deliberately - see below.
 
-- **sweep-2d (sync, gap). `HintPayload::SpecificMembership` has no production
-  producer.** `push/reconciler.rs`'s `scopes_for_hint` routes it through
-  `CursorRegistry::scopes_for_membership`, but every push hint built in imap,
-  jmap and graph is `Unknown` or `SpecificCursorScope`. Inverted polarity of the
-  calibration case - the READER arm is dead, not the producer - so nothing is
-  lost and the `Unknown` fallback is safe. Recorded because the membership index
-  carries maintenance cost (reopen rebuild, lifecycle updates, `forget_account`)
-  for one live consumer only, and a future reader could reasonably assume the
-  push path exercises it.
-
-- **sweep-2e (graph, nit). `resource_from_scope` / `id_from_scope` return
-  `None` for `Cursor(_)`.** `account/graph_error.rs` enumerates it explicitly
-  rather than falling through, so it is a decision, not drift - but Graph builds
-  `ErrorScope::Cursor(CursorScope::{Folder,FolderType})` on essentially every
-  changes, inventory, push and public-folder path, so a Graph 403 on a shared or
-  public folder derives `NoPermission { resource: None }` and names no id in the
-  support export, where the same failure on IMAP names the mailbox. Flagged only
-  as an asymmetry with IMAP's reader, which handles both shapes.
-
-- **sweep-2f (sync + google, nit). The mutation campaign drops
-  `SyncEvent::Warning`.** `engine.rs`'s campaign stream reader discards it;
-  `crates/google/src/account/mutation.rs` deliberately interleaves a
-  `StrategyDowngraded` warning ahead of its batch (pinned by three tests) when
-  Gmail cannot represent a requested flag. Same shape as sweep-2b but much lower
-  stakes: `MutationSuccess::Downgraded { actual: FlagsPartiallyApplied { .. } }`
-  is the structural channel and `error-model.md` names it as the one carrying
-  the unsupported flags, so the warning is duplicate signal rather than the only
-  copy.
+- **sweep-2e (graph). Graph's scope readers return `None` for `Cursor(_)`
+  where IMAP's read the folder.** NOT actioned as bookkeeping, and the reason
+  is worth keeping: `resource_from_scope` gates the `NotFound` classification,
+  so teaching it to read `Cursor(Folder(_))` would silently convert every
+  folder-scoped Graph 404 from a generic server error into
+  `NotFound(Mailbox)`, carrying a different recovery class. That is a
+  behaviour change for consumers wearing the clothes of a diagnostics
+  improvement, so it wants deciding on its own terms. The trade is annotated at
+  the function. What is actually lost today: a Graph 403 on a shared or public
+  folder derives `NoPermission { resource: None }` and names no id in the
+  support export, where the same failure on IMAP names the mailbox.
 
 ## Open items folded in from the bug-hunt ledgers (2026-08-23)
 

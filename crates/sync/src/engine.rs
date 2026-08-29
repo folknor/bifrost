@@ -1820,8 +1820,25 @@ impl SyncEngine {
                         }
                     }
                     bifrost_types::SyncEvent::Done(_) => break,
-                    bifrost_types::SyncEvent::Progress(_)
-                    | bifrost_types::SyncEvent::Warning(_) => {}
+                    // Forwarded on the same channel the engine uses for its own
+                    // campaign warnings a few lines above. Gmail deliberately
+                    // interleaves a `StrategyDowngraded` warning ahead of its
+                    // batch when it cannot represent a requested flag, and
+                    // absorbing it here left that announcement nowhere. The
+                    // structural answer still rides on
+                    // `MutationSuccess::Downgraded`, so this is a second copy
+                    // rather than the only one - but a lane the producer
+                    // deliberately wrote to should not dead-end in the engine.
+                    bifrost_types::SyncEvent::Warning(warning) => {
+                        let me = MultiplexerEvent {
+                            scope: CursorScope::Account,
+                            event: Arc::new(SyncEvent::Warning(warning)),
+                            checkpoint: None,
+                            publication: None,
+                        };
+                        let _ = slot.multiplexer.changes_tx.send(me);
+                    }
+                    bifrost_types::SyncEvent::Progress(_) => {}
                     _ => {}
                 }
             }

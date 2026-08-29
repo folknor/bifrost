@@ -377,6 +377,15 @@ impl Reconciler {
 /// - `SpecificCursorScope(s)` -> `vec![s]`
 /// - `SpecificMembership(m)` -> registry's membership index
 /// - `Unknown` -> every registered cursor scope.
+///
+/// The `SpecificMembership` arm has NO production producer today: every push
+/// hint built in imap, jmap and graph is `Unknown` or `SpecificCursorScope`.
+/// It is kept rather than removed because it is the correct routing for a
+/// membership-shaped invalidation and the index it consults is maintained
+/// anyway (`membership_to_cursor_scopes` is a live consumer), but do not read
+/// this arm as evidence that the push path exercises the membership index -
+/// it does not. Nothing is lost while it is unreachable: the `Unknown`
+/// fallback is a full reconcile, which is strictly wider.
 #[must_use]
 pub fn scopes_for_hint(registry: &CursorRegistry, hint: &HintPayload) -> Vec<CursorScope> {
     match hint {
