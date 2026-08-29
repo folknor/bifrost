@@ -462,6 +462,46 @@ impl CardDavClient {
         self.send_status_request(request, operation).await
     }
 
+    /// WebDAV `MOVE` of one resource into another collection.
+    ///
+    /// Twin of `bifrost-caldav`'s `move_resource`; keep them in step. See there
+    /// for why `Overwrite: F`, why the destination is credential-gated, and why
+    /// only 405/501 are fallback triggers.
+    pub(crate) async fn move_resource(
+        &self,
+        from: &str,
+        to: &str,
+        operation: AccountOperation,
+    ) -> Result<bool, AccountError> {
+        if !self.is_trusted_url(to) {
+            return Err(local_error(
+                operation,
+                format!("refusing to name an untrusted DAV move destination: {to}"),
+            ));
+        }
+        let method = Method::from_bytes(b"MOVE")
+            .map_err(|error| local_error(operation, error.to_string()))?;
+        let destination =
+            HeaderValue::from_str(to).map_err(|error| local_error(operation, error.to_string()))?;
+        let request = self
+            .http
+            .request(method, from)
+            .header("Destination", destination)
+            .header("Overwrite", "F")
+            .headers(self.auth_headers(from, operation).await?);
+        let response = self.send_raw_request(request, operation).await?;
+        if response.status.is_success() {
+            return Ok(true);
+        }
+        if matches!(
+            response.status,
+            StatusCode::METHOD_NOT_ALLOWED | StatusCode::NOT_IMPLEMENTED
+        ) {
+            return Ok(false);
+        }
+        Err(status_error(operation, response.status, response.body))
+    }
+
     pub(crate) async fn delete_vcard(
         &self,
         url: &str,
@@ -1800,6 +1840,173 @@ mod tests {
             "no request reached the plaintext origin: {:?}",
             requests.iter().map(|r| &r.url).collect::<Vec<_>>()
         );
+    }
+
+    /// A cross-address-book `contact_update` MOVES the resource, and a restated
+    /// address book still updates in place.
+    ///
+    /// Twin of `bifrost-caldav`'s
+    /// `event_update_moves_across_calendars_and_updates_in_place_otherwise`;
+    /// keep them in step. This crate refused the relocation before dav-B11 and,
+    /// unlike its CalDAV twin, never pinned the refusal - which is why the
+    /// behaviour change here broke no test. The pair is pinned now.
+    #[tokio::test]
+    async fn contact_update_moves_across_address_books_and_updates_in_place_otherwise() {
+        use bifrost_types::account::Account as _;
+
+        let multiget = |href: &str| DavResponse {
+            status: StatusCode::MULTI_STATUS,
+            headers: HeaderMap::new(),
+            body: format!(
+                "<D:multistatus xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:carddav\"><D:response><D:href>{href}</D:href><D:propstat><D:prop><C:address-data>BEGIN:VCARD\nVERSION:4.0\nFN:One\nEND:VCARD</C:address-data></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response></D:multistatus>"
+            ),
+            url: String::new(),
+        };
+        let contact =
+            || bifrost_types::ContactId("https://dav.example.test/books/work/one.vcf".to_string());
+        let patch_to = |book: &str| bifrost_types::ContactPatch {
+            address_book_id: Some(bifrost_types::AddressBookId(book.to_string())),
+            ..Default::default()
+        };
+
+        // A move: multiget the current resource, then MOVE it.
+        let script = ScriptedDavTransport::new([
+            multiget("/books/work/one.vcf"),
+            DavResponse {
+                status: StatusCode::CREATED,
+                headers: HeaderMap::new(),
+                body: String::new(),
+                url: String::new(),
+            },
+        ]);
+        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
+        let client = Arc::new(CardDavClient::with_transport(
+            "https://dav.example.test",
+            transport,
+        ));
+        let account = crate::account::CardDavAccount::for_tests(
+            client,
+            "https://dav.example.test/books/work/",
+        );
+        account
+            .contact_update(contact(), patch_to("https://dav.example.test/books/home/"))
+            .await
+            .expect("a move between address books is performed");
+        let requests = script.requests();
+        assert_eq!(
+            requests.len(),
+            2,
+            "a move-only patch is a REPORT and a MOVE, with no content write"
+        );
+        assert_eq!(requests[1].method.as_str(), "MOVE");
+        assert_eq!(
+            requests[1]
+                .headers
+                .get("Destination")
+                .and_then(|value| value.to_str().ok()),
+            Some("https://dav.example.test/books/home/one.vcf"),
+            "the destination keeps the resource's own file name"
+        );
+        assert_eq!(
+            requests[1]
+                .headers
+                .get("Overwrite")
+                .and_then(|value| value.to_str().ok()),
+            Some("F"),
+            "a name collision at the destination must refuse, not overwrite"
+        );
+
+        // Restating the contact's own address book is not a move.
+        let script = ScriptedDavTransport::new([
+            multiget("/books/work/one.vcf"),
+            DavResponse {
+                status: StatusCode::NO_CONTENT,
+                headers: HeaderMap::new(),
+                body: String::new(),
+                url: String::new(),
+            },
+        ]);
+        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
+        let client = Arc::new(CardDavClient::with_transport(
+            "https://dav.example.test",
+            transport,
+        ));
+        let account = crate::account::CardDavAccount::for_tests(
+            client,
+            "https://dav.example.test/books/work/",
+        );
+        account
+            .contact_update(contact(), patch_to("https://dav.example.test/books/work/"))
+            .await
+            .expect("restating the current address book is not a move");
+        let methods = script
+            .requests()
+            .into_iter()
+            .map(|request| request.method.as_str().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(methods, vec!["REPORT", "PUT"]);
+    }
+
+    /// A server without MOVE falls back to copy-then-delete, and a failure of
+    /// the delete leg reports the move as HALF applied. Twin of the CalDAV
+    /// assertion; keep them in step.
+    #[tokio::test]
+    async fn a_contact_move_without_server_move_support_copies_then_deletes() {
+        use bifrost_types::account::Account as _;
+
+        let response = |status: StatusCode, body: &str| DavResponse {
+            status,
+            headers: HeaderMap::new(),
+            body: body.to_string(),
+            url: String::new(),
+        };
+        let script = ScriptedDavTransport::new([
+            DavResponse {
+                status: StatusCode::MULTI_STATUS,
+                headers: HeaderMap::new(),
+                body: "<D:multistatus xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:carddav\"><D:response><D:href>/books/work/one.vcf</D:href><D:propstat><D:prop><C:address-data>BEGIN:VCARD\nVERSION:4.0\nFN:One\nEND:VCARD</C:address-data></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response></D:multistatus>".to_string(),
+                url: String::new(),
+            },
+            response(StatusCode::METHOD_NOT_ALLOWED, ""),
+            response(StatusCode::CREATED, ""),
+            response(StatusCode::INTERNAL_SERVER_ERROR, "boom"),
+        ]);
+        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
+        let client = Arc::new(CardDavClient::with_transport(
+            "https://dav.example.test",
+            transport,
+        ));
+        let account = crate::account::CardDavAccount::for_tests(
+            client,
+            "https://dav.example.test/books/work/",
+        );
+
+        let error = account
+            .contact_update(
+                bifrost_types::ContactId("https://dav.example.test/books/work/one.vcf".to_string()),
+                bifrost_types::ContactPatch {
+                    address_book_id: Some(bifrost_types::AddressBookId(
+                        "https://dav.example.test/books/home/".to_string(),
+                    )),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("a failed cleanup is not a success");
+
+        assert!(
+            matches!(
+                error.kind(),
+                AccountErrorKind::Protocol(ProtocolErrorKind::PartialResponse)
+            ),
+            "a copied-but-not-removed contact is a partial response: {error:?}"
+        );
+        let methods = script
+            .requests()
+            .into_iter()
+            .map(|request| request.method.as_str().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(methods, vec!["REPORT", "MOVE", "PUT", "DELETE"]);
     }
 
     #[tokio::test]

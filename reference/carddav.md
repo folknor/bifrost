@@ -189,8 +189,22 @@ Supported contact primitives:
   conditional form. Against a server that only ever emits weak ETags this
   means `contact_update` has no lost-update protection at all; a consumer
   that needs the guarantee needs an application-level revision check. Inline `ContactPatch.photo` replaces or clears vCard
-  PHOTO data. Changing `address_book_id` is rejected; CardDAV moves are
-  not implemented.
+  PHOTO data.
+
+  **A cross-address-book move is PERFORMED**, by the same machinery and with
+  the same guarantees as `bifrost-caldav::event_update`; see
+  `reference/caldav.md` for the MOVE-then-fallback sequence, the `Overwrite: F`
+  and credential-gated `Destination` rules, the `Protocol(PartialResponse)`
+  verdict on a failed cleanup leg, and why a move-only patch issues no content
+  write. The contact id is the resource URL and `contact_update` returns `()`,
+  so the new id reaches the consumer through sync rather than the call.
+
+  This crate refused the relocation until dav-B11 and, unlike its CalDAV twin,
+  never pinned the refusal - so the behaviour change broke no test here. Both
+  halves are pinned now
+  (`contact_update_moves_across_address_books_and_updates_in_place_otherwise`
+  and `a_contact_move_without_server_move_support_copies_then_deletes`). That
+  gap is the eighth measured divergence between these two crates.
 - `contact_delete` - deletes the DAV resource.
 - `contact_search` / `contact_autocomplete` - non-empty searches issue
   CardDAV `addressbook-query` text-match `REPORT`s over common vCard

@@ -572,6 +572,56 @@ impl CalDavClient {
         self.send_status_request(request, operation).await
     }
 
+    /// WebDAV `MOVE` of one resource into another collection.
+    ///
+    /// `Overwrite: F` so a name collision at the destination is refused rather
+    /// than silently destroying whatever already sits there. `Destination` must
+    /// be an absolute URI (RFC 4918 s10.3).
+    ///
+    /// The destination is gated by the same admitted-origin set as the source:
+    /// `Destination` is a URL this client asks the server to write to, and a
+    /// consumer-supplied `CalendarId` must not be able to steer it anywhere the
+    /// credential gate would refuse.
+    ///
+    /// `Ok(false)` means the server does not implement MOVE, so the caller can
+    /// fall back to copy-then-delete. Every other non-2xx is a real error - in
+    /// particular 412 (the destination is occupied) and 502 (the server refuses
+    /// the destination) are failures, not fallback triggers.
+    pub(crate) async fn move_resource(
+        &self,
+        from: &str,
+        to: &str,
+        operation: AccountOperation,
+    ) -> Result<bool, AccountError> {
+        if !self.is_trusted_url(to) {
+            return Err(local_error(
+                operation,
+                format!("refusing to name an untrusted DAV move destination: {to}"),
+            ));
+        }
+        let method = Method::from_bytes(b"MOVE")
+            .map_err(|error| local_error(operation, error.to_string()))?;
+        let destination =
+            HeaderValue::from_str(to).map_err(|error| local_error(operation, error.to_string()))?;
+        let request = self
+            .http
+            .request(method, from)
+            .header("Destination", destination)
+            .header("Overwrite", "F")
+            .headers(self.auth_headers(from, operation).await?);
+        let response = self.send_raw_request(request, operation).await?;
+        if response.status.is_success() {
+            return Ok(true);
+        }
+        if matches!(
+            response.status,
+            StatusCode::METHOD_NOT_ALLOWED | StatusCode::NOT_IMPLEMENTED
+        ) {
+            return Ok(false);
+        }
+        Err(status_error(operation, response.status, response.body))
+    }
+
     pub(crate) async fn post_schedule_reply(
         &self,
         outbox_url: &str,
@@ -1685,20 +1735,90 @@ mod tests {
         );
     }
 
-    /// A cross-calendar `event_update` is refused, and refused before any I/O.
+    /// A server without MOVE falls back to copy-then-delete, and a failure of
+    /// the delete leg reports the move as HALF applied.
     ///
-    /// `patch.calendar_id` only ever chose which calendar to FETCH from - the
-    /// PUT always went back to the event's original location - so a move
-    /// request used to return `Ok(())` having done nothing, which is worse than
-    /// either refusing or performing it. bifrost-carddav's `contact_update`
-    /// already refuses the same shape; these two must not drift apart.
+    /// The order is the recoverable one: a failed copy leaves the event exactly
+    /// where it was, while a failed delete leaves it readable in two places.
+    /// The second is the one that needs the `Protocol(PartialResponse)` +
+    /// acknowledged `Attempt` verdict, because replaying the whole update
+    /// against a source that may already be gone is not the consumer's best
+    /// move - reconciling is.
+    #[tokio::test]
+    async fn a_move_without_server_move_support_copies_then_deletes() {
+        use bifrost_types::account::Account as _;
+
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:u1\r\nSUMMARY:One\r\n\
+                   DTSTART:20260602T120000Z\r\nDTEND:20260602T130000Z\r\n\
+                   END:VEVENT\r\nEND:VCALENDAR\r\n";
+        let response = |status: StatusCode, body: &str| DavResponse {
+            status,
+            headers: HeaderMap::new(),
+            body: body.to_string(),
+            url: String::new(),
+        };
+        let script = ScriptedDavTransport::new([
+            response(StatusCode::OK, ics),
+            // MOVE unimplemented.
+            response(StatusCode::METHOD_NOT_ALLOWED, ""),
+            // PUT to the destination succeeds.
+            response(StatusCode::CREATED, ""),
+            // DELETE of the original fails.
+            response(StatusCode::INTERNAL_SERVER_ERROR, "boom"),
+        ]);
+        let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
+        let client = Arc::new(CalDavClient::with_transport(
+            "https://dav.example.test",
+            transport,
+        ));
+        let account =
+            crate::account::CalDavAccount::for_tests(client, "https://dav.example.test/cal/work/");
+
+        let error = account
+            .event_update(
+                bifrost_types::EventId("https://dav.example.test/cal/work/one.ics".to_string()),
+                bifrost_types::EventPatch {
+                    calendar_id: Some(bifrost_types::CalendarId(
+                        "https://dav.example.test/cal/personal/".to_string(),
+                    )),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("a failed cleanup is not a success");
+
+        assert!(
+            matches!(
+                error.kind(),
+                AccountErrorKind::Protocol(ProtocolErrorKind::PartialResponse)
+            ),
+            "a copied-but-not-removed event is a partial response: {error:?}"
+        );
+        let methods = script
+            .requests()
+            .into_iter()
+            .map(|request| request.method.as_str().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(methods, vec!["GET", "MOVE", "PUT", "DELETE"]);
+    }
+
+    /// A cross-calendar `event_update` MOVES the resource, and a restated
+    /// calendar still updates in place.
+    ///
+    /// History, because the assertion has now been inverted twice: this shape
+    /// originally returned `Ok(())` having moved nothing, was then refused
+    /// outright as better than a silent drop, and is now performed. The
+    /// move-only patch is deliberately ONE request - no content changed, so the
+    /// event must not be charged a second write or the partial-failure verdict
+    /// that would come with it.
     ///
     /// The second half matters as much as the first: a patch that RESTATES the
-    /// event's current calendar is legal and common, and must still go through.
-    /// A guard that refuses any `calendar_id` at all would pass the first
-    /// assertion and break every ordinary update.
+    /// event's current calendar is not a move and must still take the ordinary
+    /// GET-plus-PUT path. A guard that treated any `calendar_id` as a
+    /// relocation would pass the first assertion and break every ordinary
+    /// update.
     #[tokio::test]
-    async fn event_update_refuses_a_cross_calendar_move_but_allows_a_restated_calendar() {
+    async fn event_update_moves_across_calendars_and_updates_in_place_otherwise() {
         use bifrost_types::account::Account as _;
 
         let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:u1\r\nSUMMARY:One\r\n\
@@ -1711,9 +1831,22 @@ mod tests {
             ..Default::default()
         };
 
-        // Refused, with an EMPTY script: a regression sends a request and
-        // starves the transport rather than failing a soft assertion.
-        let script = ScriptedDavTransport::new([]);
+        // A move: GET the current resource, then MOVE it. The destination keeps
+        // the resource's own file name.
+        let script = ScriptedDavTransport::new([
+            DavResponse {
+                status: StatusCode::OK,
+                headers: HeaderMap::new(),
+                body: ics.to_string(),
+                url: String::new(),
+            },
+            DavResponse {
+                status: StatusCode::CREATED,
+                headers: HeaderMap::new(),
+                body: String::new(),
+                url: String::new(),
+            },
+        ]);
         let transport: Arc<dyn DavTransport> = Arc::clone(&script) as Arc<dyn DavTransport>;
         let client = Arc::new(CalDavClient::with_transport(
             "https://dav.example.test",
@@ -1724,10 +1857,33 @@ mod tests {
         account
             .event_update(event(), patch_to("https://dav.example.test/cal/personal/"))
             .await
-            .expect_err("a move between calendars must be refused, not dropped");
-        assert!(
-            script.requests().is_empty(),
-            "a refused move must reach no transport at all"
+            .expect("a move between calendars is performed");
+        let requests = script.requests();
+        assert_eq!(
+            requests.len(),
+            2,
+            "a move-only patch is a GET and a MOVE, with no content write"
+        );
+        assert_eq!(requests[1].method.as_str(), "MOVE");
+        assert_eq!(
+            requests[1].url, "https://dav.example.test/cal/work/one.ics",
+            "MOVE addresses the source resource"
+        );
+        assert_eq!(
+            requests[1]
+                .headers
+                .get("Destination")
+                .and_then(|value| value.to_str().ok()),
+            Some("https://dav.example.test/cal/personal/one.ics"),
+            "the destination keeps the resource's own file name"
+        );
+        assert_eq!(
+            requests[1]
+                .headers
+                .get("Overwrite")
+                .and_then(|value| value.to_str().ok()),
+            Some("F"),
+            "a name collision at the destination must refuse, not overwrite"
         );
 
         // Restating the event's own calendar is not a move, and still updates.

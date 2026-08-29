@@ -305,20 +305,45 @@ Supported calendar primitives:
   `EventPatch`, and writes the replacement resource with `If-Match`
   when a strong etag was present.
 
-  **A cross-calendar move is REFUSED, before any I/O.** `patch.calendar_id`
-  only ever selected which calendar to FETCH from; the PUT always returns the
-  resource to `resolve_url(&event.0)`, its original location. So a request to
-  move an event between calendars used to return `Ok(())` having moved
-  nothing, with no record that the instruction had been dropped - worse than
-  either refusing it or performing it. A `calendar_id` differing from the
-  event's own collection (derived by `event_calendar_url`) is now
-  `local_error` -> `Request(Malformed)` -> `ClientBug`, matching
-  `bifrost-carddav::contact_update`, which already refused the same shape. A
-  patch that RESTATES the event's current calendar is not a move and still
-  updates normally; `event_update_refuses_a_cross_calendar_move_but_allows_a_restated_calendar`
-  pins both halves, the refusal against an empty transport script. Actually
-  performing the move (WebDAV `MOVE`, or GET + PUT-to-new +
-  DELETE-from-old) is tracked in `notes/todo.md`. Weak ETags retain their `W/` marker for
+  **A cross-calendar move is PERFORMED.** A `calendar_id` differing from the
+  event's own collection (derived by `event_calendar_url`) relocates the
+  resource; a patch that RESTATES the event's current calendar is not a move and
+  takes the ordinary GET-plus-PUT path. The assertion here has been inverted
+  twice - the request originally returned `Ok(())` having moved nothing, was
+  then refused outright as better than a silent drop, and is now carried out -
+  so `event_update_moves_across_calendars_and_updates_in_place_otherwise` pins
+  both halves.
+
+  WebDAV `MOVE` is the atomic form and is tried first, with the resource's own
+  file name at the destination and `Overwrite: F`, so a collision refuses rather
+  than destroying a stranger's resource. `Destination` is credential-gated
+  against the same admitted-origin set as the source, so a consumer-supplied
+  `CalendarId` cannot steer a write anywhere the gate would refuse. Only 405 and
+  501 mean "no MOVE support"; 412 (destination occupied) and 502 (destination
+  refused) stay real errors.
+
+  A server without MOVE falls back to PUT-to-new then DELETE-from-old. That
+  order is the recoverable one: a failed copy leaves the event exactly where it
+  was, while a failed delete leaves it readable in two places. The delete-leg
+  failure is wrapped `Protocol(PartialResponse)` with an acknowledged `Attempt`
+  (via `partial_sequence_error`, which `event_rsvp` now shares), so a consumer
+  can tell "not moved" from "copied but not cleaned up" and reconciles instead
+  of replaying a write that already landed.
+
+  A move-only patch is ONE request beyond the fetch - no content changed, so no
+  write is issued and no partial-failure verdict can attach to a leg that was
+  never needed. Whether content changed is decided by zeroing `calendar_id` on
+  the patch and comparing against `EventPatch::default()`, not by comparing
+  serialized bytes: the writers re-emit, so a byte comparison reads a move-only
+  patch as a content change. Deriving it from the patch also means a field added
+  to `EventPatch` is covered automatically.
+
+  **The event id changes, and `event_update` cannot report it.** A CalDAV
+  `EventId` IS the resource URL, and the trait method returns `()`. The consumer
+  learns the new id through sync, as a destroy plus a create. This matches
+  `bifrost-google`, whose `events.move` inside `event_update` has the same
+  property for the same reason; reporting it would reshape a published
+  signature. Weak ETags retain their `W/` marker for
   snapshot comparison but deliberately make the PUT unconditional because
   If-Match requires strong comparison (RFC 7232), so a weak validator has
   no conforming conditional form. Against a server that only ever emits

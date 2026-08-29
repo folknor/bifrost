@@ -3,21 +3,22 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use bifrost_types::{
-    Account, AccountCapabilities, AccountError, AccountFuture, AccountId, AccountOperation,
-    AccountStream, AddressBook, AddressBookId, AttachmentHandle, BlobHandle, ByteRange, Calendar,
-    CalendarEvent, Change, ChangeCursor, Checkpoint, CloudUploadMeta, ContactCard, ContactCorpus,
-    ContactCreate, ContactId, ContactPatch, ContactProvenance, ContactSearchRequest, ContainerId,
-    ContainerKind, ContainerList, CostClass, CursorDescriptor, CursorEstablishment, CursorScope,
+    Account, AccountCapabilities, AccountError, AccountErrorBuilder, AccountErrorKind,
+    AccountFuture, AccountId, AccountOperation, AccountStream, AddressBook, AddressBookId,
+    AttachmentHandle, AttemptCause, BlobHandle, ByteRange, Calendar, CalendarEvent, Cause, Change,
+    ChangeCursor, Checkpoint, CloudUploadMeta, ContactCard, ContactCorpus, ContactCreate,
+    ContactId, ContactPatch, ContactProvenance, ContactSearchRequest, ContainerId, ContainerKind,
+    ContainerList, CostClass, CursorDescriptor, CursorEstablishment, CursorScope, DiagnosticText,
     DirectoryCard, DirectoryGroup, DirectoryGroupId, DirectoryGroupMember, DraftHandle, DraftPatch,
     ErrorScope, EventCreate, EventId, EventPatch, EventRange, EventSearchRequest, FilterValidation,
     FlagOp, HostedAttachment, HydratedObject, HydrationProjection, IdempotencyKey, Identity,
     IdentityId, IdentityPatch, Importance, InventoryEntry, InventoryEvent, InventoryPartition,
     InventoryPartitioning, ItemOutcome, MembershipScope, Message, MutationSuccess, MutationTarget,
     ObjectChange, ObjectChangeKind, ObjectId, ObjectType, OpaqueChangeState, Page, PageBoundary,
-    Priority, ProtocolKind, QuotaInfo, RsvpStatus, SearchRequest, SendRequest, ServerFilter,
-    ServerFilterCreate, ServerFilterId, ServerFilterPatch, ServerVersion, SkippedScope,
-    SubscriptionHandle, SyncEvent, SyncStrategy, ThreadHydration, ThreadId, VacationConfig,
-    WatchEvent,
+    Priority, Protocol, ProtocolErrorKind, ProtocolKind, QuotaInfo, RsvpStatus, SearchRequest,
+    SendRequest, ServerFilter, ServerFilterCreate, ServerFilterId, ServerFilterPatch,
+    ServerVersion, SkippedScope, SubscriptionHandle, SyncEvent, SyncStrategy, ThreadHydration,
+    ThreadId, TransmissionState, VacationConfig, WatchEvent, WireCause,
 };
 use bytes::Bytes;
 use futures::{StreamExt, stream};
@@ -198,6 +199,67 @@ impl CardDavAccount {
             .into_iter()
             .next()
             .ok_or_else(|| not_found_error(operation, contact.0.clone()))
+    }
+
+    /// Move one contact resource into another address book collection.
+    ///
+    /// Twin of `bifrost-caldav`'s `relocate_event`; keep them in step. WebDAV
+    /// `MOVE` is the atomic form and is tried first; a server that does not
+    /// implement it falls back to PUT-to-new then DELETE-from-old, which is not
+    /// atomic, so a failure of the delete leg is wrapped
+    /// `Protocol(PartialResponse)` with an acknowledged `Attempt`.
+    async fn relocate_contact(
+        client: &CardDavClient,
+        source_url: &str,
+        target_addressbook: &str,
+        data: String,
+        content_changed: bool,
+    ) -> Result<(), AccountError> {
+        let destination = append_path(target_addressbook, &resource_file_name(source_url));
+        if client
+            .move_resource(source_url, &destination, AccountOperation::ContactUpdate)
+            .await?
+        {
+            if !content_changed {
+                return Ok(());
+            }
+            // The move is done and the id has changed. A failure here is a
+            // half-applied request, not a failed one.
+            return client
+                .put_vcard(
+                    &destination,
+                    data,
+                    PutCondition::None,
+                    AccountOperation::ContactUpdate,
+                )
+                .await
+                .map(|_| ())
+                .map_err(|error| {
+                    partial_move_error(&error, "contact moved but the field patch failed")
+                });
+        }
+        // No MOVE support: copy first, then remove the original. A failed copy
+        // leaves the contact exactly where it was; a failed delete leaves it
+        // readable in two places - the recoverable direction of the pair.
+        client
+            .put_vcard(
+                &destination,
+                data,
+                PutCondition::IfNoneMatch,
+                AccountOperation::ContactUpdate,
+            )
+            .await
+            .map(|_| ())?;
+        client
+            .delete_vcard(source_url, AccountOperation::ContactUpdate)
+            .await
+            .map(|_| ())
+            .map_err(|error| {
+                partial_move_error(
+                    &error,
+                    "contact copied to the destination address book but the original could not be removed",
+                )
+            })
     }
 
     async fn hydrated_contacts(
@@ -1023,15 +1085,13 @@ impl Account for CardDavAccount {
                     AccountOperation::ContactUpdate,
                 )?,
             };
-            if let Some(target) = patch.address_book_id.as_ref() {
-                let target = client.resolve_url(&target.0);
-                if !same_collection_url(&target, &addressbook) {
-                    return Err(local_error(
-                        AccountOperation::ContactUpdate,
-                        "CardDAV contact_update cannot move contacts between address books",
-                    ));
-                }
-            }
+            // An `address_book_id` naming a collection other than the contact's
+            // own is a relocation. It used to be refused; it is now performed.
+            let relocation = patch
+                .address_book_id
+                .as_ref()
+                .map(|target| client.resolve_url(&target.0))
+                .filter(|target| !same_collection_url(target, &addressbook));
             let raw = Self::fetch_contact_resource(
                 &client,
                 &addressbook,
@@ -1048,15 +1108,22 @@ impl Account for CardDavAccount {
             .map_err(|error| project_error(AccountOperation::ContactUpdate, &error))?;
             let data = vcard_from_patch(&current, &raw.data, &patch);
             let url = client.resolve_url(&contact.0);
-            client
-                .put_vcard(
-                    &url,
-                    data,
-                    put_condition(current.etag.as_deref()),
-                    AccountOperation::ContactUpdate,
-                )
-                .await
-                .map(|_| ())
+            let Some(target_addressbook) = relocation else {
+                return client
+                    .put_vcard(
+                        &url,
+                        data,
+                        put_condition(current.etag.as_deref()),
+                        AccountOperation::ContactUpdate,
+                    )
+                    .await
+                    .map(|_| ());
+            };
+            // A content patch riding along with the move needs a write of its
+            // own; a move-only patch does not, and must not be charged a
+            // partial-failure verdict for a leg it never needed.
+            let content_changed = patch_changes_content(&patch);
+            Self::relocate_contact(&client, &url, &target_addressbook, data, content_changed).await
         })
     }
 
@@ -1225,6 +1292,71 @@ fn unsupported_stream<T: Send + 'static>(
         SyncEvent::Terminated(unsupported_error(operation)),
         SyncEvent::Done(None),
     ]))
+}
+
+/// Whether the patch changes anything other than which collection the contact
+/// lives in.
+///
+/// Derived by zeroing the relocation field and comparing against an empty
+/// patch, rather than enumerating the content fields: a field added to
+/// `ContactPatch` is then covered automatically, where a hand-listed check
+/// would silently stop noticing it.
+///
+/// Comparing SERIALIZED bytes is not equivalent and was tried first. The vCard
+/// writer re-emits line endings, so a move-only patch compares unequal to the
+/// fetched body and earns a redundant write plus the partial-failure verdict
+/// that rides on it.
+fn patch_changes_content(patch: &ContactPatch) -> bool {
+    let content = ContactPatch {
+        address_book_id: None,
+        ..patch.clone()
+    };
+    content != ContactPatch::default()
+}
+
+/// Reclassify the failure of a later leg of a non-atomic sequence whose
+/// earlier leg already landed on the server.
+///
+/// `Protocol(PartialResponse)` plus an acknowledged `Attempt` is what tells a
+/// consumer the request was half-applied rather than refused, so it reconciles
+/// instead of replaying a write that already took effect. Twin of
+/// `bifrost-caldav`'s `partial_sequence_error`.
+fn partial_move_error(error: &AccountError, detail: &'static str) -> AccountError {
+    let mut builder = AccountErrorBuilder::new(
+        AccountErrorKind::Protocol(ProtocolErrorKind::PartialResponse),
+        Cause::Wire(WireCause::MalformedResponse {
+            protocol: Protocol::CardDav,
+            detail: Some(DiagnosticText::support_only(detail)),
+        }),
+    )
+    .protocol(Protocol::CardDav)
+    .operation(AccountOperation::ContactUpdate)
+    .push_cause(Cause::Attempt(AttemptCause::new(
+        TransmissionState::Acknowledged,
+    )));
+    for cause in error.chain().iter() {
+        builder = builder.push_cause(cause.clone());
+    }
+    builder
+        .try_build()
+        .expect("valid partial-response classification")
+}
+
+/// The last path segment of a resource URL - the name the resource keeps when
+/// it moves into another collection.
+///
+/// Falls back to a fresh UUID-backed name when the URL has no usable final
+/// segment, so a move never targets the destination collection itself.
+fn resource_file_name(url: &str) -> String {
+    reqwest::Url::parse(url)
+        .ok()
+        .and_then(|parsed| {
+            parsed
+                .path_segments()
+                .and_then(|mut segments| segments.next_back().filter(|name| !name.is_empty()))
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| format!("{}.vcf", Uuid::new_v4()))
 }
 
 fn append_path(base: &str, path: &str) -> String {

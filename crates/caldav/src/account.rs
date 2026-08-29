@@ -7,6 +7,7 @@ use bytes::Bytes;
 use futures::{StreamExt, stream};
 use jiff::tz::Offset;
 use jiff::{Timestamp, civil};
+use reqwest::Url;
 
 use crate::capabilities::{caldav_capabilities, scheduling_available};
 use crate::client::{
@@ -169,6 +170,73 @@ impl CalDavAccount {
             can_update_events: can_edit,
             can_delete_events: can_edit,
         }
+    }
+
+    /// Move one event resource into another calendar collection.
+    ///
+    /// WebDAV `MOVE` is the atomic form and is tried first. A server that does
+    /// not implement it (405/501) falls back to PUT-to-new then
+    /// DELETE-from-old, which is NOT atomic: a failure after the PUT leaves the
+    /// event in both collections. That second-leg failure is wrapped
+    /// `Protocol(PartialResponse)` with an acknowledged `Attempt`, the same
+    /// treatment `event_rsvp` gives its own non-atomic sequence, so a consumer
+    /// can tell "not moved" from "copied but not cleaned up" and reconciles
+    /// rather than blindly replaying a write that already landed.
+    ///
+    /// The destination keeps the resource's own file name, so a collection that
+    /// already holds that name refuses the move (`Overwrite: F`) rather than
+    /// overwriting a stranger's resource.
+    async fn relocate_event(
+        client: &CalDavClient,
+        source_url: &str,
+        target_calendar: &str,
+        body: String,
+        content_changed: bool,
+    ) -> Result<(), AccountError> {
+        let destination = append_path(target_calendar, &resource_file_name(source_url));
+        if client
+            .move_resource(source_url, &destination, AccountOperation::EventUpdate)
+            .await?
+        {
+            if !content_changed {
+                return Ok(());
+            }
+            // The move is done and the id has changed. A failure here is a
+            // half-applied request, not a failed one.
+            return client
+                .put_event(
+                    &destination,
+                    body,
+                    PutCondition::None,
+                    AccountOperation::EventUpdate,
+                )
+                .await
+                .map(|_| ())
+                .map_err(|error| {
+                    partial_move_error(&error, "event moved but the field patch failed")
+                });
+        }
+        // No MOVE support: copy first, then remove the original. Ordered this
+        // way round because a failed copy leaves the event exactly where it
+        // was, while a failed delete leaves it readable in two places - the
+        // recoverable direction of a non-atomic pair.
+        client
+            .put_event(
+                &destination,
+                body,
+                PutCondition::IfNoneMatch,
+                AccountOperation::EventUpdate,
+            )
+            .await?;
+        client
+            .delete_event(source_url, AccountOperation::EventUpdate)
+            .await
+            .map_err(|error| {
+                partial_move_error(
+                    &error,
+                    "event copied to the destination calendar but the original could not be removed",
+                )
+            })
     }
 
     async fn fetch_event_from_url(
@@ -925,33 +993,17 @@ impl Account for CalDavAccount {
         let default_calendar_url = self.default_calendar_url.clone();
         Box::pin(async move {
             reject_recurrence_instance_id(&event, AccountOperation::EventUpdate)?;
-            // A cross-calendar move is refused, not silently dropped.
-            //
-            // `patch.calendar_id` only ever selected which calendar to FETCH
-            // from; the PUT below always goes back to `resolve_url(&event.0)`,
-            // the event's original location. So a caller asking to move an
-            // event from one calendar to another used to get `Ok(())` and no
-            // move - worse than either refusing or doing it, because nothing
-            // recorded that the request had been dropped.
-            //
-            // `bifrost-carddav::contact_update` already refuses the same shape
-            // through this same helper; the two must answer an unsupported
-            // relocation the same way. Implementing it (WebDAV `MOVE`, or
-            // GET + PUT-to-new + DELETE-from-old with its own partial-failure
-            // story) is tracked in `notes/todo.md`, not started here.
-            let target_calendar = patch
+            let url = client.resolve_url(&event.0);
+            // A `calendar_id` naming a collection other than the event's own is
+            // a relocation. It used to return `Ok(())` having moved nothing,
+            // then was refused outright; it is now performed.
+            let relocation = patch
                 .calendar_id
                 .as_ref()
-                .map(|calendar| client.resolve_url(&calendar.0));
-            if let Some(target) = target_calendar.as_deref()
-                && let Some(source) = event_calendar_url(&client.resolve_url(&event.0))
-                && !same_url(target, &source)
-            {
-                return Err(crate::client::local_error(
-                    AccountOperation::EventUpdate,
-                    "CalDAV event_update cannot move events between calendars",
-                ));
-            }
+                .map(|calendar| client.resolve_url(&calendar.0))
+                .filter(|target| {
+                    event_calendar_url(&url).is_some_and(|source| !same_url(target, &source))
+                });
             let current = Self::fetch_event_from_url(
                 Arc::clone(&client),
                 default_calendar_url,
@@ -962,16 +1014,22 @@ impl Account for CalDavAccount {
             .await?;
             let body = patch_to_ical(&current, &patch)
                 .map_err(|_| unsupported_error(AccountOperation::EventUpdate))?;
-            let url = client.resolve_url(&event.0);
-            client
-                .put_event(
-                    &url,
-                    body,
-                    put_condition(current.etag.as_deref()),
-                    AccountOperation::EventUpdate,
-                )
-                .await?;
-            Ok(())
+            let Some(target_calendar) = relocation else {
+                client
+                    .put_event(
+                        &url,
+                        body,
+                        put_condition(current.etag.as_deref()),
+                        AccountOperation::EventUpdate,
+                    )
+                    .await?;
+                return Ok(());
+            };
+            // A content patch riding along with the move needs a write of its
+            // own; a move-only patch does not, and must not be charged a
+            // partial-failure verdict for a leg it never needed.
+            let content_changed = patch_changes_content(&patch);
+            Self::relocate_event(&client, &url, &target_calendar, body, content_changed).await
         })
     }
 
@@ -1241,17 +1299,54 @@ fn event_page(
 /// acknowledged first-leg evidence on any second-leg failure so callers know
 /// the organizer may already have acted on the reply.
 fn rsvp_local_write_error(error: AccountError) -> AccountError {
+    partial_sequence_error(
+        &error,
+        AccountOperation::EventRsvp,
+        "schedule reply was accepted but the local event update failed",
+    )
+}
+
+/// Whether the patch changes anything other than which collection the event
+/// lives in.
+///
+/// Derived by zeroing the relocation field and comparing against an empty
+/// patch, rather than enumerating the content fields: a field added to
+/// `EventPatch` is then covered automatically, where a hand-listed check would
+/// silently stop noticing it.
+///
+/// Comparing SERIALIZED bytes is not equivalent - the writers re-emit, so a
+/// move-only patch can compare unequal to the fetched body and earn a redundant
+/// write plus the partial-failure verdict that rides on it. Twin of
+/// `bifrost-carddav`'s `patch_changes_content`.
+fn patch_changes_content(patch: &EventPatch) -> bool {
+    let content = EventPatch {
+        calendar_id: None,
+        ..patch.clone()
+    };
+    content != EventPatch::default()
+}
+
+/// Reclassify the failure of a later leg of a non-atomic sequence whose
+/// earlier leg already landed on the server.
+///
+/// `Protocol(PartialResponse)` plus an acknowledged `Attempt` is what tells a
+/// consumer the request was half-applied rather than refused, so it reconciles
+/// instead of replaying a write that already took effect. The original cause
+/// chain rides along as secondary evidence.
+fn partial_sequence_error(
+    error: &AccountError,
+    operation: AccountOperation,
+    detail: &'static str,
+) -> AccountError {
     let mut builder = AccountErrorBuilder::new(
         AccountErrorKind::Protocol(ProtocolErrorKind::PartialResponse),
         Cause::Wire(WireCause::MalformedResponse {
             protocol: Protocol::CalDav,
-            detail: Some(DiagnosticText::support_only(
-                "schedule reply was accepted but the local event update failed",
-            )),
+            detail: Some(DiagnosticText::support_only(detail)),
         }),
     )
     .protocol(Protocol::CalDav)
-    .operation(AccountOperation::EventRsvp)
+    .operation(operation)
     .push_cause(Cause::Attempt(AttemptCause::new(
         TransmissionState::Acknowledged,
     )));
@@ -1260,7 +1355,28 @@ fn rsvp_local_write_error(error: AccountError) -> AccountError {
     }
     builder
         .try_build()
-        .expect("valid RSVP partial-response classification")
+        .expect("valid partial-response classification")
+}
+
+fn partial_move_error(error: &AccountError, detail: &'static str) -> AccountError {
+    partial_sequence_error(error, AccountOperation::EventUpdate, detail)
+}
+
+/// The last path segment of a resource URL - the name the resource keeps when
+/// it moves into another collection.
+///
+/// Falls back to a fresh UID-backed name when the URL has no usable final
+/// segment, so a move never targets the destination collection itself.
+fn resource_file_name(url: &str) -> String {
+    Url::parse(url)
+        .ok()
+        .and_then(|parsed| {
+            parsed
+                .path_segments()
+                .and_then(|mut segments| segments.next_back().filter(|name| !name.is_empty()))
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| format!("{}.ics", new_uid()))
 }
 
 fn unsupported_future<T: Send + 'static>(
