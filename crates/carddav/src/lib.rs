@@ -1,5 +1,9 @@
 #![forbid(unsafe_code)]
 #![doc = "CardDAV Account implementation for bifrost."]
+// Boxed Send futures over deep reqwest/hyper type stacks exceed rustc's
+// default auto-trait recursion depth (rust-lang/rust#159228, a
+// future-incompat hard error). Raising the limit is the sanctioned fix.
+#![recursion_limit = "256"]
 
 mod account;
 mod capabilities;

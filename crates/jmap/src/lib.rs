@@ -13,6 +13,10 @@
 // shapes are RFC-imposed and won't be renamed.
 #![allow(clippy::upper_case_acronyms)]
 #![allow(clippy::enum_variant_names)]
+// Boxed Send futures over deep reqwest/hyper type stacks exceed rustc's
+// default auto-trait recursion depth (rust-lang/rust#159228, a
+// future-incompat hard error). Raising the limit is the sanctioned fix.
+#![recursion_limit = "256"]
 // The crate-internal `Error` aggregates JMAP method errors, set errors,
 // problem details, and WebSocket failures. These get translated to
 // `AccountError` (8 bytes, `Arc<Inner>`-backed) at the protocol boundary,
