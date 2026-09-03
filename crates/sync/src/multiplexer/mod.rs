@@ -155,7 +155,7 @@ impl ChangesReceiver {
 
 fn lag_warning(skipped: u64, abandoned: usize) -> MultiplexerEvent {
     let warning = bifrost_types::Warning::user_safe(
-        bifrost_types::WarningKind::OperatorAttentionNeeded,
+        bifrost_types::WarningKind::ChangeStreamLagged,
         format!(
             "change stream lagged and lost {skipped} batches; reconcile from the last acknowledged checkpoint"
         ),
@@ -1266,7 +1266,7 @@ mod tests {
         assert!(matches!(
             lag.event.as_ref(),
             SyncEvent::Warning(warning)
-                if warning.kind == bifrost_types::WarningKind::OperatorAttentionNeeded
+                if warning.kind == bifrost_types::WarningKind::ChangeStreamLagged
         ));
         assert!(
             control.abandon_pending_checkpoints() == 0,
@@ -1311,7 +1311,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn changes_receiver_surfaces_broadcast_lag_as_operator_warning() {
+    async fn changes_receiver_surfaces_broadcast_lag_as_lag_warning() {
         let (tx, sentinel) = broadcast::channel(1);
         let mut receiver = ChangesReceiver::new(tx.subscribe(), None);
         tx.send(warning_event("overwritten"))
@@ -1322,7 +1322,7 @@ mod tests {
         assert!(matches!(
             lag.event.as_ref(),
             SyncEvent::Warning(warning)
-                if warning.kind == bifrost_types::WarningKind::OperatorAttentionNeeded
+                if warning.kind == bifrost_types::WarningKind::ChangeStreamLagged
         ));
         let retained = receiver
             .recv()

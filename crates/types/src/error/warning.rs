@@ -60,5 +60,15 @@ pub enum WarningKind {
     ClockSkew,
     BlobNotByteStream,
     ReadbackSkipped,
+    /// The change-stream broadcast ring overflowed and batches were lost;
+    /// the consumer must reconcile from its last durable checkpoint.
+    ///
+    /// Structural on purpose: a consumer's whole recovery path (detach,
+    /// re-drive, reconcile) hangs on telling this apart from the other
+    /// account-scoped warnings, and before this variant existed the only
+    /// discriminator was the message-text prefix - a contract no one had
+    /// signed. Minted exclusively by the multiplexer's `ChangesReceiver`
+    /// when it converts `RecvError::Lagged` into an observable event.
+    ChangeStreamLagged,
     Other,
 }

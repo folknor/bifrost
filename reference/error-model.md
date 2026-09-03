@@ -430,8 +430,12 @@ protocol_detail, retry_count }` is **deliberately not** part of the
 error model: it is advisory, never aborts a stream, carries no
 `RecoveryClass`, and never converts to `AccountError`.
 `WarningKind::{StrategyDowngraded, OperatorAttentionNeeded, Throttled,
-ClockSkew, BlobNotByteStream, ReadbackSkipped, Other}`. The sync engine
-emits warnings alongside (not instead of) errors; see `reference/sync.md`.
+ClockSkew, BlobNotByteStream, ReadbackSkipped, ChangeStreamLagged,
+Other}`. The sync engine emits warnings alongside (not instead of)
+errors; see `reference/sync.md`. `ChangeStreamLagged` is structural on
+purpose - the multiplexer's `ChangesReceiver` mints it (and only it)
+when broadcast ring overflow destroys batches, and a consumer's
+detach/reconcile recovery keys on the kind rather than on message text.
 
 ## File map
 
