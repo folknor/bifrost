@@ -62,9 +62,10 @@ pub use recovery::ThrottleBucket;
 // Cursor and checkpoint plumbing.
 pub use cursor::{
     BarrierIncident, CheckpointStore, CheckpointTransition, CursorRegistry, DebtLedger,
-    DischargeEvidence, DynCheckpointStore, ENGINE_VERSION, InMemoryCheckpointStore, LedgerEntry,
-    MIN_MIGRATABLE, PendingCoverage, PolicyStatus, ProofStatus, PublicationId, PublicationReceipt,
-    Publications, decode_envelope, encode_envelope,
+    DischargeEvidence, DynCheckpointStore, ENGINE_VERSION, InMemoryCheckpointStore,
+    LEDGER_ENVELOPE_VERSION, LedgerEntry, MIN_MIGRATABLE, MIN_MIGRATABLE_LEDGER, PendingCoverage,
+    PolicyStatus, ProofStatus, PublicationId, PublicationReceipt, Publications, decode_envelope,
+    decode_ledger, encode_envelope, encode_ledger,
 };
 
 // Inventory coverage repair.

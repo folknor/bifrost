@@ -249,7 +249,7 @@ const OBJTYPE_EMAIL_SUBMISSION: u8 = 5;
 const OBJTYPE_CALENDAR_EVENT: u8 = 6;
 const OBJTYPE_CONTACT_GROUP: u8 = 7;
 
-fn encode_scope(scope: &CursorScope) -> Vec<u8> {
+pub(super) fn encode_scope(scope: &CursorScope) -> Vec<u8> {
     let mut out = Vec::new();
     match scope {
         CursorScope::Account => out.push(SCOPE_ACCOUNT),
@@ -277,7 +277,7 @@ fn encode_scope(scope: &CursorScope) -> Vec<u8> {
     out
 }
 
-fn decode_scope(bytes: &[u8]) -> Result<CursorScope, Error> {
+pub(super) fn decode_scope(bytes: &[u8]) -> Result<CursorScope, Error> {
     if bytes.is_empty() {
         return Err(Error::Other("cursor envelope: empty scope".into()));
     }
@@ -582,24 +582,24 @@ fn decode_backfill_payload(
 
 // ---------- varint-free length-prefixed primitives ----------
 
-fn write_string(out: &mut Vec<u8>, s: &str) {
+pub(super) fn write_string(out: &mut Vec<u8>, s: &str) {
     write_bytes(out, s.as_bytes());
 }
 
-fn write_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
+pub(super) fn write_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
     let len = u32::try_from(bytes.len()).expect("cursor envelope: field exceeds u32 length limit");
     out.extend_from_slice(&len.to_le_bytes());
     out.extend_from_slice(bytes);
 }
 
-fn read_string(bytes: &[u8]) -> Result<(String, usize), Error> {
+pub(super) fn read_string(bytes: &[u8]) -> Result<(String, usize), Error> {
     let (raw, consumed) = read_bytes(bytes)?;
     let s = String::from_utf8(raw)
         .map_err(|e| Error::Other(format!("cursor envelope: invalid UTF-8: {e}")))?;
     Ok((s, consumed))
 }
 
-fn read_bytes(bytes: &[u8]) -> Result<(Vec<u8>, usize), Error> {
+pub(super) fn read_bytes(bytes: &[u8]) -> Result<(Vec<u8>, usize), Error> {
     if bytes.len() < 4 {
         return Err(Error::Other(
             "cursor envelope: missing length prefix".into(),

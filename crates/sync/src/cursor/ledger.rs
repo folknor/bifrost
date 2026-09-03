@@ -223,6 +223,38 @@ impl DebtLedger {
         Self::default()
     }
 
+    /// Rebuild a ledger from durable parts.
+    ///
+    /// The one door into the private maps that does not go through `ingest`,
+    /// and deliberately crate-private: it exists for
+    /// [`crate::cursor::ledger_envelope::decode_ledger`], which is the only
+    /// caller that legitimately holds a whole ledger's state without having
+    /// folded a report to get it. Keeping it out of the public surface is what
+    /// preserves "no protocol crate may construct ledger state" - a consumer
+    /// restores a ledger by decoding bytes this engine wrote, never by
+    /// asserting one.
+    pub(crate) fn from_parts(
+        entries: BTreeMap<ObligationKey, LedgerEntry>,
+        barriers: BTreeMap<ObligationKey, BarrierIncident>,
+        proved: Vec<(u64, CoverageDomain)>,
+    ) -> Self {
+        Self {
+            entries,
+            barriers,
+            proved,
+        }
+    }
+
+    /// The retained proofs, with the generation that proved each.
+    ///
+    /// Not public for the same reason the field is not: proof retention is an
+    /// engine-internal consequence of `record_proof`, not a query. The codec
+    /// needs it because a restart that forgets a retained proof re-opens debt
+    /// a later partial walk can no longer discharge by union.
+    pub(crate) fn proved(&self) -> &[(u64, CoverageDomain)] {
+        &self.proved
+    }
+
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty() && self.barriers.is_empty()

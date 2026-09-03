@@ -1807,6 +1807,53 @@ authored would trade a recoverable resync for an outage. `encode_envelope` does
 panic on an unsupported outer version, consistent with the rest of that codec,
 which refuses to write any row its own decoder would reject.
 
+## Ledger envelope
+
+The checkpoint half of `apply_transition` has always been serializable; the
+ledger half was not, so a persistent backend could store only one of the two
+things the atomicity contract is about. `encode_ledger` / `decode_ledger` in
+`cursor/ledger_envelope.rs` close that, and are maintained together with the
+cursor envelope: same header shape, same little-endian length-prefixed
+primitives, same `Error::SchemaIncompatible` for a version outside
+`[MIN_MIGRATABLE_LEDGER, LEDGER_ENVELOPE_VERSION]` in either direction, same
+rule that a panic belongs to encode and never to decode. `decode_ledger` is
+likewise the single migration boundary: a version inside the window is migrated
+through `migrate_ledger`, not merely accepted, so what comes out is
+current-shaped ledger state. Both constants are `1` today, so that chain is
+empty; the first bump adds its fixup there together with a byte fixture, for the
+same reason the cursor envelope needs one.
+
+The encoded form covers everything a restart must not forget: the entry map, the
+barrier map, and the retained proof set. Proof retention is easy to mistake for
+a cache - it is not. Coverage discharges by UNION, so a proof dropped on restart
+turns debt that two later windows jointly cover into debt neither covers alone.
+A `BarrierIncident::resume_from` nests a whole cursor envelope through
+`encode_envelope` rather than re-deriving the layout, so the two codecs compose
+instead of drifting.
+
+`AccountError` is the one field that does not round-trip as a typed value, and
+the reason is structural: the `Cause` chain holds `&'static str` payloads
+(`AccessCause::InsufficientScope { needed }`,
+`RequestCause::InvalidArgument { field }`) that no decoder can produce from
+bytes without leaking. So `last_error` and `BarrierIncident::evidence` persist
+as a digest - the exact classification (`AccountErrorKind`, `ErrorScope`,
+operation, provider, protocol) plus the whole `DiagnosticInfo` - rebuilt through
+`AccountErrorBuilder` with the canonical `Cause` its kind demands. Secondary
+cause payloads, `idempotency_override` and `throttle_scope` do not survive.
+
+That is affordable because no ledger predicate reads these fields.
+`blocks_completion`, `completion_permitted`, `repairable`, `lineage_root`,
+`record_attempt` and every discharge path read proof, policy, domain, generation
+and target; `LedgerEntry::target` exists precisely so a repair descriptor is
+never taken from an error whose classifications change between revisions. The
+error is operator evidence, and a digest preserves operator evidence. Anything
+that starts DECIDING on a restored error has to promote the field first.
+
+`DebtLedger::from_parts` is the only door into the private maps that is not
+`ingest`, and it is crate-private for the reason the fields are: no protocol
+crate may construct ledger state. A consumer restores a ledger by decoding bytes
+this engine wrote, never by asserting one.
+
 ## Checkpoint store
 
 ```rust
@@ -1844,6 +1891,16 @@ A store that decodes durable bytes must surface a schema it cannot
 read as `Error::SchemaIncompatible` from `get_change_cursor`; that is
 the signal both establish paths key on. Any other error is treated as
 a store failure and propagates.
+
+The same applies to the ledger. `get_ledger` returns a `DebtLedger` by value and
+`apply_transition` / `put_ledger` take one, so a durable backend needs a
+serialized form for it, and `encode_ledger` / `decode_ledger` are it - a backend
+is not expected to invent one, and must not, because ledger state is
+engine-owned. A backend that keeps ledgers only in memory is running a
+DEGRADED store, not a simpler one: a restart forgets accepted debt, and a
+degraded scope comes back looking clean until something re-enumerates it. That
+is a legitimate choice for a test double, which is what
+`InMemoryCheckpointStore` is, and not one for a persistent backend.
 
 `InMemoryCheckpointStore` is the test backend (HashMap-backed). No
 sled / sqlite default; storage is consumer-owned.
@@ -2098,6 +2155,8 @@ crates/sync/src/
   cursor/
     mod.rs                // CursorRegistry + membership index
     envelope.rs           // MIN_MIGRATABLE / ENGINE_VERSION + migrations
+    ledger.rs             // DebtLedger: entries, barriers, retained proofs
+    ledger_envelope.rs    // encode_ledger / decode_ledger + error digest
     store.rs              // CheckpointStore trait (6 methods) +
                           // InMemoryCheckpointStore
   scheduler/
@@ -2111,6 +2170,7 @@ crates/sync/src/
 crates/sync/tests/
   cross_crate_conformance.rs  // cross-crate trait/contract checks
   envelope_roundtrip.rs       // cursor envelope encode/decode tests
+  ledger_envelope_roundtrip.rs // durable DebtLedger encode/decode tests
   partition_planner.rs        // backfill partitioner unit tests
   readback_guard.rs           // mutation readback reconciliation
   scheduler_priority.rs       // lane ordering, starvation guard, pull shape

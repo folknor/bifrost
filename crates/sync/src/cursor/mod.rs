@@ -13,6 +13,7 @@
 pub mod coverage;
 pub mod envelope;
 pub mod ledger;
+pub mod ledger_envelope;
 pub mod store;
 
 use std::collections::HashMap;
@@ -33,6 +34,9 @@ pub use envelope::{
 pub use ledger::{
     BarrierIncident, DebtLedger, DischargeEvidence, LedgerEntry, PolicyStatus, ProofStatus,
     ReplacementProgress, ReplacementRefusal,
+};
+pub use ledger_envelope::{
+    LEDGER_ENVELOPE_VERSION, MIN_MIGRATABLE_LEDGER, decode_ledger, encode_ledger,
 };
 pub use store::{
     CheckpointStore, CheckpointTransition, DynCheckpointStore, InMemoryCheckpointStore,

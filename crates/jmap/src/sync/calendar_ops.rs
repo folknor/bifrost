@@ -915,7 +915,10 @@ fn jmap_recurrence_rule_from_rrule(
                 // numbers as strings, optionally "L"-suffixed for leap
                 // months). Emitting integers here fed spec-conforming
                 // servers a shape they may reject.
-                object.insert("byMonth".to_string(), Value::Array(month_string_list(value)?));
+                object.insert(
+                    "byMonth".to_string(),
+                    Value::Array(month_string_list(value)?),
+                );
             }
             "BYMONTHDAY" => {
                 object.insert("byMonthDay".to_string(), Value::Array(integer_list(value)?));

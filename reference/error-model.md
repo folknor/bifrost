@@ -279,6 +279,26 @@ structured transport kind, access resource and needed scope, strategy
 downgrade, capability delta, invalid batch items, unsupported operation, and
 invalid argument field evidence.
 
+### An `AccountError` is not durably serializable, on purpose
+
+Several `Cause` payloads are `&'static str` (`AccessCause::InsufficientScope
+{ needed }`, `AccessCause::AdminConsentRequired { needed }`,
+`RequestCause::InvalidArgument { field }`). A decoder holding bytes cannot
+produce a `&'static str` without leaking, so a byte-exact `AccountError` round
+trip is not merely expensive - it is unrepresentable, and no amount of codec
+work changes that. Nothing in this workspace offers one.
+
+`bifrost-sync`'s ledger envelope is the one place that persists an error, and it
+persists a DIGEST: the exact classification (`AccountErrorKind`, `ErrorScope`,
+operation, provider, protocol) plus the whole `DiagnosticInfo`, rebuilt through
+`AccountErrorBuilder` with the canonical `Cause` its kind demands. Secondary
+cause payloads, `idempotency_override` and `throttle_scope` are lost. That is
+sound there only because the field is evidence an operator reads and never an
+input to a decision; see `reference/sync.md` under "Ledger envelope". Any future
+caller wanting to persist an error owes the same argument, because a restored
+error's `recovery()` was derived from a synthesized cause chain and is not the
+classification the producer made.
+
 ## Batch and stream outcomes
 
 `batch.rs`. `BatchOutcome<T>` (`#[non_exhaustive]`, immutable) is the
