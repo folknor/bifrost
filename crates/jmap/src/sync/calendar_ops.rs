@@ -911,7 +911,11 @@ fn jmap_recurrence_rule_from_rrule(
                 object.insert("byDay".to_string(), Value::Array(jmap_by_day(value)?));
             }
             "BYMONTH" => {
-                object.insert("byMonth".to_string(), Value::Array(integer_list(value)?));
+                // RFC 8984 section 4.3.3 types byMonth as String[] (month
+                // numbers as strings, optionally "L"-suffixed for leap
+                // months). Emitting integers here fed spec-conforming
+                // servers a shape they may reject.
+                object.insert("byMonth".to_string(), Value::Array(month_string_list(value)?));
             }
             "BYMONTHDAY" => {
                 object.insert("byMonthDay".to_string(), Value::Array(integer_list(value)?));
@@ -998,7 +1002,7 @@ fn rrule_from_jmap_recurrence_rule(
     if let Some(by_month) = object.get("byMonth") {
         parts.push(format!(
             "BYMONTH={}",
-            rrule_integer_list(by_month).ok_or("JMAP recurrence byMonth is invalid")?
+            rrule_month_list(by_month).ok_or("JMAP recurrence byMonth is invalid")?
         ));
     }
     if let Some(by_month_day) = object.get("byMonthDay") {
@@ -1099,6 +1103,37 @@ fn integer_list(value: &str) -> Option<Vec<Value>> {
         .split(',')
         .map(|item| Some(json!(item.parse::<i64>().ok()?)))
         .collect()
+}
+
+/// RRULE `BYMONTH=6,12` -> JSCalendar `byMonth: ["6", "12"]`. Validated as
+/// integers (RRULE months are numeric), emitted as the String[] RFC 8984
+/// section 4.3.3 requires.
+fn month_string_list(value: &str) -> Option<Vec<Value>> {
+    value
+        .split(',')
+        .map(|item| Some(Value::String(item.parse::<i64>().ok()?.to_string())))
+        .collect()
+}
+
+/// JSCalendar `byMonth` -> RRULE `BYMONTH` list. RFC 8984 types the entries
+/// as strings ("6", "12", optionally "L"-suffixed for leap months); an "L"
+/// suffix has no RRULE representation and is refused rather than silently
+/// dropped. Bare integers are also accepted - bifrost's own write side
+/// emitted them until the RFC shape landed, and lenient reads keep such
+/// events convertible.
+fn rrule_month_list(value: &Value) -> Option<String> {
+    value
+        .as_array()?
+        .iter()
+        .map(|item| {
+            if let Some(number) = item.as_i64() {
+                return Some(number.to_string());
+            }
+            let text = item.as_str()?;
+            text.parse::<i64>().ok().map(|number| number.to_string())
+        })
+        .collect::<Option<Vec<_>>>()
+        .map(|items| items.join(","))
 }
 
 fn rrule_by_day(value: &Value) -> Option<String> {
@@ -2043,8 +2078,49 @@ mod tests {
         assert_eq!(rule["count"].as_u64(), Some(5));
         assert_eq!(rule["byDay"][0]["day"].as_str(), Some("mo"));
         assert_eq!(rule["byDay"][1]["day"].as_str(), Some("we"));
-        assert_eq!(rule["byMonth"][0].as_i64(), Some(6));
+        // RFC 8984 section 4.3.3: byMonth is String[], byMonthDay is Int[].
+        assert_eq!(rule["byMonth"][0].as_str(), Some("6"));
         assert_eq!(rule["byMonthDay"][0].as_i64(), Some(2));
+    }
+
+    #[test]
+    fn recurrence_rule_reads_rfc8984_string_by_month() {
+        // RFC 8984 types byMonth as String[]; a conforming server's
+        // `["12"]` must convert, and an "L"-suffixed leap month (no RRULE
+        // representation) must refuse rather than silently drop.
+        let rrule = rrule_from_jmap_recurrence_rule(
+            &json!({
+                "@type": "RecurrenceRule",
+                "frequency": "yearly",
+                "byMonth": ["12"],
+                "byMonthDay": [24]
+            }),
+            "2026-12-24T18:00:00",
+            false,
+            Some("UTC"),
+        )
+        .expect("string byMonth should convert")
+        .expect("rrule");
+        assert_eq!(rrule, "FREQ=YEARLY;BYMONTH=12;BYMONTHDAY=24");
+
+        // Legacy integer entries stay readable.
+        let rrule = rrule_from_jmap_recurrence_rule(
+            &json!({"frequency": "yearly", "byMonth": [6]}),
+            "2026-06-01T09:00:00",
+            false,
+            None,
+        )
+        .expect("integer byMonth should convert")
+        .expect("rrule");
+        assert_eq!(rrule, "FREQ=YEARLY;BYMONTH=6");
+
+        let leap = rrule_from_jmap_recurrence_rule(
+            &json!({"frequency": "yearly", "byMonth": ["5L"]}),
+            "2026-05-01T09:00:00",
+            false,
+            None,
+        );
+        assert!(leap.is_err(), "leap-month byMonth must refuse");
     }
 
     #[test]
