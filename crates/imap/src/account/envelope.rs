@@ -295,8 +295,8 @@ pub(crate) fn encode_object_id(folder: &MailboxName, uidvalidity: u32, uid: u32)
 pub(crate) fn decode_object_id(id: &ObjectId) -> Result<DecodedObjectId, AccountError> {
     let (folder, rest) = decode_len_prefixed("imap1", &id.0)?;
     let mut parts = rest.split(':');
-    let uidvalidity = parse_u32(parts.next())?;
-    let uid = parse_u32(parts.next())?;
+    let uidvalidity = parse_nonzero_u32(parts.next(), "IMAP object id uidvalidity")?;
+    let uid = parse_nonzero_u32(parts.next(), "IMAP object id uid")?;
     if parts.next().is_some() {
         return Err(malformed("invalid IMAP object id"));
     }
@@ -328,16 +328,19 @@ pub(crate) fn encode_thread_id(folder: &MailboxName, uidvalidity: u32, uids: &[u
 pub(crate) fn decode_thread_id(id: &ThreadId) -> Result<DecodedThreadId, AccountError> {
     let (folder, rest) = decode_len_prefixed("imapthread1", &id.0)?;
     let mut parts = rest.splitn(2, ':');
-    let uidvalidity = parse_u32(parts.next())?;
+    let uidvalidity = parse_nonzero_u32(parts.next(), "IMAP thread id uidvalidity")?;
     let uid_part = parts
         .next()
         .ok_or_else(|| malformed("missing IMAP thread uid set"))?;
     let mut uids = Vec::new();
     for uid in uid_part.split(',').filter(|part| !part.is_empty()) {
-        uids.push(
-            uid.parse::<u32>()
-                .map_err(|_| malformed("invalid IMAP thread uid"))?,
-        );
+        let uid = uid
+            .parse::<u32>()
+            .map_err(|_| malformed("invalid IMAP thread uid"))?;
+        if uid == 0 {
+            return Err(malformed("invalid IMAP thread uid"));
+        }
+        uids.push(uid);
     }
     if uids.is_empty() {
         return Err(malformed("empty IMAP thread uid set"));
@@ -376,6 +379,21 @@ fn parse_u32(value: Option<&str>) -> Result<u32, AccountError> {
         .ok_or_else(|| malformed("missing IMAP id field"))?
         .parse::<u32>()
         .map_err(|_| malformed("invalid IMAP id integer"))
+}
+
+/// UIDs and UIDVALIDITY are RFC 9051 `nz-number`s: this crate never mints
+/// a 0, so a 0 on input is a corrupted or foreign id. Rejecting it here
+/// closes every downstream hole at once - `uid_set_from_u32` silently
+/// filters 0 out of wire operands, which otherwise fabricates
+/// `Succeeded(Applied)` outcomes for a uid the STORE/MOVE never targeted
+/// and, for an all-zero group, skips the group so its ids get no outcome
+/// at all.
+fn parse_nonzero_u32(value: Option<&str>, what: &str) -> Result<u32, AccountError> {
+    let parsed = parse_u32(value)?;
+    if parsed == 0 {
+        return Err(malformed(&format!("{what} must be nonzero")));
+    }
+    Ok(parsed)
 }
 
 /// Build a `Request(Malformed)` `AccountError` for IMAP object-id or
@@ -585,6 +603,29 @@ mod tests {
         assert_eq!(decoded.folder, folder);
         assert_eq!(decoded.uidvalidity, 10);
         assert_eq!(decoded.uids, vec![1, 3]);
+    }
+
+    /// UID 0 is not an RFC 9051 `nz-number` and this crate never mints it.
+    /// Accepting it at decode used to open a family of downstream holes:
+    /// `uid_set_from_u32` silently drops 0 from wire operands, so a mixed
+    /// mutation batch reported a fabricated `Succeeded(Applied)` for the
+    /// uid-0 id, an all-zero group produced NO outcome for its ids, and
+    /// `open_raw_rfc822` turned a uid-0 id into a successful empty stream.
+    /// Rejecting at the decode boundary closes them all at once.
+    #[test]
+    fn object_and_thread_ids_reject_uid_zero_and_uidvalidity_zero() {
+        let err = decode_object_id(&ObjectId("imap1:5:INBOX:7:0".into()))
+            .expect_err("uid 0 must be rejected");
+        assert!(is_malformed(&err), "kind: {:?}", err.kind());
+        let err = decode_object_id(&ObjectId("imap1:5:INBOX:0:7".into()))
+            .expect_err("uidvalidity 0 must be rejected");
+        assert!(is_malformed(&err), "kind: {:?}", err.kind());
+        let err = decode_thread_id(&ThreadId("imapthread1:5:INBOX:7:1,0,3".into()))
+            .expect_err("thread uid 0 must be rejected");
+        assert!(is_malformed(&err), "kind: {:?}", err.kind());
+        let err = decode_thread_id(&ThreadId("imapthread1:5:INBOX:0:1,3".into()))
+            .expect_err("thread uidvalidity 0 must be rejected");
+        assert!(is_malformed(&err), "kind: {:?}", err.kind());
     }
 
     fn is_schema_incompatible(err: &AccountError) -> bool {

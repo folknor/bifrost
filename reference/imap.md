@@ -174,6 +174,14 @@ Newtypes with explicit `::new` constructors. No `From<u32>`/`From<u64>` to preve
 
 `UidSet` and `SeqSet` wrap the validated sequence-set encoder (`from_uids`, `from_seqs`, `all()`, `saved_search()` (`$`), or range constructors). `parse(&str)` is an escape hatch bypassing the typed discipline.
 
+The account layer's string-typed object/thread ids (`imap1:` / `imapthread1:`)
+enforce the same `nz-number` rule at the decode boundary:
+`decode_object_id` / `decode_thread_id` reject a 0 uid or uidvalidity as
+`Request(Malformed)`. The crate never mints a 0, and accepting one used to
+leak past `uid_set_from_u32`'s silent zero-filtering into fabricated
+`Succeeded(Applied)` mutation outcomes, ids with no outcome at all, and an
+empty-but-successful `open_raw_rfc822` stream.
+
 Account cursors use `CompactUidSet`, a sorted, disjoint range list with
 range-native construction, membership, insertion, removal, and linear diff.
 QRESYNC mutates its live and fallback snapshots in that representation.

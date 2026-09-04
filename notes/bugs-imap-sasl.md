@@ -11,30 +11,12 @@ note where confidence is bounded by that.
 
 ## Confident defects
 
-### 1. `decode_object_id` accepts `uid: 0`, and downstream `uid_set_from_u32` silently filters it - producing false successes and silently dropped items
-
-- `crates/imap/src/account/envelope.rs` - `parse_u32` accepts `"0"` for the uid
-  (and uidvalidity) field, so `imap1:5:INBOX:7:0` decodes cleanly. UID 0 is not
-  an `nz-number` and the crate never mints it, but nothing rejects it on input.
-- `crates/imap/src/account/mutate.rs` - in `run_folder_mutation` (Move arm) and
-  `run_flag_mutation_groups`/`run_destroy_mutation_groups`, `uid_set_from_u32`
-  drops the 0 before building the wire operand. Mixed batch: the STORE/MOVE
-  never targets uid 0, yet `mutation_results(ids, Applied, ...)` and
-  `applied_uids_after_store` (which returns *requested* uids on `Applied`)
-  report **`Succeeded(Applied)` for the uid-0 id** - a fabricated success the
-  engine will trust. All-zero group: `let Some(uid_set) = ... else { continue; }`
-  skips the group and those ids get **no outcome at all**, violating the
-  one-outcome-per-id contract.
-- `crates/imap/src/account/get.rs` - `run_folder_get`: an all-zero request
-  `return Ok(())`s with no outcome; a mixed one lands uid 0 in
-  `Failed(NotFound(Message))` (misclassified but at least answered).
-  `crates/imap/src/account/blob.rs` `run_fetch` turns a uid-0 id into a
-  successful *empty* stream (`Done`, zero bytes).
-- Fix shape: reject `uid == 0` (and arguably `uidvalidity == 0`) in
-  `decode_object_id`/`decode_thread_id` as `Request(Malformed)`; every
-  downstream hole closes at once. Work note: this is one fix, not five - do
-  not patch the mutate/get/blob sites individually. Test obligation: a decode
-  rejection test for uid 0, plus revert-and-confirm it fails pre-fix.
+(Finding 1 - `decode_object_id` accepting uid 0 and the downstream
+zero-filtering fabricating successes / dropping outcomes - is fixed at the
+decode boundary: `decode_object_id` and `decode_thread_id` now reject a 0 uid
+or uidvalidity as `Request(Malformed)`, closing every downstream hole at once.
+Pinned by `object_and_thread_ids_reject_uid_zero_and_uidvalidity_zero` with
+revert-and-confirm; documented in `reference/imap.md`.)
 
 ### 2. `logout_best_effort` is unbounded, and dropping an `ImapConnection` leaks the driver task against a silent peer
 
