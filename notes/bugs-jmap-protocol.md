@@ -145,6 +145,48 @@ narrowing it is a product decision, not a defect fix.)
   decision and its condition are recorded in `reference/jmap.md`, and
   `core_max_concurrent_upload_is_parsed_even_though_nothing_reads_it` pins the
   decode (including omitted staying `None` rather than zero).
+- ~~**A malformed Submission block silently disabled only `scheduled_send`.**~~
+  FIXED. `submission_capabilities()` collapses `Absent` and `Malformed` into
+  `None`, and `factory` read that as `max_delayed_send = 0` - so a server whose
+  Submission object did not parse kept `send_message`, `draft_send` and the
+  identity doors live off that same unparseable block while scheduled send went
+  dark with no diagnostic. That is a malformed optional block degrading as a
+  silently different VALUE, which the lane rule forbids; the reference's rule
+  for an optional block is "the family degrades to off, by name". It now does:
+  `resolve_optional_families` drops the Submission handle on `Malformed`, so
+  the flag and the handle go together. `SubmissionCapabilities` also lost its
+  container-level `#[serde(default)]`, for the same reason `CoreCapabilities`
+  did - RFC 8621 §7 makes `maxDelayedSend` mandatory, so `{}` is a malformed
+  block, not an advertised zero-second window. A well-formed `maxDelayedSend:
+  0` still keeps the family with `scheduled_send` false. Pinned by
+  `a_submission_block_without_max_delayed_send_disables_the_family` and
+  `a_zero_delayed_send_window_keeps_the_submission_family`; the first ablated
+  against both halves of the fix and confirmed failing.
+- ~~**Family enable flags came from `primaryAccounts`, not from the block.**~~
+  FIXED. Mail, calendars, contacts and sieve derived their family flag from
+  `client.primary_account::<C>()`, which reads `primaryAccounts` alone, so a
+  malformed block left the family fully advertised with only the generic
+  `build` log line to show for it. `resolve_optional_families` now gates every
+  optional handle on its own `CapabilityState`: `Malformed` drops the handle
+  and warns with the URI and the family name, which takes the `PimSupport`
+  flag (derived from `is_some()`) and the `JmapAccount` door (which reads the
+  same `Option`) with it. `Absent` is deliberately left alone - that is the
+  separate question of a session naming a primary account for a URI it does
+  not advertise, and gating it here would drop families off working servers.
+  Mail needed no change: a malformed mail block already fails
+  `capabilities::build`, which fails the whole open, so the family cannot
+  exist. Vacation has no typed block and so no malformed lane. Pinned by
+  `a_malformed_optional_family_block_drops_its_own_handle_only`,
+  `a_malformed_family_block_is_not_advertised_in_the_capability_snapshot` and
+  the over-gating control `well_formed_optional_family_blocks_keep_every_handle`;
+  ablated by making the gate always return `true`, and confirmed failing.
+- **Serde accepts a JSON ARRAY as a capability object.** Noticed while writing
+  the fixtures above: derived struct deserializers accept a sequence in field
+  order, and `CalendarsCapabilities` / `ContactsCapabilities` default every
+  field, so `"urn:ietf:params:jmap:calendars": []` parses as PRESENT rather
+  than landing in the malformed lane. Harmless in practice (no server sends
+  one), and the fix would be a `deny_unknown`-style map-only visitor on every
+  capability struct. Recorded, not fixed.
 - **WS Response decode double-round-trips** (`json!` Value rebuild then
   `from_value`) - works (verified), but it re-allocates every method response; a
   `RawValue`-preserving envelope would decode once.

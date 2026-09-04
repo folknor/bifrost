@@ -149,20 +149,20 @@ impl AccountFactory for JmapAccountFactory {
                         .with_scope(bifrost_types::ErrorScope::Account),
                     )
                 })?;
-            let submission = client.primary_account::<capability::Submission>().ok();
-            let vacation = client
-                .primary_account::<capability::VacationResponseCap>()
-                .ok();
-            let quota = client.primary_account::<capability::Quota>().ok();
-            let sieve = client.primary_account::<capability::Sieve>().ok();
-            let contacts = client.primary_account::<capability::Contacts>().ok();
-            let calendars = client.primary_account::<capability::Calendars>().ok();
+            // Each optional family's handle is gated on the lane its own
+            // capability block is in, so the handle and the derived
+            // `PimSupport` flag cannot disagree.
+            let OptionalFamilies {
+                submission,
+                vacation,
+                quota,
+                sieve,
+                contacts,
+                calendars,
+                max_delayed_send,
+            } = resolve_optional_families(&client);
             let session = client.session();
             let self_emails = fetch_self_emails(&client, &config.credentials).await;
-            let max_delayed_send = match session.submission_capabilities() {
-                Some(caps) => caps.max_delayed_send(),
-                None => 0,
-            };
             let (email_state, mailbox_state, mailbox_names) =
                 seed_account_state(&mail).await.map_err(|err| {
                     super::error::into_account_error(
@@ -351,6 +351,145 @@ fn foreign_probe_concurrency(session: &crate::core::session::Session) -> usize {
         .and_then(crate::core::session::CoreCapabilities::max_concurrent_requests)
         .unwrap_or(1)
         .clamp(1, MAX_PROBE_CONCURRENCY)
+}
+
+/// The optional PIM family handles a session yields, each already read
+/// through the Absent / Malformed / Present lane rule.
+///
+/// A family's enable flag used to be "`primaryAccounts` names an account
+/// for this URI" and nothing else, so a server that advertised, say,
+/// `urn:ietf:params:jmap:sieve` with an object this crate refuses to parse
+/// kept the whole filters family switched on and got one log line for it.
+/// The block and the handle are one fact, so they are decided in one
+/// place: on `Malformed` the handle is dropped here, which takes the
+/// `PimSupport` flag derived from `is_some()` and the account door that
+/// reads the same `Option` off with it. A live handle behind a `false`
+/// capability - or a `true` capability in front of a handle whose
+/// capability object is gibberish - is a guaranteed `Unsupported` (or
+/// worse, a request built from limits nobody could read) one layer up.
+struct OptionalFamilies<Tr: HttpTransport> {
+    submission: Option<JmapMailAccount<Tr>>,
+    vacation: Option<JmapMailAccount<Tr>>,
+    quota: Option<JmapMailAccount<Tr>>,
+    sieve: Option<JmapMailAccount<Tr>>,
+    contacts: Option<JmapMailAccount<Tr>>,
+    calendars: Option<JmapMailAccount<Tr>>,
+    /// RFC 8621 `maxDelayedSend`, in seconds. Non-zero only when the
+    /// Submission block is present AND parseable AND advertises a window.
+    max_delayed_send: usize,
+}
+
+/// Whether an optional family may advertise, given the lane its own
+/// capability block is in.
+///
+/// `Malformed` is the only refusal, and it is named: the server offered
+/// the capability and then described it wrongly, and a family that
+/// silently vanishes from a session which does advertise its URI leaves
+/// nobody anything to debug. `Absent` is deliberately NOT refused here.
+/// A session that names a primary account for a URI it omits from
+/// `capabilities` is a separate question from one that names it and
+/// then describes it wrongly, and answering it in this function would
+/// silently drop families off servers that work today.
+fn family_block_is_usable<T>(
+    state: crate::core::session::CapabilityState<'_, T>,
+    uri: &str,
+    family: &str,
+) -> bool {
+    match state {
+        crate::core::session::CapabilityState::Present(_)
+        | crate::core::session::CapabilityState::Absent => true,
+        crate::core::session::CapabilityState::Malformed => {
+            tracing::warn!(
+                capability = uri,
+                family,
+                "JMAP session advertises this capability with an unparseable object; \
+                 the family is not advertised and its methods refuse as unsupported"
+            );
+            false
+        }
+    }
+}
+
+fn resolve_optional_families<Tr: HttpTransport>(client: &Client<Tr>) -> OptionalFamilies<Tr> {
+    let session = client.session();
+
+    let submission_usable = family_block_is_usable(
+        session.submission_capability_state(),
+        <capability::Submission as Capability>::URI,
+        "submission",
+    );
+    let submission = client
+        .primary_account::<capability::Submission>()
+        .ok()
+        .filter(|_| submission_usable);
+    // `maxDelayedSend` is a mandatory member of the Submission object, so
+    // a malformed block has no window to read. This used to fall to 0,
+    // which silently disabled `scheduled_send` while `send_message`,
+    // `draft_send` and the identity doors stayed live off the same
+    // unparseable block - a malformed optional block degrading as a
+    // different VALUE rather than as a named "off", which is exactly what
+    // the lane rule forbids. It now degrades with the family.
+    let max_delayed_send = session
+        .submission_capabilities()
+        .map_or(0, crate::email::SubmissionCapabilities::max_delayed_send);
+
+    // `urn:ietf:params:jmap:vacationresponse` carries no members this
+    // crate models, so it has no typed block and therefore no malformed
+    // lane to read: presence in `primaryAccounts` is the whole signal.
+    let vacation = client
+        .primary_account::<capability::VacationResponseCap>()
+        .ok();
+
+    let quota = client
+        .primary_account::<capability::Quota>()
+        .ok()
+        .filter(|_| {
+            family_block_is_usable(
+                session.quota_capability_state(),
+                <capability::Quota as Capability>::URI,
+                "quota",
+            )
+        });
+    let sieve = client
+        .primary_account::<capability::Sieve>()
+        .ok()
+        .filter(|_| {
+            family_block_is_usable(
+                session.sieve_capability_state(),
+                <capability::Sieve as Capability>::URI,
+                "sieve",
+            )
+        });
+
+    let contacts = client.primary_account::<capability::Contacts>().ok();
+    #[cfg(feature = "contacts")]
+    let contacts = contacts.filter(|_| {
+        family_block_is_usable(
+            session.contacts_capability_state(),
+            <capability::Contacts as Capability>::URI,
+            "contacts",
+        )
+    });
+
+    let calendars = client.primary_account::<capability::Calendars>().ok();
+    #[cfg(feature = "calendars")]
+    let calendars = calendars.filter(|_| {
+        family_block_is_usable(
+            session.calendars_capability_state(),
+            <capability::Calendars as Capability>::URI,
+            "calendars",
+        )
+    });
+
+    OptionalFamilies {
+        submission,
+        vacation,
+        quota,
+        sieve,
+        contacts,
+        calendars,
+        max_delayed_send,
+    }
 }
 
 fn account_advertises_submission(session: &crate::core::session::Session, id: &str) -> bool {
@@ -1069,6 +1208,213 @@ mod tests {
         replies: impl IntoIterator<Item = ScriptedReply>,
     ) -> Client<ScriptedTransport> {
         scripted_client_with_session(session(), replies)
+    }
+
+    /// A session whose `primaryAccounts` names an account for every
+    /// optional family, so the ONLY thing that can switch a family off is
+    /// the shape of its capability block. `blocks` supplies those blocks.
+    fn session_with_family_blocks(blocks: Value) -> Session {
+        let mut capabilities = json!({
+            "urn:ietf:params:jmap:core": {
+                "maxSizeUpload": 1000,
+                "maxConcurrentUpload": 2,
+                "maxSizeRequest": 100_000,
+                "maxConcurrentRequests": 4,
+                "maxCallsInRequest": 8,
+                "maxObjectsInGet": 256,
+                "maxObjectsInSet": 256,
+                "collationAlgorithms": []
+            },
+            "urn:ietf:params:jmap:mail": {}
+        });
+        let map = capabilities.as_object_mut().expect("object");
+        for (key, value) in blocks.as_object().expect("blocks is an object") {
+            map.insert(key.clone(), value.clone());
+        }
+        serde_json::from_value(json!({
+            "capabilities": capabilities,
+            "accounts": {
+                "primary": {"name": "Primary", "isPersonal": true, "isReadOnly": false, "accountCapabilities": {"urn:ietf:params:jmap:mail": {}}}
+            },
+            "primaryAccounts": {
+                "urn:ietf:params:jmap:mail": "primary",
+                "urn:ietf:params:jmap:submission": "primary",
+                "urn:ietf:params:jmap:vacationresponse": "primary",
+                "urn:ietf:params:jmap:quota": "primary",
+                "urn:ietf:params:jmap:sieve": "primary",
+                "urn:ietf:params:jmap:contacts": "primary",
+                "urn:ietf:params:jmap:calendars": "primary"
+            },
+            "username": "user@example.test",
+            "apiUrl": "https://example.test/jmap/api",
+            "downloadUrl": "https://example.test/download/{accountId}/{blobId}/{name}/{type}",
+            "uploadUrl": "https://example.test/upload/{accountId}",
+            "eventSourceUrl": "https://example.test/eventsource",
+            "state": "session-1"
+        }))
+        .expect("test session parses")
+    }
+
+    /// Every optional family block in its well-formed shape.
+    fn well_formed_family_blocks() -> Value {
+        json!({
+            "urn:ietf:params:jmap:submission": {"maxDelayedSend": 3600},
+            "urn:ietf:params:jmap:quota": {},
+            "urn:ietf:params:jmap:sieve": {},
+            "urn:ietf:params:jmap:contacts": {},
+            "urn:ietf:params:jmap:calendars": {}
+        })
+    }
+
+    /// The control: a session that describes every optional family
+    /// correctly hands back every handle, and the delayed-send window is
+    /// the one the Submission block advertises.
+    #[test]
+    fn well_formed_optional_family_blocks_keep_every_handle() {
+        let client = scripted_client_with_session(
+            session_with_family_blocks(well_formed_family_blocks()),
+            [],
+        );
+        let families = resolve_optional_families(&client);
+        assert!(families.submission.is_some());
+        assert!(families.vacation.is_some());
+        assert!(families.quota.is_some());
+        assert!(families.sieve.is_some());
+        assert!(families.contacts.is_some());
+        assert!(families.calendars.is_some());
+        assert_eq!(families.max_delayed_send, 3600);
+    }
+
+    /// The defect: the family enable flags came from `primaryAccounts`
+    /// alone, so a present-but-unparseable block left the family fully
+    /// advertised with only a log line to show for it. Each family is
+    /// varied on its own, so a gate that fires for the wrong URI is
+    /// visible.
+    #[test]
+    fn a_malformed_optional_family_block_drops_its_own_handle_only() {
+        for uri in [
+            "urn:ietf:params:jmap:submission",
+            "urn:ietf:params:jmap:quota",
+            "urn:ietf:params:jmap:sieve",
+            "urn:ietf:params:jmap:contacts",
+            "urn:ietf:params:jmap:calendars",
+        ] {
+            let mut blocks = well_formed_family_blocks();
+            blocks[uri] = json!("not an object");
+            let client = scripted_client_with_session(session_with_family_blocks(blocks), []);
+            let families = resolve_optional_families(&client);
+            let present = [
+                (
+                    "urn:ietf:params:jmap:submission",
+                    families.submission.is_some(),
+                ),
+                ("urn:ietf:params:jmap:quota", families.quota.is_some()),
+                ("urn:ietf:params:jmap:sieve", families.sieve.is_some()),
+                ("urn:ietf:params:jmap:contacts", families.contacts.is_some()),
+                (
+                    "urn:ietf:params:jmap:calendars",
+                    families.calendars.is_some(),
+                ),
+            ];
+            for (family_uri, is_present) in present {
+                assert_eq!(
+                    is_present,
+                    family_uri != uri,
+                    "malformed {uri}: {family_uri} availability"
+                );
+            }
+            if uri == "urn:ietf:params:jmap:submission" {
+                assert_eq!(
+                    families.max_delayed_send, 0,
+                    "a malformed Submission block advertises no window"
+                );
+            } else {
+                assert_eq!(families.max_delayed_send, 3600, "malformed {uri}");
+            }
+        }
+    }
+
+    /// A Submission block that omits its mandatory `maxDelayedSend` is
+    /// malformed, not "a server with a zero-second window". The old
+    /// reader collapsed the two, so the whole submission family stayed
+    /// live off a block nobody could parse and only `scheduled_send` went
+    /// dark - a malformed optional block degrading as a silently
+    /// different VALUE, which the lane rule forbids.
+    #[test]
+    fn a_submission_block_without_max_delayed_send_disables_the_family() {
+        let mut blocks = well_formed_family_blocks();
+        blocks["urn:ietf:params:jmap:submission"] = json!({});
+        let client = scripted_client_with_session(session_with_family_blocks(blocks), []);
+        let families = resolve_optional_families(&client);
+        assert!(
+            families.submission.is_none(),
+            "an unparseable Submission block takes the whole family, not just the window"
+        );
+        assert_eq!(families.max_delayed_send, 0);
+    }
+
+    /// A well-formed Submission block advertising a zero window is a
+    /// different server from a malformed one: the family stays live (send,
+    /// drafts, identities all work) and only `scheduled_send` is off.
+    #[test]
+    fn a_zero_delayed_send_window_keeps_the_submission_family() {
+        let mut blocks = well_formed_family_blocks();
+        blocks["urn:ietf:params:jmap:submission"] = json!({"maxDelayedSend": 0});
+        let client = scripted_client_with_session(session_with_family_blocks(blocks), []);
+        let families = resolve_optional_families(&client);
+        assert!(families.submission.is_some());
+        assert_eq!(families.max_delayed_send, 0);
+
+        let support = crate::sync::capabilities::PimSupport {
+            submission: families.submission.is_some(),
+            max_delayed_send: families.max_delayed_send,
+            foreign_submission: false,
+            vacation: families.vacation.is_some(),
+            quota: families.quota.is_some(),
+            sieve: families.sieve.is_some(),
+            contacts: families.contacts.is_some(),
+            calendar: families.calendars.is_some(),
+        };
+        let (caps, _) =
+            crate::sync::capabilities::build(&client.session(), support).expect("session is legal");
+        assert!(caps.pim_methods.send_message);
+        assert!(!caps.pim_methods.scheduled_send);
+    }
+
+    /// The end-to-end shape of hole 2: the derived `PimMethodSupport`
+    /// flags for a family whose block is malformed are all false, not just
+    /// logged about.
+    #[test]
+    fn a_malformed_family_block_is_not_advertised_in_the_capability_snapshot() {
+        let mut blocks = well_formed_family_blocks();
+        blocks["urn:ietf:params:jmap:sieve"] = json!("not an object");
+        blocks["urn:ietf:params:jmap:contacts"] = json!(7);
+        blocks["urn:ietf:params:jmap:calendars"] = json!(false);
+        let client = scripted_client_with_session(session_with_family_blocks(blocks), []);
+        let families = resolve_optional_families(&client);
+        let support = crate::sync::capabilities::PimSupport {
+            submission: families.submission.is_some(),
+            max_delayed_send: families.max_delayed_send,
+            foreign_submission: false,
+            vacation: families.vacation.is_some(),
+            quota: families.quota.is_some(),
+            sieve: families.sieve.is_some(),
+            contacts: families.contacts.is_some(),
+            calendar: families.calendars.is_some(),
+        };
+        let (caps, _) = crate::sync::capabilities::build(&client.session(), support)
+            .expect("optional families degrade");
+        let pim = &caps.pim_methods;
+        assert!(!pim.filters_list);
+        assert!(!pim.filter_validate);
+        assert_eq!(caps.filter_rule_shape, bifrost_types::FilterRuleShape::None);
+        assert!(!pim.contacts_list);
+        assert!(!pim.contact_autocomplete);
+        assert!(!pim.calendars_list);
+        assert!(!pim.event_rsvp);
+        // Quota and submission were described correctly, so they stay on.
+        assert!(pim.quota_get);
+        assert!(pim.send_message);
     }
 
     fn scripted_client_with_session(

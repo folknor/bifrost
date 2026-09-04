@@ -226,6 +226,20 @@ whether the account DEPENDS on the block:
   `PushCapability::None` silently is indistinguishable from a server that never
   offered push. It still degrades - there is no url to connect to - but the
   reason is on the record.
+- **The family gate is where "degrades to off" is actually enforced.** A
+  family's enable flag is NOT `primaryAccounts` membership alone.
+  `sync::factory::resolve_optional_families` reads each family's block state
+  and, on `Malformed`, drops the `primary_account` handle it just resolved,
+  warning with the URI and the family name. Dropping the HANDLE rather than
+  only clearing the `PimSupport` flag is the point: the derived flag is
+  `handle.is_some()` and every family door on `JmapAccount` reads the same
+  `Option`, so one decision moves both and a live handle can never sit behind
+  a `false` capability. `Absent` is deliberately not gated here - a session
+  naming a primary account for a URI it omits from `capabilities` is a
+  different question from one that names it and then describes it wrongly, and
+  answering it in this gate would drop families off servers that work today.
+  `urn:ietf:params:jmap:vacationresponse` has no typed block and therefore no
+  malformed lane: `primaryAccounts` is its whole signal.
 - **At the door.** `Client::connect_ws` separates the two states as well:
   `Absent` stays `Error::WebSocketNotConnected` (which maps to `Unsupported`),
   while `Malformed` raises `Error::MalformedCapability { capability }`, mapped
@@ -331,7 +345,7 @@ crates/jmap/src/sync/
 
 ### `JmapAccount` / `JmapAccountFactory` shape and lifecycle
 
-`JmapAccountFactory` carries a `JmapAccountFactoryBuilder` config (URL, `JmapCredentials::Basic`/`Bearer`, optional timeout, `accept_invalid_certs`, `ReconnectPolicy`). `AccountFactory::open(account_id)` connects a `Client`, passing the engine account id into the `bifrost-net` attachment so metering / priority / caps / trace use the real key on reopen. Open resolves the primary `Mail` account plus optional `Submission`/`VacationResponse`/`Quota`/`Sieve`, reads the session, builds `AccountCapabilities` + `CoreLimits`, then batches the initial `Email/get` and `Mailbox/get` (including names) probes into one request for the primary and one request per foreign account. It spawns the WebSocket reader with a `CancellationToken`, and returns `OpenedAccount` (the handle plus the foreign-account skip lane; see Foreign accounts below).
+`JmapAccountFactory` carries a `JmapAccountFactoryBuilder` config (URL, `JmapCredentials::Basic`/`Bearer`, optional timeout, `accept_invalid_certs`, `ReconnectPolicy`). `AccountFactory::open(account_id)` connects a `Client`, passing the engine account id into the `bifrost-net` attachment so metering / priority / caps / trace use the real key on reopen. Open resolves the primary `Mail` account plus the optional `Submission`/`VacationResponse`/`Quota`/`Sieve`/`Contacts`/`Calendars` handles through `resolve_optional_families` (which gates each on its own capability block's lane; see "Absent, Malformed, Present" above), reads the session, builds `AccountCapabilities` + `CoreLimits`, then batches the initial `Email/get` and `Mailbox/get` (including names) probes into one request for the primary and one request per foreign account. It spawns the WebSocket reader with a `CancellationToken`, and returns `OpenedAccount` (the handle plus the foreign-account skip lane; see Foreign accounts below).
 
 The batch is conditional on the session's own numbers. `maxCallsInRequest` and `maxSizeRequest` are hard limits (RFC 8620 §2) the server enforces by rejecting the whole request with a request-level `limit` error, and the commonly quoted 16 calls is the minimum a server is *recommended* to support, never a floor a client may assume. So `batched_open_probes` sends the two-call batch only when the advertised call count allows it and `Request::send_methods_within` finds the encoded request inside `maxSizeRequest`; otherwise nothing is sent and the probes go out one request each. `send_methods_within` takes the size limit as a required argument (and returns `Ok(None)` without sending when the batch does not fit) precisely so a future batching call site cannot forget the question.
 
@@ -348,7 +362,7 @@ Reopen is engine-delegated: on drop or `close()`, the engine calls `JmapAccountF
 - `mutation.concurrency: StateBased` (every `Email/set` gated by `ifInState`); `mutation.replay_safety: None`.
 - `batching_policy`: `max_items = core.maxObjectsInSet` clamped `[1,500]`, `max_wait: 100ms`, `flush_on_input_close: true`.
 - `rate_limit_class: Generous`; `quota_signal: None` (quota via `quota_get`); `requires_uidvalidity_recheck: false`; `historyid_/delta_token_expires_after: None`; `reopen_discovers_foreign_namespaces: true` unconditionally, because shared-account scopes are discovered from the session at open, there is no foreign scope-lifecycle stream, and no session signal can prove a server will never grant a share (the accounts list is only the current grants; RFC 9670 principals support is sufficient but not necessary evidence of sharing).
-- `pim_methods` advertises mailbox membership add/remove, keyword/read-state mutation, `set_importance`, attachment upload, draft lifecycle, search, mailbox CRUD, identity list/update (Submission), vacation get/set (VacationResponse), quota get (Quota), and thread/message hydration. `scheduled_send` is true iff `Submission` advertises `maxDelayedSend > 0` (onto `PimSupport.max_delayed_send` for boundary validation). Gmail labels, Graph categories/extended properties are false.
+- `pim_methods` advertises mailbox membership add/remove, keyword/read-state mutation, `set_importance`, attachment upload, draft lifecycle, search, mailbox CRUD, identity list/update (Submission), vacation get/set (VacationResponse), quota get (Quota), and thread/message hydration. `scheduled_send` is true iff the Submission block is PRESENT, parseable, and advertises `maxDelayedSend > 0` (onto `PimSupport.max_delayed_send` for boundary validation). A malformed Submission block does not degrade to `maxDelayedSend = 0`: `SubmissionCapabilities` is not `#[serde(default)]` at the container level, so a block omitting the mandatory RFC 8621 §7 `maxDelayedSend` fails to parse and lands in the malformed lane, where the family gate takes the whole submission family (send, drafts send, identities, `scheduled_send`) off with a named warning. A well-formed block advertising `maxDelayedSend: 0` is a different server and keeps the family, with only `scheduled_send` false. Gmail labels, Graph categories/extended properties are false.
 - `filter_rule_shape: Scripts` and every filter flag true with a primary Sieve account; without Sieve they are false and the shape is `None`.
 - `conveniences`: `starred = Keyword`, `replied`/`forwarded`/`mdn_sent` via keyword true, extended-property routes false. `set_starred`/`mark_replied`/`mark_forwarded`/`mark_mdn_sent` map to `$flagged`/`$answered`/`$forwarded`/`$MDNSent`. `set_importance` is two-valued: `High` sets `$important`, else clears; read maps `$important` presence onto `Message.importance`.
 
