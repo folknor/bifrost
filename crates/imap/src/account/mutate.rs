@@ -87,25 +87,35 @@ pub(super) fn mutation_stream(
         let move_destination = match validated_move_destination(&kind) {
             Ok(destination) => destination,
             Err(error) => {
+                // Request validation failed for every target, so the outcomes
+                // are known without touching the wire. Accumulate them to the
+                // same window the grouped path flushes on rather than sending
+                // one batch per id: a bad destination against a large target
+                // set otherwise costs one channel send per target.
+                let mut rejected = Vec::new();
                 while let Some(id) = targets.next().await {
                     let item = BatchItemId(id.0);
-                    if tx
-                        .send(batch(
-                            vec![ItemOutcome::Failed(BatchFailure::new(item, error.clone()))],
-                            PageBoundary::Page,
-                            None,
-                        ))
-                        .await
-                        .is_err()
+                    rejected.push(ItemOutcome::Failed(BatchFailure::new(item, error.clone())));
+                    if rejected.len() >= super::TARGET_BUFFER_ITEMS
+                        && flush_items(&mut rejected, &tx).await.is_err()
                     {
                         return;
                     }
+                }
+                if flush_items(&mut rejected, &tx).await.is_err() {
+                    return;
                 }
                 let _ = tx.send(SyncEvent::Done(None)).await;
                 return;
             }
         };
         let mut grouped: HashMap<String, (MailboxName, Vec<DecodedObjectId>)> = HashMap::new();
+        // Ids that fail to decode never reach a folder group, but they are
+        // buffered against the same window as the ones that do: they ride one
+        // batch per flush instead of one batch each, and they count toward
+        // `buffered` so the undecodable half cannot grow without bound while
+        // no folder group ever reaches the flush threshold.
+        let mut undecodable = Vec::new();
         let mut buffered = 0usize;
         while let Some(id) = targets.next().await {
             match decode_object_id(&id) {
@@ -115,24 +125,17 @@ pub(super) fn mutation_stream(
                         .or_insert_with(|| (decoded.folder.clone(), Vec::new()))
                         .1
                         .push(decoded);
-                    buffered += 1;
                 }
                 Err(err) => {
                     let item_id = BatchItemId(id.0.clone());
-                    if tx
-                        .send(batch(
-                            vec![ItemOutcome::Failed(BatchFailure::new(item_id, err))],
-                            PageBoundary::Page,
-                            None,
-                        ))
-                        .await
-                        .is_err()
-                    {
-                        return;
-                    }
+                    undecodable.push(ItemOutcome::Failed(BatchFailure::new(item_id, err)));
                 }
             }
+            buffered += 1;
             if buffered >= super::TARGET_BUFFER_ITEMS {
+                if flush_items(&mut undecodable, &tx).await.is_err() {
+                    return;
+                }
                 if flush_mutation_groups(
                     &account,
                     &mut grouped,
@@ -147,6 +150,9 @@ pub(super) fn mutation_stream(
                 }
                 buffered = 0;
             }
+        }
+        if flush_items(&mut undecodable, &tx).await.is_err() {
+            return;
         }
         if flush_mutation_groups(
             &account,
@@ -163,6 +169,27 @@ pub(super) fn mutation_stream(
         let _ = tx.send(SyncEvent::Done(None)).await;
     });
     boxed_receiver_stream(rx)
+}
+
+/// Send `items` as one `Batch` and clear the accumulator, doing nothing when
+/// it is empty so a flush point costs no send unless it has something to say.
+/// `Err(())` means the receiver is gone, which every streaming task treats as
+/// silent termination.
+async fn flush_items(
+    items: &mut Vec<ItemOutcome<MutationSuccess>>,
+    tx: &tokio::sync::mpsc::Sender<SyncEvent<ItemOutcome<MutationSuccess>>>,
+) -> Result<(), ()> {
+    if items.is_empty() {
+        return Ok(());
+    }
+    if tx
+        .send(batch(std::mem::take(items), PageBoundary::Page, None))
+        .await
+        .is_err()
+    {
+        return Err(());
+    }
+    Ok(())
 }
 
 async fn flush_mutation_groups(

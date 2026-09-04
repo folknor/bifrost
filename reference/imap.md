@@ -569,6 +569,26 @@ Mutation error lanes follow transmission evidence. An `InFlight` attempt makes t
 
 `mutate::mutation_stream` emits no trailing global `SyncEvent::Terminated` when a folder fails mid-batch: a per-folder fatal after per-item emissions surfaces as a per-item outcome for every remaining target in that folder (carrying the classified `AccountError`; `Uncertain` on `InFlight` transmission evidence, `Failed` otherwise), and the loop continues to the next folder. Stream-level `Terminated` is reserved for failures that prevent any further folder attempt (auth lost, schema/capability break); `stream_terminating` is the gate. The decoded ids are moved into `run_folder_mutation`, not cloned per batch: every failure it can raise (`FolderMutationFailure`) happens in `open_folder_for_mutation`, before a single outcome is minted, so the error hands the whole id vector back and the fallback lane mints from that. Once the folder is open, the per-group paths are infallible by type - they return outcomes, not `Result` - which is what makes moving the ids in safe.
 
+### Mutation batch shape
+
+Every `mutation_stream` outcome rides a batch sized by the same
+`TARGET_BUFFER_ITEMS` window, on all three lanes; no lane emits one batch per
+id. The grouped lane flushes one batch per folder group per window. The two
+lanes that never reach a folder are accumulated to the same window and flushed
+through `flush_items`: ids rejected by `validated_move_destination` (a bulk move
+whose destination is not a folder scope, refused before any source folder is
+opened), and ids `decode_object_id` refuses, which are buffered alongside the
+decodable ones and emitted just before each grouped flush. Undecodable ids count
+toward `buffered`, so an input that is entirely undecodable still flushes on the
+window rather than growing without bound behind a folder group that never fills.
+`flush_items` sends nothing when its accumulator is empty, so a flush point costs
+no send unless it has something to say.
+
+Batch shape carries no meaning downstream: bifrost-sync's mutation consumer keys
+per-item outcomes by `ObjectId` and reads `BatchOutcome`'s own submission-order
+index, never batch position or batch size. The invariant that holds is per-id:
+every submitted id is answered exactly once, across all three lanes.
+
 ### Output-channel-dropped contract
 
 Every streaming task (`inventory_stream`, `changes_stream`, `get_stream`, `open_raw_rfc822`, `mutation_stream`) treats a `tx.send` failure on a dropped output receiver as silent termination: the task returns without synthesizing any `crate::Error` or fatal `Terminated`. The error funnel is reserved for wire failures and structural invariant breaks; a consumer walking away from its stream is not an error.

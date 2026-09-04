@@ -429,6 +429,116 @@ async fn mutation_select_failure_reports_every_id_uncertain_once() {
     let _server = script.await.unwrap();
 }
 
+/// Drain a mutation stream to `Done`, returning one entry per emitted
+/// `Batch` holding that batch's item ids. Batch count and per-id
+/// multiplicity are both readable from the result.
+async fn drain_mutation_batches(
+    mut output: bifrost_types::AccountStream<
+        bifrost_types::SyncEvent<bifrost_types::ItemOutcome<bifrost_types::MutationSuccess>>,
+    >,
+) -> Vec<Vec<String>> {
+    use bifrost_types::SyncEvent;
+    use futures::StreamExt;
+
+    let mut batches = Vec::new();
+    while let Some(event) = tokio::time::timeout(Duration::from_secs(5), output.next())
+        .await
+        .expect("stream must make progress")
+    {
+        match event {
+            SyncEvent::Batch(batch) => {
+                batches.push(
+                    batch
+                        .items
+                        .iter()
+                        .map(|outcome| match outcome {
+                            bifrost_types::ItemOutcome::Failed(item) => item.item.0.clone(),
+                            bifrost_types::ItemOutcome::Uncertain(item) => item.item.0.clone(),
+                            bifrost_types::ItemOutcome::Succeeded(item) => item.item.0.clone(),
+                        })
+                        .collect(),
+                );
+            }
+            SyncEvent::Done(_) => break,
+            unexpected => panic!("unexpected event: {unexpected:?}"),
+        }
+    }
+    batches
+}
+
+/// Assert every id in `expected` appears in exactly one batch item across
+/// `batches`, and that the emitted batch count stayed within the buffering
+/// window rather than degenerating to one batch per id.
+fn assert_batched_exactly_once(batches: &[Vec<String>], expected: &[String], max_batches: usize) {
+    let mut seen: Vec<String> = batches.iter().flatten().cloned().collect();
+    seen.sort();
+    let mut want = expected.to_vec();
+    want.sort();
+    assert_eq!(seen, want, "every id owes exactly one outcome");
+    assert!(
+        batches.len() <= max_batches,
+        "expected at most {max_batches} batches for {} ids, got {}",
+        expected.len(),
+        batches.len()
+    );
+}
+
+/// A bulk move whose destination fails our own request validation rejects
+/// every target without touching the wire. Those rejections must ride the
+/// same buffering window the grouped path flushes on: emitting one
+/// single-item batch per id costs one channel send per target, which is
+/// unbounded in the size of the caller's target set.
+#[tokio::test]
+async fn invalid_move_destination_batches_its_rejections() {
+    let (conn, _server) = driver_pair(&preauth_greeting("IMAP4rev1")).await;
+    let account = scripted_account(conn, 1);
+    let folder = crate::types::MailboxName::new("INBOX").unwrap();
+    let target_count = super::TARGET_BUFFER_ITEMS * 2 + 5;
+    let ids: Vec<bifrost_types::ObjectId> = (1..=target_count)
+        .map(|uid| super::encode_object_id(&folder, 5, u32::try_from(uid).unwrap()))
+        .collect();
+    let expected: Vec<String> = ids.iter().map(|id| id.0.clone()).collect();
+
+    let output = super::mutate::mutation_stream(
+        account,
+        Box::pin(futures::stream::iter(ids)),
+        // Not a folder scope, so `validated_move_destination` refuses it
+        // before any source folder is opened.
+        super::mutate::MutationKind::Move(bifrost_types::MembershipScope::Label(
+            bifrost_types::LabelId("important".to_owned()),
+        )),
+    );
+
+    let batches = drain_mutation_batches(output).await;
+    // Ceiling of target_count / TARGET_BUFFER_ITEMS: three windows here.
+    assert_batched_exactly_once(&batches, &expected, 3);
+}
+
+/// Ids that fail to decode never reach a folder group, but they must not be
+/// emitted one batch at a time either: they accumulate against the same
+/// window and ride one batch per flush.
+#[tokio::test]
+async fn undecodable_ids_ride_one_batch_per_window() {
+    let (conn, _server) = driver_pair(&preauth_greeting("IMAP4rev1")).await;
+    let account = scripted_account(conn, 1);
+    let target_count = super::TARGET_BUFFER_ITEMS + 7;
+    let ids: Vec<bifrost_types::ObjectId> = (1..=target_count)
+        .map(|n| bifrost_types::ObjectId(format!("not-an-imap-object-id-{n}")))
+        .collect();
+    let expected: Vec<String> = ids.iter().map(|id| id.0.clone()).collect();
+
+    let output = super::mutate::mutation_stream(
+        account,
+        Box::pin(futures::stream::iter(ids)),
+        super::mutate::MutationKind::Flags(bifrost_types::FlagOp::Add(
+            std::collections::HashSet::from(["$flagged".to_owned()]),
+        )),
+    );
+
+    let batches = drain_mutation_batches(output).await;
+    assert_batched_exactly_once(&batches, &expected, 2);
+}
+
 /// A non-NOTIFY server gets one dedicated IDLE session per pushed folder, so
 /// the fifth folder of a four-session budget cannot be pushed. It must be
 /// refused in the failed lane rather than silently accepted: bifrost-sync
