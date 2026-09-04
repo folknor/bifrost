@@ -168,15 +168,16 @@ away from collapsing. Pre-1.0, splitting engine.rs into
 attach/orchestrator/writer/reattach modules and bundling worker wiring into a
 context struct would pay for itself.
 
-### 11. Minor
+### 11. Minor - RESOLVED, finding was wrong
 
-`push/mod.rs::forward_events` increments the drop counter before attempting
-the 100 ms coalesced send, so a *successfully delivered* coalesced
-invalidation is still counted as dropped - the metric over-reports. Also,
-`SyncControl::announce_durable`'s `(None, _) => true` arm lets a
-publication-less ack replace a lane snapshot recorded under a newer
-`PublicationId`; unreachable from engine paths today (only the published
-`record_checkpoint` foot-gun reaches it) but worth a comment or a `<=` guard.
+The `forward_events` drop-counter claim ("a successfully delivered coalesced
+invalidation is still counted as dropped - the metric over-reports") misread
+the metric's intent: `dropped` counts payload loss (the specific event
+replaced by a coarser coalesced form), not delivery loss, and
+`full_sink_counts_a_coalesced_invalidation_as_dropped` pins exactly that -
+the coalesced event is received AND `dropped == 1`. A comment now documents
+the semantics at the increment. The `announce_durable` `(None, _)` half of
+the finding was real-but-unreachable and is now commented at the arm.
 
 ### 12. Doc drift, small
 

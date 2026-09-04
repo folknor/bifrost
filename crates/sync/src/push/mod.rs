@@ -97,6 +97,13 @@ async fn forward_events(
                 let delivery = if lossless {
                     rejected
                 } else {
+                    // The drop counter counts PAYLOAD loss, not delivery
+                    // loss: the rejected event's specific payload is gone
+                    // the moment it is replaced by the coarser coalesced
+                    // form, even when that replacement is then delivered.
+                    // (Pinned by full_sink_counts_a_coalesced_invalidation_
+                    // as_dropped, which receives the coalesced event AND
+                    // expects dropped == 1.)
                     drops.fetch_add(1, Ordering::Relaxed);
                     coalesced_event(rejected)
                 };

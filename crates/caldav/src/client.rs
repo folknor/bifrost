@@ -673,15 +673,22 @@ pub(crate) struct MultigetFetch {
 }
 
 impl MultigetFetch {
-    /// A wholly-failed leg with nothing usable anywhere is still a failed
+    /// A wholly-failed fetch with nothing usable anywhere is still a failed
     /// call: there is no partial result to preserve, so it keeps riding the
-    /// `Err` arm with its original classification.
+    /// `Err` arm with its original classification. "Nothing usable" means no
+    /// observations of ANY kind - a successful leg that reported all its
+    /// resources 404 (genuine deletions in `failed`) or data-less
+    /// (`missing_data`) has still answered for those resources, and a
+    /// degraded sibling leg must not throw those verdicts away and force the
+    /// caller to re-walk them.
     fn settle(
         report: CalDavMultigetReport,
         degraded: Option<AccountError>,
     ) -> Result<Self, AccountError> {
+        let no_observations =
+            report.events.is_empty() && report.failed.is_empty() && report.missing_data.is_empty();
         match degraded {
-            Some(error) if report.events.is_empty() => Err(error),
+            Some(error) if no_observations => Err(error),
             degraded => Ok(Self { report, degraded }),
         }
     }

@@ -858,6 +858,13 @@ impl ResponseParts {
     /// refused propstat status or a non-2xx response-level status. A
     /// collection response (some servers echo the collection itself alongside
     /// the requested resources) is not a failed resource and is dropped.
+    // Accepted edge: a failed propstat whose status line is absent or
+    // unparseable yields no numeric code here, so the resource degrades to
+    // the benign `missing_data` lane and cannot contribute to
+    // `CompleteFailure`. A pathological server failing every resource with
+    // garbage status text thus reads as an empty success; tolerated because
+    // such a server violates RFC 4918's required status line and the honest
+    // lanes still preserve the resource (mirrored in carddav).
     fn as_failed_multiget_resource(&self) -> Option<CalDavFailedResource> {
         if self.is_collection {
             return None;

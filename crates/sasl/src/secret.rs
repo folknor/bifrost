@@ -66,6 +66,9 @@ impl AsRef<str> for Secret {
 
 impl PartialEq for Secret {
     fn eq(&self, other: &Self) -> bool {
+        // Constant-time over equal-length inputs; `subtle`'s slice ct_eq
+        // short-circuits on a length mismatch, so the LENGTH of a secret can
+        // leak through timing. Accepted: lengths here are not secret.
         bool::from(self.as_bytes().ct_eq(other.as_bytes()))
     }
 }

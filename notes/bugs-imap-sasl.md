@@ -56,17 +56,6 @@ note where confidence is bounded by that.
   `logout_best_effort` with the command timeout (or a short fixed one) inside
   the driver.
 
-### 3. Push IDLE loop has no backoff when dial+SELECT succeed but the session dies immediately
-
-`crates/imap/src/account/push.rs::idle_loop` - `backoff` resets to 5s after
-every successful SELECT, and the redial path after `event_closes_connection`
-(BYE/ServerTerminated) or `idle()` error does **not** sleep. A server that
-accepts connect/auth/SELECT but kills IDLE at once (aggressive per-user IDLE
-policy, broken middlebox) produces a hot loop of full dial+TLS+auth+SELECT
-cycles with zero delay, hammering the server and burning CPU/battery. The
-backoff should also gate the redial after an in-session termination, not just
-dial/SELECT failures.
-
 ## Latent defects / suspected
 
 ### 4. `open_raw_rfc822` does not stream and has no byte budget
@@ -79,19 +68,6 @@ chunk. Both the doc comment ("streams the whole message") and
 streaming. Every other body path has a budget (`HYDRATION_FETCH_BUDGET` 256
 MiB, `DRAFT_FETCH_BUDGET` 64 MiB); this one has none. Should route through
 `uid_fetch_streaming`/`uid_fetch_limited`.
-
-### 5. Error-scope shape inconsistency the crate's own reference forbids
-
-`reference/imap.md` (~line 411): "Folder producers build
-`ErrorScope::Cursor(Folder(id))` ... not `ErrorScope::Mailbox { id }` -
-`with_mailbox` is reached only from tests," precisely because a scope reader
-matching only one shape degrades silently. But
-`account/get.rs::uidvalidity_changed_error` and `account/blob.rs::run_fetch`'s
-UIDVALIDITY error both build `ErrorScope::Mailbox { id }` for real
-folder-scoped failures, while `account/mutate.rs::uidvalidity_changed_error`
-builds `Cursor(Folder(..))` for the identical condition. Either the doc rule or
-the two producers are wrong; the asymmetry is exactly the drift the doc warns
-recreates the `ThrottleScope::Mailbox` bug.
 
 ### 6. `Pool::close` vs `PooledConn::drop` race leaves a member parked after close
 
@@ -120,17 +96,6 @@ corruption, since cursor commits go through name lookup - but it deserves the
 same preserve-in-place treatment: keep existing entries whose name survives,
 remove the missing, add the new.
 
-### 8. Dead code / unreachable fallback in `choose_idle_folder`
-
-`account/push.rs` - the INBOX fallback for slot 0 is unreachable:
-`push_subscribe` only inserts non-empty accepted folder-scope sets, and those
-all pass `MailboxName::new`, so whenever the scopes map is non-empty
-`subscribed_idle_folders` yields at least one entry and slot 0 always takes
-index 0. If the fallback is meant to cover "subscriptions exist but none is
-watchable," that state cannot occur; if it's meant as default-INBOX-push with
-no subscriptions, the early `scopes.is_empty() -> None` defeats it. Either
-intent is currently not served.
-
 ### 9. Resubscribe interrupt always redials even when the chosen folder is unchanged
 
 `account/push.rs` - any subscribe/unsubscribe cancels the in-flight IDLE round
@@ -143,37 +108,21 @@ documented as accepted; the unconditional redial is not.)
 
 ## Contract / documentation mismatches
 
-### 10. `reference/imap.md` overstates `bulk_move` validation
-
-"validates the destination mailbox once" - `mutate.rs::validated_move_destination`
-validates only name syntax (`MailboxName::new`), not existence/selectability. A
-well-formed nonexistent destination flows into the per-folder path and comes
-back as per-item outcomes from the server's `NO [TRYCREATE]`, not the
-documented up-front `Request(Malformed)` for every target.
-
 ### 11. Unaudited reference claims
 
 `reference/imap.md` claims about APPENDLIMIT/STATUS handling, `X-GM-LABELS`,
 ESEARCH normalization etc. were not independently verified in this pass (codec
 and `pim.rs`'s long tail unread); flagged as unaudited rather than clean.
 
-## bifrost-sasl: clean, with two notes
+## bifrost-sasl: clean
 
 The crate is in excellent shape - SCRAM (RFC 5802/7677 vectors,
 duplicate-attribute and nonce-extension guards, `i=` floor/ceiling, SASLprep on
 both username and password), CRAM-MD5, RFC 5929 channel binding with a careful
 DER walk and PSS parameter validation, OAuth payload framing with `\x01`
-stripping. Two minor observations:
-
-- `channel_binding.rs::tls_server_end_point` hashes the **entire input buffer**
-  (`family.digest(cert_der)`), while `read_tlv` on the outer SEQUENCE tolerates
-  trailing bytes (`_rest` ignored). If a transport ever hands DER with trailing
-  garbage, the binding hash silently includes it and mismatches the server's.
-  Rejecting non-empty `_rest` on the outer certificate would make it airtight;
-  with native-tls as the only source today it's theoretical.
-- `secret.rs::PartialEq` via `ct_eq` short-circuits on length mismatch
-  (inherent to `subtle` slices) - acceptable, just noting the length leak is
-  known-shape.
+stripping. (Its two minor observations - trailing DER bytes after the outer
+certificate SEQUENCE, and the ct_eq length short-circuit - are closed: the
+former is now rejected, the latter documented as accepted.)
 
 The IMAP-side consumption (`connection/auth.rs`, `connection/dispatch/auth.rs`)
 is correct: SASLprep is applied via `prepare_scram_username` at consumer

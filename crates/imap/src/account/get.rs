@@ -171,9 +171,12 @@ fn uidvalidity_changed_error(folder: &MailboxName) -> AccountError {
     )
     .protocol(Protocol::Imap)
     .operation(AccountOperation::Hydrate)
-    .scope(bifrost_types::ErrorScope::Mailbox {
-        id: folder.as_str().into(),
-    })
+    // Cursor(Folder(..)), not ErrorScope::Mailbox: the folder producers'
+    // documented scope shape, so scope readers matching one shape do not
+    // silently degrade (mutate.rs builds the identical condition this way).
+    .scope(bifrost_types::ErrorScope::Cursor(
+        bifrost_types::CursorScope::Folder(bifrost_types::FolderId(folder.as_str().to_owned())),
+    ))
     .try_build()
     .expect("valid account error classification")
 }

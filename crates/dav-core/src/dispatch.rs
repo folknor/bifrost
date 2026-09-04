@@ -156,7 +156,9 @@ impl DavDispatch {
         {
             return resolved.to_string();
         }
-        if self.base_url.ends_with('/') || href.starts_with('/') {
+        // `around()` trims the trailing slash from base_url, so only the
+        // href side decides whether a separator is needed.
+        if href.starts_with('/') {
             format!("{}{href}", self.base_url)
         } else {
             format!("{}/{href}", self.base_url)
@@ -214,13 +216,25 @@ impl DavDispatch {
             ));
         }
         let mut headers = HeaderMap::new();
+        // A header-invalid byte in a credential (e.g. a stray `\n` from a
+        // sloppy config file) must fail loudly here. Swallowing it sent the
+        // request UNAUTHENTICATED and surfaced as a mystifying 401 instead
+        // of a local "credential is malformed" error. (base64 output is
+        // always header-safe, so the Basic arm can only trip on this via a
+        // future refactor; the Bearer token is user-supplied input.)
         match &self.credentials {
             DavCredentials::Basic { username, password } => {
                 let credentials = base64::engine::general_purpose::STANDARD
                     .encode(format!("{username}:{password}"));
-                if let Ok(value) = HeaderValue::from_str(&format!("Basic {credentials}")) {
-                    headers.insert(AUTHORIZATION, value);
-                }
+                let value =
+                    HeaderValue::from_str(&format!("Basic {credentials}")).map_err(|_| {
+                        local_error(
+                            operation,
+                            "Basic credential contains header-invalid bytes",
+                            self.protocol,
+                        )
+                    })?;
+                headers.insert(AUTHORIZATION, value);
             }
             DavCredentials::Bearer { token_source } => {
                 let token = token_source.current().await.map_err(|error| {
@@ -230,9 +244,15 @@ impl DavDispatch {
                         self.protocol,
                     )
                 })?;
-                if let Ok(value) = HeaderValue::from_str(&format!("Bearer {}", token.as_str())) {
-                    headers.insert(AUTHORIZATION, value);
-                }
+                let value =
+                    HeaderValue::from_str(&format!("Bearer {}", token.as_str())).map_err(|_| {
+                        local_error(
+                            operation,
+                            "bearer token contains header-invalid bytes",
+                            self.protocol,
+                        )
+                    })?;
+                headers.insert(AUTHORIZATION, value);
             }
         }
         Ok(headers)

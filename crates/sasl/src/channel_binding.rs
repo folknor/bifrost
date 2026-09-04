@@ -229,10 +229,20 @@ fn pss_hash_algorithm(field_body: &[u8]) -> Result<HashFamily, SaslError> {
 /// its first element is the OID.
 fn signature_algorithm(cert_der: &[u8]) -> Result<(&[u8], &[u8]), SaslError> {
     // Outer Certificate SEQUENCE.
-    let (outer_tag, outer_body, _rest) = read_tlv(cert_der)?;
+    let (outer_tag, outer_body, rest) = read_tlv(cert_der)?;
     if outer_tag != TAG_SEQUENCE {
         return Err(SaslError::Protocol(
             "certificate DER outer element is not a SEQUENCE".into(),
+        ));
+    }
+    // `tls_server_end_point` hashes the ENTIRE input buffer, so trailing
+    // bytes after the outer SEQUENCE would silently ride into the binding
+    // hash and mismatch the server's. Reject them instead: with native-tls
+    // as the only source this is theoretical, but a transport handing over
+    // padded DER must fail loudly, not bind wrongly.
+    if !rest.is_empty() {
+        return Err(SaslError::Protocol(
+            "certificate DER has trailing bytes after the outer SEQUENCE".into(),
         ));
     }
     // First element: tbsCertificate. Skip over it.

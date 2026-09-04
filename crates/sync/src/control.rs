@@ -191,6 +191,13 @@ impl SyncControl {
                     .get(&lane)
                     .is_none_or(|(current, _)| match (&publication, current) {
                         (Some(next), Some(previous)) => next >= previous,
+                        // A publication-less announcement replaces
+                        // unconditionally - including a lane snapshot recorded
+                        // under a newer PublicationId. No engine path reaches
+                        // that today (only the published `record_checkpoint`
+                        // foot-gun announces without a publication), but a new
+                        // publication-less caller would silently regress the
+                        // lane; guard by ordering if one ever appears.
                         _ => true,
                     });
             if replace {

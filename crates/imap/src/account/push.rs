@@ -388,8 +388,6 @@ async fn idle_loop(account: ImapAccount, cancel: CancellationToken, slot: usize)
                 continue;
             }
         };
-        // A round-trip landed: the next failure starts a fresh backoff ramp.
-        backoff = INITIAL_REDIAL_BACKOFF;
         let uidvalidity = selected.uid_validity;
         let watched = {
             let scopes = account
@@ -404,6 +402,13 @@ async fn idle_loop(account: ImapAccount, cancel: CancellationToken, slot: usize)
             let _ = account.push.tx.send(WatchEvent::Reconnected);
             was_disconnected = false;
         }
+        // Set when the session dies in-IDLE (server BYE / termination / idle
+        // error). The redial then waits out the backoff: a server that
+        // accepts dial+auth+SELECT but kills IDLE at once must not produce a
+        // zero-delay hot loop of full reconnect cycles. The backoff ramp
+        // resets only on a completed IDLE round below, not on the SELECT
+        // round trip, for the same reason.
+        let mut session_died = false;
         loop {
             if cancel.is_cancelled() || account.shutdown.is_cancelled() {
                 let _ = conn.logout().await;
@@ -470,8 +475,12 @@ async fn idle_loop(account: ImapAccount, cancel: CancellationToken, slot: usize)
                     if event_closes_connection(&event) {
                         let _ = account.push.tx.send(WatchEvent::Disconnected);
                         was_disconnected = true;
+                        session_died = true;
                         break;
                     }
+                    // A full IDLE round completed and the session survived:
+                    // the next failure starts a fresh backoff ramp.
+                    backoff = INITIAL_REDIAL_BACKOFF;
                     if let Some(event) = map_idle_event(event, &folder) {
                         let _ = account.push.tx.send(event);
                     }
@@ -479,9 +488,13 @@ async fn idle_loop(account: ImapAccount, cancel: CancellationToken, slot: usize)
                 Err(_) => {
                     let _ = account.push.tx.send(WatchEvent::Disconnected);
                     was_disconnected = true;
+                    session_died = true;
                     break;
                 }
             }
+        }
+        if session_died && !sleep_backoff(&account, &cancel, &mut backoff).await {
+            break;
         }
     }
 }
@@ -503,6 +516,15 @@ fn choose_idle_folder(account: &ImapAccount, slot: usize) -> Option<crate::types
     // The INBOX fallback belongs to one worker only. Every slot taking it
     // would point the whole budget at the same mailbox and burn
     // `idle_connection_budget` sessions to watch it once.
+    //
+    // Reachability note: with today's admission (`push_subscribe` inserts
+    // only non-empty sets of `CursorScope::Folder` whose names pass
+    // `MailboxName::new`), a non-empty scopes map always yields at least
+    // one entry above and slot 0 never falls through to here. The fallback
+    // is kept as a guard for any future scope kind that subscribes without
+    // naming a watchable folder; it is NOT a default-INBOX-push with no
+    // subscriptions (the `scopes.is_empty()` early return above forecloses
+    // that deliberately).
     if slot != 0 {
         return None;
     }

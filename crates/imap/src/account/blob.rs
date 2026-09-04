@@ -137,9 +137,13 @@ async fn run_fetch(
             )
             .protocol(Protocol::Imap)
             .operation(op)
-            .scope(bifrost_types::ErrorScope::Mailbox {
-                id: folder.as_str().into(),
-            })
+            // Cursor(Folder(..)), not ErrorScope::Mailbox: the folder
+            // producers' documented scope shape (see get.rs / mutate.rs).
+            .scope(bifrost_types::ErrorScope::Cursor(
+                bifrost_types::CursorScope::Folder(bifrost_types::FolderId(
+                    folder.as_str().to_owned(),
+                )),
+            ))
             .try_build()
             .expect("valid account error classification"),
         ));

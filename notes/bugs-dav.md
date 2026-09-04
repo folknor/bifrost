@@ -126,15 +126,6 @@ treat local redirect refusal and 405 on the well-known *probe only* as
 fallback triggers (or to admit the well-known redirect target for
 discovery-only, credential-less probing).
 
-### 7. `MultigetFetch::settle` discards benign per-resource verdicts from successful legs when another leg degrades
-
-`Some(error) if report.events.is_empty() => Err(error)` - but a leg that
-*succeeded* and reported all its resources 404 (genuine deletions,
-`failed`/`missing_data` populated) plus a second leg that 503'd yields `Err`,
-throwing away the successful leg's observations. Marginal, but it means a
-consumer retries a walk in which half the answer had already arrived. Both
-crates identically.
-
 ### 8. `contact_get` addresses the resource via `addressbook-multiget` against the derived *parent collection* URL, unlike CalDAV's direct GET
 
 `fetch_contact_resource` REPORTs the parent collection with the (possibly
@@ -161,16 +152,13 @@ length - measured divergence number nine or ten between the twins.
 
 ## Lower-confidence / latent
 
-### 10. Invalid credential bytes silently strip `Authorization`
+### 10. `DavRequest::header` / `dispatch_once` header copy drop invalid header values (residual)
 
-`DavDispatch::auth_headers`: `HeaderValue::from_str(...)` failures are
-swallowed (`if let Ok`), so a bearer token or Basic username/password
-containing a header-invalid byte (e.g. `\n` from a sloppy config file) sends
-the request **unauthenticated** and surfaces as a mystifying 401 instead of a
-local "credential is malformed" error. Same pattern in `DavRequest::header`
-and the `dispatch_once` header copy (`value.to_str().ok()` drops non-ASCII
-header values). The transport.rs comment calls this unreachable, but for
-credentials the input is user-supplied.
+The credential half of this finding is fixed (`auth_headers` now errors
+locally on header-invalid bytes). Residual: `DavRequest::header` and the
+`dispatch_once` header copy (`value.to_str().ok()`) still silently drop
+non-ASCII / invalid header values; those inputs are crate-internal today, so
+lower priority.
 
 ### 11. Non-VALARM nested components leak their properties into the VEVENT
 
@@ -181,21 +169,6 @@ wild) contributes its DTSTART/SUMMARY/etc. to the master's prop list;
 DTSTART over the master's. The code comment claims "harmless - nothing reads
 it," which is not quite true. Cheap fix: track nesting depth and skip
 everything inside an unknown component.
-
-### 12. `resolve_url` fallback dead branch
-
-`dispatch.rs` line 159: `self.base_url.ends_with('/')` is always false because
-`around()` trims the trailing slash. Harmless; the branch below covers it, but
-it's misleading.
-
-### 13. A failed propstat with an unparseable/absent status code degrades to the benign `missing_data` lane
-
-In both multiget parsers, `as_failed_multiget_resource` needs a numeric
-status; a propstat that failed with garbage status text yields
-`failed_statuses` empty and `status` None, so the resource is classified as
-"2xx that omitted data" - a benign absence - and can't contribute to
-`CompleteFailure` classification. A pathological server failing every resource
-this way returns an empty *success*. Edge-of-edge.
 
 ### 14. `TITLE` without `ORG` is dropped on read, and patching `organizations` strips a standalone TITLE line
 
@@ -221,9 +194,10 @@ comparison would close it.
 
 ## Fix grouping
 
-Findings 4, 5 and 13 are all propstat-state-machine discipline defects. Work
-them as a single change (or as part of the `ResponseParts<P>` redesign, if the
-owner rules for it below) - do not fix them as three separate patches.
+Findings 4 and 5 are both propstat-state-machine discipline defects (13, the
+third of the group, is closed as an accepted, commented edge). Work them as a
+single change (or as part of the `ResponseParts<P>` redesign, if the owner
+rules for it below) - do not fix them as separate patches.
 
 ## Structural observations (pre-1.0, rewrite-friendly posture)
 
