@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use bifrost_types::{
     AccountError, AccountErrorBuilder, AccountErrorKind, AccountOperation, AccountStream,
-    BatchFailure, BatchItemId, BatchSuccess, BatchUncertain, Cause, DiagnosticText, HydratedObject,
+    BatchFailure, BatchItemId, BatchUncertain, Cause, DiagnosticText, HydratedObject,
     HydratedObjectKind, ItemOutcome, PageBoundary, Projection, Protocol, RequestCause,
     RequestErrorKind, ResourceKind, SyncEvent,
 };
@@ -14,7 +14,7 @@ use super::hydration::{BodySelection, FetchSelection, decode_body};
 use super::inventory::{fetch_to_inventory, flags_set};
 #[cfg(test)]
 use super::pim::PREVIEW_FETCH_BYTES;
-use super::targets::TargetBatch;
+use super::targets::{TargetBatch, Verdict};
 use super::{
     BATCH_ITEMS, DecodedObjectId, ImapAccount, batch, boxed_receiver_stream, decode_object_id,
 };
@@ -286,6 +286,10 @@ async fn run_folder_get(
     let requested_uids: HashSet<u32> = target_batch.uids().iter().copied().collect();
     let (valid, excluded_outcomes) =
         target_batch.settle_streaming(bifrost_types::AccountOperation::Hydrate, folder);
+    // The permits are the only way to answer for these ids; `pending` keeps
+    // a plain copy so an early return leaves them in the unresolved set.
+    let pending_ids: Vec<DecodedObjectId> =
+        valid.iter().map(|target| target.id().clone()).collect();
     // Stale-UIDVALIDITY failures are known before any wire work, so they are
     // emitted first. Buffering them behind the FETCH would lose established
     // per-item truth if that FETCH fails and the folder falls back to the
@@ -299,7 +303,7 @@ async fn run_folder_get(
     // The stale and excluded failures are on the channel: from here on only
     // the valid ids remain unresolved should the FETCH (or MODSEQ
     // recording) fail.
-    *pending = valid.clone();
+    *pending = pending_ids;
     let mut out: Vec<ItemOutcome<HydratedObject>> = Vec::with_capacity(BATCH_ITEMS);
     let Some(uid_set) = uid_set else {
         return Ok(());
@@ -365,21 +369,14 @@ async fn run_folder_get(
             Some((uid, object))
         })
         .collect();
-    for id in valid {
-        match hydrated_by_uid.get(&id.uid).cloned() {
-            Some(object) => {
-                let item = BatchItemId(object.id.0.clone());
-                out.push(ItemOutcome::Succeeded(BatchSuccess::new(item, object)));
-            }
-            None => {
-                let item =
-                    BatchItemId(super::encode_object_id(&id.folder, id.uidvalidity, id.uid).0);
-                out.push(ItemOutcome::Failed(BatchFailure::new(
-                    item,
-                    message_not_found_error(&id),
-                )));
-            }
-        }
+    for target in valid {
+        // The permit stamps the id: a hydrated object can only ever be
+        // published under the id that was requested for it.
+        let verdict = match hydrated_by_uid.get(&target.uid()).cloned() {
+            Some(object) => Verdict::Succeeded(object),
+            None => Verdict::Failed(message_not_found_error(target.id())),
+        };
+        out.push(target.seal(verdict).into_outcome());
         if out.len() >= BATCH_ITEMS {
             tx.send(batch(std::mem::take(&mut out), PageBoundary::Page, None))
                 .await

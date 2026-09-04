@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use bifrost_types::{
     AccountError, AccountErrorBuilder, AccountErrorKind, AccountOperation, AccountStream,
-    AttemptCause, BatchFailure, BatchItemId, BatchSuccess, BatchUncertain, Cause, DiagnosticText,
-    FlagOp, IdempotencyKey, ItemOutcome, MembershipScope, MutationSuccess, PageBoundary, Protocol,
+    AttemptCause, BatchFailure, BatchItemId, BatchUncertain, Cause, DiagnosticText, FlagOp,
+    IdempotencyKey, ItemOutcome, MembershipScope, MutationSuccess, PageBoundary, Protocol,
     RequestCause, RequestErrorKind, ServerCause, ServerErrorKind, StateCause, SyncEvent,
     TransmissionState,
 };
@@ -11,7 +11,7 @@ use futures::StreamExt;
 
 use crate::types::{Flag, MailboxName, ResponseCode, StoreOperation};
 
-use super::targets::TargetBatch;
+use super::targets::{TargetBatch, Verdict};
 use super::{DecodedObjectId, ImapAccount, batch, boxed_receiver_stream, decode_object_id};
 
 pub(crate) fn bulk_set_flags(
@@ -326,21 +326,37 @@ async fn run_folder_mutation(
         }),
     };
 
-    let mut results = stale_results;
-    results.extend(target_batch.settle(operation, folder, |ids| match outcome {
-        None => Vec::new(),
+    // The wire answer and its folder-level side effect are resolved before
+    // the settle: the classifier runs once per target and must decide only
+    // that target's lane.
+    let classified = match outcome {
+        None => None,
         Some(Ok(outcome)) => {
             account.folders.clear_modseqs(folder, uidvalidity, &uids);
-            mutation_results(ids, outcome, operation, folder)
+            Some(Ok(outcome))
         }
-        Some(Err(err)) => mutation_error_outcomes(
-            ids,
-            super::account_error_with(
-                err,
-                super::error::ImapErrorContext::operation(operation).with_folder_scope(folder),
-            ),
-        ),
-    }));
+        Some(Err(err)) => Some(Err(super::account_error_with(
+            err,
+            super::error::ImapErrorContext::operation(operation).with_folder_scope(folder),
+        ))),
+    };
+
+    let mut results = stale_results;
+    match classified {
+        None => results.extend(target_batch.settle_unsent(operation, folder)),
+        Some(Ok(outcome)) => {
+            results.extend(target_batch.settle(operation, folder, |target| {
+                let verdict = mutation_verdict(target.uid(), &outcome, operation, folder);
+                target.seal(verdict)
+            }));
+        }
+        Some(Err(error)) => {
+            results.extend(target_batch.settle(operation, folder, |target| {
+                let verdict = mutation_error_verdict(&error);
+                target.seal(verdict)
+            }));
+        }
+    }
     Ok(results)
 }
 
@@ -356,8 +372,7 @@ async fn run_destroy_mutation_groups(
         let target_batch = TargetBatch::new(ids);
         let uids: Vec<u32> = target_batch.uids().to_vec();
         let Some(uid_set) = target_batch.uid_set().cloned() else {
-            results
-                .extend(target_batch.settle(AccountOperation::BulkDestroy, folder, |_| Vec::new()));
+            results.extend(target_batch.settle_unsent(AccountOperation::BulkDestroy, folder));
             continue;
         };
         let store = conn
@@ -378,11 +393,14 @@ async fn run_destroy_mutation_groups(
                     super::error::ImapErrorContext::operation(AccountOperation::BulkDestroy)
                         .with_folder_scope(folder),
                 );
-                results.extend(
-                    target_batch.settle(AccountOperation::BulkDestroy, folder, |ids| {
-                        mutation_error_outcomes(ids, error)
-                    }),
-                );
+                results.extend(target_batch.settle(
+                    AccountOperation::BulkDestroy,
+                    folder,
+                    |target| {
+                        let verdict = mutation_error_verdict(&error);
+                        target.seal(verdict)
+                    },
+                ));
                 continue;
             }
         };
@@ -399,27 +417,36 @@ async fn run_destroy_mutation_groups(
             )
             .await
         {
+            // The expunge failure applies only to the UIDs this round
+            // actually marked `\Deleted`; the rest keep the STORE's own
+            // verdict.
+            let expunge_error = expunge_failed_after_delete_mark(folder, err);
             results.extend(
-                target_batch.settle(AccountOperation::BulkDestroy, folder, |ids| {
-                    let (expunging_ids, remaining_ids) = split_ids_by_uid(ids, &expunge_uids);
-                    let mut split = mutation_error_outcomes(
-                        expunging_ids,
-                        expunge_failed_after_delete_mark(folder, err),
-                    );
-                    split.extend(mutation_results(
-                        remaining_ids,
-                        outcome,
-                        AccountOperation::BulkDestroy,
-                        folder,
-                    ));
-                    split
+                target_batch.settle(AccountOperation::BulkDestroy, folder, |target| {
+                    let verdict = if expunge_uids.contains(&target.uid()) {
+                        mutation_error_verdict(&expunge_error)
+                    } else {
+                        mutation_verdict(
+                            target.uid(),
+                            &outcome,
+                            AccountOperation::BulkDestroy,
+                            folder,
+                        )
+                    };
+                    target.seal(verdict)
                 }),
             );
             continue;
         }
         results.extend(
-            target_batch.settle(AccountOperation::BulkDestroy, folder, |ids| {
-                mutation_results(ids, outcome, AccountOperation::BulkDestroy, folder)
+            target_batch.settle(AccountOperation::BulkDestroy, folder, |target| {
+                let verdict = mutation_verdict(
+                    target.uid(),
+                    &outcome,
+                    AccountOperation::BulkDestroy,
+                    folder,
+                );
+                target.seal(verdict)
             }),
         );
     }
@@ -439,8 +466,7 @@ async fn run_flag_mutation_groups(
         let target_batch = TargetBatch::new(ids);
         let uids: Vec<u32> = target_batch.uids().to_vec();
         let Some(uid_set) = target_batch.uid_set().cloned() else {
-            results
-                .extend(target_batch.settle(AccountOperation::UpdateFlags, folder, |_| Vec::new()));
+            results.extend(target_batch.settle_unsent(AccountOperation::UpdateFlags, folder));
             continue;
         };
         if let FlagOp::Patch { add, remove } = op
@@ -472,28 +498,50 @@ async fn run_flag_mutation_groups(
             account.command_timeout(),
         )
         .await;
-        results.extend(
-            target_batch.settle(AccountOperation::UpdateFlags, folder, |ids| match outcome {
-                Ok(outcome) => {
-                    let changed_uids = applied_uids_after_store(&uids, &outcome);
-                    account
-                        .folders
-                        .clear_modseqs(folder, uidvalidity, &changed_uids);
-                    mutation_results(ids, outcome, AccountOperation::UpdateFlags, folder)
+        // Resolve the wire answer and the MODSEQ-cache side effect before the
+        // settle, so the classifier is a pure per-target decision.
+        let classified = match outcome {
+            Ok(outcome) => {
+                let changed_uids = applied_uids_after_store(&uids, &outcome);
+                account
+                    .folders
+                    .clear_modseqs(folder, uidvalidity, &changed_uids);
+                Ok(outcome)
+            }
+            Err(err) => {
+                if matches!(op, FlagOp::Patch { .. }) {
+                    account.folders.clear_modseqs(folder, uidvalidity, &uids);
                 }
-                Err(err) => {
-                    if matches!(op, FlagOp::Patch { .. }) {
-                        account.folders.clear_modseqs(folder, uidvalidity, &uids);
-                    }
-                    let error = super::account_error_with(
-                        err,
-                        super::error::ImapErrorContext::operation(AccountOperation::UpdateFlags)
-                            .with_folder_scope(folder),
+                Err(super::account_error_with(
+                    err,
+                    super::error::ImapErrorContext::operation(AccountOperation::UpdateFlags)
+                        .with_folder_scope(folder),
+                ))
+            }
+        };
+        match classified {
+            Ok(outcome) => results.extend(target_batch.settle(
+                AccountOperation::UpdateFlags,
+                folder,
+                |target| {
+                    let verdict = mutation_verdict(
+                        target.uid(),
+                        &outcome,
+                        AccountOperation::UpdateFlags,
+                        folder,
                     );
-                    mutation_error_outcomes(ids, error)
-                }
-            }),
-        );
+                    target.seal(verdict)
+                },
+            )),
+            Err(error) => results.extend(target_batch.settle(
+                AccountOperation::UpdateFlags,
+                folder,
+                |target| {
+                    let verdict = mutation_error_verdict(&error);
+                    target.seal(verdict)
+                },
+            )),
+        }
     }
     Ok(results)
 }
@@ -539,8 +587,10 @@ async fn run_patch_mutation_group(
         // folder-wide uncertain lane.
         Err(err) => {
             account.folders.clear_modseqs(folder, uidvalidity, &uids);
-            return target_batch.settle(AccountOperation::UpdateFlags, folder, |ids| {
-                patch_first_store_failure(ids, err, folder)
+            let error = patch_first_store_failure(err, folder);
+            return target_batch.settle(AccountOperation::UpdateFlags, folder, |target| {
+                let verdict = mutation_error_verdict(&error);
+                target.seal(verdict)
             });
         }
     };
@@ -566,89 +616,62 @@ async fn run_patch_mutation_group(
         }),
         None => Ok(StoreWireOutcome::Applied),
     };
-    target_batch.settle(AccountOperation::UpdateFlags, folder, |ids| {
-        patch_mutation_results(ids, &uids, first, second, folder)
+    target_batch.settle(AccountOperation::UpdateFlags, folder, |target| {
+        let verdict = patch_mutation_verdict(target.uid(), &first, &second, folder);
+        target.seal(verdict)
     })
 }
 
-/// Per-item outcomes for a MODSEQ group whose guarded add STORE errored on
-/// the wire. Scoped to the group's own ids: the surrounding loop keeps the
-/// outcomes it has already established for other groups, matching the
+/// The error for a MODSEQ group whose guarded add STORE errored on the wire.
+/// Scoped to the group's own ids: the surrounding loop keeps the outcomes it
+/// has already established for other groups, matching the
 /// single-outcome-per-id contract the sync engine relies on.
-fn patch_first_store_failure(
-    ids: Vec<DecodedObjectId>,
-    err: crate::Error,
-    folder: &MailboxName,
-) -> Vec<ItemOutcome<MutationSuccess>> {
-    let error = super::account_error_with(
+fn patch_first_store_failure(err: crate::Error, folder: &MailboxName) -> AccountError {
+    super::account_error_with(
         err,
         super::error::ImapErrorContext::operation(AccountOperation::UpdateFlags)
             .with_folder_scope(folder),
-    );
-    mutation_error_outcomes(ids, error)
+    )
 }
 
-fn patch_mutation_results(
-    ids: Vec<DecodedObjectId>,
-    requested_uids: &[u32],
-    first: StoreWireOutcome,
-    second: Result<StoreWireOutcome, AccountError>,
+/// The verdict for one UID of a two-sided patch group.
+///
+/// A UID the guarded add did not apply to is decided entirely by that first
+/// STORE (a `MODIFIED` conflict, or the whole-command rejection that
+/// `PendingRetry`/`Failed` carry). Only a UID the add did apply to reaches
+/// the unguarded remove, and only there can the second STORE's answer make
+/// it `Succeeded(Applied)`.
+fn patch_mutation_verdict(
+    uid: u32,
+    first: &StoreWireOutcome,
+    second: &Result<StoreWireOutcome, AccountError>,
     folder: &MailboxName,
-) -> Vec<ItemOutcome<MutationSuccess>> {
-    let applied = applied_uids_after_store(requested_uids, &first);
-    let (applied_ids, conflicting_ids) = split_ids_by_uid(ids, &applied);
-    let mut results = match first {
-        StoreWireOutcome::Applied => Vec::new(),
-        StoreWireOutcome::Modified(modified) => mutation_results(
-            conflicting_ids,
-            StoreWireOutcome::Modified(modified),
-            AccountOperation::UpdateFlags,
-            folder,
-        ),
-        outcome @ (StoreWireOutcome::PendingRetry(_) | StoreWireOutcome::Failed) => {
-            return mutation_results(
-                ids_from_parts(applied_ids, conflicting_ids),
-                outcome,
-                AccountOperation::UpdateFlags,
-                folder,
-            );
-        }
-    };
-
-    match second {
-        Ok(StoreWireOutcome::Applied) => results.extend(mutation_results(
-            applied_ids,
-            StoreWireOutcome::Applied,
-            AccountOperation::UpdateFlags,
-            folder,
-        )),
-        Ok(_) => results.extend(failed_all(
-            applied_ids,
-            store_failed_error(AccountOperation::UpdateFlags, folder),
-        )),
-        Err(error) => results.extend(mutation_error_outcomes(applied_ids, error)),
+) -> Verdict<MutationSuccess> {
+    if !store_applied_uid(uid, first) {
+        return mutation_verdict(uid, first, AccountOperation::UpdateFlags, folder);
     }
-    results
+    match second {
+        Ok(StoreWireOutcome::Applied) => Verdict::Succeeded(MutationSuccess::Applied),
+        Ok(_) => Verdict::Failed(store_failed_error(AccountOperation::UpdateFlags, folder)),
+        Err(error) => mutation_error_verdict(error),
+    }
 }
 
-fn ids_from_parts(
-    mut matching: Vec<DecodedObjectId>,
-    mut remaining: Vec<DecodedObjectId>,
-) -> Vec<DecodedObjectId> {
-    matching.append(&mut remaining);
-    matching
+/// The single predicate for "the STORE applied to this UID".
+fn store_applied_uid(uid: u32, outcome: &StoreWireOutcome) -> bool {
+    match outcome {
+        StoreWireOutcome::Applied => true,
+        StoreWireOutcome::Modified(modified) => !modified.contains(&uid),
+        StoreWireOutcome::PendingRetry(_) | StoreWireOutcome::Failed => false,
+    }
 }
 
 fn applied_uids_after_store(requested_uids: &[u32], outcome: &StoreWireOutcome) -> Vec<u32> {
-    match outcome {
-        StoreWireOutcome::Applied => requested_uids.to_vec(),
-        StoreWireOutcome::Modified(modified) => requested_uids
-            .iter()
-            .copied()
-            .filter(|uid| !modified.contains(uid))
-            .collect(),
-        StoreWireOutcome::PendingRetry(_) | StoreWireOutcome::Failed => Vec::new(),
-    }
+    requested_uids
+        .iter()
+        .copied()
+        .filter(|uid| store_applied_uid(*uid, outcome))
+        .collect()
 }
 
 fn partition_by_modseq(
@@ -808,36 +831,22 @@ fn modified_uids(code: Option<&ResponseCode>) -> Option<Vec<u32>> {
     }
 }
 
-fn mutation_results(
-    ids: Vec<DecodedObjectId>,
-    outcome: StoreWireOutcome,
+/// The verdict for one UID under one STORE answer.
+fn mutation_verdict(
+    uid: u32,
+    outcome: &StoreWireOutcome,
     operation: AccountOperation,
     folder: &MailboxName,
-) -> Vec<ItemOutcome<MutationSuccess>> {
+) -> Verdict<MutationSuccess> {
     match outcome {
-        StoreWireOutcome::Applied => ids
-            .into_iter()
-            .map(|id| {
-                let item =
-                    BatchItemId(super::encode_object_id(&id.folder, id.uidvalidity, id.uid).0);
-                ItemOutcome::Succeeded(BatchSuccess::new(item, MutationSuccess::Applied))
-            })
-            .collect(),
-        StoreWireOutcome::Modified(modified) => ids
-            .into_iter()
-            .map(|id| {
-                let item =
-                    BatchItemId(super::encode_object_id(&id.folder, id.uidvalidity, id.uid).0);
-                if modified.contains(&id.uid) {
-                    ItemOutcome::Failed(BatchFailure::new(
-                        item,
-                        concurrency_conflict_error(operation, folder),
-                    ))
-                } else {
-                    ItemOutcome::Succeeded(BatchSuccess::new(item, MutationSuccess::Applied))
-                }
-            })
-            .collect(),
+        StoreWireOutcome::Applied => Verdict::Succeeded(MutationSuccess::Applied),
+        StoreWireOutcome::Modified(modified) => {
+            if modified.contains(&uid) {
+                Verdict::Failed(concurrency_conflict_error(operation, folder))
+            } else {
+                Verdict::Succeeded(MutationSuccess::Applied)
+            }
+        }
         // Tagged-NO STORE carrying `[MODIFIED ...]`: the server
         // explicitly rejected the command and named the conflicting
         // UIDs. This is a *server-acknowledged* conflict - a complete
@@ -848,25 +857,14 @@ fn mutation_results(
         // analogue of an in-flight transport drop and queues for
         // read-back). The remaining UIDs were not committed because the
         // whole STORE was rejected.
-        StoreWireOutcome::PendingRetry(modified) => ids
-            .into_iter()
-            .map(|id| {
-                let item =
-                    BatchItemId(super::encode_object_id(&id.folder, id.uidvalidity, id.uid).0);
-                if modified.contains(&id.uid) {
-                    ItemOutcome::Failed(BatchFailure::new(
-                        item,
-                        concurrency_conflict_error(operation, folder),
-                    ))
-                } else {
-                    ItemOutcome::Failed(BatchFailure::new(
-                        item,
-                        store_failed_error(operation, folder),
-                    ))
-                }
-            })
-            .collect(),
-        StoreWireOutcome::Failed => failed_all(ids, store_failed_error(operation, folder)),
+        StoreWireOutcome::PendingRetry(modified) => {
+            if modified.contains(&uid) {
+                Verdict::Failed(concurrency_conflict_error(operation, folder))
+            } else {
+                Verdict::Failed(store_failed_error(operation, folder))
+            }
+        }
+        StoreWireOutcome::Failed => Verdict::Failed(store_failed_error(operation, folder)),
     }
 }
 
@@ -879,22 +877,10 @@ fn failed_all(ids: Vec<DecodedObjectId>, error: AccountError) -> Vec<ItemOutcome
         .collect()
 }
 
-fn uncertain_all(
-    ids: Vec<DecodedObjectId>,
-    error: AccountError,
-) -> Vec<ItemOutcome<MutationSuccess>> {
-    ids.into_iter()
-        .map(|id| {
-            let item = BatchItemId(super::encode_object_id(&id.folder, id.uidvalidity, id.uid).0);
-            ItemOutcome::Uncertain(BatchUncertain::new(item, error.clone()))
-        })
-        .collect()
-}
-
-fn mutation_error_outcomes(
-    ids: Vec<DecodedObjectId>,
-    error: AccountError,
-) -> Vec<ItemOutcome<MutationSuccess>> {
+/// Which lane a wire error puts one target in. Transmission evidence
+/// decides: an `InFlight` attempt is `Uncertain` (the engine reads it back),
+/// an `Unsent` or server-acknowledged failure is `Failed`.
+fn mutation_error_verdict(error: &AccountError) -> Verdict<MutationSuccess> {
     let in_flight = error.chain().iter().any(|cause| {
         matches!(
             cause,
@@ -903,9 +889,9 @@ fn mutation_error_outcomes(
         )
     });
     if in_flight {
-        uncertain_all(ids, error)
+        Verdict::Uncertain(error.clone())
     } else {
-        failed_all(ids, error)
+        Verdict::Failed(error.clone())
     }
 }
 
@@ -1057,23 +1043,6 @@ fn split_by_uidvalidity(
     (valid, stale)
 }
 
-fn split_ids_by_uid(
-    ids: Vec<DecodedObjectId>,
-    uids: &[u32],
-) -> (Vec<DecodedObjectId>, Vec<DecodedObjectId>) {
-    let uid_set: HashSet<u32> = uids.iter().copied().collect();
-    let mut matching = Vec::new();
-    let mut remaining = Vec::new();
-    for id in ids {
-        if uid_set.contains(&id.uid) {
-            matching.push(id);
-        } else {
-            remaining.push(id);
-        }
-    }
-    (matching, remaining)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1155,12 +1124,17 @@ mod tests {
                 uid: 5,
             },
         ];
-        let outcomes = mutation_results(
-            ids,
-            StoreWireOutcome::PendingRetry(vec![2]),
-            AccountOperation::UpdateFlags,
-            &folder,
-        );
+        let outcome = StoreWireOutcome::PendingRetry(vec![2]);
+        let outcomes =
+            TargetBatch::new(ids).settle(AccountOperation::UpdateFlags, &folder, |target| {
+                let verdict = mutation_verdict(
+                    target.uid(),
+                    &outcome,
+                    AccountOperation::UpdateFlags,
+                    &folder,
+                );
+                target.seal(verdict)
+            });
         // Every item is Failed - none Uncertain, none Succeeded.
         assert!(
             outcomes.iter().all(|o| matches!(o, ItemOutcome::Failed(_))),
@@ -1345,6 +1319,24 @@ mod tests {
             .collect()
     }
 
+    /// Settle a real `TargetBatch` over `uids`, classifying each target with
+    /// `classify`. The per-item accounting tests drive the production
+    /// `settle` rather than calling a verdict function directly, so what
+    /// they assert is the accounting the mutation paths actually use.
+    fn settled<F>(
+        uids: &[u32],
+        operation: AccountOperation,
+        mut classify: F,
+    ) -> Vec<ItemOutcome<MutationSuccess>>
+    where
+        F: FnMut(u32) -> Verdict<MutationSuccess>,
+    {
+        TargetBatch::new(ids(uids)).settle(operation, &folder(), |target| {
+            let verdict = classify(target.uid());
+            target.seal(verdict)
+        })
+    }
+
     #[test]
     fn only_the_modified_response_code_yields_conflicting_uids() {
         assert_eq!(modified_uids(None), None);
@@ -1368,12 +1360,10 @@ mod tests {
     // named UIDs conflicted, everything else in the same command landed.
     #[test]
     fn modified_outcome_splits_conflicts_from_successes_per_uid() {
-        let outcomes = mutation_results(
-            ids(&[1, 2, 3]),
-            StoreWireOutcome::Modified(vec![2]),
-            AccountOperation::UpdateFlags,
-            &folder(),
-        );
+        let outcome = StoreWireOutcome::Modified(vec![2]);
+        let outcomes = settled(&[1, 2, 3], AccountOperation::UpdateFlags, |uid| {
+            mutation_verdict(uid, &outcome, AccountOperation::UpdateFlags, &folder())
+        });
         assert_eq!(outcomes.len(), 3);
         let failed: Vec<&BatchFailure> = outcomes
             .iter()
@@ -1403,13 +1393,11 @@ mod tests {
 
     #[test]
     fn partially_conflicting_patch_only_succeeds_after_the_remove_lands() {
-        let outcomes = patch_mutation_results(
-            ids(&[1, 2, 3]),
-            &[1, 2, 3],
-            StoreWireOutcome::Modified(vec![2]),
-            Ok(StoreWireOutcome::Applied),
-            &folder(),
-        );
+        let first = StoreWireOutcome::Modified(vec![2]);
+        let second = Ok(StoreWireOutcome::Applied);
+        let outcomes = settled(&[1, 2, 3], AccountOperation::UpdateFlags, |uid| {
+            patch_mutation_verdict(uid, &first, &second, &folder())
+        });
         assert_eq!(outcomes.len(), 3);
         assert_eq!(
             outcomes
@@ -1429,13 +1417,11 @@ mod tests {
 
     #[test]
     fn acknowledged_second_half_rejection_is_failed() {
-        let outcomes = patch_mutation_results(
-            ids(&[1, 2]),
-            &[1, 2],
-            StoreWireOutcome::Modified(vec![2]),
-            Err(store_failed_error(AccountOperation::UpdateFlags, &folder())),
-            &folder(),
-        );
+        let first = StoreWireOutcome::Modified(vec![2]);
+        let second = Err(store_failed_error(AccountOperation::UpdateFlags, &folder()));
+        let outcomes = settled(&[1, 2], AccountOperation::UpdateFlags, |uid| {
+            patch_mutation_verdict(uid, &first, &second, &folder())
+        });
         assert!(
             outcomes
                 .iter()
@@ -1460,13 +1446,11 @@ mod tests {
     // outcomes, and known truth must never be downgraded by a later failure.
     #[test]
     fn first_store_error_in_a_patch_group_keeps_earlier_group_outcomes() {
-        let mut results = patch_mutation_results(
-            ids(&[1, 2]),
-            &[1, 2],
-            StoreWireOutcome::Applied,
-            Ok(StoreWireOutcome::Applied),
-            &folder(),
-        );
+        let first = StoreWireOutcome::Applied;
+        let second = Ok(StoreWireOutcome::Applied);
+        let mut results = settled(&[1, 2], AccountOperation::UpdateFlags, |uid| {
+            patch_mutation_verdict(uid, &first, &second, &folder())
+        });
         assert_eq!(
             results
                 .iter()
@@ -1474,11 +1458,13 @@ mod tests {
                 .count(),
             2,
         );
-        results.extend(patch_first_store_failure(
-            ids(&[5]),
+        let error = patch_first_store_failure(
             crate::Error::Protocol("STORE never answered".into()),
             &folder(),
-        ));
+        );
+        results.extend(settled(&[5], AccountOperation::UpdateFlags, |_| {
+            mutation_error_verdict(&error)
+        }));
         assert_eq!(results.len(), 3);
         assert_eq!(
             results
@@ -1518,12 +1504,10 @@ mod tests {
 
     #[test]
     fn applied_outcome_succeeds_every_target() {
-        let outcomes = mutation_results(
-            ids(&[4, 5]),
-            StoreWireOutcome::Applied,
-            AccountOperation::BulkMove,
-            &folder(),
-        );
+        let outcome = StoreWireOutcome::Applied;
+        let outcomes = settled(&[4, 5], AccountOperation::BulkMove, |uid| {
+            mutation_verdict(uid, &outcome, AccountOperation::BulkMove, &folder())
+        });
         assert!(
             outcomes
                 .iter()
@@ -1535,12 +1519,10 @@ mod tests {
     // UIDs, so every target fails - none may be reported Succeeded.
     #[test]
     fn failed_outcome_fails_every_target() {
-        let outcomes = mutation_results(
-            ids(&[4, 5]),
-            StoreWireOutcome::Failed,
-            AccountOperation::BulkDestroy,
-            &folder(),
-        );
+        let outcome = StoreWireOutcome::Failed;
+        let outcomes = settled(&[4, 5], AccountOperation::BulkDestroy, |uid| {
+            mutation_verdict(uid, &outcome, AccountOperation::BulkDestroy, &folder())
+        });
         assert_eq!(outcomes.len(), 2);
         for outcome in &outcomes {
             match outcome {
@@ -1567,29 +1549,54 @@ mod tests {
             .expect("valid mutation error")
         };
 
-        let uncertain = mutation_error_outcomes(ids(&[4]), build(TransmissionState::InFlight));
+        let in_flight = build(TransmissionState::InFlight);
+        let uncertain = settled(&[4], AccountOperation::UpdateFlags, |_| {
+            mutation_error_verdict(&in_flight)
+        });
         assert!(matches!(uncertain.as_slice(), [ItemOutcome::Uncertain(_)]));
 
-        let failed = mutation_error_outcomes(ids(&[4]), build(TransmissionState::Acknowledged));
+        let acknowledged = build(TransmissionState::Acknowledged);
+        let failed = settled(&[4], AccountOperation::UpdateFlags, |_| {
+            mutation_error_verdict(&acknowledged)
+        });
         assert!(matches!(failed.as_slice(), [ItemOutcome::Failed(_)]));
     }
 
+    // The destroy path's expunge-failure split is now a per-UID decision
+    // inside one settle: the UIDs this round marked `\Deleted` carry the
+    // expunge failure, everything else keeps the STORE's own verdict.
     #[test]
-    fn split_ids_by_uid_partitions_on_membership() {
-        let (matching, remaining) = split_ids_by_uid(ids(&[1, 2, 3]), &[2]);
-        assert_eq!(
-            matching.iter().map(|id| id.uid).collect::<Vec<_>>(),
-            vec![2]
+    fn an_expunge_failure_applies_only_to_the_uids_it_marked() {
+        let expunge_uids = [2u32];
+        let outcome = StoreWireOutcome::Modified(vec![3]);
+        let expunge_error = expunge_failed_after_delete_mark(
+            &folder(),
+            crate::Error::Protocol("EXPUNGE refused".into()),
         );
-        assert_eq!(
-            remaining.iter().map(|id| id.uid).collect::<Vec<_>>(),
-            vec![1, 3]
+        let outcomes = settled(&[2, 3], AccountOperation::BulkDestroy, |uid| {
+            if expunge_uids.contains(&uid) {
+                mutation_error_verdict(&expunge_error)
+            } else {
+                mutation_verdict(uid, &outcome, AccountOperation::BulkDestroy, &folder())
+            }
+        });
+        assert_eq!(outcomes.len(), 2);
+        assert!(
+            outcomes
+                .iter()
+                .all(|outcome| !matches!(outcome, ItemOutcome::Succeeded(_))),
+            "neither the expunged nor the conflicting UID may claim success",
         );
-
-        // An empty expunge set leaves everything on the remaining side.
-        let (matching, remaining) = split_ids_by_uid(ids(&[1, 2]), &[]);
-        assert!(matching.is_empty());
-        assert_eq!(remaining.len(), 2);
+        let conflicts = outcomes
+            .iter()
+            .filter(|outcome| {
+                matches!(outcome, ItemOutcome::Failed(failure) if matches!(
+                    failure.error.kind(),
+                    AccountErrorKind::ConcurrencyConflict
+                ))
+            })
+            .count();
+        assert_eq!(conflicts, 1, "only the MODIFIED uid is a conflict");
     }
 
     // Every target handed to `failed_all` must come back as its own

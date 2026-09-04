@@ -205,15 +205,45 @@ destroy, move, and hydration in `get.rs` - all route through it:
   subset of a guarded STORE, the UIDs to EXPUNGE after a `\Deleted` mark) and
   refuses any UID the batch was not given, so a second wire command can never
   name a message the first was not accountable for.
-- `settle` is the only way to mint the batch's outcomes. It consumes the
+- `settle` is the only way to mint the batch's outcomes, and exactly-once is
+  a property of the types rather than of an assertion. `settle` consumes the
   batch, mints the excluded lane itself as `Failed(Request(Malformed))` - a
   UID the server never saw may become neither a fabricated success nor a
-  silent drop - and debug-asserts that the caller's outcomes cover the target
-  ids exactly once each. `settle_streaming` is the hydration variant for a
-  path that publishes down a channel: it hands back the target ids and the
-  already-minted excluded lane.
-- A `TargetBatch` dropped with either lane non-empty panics in debug builds,
-  so an early return that leaves an id unaccounted for cannot pass unnoticed.
+  silent drop - and then *drives the classification itself*: it walks its own
+  targets and calls the caller once per target with a `Target`, returning the
+  `Sealed` outcome that call produced.
+  - `Target` is a non-`Clone` permit carrying the id and the `BatchItemId`
+    stamped from it. It is consumed by `Target::seal(Verdict)`, which is the
+    only constructor of `Sealed`.
+  - So a classifier cannot answer twice for an id (the permit has moved),
+    cannot skip one (it owes a `Sealed` per call and has no other way to make
+    one), and cannot stamp an outcome with an id the batch did not give it
+    (the batch stamps it; `Verdict` is the id-free half - `Succeeded(T)`,
+    `Failed(error)`, `Uncertain(error)`).
+  - There is therefore no length check, no uid-keyed token lookup that could
+    fail at runtime, and nothing a release build skips. A settle that drops or
+    duplicates an id does not compile, which is why no test asserts it: the
+    testable residue is that the id on the outcome is the batch's own.
+  - `settle_unsent` is the degenerate case: `UidSet::from_uids` returns `None`
+    only for an empty input, so `uid_set()` is `None` exactly when the target
+    lane is empty, and the path that sends no command needs no classifier.
+  - `settle_streaming` is the hydration variant for a path that publishes down
+    a channel: it hands back the target permits and the already-minted excluded
+    lane. Each permit still seals at most once; what this lane gives up is
+    total coverage, which it must, because the caller may abandon the walk (a
+    dropped channel, a failed FETCH) and leave the rest to its own unresolved
+    set.
+- The one property Rust cannot express is that a `TargetBatch` must be consumed
+  at all - a value can always be dropped. That single residue is still a debug
+  assertion in `Drop`: a batch dropped with either lane non-empty panics in
+  debug builds, so an early return that leaves an id unaccounted for cannot
+  pass unnoticed. It has its own biting test.
+
+The classification each caller supplies is a per-UID decision against the
+server's answer, which is what made the shape fit: `mutation_verdict`,
+`patch_mutation_verdict`, and `mutation_error_verdict` in `mutate.rs` each map
+one UID to one `Verdict`, and the folder-level side effects (MODSEQ-cache
+clears) are resolved before the settle rather than inside it.
 
 Underneath it, `UidOperand` is the single constructor for a wire UID operand:
 `UidOperand::build(uids)` keeps the UIDs a `UidSet` can carry, records the ones

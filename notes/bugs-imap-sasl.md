@@ -145,6 +145,24 @@ read - now take their operand from `UidOperand`, the shared constructor
 `TargetBatch` itself builds on, and refuse rather than silently narrow.
 `uid_set_from_u32` is gone. Documented in `reference/imap.md`.
 
+Built (2026-09-04, third wave): the compile-time exactly-once shape for
+`settle` that the assessment below declined. The assessment's cost estimate
+was right about the token and wrong about where the iteration lives. Once
+`settle` drives the walk itself - calling the classifier once per target with
+a `Target` permit and taking back the `Sealed` that permit produced - the
+uid-keyed token map it feared never exists: the classifier is handed the
+permit for the UID it is deciding, and `Verdict` (`Succeeded`/`Failed`/
+`Uncertain`, no id) is all it returns, because the batch stamps the
+`BatchItemId`. Skip, duplicate, and wrong-id are all compile errors; the
+debug assertion on coverage is gone, along with the `Vec`-shaped
+`mutation_results` / `patch_mutation_results` / `mutation_error_outcomes` and
+the `split_ids_by_uid` / `ids_from_parts` id-splitting they needed. The only
+debug assertions left in `targets.rs` are the two the types genuinely cannot
+express - a batch dropped without being settled, and a follow-up operand
+naming a foreign UID - and both keep their biting tests. Documented in
+`reference/imap.md` under "One outcome per id". The original assessment
+follows.
+
 Assessed and NOT built: a compile-time exactly-once shape for `settle`. A
 per-target token (`Target { id, token: Token }` where `Token` is non-`Clone`,
 non-`Default`, constructible only by `TargetBatch`, and consumed by

@@ -13,13 +13,29 @@
 //! [`TargetBatch`] is the single owner of that derivation. It takes the
 //! decoded ids, builds the wire [`UidSet`] from those ids and nothing else,
 //! keeps an explicit lane for ids the operand could not represent, and is the
-//! only way to mint the batch's outcomes: [`TargetBatch::settle`] consumes
-//! the batch, mints the excluded lane itself, and debug-asserts that the
-//! caller's minted outcomes cover the target ids exactly once each. A batch
-//! that is dropped without being settled panics in debug builds, so a path
-//! that returns early with ids unaccounted for cannot go unnoticed.
+//! only way to mint the batch's outcomes.
+//!
+//! Exactly-once is a property of the types rather than of an assertion.
+//! [`TargetBatch::settle`] drives the classification itself: it walks its own
+//! targets and hands the caller one [`Target`] at a time - a non-`Clone`
+//! permit carrying the id and the `BatchItemId` stamped from it - and the
+//! caller must hand back the [`Sealed`] outcome that permit produced.
+//! `Sealed` has no constructor but [`Target::seal`], which consumes the
+//! permit, so a classifier cannot answer for an id twice (the permit is
+//! gone), cannot skip one (it owes a `Sealed` per call and has no other way
+//! to make one), and cannot stamp an outcome with an id the batch did not
+//! give it (the batch stamps it, not the caller). No length check, no
+//! id-keyed lookup, and nothing for a release build to skip.
+//!
+//! The one property Rust cannot express is that a `TargetBatch` must be
+//! consumed at all: a value can always be dropped. That single residue is
+//! still a debug assertion in [`Drop`], so a path that returns early with ids
+//! unaccounted for cannot go unnoticed.
 
-use bifrost_types::{AccountError, AccountOperation, BatchFailure, BatchItemId, ItemOutcome};
+use bifrost_types::{
+    AccountError, AccountOperation, BatchFailure, BatchItemId, BatchSuccess, BatchUncertain,
+    ItemOutcome,
+};
 
 use super::envelope::DecodedObjectId;
 use crate::types::{MailboxName, Uid, UidSet};
@@ -157,48 +173,66 @@ impl TargetBatch {
 
     /// Mint the batch's outcomes: exactly one per id, across both lanes.
     ///
-    /// `mint` receives the target ids by value and must return one outcome
-    /// per id it was given. The excluded lane is minted here, as a
-    /// `Failed(Request(Malformed))` naming `operation` and `folder` - a UID
-    /// the server never saw is a client-side request defect, never a
-    /// success and never a silent drop.
+    /// `classify` is called once per target, with the [`Target`] permit for
+    /// that id, and must return the [`Sealed`] outcome that permit produced.
+    /// The excluded lane is minted here, as a `Failed(Request(Malformed))`
+    /// naming `operation` and `folder` - a UID the server never saw is a
+    /// client-side request defect, never a success and never a silent drop.
     pub(crate) fn settle<T, F>(
-        mut self,
+        self,
         operation: AccountOperation,
         folder: &MailboxName,
-        mint: F,
+        mut classify: F,
     ) -> Vec<ItemOutcome<T>>
     where
-        F: FnOnce(Vec<DecodedObjectId>) -> Vec<ItemOutcome<T>>,
+        F: FnMut(Target) -> Sealed<T>,
     {
-        self.settled = true;
-        let targets = std::mem::take(&mut self.targets);
-        let excluded = std::mem::take(&mut self.excluded);
-        let expected: Vec<BatchItemId> = targets.iter().map(item_id).collect();
-        let mut results: Vec<ItemOutcome<T>> = excluded
-            .into_iter()
-            .map(|id| {
-                let error = excluded_from_operand_error(operation, folder);
-                ItemOutcome::Failed(BatchFailure::new(item_id(&id), error))
-            })
-            .collect();
-        let minted = mint(targets);
-        debug_assert_covers_exactly(&expected, &minted);
-        results.extend(minted);
+        let (targets, mut results) = self.settle_streaming(operation, folder);
+        results.extend(targets.into_iter().map(|target| classify(target).0));
         results
+    }
+
+    /// Settle a batch that sent no command because no id reached the wire
+    /// operand.
+    ///
+    /// `UidSet::from_uids` returns `None` only for an empty input, so
+    /// `uid_set()` is `None` exactly when the target lane is empty and there
+    /// is nothing to classify. The classifier here is therefore never
+    /// called; it answers `Request(Malformed)` - the same verdict the
+    /// excluded lane gets - rather than panicking, because an id that never
+    /// reached an operand is precisely an excluded id.
+    pub(crate) fn settle_unsent<T>(
+        self,
+        operation: AccountOperation,
+        folder: &MailboxName,
+    ) -> Vec<ItemOutcome<T>> {
+        self.settle(operation, folder, |target| {
+            target.seal(Verdict::Failed(excluded_from_operand_error(
+                operation, folder,
+            )))
+        })
     }
 
     /// Settle a batch whose outcomes are published elsewhere (the hydration
     /// stream sends them down a channel rather than returning them), taking
-    /// the target ids out for the caller to walk. The excluded lane is
+    /// the target permits out for the caller to walk. The excluded lane is
     /// still minted here and returned, so it cannot be forgotten.
+    ///
+    /// Each [`Target`] still seals at most once, so this lane cannot answer
+    /// twice for an id either; what it gives up relative to [`Self::settle`]
+    /// is total coverage, which it must, because the caller is allowed to
+    /// abandon the walk (a dropped channel, a failed FETCH) and leave the
+    /// remaining ids to its own unresolved set.
     pub(crate) fn settle_streaming<T>(
         mut self,
         operation: AccountOperation,
         folder: &MailboxName,
-    ) -> (Vec<DecodedObjectId>, Vec<ItemOutcome<T>>) {
+    ) -> (Vec<Target>, Vec<ItemOutcome<T>>) {
         self.settled = true;
-        let targets = std::mem::take(&mut self.targets);
+        let targets = std::mem::take(&mut self.targets)
+            .into_iter()
+            .map(Target::new)
+            .collect();
         let excluded = std::mem::take(&mut self.excluded);
         let excluded_outcomes = excluded
             .into_iter()
@@ -208,6 +242,66 @@ impl TargetBatch {
             })
             .collect();
         (targets, excluded_outcomes)
+    }
+}
+
+/// The verdict a classifier reaches for one target, without the id: the
+/// [`Target`] stamps that, so an outcome can never name a message the batch
+/// was not accountable for.
+pub(crate) enum Verdict<T> {
+    Succeeded(T),
+    Failed(AccountError),
+    Uncertain(AccountError),
+}
+
+/// The permit to answer for exactly one id.
+///
+/// Not `Clone`, not `Copy`, and constructible only by [`TargetBatch`]. It is
+/// consumed by [`Target::seal`], which is the only way to produce a
+/// [`Sealed`] outcome.
+pub(crate) struct Target {
+    id: DecodedObjectId,
+    item: BatchItemId,
+}
+
+impl Target {
+    fn new(id: DecodedObjectId) -> Self {
+        let item = item_id(&id);
+        Self { id, item }
+    }
+
+    pub(crate) fn id(&self) -> &DecodedObjectId {
+        &self.id
+    }
+
+    pub(crate) fn uid(&self) -> u32 {
+        self.id.uid
+    }
+
+    /// Spend the permit on a verdict, stamping the batch's own id onto it.
+    pub(crate) fn seal<T>(self, verdict: Verdict<T>) -> Sealed<T> {
+        Sealed(match verdict {
+            Verdict::Succeeded(value) => {
+                ItemOutcome::Succeeded(BatchSuccess::new(self.item, value))
+            }
+            Verdict::Failed(error) => ItemOutcome::Failed(BatchFailure::new(self.item, error)),
+            Verdict::Uncertain(error) => {
+                ItemOutcome::Uncertain(BatchUncertain::new(self.item, error))
+            }
+        })
+    }
+}
+
+/// An outcome that provably came from a spent [`Target`]. The wrapper has no
+/// other constructor, which is what makes "one outcome per permit" a fact
+/// about the type rather than a count taken afterwards.
+pub(crate) struct Sealed<T>(ItemOutcome<T>);
+
+impl<T> Sealed<T> {
+    /// Unwrap for a lane that publishes its outcomes itself (hydration's
+    /// streaming settle) rather than returning them through [`TargetBatch`].
+    pub(crate) fn into_outcome(self) -> ItemOutcome<T> {
+        self.0
     }
 }
 
@@ -230,44 +324,6 @@ impl Drop for TargetBatch {
 
 fn item_id(id: &DecodedObjectId) -> BatchItemId {
     BatchItemId(super::encode_object_id(&id.folder, id.uidvalidity, id.uid).0)
-}
-
-fn outcome_item_id<T>(outcome: &ItemOutcome<T>) -> &BatchItemId {
-    match outcome {
-        ItemOutcome::Succeeded(success) => &success.item,
-        ItemOutcome::Failed(failure) => &failure.item,
-        ItemOutcome::Uncertain(uncertain) => &uncertain.item,
-    }
-}
-
-/// Debug-time proof that a settle covered its targets exactly once each.
-/// The check is a debug assertion rather than a type-level guarantee
-/// because the mint closures classify per UID against the server's answer;
-/// what the type does enforce unconditionally is that the operand and the
-/// accountable set come from the same place.
-fn debug_assert_covers_exactly<T>(expected: &[BatchItemId], minted: &[ItemOutcome<T>]) {
-    #[cfg(debug_assertions)]
-    {
-        use std::collections::HashMap;
-
-        let mut want: HashMap<&str, isize> = HashMap::new();
-        for id in expected {
-            *want.entry(id.0.as_str()).or_default() += 1;
-        }
-        for outcome in minted {
-            *want.entry(outcome_item_id(outcome).0.as_str()).or_default() -= 1;
-        }
-        let unbalanced: Vec<(&str, isize)> =
-            want.into_iter().filter(|(_, count)| *count != 0).collect();
-        assert!(
-            unbalanced.is_empty(),
-            "TargetBatch settled with ids not covered exactly once: {unbalanced:?}"
-        );
-    }
-    #[cfg(not(debug_assertions))]
-    {
-        let _ = (expected, minted);
-    }
 }
 
 fn excluded_from_operand_error(operation: AccountOperation, folder: &MailboxName) -> AccountError {
@@ -296,11 +352,10 @@ fn excluded_from_operand_error(operation: AccountOperation, folder: &MailboxName
 #[cfg(test)]
 mod tests {
     use bifrost_types::{
-        AccountErrorKind, AccountOperation, BatchSuccess, ItemOutcome, MutationSuccess,
-        RequestErrorKind,
+        AccountErrorKind, AccountOperation, ItemOutcome, MutationSuccess, RequestErrorKind,
     };
 
-    use super::{TargetBatch, UidOperand, item_id};
+    use super::{Sealed, Target, TargetBatch, UidOperand, Verdict, item_id};
     use crate::account::envelope::DecodedObjectId;
     use crate::types::MailboxName;
 
@@ -316,12 +371,8 @@ mod tests {
         }
     }
 
-    fn applied(ids: Vec<DecodedObjectId>) -> Vec<ItemOutcome<MutationSuccess>> {
-        ids.into_iter()
-            .map(|id| {
-                ItemOutcome::Succeeded(BatchSuccess::new(item_id(&id), MutationSuccess::Applied))
-            })
-            .collect()
+    fn applied(target: Target) -> Sealed<MutationSuccess> {
+        target.seal(Verdict::Succeeded(MutationSuccess::Applied))
     }
 
     // `UidSet` operands must never go out empty, and UID 0 is not a UID
@@ -432,14 +483,29 @@ mod tests {
         }
     }
 
+    // Dropping or duplicating an id during classification is not tested
+    // because it cannot be written: `settle` walks its own targets, a
+    // `Target` is consumed by `seal`, and `Sealed` has no other constructor,
+    // so a classifier that skipped or double-answered an id would not
+    // compile. What is testable is that the outcome carries the batch's id
+    // and not the classifier's idea of it.
     #[test]
-    #[cfg(debug_assertions)]
-    #[should_panic(expected = "not covered exactly once")]
-    fn dropping_an_id_during_minting_is_caught() {
-        let batch = TargetBatch::new(vec![id(1), id(2)]);
-        let _ = batch.settle(AccountOperation::UpdateFlags, &folder(), |ids| {
-            applied(ids.into_iter().take(1).collect())
+    fn the_batch_stamps_the_id_the_classifier_answers_for() {
+        let batch = TargetBatch::new(vec![id(11), id(12)]);
+        let results = batch.settle(AccountOperation::UpdateFlags, &folder(), |target| {
+            let uid = target.uid();
+            assert_eq!(target.id().uid, uid);
+            target.seal(Verdict::Succeeded(MutationSuccess::Applied))
         });
+        let seen: Vec<_> = results
+            .iter()
+            .map(|outcome| match outcome {
+                ItemOutcome::Succeeded(success) => success.item.clone(),
+                ItemOutcome::Failed(failure) => failure.item.clone(),
+                ItemOutcome::Uncertain(uncertain) => uncertain.item.clone(),
+            })
+            .collect();
+        assert_eq!(seen, vec![item_id(&id(11)), item_id(&id(12))]);
     }
 
     #[test]
@@ -477,7 +543,14 @@ mod tests {
         let batch = TargetBatch::new(vec![id(1), id(0)]);
         let (targets, excluded): (_, Vec<ItemOutcome<MutationSuccess>>) =
             batch.settle_streaming(AccountOperation::Hydrate, &folder());
-        assert_eq!(targets, vec![id(1)]);
+        let ids: Vec<DecodedObjectId> = targets.iter().map(|target| target.id().clone()).collect();
+        assert_eq!(ids, vec![id(1)]);
         assert_eq!(excluded.len(), 1);
+        // The permits still stamp the batch's own ids.
+        let sealed: Vec<ItemOutcome<MutationSuccess>> = targets
+            .into_iter()
+            .map(|target| applied(target).into_outcome())
+            .collect();
+        assert_eq!(sealed.len(), 1);
     }
 }
