@@ -176,6 +176,19 @@ fn email_changes<T: HttpTransport>(
             };
 
             let new_state = response.new_state().to_string();
+            // Forward-progress guard: `hasMoreChanges: true` with an unmoved
+            // state is a server that will feed this loop forever (RFC 8620
+            // s5.2 requires newState to reflect the served changes). The
+            // state did not move, so nothing is lost by terminating before
+            // this page - the next drive replays from the same state.
+            if response.has_more_changes() && new_state == since_state {
+                yield super::error::terminated_contract_violation(
+                    bifrost_types::AccountOperation::SyncChanges,
+                    Some(bifrost_types::ErrorScope::Cursor(scope.clone())),
+                    "Email/changes reported hasMoreChanges with an unmoved state",
+                );
+                break;
+            }
             // A foreign (shared/delegate) scope's change ids are qualified
             // with the owning accountId, matching what the foreign
             // inventory mints - otherwise hydrating a changed foreign email
@@ -243,6 +256,15 @@ fn mailbox_changes<T: HttpTransport>(
             };
 
             let new_state = response.new_state().to_string();
+            // Forward-progress guard; see `email_changes`.
+            if response.has_more_changes() && new_state == since_state {
+                yield super::error::terminated_contract_violation(
+                    bifrost_types::AccountOperation::SyncChanges,
+                    Some(bifrost_types::ErrorScope::Cursor(scope.clone())),
+                    "Mailbox/changes reported hasMoreChanges with an unmoved state",
+                );
+                break;
+            }
             let changes = object_changes::<Mailbox>(response.created(), ObjectChangeKind::Created, None)
                 .into_iter()
                 .chain(object_changes::<Mailbox>(
@@ -413,6 +435,10 @@ mod tests {
     /// method a cursor scope routed to without pinning any payload.
     struct RecordingTransport {
         requests: RequestLog,
+        /// When set, answer every `*/changes` call with `newState ==
+        /// sinceState` and `hasMoreChanges: true` - a stuck server that
+        /// would drive an unguarded loop forever.
+        stuck: bool,
     }
 
     /// Shared handle on the recorded requests. The transport is moved
@@ -485,6 +511,11 @@ mod tests {
                 .to_string();
             let account_id = call[1]["accountId"].clone();
             let since = call[1]["sinceState"].clone();
+            let new_state = if self.stuck {
+                since.clone()
+            } else {
+                serde_json::json!("state-2")
+            };
             let response = serde_json::json!({
                 "sessionState": "session-1",
                 "methodResponses": [[
@@ -492,8 +523,8 @@ mod tests {
                     {
                         "accountId": account_id,
                         "oldState": since,
-                        "newState": "state-2",
-                        "hasMoreChanges": false,
+                        "newState": new_state,
+                        "hasMoreChanges": self.stuck,
                         "created": [],
                         "updated": [],
                         "destroyed": []
@@ -596,6 +627,7 @@ mod tests {
         let client = crate::client::Client::with_transport(
             RecordingTransport {
                 requests: log.clone(),
+                stuck: false,
             },
             test_session(),
             "https://example.test/.well-known/jmap",
@@ -674,6 +706,63 @@ mod tests {
                 }
                 other => panic!("{scope:?}: expected a terminal Done, got {other:?}"),
             }
+        }
+    }
+
+    /// A server answering `hasMoreChanges: true` with `newState ==
+    /// sinceState` would drive an unguarded loop into an unbounded run of
+    /// wire requests, each emitting a checkpoint-bearing batch at full
+    /// speed. The forward-progress guard must terminate the stream as a
+    /// contract violation after exactly one request - the state did not
+    /// move, so nothing is lost.
+    #[tokio::test]
+    async fn a_stuck_changes_state_terminates_instead_of_looping() {
+        for (scope, method_count) in [
+            (CursorScope::Type(bifrost_types::ObjectType::Email), 1),
+            (CursorScope::Type(bifrost_types::ObjectType::Mailbox), 1),
+        ] {
+            let log = RequestLog::new();
+            let client = crate::client::Client::with_transport(
+                RecordingTransport {
+                    requests: log.clone(),
+                    stuck: true,
+                },
+                test_session(),
+                "https://example.test/.well-known/jmap",
+            )
+            .expect("client builds");
+            let mail = crate::account::Account::new(client, "primary");
+            let cursor = state::cursor_for_scope(scope.clone(), "state-1").expect("scope encodes");
+            let events = stream(
+                mail,
+                "primary".to_string(),
+                limits(),
+                cursor,
+                None,
+                empty_states(),
+                empty_states(),
+            )
+            .collect::<Vec<_>>()
+            .await;
+
+            assert_eq!(
+                log.methods().len(),
+                method_count,
+                "{scope:?}: the guard must fire after one request"
+            );
+            let terminated = events.iter().find_map(|event| match event {
+                SyncEvent::Terminated(error) => Some(error),
+                _ => None,
+            });
+            let error = terminated
+                .unwrap_or_else(|| panic!("{scope:?}: expected Terminated, got {events:?}"));
+            assert_eq!(
+                error.kind(),
+                &bifrost_types::AccountErrorKind::Protocol(
+                    bifrost_types::ProtocolErrorKind::ContractViolation
+                ),
+                "{scope:?}"
+            );
         }
     }
 

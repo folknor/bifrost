@@ -28,21 +28,14 @@ concrete contract mismatch in the scope; the fix is the same reconciliation
 structure contacts already have, with conversion failures routed to
 `failed_ids` instead of aborting.
 
-### 2. No forward-progress guard in the `*/changes` loops - a misbehaving server produces an unbounded request loop
-
-`changes.rs::email_changes` / `mailbox_changes` loop while `hasMoreChanges`,
-re-calling with `since_state = new_state`. Nothing checks that `newState`
-actually moved. A server that answers `hasMoreChanges: true` with `newState ==
-sinceState` (or an oscillating pair) drives an infinite loop of wire requests,
-each emitting a checkpoint-bearing batch onto the engine at full speed. The
-inventory walk has the analogous hole with a weaker trigger: `queryState` is
-pinned, but a server that keeps echoing the same trailing ids under a stable
-`queryState` never yields the empty page and loops forever. The crate elsewhere
-treats exactly this class as `Protocol(ContractViolation)` - and
-`error.rs::terminated_contract_violation` is documented as kept precisely for
-"the next stream that meets one." A `newState == since_state && hasMoreChanges`
-check terminating through it closes the hole cheaply. Latent (needs a broken
-server), but the cost is unbounded and invisible.
+(Finding 2's changes-loop half is fixed: `email_changes` / `mailbox_changes`
+now terminate as `Protocol(ContractViolation)` when `hasMoreChanges: true`
+arrives with an unmoved `newState`, before that page's batch. Pinned by
+`a_stuck_changes_state_terminates_instead_of_looping`, whose ablation run
+confirmed the unguarded loop spins forever. Still open from this finding: the
+inventory walk's weaker analogue - a server echoing the same trailing ids
+under a stable `queryState` never yields the empty page and loops forever;
+an oscillating state pair also still defeats the single-step guard.)
 
 ## Suspected / lower confidence
 
