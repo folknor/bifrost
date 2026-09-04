@@ -86,6 +86,13 @@ pub(crate) struct AddressBookCollection {
     pub(crate) href: String,
     pub(crate) display_name: Option<String>,
     pub(crate) ctag: Option<String>,
+    /// Writability derived from `current-user-privilege-set`: `Some(false)`
+    /// when the server answered the property and named no write privilege,
+    /// `None` when it did not answer it at all (in which case the account
+    /// assumes writable, as CalDAV does). A read-only shared address book
+    /// used to advertise writable unconditionally, so a consumer's capability
+    /// gate passed a PUT the server was always going to 403.
+    pub(crate) can_edit: Option<bool>,
 }
 
 impl AddressBookCollection {
@@ -142,6 +149,15 @@ pub(crate) fn parse_addressbook_collections(
                 if current.in_response && name == "addressbook" {
                     current.mark_addressbook();
                 }
+                if current.in_response && name == "privilege" {
+                    current.mark_privilege_seen();
+                }
+                if current.in_response
+                    && (name == "write" || name == "write-content" || name == "all")
+                    && stack.iter().any(|item| item == "privilege")
+                {
+                    current.mark_write_seen();
+                }
                 stack.push(name);
                 text.clear();
             }
@@ -156,6 +172,15 @@ pub(crate) fn parse_addressbook_collections(
                 let name = local_name(element.name().as_ref());
                 if current.in_response && name == "addressbook" {
                     current.mark_addressbook();
+                }
+                if current.in_response && name == "privilege" {
+                    current.mark_privilege_seen();
+                }
+                if current.in_response
+                    && (name == "write" || name == "write-content" || name == "all")
+                    && stack.iter().any(|item| item == "privilege")
+                {
+                    current.mark_write_seen();
                 }
             }
             Ok(Event::End(element)) => {
@@ -510,6 +535,8 @@ struct PropStat {
     status: Option<String>,
     is_addressbook: bool,
     is_collection: bool,
+    privilege_seen: bool,
+    write_seen: bool,
     etag: Option<String>,
     content_type: Option<String>,
     address_data: Option<String>,
@@ -525,6 +552,8 @@ struct ResponseParts {
     saw_failed_propstat: bool,
     is_collection: bool,
     is_addressbook: bool,
+    privilege_seen: bool,
+    write_seen: bool,
     href: Option<String>,
     etag: Option<String>,
     content_type: Option<String>,
@@ -572,6 +601,25 @@ impl ResponseParts {
         }
     }
 
+    /// A `current-user-privilege-set` the server REFUSED says nothing about
+    /// what this principal may do, so both privilege markers are staged and
+    /// promoted only from a 2xx propstat, exactly like the CalDAV twin.
+    fn mark_privilege_seen(&mut self) {
+        if self.in_propstat {
+            self.staged.privilege_seen = true;
+        } else {
+            self.privilege_seen = true;
+        }
+    }
+
+    fn mark_write_seen(&mut self) {
+        if self.in_propstat {
+            self.staged.write_seen = true;
+        } else {
+            self.write_seen = true;
+        }
+    }
+
     fn commit_propstat(&mut self) {
         let staged = std::mem::take(&mut self.staged);
         self.in_propstat = false;
@@ -588,6 +636,8 @@ impl ResponseParts {
             self.has_success_propstat = true;
             self.is_addressbook |= staged.is_addressbook;
             self.is_collection |= staged.is_collection;
+            self.privilege_seen |= staged.privilege_seen;
+            self.write_seen |= staged.write_seen;
             commit_if_present(&mut self.etag, staged.etag);
             commit_if_present(&mut self.content_type, staged.content_type);
             commit_if_present(&mut self.address_data, staged.address_data);
@@ -605,12 +655,29 @@ impl ResponseParts {
             href: href.clone(),
             display_name: self.display_name.clone(),
             ctag: self.ctag.clone(),
+            can_edit: self.privilege_seen.then_some(self.write_seen),
         })
     }
 
     fn as_contact_entry(&self) -> Option<CardDavContactEntry> {
         let href = self.href.as_ref()?;
-        if self.is_collection || !self.has_success_propstat {
+        if self.is_collection {
+            return None;
+        }
+        // Only a response whose ONLY propstat failed is withheld here - it is
+        // surfaced by `as_failed_contact_href` instead. A response carrying no
+        // propstat at all is still a member of the collection, so it commits
+        // as an entry (with whatever etag it managed to supply, usually none).
+        //
+        // Requiring a successful propstat instead DESTROYED DATA: a bare
+        // `<response><href/></response>` for a resource that exists landed in
+        // neither lane - not an entry, and not a failed href either, since
+        // `as_failed_contact_href` wants a failed propstat - so the resource
+        // vanished from the snapshot and the diff emitted a `Destroyed` for a
+        // contact the server still holds, with the failed-href preservation
+        // guard unable to help. The CalDAV twin already read it this way; this
+        // is that divergence closed on the non-destructive side.
+        if self.saw_failed_propstat && !self.has_success_propstat {
             return None;
         }
         Some(CardDavContactEntry {
@@ -822,6 +889,25 @@ mod tests {
         assert_eq!(listing.entries.len(), 1);
         assert_eq!(listing.entries[0].uri, "/contacts/opaque-id");
         assert_eq!(listing.entries[0].etag, Some("abc".to_string()));
+    }
+
+    /// A response carrying NO propstat at all names a resource the server
+    /// still holds. It used to land in neither lane - not an entry (no
+    /// success propstat) and not a failed href (no failed propstat) - so the
+    /// contact vanished from the snapshot and the diff destroyed a row that
+    /// exists. It commits as an etag-less entry, as the CalDAV twin already
+    /// read it.
+    #[test]
+    fn a_propstat_less_response_is_an_entry_rather_than_a_vanished_contact() {
+        let xml = r#"<D:multistatus xmlns:D="DAV:">
+          <D:response><D:href>/contacts/opaque-id</D:href></D:response>
+          </D:multistatus>"#;
+
+        let listing = parse_propfind_contacts(xml).expect("valid XML");
+        assert_eq!(listing.entries.len(), 1, "{listing:?}");
+        assert_eq!(listing.entries[0].uri, "/contacts/opaque-id");
+        assert_eq!(listing.entries[0].etag, None);
+        assert!(listing.failed_hrefs.is_empty());
     }
 
     /// Same rule on the multiget lane: a refused `resourcetype` must not
@@ -1130,7 +1216,54 @@ END:VCARD</C:address-data>
                 href: "/contacts/personal/".to_string(),
                 display_name: Some("Personal".to_string()),
                 ctag: Some("42".to_string()),
+                can_edit: None,
             }]
+        );
+    }
+
+    /// Writability comes from `current-user-privilege-set`, as CalDAV's does.
+    /// A read-only shared book that advertises writable makes a consumer's
+    /// capability gate pass a PUT the server will 403.
+    #[test]
+    fn addressbook_collections_derive_writability_from_the_privilege_set() {
+        let book = |privileges: &str| {
+            let xml = format!(
+                r#"<D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:carddav">
+  <D:response><D:href>/contacts/shared/</D:href><D:propstat><D:prop>
+    <D:resourcetype><D:collection/><C:addressbook/></D:resourcetype>
+    <D:current-user-privilege-set>{privileges}</D:current-user-privilege-set>
+  </D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>
+</D:multistatus>"#
+            );
+            parse_addressbook_collections(&xml).expect("valid XML")[0].can_edit
+        };
+
+        assert_eq!(
+            book("<D:privilege><D:read/></D:privilege>"),
+            Some(false),
+            "a read-only book must report read-only"
+        );
+        assert_eq!(
+            book(
+                "<D:privilege><D:read/></D:privilege><D:privilege><D:write-content/></D:privilege>"
+            ),
+            Some(true)
+        );
+    }
+
+    /// A server that never answers the property leaves the answer unknown,
+    /// and the account assumes writable rather than locking the user out.
+    #[test]
+    fn an_unanswered_privilege_set_leaves_writability_unknown() {
+        let xml = r#"<D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:carddav">
+  <D:response><D:href>/contacts/personal/</D:href><D:propstat><D:prop>
+    <D:resourcetype><D:collection/><C:addressbook/></D:resourcetype>
+  </D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>
+</D:multistatus>"#;
+
+        assert_eq!(
+            parse_addressbook_collections(xml).expect("valid XML")[0].can_edit,
+            None
         );
     }
 

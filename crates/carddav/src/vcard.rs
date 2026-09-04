@@ -260,7 +260,12 @@ fn append_organizations(lines: &mut Vec<String>, organizations: &[ContactOrganiz
             .map(escape_text)
             .collect::<Vec<_>>()
             .join(";");
-        lines.push(format!("ORG:{value}"));
+        // A title-only organization (the shape a standalone TITLE line parses
+        // into) emits no ORG line: a bare `ORG:` would invent an empty
+        // organization the card never had.
+        if !value.is_empty() {
+            lines.push(format!("ORG:{value}"));
+        }
         if let Some(title) = organization.title.as_deref() {
             lines.push(format!("TITLE:{}", escape_text(title)));
         }
@@ -481,8 +486,20 @@ fn parse_vcard(data: &str) -> Result<ParsedVCard, VCardParseError> {
                 });
             }
             "TITLE" if !value.is_empty() => {
-                if let Some(org) = pending_org.as_mut() {
-                    org.title = Some(value);
+                // A TITLE with no ORG above it is a job title the card really
+                // carries, and the shared model has no title-only slot - so it
+                // becomes an organization with an empty name rather than being
+                // dropped. Dropped, it was invisible to the consumer AND
+                // deleted by the next `organizations` patch, which strips
+                // every ORG/TITLE line and re-emits only what the model holds.
+                match pending_org.as_mut() {
+                    Some(org) => org.title = Some(value),
+                    None => {
+                        pending_org = Some(ContactOrganization {
+                            name: String::new(),
+                            title: Some(value),
+                        });
+                    }
                 }
             }
             "ADR" if !raw_value.is_empty() => {
@@ -1027,6 +1044,44 @@ mod tests {
             Some("https://example.test/a.jpg")
         );
         assert!(contact.photo.is_none());
+    }
+
+    /// A TITLE with no ORG above it used to be dropped on read, which also
+    /// meant an `organizations` patch - which strips every ORG/TITLE line and
+    /// re-emits only what the model holds - deleted a title the model had
+    /// never seen. It round-trips now, and emits no invented empty ORG line.
+    #[test]
+    fn a_standalone_title_survives_read_and_write() {
+        let contact = parse_contact(
+            "/ab/1.vcf".to_string(),
+            Some(AddressBookId("/ab/".to_string())),
+            None,
+            "BEGIN:VCARD\r\nVERSION:4.0\r\nFN:Ada\r\nTITLE:Programmer\r\nEND:VCARD\r\n",
+        );
+
+        assert_eq!(
+            contact.organizations[0].title.as_deref(),
+            Some("Programmer"),
+            "a title with no ORG is still a title the card carries"
+        );
+        assert_eq!(contact.organizations[0].name, "");
+
+        // The write half: an organizations patch strips every ORG/TITLE line
+        // and re-emits the model, so a title the model never saw was deleted.
+        let source = "BEGIN:VCARD\r\nVERSION:4.0\r\nFN:Ada\r\nTITLE:Programmer\r\nEND:VCARD\r\n";
+        let written = vcard_from_patch(
+            &contact,
+            source,
+            &ContactPatch {
+                organizations: Some(contact.organizations.clone()),
+                ..ContactPatch::default()
+            },
+        );
+        assert!(written.contains("TITLE:Programmer"), "{written}");
+        assert!(
+            !written.lines().any(|line| line.trim_end() == "ORG:"),
+            "a title-only organization must not invent an empty ORG line: {written}"
+        );
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use bifrost_dav_core::append_path;
+use bifrost_dav_core::{append_path, same_dav_url};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
@@ -128,6 +128,7 @@ impl CardDavAccount {
 
     fn map_addressbook(collection: AddressBookCollection) -> AddressBook {
         let native = collection.href;
+        let can_edit = collection.can_edit.unwrap_or(true);
         let name = collection
             .display_name
             .filter(|name| !name.trim().is_empty())
@@ -143,9 +144,15 @@ impl CardDavAccount {
             },
             corpus: ContactCorpus::Main,
             is_default: false,
-            can_create_contacts: true,
-            can_update_contacts: true,
-            can_delete_contacts: true,
+            // Derived from `current-user-privilege-set`, as the CalDAV twin
+            // derives its `can_*_events`. A server that does not answer the
+            // property leaves `can_edit` `None` and the book is assumed
+            // writable; one that answers it and names no write privilege is
+            // reported read-only, so a consumer's capability gate stops a PUT
+            // the server was always going to refuse with a 403.
+            can_create_contacts: can_edit,
+            can_update_contacts: can_edit,
+            can_delete_contacts: can_edit,
         }
     }
 
@@ -1374,6 +1381,21 @@ mod collection_url_tests {
     use super::*;
     use bifrost_dav_core::test_support::{dav_script_empty, scripted_dav_net};
 
+    /// Twin of `bifrost-caldav::a_restated_calendar_url_is_not_a_relocation`:
+    /// a restated address book id differing only in spelling must not read as
+    /// a cross-book move.
+    #[test]
+    fn a_restated_address_book_url_is_not_a_relocation() {
+        assert!(same_collection_url(
+            "https://dav.example.test/books/My%20Book/",
+            "https://DAV.example.test:443/books/My Book"
+        ));
+        assert!(!same_collection_url(
+            "https://dav.example.test/books/work/",
+            "https://dav.example.test/books/home/"
+        ));
+    }
+
     #[test]
     fn contact_addressbook_url_ignores_query_and_fragment_slashes() {
         let client = CardDavClient::with_account_net(
@@ -1399,8 +1421,12 @@ mod collection_url_tests {
     }
 }
 
+/// Resource identity for a consumer-restated address book id against a URL this
+/// crate derived. Delegates to the shared normalizing comparison for the reason
+/// `bifrost-caldav::same_url` gives: a spelling difference read as a relocation
+/// issues a MOVE onto the collection the resource is already in.
 fn same_collection_url(left: &str, right: &str) -> bool {
-    left.trim_end_matches('/') == right.trim_end_matches('/')
+    same_dav_url(left, right)
 }
 
 fn put_condition(etag: Option<&str>) -> PutCondition<'_> {
@@ -2039,11 +2065,37 @@ mod tests {
         assert_eq!(net.priority(), Priority::Foreground);
     }
 
+    /// The privilege set reaches the published `AddressBook` flags. Twin of
+    /// the CalDAV mapping; these three were hardcoded `true`, so a read-only
+    /// shared book advertised writable and the consumer's capability gate
+    /// passed a PUT the server refuses.
+    #[test]
+    fn a_read_only_address_book_is_not_advertised_as_writable() {
+        let read_only = CardDavAccount::map_addressbook(AddressBookCollection {
+            href: "https://dav.example.test/contacts/shared/".to_string(),
+            display_name: None,
+            ctag: None,
+            can_edit: Some(false),
+        });
+        assert!(!read_only.can_create_contacts);
+        assert!(!read_only.can_update_contacts);
+        assert!(!read_only.can_delete_contacts);
+
+        let unknown = CardDavAccount::map_addressbook(collection(
+            "https://dav.example.test/contacts/personal/",
+        ));
+        assert!(
+            unknown.can_create_contacts,
+            "an unanswered privilege set must not lock the user out"
+        );
+    }
+
     fn collection(href: &str) -> AddressBookCollection {
         AddressBookCollection {
             href: href.to_string(),
             display_name: None,
             ctag: None,
+            can_edit: None,
         }
     }
 

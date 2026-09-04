@@ -14,30 +14,19 @@ error `CursorScope::Folder(collection url)`, so the engine restarts the
 actually-invalid per-calendar cursor. Test flipped to pin the folder scope and
 revert-and-confirmed; `reference/caldav.md` updated.)
 
-### 2. RFC 6578 truncated sync-collection responses are misread as creations, and truncation semantics are unhandled
-
-`crates/caldav/src/parse.rs` `parse_sync_collection_report` +
-`crates/caldav/src/account.rs` `apply_sync_report`. RFC 6578 s3.6: a server
-may truncate a sync-collection result, marking it with a `<D:response>` for
-the *collection URI itself* carrying `<D:status>HTTP/1.1 507 Insufficient
-Storage</D:status>`, plus a sync-token representing only partial progress; the
-client must issue another sync REPORT to drain the rest. Here: (a)
-`SyncResponseParts` has no collection awareness (the REPORT requests only
-`getetag`, so there's no `resourcetype` to key on, but the href equals the
-request collection and could be compared), and (b) `apply_sync_report` treats
-every entry whose status is not 404/410 as an upsert. Consequences: the 507
-marker entry is inserted into the snapshot as an `EventSnapshotEntry` for the
-collection URL and a phantom `Created` change is emitted for an "event" that
-is the collection itself; and the remaining changes beyond the truncation
-point are never fetched this poll - they are only recovered later by etag
-drift, if ever, because the *new partial* token is checkpointed as if
-complete. The same non-404/410 blanket-upsert also turns any per-member
-failure status (e.g. a 403 or 507 on one member) into a Created/Updated with
-`etag: None`. iCloud and large Fastmail/Cyrus collections do truncate in
-practice. Fix shape: drop the response whose href equals the collection URL;
-treat any entry with a non-2xx/404/410 status as a preserved-not-upserted
-resource; and (ideally) loop the REPORT until the response arrives
-untruncated.
+(Finding 2 - truncated sync-collection responses misread as creations, with the
+partial token checkpointed as complete - is fixed:
+`CalDavSyncReport::take_collection_response` drops the response whose href is
+the collection itself (comparing through the new normalizing
+`bifrost_dav_core::same_dav_url`) and records its `507` as
+`CalDavSyncReport::truncated`; `apply_sync_report` now preserves rather than
+upserts any member whose status is neither 2xx nor 404/410; and
+`changes_from_cursor` drains a truncated result by re-issuing the REPORT with
+each returned token, bounded by `SYNC_TRUNCATION_ROUNDS` with a
+same-token forward-progress guard. Pinned by
+`a_refused_sync_member_is_preserved_rather_than_upserted` and
+`a_truncated_sync_report_is_drained_before_the_cursor_advances`, both
+revert-and-confirmed; `reference/caldav.md` updated.)
 
 (Finding 3 - a UTC instant under a TZID emitted as the UTC wall clock,
 shifting the event by the zone offset - is fixed: `instant_zone_wall` projects
@@ -46,54 +35,30 @@ the instant into the named zone (UTC fallback only for unknown zones) in both
 values and the VTIMEZONE anchor agree. The two serializer tests that pinned
 the shifted output now pin the zone-local rendering.)
 
-### 4. CalDAV depth-1 event PROPFIND commits `getetag` from *failed* propstats - drift from both its own multiget parser and the CardDAV twin
-
-`crates/caldav/src/parse.rs` `parse_propfind_events` (~line 345):
-`(Some("prop"), "getetag") => current.etag = normalize_etag(&text)` writes the
-**committed** field directly, bypassing the propstat staging/commit rule that
-the same file's `parse_multiget_report` applies (`current.staged.etag`) and
-that CardDAV's `parse_propfind_contacts` applies (`current.staged.etag`, line
-249). A server echoing a stale etag value inside a non-2xx propstat (the
-echoed-prop-skeleton shape both references document defending against) poisons
-the snapshot etag, which then feeds the snapshot diff and inventory
-fingerprints - a wrong `Updated`/suppressed-update signal. `content_type` has
-the same direct write (harmless today, it's unused for identification). This
-is precisely the "drift is the defect" class both reference docs warn about,
-in the eleventh hand-mirrored propstat machine.
-
-### 5. Listing-lane asymmetry: a response with *no propstats at all* is an entry in CalDAV and silently vanishes in CardDAV
-
-CalDAV `as_event_entry`: rejects only when `saw_failed_propstat &&
-!has_success_propstat`, so an href with zero propstats commits as an entry.
-CardDAV `as_contact_entry`: requires `has_success_propstat`, so the same
-response yields nothing - and `as_failed_contact_href` also rejects it
-(`!saw_failed_propstat`), so it lands in **neither** lane. In CardDAV, a
-server emitting a bare `<response><href/></response>` for an existing resource
-makes it disappear from the snapshot, and `diff_contact_snapshots` then emits
-a `Destroyed` for a resource that exists (the failed-href preservation guard
-can't help, because the href never reaches `failed_hrefs`). Undocumented
-divergence; one of the two behaviors is wrong, and the CardDAV one destroys
-data.
+(Findings 4 and 5 - the depth-1 listing committing `getetag` from failed
+propstats, and the zero-propstat response reading as an entry in CalDAV but
+vanishing from both lanes in CardDAV - are fixed as one change:
+`parse_propfind_events` now stages `getetag` and `getcontenttype` like every
+other property (`PropStat` grew a `content_type` slot, committed on 2xx only),
+and `as_contact_entry` adopts the CalDAV rule - only a response whose ONLY
+propstat failed is withheld, so a bare `<response><href/></response>` commits as
+an etag-less entry instead of being destroyed by the diff. Pinned by
+`propfind_events_ignores_an_etag_inside_a_failed_propstat` and
+`a_propstat_less_response_is_an_entry_rather_than_a_vanished_contact`, both
+revert-and-confirmed; both reference docs updated. The `ResponseParts<P>`
+redesign the fix grouping mentions was NOT done - it remains the owner's call.)
 
 ## Contract / spec findings, confident
 
-### 6. Well-known discovery only falls back on 404; common real deployments fail the open
-
-Both crates' `should_fallback_discovery` accepts only
-`AccountErrorKind::NotFound(...)`. A deployment whose origin root answers the
-`/.well-known/caldav|carddav` PROPFIND with 405 (Method Not Allowed - typical
-for a static site or proxy in front of a DAV path), 400, or 500 fails `open`
-outright even though the configured base URL works. Worse: a well-known that
-*redirects to an origin discovery has not admitted* (the canonical RFC 6764
-use - e.g. provider host redirecting to `caldav.provider.com`) dies as a local
-`Request(Malformed)` in the redirect walk, which is not NotFound, so no
-fallback - the open fails. The comment above the code explicitly defends
-failing on 401/403, which is right; but 405/redirect-refused are "this isn't a
-discovery endpoint" answers just as 404 is. Since a cross-origin well-known
-target genuinely can't be admitted before discovery, the pragmatic fix is to
-treat local redirect refusal and 405 on the well-known *probe only* as
-fallback triggers (or to admit the well-known redirect target for
-discovery-only, credential-less probing).
+(Finding 6 - well-known discovery falling back only on 404 - is fixed in both
+crates: `should_fallback_discovery`, which is consulted for the well-known PROBE
+only, now also accepts a 405 (static site or proxy on the origin root) and a
+locally-refused redirect (`Request(Malformed)` from the redirect walk - RFC
+6764's canonical cross-origin well-known, which the credential gate cannot admit
+before discovery authenticates anything). 401 and 403 still fail the open, as
+the original comment argued. Pinned by
+`discovery_falls_back_on_not_found_405_and_a_refused_redirect` in each crate,
+revert-and-confirmed in CalDAV; both reference docs updated.)
 
 ### 8. `contact_get` addresses the resource via `addressbook-multiget` against the derived *parent collection* URL, unlike CalDAV's direct GET
 
@@ -109,15 +74,15 @@ multiget prop, so the divergence has a reason, but a GET returns the ETag
 header too - this looks like an accident of history rather than a necessity.
 Low-moderate severity, real-server dependent.
 
-### 9. CardDAV address books always advertise `can_create/update/delete = true`; CalDAV derives writability from `current-user-privilege-set`
-
-`map_addressbook` hardcodes the three flags and `PROPFIND_ADDRESSBOOKS`
-doesn't even request the privilege set, while CalDAV's `PROPFIND_CALENDARS` +
-`mark_privilege_seen`/`mark_write_seen` do the real derivation. A read-only
-shared address book advertises writable, and the consumer's capability gate
-passes a PUT that will 403. This is the same defect class as the removed
-phantom-book `can_create_contacts: true` the CardDAV reference narrates at
-length - measured divergence number nine or ten between the twins.
+(Finding 9 - CardDAV address books always advertising writable - is fixed:
+`PROPFIND_ADDRESSBOOKS` now requests `current-user-privilege-set`, the collection
+parser stages and commits `privilege`/`write` markers exactly as the CalDAV twin
+does, `AddressBookCollection` carries `can_edit: Option<bool>`, and
+`map_addressbook` derives all three flags from it (unknown still means writable).
+Pinned by `addressbook_collections_derive_writability_from_the_privilege_set`,
+`an_unanswered_privilege_set_leaves_writability_unknown` and
+`a_read_only_address_book_is_not_advertised_as_writable`, revert-and-confirmed;
+`reference/carddav.md` updated.)
 
 ## Lower-confidence / latent
 
@@ -129,44 +94,46 @@ locally on header-invalid bytes). Residual: `DavRequest::header` and the
 non-ASCII / invalid header values; those inputs are crate-internal today, so
 lower priority.
 
-### 11. Non-VALARM nested components leak their properties into the VEVENT
+(Finding 11 - non-VALARM nested components leaking their properties into the
+VEVENT - is fixed: `parse_vevents` tracks nesting depth and skips every line
+inside an unmodeled component, VALARMs nested in it included. Pinned by
+`an_unknown_nested_component_does_not_leak_into_the_event`; the ablation
+reproduced the real defect - the sub-component's TZID DTSTART won over the
+event's UTC one - and `reference/caldav.md` is updated.)
 
-`parse_vevents` treats any nested `BEGIN:`/`END:` other than VALARM as
-ordinary properties, so a vendor sub-component (X-components exist in the
-wild) contributes its DTSTART/SUMMARY/etc. to the master's prop list;
-`pick_datetime`'s specificity ladder can then prefer the sub-component's
-DTSTART over the master's. The code comment claims "harmless - nothing reads
-it," which is not quite true. Cheap fix: track nesting depth and skip
-everything inside an unknown component.
+(Finding 14 - a standalone `TITLE` dropped on read and then destroyed by an
+`organizations` patch - is fixed: `parse_vcard` maps a TITLE with no pending ORG
+to an organization with an empty name, and `append_organizations` omits the ORG
+line for such an entry rather than inventing a bare `ORG:`. Pinned by
+`a_standalone_title_survives_read_and_write`, revert-and-confirmed;
+`reference/carddav.md` updated.)
 
-### 14. `TITLE` without `ORG` is dropped on read, and patching `organizations` strips a standalone TITLE line
+(Finding 15 - duration-derived ends under a TZID using DST-blind civil
+addition - is fixed: `event_end_from_duration` routes an EXACT (time-only)
+duration through the named zone via the new `exact_zone_end`, keeping civil
+arithmetic for the nominal DAY/WEEK parts RFC 5545 s3.3.6 defines as nominal,
+and for unknown zones. Pinned by
+`a_duration_end_under_a_tzid_respects_the_dst_transition`, which covers both
+halves and was revert-and-confirmed; `reference/caldav.md` updated.)
 
-`parse_vcard` only attaches TITLE to a pending org; `should_replace_property`
-removes all `ORG|TITLE` lines when organizations are patched. A card with
-`TITLE:` but no `ORG:` loses the title on an organizations patch even though
-the model never saw it.
-
-### 15. Duration-derived ends under a TZID use civil (DST-blind) addition
-
-`event_end_from_duration` strptime branch - a `DTSTART;TZID=...` +
-`DURATION:PT10H` crossing a DST transition projects an end an hour off from
-the RFC 5545 nominal-duration rule. Small and defensible either way; noted
-because the crate is otherwise scrupulous about fold/gap discipline.
-
-### 16. `same_url`/`same_collection_url` are byte comparisons after slash-trim
-
-Percent-encoding or case differences in host between a consumer-restated
-`calendar_id` and the derived parent URL read as a *relocation* and trigger a
-MOVE to what is actually the same collection (`Overwrite: F` then refuses with
-412, surfacing a spurious conflict). `url_origin`-style normalization before
-comparison would close it.
+(Finding 16 - `same_url`/`same_collection_url` as byte comparisons after a
+slash trim - is fixed: both delegate to the new
+`bifrost_dav_core::same_dav_url`, which compares scheme, case-folded host,
+`port_or_known_default` and percent-decoded path SEGMENTS (so an encoded `%2F`
+stays distinct from a real separator) and falls back to the old comparison for
+anything that will not parse. A restated collection id therefore no longer reads
+as a relocation and no longer issues a MOVE onto the collection the resource is
+already in. Pinned by the two dav-core unit tests plus
+`a_restated_calendar_url_is_not_a_relocation` and
+`a_restated_address_book_url_is_not_a_relocation`; the dav-core pair was
+revert-and-confirmed.)
 
 ## Fix grouping
 
-Findings 4 and 5 are both propstat-state-machine discipline defects (13, the
-third of the group, is closed as an accepted, commented edge). Work them as a
-single change (or as part of the `ResponseParts<P>` redesign, if the owner
-rules for it below) - do not fix them as separate patches.
+Findings 4 and 5 were propstat-state-machine discipline defects and were worked
+as a single change (13, the third of the group, is closed as an accepted,
+commented edge). The `ResponseParts<P>` redesign below was NOT taken; it stays
+the repository owner's decision.
 
 ## Structural observations (pre-1.0, rewrite-friendly posture)
 

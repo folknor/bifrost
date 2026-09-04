@@ -7,7 +7,8 @@ use bifrost_dav_core::{
 use bifrost_net::{AccountId, AccountNet};
 use bifrost_types::{
     AccountError, AccountErrorBuilder, AccountErrorKind, AccountOperation, Cause, CursorScope,
-    DiagnosticText, ErrorScope, FolderId, Protocol, ResourceKind, StateCause, SyncStateErrorKind,
+    DiagnosticText, ErrorScope, FolderId, Protocol, RequestErrorKind, ResourceKind,
+    ServerErrorKind, StateCause, SyncStateErrorKind,
 };
 use reqwest::header::{CONTENT_TYPE, HeaderValue};
 use reqwest::{Method, StatusCode};
@@ -427,6 +428,7 @@ impl CalDavClient {
             parse_error(AccountOperation::SyncChanges, format!("sync: {error}"))
         })?;
         report.resolve_hrefs(&effective_url);
+        report.take_collection_response(calendar_url, &effective_url);
         Ok(report)
     }
 
@@ -643,10 +645,33 @@ fn cursor_invalid_error(calendar_url: &str, status: StatusCode, body: String) ->
         .expect("valid account error classification")
 }
 
+/// Does this well-known PROBE failure mean "this is not a discovery endpoint"?
+///
+/// Applied to the `/.well-known/caldav` attempt ONLY, never to a request
+/// against the configured base URL, so widening it cannot mask a real failure
+/// of the account itself.
+///
+/// A 401 or 403 still fails the open: those are answers from a discovery
+/// endpoint that exists and refused the credential, and quietly retrying the
+/// base URL would turn a reauthorization signal into a confusing later failure.
+///
+/// Three answers mean the endpoint simply is not there:
+/// - 404, the spec-correct one.
+/// - 405 Method Not Allowed, what a static site or a proxy in front of the DAV
+///   path answers a PROPFIND on the origin root with. This is common enough
+///   that accepting only 404 failed the open on deployments whose configured
+///   base URL works perfectly.
+/// - A locally-refused redirect (`Request(Malformed)` from the redirect walk).
+///   RFC 6764's canonical shape is a well-known that redirects to another host,
+///   and that host cannot be admitted to the credential-origin set before
+///   discovery has authenticated anything - so the walk refuses it locally, and
+///   that refusal is evidence about the probe, not about the account.
 fn should_fallback_discovery(error: &AccountError) -> bool {
     matches!(
         error.kind(),
         AccountErrorKind::NotFound(ResourceKind::Calendar)
+            | AccountErrorKind::Request(RequestErrorKind::Malformed)
+            | AccountErrorKind::Server(ServerErrorKind::Error { status: Some(405) })
     )
 }
 
@@ -1810,21 +1835,32 @@ mod tests {
         );
     }
 
+    /// The probe falls back on "not a discovery endpoint" answers and only
+    /// those: a credential refusal must still fail the open.
     #[test]
-    fn discovery_fallback_only_allows_not_found() {
-        let unauthorized = status_error(
-            AccountOperation::Discover,
-            StatusCode::UNAUTHORIZED,
-            String::new(),
-        );
-        assert!(!should_fallback_discovery(&unauthorized));
+    fn discovery_falls_back_on_not_found_405_and_a_refused_redirect() {
+        let status = |status| status_error(AccountOperation::Discover, status, String::new());
 
-        let not_found = status_error(
+        assert!(!should_fallback_discovery(&status(
+            StatusCode::UNAUTHORIZED
+        )));
+        assert!(!should_fallback_discovery(&status(StatusCode::FORBIDDEN)));
+        assert!(!should_fallback_discovery(&status(
+            StatusCode::INTERNAL_SERVER_ERROR
+        )));
+
+        assert!(should_fallback_discovery(&status(StatusCode::NOT_FOUND)));
+        // A static site or proxy in front of the DAV path answers a PROPFIND
+        // on the origin root with 405.
+        assert!(should_fallback_discovery(&status(
+            StatusCode::METHOD_NOT_ALLOWED
+        )));
+        // RFC 6764's canonical redirect to another host, refused locally by
+        // the credential-origin gate before any request went out.
+        assert!(should_fallback_discovery(&local_error(
             AccountOperation::Discover,
-            StatusCode::NOT_FOUND,
-            String::new(),
-        );
-        assert!(should_fallback_discovery(&not_found));
+            "redirect to an unadmitted origin",
+        )));
     }
 
     #[test]

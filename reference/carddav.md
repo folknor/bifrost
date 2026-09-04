@@ -22,8 +22,11 @@ crate-private; consumers use only the factory and the shared `Account`
 contact primitives. Discovery tries `/.well-known/carddav` first - built from the ORIGIN of the
 configured base URL via `bifrost_net::url::well_known_url`, never by appending
 the suffix to a configured path - and falls
-back to the configured base URL both when that request is not found and when
-its successful body does not identify a current-user principal.
+back to the configured base URL both when that probe answers that it is not a
+discovery endpoint and when its successful body does not identify a current-user
+principal. The probe-only fallback triggers are 404, 405, and a locally-refused
+cross-origin redirect; 401 and 403 still fail the open. `reference/caldav.md`
+carries the reasoning, and the twin must not drift from it.
 
 ## Module layout
 
@@ -72,7 +75,13 @@ its successful body does not identify a current-user principal.
   `parse_propfind_contacts` returns a `CardDavContactListing`: committed
   non-collection `entries` plus `failed_hrefs` (non-collection resources
   whose only propstat failed within the 207), so the snapshot diff can preserve a
-  transiently-failed resource instead of destroying it. Response parsers
+  transiently-failed resource instead of destroying it. A response with NO
+  propstat at all commits as an etag-less entry, matching the CalDAV twin:
+  requiring a successful propstat dropped a bare
+  `<response><href/></response>` out of BOTH lanes - not an entry, and not a
+  failed href either - so the contact vanished from the snapshot and the diff
+  emitted a `Destroyed` for a row the server still holds, with the failed-href
+  preservation guard unable to reach it. Response parsers
   use element-stack parent checks so nested same-name properties do not
   overwrite response-level hrefs. Every text-bearing parser accepts both
   XML text and CDATA. Response hrefs are rebased against the URI of the request
@@ -111,7 +120,11 @@ its successful body does not identify a current-user principal.
   `item1.X-ABLabel`) are carried onto rewritten EMAIL/TEL/ADR lines so an
   Apple-Contacts label stays bound. ADR po-box/extended components are
   preserved as leading entries of the ordered `street` vector rather than
-  zeroed; ORG `;`-structure is preserved (the shared model lacks dedicated
+  zeroed; A TITLE line with no ORG above it maps to an organization with an
+  EMPTY name (the shared model has no title-only slot) and writes back as a
+  bare TITLE with no invented `ORG:` line - dropped on read, it was also
+  deleted by the next `organizations` patch, which strips every ORG/TITLE line
+  and re-emits only what the model holds. ORG `;`-structure is preserved (the shared model lacks dedicated
   po-box/extended and ORG-component slots - a types change, out of scope
   here, would make these fully structural). The create path emits a minimal
   `N` (mandatory in 3.0). A present-but-empty value is still
@@ -128,7 +141,15 @@ Supported contact primitives:
 
 - `address_books_list` - `PROPFIND` depth 1 on the discovered
   addressbook home, filtering `resourcetype` entries that contain
-  `addressbook`. A home enumerating zero addressbook collections yields an
+  `addressbook`. The PROPFIND requests `current-user-privilege-set` and
+  `can_create/update/delete_contacts` are DERIVED from it, as the CalDAV twin
+  derives its event flags: a book whose answered privilege set names no write
+  privilege is reported read-only, and one the server does not answer for stays
+  unknown and is assumed writable. The three flags were hardcoded `true` for a
+  long time, so a read-only shared book advertised writable and a consumer's
+  capability gate passed a PUT the server was always going to refuse - the same
+  defect class as the phantom book below, and the tenth measured divergence
+  between the twins. A home enumerating zero addressbook collections yields an
   EMPTY list, never a fabricated placeholder. The depth-1 parse returns the
   home's own response too, so a home that is itself an addressbook collection
   is already mapped; an empty result therefore means a genuinely empty

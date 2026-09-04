@@ -6,7 +6,10 @@ use bifrost_dav_core::{
     DavDispatch, DavProtocol, DavRequest, normalize_http_etag, prepare_if_match, worse_recovery,
 };
 use bifrost_net::{AccountId, AccountNet};
-use bifrost_types::{AccountError, AccountErrorKind, AccountOperation, ErrorScope, ResourceKind};
+use bifrost_types::{
+    AccountError, AccountErrorKind, AccountOperation, ErrorScope, RequestErrorKind, ResourceKind,
+    ServerErrorKind,
+};
 use reqwest::header::{CONTENT_TYPE, ETAG};
 use reqwest::{Method, StatusCode};
 
@@ -474,10 +477,21 @@ fn addressbook_text_query_body(property: &str, query: &str) -> String {
     )
 }
 
+/// Does this well-known PROBE failure mean "this is not a discovery endpoint"?
+///
+/// Twin of `bifrost-caldav::should_fallback_discovery`, which carries the full
+/// reasoning: applied to the `/.well-known/carddav` attempt only; 401/403 still
+/// fail the open, while 404, a 405 from a static site or proxy sitting on the
+/// origin root, and a locally-refused cross-origin redirect (RFC 6764's
+/// canonical shape, which the credential-origin gate cannot admit before
+/// discovery has authenticated anything) all mean the probe found no discovery
+/// endpoint and the configured base URL should be tried.
 fn should_fallback_discovery(error: &AccountError) -> bool {
     matches!(
         error.kind(),
         AccountErrorKind::NotFound(ResourceKind::Contact)
+            | AccountErrorKind::Request(RequestErrorKind::Malformed)
+            | AccountErrorKind::Server(ServerErrorKind::Error { status: Some(405) })
     )
 }
 
@@ -617,6 +631,7 @@ const PROPFIND_ADDRESSBOOKS: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\
   <D:prop>\n\
     <D:resourcetype/>\n\
     <D:displayname/>\n\
+    <D:current-user-privilege-set/>\n\
     <CS:getctag/>\n\
   </D:prop>\n\
 </D:propfind>";
@@ -1677,21 +1692,28 @@ mod tests {
         );
     }
 
+    /// Twin of the CalDAV test: fall back on "not a discovery endpoint"
+    /// answers, never on a credential refusal.
     #[test]
-    fn discovery_fallback_only_allows_not_found() {
-        let unauthorized = status_error(
-            AccountOperation::Discover,
-            StatusCode::UNAUTHORIZED,
-            String::new(),
-        );
-        assert!(!should_fallback_discovery(&unauthorized));
+    fn discovery_falls_back_on_not_found_405_and_a_refused_redirect() {
+        let status = |status| status_error(AccountOperation::Discover, status, String::new());
 
-        let not_found = status_error(
+        assert!(!should_fallback_discovery(&status(
+            StatusCode::UNAUTHORIZED
+        )));
+        assert!(!should_fallback_discovery(&status(StatusCode::FORBIDDEN)));
+        assert!(!should_fallback_discovery(&status(
+            StatusCode::INTERNAL_SERVER_ERROR
+        )));
+
+        assert!(should_fallback_discovery(&status(StatusCode::NOT_FOUND)));
+        assert!(should_fallback_discovery(&status(
+            StatusCode::METHOD_NOT_ALLOWED
+        )));
+        assert!(should_fallback_discovery(&local_error(
             AccountOperation::Discover,
-            StatusCode::NOT_FOUND,
-            String::new(),
-        );
-        assert!(should_fallback_discovery(&not_found));
+            "redirect to an unadmitted origin",
+        )));
     }
 
     #[test]

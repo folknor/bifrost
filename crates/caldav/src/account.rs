@@ -1,4 +1,4 @@
-use bifrost_dav_core::append_path;
+use bifrost_dav_core::{append_path, same_dav_url};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
@@ -24,6 +24,11 @@ use crate::{CalDavConfig, CalDavCredentials};
 // Version 2 changes snapshot ids from base-URL-relative to request-URI-relative.
 const CURSOR_ENVELOPE_VERSION: u32 = 2;
 const CURSOR_MAGIC: &[u8] = b"CALDAVET1";
+/// How many `sync-collection` REPORTs one poll may spend draining an RFC 6578
+/// truncated result. A bound rather than an unbounded loop: a server that keeps
+/// reporting truncation must not hold one poll on the wire forever, and what is
+/// left over is picked up by the next poll from the checkpointed token.
+const SYNC_TRUNCATION_ROUNDS: usize = 16;
 
 #[derive(Debug)]
 pub(crate) struct CalDavAccount {
@@ -1454,8 +1459,13 @@ fn put_condition(etag: Option<&str>) -> PutCondition<'_> {
     .map_or(PutCondition::None, PutCondition::IfMatch)
 }
 
+/// Resource identity for a consumer-restated calendar id against a URL this
+/// crate derived. Delegates to the shared normalizing comparison: percent
+/// encoding, host case and a redundant default port are spellings, not
+/// relocations, and reading one as a move issues a MOVE onto the collection the
+/// resource already lives in (refused by `Overwrite: F` as a spurious 412).
 fn same_url(left: &str, right: &str) -> bool {
-    left.trim_end_matches('/') == right.trim_end_matches('/')
+    same_dav_url(left, right)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -1697,19 +1707,47 @@ async fn changes_from_cursor(
     previous: &EventSnapshot,
 ) -> Result<(EventSnapshot, Vec<Change>), AccountError> {
     if let Some(sync_token) = previous.sync_token.as_deref() {
-        let report = client
-            .sync_events(&previous.calendar_url, sync_token)
-            .await?;
         let mut current = previous.clone();
-        if report.sync_token.is_none() {
-            tracing::warn!(
-                target: "bifrost_caldav::sync",
-                calendar = %previous.calendar_url,
-                "sync-collection response omitted the required sync-token; retaining the previous token"
-            );
+        let mut changes = Vec::new();
+        let mut token = sync_token.to_string();
+        // RFC 6578 s3.6: a server may answer a sync REPORT with only part of
+        // the change set, marking it with a 507 response for the collection
+        // itself and a token that represents that partial progress. Stopping
+        // there and checkpointing the partial token as if it were complete
+        // loses every change beyond the truncation point until etag drift
+        // happens to surface it. iCloud and large Cyrus collections truncate in
+        // practice, so drain the rest by re-issuing the REPORT with the token
+        // the server just handed back.
+        for _ in 0..SYNC_TRUNCATION_ROUNDS {
+            let report = client.sync_events(&previous.calendar_url, &token).await?;
+            let truncated = report.truncated;
+            let next_token = report.sync_token;
+            changes.extend(apply_sync_report(&mut current, report.entries));
+            let Some(next_token) = next_token else {
+                tracing::warn!(
+                    target: "bifrost_caldav::sync",
+                    calendar = %previous.calendar_url,
+                    "sync-collection response omitted the required sync-token; retaining the previous token"
+                );
+                break;
+            };
+            current.sync_token = Some(next_token.clone());
+            if !truncated {
+                break;
+            }
+            // Forward progress or stop. A server that repeats the token it was
+            // given while still claiming truncation would otherwise spin this
+            // loop against the wire for as many rounds as the cap allows.
+            if next_token == token {
+                tracing::warn!(
+                    target: "bifrost_caldav::sync",
+                    calendar = %previous.calendar_url,
+                    "truncated sync-collection response returned the same sync-token; stopping the drain"
+                );
+                break;
+            }
+            token = next_token;
         }
-        current.sync_token = report.sync_token.or_else(|| previous.sync_token.clone());
-        let changes = apply_sync_report(&mut current, report.entries);
         return Ok((current, changes));
     }
     let mut current = CalDavAccount::event_snapshot(
@@ -1752,6 +1790,18 @@ fn apply_sync_report(
     let mut changes = Vec::new();
     for entry in entries {
         let uri = entry.uri;
+        // A per-member status that is neither success nor a removal is a
+        // refusal to report on THAT member (403, 507, 503 ...). It says nothing
+        // about the resource's content, so the prior snapshot entry is
+        // preserved untouched: upserting it would record an etag-less entry and
+        // emit a Created/Updated for a resource nobody observed, and the
+        // etag-less entry then makes the next poll report an Updated as well.
+        if entry
+            .status
+            .is_some_and(|code| !(200..300).contains(&code) && !matches!(code, 404 | 410))
+        {
+            continue;
+        }
         if matches!(entry.status, Some(404 | 410)) {
             // Only emit a Destroyed event for an href the prior snapshot
             // actually held. A 404/410 sync-report entry for an unknown
@@ -2856,6 +2906,128 @@ mod tests {
             ]
         );
         assert_eq!(snapshot.entries.len(), 2);
+    }
+
+    /// A per-member status that is neither success nor a removal is the
+    /// server declining to report on that member. Upserting it recorded an
+    /// etag-less entry and emitted a change for a resource nobody observed.
+    #[test]
+    fn a_refused_sync_member_is_preserved_rather_than_upserted() {
+        let mut snapshot = EventSnapshot {
+            calendar_url: "https://dav.example.test/cal/".to_string(),
+            sync_token: Some("token-1".to_string()),
+            entries: vec![EventSnapshotEntry {
+                uri: "https://dav.example.test/cal/one.ics".to_string(),
+                etag: Some("kept".to_string()),
+            }],
+            failed_hrefs: Vec::new(),
+        };
+
+        let changes = apply_sync_report(
+            &mut snapshot,
+            vec![
+                crate::parse::CalDavSyncEntry {
+                    uri: "https://dav.example.test/cal/one.ics".to_string(),
+                    etag: None,
+                    status: Some(403),
+                },
+                crate::parse::CalDavSyncEntry {
+                    uri: "https://dav.example.test/cal/two.ics".to_string(),
+                    etag: None,
+                    status: Some(507),
+                },
+            ],
+        );
+
+        assert!(changes.is_empty(), "refusals are not changes: {changes:?}");
+        assert_eq!(snapshot.entries.len(), 1);
+        assert_eq!(snapshot.entries[0].etag.as_deref(), Some("kept"));
+    }
+
+    /// RFC 6578 s3.6: a truncated result must be drained with the partial
+    /// token it came with, or every change past the truncation point is lost
+    /// until etag drift happens to surface it.
+    #[tokio::test]
+    async fn a_truncated_sync_report_is_drained_before_the_cursor_advances() {
+        use bifrost_dav_core::DavResponse;
+        use bifrost_dav_core::test_support::{dav_script, transcripts};
+        use reqwest::StatusCode;
+        use reqwest::header::HeaderMap;
+
+        let multistatus = |body: &str| DavResponse {
+            status: StatusCode::MULTI_STATUS,
+            headers: HeaderMap::new(),
+            body: body.to_string(),
+            url: String::new(),
+        };
+        let script = dav_script([
+            multistatus(
+                "<D:multistatus xmlns:D=\"DAV:\"><D:response><D:href>/cal/</D:href><D:status>HTTP/1.1 507 Insufficient Storage</D:status></D:response><D:response><D:href>/cal/one.ics</D:href><D:propstat><D:prop><D:getetag>\"a\"</D:getetag></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response><D:sync-token>partial</D:sync-token></D:multistatus>",
+            ),
+            multistatus(
+                "<D:multistatus xmlns:D=\"DAV:\"><D:response><D:href>/cal/two.ics</D:href><D:propstat><D:prop><D:getetag>\"b\"</D:getetag></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response><D:sync-token>complete</D:sync-token></D:multistatus>",
+            ),
+        ]);
+        let client =
+            CalDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
+        let previous = EventSnapshot {
+            calendar_url: "https://dav.example.test/cal/".to_string(),
+            sync_token: Some("start".to_string()),
+            entries: Vec::new(),
+            failed_hrefs: Vec::new(),
+        };
+
+        let (current, changes) = changes_from_cursor(&client, &previous)
+            .await
+            .expect("the scripted drain succeeds");
+
+        let ids = changes
+            .iter()
+            .map(|change| match change {
+                Change::ObjectChange(change) => change.id.0.clone(),
+                _ => panic!("unexpected scope change"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            vec![
+                "https://dav.example.test/cal/one.ics".to_string(),
+                "https://dav.example.test/cal/two.ics".to_string(),
+            ],
+            "the second REPORT's members must reach the consumer"
+        );
+        // The collection's own 507 response is a statement about the REPORT,
+        // never a member: it must not become an entry or a phantom Created.
+        assert_eq!(current.entries.len(), 2);
+        assert!(
+            current
+                .entries
+                .iter()
+                .all(|entry| entry.uri.ends_with(".ics")),
+            "the collection self-response leaked into the snapshot: {:?}",
+            current.entries
+        );
+        assert_eq!(current.sync_token.as_deref(), Some("complete"));
+        let requests = transcripts(&script);
+        assert_eq!(requests.len(), 2, "the drain must re-issue the REPORT");
+        assert!(requests[1].body.contains("partial"));
+    }
+
+    /// A consumer restating the calendar it read back, in the encoding it read
+    /// it in, is not asking for a relocation. Byte comparison after a slash
+    /// trim read it as one and issued a MOVE onto the collection the event
+    /// already lives in, which `Overwrite: F` refuses with a 412 the consumer
+    /// sees as a conflict.
+    #[test]
+    fn a_restated_calendar_url_is_not_a_relocation() {
+        assert!(same_url(
+            "https://dav.example.test/cal/My%20Cal/",
+            "https://DAV.example.test:443/cal/My Cal"
+        ));
+        assert!(!same_url(
+            "https://dav.example.test/cal/work/",
+            "https://dav.example.test/cal/home/"
+        ));
     }
 
     #[test]

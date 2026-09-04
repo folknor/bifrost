@@ -27,9 +27,19 @@ calendar primitives.
 Discovery tries `/.well-known/caldav` first - built from the ORIGIN of the
 configured base URL via `bifrost_net::url::well_known_url`, never by appending
 the suffix to a configured path - and falls back to the configured
-base URL only when that initial principal lookup is not found or its successful
-body names no principal. A failure after the principal is identified is not a
-root-discovery fallback trigger.
+base URL only when that initial principal lookup answers that it is not a
+discovery endpoint, or its successful body names no principal. Three probe
+answers mean that: 404, a 405 (a static site or a proxy sitting on the origin
+root in front of the DAV path, common enough that a 404-only rule failed the
+open on deployments whose configured base URL works), and a locally-refused
+redirect - RFC 6764's canonical shape is a well-known redirecting to another
+host, which the credential-origin gate cannot admit before discovery has
+authenticated anything, so the walk refuses it as `Request(Malformed)`. A 401 or
+403 still FAILS the open: those come from a discovery endpoint that exists and
+refused the credential, and retrying the base URL would bury a reauthorization
+signal. The widening applies to the well-known probe only, never to a request
+against the configured base URL. A failure after the principal is identified is
+not a root-discovery fallback trigger.
 
 ## Module layout
 
@@ -76,6 +86,16 @@ root-discovery fallback trigger.
   collection metadata and href-valued discovery properties are staged per
   `propstat` and committed only for successful 2xx statuses or a missing
   status, which RFC 4918 requires but the parser tolerates as success.
+  Event listing properties (`getetag`, `getcontenttype`) are staged and
+  committed by the same rule as everything else - the depth-1 listing wrote them
+  straight to the committed field for a while, so an etag echoed back inside a
+  refused propstat poisoned the snapshot etag that drives the change diff and
+  the inventory fingerprint.
+  A response with NO propstat at all still names a member, so it commits as an
+  etag-less entry rather than being withheld; only a response whose ONLY
+  propstat failed moves to the failure lane. `bifrost-carddav` reads it the same
+  way - it used to require a successful propstat, which dropped such a response
+  out of both lanes and let the diff destroy a contact that exists.
   `parse_propfind_events` returns a
   `CalDavEventListing`: committed non-collection `entries` plus
   `failed_hrefs` (non-collection resources whose only propstat failed within
@@ -85,7 +105,9 @@ root-discovery fallback trigger.
   content type. Depth-1 listing, calendar-query, text-query, and multiget
   requests include `resourcetype` and exclude collection self-responses;
   `sync-collection` accepts every returned member href because
-  that REPORT supplies neither content type nor a naming convention. The
+  that REPORT supplies neither content type nor a naming convention - the one
+  response it drops is the collection's OWN, identified by href, which is also
+  where the RFC 6578 truncation marker rides (see `changes_stream` below). The
   `collection` marker obeys the same commit-on-success rule as every other
   property: seen inside a `propstat` it is staged and promoted only if that
   block's status was 2xx, so a server echoing the requested prop skeleton
@@ -145,6 +167,11 @@ root-discovery fallback trigger.
   represent; Google's `{calendar}::{event}` ids wrap the provider's own instance
   ids. None can inherit this shape, so fixing it here buys them nothing.
 
+  A nested component this projection does not model - a vendor X-component, a
+  nested VTODO - is skipped WHOLE, including any VALARM inside it. Its
+  properties used to be appended to the master's own list, where
+  `pick_datetime`'s specificity ladder could prefer the sub-component's
+  TZID-bearing DTSTART over the event's own value.
   VALARM sub-components project into `CalendarEvent.reminders` (relative
   DURATION or absolute DATE-TIME triggers). All-day ends follow the
   exclusive `EventTime` contract: an iCalendar all-day DTEND is neither
@@ -163,7 +190,12 @@ root-discovery fallback trigger.
   (e.g. `W. Europe Standard Time`) are mapped to IANA via caldata's
   proprietary-TZID table. A non-ASCII DATE or DATE-TIME grammar value is
   preserved verbatim rather than sliced at fixed byte offsets. `DTSTART`
-  plus `DURATION` projects an end when `DTEND` is absent; an explicit end
+  plus `DURATION` projects an end when `DTEND` is absent, splitting the
+  duration the way RFC 5545 s3.3.6 does: the DAY and WEEK parts are nominal and
+  keep their wall clock, while a time-only duration under a known TZID is added
+  THROUGH the zone (same fold-earlier / gap-post-offset discipline as the rest
+  of the module), so `PT10H` across a DST transition no longer lands an hour
+  off. An unknown zone or a mixed duration falls back to civil addition; an explicit end
   patch removes DURATION before emitting DTEND. A resource with no VEVENT
   (a VTODO or VJOURNAL sharing the collection) maps to
   `NotFound(Calendar)` for `event_get`/`event_update` and to *no* events in
@@ -316,7 +348,12 @@ Supported calendar primitives:
   **A cross-calendar move is PERFORMED.** A `calendar_id` differing from the
   event's own collection (derived by `event_calendar_url`) relocates the
   resource; a patch that RESTATES the event's current calendar is not a move and
-  takes the ordinary GET-plus-PUT path. The assertion here has been inverted
+  takes the ordinary GET-plus-PUT path. "Differing" is decided by
+  `bifrost_dav_core::same_dav_url`, which normalizes percent-encoding, host case
+  and a redundant default port before comparing percent-decoded path segments -
+  a byte comparison after a slash trim read a restated id in a different
+  spelling as a relocation and issued a MOVE onto the collection the resource
+  already lives in, which `Overwrite: F` then refused with a spurious 412. The assertion here has been inverted
   twice - the request originally returned `Ok(())` having moved nothing, was
   then refused outright as better than a silent drop, and is now carried out -
   so `event_update_moves_across_calendars_and_updates_in_place_otherwise` pins
@@ -414,7 +451,24 @@ builds a hybrid cursor from the calendar URL, the collection
 sync token, issuing the REPORT with `Depth: 0` as required by RFC 6578,
 and applies returned href/etag/status entries to the snapshot
 (deleting only on explicit per-entry `404`/`410`), and emits
-created/updated/destroyed event changes. Calendars without a sync token
+created/updated/destroyed event changes. A per-member status that is neither
+2xx nor `404`/`410` is the server declining to report on that member (403, 507,
+503): the prior entry is PRESERVED untouched rather than upserted, because an
+upsert records an etag-less entry and emits a change for a resource nobody
+observed - and the etag-less entry then makes the next poll report an update as
+well.
+The collection's OWN response is removed before the entries reach the snapshot.
+The REPORT requests only `getetag`, so nothing but the href distinguishes it
+from a member, and left in place it becomes a snapshot entry for the collection
+plus a phantom `Created`. Its status is also the RFC 6578 s3.6 truncation
+marker: a `507` there says the server returned only part of the change set and
+the accompanying sync-token records only that partial progress. `changes_stream`
+DRAINS a truncated result, re-issuing the REPORT with each returned token until
+one comes back untruncated, bounded by `SYNC_TRUNCATION_ROUNDS` and stopped
+early if a server claims truncation while handing back the same token. Without
+the drain the partial token was checkpointed as complete and every change past
+the truncation point was lost until etag drift happened to surface it; iCloud
+and large Cyrus collections truncate in practice. Calendars without a sync token
 fall back to polling snapshot diffs. The PROPFIND-snapshot diff (not the
 sync-token path) is hardened against destroy-everything failure modes: an
 empty multistatus against a populated prior snapshot suppresses the

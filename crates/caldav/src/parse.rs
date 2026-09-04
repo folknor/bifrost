@@ -1,5 +1,5 @@
 pub(crate) use bifrost_dav_core::resolve_href;
-use bifrost_dav_core::{local_name, normalize_etag, push_text, trimmed};
+use bifrost_dav_core::{local_name, normalize_etag, push_text, same_dav_url, trimmed};
 use bifrost_net::{status_line_code, status_line_is_success};
 use quick_xml::Reader;
 use quick_xml::events::Event;
@@ -143,6 +143,12 @@ impl CalDavMultigetReport {
 pub(crate) struct CalDavSyncReport {
     pub(crate) sync_token: Option<String>,
     pub(crate) entries: Vec<CalDavSyncEntry>,
+    /// The server truncated this result (RFC 6578 s3.6): it answered with a
+    /// `<response>` for the COLLECTION URI itself carrying `507 Insufficient
+    /// Storage`, and the accompanying sync-token represents only partial
+    /// progress. The remaining changes arrive only if the client issues
+    /// another sync REPORT with the returned token.
+    pub(crate) truncated: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -188,6 +194,34 @@ impl CalDavSyncReport {
         for entry in &mut self.entries {
             entry.uri = resolve_href(request_url, &entry.uri);
         }
+    }
+
+    /// Remove the response describing the COLLECTION itself and record whether
+    /// it announced truncation.
+    ///
+    /// The `sync-collection` REPORT requests only `getetag`, so no
+    /// `resourcetype` distinguishes the collection's own response from a
+    /// member's - the href does, and it is resolved absolute by the time this
+    /// runs. Left in place, that response is an ordinary member entry: it is
+    /// inserted into the snapshot as if the collection were an event, and a
+    /// phantom `Created` is emitted for it. Its status is also the RFC 6578
+    /// s3.6 truncation marker (507), which is a statement about the REPORT and
+    /// not about any resource.
+    ///
+    /// `request_url` is the URI the REPORT was actually served from and
+    /// `collection_url` the one it was addressed to; a redirect can make them
+    /// differ, and either spelling identifies the collection.
+    pub(crate) fn take_collection_response(&mut self, collection_url: &str, request_url: &str) {
+        let mut truncated = false;
+        self.entries.retain(|entry| {
+            if same_dav_url(&entry.uri, collection_url) || same_dav_url(&entry.uri, request_url) {
+                truncated |= entry.status == Some(507);
+                false
+            } else {
+                true
+            }
+        });
+        self.truncated = truncated;
     }
 }
 
@@ -342,8 +376,18 @@ pub(crate) fn parse_propfind_events(xml: &str) -> Result<CalDavEventListing, Str
                 if current.in_response {
                     match (parent, name.as_str()) {
                         (Some("response"), "href") => current.href = trimmed(&text),
-                        (Some("prop"), "getetag") => current.etag = normalize_etag(&text),
-                        (Some("prop"), "getcontenttype") => current.content_type = trimmed(&text),
+                        // Staged, never written straight to the committed
+                        // field: a property inside a REFUSED propstat is not
+                        // evidence about the resource. A server echoing the
+                        // requested prop skeleton back inside a 404 - the same
+                        // shape the `collection` marker is staged against -
+                        // would otherwise poison the snapshot etag with a stale
+                        // value, and the snapshot diff and the inventory
+                        // fingerprint both read that etag.
+                        (Some("prop"), "getetag") => current.staged.etag = normalize_etag(&text),
+                        (Some("prop"), "getcontenttype") => {
+                            current.staged.content_type = trimmed(&text);
+                        }
                         (Some("propstat"), "status") => {
                             current.staged.success = Some(status_line_is_success(&text));
                         }
@@ -485,6 +529,7 @@ pub(crate) fn parse_sync_collection_report(xml: &str) -> Result<CalDavSyncReport
     let mut report = CalDavSyncReport {
         sync_token: None,
         entries: Vec::new(),
+        truncated: false,
     };
     let mut current = SyncResponseParts::default();
     let mut stack = Vec::new();
@@ -678,6 +723,7 @@ struct PropStat {
     status: Option<String>,
     calendar_data: Option<String>,
     etag: Option<String>,
+    content_type: Option<String>,
 }
 
 #[derive(Default)]
@@ -801,6 +847,9 @@ impl ResponseParts {
             if staged.etag.is_some() {
                 self.etag = staged.etag;
             }
+            if staged.content_type.is_some() {
+                self.content_type = staged.content_type;
+            }
         }
     }
 
@@ -823,7 +872,12 @@ impl ResponseParts {
             return None;
         }
         // A resource whose only propstat failed is not a committed
-        // entry; it is surfaced via `as_failed_event_href` instead.
+        // entry; it is surfaced via `as_failed_event_href` instead. A
+        // response carrying NO propstat at all is still a member and
+        // commits, etag-less: withholding it would drop a resource the
+        // server named out of both lanes, and the snapshot diff would then
+        // destroy a resource that exists. `bifrost-carddav` reads it the
+        // same way - the two drifted here, and this is the surviving side.
         if self.saw_failed_propstat && !self.has_success_propstat {
             return None;
         }
@@ -1204,6 +1258,24 @@ END:VCALENDAR</C:calendar-data></D:prop>
         let report = parse_multiget_report(xml).expect("valid XML");
         assert_eq!(report.events.len(), 1);
         assert_eq!(report.events[0].uri, "/cal/opaque-id");
+    }
+
+    /// An etag echoed back inside a REFUSED propstat is not evidence about
+    /// the resource. Committing it poisons the snapshot etag, which drives
+    /// both the change diff and the inventory fingerprint.
+    #[test]
+    fn propfind_events_ignores_an_etag_inside_a_failed_propstat() {
+        let xml = r#"<D:multistatus xmlns:D="DAV:"><D:response>
+          <D:href>/cal/opaque-id</D:href>
+          <D:propstat><D:prop><D:getcontenttype>text/calendar</D:getcontenttype></D:prop>
+          <D:status>HTTP/1.1 200 OK</D:status></D:propstat>
+          <D:propstat><D:prop><D:getetag>"stale"</D:getetag></D:prop>
+          <D:status>HTTP/1.1 404 Not Found</D:status></D:propstat>
+          </D:response></D:multistatus>"#;
+
+        let listing = parse_propfind_events(xml).expect("valid XML");
+        assert_eq!(listing.entries.len(), 1);
+        assert_eq!(listing.entries[0].etag, None);
     }
 
     #[test]

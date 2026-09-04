@@ -409,6 +409,8 @@ fn parse_vevents(data: &str) -> Result<Vec<VeventBlock>, IcalParseError> {
     let mut blocks = Vec::new();
     let mut current: Option<VeventBlock> = None;
     let mut alarm: Option<Vec<Prop>> = None;
+    // How deep we are inside a nested component this parser does not model.
+    let mut unknown_depth: usize = 0;
     for line in LineReader::from_slice(data.as_bytes()) {
         let line = line.map_err(|error| IcalParseError(error.to_string()))?;
         let normalized = normalize_exchange_cn_param(line.as_str());
@@ -418,6 +420,20 @@ fn parse_vevents(data: &str) -> Result<Vec<VeventBlock>, IcalParseError> {
             .expect("one logical line produces one content line")
             .map_err(|error| IcalParseError(error.to_string()))?;
         let name = line.name;
+        // Inside a sub-component this VEVENT projection does not model
+        // (vendor X-components exist in the wild, and VTODO/VJOURNAL can
+        // nest), every line belongs to that component and NONE of it belongs
+        // to the event. Feeding them into the master's prop list let
+        // `pick_datetime`'s specificity ladder prefer a sub-component's
+        // DTSTART over the event's own.
+        if unknown_depth > 0 {
+            if name == "BEGIN" {
+                unknown_depth += 1;
+            } else if name == "END" {
+                unknown_depth -= 1;
+            }
+            continue;
+        }
         if name == "BEGIN" && line.value.eq_ignore_ascii_case("VEVENT") {
             current = Some(VeventBlock::default());
             continue;
@@ -427,6 +443,7 @@ fn parse_vevents(data: &str) -> Result<Vec<VeventBlock>, IcalParseError> {
                 blocks.push(block);
             }
             alarm = None;
+            unknown_depth = 0;
             continue;
         }
         let Some(block) = current.as_mut() else {
@@ -441,6 +458,17 @@ fn parse_vevents(data: &str) -> Result<Vec<VeventBlock>, IcalParseError> {
             if let Some(alarm) = alarm.take() {
                 block.alarms.push(alarm);
             }
+            continue;
+        }
+        // Any other nested component - a vendor X-component, a nested
+        // VTODO - is skipped whole, including a VALARM inside it, until its
+        // END. A stray END with nothing open is ignored rather than treated
+        // as a property.
+        if name == "BEGIN" {
+            unknown_depth = 1;
+            continue;
+        }
+        if name == "END" {
             continue;
         }
         let prop = Prop {
@@ -735,6 +763,7 @@ fn ical_offset_suffix(value: &str) -> String {
 fn event_end_from_duration(start: &EventTime, duration: &str) -> Option<EventTime> {
     // `caldata` still speaks chrono, so cross the boundary as a plain
     // second count rather than naming its duration type.
+    let raw_duration = duration;
     let duration =
         SignedDuration::from_secs(caldata::types::parse_duration(duration).ok()?.num_seconds());
     let value = if let Ok(value) = start.value.parse::<Timestamp>() {
@@ -745,11 +774,19 @@ fn event_end_from_duration(start: &EventTime, duration: &str) -> Option<EventTim
             end.strftime("%Y-%m-%dT%H:%M:%S+00:00").to_string()
         }
     } else if let Ok(value) = civil::DateTime::strptime("%Y-%m-%dT%H:%M:%S", &start.value) {
-        value
-            .checked_add(duration)
-            .ok()?
-            .strftime("%Y-%m-%dT%H:%M:%S")
-            .to_string()
+        // RFC 5545 s3.3.6 splits a duration in two: the DAY and WEEK parts are
+        // NOMINAL (a day is "the same wall time tomorrow", DST or not) while
+        // the time parts are EXACT seconds. Civil addition is right for the
+        // first and wrong for the second, and this branch is exactly where a
+        // TZID-bearing DTSTART lands - so an exact duration under a known zone
+        // is added through the zone, and everything else keeps the civil
+        // arithmetic that was already correct for it.
+        match exact_zone_end(&start.timezone, value, duration, raw_duration) {
+            Some(end) => end,
+            None => value.checked_add(duration).ok()?,
+        }
+        .strftime("%Y-%m-%dT%H:%M:%S")
+        .to_string()
     } else if let Ok(value) = civil::Date::strptime("%Y-%m-%d", &start.value) {
         value
             .to_datetime(civil::Time::MIN)
@@ -765,6 +802,43 @@ fn event_end_from_duration(start: &EventTime, duration: &str) -> Option<EventTim
         value,
         timezone: start.timezone.clone(),
     })
+}
+
+/// Add an EXACT (time-only) duration to a wall clock through its named zone,
+/// so a `DTSTART;TZID=...` plus `PT10H` crossing a DST transition lands on the
+/// wall clock that is really that many seconds later.
+///
+/// Returns `None` - meaning "use civil arithmetic" - when the duration carries
+/// a nominal day or week part, when there is no zone, or when the zone is not
+/// in the tzdb. Ambiguity discipline matches the rest of this module: a
+/// fall-back fold takes the earlier instant, a spring-forward gap the post-gap
+/// offset.
+fn exact_zone_end(
+    timezone: &Option<String>,
+    start: civil::DateTime,
+    duration: SignedDuration,
+    raw_duration: &str,
+) -> Option<civil::DateTime> {
+    if !duration_is_exact(raw_duration) {
+        return None;
+    }
+    let tz = TimeZone::get(&canonical_tzid(timezone.as_deref()?)).ok()?;
+    let start = match tz.to_ambiguous_timestamp(start).offset() {
+        AmbiguousOffset::Unambiguous { offset } => offset,
+        AmbiguousOffset::Fold { before, .. } => before,
+        AmbiguousOffset::Gap { after, .. } => after,
+    }
+    .to_timestamp(start)
+    .ok()?;
+    Some(tz.to_datetime(start.checked_add(duration).ok()?))
+}
+
+/// True when every component of an RFC 5545 duration is an exact one. `D` and
+/// `W` are nominal by the spec and stay on the civil path.
+fn duration_is_exact(duration: &str) -> bool {
+    !duration
+        .chars()
+        .any(|character| matches!(character.to_ascii_uppercase(), 'D' | 'W'))
 }
 
 fn ical_time_from_event_time(time: &EventTime, is_all_day: bool) -> String {
@@ -1394,6 +1468,66 @@ mod tests {
         assert_eq!(event.title.as_deref(), Some("Meet, now"));
         assert_eq!(event.start.value, "2026-06-02T12:00:00Z");
         assert_eq!(event.attendees[0].status, RsvpStatus::Accepted);
+    }
+
+    /// A nested component this projection does not model contributes NOTHING
+    /// to the event. Its properties used to be appended to the master's prop
+    /// list, where `pick_datetime`'s specificity ladder could prefer the
+    /// sub-component's TZID-bearing DTSTART over the event's own UTC one -
+    /// projecting the wrong time for the event.
+    #[test]
+    fn an_unknown_nested_component_does_not_leak_into_the_event() {
+        let event = parse_event(
+            "/cal/one.ics".to_string(),
+            CalendarId("/cal/".to_string()),
+            None,
+            "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:u1\r\nSUMMARY:Real\r\n\
+             DTSTART:20260602T120000Z\r\nDTEND:20260602T130000Z\r\n\
+             BEGIN:X-VENDOR-THING\r\nSUMMARY:Nested\r\n\
+             DTSTART;TZID=Europe/Oslo:20200101T090000\r\n\
+             BEGIN:VALARM\r\nTRIGGER:-PT5M\r\nEND:VALARM\r\n\
+             END:X-VENDOR-THING\r\n\
+             BEGIN:VALARM\r\nTRIGGER:-PT10M\r\nEND:VALARM\r\n\
+             END:VEVENT\r\nEND:VCALENDAR\r\n",
+        );
+
+        assert_eq!(event.title.as_deref(), Some("Real"));
+        assert_eq!(event.start.value, "2026-06-02T12:00:00Z");
+        assert_eq!(event.start.timezone, None);
+        assert_eq!(
+            event.reminders.len(),
+            1,
+            "an alarm inside the vendor component is not the event's reminder"
+        );
+    }
+
+    /// RFC 5545 s3.3.6: the time parts of a duration are EXACT seconds, so
+    /// `PT10H` across Europe/Oslo's spring-forward lands on 21:00 wall clock,
+    /// not the 20:00 civil addition produces. The day and week parts stay
+    /// nominal, so `P1D` over the same transition keeps its wall clock.
+    #[test]
+    fn a_duration_end_under_a_tzid_respects_the_dst_transition() {
+        let event = |duration: &str| {
+            parse_event(
+                "/cal/one.ics".to_string(),
+                CalendarId("/cal/".to_string()),
+                None,
+                &format!(
+                    "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:u1\r\n\
+                     DTSTART;TZID=Europe/Oslo:20260329T010000\r\n\
+                     DURATION:{duration}\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+                ),
+            )
+        };
+
+        // 01:00 + 10 exact hours over the 02:00 -> 03:00 jump is 12:00, where
+        // DST-blind civil addition answers 11:00.
+        let exact = event("PT10H");
+        assert_eq!(exact.end.value, "2026-03-29T12:00:00");
+        assert_eq!(exact.end.timezone.as_deref(), Some("Europe/Oslo"));
+
+        // A nominal day keeps the wall clock across the same transition.
+        assert_eq!(event("P1D").end.value, "2026-03-30T01:00:00");
     }
 
     #[test]
