@@ -39,24 +39,12 @@ treat any entry with a non-2xx/404/410 status as a preserved-not-upserted
 resource; and (ideally) loop the REPORT until the response arrives
 untruncated.
 
-### 3. `ical_time_from_event_time` mislabels a UTC-instant-with-TZID as a wall clock, shifting the event by the zone offset
-
-`crates/caldav/src/ical.rs` (~line 776): when `time.value` parses as a
-`Timestamp` (e.g. `2026-06-02T12:00:00Z`) *and* `time.timezone` is
-`Some("Europe/Oslo")`, the code tries `time.value.parse::<civil::DateTime>()`,
-which **fails** on the trailing `Z`, and falls back to
-`Offset::UTC.to_datetime(instant)` - then emits that UTC wall clock under
-`DTSTART;TZID=Europe/Oslo:`. 12:00 UTC becomes 12:00 Oslo: a 1-2 hour shift on
-the wire. The internal read path never produces this combination (TZID values
-project bare), so round trips are safe; but `EventCreate`/`EventPatch` come
-from consumers, and a consumer supplying an instant plus a display zone - a
-completely natural pairing given `EventTime`'s shape - gets a silently shifted
-event. The correct fallback is to convert the instant *into* the named zone's
-wall clock (jiff `TimeZone::get` + `to_datetime`), not into UTC. Same latent
-shape feeds `push_vtimezones`' anchor via `event_naive_local`, which for a `Z`
-value strips the `Z` and reads the UTC wall clock as the zone's local time, so
-the VTIMEZONE offset can also be resolved at the wrong local instant across a
-DST boundary.
+(Finding 3 - a UTC instant under a TZID emitted as the UTC wall clock,
+shifting the event by the zone offset - is fixed: `instant_zone_wall` projects
+the instant into the named zone (UTC fallback only for unknown zones) in both
+`ical_time_from_event_time` and `event_naive_local`, so the DTSTART/DTEND
+values and the VTIMEZONE anchor agree. The two serializer tests that pinned
+the shifted output now pin the zone-local rendering.)
 
 ### 4. CalDAV depth-1 event PROPFIND commits `getetag` from *failed* propstats - drift from both its own multiget parser and the CardDAV twin
 

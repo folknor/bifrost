@@ -775,12 +775,16 @@ fn ical_time_from_event_time(time: &EventTime, is_all_day: bool) -> String {
     }
     if let Ok(instant) = time.value.parse::<Timestamp>() {
         if time.timezone.is_some() {
-            // Under a TZID the wall clock is what belongs on the wire, so
-            // render in the value's own offset rather than normalizing.
+            // Under a TZID the wall clock is what belongs on the wire. An
+            // offset-carrying value renders in its own offset (the civil
+            // parser accepts and drops a numeric offset); a `Z` value names
+            // an instant, which must be projected into the TZID's wall clock
+            // - emitting the UTC wall clock under the zone label would shift
+            // the event by the zone offset.
             let wall = time
                 .value
                 .parse::<civil::DateTime>()
-                .unwrap_or_else(|_| Offset::UTC.to_datetime(instant));
+                .unwrap_or_else(|_| instant_zone_wall(time.timezone.as_deref(), instant));
             return wall.strftime("%Y%m%dT%H%M%S").to_string();
         }
         return Offset::UTC
@@ -973,12 +977,29 @@ fn event_naive_local(time: &EventTime) -> Option<civil::DateTime> {
     if let Ok(parsed) = time.value.parse::<civil::DateTime>() {
         return Some(parsed);
     }
-    // Fall back to parsing a bare iCalendar-style `YYYYMMDDTHHMMSS[Z]` value.
-    // This also covers a `Z`-suffixed RFC 3339 value, which the civil parser
-    // rejects because Temporal reads `Z` as an unknown offset.
+    // A `Z`-suffixed RFC 3339 value names an instant (the civil parser
+    // rejects it because Temporal reads `Z` as an unknown offset). The
+    // VTIMEZONE anchor must be that instant's wall clock IN THE ZONE;
+    // reading the UTC wall clock as zone-local can resolve the offset on
+    // the wrong side of a DST transition.
+    if let Ok(instant) = time.value.parse::<Timestamp>() {
+        return Some(instant_zone_wall(time.timezone.as_deref(), instant));
+    }
+    // Fall back to parsing a bare iCalendar-style `YYYYMMDDTHHMMSS` value.
     let raw = time.value.replace(['-', ':'], "");
     let raw = raw.trim_end_matches('Z');
     civil::DateTime::strptime("%Y%m%dT%H%M%S", raw).ok()
+}
+
+/// Project an instant into `tzid`'s wall clock. Falls back to the UTC wall
+/// clock when the zone is absent or unknown to the tzdb - the least-wrong
+/// rendering available once the value has already committed to an instant.
+fn instant_zone_wall(tzid: Option<&str>, instant: Timestamp) -> civil::DateTime {
+    tzid.and_then(|name| TimeZone::get(&canonical_tzid(name)).ok())
+        .map_or_else(
+            || Offset::UTC.to_datetime(instant),
+            |tz| tz.to_datetime(instant),
+        )
 }
 
 /// Resolve the iCalendar UTC-offset string (`+HHMM` / `-HHMM`) for `tzid` at
@@ -1821,8 +1842,11 @@ mod tests {
         // event by 2h).
         assert!(body.contains("TZOFFSETFROM:+0200"));
         assert!(body.contains("TZOFFSETTO:+0200"));
-        assert!(body.contains("DTSTART;TZID=Europe/Oslo:20260602T120000"));
-        assert!(body.contains("DTEND;TZID=Europe/Oslo:20260602T130000"));
+        // The `Z` values name instants; under the TZID they must render as
+        // the zone's wall clock (12:00Z = 14:00 CEST), not the UTC wall
+        // clock the old code emitted (a silent 2h shift on the wire).
+        assert!(body.contains("DTSTART;TZID=Europe/Oslo:20260602T140000"));
+        assert!(body.contains("DTEND;TZID=Europe/Oslo:20260602T150000"));
     }
 
     #[test]
@@ -1852,9 +1876,10 @@ mod tests {
             "uid-1",
         );
 
-        // January is winter time in Oslo: CET = +0100.
+        // January is winter time in Oslo: CET = +0100, so the 12:00Z
+        // instant is 13:00 on the local wall clock.
         assert!(body.contains("TZOFFSETTO:+0100"));
-        assert!(body.contains("DTSTART;TZID=Europe/Oslo:20260115T120000"));
+        assert!(body.contains("DTSTART;TZID=Europe/Oslo:20260115T130000"));
     }
 
     #[test]

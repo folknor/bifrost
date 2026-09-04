@@ -304,6 +304,11 @@ Supported calendar primitives:
   carries the real UTC offset for the event's instant in a single STANDARD
   block (resolved via jiff's bundled tzdb), not full timezone transition-rule
   definitions; an unknown zone emits the bare VTIMEZONE with no offset block.
+  A TZID-bearing time whose value is an instant (`...Z` / numeric offset)
+  renders as that instant's wall clock in the named zone (a `Z` value is
+  projected through the tzdb; an unknown zone falls back to the UTC wall
+  clock): emitting the UTC wall clock under a TZID would shift the event by
+  the zone offset on the wire.
 - `event_update` - fetches the current event, applies the shared
   `EventPatch`, and writes the replacement resource with `If-Match`
   when a strong etag was present.
