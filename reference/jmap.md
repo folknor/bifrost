@@ -55,10 +55,9 @@ reopened forever against a session that will never change. `core_capabilities()`
 still collapses `Absent` and `Malformed` into `None`, which is correct for any
 reader that only declines to enforce a bound; every reader that CLASSIFIES a bad
 session must use the three-state. Treating the first two as a limit of zero would make
-every request unable to hold a single call - and because open issues its probe
-requests through `seed_account_state` *before* `sync::capabilities::build`
-validates the session, that failure would land as `Request(Malformed)` /
-`ClientBug` and preempt the classifications the engine actually needs:
+every request unable to hold a single call - and any caller probing such a
+session would then see `Request(Malformed)` /
+`ClientBug`, preempting the classifications the engine actually needs:
 `SyncState(CapabilityChanged)` / `RestartAccount` for an absent core capability,
 `Protocol(ContractViolation)` for a zero-valued one. Capability validation is
 the gate for both bad sessions; the request builder enforces only a limit the
@@ -203,7 +202,15 @@ Every JMAP object type under `crates/jmap/src/<type>/`:
 
 `try_cap!` falls back to `Capabilities::Malformed(value)`, never to
 `Capabilities::Other`, so a URI this crate models whose object it refuses to
-parse is never reported as unadvertised. `Other` now means exactly one thing: a
+parse is never reported as unadvertised. It first refuses any value that is not
+a JSON OBJECT, which is not redundant with the typed parse: serde's derived
+struct deserializers also accept a SEQUENCE in field-declaration order, so a
+block sent as `[]` deserialized into any capability struct whose fields all
+default and read as a fully advertised Present block (the calendars block sent
+as `[]` was the concrete case), while `["16"]` fed the core block a
+limit positionally. RFC 8620 §2 makes every capability value an object, and the
+guard sits at the one door every modelled URI passes through, so the array lane
+is closed for all of them at once rather than per struct. `Other` now means exactly one thing: a
 URI the crate does not model. `session_cap_accessor!` generates the two readers
 each capability needs from one mechanism - `x_capabilities() -> Option<&T>` for
 callers that only decline to act, and `x_capability_state() ->
@@ -215,7 +222,8 @@ whether the account DEPENDS on the block:
 
 - **Required.** `urn:ietf:params:jmap:core` and `urn:ietf:params:jmap:mail`.
   A malformed block is `Protocol(ContractViolation)` at
-  `sync::capabilities::build`, refused at open, with the URI in the diagnostic.
+  `sync::capabilities::validate_session`, refused at open BEFORE any probe goes
+  out, with the URI in the diagnostic.
   Not `SyncState(CapabilityChanged)`: nothing about this session changes on a
   reopen, so that lane buys an endless reopen loop.
 - **Optional.** Everything else the crate models (websocket, submission, sieve,
@@ -345,7 +353,7 @@ crates/jmap/src/sync/
 
 ### `JmapAccount` / `JmapAccountFactory` shape and lifecycle
 
-`JmapAccountFactory` carries a `JmapAccountFactoryBuilder` config (URL, `JmapCredentials::Basic`/`Bearer`, optional timeout, `accept_invalid_certs`, `ReconnectPolicy`). `AccountFactory::open(account_id)` connects a `Client`, passing the engine account id into the `bifrost-net` attachment so metering / priority / caps / trace use the real key on reopen. Open resolves the primary `Mail` account plus the optional `Submission`/`VacationResponse`/`Quota`/`Sieve`/`Contacts`/`Calendars` handles through `resolve_optional_families` (which gates each on its own capability block's lane; see "Absent, Malformed, Present" above), reads the session, builds `AccountCapabilities` + `CoreLimits`, then batches the initial `Email/get` and `Mailbox/get` (including names) probes into one request for the primary and one request per foreign account. It spawns the WebSocket reader with a `CancellationToken`, and returns `OpenedAccount` (the handle plus the foreign-account skip lane; see Foreign accounts below).
+`JmapAccountFactory` carries a `JmapAccountFactoryBuilder` config (URL, `JmapCredentials::Basic`/`Bearer`, optional timeout, `accept_invalid_certs`, `ReconnectPolicy`). `AccountFactory::open(account_id)` connects a `Client`, passing the engine account id into the `bifrost-net` attachment so metering / priority / caps / trace use the real key on reopen. Open resolves the primary `Mail` account plus the optional `Submission`/`VacationResponse`/`Quota`/`Sieve`/`Contacts`/`Calendars` handles through `resolve_optional_families` (which gates each on its own capability block's lane; see "Absent, Malformed, Present" above), reads the session, and then runs `validate_and_seed`: the session-only half of the capability validation (`capabilities::validate_session` - the core block's lane and its mandatory limits, plus the required mail block's lane) FIRST, and only then the initial `Email/get` and `Mailbox/get` (including names) probes, batched into one request for the primary and one request per foreign account. The order is load-bearing, not incidental: validation used to run only inside `capabilities::build`, after the whole seeding stage, so an open destined to be refused as a contract violation first spent two primary probes plus one per share against a server already known non-conformant and discarded every answer. The half of the validation that genuinely needs probe results - the `PimSupport` gates, which depend on which shares actually seeded - stays in `build`, which still calls `validate_session` itself so the refusal does not depend on the caller having run it. `build` then produces `AccountCapabilities` + `CoreLimits`. It spawns the WebSocket reader with a `CancellationToken`, and returns `OpenedAccount` (the handle plus the foreign-account skip lane; see Foreign accounts below).
 
 The batch is conditional on the session's own numbers. `maxCallsInRequest` and `maxSizeRequest` are hard limits (RFC 8620 §2) the server enforces by rejecting the whole request with a request-level `limit` error, and the commonly quoted 16 calls is the minimum a server is *recommended* to support, never a floor a client may assume. So `batched_open_probes` sends the two-call batch only when the advertised call count allows it and `Request::send_methods_within` finds the encoded request inside `maxSizeRequest`; otherwise nothing is sent and the probes go out one request each. `send_methods_within` takes the size limit as a required argument (and returns `Ok(None)` without sending when the batch does not fit) precisely so a future batching call site cannot forget the question.
 

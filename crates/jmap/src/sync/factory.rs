@@ -20,15 +20,12 @@ use crate::core::transport::HttpTransport;
 use crate::email::{EmailGet, EmailId};
 use crate::mailbox::{MailboxGet, Property as MailboxProperty};
 use crate::principal::PrincipalGet;
-use crate::transport_reqwest::ReqwestTransport;
 
 use super::account::JmapAccount;
 use super::capabilities;
 use super::foreign;
 use super::push::{PushRouting, ReconnectPolicy, WsState};
 use super::state;
-
-type MailAccount = JmapMailAccount<ReqwestTransport>;
 
 // pub: re-exported through crate::sync for engine AccountFactory registration.
 #[derive(Debug, Clone)]
@@ -162,117 +159,18 @@ impl AccountFactory for JmapAccountFactory {
                 max_delayed_send,
             } = resolve_optional_families(&client);
             let session = client.session();
+            let SeededOpenState {
+                seed_states,
+                email_states,
+                mailbox_states,
+                lifecycle_mailbox_states,
+                mailbox_names,
+                primary_id,
+                foreign_mail,
+                foreign_submission,
+                skipped_scopes,
+            } = validate_and_seed(&client, &mail).await?;
             let self_emails = fetch_self_emails(&client, &config.credentials).await;
-            let (email_state, mailbox_state, mailbox_names) =
-                seed_account_state(&mail).await.map_err(|err| {
-                    super::error::into_account_error(
-                        err,
-                        super::error::JmapErrorContext::new(
-                            bifrost_types::AccountOperation::Discover,
-                        )
-                        .with_scope(bifrost_types::ErrorScope::Account),
-                    )
-                })?;
-
-            let mut seed_states = HashMap::new();
-            seed_states.insert(
-                CursorScope::Type(ObjectType::Email),
-                state::encode_for_scope(&CursorScope::Type(ObjectType::Email), email_state.clone())
-                    .expect("static email cursor scope is supported"),
-            );
-            seed_states.insert(
-                CursorScope::Type(ObjectType::Mailbox),
-                state::encode_for_scope(
-                    &CursorScope::Type(ObjectType::Mailbox),
-                    mailbox_state.clone(),
-                )
-                .expect("static mailbox cursor scope is supported"),
-            );
-
-            // Per-accountId state caches. The primary account's id keys
-            // the same maps every foreign account does - no primary-vs-
-            // foreign branch in the cache itself.
-            let primary_id = mail.id_str().to_string();
-            let mut email_states: HashMap<String, Option<String>> = HashMap::new();
-            let mut mailbox_states: HashMap<String, Option<String>> = HashMap::new();
-            email_states.insert(primary_id.clone(), Some(email_state.clone()));
-            mailbox_states.insert(primary_id.clone(), Some(mailbox_state.clone()));
-            let mut lifecycle_mailbox_states = HashMap::new();
-            lifecycle_mailbox_states.insert(primary_id.clone(), Some(mailbox_state.clone()));
-
-            // Foreign (shared/delegate) accounts: the session lists every
-            // non-personal mail account. For each, probe its two states
-            // and seed ONE account-level `Folder` cursor scope. JMAP
-            // `Email/changes` state is per (accountId, type) and cannot
-            // be filtered by mailbox, so a per-mailbox topology would
-            // stream the same account-wide change set once per mailbox
-            // (the original B9 defect); the account-level scope streams
-            // it exactly once, and per-mailbox membership is derived at
-            // hydration from the qualified `mailboxIds` - the same model
-            // the primary `Type(Email)` scope uses. A probe failure -
-            // revoked grant and exhausted transient retry alike - skips
-            // that foreign account and records the omission on
-            // `OpenedAccount::skipped_scopes` with its classified error.
-            // Open itself must not fail here: initial attach does not
-            // retry `factory.open`, so failing would block the user's
-            // own primary mail on someone else's shared mailbox being
-            // down. And skipping silently would erase the share for the
-            // session with no signal anywhere.
-            let foreign_ids = foreign_mail_account_ids(&session, &primary_id);
-            let mut foreign_mail: HashMap<String, MailAccount> = HashMap::new();
-            let mut foreign_submission = HashSet::new();
-            let mut skipped_scopes: Vec<SkippedScope> = Vec::new();
-            // Probing the shares concurrently bounds open latency by the
-            // slowest share instead of their sum, but the concurrency has
-            // to be the server's number, not the share count: RFC 8620 s2
-            // advertises `maxConcurrentRequests`, and a client that
-            // exceeds it earns a request-level `limit` error - which here
-            // would arrive as a spurious skip of a perfectly healthy
-            // share. This is the only place in the crate that issues
-            // overlapping API requests, so the bound lives here.
-            let probe_concurrency = foreign_probe_concurrency(&session);
-            let foreign_results =
-                futures::stream::iter(foreign_ids.into_iter().map(|foreign_id| {
-                    let foreign_account =
-                        MailAccount::new(client.clone(), JmapAccountId::new(&foreign_id));
-                    async move {
-                        let result =
-                            seed_foreign_account_or_skip(&foreign_id, &foreign_account).await;
-                        (foreign_id, foreign_account, result)
-                    }
-                }))
-                .buffer_unordered(probe_concurrency)
-                .collect::<Vec<_>>()
-                .await;
-            // Completion order is arrival order; installation order must
-            // not be. Sorting by accountId keeps `foreign_mail`,
-            // `seed_states`, and `skipped_scopes` identical across runs.
-            let mut foreign_results = foreign_results;
-            foreign_results.sort_by(|a, b| a.0.cmp(&b.0));
-            for (foreign_id, foreign_account, result) in foreign_results {
-                match result {
-                    Ok(seed) => {
-                        apply_foreign_seed(
-                            &foreign_id,
-                            seed,
-                            &mut seed_states,
-                            &mut email_states,
-                            &mut mailbox_states,
-                        );
-                        if account_advertises_submission(&session, &foreign_id) {
-                            foreign_submission.insert(foreign_id.clone());
-                        }
-                        foreign_mail.insert(foreign_id, foreign_account);
-                    }
-                    Err(skip) => {
-                        // Leave the share out of this session's surface
-                        // and report the omission. Reopen re-reads the
-                        // session, so a restored grant or a recovered
-                        // server brings the share back.
-                        skipped_scopes.push(skip);
-                    }
-                }
-            }
 
             // This gate is derived from the successfully seeded routing set,
             // never merely from the session. A foreign account skipped during
@@ -334,6 +232,159 @@ impl AccountFactory for JmapAccountFactory {
             })
         })
     }
+}
+
+/// Everything the open sequence reads off the wire before it can build an
+/// account: the primary account's two states, and one probe per foreign
+/// (shared/delegate) mail account.
+struct SeededOpenState<Tr: HttpTransport> {
+    seed_states: HashMap<CursorScope, bifrost_types::OpaqueChangeState>,
+    email_states: HashMap<String, Option<String>>,
+    mailbox_states: HashMap<String, Option<String>>,
+    lifecycle_mailbox_states: HashMap<String, Option<String>>,
+    mailbox_names: HashMap<String, String>,
+    primary_id: String,
+    foreign_mail: HashMap<String, JmapMailAccount<Tr>>,
+    foreign_submission: HashSet<String>,
+    skipped_scopes: Vec<SkippedScope>,
+}
+
+/// Validate the session, THEN seed.
+///
+/// The order is the point, and it is why this stage is a function rather
+/// than inline in `open`. `capabilities::build` used to be the only caller
+/// of the session validation, and it runs after this whole stage - so an
+/// open destined to be refused as a contract violation first issued the two
+/// primary probes plus one per share, against a server already known to be
+/// non-conformant, and threw every answer away. The session-only half of
+/// that validation (core lane and limits, the required mail block's lane)
+/// needs nothing from the wire, so it is decided first and the probes never
+/// go out. The half that DOES need probe results - the `PimSupport` gates,
+/// which depend on which shares actually seeded - stays in `build`.
+async fn validate_and_seed<Tr: HttpTransport>(
+    client: &Client<Tr>,
+    mail: &JmapMailAccount<Tr>,
+) -> Result<SeededOpenState<Tr>, AccountError> {
+    let session = client.session();
+    capabilities::validate_session(&session)?;
+
+    let (email_state, mailbox_state, mailbox_names) =
+        seed_account_state(mail).await.map_err(|err| {
+            super::error::into_account_error(
+                err,
+                super::error::JmapErrorContext::new(bifrost_types::AccountOperation::Discover)
+                    .with_scope(bifrost_types::ErrorScope::Account),
+            )
+        })?;
+
+    let mut seed_states = HashMap::new();
+    seed_states.insert(
+        CursorScope::Type(ObjectType::Email),
+        state::encode_for_scope(&CursorScope::Type(ObjectType::Email), email_state.clone())
+            .expect("static email cursor scope is supported"),
+    );
+    seed_states.insert(
+        CursorScope::Type(ObjectType::Mailbox),
+        state::encode_for_scope(
+            &CursorScope::Type(ObjectType::Mailbox),
+            mailbox_state.clone(),
+        )
+        .expect("static mailbox cursor scope is supported"),
+    );
+
+    // Per-accountId state caches. The primary account's id keys
+    // the same maps every foreign account does - no primary-vs-
+    // foreign branch in the cache itself.
+    let primary_id = mail.id_str().to_string();
+    let mut email_states: HashMap<String, Option<String>> = HashMap::new();
+    let mut mailbox_states: HashMap<String, Option<String>> = HashMap::new();
+    email_states.insert(primary_id.clone(), Some(email_state.clone()));
+    mailbox_states.insert(primary_id.clone(), Some(mailbox_state.clone()));
+    let mut lifecycle_mailbox_states = HashMap::new();
+    lifecycle_mailbox_states.insert(primary_id.clone(), Some(mailbox_state.clone()));
+
+    // Foreign (shared/delegate) accounts: the session lists every
+    // non-personal mail account. For each, probe its two states
+    // and seed ONE account-level `Folder` cursor scope. JMAP
+    // `Email/changes` state is per (accountId, type) and cannot
+    // be filtered by mailbox, so a per-mailbox topology would
+    // stream the same account-wide change set once per mailbox
+    // (the original B9 defect); the account-level scope streams
+    // it exactly once, and per-mailbox membership is derived at
+    // hydration from the qualified `mailboxIds` - the same model
+    // the primary `Type(Email)` scope uses. A probe failure -
+    // revoked grant and exhausted transient retry alike - skips
+    // that foreign account and records the omission on
+    // `OpenedAccount::skipped_scopes` with its classified error.
+    // Open itself must not fail here: initial attach does not
+    // retry `factory.open`, so failing would block the user's
+    // own primary mail on someone else's shared mailbox being
+    // down. And skipping silently would erase the share for the
+    // session with no signal anywhere.
+    let foreign_ids = foreign_mail_account_ids(&session, &primary_id);
+    let mut foreign_mail: HashMap<String, JmapMailAccount<Tr>> = HashMap::new();
+    let mut foreign_submission = HashSet::new();
+    let mut skipped_scopes: Vec<SkippedScope> = Vec::new();
+    // Probing the shares concurrently bounds open latency by the
+    // slowest share instead of their sum, but the concurrency has
+    // to be the server's number, not the share count: RFC 8620 s2
+    // advertises `maxConcurrentRequests`, and a client that
+    // exceeds it earns a request-level `limit` error - which here
+    // would arrive as a spurious skip of a perfectly healthy
+    // share. This is the only place in the crate that issues
+    // overlapping API requests, so the bound lives here.
+    let probe_concurrency = foreign_probe_concurrency(&session);
+    let foreign_results = futures::stream::iter(foreign_ids.into_iter().map(|foreign_id| {
+        let foreign_account = JmapMailAccount::new(client.clone(), JmapAccountId::new(&foreign_id));
+        async move {
+            let result = seed_foreign_account_or_skip(&foreign_id, &foreign_account).await;
+            (foreign_id, foreign_account, result)
+        }
+    }))
+    .buffer_unordered(probe_concurrency)
+    .collect::<Vec<_>>()
+    .await;
+    // Completion order is arrival order; installation order must
+    // not be. Sorting by accountId keeps `foreign_mail`,
+    // `seed_states`, and `skipped_scopes` identical across runs.
+    let mut foreign_results = foreign_results;
+    foreign_results.sort_by(|a, b| a.0.cmp(&b.0));
+    for (foreign_id, foreign_account, result) in foreign_results {
+        match result {
+            Ok(seed) => {
+                apply_foreign_seed(
+                    &foreign_id,
+                    seed,
+                    &mut seed_states,
+                    &mut email_states,
+                    &mut mailbox_states,
+                );
+                if account_advertises_submission(&session, &foreign_id) {
+                    foreign_submission.insert(foreign_id.clone());
+                }
+                foreign_mail.insert(foreign_id, foreign_account);
+            }
+            Err(skip) => {
+                // Leave the share out of this session's surface
+                // and report the omission. Reopen re-reads the
+                // session, so a restored grant or a recovered
+                // server brings the share back.
+                skipped_scopes.push(skip);
+            }
+        }
+    }
+
+    Ok(SeededOpenState {
+        seed_states,
+        email_states,
+        mailbox_states,
+        lifecycle_mailbox_states,
+        mailbox_names,
+        primary_id,
+        foreign_mail,
+        foreign_submission,
+        skipped_scopes,
+    })
 }
 
 /// How many foreign-account state probes may be in flight at once.
@@ -1415,6 +1466,66 @@ mod tests {
         // Quota and submission were described correctly, so they stay on.
         assert!(pim.quota_get);
         assert!(pim.send_message);
+    }
+
+    /// A session whose REQUIRED mail block is malformed is refused as a
+    /// contract violation. That refusal is decided by the session alone, so
+    /// it must land before the seeding stage puts anything on the wire:
+    /// otherwise open pays two primary probes plus one per share - here
+    /// three requests, all against a server already known non-conformant -
+    /// and discards every answer with the error. The scripted transport is
+    /// armed with NO replies, so any probe that does go out panics rather
+    /// than merely being counted.
+    #[tokio::test]
+    async fn a_malformed_required_block_refuses_the_open_before_any_probe() {
+        let session: Session = serde_json::from_value(json!({
+            "capabilities": {
+                "urn:ietf:params:jmap:core": {
+                    "maxSizeUpload": 1000,
+                    "maxSizeRequest": 100_000,
+                    "maxConcurrentRequests": 4,
+                    "maxCallsInRequest": 8,
+                    "maxObjectsInGet": 256,
+                    "maxObjectsInSet": 256,
+                    "collationAlgorithms": []
+                },
+                // Present and unparseable: the malformed lane, not absent.
+                "urn:ietf:params:jmap:mail": "not an object"
+            },
+            "accounts": {
+                "primary": {"name": "Primary", "isPersonal": true, "isReadOnly": false,
+                            "accountCapabilities": {"urn:ietf:params:jmap:mail": {}}},
+                "shared": {"name": "Shared", "isPersonal": false, "isReadOnly": false,
+                           "accountCapabilities": {"urn:ietf:params:jmap:mail": {}}}
+            },
+            "primaryAccounts": {"urn:ietf:params:jmap:mail": "primary"},
+            "username": "user@example.test",
+            "apiUrl": "https://example.test/jmap/api",
+            "downloadUrl": "https://example.test/download/{accountId}/{blobId}/{name}/{type}",
+            "uploadUrl": "https://example.test/upload/{accountId}",
+            "eventSourceUrl": "https://example.test/eventsource",
+            "state": "session-1"
+        }))
+        .expect("test session parses");
+        let client = scripted_client_with_session(session, []);
+        let primary = JmapMailAccount::new(client.clone(), JmapAccountId::new("primary"));
+
+        let error = validate_and_seed(&client, &primary)
+            .await
+            .err()
+            .expect("a malformed required capability block refuses the open");
+
+        assert_eq!(
+            error.kind(),
+            &bifrost_types::AccountErrorKind::Protocol(
+                bifrost_types::ProtocolErrorKind::ContractViolation
+            )
+        );
+        assert!(
+            client.transport().requests().is_empty(),
+            "a session the contract already condemns must cost zero requests, \
+             not two primary probes and one per share"
+        );
     }
 
     fn scripted_client_with_session(
@@ -2568,11 +2679,14 @@ mod tests {
     /// An absent core capability advertises no call limit, so the probes
     /// must still go out - serially, since nothing licenses batching.
     /// The request builder must NOT read "no advertised limit" as "the
-    /// limit is zero": open issues its probes before
-    /// `capabilities::build` validates the session, so a zero enforced
-    /// here would fail the open as a client bug and the session would
-    /// never reach `SyncState(CapabilityChanged)` / `RestartAccount`,
-    /// which is the classification that tells the engine to reopen.
+    /// limit is zero": a zero enforced here would fail every probe as a
+    /// client bug, so any caller probing such a session would see
+    /// `Request(Malformed)` / `ClientBug` instead of the
+    /// `SyncState(CapabilityChanged)` / `RestartAccount` that tells the
+    /// engine to reopen. (`open` itself no longer probes at all here -
+    /// `validate_and_seed` refuses this session first - but the builder's
+    /// reading of an absent limit is a separate contract, and the other
+    /// probing callers still depend on it.)
     #[tokio::test]
     async fn an_absent_core_capability_still_probes_and_classifies_as_a_capability_change() {
         let client = scripted_client_with_session(
@@ -2613,10 +2727,11 @@ mod tests {
     }
 
     /// `maxCallsInRequest: 0` is an advertised limit that is not usable.
-    /// It is a `Protocol(ContractViolation)` decided by
-    /// `capabilities::build`, and enforcing it in the request builder
-    /// would preempt that ruling with `Request(Malformed)` / `ClientBug`
-    /// raised from the probe.
+    /// It is a `Protocol(ContractViolation)` decided by the session
+    /// validation, and enforcing it in the request builder would preempt
+    /// that ruling with `Request(Malformed)` / `ClientBug` raised from the
+    /// probe. (`open` refuses this session before probing; the builder's
+    /// behaviour is pinned here for every other probing caller.)
     #[tokio::test]
     async fn a_zero_call_limit_still_probes_and_classifies_as_a_contract_violation() {
         let client = scripted_client_with_session(

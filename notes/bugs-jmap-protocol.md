@@ -180,13 +180,40 @@ narrowing it is a product decision, not a defect fix.)
   `a_malformed_family_block_is_not_advertised_in_the_capability_snapshot` and
   the over-gating control `well_formed_optional_family_blocks_keep_every_handle`;
   ablated by making the gate always return `true`, and confirmed failing.
-- **Serde accepts a JSON ARRAY as a capability object.** Noticed while writing
-  the fixtures above: derived struct deserializers accept a sequence in field
-  order, and `CalendarsCapabilities` / `ContactsCapabilities` default every
-  field, so `"urn:ietf:params:jmap:calendars": []` parses as PRESENT rather
-  than landing in the malformed lane. Harmless in practice (no server sends
-  one), and the fix would be a `deny_unknown`-style map-only visitor on every
-  capability struct. Recorded, not fixed.
+- ~~**Serde accepts a JSON ARRAY as a capability object.**~~ FIXED. Derived
+  struct deserializers accept a sequence in field order, and
+  `CalendarsCapabilities` / `ContactsCapabilities` default every field, so
+  `"urn:ietf:params:jmap:calendars": []` parsed as PRESENT rather than landing
+  in the malformed lane (and `["16"]` fed the core block a limit
+  positionally). No per-struct visitor was needed: `try_cap!` now refuses any
+  non-object value before the typed parse, so the one door every modelled URI
+  passes through closes the array lane for all of them at once, per RFC 8620
+  s2. Pinned by `a_capability_sent_as_an_array_is_malformed_and_not_present`,
+  which sweeps every modelled URI and additionally asserts the core and
+  calendars three-state readers; ablated by disabling the guard and confirmed
+  failing.
+
+- ~~**A refused open still paid for a full round of foreign probes.**~~ FIXED.
+  `capabilities::build` ran after `seed_account_state` and the foreign-account
+  fan-out, so a session the contract already condemns - malformed core or mail
+  block, a zero or omitted mandatory core limit - still cost two primary probes
+  plus one request per share against a server known non-conformant, every
+  answer discarded with the refusal. The session-only half of the validation is
+  now `capabilities::validate_session`, hoisted to the top of the new
+  `validate_and_seed` stage that `open` calls; the half that needs probe
+  results (the `PimSupport` gates, which depend on which shares seeded) stays
+  in `build`, which still calls `validate_session` itself so the refusal does
+  not depend on call order elsewhere. Pinned by
+  `a_malformed_required_block_refuses_the_open_before_any_probe` - a scripted
+  transport armed with NO replies, so a probe that does go out fails loudly -
+  ablated by dropping the hoisted call and confirmed failing
+  (`Transport(Network)` from the probe instead of
+  `Protocol(ContractViolation)`). The two factory tests whose doc comments
+  cited the old order (`an_absent_core_capability_still_probes_...`,
+  `a_zero_call_limit_still_probes_...`) were NOT flipped: they pin the request
+  BUILDER's refusal to read an absent or zero limit as a hard bound, drive
+  `seed_account_state` directly, and that contract is unchanged - only their
+  stale prose about `open`'s ordering was corrected.
 - **WS Response decode double-round-trips** (`json!` Value rebuild then
   `from_value`) - works (verified), but it re-allocates every method response; a
   `RawValue`-preserving envelope would decode once.

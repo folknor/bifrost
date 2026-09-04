@@ -110,12 +110,25 @@ where
     /// never reported as unadvertised. Serializes to a string first to
     /// avoid cloning the Value - `from_value` consumes on error, and the
     /// original has to survive into `Malformed`.
+    ///
+    /// The `is_object` guard is load-bearing and not redundant with the
+    /// typed parse: serde's DERIVED struct deserializers also accept a
+    /// JSON sequence in field-declaration order, so `[]` deserializes
+    /// into any capability struct whose fields all default - which meant
+    /// `"urn:ietf:params:jmap:calendars": []` read as a fully advertised,
+    /// all-defaults PRESENT block. RFC 8620 s2 makes every capability
+    /// value an object, so anything else is Malformed at the one door
+    /// every modelled URI passes through.
     macro_rules! try_cap {
         ($value:expr, $variant:ident) => {{
-            let s = serde_json::to_string(&$value).unwrap();
-            match serde_json::from_str(&s) {
-                Ok(v) => Capabilities::$variant(v),
-                Err(_) => Capabilities::Malformed($value),
+            if !$value.is_object() {
+                Capabilities::Malformed($value)
+            } else {
+                let s = serde_json::to_string(&$value).unwrap();
+                match serde_json::from_str(&s) {
+                    Ok(v) => Capabilities::$variant(v),
+                    Err(_) => Capabilities::Malformed($value),
+                }
             }
         }};
     }

@@ -2854,6 +2854,61 @@ mod session_capability_fallbacks {
         }
     }
 
+    /// A JSON ARRAY is the malformed shape a string does not catch: serde's
+    /// derived struct deserializers accept a SEQUENCE in field-declaration
+    /// order, so `[]` parses cleanly into any capability struct whose
+    /// fields all default - `"urn:ietf:params:jmap:calendars": []` read as
+    /// a fully advertised block, and `["16"]` fed the core block a limit
+    /// positionally. RFC 8620 s2 makes a capability value an object, so
+    /// every modelled URI must refuse a non-object before the typed parse.
+    #[test]
+    fn a_capability_sent_as_an_array_is_malformed_and_not_present() {
+        use crate::core::session::CoreCapabilityState;
+
+        for uri in [
+            "urn:ietf:params:jmap:core",
+            "urn:ietf:params:jmap:mail",
+            "urn:ietf:params:jmap:submission",
+            "urn:ietf:params:jmap:websocket",
+            "urn:ietf:params:jmap:sieve",
+            "urn:ietf:params:jmap:quota",
+            "urn:ietf:params:jmap:blob",
+            "urn:ietf:params:jmap:calendars",
+            "urn:ietf:params:jmap:contacts",
+            "urn:ietf:params:jmap:principals",
+            "urn:ietf:params:jmap:principals:owner",
+        ] {
+            let session = session_with(json!({uri: []}));
+            assert!(
+                matches!(session.capability(uri), Some(Capabilities::Malformed(v)) if v.is_array()),
+                "{uri} sent as an array must be malformed, not an all-defaults present block"
+            );
+            assert_eq!(
+                session.malformed_capabilities().collect::<Vec<_>>(),
+                vec![uri]
+            );
+        }
+
+        // Core, specifically: an array is not a present-with-limits block.
+        let core = session_with(json!({"urn:ietf:params:jmap:core": []}));
+        assert!(matches!(
+            core.core_capability_state(),
+            CoreCapabilityState::Malformed
+        ));
+
+        // And one optional family, whose every field defaults - the case
+        // that parsed as Present before the guard.
+        #[cfg(feature = "calendars")]
+        {
+            use crate::core::session::CapabilityState;
+            let calendars = session_with(json!({"urn:ietf:params:jmap:calendars": []}));
+            assert!(matches!(
+                calendars.calendars_capability_state(),
+                CapabilityState::Malformed
+            ));
+        }
+    }
+
     /// `maxConcurrentUpload` is parsed and, by design, has no reader (see
     /// `reference/jmap.md`): every upload door in this crate awaits one
     /// upload at a time, so there is no concurrency for the limit to

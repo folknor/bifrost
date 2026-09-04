@@ -126,10 +126,21 @@ pub(crate) struct PimSupport {
     pub(crate) calendar: bool,
 }
 
-pub(crate) fn build(
-    session: &Session,
-    support: PimSupport,
-) -> Result<(AccountCapabilities, CoreLimits), AccountError> {
+/// Everything `build` refuses an open for that is decided by the SESSION
+/// alone - the core block's lane, its mandatory limits, and the required
+/// `urn:ietf:params:jmap:mail` block's lane.
+///
+/// Split out of `build` so the open sequence can run it BEFORE the state
+/// seeding and the foreign-account probe fan-out. Those probes are real
+/// requests against a server we have already decided is non-conformant,
+/// one per share, and their only possible outcome on this path is being
+/// thrown away with the refusal. Validation that genuinely needs probe
+/// results (the `PimSupport` gates, which depend on which shares seeded)
+/// stays in `build`.
+///
+/// `build` calls this too, so the refusal does not depend on the caller
+/// having run it first; running it twice is pure session reads.
+pub(crate) fn validate_session(session: &Session) -> Result<CoreLimits, AccountError> {
     // Three lanes, not two. An ABSENT core block is a capability change
     // (the server dropped a capability the session previously claimed):
     // reopen. A block that is present but unparseable, or present with a
@@ -175,6 +186,22 @@ pub(crate) fn build(
             return Err(malformed_required_capability(mail_uri));
         }
     }
+
+    Ok(CoreLimits {
+        max_objects_in_get,
+        max_objects_in_set,
+    })
+}
+
+pub(crate) fn build(
+    session: &Session,
+    support: PimSupport,
+) -> Result<(AccountCapabilities, CoreLimits), AccountError> {
+    let CoreLimits {
+        max_objects_in_get,
+        max_objects_in_set,
+    } = validate_session(session)?;
+
     for uri in session.malformed_capabilities() {
         tracing::warn!(
             capability = uri,
