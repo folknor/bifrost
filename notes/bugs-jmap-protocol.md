@@ -46,7 +46,10 @@ keywords may legally contain `/` (IMAP atoms exclude parens, `%`, `*`, `"`,
 server, does something else. Same shape applies anywhere in the crate that
 builds dotted paths by `format!` (the sync layer does it too, e.g. RSVP's
 participant path - outside this scope but same missing helper). The fix is one
-`escape_json_pointer_token` used at every path-construction site.
+`escape_json_pointer_token` used at every path-construction site. Work note:
+this one fix covers the sync-layer sites too (grep the whole crate for
+`format!`-built patch paths when applying it); do not file or fix the sync-side
+instances separately.
 
 ### 4. EventSource URL building violates the crate's own RFC 6570 rule
 

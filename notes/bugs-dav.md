@@ -29,6 +29,9 @@ thread the scope into `cursor_invalid_error` (or re-scope in
 `changes_stream`). The client test at line ~2055 pins the wrong behavior, so
 it will need updating. CardDAV has no invalidation path (ctag), so no twin
 exists to drift against - which is presumably why this survived.
+Test obligation: the client test at ~2055 currently pins the *wrong* scope;
+flip it to pin the folder scope, and revert-and-confirm that it fails against
+the pre-fix code.
 
 ### 2. RFC 6578 truncated sync-collection responses are misread as creations, and truncation semantics are unhandled
 
@@ -216,6 +219,12 @@ MOVE to what is actually the same collection (`Overwrite: F` then refuses with
 412, surfacing a spurious conflict). `url_origin`-style normalization before
 comparison would close it.
 
+## Fix grouping
+
+Findings 4, 5 and 13 are all propstat-state-machine discipline defects. Work
+them as a single change (or as part of the `ResponseParts<P>` redesign, if the
+owner rules for it below) - do not fix them as three separate patches.
+
 ## Structural observations (pre-1.0, rewrite-friendly posture)
 
 - **The propstat state machine is the drift engine, and findings 4, 5 and 13
@@ -238,10 +247,3 @@ comparison would close it.
   (`last_href`) instead of an integer offset would keep the stability property
   while allowing the multiget hydration to fetch only the page - no protocol
   obstacle prevents it.
-
-## Lateral note (bifrost-net scope)
-
-`bifrost_net::RedirectPolicy::default().max_hops` is read by the DAV walk for
-its cap; if net's default ever becomes configurable per account, the DAV walk
-silently won't follow the account's configured value - it re-derives from the
-type default, not from the attached spec.

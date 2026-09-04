@@ -111,11 +111,3 @@ probability, cheap insurance.
   `Person`, but the People API wraps it as `{ "person": {...} }`. It only
   "works" because every `Person` field is optional and the value is discarded -
   a latent decode landmine if anyone ever reads that response.
-
-## Lateral note (bifrost-net scope)
-
-`bifrost_net::url::encode_query_value` / `encode_path_component` carry the
-whole injection-safety load for three Google surfaces here; the crate's own
-tests only pin `+`, `&`, `#`. If bifrost-net's encoders don't have a test
-pinning the `.`/`..` double-escape behavior that `reference/google.md` leans on
-for `events.move`, that invariant is pinned only in this crate's prose.

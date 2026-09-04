@@ -3,13 +3,17 @@
 Hunt date: 2026-09-04. Hunter: Claude (Fable 5), read-only. Scope:
 `crates/net/`, `crates/types/`, and the cross-cutting error-model contract
 (`reference/error-model.md`) as implemented in shared code. Also checked two
-lateral claims routed from the google and DAV hunts.
+lateral claims routed from the google and DAV hunts; the resolved versions
+live here only.
 
 ## The two routed claims
 
-### (a) URL encoder dot-segment tests - the claim is wrong; tests exist
+### (a) URL encoder dot-segment behavior: tests exist, but the double-escape has an undocumented consequence
 
-`crates/net/src/url.rs` pins the behavior directly:
+The google hunt suspected bifrost-net's encoders lacked a test pinning the
+`.`/`..` double-escape behavior that `reference/google.md` leans on for
+`events.move`. That suspicion is wrong - `crates/net/src/url.rs` pins the
+behavior directly:
 `complete_dot_segments_cannot_navigate_the_parsed_url` asserts
 `encode_path_component(".") == "%252E"` and `".." == "%252E%252E"` and proves
 via a WHATWG `Url::join` that the encoded component stays in path position;
@@ -29,6 +33,8 @@ sentence in the docs.
 
 ### (b) `RedirectPolicy::default().max_hops` in dav-core - latent coupling, not a live trap
 
+The DAV hunt flagged that the DAV redirect walk derives its hop cap from
+bifrost-net's type default rather than from any attached spec.
 `crates/dav-core/src/dispatch.rs:350` reads
 `RedirectPolicy::default().max_hops` for its self-walked hop cap, while line
 61 sets `FollowRedirects::Disabled` on the spec. There is no attached

@@ -32,7 +32,9 @@ note where confidence is bounded by that.
   successful *empty* stream (`Done`, zero bytes).
 - Fix shape: reject `uid == 0` (and arguably `uidvalidity == 0`) in
   `decode_object_id`/`decode_thread_id` as `Request(Malformed)`; every
-  downstream hole closes at once.
+  downstream hole closes at once. Work note: this is one fix, not five - do
+  not patch the mutate/get/blob sites individually. Test obligation: a decode
+  rejection test for uid 0, plus revert-and-confirm it fails pre-fix.
 
 ### 2. `logout_best_effort` is unbounded, and dropping an `ImapConnection` leaks the driver task against a silent peer
 

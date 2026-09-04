@@ -40,9 +40,12 @@ one-line-per-read behavior empties the buffer between replies; the sync batch
 pipelined tests never use `expect_coalesced`, which exists precisely to model
 this. Fix: mirror the async shape (verify + set Broken after the window
 write, `read_response_inner(true, false)` for the drain, `finish_reply_group()`
-after) and add a sync batch test with `expect_coalesced` window replies. This
-is exactly the crate's own documented recurring defect shape: a fix landed in
-one half only.
+after). This is exactly the crate's own documented recurring defect shape: a
+fix landed in one half only.
+Test obligation: a sync batch pipelined test using `expect_coalesced` window
+replies (the harness feature that exists precisely to model this and that no
+sync batch test uses), with revert-and-confirm that it fails against the
+current reader.
 
 ### 2. Non-pipelined direct sends abort the connection on every routine negative reply
 
@@ -72,18 +75,23 @@ direct LMTP path.
 
 ## Contract / documentation mismatches
 
-### 4. The reference claims the socket-listener tests were retired; they were not
+### 4a. Doc defect: the reference claims the socket-listener tests were retired; they were not
 
 `reference/smtp.md` "Connection test harness": "it replaced the
-socket-listener tests, which were neither hermetic nor deterministic." But
+socket-listener tests, which were neither hermetic nor deterministic." False
+today - see 4b for what still exists. Since `reference/` is binding, the
+sentence must be corrected (or become true via 4b).
+
+### 4b. Compliance item: live socket-listener tests violate the testing rules
+
 `test_support.rs` still contains `spawn_lmtp_delivery_server` /
 `spawn_unix_lmtp_delivery_server` (real `TcpListener`/`UnixListener` + threads
 + 2-second read timeouts), used by transport tests in `transport.rs` and
 `async_transport.rs`, and `async_net.rs` has a `TcpListener`-based
-TLS-deadline test with a `thread::sleep(250ms)`. These also sit on the wrong
-side of AGENTS.md's testing rule ("Out of scope, still: real sockets or
-listeners... wall-clock sleeps"). Either the tests should move to the
-transcript harness or the doc claim should be corrected.
+TLS-deadline test with a `thread::sleep(250ms)`. These sit on the wrong side
+of AGENTS.md's testing rule ("Out of scope, still: real sockets or
+listeners... wall-clock sleeps"). Fix: port them to the transcript harness
+(distinct work from the 4a doc fix; doing 4b makes 4a's claim true).
 
 ### 5. `client/mod.rs` module doc example is rotted and cannot compile
 
