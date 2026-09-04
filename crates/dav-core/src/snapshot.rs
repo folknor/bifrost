@@ -1,0 +1,426 @@
+//! The DAV polling cursor: one snapshot shape, one codec, one diff, one page
+//! slicer.
+//!
+//! Neither CalDAV nor CardDAV has a change feed it can rely on. Both poll a
+//! collection with a depth-1 PROPFIND, keep `(href, etag)` per member in an
+//! opaque cursor, and derive `Created` / `Updated` / `Destroyed` by comparing
+//! the new listing against the stored one. The two crates carried that whole
+//! mechanism twice - the byte codec, the merge diff, the offset slicer, the
+//! inventory projection - differing only in the words `calendar` and
+//! `addressbook`, and one of the recorded drift defects (a snapshot path fixed
+//! on one side only) lived here.
+//!
+//! What stays in the crates is what genuinely differs: the magic bytes, the
+//! name of the token (`sync-token` against `getctag`), and the error each maps
+//! a malformed cursor onto.
+
+use std::collections::HashSet;
+
+use bifrost_types::{
+    AccountError, AccountOperation, Change, Fingerprint, InventoryEntry, ObjectChange,
+    ObjectChangeKind, ObjectId, Page, ServerVersion, SkippedScope,
+};
+
+use crate::error::{DavProtocol, local_error};
+
+/// One member of a polled collection: the href that identifies it and the
+/// validator that says whether it changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotEntry {
+    pub uri: String,
+    pub etag: Option<String>,
+}
+
+/// A cursor payload read back off the wire.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedSnapshot {
+    pub collection_url: String,
+    /// The collection-level token this protocol persists: CalDAV's
+    /// `sync-token`, CardDAV's `getctag`.
+    pub token: Option<String>,
+    pub entries: Vec<SnapshotEntry>,
+}
+
+#[must_use]
+pub fn object_change(uri: &str, kind: ObjectChangeKind) -> Change {
+    Change::ObjectChange(ObjectChange {
+        id: ObjectId(uri.to_string()),
+        kind,
+    })
+}
+
+/// Project one snapshot member onto an inventory entry. A member with no etag
+/// reports `ServerVersion::Unavailable` rather than a fabricated version.
+#[must_use]
+pub fn inventory_entry(entry: &SnapshotEntry) -> InventoryEntry {
+    InventoryEntry {
+        id: ObjectId(entry.uri.clone()),
+        memberships: Vec::new(),
+        size: None,
+        blob_id: None,
+        fingerprint: Fingerprint {
+            server_version: entry
+                .etag
+                .clone()
+                .map(ServerVersion::ETag)
+                .unwrap_or(ServerVersion::Unavailable),
+            size: None,
+            flags_hash: bifrost_types::canonical_flags_hash(std::iter::empty::<&str>()),
+        },
+        thread_id: None,
+        message_id: None,
+        references: Vec::new(),
+        in_reply_to: None,
+    }
+}
+
+/// Diff two href-sorted snapshots into object changes.
+///
+/// Suspected transient empty multistatus: a server returning zero hrefs against
+/// a populated local snapshot would emit a `Destroyed` for every object and
+/// wipe the consumer's store. Empty-versus-nonempty is therefore read as "no
+/// observation", not "everything deleted".
+///
+/// Accepted cost, stated plainly because it is easy to re-file as a bug: a REAL
+/// empty-out - a user deleting every member of the collection - is suppressed
+/// along with the transient empty-207, on this poll AND on later ones, because
+/// on the wire the two are identical. There is no signal that separates them,
+/// so the choice is between never wrongly wiping a consumer's store and never
+/// missing a genuine mass delete; both crates take the first, and the CalDAV
+/// `sync-collection` lane (which is not exposed to a bare empty multistatus)
+/// remains the path that does report one.
+///
+/// `current_failed` holds the hrefs the server reported *failed* within the 207
+/// that produced `current`. A transiently-failed resource is not an absent one,
+/// so it is never destroyed.
+#[must_use]
+pub fn diff_snapshots(
+    previous: &[SnapshotEntry],
+    current: &[SnapshotEntry],
+    current_failed: &[String],
+) -> Vec<Change> {
+    if current.is_empty() && !previous.is_empty() {
+        return Vec::new();
+    }
+    let failed: HashSet<&str> = current_failed.iter().map(String::as_str).collect();
+    let mut changes = Vec::new();
+    let mut left = 0;
+    let mut right = 0;
+    while left < previous.len() || right < current.len() {
+        match (previous.get(left), current.get(right)) {
+            (Some(old), Some(new)) if old.uri == new.uri => {
+                if old.etag != new.etag {
+                    changes.push(object_change(&new.uri, ObjectChangeKind::Updated));
+                }
+                left += 1;
+                right += 1;
+            }
+            (Some(old), Some(new)) if old.uri < new.uri => {
+                push_destroyed_unless_failed(&mut changes, &failed, &old.uri);
+                left += 1;
+            }
+            (Some(_), Some(new)) => {
+                changes.push(object_change(&new.uri, ObjectChangeKind::Created));
+                right += 1;
+            }
+            (Some(old), None) => {
+                push_destroyed_unless_failed(&mut changes, &failed, &old.uri);
+                left += 1;
+            }
+            (None, Some(new)) => {
+                changes.push(object_change(&new.uri, ObjectChangeKind::Created));
+                right += 1;
+            }
+            (None, None) => break,
+        }
+    }
+    changes
+}
+
+fn push_destroyed_unless_failed(changes: &mut Vec<Change>, failed: &HashSet<&str>, uri: &str) {
+    if failed.contains(uri) {
+        return;
+    }
+    changes.push(object_change(uri, ObjectChangeKind::Destroyed));
+}
+
+/// Carry forward the members this poll did not actually observe, so the next
+/// diff compares like with like.
+///
+/// A wholly empty listing against a populated previous snapshot is no
+/// observation at all and the previous entries are kept verbatim. Otherwise the
+/// entries whose hrefs the server reported failed are re-inserted from the
+/// previous snapshot, then the result is re-sorted and deduplicated on href -
+/// the diff above depends on both.
+pub fn preserve_unobserved_entries(
+    previous: &[SnapshotEntry],
+    current: &mut Vec<SnapshotEntry>,
+    current_failed: &[String],
+) {
+    if current.is_empty() && !previous.is_empty() {
+        current.clear();
+        current.extend_from_slice(previous);
+        return;
+    }
+    let failed: HashSet<&str> = current_failed.iter().map(String::as_str).collect();
+    current.extend(
+        previous
+            .iter()
+            .filter(|entry| failed.contains(entry.uri.as_str()))
+            .cloned(),
+    );
+    current.sort_by(|left, right| left.uri.cmp(&right.uri));
+    current.dedup_by(|left, right| left.uri == right.uri);
+}
+
+/// Encode a snapshot into cursor bytes behind `magic`.
+#[must_use]
+pub fn encode_snapshot(
+    magic: &[u8],
+    collection_url: &str,
+    token: Option<&str>,
+    entries: &[SnapshotEntry],
+) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(magic);
+    write_string(&mut bytes, collection_url);
+    write_option_string(&mut bytes, token);
+    write_u32(&mut bytes, entries.len());
+    for entry in entries {
+        write_string(&mut bytes, &entry.uri);
+        write_option_string(&mut bytes, entry.etag.as_deref());
+    }
+    bytes
+}
+
+/// Decode cursor bytes written by [`encode_snapshot`].
+///
+/// `label` names the protocol in the diagnostics ("CalDAV" / "CardDAV"); the
+/// caller wraps the returned message in its own cursor error so the classified
+/// `AccountError` stays crate-local.
+///
+/// Every length read is bounded against what remains: the entry count is
+/// rejected outright when it exceeds one entry per five remaining bytes (the
+/// smallest an entry can encode), so a corrupt count cannot make this allocate
+/// against a four-byte lie. Trailing bytes are an error too - a payload this
+/// did not fully consume is not a payload this understood.
+pub fn decode_snapshot(magic: &[u8], label: &str, bytes: &[u8]) -> Result<DecodedSnapshot, String> {
+    let mut input = bytes;
+    if !input.starts_with(magic) {
+        return Err(format!("{label} cursor magic mismatch"));
+    }
+    input = &input[magic.len()..];
+    let collection_url = read_string(&mut input, label)?;
+    let token = read_option_string(&mut input, label)?;
+    let count = read_u32(&mut input, label)?;
+    if count > input.len() / 5 {
+        return Err(format!(
+            "{label} cursor entry count exceeds remaining payload"
+        ));
+    }
+    let mut entries = Vec::with_capacity(count);
+    for _ in 0..count {
+        entries.push(SnapshotEntry {
+            uri: read_string(&mut input, label)?,
+            etag: read_option_string(&mut input, label)?,
+        });
+    }
+    if !input.is_empty() {
+        return Err(format!("{label} cursor has trailing bytes"));
+    }
+    Ok(DecodedSnapshot {
+        collection_url,
+        token,
+        entries,
+    })
+}
+
+fn write_string(bytes: &mut Vec<u8>, value: &str) {
+    write_u32(bytes, value.len());
+    bytes.extend_from_slice(value.as_bytes());
+}
+
+fn write_option_string(bytes: &mut Vec<u8>, value: Option<&str>) {
+    match value {
+        Some(value) => {
+            bytes.push(1);
+            write_string(bytes, value);
+        }
+        None => bytes.push(0),
+    }
+}
+
+fn write_u32(bytes: &mut Vec<u8>, value: usize) {
+    let value = u32::try_from(value).unwrap_or(u32::MAX);
+    bytes.extend_from_slice(&value.to_be_bytes());
+}
+
+fn read_string(input: &mut &[u8], label: &str) -> Result<String, String> {
+    let len = read_u32(input, label)?;
+    if input.len() < len {
+        return Err(format!("{label} cursor string length exceeds payload"));
+    }
+    let value = String::from_utf8(input[..len].to_vec())
+        .map_err(|error| format!("{label} cursor string is not UTF-8: {error}"))?;
+    *input = &input[len..];
+    Ok(value)
+}
+
+fn read_option_string(input: &mut &[u8], label: &str) -> Result<Option<String>, String> {
+    let Some((tag, rest)) = input.split_first() else {
+        return Err(format!("{label} cursor option tag is missing"));
+    };
+    *input = rest;
+    match tag {
+        0 => Ok(None),
+        1 => read_string(input, label).map(Some),
+        _ => Err(format!("{label} cursor option tag is invalid")),
+    }
+}
+
+fn read_u32(input: &mut &[u8], label: &str) -> Result<usize, String> {
+    let bytes = input
+        .get(..4)
+        .ok_or_else(|| format!("{label} cursor integer is truncated"))?;
+    let bytes = <[u8; 4]>::try_from(bytes)
+        .map_err(|error| format!("{label} cursor integer shape: {error}"))?;
+    let value = u32::from_be_bytes(bytes);
+    *input = &input[4..];
+    Ok(value as usize)
+}
+
+/// Read a decimal offset page cursor, treating an absent cursor as offset zero.
+pub fn decode_offset_cursor(
+    cursor: Option<Vec<u8>>,
+    operation: AccountOperation,
+    protocol: DavProtocol,
+) -> Result<usize, AccountError> {
+    let Some(cursor) = cursor else {
+        return Ok(0);
+    };
+    let value = String::from_utf8(cursor)
+        .map_err(|error| local_error(operation, error.to_string(), protocol))?;
+    value.parse().map_err(|error| {
+        local_error(
+            operation,
+            format!("invalid {} page cursor: {error}", protocol.label()),
+            protocol,
+        )
+    })
+}
+
+/// Slice a materialized result set into one offset page.
+///
+/// `items` must already be in a STABLE order: the offset is local and each
+/// continuation re-runs the remote request, and DAV guarantees no ordering on a
+/// multistatus, so slicing raw response order would let an unchanged result set
+/// come back permuted between page one and page two - items the permutation
+/// moved behind the offset are SKIPPED and items it moved past the offset are
+/// served TWICE, with nothing to tell the consumer either happened.
+///
+/// `failed_ids` and `skipped_scopes` describe the fetch that produced `items`,
+/// not the slice, and every page reruns that fetch. Both lanes are therefore
+/// reported on every page, which is exactly what `Page::failed_ids` documents:
+/// a resource that first starts failing while the consumer is on page three is
+/// news on page three, and suppressing it after page one would lose it
+/// entirely. The cost is that a resource failing throughout is named once per
+/// page, so a consumer accumulating across pages must treat the lane as a set,
+/// not a tally.
+#[must_use]
+pub fn page_from_offset<T>(
+    items: Vec<T>,
+    offset: usize,
+    page_size: usize,
+    failed_ids: Vec<String>,
+    skipped_scopes: Vec<SkippedScope>,
+) -> Page<T> {
+    let total = items.len();
+    let estimated_total = Some(u64::try_from(total).unwrap_or(u64::MAX));
+    // A zero page size is an exhausted page, not a page of nothing that still
+    // points at itself: emitting the current offset again whenever results
+    // exist gives a consumer that follows `next_cursor` an infinite loop that
+    // never advances and never delivers an item.
+    if page_size == 0 {
+        return Page {
+            items: Vec::new(),
+            next_cursor: None,
+            estimated_total,
+            failed_ids,
+            skipped_scopes,
+        };
+    }
+    let end = offset.saturating_add(page_size).min(total);
+    Page {
+        items: items.into_iter().skip(offset).take(page_size).collect(),
+        next_cursor: (end < total).then(|| end.to_string().into_bytes()),
+        estimated_total,
+        failed_ids,
+        skipped_scopes,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(uri: &str, etag: Option<&str>) -> SnapshotEntry {
+        SnapshotEntry {
+            uri: uri.to_string(),
+            etag: etag.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn a_snapshot_round_trips_through_the_cursor_codec() {
+        let entries = vec![entry("/c/one", Some("a")), entry("/c/two", None)];
+        let bytes = encode_snapshot(b"MAGIC1", "/c/", Some("token-1"), &entries);
+
+        let decoded = decode_snapshot(b"MAGIC1", "CalDAV", &bytes).expect("valid cursor");
+        assert_eq!(decoded.collection_url, "/c/");
+        assert_eq!(decoded.token.as_deref(), Some("token-1"));
+        assert_eq!(decoded.entries, entries);
+    }
+
+    #[test]
+    fn a_corrupt_entry_count_is_refused_rather_than_allocated() {
+        let mut bytes = encode_snapshot(b"MAGIC1", "/c/", None, &[]);
+        let tail = bytes.len() - 4;
+        bytes[tail..].copy_from_slice(&u32::MAX.to_be_bytes());
+
+        let error = decode_snapshot(b"MAGIC1", "CardDAV", &bytes).expect_err("refused");
+        assert!(
+            error.contains("entry count exceeds remaining payload"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_wholly_empty_listing_is_no_observation_rather_than_a_mass_delete() {
+        let previous = vec![entry("/c/one", Some("a"))];
+        assert!(diff_snapshots(&previous, &[], &[]).is_empty());
+    }
+
+    #[test]
+    fn a_failed_href_is_preserved_rather_than_destroyed() {
+        let previous = vec![entry("/c/one", Some("a")), entry("/c/two", Some("b"))];
+        let current = vec![entry("/c/two", Some("b"))];
+
+        assert!(diff_snapshots(&previous, &current, &["/c/one".to_string()]).is_empty());
+        let unguarded = diff_snapshots(&previous, &current, &[]);
+        assert!(matches!(
+            unguarded.as_slice(),
+            [Change::ObjectChange(ObjectChange {
+                id,
+                kind: ObjectChangeKind::Destroyed,
+            })] if id.0 == "/c/one"
+        ));
+    }
+
+    #[test]
+    fn a_zero_page_size_is_exhausted_rather_than_self_pointing() {
+        let page = page_from_offset(vec![1, 2, 3], 0, 0, Vec::new(), Vec::new());
+        assert!(page.items.is_empty());
+        assert!(page.next_cursor.is_none());
+        assert_eq!(page.estimated_total, Some(3));
+    }
+}

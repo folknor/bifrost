@@ -1,8 +1,9 @@
+pub(crate) use bifrost_dav_core::extract_href_property;
 pub(crate) use bifrost_dav_core::resolve_href;
-use bifrost_dav_core::{local_name, normalize_etag, push_text, trimmed};
-use bifrost_net::{status_line_code, status_line_is_success};
-use quick_xml::Reader;
-use quick_xml::events::Event;
+use bifrost_dav_core::{
+    MultiStatusSink, PropSet, ResponseParts, commit_if_present, normalize_etag,
+    parse_collection_property, parse_multistatus, trimmed,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CardDavContactEntry {
@@ -126,617 +127,235 @@ impl CardDavMultigetReport {
     }
 }
 
+/// Properties an address-book PROPFIND stages. The `<addressbook/>`
+/// resourcetype marker and the privilege markers are staged like every value
+/// property: a `resourcetype` or `current-user-privilege-set` the server
+/// REFUSED says nothing about the collection.
+#[derive(Default)]
+struct AddressBookProps {
+    is_addressbook: bool,
+    privilege_seen: bool,
+    write_seen: bool,
+    display_name: Option<String>,
+    ctag: Option<String>,
+}
+
+impl PropSet for AddressBookProps {
+    fn commit_from(&mut self, staged: Self) {
+        self.is_addressbook |= staged.is_addressbook;
+        self.privilege_seen |= staged.privilege_seen;
+        self.write_seen |= staged.write_seen;
+        commit_if_present(&mut self.display_name, staged.display_name);
+        commit_if_present(&mut self.ctag, staged.ctag);
+    }
+}
+
+/// Properties the contact-resource lanes stage: the depth-1 listing and the
+/// `addressbook-multiget` REPORT both read from this set.
+#[derive(Default)]
+struct ContactProps {
+    is_collection: bool,
+    etag: Option<String>,
+    content_type: Option<String>,
+    address_data: Option<String>,
+}
+
+impl PropSet for ContactProps {
+    fn commit_from(&mut self, staged: Self) {
+        self.is_collection |= staged.is_collection;
+        commit_if_present(&mut self.etag, staged.etag);
+        commit_if_present(&mut self.content_type, staged.content_type);
+        commit_if_present(&mut self.address_data, staged.address_data);
+    }
+
+    fn is_collection(&self) -> bool {
+        self.is_collection
+    }
+
+    fn resource_data(&self) -> Option<&str> {
+        self.address_data.as_deref()
+    }
+}
+
+/// Mark `<collection/>` inside a `<resourcetype>`, the guard both member lanes
+/// share.
+fn mark_collection(name: &str, stack: &[String], parts: &mut ResponseParts<ContactProps>) {
+    if name == "collection" && stack.iter().any(|item| item == "resourcetype") {
+        parts.marker_mut().is_collection = true;
+    }
+}
+
+#[derive(Default)]
+struct AddressBookSink {
+    collections: Vec<AddressBookCollection>,
+}
+
+impl MultiStatusSink for AddressBookSink {
+    type Props = AddressBookProps;
+
+    fn element(&mut self, name: &str, stack: &[String], parts: &mut ResponseParts<Self::Props>) {
+        // The `resourcetype` ancestor guard is not decoration: without it an
+        // `<addressbook/>` named anywhere else in the prop bag - inside
+        // `<D:owner>`, or in a server extension element - reads as the
+        // collection's own resourcetype and mints a phantom address book. The
+        // CalDAV twin has always guarded its `<calendar/>` marker; this side
+        // had not, which is the drift the collapse removes.
+        if name == "addressbook" && stack.iter().any(|item| item == "resourcetype") {
+            parts.marker_mut().is_addressbook = true;
+        }
+        if name == "privilege" {
+            parts.marker_mut().privilege_seen = true;
+        }
+        if (name == "write" || name == "write-content" || name == "all")
+            && stack.iter().any(|item| item == "privilege")
+        {
+            parts.marker_mut().write_seen = true;
+        }
+    }
+
+    fn property(
+        &mut self,
+        parent: Option<&str>,
+        name: &str,
+        text: &str,
+        parts: &mut ResponseParts<Self::Props>,
+    ) {
+        match (parent, name) {
+            (Some("prop"), "displayname") => parts.staged_mut().display_name = trimmed(text),
+            (Some("prop"), "getctag") => parts.staged_mut().ctag = trimmed(text),
+            _ => {}
+        }
+    }
+
+    fn finish_response(&mut self, parts: &ResponseParts<Self::Props>) {
+        let props = parts.props();
+        if !props.is_addressbook {
+            return;
+        }
+        let Some(href) = parts.href() else {
+            return;
+        };
+        self.collections.push(AddressBookCollection {
+            href: href.to_string(),
+            display_name: props.display_name.clone(),
+            ctag: props.ctag.clone(),
+            can_edit: props.privilege_seen.then_some(props.write_seen),
+        });
+    }
+}
+
 pub(crate) fn parse_addressbook_collections(
     xml: &str,
 ) -> Result<Vec<AddressBookCollection>, String> {
-    let mut reader = Reader::from_str(xml);
-    let mut collections = Vec::new();
-    let mut current = ResponseParts::default();
-    let mut stack = Vec::new();
-    let mut text = String::new();
+    let mut sink = AddressBookSink::default();
+    parse_multistatus(xml, &mut sink)?;
+    Ok(sink.collections)
+}
 
-    loop {
-        match reader.read_event() {
-            Ok(Event::Start(element)) => {
-                let name = local_name(element.name().as_ref());
-                if name == "response" {
-                    current = ResponseParts::default();
-                    current.in_response = true;
-                }
-                if current.in_response && name == "propstat" {
-                    current.begin_propstat();
-                }
-                if current.in_response && name == "addressbook" {
-                    current.mark_addressbook();
-                }
-                if current.in_response && name == "privilege" {
-                    current.mark_privilege_seen();
-                }
-                if current.in_response
-                    && (name == "write" || name == "write-content" || name == "all")
-                    && stack.iter().any(|item| item == "privilege")
-                {
-                    current.mark_write_seen();
-                }
-                stack.push(name);
-                text.clear();
-            }
-            Ok(Event::Text(value)) => {
-                push_text(&mut text, value.as_ref())?;
-            }
-            Ok(Event::CData(value)) => {
-                let value = value.decode().map_err(|error| error.to_string())?;
-                text.push_str(&value);
-            }
-            Ok(Event::Empty(element)) => {
-                let name = local_name(element.name().as_ref());
-                if current.in_response && name == "addressbook" {
-                    current.mark_addressbook();
-                }
-                if current.in_response && name == "privilege" {
-                    current.mark_privilege_seen();
-                }
-                if current.in_response
-                    && (name == "write" || name == "write-content" || name == "all")
-                    && stack.iter().any(|item| item == "privilege")
-                {
-                    current.mark_write_seen();
-                }
-            }
-            Ok(Event::End(element)) => {
-                let name = local_name(element.name().as_ref());
-                let parent = stack.iter().rev().nth(1).map(String::as_str);
-                if current.in_response {
-                    match (parent, name.as_str()) {
-                        (Some("response"), "href") => current.href = trimmed(&text),
-                        (Some("prop"), "displayname") => {
-                            current.staged.display_name = trimmed(&text);
-                        }
-                        (Some("prop"), "getctag") => {
-                            current.staged.ctag = trimmed(&text);
-                        }
-                        (Some("propstat"), "status") => {
-                            current.staged.success = Some(status_line_is_success(&text));
-                        }
-                        _ => {}
-                    }
-                }
-                if name == "propstat" {
-                    current.commit_propstat();
-                }
-                if name == "response" {
-                    current.in_response = false;
-                    if let Some(collection) = current.as_addressbook_collection() {
-                        collections.push(collection);
-                    }
-                }
-                stack.pop();
-                text.clear();
-            }
-            Ok(Event::Eof) => break,
-            Ok(_) => {}
-            Err(error) => return Err(format!("XML parse error: {error}")),
+#[derive(Default)]
+struct ContactListingSink {
+    listing: CardDavContactListing,
+}
+
+impl MultiStatusSink for ContactListingSink {
+    type Props = ContactProps;
+
+    fn element(&mut self, name: &str, stack: &[String], parts: &mut ResponseParts<Self::Props>) {
+        mark_collection(name, stack, parts);
+    }
+
+    fn property(
+        &mut self,
+        parent: Option<&str>,
+        name: &str,
+        text: &str,
+        parts: &mut ResponseParts<Self::Props>,
+    ) {
+        match (parent, name) {
+            (Some("prop"), "getetag") => parts.staged_mut().etag = normalize_etag(text),
+            (Some("prop"), "getcontenttype") => parts.staged_mut().content_type = trimmed(text),
+            _ => {}
         }
     }
 
-    Ok(collections)
+    fn finish_response(&mut self, parts: &ResponseParts<Self::Props>) {
+        if let Some(href) = parts.entry_href() {
+            self.listing.entries.push(CardDavContactEntry {
+                uri: href.to_string(),
+                etag: parts.props().etag.clone(),
+            });
+        } else if let Some(href) = parts.failed_href() {
+            self.listing.failed_hrefs.push(href.to_string());
+        }
+    }
 }
 
 pub(crate) fn parse_propfind_contacts(xml: &str) -> Result<CardDavContactListing, String> {
-    let mut reader = Reader::from_str(xml);
-    let mut listing = CardDavContactListing::default();
-    let mut current = ResponseParts::default();
-    let mut stack = Vec::new();
-    let mut text = String::new();
+    let mut sink = ContactListingSink::default();
+    parse_multistatus(xml, &mut sink)?;
+    Ok(sink.listing)
+}
 
-    loop {
-        match reader.read_event() {
-            Ok(Event::Start(element)) => {
-                let name = local_name(element.name().as_ref());
-                if name == "response" {
-                    current = ResponseParts::default();
-                    current.in_response = true;
-                }
-                if current.in_response && name == "propstat" {
-                    current.begin_propstat();
-                }
-                if current.in_response
-                    && name == "collection"
-                    && stack.iter().any(|item| item == "resourcetype")
-                {
-                    current.mark_collection();
-                }
-                stack.push(name);
-                text.clear();
-            }
-            Ok(Event::Empty(element)) => {
-                let name = local_name(element.name().as_ref());
-                if current.in_response
-                    && name == "collection"
-                    && stack.iter().any(|item| item == "resourcetype")
-                {
-                    current.mark_collection();
-                }
-            }
-            Ok(Event::Text(value)) => {
-                push_text(&mut text, value.as_ref())?;
-            }
-            Ok(Event::CData(value)) => {
-                let value = value.decode().map_err(|error| error.to_string())?;
-                text.push_str(&value);
-            }
-            Ok(Event::End(element)) => {
-                let name = local_name(element.name().as_ref());
-                let parent = stack.iter().rev().nth(1).map(String::as_str);
-                if current.in_response {
-                    match (parent, name.as_str()) {
-                        (Some("response"), "href") => current.href = trimmed(&text),
-                        (Some("prop"), "getetag") => current.staged.etag = normalize_etag(&text),
-                        (Some("prop"), "getcontenttype") => {
-                            current.staged.content_type = trimmed(&text);
-                        }
-                        (Some("propstat"), "status") => {
-                            current.staged.success = Some(status_line_is_success(&text));
-                        }
-                        _ => {}
-                    }
-                }
-                if name == "propstat" {
-                    current.commit_propstat();
-                }
-                if name == "response" {
-                    current.in_response = false;
-                    if let Some(entry) = current.as_contact_entry() {
-                        listing.entries.push(entry);
-                    } else if let Some(href) = current.as_failed_contact_href() {
-                        listing.failed_hrefs.push(href);
-                    }
-                }
-                stack.pop();
-                text.clear();
-            }
-            Ok(Event::Eof) => break,
-            Ok(_) => {}
-            Err(error) => return Err(format!("XML parse error: {error}")),
+#[derive(Default)]
+struct MultigetSink {
+    report: CardDavMultigetReport,
+}
+
+impl MultiStatusSink for MultigetSink {
+    type Props = ContactProps;
+
+    fn element(&mut self, name: &str, stack: &[String], parts: &mut ResponseParts<Self::Props>) {
+        mark_collection(name, stack, parts);
+    }
+
+    fn property(
+        &mut self,
+        parent: Option<&str>,
+        name: &str,
+        text: &str,
+        parts: &mut ResponseParts<Self::Props>,
+    ) {
+        match (parent, name) {
+            (Some("prop"), "getetag") => parts.staged_mut().etag = normalize_etag(text),
+            (Some("prop"), "address-data") => parts.staged_mut().address_data = trimmed(text),
+            _ => {}
         }
     }
 
-    Ok(listing)
+    fn finish_response(&mut self, parts: &ResponseParts<Self::Props>) {
+        if let Some((href, data)) = parts.fetched() {
+            self.report.cards.push(CardDavFetchedVCard {
+                uri: href.to_string(),
+                etag: parts.props().etag.clone(),
+                data: data.to_string(),
+            });
+        } else if let Some((href, status)) = parts.failed_resource() {
+            self.report.failed.push(CardDavFailedResource {
+                href: href.to_string(),
+                status: Some(status),
+            });
+        } else if let Some(href) = parts.missing_data_href() {
+            self.report.missing_data.push(href.to_string());
+        }
+    }
 }
 
 pub(crate) fn parse_multiget_report(xml: &str) -> Result<CardDavMultigetReport, String> {
-    let mut reader = Reader::from_str(xml);
-    let mut report = CardDavMultigetReport::default();
-    let mut current = ResponseParts::default();
-    let mut stack = Vec::new();
-    let mut text = String::new();
-
-    loop {
-        match reader.read_event() {
-            Ok(Event::Start(element)) => {
-                let name = local_name(element.name().as_ref());
-                if name == "response" {
-                    current = ResponseParts::default();
-                    current.in_response = true;
-                }
-                if current.in_response && name == "propstat" {
-                    current.begin_propstat();
-                }
-                if current.in_response
-                    && name == "collection"
-                    && stack.iter().any(|item| item == "resourcetype")
-                {
-                    current.mark_collection();
-                }
-                stack.push(name);
-                text.clear();
-            }
-            Ok(Event::Empty(element)) => {
-                let name = local_name(element.name().as_ref());
-                if current.in_response
-                    && name == "collection"
-                    && stack.iter().any(|item| item == "resourcetype")
-                {
-                    current.mark_collection();
-                }
-            }
-            Ok(Event::Text(value)) => {
-                push_text(&mut text, value.as_ref())?;
-            }
-            Ok(Event::CData(value)) => {
-                let value = value.decode().map_err(|error| error.to_string())?;
-                text.push_str(&value);
-            }
-            Ok(Event::End(element)) => {
-                let name = local_name(element.name().as_ref());
-                let parent = stack.iter().rev().nth(1).map(String::as_str);
-                if current.in_response {
-                    match (parent, name.as_str()) {
-                        (Some("response"), "href") => current.href = trimmed(&text),
-                        (Some("prop"), "getetag") => current.staged.etag = normalize_etag(&text),
-                        (Some("prop"), "address-data") => {
-                            current.staged.address_data = trimmed(&text);
-                        }
-                        (Some("propstat"), "status") => {
-                            current.staged.status = trimmed(&text);
-                            current.staged.success = Some(status_line_is_success(&text));
-                        }
-                        (Some("response"), "status") => current.status = trimmed(&text),
-                        _ => {}
-                    }
-                }
-                if name == "propstat" {
-                    current.commit_propstat();
-                }
-                if name == "response" {
-                    current.in_response = false;
-                    if let Some(card) = current.as_fetched_vcard() {
-                        report.cards.push(card);
-                    } else if let Some(failed) = current.as_failed_multiget_resource() {
-                        report.failed.push(failed);
-                    } else if let Some(href) = current.as_missing_multiget_data() {
-                        report.missing_data.push(href);
-                    }
-                }
-                stack.pop();
-                text.clear();
-            }
-            Ok(Event::Eof) => break,
-            Ok(_) => {}
-            Err(error) => return Err(format!("XML parse error: {error}")),
-        }
-    }
-
-    Ok(report)
+    let mut sink = MultigetSink::default();
+    parse_multistatus(xml, &mut sink)?;
+    Ok(sink.report)
 }
 
 /// Extract the collection `getctag` value from a depth-0 PROPFIND
 /// response. Returns `None` when the server omits `getctag` (the caller
 /// then falls through to a full snapshot + diff).
-pub(crate) fn parse_collection_ctag(xml: &str) -> Result<Option<String>, String> {
-    let mut reader = Reader::from_str(xml);
-    let mut stack: Vec<String> = Vec::new();
-    let mut text = String::new();
-    // Track the ctag and status of the propstat currently being read,
-    // and commit the ctag only when its propstat reports success. A
-    // stale `getctag` returned inside a failed (non-2xx) propstat must
-    // not feed the short-circuit, or a server emitting an old ctag in a
-    // failed block would suppress a real change (false-positive
-    // short-circuit). Mirrors the depth-1 parser's success gating.
-    let mut propstat_ctag: Option<String> = None;
-    let mut propstat_success: Option<bool> = None;
-    let mut committed: Option<String> = None;
-
-    loop {
-        match reader.read_event() {
-            Ok(Event::Start(element)) => {
-                let name = local_name(element.name().as_ref());
-                if name == "propstat" {
-                    propstat_ctag = None;
-                    propstat_success = None;
-                }
-                stack.push(name);
-                text.clear();
-            }
-            Ok(Event::Text(value)) => push_text(&mut text, value.as_ref())?,
-            Ok(Event::CData(value)) => {
-                let value = value.decode().map_err(|error| error.to_string())?;
-                text.push_str(&value);
-            }
-            Ok(Event::End(element)) => {
-                let name = local_name(element.name().as_ref());
-                let parent = stack.iter().rev().nth(1).map(String::as_str);
-                match (parent, name.as_str()) {
-                    (Some("prop"), "getctag") => propstat_ctag = trimmed(&text),
-                    (Some("propstat"), "status") => {
-                        propstat_success = Some(status_line_is_success(&text));
-                    }
-                    _ => {}
-                }
-                if name == "propstat" {
-                    // Absent status defaults to success, matching
-                    // `ResponseParts::commit_propstat`.
-                    if propstat_success.unwrap_or(true)
-                        && let Some(ctag) = propstat_ctag.take()
-                    {
-                        committed = Some(ctag);
-                    }
-                    propstat_ctag = None;
-                    propstat_success = None;
-                }
-                stack.pop();
-                text.clear();
-            }
-            Ok(Event::Eof) => break,
-            Ok(_) => {}
-            Err(error) => return Err(format!("XML parse error: {error}")),
-        }
-    }
-
-    Ok(committed)
-}
-
-pub(crate) fn extract_href_property(
-    xml: &str,
-    property_name: &str,
-) -> Result<Option<String>, String> {
-    let mut reader = Reader::from_str(xml);
-    let mut stack = Vec::new();
-    let mut text = String::new();
-    let mut propstat_href = None;
-    let mut propstat_success = None;
-
-    loop {
-        match reader.read_event() {
-            Ok(Event::Start(element)) => {
-                let name = local_name(element.name().as_ref());
-                stack.push(name);
-                text.clear();
-            }
-            Ok(Event::Text(value)) => {
-                push_text(&mut text, value.as_ref())?;
-            }
-            Ok(Event::CData(value)) => {
-                let value = value.decode().map_err(|error| error.to_string())?;
-                text.push_str(&value);
-            }
-            Ok(Event::End(element)) => {
-                let name = local_name(element.name().as_ref());
-                if name == "href"
-                    && stack.iter().any(|tag| tag == property_name)
-                    && let Some(href) = trimmed(&text)
-                {
-                    if stack.iter().any(|tag| tag == "propstat") {
-                        propstat_href = Some(href);
-                    } else {
-                        return Ok(Some(href));
-                    }
-                }
-                let parent = stack.iter().rev().nth(1).map(String::as_str);
-                if name == "status" && matches!(parent, Some("propstat")) {
-                    propstat_success = Some(
-                        trimmed(&text)
-                            .as_deref()
-                            .is_some_and(status_line_is_success),
-                    );
-                }
-                if name == "propstat" {
-                    if propstat_success.unwrap_or(true) && propstat_href.is_some() {
-                        return Ok(propstat_href);
-                    }
-                    propstat_href = None;
-                    propstat_success = None;
-                }
-                stack.pop();
-                text.clear();
-            }
-            Ok(Event::Eof) => break,
-            Ok(_) => {}
-            Err(error) => return Err(format!("XML parse error: {error}")),
-        }
-    }
-
-    Ok(None)
-}
-
-/// Properties read from the `propstat` currently being parsed, held apart
-/// from the committed values until its `status` is known.
 ///
-/// One struct rather than a `propstat_`-prefixed twin of every committed
-/// field: the two reset lists this replaces had to be kept in sync by hand
-/// (a `begin` that forgot a field would leak the previous propstat's value
-/// into this one), and each of the three parsers below reads only the subset
-/// it asked the server for - the rest simply stay `None` and commit nothing.
-#[derive(Default)]
-struct PropStat {
-    /// `None` when the propstat carried no `status` element at all, which
-    /// `commit` reads as success.
-    success: Option<bool>,
-    status: Option<String>,
-    is_addressbook: bool,
-    is_collection: bool,
-    privilege_seen: bool,
-    write_seen: bool,
-    etag: Option<String>,
-    content_type: Option<String>,
-    address_data: Option<String>,
-    display_name: Option<String>,
-    ctag: Option<String>,
-}
-
-#[derive(Default)]
-struct ResponseParts {
-    in_response: bool,
-    in_propstat: bool,
-    has_success_propstat: bool,
-    saw_failed_propstat: bool,
-    is_collection: bool,
-    is_addressbook: bool,
-    privilege_seen: bool,
-    write_seen: bool,
-    href: Option<String>,
-    etag: Option<String>,
-    content_type: Option<String>,
-    address_data: Option<String>,
-    status: Option<String>,
-    failed_statuses: Vec<u16>,
-    display_name: Option<String>,
-    ctag: Option<String>,
-    staged: PropStat,
-}
-
-/// Commit a staged property over its committed slot, leaving the committed
-/// value alone when this propstat did not carry the property.
-fn commit_if_present<T>(committed: &mut Option<T>, staged: Option<T>) {
-    if staged.is_some() {
-        *committed = staged;
-    }
-}
-
-impl ResponseParts {
-    fn begin_propstat(&mut self) {
-        self.in_propstat = true;
-        self.staged = PropStat::default();
-    }
-
-    /// A `resourcetype` the server refused is not evidence about the
-    /// resource, so a `collection` marker seen inside a propstat is staged
-    /// and only promoted when that propstat's own status was 2xx. Otherwise
-    /// a response whose contact properties succeeded but whose `resourcetype`
-    /// block was rejected (echoing back `<collection/>` in the 404 prop
-    /// skeleton) would be discarded as a collection.
-    fn mark_collection(&mut self) {
-        if self.in_propstat {
-            self.staged.is_collection = true;
-        } else {
-            self.is_collection = true;
-        }
-    }
-
-    fn mark_addressbook(&mut self) {
-        if self.in_propstat {
-            self.staged.is_addressbook = true;
-        } else {
-            self.is_addressbook = true;
-        }
-    }
-
-    /// A `current-user-privilege-set` the server REFUSED says nothing about
-    /// what this principal may do, so both privilege markers are staged and
-    /// promoted only from a 2xx propstat, exactly like the CalDAV twin.
-    fn mark_privilege_seen(&mut self) {
-        if self.in_propstat {
-            self.staged.privilege_seen = true;
-        } else {
-            self.privilege_seen = true;
-        }
-    }
-
-    fn mark_write_seen(&mut self) {
-        if self.in_propstat {
-            self.staged.write_seen = true;
-        } else {
-            self.write_seen = true;
-        }
-    }
-
-    fn commit_propstat(&mut self) {
-        let staged = std::mem::take(&mut self.staged);
-        self.in_propstat = false;
-
-        if staged.success == Some(false) {
-            self.saw_failed_propstat = true;
-            if let Some(code) = staged.status.as_deref().and_then(status_line_code) {
-                self.failed_statuses.push(code);
-            }
-        }
-        // An absent status is success (RFC 4918 Section 14.22 requires one,
-        // but servers omit it and the properties are still there).
-        if staged.success.unwrap_or(true) {
-            self.has_success_propstat = true;
-            self.is_addressbook |= staged.is_addressbook;
-            self.is_collection |= staged.is_collection;
-            self.privilege_seen |= staged.privilege_seen;
-            self.write_seen |= staged.write_seen;
-            commit_if_present(&mut self.etag, staged.etag);
-            commit_if_present(&mut self.content_type, staged.content_type);
-            commit_if_present(&mut self.address_data, staged.address_data);
-            commit_if_present(&mut self.display_name, staged.display_name);
-            commit_if_present(&mut self.ctag, staged.ctag);
-        }
-    }
-
-    fn as_addressbook_collection(&self) -> Option<AddressBookCollection> {
-        if !self.is_addressbook {
-            return None;
-        }
-        let href = self.href.as_ref()?;
-        Some(AddressBookCollection {
-            href: href.clone(),
-            display_name: self.display_name.clone(),
-            ctag: self.ctag.clone(),
-            can_edit: self.privilege_seen.then_some(self.write_seen),
-        })
-    }
-
-    fn as_contact_entry(&self) -> Option<CardDavContactEntry> {
-        let href = self.href.as_ref()?;
-        if self.is_collection {
-            return None;
-        }
-        // Only a response whose ONLY propstat failed is withheld here - it is
-        // surfaced by `as_failed_contact_href` instead. A response carrying no
-        // propstat at all is still a member of the collection, so it commits
-        // as an entry (with whatever etag it managed to supply, usually none).
-        //
-        // Requiring a successful propstat instead DESTROYED DATA: a bare
-        // `<response><href/></response>` for a resource that exists landed in
-        // neither lane - not an entry, and not a failed href either, since
-        // `as_failed_contact_href` wants a failed propstat - so the resource
-        // vanished from the snapshot and the diff emitted a `Destroyed` for a
-        // contact the server still holds, with the failed-href preservation
-        // guard unable to help. The CalDAV twin already read it this way; this
-        // is that divergence closed on the non-destructive side.
-        if self.saw_failed_propstat && !self.has_success_propstat {
-            return None;
-        }
-        Some(CardDavContactEntry {
-            uri: href.clone(),
-            etag: self.etag.clone(),
-        })
-    }
-
-    /// The href of a resource the server reported *failed* within the
-    /// 207 (a non-2xx propstat, no success propstat). A response known
-    /// to be a collection is excluded; resource names need no `.vcf` suffix.
-    fn as_failed_contact_href(&self) -> Option<String> {
-        if self.is_collection || self.has_success_propstat || !self.saw_failed_propstat {
-            return None;
-        }
-        self.href.clone()
-    }
-
-    fn as_fetched_vcard(&self) -> Option<CardDavFetchedVCard> {
-        if self.is_collection {
-            return None;
-        }
-        Some(CardDavFetchedVCard {
-            uri: self.href.as_ref()?.clone(),
-            etag: self.etag.clone(),
-            data: self.address_data.as_ref()?.clone(),
-        })
-    }
-
-    // Accepted edge: a failed propstat whose status line is absent or
-    // unparseable yields no numeric code here, so the resource degrades to
-    // the benign `missing_data` lane and cannot contribute to
-    // `CompleteFailure`. A pathological server failing every resource with
-    // garbage status text thus reads as an empty success; tolerated because
-    // such a server violates RFC 4918's required status line and the honest
-    // lanes still preserve the resource (mirrored in caldav).
-    fn as_failed_multiget_resource(&self) -> Option<CardDavFailedResource> {
-        if self.is_collection {
-            return None;
-        }
-        let href = self.href.clone()?;
-        let status = self.failed_statuses.first().copied().or_else(|| {
-            self.status
-                .as_deref()
-                .and_then(status_line_code)
-                .filter(|status| !(200..=299).contains(status))
-        })?;
-        Some(CardDavFailedResource {
-            href,
-            status: Some(status),
-        })
-    }
-
-    fn as_missing_multiget_data(&self) -> Option<String> {
-        if self.is_collection || self.address_data.is_some() {
-            return None;
-        }
-        self.href.clone()
-    }
+/// A stale `getctag` returned inside a failed (non-2xx) propstat must not feed
+/// the short-circuit, or a server emitting an old ctag in a failed block would
+/// suppress a real change; the shared reader commits only from a successful
+/// propstat, exactly as the depth-1 parser does.
+pub(crate) fn parse_collection_ctag(xml: &str) -> Result<Option<String>, String> {
+    parse_collection_property(xml, "getctag")
 }
 
 #[cfg(test)]
@@ -1284,6 +903,21 @@ END:VCARD</C:address-data>
 </D:multistatus>"#;
 
         let books = parse_addressbook_collections(xml).expect("valid XML");
+        assert!(books.is_empty());
+    }
+
+    /// The CalDAV twin has always required its `<calendar/>` marker to sit
+    /// inside a `<resourcetype>`; this side did not, so an `<addressbook/>`
+    /// named anywhere else in the prop bag minted a phantom address book whose
+    /// href is not a collection at all. The collapse onto the shared machine
+    /// closes that drift.
+    #[test]
+    fn addressbook_element_outside_resourcetype_does_not_mark_a_collection() {
+        let books = parse_addressbook_collections(
+            r#"<D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:carddav"><D:response><D:href>/not-a-book/</D:href><D:propstat><D:prop><D:owner><C:addressbook/></D:owner></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response></D:multistatus>"#,
+        )
+        .expect("valid multistatus");
+
         assert!(books.is_empty());
     }
 

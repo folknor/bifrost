@@ -392,6 +392,26 @@ cross-origin redirect walk and the generic WebDAV verbs.
 `CardDavCredentials` stays published and unchanged; `to_shared` projects it onto
 the dispatcher's `DavCredentials`.
 
+The 207 parser and the polling cursor were both collapsed into that shared crate
+too; `reference/caldav.md`, "The 207 parser, collapsed" and "The polling cursor,
+collapsed", is the description. What this crate supplies is two `PropSet`
+implementations - `AddressBookProps` (`<addressbook/>`, the privilege markers,
+`displayname`, `getctag`) and `ContactProps` (`<collection/>`, `getetag`,
+`getcontenttype`, `address-data`) - plus its entry constructors. Every listing
+lane runs through `bifrost_dav_core::parse_multistatus`: address-book discovery,
+the depth-1 contact PROPFIND, and the `addressbook-multiget` /
+`addressbook-query` REPORT. The depth-0 `getctag` read is
+`parse_collection_property(xml, "getctag")`, and the snapshot codec, diff,
+inventory projection and offset page slicer are the shared ones, parameterized
+only by the `CDAVCTAG1` magic and this crate's `cursor_error`.
+
+The collapse closed one drift on this side: `<addressbook/>` was accepted as a
+resourcetype marker no matter where in the prop bag it appeared, where the
+CalDAV twin had always required its `<calendar/>` marker to sit inside a
+`<resourcetype>`. An `<addressbook/>` named inside `<D:owner>` or a server
+extension therefore minted a phantom address book. Both sides now guard, pinned
+by `addressbook_element_outside_resourcetype_does_not_mark_a_collection`.
+
 TWO things deliberately stayed local, both behavioural differences rather than
 drift, and both of which the extraction would otherwise have silently flattened:
 
@@ -404,15 +424,19 @@ drift, and both of which the extraction would otherwise have silently flattened:
 
 ## This crate and bifrost-caldav are near-duplicates, and drift is the defect
 
-The two crates hand-mirror roughly 1500 lines of DAV machinery. Nothing compares
-the copies, so divergence is silent, and five separate defects in one hardening
-arc were exactly that - most recently `as_fetched_vcard` missing the
-`is_collection` guard its CalDAV twin already had, which surfaced an echoed
-collection as a phantom card. **Any fix to shared-shape code here must be
-checked against `bifrost-caldav`, and vice versa.** The full inventory of the
-duplication, and the standing note that collapsing it into a shared `bifrost-dav`
-is the repository owner's decision rather than the loop's, live in
-`reference/caldav.md`.
+The two crates used to hand-mirror roughly 1500 lines of DAV machinery, and
+nothing compared the copies, so divergence was silent: eight separate defects
+were exactly that. The transport, credential gate, error ladder, 207 parser and
+polling cursor have all been collapsed into `bifrost-dav-core` and can no longer
+drift.
+
+What remains duplicated is smaller but still real: the query bodies and property
+constants, the discovery walk's shape, the `Unsupported` stubs each crate
+carries for the other's domain, and the account-level orchestration around the
+shared pieces. **Any fix to shared-shape code here must still be checked against
+`bifrost-caldav`, and vice versa** - and where the fix is to something both
+crates route through, it belongs in `bifrost-dav-core` rather than in one
+`account.rs`.
 
 ## Related providers
 

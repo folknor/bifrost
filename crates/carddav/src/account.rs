@@ -1,4 +1,8 @@
-use bifrost_dav_core::{append_path, same_dav_url};
+use bifrost_dav_core::{
+    DavProtocol, SnapshotEntry, append_path, decode_snapshot, diff_snapshots, encode_snapshot,
+    inventory_entry as inventory_entry_from_snapshot, page_from_offset,
+    preserve_unobserved_entries, same_dav_url,
+};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
@@ -13,13 +17,13 @@ use bifrost_types::{
     DirectoryCard, DirectoryGroup, DirectoryGroupId, DirectoryGroupMember, DraftHandle, DraftPatch,
     ErrorScope, EventCreate, EventId, EventPatch, EventRange, EventSearchRequest, FilterValidation,
     FlagOp, HostedAttachment, HydratedObject, HydrationProjection, IdempotencyKey, Identity,
-    IdentityId, IdentityPatch, Importance, InventoryEntry, InventoryEvent, InventoryPartition,
+    IdentityId, IdentityPatch, Importance, InventoryEvent, InventoryPartition,
     InventoryPartitioning, ItemOutcome, MembershipScope, Message, MutationSuccess, MutationTarget,
-    ObjectChange, ObjectChangeKind, ObjectId, ObjectType, OpaqueChangeState, Page, PageBoundary,
-    Priority, Protocol, ProtocolErrorKind, ProtocolKind, QuotaInfo, RsvpStatus, SearchRequest,
-    SendRequest, ServerFilter, ServerFilterCreate, ServerFilterId, ServerFilterPatch,
-    ServerVersion, SkippedScope, SubscriptionHandle, SyncEvent, SyncStrategy, ThreadHydration,
-    ThreadId, TransmissionState, VacationConfig, WatchEvent, WireCause,
+    ObjectId, ObjectType, OpaqueChangeState, Page, PageBoundary, Priority, Protocol,
+    ProtocolErrorKind, ProtocolKind, QuotaInfo, RsvpStatus, SearchRequest, SendRequest,
+    ServerFilter, ServerFilterCreate, ServerFilterId, ServerFilterPatch, SkippedScope,
+    SubscriptionHandle, SyncEvent, SyncStrategy, ThreadHydration, ThreadId, TransmissionState,
+    VacationConfig, WatchEvent, WireCause,
 };
 use bytes::Bytes;
 use futures::{StreamExt, stream};
@@ -1449,11 +1453,10 @@ pub(crate) struct ContactSnapshot {
     failed_hrefs: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ContactSnapshotEntry {
-    uri: String,
-    etag: Option<String>,
-}
+/// One polled address-book member. The shape, the cursor codec, the diff and
+/// the page slicer are all shared with `bifrost-caldav` through
+/// `bifrost-dav-core`; only the magic bytes and the token's name differ.
+type ContactSnapshotEntry = SnapshotEntry;
 
 fn validate_contact_scope(
     scope: &CursorScope,
@@ -1579,16 +1582,12 @@ fn cursor_from_snapshot(scope: CursorScope, snapshot: &ContactSnapshot) -> Chang
 }
 
 fn encode_cursor_snapshot(snapshot: &ContactSnapshot) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(CURSOR_MAGIC);
-    write_string(&mut bytes, &snapshot.addressbook_url);
-    write_option_string(&mut bytes, snapshot.ctag.as_deref());
-    write_u32(&mut bytes, snapshot.entries.len());
-    for entry in &snapshot.entries {
-        write_string(&mut bytes, &entry.uri);
-        write_option_string(&mut bytes, entry.etag.as_deref());
-    }
-    bytes
+    encode_snapshot(
+        CURSOR_MAGIC,
+        &snapshot.addressbook_url,
+        snapshot.ctag.as_deref(),
+        &snapshot.entries,
+    )
 }
 
 fn decode_cursor_snapshot(cursor: &ChangeCursor) -> Result<ContactSnapshot, AccountError> {
@@ -1598,200 +1597,33 @@ fn decode_cursor_snapshot(cursor: &ChangeCursor) -> Result<ContactSnapshot, Acco
     {
         return Err(cursor_error("CardDAV cursor protocol or version mismatch"));
     }
-    let mut input = cursor.server_state.bytes.as_slice();
-    if !input.starts_with(CURSOR_MAGIC) {
-        return Err(cursor_error("CardDAV cursor magic mismatch"));
-    }
-    input = &input[CURSOR_MAGIC.len()..];
-    let addressbook_url = read_string(&mut input)?;
-    let ctag = read_option_string(&mut input)?;
-    let count = read_u32(&mut input)?;
-    if count > input.len() / 5 {
-        return Err(cursor_error(
-            "CardDAV cursor entry count exceeds remaining payload",
-        ));
-    }
-    let mut entries = Vec::with_capacity(count);
-    for _ in 0..count {
-        entries.push(ContactSnapshotEntry {
-            uri: read_string(&mut input)?,
-            etag: read_option_string(&mut input)?,
-        });
-    }
-    if !input.is_empty() {
-        return Err(cursor_error("CardDAV cursor has trailing bytes"));
-    }
+    let decoded = decode_snapshot(
+        CURSOR_MAGIC,
+        DavProtocol::CardDav.label(),
+        &cursor.server_state.bytes,
+    )
+    .map_err(cursor_error)?;
     Ok(ContactSnapshot {
-        addressbook_url,
-        ctag,
-        entries,
+        addressbook_url: decoded.collection_url,
+        ctag: decoded.token,
+        entries: decoded.entries,
         failed_hrefs: Vec::new(),
     })
 }
 
+/// Diff two contact snapshots. The rule, the transient-empty-207 suppression
+/// and the failed-href preservation all live in `bifrost-dav-core`, which
+/// `bifrost-caldav` reads through the same door.
 fn diff_contact_snapshots(previous: &ContactSnapshot, current: &ContactSnapshot) -> Vec<Change> {
-    // Suspected transient empty multistatus: a server returning zero
-    // hrefs against a populated local snapshot would emit a Destroyed for
-    // every contact and wipe the consumer's store. Treat
-    // empty-vs-nonempty as "no observation," not "everything deleted."
-    //
-    // Accepted cost, stated plainly because it is easy to re-file as a bug:
-    // a REAL empty-out - a user deleting every contact - is suppressed along
-    // with the transient empty-207, on this poll AND on later ones, because
-    // on the wire the two are identical. `reference/carddav.md` says so, with
-    // the ctag short-circuit caveat. `bifrost-caldav`'s event snapshot diff
-    // makes the same trade; these two crates are near-duplicates and a change
-    // to one of them must be checked against the other.
-    if current.entries.is_empty() && !previous.entries.is_empty() {
-        return Vec::new();
-    }
-    let failed: HashSet<&str> = current.failed_hrefs.iter().map(String::as_str).collect();
-    let mut changes = Vec::new();
-    let mut left = 0;
-    let mut right = 0;
-    while left < previous.entries.len() || right < current.entries.len() {
-        match (previous.entries.get(left), current.entries.get(right)) {
-            (Some(old), Some(new)) if old.uri == new.uri => {
-                if old.etag != new.etag {
-                    changes.push(object_change(&new.uri, ObjectChangeKind::Updated));
-                }
-                left += 1;
-                right += 1;
-            }
-            (Some(old), Some(new)) if old.uri < new.uri => {
-                push_destroyed_unless_failed(&mut changes, &failed, &old.uri);
-                left += 1;
-            }
-            (Some(_), Some(new)) => {
-                changes.push(object_change(&new.uri, ObjectChangeKind::Created));
-                right += 1;
-            }
-            (Some(old), None) => {
-                push_destroyed_unless_failed(&mut changes, &failed, &old.uri);
-                left += 1;
-            }
-            (None, Some(new)) => {
-                changes.push(object_change(&new.uri, ObjectChangeKind::Created));
-                right += 1;
-            }
-            (None, None) => break,
-        }
-    }
-    changes
+    diff_snapshots(&previous.entries, &current.entries, &current.failed_hrefs)
 }
 
 fn preserve_unobserved_contact_entries(previous: &ContactSnapshot, current: &mut ContactSnapshot) {
-    if current.entries.is_empty() && !previous.entries.is_empty() {
-        current.entries.clone_from(&previous.entries);
-        return;
-    }
-    let failed: HashSet<&str> = current.failed_hrefs.iter().map(String::as_str).collect();
-    current.entries.extend(
-        previous
-            .entries
-            .iter()
-            .filter(|entry| failed.contains(entry.uri.as_str()))
-            .cloned(),
+    preserve_unobserved_entries(
+        &previous.entries,
+        &mut current.entries,
+        &current.failed_hrefs,
     );
-    current
-        .entries
-        .sort_by(|left, right| left.uri.cmp(&right.uri));
-    current
-        .entries
-        .dedup_by(|left, right| left.uri == right.uri);
-}
-
-/// Emit `Destroyed` for `uri` unless the server reported that resource
-/// *failed* within the 207. A transiently-failed resource is preserved
-/// locally rather than treated as absent (brick 7).
-fn push_destroyed_unless_failed(changes: &mut Vec<Change>, failed: &HashSet<&str>, uri: &str) {
-    if failed.contains(uri) {
-        return;
-    }
-    changes.push(object_change(uri, ObjectChangeKind::Destroyed));
-}
-
-fn object_change(uri: &str, kind: ObjectChangeKind) -> Change {
-    Change::ObjectChange(ObjectChange {
-        id: ObjectId(uri.to_string()),
-        kind,
-    })
-}
-
-fn inventory_entry_from_snapshot(entry: &ContactSnapshotEntry) -> InventoryEntry {
-    InventoryEntry {
-        id: ObjectId(entry.uri.clone()),
-        memberships: Vec::new(),
-        size: None,
-        blob_id: None,
-        fingerprint: bifrost_types::Fingerprint {
-            server_version: entry
-                .etag
-                .clone()
-                .map(ServerVersion::ETag)
-                .unwrap_or(ServerVersion::Unavailable),
-            size: None,
-            flags_hash: bifrost_types::canonical_flags_hash(std::iter::empty::<&str>()),
-        },
-        thread_id: None,
-        message_id: None,
-        references: Vec::new(),
-        in_reply_to: None,
-    }
-}
-
-fn write_string(bytes: &mut Vec<u8>, value: &str) {
-    write_u32(bytes, value.len());
-    bytes.extend_from_slice(value.as_bytes());
-}
-
-fn write_option_string(bytes: &mut Vec<u8>, value: Option<&str>) {
-    match value {
-        Some(value) => {
-            bytes.push(1);
-            write_string(bytes, value);
-        }
-        None => bytes.push(0),
-    }
-}
-
-fn write_u32(bytes: &mut Vec<u8>, value: usize) {
-    let value = u32::try_from(value).unwrap_or(u32::MAX);
-    bytes.extend_from_slice(&value.to_be_bytes());
-}
-
-fn read_string(input: &mut &[u8]) -> Result<String, AccountError> {
-    let len = read_u32(input)?;
-    if input.len() < len {
-        return Err(cursor_error("CardDAV cursor string length exceeds payload"));
-    }
-    let value = String::from_utf8(input[..len].to_vec())
-        .map_err(|error| cursor_error(format!("CardDAV cursor string is not UTF-8: {error}")))?;
-    *input = &input[len..];
-    Ok(value)
-}
-
-fn read_option_string(input: &mut &[u8]) -> Result<Option<String>, AccountError> {
-    let Some((tag, rest)) = input.split_first() else {
-        return Err(cursor_error("CardDAV cursor option tag is missing"));
-    };
-    *input = rest;
-    match tag {
-        0 => Ok(None),
-        1 => read_string(input).map(Some),
-        _ => Err(cursor_error("CardDAV cursor option tag is invalid")),
-    }
-}
-
-fn read_u32(input: &mut &[u8]) -> Result<usize, AccountError> {
-    let bytes = input
-        .get(..4)
-        .ok_or_else(|| cursor_error("CardDAV cursor integer is truncated"))?;
-    let bytes = <[u8; 4]>::try_from(bytes)
-        .map_err(|error| cursor_error(format!("CardDAV cursor integer shape: {error}")))?;
-    let value = u32::from_be_bytes(bytes);
-    *input = &input[4..];
-    Ok(value as usize)
 }
 
 fn cursor_error(message: impl Into<String>) -> AccountError {
@@ -1812,57 +1644,7 @@ fn decode_offset_cursor(
     cursor: Option<Vec<u8>>,
     operation: AccountOperation,
 ) -> Result<usize, AccountError> {
-    let Some(cursor) = cursor else {
-        return Ok(0);
-    };
-    let value =
-        String::from_utf8(cursor).map_err(|error| local_error(operation, error.to_string()))?;
-    value
-        .parse()
-        .map_err(|error| local_error(operation, format!("invalid CardDAV page cursor: {error}")))
-}
-
-/// Slice a materialized result set into one offset page.
-///
-/// `failed_ids` and `skipped_scopes` describe the fetch that produced
-/// `items`, not the slice, and every page of a CardDAV search reruns that
-/// fetch against the server. So both lanes are reported on every page,
-/// which is exactly what `Page::failed_ids` documents ("resources the
-/// provider fetched FOR THIS PAGE"): a resource that first starts failing
-/// while the consumer is on page three is news on page three, and
-/// suppressing it after page one would lose it entirely. The cost is that
-/// a resource failing throughout is named once per page, so a consumer
-/// accumulating across pages must treat the lane as a set, not a tally.
-fn page_from_offset<T>(
-    items: Vec<T>,
-    offset: usize,
-    page_size: usize,
-    failed_ids: Vec<String>,
-    skipped_scopes: Vec<SkippedScope>,
-) -> Page<T> {
-    let total = items.len();
-    // A zero page size is an exhausted page, not a page of nothing that still
-    // points at itself: emitting the current offset again whenever results
-    // exist gives a consumer that follows `next_cursor` an infinite loop that
-    // never advances and never delivers an item.
-    if page_size == 0 {
-        return Page {
-            items: Vec::new(),
-            next_cursor: None,
-            estimated_total: Some(estimated_total(total)),
-            failed_ids,
-            skipped_scopes,
-        };
-    }
-    let end = offset.saturating_add(page_size).min(total);
-    let page_items = items.into_iter().skip(offset).take(page_size).collect();
-    Page {
-        items: page_items,
-        next_cursor: (end < total).then(|| end.to_string().into_bytes()),
-        estimated_total: Some(estimated_total(total)),
-        failed_ids,
-        skipped_scopes,
-    }
+    bifrost_dav_core::decode_offset_cursor(cursor, operation, DavProtocol::CardDav)
 }
 
 /// One CardDAV search or hydration leg: what materialized, the resources
@@ -2027,7 +1809,10 @@ fn contains(value: &str, needle: &str) -> bool {
 mod tests {
     use super::*;
     use bifrost_dav_core::test_support::{dav_script_empty, scripted_dav_net};
-    use bifrost_types::{AccountErrorKind, EngineDirective, RecoveryClass, SyncStateErrorKind};
+    use bifrost_types::{
+        AccountErrorKind, EngineDirective, ObjectChange, ObjectChangeKind, RecoveryClass,
+        SyncStateErrorKind,
+    };
 
     /// `set_priority` and `set_bandwidth_cap` reach the account's transport.
     ///

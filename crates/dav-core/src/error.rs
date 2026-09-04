@@ -42,6 +42,15 @@ impl DavProtocol {
         }
     }
 
+    /// The protocol's name as it appears in support-only diagnostics.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::CalDav => "CalDAV",
+            Self::CardDav => "CardDAV",
+        }
+    }
+
     /// The `field` label on a locally-refused request.
     #[must_use]
     pub fn field(self) -> &'static str {

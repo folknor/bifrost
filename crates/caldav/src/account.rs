@@ -1,4 +1,8 @@
-use bifrost_dav_core::{append_path, same_dav_url};
+use bifrost_dav_core::{
+    DavProtocol, SnapshotEntry, append_path, decode_offset_cursor, decode_snapshot, diff_snapshots,
+    encode_snapshot, inventory_entry as inventory_entry_from_snapshot, object_change,
+    page_from_offset, preserve_unobserved_entries, same_dav_url,
+};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
@@ -1243,34 +1247,22 @@ fn decode_event_page_cursor(
     cursor: Option<Vec<u8>>,
     operation: AccountOperation,
 ) -> Result<usize, AccountError> {
-    let Some(cursor) = cursor else {
-        return Ok(0);
-    };
-    let value =
-        String::from_utf8(cursor).map_err(|error| local_error(operation, error.to_string()))?;
-    value
-        .parse()
-        .map_err(|error| local_error(operation, format!("invalid CalDAV page cursor: {error}")))
+    decode_offset_cursor(cursor, operation, DavProtocol::CalDav)
 }
 
-/// Slice a materialized result set into one offset page.
+/// Sort a materialized result set into its stable order, then slice one offset
+/// page out of it through the shared slicer.
 ///
 /// Takes `Vec<CalendarEvent>` rather than being generic on purpose: the sort
 /// below is the load-bearing half of the offset contract, and a generic
-/// signature would let a caller page something with no stable key at all.
-///
-/// The offset is local, and each continuation re-runs the remote REPORT. DAV
-/// guarantees no ordering on a multistatus, so slicing raw response order
-/// would let an unchanged result set come back permuted between page one and
-/// page two: events the permutation moved behind the offset are SKIPPED and
-/// events it moved past the offset are served TWICE, with nothing to tell the
-/// consumer either happened. Sorting first is what makes the offset mean the
-/// same thing on both requests. The key is the recurrence-qualified `EventId`
-/// (resource href, plus `#RECURRENCE-ID` for an override instance), which is
-/// unique per emitted item and stable across polls because it is derived from
-/// the resource URL rather than from anything the server chose to order by.
-/// `bifrost-carddav::contact_search` already sorted by `native_id` for this
-/// reason; the two must not drift apart again.
+/// signature would let a caller page something with no stable key at all. The
+/// key is the recurrence-qualified `EventId` (resource href, plus
+/// `#RECURRENCE-ID` for an override instance), which is unique per emitted item
+/// and stable across polls because it is derived from the resource URL rather
+/// than from anything the server chose to order by. `bifrost-carddav` sorts by
+/// `native_id` for the same reason, and both now slice through
+/// `bifrost_dav_core::page_from_offset`, which is where the offset contract -
+/// including the zero-limit exhaustion rule - is written down.
 fn event_page(
     mut items: Vec<CalendarEvent>,
     offset: usize,
@@ -1279,30 +1271,10 @@ fn event_page(
     skipped_scopes: Vec<SkippedScope>,
 ) -> Page<CalendarEvent> {
     items.sort_by(|left, right| left.id.0.cmp(&right.id.0));
-    let total = items.len();
-    let estimated_total = Some(u64::try_from(total).unwrap_or(u64::MAX));
-    // A zero limit is an exhausted page, not a page of nothing that still
-    // points at itself. Emitting the current offset again whenever results
-    // exist gives a consumer that follows `next_cursor` an infinite loop that
-    // never advances and never delivers an item.
-    if limit == Some(0) {
-        return Page {
-            items: Vec::new(),
-            next_cursor: None,
-            estimated_total,
-            failed_ids,
-            skipped_scopes,
-        };
-    }
-    let page_size = limit.map_or(total, |value| usize::try_from(value).unwrap_or(usize::MAX));
-    let end = offset.saturating_add(page_size).min(total);
-    Page {
-        items: items.into_iter().skip(offset).take(page_size).collect(),
-        next_cursor: (end < total).then(|| end.to_string().into_bytes()),
-        estimated_total,
-        failed_ids,
-        skipped_scopes,
-    }
+    let page_size = limit.map_or(items.len(), |value| {
+        usize::try_from(value).unwrap_or(usize::MAX)
+    });
+    page_from_offset(items, offset, page_size, failed_ids, skipped_scopes)
 }
 
 /// The scheduling POST completed before the local PUT began. Preserve that
@@ -1480,11 +1452,10 @@ struct EventSnapshot {
     failed_hrefs: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct EventSnapshotEntry {
-    uri: String,
-    etag: Option<String>,
-}
+/// One polled calendar member. The shape, the cursor codec, the diff and the
+/// page slicer are all shared with `bifrost-carddav` through
+/// `bifrost-dav-core`; only the magic bytes and the token's name differ.
+type EventSnapshotEntry = SnapshotEntry;
 
 /// Refuse an `EventId` that names one occurrence of a recurring series.
 ///
@@ -1652,16 +1623,12 @@ fn cursor_from_snapshot(scope: CursorScope, snapshot: &EventSnapshot) -> ChangeC
 }
 
 fn encode_cursor_snapshot(snapshot: &EventSnapshot) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(CURSOR_MAGIC);
-    write_string(&mut bytes, &snapshot.calendar_url);
-    write_option_string(&mut bytes, snapshot.sync_token.as_deref());
-    write_u32(&mut bytes, snapshot.entries.len());
-    for entry in &snapshot.entries {
-        write_string(&mut bytes, &entry.uri);
-        write_option_string(&mut bytes, entry.etag.as_deref());
-    }
-    bytes
+    encode_snapshot(
+        CURSOR_MAGIC,
+        &snapshot.calendar_url,
+        snapshot.sync_token.as_deref(),
+        &snapshot.entries,
+    )
 }
 
 fn decode_cursor_snapshot(cursor: &ChangeCursor) -> Result<EventSnapshot, AccountError> {
@@ -1671,33 +1638,16 @@ fn decode_cursor_snapshot(cursor: &ChangeCursor) -> Result<EventSnapshot, Accoun
     {
         return Err(cursor_error("CalDAV cursor protocol or version mismatch"));
     }
-    let mut input = cursor.server_state.bytes.as_slice();
-    if !input.starts_with(CURSOR_MAGIC) {
-        return Err(cursor_error("CalDAV cursor magic mismatch"));
-    }
-    input = &input[CURSOR_MAGIC.len()..];
-    let calendar_url = read_string(&mut input)?;
-    let sync_token = read_option_string(&mut input)?;
-    let count = read_u32(&mut input)?;
-    if count > input.len() / 5 {
-        return Err(cursor_error(
-            "CalDAV cursor entry count exceeds remaining payload",
-        ));
-    }
-    let mut entries = Vec::with_capacity(count);
-    for _ in 0..count {
-        entries.push(EventSnapshotEntry {
-            uri: read_string(&mut input)?,
-            etag: read_option_string(&mut input)?,
-        });
-    }
-    if !input.is_empty() {
-        return Err(cursor_error("CalDAV cursor has trailing bytes"));
-    }
+    let decoded = decode_snapshot(
+        CURSOR_MAGIC,
+        DavProtocol::CalDav.label(),
+        &cursor.server_state.bytes,
+    )
+    .map_err(cursor_error)?;
     Ok(EventSnapshot {
-        calendar_url,
-        sync_token,
-        entries,
+        calendar_url: decoded.collection_url,
+        sync_token: decoded.token,
+        entries: decoded.entries,
         failed_hrefs: Vec::new(),
     })
 }
@@ -1763,24 +1713,11 @@ async fn changes_from_cursor(
 }
 
 fn preserve_unobserved_event_entries(previous: &EventSnapshot, current: &mut EventSnapshot) {
-    if current.entries.is_empty() && !previous.entries.is_empty() {
-        current.entries.clone_from(&previous.entries);
-        return;
-    }
-    let failed: HashSet<&str> = current.failed_hrefs.iter().map(String::as_str).collect();
-    current.entries.extend(
-        previous
-            .entries
-            .iter()
-            .filter(|entry| failed.contains(entry.uri.as_str()))
-            .cloned(),
+    preserve_unobserved_entries(
+        &previous.entries,
+        &mut current.entries,
+        &current.failed_hrefs,
     );
-    current
-        .entries
-        .sort_by(|left, right| left.uri.cmp(&right.uri));
-    current
-        .entries
-        .dedup_by(|left, right| left.uri == right.uri);
 }
 
 fn apply_sync_report(
@@ -1837,153 +1774,11 @@ fn apply_sync_report(
     changes
 }
 
+/// Diff two event snapshots. The rule, the transient-empty-207 suppression
+/// and the failed-href preservation all live in `bifrost-dav-core`, which
+/// `bifrost-carddav` reads through the same door.
 fn diff_event_snapshots(previous: &EventSnapshot, current: &EventSnapshot) -> Vec<Change> {
-    // Suspected transient empty multistatus: a server returning zero
-    // hrefs against a populated local snapshot would emit a Destroyed for
-    // every object and wipe the consumer's store. Treat
-    // empty-vs-nonempty as "no observation," not "everything deleted."
-    // A genuine empty-out reconciles on the next non-empty poll or via
-    // the sync-token path (apply_sync_report), which is not exposed to a
-    // bare empty multistatus.
-    //
-    // Accepted cost, stated plainly because it is easy to re-file as a bug:
-    // a REAL empty-out - a user deleting every event in the collection - is
-    // suppressed along with the transient empty-207, on this poll AND on
-    // later ones, because on the wire the two are identical. There is no
-    // signal that separates them, so the choice is between never wrongly
-    // wiping a consumer's store and never missing a genuine mass delete;
-    // this crate takes the first. `reference/caldav.md` says so, with the
-    // ctag short-circuit caveat, and `bifrost-carddav` makes the same trade
-    // in its own snapshot diff - change one and change the other.
-    if current.entries.is_empty() && !previous.entries.is_empty() {
-        return Vec::new();
-    }
-    let failed: HashSet<&str> = current.failed_hrefs.iter().map(String::as_str).collect();
-    let mut changes = Vec::new();
-    let mut left = 0;
-    let mut right = 0;
-    while left < previous.entries.len() || right < current.entries.len() {
-        match (previous.entries.get(left), current.entries.get(right)) {
-            (Some(old), Some(new)) if old.uri == new.uri => {
-                if old.etag != new.etag {
-                    changes.push(object_change(&new.uri, ObjectChangeKind::Updated));
-                }
-                left += 1;
-                right += 1;
-            }
-            (Some(old), Some(new)) if old.uri < new.uri => {
-                push_destroyed_unless_failed(&mut changes, &failed, &old.uri);
-                left += 1;
-            }
-            (Some(_), Some(new)) => {
-                changes.push(object_change(&new.uri, ObjectChangeKind::Created));
-                right += 1;
-            }
-            (Some(old), None) => {
-                push_destroyed_unless_failed(&mut changes, &failed, &old.uri);
-                left += 1;
-            }
-            (None, Some(new)) => {
-                changes.push(object_change(&new.uri, ObjectChangeKind::Created));
-                right += 1;
-            }
-            (None, None) => break,
-        }
-    }
-    changes
-}
-
-/// Emit `Destroyed` for `uri` unless the server reported that resource
-/// *failed* within the 207. A transiently-failed resource is preserved
-/// locally rather than treated as absent (brick 7).
-fn push_destroyed_unless_failed(changes: &mut Vec<Change>, failed: &HashSet<&str>, uri: &str) {
-    if failed.contains(uri) {
-        return;
-    }
-    changes.push(object_change(uri, ObjectChangeKind::Destroyed));
-}
-
-fn object_change(uri: &str, kind: ObjectChangeKind) -> Change {
-    Change::ObjectChange(ObjectChange {
-        id: ObjectId(uri.to_string()),
-        kind,
-    })
-}
-
-fn inventory_entry_from_snapshot(entry: &EventSnapshotEntry) -> InventoryEntry {
-    InventoryEntry {
-        id: ObjectId(entry.uri.clone()),
-        memberships: Vec::new(),
-        size: None,
-        blob_id: None,
-        fingerprint: Fingerprint {
-            server_version: entry
-                .etag
-                .clone()
-                .map(ServerVersion::ETag)
-                .unwrap_or(ServerVersion::Unavailable),
-            size: None,
-            flags_hash: bifrost_types::canonical_flags_hash(std::iter::empty::<&str>()),
-        },
-        thread_id: None,
-        message_id: None,
-        references: Vec::new(),
-        in_reply_to: None,
-    }
-}
-
-fn write_string(bytes: &mut Vec<u8>, value: &str) {
-    write_u32(bytes, value.len());
-    bytes.extend_from_slice(value.as_bytes());
-}
-
-fn write_option_string(bytes: &mut Vec<u8>, value: Option<&str>) {
-    match value {
-        Some(value) => {
-            bytes.push(1);
-            write_string(bytes, value);
-        }
-        None => bytes.push(0),
-    }
-}
-
-fn write_u32(bytes: &mut Vec<u8>, value: usize) {
-    let value = u32::try_from(value).unwrap_or(u32::MAX);
-    bytes.extend_from_slice(&value.to_be_bytes());
-}
-
-fn read_string(input: &mut &[u8]) -> Result<String, AccountError> {
-    let len = read_u32(input)?;
-    if input.len() < len {
-        return Err(cursor_error("CalDAV cursor string length exceeds payload"));
-    }
-    let value = String::from_utf8(input[..len].to_vec())
-        .map_err(|error| cursor_error(format!("CalDAV cursor string is not UTF-8: {error}")))?;
-    *input = &input[len..];
-    Ok(value)
-}
-
-fn read_option_string(input: &mut &[u8]) -> Result<Option<String>, AccountError> {
-    let Some((tag, rest)) = input.split_first() else {
-        return Err(cursor_error("CalDAV cursor option tag is missing"));
-    };
-    *input = rest;
-    match tag {
-        0 => Ok(None),
-        1 => read_string(input).map(Some),
-        _ => Err(cursor_error("CalDAV cursor option tag is invalid")),
-    }
-}
-
-fn read_u32(input: &mut &[u8]) -> Result<usize, AccountError> {
-    let bytes = input
-        .get(..4)
-        .ok_or_else(|| cursor_error("CalDAV cursor integer is truncated"))?;
-    let bytes = <[u8; 4]>::try_from(bytes)
-        .map_err(|error| cursor_error(format!("CalDAV cursor integer shape: {error}")))?;
-    let value = u32::from_be_bytes(bytes);
-    *input = &input[4..];
-    Ok(value as usize)
+    diff_snapshots(&previous.entries, &current.entries, &current.failed_hrefs)
 }
 
 fn cursor_error(message: impl Into<String>) -> AccountError {

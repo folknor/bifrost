@@ -456,7 +456,14 @@ created/updated/destroyed event changes. A per-member status that is neither
 503): the prior entry is PRESERVED untouched rather than upserted, because an
 upsert records an etag-less entry and emits a change for a resource nobody
 observed - and the etag-less entry then makes the next poll report an update as
-well.
+well. The member status itself comes from
+`ResponseParts::member_status_code`: a response-level status wins (RFC 6578
+reports a removed member as a response carrying its own `404`/`410` and no
+propstat); below that, any successful propstat makes the member successful,
+and only a response whose every propstat failed reports its first failed code.
+A propstat `404` is a per-PROPERTY miss that servers answer for any requested
+property they lack, beside the `200` propstat carrying the etag; reading it as
+the member status destroyed a live resource.
 The collection's OWN response is removed before the entries reach the snapshot.
 The REPORT requests only `getetag`, so nothing but the href distinguishes it
 from a member, and left in place it becomes a snapshot entry for the collection
@@ -606,21 +613,59 @@ Finally the XML decoding primitives, in `bifrost_dav_core::xml`: `local_name`,
 `normalize_etag`, `resolve_href`, `push_text`, `trimmed`, plus `escape_xml` and
 `append_path`. All were byte-identical.
 
-**Where the extraction stops, and why.** The parsers ABOVE those primitives are
-NOT shared and are not candidates for it. `PropStat`, `ResponseParts` and
-`parse_multiget_report` differ in real content, not in spelling: they carry
-different property sets and different entry types (`calendar-data` and
-`CalDavEventEntry` against `address-data` and `CardDavContactEntry`), and CalDAV
-additionally has the whole `sync-collection` lane that CardDAV has no analogue
-for. Unifying them would mean parameterizing the parser over the resource kind,
-which is a redesign of both crates rather than a move - the shape option A was
-proposed as, and a different decision from the one taken here. The same is true
-of the cursor codecs and the snapshot diffs in each `account.rs`: they are
-similar in outline and different in substance.
+**The 207 parser, collapsed.** The propstat state machine used to be the one
+piece deliberately left behind, on the argument that unifying it was a redesign
+rather than a move. The defect ledger overruled that: eight recorded drift
+defects lived in those hand-mirrored lines. It is now
+`bifrost_dav_core::ResponseParts<P: PropSet>`, driven by
+`parse_multistatus(xml, &mut sink)` against a `MultiStatusSink`.
 
-So the rule from the next section still applies to everything that stayed
-behind. What changed is that the code most likely to drift, and most damaging
-when it does, no longer can.
+`ResponseParts<P>` owns everything that is not a property name: whether a
+`<response>` is open, the `<href>`, the response-level `<status>`, which
+propstats succeeded and which failed with what code, the staged-versus-committed
+split, and the lane decision. It exposes three rules as methods, and those three
+rules are where every one of the drift defects lived:
+
+- `staged_mut` / `marker_mut` plus `commit_propstat` - a property is read into
+  the STAGED bag and promoted only when its own propstat answered 2xx. An absent
+  status is success; a status that is PRESENT and unparseable is a refusal.
+- `entry_href` / `failed_href` - a response whose ONLY propstat failed is a
+  failed href, not an entry; a response with NO propstat at all commits as an
+  entry, because dropping a resource the server named out of both lanes makes
+  the snapshot diff destroy something that exists.
+- `fetched` / `failed_resource` / `missing_data_href` - the multiget lanes,
+  including the collection exclusion and the first-refused-code rule.
+
+Each crate supplies only a `PropSet` (which properties it stages and how a
+successful propstat merges them) and its entry constructors. CalDAV has two:
+`CalendarCollectionProps` (`<calendar/>`, the privilege markers, `displayname`,
+`calendar-color`, `sync-token`) and `EventProps` (`<collection/>`, `getetag`,
+`getcontenttype`, `calendar-data`). Every listing lane goes through the shared
+machine: the depth-1 PROPFIND, the `calendar-multiget` / `calendar-query`
+REPORT, the `sync-collection` REPORT, and calendar discovery. The depth-0 token
+reads (`sync-token` here, `getctag` in CardDAV) share
+`parse_collection_property`, and both crates' `current-user-principal` /
+home-set walks share `extract_href_property` / `extract_href_properties`.
+
+`take_collection_response` stays here: it is CalDAV-specific post-processing,
+dropping the collection's own response from a sync report and reading its RFC
+6578 s3.6 `507` as the truncation marker.
+
+**The polling cursor, collapsed.** The second tier went the same way, into
+`bifrost_dav_core::snapshot`: `SnapshotEntry`, `encode_snapshot` /
+`decode_snapshot` (the length-bounded byte codec, with the entry-count guard and
+the trailing-bytes refusal), `diff_snapshots` (including the transient-empty-207
+suppression and the failed-href preservation), `preserve_unobserved_entries`,
+`inventory_entry`, `object_change`, `decode_offset_cursor` and
+`page_from_offset`. What stays local is what genuinely differs: the magic bytes
+(`CALDAVET1` / `CDAVCTAG1`), the envelope-version and scope validation, the name
+of the token, and the crate's own `cursor_error`. `event_page` still sorts by
+the recurrence-qualified `EventId` before slicing - the sort is the load-bearing
+half of the offset contract and stays where the key type is known.
+
+So the drift rule from the next section still applies, but to a much smaller
+remainder: the query bodies, the property constants, the iCalendar projection,
+the scheduling lane, and the handful of error mappings listed below.
 
 Also NOT moved, and for the same reason as `not_found_error`:
 `bifrost-carddav` has its own `send_status_request` that returns the response

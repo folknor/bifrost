@@ -46,7 +46,8 @@ an etag-less entry instead of being destroyed by the diff. Pinned by
 `propfind_events_ignores_an_etag_inside_a_failed_propstat` and
 `a_propstat_less_response_is_an_entry_rather_than_a_vanished_contact`, both
 revert-and-confirmed; both reference docs updated. The `ResponseParts<P>`
-redesign the fix grouping mentions was NOT done - it remains the owner's call.)
+redesign the fix grouping mentions landed later the same day under ruling 6;
+both rules are now pinned once more at the dav-core level.)
 
 ## Contract / spec findings, confident
 
@@ -134,23 +135,36 @@ revert-and-confirmed.)
 
 Findings 4 and 5 were propstat-state-machine discipline defects and were worked
 as a single change (13, the third of the group, is closed as an accepted,
-commented edge). The `ResponseParts<P>` redesign below was NOT taken; it stays
-the repository owner's decision.
+commented edge, and that comment now lives once on
+`ResponseParts::failed_resource` in dav-core). The `ResponseParts<P>` redesign
+below was subsequently taken, as ruling 6.
 
 ## Structural observations (pre-1.0, rewrite-friendly posture)
 
-- **The propstat state machine is the drift engine, and findings 4, 5 and 13
-  all live in it.** The references defend not parameterizing the parser as "a
-  redesign, not a move" - but the ledger now shows the redesign paying for
-  itself: five historical defects plus three found here, all in the ~1500
-  hand-mirrored lines. A generic `ResponseParts<P: PropSet>` in dav-core (each
-  crate supplying only its staged-property enum and entry constructors) would
-  erase the entire class. The reference marks the collapse as a
-  repository-owner decision; the hunter registers that the defect count keeps
-  voting for it.
-- The **cursor codecs, snapshot diffs, offset-page slicers and
-  `one_outcome_per_id`** are likewise near-identical twins differing only in
-  field names; same argument, lower stakes.
+- (**The propstat state machine is the drift engine** - DONE 2026-09-04 under
+  ruling 6. `bifrost_dav_core::ResponseParts<P: PropSet>` now owns the machine
+  and every listing lane in both crates runs through `parse_multistatus`; the
+  cursor codecs, snapshot diffs and offset-page slicers followed into
+  `bifrost_dav_core::snapshot`. The move found one further twin difference on
+  top of findings 4, 5 and 13: CardDAV accepted `<addressbook/>` as a
+  resourcetype marker anywhere in the prop bag, where CalDAV required it inside
+  `<resourcetype>`, so an `<addressbook/>` nested in `<D:owner>` or a server
+  extension minted a phantom address book. Closed to the CalDAV behaviour and
+  pinned by `addressbook_element_outside_resourcetype_does_not_mark_a_collection`,
+  revert-confirmed. `one_outcome_per_id` was NOT collapsed: the two versions
+  filter against different things - CalDAV against a materialized href set,
+  CardDAV against the `native_id` of parsed cards - and share only their shape.
+  The cold review of the collapse caught one hole the move OPENED: the shared
+  machine reported a sync member's status as the first readable propstat code
+  when no response-level status was present, so a `404` propstat for a
+  property the server lacks, beside the `200` propstat carrying the etag, read
+  as a removed member and `apply_sync_report` destroyed a live event. The old
+  CalDAV parser kept the last propstat's code, which was wrong the same way
+  under the opposite ordering. `member_status_code` now lets a response-level
+  status win, treats any successful propstat as member success, and reports
+  a failed code only for an all-failed response; pinned by
+  `a_failed_property_propstat_beside_a_successful_one_is_not_a_member_failure`,
+  revert-confirmed.)
 - `event_page` (CalDAV) materializes and sorts the *entire* result set on
   every page fetch, and empty-query `contact_search` re-hydrates the whole
   address book per page. Documented and honest, but for a large collection

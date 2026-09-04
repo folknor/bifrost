@@ -21,6 +21,8 @@
 mod dispatch;
 mod error;
 mod etag;
+mod multistatus;
+mod snapshot;
 #[cfg(feature = "test-support")]
 pub mod test_support;
 mod transport;
@@ -33,6 +35,14 @@ pub use error::{
     status_error, transport_error, unsupported_error, worse_recovery,
 };
 pub use etag::{PutCondition, normalize_http_etag, prepare_if_match, response_etag};
+pub use multistatus::{
+    MultiStatusSink, PropSet, ResponseParts, commit_if_present, extract_href_properties,
+    extract_href_property, parse_collection_property, parse_multistatus,
+};
+pub use snapshot::{
+    DecodedSnapshot, SnapshotEntry, decode_offset_cursor, decode_snapshot, diff_snapshots,
+    encode_snapshot, inventory_entry, object_change, page_from_offset, preserve_unobserved_entries,
+};
 pub use transport::{
     DAV_CLIENT_TIMEOUT, DavBody, DavRequest, DavResponse, origin_is_secure, settle_body, url_origin,
 };

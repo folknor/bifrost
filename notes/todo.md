@@ -61,17 +61,23 @@ between them.
    `RedirectPolicy::admits_hop`; the recommendation was to keep it on the
    published-surface rule in AGENTS.md. The owner ruled delete. Remove the
    method and its tests; `admits_hop` stays as the single rule.
-6. **dav: collapse the propstat parsers into `ResponseParts<P: PropSet>` in
-   dav-core. PROCEED, full scope.** Each crate supplies only its
-   staged-property enum and entry constructors. The cursor codecs, snapshot
-   diffs and page slicers follow the same pattern. Eight defects on record in
-   those lines (five historical plus findings 4, 5, 13 of the 2026-09-04
-   hunt), every one a drift between twins. Supersedes the "deliberately NOT
-   extracted" carve-out recorded under `dav-B5` and in `reference/caldav.md`
-   "The shared layer"; update that section when the collapse lands. Finding 5
-   was resolved to the CalDAV behavior in both crates, so that divergence is
-   already unified; any other twin difference found during the move must be
-   surfaced, not silently flattened. Single agent, cold review after.
+6. **DONE (2026-09-04). dav: collapse the propstat parsers into
+   `ResponseParts<P: PropSet>` in dav-core.** Landed at full scope.
+   `bifrost_dav_core::multistatus` owns the response/href/propstat state
+   machine, the stage-under-status rule, the commit-on-success rule and the
+   entry-versus-failed-href lane decision, driven by
+   `parse_multistatus(xml, &mut sink)` against a `MultiStatusSink`; each crate
+   supplies only its `PropSet` impls and entry constructors. All seven listing
+   lanes go through it (both crates' collection discovery, depth-1 PROPFIND and
+   multiget REPORT, plus CalDAV's sync-collection REPORT), and the depth-0
+   token reads and href-property extractors are shared too. The second tier
+   followed into `bifrost_dav_core::snapshot`: cursor codec, snapshot diff,
+   `preserve_unobserved_entries`, inventory projection, offset cursor and page
+   slicer. Four dav-core tests pin the shared machine, each revert-confirmed;
+   both reference docs rewritten. One twin difference was found and closed:
+   CardDAV accepted `<addressbook/>` as a resourcetype marker anywhere in the
+   prop bag where CalDAV required it inside `<resourcetype>` - now guarded on
+   both sides and pinned. Cold review still wanted.
 7. **smtp: sans-I/O protocol core driven by a blocking and an async I/O
    adapter. PROCEED, last.** Command sequencing, reply-group accounting,
    phase decoration and `SendProgress` transitions in one core; the two
@@ -822,15 +828,19 @@ confirm against the code before working any of them.
 
 ### Fenced for the repository owner (published surface)
 
-- **dav-B5. RESOLVED 2026-08-29 as option B; the propstat carve-out is
-  REOPENED 2026-09-04 by ruling 6 at the top of this file (PROCEED).** Kept
-  for the option reasoning. The protocol-neutral half now lives in the private
-  `bifrost-dav-core`; both published surfaces are untouched. What was
-  deliberately NOT extracted - the propstat parsers, the cursor codecs, the
-  snapshot diffs - is recorded with its reasoning in `reference/caldav.md`
-  under "The shared layer", along with the two behavioural divergences that
-  were preserved rather than flattened. The drift rule below still governs
-  what stayed behind.
+- **dav-B5. CLOSED 2026-09-04 as option B, taken all the way.** Kept for the
+  option reasoning. The protocol-neutral half lives in the private
+  `bifrost-dav-core` and both published surfaces are untouched. The carve-out
+  this entry used to record - the propstat parsers, the cursor codecs, the
+  snapshot diffs kept behind as "a redesign, not a move" - was reversed by
+  ruling 6 and no longer exists: `ResponseParts<P: PropSet>` and the shared
+  snapshot layer now carry all of it, and `reference/caldav.md` describes the
+  collapse rather than defending the exception. The two behavioural
+  divergences that were deliberate (`not_found_error`'s scope, CardDAV's
+  etag-returning `send_status_request`) are still preserved and still
+  recorded there. The drift rule below governs what remains duplicated: query
+  bodies, property constants, the per-domain projections, and the
+  `Unsupported` stubs.
 
   Original entry, for the reasoning that led here:
 

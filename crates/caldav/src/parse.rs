@@ -1,8 +1,9 @@
 pub(crate) use bifrost_dav_core::resolve_href;
-use bifrost_dav_core::{local_name, normalize_etag, push_text, same_dav_url, trimmed};
-use bifrost_net::{status_line_code, status_line_is_success};
-use quick_xml::Reader;
-use quick_xml::events::Event;
+use bifrost_dav_core::{
+    MultiStatusSink, PropSet, ResponseParts, commit_if_present, normalize_etag,
+    parse_collection_property, parse_multistatus, same_dav_url, trimmed,
+};
+pub(crate) use bifrost_dav_core::{extract_href_properties, extract_href_property};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CalendarCollection {
@@ -225,196 +226,230 @@ impl CalDavSyncReport {
     }
 }
 
-pub(crate) fn parse_calendar_collections(xml: &str) -> Result<Vec<CalendarCollection>, String> {
-    let mut reader = Reader::from_str(xml);
-    let mut stack = Vec::new();
-    let mut text = String::new();
-    let mut current = ResponseParts::default();
-    let mut collections = Vec::new();
+/// Properties a calendar-collection PROPFIND stages. The `<calendar/>`
+/// resourcetype marker and the privilege markers are staged like every value
+/// property: a `resourcetype` or `current-user-privilege-set` the server
+/// REFUSED says nothing about the collection.
+#[derive(Default)]
+struct CalendarCollectionProps {
+    is_calendar: bool,
+    privilege_seen: bool,
+    write_seen: bool,
+    display_name: Option<String>,
+    color: Option<String>,
+    sync_token: Option<String>,
+}
 
-    loop {
-        match reader.read_event() {
-            Ok(Event::Start(element)) => {
-                let name = local_name(element.name().as_ref());
-                if name == "response" {
-                    current = ResponseParts {
-                        in_response: true,
-                        ..ResponseParts::default()
-                    };
-                }
-                if current.in_response && name == "propstat" {
-                    current.begin_propstat();
-                }
-                if current.in_response
-                    && name == "calendar"
-                    && stack.iter().any(|item| item == "resourcetype")
-                {
-                    current.mark_calendar();
-                }
-                if current.in_response && name == "privilege" {
-                    current.mark_privilege_seen();
-                }
-                if current.in_response
-                    && (name == "write" || name == "write-content" || name == "all")
-                    && stack.iter().any(|item| item == "privilege")
-                {
-                    current.mark_write_seen();
-                }
-                stack.push(name);
-                text.clear();
-            }
-            Ok(Event::Empty(element)) => {
-                let name = local_name(element.name().as_ref());
-                if current.in_response
-                    && name == "calendar"
-                    && stack.iter().any(|item| item == "resourcetype")
-                {
-                    current.mark_calendar();
-                }
-                if current.in_response && name == "privilege" {
-                    current.mark_privilege_seen();
-                }
-                if current.in_response
-                    && (name == "write" || name == "write-content" || name == "all")
-                    && stack.iter().any(|item| item == "privilege")
-                {
-                    current.mark_write_seen();
-                }
-            }
-            Ok(Event::Text(value)) => push_text(&mut text, value.as_ref())?,
-            Ok(Event::CData(value)) => {
-                let value = value.decode().map_err(|error| error.to_string())?;
-                text.push_str(&value);
-            }
-            Ok(Event::End(element)) => {
-                let name = local_name(element.name().as_ref());
-                let parent = stack.iter().rev().nth(1).map(String::as_str);
-                if current.in_response {
-                    match (parent, name.as_str()) {
-                        (Some("response"), "href") => current.href = trimmed(&text),
-                        (Some("prop"), "displayname") => {
-                            current.staged.display_name = trimmed(&text);
-                        }
-                        (Some("prop"), "calendar-color") => {
-                            current.staged.color =
-                                trimmed(&text).map(|value| value.trim().to_string());
-                        }
-                        (Some("prop"), "sync-token") => {
-                            current.staged.sync_token = trimmed(&text);
-                        }
-                        (Some("propstat"), "status") => {
-                            current.staged.success = Some(status_line_is_success(&text));
-                        }
-                        _ => {}
-                    }
-                }
-                if name == "propstat" {
-                    current.commit_propstat();
-                }
-                if name == "response" {
-                    current.in_response = false;
-                    if let Some(collection) = current.as_calendar_collection() {
-                        collections.push(collection);
-                    }
-                }
-                stack.pop();
-                text.clear();
-            }
-            Ok(Event::Eof) => break,
-            Ok(_) => {}
-            Err(error) => return Err(format!("XML parse error: {error}")),
+impl PropSet for CalendarCollectionProps {
+    fn commit_from(&mut self, staged: Self) {
+        self.is_calendar |= staged.is_calendar;
+        self.privilege_seen |= staged.privilege_seen;
+        self.write_seen |= staged.write_seen;
+        commit_if_present(&mut self.display_name, staged.display_name);
+        commit_if_present(&mut self.color, staged.color);
+        commit_if_present(&mut self.sync_token, staged.sync_token);
+    }
+}
+
+/// Properties an event-resource lane stages: the depth-1 listing, the
+/// multiget/query REPORT and the sync REPORT all read from this set.
+#[derive(Default)]
+struct EventProps {
+    is_collection: bool,
+    etag: Option<String>,
+    content_type: Option<String>,
+    calendar_data: Option<String>,
+}
+
+impl PropSet for EventProps {
+    fn commit_from(&mut self, staged: Self) {
+        self.is_collection |= staged.is_collection;
+        commit_if_present(&mut self.etag, staged.etag);
+        commit_if_present(&mut self.content_type, staged.content_type);
+        commit_if_present(&mut self.calendar_data, staged.calendar_data);
+    }
+
+    fn is_collection(&self) -> bool {
+        self.is_collection
+    }
+
+    fn resource_data(&self) -> Option<&str> {
+        self.calendar_data.as_deref()
+    }
+}
+
+/// Mark `<collection/>` inside a `<resourcetype>`, the guard both member lanes
+/// share.
+fn mark_collection(name: &str, stack: &[String], parts: &mut ResponseParts<EventProps>) {
+    if name == "collection" && stack.iter().any(|item| item == "resourcetype") {
+        parts.marker_mut().is_collection = true;
+    }
+}
+
+#[derive(Default)]
+struct CalendarCollectionSink {
+    collections: Vec<CalendarCollection>,
+}
+
+impl MultiStatusSink for CalendarCollectionSink {
+    type Props = CalendarCollectionProps;
+
+    fn element(&mut self, name: &str, stack: &[String], parts: &mut ResponseParts<Self::Props>) {
+        if name == "calendar" && stack.iter().any(|item| item == "resourcetype") {
+            parts.marker_mut().is_calendar = true;
+        }
+        if name == "privilege" {
+            parts.marker_mut().privilege_seen = true;
+        }
+        if (name == "write" || name == "write-content" || name == "all")
+            && stack.iter().any(|item| item == "privilege")
+        {
+            parts.marker_mut().write_seen = true;
         }
     }
 
-    Ok(collections)
+    fn property(
+        &mut self,
+        parent: Option<&str>,
+        name: &str,
+        text: &str,
+        parts: &mut ResponseParts<Self::Props>,
+    ) {
+        match (parent, name) {
+            (Some("prop"), "displayname") => parts.staged_mut().display_name = trimmed(text),
+            (Some("prop"), "calendar-color") => {
+                parts.staged_mut().color = trimmed(text).map(|value| value.trim().to_string());
+            }
+            (Some("prop"), "sync-token") => parts.staged_mut().sync_token = trimmed(text),
+            _ => {}
+        }
+    }
+
+    fn finish_response(&mut self, parts: &ResponseParts<Self::Props>) {
+        let props = parts.props();
+        if !props.is_calendar {
+            return;
+        }
+        let Some(href) = parts.href() else {
+            return;
+        };
+        self.collections.push(CalendarCollection {
+            href: href.to_string(),
+            display_name: props.display_name.clone(),
+            color: props.color.clone(),
+            can_edit: props.privilege_seen.then_some(props.write_seen),
+            sync_token: props.sync_token.clone(),
+        });
+    }
+}
+
+pub(crate) fn parse_calendar_collections(xml: &str) -> Result<Vec<CalendarCollection>, String> {
+    let mut sink = CalendarCollectionSink::default();
+    parse_multistatus(xml, &mut sink)?;
+    Ok(sink.collections)
+}
+
+#[derive(Default)]
+struct EventListingSink {
+    listing: CalDavEventListing,
+}
+
+impl MultiStatusSink for EventListingSink {
+    type Props = EventProps;
+
+    fn element(&mut self, name: &str, stack: &[String], parts: &mut ResponseParts<Self::Props>) {
+        mark_collection(name, stack, parts);
+    }
+
+    fn property(
+        &mut self,
+        parent: Option<&str>,
+        name: &str,
+        text: &str,
+        parts: &mut ResponseParts<Self::Props>,
+    ) {
+        // Staged, never written straight to the committed field: a property
+        // inside a REFUSED propstat is not evidence about the resource. A
+        // server echoing the requested prop skeleton back inside a 404 - the
+        // same shape the `collection` marker is staged against - would
+        // otherwise poison the snapshot etag with a stale value, and the
+        // snapshot diff and the inventory fingerprint both read that etag.
+        match (parent, name) {
+            (Some("prop"), "getetag") => parts.staged_mut().etag = normalize_etag(text),
+            (Some("prop"), "getcontenttype") => parts.staged_mut().content_type = trimmed(text),
+            _ => {}
+        }
+    }
+
+    fn finish_response(&mut self, parts: &ResponseParts<Self::Props>) {
+        if let Some(href) = parts.entry_href() {
+            self.listing.entries.push(CalDavEventEntry {
+                uri: href.to_string(),
+                etag: parts.props().etag.clone(),
+            });
+        } else if let Some(href) = parts.failed_href() {
+            self.listing.failed_hrefs.push(href.to_string());
+        }
+    }
 }
 
 pub(crate) fn parse_propfind_events(xml: &str) -> Result<CalDavEventListing, String> {
-    let mut reader = Reader::from_str(xml);
-    let mut listing = CalDavEventListing::default();
-    let mut current = ResponseParts::default();
-    let mut stack = Vec::new();
-    let mut text = String::new();
+    let mut sink = EventListingSink::default();
+    parse_multistatus(xml, &mut sink)?;
+    Ok(sink.listing)
+}
 
-    loop {
-        match reader.read_event() {
-            Ok(Event::Start(element)) => {
-                let name = local_name(element.name().as_ref());
-                if name == "response" {
-                    current = ResponseParts::default();
-                    current.in_response = true;
-                }
-                if current.in_response && name == "propstat" {
-                    current.begin_propstat();
-                }
-                if current.in_response
-                    && name == "collection"
-                    && stack.iter().any(|item| item == "resourcetype")
-                {
-                    current.mark_collection();
-                }
-                stack.push(name);
-                text.clear();
-            }
-            Ok(Event::Empty(element)) => {
-                let name = local_name(element.name().as_ref());
-                if current.in_response
-                    && name == "collection"
-                    && stack.iter().any(|item| item == "resourcetype")
-                {
-                    current.mark_collection();
-                }
-            }
-            Ok(Event::Text(value)) => push_text(&mut text, value.as_ref())?,
-            Ok(Event::CData(value)) => {
-                let value = value.decode().map_err(|error| error.to_string())?;
-                text.push_str(&value);
-            }
-            Ok(Event::End(element)) => {
-                let name = local_name(element.name().as_ref());
-                let parent = stack.iter().rev().nth(1).map(String::as_str);
-                if current.in_response {
-                    match (parent, name.as_str()) {
-                        (Some("response"), "href") => current.href = trimmed(&text),
-                        // Staged, never written straight to the committed
-                        // field: a property inside a REFUSED propstat is not
-                        // evidence about the resource. A server echoing the
-                        // requested prop skeleton back inside a 404 - the same
-                        // shape the `collection` marker is staged against -
-                        // would otherwise poison the snapshot etag with a stale
-                        // value, and the snapshot diff and the inventory
-                        // fingerprint both read that etag.
-                        (Some("prop"), "getetag") => current.staged.etag = normalize_etag(&text),
-                        (Some("prop"), "getcontenttype") => {
-                            current.staged.content_type = trimmed(&text);
-                        }
-                        (Some("propstat"), "status") => {
-                            current.staged.success = Some(status_line_is_success(&text));
-                        }
-                        _ => {}
-                    }
-                }
-                if name == "propstat" {
-                    current.commit_propstat();
-                }
-                if name == "response" {
-                    current.in_response = false;
-                    if let Some(entry) = current.as_event_entry() {
-                        listing.entries.push(entry);
-                    } else if let Some(href) = current.as_failed_event_href() {
-                        listing.failed_hrefs.push(href);
-                    }
-                }
-                stack.pop();
-                text.clear();
-            }
-            Ok(Event::Eof) => break,
-            Ok(_) => {}
-            Err(error) => return Err(format!("XML parse error: {error}")),
+#[derive(Default)]
+struct MultigetSink {
+    report: CalDavMultigetReport,
+}
+
+impl MultiStatusSink for MultigetSink {
+    type Props = EventProps;
+
+    fn element(&mut self, name: &str, stack: &[String], parts: &mut ResponseParts<Self::Props>) {
+        mark_collection(name, stack, parts);
+    }
+
+    fn property(
+        &mut self,
+        parent: Option<&str>,
+        name: &str,
+        text: &str,
+        parts: &mut ResponseParts<Self::Props>,
+    ) {
+        // Properties are collected PROPSTAT-scoped and only promoted by the
+        // shared machine if that propstat's own status was 2xx. Writing the
+        // response-level fields here instead made the result depend on
+        // propstat order: data from a failed block could be adopted, and a
+        // trailing non-2xx block could discard data a successful one supplied.
+        match (parent, name) {
+            (Some("prop"), "getetag") => parts.staged_mut().etag = normalize_etag(text),
+            (Some("prop"), "calendar-data") => parts.staged_mut().calendar_data = trimmed(text),
+            _ => {}
         }
     }
 
-    Ok(listing)
+    fn finish_response(&mut self, parts: &ResponseParts<Self::Props>) {
+        if let Some((href, data)) = parts.fetched() {
+            self.report.events.push(CalDavFetchedEvent {
+                uri: href.to_string(),
+                etag: parts.props().etag.clone(),
+                data: data.to_string(),
+            });
+        } else if let Some((href, status)) = parts.failed_resource() {
+            // Nothing usable came back for this one resource. That says
+            // nothing about its siblings, so the rest of the page survives;
+            // the carried status lets the caller tell a vanished resource
+            // apart from a refusal.
+            self.report.failed.push(CalDavFailedResource {
+                href: href.to_string(),
+                status: Some(status),
+            });
+        } else if let Some(href) = parts.missing_data_href() {
+            self.report.missing_data.push(href.to_string());
+        }
+    }
 }
 
 /// Parse a `calendar-multiget` / `calendar-query` 207 response.
@@ -427,521 +462,69 @@ pub(crate) fn parse_propfind_events(xml: &str) -> Result<CalDavEventListing, Str
 /// the caller can report the casualties through `Page::failed_ids`
 /// while the rest of the pull succeeds.
 pub(crate) fn parse_multiget_report(xml: &str) -> Result<CalDavMultigetReport, String> {
-    let mut reader = Reader::from_str(xml);
-    let mut report = CalDavMultigetReport::default();
-    let mut current = ResponseParts::default();
-    let mut stack = Vec::new();
-    let mut text = String::new();
+    let mut sink = MultigetSink::default();
+    parse_multistatus(xml, &mut sink)?;
+    Ok(sink.report)
+}
 
-    loop {
-        match reader.read_event() {
-            Ok(Event::Start(element)) => {
-                let name = local_name(element.name().as_ref());
-                if name == "response" {
-                    current = ResponseParts::default();
-                    current.in_response = true;
-                }
-                if current.in_response && name == "propstat" {
-                    current.begin_propstat();
-                }
-                if current.in_response
-                    && name == "collection"
-                    && stack.iter().any(|item| item == "resourcetype")
-                {
-                    current.mark_collection();
-                }
-                stack.push(name);
-                text.clear();
-            }
-            Ok(Event::Empty(element)) => {
-                let name = local_name(element.name().as_ref());
-                if current.in_response
-                    && name == "collection"
-                    && stack.iter().any(|item| item == "resourcetype")
-                {
-                    current.mark_collection();
-                }
-            }
-            Ok(Event::Text(value)) => push_text(&mut text, value.as_ref())?,
-            Ok(Event::CData(value)) => {
-                let value = value.decode().map_err(|error| error.to_string())?;
-                text.push_str(&value);
-            }
-            Ok(Event::End(element)) => {
-                let name = local_name(element.name().as_ref());
-                let parent = stack.iter().rev().nth(1).map(String::as_str);
-                if current.in_response {
-                    // Properties are collected PROPSTAT-scoped and only
-                    // promoted by `commit_propstat` if that propstat's
-                    // own status was 2xx. Writing the response-level
-                    // fields here instead made the result depend on
-                    // propstat order: data from a failed block could be
-                    // adopted, and a trailing non-2xx block could
-                    // discard data a successful one supplied.
-                    match (parent, name.as_str()) {
-                        (Some("response"), "href") => current.href = trimmed(&text),
-                        (Some("prop"), "getetag") => {
-                            current.staged.etag = normalize_etag(&text);
-                        }
-                        (Some("prop"), "calendar-data") => {
-                            current.staged.calendar_data = trimmed(&text);
-                        }
-                        (Some("propstat"), "status") => {
-                            current.staged.status = trimmed(&text);
-                            current.staged.success = Some(status_line_is_success(&text));
-                        }
-                        (Some("response"), "status") => current.status = trimmed(&text),
-                        _ => {}
-                    }
-                }
-                if name == "propstat" {
-                    current.commit_propstat();
-                }
-                if name == "response" {
-                    current.in_response = false;
-                    if let Some(event) = current.as_fetched_event() {
-                        report.events.push(event);
-                    } else if let Some(failed) = current.as_failed_multiget_resource() {
-                        // Nothing usable came back for this one
-                        // resource. That says nothing about its
-                        // siblings, so the rest of the page survives;
-                        // the carried status lets the caller tell a
-                        // vanished resource apart from a refusal.
-                        report.failed.push(failed);
-                    } else if let Some(href) = current.as_missing_multiget_data() {
-                        report.missing_data.push(href);
-                    }
-                }
-                stack.pop();
-                text.clear();
-            }
-            Ok(Event::Eof) => break,
-            Ok(_) => {}
-            Err(error) => return Err(format!("XML parse error: {error}")),
+#[derive(Default)]
+struct SyncReportSink {
+    sync_token: Option<String>,
+    entries: Vec<CalDavSyncEntry>,
+}
+
+impl MultiStatusSink for SyncReportSink {
+    type Props = EventProps;
+
+    fn property(
+        &mut self,
+        parent: Option<&str>,
+        name: &str,
+        text: &str,
+        parts: &mut ResponseParts<Self::Props>,
+    ) {
+        if let (Some("prop"), "getetag") = (parent, name) {
+            parts.staged_mut().etag = normalize_etag(text);
         }
     }
 
-    Ok(report)
+    fn document_property(&mut self, parent: Option<&str>, name: &str, text: &str) {
+        if matches!(parent, Some("multistatus")) && name == "sync-token" {
+            self.sync_token = trimmed(text);
+        }
+    }
+
+    /// Every response with an href is a sync member, including the
+    /// collection's own (dropped later by `take_collection_response`, which
+    /// reads its 507 as the RFC 6578 s3.6 truncation marker) and including
+    /// deletions, which carry a response-level 404 and no propstat at all.
+    fn finish_response(&mut self, parts: &ResponseParts<Self::Props>) {
+        let Some(href) = parts.href() else {
+            return;
+        };
+        self.entries.push(CalDavSyncEntry {
+            uri: href.to_string(),
+            etag: parts.props().etag.clone(),
+            status: parts.member_status_code(),
+        });
+    }
 }
 
 pub(crate) fn parse_sync_collection_report(xml: &str) -> Result<CalDavSyncReport, String> {
-    let mut reader = Reader::from_str(xml);
-    let mut report = CalDavSyncReport {
-        sync_token: None,
-        entries: Vec::new(),
+    let mut sink = SyncReportSink::default();
+    parse_multistatus(xml, &mut sink)?;
+    Ok(CalDavSyncReport {
+        sync_token: sink.sync_token,
+        entries: sink.entries,
         truncated: false,
-    };
-    let mut current = SyncResponseParts::default();
-    let mut stack = Vec::new();
-    let mut text = String::new();
-
-    loop {
-        match reader.read_event() {
-            Ok(Event::Start(element)) => {
-                let name = local_name(element.name().as_ref());
-                if name == "response" {
-                    current = SyncResponseParts::default();
-                    current.in_response = true;
-                }
-                stack.push(name);
-                text.clear();
-            }
-            Ok(Event::Text(value)) => push_text(&mut text, value.as_ref())?,
-            Ok(Event::CData(value)) => {
-                let value = value.decode().map_err(|error| error.to_string())?;
-                text.push_str(&value);
-            }
-            Ok(Event::End(element)) => {
-                let name = local_name(element.name().as_ref());
-                let parent = stack.iter().rev().nth(1).map(String::as_str);
-                if current.in_response {
-                    match (parent, name.as_str()) {
-                        (Some("response"), "href") => current.href = trimmed(&text),
-                        (Some("response"), "status") => current.response_status = trimmed(&text),
-                        (Some("prop"), "getetag") => current.etag = normalize_etag(&text),
-                        (Some("propstat"), "status") => current.propstat_status = trimmed(&text),
-                        _ => {}
-                    }
-                } else if matches!(parent, Some("multistatus")) && name == "sync-token" {
-                    report.sync_token = trimmed(&text);
-                }
-                if name == "response" {
-                    current.in_response = false;
-                    if let Some(entry) = current.as_sync_entry() {
-                        report.entries.push(entry);
-                    }
-                }
-                stack.pop();
-                text.clear();
-            }
-            Ok(Event::Eof) => break,
-            Ok(_) => {}
-            Err(error) => return Err(format!("XML parse error: {error}")),
-        }
-    }
-
-    Ok(report)
+    })
 }
 
 /// Extract a collection sync token from a depth-0 PROPFIND. The token is
 /// committed only from a successful propstat so a stale value in a refused
 /// property cannot revive an invalid cursor.
 pub(crate) fn parse_collection_sync_token(xml: &str) -> Result<Option<String>, String> {
-    let mut reader = Reader::from_str(xml);
-    let mut stack: Vec<String> = Vec::new();
-    let mut text = String::new();
-    let mut propstat_token = None;
-    let mut propstat_success = None;
-    let mut committed = None;
-
-    loop {
-        match reader.read_event() {
-            Ok(Event::Start(element)) => {
-                let name = local_name(element.name().as_ref());
-                if name == "propstat" {
-                    propstat_token = None;
-                    propstat_success = None;
-                }
-                stack.push(name);
-                text.clear();
-            }
-            Ok(Event::Text(value)) => push_text(&mut text, value.as_ref())?,
-            Ok(Event::CData(value)) => {
-                let value = value.decode().map_err(|error| error.to_string())?;
-                text.push_str(&value);
-            }
-            Ok(Event::End(element)) => {
-                let name = local_name(element.name().as_ref());
-                let parent = stack.iter().rev().nth(1).map(String::as_str);
-                match (parent, name.as_str()) {
-                    (Some("prop"), "sync-token") => propstat_token = trimmed(&text),
-                    (Some("propstat"), "status") => {
-                        propstat_success = Some(status_line_is_success(&text));
-                    }
-                    _ => {}
-                }
-                if name == "propstat"
-                    && propstat_success.unwrap_or(true)
-                    && propstat_token.is_some()
-                {
-                    committed = propstat_token.take();
-                }
-                stack.pop();
-                text.clear();
-            }
-            Ok(Event::Eof) => break,
-            Ok(_) => {}
-            Err(error) => return Err(format!("XML parse error: {error}")),
-        }
-    }
-
-    Ok(committed)
-}
-
-pub(crate) fn extract_href_property(
-    xml: &str,
-    property_name: &str,
-) -> Result<Option<String>, String> {
-    Ok(extract_href_properties(xml, property_name)?
-        .into_iter()
-        .next())
-}
-
-pub(crate) fn extract_href_properties(
-    xml: &str,
-    property_name: &str,
-) -> Result<Vec<String>, String> {
-    let mut reader = Reader::from_str(xml);
-    let mut stack = Vec::new();
-    let mut text = String::new();
-    let mut hrefs = Vec::new();
-    let mut propstat_hrefs = Vec::new();
-    let mut propstat_success = None;
-
-    loop {
-        match reader.read_event() {
-            Ok(Event::Start(element)) => {
-                let name = local_name(element.name().as_ref());
-                stack.push(name);
-                text.clear();
-            }
-            Ok(Event::Text(value)) => push_text(&mut text, value.as_ref())?,
-            Ok(Event::CData(value)) => {
-                let value = value.decode().map_err(|error| error.to_string())?;
-                text.push_str(&value);
-            }
-            Ok(Event::End(element)) => {
-                let name = local_name(element.name().as_ref());
-                if name == "href"
-                    && stack.iter().any(|tag| tag == property_name)
-                    && let Some(href) = trimmed(&text)
-                {
-                    if stack.iter().any(|tag| tag == "propstat") {
-                        propstat_hrefs.push(href);
-                    } else {
-                        hrefs.push(href);
-                    }
-                }
-                let parent = stack.iter().rev().nth(1).map(String::as_str);
-                if name == "status" && matches!(parent, Some("propstat")) {
-                    propstat_success = Some(
-                        trimmed(&text)
-                            .as_deref()
-                            .is_some_and(status_line_is_success),
-                    );
-                }
-                if name == "propstat" {
-                    if propstat_success.unwrap_or(true) {
-                        hrefs.append(&mut propstat_hrefs);
-                    } else {
-                        propstat_hrefs.clear();
-                    }
-                    propstat_success = None;
-                }
-                stack.pop();
-                text.clear();
-            }
-            Ok(Event::Eof) => break,
-            Ok(_) => {}
-            Err(error) => return Err(format!("XML parse error: {error}")),
-        }
-    }
-
-    Ok(hrefs)
-}
-
-#[derive(Default)]
-struct PropStat {
-    success: Option<bool>,
-    is_calendar: bool,
-    privilege_seen: bool,
-    write_seen: bool,
-    is_collection: bool,
-    display_name: Option<String>,
-    color: Option<String>,
-    sync_token: Option<String>,
-    status: Option<String>,
-    calendar_data: Option<String>,
-    etag: Option<String>,
-    content_type: Option<String>,
-}
-
-#[derive(Default)]
-struct ResponseParts {
-    in_response: bool,
-    in_propstat: bool,
-    has_success_propstat: bool,
-    saw_failed_propstat: bool,
-    is_calendar: bool,
-    privilege_seen: bool,
-    write_seen: bool,
-    is_collection: bool,
-    href: Option<String>,
-    etag: Option<String>,
-    content_type: Option<String>,
-    calendar_data: Option<String>,
-    status: Option<String>,
-    display_name: Option<String>,
-    color: Option<String>,
-    sync_token: Option<String>,
-    /// Status codes of every non-2xx propstat in this response, in
-    /// document order. Drives failure classification.
-    failed_statuses: Vec<u16>,
-    staged: PropStat,
-}
-
-#[derive(Default)]
-struct SyncResponseParts {
-    in_response: bool,
-    href: Option<String>,
-    etag: Option<String>,
-    response_status: Option<String>,
-    propstat_status: Option<String>,
-}
-
-impl SyncResponseParts {
-    fn as_sync_entry(&self) -> Option<CalDavSyncEntry> {
-        Some(CalDavSyncEntry {
-            uri: self.href.as_ref()?.clone(),
-            etag: self.etag.clone(),
-            status: self
-                .response_status
-                .as_deref()
-                .and_then(status_line_code)
-                .or_else(|| self.propstat_status.as_deref().and_then(status_line_code)),
-        })
-    }
-}
-
-impl ResponseParts {
-    fn begin_propstat(&mut self) {
-        self.in_propstat = true;
-        self.staged = PropStat::default();
-    }
-
-    /// A `resourcetype` the server refused is not evidence about the
-    /// resource, so a `collection` marker seen inside a propstat is staged
-    /// and only promoted when that propstat's own status was 2xx. Otherwise
-    /// a response whose contact/event properties succeeded but whose
-    /// `resourcetype` block was rejected (echoing back `<collection/>` in
-    /// the 404 prop skeleton) would be discarded as a collection.
-    fn mark_collection(&mut self) {
-        if self.in_propstat {
-            self.staged.is_collection = true;
-        } else {
-            self.is_collection = true;
-        }
-    }
-
-    fn mark_calendar(&mut self) {
-        if self.in_propstat {
-            self.staged.is_calendar = true;
-        } else {
-            self.is_calendar = true;
-        }
-    }
-
-    fn mark_privilege_seen(&mut self) {
-        if self.in_propstat {
-            self.staged.privilege_seen = true;
-        } else {
-            self.privilege_seen = true;
-        }
-    }
-
-    fn mark_write_seen(&mut self) {
-        if self.in_propstat {
-            self.staged.write_seen = true;
-        } else {
-            self.write_seen = true;
-        }
-    }
-
-    fn commit_propstat(&mut self) {
-        let staged = std::mem::take(&mut self.staged);
-        self.in_propstat = false;
-        if staged.success == Some(false) {
-            self.saw_failed_propstat = true;
-            if let Some(code) = staged.status.as_deref().and_then(status_line_code) {
-                self.failed_statuses.push(code);
-            }
-        }
-        if staged.success.unwrap_or(true) {
-            self.has_success_propstat = true;
-            self.is_calendar |= staged.is_calendar;
-            self.is_collection |= staged.is_collection;
-            self.privilege_seen |= staged.privilege_seen;
-            self.write_seen |= staged.write_seen;
-            if staged.display_name.is_some() {
-                self.display_name = staged.display_name;
-            }
-            if staged.color.is_some() {
-                self.color = staged.color;
-            }
-            if staged.sync_token.is_some() {
-                self.sync_token = staged.sync_token;
-            }
-            if staged.calendar_data.is_some() {
-                self.calendar_data = staged.calendar_data;
-            }
-            if staged.etag.is_some() {
-                self.etag = staged.etag;
-            }
-            if staged.content_type.is_some() {
-                self.content_type = staged.content_type;
-            }
-        }
-    }
-
-    fn as_calendar_collection(&self) -> Option<CalendarCollection> {
-        if !self.is_calendar {
-            return None;
-        }
-        Some(CalendarCollection {
-            href: self.href.as_ref()?.clone(),
-            display_name: self.display_name.clone(),
-            color: self.color.clone(),
-            can_edit: self.privilege_seen.then_some(self.write_seen),
-            sync_token: self.sync_token.clone(),
-        })
-    }
-
-    fn as_event_entry(&self) -> Option<CalDavEventEntry> {
-        let href = self.href.as_ref()?;
-        if self.is_collection {
-            return None;
-        }
-        // A resource whose only propstat failed is not a committed
-        // entry; it is surfaced via `as_failed_event_href` instead. A
-        // response carrying NO propstat at all is still a member and
-        // commits, etag-less: withholding it would drop a resource the
-        // server named out of both lanes, and the snapshot diff would then
-        // destroy a resource that exists. `bifrost-carddav` reads it the
-        // same way - the two drifted here, and this is the surviving side.
-        if self.saw_failed_propstat && !self.has_success_propstat {
-            return None;
-        }
-        Some(CalDavEventEntry {
-            uri: href.clone(),
-            etag: self.etag.clone(),
-        })
-    }
-
-    /// The href of an event resource the server reported *failed* within
-    /// the 207 (a non-2xx propstat, no success propstat). A response known
-    /// to be a collection is excluded; resource names need no `.ics` suffix.
-    fn as_failed_event_href(&self) -> Option<String> {
-        if self.is_collection || self.has_success_propstat || !self.saw_failed_propstat {
-            return None;
-        }
-        self.href.clone()
-    }
-
-    fn as_fetched_event(&self) -> Option<CalDavFetchedEvent> {
-        if self.is_collection {
-            return None;
-        }
-        Some(CalDavFetchedEvent {
-            uri: self.href.as_ref()?.clone(),
-            etag: self.etag.clone(),
-            data: self.calendar_data.as_ref()?.clone(),
-        })
-    }
-
-    /// A multiget response with an actual non-2xx status, using the first
-    /// refused propstat status or a non-2xx response-level status. A
-    /// collection response (some servers echo the collection itself alongside
-    /// the requested resources) is not a failed resource and is dropped.
-    // Accepted edge: a failed propstat whose status line is absent or
-    // unparseable yields no numeric code here, so the resource degrades to
-    // the benign `missing_data` lane and cannot contribute to
-    // `CompleteFailure`. A pathological server failing every resource with
-    // garbage status text thus reads as an empty success; tolerated because
-    // such a server violates RFC 4918's required status line and the honest
-    // lanes still preserve the resource (mirrored in carddav).
-    fn as_failed_multiget_resource(&self) -> Option<CalDavFailedResource> {
-        if self.is_collection {
-            return None;
-        }
-        let href = self.href.clone()?;
-        let status = self.failed_statuses.first().copied().or_else(|| {
-            self.status
-                .as_deref()
-                .and_then(status_line_code)
-                .filter(|status| !(200..=299).contains(status))
-        })?;
-        Some(CalDavFailedResource {
-            href,
-            status: Some(status),
-        })
-    }
-
-    fn as_missing_multiget_data(&self) -> Option<String> {
-        if self.is_collection || self.calendar_data.is_some() {
-            return None;
-        }
-        self.href.clone()
-    }
+    parse_collection_property(xml, "sync-token")
 }
 
 #[cfg(test)]
@@ -1704,10 +1287,13 @@ END:VCALENDAR</C:calendar-data>
         assert_eq!(
             report.entries,
             vec![
+                // A member with a successful propstat and no response-level
+                // status reports NO member status: the propstat code speaks
+                // for one property, not the resource.
                 CalDavSyncEntry {
                     uri: "/cal/one.ics".to_string(),
                     etag: Some("new".to_string()),
-                    status: Some(200),
+                    status: None,
                 },
                 CalDavSyncEntry {
                     uri: "/cal/two.ics".to_string(),
