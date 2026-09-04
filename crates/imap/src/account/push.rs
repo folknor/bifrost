@@ -448,20 +448,57 @@ async fn idle_loop(account: ImapAccount, cancel: CancellationToken, slot: usize)
             nudge.abort();
             match idle_result {
                 Ok(event) if interrupted_by_resubscribe => {
-                    // The scope set changed and this IDLE was cancelled to
-                    // re-choose a folder. Cancellation has strict priority
-                    // over queued server events inside `idle()`, and the
-                    // DONE drain that follows discards whatever was still
-                    // in flight, so an EXISTS/EXPUNGE/VANISHED that landed
-                    // in that window is simply gone - and the remaining
-                    // subscriptions would never hear about it. Absorb what
-                    // did come back, then degrade to a coarse invalidation
-                    // rather than losing the window silently.
+                    // The scope set changed and this IDLE was cancelled so
+                    // the folder choice can be re-evaluated. Absorb what did
+                    // come back either way (cache coherence is independent
+                    // of what happens next).
                     if !matches!(event, IdleEvent::Cancelled) {
                         let _ = absorb_idle_event(&account, &folder, uidvalidity, &event);
                     }
-                    signal_idle_interrupt_loss(&account.push);
-                    break;
+                    // Re-choose under the new scope set. Marking the
+                    // generation seen first keeps the same discipline as the
+                    // outer loop: a bump landing after this read still
+                    // latches and cancels the next round.
+                    resubscribe.mark_unchanged();
+                    let chosen = choose_idle_folder(&account, slot);
+                    if !matches!(
+                        resubscribe_action(&folder, chosen.as_ref()),
+                        ResubscribeAction::Reidle
+                    ) {
+                        // A different folder (or none): this connection is
+                        // wrong for the new assignment, so the outer loop
+                        // redials. Cancellation outranks queued events
+                        // inside `idle()` and the events the DONE drain
+                        // emitted die with this session, so the window
+                        // degrades to a coarse invalidation rather than
+                        // being lost silently.
+                        signal_idle_interrupt_loss(&account.push);
+                        break;
+                    }
+                    // Same mailbox: re-IDLE on the SAME connection. No
+                    // redial (providers with strict connection-rate limits
+                    // charge for one on every subscription change), and no
+                    // coarse `Unknown` invalidation - nothing was lost,
+                    // because `drain_idle_responses` emitted the queued
+                    // events to the sink and this session survives into the
+                    // next round. The event this round did return is
+                    // published rather than folded into the coarse hint.
+                    if let Some(event) = map_idle_event(event, &folder) {
+                        let _ = account.push.tx.send(event);
+                    }
+                    // The watched set may still have changed around this
+                    // folder, so the NOTIFY registration is re-issued; a
+                    // server without NOTIFY logs and keeps selected-only
+                    // coverage exactly as it did on the first round.
+                    let watched = {
+                        let scopes = account
+                            .push
+                            .scopes
+                            .lock()
+                            .expect("push scopes lock poisoned");
+                        subscribed_idle_folders(&scopes)
+                    };
+                    register_notify(&conn, &folder, &watched, account.command_timeout()).await;
                 }
                 Ok(event) => {
                     if absorb_idle_event(&account, &folder, uidvalidity, &event).is_err() {
@@ -496,6 +533,37 @@ async fn idle_loop(account: ImapAccount, cancel: CancellationToken, slot: usize)
         if session_died && !sleep_backoff(&account, &cancel, &mut backoff).await {
             break;
         }
+    }
+}
+
+/// What an IDLE round cancelled by a subscription change does next.
+#[derive(Debug, PartialEq, Eq)]
+enum ResubscribeAction {
+    /// The new scope set assigns this slot the same mailbox: keep the
+    /// connection and issue another IDLE on it.
+    Reidle,
+    /// A different mailbox, or none at all: release the connection and let
+    /// the outer loop re-dial for the new assignment.
+    Redial,
+}
+
+/// A subscribe/unsubscribe cancels the in-flight IDLE round so the folder
+/// choice can be re-evaluated - but re-evaluating it very often yields the
+/// same mailbox (subscribing a SECOND folder does not move slot 0). Dialing
+/// a brand-new session for the assignment this connection already serves
+/// costs a full connect+auth+SELECT on every subscription change, which is
+/// exactly what providers enforcing per-user connection rate limits punish,
+/// and it forces a coarse `Unknown` invalidation for a window a same-folder
+/// re-IDLE on the same connection never loses.
+///
+/// Pure so the decision is pinnable without a live server.
+fn resubscribe_action(
+    current: &crate::types::MailboxName,
+    chosen: Option<&crate::types::MailboxName>,
+) -> ResubscribeAction {
+    match chosen {
+        Some(chosen) if chosen.as_str() == current.as_str() => ResubscribeAction::Reidle,
+        _ => ResubscribeAction::Redial,
     }
 }
 
@@ -775,6 +843,35 @@ mod tests {
                 }
             }
         ));
+    }
+
+    /// The unchanged-assignment case must NOT redial. Every subscribe and
+    /// unsubscribe cancels the in-flight round, and the common shape is a
+    /// scope set that grows or shrinks somewhere other than this slot, so
+    /// treating every interrupt as a redial burns a connect+auth+SELECT per
+    /// subscription change on providers that rate-limit connections - and
+    /// throws away a window that a same-folder re-IDLE keeps.
+    #[test]
+    fn a_resubscribe_keeps_the_connection_when_the_folder_is_unchanged() {
+        let inbox = crate::types::MailboxName::new("INBOX").expect("valid mailbox");
+        let same = crate::types::MailboxName::new("INBOX").expect("valid mailbox");
+        let other = crate::types::MailboxName::new("Archive").expect("valid mailbox");
+
+        assert_eq!(
+            resubscribe_action(&inbox, Some(&same)),
+            ResubscribeAction::Reidle,
+            "the same mailbox must be re-IDLEd on the connection already holding it",
+        );
+        assert_eq!(
+            resubscribe_action(&inbox, Some(&other)),
+            ResubscribeAction::Redial,
+            "a different assignment needs a session selected on that mailbox",
+        );
+        assert_eq!(
+            resubscribe_action(&inbox, None),
+            ResubscribeAction::Redial,
+            "no assignment at all releases the connection",
+        );
     }
 
     #[test]

@@ -10,7 +10,7 @@ use super::{
     ImapAccount, batch, boxed_receiver_stream, decode_object_id, terminated_event, uid_set_from_u32,
 };
 
-enum BlobError {
+pub(super) enum BlobError {
     Account(AccountError),
     Imap(crate::Error),
     ChannelDropped,
@@ -28,11 +28,24 @@ impl From<crate::Error> for BlobError {
     }
 }
 
+/// Client-side ceiling on one raw-message read.
+///
+/// Every other body path carries a budget (hydration 256 MiB, draft fetch
+/// 64 MiB) because the response size is the server's to choose: a corrupt
+/// or adversarial peer can answer a single `BODY.PEEK[]` with an arbitrary
+/// number of octets. This lane streams, so the budget bounds what one
+/// message may cost in total rather than what is held at once; crossing it
+/// is `Error::FetchLimit`.
+const RAW_FETCH_BUDGET: usize = 256 * 1024 * 1024;
+
 /// Open a message's assembled RFC822 octets (`BODY.PEEK[]`).
 ///
 /// Mirrors `open_blob` but decodes an `ObjectId` (folder / uidvalidity /
 /// uid, no section) and fetches the whole message with no section or
 /// partial, tagging transport errors `OpenRawRfc822`.
+///
+/// The FETCH is streamed: each response's body sections are forwarded to
+/// the consumer as they arrive off the socket, under `RAW_FETCH_BUDGET`.
 pub(crate) fn open_raw_rfc822(
     account: ImapAccount,
     message: ObjectId,
@@ -80,22 +93,25 @@ async fn run_raw(
         decoded.uid,
         attr,
         AccountOperation::OpenRawRfc822,
+        RAW_FETCH_BUDGET,
         tx,
     )
     .await
 }
 
-/// Shared selection / UIDVALIDITY recheck / `uid_fetch` core for the
+/// Shared selection / UIDVALIDITY recheck / streaming-FETCH core for the
 /// blob and raw-message reads. `op` tags the UIDVALIDITY-mismatch error
-/// so the caller's operation is preserved.
+/// so the caller's operation is preserved, and `budget` is the client-side
+/// ceiling on the octets one read may stream before `Error::FetchLimit`.
 #[allow(clippy::too_many_arguments)]
-async fn run_fetch(
+pub(super) async fn run_fetch(
     account: &ImapAccount,
     folder: &MailboxName,
     expected_uidvalidity: u32,
     uid: u32,
     attr: FetchAttr,
     op: AccountOperation,
+    budget: usize,
     tx: &tokio::sync::mpsc::Sender<SyncEvent<Bytes>>,
 ) -> Result<(), BlobError> {
     let mut conn = account.checkout_for_folder(folder).await?;
@@ -151,26 +167,71 @@ async fn run_fetch(
     let Some(uid_set) = uid_set_from_u32(&[uid]) else {
         return Ok(());
     };
-    let fetches = conn
-        .connection()
-        .uid_fetch(
-            uid_set.as_sequence_set(),
-            &[attr],
-            account.command_timeout(),
-        )
-        .await?;
-    for fetch in fetches {
-        for section in fetch.body_sections {
-            if let Some(data) = section.data {
-                tx.send(batch(
-                    vec![Bytes::from(data)],
-                    PageBoundary::Page,
-                    None::<Checkpoint>,
-                ))
-                .await
-                .map_err(|_| BlobError::ChannelDropped)?;
+    let attrs = [attr];
+    let connection = conn.connection();
+    let (mut rx, fetch_fut) = connection.uid_fetch_stream(
+        uid_set.as_sequence_set(),
+        &attrs,
+        account.command_timeout(),
+    )?;
+    // Forward each body section as it comes off the socket. The bounded
+    // receiver is the back-pressure: a slow consumer stalls this drain,
+    // which stalls the driver's next `reserve_owned`, which stalls the
+    // socket read. Dropping `rx` on the way out (every exit below) is what
+    // releases the driver to read through the tagged completion instead of
+    // parking on a permit that will never be taken.
+    let drain = async {
+        let mut streamed: usize = 0;
+        let mut outcome: Result<(), BlobError> = Ok(());
+        while let Some(item) = rx.recv().await {
+            let fetch = match item {
+                Ok(fetch) => fetch,
+                Err(err) => {
+                    outcome = Err(err.into());
+                    break;
+                }
+            };
+            let (seq, uid) = (fetch.seq, fetch.uid);
+            for section in fetch.body_sections {
+                let Some(data) = section.data else { continue };
+                streamed = streamed.saturating_add(data.len());
+                if streamed > budget {
+                    outcome = Err(BlobError::Imap(crate::Error::FetchLimit {
+                        estimated: streamed,
+                        limit: budget,
+                        seq,
+                        uid,
+                    }));
+                    break;
+                }
+                if tx
+                    .send(batch(
+                        vec![Bytes::from(data)],
+                        PageBoundary::Page,
+                        None::<Checkpoint>,
+                    ))
+                    .await
+                    .is_err()
+                {
+                    outcome = Err(BlobError::ChannelDropped);
+                    break;
+                }
+            }
+            if outcome.is_err() {
+                break;
             }
         }
-    }
+        drop(rx);
+        outcome
+    };
+    // The command future is authoritative for the wire outcome, exactly as
+    // in inventory / QRESYNC / CONDSTORE: the driver drops the streaming
+    // consumer before answering its oneshot, so the receiver closing says
+    // nothing about whether the FETCH succeeded. A local drain failure
+    // (limit crossed, dropped consumer) still wins, since it describes this
+    // caller rather than the server.
+    let (fetch_result, drain_result) = tokio::join!(fetch_fut, drain);
+    drain_result?;
+    fetch_result?;
     Ok(())
 }

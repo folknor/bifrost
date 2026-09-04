@@ -26,61 +26,76 @@ revert-and-confirm; documented in `reference/imap.md`.)
 
 ## Latent defects / suspected
 
-### 4. `open_raw_rfc822` does not stream and has no byte budget
+(Finding 4 - `open_raw_rfc822` buffering the whole message with no byte
+budget while both the doc comment and the reference claimed streaming - is
+fixed: `run_fetch` now drives `uid_fetch_stream`, emits each body section as
+it arrives, and takes an explicit budget (`RAW_FETCH_BUDGET`, 256 MiB) whose
+crossing is `Error::FetchLimit`; the command future stays authoritative.
+Pinned by `open_raw_rfc822_emits_chunks_before_the_tagged_completion` (a
+transcript gated on the first chunk reaching the consumer) and
+`a_raw_message_read_stops_at_its_byte_budget`, both revert-and-confirmed;
+documented in `reference/imap.md`.)
 
-`crates/imap/src/account/blob.rs::run_fetch` uses buffered `uid_fetch` with no
-limit, materializing the entire message (arbitrarily large; adversarial server
-unbounded) in one `Vec<FetchResponse>` before emitting it as a single `Bytes`
-chunk. Both the doc comment ("streams the whole message") and
-`reference/imap.md` ("streams the whole message via BODY.PEEK[]") claim
-streaming. Every other body path has a budget (`HYDRATION_FETCH_BUDGET` 256
-MiB, `DRAFT_FETCH_BUDGET` 64 MiB); this one has none. Should route through
-`uid_fetch_streaming`/`uid_fetch_limited`.
+(Finding 6 - `PooledConn::drop` reading `is_closed()` outside the lock and
+parking a terminated member after `close` had drained - is fixed: the drop
+path now re-checks `closed` while holding the `idle` mutex, in the same
+critical section as the push, which is the linearization `close`'s
+store-then-drain order already relies on. Pinned by
+`a_drop_that_finishes_after_the_close_drain_parks_nothing`, which forces the
+interleaving by holding the idle lock across close's linearization rather
+than racing it; revert-and-confirmed 3/3. Documented in
+`reference/imap.md`.)
 
-### 6. `Pool::close` vs `PooledConn::drop` race leaves a member parked after close
+(Finding 7 - `replace_personal` rebuilding every personal entry and so
+zeroing cursor and MODSEQ caches on each folder CRUD - is fixed: surviving
+names keep their existing `Arc<FolderEntry>` with `refresh_listing` applied
+in place, missing names are removed, new names are added; a retained shared
+entry keeps its own MYRIGHTS-derived listing. Pinned by
+`replace_personal_preserves_surviving_entries_in_place` (`Arc::ptr_eq`,
+cache survival, write-through-the-held-Arc, attribute refresh, removal)
+with revert-and-confirm; documented in `reference/imap.md`.)
 
-`crates/imap/src/account/pool.rs` - `Drop` reads `is_closed()` and then pushes
-to `idle` without holding the `sessions` linearization lock. Sequence: drop
-reads `closed == false` -> `close()` sets flag, drains `idle` and `sessions`,
-LOGOUTs/terminates the connection -> drop pushes the (now-terminated) member
-into `idle`. Consequence is only a retained dead entry on a closed pool
-(checkouts refuse anyway), so severity is low - but it falsifies the
-`close_gates_every_way_into_the_pool` test's `idle_len == 0` postcondition
-under the race, and the file's own comments claim "nothing can land a live
-session on the far side of a completed close" via a lock the drop path doesn't
-take.
-
-### 7. `FolderRegistry::replace_personal` rebuilds every personal entry, discarding cursor and MODSEQ caches
-
-`crates/imap/src/account/folder_registry.rs` - mid-session `refresh_folders`
-(after any folder CRUD) retains only shared entries and creates fresh
-`FolderEntry`s for all personal folders, zeroing their cursor cache and
-50k-entry MODSEQ caches, and orphaning any `Arc<FolderEntry>` a concurrent
-task holds (its subsequent per-entry writes land on the orphan). This is the
-exact lost-update/in-place-refresh hazard `apply_mailbox_event` and
-`refresh_listing` were carefully built to avoid, reintroduced one function
-over. Cost today is a cold MODSEQ cache (unprotected STOREs) rather than
-corruption, since cursor commits go through name lookup - but it deserves the
-same preserve-in-place treatment: keep existing entries whose name survives,
-remove the missing, add the new.
-
-### 9. Resubscribe interrupt always redials even when the chosen folder is unchanged
-
-`account/push.rs` - any subscribe/unsubscribe cancels the in-flight IDLE round
-and the inner-loop `break` discards the connection; the outer loop dials a
-brand-new session even if `choose_idle_folder` returns the same mailbox, and
-emits a coarse `Unknown` invalidation for a window that a same-folder re-IDLE
-on the same connection would not have lost. Costly on providers with strict
-connection-rate limits when subscriptions churn. (The lost-events part is
-documented as accepted; the unconditional redial is not.)
+(Finding 9 - the resubscribe interrupt redialing unconditionally and
+emitting a coarse `Unknown` even when `choose_idle_folder` returns the same
+mailbox - is fixed: the interrupt re-chooses first and, on an unchanged
+assignment, re-IDLEs on the same connection with the round's own event
+published normally and `NOTIFY SET` re-issued for the new watched set; only
+a changed or absent assignment breaks out to redial and signals the coarse
+loss. The decision is the pure `resubscribe_action`, pinned by
+`a_resubscribe_keeps_the_connection_when_the_folder_is_unchanged`.
+Caveat: only the decision function is pinned. The loop around it is not
+hermetically testable - an IDLE worker's connection comes from
+`pool.dial_idle()`, i.e. a real dial - so the wiring rests on review.
+Documented in `reference/imap.md`.)
 
 ## Contract / documentation mismatches
 
-### 11. Unaudited reference claims
+(Finding 11 - the three named unaudited reference claims - is now verified
+against the code, with no discrepancies found:
 
-`reference/imap.md` claims about APPENDLIMIT/STATUS handling, `X-GM-LABELS`,
-ESEARCH normalization etc. were not independently verified in this pass (codec
-and `pim.rs`'s long tail unread); flagged as unaudited rather than clean.
+- APPENDLIMIT/STATUS (`connection/append.rs`): numeric `APPENDLIMIT=<n>` is
+  the global limit, bare `APPENDLIMIT` triggers the preflight
+  `STATUS <mailbox> (APPENDLIMIT)`, both advertised takes `global.min(mailbox)`,
+  `mailbox_append_limit` reads `items` chained with `ambiguous` and takes the
+  smallest named value, an omitted item is `Error::Protocol`, and both the
+  STATUS failure (`unsent_preflight`) and a deadline that expires before
+  `submit_prebuilt` (`remaining_timeout`) are stamped `Unsent`.
+- `X-GM-LABELS` (`codec/decode/envelope_fetch.rs`): the label grammar is
+  `"\" atom / astring`, astring labels are MUTF-7 decoded and system labels
+  kept verbatim, `X-GM-MSGID`/`X-GM-THRID` accept the quoted decimal, all
+  three are in `has_closed_grammar`, `X-GM-EXT-1` gates the request
+  (`connection/helpers.rs`), and labels count toward the buffered-FETCH byte
+  estimate (`dispatch/fetch.rs`).
+- ESEARCH (`connection/mod.rs::expand_uid_ranges`,
+  `dispatch/search.rs`): `*` is refused wherever it appears (not only as an
+  endpoint), ranges are sorted and merged - adjacent ones too - before both
+  the 1e6 cap check and the expansion, an unexpandable set is
+  `Error::SearchResultTruncated` rather than a partial list, and
+  `reclassified_extras` keeps the chosen solicited ESEARCH consumed by the
+  command instead of republishing it as an event.
+
+The rest of `pim.rs`'s long tail and the codec internals remain unread and so
+still unaudited.)
 
 ## bifrost-sasl: clean
 

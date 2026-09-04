@@ -322,20 +322,31 @@ impl PooledConn {
 
 impl Drop for PooledConn {
     fn drop(&mut self) {
-        if let Some(member) = self.member.take()
-            && !matches!(
-                member.conn.session_state(),
-                crate::connection::SessionState::Logout
-            )
-            && member.conn.is_reusable()
-            && !self.pool.is_closed()
+        let Some(member) = self.member.take() else {
+            return;
+        };
+        if matches!(
+            member.conn.session_state(),
+            crate::connection::SessionState::Logout
+        ) || !member.conn.is_reusable()
         {
-            self.pool
-                .idle
-                .lock()
-                .expect("pool lock poisoned")
-                .push(member);
+            return;
         }
+        // The `closed` re-check happens UNDER the idle lock, together with
+        // the push. Reading the flag before taking the lock is a race:
+        // `close` stores the flag and only then drains `idle`, so a drop
+        // that read `closed == false` and was preempted before its push
+        // could park a member on the far side of a completed close - and
+        // that member has already been LOGOUT'd and terminated by the
+        // drain. Holding the lock across both makes the two orders the only
+        // possible ones: this push lands before the drain and is drained,
+        // or it observes the flag the drain's own lock acquisition
+        // published and parks nothing.
+        let mut idle = self.pool.idle.lock().expect("pool lock poisoned");
+        if self.pool.is_closed() {
+            return;
+        }
+        idle.push(member);
     }
 }
 
@@ -622,6 +633,57 @@ mod tests {
             idle_len(&pool),
             0,
             "a closed pool must not accept a returning checkout",
+        );
+    }
+
+    /// A drop that starts before `close` and finishes after its drain must
+    /// not park the member it is returning.
+    ///
+    /// `close` stores the closed flag and only then drains `idle`, so a
+    /// `Drop` that reads the flag BEFORE taking the idle lock can be
+    /// preempted in between and push a member the drain has already
+    /// LOGOUT'd and terminated - leaving a dead entry parked on a closed
+    /// pool and falsifying the `idle_len == 0` postcondition the close
+    /// tests assert. The interleaving is forced here rather than raced:
+    /// this thread holds the idle lock for the whole of close's
+    /// linearization (store the flag, drain the list), so the dropper can
+    /// only reach its push afterwards. A drop that re-checks the flag under
+    /// that lock parks nothing; one that checked it earlier parks a corpse.
+    #[tokio::test]
+    async fn a_drop_that_finishes_after_the_close_drain_parks_nothing() {
+        let (primed, primed_server) = marked("ACL").await;
+        // No responder is needed: this test never issues a command.
+        drop(primed_server);
+        let pool = pool_of(primed, 1);
+        let conn = pool.checkout_any().await.unwrap();
+
+        let idle = pool.inner.idle.lock().unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let dropper = std::thread::spawn(move || {
+            ready_tx.send(()).expect("the test is still waiting");
+            drop(conn);
+        });
+        ready_rx.recv().expect("the dropper thread started");
+        // Let the dropper run far enough to perform the pre-lock `closed`
+        // read the racing ordering does, and block on the lock this thread
+        // holds. No wall clock is involved.
+        for _ in 0..10_000 {
+            std::thread::yield_now();
+        }
+
+        // Close's linearization, under the lock the drop must respect.
+        let mut idle = idle;
+        pool.inner
+            .closed
+            .store(true, std::sync::atomic::Ordering::Release);
+        idle.clear();
+        drop(idle);
+
+        dropper.join().expect("the dropper thread finished");
+        assert_eq!(
+            idle_len(&pool),
+            0,
+            "a member returned after the close drain must not be parked",
         );
     }
 

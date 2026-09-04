@@ -1783,6 +1783,160 @@ async fn the_blob_openers_terminate_unsupported_with_their_own_operation() {
     }
 }
 
+/// `open_raw_rfc822` must STREAM, not buffer the whole message.
+///
+/// The transcript gates the second half of the FETCH behind the test having
+/// already received the first chunk, so a buffered `uid_fetch` - which
+/// emits nothing until the tagged completion - deadlocks and fails on the
+/// timeout instead of quietly holding an arbitrarily large message in one
+/// `Vec<FetchResponse>`.
+#[tokio::test]
+async fn open_raw_rfc822_emits_chunks_before_the_tagged_completion() {
+    use bytes::Bytes;
+    use futures::StreamExt;
+
+    let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1")).await;
+    let account = scripted_account(conn, 1);
+    let folder = crate::types::MailboxName::new("INBOX").unwrap();
+    let (gate_tx, gate_rx) = tokio::sync::oneshot::channel::<()>();
+
+    let script = tokio::spawn(async move {
+        let select = read_line(&mut server).await;
+        assert!(
+            select.contains("EXAMINE") || select.contains("SELECT"),
+            "expected a select, got {select}"
+        );
+        respond(
+            &mut server,
+            &format!(
+                "* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)\r\n\
+                 * 1 EXISTS\r\n\
+                 * 0 RECENT\r\n\
+                 * OK [UIDVALIDITY 5] ok\r\n\
+                 * OK [UIDNEXT 9] ok\r\n\
+                 {} OK [READ-ONLY] done\r\n",
+                tag_of(&select)
+            ),
+        )
+        .await;
+
+        let fetch = read_line(&mut server).await;
+        assert!(fetch.contains("FETCH"), "expected UID FETCH, got {fetch}");
+        respond(&mut server, "* 1 FETCH (UID 7 BODY[] {5}\r\nhello)\r\n").await;
+        // Nothing more until the consumer has seen the first chunk.
+        gate_rx.await.expect("the consumer must reach the gate");
+        respond(
+            &mut server,
+            &format!(
+                "* 1 FETCH (UID 7 BODY[] {{5}}\r\nworld)\r\n{} OK FETCH done\r\n",
+                tag_of(&fetch)
+            ),
+        )
+        .await;
+        server
+    });
+
+    let message = super::encode_object_id(&folder, 5, 7);
+    let mut stream = super::blob::open_raw_rfc822(account, message);
+
+    let first = tokio::time::timeout(Duration::from_secs(5), stream.next())
+        .await
+        .expect("a chunk must arrive before the tagged OK")
+        .expect("the stream emits a batch");
+    let SyncEvent::Batch(batch) = first else {
+        panic!("expected a Batch, got {first:?}");
+    };
+    assert_eq!(batch.items, vec![Bytes::from_static(b"hello")]);
+    gate_tx.send(()).expect("the script is still running");
+
+    let mut rest = Vec::new();
+    while let Some(event) = tokio::time::timeout(Duration::from_secs(5), stream.next())
+        .await
+        .expect("the stream must finish")
+    {
+        match event {
+            SyncEvent::Batch(batch) => rest.extend(batch.items),
+            SyncEvent::Done(_) => break,
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+    assert_eq!(rest, vec![Bytes::from_static(b"world")]);
+    let _server = script.await.unwrap();
+}
+
+/// The raw-message lane carries a byte budget like every other body path.
+///
+/// Without one, a corrupt or adversarial server can answer a single
+/// `BODY.PEEK[]` with an unbounded number of octets and this lane forwards
+/// all of them. The budget is exercised at 3 bytes against a 5-byte body;
+/// the command still drains to its tagged OK so the stream stays framed.
+#[tokio::test]
+async fn a_raw_message_read_stops_at_its_byte_budget() {
+    let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1")).await;
+    let account = scripted_account(conn, 1);
+    let folder = crate::types::MailboxName::new("INBOX").unwrap();
+
+    let script = tokio::spawn(async move {
+        let select = read_line(&mut server).await;
+        respond(
+            &mut server,
+            &format!(
+                "* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)\r\n\
+                 * 1 EXISTS\r\n\
+                 * 0 RECENT\r\n\
+                 * OK [UIDVALIDITY 5] ok\r\n\
+                 * OK [UIDNEXT 9] ok\r\n\
+                 {} OK [READ-ONLY] done\r\n",
+                tag_of(&select)
+            ),
+        )
+        .await;
+        let fetch = read_line(&mut server).await;
+        respond(
+            &mut server,
+            &format!(
+                "* 1 FETCH (UID 7 BODY[] {{5}}\r\nhello)\r\n{} OK FETCH done\r\n",
+                tag_of(&fetch)
+            ),
+        )
+        .await;
+        server
+    });
+
+    let (tx, _rx) = tokio::sync::mpsc::channel(super::STREAM_CAPACITY);
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(5),
+        super::blob::run_fetch(
+            &account,
+            &folder,
+            5,
+            7,
+            crate::types::FetchAttr::BodySection {
+                peek: true,
+                section: None,
+                partial: None,
+            },
+            bifrost_types::AccountOperation::OpenRawRfc822,
+            3,
+            &tx,
+        ),
+    )
+    .await
+    .expect("the budgeted read must finish");
+
+    match outcome {
+        Err(super::blob::BlobError::Imap(crate::Error::FetchLimit { limit, uid, .. })) => {
+            assert_eq!(limit, 3);
+            assert_eq!(uid, Some(7));
+        }
+        Err(super::blob::BlobError::Imap(other)) => panic!("unexpected imap error: {other:?}"),
+        Err(super::blob::BlobError::Account(err)) => panic!("unexpected account error: {err:?}"),
+        Err(super::blob::BlobError::ChannelDropped) => panic!("the receiver was held"),
+        Ok(()) => panic!("a body past the budget must not stream in full"),
+    }
+    let _server = script.await.unwrap();
+}
+
 /// The engine's bandwidth knob writes the SHARED atomic every pooled dial
 /// reads, and `None` means unlimited while `Some(0)` is clamped to 1 B/s.
 ///

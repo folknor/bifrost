@@ -634,12 +634,32 @@ impl FolderRegistry {
     /// next account reopen. A personal candidate that collides with a
     /// retained shared entry does not overwrite it (the shared tagging is
     /// the more specific fact).
+    ///
+    /// A personal folder whose name survives the re-LIST keeps its EXISTING
+    /// entry, refreshed in place, exactly as `apply_mailbox_event` does for
+    /// a same-name re-announcement. Rebuilding it would zero its cursor and
+    /// its (up to 50k-entry) MODSEQ cache on every folder CRUD, and orphan
+    /// any `Arc<FolderEntry>` a concurrent task is holding across an await -
+    /// that task's later cursor and MODSEQ writes would land on an entry no
+    /// longer in the map. Only the names that disappeared are removed and
+    /// the names that are new are added; the re-LIST is not a new
+    /// UIDVALIDITY epoch, so nothing else about a surviving entry changes.
     pub(crate) fn replace_personal(&self, folders: Vec<MailboxInfo>) {
         let mut map = self.by_name.write().expect("folder registry lock poisoned");
-        map.retain(|_, entry| entry.shared_owner.is_some());
+        let listed: std::collections::HashSet<String> = folders
+            .iter()
+            .map(|info| info.name.as_str().to_owned())
+            .collect();
+        map.retain(|name, entry| entry.shared_owner.is_some() || listed.contains(name));
         for info in folders {
             let name = info.name.as_str().to_owned();
-            if map.contains_key(&name) {
+            if let Some(existing) = map.get(&name) {
+                // A retained SHARED entry keeps its own listing: its
+                // selectability is derived from MYRIGHTS, which a personal
+                // LIST line carries nothing about.
+                if existing.shared_owner.is_none() {
+                    existing.refresh_listing(&info);
+                }
                 continue;
             }
             map.insert(name, Arc::new(FolderEntry::from_mailbox(info)));
@@ -1403,6 +1423,80 @@ mod tests {
             retained.rights,
             Some(crate::types::MailboxRights::parse("lrswipkxte")),
             "a personal re-LIST must not blank shared rights"
+        );
+    }
+
+    // A mid-session personal re-LIST is not a new UIDVALIDITY epoch, so a
+    // folder whose name survives it must survive it AS THE SAME ENTRY.
+    // Rebuilding it zeroes the cursor and the MODSEQ cache on every folder
+    // CRUD (turning the next round of STOREs unprotected), and orphans any
+    // `Arc<FolderEntry>` a concurrent sync run is holding across an await:
+    // that run's cursor and MODSEQ commits then land on an entry no longer
+    // in the map. The attributes still refresh in place, and a name the
+    // re-LIST dropped still leaves.
+    #[test]
+    fn replace_personal_preserves_surviving_entries_in_place() {
+        let kept = MailboxName::new("INBOX").expect("valid mailbox");
+        let gone = MailboxName::new("Old").expect("valid mailbox");
+        let registry = FolderRegistry::from_list(vec![
+            MailboxInfo {
+                name: kept.clone(),
+                ..Default::default()
+            },
+            MailboxInfo {
+                name: gone.clone(),
+                ..Default::default()
+            },
+        ]);
+
+        let held = registry.get(&kept).expect("entry present");
+        held.record_modseq(11, 7, 99).expect("valid modseq");
+        held.set_cursor(FolderCursor::Basic {
+            uidvalidity: 11,
+            uidnext: 8,
+            known_uids: CompactUidSet::from_uids([7]),
+        });
+
+        let created = MailboxName::new("Projects").expect("valid mailbox");
+        registry.replace_personal(vec![
+            MailboxInfo {
+                name: kept.clone(),
+                attributes: vec![MailboxAttribute::NoSelect],
+                ..Default::default()
+            },
+            MailboxInfo {
+                name: created.clone(),
+                ..Default::default()
+            },
+        ]);
+
+        let after = registry.get(&kept).expect("surviving entry");
+        assert!(
+            Arc::ptr_eq(&held, &after),
+            "a surviving personal folder must keep its identity, not be rebuilt",
+        );
+        assert_eq!(
+            after.modseq(11, 7),
+            Some(99),
+            "the MODSEQ cache must survive a personal re-LIST",
+        );
+        assert!(
+            after.cursor().is_some(),
+            "the cursor cache must survive a personal re-LIST",
+        );
+        assert!(
+            !after.selectable(),
+            "live LIST attributes still refresh in place",
+        );
+        // Writes through the pre-refresh Arc must still be visible: that is
+        // the lost-update hazard a rebuild reintroduces.
+        held.record_modseq(11, 8, 100).expect("valid modseq");
+        assert_eq!(registry.get(&kept).expect("entry").modseq(11, 8), Some(100));
+
+        assert!(registry.get(&created).is_some(), "a new folder is added");
+        assert!(
+            registry.get(&gone).is_none(),
+            "a folder the re-LIST dropped is removed",
         );
     }
 
