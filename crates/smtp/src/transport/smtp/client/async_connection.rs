@@ -59,12 +59,15 @@ macro_rules! try_smtp (
     // Phase-tagged variant (mirrors the sync sibling). Stamps the SMTP
     // error with the given SmtpCommandPhase so the translation
     // boundary in `account_error.rs` can route per-phase.
+    // Set-if-absent (`or_phase`): a multi-phase callee (the LMTP body
+    // upload + final-status drain) stamps its own finer-grained phase
+    // inside, and this wrapper must not overwrite it.
     ($err: expr, $client: ident, $phase: expr) => ({
         match $err {
             Ok(val) => val,
             Err(err) => {
                 $client.abort().await;
-                return Err(From::from(err.with_phase($phase)))
+                return Err(From::from(err.or_phase($phase)))
             },
         }
     });
@@ -1936,8 +1939,15 @@ impl AsyncSmtpConnection {
         message: &[u8],
         recipients: usize,
     ) -> Result<Vec<Response>, Error> {
-        self.write_command(Bdat::last(message.len())).await?;
-        self.write(message).await?;
+        // Body-upload failures are DataBody; only the per-recipient status
+        // drain below is LmtpFinalStatus. The caller's coarse LmtpFinalStatus
+        // tag applies set-if-absent, so these inner tags win.
+        self.write_command(Bdat::last(message.len()))
+            .await
+            .map_err(|error| error.with_phase(SmtpCommandPhase::DataBody))?;
+        self.write(message)
+            .await
+            .map_err(|error| error.with_phase(SmtpCommandPhase::DataBody))?;
 
         // A dropped LMTP BDAT send cannot safely reuse the stream until every
         // accepted recipient status has been consumed.
@@ -2012,10 +2022,15 @@ impl AsyncSmtpConnection {
             }
             let mut out_buf = Vec::with_capacity(message_part.len());
             codec.encode(message_part, &mut out_buf);
-            self.write(out_buf.as_slice()).await?;
+            // Body-upload failures are DataBody; only the status drain below
+            // is LmtpFinalStatus (the caller's coarse tag is set-if-absent).
+            self.write(out_buf.as_slice())
+                .await
+                .map_err(|error| error.with_phase(SmtpCommandPhase::DataBody))?;
         }
         self.write(data_terminator(seen >= 2 && last_two == *b"\r\n"))
-            .await?;
+            .await
+            .map_err(|error| error.with_phase(SmtpCommandPhase::DataBody))?;
 
         // A dropped LMTP send cannot safely reuse the stream until every
         // accepted recipient status has been consumed.

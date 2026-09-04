@@ -1426,7 +1426,7 @@ mod tests {
             assert_eq!(outcome.succeeded().len(), 1);
             assert_eq!(outcome.failed().len(), 1);
             assert_eq!(
-                pool.idle_count_for_test().await,
+                pool.idle_count_for_test(),
                 0,
                 "a drained LMTP connection must be retired, not parked"
             );
@@ -1563,7 +1563,7 @@ mod tests {
                 .unwrap();
             assert_eq!(first.succeeded().len(), 1);
             assert_eq!(
-                pool.idle_count_for_test().await,
+                pool.idle_count_for_test(),
                 1,
                 "a healthy SMTP connection must be recycled"
             );
@@ -1578,7 +1578,7 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(second.succeeded().len(), 1);
-            assert_eq!(pool.idle_count_for_test().await, 1);
+            assert_eq!(pool.idle_count_for_test(), 1);
             transcript.assert_exhausted();
         }
 
@@ -1613,7 +1613,7 @@ mod tests {
             drop(first);
             let second = second.await.expect("released slot wakes the next checkout");
             drop(second);
-            assert_eq!(pool.idle_count_for_test().await, 1);
+            assert_eq!(pool.idle_count_for_test(), 1);
             transcript.assert_exhausted();
         }
 
@@ -1681,7 +1681,7 @@ mod tests {
             // Returning the checked-out connection after shutdown releases its
             // permit. That must not resurrect the pool.
             drop(first);
-            assert_eq!(pool.idle_count_for_test().await, 0);
+            assert_eq!(pool.idle_count_for_test(), 0);
             transcript.assert_exhausted();
         }
 

@@ -440,9 +440,12 @@ pub(super) fn spawn_lmtp_delivery_server() -> LmtpServer {
 #[cfg(unix)]
 pub(super) fn spawn_unix_lmtp_delivery_server() -> UnixLmtpServer {
     let socket_id = NEXT_UNIX_SOCKET.fetch_add(1, Ordering::Relaxed);
+    // Fall back to the WORKSPACE target dir, not a crate-local `target/`,
+    // which litters an otherwise clean crate tree when the env var is unset
+    // (unit-test builds do not set CARGO_TARGET_TMPDIR).
     let socket_dir = std::env::var_os("CARGO_TARGET_TMPDIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/t"));
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/t"));
     fs::create_dir_all(&socket_dir).unwrap();
     let path = socket_dir.join(format!("lmtp-{}-{socket_id}.sock", process::id()));
     let _ = fs::remove_file(&path);

@@ -62,17 +62,6 @@ wasteful (one reconnect per rejection), and diverges from the documented
 reset_transaction contract. The batch paths handle this correctly with
 `command_accepting_status`; the direct paths should too.
 
-### 3. Direct (non-batch) LMTP body-upload failures are phase-tagged `LmtpFinalStatus`, not `DataBody`
-
-`send_lmtp_with_options` / `send_lmtp_bdat_with_options` wrap the entire
-`message_lmtp` / `message_lmtp_bdat` call (body write + terminator +
-final-status drain) in one `try_smtp!(..., SmtpCommandPhase::LmtpFinalStatus)`.
-A transport failure during the body upload is therefore misattributed to the
-final-status phase. The batch path distinguishes `DataBody` from
-`LmtpFinalStatus` correctly. Consequence: any future per-phase classifier
-refinement (which the code explicitly anticipates) gets wrong evidence on the
-direct LMTP path.
-
 ## Contract / documentation mismatches
 
 ### 4a. Doc defect: the reference claims the socket-listener tests were retired; they were not
@@ -92,16 +81,6 @@ TLS-deadline test with a `thread::sleep(250ms)`. These sit on the wrong side
 of AGENTS.md's testing rule ("Out of scope, still: real sockets or
 listeners... wall-clock sleeps"). Fix: port them to the transcript harness
 (distinct work from the 4a doc fix; doing 4b makes 4a's claim true).
-
-### 5. `client/mod.rs` module doc example is rotted and cannot compile
-
-It calls `SmtpConnection::connect` (which is `#[cfg(test)]`), uses `client::`
-paths (the module is private, so the doctest never runs - which is the only
-reason it doesn't fail CI), and ends with `client.command(Quit)` - there is no
-`Quit` command any more ("the Quit command builder is gone" per the reference;
-`commands.rs` confirms). The reference's module-layout section also still
-lists "QUIT" among `commands.rs` contents. Dead documentation that will
-mislead the next reader.
 
 ### 6. Async bandwidth throttling: outbound debt delays the next read, contradicting the stated invariant
 
@@ -136,31 +115,12 @@ CRLF-rewritten (`effective` = 8bit) and then end up base64-encoded (final
 choice), mutating what should have been opaque payload. Extremely narrow
 window; flagged as a suspicion, not a confirmed repro.
 
-### 9. `in_place_crlf_line_endings` is O(n*m)
-
-One `String::insert` (which shifts the tail) per bare LF; a multi-megabyte
-LF-only body pays quadratic cost. The byte-path sibling `in_place_crlf_bytes`
-already does the single-pass rebuild; the String path should too.
-
-### 10. `ServerInfo::from_response` inconsistent strictness
-
-An unparseable `SIZE` or `FUTURERELEASE` limit is a hard `Parse` error
-(documented), but an unparseable `DELIVERBY` minimum is silently swallowed
-(`minimum.parse().ok()`), storing `DeliverBy(None)` - a silently dropped
-floor, the exact shape the SIZE rule was written to prevent.
-
 ### 11. Boundary re-roll can drop foreign Content-Type parameters
 
 `MultiPart::ensure_boundary_absent` rebuilds the Content-Type from
 `MultiPartKind` alone; any non-standard parameter a caller put on the
 multipart Content-Type (e.g. `charset`, vendor params) is lost when a body
 forces a boundary re-roll.
-
-### 12. `connection_url` ignores a username without a password
-
-`smtp://user@host` yields no credentials at all (the block is keyed on
-`password()`), and the EHLO-name path segment is not percent-decoded. Minor
-URL-parsing asymmetries.
 
 ### 13. `Headers` cannot represent repeated header fields
 
@@ -169,22 +129,6 @@ repeated trace header is silently dropped (the DKIM test even pins "last write
 wins"). Fine for submission of freshly-built mail, but a structural limitation
 worth stating in the reference for anyone routing pre-existing messages
 through `Message`.
-
-## Lateral findings
-
-- **Stale litter inside the crate:**
-  `crates/smtp/target/sendmail-tests/asyncstd-failure-*` - leftovers from
-  lettre's deleted sendmail/async-std machinery - and `target/t` created by
-  `spawn_unix_lmtp_delivery_server` when `CARGO_TARGET_TMPDIR` is unset.
-  Untracked junk; delete, and point the unix-socket helper at the workspace
-  target dir.
-- **`ClientCodec` treats a bare CR as a line break in progress:** after `\r` +
-  non-LF the state goes to `MiddleOfLine`, so `...\r.` is never stuffed.
-  Bare-LF is defended (good); bare-CR smuggling would require a relay that
-  treats lone CR as EOL - theoretical, but the asymmetry is undocumented.
-- **`dkim_sign_fixed_time` panics on a pre-epoch clock**
-  (`duration_since(UNIX_EPOCH).unwrap()`).
-- **`Pool::idle_count_for_test` (async) is needlessly `async`** - cosmetic.
 
 ## Posture / structural note (owner proposal, not a defect)
 

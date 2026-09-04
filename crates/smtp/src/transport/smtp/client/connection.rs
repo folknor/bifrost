@@ -58,12 +58,15 @@ macro_rules! try_smtp (
     // can route per-phase (e.g. AUTH-time failures -> PolicyBlocked,
     // MAIL FROM phase tagged on telemetry, etc.). Use this in the
     // legacy non-batch send paths and the AUTH command exchange.
+    // Set-if-absent (`or_phase`): a multi-phase callee (the LMTP body
+    // upload + final-status drain) stamps its own finer-grained phase
+    // inside, and this wrapper must not overwrite it.
     ($err: expr, $client: ident, $phase: expr) => ({
         match $err {
             Ok(val) => val,
             Err(err) => {
                 $client.abort();
-                return Err(From::from(err.with_phase($phase)))
+                return Err(From::from(err.or_phase($phase)))
             },
         }
     });
@@ -1775,8 +1778,13 @@ impl SmtpConnection {
         message: &[u8],
         recipients: usize,
     ) -> Result<Vec<Response>, Error> {
-        self.write_command(Bdat::last(message.len()))?;
-        self.write(message)?;
+        // Body-upload failures are DataBody; only the per-recipient status
+        // drain below is LmtpFinalStatus. The caller's coarse LmtpFinalStatus
+        // tag applies set-if-absent, so these inner tags win.
+        self.write_command(Bdat::last(message.len()))
+            .map_err(|error| error.with_phase(SmtpCommandPhase::DataBody))?;
+        self.write(message)
+            .map_err(|error| error.with_phase(SmtpCommandPhase::DataBody))?;
 
         self.stream.get_ref().state().verify()?;
         self.stream.get_mut().set_state(ConnectionState::Broken);
@@ -1844,9 +1852,13 @@ impl SmtpConnection {
             }
             let mut out_buf = Vec::with_capacity(message_part.len());
             codec.encode(message_part, &mut out_buf);
-            self.write(out_buf.as_slice())?;
+            // Body-upload failures are DataBody; only the status drain below
+            // is LmtpFinalStatus (the caller's coarse tag is set-if-absent).
+            self.write(out_buf.as_slice())
+                .map_err(|error| error.with_phase(SmtpCommandPhase::DataBody))?;
         }
-        self.write(data_terminator(seen >= 2 && last_two == *b"\r\n"))?;
+        self.write(data_terminator(seen >= 2 && last_two == *b"\r\n"))
+            .map_err(|error| error.with_phase(SmtpCommandPhase::DataBody))?;
 
         self.stream.get_ref().state().verify()?;
         self.stream.get_mut().set_state(ConnectionState::Broken);

@@ -156,6 +156,18 @@ impl Error {
         self
     }
 
+    /// Attach a command phase only when none is stamped yet. Callers that
+    /// wrap a multi-phase exchange use this so an inner, more specific tag
+    /// (e.g. `DataBody` on a body-upload write) survives the outer wrapper's
+    /// coarser tag.
+    pub(crate) fn or_phase(self, phase: SmtpCommandPhase) -> Self {
+        if self.inner.phase.is_some() {
+            self
+        } else {
+            self.with_phase(phase)
+        }
+    }
+
     pub(crate) fn phase(&self) -> Option<SmtpCommandPhase> {
         self.inner.phase
     }

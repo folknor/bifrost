@@ -384,10 +384,11 @@ pub fn dkim_sign(message: &mut Message, dkim_config: &DkimConfig) {
 }
 
 fn dkim_sign_fixed_time(message: &mut Message, dkim_config: &DkimConfig, timestamp: SystemTime) {
+    // A pre-epoch clock yields t=0 rather than panicking the signer; DKIM
+    // timestamps are advisory and a verifier treats a bad one as stale.
     let timestamp = timestamp
         .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
+        .map_or(0, |elapsed| elapsed.as_secs());
     let headers = message.headers();
     let body_hash = Sha256::digest(dkim_canonicalize_body(
         &message.body_raw(),

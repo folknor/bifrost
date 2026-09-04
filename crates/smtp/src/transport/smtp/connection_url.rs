@@ -103,24 +103,35 @@ pub(crate) fn from_connection_url<B: TransportBuilder>(connection_url: &str) -> 
         }
     }
 
+    let percent_decode = |s: &str| {
+        percent_encoding::percent_decode_str(s)
+            .decode_utf8()
+            .map(Cow::into_owned)
+            .map_err(error::connection)
+    };
+
     // use the path segment of the URL as name in the name in the HELO / EHLO command
     if connection_url.path().len() > 1 {
-        let name = connection_url.path().trim_matches('/').to_owned();
+        let name = percent_decode(connection_url.path().trim_matches('/'))?;
         builder = builder.hello_name(ClientId::domain(name)?);
     }
 
-    if let Some(password) = connection_url.password() {
-        let percent_decode = |s: &str| {
-            percent_encoding::percent_decode_str(s)
-                .decode_utf8()
-                .map(Cow::into_owned)
-                .map_err(error::connection)
-        };
-        let credentials = Credentials::password(
-            percent_decode(connection_url.username())?,
-            percent_decode(password)?,
-        );
-        builder = builder.credentials(credentials);
+    // A username without a password is still a credential intent: refuse it
+    // loudly rather than silently connecting unauthenticated.
+    match (connection_url.username(), connection_url.password()) {
+        (_, Some(password)) => {
+            let credentials = Credentials::password(
+                percent_decode(connection_url.username())?,
+                percent_decode(password)?,
+            );
+            builder = builder.credentials(credentials);
+        }
+        ("", None) => {}
+        (_, None) => {
+            return Err(error::connection(
+                "connection URL has a username but no password",
+            ));
+        }
     }
 
     Ok(builder)

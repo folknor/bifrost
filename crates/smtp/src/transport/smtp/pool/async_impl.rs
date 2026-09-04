@@ -307,7 +307,7 @@ impl<E: Executor> Pool<E> {
 
     /// Number of connections currently parked as idle.
     #[cfg(test)]
-    pub(crate) async fn idle_count_for_test(&self) -> usize {
+    pub(crate) fn idle_count_for_test(&self) -> usize {
         self.connections
             .lock()
             .expect("connection pool lock")

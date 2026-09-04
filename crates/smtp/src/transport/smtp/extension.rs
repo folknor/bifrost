@@ -294,9 +294,19 @@ impl ServerInfo {
                     });
                 }
                 "DELIVERBY" => {
-                    features.insert(Extension::DeliverBy(
-                        split.next().and_then(|minimum| minimum.parse().ok()),
-                    ));
+                    // An unparseable advertised minimum is a hard parse
+                    // error, matching SIZE and FUTURERELEASE: silently
+                    // storing DeliverBy(None) would drop a floor the server
+                    // told us about.
+                    let minimum = match split.next() {
+                        Some(value) => Some(
+                            value
+                                .parse()
+                                .map_err(|_| error::parse("invalid DELIVERBY minimum"))?,
+                        ),
+                        None => None,
+                    };
+                    features.insert(Extension::DeliverBy(minimum));
                 }
                 "MT-PRIORITY" => {
                     features.insert(Extension::MtPriority);

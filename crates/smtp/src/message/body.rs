@@ -327,14 +327,26 @@ impl Deref for MaybeString {
     }
 }
 
-/// In place conversion to CRLF line endings
+/// In place conversion to CRLF line endings.
+///
+/// Single-pass rebuild like the byte sibling below: per-LF `String::insert`
+/// shifts the whole tail each time, which is quadratic on a large LF-only
+/// body.
 fn in_place_crlf_line_endings(string: &mut String) {
-    let indices = find_all_lf_char_indices(string);
-
-    for i in indices {
-        // this relies on `indices` being in reverse order
-        string.insert(i, '\r');
+    let bare_lf_count = find_all_lf_char_indices(string).len();
+    if bare_lf_count == 0 {
+        return;
     }
+    let mut normalized = String::with_capacity(string.len() + bare_lf_count);
+    let mut previous = None;
+    for ch in string.chars() {
+        if ch == '\n' && previous != Some('\r') {
+            normalized.push('\r');
+        }
+        normalized.push(ch);
+        previous = Some(ch);
+    }
+    *string = normalized;
 }
 
 /// Convert bare LF bytes to CRLF without interpreting the rest of a raw body.

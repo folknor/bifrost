@@ -1,25 +1,7 @@
-//! SMTP client
-//!
-//! `SmtpConnection` allows manually sending SMTP commands.
-//!
-//! ```rust,no_run
-//! # use std::error::Error;
-//!
-//! # //! # fn main() -> Result<(), Box<dyn Error>> {
-//! use bifrost_smtp::transport::smtp::{
-//!     SMTP_PORT, client::SmtpConnection, commands::*, extension::ClientId,
-//! };
-//!
-//! let hello = ClientId::Domain("my_hostname".to_owned());
-//! let mut client = SmtpConnection::connect(&("localhost", SMTP_PORT), None, &hello, None, None)?;
-//! client.command(Mail::new(Some("user@example.com".parse()?), vec![]))?;
-//! client.command(Rcpt::new("user@example.org".parse()?, vec![]))?;
-//! client.command(Data)?;
-//! client.message("Test email".as_bytes())?;
-//! client.command(Quit)?;
-//! # Ok(())
-//! # }
-//! ```
+//! SMTP client internals: the blocking (`SmtpConnection`) and async
+//! (`AsyncSmtpConnection`) protocol drivers, the transparency codec, TLS
+//! plumbing, and wire metering. This module is private; consumers drive
+//! sends through the transports in `crate::transport`.
 
 #[cfg(feature = "serde")]
 use std::fmt::Debug;
@@ -79,7 +61,13 @@ impl ConnectionState {
     }
 }
 
-/// The codec used for transparency
+/// The codec used for transparency.
+///
+/// Bare LF is treated as a line break (defended by test), so LF-smuggled
+/// `.`-lines get stuffed. Bare CR deliberately is NOT: after `\r` +
+/// non-LF the state is `MiddleOfLine`, so `...\r.` is never stuffed.
+/// Exploiting that would require a relay that treats a lone CR as EOL,
+/// which is theoretical; the asymmetry is a documented accepted shape.
 #[derive(Debug)]
 struct ClientCodec {
     status: CodecStatus,

@@ -414,7 +414,7 @@ crates/smtp/src/
 │   └── smtp/
 │       ├── client/      - connection, async_connection, net, async_net
 │       ├── transport.rs / async_transport.rs - public sync + async transports
-│       ├── commands.rs  - EHLO, MAIL, RCPT, DATA, BDAT, AUTH, NOOP, RSET, QUIT, VRFY, EXPN, STARTTLS, LHLO
+│       ├── commands.rs  - EHLO, MAIL, RCPT, DATA, BDAT, AUTH, NOOP, RSET, VRFY, EXPN, STARTTLS, LHLO
 │       ├── extension.rs - ServerInfo, SendOptions, MAIL/RCPT parameters
 │       ├── response.rs  - parser, enhanced status codes
 │       └── test_support.rs - in-process `Transcript` harness + mock servers
