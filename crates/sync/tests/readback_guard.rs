@@ -57,6 +57,12 @@ struct FlagsAccount {
 #[derive(Default)]
 struct CampaignState {
     engine_block_first: AtomicBool,
+    /// First attempt: one item raises an engine directive while a SIBLING item
+    /// comes back `Uncertain`, i.e. parked in the read-back lane.
+    engine_block_beside_uncertain: AtomicBool,
+    /// First attempt: a PER-ITEM retryable failure carrying a long provider
+    /// hint, after which the stream ends `Done` rather than `Terminated`.
+    per_item_retry_then_done: AtomicBool,
     gate_first_campaign: AtomicBool,
     release_first_campaign: tokio::sync::Notify,
     submissions: AtomicUsize,
@@ -276,6 +282,69 @@ impl Account for FlagsAccount {
                     })
                     .collect()
                     .await;
+                SyncEvent::Batch(Batch {
+                    items,
+                    page_boundary: PageBoundary::Final,
+                    server_latency: std::time::Duration::ZERO,
+                    bytes_in: 0,
+                    checkpoint: None,
+                })
+            }));
+        }
+        if campaign.per_item_retry_then_done.load(Ordering::SeqCst) && attempt == 0 {
+            return Box::pin(
+                stream::once(async move {
+                    let ids: Vec<ObjectId> = targets.collect().await;
+                    let error = AccountErrorBuilder::new(
+                        AccountErrorKind::Server(bifrost_types::ServerErrorKind::RateLimited),
+                        Cause::Server(bifrost_types::ServerCause::RateLimited {
+                            retry_hint: Some(bifrost_types::RetryHint::After(
+                                std::time::Duration::from_secs(HINTED_RETRY_SECS),
+                            )),
+                        }),
+                    )
+                    .try_build()
+                    .expect("valid rate-limited server error");
+                    SyncEvent::Batch(Batch {
+                        items: vec![ItemOutcome::Failed(bifrost_types::BatchFailure::new(
+                            bifrost_types::BatchItemId(ids[0].0.clone()),
+                            error,
+                        ))],
+                        page_boundary: PageBoundary::Final,
+                        server_latency: std::time::Duration::ZERO,
+                        bytes_in: 0,
+                        checkpoint: None,
+                    })
+                })
+                // Ends DONE, not Terminated: there is no stream-level retry
+                // advice, so only the per-item advice can supply the delay.
+                .chain(stream::once(async { SyncEvent::Done(None) })),
+            );
+        }
+        if campaign
+            .engine_block_beside_uncertain
+            .load(Ordering::SeqCst)
+            && attempt == 0
+        {
+            return Box::pin(stream::once(async move {
+                let ids: Vec<ObjectId> = targets.collect().await;
+                let blocked = AccountErrorBuilder::new(
+                    AccountErrorKind::SyncState(bifrost_types::SyncStateErrorKind::CursorInvalid),
+                    Cause::State(bifrost_types::StateCause::CursorInvalid),
+                )
+                .scope(bifrost_types::ErrorScope::Cursor(CursorScope::Account))
+                .try_build()
+                .expect("valid engine-blocked error");
+                let items = vec![
+                    ItemOutcome::Failed(bifrost_types::BatchFailure::new(
+                        bifrost_types::BatchItemId(ids[0].0.clone()),
+                        blocked,
+                    )),
+                    ItemOutcome::Uncertain(bifrost_types::BatchUncertain::new(
+                        bifrost_types::BatchItemId(ids[1].0.clone()),
+                        retryable_transport(),
+                    )),
+                ];
                 SyncEvent::Batch(Batch {
                     items,
                     page_boundary: PageBoundary::Final,
@@ -933,6 +1002,9 @@ async fn readback_guard_works_through_arc() {
     assert_eq!(outcome.still_failed, 0);
 }
 
+/// Long enough that an un-delayed resubmission is unambiguous.
+const HINTED_RETRY_SECS: u64 = 600;
+
 fn campaign_account(state: Arc<CampaignState>) -> Arc<FlagsAccount> {
     Arc::new(FlagsAccount {
         caps: caps(),
@@ -1097,6 +1169,103 @@ async fn per_item_engine_block_accounts_for_unseen_campaign_ids() {
         .expect("campaign");
 
     assert_eq!(counters.blocked_by_engine, 3);
+    engine.detach(&account_id).await.expect("detach");
+}
+
+/// An engine directive raised by one item must not erase a SIBLING item's
+/// read-back protection.
+///
+/// The read-back lane exists so a write that may already have landed is
+/// verified against observed state instead of replayed or guessed at. The
+/// engine-directive sweep used to overwrite every outcome that was not already
+/// terminal, `PendingReadback` included, which emptied the read-back set,
+/// skipped the guard entirely, and reported a mutation that had actually
+/// applied as `blocked_by_engine`.
+#[tokio::test]
+async fn an_engine_directive_leaves_a_sibling_read_back_alone() {
+    let state = Arc::new(CampaignState::default());
+    state
+        .engine_block_beside_uncertain
+        .store(true, Ordering::SeqCst);
+    let account = Arc::new(FlagsAccount {
+        caps: caps(),
+        flag_table: std::collections::HashMap::from([(ObjectId("two".into()), set(&["\\Seen"]))]),
+        campaign: Some(Arc::clone(&state)),
+    });
+    let engine = SyncEngine::builder().build().expect("engine");
+    let account_id = AccountId("engine-block-beside-readback".into());
+    engine
+        .attach(account_id.clone(), Arc::new(FlagsFactory(account)))
+        .await
+        .expect("attach");
+
+    let counters = engine
+        .bulk_set_flags(
+            &account_id,
+            vec![ObjectId("one".into()), ObjectId("two".into())],
+            FlagOp::Add(set(&["\\Seen"])),
+            &vendor(),
+            ProtocolKind::Imap,
+        )
+        .await
+        .expect("campaign");
+
+    assert_eq!(
+        counters.blocked_by_engine, 1,
+        "only the id that actually raised the directive is engine-blocked: {counters:?}"
+    );
+    assert_eq!(
+        counters.skipped, 1,
+        "the uncertain sibling must still be read back and reconciled - observed state \
+         already carries the flag, which the guard downgrades to skipped: {counters:?}"
+    );
+    engine.detach(&account_id).await.expect("detach");
+}
+
+/// A stream that ends `Done` after emitting per-item retryable failures must
+/// still honor the delay before resubmitting.
+///
+/// `retry_advice` used to be set only from a STREAM-LEVEL `Retry` termination,
+/// so this shape looped straight into the next attempt with no sleep at all -
+/// `mutation_max_retries` back-to-back resubmissions against a provider that
+/// had just named a deadline, while every other retry path in the engine
+/// honors the hint.
+#[tokio::test(start_paused = true)]
+async fn a_per_item_retry_delays_the_resubmission() {
+    let state = Arc::new(CampaignState::default());
+    state.per_item_retry_then_done.store(true, Ordering::SeqCst);
+    let engine = SyncEngine::builder().build().expect("engine");
+    let account_id = AccountId("per-item-retry-delay".into());
+    engine
+        .attach(
+            account_id.clone(),
+            Arc::new(FlagsFactory(campaign_account(Arc::clone(&state)))),
+        )
+        .await
+        .expect("attach");
+
+    let started = tokio::time::Instant::now();
+    let counters = engine
+        .bulk_set_flags(
+            &account_id,
+            vec![ObjectId("one".into())],
+            FlagOp::Add(set(&["\\Seen"])),
+            &vendor(),
+            ProtocolKind::Imap,
+        )
+        .await
+        .expect("campaign");
+    let elapsed = started.elapsed();
+
+    assert!(
+        state.submissions.load(Ordering::SeqCst) >= 2,
+        "the campaign must resubmit the retryable id"
+    );
+    assert!(
+        elapsed >= std::time::Duration::from_secs(HINTED_RETRY_SECS),
+        "the resubmission must honor the per-item provider hint (elapsed {elapsed:?}, \
+         counters {counters:?})"
+    );
     engine.detach(&account_id).await.expect("detach");
 }
 

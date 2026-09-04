@@ -33,6 +33,14 @@ pub struct Reconciler {
     /// its own Retry outcomes carry.
     pub throttles: Arc<std::sync::Mutex<crate::recovery::ThrottleBucket>>,
     pub scheduler: crate::scheduler::Scheduler,
+    /// The multiplexer's per-scope poll tokens, shared rather than copied.
+    ///
+    /// A scope whose poll task exited on a TERMINAL verdict leaves a parked
+    /// tombstone here, and the 1s poll scan honors it. The reconciler is the
+    /// other producer on the same lane, so without reading the same record a
+    /// later push hint re-drove a terminally failed scope - re-broadcasting
+    /// `Terminated` and re-running a wire call that cannot succeed.
+    pub scope_tokens: crate::multiplexer::ScopeTokens,
 }
 
 impl Reconciler {
@@ -188,6 +196,19 @@ impl Reconciler {
     async fn reconcile(&self, hint: &InvalidationHint) -> Result<(), Error> {
         let scopes = scopes_for_hint(&self.cursors, &hint.payload);
         for scope in scopes {
+            // A parked scope is terminally failed. Only an explicit
+            // scope-retiring path (lifecycle deletion, an engine restart of
+            // the scope, multiplexer shutdown) clears the tombstone, and until
+            // one does, driving it again is wire work that cannot succeed.
+            if crate::multiplexer::scope_is_parked(&self.scope_tokens, &scope) {
+                tracing::debug!(
+                    target: "bifrost.sync.reconcile",
+                    account = ?self.account_id,
+                    scope = ?scope,
+                    "hinted scope is terminally parked; not re-driving it"
+                );
+                continue;
+            }
             // Honor any account-wide throttle deadline (a sibling
             // scope's Retry-After, or a shared tenant/provider key)
             // before driving the wire for this hint. Re-checked after
@@ -296,22 +317,36 @@ impl Reconciler {
                     };
                     let original = error.clone();
                     match plan_recovery(error) {
+                        // Retry and Reconcile both record their deadline in the
+                        // shared throttle bucket and then SKIP this scope,
+                        // continuing the sweep. The reconciler is one task for
+                        // the whole account, so sleeping the delay out inline
+                        // froze every other scope's push reconciliation for a
+                        // provider `Retry-After` that named one scope - while
+                        // the watch channel filled and coalesced behind it. The
+                        // sleep was redundant anyway: every drive path consults
+                        // the bucket (this sweep does so at the top of each
+                        // scope, under a shutdown select), so the deadline is
+                        // honored without a task-wide stall.
                         RecoveryPlan::Retry(advice) => {
-                            // Share the throttle deadline with the poll
-                            // loop and sibling accounts before sleeping
-                            // it off locally.
                             crate::recovery::record_throttle(
                                 &self.throttles,
                                 &self.account_id,
                                 &advice,
                                 &original,
                             );
-                            let delay = retry_delay(
-                                &advice,
-                                std::time::SystemTime::now(),
-                                std::time::Duration::from_secs(1),
+                            tracing::debug!(
+                                target: "bifrost.sync.reconcile",
+                                account = ?self.account_id,
+                                scope = ?scope,
+                                delay_secs = retry_delay(
+                                    &advice,
+                                    std::time::SystemTime::now(),
+                                    std::time::Duration::from_secs(1),
+                                ).as_secs(),
+                                "hinted scope throttled; skipping it and continuing the sweep"
                             );
-                            tokio::time::sleep(delay).await;
+                            continue;
                         }
                         RecoveryPlan::Reconcile(advice) => {
                             crate::recovery::record_reconcile_throttle(
@@ -320,12 +355,18 @@ impl Reconciler {
                                 &advice,
                                 &original,
                             );
-                            let delay = crate::recovery::reconcile_delay(
-                                &advice,
-                                std::time::SystemTime::now(),
-                                std::time::Duration::from_secs(1),
+                            tracing::debug!(
+                                target: "bifrost.sync.reconcile",
+                                account = ?self.account_id,
+                                scope = ?scope,
+                                delay_secs = crate::recovery::reconcile_delay(
+                                    &advice,
+                                    std::time::SystemTime::now(),
+                                    std::time::Duration::from_secs(1),
+                                ).as_secs(),
+                                "hinted scope deferred for reconcile; continuing the sweep"
                             );
-                            tokio::time::sleep(delay).await;
+                            continue;
                         }
                         RecoveryPlan::Engine(directive) => {
                             let directive_scope = directive_target_scope(&directive);

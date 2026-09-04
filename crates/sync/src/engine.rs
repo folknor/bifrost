@@ -519,6 +519,13 @@ impl SyncEngine {
             );
         }
 
+        // The multiplexer's per-scope poll tokens. Created here rather than
+        // inside `Multiplexer` because the push reconciler - spawned first -
+        // shares them: it is the other producer on the same lane and must
+        // honor the same terminal tombstones the 1s poll scan does.
+        let scope_tokens: crate::multiplexer::ScopeTokens =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+
         // Spawn push reconciler.
         let reconciler = crate::push::Reconciler {
             account_id: account_id.clone(),
@@ -531,6 +538,7 @@ impl SyncEngine {
             reopen_tx: reopen_tx.clone(),
             throttles: Arc::clone(&throttles),
             scheduler: self.scheduler.clone(),
+            scope_tokens: Arc::clone(&scope_tokens),
         };
         spawn(
             crate::types::WorkerRole::Stream,
@@ -1314,6 +1322,11 @@ impl SyncEngine {
                 // registration, and nothing was opened. Keep this public
                 // request queued until the account runs again.
                 Err(ReplacementOpen::Paused) => continue,
+                // The slot is going away under us. Report it as what it is
+                // rather than looping into another open.
+                Err(ReplacementOpen::Detached) => {
+                    return Err(Error::AccountNotAttached(account_id.clone()));
+                }
                 // `reopen` is the post-attach swap path. Per the engine error
                 // policy, failures in this path use `Account` (not
                 // `OpenFailed`) so callers know the account was running and
@@ -1714,6 +1727,7 @@ impl SyncEngine {
             // resubmits its siblings.
             retry_ids.clear();
             let mut stream_termination_advice: Option<RetryAdvice> = None;
+            let mut item_retry_advice: Option<RetryAdvice> = None;
 
             loop {
                 let event = tokio::select! {
@@ -1733,6 +1747,7 @@ impl SyncEngine {
                                 &mut dedupe_count,
                                 &slot.throttles,
                                 account_id,
+                                &mut item_retry_advice,
                             ) {
                                 if should_forward_engine_recovery(
                                     &mut forwarded_directives,
@@ -1865,6 +1880,16 @@ impl SyncEngine {
 
             if blocked_by_engine {
                 for id in &remaining {
+                    // `PendingReadback` is deliberately excluded, exactly as it
+                    // is from the retry-termination sweep. Those are the ids
+                    // whose write may already have landed - `Uncertain`,
+                    // downgrades, `AfterStateRefresh` - and the read-back lane
+                    // exists so they are VERIFIED rather than replayed or
+                    // guessed at. Claiming them here emptied
+                    // `unresolved_readback_ids`, skipped the guard entirely,
+                    // and reported a mutation that actually applied as
+                    // `blocked_by_engine`. The campaign still stops submitting;
+                    // the guard that follows only observes state.
                     if !matches!(
                         outcomes.get(id),
                         Some(
@@ -1872,6 +1897,7 @@ impl SyncEngine {
                                 | MutationBucket::Skipped
                                 | MutationBucket::FailedTerminal
                                 | MutationBucket::BlockedByEngine
+                                | MutationBucket::PendingReadback
                         )
                     ) {
                         outcomes.insert(id.clone(), MutationBucket::BlockedByEngine);
@@ -1923,7 +1949,12 @@ impl SyncEngine {
                 }
             }
             if attempt < max_retries && !next_remaining.is_empty() {
-                retry_advice = stream_termination_advice;
+                // A stream-level Retry termination speaks for the whole
+                // submission, so it wins; otherwise the per-item advice of the
+                // failures actually being resubmitted supplies the delay. With
+                // neither, `retry_delay`'s own fallback applies once an advice
+                // exists - what must not happen is resubmitting instantly.
+                retry_advice = stream_termination_advice.or(item_retry_advice);
                 std::mem::swap(&mut remaining, &mut next_remaining);
                 continue;
             }
@@ -4483,7 +4514,25 @@ async fn ack_writer(
         };
         let result = persist_ack_request(&account_id, &store, &coverage, &mut ledger, &req).await;
         match result {
-            Ok(()) => {
+            Ok(AckPersistOutcome::SentinelWithheld) => {
+                // The completion sentinel was deliberately NOT written: the
+                // scope still carries open debt, so only the ledger landed.
+                // Nothing durable was created for this publication, so the
+                // watermark must not move (a retried ack has to report
+                // `Unknown` and be re-evaluated, never `AlreadyPersisted`) and
+                // the boundary must not be announced durable - the store holds
+                // no such row and the next attach re-walks. The publication is
+                // retired instead, exactly as a failed write retires it, so
+                // boundary waiters stop being gated. The consumer's ack itself
+                // succeeded: its batch was empty and was honoured.
+                if let Some(publication) = req.publication {
+                    control.retire_publication(publication);
+                }
+                if let Some(done) = req.complete {
+                    let _ = done.send(Ok(()));
+                }
+            }
+            Ok(AckPersistOutcome::Durable) => {
                 // Notify pause / checkpoint_now waiters AFTER the
                 // durable write lands - the contract is that the
                 // returned checkpoint has been persisted. The
@@ -4834,13 +4883,26 @@ fn apply_replacement(
 ///    been accepted since, and writing the sentinel over it makes the next
 ///    attach skip a scope with open obligations.
 /// 3. The checkpoint and the resulting ledger land in ONE store operation.
+///
+/// The outcome distinguishes "the checkpoint is durable" from "only the ledger
+/// was written because the completion sentinel was withheld". The caller must
+/// not settle the watermark or announce a durable boundary for the latter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AckPersistOutcome {
+    /// The acknowledged checkpoint itself is in the store.
+    Durable,
+    /// A backfill completion sentinel was withheld over open debt; only the
+    /// ledger was persisted, so nothing durable exists for this checkpoint.
+    SentinelWithheld,
+}
+
 async fn persist_ack_request(
     account_id: &AccountId,
     store: &Arc<DynCheckpointStore>,
     coverage: &PendingCoverage,
     ledger: &mut crate::cursor::DebtLedger,
     req: &AckRequest,
-) -> Result<(), Error> {
+) -> Result<AckPersistOutcome, Error> {
     if let Checkpoint::Change(cursor) = &req.checkpoint {
         cursor
             .validate_envelope()
@@ -4860,7 +4922,7 @@ async fn persist_ack_request(
         // Already persisted by an earlier acknowledgement of this exact
         // publication. Re-applying would double-ingest; reporting failure would
         // make a successful ack non-idempotent.
-        Some(ClaimLookup::AlreadyPersisted) => return Ok(()),
+        Some(ClaimLookup::AlreadyPersisted) => return Ok(AckPersistOutcome::Durable),
         Some(ClaimLookup::Unknown) => {
             // Emphatically NOT treated as complete coverage. An unknown
             // publication is a stale or buggy caller, and inventing a
@@ -4888,7 +4950,8 @@ async fn persist_ack_request(
         // Not an error for the consumer - its batch was empty and its
         // acknowledgement was honoured. The sentinel simply does not become
         // durable, so the next attach re-walks instead of skipping the scope.
-        return persist_ledger_only(account_id, store, ledger).await;
+        persist_ledger_only(account_id, store, ledger).await?;
+        return Ok(AckPersistOutcome::SentinelWithheld);
     }
 
     store
@@ -4899,7 +4962,8 @@ async fn persist_ack_request(
                 ledger: ledger.clone(),
             },
         )
-        .await
+        .await?;
+    Ok(AckPersistOutcome::Durable)
 }
 
 /// Shared context bundle used by every recovery-dispatch path. Folds
@@ -5211,6 +5275,19 @@ async fn handle_schema_incompatible(ctx: &RecoveryContext<'_>) {
 /// verbatim as `SyncEvent::Terminated`. (sync-D6)
 const REOPEN_RETRY_BUDGET: u32 = 3;
 
+/// Wait out a recovery backoff, unless the account is being torn down.
+///
+/// Returns `false` when the shutdown token tripped, which every caller reads as
+/// "stop, do not attempt again". An un-selected sleep here is what guaranteed
+/// that a detach landing during recovery burned toward `detach_timeout` and hit
+/// the abort path instead of draining the worker cleanly.
+async fn sleep_unless_shutdown(delay: Duration, shutdown: &CancellationToken) -> bool {
+    tokio::select! {
+        () = shutdown.cancelled() => false,
+        () = tokio::time::sleep(delay) => true,
+    }
+}
+
 const REOPEN_BACKOFF_INITIAL: Duration = Duration::from_secs(1);
 const REOPEN_BACKOFF_CAP: Duration = Duration::from_secs(5 * 60);
 
@@ -5272,7 +5349,9 @@ async fn re_establish_scope_with_backoff(ctx: &RecoveryContext<'_>, scope: Curso
     for attempt in 0..REOPEN_RETRY_BUDGET {
         if attempt > 0 {
             let sleep_for = jittered(delay);
-            tokio::time::sleep(sleep_for).await;
+            if !sleep_unless_shutdown(sleep_for, ctx.shutdown).await {
+                return;
+            }
             delay = (delay.saturating_mul(2)).min(REOPEN_BACKOFF_CAP);
         }
         let acc_arc = ctx.current.load_full();
@@ -5464,6 +5543,13 @@ enum ReplacementOpen {
     /// The boundary left `Run` before activity could be registered. Nothing
     /// was opened, so there is nothing to close.
     Paused,
+    /// The slot is being torn down: its shutdown token was cancelled either
+    /// before the open started or while it was in flight. A replacement opened
+    /// inside that window has no owner - `detach` has already closed the handle
+    /// it knew about and removed the slot - so `open_replacement` closes the
+    /// replacement itself and reports this rather than swapping it into an
+    /// orphaned slot, where nothing would ever close it.
+    Detached,
     Failed(AccountError),
 }
 
@@ -5494,8 +5580,29 @@ async fn open_replacement(
         .begin_activity()
         .ok_or(ReplacementOpen::Paused)?;
     let reopen_guard = Arc::clone(ctx.reopen_lock).lock_owned().await;
+    // Detach does not wait for consumer-driven activity, so nothing excludes a
+    // `SyncEngine::reopen` that registered its activity just before detach
+    // flipped the boundary to `Stop`. The slot's shutdown token is the one
+    // thing that observes the teardown from here, so it is consulted on both
+    // sides of the open: before, to avoid spending a connection at all, and
+    // after, because detach can remove the slot and close the old handle while
+    // the open is in flight. A reattach that then completes without touching
+    // the closed writer channel would swap the replacement into an orphaned
+    // slot and close the already-closed previous handle, leaking the
+    // replacement connection for the life of the process.
+    if ctx.shutdown.is_cancelled() {
+        return Err(ReplacementOpen::Detached);
+    }
     match ctx.factory.open(ctx.account_id.clone()).await {
-        Ok(next) => Ok((reopen_guard, activity, next)),
+        Ok(next) => {
+            if ctx.shutdown.is_cancelled() {
+                // Close what we opened. Best-effort, exactly like every other
+                // abort path here: the alternative is an owner-less connection.
+                let _ = next.account.close().await;
+                return Err(ReplacementOpen::Detached);
+            }
+            Ok((reopen_guard, activity, next))
+        }
         // Dropping `activity` here is the point: the failed open registered
         // no lasting work, so quiescence must not stay blocked on it.
         Err(error) => Err(ReplacementOpen::Failed(error)),
@@ -5805,7 +5912,9 @@ async fn restart_account(ctx: &RecoveryContext<'_>) {
         }
         if attempt > 0 {
             let sleep_for = jittered(delay);
-            tokio::time::sleep(sleep_for).await;
+            if !sleep_unless_shutdown(sleep_for, ctx.shutdown).await {
+                return;
+            }
             delay = (delay.saturating_mul(2)).min(REOPEN_BACKOFF_CAP);
         }
         match open_replacement(ctx).await {
@@ -5813,6 +5922,9 @@ async fn restart_account(ctx: &RecoveryContext<'_>) {
             // registration, and nothing was opened. Loop back through the
             // boundary wait instead of spending an attempt on it.
             Err(ReplacementOpen::Paused) => continue,
+            // The slot is being torn down. Nothing to restart, and the
+            // replacement (if one was opened at all) has already been closed.
+            Err(ReplacementOpen::Detached) => return,
             Ok((_reopen_guard, activity, next)) => {
                 match reattach_account(ctx, activity, next).await {
                     Ok(()) => return,
@@ -6187,6 +6299,22 @@ fn unresolved_readback_ids(
     ids
 }
 
+/// Keep whichever advice asks for the LONGER wait.
+///
+/// A batch can carry several retryable failures with different hints; the
+/// campaign resubmits them together, so honoring the shortest would resubmit
+/// an id whose provider named a later deadline. Ties keep the incumbent.
+fn keep_longer_advice(current: &mut Option<RetryAdvice>, candidate: RetryAdvice) {
+    let now = std::time::SystemTime::now();
+    let fallback = Duration::from_secs(1);
+    let candidate_delay = crate::recovery::retry_delay(&candidate, now, fallback);
+    match current {
+        Some(existing)
+            if crate::recovery::retry_delay(existing, now, fallback) >= candidate_delay => {}
+        _ => *current = Some(candidate),
+    }
+}
+
 /// Classify one `ItemOutcome<MutationSuccess>` and update the
 /// per-id outcome map and retry queue.
 ///
@@ -6214,6 +6342,13 @@ fn classify_item_outcome(
     dedupe_count: &mut u64,
     throttles: &std::sync::Mutex<crate::recovery::ThrottleBucket>,
     account_id: &AccountId,
+    // The retry advice of the per-item failures that were QUEUED for
+    // resubmission, folded to the longest delay. A stream that ends `Done`
+    // after emitting per-item retryable failures carries no stream-level
+    // advice, and without this the campaign looped straight into its next
+    // attempt with no delay at all - up to `mutation_max_retries`
+    // back-to-back resubmissions against a provider that just said no.
+    item_retry_advice: &mut Option<RetryAdvice>,
 ) -> Option<(EngineDirective, AccountError)> {
     use crate::recovery::{RecoveryPlan, plan_recovery};
     match item {
@@ -6260,6 +6395,7 @@ fn classify_item_outcome(
                         }
                         bifrost_types::RetryDisposition::SameRequest
                         | bifrost_types::RetryDisposition::AfterAuthRefresh => {
+                            keep_longer_advice(item_retry_advice, advice);
                             retry_ids.push(id.clone());
                             outcomes.insert(id, MutationBucket::PendingRetry);
                             None
@@ -6440,12 +6576,13 @@ mod tests {
     use std::collections::HashSet;
 
     /// Harness for driving the account writer directly.
-    fn writer_harness() -> (
+    fn writer_harness_observed() -> (
         bifrost_types::AccountId,
         Arc<crate::cursor::InMemoryCheckpointStore>,
         Arc<crate::cursor::PendingCoverage>,
         mpsc::Sender<WriterRequest>,
         tokio::task::JoinHandle<()>,
+        crate::control::SyncControl,
     ) {
         use crate::cursor::InMemoryCheckpointStore;
 
@@ -6457,8 +6594,17 @@ mod tests {
         let (boundary, _view) = crate::cancel::Boundary::new();
         let (priority, _p) = tokio::sync::watch::channel(bifrost_types::Priority::Normal);
         let (bandwidth, _b) = tokio::sync::watch::channel(None);
-        let control =
-            crate::control::SyncControl::new(account.clone(), boundary, priority, bandwidth);
+        // The same `PendingCoverage` backs the control's publication ledger, as
+        // it does in `attach`: a harness with two separate ledgers would never
+        // observe a boundary registration being retired.
+        let control = crate::control::SyncControl::new_with_publications(
+            account.clone(),
+            boundary,
+            priority,
+            bandwidth,
+            Arc::clone(&coverage),
+        );
+        let observed = control.clone();
         let writer = tokio::spawn(ack_writer(
             account.clone(),
             store,
@@ -6468,7 +6614,20 @@ mod tests {
         ));
         // The watch senders must outlive the writer task.
         std::mem::forget((_view, _p, _b));
-        (account, inner, coverage, tx, writer)
+        (account, inner, coverage, tx, writer, observed)
+    }
+
+    /// The common shape: the control handle is only needed by the tests that
+    /// assert what a boundary waiter would be told.
+    fn writer_harness() -> (
+        bifrost_types::AccountId,
+        Arc<crate::cursor::InMemoryCheckpointStore>,
+        Arc<crate::cursor::PendingCoverage>,
+        mpsc::Sender<WriterRequest>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (account, store, coverage, tx, writer, _control) = writer_harness_observed();
+        (account, store, coverage, tx, writer)
     }
 
     /// Same writer, but over a caller-supplied store so a test can observe or
@@ -6987,6 +7146,91 @@ mod tests {
                     )
                 ),
             "no completion marker may be durable while the scope owes obligations"
+        );
+
+        drop(tx);
+        writer.await.expect("writer exits");
+    }
+
+    /// Both recovery backoffs (`re_establish_scope_with_backoff` and
+    /// `restart_account`) wait through this, and a detach must cut the wait
+    /// short rather than have it wait out: the un-selected sleep it replaced
+    /// guaranteed that a detach during recovery reached `detach_timeout` and
+    /// aborted the worker instead of draining it.
+    #[tokio::test(start_paused = true)]
+    async fn a_recovery_backoff_is_cut_short_by_shutdown() {
+        use std::time::Duration;
+        use tokio_util::sync::CancellationToken;
+
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        let started = tokio::time::Instant::now();
+        let completed = super::sleep_unless_shutdown(Duration::from_secs(300), &shutdown).await;
+        assert!(
+            !completed,
+            "a cancelled backoff must report that it was cut"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(300),
+            "the backoff must not be waited out during teardown"
+        );
+
+        let live = CancellationToken::new();
+        assert!(
+            super::sleep_unless_shutdown(Duration::from_millis(1), &live).await,
+            "an uncancelled backoff still runs to completion"
+        );
+    }
+
+    /// A withheld sentinel must not be announced as a durable boundary.
+    ///
+    /// The store never accepted the marker, so reporting it through
+    /// `pause` / `checkpoint_now` would tell the consumer a backfill-complete
+    /// boundary is durable while the next attach re-walks the scope. The
+    /// module's own rule is that nothing durable is invented, so the withheld
+    /// path retires the publication (releasing boundary waiters) exactly as a
+    /// failed store write does, instead of recording it.
+    #[tokio::test]
+    async fn a_withheld_completion_sentinel_is_not_announced_durable() {
+        let (_account, _store, coverage, tx, writer, control) = writer_harness_observed();
+
+        let page = backfill_checkpoint(bifrost_types::Partition(b"page-0".to_vec()));
+        let debt = register(
+            &coverage,
+            &page,
+            crate::cursor::CoverageClaim::new(
+                bifrost_types::InventoryCoverageReport::degraded(
+                    bifrost_types::CoverageDomain::full(email_scope()),
+                    vec![unrepresentable("broken")],
+                ),
+                1,
+            ),
+        );
+        ack(&tx, page.clone(), Some(debt)).await.expect("ack lands");
+
+        let completion =
+            backfill_checkpoint_at(crate::backfill::partitioner::completion_partition(), 99);
+        let sentinel = register(
+            &coverage,
+            &completion,
+            crate::cursor::CoverageClaim {
+                reports: Vec::new(),
+                generation: 1,
+            },
+        );
+        ack(&tx, completion.clone(), Some(sentinel))
+            .await
+            .expect("the acknowledgement itself still succeeds");
+
+        let announced = control.durable_snapshot();
+        assert!(
+            !announced.checkpoints().contains(&completion),
+            "a sentinel the store never accepted must not appear in the durable snapshot"
+        );
+        assert_eq!(
+            coverage.pending_checkpoints(),
+            0,
+            "the withheld publication must still be retired so boundary waiters are released"
         );
 
         drop(tx);
@@ -7631,6 +7875,7 @@ mod tests {
             &mut dedupe,
             &throttles,
             &account,
+            &mut None,
         );
 
         assert!(forwarded.is_none(), "a downgrade is not an engine recovery");
@@ -7673,6 +7918,7 @@ mod tests {
             &mut dedupe,
             &throttles,
             &account,
+            &mut None,
         )
         .expect("engine recovery must be forwarded");
 

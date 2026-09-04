@@ -13,9 +13,10 @@ once per second forever - is fixed: poll exits now carry a `PollExit`
 disposition, and the Terminal arm parks the scope by leaving its uncancelled
 `ScopeToken` in the map as a tombstone the 1s scan honors; pinned by
 `terminal_drive_outcome_parks_the_scope_instead_of_retiring_it` and documented
-in `reference/sync.md`. The push reconciler's milder sibling - a later hint
-can still re-drive a terminally failed scope, since the reconciler does not
-consult scope tokens - remains open and is now stated in the reference.)
+in `reference/sync.md`. The push reconciler's milder sibling is now fixed too:
+the tombstone is marked `parked`, the reconciler shares the same token map and
+skips a parked scope rather than re-driving it. Pinned by
+`a_terminally_parked_scope_is_not_re_driven_by_a_later_hint`.)
 
 (Finding 2 - lifecycle `Deleted` leaving the durable change cursor and
 backfill rows (completion marker included) behind, so a folder recreated
@@ -26,95 +27,56 @@ via the new `reset_scope_for_deletion` (delete_backfill = true). Pinned by
 `deleted_lifecycle_purges_cursor_and_requests_durable_deletion`;
 `reference/sync.md` updated.)
 
-### 3. A withheld backfill completion sentinel is reported as a durable checkpoint
+(Finding 3 - a withheld backfill completion sentinel reported as a durable
+checkpoint - is fixed: `persist_ack_request` now answers `Durable` or
+`SentinelWithheld`, and the withheld arm skips `settle_checkpoint` and
+`announce_durable`, retiring the publication instead exactly as a failed store
+write does. The consumer's ack still returns `Ok`. Pinned by
+`a_withheld_completion_sentinel_is_not_announced_durable`; `reference/sync.md`
+updated.)
 
-`engine.rs::persist_ack_request` + `control.rs::announce_durable`. When the
-ledger has open debt, `persist_ack_request` deliberately withholds the
-completion sentinel and persists only the ledger, returning `Ok`. The ack
-writer's success arm then runs `coverage.settle_checkpoint(...)` (moving the
-persisted watermark for a checkpoint the store never accepted - a later retry
-answers `AlreadyPersisted`) and `control.record_publication(...)`, whose
-`announce_durable` inserts the sentinel into the `DurableCheckpointSet` under
-`DurableLane::Backfill(scope, "complete")`. Every subsequent `pause()` /
-`checkpoint_now()` therefore reports the backfill-complete boundary as durable
-while the store holds no such row and the next attach will re-walk.
-Re-delivery, not loss - but the module's own rule is "nothing durable is
-invented; the snapshot is not advanced," and here it is. The withheld-sentinel
-path needs to skip both `settle_checkpoint` and `announce_durable` (retiring
-the publication instead, the way a failed write does), or return a
-distinguishable outcome.
-
-### 4. Repair publications misattribute every recovered id to the first id's scope
-
-`repair.rs::publish_recovered`. `plan_requests` plans across *all* repairable
-obligations, which can span multiple scopes, yet the single batched
-`MultiplexerEvent` uses `recovered[0].0` as the scope for the whole batch. The
-recovered ids are collected as `(CursorScope, ObjectId)` pairs - the per-id
-scope is right there and then discarded. A consumer that routes broadcast
-events by `MultiplexerEvent::scope` (the type's stated purpose) files scope-B
-`Created` ids under scope A, or drops them if it filters. Either publish one
-event per scope or per (scope-grouped) batch.
+(Finding 4 - repair publications misattributing every recovered id to the first
+id's scope - is fixed: `run_repair_pass` groups both the recovered ids and the
+resolutions by scope and emits one publication plus one `ApplyRepair` per scope,
+so an obligation discharges only on the acknowledgement of the batch that
+carried its own id. Pinned by
+`recovered_ids_are_published_under_their_own_scope`; `reference/sync.md`
+updated.)
 
 ## Suspected defects / contract tensions
 
-### 5. An engine directive raised by one item erases sibling items' read-back protection
+(Finding 5 - an engine directive erasing sibling items' read-back protection -
+is fixed: the `blocked_by_engine` sweep now skips `PendingReadback` the way the
+retry-termination sweep already did, so the read-back guard still runs and a
+mutation that actually landed is reconciled instead of being reported
+`blocked_by_engine`. Pinned by
+`an_engine_directive_leaves_a_sibling_read_back_alone`. The mutation section of
+`reference/sync.md` named in finding 12 is updated to state the invariant on
+every exit path, which closes that half of 12 too.)
 
-`engine.rs::run_bulk_pipeline`. When any item (or the stream) yields
-`RecoveryPlan::Engine`, the `blocked_by_engine` sweep overwrites every outcome
-not in {Applied, Skipped, FailedTerminal, BlockedByEngine} - including
-`PendingReadback`. Those are exactly the ids whose write "may have landed and
-must be verified rather than replayed" (`Uncertain`, downgrades,
-`AfterStateRefresh`). After the sweep, `unresolved_readback_ids` finds
-nothing, the read-back guard is skipped entirely, and a mutation that actually
-applied is reported `blocked_by_engine`. The retry-termination sweep was
-deliberately narrowed to *not* claim read-back-lane ids ("An id sitting in the
-read-back lane belongs to the guard"); the engine-directive sweep tramples the
-same invariant. If the intent is "campaign halted, accounting stops," the
-reference should say the read-back guarantee is void on engine directives; if
-not, the sweep should leave `PendingReadback` alone and still run the guard.
+(Finding 6 - `reopen` not serialized against `detach`, leaking a replacement
+connection - is fixed: `open_replacement` consults the slot's shutdown token
+before and after `factory.open()` and answers a new `ReplacementOpen::Detached`,
+closing the replacement it opened rather than swapping it into an orphaned slot.
+The public entry reports `AccountNotAttached`; `restart_account` stops. Pinned by
+`a_reopen_racing_detach_closes_its_replacement_instead_of_leaking_it`;
+`reference/sync.md` updated.)
 
-### 6. Public `SyncEngine::reopen` is not serialized against `detach`, allowing a leaked replacement connection
+(Finding 7 - inline recovery sleeps stalling the single push reconciler and
+ignoring cancellation - is fixed: the reconciler's Retry/Reconcile arms record
+their deadline in the shared throttle bucket and skip that scope, continuing the
+sweep; the poll loop's Retry and Reconcile delays select on scope cancellation
+and shutdown; and both engine backoffs go through the new
+`sleep_unless_shutdown`. Pinned by
+`a_throttled_scope_does_not_freeze_the_account_wide_sweep`,
+`a_cancelled_scope_does_not_wait_out_its_retry_hint` and
+`a_recovery_backoff_is_cut_short_by_shutdown`; `reference/sync.md` updated.)
 
-`engine.rs`. `reopen` takes neither the `lifecycle_inflight` guard nor
-anything that observes slot removal; it holds a pre-detach
-`Arc<AccountSlot>`. Race: `reopen`'s `begin_activity()` succeeds just before
-detach flips the boundary to `Stop`; `factory.open()` proceeds while detach
-removes the slot, awaits workers, and closes the *old* handle. If the reattach
-then completes with no newly-established cursors and no push subscriptions
-(the two paths that would touch the now-closed writer channel and abort),
-`reattach_account` swaps the replacement into the orphaned slot's `ArcSwap`
-and closes the *previous* (already-closed) handle. The replacement connection
-has no owner and is never closed. Narrow window, but detach explicitly does
-not wait for consumer-driven activity, so nothing excludes it. A cheap fix:
-have `reopen` re-check `accounts.contains_key` under the lifecycle guard (or
-make `open_replacement` fail when the slot's shutdown token is cancelled - it
-currently never consults it between `begin_activity` and the swap).
-
-### 7. Inline recovery sleeps stall the single push reconciler account-wide and ignore scope cancellation
-
-`push/reconciler.rs`, `multiplexer/mod.rs`. The reconciler's `Terminated ->
-Retry/Reconcile` arms `tokio::time::sleep(delay).await` inline, un-`select!`ed,
-inside the one reconciler task. A provider `Retry-After` of minutes on one
-scope freezes all push reconciliation for the account for that duration (the
-watch channel meanwhile fills and coalesces). The throttle bucket already
-records the same deadline and every drive path consults it, so the inline
-sleep is redundant with a much cheaper "skip this scope, continue the sweep."
-The poll loop's Retry sleep has the milder version: it ignores
-`scope_cancel`/`shutdown`, so a deleted scope or detach waits out the full
-provider hint (detach then burns toward `detach_timeout` and aborts). Same
-pattern in `re_establish_scope_with_backoff` / `restart_account` backoff
-sleeps (no shutdown select), which guarantees detach-during-recovery always
-hits the abort path rather than draining cleanly.
-
-### 8. Per-item retryable failures resubmit with no delay
-
-`engine.rs::run_bulk_pipeline`. `retry_advice` is set only from a
-*stream-level* Retry termination. A stream that ends `Done` after emitting
-per-item `Retry(SameRequest)` failures loops straight into the next attempt
-with zero sleep unless the advice happened to carry a throttle scope + hint (a
-bare `RetryHint` with `throttle_scope: None` records nothing). Bounded by
-`mutation_max_retries` (5), but it's 5 back-to-back resubmissions against a
-failing provider where every other retry path honors the hint.
+(Finding 8 - per-item retryable failures resubmitting with no delay - is fixed:
+`classify_item_outcome` now reports the retry advice of the items it queued,
+folded to the longest delay, and the campaign uses it when the stream carried no
+termination-level advice. Pinned by `a_per_item_retry_delays_the_resubmission`;
+`reference/sync.md` updated.)
 
 ## Latent / design-level observations
 
@@ -158,11 +120,9 @@ the finding was real-but-unreachable and is now commented at the arm.
 
 ### 12. Doc drift, small
 
-The `Deleted` half is resolved with finding 2 (the reference now documents
-the durable purge). Remaining: the mutation section's read-back derivation
-claim ("every id still PendingRetry or PendingReadback") is falsified by the
-engine-directive sweep (finding 5) - whichever way 5 is resolved, one of the
-two texts needs updating.
+(Resolved. The `Deleted` half went with finding 2, and the mutation section's
+read-back derivation claim is now true on every exit path: finding 5 was fixed
+in the direction that preserves it, and the reference says so explicitly.)
 
 ## Not found / verified sound
 

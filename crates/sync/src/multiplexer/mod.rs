@@ -268,9 +268,32 @@ fn lifecycle_termination(error: &AccountError) -> LifecycleTermination {
 pub struct ScopeToken {
     generation: u64,
     token: CancellationToken,
+    /// The poll task exited on a terminal verdict and left this entry behind
+    /// as a tombstone. The 1s scan reads any present entry as "owned", but a
+    /// tombstone is not an owner - it is a record that the scope is DEAD - so
+    /// paths that drive a scope on their own initiative (the push reconciler)
+    /// must be able to tell the two apart.
+    parked: bool,
 }
 
 impl ScopeToken {
+    /// A terminal tombstone for `scope_tokens`: no owner, uncancelled, and
+    /// marked parked, which is exactly the state a poll task leaves behind
+    /// when its recovery verdict was `Terminal`. Both the 1s poll scan and
+    /// the push reconciler refuse to drive a scope holding one.
+    ///
+    /// Published because `ScopeTokens` is published while every field of an
+    /// entry is private, so nothing outside this module could otherwise place
+    /// an entry in the map at all.
+    #[must_use]
+    pub fn tombstone() -> Self {
+        Self {
+            generation: SCOPE_TOKEN_GENERATION.fetch_add(1, Ordering::Relaxed),
+            token: CancellationToken::new(),
+            parked: true,
+        }
+    }
+
     fn is_cancelled(&self) -> bool {
         self.token.is_cancelled()
     }
@@ -618,6 +641,7 @@ fn spawn_and_track_scope_poll(
         ScopeToken {
             generation,
             token: scope_cancel.clone(),
+            parked: false,
         },
     );
     let cleanup_tokens = Arc::clone(&scope_tokens);
@@ -646,8 +670,13 @@ fn spawn_and_track_scope_poll(
         // (`cancel_scope_token` via lifecycle deletion or an engine restart,
         // and multiplexer shutdown) still clear the entry, so a scope that
         // is deleted-and-recreated or explicitly restarted respawns cleanly.
-        if matches!(exit, PollExit::Retire) {
-            retire_scope_token(&cleanup_tokens, &cleanup_scope, generation);
+        match exit {
+            PollExit::Retire => retire_scope_token(&cleanup_tokens, &cleanup_scope, generation),
+            // Mark the tombstone as such, by identity, so the push reconciler
+            // can refuse to re-drive a terminally parked scope. Without the
+            // mark a later hint drove the scope again - the milder sibling of
+            // the once-per-second respawn loop the park exists to stop.
+            PollExit::Park => park_scope_token(&cleanup_tokens, &cleanup_scope, generation),
         }
     });
 }
@@ -665,6 +694,31 @@ fn retire_scope_token(tokens: &ScopeTokens, scope: &CursorScope, generation: u64
     if matches!(g.get(scope), Some(entry) if entry.generation == generation) {
         g.remove(scope);
     }
+}
+
+/// Mark an exiting task's registration as a terminal tombstone, by identity.
+fn park_scope_token(tokens: &ScopeTokens, scope: &CursorScope, generation: u64) {
+    let mut g = tokens.lock().expect("poisoned");
+    if let Some(entry) = g.get_mut(scope)
+        && entry.generation == generation
+    {
+        entry.parked = true;
+    }
+}
+
+/// Whether this scope is a terminal tombstone: a poll task exited on a
+/// terminal recovery verdict and nothing has cleared the entry since.
+///
+/// Reading `None` as "not parked" is the safe default - an unknown scope is
+/// one nothing has terminated - and so is an ACTIVE token, whose owner is
+/// polling it normally.
+#[must_use]
+pub fn scope_is_parked(tokens: &ScopeTokens, scope: &CursorScope) -> bool {
+    tokens
+        .lock()
+        .expect("poisoned")
+        .get(scope)
+        .is_some_and(|entry| entry.parked)
 }
 
 fn cancel_scope_token(tokens: &ScopeTokens, scope: &CursorScope) {
@@ -868,6 +922,8 @@ async fn spawn_scope_poll_inner(
             &reopen_tx,
             &account_id,
             &throttles,
+            &shutdown,
+            &scope_cancel,
         )
         .await;
 
@@ -932,6 +988,17 @@ struct DriveRecovery {
     exit: Option<PollExit>,
 }
 
+/// A recovery delay cut short by detach or scope deletion. The scope is left
+/// RETIRED, never parked: the token is being cleared anyway, and parking would
+/// leave a tombstone behind for a scope nobody asked to keep.
+fn retired() -> DriveRecovery {
+    DriveRecovery {
+        advanced: false,
+        exit: Some(PollExit::Retire),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn handle_drive_outcome(
     scope: &CursorScope,
     outcome: Result<ChangesEvent, Error>,
@@ -943,6 +1010,12 @@ async fn handle_drive_outcome(
     reopen_tx: &mpsc::Sender<ReopenRequest>,
     account_id: &AccountId,
     throttles: &StdMutex<crate::recovery::ThrottleBucket>,
+    // Detach and scope deletion must interrupt a recovery delay, not wait it
+    // out. A provider `Retry-After` of minutes otherwise kept a deleted scope
+    // or a detaching account parked for the full hint, and detach then burned
+    // toward `detach_timeout` and aborted the task instead of draining it.
+    shutdown: &CancellationToken,
+    scope_cancel: &CancellationToken,
 ) -> DriveRecovery {
     // Account errors already carry the complete recovery verdict. Normalize
     // them onto the same path as an account-authored Terminated event instead
@@ -991,7 +1064,11 @@ async fn handle_drive_outcome(
                         std::time::SystemTime::now(),
                         std::time::Duration::from_secs(1),
                     );
-                    tokio::time::sleep(delay).await;
+                    tokio::select! {
+                        () = shutdown.cancelled() => return retired(),
+                        () = scope_cancel.cancelled() => return retired(),
+                        () = tokio::time::sleep(delay) => {}
+                    }
                     DriveRecovery {
                         advanced: false,
                         exit: None,
@@ -1013,7 +1090,11 @@ async fn handle_drive_outcome(
                         std::time::SystemTime::now(),
                         std::time::Duration::from_secs(1),
                     );
-                    tokio::time::sleep(delay).await;
+                    tokio::select! {
+                        () = shutdown.cancelled() => return retired(),
+                        () = scope_cancel.cancelled() => return retired(),
+                        () = tokio::time::sleep(delay) => {}
+                    }
                     DriveRecovery {
                         advanced: false,
                         exit: None,
@@ -1259,6 +1340,48 @@ mod tests {
         })
     }
 
+    /// A scope deletion (or a detach) must CUT SHORT a recovery delay, not wait
+    /// it out. The retry sleep used to be un-selected, so a deleted scope or a
+    /// detaching account sat through the provider's full hint - and detach then
+    /// burned toward `detach_timeout` and aborted the task instead of draining
+    /// it.
+    #[tokio::test(start_paused = true)]
+    async fn a_cancelled_scope_does_not_wait_out_its_retry_hint() {
+        let scope = CursorScope::Account;
+        let (reopen_tx, _reopen_rx) = mpsc::channel(1);
+        let error = bifrost_types::AccountErrorBuilder::new(
+            bifrost_types::AccountErrorKind::Server(bifrost_types::ServerErrorKind::RateLimited),
+            bifrost_types::Cause::Server(bifrost_types::ServerCause::RateLimited {
+                retry_hint: Some(bifrost_types::RetryHint::After(
+                    std::time::Duration::from_secs(600),
+                )),
+            }),
+        )
+        .try_build()
+        .expect("valid rate-limited server error");
+        let scope_cancel = CancellationToken::new();
+        scope_cancel.cancel();
+
+        let started = tokio::time::Instant::now();
+        let recovery = handle_drive_outcome(
+            &scope,
+            Ok(ChangesEvent::Terminated(error)),
+            false,
+            &reopen_tx,
+            &AccountId("cancelled".into()),
+            &StdMutex::new(crate::recovery::ThrottleBucket::default()),
+            &CancellationToken::new(),
+            &scope_cancel,
+        )
+        .await;
+
+        assert_eq!(recovery.exit, Some(PollExit::Retire));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(600),
+            "the cancelled scope must not sleep off the provider hint"
+        );
+    }
+
     #[tokio::test]
     async fn account_error_from_driver_routes_through_recovery_plan() {
         let scope = CursorScope::Account;
@@ -1276,6 +1399,8 @@ mod tests {
             &reopen_tx,
             &AccountId("routing".into()),
             &StdMutex::new(crate::recovery::ThrottleBucket::default()),
+            &CancellationToken::new(),
+            &CancellationToken::new(),
         )
         .await;
 
@@ -1355,6 +1480,8 @@ mod tests {
             &reopen_tx,
             &AccountId("terminal".into()),
             &StdMutex::new(crate::recovery::ThrottleBucket::default()),
+            &CancellationToken::new(),
+            &CancellationToken::new(),
         )
         .await;
 
@@ -1463,6 +1590,7 @@ mod tests {
             ScopeToken {
                 generation,
                 token: CancellationToken::new(),
+                parked: false,
             },
         );
         generation
@@ -1588,6 +1716,7 @@ mod tests {
             ScopeToken {
                 generation: 7,
                 token: token.clone(),
+                parked: false,
             },
         );
 
@@ -1611,6 +1740,7 @@ mod tests {
             ScopeToken {
                 generation: 9,
                 token: CancellationToken::new(),
+                parked: false,
             },
         );
 

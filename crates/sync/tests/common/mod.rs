@@ -40,6 +40,7 @@ use bifrost_types::{
 use bifrost_types::{AddressBook, AddressBookId};
 use bifrost_types::{Calendar, CalendarEvent};
 use bytes::Bytes;
+use futures::StreamExt;
 use futures::stream;
 
 pub fn unsupported(op: bifrost_types::AccountOperation) -> AccountError {
@@ -101,6 +102,13 @@ pub type PartitionHook =
 /// Produces the `InventoryEvent`s a whole-scope inventory walk yields.
 pub type InventoryHook = Arc<dyn Fn(&CursorScope) -> Vec<InventoryEvent> + Send + Sync>;
 
+/// Answers one inventory repair request.
+pub type RepairHook = Arc<
+    dyn Fn(&bifrost_types::InventoryRepairRequest) -> bifrost_types::InventoryRepairEvent
+        + Send
+        + Sync,
+>;
+
 /// Produces the `SyncEvent<Change>`s one changes drive yields.
 pub type ChangesHook = Arc<dyn Fn(&ChangeCursor) -> Vec<SyncEvent<Change>> + Send + Sync>;
 
@@ -122,6 +130,12 @@ pub struct StubAccount {
     pub inventory_hook: Option<InventoryHook>,
     /// Hook for `changes_stream`. Default: empty stream.
     pub changes_hook: Option<ChangesHook>,
+    /// Answers one `repair_inventory` request. Mapped over the request
+    /// stream, so an answer always carries the attempt id it belongs to -
+    /// which a canned outcome list cannot, since attempt ids are minted at
+    /// plan time. Default: empty stream, i.e. every request falls through to
+    /// a local deferral.
+    pub repair_hook: Option<RepairHook>,
     /// Every partition the engine asked this account to walk, in call order.
     pub walked: Arc<Mutex<Vec<(CursorScope, InventoryPartition)>>>,
     /// Every scope the engine asked to establish, in call order.
@@ -141,6 +155,7 @@ impl StubAccount {
             partition_hook: None,
             inventory_hook: None,
             changes_hook: None,
+            repair_hook: None,
             walked: Arc::new(Mutex::new(Vec::new())),
             established: Arc::new(Mutex::new(Vec::new())),
             closed: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -271,6 +286,19 @@ impl Account for StubAccount {
         _projection: Projection,
     ) -> AccountStream<SyncEvent<ItemOutcome<HydratedObject>>> {
         Box::pin(stream::empty())
+    }
+
+    fn repair_inventory(
+        &self,
+        requests: AccountStream<bifrost_types::InventoryRepairRequest>,
+    ) -> AccountStream<bifrost_types::InventoryRepairEvent> {
+        match &self.repair_hook {
+            Some(hook) => {
+                let hook = Arc::clone(hook);
+                Box::pin(requests.map(move |request| hook(&request)))
+            }
+            None => Box::pin(stream::empty()),
+        }
     }
 
     fn changes_stream(&self, cursor: ChangeCursor) -> AccountStream<SyncEvent<Change>> {

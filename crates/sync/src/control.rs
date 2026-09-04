@@ -362,6 +362,13 @@ impl SyncControl {
         &self.inner.account
     }
 
+    /// Test-only view of the announced durable snapshot, i.e. exactly what a
+    /// `pause` / `checkpoint_now` waiter would be handed right now.
+    #[cfg(test)]
+    pub(crate) fn durable_snapshot(&self) -> DurableCheckpointSet {
+        self.inner.checkpoint_tx.borrow().checkpoints.clone()
+    }
+
     pub(crate) async fn wait_until_running(&self, shutdown: &CancellationToken) -> bool {
         let mut boundary = self.inner.boundary.subscribe();
         loop {

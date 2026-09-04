@@ -534,6 +534,15 @@ and the accompanying warning is what tells the consumer to reconcile.
   (default 30s), doubles after **five** consecutive no-change
   ticks up to `poll_max` (default 30 minutes). The pure helper is
   `Multiplexer::updated_cadence(cur, seen_change, min, max)`.
+  Every recovery delay in the poll loop - the `Retry` and `Reconcile` arms of
+  `handle_drive_outcome` - selects on the scope token and the account shutdown
+  token, so a deleted scope or a detaching account leaves immediately instead
+  of waiting out a provider hint (which made detach burn toward
+  `detach_timeout` and abort the task rather than draining it). The two
+  recovery backoffs on the engine side, `re_establish_scope_with_backoff` and
+  `restart_account`, wait through the shared `sleep_unless_shutdown` for the
+  same reason. Pinned by `a_cancelled_scope_does_not_wait_out_its_retry_hint`
+  and `a_recovery_backoff_is_cut_short_by_shutdown`.
 - **Scope lifecycle** events from `Account::scope_lifecycle_stream`.
   `Created` and `Renamed` consult the registered cursor shapes.
   Account-wide and type-wide models already cover the new membership
@@ -600,10 +609,19 @@ respawn/re-drive loop (each drive of which would re-broadcast
 `Terminated`). A parked scope is only revived by an explicit
 scope-retiring path: `cancel_scope_token` (lifecycle deletion, engine
 restart of the scope) or multiplexer shutdown clears the entry, after
-which a still-present or re-established cursor respawns normally. The
-push reconciler does not consult these tokens; its per-scope terminal
-arm stops the current sweep, and a later hint can still re-drive a
-terminally failed scope (a known, milder gap).
+which a still-present or re-established cursor respawns normally.
+
+The tombstone is MARKED (`ScopeToken::parked`), not merely present, because
+the push reconciler shares the same map and needs to tell a tombstone from a
+live poll task's registration. The reconciler is the other producer on the
+lane, and it now skips a parked scope (`scope_is_parked`) instead of driving
+it: without that, a later push hint re-drove a terminally failed scope,
+re-broadcasting `Terminated` and spending a wire call that cannot succeed -
+the milder sibling of the once-per-second respawn loop the park exists to
+stop. `ScopeToken::tombstone()` is published because `ScopeTokens` is
+published while every field of an entry is private, so nothing outside the
+module could otherwise place an entry in the map. Pinned by
+`a_terminally_parked_scope_is_not_re_driven_by_a_later_hint`.
 
 Output is a `broadcast::Sender<MultiplexerEvent>`. The event
 carries `{ scope, event: Arc<SyncEvent<Change>>, checkpoint }`.
@@ -866,8 +884,15 @@ On
 `Terminated(err)`, the reconciler routes through
 `crate::recovery::plan_recovery` and forwards
 `RecoveryPlan::Engine(directive)` to the slot's reopen channel
-carrying the original account error; `Retry(advice)` sleeps for the
-duration derived from `advice.retry_hint`.
+carrying the original account error. `Retry(advice)` and
+`Reconcile(advice)` record their deadline in the shared throttle bucket and
+then SKIP that scope, continuing the sweep. They deliberately do NOT sleep the
+delay out: this is one task for the whole account, so a provider `Retry-After`
+of minutes naming one scope froze every other scope's push reconciliation for
+that long while the watch channel filled and coalesced behind it. The sleep was
+redundant with the bucket, which every drive path consults - including the top
+of each scope in this sweep, under a shutdown select. Pinned by
+`a_throttled_scope_does_not_freeze_the_account_wide_sweep`.
 
 `directive_target_scope` IS the blast radius, and the sweep obeys it:
 `Some(scope)` names one scope to reset, so the hint's remaining scopes are
@@ -916,6 +941,21 @@ The lock means both calls queue behind an active open/swap attempt rather
 than racing it. A reopen queued behind `Pause` does not hold the lock
 while it waits for `Run`, so `unsubscribe_push` remains available for
 shutdown cleanup during an indefinitely paused account.
+
+`open_replacement` also consults the slot's SHUTDOWN TOKEN on both sides of
+`factory.open()`, and answers `ReplacementOpen::Detached` when it is cancelled -
+closing the replacement it just opened before returning. `detach` deliberately
+does not wait for consumer-driven activity, so nothing else excludes a public
+`SyncEngine::reopen` whose `begin_activity()` landed just before detach flipped
+the boundary to `Stop`: the open proceeds while detach removes the slot, awaits
+the workers, and closes the old handle. With unchanged topology the reattach
+establishes no cursor and recreates no subscription - the two paths that would
+touch the dead writer channel and abort - so it used to run to completion, swap
+the replacement into the orphaned slot, and close the already-closed previous
+handle, leaving the replacement connection with no owner and never closed. The
+public entry reports `AccountNotAttached`; `restart_account` simply stops.
+Pinned by
+`a_reopen_racing_detach_closes_its_replacement_instead_of_leaking_it`.
 
 That property is structural rather than remembered. `open_replacement`
 is the single acquisition site for an open/swap, taking the guard after
@@ -986,6 +1026,15 @@ method and final read-back guard. Campaign flow:
    (engine bookkeeping; no protocol today emits it on the wire).
    Repeat up to `EngineConfig::mutation_max_retries`.
 
+   The advice comes from the stream-level `Retry` termination when there is
+   one, and otherwise from the PER-ITEM retryable failures actually being
+   resubmitted, folded to the longest of their delays. It used to come only
+   from the stream level, so a stream that ended `Done` after emitting per-item
+   `Retry(SameRequest)` failures looped straight into its next attempt with no
+   sleep at all - `mutation_max_retries` back-to-back resubmissions against a
+   provider that had just named a deadline. Pinned by
+   `a_per_item_retry_delays_the_resubmission`.
+
    One resubmission is at most `MutationConfig::retry_queue_cap` targets
    wide (default 4096). The retry set only shrinks - it is filtered out of
    the ids still outstanding - so this is not a guard against unbounded
@@ -1007,6 +1056,18 @@ method and final read-back guard. Campaign flow:
    (every id still `PendingRetry` or `PendingReadback`), not
    accumulated during it, so an id parked in the read-back lane cannot
    be dropped by a later attempt that resubmits its siblings.
+
+That derivation holds on EVERY exit path, the engine-directive one included.
+When any item or the stream yields `RecoveryPlan::Engine`, the campaign stops
+submitting and sweeps its still-unresolved ids to `BlockedByEngine` - but the
+sweep skips `PendingReadback`, exactly as the retry-termination sweep does. Those
+are the ids whose write may already have landed (`Uncertain`, downgrades,
+`AfterStateRefresh`), and the read-back lane exists so they are verified rather
+than replayed or guessed at; claiming them emptied the read-back set, skipped the
+guard entirely, and reported a mutation that had actually applied as
+`blocked_by_engine`. The guard that follows only OBSERVES state - it submits no
+mutation - so running it does not contradict "the campaign was halted by the
+engine". Pinned by `an_engine_directive_leaves_a_sibling_read_back_alone`.
 
 `ItemOutcome::Succeeded` buckets by its `MutationSuccess` payload:
 `Applied` -> `applied`, `Skipped` -> `skipped`, and **`Downgraded { .. }` ->
@@ -1633,6 +1694,18 @@ STANDS at the moment it processes the sentinel acknowledgement, and withholds th
 marker if the scope owes anything unwaived. The consumer's acknowledgement still
 succeeds; the marker simply does not become durable, so the next attach re-walks.
 
+A withheld sentinel is NOT reported as a durable checkpoint. `persist_ack_request`
+answers `Durable` or `SentinelWithheld`, and the withheld arm skips both
+`PendingCoverage::settle_checkpoint` and `SyncControl::record_publication`,
+RETIRING the publication instead - the same treatment a failed store write gets.
+Settling would let a retried acknowledgement answer `AlreadyPersisted` for a row
+the store never accepted, and announcing would put the backfill-complete boundary
+into the `DurableCheckpointSet` every later `pause` / `checkpoint_now` reports,
+while the next attach re-walks the scope. Retiring still releases boundary
+waiters, so nothing wedges. Nothing durable is invented; the snapshot is not
+advanced. Pinned by
+`a_withheld_completion_sentinel_is_not_announced_durable`.
+
 Note `seen` counts only entries a page materialized, so an object that never
 became an entry is not in that total - the count cannot be used to detect any of
 this.
@@ -1693,6 +1766,18 @@ building it is the proof that the representation failure which raised the
 obligation has healed; an id alone would only prove the object still exists. The
 engine validates it (one entry, matching id, right request kind), keeps the id,
 and drops the rest.
+
+**One publication, and one writer request, PER SCOPE.** A pass plans across
+every repairable obligation in the ledger, which can span scopes, so the
+recovered ids are grouped by the scope they were recovered from and each group
+is broadcast as its own `MultiplexerEvent`. `MultiplexerEvent::scope` is the
+routing key a consumer files or filters on, so one batch stamped with whichever
+scope happened to be recovered first delivers scope B's ids as scope A's, or
+drops them. The RESOLUTIONS are grouped the same way, which is what keeps
+discharge honest after the split: an obligation discharges only on an
+acknowledgement of the batch that actually carried its id, never on a sibling
+scope's batch. Within a scope the pass is still all-or-nothing. Pinned by
+`recovered_ids_are_published_under_their_own_scope`.
 
 Discharge happens on the consumer's explicit `ack_publication` acknowledgement
 of the repair publication,

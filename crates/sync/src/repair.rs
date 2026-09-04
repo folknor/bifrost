@@ -118,7 +118,7 @@ pub async fn run_repair_pass(
     let requests: Vec<InventoryRepairRequest> = planned.iter().map(|p| p.request.clone()).collect();
 
     let mut stream = account.repair_inventory(Box::pin(futures::stream::iter(requests)));
-    let mut resolutions: Vec<RepairResolution> = Vec::new();
+    let mut resolutions: Vec<(CursorScope, RepairResolution)> = Vec::new();
     let mut recovered_ids: Vec<(CursorScope, bifrost_types::ObjectId)> = Vec::new();
 
     while let Some(event) = stream.next().await {
@@ -158,11 +158,14 @@ pub async fn run_repair_pass(
                 match validate_object_recovery(&planned, &entry) {
                     Ok(id) => {
                         recovered_ids.push((planned.scope.clone(), id));
-                        resolutions.push(RepairResolution::Recovered {
-                            key: planned.request.key.clone(),
-                            attempt,
-                            generation: planned.generation,
-                        });
+                        resolutions.push((
+                            planned.scope.clone(),
+                            RepairResolution::Recovered {
+                                key: planned.request.key.clone(),
+                                attempt,
+                                generation: planned.generation,
+                            },
+                        ));
                     }
                     Err(reason) => {
                         tracing::warn!(
@@ -172,9 +175,12 @@ pub async fn run_repair_pass(
                             reason,
                             "rejecting an object recovery that does not match its request"
                         );
-                        resolutions.push(RepairResolution::Deferred {
-                            key: planned.request.key.clone(),
-                        });
+                        resolutions.push((
+                            planned.scope.clone(),
+                            RepairResolution::Deferred {
+                                key: planned.request.key.clone(),
+                            },
+                        ));
                     }
                 }
             }
@@ -186,9 +192,12 @@ pub async fn run_repair_pass(
                         attempt = attempt.0,
                         "region recovery returned for an object request"
                     );
-                    resolutions.push(RepairResolution::Deferred {
-                        key: planned.request.key.clone(),
-                    });
+                    resolutions.push((
+                        planned.scope.clone(),
+                        RepairResolution::Deferred {
+                            key: planned.request.key.clone(),
+                        },
+                    ));
                     continue;
                 }
                 for entry in &entries {
@@ -197,11 +206,14 @@ pub async fn run_repair_pass(
                 // Some entries never discharge a region; the completeness proof
                 // is what does, and the writer checks it against the
                 // obligation's own domain.
-                resolutions.push(RepairResolution::Replaced {
-                    key: planned.request.key.clone(),
-                    proof: Box::new(proof),
-                    generation: planned.generation,
-                });
+                resolutions.push((
+                    planned.scope.clone(),
+                    RepairResolution::Replaced {
+                        key: planned.request.key.clone(),
+                        proof: Box::new(proof),
+                        generation: planned.generation,
+                    },
+                ));
             }
             InventoryRepairOutcome::DefinitivelyIrrelevant { evidence, .. } => {
                 let detail = match &evidence {
@@ -209,11 +221,14 @@ pub async fn run_repair_pass(
                     | bifrost_types::DefinitiveIrrelevance::OutOfScope { detail } => detail.clone(),
                     _ => String::new(),
                 };
-                resolutions.push(RepairResolution::Irrelevant {
-                    key: planned.request.key.clone(),
-                    detail,
-                    generation: planned.generation,
-                });
+                resolutions.push((
+                    planned.scope.clone(),
+                    RepairResolution::Irrelevant {
+                        key: planned.request.key.clone(),
+                        detail,
+                        generation: planned.generation,
+                    },
+                ));
             }
             InventoryRepairOutcome::Deferred { error, .. } => {
                 tracing::debug!(
@@ -223,21 +238,30 @@ pub async fn run_repair_pass(
                     error = %error,
                     "repair attempt deferred"
                 );
-                resolutions.push(RepairResolution::Deferred {
-                    key: planned.request.key.clone(),
-                });
+                resolutions.push((
+                    planned.scope.clone(),
+                    RepairResolution::Deferred {
+                        key: planned.request.key.clone(),
+                    },
+                ));
             }
             InventoryRepairOutcome::Replaced { proof, .. } => {
-                resolutions.push(RepairResolution::Replaced {
-                    key: planned.request.key.clone(),
-                    proof: Box::new(proof),
-                    generation: planned.generation,
-                });
+                resolutions.push((
+                    planned.scope.clone(),
+                    RepairResolution::Replaced {
+                        key: planned.request.key.clone(),
+                        proof: Box::new(proof),
+                        generation: planned.generation,
+                    },
+                ));
             }
             _ => {
-                resolutions.push(RepairResolution::Deferred {
-                    key: planned.request.key.clone(),
-                });
+                resolutions.push((
+                    planned.scope.clone(),
+                    RepairResolution::Deferred {
+                        key: planned.request.key.clone(),
+                    },
+                ));
             }
         }
     }
@@ -246,24 +270,58 @@ pub async fn run_repair_pass(
     // that an attempt happened and produced nothing, without claiming the
     // account reached any conclusion about it.
     for planned in outstanding.into_values() {
-        resolutions.push(RepairResolution::Deferred {
-            key: planned.request.key.clone(),
-        });
+        resolutions.push((
+            planned.scope.clone(),
+            RepairResolution::Deferred {
+                key: planned.request.key.clone(),
+            },
+        ));
     }
 
-    let publication = publish_recovered(changes_tx, coverage, &recovered_ids);
     let resolved = resolutions.len();
-    let (done, wait) = oneshot::channel();
-    writer_tx
-        .send(WriterRequest::ApplyRepair {
-            resolutions,
-            publication,
-            done,
-        })
-        .await
-        .map_err(|e| Error::Other(format!("writer channel closed: {e}")))?;
-    wait.await
-        .map_err(|e| Error::Other(format!("writer dropped before applying repair: {e}")))??;
+
+    // A pass plans across every repairable obligation, which can span scopes,
+    // so the recovered ids are grouped by the scope they came from and each
+    // group is published as its own event. `MultiplexerEvent::scope` is how a
+    // broadcast consumer routes (or filters) an event, so a single batch filed
+    // under whichever scope happened to be recovered first delivers scope B's
+    // ids as scope A's - or drops them.
+    //
+    // Grouping the RESOLUTIONS the same way is what keeps discharge honest
+    // after the split: an obligation may only discharge on an acknowledgement
+    // of the batch that actually carried its id, never on a sibling scope's
+    // batch the consumer happened to apply first. Within a scope the pass is
+    // still all-or-nothing, exactly as it was.
+    let mut order: Vec<CursorScope> = Vec::new();
+    let mut grouped: HashMap<CursorScope, Vec<RepairResolution>> = HashMap::new();
+    for (scope, resolution) in resolutions {
+        let entry = grouped.entry(scope.clone()).or_insert_with(|| {
+            order.push(scope.clone());
+            Vec::new()
+        });
+        entry.push(resolution);
+    }
+    let mut ids_by_scope: HashMap<CursorScope, Vec<bifrost_types::ObjectId>> = HashMap::new();
+    for (scope, id) in recovered_ids {
+        ids_by_scope.entry(scope).or_default().push(id);
+    }
+
+    for scope in order {
+        let resolutions = grouped.remove(&scope).unwrap_or_default();
+        let ids = ids_by_scope.remove(&scope).unwrap_or_default();
+        let publication = publish_recovered(changes_tx, coverage, &scope, &ids);
+        let (done, wait) = oneshot::channel();
+        writer_tx
+            .send(WriterRequest::ApplyRepair {
+                resolutions,
+                publication,
+                done,
+            })
+            .await
+            .map_err(|e| Error::Other(format!("writer channel closed: {e}")))?;
+        wait.await
+            .map_err(|e| Error::Other(format!("writer dropped before applying repair: {e}")))??;
+    }
     Ok(resolved)
 }
 
@@ -318,22 +376,25 @@ fn validate_object_recovery(
 /// here carries object state, which is what keeps repair free of the
 /// version-ordering problem it superficially resembles.
 ///
-/// One publication for the whole batch, so discharge is all-or-nothing: partial
-/// consumer application would otherwise force the writer to manufacture
-/// residual obligations for whichever ids did not land.
+/// One publication per SCOPE, so discharge is all-or-nothing within the scope:
+/// partial consumer application would otherwise force the writer to manufacture
+/// residual obligations for whichever ids did not land. Ids from another scope
+/// ride their own event and their own publication - an event carries exactly
+/// the ids its `scope` field names.
 fn publish_recovered(
     changes_tx: Option<&broadcast::Sender<MultiplexerEvent>>,
     coverage: &Arc<crate::cursor::PendingCoverage>,
-    recovered: &[(CursorScope, bifrost_types::ObjectId)],
+    scope: &CursorScope,
+    recovered: &[bifrost_types::ObjectId],
 ) -> Option<crate::cursor::PublicationId> {
     let tx = changes_tx?;
     if recovered.is_empty() {
         return None;
     }
-    let scope = recovered[0].0.clone();
+    let scope = scope.clone();
     let changes: Vec<Change> = recovered
         .iter()
-        .map(|(_, id)| {
+        .map(|id| {
             Change::ObjectChange(ObjectChange {
                 id: id.clone(),
                 kind: ObjectChangeKind::Created,
