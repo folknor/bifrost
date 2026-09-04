@@ -98,7 +98,7 @@ pub(crate) fn owner_tag(mailbox: &str) -> MembershipScope {
 /// item carrying the `/users/{mailbox}` routing key it must be fetched
 /// from. The owning mailbox is encoded into the id string exactly like the
 /// folder codec above (same `\u{1f}` separator, same precedent as the
-/// `pim.rs` scheduled-send handle): the `bifrost-types::ObjectId` type is
+/// `pim/send.rs` scheduled-send handle): the `bifrost-types::ObjectId` type is
 /// unchanged, only its string content carries the routing key.
 ///
 /// This is what makes hydration / blob / raw-RFC822 reads route to

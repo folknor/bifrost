@@ -102,9 +102,37 @@ resumes within an over-delivered page (see "Bounded `nextLink` traversal").
 `mod.rs` (`EwsError`, `SoapFaultCode`, `EwsHeaders` routing pair).
 - `mutate.rs` - `bulk_set_flags` / `bulk_move` / `bulk_destroy` over
   `$batch` with `If-Match` and a `Retry-After`-aware throttle path.
-- `pim.rs` - Stage 1 PIM primitives and Graph conveniences: message
-  move/read/category/extended-property writes, send/drafts, search, mail
-  folder CRUD, identity snapshot, automatic replies, typed hydration.
+- `pim/` - Stage 1 PIM primitives and Graph conveniences, split by topic.
+  `mod.rs` declares the modules and re-exports the `pub(crate)` doors the
+  rest of `account/` calls; everything else is `pub(super)` inside `pim`.
+  - `pim/messages.rs` - per-message writes (add-to-container, category,
+    extended property, read flag, importance) and the shared `$batch`
+    write pipeline: `resolve_target_ids` / `resolve_target_values`,
+    `message_batch_url`, `patch_messages` / `move_messages` /
+    `destroy_messages`, `submit_write_batch(_with_targets)`, etag caching.
+  - `pim/send.rs` - `send_message` / `send_raw_message`, send-as stamping,
+    the deferred-send-time property, and the scheduled-send handle codec
+    with `cancel_scheduled_send` / `reschedule_send`.
+  - `pim/drafts.rs` - draft create/update/discard/send plus the
+    `DraftPatch` and `SendRequest` to Graph message-body projections.
+  - `pim/search.rs` - `search` / `search_messages`, the KQL and OData
+    filter builders, the shared-mailbox walk, and the versioned opaque
+    search cursor (`SearchCursor`, `encode_/decode_search_cursor`).
+  - `pim/containers.rs` - container list and CRUD across primary, shared
+    and public namespaces, well-known folder roles, `container_from_folder`,
+    and `trash_container_id` with its per-mailbox cache plus
+    `container_is_trash`.
+  - `pim/identities.rs` - identity snapshot and vacation (automatic
+    replies) get/set with their Graph datetime projections.
+  - `pim/threads.rs` - the thread doors `thread_hydrate` / `move_thread` /
+    `delete_thread` and their owner routing.
+  - `pim/hydrate.rs` - typed hydration: `message_hydrate`,
+    `ews_read_folder`, the public-folder EWS read arm, and the Graph-JSON
+    and EWS-item projections onto `Message`.
+  - `pim/common.rs` - the few helpers two or more of the above share:
+    `object_id_from_value`, `pim_protocol_error`,
+    `graph_extended_property_id`, and the Graph time formats.
+  - `pim/tests.rs` - the PIM suite, kept as one module across the split.
 - `filters.rs` - Stage 2 Inbox `messageRules` typed-rule
   list/create/update/delete plus local validation.
 - `blob.rs` - `open_blob` / `open_blob_range` over Graph
@@ -630,7 +658,7 @@ never answered.
 An unanswered subrequest classifies `Protocol(PartialResponse)` with
 `TransmissionState::Acknowledged` (`graph_error::batch_response_missing`), on
 all four `$batch` paths - hydration, the bulk mutation funnel,
-`pim::submit_write_batch_with_targets`, and the reaction read's
+`pim::messages::submit_write_batch_with_targets`, and the reaction read's
 `classify_chunk` (whose unanswered ids ride the `BatchOutcome` uncertain
 lane). The outer envelope decoding is
 evidence about the envelope only: a `move` or `DELETE` that committed and
@@ -644,8 +672,9 @@ routes the non-idempotent ones (`BulkMove`, `BulkDestroy`) to
 also rides the **uncertain** lane rather than `failed`, so the engine's
 read-back guard resolves it.
 
-`pim::submit_write_batch_with_targets` is the one `$batch` path that answers
-per REQUEST - its callers are single-`Result` trait methods - but it still
+`pim::messages::submit_write_batch_with_targets` is the one `$batch` path
+that answers per REQUEST - its callers are single-`Result` trait methods -
+but it still
 DRAINS every subresponse before returning. `$batch` response order is
 Graph's, not the caller's, so returning on the first bad item left the etag
 of a message that demonstrably was destroyed in the LRU whenever its
@@ -734,7 +763,7 @@ as a stable primary key, and a shared-mailbox message never also surfaces bare
 via `/me`. Every per-message request decodes it and routes via
 `client_for_owner(parsed.owner())` using `parsed.native_id()`: hydration
 (`get.rs hydrate_url_for_id`), blob + raw (`blob.rs`), mutations (`mutate.rs`
-flag/move/destroy and the `pim.rs` writes), and the typed `message_hydrate`. A
+flag/move/destroy and the `pim/messages.rs` writes), and the typed `message_hydrate`. A
 foreign id builds `/users/{owner}/messages/{native}`, a primary id
 `/me/messages/{id}`.
 
@@ -1160,7 +1189,7 @@ last, buying the consumer nothing. Pinned by
 
 ## PIM primitives
 
-Mail mutation primitives live in `pim.rs`, per-message, fanning out a
+Mail mutation primitives live in `pim/messages.rs`, per-message, fanning out a
 `MutationTarget::Thread` via `/messages?$filter=conversationId eq ...`.
 `add_to_container` is `POST /messages/{id}/move` (no symmetric remove ->
 `remove_from_container` unsupported). `set_is_read` patches `isRead`;
@@ -1294,7 +1323,7 @@ message at the requested projection into `Message`; `thread_hydrate` queries
 the conversation, sorted by date.
 
 `message_hydrate` makes the SAME transport decision the batch door makes
-(`pim::ews_read_folder`, the pure discriminator `partition_ews_ids` also uses):
+(`pim::hydrate::ews_read_folder`, the pure discriminator `partition_ews_ids` also uses):
 a public-folder id reads over EWS `GetItem` via `public_message_hydrate` +
 `message_from_ews_item`, everything else over Graph REST. Without that split
 the single-id door - the one a consumer reaches through the engine's hydration
@@ -1449,7 +1478,8 @@ Mapping highlights:
 + `AttemptCause(Acknowledged)` + wire signal. Before projection, bulk mutation
 responses update the etag cache: flag writes record the returned etag or evict
 when absent, moves and destroys evict the old id, and 412 evicts so retry must
-refresh. Shared by `mutate.rs` `bulk_*`, `pim::submit_write_batch`, `get_stream`.
+refresh. Shared by `mutate.rs` `bulk_*`, `pim::messages::submit_write_batch`,
+`get_stream`.
 
 Cursor-decode failures (`CursorProtocolMismatch`, `CursorEnvelopeUnknown`,
 `SchemaIncompatible`, malformed payload) build an AccountError with

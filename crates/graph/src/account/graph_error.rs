@@ -1169,7 +1169,7 @@ pub(crate) fn cursor_error_to_account_error(
 
 /// Build a typed `Protocol(_)` `AccountError` for graph-side
 /// data-shape violations (missing id, missing etag, etc.). Used by
-/// pim.rs and mutate.rs for the produce-without-attempting-the-wire
+/// the `pim` modules and mutate.rs for the produce-without-attempting-the-wire
 /// path. `scope` carries the affected resource so support exports
 /// can pinpoint the message; the caller's `operation` is preserved
 /// rather than coerced into `Hydrate`.

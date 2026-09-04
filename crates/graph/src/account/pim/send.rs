@@ -1,0 +1,266 @@
+//! Send and scheduled send: the submit doors, send-as stamping, and
+//! the deferred-send-time property with its opaque handle codec.
+
+use crate::account::GraphAccount;
+use crate::account::GraphClient;
+use crate::account::graph_error::{
+    GraphErrorContext, into_account_error, invalid_account_error, unsupported_account_error,
+};
+use base64::Engine;
+use bifrost_types::{AccountError, AccountOperation, DraftHandle, MailboxId, ObjectId, SendAs};
+use serde_json::{Value, json};
+
+use super::common::*;
+use super::drafts::*;
+
+pub(crate) async fn send_message(
+    account: GraphAccount,
+    request: bifrost_types::SendRequest,
+) -> Result<ObjectId, AccountError> {
+    if !request.attachments_uploaded.is_empty() {
+        return Err(unsupported_account_error(AccountOperation::Send));
+    }
+    if let Some(at) = request.scheduled {
+        // Graph has no documented hard cap on deferred-send time;
+        // rely on server rejection for an unreasonable window. Only
+        // the past-instant rule is enforced client-side.
+        bifrost_types::validate_scheduled(at, None)?;
+    }
+    let scheduled = request.scheduled;
+    // Resolve the API-path client up front: a personal send uses the
+    // primary `/me` client; a send-as routes the entire
+    // draft-create-stamp-send cycle through the shared mailbox's
+    // `/users/{id}` client so the draft is owned by the shared mailbox.
+    let client = match &request.send_as {
+        None => &account.client,
+        Some(send_as) => account
+            .shared_clients
+            .get(&send_as.mailbox().0)
+            .ok_or_else(|| send_as_unknown_mailbox(send_as.mailbox()))?,
+    };
+    let mut message = message_from_send_request(&request)?;
+    if let Some(send_as) = &request.send_as {
+        apply_send_as(&mut message, send_as, account.user_email.as_deref());
+    }
+    let draft = create_draft_message(client, message).await?;
+    if let Some(at) = scheduled {
+        // Stamp PidTagDeferredSendTime on the draft before send so
+        // Graph queues it for deferred delivery.
+        stamp_deferred_send_time(client, &draft, at, AccountOperation::Send).await?;
+    }
+    send_draft_message(client, &draft).await?;
+    // For a scheduled send-as, the draft lives in the shared mailbox, not
+    // `/me`; the cancel/reschedule handle must carry the owning mailbox so
+    // those ops route to the same `/users/{id}` client the draft was
+    // created on (a bare draft id would 404 against `/me`). A non-scheduled
+    // send has nothing to cancel, so the discriminator is moot there.
+    let owning_mailbox = scheduled
+        .and(request.send_as.as_ref())
+        .map(|send_as| send_as.mailbox().0.clone());
+    Ok(ObjectId(encode_scheduled_send_handle(
+        owning_mailbox.as_deref(),
+        &draft.0,
+    )))
+}
+
+pub(crate) async fn send_raw_message(
+    account: GraphAccount,
+    raw: bytes::Bytes,
+    _save_to_sent: Option<bool>,
+) -> Result<ObjectId, AccountError> {
+    // Graph has no raw-MIME sendMail. It imports raw MIME by POSTing the
+    // base64 of the octets to `/messages` with `Content-Type: text/plain`,
+    // which creates a draft; we then send that draft. Graph always files
+    // the sent copy in Sent, so `save_to_sent` has no Graph-side toggle.
+    let client = &account.client;
+    let base64_mime = base64::engine::general_purpose::STANDARD.encode(&raw);
+    let path = format!("{}/messages", client.api_path_prefix());
+    let created: Value = client
+        .post_mime(&path, bytes::Bytes::from(base64_mime))
+        .await
+        .map_err(|e| into_account_error(e, GraphErrorContext::graph(AccountOperation::Send)))?;
+    let id = created.get("id").and_then(Value::as_str).ok_or_else(|| {
+        pim_protocol_error(
+            AccountOperation::Send,
+            None,
+            "Graph MIME import did not return an id",
+        )
+    })?;
+    let draft = DraftHandle(id.to_string());
+    send_draft_message(client, &draft).await?;
+    Ok(ObjectId(draft.0))
+}
+
+/// Reserved separator for the scheduled-send cancel/reschedule handle.
+/// A handle of the form `"<mailbox>\u{1f}<draft id>"` is a send-as
+/// scheduled draft owned by a shared mailbox; a plain id is a primary
+/// (`/me`) draft. `\u{1f}` (US) cannot appear in a Graph message id or an
+/// SMTP address / user id, so it is an unambiguous delimiter (mirrors the
+/// foreign-folder codec in `foreign.rs`).
+pub(super) const SCHEDULED_SEND_HANDLE_SEP: char = '\u{1f}';
+
+/// Encode the owning-mailbox discriminator into a scheduled-send handle.
+/// `None` mailbox yields a bare draft id (primary `/me` draft).
+pub(super) fn encode_scheduled_send_handle(mailbox: Option<&str>, draft_id: &str) -> String {
+    match mailbox {
+        Some(mailbox) => format!("{mailbox}{SCHEDULED_SEND_HANDLE_SEP}{draft_id}"),
+        None => draft_id.to_string(),
+    }
+}
+
+/// Split a scheduled-send handle back into `(owning mailbox, draft id)`.
+/// A handle with no separator is a primary draft (`None` mailbox).
+pub(super) fn decode_scheduled_send_handle(handle: &str) -> (Option<&str>, &str) {
+    match handle.split_once(SCHEDULED_SEND_HANDLE_SEP) {
+        Some((mailbox, draft_id)) => (Some(mailbox), draft_id),
+        None => (None, handle),
+    }
+}
+
+/// Resolve the `GraphClient` a scheduled-send handle was created on: the
+/// shared-mailbox client when the handle carries an owning mailbox, else
+/// the primary client.
+pub(super) fn client_for_scheduled_send_handle<'a>(
+    account: &'a GraphAccount,
+    mailbox: Option<&str>,
+) -> Result<&'a GraphClient, AccountError> {
+    match mailbox {
+        None => Ok(&account.client),
+        Some(mailbox) => account
+            .shared_clients
+            .get(mailbox)
+            .ok_or_else(|| send_as_unknown_mailbox(&MailboxId(mailbox.to_string()))),
+    }
+}
+
+/// Stamp Graph's `from` / `sender` fields from a `SendAs` directive.
+/// `from` is the author header; `sender` is the on-behalf-of
+/// discriminator. The two arms differ deliberately on `from`:
+/// `As` overrides any consumer-set `from` (`insert`), because its
+/// contract is author == sender == mailbox; `OnBehalfOf` honors a
+/// consumer-set `from` (`entry(..).or_insert_with`), filling it only
+/// when absent, because an explicit author is a legitimate divergence
+/// there.
+pub(super) fn apply_send_as(message: &mut Value, send_as: &SendAs, user_email: Option<&str>) {
+    let mailbox = send_as.mailbox();
+    let mailbox_recipient = json!({ "emailAddress": { "address": mailbox.0 } });
+    // `message_from_draft_patch` always returns `Value::Object`.
+    let obj = message.as_object_mut().expect("message is an object");
+    match send_as {
+        SendAs::As(_) => {
+            obj.insert("from".to_string(), mailbox_recipient.clone());
+            obj.insert("sender".to_string(), mailbox_recipient);
+        }
+        SendAs::OnBehalfOf(_) => {
+            obj.entry("from")
+                .or_insert_with(|| mailbox_recipient.clone());
+            // When the config carries the authenticated user's own
+            // address, stamp it as `sender`; otherwise omit `sender`
+            // and let Graph populate it from the authenticated context.
+            if let Some(me) = user_email {
+                obj.insert(
+                    "sender".to_string(),
+                    json!({ "emailAddress": { "address": me } }),
+                );
+            }
+        }
+        // `SendAs` is `#[non_exhaustive]`; a future mode falls back to
+        // the most conservative stamping (author == sender == mailbox),
+        // so a new variant can never leak the authenticated user's own
+        // mailbox as the visible sender.
+        _ => {
+            obj.insert("from".to_string(), mailbox_recipient.clone());
+            obj.insert("sender".to_string(), mailbox_recipient);
+        }
+    }
+}
+
+/// A `send_as` request targeting a mailbox not registered on this
+/// account (`shared_clients` is seeded at construction). The provider
+/// supports send-as; this specific mailbox is just not configured, so
+/// it is a caller error (`Request(Malformed)`), not `Unsupported`.
+#[must_use]
+pub(super) fn send_as_unknown_mailbox(mailbox: &MailboxId) -> AccountError {
+    invalid_account_error(
+        AccountOperation::Send,
+        format!(
+            "shared mailbox not configured on this account: {}",
+            mailbox.0
+        ),
+    )
+}
+
+/// MAPI proptag form for `PidTagDeferredSendTime` (`PT_SYSTIME 0x3FEF`),
+/// the single-valued extended property Graph reads to defer a send.
+pub(super) const DEFERRED_SEND_TIME_PROPERTY_ID: &str = "SystemTime 0x3FEF";
+
+/// PATCH a draft's `PidTagDeferredSendTime` extended property to `at`,
+/// serialized as ISO-8601 UTC. Used both by the scheduled send path and
+/// by `reschedule_send` (Graph reschedule is an in-place PATCH).
+pub(super) async fn stamp_deferred_send_time(
+    client: &GraphClient,
+    draft: &DraftHandle,
+    at: std::time::SystemTime,
+    operation: AccountOperation,
+) -> Result<(), AccountError> {
+    let path = format!(
+        "{}/messages/{}",
+        client.api_path_prefix(),
+        bifrost_net::url::encode_path_component(&draft.0)
+    );
+    let body = deferred_send_time_body(at);
+    client
+        .patch(&path, &body)
+        .await
+        .map_err(|e| into_account_error(e, GraphErrorContext::graph(operation)))
+}
+
+/// The `MessagePatch` body that stamps `PidTagDeferredSendTime` on a
+/// Graph draft.
+pub(super) fn deferred_send_time_body(at: std::time::SystemTime) -> Value {
+    json!({
+        "singleValueExtendedProperties": [{
+            "id": DEFERRED_SEND_TIME_PROPERTY_ID,
+            "value": graph_iso8601_utc(at)
+        }]
+    })
+}
+
+pub(crate) async fn cancel_scheduled_send(
+    account: GraphAccount,
+    handle: ObjectId,
+) -> Result<(), AccountError> {
+    // A Graph deferred message sits in the mailbox until its send time;
+    // deleting it cancels the send. The handle carries the owning mailbox
+    // for a send-as draft so the DELETE routes to the same client the
+    // draft was created on (else a shared-mailbox draft 404s against /me).
+    let (mailbox, draft_id) = decode_scheduled_send_handle(&handle.0);
+    let client = client_for_scheduled_send_handle(&account, mailbox)?;
+    let path = format!(
+        "{}/messages/{}",
+        client.api_path_prefix(),
+        bifrost_net::url::encode_path_component(draft_id)
+    );
+    client.delete(&path).await.map_err(|e| {
+        into_account_error(
+            e,
+            GraphErrorContext::graph(AccountOperation::CancelScheduledSend),
+        )
+    })
+}
+
+pub(crate) async fn reschedule_send(
+    account: GraphAccount,
+    handle: ObjectId,
+    scheduled: std::time::SystemTime,
+) -> Result<ObjectId, AccountError> {
+    bifrost_types::validate_scheduled(scheduled, None)?;
+    // Graph reschedule is an in-place PATCH of the deferred-send time.
+    // Route through the client the draft was created on (the handle's
+    // owning-mailbox discriminator) and patch the native draft id.
+    let (mailbox, draft_id) = decode_scheduled_send_handle(&handle.0);
+    let client = client_for_scheduled_send_handle(&account, mailbox)?;
+    let draft = DraftHandle(draft_id.to_string());
+    stamp_deferred_send_time(client, &draft, scheduled, AccountOperation::RescheduleSend).await?;
+    Ok(handle)
+}

@@ -15,7 +15,12 @@ between them.
    `OpenPages` orchestrator arms collapsed behind one resume enum. Pure
    structure, no behavior or published-API change. Supersedes and closes
    `sync-B1` below. Must land before item 8 whenever that is scheduled.
-2. **graph: split `pim.rs` into modules. PROCEED, split only.** Search plus
+2. **DONE 2026-09-04. graph: split `pim.rs` into modules. PROCEED, split
+   only.** Landed as `account/pim/` - `messages`, `send`, `drafts`,
+   `search`, `containers`, `identities`, `threads`, `hydrate`, a small
+   `common`, and the suite kept whole in `tests`. Move only: every line of
+   the old file survives, the 62 PIM tests are unchanged, and the
+   `$batch` projection stayed unbuilt as ruled. Search plus
    its cursor codec, drafts and send, containers and identities, thread and
    trash routing, and typed hydration into modules under `account/pim/`. The
    validated `$batch` projection type replacing the four per-lane copies of
@@ -28,8 +33,8 @@ between them.
    ids excluded from the wire set. Replaces the four hand-rolled loops
    (flags, destroy, move, hydration). Same move that `StoreConsumer` and
    `SideEffectDigest` already made for their classes.
-4. **jmap: route a foreign-container search to its owner account. PROCEED,
-   reframed as a defect.** Originally raised as "should mail search cover
+4. **jmap: route a foreign-container search to its owner account. DONE
+   (2026-09-04).** Originally raised as "should mail search cover
    shares"; the implicit cross-account union is SKIPPED (no other provider
    offers one, so the shared trait cannot promise it). But the explicit path
    is broken today: `SearchFilter::In` naming a foreign container sends an
@@ -1211,12 +1216,10 @@ backlog. The same category labels and the PUBLISHED SURFACE fence apply.
   decision about what a query surface should answer. Wants a deliberate
   answer.
 
-- **graph-B1. `pim.rs` and `push.rs` are oversized.** [C3] 4,795 and 2,600
-  lines. Low confidence as defects, high as maintenance risk. `pim.rs` holds
-  message writes, drafts, send-as, search plus its own versioned cursor codec,
-  folder CRUD, identities, vacation, and typed hydration in one file; the
-  search cursor logic alone is a self-contained subsystem with its own wire
-  format. No round has judged the churn worth it. Same standing as sync-B1 and
+- **graph-B1. `push.rs` is oversized.** [C3] 2,600 lines. The `pim.rs` half
+  of this item was settled by ruling 2 at the top of this file and is done;
+  what remains is `push.rs`. Low confidence as a defect, higher as
+  maintenance risk. No round has judged the churn worth it. Same standing as
   the rest of the refactor backlog: it does not misbehave, and it must not
   become a prerequisite for a local fix.
 
