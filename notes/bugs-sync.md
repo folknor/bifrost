@@ -17,23 +17,14 @@ in `reference/sync.md`. The push reconciler's milder sibling - a later hint
 can still re-drive a terminally failed scope, since the reconciler does not
 consult scope tokens - remains open and is now stated in the reference.)
 
-### 2. `ScopeLifecycle::Deleted` never touches durable state, and the surviving backfill completion marker silently skips a recreated folder's backfill
-
-`multiplexer/mod.rs` lifecycle arm + `engine.rs` orchestrator. The `Deleted`
-(and the delete half of `Renamed`) handler calls only
-`lifecycle_cursors.delete(&scope)` and cancels the token - no
-`writer.reset_scope_for_disable`, unlike every other scope-retirement path.
-The durable change cursor AND all backfill rows, completion marker included,
-survive. Consequences: (a) a stale durable row leaks until the next full
-reopen's vanished-scope cleanup; (b) worse, if a folder is deleted and later
-recreated under the same `FolderId` (a folder name, for most protocols), the
-new incarnation's backfill scan finds the old completion marker via
-`backfill_complete_recorded` and **skips the entire cold-start walk**. The
-consumer, which plausibly purged the folder's data on `Deleted`, never
-receives the recreated folder's contents except via live changes. That is a
-data-invisibility shape, not just a leak, and it violates the crate's own "a
-leak, never data loss" standard for stale rows. (For IMAP, UIDVALIDITY may
-save the change cursor, but nothing saves the backfill marker.)
+(Finding 2 - lifecycle `Deleted` leaving the durable change cursor and
+backfill rows (completion marker included) behind, so a folder recreated
+under the same id skipped its cold-start walk - is fixed: the extracted
+`apply_lifecycle_transition` raises `ReopenRequest::ScopeDeleted` for the
+delete half of `Deleted`/`Renamed`, and the engine's reopen listener purges
+via the new `reset_scope_for_deletion` (delete_backfill = true). Pinned by
+`deleted_lifecycle_purges_cursor_and_requests_durable_deletion`;
+`reference/sync.md` updated.)
 
 ### 3. A withheld backfill completion sentinel is reported as a durable checkpoint
 
@@ -167,11 +158,11 @@ the finding was real-but-unreachable and is now commented at the arm.
 
 ### 12. Doc drift, small
 
-`reference/sync.md` says lifecycle `Deleted` "drops the cursor" without noting
-the durable rows survive (finding 2 makes that gap load-bearing), and the
-mutation section's read-back derivation claim ("every id still PendingRetry or
-PendingReadback") is falsified by the engine-directive sweep (finding 5) -
-whichever way 5 is resolved, one of the two texts needs updating.
+The `Deleted` half is resolved with finding 2 (the reference now documents
+the durable purge). Remaining: the mutation section's read-back derivation
+claim ("every id still PendingRetry or PendingReadback") is falsified by the
+engine-directive sweep (finding 5) - whichever way 5 is resolved, one of the
+two texts needs updating.
 
 ## Not found / verified sound
 

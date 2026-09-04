@@ -540,7 +540,14 @@ and the accompanying warning is what tells the consumer to reconcile.
   and create no cursor. Per-folder and query models translate the
   membership into matching `RestartScope` requests so the engine
   establishes only shapes the protocol already advertises. `Deleted`
-  cancels the per-scope token and drops the cursor.
+  (and the delete half of `Renamed`) cancels the per-scope token, drops
+  the in-memory cursor, and raises `ReopenRequest::ScopeDeleted`, on
+  which the engine's reopen listener purges the scope's durable rows in
+  full - change cursor and backfill rows, completion marker included
+  (`reset_scope_for_deletion`). The marker must go: the consumer
+  plausibly purged the folder's data on `Deleted`, so a marker surviving
+  into a folder recreated under the same id would skip the new
+  incarnation's entire cold-start walk.
   Not every protocol feeds this stream: IMAP deliberately emits
   no lifecycle events (the stream stays open and yields nothing
   until shutdown). IMAP discovers folders only at open/reopen, and

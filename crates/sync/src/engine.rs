@@ -820,6 +820,26 @@ impl SyncEngine {
                                     };
                                     handle_account_error(&ctx, scope, error).await;
                                 }
+                                ReopenRequest::ScopeDeleted { scope } => {
+                                    // A provider-deleted folder retires its
+                                    // durable rows in full: change cursor and
+                                    // backfill rows, completion marker
+                                    // included. A surviving marker would make
+                                    // a folder recreated under the same id
+                                    // skip its cold-start walk entirely.
+                                    let writer = WriterHandle::new(reopen_writer_tx.clone());
+                                    if let Err(error) =
+                                        writer.reset_scope_for_deletion(scope.clone()).await
+                                    {
+                                        tracing::warn!(
+                                            target: "bifrost.sync.changes",
+                                            account = ?reopen_aid,
+                                            scope = ?scope,
+                                            error = %error,
+                                            "failed to purge durable rows for a provider-deleted scope"
+                                        );
+                                    }
+                                }
                             }
                         }
                     }
@@ -4560,6 +4580,16 @@ impl WriterHandle {
     /// nothing re-establishes afterwards.
     async fn reset_scope_for_disable(&self, scope: CursorScope) -> Result<(), Error> {
         self.reset_scope(scope, false).await
+    }
+
+    /// A provider-deleted scope (folder gone): drop the backfill rows too,
+    /// completion marker included. Unlike a disable, the folder can come
+    /// back under the same id, and a surviving completion marker would make
+    /// the recreated incarnation skip its entire cold-start walk - the
+    /// consumer plausibly purged its data on `Deleted`, so that is data
+    /// invisibility, not a mere leak.
+    async fn reset_scope_for_deletion(&self, scope: CursorScope) -> Result<(), Error> {
+        self.reset_scope(scope, true).await
     }
 
     /// Schema recovery: drop the backfill rows too, completion marker included.

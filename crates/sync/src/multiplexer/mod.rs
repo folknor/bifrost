@@ -199,6 +199,14 @@ pub enum ReopenRequest {
         scope: Option<CursorScope>,
         error: AccountError,
     },
+    /// A provider lifecycle event deleted this scope's folder. The engine
+    /// must purge the scope's durable rows - the change cursor AND the
+    /// backfill rows, completion marker included. The consumer plausibly
+    /// purged the folder's data on `Deleted`, so a completion marker
+    /// surviving into a folder recreated under the same id would skip the
+    /// new incarnation's entire cold-start walk: data invisibility, not
+    /// just a leaked row.
+    ScopeDeleted { scope: CursorScope },
 }
 
 /// Upper bound on the lifecycle reader's wait for a replacement connection.
@@ -480,78 +488,13 @@ impl Multiplexer {
                                 }
                                 _ => continue,
                             };
-                            match lifecycle {
-                                ScopeLifecycle::Created(membership) => {
-                                    for scope in
-                                        membership_to_cursor_scopes(&lifecycle_cursors, &membership)
-                                    {
-                                        // Track the new scope. The cursor
-                                        // registry has no entry yet; the
-                                        // poll task will see snapshot=None
-                                        // and exit cleanly unless the
-                                        // engine establishes a cursor for
-                                        // it first. We raise a Recovery
-                                        // request so the engine drives the
-                                        // initial cursor establishment.
-                                        // Synthesize a cursor-invalid
-                                        // `AccountError` for this scope so
-                                        // the engine's `handle_account_error`
-                                        // dispatch derives
-                                        // `Engine(RestartScope(scope))`
-                                        // through the same path it uses for
-                                        // every other recovery.
-                                        let error = crate::recovery::restart_scope_error(
-                                            scope.clone(),
-                                            AccountOperation::SyncChanges,
-                                        );
-                                        let _ = lifecycle_reopen
-                                            .send(ReopenRequest::Recovery {
-                                                scope: Some(scope.clone()),
-                                                error,
-                                            })
-                                            .await;
-                                    }
-                                }
-                                ScopeLifecycle::Deleted(membership) => {
-                                    let scopes = lifecycle_cursors.scopes_for_membership(&membership);
-                                    for scope in scopes {
-                                        cancel_scope_token(&lifecycle_tokens, &scope);
-                                        lifecycle_cursors.delete(&scope);
-                                    }
-                                }
-                                ScopeLifecycle::Renamed { old, new, .. } => {
-                                    // Treat as delete + create: cancel the
-                                    // old scope's poll task, drop the
-                                    // cursor, then trigger a fresh
-                                    // establishment for the new id.
-                                    let old_scopes =
-                                        lifecycle_cursors.scopes_for_membership(&old);
-                                    for scope in old_scopes {
-                                        cancel_scope_token(&lifecycle_tokens, &scope);
-                                        lifecycle_cursors.delete(&scope);
-                                    }
-                                    for scope in membership_to_cursor_scopes(&lifecycle_cursors, &new) {
-                                        // Synthesize a cursor-invalid
-                                        // `AccountError` for this scope so
-                                        // the engine's `handle_account_error`
-                                        // dispatch derives
-                                        // `Engine(RestartScope(scope))`
-                                        // through the same path it uses for
-                                        // every other recovery.
-                                        let error = crate::recovery::restart_scope_error(
-                                            scope.clone(),
-                                            AccountOperation::SyncChanges,
-                                        );
-                                        let _ = lifecycle_reopen
-                                            .send(ReopenRequest::Recovery {
-                                                scope: Some(scope.clone()),
-                                                error,
-                                            })
-                                            .await;
-                                    }
-                                }
-                                _ => {}
-                            }
+                            apply_lifecycle_transition(
+                                &lifecycle_cursors,
+                                &lifecycle_tokens,
+                                &lifecycle_reopen,
+                                lifecycle,
+                            )
+                            .await;
                         }
                     }
                 }
@@ -1130,6 +1073,75 @@ async fn handle_drive_outcome(
     }
 }
 
+/// Apply one `ScopeLifecycle` transition to the live registry, the poll
+/// tokens, and the engine's reopen channel.
+///
+/// `Created` asks the engine (via a synthesized restart-scope error) to
+/// establish the new scope's cursor. `Deleted` cancels the poll task,
+/// drops the in-memory cursor, and raises `ReopenRequest::ScopeDeleted`
+/// so the engine purges the scope's DURABLE rows too - change cursor and
+/// backfill rows, completion marker included; without that, a folder
+/// recreated under the same id would find the old completion marker and
+/// skip its entire cold-start walk. `Renamed` is the delete half plus
+/// the create half on the new id.
+async fn apply_lifecycle_transition(
+    cursors: &CursorRegistry,
+    tokens: &ScopeTokens,
+    reopen_tx: &mpsc::Sender<ReopenRequest>,
+    lifecycle: ScopeLifecycle,
+) {
+    async fn delete_scopes(
+        cursors: &CursorRegistry,
+        tokens: &ScopeTokens,
+        reopen_tx: &mpsc::Sender<ReopenRequest>,
+        membership: &bifrost_types::MembershipScope,
+    ) {
+        for scope in cursors.scopes_for_membership(membership) {
+            cancel_scope_token(tokens, &scope);
+            cursors.delete(&scope);
+            let _ = reopen_tx.send(ReopenRequest::ScopeDeleted { scope }).await;
+        }
+    }
+
+    async fn establish_scopes(
+        cursors: &CursorRegistry,
+        reopen_tx: &mpsc::Sender<ReopenRequest>,
+        membership: &bifrost_types::MembershipScope,
+    ) {
+        for scope in membership_to_cursor_scopes(cursors, membership) {
+            // The cursor registry has no entry yet; the poll task would
+            // see snapshot=None and exit cleanly unless the engine
+            // establishes a cursor first. Synthesize a cursor-invalid
+            // `AccountError` for this scope so the engine's
+            // `handle_account_error` dispatch derives
+            // `Engine(RestartScope(scope))` through the same path it
+            // uses for every other recovery.
+            let error =
+                crate::recovery::restart_scope_error(scope.clone(), AccountOperation::SyncChanges);
+            let _ = reopen_tx
+                .send(ReopenRequest::Recovery {
+                    scope: Some(scope.clone()),
+                    error,
+                })
+                .await;
+        }
+    }
+
+    match lifecycle {
+        ScopeLifecycle::Created(membership) => {
+            establish_scopes(cursors, reopen_tx, &membership).await;
+        }
+        ScopeLifecycle::Deleted(membership) => {
+            delete_scopes(cursors, tokens, reopen_tx, &membership).await;
+        }
+        ScopeLifecycle::Renamed { old, new, .. } => {
+            delete_scopes(cursors, tokens, reopen_tx, &old).await;
+            establish_scopes(cursors, reopen_tx, &new).await;
+        }
+        _ => {}
+    }
+}
+
 /// Map a `MembershipScope` from `ScopeLifecycle` to newly-required
 /// cursor scopes using the account's registered cursor topology.
 ///
@@ -1273,6 +1285,50 @@ mod tests {
             request,
             ReopenRequest::Recovery { error: routed, .. }
                 if routed.kind() == error.kind()
+        ));
+    }
+
+    /// `ScopeLifecycle::Deleted` must retire more than the in-memory
+    /// cursor: it raises `ReopenRequest::ScopeDeleted` so the engine also
+    /// purges the durable rows (change cursor AND backfill rows, completion
+    /// marker included). Without the request, a folder recreated under the
+    /// same id finds the surviving completion marker and skips its entire
+    /// cold-start walk.
+    #[tokio::test]
+    async fn deleted_lifecycle_purges_cursor_and_requests_durable_deletion() {
+        let cursors = CursorRegistry::new();
+        let folder = bifrost_types::FolderId("Projects".into());
+        let scope = CursorScope::Folder(folder.clone());
+        cursors.put(bifrost_types::ChangeCursor {
+            scope: scope.clone(),
+            server_state: bifrost_types::OpaqueChangeState {
+                protocol: bifrost_types::ProtocolKind::Imap,
+                envelope_version: 1,
+                bytes: b"state".to_vec(),
+            },
+            advanced_through: None,
+            envelope_version: 1,
+        });
+        let membership = bifrost_types::MembershipScope::Folder(folder);
+        cursors.link_membership(membership.clone(), scope.clone());
+        let tokens = scope_tokens();
+        track(&tokens, &scope);
+        let (reopen_tx, mut reopen_rx) = mpsc::channel(4);
+
+        apply_lifecycle_transition(
+            &cursors,
+            &tokens,
+            &reopen_tx,
+            ScopeLifecycle::Deleted(membership),
+        )
+        .await;
+
+        assert!(cursors.snapshot(&scope).is_none());
+        assert!(!tokens.lock().expect("poisoned").contains_key(&scope));
+        let request = reopen_rx.try_recv().expect("durable deletion requested");
+        assert!(matches!(
+            request,
+            ReopenRequest::ScopeDeleted { scope: deleted } if deleted == scope
         ));
     }
 
