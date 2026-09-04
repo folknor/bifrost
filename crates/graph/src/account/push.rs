@@ -10,7 +10,7 @@ use bifrost_types::{
 use serde::{Deserialize, Serialize};
 
 use crate::webhooks::{
-    create_subscription, delete_subscription, is_expiring_soon, renew_subscription,
+    ExpiryCheck, check_expiry, create_subscription, delete_subscription, renew_subscription,
     subscription_is_gone,
 };
 
@@ -81,6 +81,10 @@ pub(crate) struct GraphSubscriptionState {
     /// which scopes to fall back to polling. Every other error path in this
     /// crate carries an `ErrorScope`.
     pub(crate) scopes: Vec<CursorScope>,
+    /// Whether the renewal worker has already warned about an unparseable
+    /// `expires_at` for this subscription, so the warning fires once per
+    /// subscription rather than once per renewal tick.
+    pub(crate) warned_unparseable_expiry: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -318,6 +322,7 @@ async fn subscribe_graph(
                     expires_at: response.expiration_date_time,
                     resource,
                     scopes: covered.into_iter().map(|(_, scope)| scope).collect(),
+                    warned_unparseable_expiry: false,
                 });
             }
             Err(error) => {
@@ -497,7 +502,7 @@ async fn run_graph_subscription_worker(account: GraphAccount) {
         }
 
         let due = {
-            let groups = account.graph_subscriptions.read().await;
+            let mut groups = account.graph_subscriptions.write().await;
             if !has_live_graph_subscription_group(&groups) {
                 // Retire the slot BEFORE releasing the guard that made this
                 // decision. A concurrent `push_subscribe` cannot install its
@@ -510,7 +515,7 @@ async fn run_graph_subscription_worker(account: GraphAccount) {
                 retire_graph_worker_slot(&account).await;
                 return;
             }
-            due_renewals(&groups)
+            due_renewals(&mut groups)
         };
 
         let mut had_error = false;
@@ -664,25 +669,38 @@ struct DueRenewal {
 /// delete, and recreating a vanished one would hand teardown a server id its
 /// snapshot cannot contain. Their rows stay registered only so that a failed
 /// DELETE can be retried against them.
-fn due_renewals(groups: &HashMap<SubscriptionHandle, GraphSubscriptionGroup>) -> Vec<DueRenewal> {
-    groups
-        .iter()
-        .filter(|(_, group)| !group.tearing_down)
-        .flat_map(|(handle, group)| {
-            group.subscriptions.iter().filter_map(move |state| {
-                if is_expiring_soon(&state.expires_at, RENEWAL_THRESHOLD_MINUTES) {
-                    Some(DueRenewal {
-                        handle: handle.clone(),
-                        server_id: state.server_id.clone(),
-                        resource: state.resource.clone(),
-                        scopes: state.scopes.clone(),
-                    })
-                } else {
-                    None
+fn due_renewals(
+    groups: &mut HashMap<SubscriptionHandle, GraphSubscriptionGroup>,
+) -> Vec<DueRenewal> {
+    let mut due = Vec::new();
+    for (handle, group) in groups.iter_mut() {
+        if group.tearing_down {
+            continue;
+        }
+        for state in &mut group.subscriptions {
+            match check_expiry(&state.expires_at, RENEWAL_THRESHOLD_MINUTES) {
+                ExpiryCheck::Live => continue,
+                ExpiryCheck::ExpiringSoon => {}
+                ExpiryCheck::Unparseable => {
+                    if !state.warned_unparseable_expiry {
+                        state.warned_unparseable_expiry = true;
+                        tracing::warn!(
+                            subscription = state.server_id,
+                            expiration = state.expires_at,
+                            "[Graph webhooks] Unparseable subscription expiry; treating as due for renewal"
+                        );
+                    }
                 }
-            })
-        })
-        .collect()
+            }
+            due.push(DueRenewal {
+                handle: handle.clone(),
+                server_id: state.server_id.clone(),
+                resource: state.resource.clone(),
+                scopes: state.scopes.clone(),
+            });
+        }
+    }
+    due
 }
 
 /// What happened to a subscription the renewal worker had to recreate.
@@ -722,6 +740,7 @@ async fn replace_gone_subscription(
         expires_at: response.expiration_date_time,
         resource: resource.to_string(),
         scopes: scopes.to_vec(),
+        warned_unparseable_expiry: false,
     };
     let created_id = replacement.server_id.clone();
 
@@ -1703,6 +1722,7 @@ mod tests {
                 folder: FolderId(resource.to_string()),
                 ty: ObjectType::Email,
             }],
+            warned_unparseable_expiry: false,
         }
     }
 
@@ -1717,6 +1737,7 @@ mod tests {
                 folder: FolderId(resource.to_string()),
                 ty: ObjectType::Email,
             }],
+            warned_unparseable_expiry: false,
         }
     }
 
@@ -1945,7 +1966,7 @@ mod tests {
         ]);
         assert!(mark_group_tearing_down(&mut groups, &condemned).is_some());
 
-        let due = due_renewals(&groups);
+        let due = due_renewals(&mut groups);
         assert_eq!(due.len(), 1, "only the live group is due");
         assert_eq!(due[0].handle, live);
         assert_eq!(due[0].server_id, "live-sub");
@@ -1957,7 +1978,7 @@ mod tests {
         // And an expiry outside the threshold is not due at all.
         groups.get_mut(&live).expect("live group").subscriptions[0].expires_at =
             "2099-01-01T00:00:00Z".to_string();
-        assert!(due_renewals(&groups).is_empty());
+        assert!(due_renewals(&mut groups).is_empty());
     }
 
     /// Letting the worker exit on condemned-only groups opened a window in
@@ -2171,7 +2192,7 @@ mod tests {
                 group.subscriptions[0].expires_at, "2099-01-01T00:00:00Z",
                 "the stored expiry is the server-granted one"
             );
-            assert!(!is_expiring_soon(
+            assert!(!crate::webhooks::is_expiring_soon(
                 &group.subscriptions[0].expires_at,
                 RENEWAL_THRESHOLD_MINUTES
             ));
@@ -2291,7 +2312,7 @@ mod tests {
                 .await
                 .get(&handle)
                 .is_some_and(|group| {
-                    !is_expiring_soon(
+                    !crate::webhooks::is_expiring_soon(
                         &group.subscriptions[0].expires_at,
                         RENEWAL_THRESHOLD_MINUTES,
                     )

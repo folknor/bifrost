@@ -274,7 +274,7 @@ mint a random per-resource value and drop it on the floor, producing
 subscriptions no receiver could authenticate; nothing in the crate generates a
 `clientState` any more. `with_ews_streaming()` selects `EwsStreaming`
 and clears the endpoint; default webhook-mode without an endpoint makes
-`push_subscribe` return `Error::MissingCoreCapability`.
+`push_subscribe` fail with `Unsupported(PushSubscribe)`.
 `with_shared_mailbox(id)` registers a delegate/shared mailbox by its
 `/users/{id}` routing key. `with_public_folders(scope)` opts in to
 public-folder discovery (default off) and says which folders may SYNC:
@@ -1500,7 +1500,7 @@ exhausted" without them.
   deletion baseline and support for those remaining item classes are named
   follow-ups.
 - EWS streaming requires EWS reachable with an accepted token; webhook mode
-  needs a public HTTPS endpoint (else `Error::MissingCoreCapability`). EWS
+  needs a public HTTPS endpoint (else `Unsupported(PushSubscribe)`). EWS
   streaming currently supports primary-mailbox folders only: shared-mailbox
   scopes need mailbox-specific EWS routing headers and are not yet grouped by
   owner. Folder ids ARE translated (`restId` -> `ewsId` once at

@@ -465,7 +465,14 @@ impl GraphClient {
             // keep metering against the same counters.
             let displaced = match self.inner.account_net.write() {
                 Ok(mut slot) => slot.replace(account_net),
-                Err(_) => None,
+                Err(_) => {
+                    // A poisoned lock means a panic happened while a writer
+                    // held it. Skipping the detach here leaks one meter
+                    // attachment (the very leak the ordering above exists to
+                    // prevent), so it must not be silent.
+                    tracing::warn!("account_net lock poisoned; displaced attachment not detached");
+                    None
+                }
             };
             if let Some(displaced) = displaced {
                 displaced.detach();

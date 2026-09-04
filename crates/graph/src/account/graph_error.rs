@@ -1021,6 +1021,31 @@ pub(crate) fn invalid_account_error(
     .expect("valid account error classification")
 }
 
+/// Build an `AccountError` for ONE item whose input was malformed before any
+/// wire traffic (e.g. a Move whose destination does not resolve to a
+/// same-mailbox folder). Classifies `Request(Malformed)` -> `ClientBug`: the
+/// fault is the caller's request, not the provider's, and no transmission
+/// evidence is attached because nothing was sent for this item.
+#[must_use]
+pub(crate) fn invalid_item_error(
+    operation: AccountOperation,
+    scope: ErrorScope,
+    detail: impl Into<String>,
+) -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed),
+        Cause::Request(RequestCause::Malformed {
+            detail: DiagnosticText::support_only(detail.into()),
+        }),
+    )
+    .operation(operation)
+    .provider(Provider::Microsoft)
+    .protocol(Protocol::Graph)
+    .scope(scope)
+    .try_build()
+    .expect("valid account error classification")
+}
+
 /// Build an `AccountError` for ONE id `translateExchangeIds` refused inside
 /// an otherwise successful 200.
 ///

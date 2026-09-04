@@ -291,7 +291,13 @@ pub(crate) fn snapshot(cache: &ScopeCache) -> ScopeSnapshot {
         .snapshot
         .read()
         .map(|guard| guard.clone())
-        .unwrap_or_else(|_| ScopeSnapshot::empty())
+        .unwrap_or_else(|_| {
+            // A poisoned lock means a panic happened mid-write. Degrading to
+            // an empty snapshot (which reads as "never fetched" and triggers
+            // a refetch) is the right recovery, but it must not be silent.
+            tracing::warn!("scope snapshot lock poisoned; treating cache as never fetched");
+            ScopeSnapshot::empty()
+        })
 }
 
 pub(crate) async fn refresh_scope_snapshot(

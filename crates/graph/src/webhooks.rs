@@ -154,21 +154,34 @@ fn parse_iso8601_to_unix(s: &str) -> Option<i64> {
         .map(jiff::Timestamp::as_second)
 }
 
-pub(crate) fn is_expiring_soon(expiration_iso: &str, threshold_minutes: i64) -> bool {
+/// Renewing is the safe direction for an unparseable expiry (the alternative
+/// is a subscription that silently dies at its real expiry), so `None` from
+/// the parser answers "expiring". The unparseable value itself is a defect
+/// worth seeing; the renewal worker logs it once per subscription via
+/// `ExpiryCheck::Unparseable` rather than once per tick.
+pub(crate) fn check_expiry(expiration_iso: &str, threshold_minutes: i64) -> ExpiryCheck {
     let Some(expiry) = parse_iso8601_to_unix(expiration_iso) else {
-        // Renewing is the safe direction (the alternative is a
-        // subscription that silently dies at its real expiry), but the
-        // value itself is a defect worth seeing: a successful renewal
-        // replaces it with `compute_expiry_iso8601`'s own output, so this
-        // should be logged once per subscription, not once per tick.
-        tracing::warn!(
-            expiration = expiration_iso,
-            "[Graph webhooks] Unparseable subscription expiry; treating as due for renewal"
-        );
-        return true;
+        return ExpiryCheck::Unparseable;
     };
-    let remaining = expiry - now_unix();
-    remaining < threshold_minutes * 60
+    if expiry - now_unix() < threshold_minutes * 60 {
+        ExpiryCheck::ExpiringSoon
+    } else {
+        ExpiryCheck::Live
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExpiryCheck {
+    Live,
+    ExpiringSoon,
+    /// Treated as due for renewal; a successful renewal replaces the value
+    /// with `compute_expiry_iso8601`'s own output.
+    Unparseable,
+}
+
+#[cfg(test)]
+pub(crate) fn is_expiring_soon(expiration_iso: &str, threshold_minutes: i64) -> bool {
+    check_expiry(expiration_iso, threshold_minutes) != ExpiryCheck::Live
 }
 
 #[cfg(test)]

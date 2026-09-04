@@ -1185,6 +1185,11 @@ fan-out and isolates them by bisection.
   (`from`/`to`/`subject`/attachment/size) plus native query strings surface as
   `FilterCondition::ProviderExpression`. Writes reject names, disabled rules,
   stop-processing, and unstorable actions. `filter_update` is unsupported.
+  Read/write asymmetry: `To`, `Cc`, and `Recipient` conditions all collapse
+  into Gmail's `criteria.to` on write (Gmail's `to` matches all recipient
+  fields), and `criteria.to` projects back as `FilterCondition::Recipient` on
+  read - so a created `To` filter reads back as `Recipient`. A consumer doing
+  create-then-list equality checks must expect this.
 
 ### Accepted residuals
 

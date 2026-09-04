@@ -139,6 +139,12 @@ pub(crate) fn changes_stream(
                 }
             };
             let mut changes = Vec::new();
+            // Diagnostic page marker only: the bare Graph id of the last
+            // value seen (including `@removed` values), captured before
+            // foreign encoding. Resume never reads it - `next_link` alone
+            // drives resumption - so it deliberately differs from the
+            // inventory walk's marker, which records the encoded id of the
+            // last surviving entry.
             let mut last_seen_id = None;
             let mut etags = Vec::new();
             let mut removed_etag_ids = Vec::new();

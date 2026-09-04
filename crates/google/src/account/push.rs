@@ -300,6 +300,13 @@ async fn watch_actor(
                         }
                         let _ = reply.send(result);
                     }
+                    // Accepted: because commands are biased ahead of the
+                    // shutdown arm, an unsubscribe already queued when
+                    // `close()` cancels the token can still issue a wire
+                    // `users.stop` after close intent. The transport is still
+                    // attached at that point and stopping the watch is what
+                    // close wants anyway, so this small hole in "no wire
+                    // traffic after shutdown" is deliberate.
                     WatchCommand::Unsubscribe { handle, reply } => {
                         let result = actor_unsubscribe(
                             &client, handle, &mut lifecycle, &mut handles,
@@ -447,7 +454,13 @@ async fn actor_subscribe(
     let handle = match serde_json::to_string(&handle).map(SubscriptionHandle) {
         Ok(handle) => handle,
         Err(error) => {
-            let _ = stop_watch(client).await;
+            // Only tear down the Gmail-side watch if no other subscriber is
+            // sharing it. A later subscriber joining an existing watch must
+            // not stop the watch the earlier handles depend on; the watch
+            // stays live and the renewer keeps refreshing it.
+            if handles.is_empty() {
+                let _ = stop_watch(client).await;
+            }
             return Err(error::into_account_error(
                 crate::error::Error::invalid_request(
                     AccountOperation::PushSubscribe,

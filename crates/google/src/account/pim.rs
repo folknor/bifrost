@@ -259,6 +259,17 @@ pub(crate) fn search(
             .limit
             .unwrap_or(MAX_GMAIL_PAGE_SIZE)
             .min(MAX_GMAIL_PAGE_SIZE);
+        // Gmail treats maxResults=0 as "use the default page size", so a
+        // zero limit must short-circuit locally to mean "return nothing".
+        if max == 0 {
+            return Ok(Page {
+                items: Vec::new(),
+                next_cursor: None,
+                estimated_total: None,
+                failed_ids: Vec::new(),
+                skipped_scopes: Vec::new(),
+            });
+        }
         let (threads, next) = client
             .list_threads(query.as_deref(), Some(max), page_token.as_deref())
             .await
@@ -287,6 +298,17 @@ pub(crate) fn search_messages(
             .limit
             .unwrap_or(MAX_GMAIL_PAGE_SIZE)
             .min(MAX_GMAIL_PAGE_SIZE);
+        // Gmail treats maxResults=0 as "use the default page size", so a
+        // zero limit must short-circuit locally to mean "return nothing".
+        if max == 0 {
+            return Ok(Page {
+                items: Vec::new(),
+                next_cursor: None,
+                estimated_total: None,
+                failed_ids: Vec::new(),
+                skipped_scopes: Vec::new(),
+            });
+        }
         let (messages, next, estimate) = client
             .list_messages(query.as_deref(), Some(max), page_token.as_deref())
             .await

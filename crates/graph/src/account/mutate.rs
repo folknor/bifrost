@@ -217,10 +217,11 @@ async fn submit_batch(
             // doesn't support moves at all. (graph-F4 / F1b)
             preflight_outcomes.push(ItemOutcome::Failed(BatchFailure::new(
                 BatchItemId(id.0.clone()),
-                super::graph_error::protocol_violation(
-                    bifrost_types::ProtocolErrorKind::ContractViolation,
+                super::graph_error::invalid_item_error(
                     operation_for_kind(kind),
-                    Some(bifrost_types::ErrorScope::Message { id: (id.0.clone() ).into()}),
+                    bifrost_types::ErrorScope::Message {
+                        id: (id.0.clone()).into(),
+                    },
                     format!(
                         "Graph Move request for {} did not resolve to a same-mailbox folder destination",
                         id.0

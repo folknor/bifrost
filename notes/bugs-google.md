@@ -33,21 +33,6 @@ fix belongs in a real address-list parser (or reusing whatever
 bifrost-types/imap already has); comma-splitting is not salvageable. Also note
 `.trim_matches('"')` only strips quotes, never unescapes `\"`.
 
-### 2. `actor_subscribe`'s encode-failure path can stop a live shared watch while leaving `Watched` intact
-
-`crates/google/src/account/push.rs` lines 447-459: when handle JSON encoding
-fails after `watch_once` succeeded, the code calls `stop_watch` - correct for a
-*first* subscribe, but a second subscriber joining an existing watch (non-empty
-`handles`, lifecycle `Watched`) would tear down the watch the existing
-subscribers depend on, while lifecycle stays `Watched` and the renewer keeps
-renewing a watch it just stopped (the next renewal would actually recreate it,
-masking the outage window). Severity is theoretical - `serde_json::to_string`
-of three `String` fields cannot fail - but the branch as written is wrong for
-the multi-handle case, and since it's unreachable it will never be caught by a
-test. Either scope the `stop_watch` to `handles.is_empty()`, or replace the
-branch with an `expect` and a comment, since the failure is structurally
-impossible.
-
 ## Suspected defects (verify before filing as fixes)
 
 ### 3. `events_in_range` combines `orderBy=startTime` with `showDeleted=true`
@@ -63,51 +48,11 @@ live-API refusal. Worth one live-API probe; if Google rejects it, every
 production range read fails, which would be a top-severity defect hiding behind
 a hermetic test suite.
 
-### 4. `decode_base64url_nopad` is strict no-pad
-
-`crates/google/src/encoding.rs`. Gmail is documented (and observed) to emit
-unpadded base64url, but a padded value - from a proxy, or a future API change -
-fails the decode and classifies as `Protocol(ParseFailed)` for the whole
-message/attachment. A forgiving decoder (`general_purpose::URL_SAFE` with
-`DecodePaddingMode::Indifferent`) removes the fragility at zero cost. Low
-probability, cheap insurance.
-
 ## Minor observations / smells
 
-- **`pim::search` / `search_messages` with `limit: Some(0)`** sends
-  `maxResults=0`, which Gmail treats as "use default" rather than "return
-  nothing" - a zero-limit caller gets a full default page. (`pim.rs`
-  `request.limit.unwrap_or(...).min(...)`.)
 - **`get_stream`'s label-refresh failure terminator** (`inventory.rs` line
   ~500) scopes the error to `ids[0]` only; the other 31 ids of the drained
   batch vanish into the `Terminated` with no per-id lane. Consistent with
   "Terminated means unreported", but the arbitrary first-id scope on an error
   that has nothing to do with that message is mildly misleading in support
   exports.
-- **`actor_unsubscribe` runs before the shutdown arm** (the actor `select!` is
-  biased toward commands), so an unsubscribe already queued when `close()`
-  cancels the token can still issue a wire `users.stop` post-close-intent.
-  Harmless - the transport is still attached at that point and stopping the
-  watch is what close wants anyway - but it is a small hole in the "no wire
-  traffic after shutdown" story the subscribe path enforces.
-- **`snapshot()` on a poisoned `RwLock`** (`scopes.rs`) silently returns an
-  empty snapshot, which reads as "never fetched" and triggers a refetch - a
-  reasonable degradation, but a poisoned lock means a panic happened mid-write
-  and nothing logs it.
-- **`contacts::update` re-serializes the fetched `Person` DTO as the PATCH
-  body**, relying on `updatePersonFields` to fence off the unmodeled People
-  fields the DTO dropped. Correct today, but a trap for whoever next adds a
-  field to `update_fields_for_patch` without adding it to the `Person` DTO: the
-  mask would then name a field the body no longer carries, clearing it
-  server-side. A comment at `update_fields_for_patch` naming this coupling
-  would be cheap.
-- **`filters.rs` read/write asymmetry**: `criteria.to` projects to
-  `FilterCondition::Recipient` on read, while `To`/`Cc`/`Recipient` all
-  collapse into `criteria.to` on write - so a created `To` filter reads back as
-  `Recipient`. Defensible (Gmail's `to` matches all recipient fields) but worth
-  a doc line, since a consumer doing create-then-list equality checks will trip
-  on it.
-- **`updateContactPhoto` response shape**: the code parses the response as
-  `Person`, but the People API wraps it as `{ "person": {...} }`. It only
-  "works" because every `Person` field is optional and the value is discarded -
-  a latent decode landmine if anyone ever reads that response.

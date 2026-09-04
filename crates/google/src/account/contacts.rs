@@ -262,7 +262,11 @@ async fn update_contact_photo(
     let encoded = encode_resource_name_path(&contact.0);
     if let Some(photo) = photo {
         let url = update_contact_photo_url(client.people_base(), &encoded);
-        let _: Person = client
+        // `updateContactPhoto` wraps its response as `{ "person": {...} }`,
+        // not a bare `Person`. The value is discarded, so decode into a raw
+        // Value rather than a type that only "works" because every Person
+        // field is optional.
+        let _: serde_json::Value = client
             .post(&url, &update_contact_photo_request(photo))
             .await
             .map_err(|error| {
@@ -953,6 +957,11 @@ fn require_person_etag(person: &Person) -> Result<String, AccountError> {
     })
 }
 
+// COUPLING: every field named here must also be carried by the `Person` DTO,
+// because `update` re-serializes the fetched `Person` as the PATCH body and
+// relies on this mask to fence off the unmodeled People fields the DTO
+// dropped. Naming a field here that the body does not carry would clear it
+// server-side.
 fn update_fields_for_patch(patch: &ContactPatch) -> String {
     let mut fields = Vec::new();
     if patch.display_name.is_some() {

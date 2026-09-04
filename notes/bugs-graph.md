@@ -26,32 +26,6 @@ neither-link arm at lines 229-247 does), so the cursor never crosses the page.
 As written, a malformed value in a delta page after initial sync is
 unrecoverable, unreported loss for that scope.
 
-### 2. Bad move destination misclassified as a terminal provider fault
-
-`crates/graph/src/account/mutate.rs` lines 206-230. When
-`request_for_mutation` returns `Ok(None)` for a `Move` (destination is not a
-folder, or a cross-mailbox move), the outcome is built with
-`protocol_violation(ProtocolErrorKind::ContractViolation, ...)` - i.e.
-`Protocol(ContractViolation)` with `Cause::Wire(MalformedResponse)`, which per
-the crate's own documentation (graph_error.rs lines 1187-1189) derives
-terminal `ProviderContractViolation`. The comment directly above (lines
-214-217) says "Classify as `Request(Malformed)` so recovery routes to
-`ClientBug` rather than the misleading `Unsupported(BulkMove)` shape", and
-`reference/graph.md` says `bulk_move` "rejects a cross-mailbox move ... as
-`Request(Malformed)`". The code matches neither: it blames Microsoft (wrong
-provider attribution in telemetry, and possibly wrong engine recovery) for a
-caller-side malformed request, and it fabricates a `Cause::Wire(MalformedResponse)`
-for a failure raised before any wire traffic. Three-way disagreement between
-comment, reference, and code; the code is the odd one out.
-
-### 3. `reference/graph.md` claims `push_subscribe` without a webhook endpoint returns `Error::MissingCoreCapability`; the code returns `Unsupported(PushSubscribe)`
-
-`push.rs` `subscribe_graph` (line 260-261) returns `unsupported_push_error()`;
-`grep MissingCoreCapability crates/graph/src` finds nothing. The reference
-makes the claim twice (factory section and "Known limitations"). One of them
-must change; since `reference/` is binding, this is a live doc defect, and
-possibly a behavioral one if bifrost-sync branches on the kind.
-
 ## Suspected defects (verify against the engine)
 
 ### 4. `get_stream` can only hydrate messages, but Graph establishes event and contact cursor scopes
@@ -77,24 +51,6 @@ asymmetry with the hydration fix is unexplained.
 
 ## Smells / minor findings
 
-- **`changes.rs` page-marker `last_seen_id` is the bare Graph id** (captured at
-  line 146 before foreign encoding), while inventory's marker records the
-  encoded id (`entries.last`, line 222). Also captured from `@removed` values
-  in changes but only from surviving entries in inventory. Harmless today
-  (resume uses `next_link` only) but the two walks disagree on what the field
-  means.
-- **`is_expiring_soon` warns on every renewal tick for an unparseable expiry** -
-  the comment itself (`webhooks.rs` lines 160-167) says it "should be logged
-  once per subscription, not once per tick". Known, unfixed.
-- **`run_get_events_loop`'s `Resubscribe` arm has no backoff** - deliberately
-  flagged in-code (`ews_stream.rs` lines 147-154) as accepted: a server that
-  answers every long poll with a resubscribe directive spins full round-trips.
-  The hunter agrees it's defensible; noting it stays a documented spin.
-- **`attach_account` swallows a poisoned `RwLock`** (`client.rs` line 466-469:
-  `Err(_) => None`) - a poisoned lock silently skips the detach of the
-  displaced handle, leaking one meter attachment. Vanishingly unlikely
-  (nothing panics while holding it), but the leak the surrounding comment
-  exists to prevent.
 - **`open` lists mail folders twice per attach** - `GraphAccountFactory::open`
   runs `list_mail_folders_recursive` to seed the folder tree, and
   `discover_cursor_scopes_inner` runs it again (and re-seeds the same tree)

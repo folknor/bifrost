@@ -1508,6 +1508,7 @@ mod tests {
                         folder: FolderId("inbox".to_string()),
                         ty: ObjectType::Email,
                     }],
+                    warned_unparseable_expiry: false,
                 },
                 push::GraphSubscriptionState {
                     server_id: "two".to_string(),
@@ -1517,6 +1518,7 @@ mod tests {
                         folder: FolderId("cal".to_string()),
                         ty: ObjectType::Event,
                     }],
+                    warned_unparseable_expiry: false,
                 },
             ]),
         );
