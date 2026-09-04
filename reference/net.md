@@ -833,30 +833,22 @@ terminates on hop 256 with `Error::RedirectLoop`. Each redirect hop
 resets the retry counter to 0 - hops are fresh logical requests, not
 retries.
 
-`RedirectPolicy::reqwest_policy()` is the general bare-client entry point for
-callers that build their own `reqwest::Client` instead of routing
-through the pipeline. It returns a
-`reqwest::redirect::Policy::custom` whose follow / stop / error
-decision is driven by the same `max_hops` (default 10), the same
-case-insensitive `allows_host` allowlist check, and - since the
-divergence below was fixed - the same **cross-origin-only precondition**
-the pipeline's `classify_redirect` applies, so the redirect-hardening
-rule lives in exactly one place. The shared decision is
-`RedirectPolicy::admits_hop(prior, next)`: a same-origin hop (RFC 6454
-scheme + host + port, the `same_origin` comparison above) is always
-admitted, and only a hop that leaves the origin consults the allowlist.
-It previously checked every hop's target host, allowlist-populated or
-not, so a policy whose allowlist did not happen to name the origin's own
-host stopped a plain same-host redirect here while the pipeline followed
-it - the two paths disagreeing about the one rule they exist to share. A
-departing URL that is unknown is treated conservatively as cross-origin.
-A reqwest `Policy` can only decide follow / stop /
-error - it cannot rewrite methods or strip headers; cross-origin
-`Authorization` stripping is reqwest's own default and applies
-regardless, and the method-rewriting / explicit auth-strip in the
-pipeline are not part of this bare-client path. A cross-origin hop
-outside the allowlist is stopped (the 3xx surfaces as a terminal
-status); exceeding `max_hops` errors. The DAV crates need their redirect gate to
+The admissibility decision for one hop is `RedirectPolicy::admits_hop(prior,
+next)`, the single rule `classify_redirect` applies: a same-origin hop
+(RFC 6454 scheme + host + port, the `same_origin` comparison above) is
+always admitted, and only a hop that leaves the origin consults the
+allowlist. A departing URL that is unknown is treated conservatively as
+cross-origin.
+
+There was once a second implementation of this rule - a
+`RedirectPolicy::reqwest_policy()` builder returning a
+`reqwest::redirect::Policy::custom` for callers assembling their own
+`reqwest::Client`. It drifted (it checked every hop's target host rather
+than only cross-origin ones, so a populated allowlist that omitted the
+origin's own host stopped a plain same-host redirect there while the
+pipeline followed it), and a reqwest `Policy` could not rewrite methods
+or strip headers anyway. It was deleted on 2026-09-04 on the repository
+owner's ruling; `admits_hop` is now the only implementation. The DAV crates need their redirect gate to
 match their stricter credential gate, which compares scheme, host, and
 effective port - and this crate strips `Authorization` on any origin change
 with no way to restore it, so a followed cross-origin hop would arrive

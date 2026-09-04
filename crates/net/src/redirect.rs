@@ -128,61 +128,9 @@ impl RedirectPolicy {
         self.trusted_hosts.contains(&host.to_ascii_lowercase())
     }
 
-    /// Build a `reqwest::redirect::Policy` enforcing this policy's hop
-    /// cap and trusted-host allowlist for callers that build their own
-    /// `reqwest::Client` rather than routing through `bifrost-net`'s
-    /// request pipeline. This is the single source of truth for
-    /// redirect hardening: the same `max_hops` constant, the same
-    /// case-insensitive host allowlist (`allows_host`), and the same
-    /// **cross-origin-only** precondition the pipeline's
-    /// `classify_redirect` applies drive the follow / stop decision
-    /// here too, so the rule lives in exactly one place.
-    ///
-    /// The cross-origin precondition is load-bearing and was once
-    /// missing here: the pipeline consults the allowlist only when a
-    /// hop leaves the current origin, and a same-origin hop is always
-    /// followed. Checking every hop's host instead meant a populated
-    /// allowlist that did not happen to name the origin's own host
-    /// stopped a plain same-host redirect under this path while the
-    /// pipeline followed it - the two paths disagreeing about the
-    /// single rule they are supposed to share. Origin here means
-    /// scheme + host + port (RFC 6454), the same comparison
-    /// `classify_redirect` uses.
-    ///
-    /// A `reqwest::redirect::Policy` can only decide follow / stop /
-    /// error - it cannot rewrite methods or strip headers. Cross-origin
-    /// `Authorization` stripping is reqwest's own default and applies
-    /// regardless; the method-rewriting and explicit auth-strip in the
-    /// `bifrost-net` pipeline are out of scope for this bare-client
-    /// path.
-    ///
-    /// A cross-origin hop whose target host is outside the allowlist is
-    /// stopped (the 3xx surfaces to the caller as a terminal status)
-    /// rather than followed; exceeding `max_hops` errors the request.
-    #[must_use]
-    pub fn reqwest_policy(&self) -> reqwest::redirect::Policy {
-        let max_hops = usize::from(self.max_hops);
-        let policy = self.clone();
-        reqwest::redirect::Policy::custom(move |attempt| {
-            if attempt.previous().len() >= max_hops {
-                return attempt.error("too many redirects");
-            }
-            let next = attempt.url().clone();
-            // `previous()` is the chain walked so far, ending with the
-            // URL that produced this 3xx; that last entry is the origin
-            // this hop departs from.
-            let prior = attempt.previous().last().cloned();
-            if policy.admits_hop(prior.as_ref(), &next) {
-                attempt.follow()
-            } else {
-                attempt.stop()
-            }
-        })
-    }
-
-    /// The follow / stop decision for one hop, shared by
-    /// `reqwest_policy` and pinned directly by tests (reqwest exposes no
-    /// way to construct an `Attempt`).
+    /// The follow / stop decision for one hop. The single rule the
+    /// request pipeline's `classify_redirect` applies to decide whether
+    /// a hop is admissible.
     ///
     /// A same-origin hop is always admitted; the allowlist governs
     /// cross-origin hops only. `prior` is `None` when the departing URL
@@ -298,8 +246,8 @@ pub(crate) fn classify_redirect(
         _ => (prior_method.clone(), prior_method != Method::HEAD),
     };
 
-    let next_host = next_url.host_str().unwrap_or("");
-    if cross_host && !policy.allows_host(next_host) {
+    if !policy.admits_hop(Some(prior_url), &next_url) {
+        let next_host = next_url.host_str().unwrap_or("");
         return Err(Error::RedirectRejected {
             message: format!("redirect to host {next_host:?} rejected by trusted-host allowlist"),
         });
@@ -382,18 +330,6 @@ mod tests {
         h
     }
 
-    #[test]
-    fn reqwest_policy_same_host_mixed_case_follows() {
-        // The bare-client `reqwest_policy` follow/stop decision is driven
-        // by `allows_host` (case-insensitive) and the hop cap. reqwest
-        // does not expose an `Attempt` constructor, so pin the decision
-        // inputs directly: a mixed-case same-host hop is allowed (follow).
-        let policy = RedirectPolicy::default().trust_host("dav.example");
-        assert!(policy.allows_host("DAV.Example"));
-        // Smoke-check the builder constructs without panicking.
-        let _ = policy.reqwest_policy();
-    }
-
     /// The precondition the two paths must share: the allowlist governs
     /// cross-origin hops only. A same-origin hop is followed even when
     /// the allowlist does not name that host - which is exactly what
@@ -467,28 +403,25 @@ mod tests {
     }
 
     #[test]
-    fn reqwest_policy_different_host_stops() {
-        // A hop to a host outside the allowlist is not allowed (stop).
+    fn allows_host_rejects_a_host_outside_the_allowlist() {
         let policy = RedirectPolicy::default().trust_host("dav.example");
         assert!(!policy.allows_host("evil.example"));
+        assert!(
+            policy.allows_host("DAV.Example"),
+            "host comparison is case-insensitive"
+        );
     }
 
     #[test]
-    fn reqwest_policy_empty_allowlist_follows_any_host() {
-        // An empty allowlist accepts every host; the hop cap is the only
-        // limit then.
+    fn an_empty_allowlist_admits_any_host_and_with_hops_sets_the_cap() {
         let policy = RedirectPolicy::with_hops(5);
         assert!(policy.allows_host("anything.example"));
         assert_eq!(policy.max_hops, 5);
-    }
-
-    #[test]
-    fn reqwest_policy_hop_cap_uses_max_hops() {
-        // The reqwest policy errors once `previous().len() >= max_hops`;
-        // pin that the cap it reads is the policy's own `max_hops` (the
-        // single source the pipeline shares), default 10.
-        assert_eq!(RedirectPolicy::default().max_hops, 10);
-        let _ = RedirectPolicy::default().reqwest_policy();
+        assert_eq!(
+            RedirectPolicy::default().max_hops,
+            DEFAULT_MAX_HOPS,
+            "the default cap is the shared constant"
+        );
     }
 
     #[test]

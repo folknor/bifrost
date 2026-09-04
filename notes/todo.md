@@ -1,5 +1,82 @@
 # TODO
 
+## Structural rulings from the 2026-09-04 bug-hunt round
+
+The nine `notes/bugs-*.md` hunts of 2026-09-04 closed every defect-shaped
+item except google 3 (needs a live-API probe). What they left were structural
+proposals and product calls. Each was presented to the repository owner and
+ruled on 2026-09-04. Execution order is as listed; items 1 through 5 touch
+disjoint crates and may run in parallel, 6 and 7 run alone with a cold review
+between them.
+
+1. **sync: split `engine.rs` into modules. PROCEED.** Attach, backfill
+   orchestrator, ack writer, reattach and bulk pipeline into modules under
+   `engine/`; worker wiring bundled into a context struct; the `Fixed` /
+   `OpenPages` orchestrator arms collapsed behind one resume enum. Pure
+   structure, no behavior or published-API change. Supersedes and closes
+   `sync-B1` below. Must land before item 8 whenever that is scheduled.
+2. **graph: split `pim.rs` into modules. PROCEED, split only.** Search plus
+   its cursor codec, drafts and send, containers and identities, thread and
+   trash routing, and typed hydration into modules under `account/pim/`. The
+   validated `$batch` projection type replacing the four per-lane copies of
+   the invalid-index and duplicate-index rules is NOT approved: one recorded
+   drift is thin evidence for restructuring four working lanes. Re-raise if a
+   future hunt finds a second drift between them.
+3. **imap: `TargetBatch` type owning id-to-outcome accounting. PROCEED.** One
+   type takes the decoded ids, produces the wire `UidSet`, and is the only way
+   to mint outcomes: each id consumed exactly once, with an explicit lane for
+   ids excluded from the wire set. Replaces the four hand-rolled loops
+   (flags, destroy, move, hydration). Same move that `StoreConsumer` and
+   `SideEffectDigest` already made for their classes.
+4. **jmap: route a foreign-container search to its owner account. PROCEED,
+   reframed as a defect.** Originally raised as "should mail search cover
+   shares"; the implicit cross-account union is SKIPPED (no other provider
+   offers one, so the shared trait cannot promise it). But the explicit path
+   is broken today: `SearchFilter::In` naming a foreign container sends an
+   `inMailbox` filter carrying the owner-qualified id to the primary account,
+   which matches nothing, so the consumer sees an empty result with no error.
+   Fix: when `In` names a foreign container, route `Email/query` and the
+   follow-up `Email/get` to that owner's account and re-qualify result ids,
+   as the thread doors and hydration already do. No `In`, or a primary
+   container, stays primary-only.
+5. **DONE (2026-09-04). net: delete `RedirectPolicy::reqwest_policy`. DELETE, on
+   the owner's instruction.** The divergence from the pipeline was already fixed by
+   `RedirectPolicy::admits_hop`; the recommendation was to keep it on the
+   published-surface rule in AGENTS.md. The owner ruled delete. Remove the
+   method and its tests; `admits_hop` stays as the single rule.
+6. **dav: collapse the propstat parsers into `ResponseParts<P: PropSet>` in
+   dav-core. PROCEED, full scope.** Each crate supplies only its
+   staged-property enum and entry constructors. The cursor codecs, snapshot
+   diffs and page slicers follow the same pattern. Eight defects on record in
+   those lines (five historical plus findings 4, 5, 13 of the 2026-09-04
+   hunt), every one a drift between twins. Supersedes the "deliberately NOT
+   extracted" carve-out recorded under `dav-B5` and in `reference/caldav.md`
+   "The shared layer"; update that section when the collapse lands. Finding 5
+   was resolved to the CalDAV behavior in both crates, so that divergence is
+   already unified; any other twin difference found during the move must be
+   surfaced, not silently flattened. Single agent, cold review after.
+7. **smtp: sans-I/O protocol core driven by a blocking and an async I/O
+   adapter. PROCEED, last.** Command sequencing, reply-group accounting,
+   phase decoration and `SendProgress` transitions in one core; the two
+   ~3300 / ~3900-line driver clones become adapters. The published blocking
+   surface (`SmtpTransport`, `LmtpTransport`, the pool, the examples) stays
+   exactly as is. Three one-half-only defects in the 2026-09-04 hunt are the
+   evidence; the transcript harness now covering both halves is the
+   acceptance suite. Largest blast radius of the set, and teardown /
+   RSET-and-keep / abort ordering are exactly the code that moves holes when
+   restructured. Not alongside any other smtp work; cold review required.
+8. **sync: bounded backfill lane instead of the broadcast ring. DEFERRED,
+   will happen.** Keep the broadcast channel for live changes; feed cold-start
+   backfill pages through a bounded per-account queue so a slow consumer
+   applies flow control instead of causing lag-abandonment plus re-read.
+   The consumer surface does not change: `account_changes_stream` stays one
+   stream carrying both batch kinds, distinguished by checkpoint kind as
+   today, and the existing backfill acks are the permit signal. Deferred
+   because the current behavior is correct and heavily pinned, the cost is
+   re-reads rather than wrong results, and no measured large-mailbox
+   cold-start number exists yet. Schedule after item 1 so it lands in an
+   orchestrator module.
+
 - **sync tenant throttle identity.** `ThrottleScope::Tenant` cannot be enforced
   across sibling accounts because `AccountError` carries no tenant identity.
   `bifrost-sync` can key mailbox throttles from `ErrorScope::Mailbox` and
@@ -728,8 +805,9 @@ confirm against the code before working any of them.
 
 ### Fenced for the repository owner (published surface)
 
-- **dav-B5. RESOLVED 2026-08-29 as option B.** Kept only to stop it being
-  re-filed. The protocol-neutral half now lives in the private
+- **dav-B5. RESOLVED 2026-08-29 as option B; the propstat carve-out is
+  REOPENED 2026-09-04 by ruling 6 at the top of this file (PROCEED).** Kept
+  for the option reasoning. The protocol-neutral half now lives in the private
   `bifrost-dav-core`; both published surfaces are untouched. What was
   deliberately NOT extracted - the propstat parsers, the cursor codecs, the
   snapshot diffs - is recorded with its reasoning in `reference/caldav.md`
@@ -897,7 +975,9 @@ Nothing in this section misbehaves. None of it is a bug, and none of it blocks a
 defect fix - in particular, do not let a unification proposal become a
 prerequisite for the small local fixes above.
 
-- **sync-B1.** `crates/sync/src/engine.rs` is 5278 lines mixing five concerns:
+- **sync-B1. SUPERSEDED 2026-09-04 by ruling 1 at the top of this file
+  (PROCEED).** Kept for the concern inventory below; the file has since
+  grown to ~8000 lines. `crates/sync/src/engine.rs` mixes five concerns:
   lifecycle, ~900 lines of recovery dispatch free functions, the ~500-line
   backfill orchestrator, the ~500-line mutation pipeline, and ~1200 lines of 1:1
   passthrough forwarders that invent no semantics (every one is `live_account(id)?`

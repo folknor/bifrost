@@ -20,7 +20,13 @@ no longer claims the CalDAV/CardDAV clients as its callers. Pinned by
 `a_same_origin_hop_is_followed_even_when_the_allowlist_omits_its_host` - which
 also asserts the pipeline's agreeing answer - and
 `a_cross_origin_hop_is_checked_against_the_allowlist`, both revert-and-confirmed.
-Whether the method should exist at all remains the owner's call.)
+
+Closed out 2026-09-04: on the repository owner's ruling (ruling 5 in
+`notes/todo.md`), the published `RedirectPolicy::reqwest_policy` method was
+deleted outright along with the tests that existed only to exercise it.
+`admits_hop` stays and is now the only implementation of the rule -
+`classify_redirect` calls it directly for the allowlist decision, so there is no
+second path left to diverge.)
 
 (Finding 2 - a redirect chain A->B->A producing a terminal `AuthLost` that
 masquerades as credential loss - is fixed: the pipeline now tracks whether the
