@@ -9,22 +9,14 @@ spot-checked; findings verified against source lines and `reference/graph.md` /
 
 ## Confident defects
 
-### 1. `changes_stream` silently drops an id-less delta value and advances the cursor - the exact "silent permanent loss" the inventory walk was hardened against
-
-`crates/graph/src/account/changes.rs`, page loop (~lines 145-184). A
-non-removed value without a usable `id` matches neither the `is_removed` branch
-nor the `if let Some(id)` branch, so it contributes nothing, and the page's
-checkpoint (`advanced_through` / new `delta_link`) is still emitted, crossing
-the page. `inventory.rs` (lines 151-194) treats the identical condition as a
-`Region` obligation with `RegionRecovery::CheckpointBarrier` - with an
-extensive comment explaining why silently dropping is a checkpoint-contract
-violation - and `reference/graph.md` ("An id-less delta value is a checkpoint
-barrier") states the rule for "a delta page" generically. The changes lane has
-no obligation vocabulary in `SyncEvent<Change>`, but the honest fallback exists
-in the same file: terminate before emitting the checkpoint (as the
-neither-link arm at lines 229-247 does), so the cursor never crosses the page.
-As written, a malformed value in a delta page after initial sync is
-unrecoverable, unreported loss for that scope.
+(Finding 1 - `changes_stream` silently dropping an id-less delta value while
+still emitting the page's checkpoint - is fixed: an id-less value (removed or
+not) now delivers the page's decoded siblings on a checkpoint-less batch and
+terminates as `Protocol(ContractViolation)`, mirroring the neither-link arm,
+so the cursor never crosses the page. Pinned by
+`an_idless_delta_value_terminates_without_crossing_the_page` with
+revert-and-confirm; the rule is documented for the changes lane in
+`reference/graph.md`.)
 
 ## Suspected defects (verify against the engine)
 

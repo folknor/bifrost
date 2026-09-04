@@ -1447,6 +1447,16 @@ a waiver cannot silently accept every future id-less value in the scope.
 An earlier revision recorded the page URL as a replay token and let the delta link
 advance regardless, with a test pinning that as correct.
 
+The changes lane (`changes_stream`) enforces the same rule with the tools it
+has: `SyncEvent<Change>` carries no obligation vocabulary, so an id-less
+value (removed or not) in a live delta page delivers the page's decoded
+siblings on a checkpoint-less batch and then terminates the stream as a
+`Protocol(ContractViolation)` - the same shape as the neither-link arm -
+instead of emitting the page's checkpoint. Crossing the page would advance
+the cursor past a value the stream could not represent, which is silent
+permanent loss. Pinned by
+`an_idless_delta_value_terminates_without_crossing_the_page`.
+
 ## Bounded `nextLink` traversal
 
 Every Graph collection walk follows server-supplied `@odata.nextLink` values

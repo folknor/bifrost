@@ -148,6 +148,7 @@ pub(crate) fn changes_stream(
             let mut last_seen_id = None;
             let mut etags = Vec::new();
             let mut removed_etag_ids = Vec::new();
+            let mut idless_value = false;
             for value in page.value {
                 if let Some(id) = value.get("id").and_then(Value::as_str).map(str::to_string) {
                     last_seen_id = Some(id);
@@ -165,8 +166,13 @@ pub(crate) fn changes_stream(
                             membership: membership_from_value(&scope, &value),
                             kind: ScopeChangeKind::Removed,
                         }));
+                    } else {
+                        idless_value = true;
                     }
                     continue;
+                }
+                if value.get("id").and_then(Value::as_str).is_none() {
+                    idless_value = true;
                 }
                 if let Some(id) = value.get("id").and_then(Value::as_str) {
                     // Foreign-encode the change id at mint: the readback
@@ -197,6 +203,29 @@ pub(crate) fn changes_stream(
                 for id in removed_etag_ids {
                     cache.remove(&id);
                 }
+            }
+
+            if idless_value {
+                // An id-less delta value is a checkpoint barrier - the same
+                // rule the inventory walk enforces with a Region obligation.
+                // The changes lane has no obligation vocabulary in
+                // `SyncEvent<Change>`, so the honest fallback is the
+                // neither-link arm's: surface what was decoded, then
+                // terminate WITHOUT emitting the page's checkpoint. Crossing
+                // the page would advance the cursor past a value this stream
+                // could not represent, converting a malformed page into
+                // silent, permanent, unreported loss for the scope.
+                if !changes.is_empty() {
+                    yield batch(changes, PageBoundary::Page, None, tally.take());
+                }
+                yield SyncEvent::Terminated(super::graph_error::protocol_violation(
+                    bifrost_types::ProtocolErrorKind::ContractViolation,
+                    AccountOperation::SyncChanges,
+                    Some(ErrorScope::Cursor(scope.clone())),
+                    "Graph delta page carried a value with no usable id",
+                ));
+                yield SyncEvent::Done(None);
+                return;
             }
 
             if let Some(next_link) = page.next_link {
@@ -666,6 +695,56 @@ mod tests {
             1,
             "the echoed link is refused before a second fetch"
         );
+    }
+
+    /// An id-less delta value is a checkpoint barrier (the rule the
+    /// inventory walk enforces with a Region obligation). The changes lane
+    /// must not cross the page: emitting the delta-link checkpoint would
+    /// advance the cursor past a value the stream could not represent -
+    /// silent, permanent, unreported loss. Decoded siblings still ride a
+    /// checkpoint-less batch, and the stream terminates as a contract
+    /// violation.
+    #[tokio::test]
+    async fn an_idless_delta_value_terminates_without_crossing_the_page() {
+        let client = GraphClient::new("token");
+        client.script_rest([ScriptedRestResponse::json(
+            reqwest::StatusCode::OK,
+            json!({
+                "value": [
+                    { "id": "m1", "changeKey": "ck1" },
+                    { "subject": "no id at all" }
+                ],
+                "@odata.deltaLink": "https://graph.example/delta?token=next"
+            }),
+        )]);
+        let account = GraphAccount::new_for_tests(client, PushMode::GraphSubscriptions);
+        let payload = GraphCursorPayload::new(
+            kind_for_scope(&email_scope("inbox")).expect("email scope maps"),
+            "https://graph.example/delta".to_string(),
+            None,
+        );
+        let cursor = encode_cursor(email_scope("inbox"), payload).expect("cursor encodes");
+
+        let mut stream = changes_stream(account, cursor);
+        let Some(SyncEvent::Batch(batch)) = stream.next().await else {
+            panic!("the decoded sibling still rides a batch");
+        };
+        assert!(
+            batch.checkpoint.is_none(),
+            "the malformed page's checkpoint must not be emitted"
+        );
+        let Some(SyncEvent::Terminated(error)) = stream.next().await else {
+            panic!("expected SyncEvent::Terminated on the id-less value");
+        };
+        assert!(matches!(
+            error.kind(),
+            AccountErrorKind::Protocol(bifrost_types::ProtocolErrorKind::ContractViolation)
+        ));
+        assert!(
+            matches!(stream.next().await, Some(SyncEvent::Done(None))),
+            "no terminal checkpoint may cross the page"
+        );
+        assert!(stream.next().await.is_none());
     }
 
     #[tokio::test]
