@@ -1046,17 +1046,13 @@ mod tests {
         time::Duration,
     };
 
-    #[cfg(unix)]
-    use crate::transport::smtp::test_support::spawn_unix_lmtp_delivery_server;
     use crate::{
-        AsyncLmtpTransport, AsyncSmtpTransport, AsyncTransport, TokioExecutor,
-        address::Envelope,
+        AsyncLmtpTransport, AsyncSmtpTransport, TokioExecutor,
         transport::smtp::{
             authentication::{
                 Credentials, DEFAULT_MECHANISMS, Mechanism, OAUTH2_MECHANISMS, PASSWORD_MECHANISMS,
             },
             client::Tls,
-            test_support::{assert_lmtp_delivery_commands, spawn_lmtp_delivery_server},
         },
     };
 
@@ -1234,71 +1230,6 @@ mod tests {
     }
 
     #[tokio::test(crate = "tokio")]
-    async fn tokio_lmtp_transport_returns_per_recipient_statuses() {
-        let server = spawn_lmtp_delivery_server();
-
-        let envelope = Envelope::new(
-            Some("sender@example.com".parse().unwrap()),
-            vec![
-                "first@example.com".parse().unwrap(),
-                "second@example.com".parse().unwrap(),
-                "third@example.com".parse().unwrap(),
-            ],
-        )
-        .unwrap();
-        let mailer: AsyncLmtpTransport<TokioExecutor> =
-            AsyncLmtpTransport::<TokioExecutor>::builder_dangerous("127.0.0.1")
-                .port(server.address.port())
-                .build();
-
-        let responses = mailer
-            .send_raw(&envelope, b"Subject: test\r\n\r\nHello")
-            .await
-            .unwrap();
-
-        assert_eq!(responses.len(), 3);
-        assert!(responses[0].has_code(250));
-        assert!(responses[1].has_code(550));
-        assert!(!responses[1].is_positive());
-        assert!(responses[2].has_code(451));
-        assert!(!responses[2].is_positive());
-
-        let commands = server.commands();
-        assert_lmtp_delivery_commands(&commands);
-    }
-
-    #[tokio::test(crate = "tokio")]
-    #[cfg(unix)]
-    async fn tokio_lmtp_transport_sends_over_unix_socket() {
-        let server = spawn_unix_lmtp_delivery_server();
-
-        let envelope = Envelope::new(
-            Some("sender@example.com".parse().unwrap()),
-            vec![
-                "first@example.com".parse().unwrap(),
-                "second@example.com".parse().unwrap(),
-                "third@example.com".parse().unwrap(),
-            ],
-        )
-        .unwrap();
-        let mailer: AsyncLmtpTransport<TokioExecutor> =
-            AsyncLmtpTransport::<TokioExecutor>::unix_socket(server.path.clone()).build();
-
-        let responses = mailer
-            .send_raw(&envelope, b"Subject: test\r\n\r\nHello")
-            .await
-            .unwrap();
-
-        assert_eq!(responses.len(), 3);
-        assert!(responses[0].has_code(250));
-        assert!(responses[1].has_code(550));
-        assert!(responses[2].has_code(451));
-
-        let commands = server.commands();
-        assert_lmtp_delivery_commands(&commands);
-    }
-
-    #[tokio::test(crate = "tokio")]
     async fn tokio_plaintext_auth_is_refused_before_auth_command() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -1387,6 +1318,104 @@ mod tests {
                     )
                 })
                 .collect()
+        }
+
+        /// Finding 4b: the async transport-level LMTP delivery pin, ported off
+        /// the `TcpListener`/`UnixListener` scripted servers it used to run
+        /// against. The transcript asserts the exact command sequence the old
+        /// `assert_lmtp_delivery_commands` checked, and the returned statuses
+        /// pin that a mid-envelope RCPT rejection is re-inserted in the
+        /// original recipient order alongside the two real final statuses.
+        #[tokio::test(crate = "tokio")]
+        async fn tokio_lmtp_transport_returns_per_recipient_statuses() {
+            use crate::AsyncTransport;
+            use crate::address::Envelope;
+
+            let transcript = Transcript::new("220 localhost\r\n")
+                .expect(
+                    "LHLO client.example\r\n",
+                    "250-localhost\r\n250 8BITMIME\r\n",
+                )
+                .expect("MAIL FROM:<sender@example.com>\r\n", "250 sender ok\r\n")
+                .expect("RCPT TO:<first@example.com>\r\n", "250 rcpt ok\r\n")
+                .expect("RCPT TO:<second@example.com>\r\n", "550 rcpt rejected\r\n")
+                .expect("RCPT TO:<third@example.com>\r\n", "250 rcpt ok\r\n")
+                .expect("DATA\r\n", "354 send message\r\n")
+                .expect("Subject: test\r\n\r\nHello", "")
+                .expect(
+                    "\r\n.\r\n",
+                    "250 first recipient ok\r\n451 third recipient deferred\r\n",
+                );
+            let conn =
+                AsyncSmtpConnection::from_transcript(transcript.clone(), &hello(), Protocol::Lmtp)
+                    .await
+                    .unwrap();
+            let transport = AsyncLmtpTransport::<TokioExecutor> {
+                inner: pool_with(conn, Protocol::Lmtp).await,
+            };
+
+            let envelope = Envelope::new(
+                Some("sender@example.com".parse().unwrap()),
+                vec![
+                    "first@example.com".parse().unwrap(),
+                    "second@example.com".parse().unwrap(),
+                    "third@example.com".parse().unwrap(),
+                ],
+            )
+            .unwrap();
+
+            let responses = transport
+                .send_raw(&envelope, b"Subject: test\r\n\r\nHello")
+                .await
+                .unwrap();
+
+            assert_eq!(responses.len(), 3);
+            assert!(responses[0].has_code(250));
+            assert!(responses[1].has_code(550));
+            assert!(!responses[1].is_positive());
+            assert!(responses[2].has_code(451));
+            assert!(!responses[2].is_positive());
+            transcript.assert_exhausted();
+        }
+
+        /// Finding 4b: what the old `UnixListener` test could actually pin
+        /// in-process is the routing decision, not the kernel's socket. The
+        /// delivery behaviour over a Unix-domain LMTP socket is identical to
+        /// the TCP case above (same connection driver), so what is left to pin
+        /// is that the builder routes to the Unix funnel at all and that the
+        /// documented TLS-over-Unix rejection fires before any dial.
+        #[tokio::test(crate = "tokio")]
+        #[cfg(unix)]
+        async fn tokio_lmtp_unix_socket_builder_routes_to_the_unix_funnel() {
+            use crate::transport::smtp::client::{Tls, TlsParametersBuilder};
+
+            let builder = AsyncLmtpTransport::<TokioExecutor>::unix_socket("/run/lmtp.sock");
+            assert_eq!(
+                builder.info.unix_socket.as_deref(),
+                Some(std::path::Path::new("/run/lmtp.sock"))
+            );
+            assert_eq!(builder.info.protocol, Protocol::Lmtp);
+
+            let mut info = SmtpInfo::new("localhost", Protocol::Lmtp);
+            info.unix_socket = Some(std::path::PathBuf::from("/run/lmtp.sock"));
+            info.tls = Tls::Wrapper(
+                TlsParametersBuilder::new("localhost".to_owned())
+                    .build()
+                    .unwrap(),
+            );
+            let client = AsyncSmtpClient::<TokioExecutor> {
+                info,
+                marker_: PhantomData,
+            };
+            let error = client
+                .connection()
+                .await
+                .err()
+                .expect("TLS over a Unix socket is refused");
+            assert!(
+                error.to_string().contains("Unix-domain LMTP sockets"),
+                "got {error}"
+            );
         }
 
         /// End-to-end counterpart to the connection-level `should_retire()`

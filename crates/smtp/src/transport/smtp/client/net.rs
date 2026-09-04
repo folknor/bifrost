@@ -258,7 +258,13 @@ impl NetworkStream {
                 stream.get_ref().set_read_timeout(duration)
             }
             #[cfg(test)]
-            Some(InnerNetworkStream::Transcript(_)) => Ok(()),
+            Some(InnerNetworkStream::Transcript(s)) => {
+                // No clock to enforce it against, but recording what the
+                // driver armed is what makes the per-reply read deadline
+                // observable in a hermetic test.
+                s.record_read_timeout(duration);
+                Ok(())
+            }
             None => Err(not_connected()),
         }
     }

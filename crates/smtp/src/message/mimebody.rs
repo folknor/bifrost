@@ -192,6 +192,35 @@ pub enum MultiPartKind {
     Signed { protocol: String, micalg: String },
 }
 
+/// Rebuild `mime` with its `boundary` parameter replaced, keeping every other
+/// parameter - including ones this crate has no vocabulary for - exactly as
+/// the caller wrote it.
+///
+/// Returns `None` when a parameter value cannot be re-emitted losslessly as a
+/// quoted string (it contains a `"` or a `\`); the caller then falls back to
+/// rebuilding from `MultiPartKind`, which is what always happened before.
+fn replace_boundary_param(mime: &Mime, boundary: &str) -> Option<Mime> {
+    let mut rebuilt = format!("{}/{}", mime.type_(), mime.subtype());
+    if let Some(suffix) = mime.suffix() {
+        rebuilt.push('+');
+        rebuilt.push_str(suffix.as_str());
+    }
+    rebuilt.push_str(&format!("; boundary=\"{boundary}\""));
+
+    for (name, value) in mime.params() {
+        if name == mime::BOUNDARY {
+            continue;
+        }
+        let value = value.as_str();
+        if value.contains('"') || value.contains('\\') {
+            return None;
+        }
+        rebuilt.push_str(&format!("; {name}=\"{value}\""));
+    }
+
+    rebuilt.parse().ok()
+}
+
 /// Create a cryptographically random MIME boundary.
 fn make_boundary() -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -615,16 +644,27 @@ impl MultiPart {
             return;
         }
 
-        let kind = self
-            .headers
-            .get::<ContentType>()
+        let existing = self.headers.get::<ContentType>();
+        let kind = existing
+            .as_ref()
             .and_then(|content_type| MultiPartKind::from_mime(content_type.as_ref()))
             .unwrap_or(MultiPartKind::Mixed);
         loop {
             let boundary = make_boundary();
             if !self.parts_contain_boundary(&boundary, 0) {
-                self.headers
-                    .set(ContentType::from_mime(kind.to_mime(Some(boundary))));
+                // Re-roll the BOUNDARY, not the whole Content-Type. Rebuilding
+                // from `MultiPartKind` alone reproduces only the parameters
+                // this crate knows about, so any parameter a caller set on the
+                // multipart Content-Type itself - a vendor param, a `charset`,
+                // anything outside the kind's own vocabulary - vanished the
+                // moment a part forced a re-roll.
+                let mime = existing
+                    .as_ref()
+                    .and_then(|content_type| {
+                        replace_boundary_param(content_type.as_ref(), &boundary)
+                    })
+                    .unwrap_or_else(|| kind.to_mime(Some(boundary)));
+                self.headers.set(ContentType::from_mime(mime));
                 return;
             }
         }
@@ -1099,6 +1139,52 @@ mod test {
 
         assert_ne!(part.boundary(), "BOUNDARY");
         assert_eq!(formatted.matches("\r\n--BOUNDARY\r\n").count(), 1);
+    }
+
+    /// Finding 11: a boundary re-roll must replace the BOUNDARY, not rebuild
+    /// the whole Content-Type from `MultiPartKind`. Rebuilding reproduces only
+    /// the parameters this crate has a vocabulary for, so a caller's own
+    /// parameter on the multipart Content-Type disappeared the moment a part
+    /// forced a re-roll - and a re-roll is data-driven, so the same message
+    /// keeps or loses the parameter depending on its body.
+    #[test]
+    fn a_boundary_re_roll_keeps_foreign_content_type_parameters() {
+        let content_type =
+            ContentType::parse("multipart/mixed; boundary=\"BOUNDARY\"; x-vendor=\"keep-me\"")
+                .unwrap();
+
+        // No collision: the Content-Type is untouched, parameter included.
+        let quiet = MultiPart::builder()
+            .header(content_type.clone())
+            .singlepart(SinglePart::plain("nothing to see".to_owned()));
+        assert_eq!(quiet.boundary(), "BOUNDARY");
+        assert_eq!(
+            quiet
+                .headers()
+                .get::<ContentType>()
+                .unwrap()
+                .as_ref()
+                .get_param("x-vendor")
+                .map(|value| value.as_str().to_owned()),
+            Some("keep-me".to_owned())
+        );
+
+        // Collision: the boundary must change and the parameter must not.
+        let re_rolled = MultiPart::builder()
+            .header(content_type)
+            .singlepart(SinglePart::plain(
+                "before\r\n--BOUNDARY\r\nafter".to_owned(),
+            ));
+        assert_ne!(re_rolled.boundary(), "BOUNDARY");
+        let mime = re_rolled.headers().get::<ContentType>().unwrap();
+        assert_eq!(mime.as_ref().subtype().as_ref(), "mixed");
+        assert_eq!(
+            mime.as_ref()
+                .get_param("x-vendor")
+                .map(|value| value.as_str().to_owned()),
+            Some("keep-me".to_owned()),
+            "a re-roll must not drop parameters it does not understand"
+        );
     }
 
     #[test]

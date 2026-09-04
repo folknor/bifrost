@@ -90,6 +90,38 @@ and the connection stays reusable.
 
 `AsyncDeadline` is a single shared deadline across DNS, connect, TLS handshake, banner read, and initial EHLO. The deadline lives only until `connect_impl` returns; established connections use the per-operation timeout. `starttls(...)` on an established connection uses the per-operation timeout because it is an explicit command, not setup.
 
+It measures on `tokio::time::Instant`, not `std`'s. Every timeout the deadline
+hands out is a `tokio::time::timeout`, and a deadline that reads a different
+clock from the timers it arms is only accidentally right - it disagrees
+wherever tokio's clock is not the system one, which under `start_paused` test
+time meant the deadline never expired at all.
+
+## Per-reply read deadline
+
+The configured timeout bounds one REPLY, not each line of it. Both drivers
+enforce that, by different mechanics for the same reason: the natural unit on
+each side is smaller than a reply, so a multi-line reply armed naively gets a
+fresh full timeout per line and a peer trickling one line per period stretches
+one reply to `MAX_RESPONSE_BYTES / line` times the configured timeout, bounded
+only by the size caps.
+
+- The async reader collapses a `PerOperation` budget into an `AsyncDeadline` on
+  entry and draws every line's `tokio::time::timeout` from the slack left on
+  it. A `SetupDeadline` budget is already deadline-shaped and passes through,
+  so the connect path keeps its one shared deadline.
+- The blocking reader has only `SO_RCVTIMEO`, which is per read syscall and has
+  no getter, so `SmtpConnection` keeps the configured value in `read_timeout`
+  and re-arms the socket with the remaining slack before each line, restoring
+  the full value when the reply ends. An exactly-spent deadline is an error
+  rather than a zero re-arm, because a zero `SO_RCVTIMEO` means "block
+  forever".
+
+Pinned on both sides: `a_trickled_multi_line_reply_cannot_outrun_the_operation_timeout`
+drives a clock-trickling peer under paused tokio time, and
+`multi_line_reply_reads_share_one_deadline` reads back the timeouts the
+blocking driver armed on the transcript and asserts they shrink within a reply
+and reset between replies.
+
 ## PIPELINING
 
 When the server advertises PIPELINING, `MAIL FROM` and `RCPT TO` commands are written in bounded recipient windows, with every reply in one window drained before the next is written. `DATA` is issued only after all recipient windows complete; the body is never in the pipelined batch. On RCPT failure mid-pipeline the transaction is reset before the body. The shared window bound respects the peer TCP window while preserving the original recipient indexes in `SendProgress`.
@@ -146,6 +178,19 @@ so there is nothing to reset and the connection stays reusable as it is. The
 rejection paths that follow an accepted `MAIL FROM` go through
 `reset_transaction`, which keeps the connection when the peer positively
 acknowledges the reset and aborts it otherwise.
+
+This is not a PIPELINING-only rule. The direct sends (`send_with_options` and
+`send_bdat_with_options`) take the same shape when the server advertises no
+PIPELINING: `MAIL FROM`, `RCPT TO` and `DATA` are issued through
+`command_accepting_status`, so a routine 4xx/5xx stays an `Ok(Response)` that
+the driver classifies itself instead of a transport-shaped `Err` that
+`try_smtp!` would turn into an `abort()`. Only genuine I/O or parse failures
+abort. Both halves share a `run_unpipelined_envelope` helper for the
+`MAIL FROM` + `RCPT TO` sequence and are pinned by
+`unpipelined_server_rejections_keep_the_connection_reusable`, which asserts the
+exact RSET traffic and that the connection is still unbroken afterwards. A
+server rejection therefore costs no reconnect on either the pipelined or the
+non-pipelined path.
 
 ## DSN and SendOptions
 
@@ -252,9 +297,32 @@ Display-name encoding emits RFC 5322 phrase text when the name is atom-shaped, R
 
 Multipart builders ensure a `boundary` is present even when a caller supplies a boundary-less multipart `Content-Type`. `try_boundary`, `try_encrypted`, and `try_signed` are the fallible validation entry points; the infallible `boundary`, `MultiPart::encrypted`, and `MultiPart::signed` keep their signatures and panic on values that would break out of the MIME parameter (a deliberate runtime behavior change for callers passing unvalidated strings); default boundaries use OS randomness, and a caller-supplied boundary is regenerated if it appears at a MIME delimiter position in an added part.
 
+A regeneration replaces the `boundary` PARAMETER and keeps every other
+parameter on the multipart `Content-Type` verbatim, including ones outside this
+crate's vocabulary. Rebuilding the header from `MultiPartKind` alone would
+reproduce only the kind's own parameters, and since a re-roll is data-driven,
+the same message would keep or lose a caller's vendor parameter depending on
+its body. The fallback to a kind-rebuilt header remains for the one case a
+lossless rebuild cannot cover: a parameter value containing a `"` or a `\`.
+
 `SinglePartBuilder::body(String)` and `MessageBuilder::body(String)` infer `Content-Type: text/plain; charset=utf-8` when no content type is set.
 
 `MessageBuilder::body` CRLF-normalizes bare LF at the builder boundary, so a byte body never reaches the DATA writer's defensive bare-LF dot-stuffing and gains a literal extra dot on a CRLF-strict relay. Normalization is scoped by the encoding that will actually be emitted: `String` input always normalizes, and `Vec<u8>` input normalizes only when it goes on the wire as literal `7bit`/`8bit` text. Byte input that is re-encoded (base64, `binary`) is opaque payload and is passed through untouched, so `0x0A` inside a binary attachment survives the round trip. `body_raw()` (DKIM) and the DATA writer both see the normalized buffer, so signing and delivery still agree. A pre-encoded `Body` is never rewritten.
+
+One encoding decision governs both steps: the encoding chosen from the input
+decides whether the buffer is normalized, and that same encoding is what the
+resulting `Body` carries. Choosing again from the post-normalization bytes
+would leave a window - narrow, and not reachable today - where a buffer was
+CRLF-rewritten as text and then encoded as opaque payload, mutating bytes the
+caller handed over untouchable. `crlf_normalization_never_changes_the_chosen_encoding`
+pins the property the old two-decision shape rested on.
+
+`Headers` cannot represent REPEATED header fields. `insert_raw` overwrites by
+name, so a second `Received`, `Comments` or other repeated trace header
+replaces the first rather than appending. That is correct for what this crate
+is for - building fresh mail for submission - but a caller routing an existing
+message through `Message` will lose repeated fields. Preserve such headers
+outside `Headers`, or submit the original bytes with `send_raw`.
 
 Typed headers for list management: `List-ID`, `List-Help`, `List-Unsubscribe`, `List-Unsubscribe-Post` (fixed value `List-Unsubscribe=One-Click` per RFC 8058), `List-Subscribe`, `List-Post`, `List-Owner`, `List-Archive`.
 
@@ -328,10 +396,27 @@ Two properties worth not regressing: tokens may go NEGATIVE, so a
 transfer larger than one second of budget owes proportional time instead
 of being clamped to one second (clamping would let a 1 B/s cap run at
 hundreds of B/s), and the cap is re-read on every transfer, so a consumer
-can retune or lift it without reconnecting. Inbound and outbound are
-separate buckets: a large send must not throttle the reply to it. Bytes
-are charged as ACCEPTED by the socket, not as offered, so a short write
-charges the remainder on its retry.
+can retune or lift it without reconnecting. Bytes are charged as ACCEPTED
+by the socket, not as offered, so a short write charges the remainder on
+its retry.
+
+Inbound and outbound are separate buckets: a large send must not throttle
+the reply to it. In the async funnel the parked debt is separate too -
+`throttle_in` and `throttle_out` are distinct `Sleep` slots, `poll_read`
+consults only the first and `poll_write` only the second. A single shared
+slot silently undid the separate buckets, because the debt parked by the
+final DATA-body write gated the read of the server's reply to it, spending
+the caller's per-operation read timeout on outbound debt.
+`outbound_throttle_debt_does_not_gate_the_next_read` pins that a read
+completes on its first poll while a write is still in debt.
+
+The blocking funnel cannot deliver that property and is not claimed to.
+`NetworkStream::charge` sleeps the calling thread, and that thread is the
+same one that will issue the next read, so outbound debt necessarily
+delays it. Overlapping the two directions there would need a second thread
+or a non-blocking socket, neither of which belongs in a transport whose
+contract is "this call blocks". For a caller who needs the guarantee under
+a tight cap, the async half is the one that has it.
 
 ## Error model
 
@@ -352,7 +437,16 @@ Evidence must match what actually crossed the wire. A transport failure in the e
 
 `test_support::Transcript` is the in-process scripted peer both connection
 drivers test against; it replaced the socket-listener tests, which were neither
-hermetic nor deterministic. A transcript is a greeting plus an ordered list of
+hermetic nor deterministic. `test_support` itself now binds no `TcpListener`
+and no `UnixListener`, spawns no threads and sleeps nowhere: the transport-level
+LMTP delivery pins (`lmtp_transport_returns_per_recipient_statuses` and its
+`tokio_` twin) run against a parked transcript connection, and the Unix-socket
+case pins the routing decision - builder wiring plus the TLS-over-Unix refusal
+raised inside `connection()` before any dial - since the kernel's socket is not
+the part a test can prove in-process. A handful of loopback-listener tests
+outside this module still cover the pre-AUTH refusal ladder; they are the
+remaining non-hermetic tests in the crate. A transcript is a greeting plus an
+ordered list of
 `expect(client_bytes, server_bytes)` steps. Three properties make it bite:
 
 - Each client write must match one scripted step byte-for-byte, so command
@@ -390,6 +484,13 @@ through to a weaker mechanism.
 then never answers; reads park with no waker, so only the caller's own timeout
 or cancellation resumes the task. That is what the async timeout, setup-deadline
 and cancellation tests observe, under `start_paused` tokio time.
+
+`test_support::StalledPeer` is the same idea one layer lower: a bare
+`AsyncRead`/`AsyncWrite` that swallows every byte and parks every read. It
+exists for the setup-deadline cases whose traffic is not scriptable - a TLS
+`ClientHello` is opaque bytes, so `expect(...)` cannot match it - and it is what
+`tokio_tls_handshake_uses_deadline` drives `upgrade_tls_stream` against, in
+place of the listener plus sleeping thread that test used to need.
 
 Pool-level tests park a transcript-backed connection directly
 (`Pool::park_for_test`) and drive the public batch entry points through it, so

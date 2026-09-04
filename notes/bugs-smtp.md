@@ -13,88 +13,104 @@ the async shape (verify + Broken after the window write, deferred surplus
 reads, `finish_reply_group` per window), pinned by
 `pipelined_batch_drains_coalesced_window_replies` with revert-and-confirm.)
 
-### 2. Non-pipelined direct sends abort the connection on every routine negative reply
-
-`send_with_options` / `send_bdat_with_options` (both drivers; e.g.
-`connection.rs` 236-271, `async_connection.rs` 377-429) use `self.command(...)`,
-whose reader converts any 4xx/5xx into `Err(status)`, and `try_smtp!` then
-**aborts** the connection. So on a server that does not advertise PIPELINING,
-a plain 550 recipient rejection - or even a rejected MAIL FROM, which per the
-reference "opened no transaction so the connection stays reusable" - tears
-down the pooled connection (`abort()` -> `Shutdown::Both`, marked Broken,
-dropped at recycle). The pipelined path for the identical wire exchange sends
-RSET and keeps the connection. This is a behavioral/pooling inconsistency,
-wasteful (one reconnect per rejection), and diverges from the documented
-reset_transaction contract. The batch paths handle this correctly with
-`command_accepting_status`; the direct paths should too.
+(Finding 2, MEDIUM - non-pipelined direct sends aborting the connection on
+every routine negative reply - is fixed: both drivers now issue MAIL FROM /
+RCPT TO / DATA through `command_accepting_status` via a shared
+`run_unpipelined_envelope`, so a rejected MAIL FROM leaves the connection
+untouched and a rejected RCPT or DATA sends RSET and keeps it, matching the
+pipelined and batch paths; pinned in both halves by
+`unpipelined_server_rejections_keep_the_connection_reusable` with
+revert-and-confirm.)
 
 ## Contract / documentation mismatches
 
-### 4a. Doc defect: the reference claims the socket-listener tests were retired; they were not
+(Findings 4a and 4b - the reference claiming the socket-listener tests were
+retired when they were not - are fixed together: `spawn_lmtp_delivery_server`,
+`spawn_unix_lmtp_delivery_server` and `assert_lmtp_delivery_commands` are gone,
+so `test_support` binds no listener, spawns no thread and sleeps nowhere. The
+transport-level LMTP delivery tests now run a parked transcript connection
+through `send_raw` in both halves - the transcript asserts the exact command
+sequence the old command-capture asserted - and the Unix-socket case pins what
+is provable in-process: builder routing plus the TLS-over-Unix refusal raised
+in `connection()` before any dial. `tokio_tls_handshake_uses_deadline` drives
+`upgrade_tls_stream` against a new `test_support::StalledPeer` instead of a
+listener plus a 250ms `thread::sleep`. Both ports verified by
+revert-and-confirm. The reference was corrected to match, including the note
+that a few loopback-listener tests for the pre-AUTH refusal ladder remain
+outside `test_support` - see the residual item below.)
 
-`reference/smtp.md` "Connection test harness": "it replaced the
-socket-listener tests, which were neither hermetic nor deterministic." False
-today - see 4b for what still exists. Since `reference/` is binding, the
-sentence must be corrected (or become true via 4b).
+### 4c. Residual: loopback-listener tests for the pre-AUTH refusal ladder
 
-### 4b. Compliance item: live socket-listener tests violate the testing rules
+`transport.rs` and `async_transport.rs` still bind `TcpListener` in
+`plaintext_auth_is_refused_before_auth_command` (and its tokio twin), as does
+`tests/transport_smtp.rs`. These were out of 4b's scope and are a separate,
+smaller port: what they pin is that no AUTH command reaches the wire, which a
+transcript with no scripted AUTH step expresses directly.
 
-`test_support.rs` still contains `spawn_lmtp_delivery_server` /
-`spawn_unix_lmtp_delivery_server` (real `TcpListener`/`UnixListener` + threads
-+ 2-second read timeouts), used by transport tests in `transport.rs` and
-`async_transport.rs`, and `async_net.rs` has a `TcpListener`-based
-TLS-deadline test with a `thread::sleep(250ms)`. These sit on the wrong side
-of AGENTS.md's testing rule ("Out of scope, still: real sockets or
-listeners... wall-clock sleeps"). Fix: port them to the transcript harness
-(distinct work from the 4a doc fix; doing 4b makes 4a's claim true).
-
-### 6. Async bandwidth throttling: outbound debt delays the next read, contradicting the stated invariant
-
-`async_net.rs`: `throttle` is a single `Option<Pin<Box<Sleep>>>` slot polled
-at the top of **both** `poll_read` and `poll_write`. The reference insists
-"Inbound and outbound are separate buckets: a large send must not throttle the
-reply to it" - the buckets are separate, but the parked outbound debt from the
-final DATA-body write gates the subsequent read of the server's reply. Under a
-tight cap, reply reads (and thereby the per-operation read timeout budget) are
-consumed by outbound debt. If the invariant is meant literally, the stream
-needs two debt slots (or read-side polling should only wait inbound debt). The
-blocking half has the same wall-clock effect (sleeps inside `write`), so at
-minimum the reference's claim overstates what the design delivers.
+(Finding 6 - outbound throttle debt delaying the next read - is fixed on the
+async side: `AsyncNetworkStream` now carries separate `throttle_in` and
+`throttle_out` sleep slots, `poll_read` consults only inbound debt and
+`poll_write` only outbound, so the debt parked by the final DATA-body write no
+longer eats the read timeout budget for the reply. Pinned by
+`outbound_throttle_debt_does_not_gate_the_next_read`, which polls the read once
+while the write is still in debt, with revert-and-confirm. The blocking half
+genuinely cannot deliver the invariant - `charge` sleeps the very thread that
+will issue the next read, and overlapping the directions would need a second
+thread or a non-blocking socket - so the reference now scopes the guarantee to
+the async funnel and says so explicitly rather than overstating it.)
 
 ## Suspected / minor defects
 
-### 7. Per-line timeout re-arming on multi-line replies
+(Finding 7 - per-line timeout re-arming on multi-line replies - is fixed in
+both halves. The async reader collapses a `PerOperation` budget into an
+`AsyncDeadline` on entry so every line draws from one reply-wide slack; a
+`SetupDeadline` budget passes through unchanged. The blocking reader has only
+`SO_RCVTIMEO`, which is per syscall and has no getter, so `SmtpConnection` now
+keeps the configured value in `read_timeout`, re-arms the socket with the
+remaining slack before each line, and restores the full value when the reply
+ends - treating an exactly-spent deadline as an error rather than a zero
+re-arm, since a zero `SO_RCVTIMEO` means "block forever". Pinned by
+`a_trickled_multi_line_reply_cannot_outrun_the_operation_timeout` (a
+clock-trickling peer under paused tokio time) and
+`multi_line_reply_reads_share_one_deadline` (the transcript now records armed
+read timeouts), both with revert-and-confirm.
 
-`read_response_with_budget_inner` applies the full per-operation timeout to
-*each* line read. A malicious or pathological peer can trickle one line per
-timeout period; the total is bounded only by `MAX_RESPONSE_BYTES / line`
-iterations (~100 lines of 1000 bytes -> 100x the configured timeout). Low
-severity (caps bound it), but a per-reply deadline would match user
-expectations of "timeout".
+Lateral find while fixing it: `AsyncDeadline` measured on `std::time::Instant`
+while every timeout it arms is a `tokio::time::timeout`. Harmless in
+production, where both track the system clock, but it means the deadline and
+its own timers read different clocks - and under `start_paused` test time the
+deadline never expired at all, which is why the setup deadline was effectively
+untestable. Switched to `tokio::time::Instant`.)
 
-### 8. `into_message_body` computes the normalization decision on pre-normalized bytes
+(Finding 8 - `into_message_body` computing the normalization decision on
+pre-normalized bytes - is closed as hardened, NOT as a live defect. The window
+turns out to be unreachable: CRLF normalization only ever lengthens a line
+TERMINATOR or splits a line in two, never lengthens a line, so the
+post-normalization choice can never be stronger than the pre-normalization
+one - and only a stronger choice would mean an already-rewritten buffer being
+treated as opaque. That is now pinned
+directly by `crlf_normalization_never_changes_the_chosen_encoding` over a
+spread of byte bodies (bare CR, bare LF, mixed terminators, over-long lines,
+high bytes, NUL, empty). The suspicion is also structurally removed:
+`into_message_body` carries its ONE decision through to `Body::new_with_encoding`
+instead of letting `Body::new` choose a second time, so a future change to
+`MaybeString::encoding` cannot reintroduce the gap silently - it fails the
+property test instead.)
 
-`body.rs` `into_message_body`: `effective = body.encoding(false)` is evaluated
-before CRLF normalization, then `Body::new` re-chooses the encoding after
-normalization. A byte body sitting exactly at an encoding boundary could be
-CRLF-rewritten (`effective` = 8bit) and then end up base64-encoded (final
-choice), mutating what should have been opaque payload. Extremely narrow
-window; flagged as a suspicion, not a confirmed repro.
+(Finding 11 - boundary re-roll dropping foreign Content-Type parameters - is
+fixed: `ensure_boundary_absent` now replaces the `boundary` parameter on the
+existing Content-Type and keeps every other parameter verbatim, falling back to
+the kind-rebuilt header only for a parameter value containing a `"` or a `\`,
+which cannot be re-emitted losslessly as a quoted string. Pinned by
+`a_boundary_re_roll_keeps_foreign_content_type_parameters`, which checks both
+the no-collision and the re-roll path, with revert-and-confirm.)
 
-### 11. Boundary re-roll can drop foreign Content-Type parameters
-
-`MultiPart::ensure_boundary_absent` rebuilds the Content-Type from
-`MultiPartKind` alone; any non-standard parameter a caller put on the
-multipart Content-Type (e.g. `charset`, vendor params) is lost when a body
-forces a boundary re-roll.
-
-### 13. `Headers` cannot represent repeated header fields
-
-`insert_raw` overwrites by name, so a second `Received`, `Comments`, or
-repeated trace header is silently dropped (the DKIM test even pins "last write
-wins"). Fine for submission of freshly-built mail, but a structural limitation
-worth stating in the reference for anyone routing pre-existing messages
-through `Message`.
+(Finding 13 - `Headers` cannot represent repeated header fields - is closed as
+a documentation item, which is what it asked for: `reference/smtp.md` now
+states the limitation under "Message builder", says who it bites (a caller
+routing pre-existing mail through `Message`, not a caller building fresh mail
+for submission) and points at `send_raw` for that case. No code change; the
+last-write-wins behaviour is intended for the crate's purpose.)
 
 ## Posture / structural note (owner proposal, not a defect)
 

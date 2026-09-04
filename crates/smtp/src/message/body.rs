@@ -269,10 +269,18 @@ where
         let effective = encoding.unwrap_or_else(|| body.encoding(false));
         body.encode_message_crlf(effective);
 
-        match encoding {
-            Some(encoding) => Body::new_with_encoding(body, encoding).expect("invalid encoding"),
-            None => Body::new(body),
-        }
+        // ONE decision governs both steps. `Body::new` would choose again,
+        // from the already-normalized bytes, and a buffer that was CRLF
+        // rewritten because `effective` said "line-oriented text" must not
+        // then be encoded as opaque payload - that rewrite would have mutated
+        // bytes the caller handed over untouchable. The two choices cannot
+        // currently disagree (normalization only ever splits or lengthens
+        // terminators, never a line), which
+        // `crlf_normalization_never_changes_the_chosen_encoding` pins; passing
+        // `effective` through means a future change to `MaybeString::encoding`
+        // cannot quietly reintroduce the gap either.
+        let chosen = encoding.unwrap_or(effective);
+        Body::new_with_encoding(body, chosen).expect("invalid encoding")
     }
 }
 
@@ -408,6 +416,55 @@ mod test {
         in_place_crlf_bytes(&mut bytes);
 
         assert_eq!(bytes, b"first\r\nsecond\r\nthird\r\n");
+    }
+
+    /// Finding 8: `into_message_body` decides whether the buffer is
+    /// line-oriented text from the PRE-normalization bytes, then normalizes.
+    /// If a second choice made from the post-normalization bytes could
+    /// disagree - text going in, opaque payload coming out - the normalization
+    /// would have mutated bytes the caller handed over untouchable. The driver
+    /// now carries the one decision through, and this pins the property that
+    /// made the old two-decision shape safe in the first place, so a change to
+    /// `MaybeString::encoding` that breaks it is caught here rather than in
+    /// somebody's mail.
+    #[test]
+    fn crlf_normalization_never_changes_the_chosen_encoding() {
+        use super::MaybeString;
+
+        let long_line = "a".repeat(1500);
+        let long_line_high = "\u{e9}".repeat(700);
+        let cases: Vec<Vec<u8>> = vec![
+            b"plain ascii".to_vec(),
+            b"bare\nlf\nlines".to_vec(),
+            b"bare\rcr\rlines".to_vec(),
+            b"mixed\r\nand\nand\rterminators\n".to_vec(),
+            b"high \xc3\xa9 bytes\nwith bare lf\n".to_vec(),
+            b"high \xc3\xa9 bytes\rwith bare cr\r".to_vec(),
+            b"trailing bare cr\r".to_vec(),
+            b"trailing bare lf\n".to_vec(),
+            b"\r".to_vec(),
+            b"\n".to_vec(),
+            b"\0nul byte\n".to_vec(),
+            long_line.clone().into_bytes(),
+            format!("{long_line}\nsecond line").into_bytes(),
+            format!("{long_line}\rsecond line").into_bytes(),
+            long_line_high.clone().into_bytes(),
+            format!("{long_line_high}\nsecond").into_bytes(),
+            Vec::new(),
+        ];
+
+        for case in cases {
+            let before = MaybeString::Binary(case.clone()).encoding(false);
+            let mut normalized = MaybeString::Binary(case.clone());
+            normalized.encode_message_crlf(before);
+            let after = normalized.encoding(false);
+            assert_eq!(
+                before,
+                after,
+                "normalization changed the chosen encoding for {:?}",
+                String::from_utf8_lossy(&case)
+            );
+        }
     }
 
     #[test]

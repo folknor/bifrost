@@ -7,8 +7,15 @@ use std::{
     net::{IpAddr, SocketAddr},
     pin::Pin,
     task::{Context, Poll},
-    time::{Duration, Instant},
+    time::Duration,
 };
+
+// Tokio's clock, not `std`'s: every timeout this deadline arms is a
+// `tokio::time::timeout`, so measuring the deadline on a different clock
+// makes the two disagree wherever tokio's clock is not the system one -
+// under `start_paused` test time most visibly, but the principle is that a
+// deadline and the timers it hands out must read the same clock.
+use tokio::time::Instant;
 
 use std::fmt;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -89,14 +96,24 @@ pub(crate) struct AsyncNetworkStream {
     /// Byte accounting and cap for this connection. `disabled()` unless
     /// an account wired one in, so the non-account path is unchanged.
     metering: WireMetering,
-    /// Outstanding throttle debt. Polled to completion before the next
-    /// read or write touches the socket.
+    /// Outstanding inbound throttle debt. Polled to completion before the
+    /// next read touches the socket, and never consulted by a write.
     ///
     /// Held here rather than awaited inline because both the read and
     /// write funnels are `poll_` methods that cannot await. Parking the
     /// sleep in the stream means a throttled connection yields to the
     /// runtime like any other pending IO instead of blocking the task.
-    throttle: Option<Pin<Box<Sleep>>>,
+    ///
+    /// Inbound and outbound debt are separate slots on purpose: the meter
+    /// already keeps separate buckets, and a single shared slot silently
+    /// undid that, because the debt parked by the last DATA-body write
+    /// gated the read of the server's reply to it. That spends the caller's
+    /// per-operation read timeout on outbound debt. See "Bandwidth metering
+    /// and throttling" in `reference/smtp.md`.
+    throttle_in: Option<Pin<Box<Sleep>>>,
+    /// Outstanding outbound throttle debt. Polled to completion before the
+    /// next write touches the socket, and never consulted by a read.
+    throttle_out: Option<Pin<Box<Sleep>>>,
     /// Test-injected peer-certificate DER, returned by
     /// [`Self::peer_certificate_der`] ahead of the TLS session's. The
     /// transcript harness is an in-memory duplex with no TLS, so without this
@@ -117,6 +134,10 @@ impl AsyncTokioStream for TcpStream {}
 impl AsyncTokioStream for TokioUnixStream {}
 #[cfg(test)]
 impl AsyncTokioStream for crate::transport::smtp::test_support::AsyncTranscriptStream {}
+#[cfg(test)]
+impl AsyncTokioStream for crate::transport::smtp::test_support::StalledPeer {}
+#[cfg(test)]
+impl AsyncTokioStream for crate::transport::smtp::test_support::SlowLinePeer {}
 
 /// Represents the different types of underlying network streams
 // usually only one TLS backend at a time is going to be enabled,
@@ -148,7 +169,8 @@ impl AsyncNetworkStream {
             inner,
             state: ConnectionState::Ok,
             metering: WireMetering::disabled(),
-            throttle: None,
+            throttle_in: None,
+            throttle_out: None,
             #[cfg(test)]
             test_peer_certificate_der: None,
         }
@@ -160,14 +182,20 @@ impl AsyncNetworkStream {
         self.metering = metering;
     }
 
-    /// Wait out any throttle debt owed from the previous transfer.
+    /// Wait out any throttle debt owed from the previous transfer in this
+    /// direction. Debt in the other direction is not consulted.
     ///
     /// Returns `Pending` while the debt is outstanding, which parks the
     /// caller the same way a not-yet-readable socket would.
-    fn poll_throttle(&mut self, cx: &mut Context<'_>) -> Poll<()> {
-        if let Some(delay) = &mut self.throttle {
+    fn poll_throttle(&mut self, cx: &mut Context<'_>, inbound: bool) -> Poll<()> {
+        let slot = if inbound {
+            &mut self.throttle_in
+        } else {
+            &mut self.throttle_out
+        };
+        if let Some(delay) = slot {
             std::task::ready!(delay.as_mut().poll(cx));
-            self.throttle = None;
+            *slot = None;
         }
         Poll::Ready(())
     }
@@ -177,13 +205,13 @@ impl AsyncNetworkStream {
         if n == 0 || !self.metering.is_enabled() {
             return;
         }
-        let debt = if inbound {
-            self.metering.record_in(n)
+        let (debt, slot) = if inbound {
+            (self.metering.record_in(n), &mut self.throttle_in)
         } else {
-            self.metering.record_out(n)
+            (self.metering.record_out(n), &mut self.throttle_out)
         };
         if let Some(debt) = debt {
-            self.throttle = Some(Box::pin(tokio::time::sleep(debt)));
+            *slot = Some(Box::pin(tokio::time::sleep(debt)));
         }
     }
 
@@ -200,6 +228,13 @@ impl AsyncNetworkStream {
         Self::new(InnerAsyncNetworkStream::Transcript(Box::new(
             crate::transport::smtp::test_support::AsyncTranscriptStream::new(transcript),
         )))
+    }
+
+    /// Wrap an arbitrary scripted stream. For peers a `Transcript` cannot
+    /// express; see `AsyncSmtpConnection::from_raw_stream_for_test`.
+    #[cfg(test)]
+    pub(crate) fn from_raw_stream_for_test(stream: Box<dyn AsyncTokioStream>) -> Self {
+        Self::new(InnerAsyncNetworkStream::Transcript(stream))
     }
 
     pub(super) fn state(&self) -> ConnectionState {
@@ -380,7 +415,7 @@ impl AsyncRead for AsyncNetworkStream {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<IoResult<()>> {
         let this = self.as_mut().get_mut();
-        std::task::ready!(this.poll_throttle(cx));
+        std::task::ready!(this.poll_throttle(cx, true));
         let before = buf.filled().len();
         let result = match &mut this.inner {
             InnerAsyncNetworkStream::TokioTcp(s) => Pin::new(s).poll_read(cx, buf),
@@ -408,7 +443,7 @@ impl AsyncWrite for AsyncNetworkStream {
         buf: &[u8],
     ) -> Poll<IoResult<usize>> {
         let this = self.as_mut().get_mut();
-        std::task::ready!(this.poll_throttle(cx));
+        std::task::ready!(this.poll_throttle(cx, false));
         let result = match &mut this.inner {
             InnerAsyncNetworkStream::TokioTcp(s) => Pin::new(s).poll_write(cx, buf),
             #[cfg(unix)]
@@ -465,7 +500,9 @@ impl AsyncWrite for AsyncNetworkStream {
 
 #[cfg(test)]
 mod tokio_test {
-    use std::{future::pending, net::TcpListener, thread, time::Duration};
+    use std::{future::pending, time::Duration};
+
+    use crate::transport::smtp::test_support::StalledPeer;
 
     use super::*;
 
@@ -482,27 +519,66 @@ mod tokio_test {
         assert!(error.is_timeout(), "expected timeout, got {error:?}");
     }
 
+    /// Finding 6: the meter keeps separate inbound and outbound buckets, and
+    /// the stream must keep the resulting debt separate too. A single shared
+    /// sleep slot made the debt parked by the final DATA-body write gate the
+    /// read of the server's reply to it, spending the caller's read timeout on
+    /// outbound debt. The read below must complete on its first poll even
+    /// though the preceding write is still in debt.
+    #[tokio::test(crate = "tokio", start_paused = true)]
+    async fn outbound_throttle_debt_does_not_gate_the_next_read() {
+        use std::sync::{Arc, atomic::AtomicU64};
+
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        use crate::transport::smtp::client::metering::WireMetering;
+        use crate::transport::smtp::test_support::Transcript;
+
+        // One byte per second: any write of consequence parks real debt.
+        let cap = Arc::new(AtomicU64::new(1));
+        let transcript = Transcript::new("").expect("PING\r\n", "250 pong\r\n");
+        let mut stream = AsyncNetworkStream::from_transcript(transcript);
+        stream.set_metering(WireMetering::new(None, Some(cap)));
+
+        stream.write_all(b"PING\r\n").await.unwrap();
+        assert!(
+            stream.throttle_out.is_some(),
+            "the write must have parked outbound debt for this test to mean anything"
+        );
+        assert!(
+            stream.throttle_in.is_none(),
+            "an outbound charge must not park inbound debt"
+        );
+
+        // Poll the read exactly once. A read gated on outbound debt returns
+        // Pending here; a read gated only on inbound debt returns the reply.
+        let mut buf = [0_u8; 10];
+        let mut read = Box::pin(stream.read(&mut buf));
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let polled = read.as_mut().poll(&mut cx);
+        let Poll::Ready(Ok(n)) = polled else {
+            panic!("the reply read was gated on outbound throttle debt: {polled:?}");
+        };
+        assert_eq!(&buf[..n], b"250 pong\r\n");
+    }
+
+    /// Finding 4b: this used to bind a `TcpListener` and park a thread in a
+    /// 250ms `thread::sleep` so the handshake would outlive a 50ms deadline.
+    /// `StalledPeer` is the in-memory equivalent - it swallows the opaque
+    /// `ClientHello` and never answers - so the deadline is the only thing that
+    /// can resolve the handshake, with no socket, no thread and no sleep.
     #[tokio::test(crate = "tokio")]
     async fn tokio_tls_handshake_uses_deadline() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-
-        let handle = thread::spawn(move || {
-            let (_stream, _) = listener.accept().unwrap();
-            thread::sleep(Duration::from_millis(250));
-        });
-
         let tls_parameters = TlsParameters::new("localhost".to_owned()).unwrap();
-        let result = AsyncNetworkStream::connect_until(
-            address,
-            AsyncDeadline::new(Some(Duration::from_millis(50))),
-            Some(tls_parameters),
-            None,
+        let result = AsyncNetworkStream::upgrade_tls_stream(
+            Box::new(StalledPeer),
+            tls_parameters,
+            AsyncDeadline::new(Some(Duration::from_millis(25))),
         )
         .await;
 
         let error = result.unwrap_err();
         assert!(error.is_timeout(), "expected timeout, got {error:?}");
-        handle.join().unwrap();
     }
 }

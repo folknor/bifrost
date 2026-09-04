@@ -333,6 +333,28 @@ impl AsyncSmtpConnection {
         .await
     }
 
+    /// A connection over an arbitrary scripted stream, with no banner and no
+    /// EHLO. For peers whose traffic a `Transcript` cannot express - notably
+    /// one that trickles reply lines on a clock, which is what separates a
+    /// per-reply read deadline from a per-line one.
+    #[cfg(test)]
+    pub(in crate::transport::smtp) fn from_raw_stream_for_test(
+        stream: Box<dyn super::async_net::AsyncTokioStream>,
+        hello_name: &ClientId,
+        protocol: Protocol,
+        timeout: Option<Duration>,
+    ) -> Self {
+        AsyncSmtpConnection {
+            stream: BufReader::new(AsyncNetworkStream::from_raw_stream_for_test(stream)),
+            server_info: ServerInfo::default(),
+            hello_name: hello_name.clone(),
+            protocol,
+            timeout,
+            command_buffer: Zeroizing::new(String::new()),
+            retire: false,
+        }
+    }
+
     /// Transcript setup that goes through the same single setup deadline the
     /// real `connect` path uses, so banner and EHLO share one budget.
     #[cfg(test)]
@@ -377,23 +399,55 @@ impl AsyncSmtpConnection {
             return self.send_pipelined(email, mail, recipients).await;
         }
 
-        try_smtp!(self.command(mail).await, self, SmtpCommandPhase::MailFrom);
+        // A routine negative reply is not a transport failure. Mirror the
+        // pipelined path: a rejected MAIL FROM opened no transaction so the
+        // connection stays reusable untouched; a rejected RCPT or DATA is
+        // cleared with RSET. Only a genuine I/O/parse failure aborts.
+        self.run_unpipelined_envelope(mail, recipients).await?;
 
-        for recipient in recipients {
-            try_smtp!(
-                self.command(recipient).await,
-                self,
-                SmtpCommandPhase::RcptTo
-            );
-        }
-
-        try_smtp!(
-            self.command(Data).await,
+        let data_response = try_smtp!(
+            self.command_accepting_status(Data).await,
             self,
             SmtpCommandPhase::DataCommand
         );
+        if !data_response.is_positive() {
+            self.reset_transaction().await;
+            return Err(error::status(data_response).with_phase(SmtpCommandPhase::DataCommand));
+        }
+
         let result = try_smtp!(self.message(email).await, self, SmtpCommandPhase::DataBody);
         Ok(result)
+    }
+
+    /// MAIL FROM + RCPT TO on a server without PIPELINING, treating routine
+    /// negative replies as recoverable (see `send_with_options`).
+    async fn run_unpipelined_envelope(
+        &mut self,
+        mail: Mail,
+        recipients: Vec<Rcpt>,
+    ) -> Result<(), Error> {
+        let mail_response = try_smtp!(
+            self.command_accepting_status(mail).await,
+            self,
+            SmtpCommandPhase::MailFrom
+        );
+        if !mail_response.is_positive() {
+            // No RSET: a rejected MAIL FROM opened no transaction.
+            return Err(error::status(mail_response).with_phase(SmtpCommandPhase::MailFrom));
+        }
+
+        for recipient in recipients {
+            let response = try_smtp!(
+                self.command_accepting_status(recipient).await,
+                self,
+                SmtpCommandPhase::RcptTo
+            );
+            if !response.is_positive() {
+                self.reset_transaction().await;
+                return Err(error::status(response).with_phase(SmtpCommandPhase::RcptTo));
+            }
+        }
+        Ok(())
     }
 
     pub(crate) async fn send_bdat_with_options(
@@ -413,15 +467,7 @@ impl AsyncSmtpConnection {
 
         let (mail, recipients) = build_transaction_commands(envelope, mail_options, &rcpt_options)?;
 
-        try_smtp!(self.command(mail).await, self, SmtpCommandPhase::MailFrom);
-
-        for recipient in recipients {
-            try_smtp!(
-                self.command(recipient).await,
-                self,
-                SmtpCommandPhase::RcptTo
-            );
-        }
+        self.run_unpipelined_envelope(mail, recipients).await?;
 
         let result = try_smtp!(
             self.message_bdat(email).await,
@@ -2194,6 +2240,20 @@ impl AsyncSmtpConnection {
             self.stream.get_mut().set_state(ConnectionState::Broken);
         }
 
+        // The configured timeout bounds the REPLY, not each line of it. Arming
+        // it per line let a peer trickling one line per timeout period stretch
+        // a multi-line reply to `MAX_RESPONSE_BYTES / line` times the
+        // configured timeout - the size caps were the only bound. Collapsing
+        // the per-operation budget to a deadline here makes every subsequent
+        // line read draw from the same remaining slack. A `SetupDeadline`
+        // budget is already deadline-shaped and passes through unchanged.
+        let budget = match budget {
+            TimeoutBudget::PerOperation(timeout) => {
+                TimeoutBudget::SetupDeadline(AsyncDeadline::new(timeout))
+            }
+            deadline @ TimeoutBudget::SetupDeadline(_) => deadline,
+        };
+
         let mut buffer = String::with_capacity(100);
 
         loop {
@@ -2418,6 +2478,128 @@ mod transcript_tests {
                 .unwrap();
         let error = connection.send(&envelope, b"body").await.unwrap_err();
         assert_eq!(error.phase(), Some(super::SmtpCommandPhase::DataCommand));
+    }
+
+    /// Finding 7: the configured timeout bounds the REPLY, not each line of
+    /// it. Arming it per line let a peer trickling one line per timeout period
+    /// stretch one reply to `MAX_RESPONSE_BYTES / line` times the configured
+    /// timeout, with only the size caps as a bound. The peer here answers - it
+    /// is never silent, so every individual line read completes well inside
+    /// the timeout - but the reply as a whole outruns the budget and must
+    /// fail.
+    #[tokio::test(crate = "tokio", start_paused = true)]
+    async fn a_trickled_multi_line_reply_cannot_outrun_the_operation_timeout() {
+        use std::time::Duration;
+
+        use crate::transport::smtp::test_support::SlowLinePeer;
+
+        let hello = ClientId::Domain("client.example".to_owned());
+        // Six lines, 20s apart, under a 30s per-operation timeout. Each line
+        // arrives inside the timeout; six of them are 120s of reply.
+        let peer = SlowLinePeer::new(
+            [
+                "250-one\r\n",
+                "250-two\r\n",
+                "250-three\r\n",
+                "250-four\r\n",
+                "250-five\r\n",
+                "250 six\r\n",
+            ],
+            Duration::from_secs(20),
+        );
+        let mut connection = AsyncSmtpConnection::from_raw_stream_for_test(
+            Box::new(peer),
+            &hello,
+            Protocol::Smtp,
+            Some(Duration::from_secs(30)),
+        );
+
+        let started = tokio::time::Instant::now();
+        let error = connection.read_response().await.unwrap_err();
+
+        assert!(error.is_timeout(), "expected a timeout, got {error:?}");
+        assert!(
+            started.elapsed() <= Duration::from_secs(30),
+            "the whole reply must be bounded by one timeout, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Finding 2: without PIPELINING, a routine negative reply must be handled
+    /// exactly as the pipelined path handles it - RSET (or nothing, for a
+    /// rejected MAIL FROM) and a reusable connection - not `abort()`.
+    #[tokio::test(crate = "tokio")]
+    async fn unpipelined_server_rejections_keep_the_connection_reusable() {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let envelope = Envelope::new(
+            Some("sender@example.com".parse().unwrap()),
+            vec!["recipient@example.com".parse().unwrap()],
+        )
+        .unwrap();
+        let mail = "MAIL FROM:<sender@example.com>\r\n";
+        let rcpt = "RCPT TO:<recipient@example.com>\r\n";
+
+        // MAIL FROM rejected: no transaction was opened, so no RSET.
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250 smtp.example\r\n")
+            .expect(mail, "550 sender rejected\r\n");
+        let mut connection =
+            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp)
+                .await
+                .unwrap();
+        let error = connection.send(&envelope, b"body").await.unwrap_err();
+        assert_eq!(error.phase(), Some(super::SmtpCommandPhase::MailFrom));
+        assert!(!connection.has_broken());
+        transcript.assert_exhausted();
+
+        // RCPT TO rejected: RSET clears the open transaction.
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250 smtp.example\r\n")
+            .expect(mail, "250 sender ok\r\n")
+            .expect(rcpt, "550 recipient rejected\r\n")
+            .expect("RSET\r\n", "250 reset ok\r\n");
+        let mut connection =
+            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp)
+                .await
+                .unwrap();
+        let error = connection.send(&envelope, b"body").await.unwrap_err();
+        assert_eq!(error.phase(), Some(super::SmtpCommandPhase::RcptTo));
+        assert!(!connection.has_broken());
+        transcript.assert_exhausted();
+
+        // DATA rejected before the body: RSET, connection survives.
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250 smtp.example\r\n")
+            .expect(mail, "250 sender ok\r\n")
+            .expect(rcpt, "250 recipient ok\r\n")
+            .expect("DATA\r\n", "554 no data\r\n")
+            .expect("RSET\r\n", "250 reset ok\r\n");
+        let mut connection =
+            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp)
+                .await
+                .unwrap();
+        let error = connection.send(&envelope, b"body").await.unwrap_err();
+        assert_eq!(error.phase(), Some(super::SmtpCommandPhase::DataCommand));
+        assert!(!connection.has_broken());
+        transcript.assert_exhausted();
+
+        // The BDAT path shares the same envelope runner.
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250-smtp.example\r\n250 CHUNKING\r\n")
+            .expect(mail, "250 sender ok\r\n")
+            .expect(rcpt, "550 recipient rejected\r\n")
+            .expect("RSET\r\n", "250 reset ok\r\n");
+        let mut connection =
+            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp)
+                .await
+                .unwrap();
+        let error = connection
+            .send_bdat_with_options(&envelope, b"body", &SendOptions::default())
+            .await
+            .unwrap_err();
+        assert_eq!(error.phase(), Some(super::SmtpCommandPhase::RcptTo));
+        assert!(!connection.has_broken());
+        transcript.assert_exhausted();
     }
 
     #[tokio::test(crate = "tokio")]

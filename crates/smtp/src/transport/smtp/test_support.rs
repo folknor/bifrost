@@ -1,11 +1,9 @@
-use std::{
-    collections::VecDeque,
-    io::{BufRead, BufReader, Write},
-    net::{SocketAddr, TcpListener},
-    sync::mpsc,
-    thread,
-    time::Duration,
-};
+//! In-memory transcript harness. Everything the drivers, transports and pool
+//! are tested against is scripted here: there are deliberately no listeners,
+//! no threads and no sleeps in this module, so a test can never fail because
+//! of a port, a socket path or the scheduler.
+
+use std::{collections::VecDeque, time::Duration};
 
 #[derive(Clone, Debug)]
 pub(super) struct Transcript {
@@ -28,6 +26,11 @@ struct TranscriptState {
     /// does, so a driver cannot keep talking to a hung-up peer.
     closed: bool,
     shutdown_stalled: bool,
+    /// Every read timeout the blocking driver armed on this stream, in order.
+    /// The transcript never enforces them - it has no clock - but recording
+    /// them is how the per-reply deadline (as opposed to a per-line one) is
+    /// observable hermetically.
+    read_timeouts: Vec<Option<Duration>>,
 }
 
 #[derive(Debug)]
@@ -59,6 +62,7 @@ impl Transcript {
                 coalesced: false,
                 closed: false,
                 shutdown_stalled: false,
+                read_timeouts: Vec::new(),
             })),
         }
     }
@@ -131,6 +135,12 @@ impl Transcript {
         self
     }
 
+    /// Every read timeout armed on this transcript's stream since the last
+    /// call, in order, clearing the record.
+    pub(super) fn take_read_timeouts(&self) -> Vec<Option<Duration>> {
+        std::mem::take(&mut self.shared.lock().expect("transcript lock").read_timeouts)
+    }
+
     pub(super) fn stream(&self) -> TranscriptStream {
         TranscriptStream {
             transcript: self.clone(),
@@ -160,6 +170,19 @@ impl Transcript {
 #[derive(Clone, Debug)]
 pub(super) struct TranscriptStream {
     transcript: Transcript,
+}
+
+impl TranscriptStream {
+    /// Records the timeout the driver armed. The transcript has no clock, so
+    /// nothing is enforced; the record is the observable.
+    pub(super) fn record_read_timeout(&self, duration: Option<Duration>) {
+        self.transcript
+            .shared
+            .lock()
+            .expect("transcript lock")
+            .read_timeouts
+            .push(duration);
+    }
 }
 
 impl std::io::Read for TranscriptStream {
@@ -244,6 +267,129 @@ impl std::io::Write for TranscriptStream {
     }
 }
 
+/// A peer that trickles one reply line per `gap`, swallowing every write.
+///
+/// The in-memory stand-in for a pathological server that answers, just very
+/// slowly. Each line is preceded by a real (paused-clock) sleep, so under
+/// `start_paused` tokio time a reply of N lines costs N gaps of virtual time
+/// with no wall-clock cost. That is what distinguishes a per-reply read
+/// deadline from a per-line one: the per-line arm gives every line a fresh
+/// full timeout and never fires, while one deadline across the reply does.
+#[cfg(feature = "tokio")]
+#[derive(Debug)]
+pub(super) struct SlowLinePeer {
+    lines: VecDeque<Vec<u8>>,
+    gap: Duration,
+    next: std::pin::Pin<Box<tokio::time::Sleep>>,
+}
+
+#[cfg(feature = "tokio")]
+impl SlowLinePeer {
+    pub(super) fn new<I: IntoIterator<Item = &'static str>>(lines: I, gap: Duration) -> Self {
+        Self {
+            lines: lines
+                .into_iter()
+                .map(|line| line.as_bytes().to_vec())
+                .collect(),
+            gap,
+            next: Box::pin(tokio::time::sleep(gap)),
+        }
+    }
+}
+
+#[cfg(feature = "tokio")]
+impl tokio::io::AsyncRead for SlowLinePeer {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::ready!(std::future::Future::poll(self.next.as_mut(), cx));
+        let Some(line) = self.lines.pop_front() else {
+            // Out of lines: park forever, the way a peer that simply stops
+            // talking does. Only the caller's own deadline resumes this.
+            return std::task::Poll::Pending;
+        };
+        let gap = self.gap;
+        self.next = Box::pin(tokio::time::sleep(gap));
+        buf.put_slice(&line);
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+#[cfg(feature = "tokio")]
+impl tokio::io::AsyncWrite for SlowLinePeer {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::task::Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+/// A peer that accepts every byte written to it and never answers.
+///
+/// The in-memory stand-in for "a listener that accepts the TCP connection and
+/// then sleeps": it is what a setup-deadline test needs, because the handshake
+/// bytes it swallows are opaque (a TLS `ClientHello` is not scriptable) and the
+/// only thing that may resume the caller is the caller's own deadline. Reads
+/// park with no waker registered, exactly as `AsyncTranscriptStream` does for
+/// a stalled step, so nothing but a timeout or a cancellation can wake it.
+#[cfg(feature = "tokio")]
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct StalledPeer;
+
+#[cfg(feature = "tokio")]
+impl tokio::io::AsyncRead for StalledPeer {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        _buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Pending
+    }
+}
+
+#[cfg(feature = "tokio")]
+impl tokio::io::AsyncWrite for StalledPeer {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::task::Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
 #[cfg(feature = "tokio")]
 #[derive(Clone, Debug)]
 pub(super) struct AsyncTranscriptStream {
@@ -317,203 +463,4 @@ impl tokio::io::AsyncWrite for AsyncTranscriptStream {
             std::task::Poll::Ready(Ok(()))
         }
     }
-}
-
-#[cfg(unix)]
-use std::{
-    fs,
-    path::PathBuf,
-    process,
-    sync::atomic::{AtomicU64, Ordering},
-};
-
-#[cfg(unix)]
-use std::os::unix::net::UnixListener;
-
-#[cfg(unix)]
-static NEXT_UNIX_SOCKET: AtomicU64 = AtomicU64::new(0);
-
-pub(super) struct LmtpServer {
-    pub(super) address: SocketAddr,
-    commands_rx: mpsc::Receiver<Vec<String>>,
-    handle: thread::JoinHandle<()>,
-}
-
-#[cfg(unix)]
-pub(super) struct UnixLmtpServer {
-    pub(super) path: PathBuf,
-    commands_rx: mpsc::Receiver<Vec<String>>,
-    handle: Option<thread::JoinHandle<()>>,
-}
-
-impl LmtpServer {
-    pub(super) fn commands(self) -> Vec<String> {
-        let commands = self
-            .commands_rx
-            .recv_timeout(Duration::from_secs(3))
-            .unwrap();
-        self.handle.join().unwrap();
-        commands
-    }
-}
-
-#[cfg(unix)]
-impl UnixLmtpServer {
-    pub(super) fn commands(mut self) -> Vec<String> {
-        let commands = self
-            .commands_rx
-            .recv_timeout(Duration::from_secs(3))
-            .unwrap();
-        self.handle.take().unwrap().join().unwrap();
-        commands
-    }
-}
-
-#[cfg(unix)]
-impl Drop for UnixLmtpServer {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
-}
-
-pub(super) fn spawn_lmtp_delivery_server() -> LmtpServer {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap();
-    let (commands_tx, commands_rx) = mpsc::channel();
-
-    let handle = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
-        stream.write_all(b"220 localhost\r\n").unwrap();
-
-        let mut reader = BufReader::new(stream.try_clone().unwrap());
-        let mut commands = Vec::new();
-
-        let mut lhlo = String::new();
-        reader.read_line(&mut lhlo).unwrap();
-        commands.push(lhlo);
-        stream
-            .write_all(b"250-localhost\r\n250 8BITMIME\r\n")
-            .unwrap();
-
-        for response in [
-            b"250 sender ok\r\n".as_slice(),
-            b"250 rcpt ok\r\n".as_slice(),
-            b"550 rcpt rejected\r\n".as_slice(),
-            b"250 rcpt ok\r\n".as_slice(),
-        ] {
-            let mut command = String::new();
-            reader.read_line(&mut command).unwrap();
-            commands.push(command);
-            stream.write_all(response).unwrap();
-        }
-
-        let mut data = String::new();
-        reader.read_line(&mut data).unwrap();
-        commands.push(data);
-        stream.write_all(b"354 send message\r\n").unwrap();
-
-        let mut line = String::new();
-        loop {
-            line.clear();
-            reader.read_line(&mut line).unwrap();
-            if line == ".\r\n" {
-                break;
-            }
-        }
-
-        stream
-            .write_all(b"250 first recipient ok\r\n451 third recipient deferred\r\n")
-            .unwrap();
-        commands_tx.send(commands).unwrap();
-    });
-
-    LmtpServer {
-        address,
-        commands_rx,
-        handle,
-    }
-}
-
-#[cfg(unix)]
-pub(super) fn spawn_unix_lmtp_delivery_server() -> UnixLmtpServer {
-    let socket_id = NEXT_UNIX_SOCKET.fetch_add(1, Ordering::Relaxed);
-    // Fall back to the WORKSPACE target dir, not a crate-local `target/`,
-    // which litters an otherwise clean crate tree when the env var is unset
-    // (unit-test builds do not set CARGO_TARGET_TMPDIR).
-    let socket_dir = std::env::var_os("CARGO_TARGET_TMPDIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/t"));
-    fs::create_dir_all(&socket_dir).unwrap();
-    let path = socket_dir.join(format!("lmtp-{}-{socket_id}.sock", process::id()));
-    let _ = fs::remove_file(&path);
-
-    let listener = UnixListener::bind(&path).unwrap();
-    let (commands_tx, commands_rx) = mpsc::channel();
-
-    let handle = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
-        stream.write_all(b"220 localhost\r\n").unwrap();
-
-        let mut reader = BufReader::new(stream.try_clone().unwrap());
-        let mut commands = Vec::new();
-
-        let mut lhlo = String::new();
-        reader.read_line(&mut lhlo).unwrap();
-        commands.push(lhlo);
-        stream
-            .write_all(b"250-localhost\r\n250 8BITMIME\r\n")
-            .unwrap();
-
-        for response in [
-            b"250 sender ok\r\n".as_slice(),
-            b"250 rcpt ok\r\n".as_slice(),
-            b"550 rcpt rejected\r\n".as_slice(),
-            b"250 rcpt ok\r\n".as_slice(),
-        ] {
-            let mut command = String::new();
-            reader.read_line(&mut command).unwrap();
-            commands.push(command);
-            stream.write_all(response).unwrap();
-        }
-
-        let mut data = String::new();
-        reader.read_line(&mut data).unwrap();
-        commands.push(data);
-        stream.write_all(b"354 send message\r\n").unwrap();
-
-        let mut line = String::new();
-        loop {
-            line.clear();
-            reader.read_line(&mut line).unwrap();
-            if line == ".\r\n" {
-                break;
-            }
-        }
-
-        stream
-            .write_all(b"250 first recipient ok\r\n451 third recipient deferred\r\n")
-            .unwrap();
-        commands_tx.send(commands).unwrap();
-    });
-
-    UnixLmtpServer {
-        path,
-        commands_rx,
-        handle: Some(handle),
-    }
-}
-
-pub(super) fn assert_lmtp_delivery_commands(commands: &[String]) {
-    assert!(commands[0].starts_with("LHLO "));
-    assert!(commands[1].starts_with("MAIL FROM:<sender@example.com>"));
-    assert!(commands[2].starts_with("RCPT TO:<first@example.com>"));
-    assert!(commands[3].starts_with("RCPT TO:<second@example.com>"));
-    assert!(commands[4].starts_with("RCPT TO:<third@example.com>"));
-    assert_eq!(commands[5], "DATA\r\n");
 }

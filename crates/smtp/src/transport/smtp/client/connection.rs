@@ -4,7 +4,7 @@ use std::{
     fmt::{Display, Write as _},
     io::{self, BufRead, BufReader, Read, Write},
     net::{IpAddr, ToSocketAddrs},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use bifrost_sasl::ScramChannelBinding;
@@ -102,6 +102,15 @@ pub(crate) struct SmtpConnection {
     /// Set once an LMTP final-status drain has run: the connection must not
     /// go back into the pool because stream cleanliness cannot be proven.
     retire: bool,
+    /// The per-operation read timeout this connection was configured with.
+    ///
+    /// The socket option is per read SYSCALL, so a multi-line reply armed with
+    /// it alone re-arms the full timeout for every line - a peer trickling one
+    /// line per period stretches one reply to many times the configured
+    /// timeout. `read_response_inner` therefore re-arms the socket with the
+    /// slack left on a per-reply deadline instead, which needs the configured
+    /// value kept here (the socket has no getter for it).
+    read_timeout: Option<Duration>,
 }
 
 impl SmtpConnection {
@@ -149,6 +158,7 @@ impl SmtpConnection {
             protocol,
             command_buffer: Zeroizing::new(String::new()),
             retire: false,
+            read_timeout: None,
         };
         let _response = conn.read_response()?;
         conn.hello(hello_name)?;
@@ -176,6 +186,7 @@ impl SmtpConnection {
             protocol,
             command_buffer: Zeroizing::new(String::new()),
             retire: false,
+            read_timeout: None,
         };
         conn.set_timeout(timeout).map_err(error::network)?;
         let _response = conn.read_response()?;
@@ -206,6 +217,7 @@ impl SmtpConnection {
             protocol,
             command_buffer: Zeroizing::new(String::new()),
             retire: false,
+            read_timeout: None,
         };
         conn.set_timeout(timeout).map_err(error::network)?;
         let _response = conn.read_response()?;
@@ -236,15 +248,51 @@ impl SmtpConnection {
             return self.send_pipelined(email, mail, recipients);
         }
 
-        try_smtp!(self.command(mail), self, SmtpCommandPhase::MailFrom);
+        // A routine negative reply is not a transport failure. Mirror the
+        // pipelined path: a rejected MAIL FROM opened no transaction so the
+        // connection stays reusable untouched; a rejected RCPT or DATA is
+        // cleared with RSET. Only a genuine I/O/parse failure aborts.
+        self.run_unpipelined_envelope(mail, recipients)?;
 
-        for recipient in recipients {
-            try_smtp!(self.command(recipient), self, SmtpCommandPhase::RcptTo);
+        let data_response = try_smtp!(
+            self.command_accepting_status(Data),
+            self,
+            SmtpCommandPhase::DataCommand
+        );
+        if !data_response.is_positive() {
+            self.reset_transaction();
+            return Err(error::status(data_response).with_phase(SmtpCommandPhase::DataCommand));
         }
 
-        try_smtp!(self.command(Data), self, SmtpCommandPhase::DataCommand);
         let result = try_smtp!(self.message(email), self, SmtpCommandPhase::DataBody);
         Ok(result)
+    }
+
+    /// MAIL FROM + RCPT TO on a server without PIPELINING, treating routine
+    /// negative replies as recoverable (see `send_with_options`).
+    fn run_unpipelined_envelope(&mut self, mail: Mail, recipients: Vec<Rcpt>) -> Result<(), Error> {
+        let mail_response = try_smtp!(
+            self.command_accepting_status(mail),
+            self,
+            SmtpCommandPhase::MailFrom
+        );
+        if !mail_response.is_positive() {
+            // No RSET: a rejected MAIL FROM opened no transaction.
+            return Err(error::status(mail_response).with_phase(SmtpCommandPhase::MailFrom));
+        }
+
+        for recipient in recipients {
+            let response = try_smtp!(
+                self.command_accepting_status(recipient),
+                self,
+                SmtpCommandPhase::RcptTo
+            );
+            if !response.is_positive() {
+                self.reset_transaction();
+                return Err(error::status(response).with_phase(SmtpCommandPhase::RcptTo));
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn send_bdat_with_options(
@@ -264,11 +312,7 @@ impl SmtpConnection {
 
         let (mail, recipients) = build_transaction_commands(envelope, mail_options, &rcpt_options)?;
 
-        try_smtp!(self.command(mail), self, SmtpCommandPhase::MailFrom);
-
-        for recipient in recipients {
-            try_smtp!(self.command(recipient), self, SmtpCommandPhase::RcptTo);
-        }
+        self.run_unpipelined_envelope(mail, recipients)?;
 
         let result = try_smtp!(self.message_bdat(email), self, SmtpCommandPhase::BdatBody);
         Ok(result)
@@ -1505,6 +1549,7 @@ impl SmtpConnection {
 
     /// Set timeout
     pub(crate) fn set_timeout(&mut self, duration: Option<Duration>) -> io::Result<()> {
+        self.read_timeout = duration;
         self.stream.get_mut().set_read_timeout(duration)?;
         self.stream.get_mut().set_write_timeout(duration)
     }
@@ -1973,6 +2018,26 @@ impl SmtpConnection {
         accept_negative: bool,
         manage_state: bool,
     ) -> Result<Response, Error> {
+        let configured = self.read_timeout;
+        let result = self.read_response_until(accept_negative, manage_state, configured);
+        if configured.is_some() {
+            // Restore the full per-operation timeout for the next reply,
+            // whichever way this one ended.
+            let _ = self.stream.get_mut().set_read_timeout(configured);
+        }
+        result
+    }
+
+    /// One reply, bounded as a whole rather than per line. See the
+    /// `read_timeout` field for why the deadline lives here.
+    fn read_response_until(
+        &mut self,
+        accept_negative: bool,
+        manage_state: bool,
+        configured: Option<Duration>,
+    ) -> Result<Response, Error> {
+        let expires_at = configured.map(|timeout| Instant::now() + timeout);
+
         if manage_state {
             self.stream.get_ref().state().verify()?;
             self.stream.get_mut().set_state(ConnectionState::Broken);
@@ -1981,6 +2046,19 @@ impl SmtpConnection {
         let mut buffer = String::with_capacity(100);
 
         loop {
+            if let Some(expires_at) = expires_at {
+                // A zero `SO_RCVTIMEO` means "block forever" on a real socket,
+                // so an exactly-spent deadline must be an error here, not a
+                // zero re-arm that would hang the very read it bounds.
+                let remaining = expires_at
+                    .checked_duration_since(Instant::now())
+                    .filter(|remaining| !remaining.is_zero())
+                    .ok_or_else(|| error::timeout("SMTP read timed out"))?;
+                self.stream
+                    .get_mut()
+                    .set_read_timeout(Some(remaining))
+                    .map_err(error::network)?;
+            }
             let mut line = Vec::with_capacity(100);
             let bytes_read = {
                 let mut limited = (&mut self.stream).take((MAX_RESPONSE_LINE_BYTES + 1) as u64);
@@ -2181,6 +2259,135 @@ mod transcript_tests {
             SmtpConnection::from_transcript(transcript, &hello, Protocol::Smtp).unwrap();
         let error = connection.send(&envelope, b"body").unwrap_err();
         assert_eq!(error.phase(), Some(super::SmtpCommandPhase::DataCommand));
+    }
+
+    /// Finding 7: the configured timeout bounds the REPLY, not each line of
+    /// it. The socket option is per read syscall, so the driver must re-arm it
+    /// with the slack left on a per-reply deadline; otherwise a peer trickling
+    /// one line per timeout period stretches one reply to many times the
+    /// configured timeout. The transcript records every armed value, so the
+    /// per-line arm (a constant) and the per-reply arm (strictly decreasing
+    /// within a reply, reset between replies) are distinguishable.
+    #[test]
+    fn multi_line_reply_reads_share_one_deadline() {
+        use std::time::Duration;
+
+        use crate::transport::smtp::commands::Noop;
+
+        let hello = ClientId::Domain("client.example".to_owned());
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250 smtp.example\r\n")
+            .expect(
+                "NOOP\r\n",
+                "250-first\r\n250-second\r\n250-third\r\n250 fourth\r\n",
+            );
+        let mut connection =
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp).unwrap();
+        connection
+            .set_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        transcript.take_read_timeouts();
+
+        connection.command(Noop).unwrap();
+
+        // One arm per line read, then the restore. Every arm inside the reply
+        // must be strictly shorter than the previous one: they all draw from
+        // the same deadline. A per-line re-arm would repeat 30s verbatim.
+        let armed = transcript.take_read_timeouts();
+        let restore = armed.last().copied().flatten();
+        assert_eq!(
+            restore,
+            Some(Duration::from_secs(30)),
+            "the full per-operation timeout must be restored after the reply"
+        );
+        let within: Vec<Duration> = armed[..armed.len() - 1]
+            .iter()
+            .map(|armed| armed.expect("a bounded read must arm a bounded timeout"))
+            .collect();
+        assert!(
+            within.len() >= 2,
+            "the multi-line reply must have taken more than one read: {within:?}"
+        );
+        assert!(
+            within.windows(2).all(|pair| pair[1] <= pair[0]),
+            "each line must draw from the reply's remaining slack: {within:?}"
+        );
+        assert!(
+            within[within.len() - 1] < within[0],
+            "the slack must actually shrink across the reply, not re-arm: {within:?}"
+        );
+        assert!(
+            within.iter().all(|armed| *armed <= Duration::from_secs(30)),
+            "no line may be armed with more than the configured timeout: {within:?}"
+        );
+    }
+
+    /// Finding 2: without PIPELINING, a routine negative reply must be handled
+    /// exactly as the pipelined path handles it - RSET (or nothing, for a
+    /// rejected MAIL FROM) and a reusable connection - not `abort()`.
+    #[test]
+    fn unpipelined_server_rejections_keep_the_connection_reusable() {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let envelope = Envelope::new(
+            Some("sender@example.com".parse().unwrap()),
+            vec!["recipient@example.com".parse().unwrap()],
+        )
+        .unwrap();
+        let mail = "MAIL FROM:<sender@example.com>\r\n";
+        let rcpt = "RCPT TO:<recipient@example.com>\r\n";
+
+        // MAIL FROM rejected: no transaction was opened, so no RSET.
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250 smtp.example\r\n")
+            .expect(mail, "550 sender rejected\r\n");
+        let mut connection =
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp).unwrap();
+        let error = connection.send(&envelope, b"body").unwrap_err();
+        assert_eq!(error.phase(), Some(super::SmtpCommandPhase::MailFrom));
+        assert!(!connection.has_broken());
+        transcript.assert_exhausted();
+
+        // RCPT TO rejected: RSET clears the open transaction.
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250 smtp.example\r\n")
+            .expect(mail, "250 sender ok\r\n")
+            .expect(rcpt, "550 recipient rejected\r\n")
+            .expect("RSET\r\n", "250 reset ok\r\n");
+        let mut connection =
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp).unwrap();
+        let error = connection.send(&envelope, b"body").unwrap_err();
+        assert_eq!(error.phase(), Some(super::SmtpCommandPhase::RcptTo));
+        assert!(!connection.has_broken());
+        transcript.assert_exhausted();
+
+        // DATA rejected before the body: RSET, connection survives.
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250 smtp.example\r\n")
+            .expect(mail, "250 sender ok\r\n")
+            .expect(rcpt, "250 recipient ok\r\n")
+            .expect("DATA\r\n", "554 no data\r\n")
+            .expect("RSET\r\n", "250 reset ok\r\n");
+        let mut connection =
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp).unwrap();
+        let error = connection.send(&envelope, b"body").unwrap_err();
+        assert_eq!(error.phase(), Some(super::SmtpCommandPhase::DataCommand));
+        assert!(!connection.has_broken());
+        transcript.assert_exhausted();
+
+        // The BDAT path shares the same envelope runner.
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250-smtp.example\r\n250 CHUNKING\r\n")
+            .expect(mail, "250 sender ok\r\n")
+            .expect(rcpt, "550 recipient rejected\r\n")
+            .expect("RSET\r\n", "250 reset ok\r\n");
+        let mut connection =
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp).unwrap();
+        let error = connection
+            .send_bdat_with_options(&envelope, b"body", &SendOptions::default())
+            .unwrap_err();
+        assert_eq!(error.phase(), Some(super::SmtpCommandPhase::RcptTo));
+        assert!(!connection.has_broken());
+        transcript.assert_exhausted();
     }
 
     #[test]
