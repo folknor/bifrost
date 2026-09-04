@@ -27,9 +27,7 @@ use uuid::Uuid;
 
 use crate::CardDavConfig;
 use crate::capabilities::carddav_capabilities;
-use crate::client::{
-    CardDavClient, PutCondition, local_error, not_found_error, parse_error, unsupported_error,
-};
+use crate::client::{CardDavClient, PutCondition, local_error, not_found_error, unsupported_error};
 use crate::parse::{AddressBookCollection, CardDavFetchedVCard, CardDavMultigetReport};
 use crate::vcard::{VCardParseError, contact_from_vcard, vcard_from_create, vcard_from_patch};
 
@@ -172,7 +170,7 @@ impl CardDavAccount {
                 .or(default_addressbook_url)
                 .ok_or_else(|| no_default_addressbook(operation))?,
         };
-        let card = Self::fetch_contact_resource(&client, &addressbook, &contact, operation).await?;
+        let card = Self::fetch_contact_resource(&client, &contact, operation).await?;
         contact_from_vcard(
             card.uri,
             Some(AddressBookId(addressbook)),
@@ -182,31 +180,27 @@ impl CardDavAccount {
         .map_err(|error| project_error(operation, &error))
     }
 
+    /// Fetch one contact resource by addressing the resource itself.
+    ///
+    /// Twin of `bifrost-caldav`'s `fetch_event_from_url`. This used to REPORT an
+    /// `addressbook-multiget` against the collection derived from the resource
+    /// URL; the GET has no dependence on that derivation being right and reads
+    /// the same validator from the `ETag` header. A missing resource still
+    /// surfaces as `NotFound(Contact)` scoped to the id, as it did when the
+    /// empty multiget report produced it.
     async fn fetch_contact_resource(
         client: &CardDavClient,
-        addressbook: &str,
         contact: &ContactId,
         operation: AccountOperation,
     ) -> Result<CardDavFetchedVCard, AccountError> {
-        let report = client
-            .fetch_vcards(addressbook, std::slice::from_ref(&contact.0), operation)
-            .await?
-            .report;
-        if report
-            .missing_data
-            .iter()
-            .any(|href| href == &client.resolve_url(&contact.0))
-        {
-            return Err(parse_error(
-                operation,
-                "CardDAV multiget response omitted address-data",
-            ));
-        }
-        let (cards, _) = resolved_report(report);
-        cards
-            .into_iter()
-            .next()
-            .ok_or_else(|| not_found_error(operation, contact.0.clone()))
+        let url = client.resolve_url(&contact.0);
+        client.get_vcard(&url, operation).await.map_err(|error| {
+            if matches!(error.kind(), AccountErrorKind::NotFound(_)) {
+                not_found_error(operation, contact.0.clone())
+            } else {
+                error
+            }
+        })
     }
 
     /// Move one contact resource into another address book collection.
@@ -1104,13 +1098,9 @@ impl Account for CardDavAccount {
                 .as_ref()
                 .map(|target| client.resolve_url(&target.0))
                 .filter(|target| !same_collection_url(target, &addressbook));
-            let raw = Self::fetch_contact_resource(
-                &client,
-                &addressbook,
-                &contact,
-                AccountOperation::ContactUpdate,
-            )
-            .await?;
+            let raw =
+                Self::fetch_contact_resource(&client, &contact, AccountOperation::ContactUpdate)
+                    .await?;
             let current = contact_from_vcard(
                 raw.uri.clone(),
                 Some(AddressBookId(addressbook)),

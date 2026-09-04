@@ -200,8 +200,22 @@ Supported contact primitives:
   reauthorize/retry signal. A refusal with nothing usable anywhere is still
   an `Err`. Ids appear in exactly one lane: `one_outcome_per_id` drops from
   the failure lane anything that materialized in some leg.
-- `contact_get` - single-resource multiget using the contact id as the
-  DAV href. A missing resource maps to `NotFound(Contact)`.
+- `contact_get` - a plain `GET` of the resource named by the contact id, with
+  the validator read from the `ETag` response header and normalized exactly as
+  the multiget `getetag` was, so snapshot comparison still compares like with
+  like. A missing resource maps to `NotFound(Contact)` scoped to the id.
+  `contact_update` reads the current card through the same path. This was an
+  `addressbook-multiget` REPORT against the collection DERIVED from the resource
+  URL until the dav-bug-hunt round: that shape only works where the derivation
+  matches the collection the server believes holds the card (nested collections
+  and split principal namespaces break it), a `Depth: 0` multiget against a
+  derived parent that is not a collection is a 404/501, and some servers reject
+  absolute-URI hrefs in a multiget body. The multiget's only advantage was
+  carrying the etag in a prop, which the header supplies. CalDAV's `get_event`
+  had the simpler shape all along, so this was the ninth measured divergence
+  between the twins; pinned by
+  `contact_get_addresses_the_resource_with_a_plain_get`, which asserts the
+  method and URL against the request transcript.
 - `contact_create` - creates a vCard 4.0 resource with a UUID-backed
   `.vcf` path using `PUT`.
 - `contact_update` - fetches the current vCard, applies the shared

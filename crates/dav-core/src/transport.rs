@@ -67,6 +67,15 @@ pub struct DavRequest {
     /// `PROPFIND` and `REPORT` - both are reads, and refusing to retry them
     /// after a dropped connection loses resilience for nothing.
     pub(crate) idempotent: Option<bool>,
+    /// The first header this record could not carry, if any.
+    ///
+    /// `header` is a fluent builder and cannot return a `Result` without
+    /// rewriting every call chain in both dialects, so a rejection is recorded
+    /// here and raised by the dispatcher before the request goes out. Silently
+    /// dropping it put a request on the wire MISSING a header the caller asked
+    /// for - an unconditional PUT where an `If-Match` was intended, say - which
+    /// is a far worse failure than a local `Request(Malformed)`.
+    pub(crate) invalid_header: Option<String>,
 }
 
 impl DavRequest {
@@ -78,26 +87,48 @@ impl DavRequest {
             headers: HeaderMap::new(),
             body: None,
             idempotent: None,
+            invalid_header: None,
         }
     }
 
     /// Set one header.
     ///
-    /// A name or value the HTTP grammar rejects is dropped rather than raised.
-    /// Every call site passes either a `HeaderName` constant or a value it has
-    /// already validated, so a rejection here is unreachable in practice; the
-    /// previous builder silently skipped the same cases, and preserving that
-    /// keeps the migration behaviour-neutral.
+    /// A name or value the HTTP grammar rejects is RECORDED rather than
+    /// dropped: the dispatcher refuses the request locally with
+    /// `Request(Malformed)` before any I/O. Every call site passes either a
+    /// `HeaderName` constant or a value it has already validated, so this is
+    /// unreachable in practice - but an etag or destination path carrying a
+    /// stray control byte used to produce a request that went out without the
+    /// header, and a conditional write silently demoted to an unconditional one
+    /// is exactly the failure a lost-update guard exists to prevent.
     #[must_use]
     pub fn header<K, V>(mut self, name: K, value: V) -> Self
     where
         K: TryInto<HeaderName>,
         V: TryInto<HeaderValue>,
     {
-        if let (Ok(name), Ok(value)) = (name.try_into(), value.try_into()) {
-            self.headers.insert(name, value);
+        match (name.try_into(), value.try_into()) {
+            (Ok(name), Ok(value)) => {
+                self.headers.insert(name, value);
+            }
+            (Ok(name), Err(_)) => self.record_invalid_header(name.as_str().to_string()),
+            (Err(_), _) => self.record_invalid_header("<unnameable>".to_string()),
         }
         self
+    }
+
+    /// Keep the FIRST rejection: it is the one closest to the caller's mistake,
+    /// and a later one cannot make the request sendable again.
+    fn record_invalid_header(&mut self, name: String) {
+        if self.invalid_header.is_none() {
+            self.invalid_header = Some(name);
+        }
+    }
+
+    /// The first header this request could not carry, if any.
+    #[must_use]
+    pub fn invalid_header(&self) -> Option<&str> {
+        self.invalid_header.as_deref()
     }
 
     #[must_use]
@@ -195,6 +226,27 @@ mod tests {
         assert!(!origin_is_secure("http://dav.example.test"));
         // Fails closed rather than open.
         assert!(!origin_is_secure("not a url"));
+    }
+
+    /// An invalid header value is RECORDED, not dropped.
+    ///
+    /// Dropping it produced a request that went out missing a header the caller
+    /// asked for - the `If-Match` case turns a conditional write into an
+    /// unconditional one, which is the exact failure the validator exists to
+    /// prevent. The record is what lets the dispatcher refuse locally instead.
+    #[test]
+    fn an_invalid_header_value_is_recorded_rather_than_dropped() {
+        let request = DavRequest::new(Method::PUT, "https://dav.example.test/one.vcf")
+            .header("If-Match", "\"etag\u{7f}\"")
+            .header(reqwest::header::CONTENT_TYPE, "text/vcard");
+        assert_eq!(request.invalid_header(), Some("if-match"));
+        assert!(
+            !request.headers.contains_key("if-match"),
+            "the rejected value must not reach the header map"
+        );
+        // The first rejection is the one kept, and a later good header still
+        // lands.
+        assert!(request.headers.contains_key(reqwest::header::CONTENT_TYPE));
     }
 
     /// A body no longer makes a request unreplayable. The previous walk held a

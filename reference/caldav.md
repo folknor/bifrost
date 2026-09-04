@@ -584,6 +584,20 @@ half: the credential gate, the HTTPS-downgrade refusal and the redirect walk
 were all duplicated, and a divergence there is a credential leak. Ablating
 `is_trusted_url` in the shared crate fails three tests in each crate.
 
+`DavRequest::header` is a fluent builder, so it cannot return a `Result`. A name
+or value the HTTP grammar rejects is therefore RECORDED on the request
+(`invalid_header`, exposed by the accessor of the same name) and raised by
+`dispatch_once` as a local `Request(Malformed)` before any I/O; the header copy
+into the `bifrost-net` builder, which takes `&str`, refuses a non-ASCII
+`HeaderValue` the same way. Both used to be silently dropped, which put a request
+on the wire MISSING a header the caller asked for - a conditional PUT demoted to
+an unconditional one loses its lost-update guard without telling anyone. The
+credential half of the same defect was fixed earlier, in `auth_headers`. Pinned
+by `an_invalid_header_value_is_recorded_rather_than_dropped` in dav-core and, at
+the wire, by `a_header_the_record_could_not_carry_fails_before_the_wire` and
+`a_non_ascii_header_value_fails_before_the_wire` in bifrost-carddav, both of
+which script an EMPTY transport so a regression panics on an exhausted script.
+
 `CalDavCredentials` stays published and unchanged; `to_shared` projects it onto
 the dispatcher's `DavCredentials`, cloning the `Arc` so a bearer token is still
 read live from the shared source at every request.

@@ -15,8 +15,8 @@ use reqwest::{Method, StatusCode};
 
 use crate::CardDavConfig;
 use crate::parse::{
-    AddressBookCollection, CardDavContactListing, CardDavMultigetReport, MultigetOutcome,
-    extract_href_property, parse_addressbook_collections, parse_multiget_report,
+    AddressBookCollection, CardDavContactListing, CardDavFetchedVCard, CardDavMultigetReport,
+    MultigetOutcome, extract_href_property, parse_addressbook_collections, parse_multiget_report,
     parse_propfind_contacts, resolve_href,
 };
 
@@ -363,6 +363,44 @@ impl CardDavClient {
             }
         }
         MultigetFetch::settle(all_results, degraded)
+    }
+
+    /// Fetch one vCard resource with a plain `GET`, reading the validator from
+    /// the `ETag` response header.
+    ///
+    /// Twin of `bifrost-caldav`'s `get_event`; keep them in step. Single-resource
+    /// reads used to go through `addressbook-multiget` against the collection
+    /// DERIVED from the resource URL, which is strictly more fragile: it depends
+    /// on the derived parent actually being the collection the server believes
+    /// holds the resource (nested collections and split principal namespaces
+    /// break that), and some servers reject absolute-URI hrefs in a multiget
+    /// body. The multiget's only advantage was carrying the etag back in a
+    /// prop, and a GET reports the same validator in its `ETag` header.
+    pub(crate) async fn get_vcard(
+        &self,
+        url: &str,
+        operation: AccountOperation,
+    ) -> Result<CardDavFetchedVCard, AccountError> {
+        let request = self
+            .dav
+            .request(Method::GET, url)
+            .headers(self.dav.auth_headers(url, operation).await?);
+        let response = self.dav.send_raw_request(request, operation).await?;
+        let status = response.status;
+        let etag = response
+            .headers
+            .get(ETAG)
+            .and_then(|value| value.to_str().ok())
+            .map(normalize_http_etag);
+        if status.is_success() {
+            Ok(CardDavFetchedVCard {
+                uri: url.to_string(),
+                etag,
+                data: response.body,
+            })
+        } else {
+            Err(status_error(operation, status, response.body))
+        }
     }
 
     pub(crate) async fn put_vcard(
@@ -843,6 +881,121 @@ mod tests {
         );
     }
 
+    /// A header the request record could not carry fails the request LOCALLY.
+    ///
+    /// The empty script is the assertion: a regression that goes back to
+    /// dropping the header silently would put a request on the wire and panic
+    /// on the exhausted script instead of returning `Request(Malformed)`. The
+    /// dropped-`If-Match` case is the one that matters - a conditional write
+    /// demoted to an unconditional one loses the lost-update guard without
+    /// telling anyone.
+    #[tokio::test]
+    async fn a_header_the_record_could_not_carry_fails_before_the_wire() {
+        let script = dav_script_empty();
+        let client =
+            CardDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
+        let request = DavRequest::new(Method::PUT, "https://dav.example.test/book/one.vcf")
+            .header("If-Match", "\"etag\u{7f}\"");
+        let error = client
+            .dav
+            .send_raw_request(request, AccountOperation::ContactUpdate)
+            .await
+            .expect_err("a header-invalid value refuses locally");
+        assert!(
+            matches!(
+                error.kind(),
+                AccountErrorKind::Request(RequestErrorKind::Malformed)
+            ),
+            "expected a local malformed-request refusal: {error:?}"
+        );
+        assert!(transcripts(&script).is_empty(), "no request may go out");
+    }
+
+    /// A header value the transport cannot express as text is the same refusal,
+    /// caught one layer lower: the record holds it, the copy into the
+    /// `bifrost-net` builder (which takes `&str`) cannot.
+    #[tokio::test]
+    async fn a_non_ascii_header_value_fails_before_the_wire() {
+        let script = dav_script_empty();
+        let client =
+            CardDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "If-Match",
+            HeaderValue::from_bytes(b"\"etag-\xff\"")
+                .expect("opaque bytes are a valid HeaderValue"),
+        );
+        let request =
+            DavRequest::new(Method::PUT, "https://dav.example.test/book/one.vcf").headers(headers);
+        assert!(
+            request.invalid_header().is_none(),
+            "the record accepted this value; the transport is the layer that cannot"
+        );
+        let error = client
+            .dav
+            .send_raw_request(request, AccountOperation::ContactUpdate)
+            .await
+            .expect_err("a non-ASCII header value refuses locally");
+        assert!(
+            matches!(
+                error.kind(),
+                AccountErrorKind::Request(RequestErrorKind::Malformed)
+            ),
+            "expected a local malformed-request refusal: {error:?}"
+        );
+        assert!(transcripts(&script).is_empty(), "no request may go out");
+    }
+
+    /// `contact_get` addresses the RESOURCE with a plain GET and reads the
+    /// validator out of the `ETag` header.
+    ///
+    /// It used to REPORT an `addressbook-multiget` against the collection
+    /// derived from the resource URL - a request that only works when that
+    /// derivation matches the collection the server believes holds the card
+    /// (nested collections and split principal namespaces break it), and whose
+    /// body carries an absolute-URI href some servers reject. CalDAV's
+    /// `get_event` had the simpler shape all along. The transcript is asserted
+    /// so a revert to the REPORT is loud.
+    #[tokio::test]
+    async fn contact_get_addresses_the_resource_with_a_plain_get() {
+        use bifrost_types::account::Account as _;
+
+        let mut headers = HeaderMap::new();
+        headers.insert(ETAG, HeaderValue::from_static("\"etag-9\""));
+        let script = dav_script([DavResponse {
+            status: StatusCode::OK,
+            headers,
+            body: "BEGIN:VCARD\r\nVERSION:4.0\r\nFN:Ada Lovelace\r\nEND:VCARD\r\n".to_string(),
+            url: String::new(),
+        }]);
+        let client = Arc::new(CardDavClient::with_account_net(
+            "https://dav.example.test",
+            scripted_dav_net(&script),
+        ));
+        let account = crate::account::CardDavAccount::for_tests(
+            client,
+            "https://dav.example.test/books/ada/personal/",
+        );
+
+        let card = account
+            .contact_get(bifrost_types::ContactId(
+                "https://dav.example.test/books/ada/personal/one.vcf".into(),
+            ))
+            .await
+            .expect("contact_get");
+        // Normalized exactly as the multiget `getetag` was, so the snapshot
+        // diff keeps comparing like with like.
+        assert_eq!(card.etag.as_deref(), Some("etag-9"));
+
+        let requests = transcripts(&script);
+        assert_eq!(requests.len(), 1, "one request, not a REPORT plus anything");
+        assert_eq!(requests[0].method, Method::GET);
+        assert_eq!(
+            requests[0].url, "https://dav.example.test/books/ada/personal/one.vcf",
+            "the request addresses the card, never its derived parent collection"
+        );
+    }
+
     /// An empty address book home lists NOTHING - no fabricated placeholder.
     ///
     /// The phantom this pins the absence of pointed at the home itself and
@@ -1298,12 +1451,11 @@ mod tests {
     async fn contact_update_moves_across_address_books_and_updates_in_place_otherwise() {
         use bifrost_types::account::Account as _;
 
-        let multiget = |href: &str| DavResponse {
-            status: StatusCode::MULTI_STATUS,
+        // The current resource is read with a plain GET now, not a multiget.
+        let fetched = || DavResponse {
+            status: StatusCode::OK,
             headers: HeaderMap::new(),
-            body: format!(
-                "<D:multistatus xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:carddav\"><D:response><D:href>{href}</D:href><D:propstat><D:prop><C:address-data>BEGIN:VCARD\nVERSION:4.0\nFN:One\nEND:VCARD</C:address-data></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response></D:multistatus>"
-            ),
+            body: "BEGIN:VCARD\r\nVERSION:4.0\r\nFN:One\r\nEND:VCARD\r\n".to_string(),
             url: String::new(),
         };
         let contact =
@@ -1313,9 +1465,9 @@ mod tests {
             ..Default::default()
         };
 
-        // A move: multiget the current resource, then MOVE it.
+        // A move: GET the current resource, then MOVE it.
         let script = dav_script([
-            multiget("/books/work/one.vcf"),
+            fetched(),
             DavResponse {
                 status: StatusCode::CREATED,
                 headers: HeaderMap::new(),
@@ -1339,7 +1491,7 @@ mod tests {
         assert_eq!(
             requests.len(),
             2,
-            "a move-only patch is a REPORT and a MOVE, with no content write"
+            "a move-only patch is a GET and a MOVE, with no content write"
         );
         assert_eq!(requests[1].method.as_str(), "MOVE");
         assert_eq!(
@@ -1361,7 +1513,7 @@ mod tests {
 
         // Restating the contact's own address book is not a move.
         let script = dav_script([
-            multiget("/books/work/one.vcf"),
+            fetched(),
             DavResponse {
                 status: StatusCode::NO_CONTENT,
                 headers: HeaderMap::new(),
@@ -1385,7 +1537,7 @@ mod tests {
             .into_iter()
             .map(|request| request.method.as_str().to_string())
             .collect::<Vec<_>>();
-        assert_eq!(methods, vec!["REPORT", "PUT"]);
+        assert_eq!(methods, vec!["GET", "PUT"]);
     }
 
     /// A server without MOVE falls back to copy-then-delete, and a failure of
@@ -1401,25 +1553,25 @@ mod tests {
             body: body.to_string(),
             url: String::new(),
         };
-        let script = dav_script([
-            DavResponse {
-                status: StatusCode::MULTI_STATUS,
-                headers: HeaderMap::new(),
-                body: "<D:multistatus xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:carddav\"><D:response><D:href>/books/work/one.vcf</D:href><D:propstat><D:prop><C:address-data>BEGIN:VCARD\nVERSION:4.0\nFN:One\nEND:VCARD</C:address-data></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response></D:multistatus>".to_string(),
-                url: String::new(),
-            },
-            response(StatusCode::METHOD_NOT_ALLOWED, ""),
-            response(StatusCode::CREATED, ""),
-        ]
-        .into_iter()
-        .map(Canned::from)
-        // The DELETE of the original 500s, and a 500 is now retried to
-        // exhaustion before it surfaces.
-        .chain(dav_retried(response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "boom",
-        )))
-        .collect::<Vec<_>>());
+        let script = dav_script(
+            [
+                response(
+                    StatusCode::OK,
+                    "BEGIN:VCARD\r\nVERSION:4.0\r\nFN:One\r\nEND:VCARD\r\n",
+                ),
+                response(StatusCode::METHOD_NOT_ALLOWED, ""),
+                response(StatusCode::CREATED, ""),
+            ]
+            .into_iter()
+            .map(Canned::from)
+            // The DELETE of the original 500s, and a 500 is now retried to
+            // exhaustion before it surfaces.
+            .chain(dav_retried(response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "boom",
+            )))
+            .collect::<Vec<_>>(),
+        );
         let client = Arc::new(CardDavClient::with_account_net(
             "https://dav.example.test",
             scripted_dav_net(&script),
@@ -1456,7 +1608,7 @@ mod tests {
         // The trailing DELETEs are the retry budget being spent on the 500.
         assert_eq!(
             methods,
-            vec!["REPORT", "MOVE", "PUT", "DELETE", "DELETE", "DELETE"]
+            vec!["GET", "MOVE", "PUT", "DELETE", "DELETE", "DELETE"]
         );
     }
 

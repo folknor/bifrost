@@ -281,14 +281,31 @@ impl DavDispatch {
         request: &DavRequest,
         operation: AccountOperation,
     ) -> Result<DavResponse, AccountError> {
+        // A header the record could not carry, and a header value the transport
+        // cannot express as text, are the same failure seen one layer apart:
+        // the request would go out MISSING something the caller asked for. Both
+        // refuse locally instead, so the caller sees `Request(Malformed)`
+        // rather than a server answering a request it was never sent.
+        if let Some(name) = request.invalid_header() {
+            return Err(local_error(
+                operation,
+                format!("DAV request header {name} is not a valid HTTP header"),
+                self.protocol,
+            ));
+        }
         let mut builder = self
             .net
             .request(request.method.clone(), &request.url)
             .without_bearer_auth();
         for (name, value) in &request.headers {
-            if let Ok(value) = value.to_str() {
-                builder = builder.header(name.as_str(), value);
-            }
+            let Ok(value) = value.to_str() else {
+                return Err(local_error(
+                    operation,
+                    format!("DAV request header {name} carries a non-ASCII value"),
+                    self.protocol,
+                ));
+            };
+            builder = builder.header(name.as_str(), value);
         }
         if let Some(idempotent) = request.idempotent {
             builder = builder.idempotent(idempotent);
@@ -427,6 +444,10 @@ impl DavDispatch {
                 headers,
                 body: request.body,
                 idempotent: request.idempotent,
+                // Unreachable: the first dispatch already refused a request
+                // carrying one. Carried rather than reset so a future path that
+                // reaches here does not launder the rejection away.
+                invalid_header: request.invalid_header,
             };
         }
     }

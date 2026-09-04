@@ -60,19 +60,16 @@ the original comment argued. Pinned by
 `discovery_falls_back_on_not_found_405_and_a_refused_redirect` in each crate,
 revert-and-confirmed in CalDAV; both reference docs updated.)
 
-### 8. `contact_get` addresses the resource via `addressbook-multiget` against the derived *parent collection* URL, unlike CalDAV's direct GET
-
-`fetch_contact_resource` REPORTs the parent collection with the (possibly
-absolute) contact URL as body href. Two exposures: (a) some servers reject
-absolute-URI hrefs in multiget bodies or reject a REPORT on a resource-derived
-URL that isn't actually the collection the server thinks it is (nested
-collections, principals with split namespaces); (b) `Depth: 0` multiget
-against a *derived* parent that happens not to be a collection is a 404/501
-where a plain GET of the resource itself would have worked. CalDAV's
-`get_event` proves the simpler shape exists. The etag does come back via the
-multiget prop, so the divergence has a reason, but a GET returns the ETag
-header too - this looks like an accident of history rather than a necessity.
-Low-moderate severity, real-server dependent.
+(Finding 8 - `contact_get` fetching through `addressbook-multiget` against a
+derived parent collection - is fixed: the new `CardDavClient::get_vcard` is a
+plain GET of the resource, reading the validator from the `ETag` header through
+the same `normalize_http_etag` the multiget `getetag` went through, and
+`fetch_contact_resource` (used by both `contact_get` and `contact_update`) calls
+it, still mapping a 404 to `NotFound(Contact)` scoped to the id. No documented
+reason to keep the multiget was found. Pinned by
+`contact_get_addresses_the_resource_with_a_plain_get`, which asserts method and
+URL against the transcript and was revert-and-confirmed; the two move tests
+moved from a scripted REPORT to a scripted GET. `reference/carddav.md` updated.)
 
 (Finding 9 - CardDAV address books always advertising writable - is fixed:
 `PROPFIND_ADDRESSBOOKS` now requests `current-user-privilege-set`, the collection
@@ -86,13 +83,18 @@ Pinned by `addressbook_collections_derive_writability_from_the_privilege_set`,
 
 ## Lower-confidence / latent
 
-### 10. `DavRequest::header` / `dispatch_once` header copy drop invalid header values (residual)
-
-The credential half of this finding is fixed (`auth_headers` now errors
-locally on header-invalid bytes). Residual: `DavRequest::header` and the
-`dispatch_once` header copy (`value.to_str().ok()`) still silently drop
-non-ASCII / invalid header values; those inputs are crate-internal today, so
-lower priority.
+(Finding 10 - `DavRequest::header` and the `dispatch_once` header copy dropping
+invalid header values - is fixed: `header` cannot return a `Result` without
+rewriting every builder chain, so a rejected name or value is RECORDED on the
+request (`invalid_header`) and `dispatch_once` refuses it locally with
+`Request(Malformed)` before any I/O; the header copy into the `bifrost-net`
+builder refuses a non-ASCII `HeaderValue` the same way instead of skipping it.
+Pinned by `an_invalid_header_value_is_recorded_rather_than_dropped` in dav-core
+and by `a_header_the_record_could_not_carry_fails_before_the_wire` /
+`a_non_ascii_header_value_fails_before_the_wire` in bifrost-carddav, which
+script an empty transport so a silent drop panics on the exhausted script; all
+three revert-and-confirmed. `reference/caldav.md` (the shared-layer section)
+updated.)
 
 (Finding 11 - non-VALARM nested components leaking their properties into the
 VEVENT - is fixed: `parse_vevents` tracks nesting depth and skips every line
