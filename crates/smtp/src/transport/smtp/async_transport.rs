@@ -1015,6 +1015,21 @@ where
         )
         .await?;
 
+        self.authenticate_if_configured(&mut conn).await?;
+        Ok(conn)
+    }
+
+    /// The post-greeting authentication stage.
+    ///
+    /// Factored out of `connection()` so it can be driven against a scripted
+    /// in-memory connection: the refusal it enforces (no AUTH over an
+    /// unencrypted link unless the caller opted in) is a decision made after
+    /// the greeting and EHLO, and has nothing to do with how the socket was
+    /// dialled.
+    pub(super) async fn authenticate_if_configured(
+        &self,
+        conn: &mut AsyncSmtpConnection,
+    ) -> Result<(), Error> {
         if let Some(credentials) = &self.info.credentials {
             if let Err(error) = self.info.ensure_can_authenticate(conn.is_encrypted()) {
                 conn.abort().await;
@@ -1022,7 +1037,7 @@ where
             }
             conn.auth(&self.info.authentication, credentials).await?;
         }
-        Ok(conn)
+        Ok(())
     }
 }
 
@@ -1037,14 +1052,7 @@ impl<E> Debug for AsyncSmtpClient<E> {
 #[cfg(test)]
 #[cfg(feature = "tokio")]
 mod tests {
-    use std::{
-        io::{BufRead, BufReader, Write},
-        marker::PhantomData,
-        net::TcpListener,
-        sync::mpsc,
-        thread,
-        time::Duration,
-    };
+    use std::marker::PhantomData;
 
     use crate::{
         AsyncLmtpTransport, AsyncSmtpTransport, TokioExecutor,
@@ -1053,10 +1061,11 @@ mod tests {
                 Credentials, DEFAULT_MECHANISMS, Mechanism, OAUTH2_MECHANISMS, PASSWORD_MECHANISMS,
             },
             client::Tls,
+            test_support::Transcript,
         },
     };
 
-    use super::{AsyncSmtpClient, Protocol};
+    use super::{AsyncSmtpClient, AsyncSmtpConnection, ClientId, Protocol};
 
     #[test]
     fn tokio_transport_from_plaintext_url() {
@@ -1229,47 +1238,78 @@ mod tests {
         );
     }
 
+    /// Finding 4c: ported off the loopback listener, the async mirror of the
+    /// blocking pin. The transcript scripts the greeting and the `AUTH
+    /// PLAIN`-advertising EHLO reply and NOTHING else, so an AUTH command
+    /// reaching the wire fails the write outright instead of producing the
+    /// policy error - the same observable the old listener's zero-length read
+    /// gave, without a socket.
     #[tokio::test(crate = "tokio")]
     async fn tokio_plaintext_auth_is_refused_before_auth_command() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let (observed_tx, observed_rx) = mpsc::channel();
+        let transcript = Transcript::new("220 localhost\r\n").expect(
+            "EHLO client.example\r\n",
+            "250-localhost\r\n250 AUTH PLAIN\r\n",
+        );
+        let mut conn = AsyncSmtpConnection::from_transcript(
+            transcript.clone(),
+            &ClientId::Domain("client.example".to_owned()),
+            Protocol::Smtp,
+        )
+        .await
+        .unwrap();
 
-        let handle = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
-            stream.write_all(b"220 localhost\r\n").unwrap();
-
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut ehlo = String::new();
-            reader.read_line(&mut ehlo).unwrap();
-            stream
-                .write_all(b"250-localhost\r\n250 AUTH PLAIN\r\n")
-                .unwrap();
-
-            let mut after_ehlo = String::new();
-            let read = reader.read_line(&mut after_ehlo).unwrap();
-            observed_tx.send((read, after_ehlo)).unwrap();
-        });
-
-        let builder = AsyncSmtpTransport::<TokioExecutor>::builder_dangerous("127.0.0.1")
-            .port(address.port())
-            .password("user", "pass");
+        let info = AsyncSmtpTransport::<TokioExecutor>::builder_dangerous("127.0.0.1")
+            .password("user", "pass")
+            .info;
         let client = AsyncSmtpClient::<TokioExecutor> {
-            info: builder.info,
+            info,
             marker_: PhantomData,
         };
-        let Err(error) = client.connection().await else {
+        let Err(error) = client.authenticate_if_configured(&mut conn).await else {
             panic!("plaintext auth must be refused");
         };
 
         assert!(error.is_policy(), "expected policy error, got {error:?}");
-        let (read, after_ehlo) = observed_rx.recv_timeout(Duration::from_secs(3)).unwrap();
-        assert_eq!(read, 0, "client must close instead of sending AUTH");
-        assert_eq!(after_ehlo, "");
-        handle.join().unwrap();
+        transcript.assert_exhausted();
+    }
+
+    /// Finding 4c: the async escape-hatch mirror. The transcript DOES script
+    /// an `AUTH PLAIN` step here, so the exact base64 credential line the
+    /// driver puts on the wire is asserted by the transcript itself.
+    #[tokio::test(crate = "tokio")]
+    async fn tokio_dangerous_allow_insecure_auth_sends_auth_plain_on_a_plaintext_connection() {
+        let transcript = Transcript::new("220 localhost\r\n")
+            .expect(
+                "EHLO client.example\r\n",
+                "250-localhost\r\n250 AUTH PLAIN\r\n",
+            )
+            .expect("AUTH PLAIN AHVzZXIAcGFzcw==\r\n", "235 authenticated\r\n")
+            // A successful AUTH re-issues EHLO: the server's capability list
+            // may change once the session is authenticated.
+            .expect("EHLO client.example\r\n", "250 localhost\r\n");
+        let mut conn = AsyncSmtpConnection::from_transcript(
+            transcript.clone(),
+            &ClientId::Domain("client.example".to_owned()),
+            Protocol::Smtp,
+        )
+        .await
+        .unwrap();
+
+        let info = AsyncSmtpTransport::<TokioExecutor>::builder_dangerous("127.0.0.1")
+            .password("user", "pass")
+            .dangerous_allow_insecure_auth(true)
+            .authentication(vec![Mechanism::Plain])
+            .info;
+        let client = AsyncSmtpClient::<TokioExecutor> {
+            info,
+            marker_: PhantomData,
+        };
+        client
+            .authenticate_if_configured(&mut conn)
+            .await
+            .expect("the escape hatch permits plaintext AUTH");
+
+        transcript.assert_exhausted();
     }
 
     mod pooled_batch {

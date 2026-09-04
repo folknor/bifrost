@@ -443,10 +443,16 @@ LMTP delivery pins (`lmtp_transport_returns_per_recipient_statuses` and its
 `tokio_` twin) run against a parked transcript connection, and the Unix-socket
 case pins the routing decision - builder wiring plus the TLS-over-Unix refusal
 raised inside `connection()` before any dial - since the kernel's socket is not
-the part a test can prove in-process. A handful of loopback-listener tests
-outside this module still cover the pre-AUTH refusal ladder; they are the
-remaining non-hermetic tests in the crate. A transcript is a greeting plus an
-ordered list of
+the part a test can prove in-process. No test anywhere in the crate - unit or
+integration - binds a socket, spawns a listener thread or sleeps on the wall
+clock. The pre-AUTH refusal ladder is the last thing that did: the post-greeting
+authentication stage is factored into
+`SmtpClient::authenticate_if_configured` (and its async twin) precisely so
+`plaintext_auth_is_refused_before_auth_command` can drive it against a
+transcript that scripts no AUTH step, where an AUTH command reaching the wire
+fails the write instead of producing the policy error. The escape-hatch mirror
+scripts the exact `AUTH PLAIN` line and the post-AUTH EHLO. A transcript is a
+greeting plus an ordered list of
 `expect(client_bytes, server_bytes)` steps. Three properties make it bite:
 
 - Each client write must match one scripted step byte-for-byte, so command
@@ -468,7 +474,11 @@ ordered list of
   close-mid-response case: reads report EOF once the scripted bytes are gone
   and any later client write fails the way a write to a closed socket does.
   A truncated reply must surface as an `incomplete response` parse error,
-  never a hang.
+  never a hang. The `MAX_RESPONSE_LINE_BYTES` cap is pinned the same way, by
+  `an_oversized_greeting_line_is_a_parse_error_not_a_hang` in both halves. Note
+  that the greeting it scripts is well-formed and merely over-long: a line of
+  garbage fails to parse whether or not the cap is enforced, so it pins nothing
+  about the cap.
 
 The transcript stream carries no TLS, so `peer_certificate_der()` is `None`
 under test. A test-only seam on `AsyncNetworkStream`

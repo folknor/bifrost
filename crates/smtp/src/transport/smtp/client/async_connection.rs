@@ -2344,6 +2344,33 @@ mod transcript_tests {
 
     const HELLO: &str = "EHLO client.example\r\n";
 
+    /// Finding 4c: ported off `tests/transport_smtp.rs`, which used to bind a
+    /// listener that wrote a 4096-byte banner line and then assert that
+    /// `test_connection()` returned within five wall-clock seconds. The
+    /// invariant is the same and needs no socket: a greeting line past
+    /// `MAX_RESPONSE_LINE_BYTES` must surface as a parse error, and must do so
+    /// by returning rather than reading forever waiting for a terminator.
+    #[tokio::test(crate = "tokio")]
+    async fn an_oversized_greeting_line_is_a_parse_error_not_a_hang() {
+        // A WELL-FORMED greeting that is merely too long. A line of garbage
+        // would fail to parse whether or not the cap exists, so it pins
+        // nothing about the cap; this one parses fine once the cap is removed.
+        let mut banner = format!("220 {}", "x".repeat(4096));
+        banner.push_str("\r\n");
+        let transcript = Transcript::new(&banner);
+
+        let error = AsyncSmtpConnection::from_transcript(
+            transcript,
+            &ClientId::Domain("client.example".to_owned()),
+            Protocol::Smtp,
+        )
+        .await
+        .err()
+        .expect("an oversized banner line must surface as an error");
+
+        assert!(error.is_parse(), "expected a parse error, got {error:?}");
+    }
+
     #[tokio::test(crate = "tokio")]
     async fn all_recipient_rejection_resets_every_direct_and_batch_transaction() {
         let hello = ClientId::Domain("client.example".to_owned());

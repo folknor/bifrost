@@ -2139,6 +2139,30 @@ mod transcript_tests {
 
     const HELLO: &str = "EHLO client.example\r\n";
 
+    /// The blocking mirror of the async oversized-banner pin (finding 4c): a
+    /// greeting line past `MAX_RESPONSE_LINE_BYTES` is a parse error, and the
+    /// reader returns it instead of reading on for a terminator that a
+    /// pathological peer may never send.
+    #[test]
+    fn an_oversized_greeting_line_is_a_parse_error_not_a_hang() {
+        // A WELL-FORMED greeting that is merely too long. A line of garbage
+        // would fail to parse whether or not the cap exists, so it pins
+        // nothing about the cap; this one parses fine once the cap is removed.
+        let mut banner = format!("220 {}", "x".repeat(4096));
+        banner.push_str("\r\n");
+        let transcript = Transcript::new(&banner);
+
+        let error = SmtpConnection::from_transcript(
+            transcript,
+            &ClientId::Domain("client.example".to_owned()),
+            Protocol::Smtp,
+        )
+        .err()
+        .expect("an oversized banner line must surface as an error");
+
+        assert!(error.is_parse(), "expected a parse error, got {error:?}");
+    }
+
     #[test]
     fn all_recipient_rejection_resets_every_direct_and_batch_transaction() {
         let hello = ClientId::Domain("client.example".to_owned());

@@ -878,13 +878,7 @@ impl SmtpClient {
                     self.info.metering.clone(),
                 )?;
 
-                if let Some(credentials) = &self.info.credentials {
-                    if let Err(error) = self.info.ensure_can_authenticate(conn.is_encrypted()) {
-                        conn.abort();
-                        return Err(error.with_phase(SmtpCommandPhase::Auth));
-                    }
-                    conn.auth(&self.info.authentication, credentials)?;
-                }
+                self.authenticate_if_configured(&mut conn)?;
                 return Ok(conn);
             }
             #[cfg(not(unix))]
@@ -921,6 +915,19 @@ impl SmtpClient {
             _ => (),
         }
 
+        self.authenticate_if_configured(&mut conn)?;
+        Ok(conn)
+    }
+
+    /// The post-greeting authentication stage, shared by the TCP and the
+    /// Unix-socket funnels.
+    ///
+    /// Factored out of `connection()` so it can be driven against a scripted
+    /// in-memory connection: the refusal it enforces (no AUTH over an
+    /// unencrypted link unless the caller opted in) is a decision made after
+    /// the greeting and EHLO, and has nothing to do with how the socket was
+    /// dialled.
+    fn authenticate_if_configured(&self, conn: &mut SmtpConnection) -> Result<(), Error> {
         if let Some(credentials) = &self.info.credentials {
             if let Err(error) = self.info.ensure_can_authenticate(conn.is_encrypted()) {
                 conn.abort();
@@ -928,21 +935,14 @@ impl SmtpClient {
             }
             conn.auth(&self.info.authentication, credentials)?;
         }
-        Ok(conn)
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        io::{BufRead, BufReader, Write},
-        net::TcpListener,
-        sync::mpsc,
-        thread,
-        time::Duration,
-    };
-
     use crate::transport::smtp::Tls;
+    use crate::transport::smtp::test_support::Transcript;
     use crate::{
         LmtpTransport, SmtpTransport,
         transport::smtp::authentication::{
@@ -950,7 +950,11 @@ mod tests {
         },
     };
 
-    use super::{Protocol, SmtpClient};
+    use super::{ClientId, Protocol, SmtpClient, SmtpConnection};
+
+    fn hello() -> ClientId {
+        ClientId::Domain("client.example".to_owned())
+    }
 
     #[test]
     fn transport_from_plaintext_url() {
@@ -1085,87 +1089,60 @@ mod tests {
         assert_eq!(builder.info.authentication, [Mechanism::Plain]);
     }
 
+    /// Finding 4c: ported off the loopback listener. The transcript scripts
+    /// the greeting and the `AUTH PLAIN`-advertising EHLO reply and NOTHING
+    /// else, so an AUTH command reaching the wire fails the write outright
+    /// ("transcript exhausted by client write") instead of producing the
+    /// policy error - which is the same observable the old listener's
+    /// zero-length read gave, without a socket.
     #[test]
     fn plaintext_auth_is_refused_before_auth_command() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let (observed_tx, observed_rx) = mpsc::channel();
+        let transcript = Transcript::new("220 localhost\r\n").expect(
+            "EHLO client.example\r\n",
+            "250-localhost\r\n250 AUTH PLAIN\r\n",
+        );
+        let mut conn =
+            SmtpConnection::from_transcript(transcript.clone(), &hello(), Protocol::Smtp).unwrap();
 
-        let handle = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
-            stream.write_all(b"220 localhost\r\n").unwrap();
-
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut ehlo = String::new();
-            reader.read_line(&mut ehlo).unwrap();
-            stream
-                .write_all(b"250-localhost\r\n250 AUTH PLAIN\r\n")
-                .unwrap();
-
-            let mut after_ehlo = String::new();
-            let read = reader.read_line(&mut after_ehlo).unwrap();
-            observed_tx.send((read, after_ehlo)).unwrap();
-        });
-
-        let builder = SmtpTransport::builder_dangerous("127.0.0.1")
-            .port(address.port())
-            .password("user", "pass");
-        let client = SmtpClient { info: builder.info };
-        let Err(error) = client.connection() else {
+        let info = SmtpTransport::builder_dangerous("127.0.0.1")
+            .password("user", "pass")
+            .info;
+        let Err(error) = (SmtpClient { info }).authenticate_if_configured(&mut conn) else {
             panic!("plaintext auth must be refused");
         };
 
         assert!(error.is_policy(), "expected policy error, got {error:?}");
-        let (read, after_ehlo) = observed_rx.recv_timeout(Duration::from_secs(3)).unwrap();
-        assert_eq!(read, 0, "client must close instead of sending AUTH");
-        assert_eq!(after_ehlo, "");
-        handle.join().unwrap();
+        transcript.assert_exhausted();
     }
 
+    /// Finding 4c: the escape-hatch mirror, also ported off the listener. Here
+    /// the transcript DOES script an `AUTH PLAIN` step, so the exact base64
+    /// credential line the driver puts on the wire is asserted by the
+    /// transcript itself.
     #[test]
-    fn dangerous_allow_insecure_auth_preserves_plaintext_auth_escape_hatch() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let (auth_tx, auth_rx) = mpsc::channel();
+    fn dangerous_allow_insecure_auth_sends_auth_plain_on_a_plaintext_connection() {
+        let transcript = Transcript::new("220 localhost\r\n")
+            .expect(
+                "EHLO client.example\r\n",
+                "250-localhost\r\n250 AUTH PLAIN\r\n",
+            )
+            .expect("AUTH PLAIN AHVzZXIAcGFzcw==\r\n", "235 authenticated\r\n")
+            // A successful AUTH re-issues EHLO: the server's capability list
+            // may change once the session is authenticated.
+            .expect("EHLO client.example\r\n", "250 localhost\r\n");
+        let mut conn =
+            SmtpConnection::from_transcript(transcript.clone(), &hello(), Protocol::Smtp).unwrap();
 
-        let handle = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
-            stream.write_all(b"220 localhost\r\n").unwrap();
-
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut ehlo = String::new();
-            reader.read_line(&mut ehlo).unwrap();
-            stream
-                .write_all(b"250-localhost\r\n250 AUTH PLAIN\r\n")
-                .unwrap();
-
-            let mut auth = String::new();
-            reader.read_line(&mut auth).unwrap();
-            stream.write_all(b"235 authenticated\r\n").unwrap();
-
-            let mut post_auth_ehlo = String::new();
-            reader.read_line(&mut post_auth_ehlo).unwrap();
-            stream.write_all(b"250 localhost\r\n").unwrap();
-            auth_tx.send(auth).unwrap();
-        });
-
-        let builder = SmtpTransport::builder_dangerous("127.0.0.1")
-            .port(address.port())
+        let info = SmtpTransport::builder_dangerous("127.0.0.1")
             .password("user", "pass")
-            .dangerous_allow_insecure_auth(true);
-        let client = SmtpClient { info: builder.info };
-        let mut connection = client.connection().unwrap();
-        connection.abort();
+            .dangerous_allow_insecure_auth(true)
+            .authentication(vec![Mechanism::Plain])
+            .info;
+        (SmtpClient { info })
+            .authenticate_if_configured(&mut conn)
+            .expect("the escape hatch permits plaintext AUTH");
 
-        let auth = auth_rx.recv_timeout(Duration::from_secs(3)).unwrap();
-        assert!(auth.starts_with("AUTH PLAIN "), "got {auth:?}");
-        handle.join().unwrap();
+        transcript.assert_exhausted();
     }
 
     mod pooled_batch {

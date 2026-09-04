@@ -39,13 +39,41 @@ revert-and-confirm. The reference was corrected to match, including the note
 that a few loopback-listener tests for the pre-AUTH refusal ladder remain
 outside `test_support` - see the residual item below.)
 
-### 4c. Residual: loopback-listener tests for the pre-AUTH refusal ladder
+(Finding 4c - the residual loopback-listener tests for the pre-AUTH refusal
+ladder - is fixed. No test in `crates/smtp/` binds a socket, spawns a listener
+thread or sleeps on the wall clock any more.
 
-`transport.rs` and `async_transport.rs` still bind `TcpListener` in
-`plaintext_auth_is_refused_before_auth_command` (and its tokio twin), as does
-`tests/transport_smtp.rs`. These were out of 4b's scope and are a separate,
-smaller port: what they pin is that no AUTH command reaches the wire, which a
-transcript with no scripted AUTH step expresses directly.
+The post-greeting authentication stage was factored out of `connection()` into
+`SmtpClient::authenticate_if_configured` / `AsyncSmtpClient::authenticate_if_configured`
+(the sync one also de-duplicates the block that the TCP and Unix funnels each
+carried a copy of). That stage is what the listener tests were really
+exercising - the refusal is decided after the greeting and EHLO and has nothing
+to do with how the socket was dialled - so it now runs against a transcript
+connection in both halves.
+
+`plaintext_auth_is_refused_before_auth_command` and its tokio twin script the
+greeting and the `AUTH PLAIN`-advertising EHLO reply and NOTHING else: an AUTH
+command reaching the wire fails the write outright, which is the same
+observable the old listener's zero-length read gave. Ablating
+`ensure_can_authenticate` makes both fail with exactly
+"SMTP transcript exhausted by client write". The escape-hatch mirror is now
+`dangerous_allow_insecure_auth_sends_auth_plain_on_a_plaintext_connection` (plus
+tokio twin), which is strictly stronger than the listener version: the
+transcript asserts the exact `AUTH PLAIN AHVzZXIAcGFzcw==` line and the
+post-AUTH EHLO, where the old test only checked an `AUTH PLAIN ` prefix.
+
+`tests/transport_smtp.rs` no longer has a `read_response_caps` module. Its
+oversized-banner cap moved in-crate as
+`an_oversized_greeting_line_is_a_parse_error_not_a_hang` in both connection
+transcript suites, and the wall-clock 5s "did it return" timeout is gone -
+a transcript read cannot hang there in the first place.
+
+Lateral find while porting it: the ORIGINAL integration test did not bite. It
+wrote 4096 bytes of `x` with no reply code, which fails to parse whether or not
+`MAX_RESPONSE_LINE_BYTES` is enforced - ablating the cap left it green. The
+ported test uses a well-formed but oversize greeting (`220 ` + 4096 `x`), which
+parses cleanly once the cap is removed, so it fails under ablation. The cap had
+been effectively unpinned since it was written.)
 
 (Finding 6 - outbound throttle debt delaying the next read - is fixed on the
 async side: `AsyncNetworkStream` now carries separate `throttle_in` and

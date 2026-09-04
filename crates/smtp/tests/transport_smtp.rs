@@ -44,42 +44,8 @@ mod tokio {
     }
 }
 
-#[cfg(test)]
-#[cfg(feature = "tokio")]
-mod read_response_caps {
-    use std::{io::Write, net::TcpListener, thread, time::Duration};
-
-    use bifrost_smtp::{AsyncSmtpTransport, TokioExecutor};
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_connection_returns_on_oversized_banner_line() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        thread::spawn(move || {
-            if let Ok((mut sock, _)) = listener.accept() {
-                let mut line = vec![b'x'; 4096];
-                line.extend_from_slice(b"\r\n");
-                let _ = sock.write_all(&line);
-            }
-        });
-
-        let result = tokio::time::timeout(
-            Duration::from_secs(5),
-            AsyncSmtpTransport::<TokioExecutor>::builder_dangerous("127.0.0.1")
-                .port(addr.port())
-                .build::<TokioExecutor>()
-                .test_connection(),
-        )
-        .await
-        .expect("connect must return within 5s, not hang");
-
-        let err = match result {
-            Ok(_) => panic!("oversized line must surface as an error"),
-            Err(e) => e,
-        };
-        assert!(
-            err.is_parse(),
-            "expected SMTP response parse error, got {err:?}"
-        );
-    }
-}
+// The oversized-banner cap that used to be pinned here against a loopback
+// listener now lives in-crate as
+// `an_oversized_greeting_line_is_a_parse_error_not_a_hang`, in both the
+// blocking and the async connection transcript suites. It needs no socket:
+// the transcript hands the driver the oversized greeting directly.
