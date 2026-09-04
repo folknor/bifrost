@@ -77,12 +77,14 @@ impl Serialize for RawMethodCall {
 /// that advertised no usable limit has no limit for us to respect.
 #[derive(Debug, Clone, Copy)]
 enum CallLimit {
-    /// The session document carries no `urn:ietf:params:jmap:core`
-    /// capability, so no limit was advertised at all.
+    /// No limit was advertised at all: either the session document
+    /// carries no `urn:ietf:params:jmap:core` capability, or it carries
+    /// one that omits `maxCallsInRequest`.
     Unadvertised,
-    /// The core capability is present but advertises `maxCallsInRequest:
-    /// 0`, which the spec forbids. A limit was advertised and it is not
-    /// usable.
+    /// A limit was advertised and it is not usable: the core block
+    /// advertises `maxCallsInRequest: 0` (which the spec forbids), or the
+    /// block itself is present but unparseable, so whatever it advertised
+    /// cannot be honoured.
     Invalid,
     /// A usable advertised bound.
     Advertised(std::num::NonZeroUsize),
@@ -90,10 +92,15 @@ enum CallLimit {
 
 impl CallLimit {
     fn read(session: &super::session::Session) -> Self {
-        match session.core_capabilities() {
-            None => CallLimit::Unadvertised,
-            Some(core) => std::num::NonZeroUsize::new(core.max_calls_in_request())
-                .map_or(CallLimit::Invalid, CallLimit::Advertised),
+        use super::session::CoreCapabilityState;
+        match session.core_capability_state() {
+            CoreCapabilityState::Absent => CallLimit::Unadvertised,
+            CoreCapabilityState::Malformed => CallLimit::Invalid,
+            CoreCapabilityState::Present(core) => match core.max_calls_in_request() {
+                None => CallLimit::Unadvertised,
+                Some(max) => std::num::NonZeroUsize::new(max)
+                    .map_or(CallLimit::Invalid, CallLimit::Advertised),
+            },
         }
     }
 
@@ -368,5 +375,73 @@ impl Request<'_, crate::transport_reqwest::ReqwestTransport> {
     /// [`Request::send`].
     pub(crate) async fn send_ws_awaiting(self) -> crate::Result<Response> {
         self.client.send_ws_awaiting(self).await?.response().await
+    }
+}
+
+#[cfg(test)]
+mod call_limit_tests {
+    use super::CallLimit;
+    use crate::core::session::Session;
+
+    fn session_with_capabilities(capabilities: serde_json::Value) -> Session {
+        serde_json::from_value(serde_json::json!({
+            "capabilities": capabilities,
+            "accounts": {},
+            "primaryAccounts": {},
+            "username": "user@example.test",
+            "apiUrl": "https://example.test/jmap/api",
+            "downloadUrl": "https://example.test/download/{accountId}/{blobId}",
+            "uploadUrl": "https://example.test/upload/{accountId}",
+            "eventSourceUrl": "https://example.test/eventsource",
+            "state": "session-1"
+        }))
+        .expect("session fixture parses")
+    }
+
+    fn session_with_core(core: serde_json::Value) -> Session {
+        session_with_capabilities(serde_json::json!({ "urn:ietf:params:jmap:core": core }))
+    }
+
+    /// The three lanes must be told apart at the source. "No core block",
+    /// "core block that omits the limit", "core block that advertises
+    /// zero" and "core block that does not parse" all decline to enforce,
+    /// so nothing but the lane itself distinguishes them here - and the
+    /// session validator classifies each differently.
+    #[test]
+    fn call_limit_reads_the_lane_the_session_actually_describes() {
+        assert!(matches!(
+            CallLimit::read(&session_with_capabilities(serde_json::json!({}))),
+            CallLimit::Unadvertised
+        ));
+        assert!(
+            matches!(
+                CallLimit::read(&session_with_core(serde_json::json!({}))),
+                CallLimit::Unadvertised
+            ),
+            "an OMITTED maxCallsInRequest advertised no limit; \
+             it is not an advertised zero"
+        );
+        assert!(matches!(
+            CallLimit::read(&session_with_core(
+                serde_json::json!({"maxCallsInRequest": 0})
+            )),
+            CallLimit::Invalid
+        ));
+        assert!(
+            matches!(
+                CallLimit::read(&session_with_core(
+                    serde_json::json!({"maxCallsInRequest": "16"})
+                )),
+                CallLimit::Invalid
+            ),
+            "a present-but-unparseable core block advertised something \
+             unusable; it must not read as unadvertised"
+        );
+        assert!(matches!(
+            CallLimit::read(&session_with_core(
+                serde_json::json!({"maxCallsInRequest": 16})
+            )),
+            CallLimit::Advertised(max) if max.get() == 16
+        ));
     }
 }

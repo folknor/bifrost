@@ -93,15 +93,19 @@ narrowing it is a product decision, not a defect fix.)
 
 ## Suspicions / lesser notes
 
-- **Malformed capability objects downgrade to "absent".** `session.rs`
-  `try_cap!` falls back to `Capabilities::Other(value)` on a typed-parse
-  failure, so `core_capabilities()` returns `None` and everything downstream
-  (CallLimit, `capabilities::build`) treats a *present but malformed* core block
-  as *unadvertised* - the reference carefully distinguishes `Unadvertised` from
-  `Invalid`, but a core block whose `maxCallsInRequest` is `"16"` (string) lands
-  in the wrong lane. Also, blanket `#[serde(default)]` on `CoreCapabilities`
-  zero-fills any omitted limit, merging "absent field" and "advertised 0" - the
-  two cases the reference says map to different recovery classes.
+- ~~**Malformed capability objects downgrade to "absent".**~~ FIXED. The core
+  block now parses into its own `Capabilities::CoreMalformed` variant, read
+  through the three-state `Session::core_capability_state()`
+  (`Absent`/`Malformed`/`Present`), so a present-but-unparseable block is
+  `Protocol(ContractViolation)` at `capabilities::build` and `Invalid` at
+  `CallLimit` instead of masquerading as unadvertised (which had the engine
+  reopening forever). Every core limit is an `Option<usize>`, so an omitted
+  field no longer zero-fills into "advertised 0"; `build` refuses omitted and
+  zero alike as contract violations (RFC 8620 §2 makes them mandatory), and
+  the WS `maxSizeRequest` guard and the foreign-probe concurrency reader take
+  the `Option` explicitly. Pinned in `core/request.rs` (`CallLimit` lanes),
+  `sync/capabilities.rs` (malformed and omitted-limit refusals) and
+  `tests.rs`, each confirmed to bite.
 - **WS Response decode double-round-trips** (`json!` Value rebuild then
   `from_value`) - works (verified), but it re-allocates every method response; a
   `RawValue`-preserving envelope would decode once.

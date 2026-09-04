@@ -42,18 +42,44 @@ pub(crate) fn session_state_changed() -> AccountError {
     .expect("valid account error classification")
 }
 
-/// Server advertises the core capability but with one or more
-/// zero-valued limits (`maxCallsInRequest`, `maxObjectsInGet`,
-/// `maxObjectsInSet`, `maxSizeRequest`). That is a `Protocol(ContractViolation)`:
-/// the server claimed conformance and then lied about the lower bounds
-/// the spec requires it to advertise. It is not a capability change.
-fn zero_core_limits() -> AccountError {
+/// Server advertises the core capability but with one or more unusable
+/// limits (`maxCallsInRequest`, `maxObjectsInGet`, `maxObjectsInSet`,
+/// `maxSizeRequest`) - zero-valued, or omitted entirely from a block RFC
+/// 8620 §2 makes them mandatory members of. That is a
+/// `Protocol(ContractViolation)`: the server claimed conformance and then
+/// lied about, or withheld, the lower bounds the spec requires it to
+/// advertise. It is not a capability change.
+fn unusable_core_limits() -> AccountError {
     AccountErrorBuilder::new(
         AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
         Cause::Wire(WireCause::MalformedResponse {
             protocol: Protocol::Jmap,
             detail: Some(DiagnosticText::support_only(
-                "JMAP core capability advertises zero-valued limits",
+                "JMAP core capability advertises zero-valued or omitted limits",
+            )),
+        }),
+    )
+    .protocol(Protocol::Jmap)
+    .operation(AccountOperation::Discover)
+    .try_build()
+    .expect("valid account error classification")
+}
+
+/// The `urn:ietf:params:jmap:core` block is PRESENT but does not parse as
+/// the RFC 8620 §2 core object (`"maxCallsInRequest": "16"` as a string is
+/// the canonical shape). The server advertised the capability and then
+/// described it wrongly, so this is the same `Protocol(ContractViolation)`
+/// lane as a zero-valued limit, and deliberately NOT the
+/// `SyncState(CapabilityChanged)` lane an absent block takes: nothing about
+/// this session changes on a reopen, so classifying it as a capability
+/// change would buy an endless reopen loop.
+fn malformed_core_capability() -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
+        Cause::Wire(WireCause::MalformedResponse {
+            protocol: Protocol::Jmap,
+            detail: Some(DiagnosticText::support_only(
+                "JMAP core capability object is present but not parseable",
             )),
         }),
     )
@@ -92,23 +118,41 @@ pub(crate) fn build(
     session: &Session,
     support: PimSupport,
 ) -> Result<(AccountCapabilities, CoreLimits), AccountError> {
-    let core = session
-        .core_capabilities()
-        .ok_or_else(missing_core_capability)?;
+    // Three lanes, not two. An ABSENT core block is a capability change
+    // (the server dropped a capability the session previously claimed):
+    // reopen. A block that is present but unparseable, or present with a
+    // zero or missing mandatory limit, is a contract violation: the server
+    // is answering `urn:ietf:params:jmap:core` with something that is not
+    // one. Collapsing malformed into absent would send the engine into a
+    // reopen loop against a server that will keep sending the same bad
+    // session forever.
+    let core = match session.core_capability_state() {
+        crate::core::session::CoreCapabilityState::Absent => {
+            return Err(missing_core_capability());
+        }
+        crate::core::session::CoreCapabilityState::Malformed => {
+            return Err(malformed_core_capability());
+        }
+        crate::core::session::CoreCapabilityState::Present(core) => core,
+    };
 
-    if core.max_calls_in_request() == 0
-        || core.max_objects_in_get() == 0
-        || core.max_objects_in_set() == 0
-        || core.max_size_request() == 0
+    let usable = |limit: Option<usize>| limit.is_some_and(|value| value > 0);
+    if !usable(core.max_calls_in_request())
+        || !usable(core.max_objects_in_get())
+        || !usable(core.max_objects_in_set())
+        || !usable(core.max_size_request())
     {
-        return Err(zero_core_limits());
+        return Err(unusable_core_limits());
     }
+    // Every one of the four is `Some(> 0)` past this point.
+    let max_objects_in_get = core.max_objects_in_get().unwrap_or(1).max(1);
+    let max_objects_in_set = core.max_objects_in_set().unwrap_or(1).max(1);
 
     let ws_push = session
         .websocket_capabilities()
         .is_some_and(crate::core::session::WebSocketCapabilities::supports_push);
 
-    let max_items = core.max_objects_in_set().clamp(1, 500);
+    let max_items = max_objects_in_set.clamp(1, 500);
     let caps = AccountCapabilities {
         cursor_freshness: CursorFreshness::ServerIssued,
         // The existing JMAP transport exposes whole-blob downloads only.
@@ -219,8 +263,8 @@ pub(crate) fn build(
     };
 
     let limits = CoreLimits {
-        max_objects_in_get: core.max_objects_in_get(),
-        max_objects_in_set: core.max_objects_in_set(),
+        max_objects_in_get,
+        max_objects_in_set,
     };
 
     Ok((caps, limits))
@@ -625,6 +669,93 @@ mod tests {
                 err.kind(),
                 &AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
                 "zero {field}"
+            );
+        }
+    }
+
+    /// A session document carrying an arbitrary core capability block.
+    fn session_with_core(core: serde_json::Value) -> Session {
+        serde_json::from_value(serde_json::json!({
+            "capabilities": {
+                "urn:ietf:params:jmap:core": core,
+                "urn:ietf:params:jmap:mail": {}
+            },
+            "accounts": {},
+            "primaryAccounts": {},
+            "username": "user",
+            "apiUrl": "https://example.test/jmap/api",
+            "downloadUrl": "https://example.test/download/{accountId}/{blobId}/{name}/{type}",
+            "uploadUrl": "https://example.test/upload/{accountId}",
+            "eventSourceUrl": "https://example.test/eventsource",
+            "state": "session-state"
+        }))
+        .expect("session fixture parses")
+    }
+
+    /// The defect: a PRESENT core block that does not parse used to fall
+    /// back to `Capabilities::Other`, which is indistinguishable from
+    /// absent, so a server sending `"maxCallsInRequest": "16"` was
+    /// classified `SyncState(CapabilityChanged)` and the engine reopened
+    /// forever against a session that will never change. It is a contract
+    /// violation: the server advertised the capability and then described
+    /// it wrongly.
+    #[test]
+    fn a_present_but_malformed_core_block_is_a_contract_violation() {
+        let session = session_with_core(serde_json::json!({
+            "maxSizeUpload": 1000,
+            "maxConcurrentUpload": 2,
+            "maxSizeRequest": 100_000,
+            "maxConcurrentRequests": 4,
+            "maxCallsInRequest": "16",
+            "maxObjectsInGet": 256,
+            "maxObjectsInSet": 256,
+            "collationAlgorithms": []
+        }));
+
+        let err =
+            build(&session, no_pim_support()).expect_err("a malformed core block must be refused");
+        assert_eq!(
+            err.kind(),
+            &AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation)
+        );
+        assert_ne!(
+            err.kind(),
+            &AccountErrorKind::SyncState(SyncStateErrorKind::CapabilityChanged),
+            "malformed is not absent"
+        );
+    }
+
+    /// An OMITTED mandatory limit is not an advertised zero, but it is
+    /// equally unusable, and blanket `#[serde(default)]` zero-filling used
+    /// to erase the difference. Each of the four must be refused when it
+    /// is missing entirely - and refused as a contract violation, since
+    /// RFC 8620 §2 makes every one of them a mandatory member.
+    #[test]
+    fn any_omitted_core_limit_is_a_contract_violation() {
+        for field in [
+            "maxCallsInRequest",
+            "maxObjectsInGet",
+            "maxObjectsInSet",
+            "maxSizeRequest",
+        ] {
+            let mut core = serde_json::json!({
+                "maxSizeUpload": 1000,
+                "maxConcurrentUpload": 2,
+                "maxSizeRequest": 100_000,
+                "maxConcurrentRequests": 4,
+                "maxCallsInRequest": 8,
+                "maxObjectsInGet": 256,
+                "maxObjectsInSet": 256,
+                "collationAlgorithms": []
+            });
+            core.as_object_mut().expect("object").remove(field);
+            let err = build(&session_with_core(core), no_pim_support())
+                .err()
+                .unwrap_or_else(|| panic!("omitted {field} must be refused"));
+            assert_eq!(
+                err.kind(),
+                &AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
+                "omitted {field}"
             );
         }
     }

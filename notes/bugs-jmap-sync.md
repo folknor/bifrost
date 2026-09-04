@@ -100,6 +100,22 @@ against so a page 2 cannot cross accounts. The implicit cross-account union
 was explicitly not approved and is not implemented. Pinned by the six
 `search_handles` transport tests in `sync/pim.rs`, each confirmed to bite.
 
+### 11b. Search paging read fullness and pinned no `queryState` (CLOSED)
+
+Surfaced while auditing 11's cursor. `search_email_ids` derived `next_cursor`
+from "the page came back full", so a server answering a non-final page with
+fewer ids than `limit` (which RFC 8620 permits) ended the walk in Done-shaped
+silence with most hits unreported; and nothing pinned `queryState`, so page 2
+taken under a moved order silently duplicated one hit and dropped another.
+Both closed: the echoed `position` plus `total` decide whether more remains
+(fullness survives only as the fallback for a server omitting `total`), and
+the cursor payload is now versioned `2:<position>:<queryState>`,
+owner-qualification intact. A moved state is `ConcurrencyConflict` ->
+`Retry(AfterStateRefresh)`; a v1 bare-integer cursor is refused
+`SchemaIncompatible` rather than resumed unpinned. Pinned by the
+`PagingTransport` tests plus the codec round-trip and refusal tests in
+`sync/pim.rs`, confirmed to bite by ablating each half.
+
 ### 12. `filters_list` downloads script blobs serially
 
 N+2 round trips for N scripts; the only other concurrency-capable spot in the

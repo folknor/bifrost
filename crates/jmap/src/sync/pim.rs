@@ -22,7 +22,7 @@ fn to_acct_err(op: AccountOperation) -> impl Fn(crate::Error) -> AccountError {
 /// Local helper for search-cursor decode failures: the page cursor
 /// JMAP stores is opaque, and a malformed value is a schema mismatch
 /// from the caller's point of view. Maps to `SyncState(SchemaIncompatible)`.
-fn schema_incompatible_search_cursor() -> AccountError {
+fn schema_incompatible_search_cursor(op: AccountOperation) -> AccountError {
     bifrost_types::AccountErrorBuilder::new(
         bifrost_types::AccountErrorKind::SyncState(
             bifrost_types::SyncStateErrorKind::SchemaIncompatible,
@@ -30,9 +30,9 @@ fn schema_incompatible_search_cursor() -> AccountError {
         bifrost_types::Cause::State(bifrost_types::StateCause::SchemaIncompatible),
     )
     .protocol(bifrost_types::Protocol::Jmap)
-    .operation(AccountOperation::Search)
+    .operation(op)
     .text(bifrost_types::DiagnosticText::support_only(
-        "search page cursor was malformed",
+        "search page cursor was malformed or from an older cursor version",
     ))
     .try_build()
     .expect("valid account error classification")
@@ -2376,27 +2376,66 @@ async fn search_email_ids<T: HttpTransport>(
     owner: Option<&str>,
     op: AccountOperation,
 ) -> Result<Page<EmailId>, AccountError> {
-    let position = decode_position(request.page_cursor.as_deref(), owner, op)?;
+    let cursor = decode_position(request.page_cursor.as_deref(), owner, op)?;
     let limit = request.limit.unwrap_or(50).max(1);
-    let query_request = build_search_query(request, collapse_threads, position, limit)?;
+    let query_request = build_search_query(request, collapse_threads, cursor.position, limit)?;
     let response = mail.call(query_request).await.map_err(to_acct_err(op))?;
-    let total = response.total().and_then(|v| u64::try_from(v).ok());
+
+    // The result set must not have moved between the page that minted the
+    // cursor and this one. `Email/query` positions index an order the server
+    // recomputes per call, so a `queryState` change means page 2 is being
+    // taken from a DIFFERENT list than page 1: at a single delivery the
+    // window slides by one and the caller silently loses a hit or sees a
+    // duplicate. One delivered message is enough to move it, so this is not
+    // terminal - it is a concurrency conflict: repeat the search.
+    if let Some(pinned) = cursor.query_state.as_deref()
+        && pinned != response.query_state()
+    {
+        return Err(super::error::search_result_set_superseded(op));
+    }
+
+    let total = response.total();
+    // The server echoes the position it actually served from; a server that
+    // clamped or adjusted the requested one makes its own echo the only
+    // truthful base for the next offset.
+    let served_from = response.position();
+    let query_state = response.query_state().to_string();
     let ids = response.into_ids();
-    let next_cursor = if ids.len() == usize::try_from(limit).unwrap_or(usize::MAX) {
-        let next = position
-            .checked_add(i32::try_from(ids.len()).map_err(|_| schema_incompatible_search_cursor())?)
-            .ok_or(schema_incompatible_search_cursor())?;
-        Some(encode_position(next, owner))
+    let served = i32::try_from(ids.len()).map_err(|_| schema_incompatible_search_cursor(op))?;
+    let next_position = served_from
+        .checked_add(served)
+        .ok_or_else(|| schema_incompatible_search_cursor(op))?;
+
+    // "The page came back full" is not evidence that more remains, and a
+    // short page is not evidence that nothing does: RFC 8620 lets a server
+    // return fewer ids than `limit` on a non-final page. `total` (which this
+    // query always requests via `calculateTotal`) is the authoritative
+    // answer; page fullness is only the fallback for a server that omits it.
+    let more = if ids.is_empty() {
+        false
+    } else if let Some(total) = total {
+        i64::from(next_position) < i64::try_from(total).unwrap_or(i64::MAX)
     } else {
-        None
+        ids.len() == usize::try_from(limit).unwrap_or(usize::MAX)
     };
+    let next_cursor = more.then(|| encode_position(next_position, &query_state, owner));
+
     Ok(Page {
         items: ids,
         next_cursor,
-        estimated_total: total,
+        estimated_total: total.and_then(|v| u64::try_from(v).ok()),
         failed_ids: Vec::new(),
         skipped_scopes: Vec::new(),
     })
+}
+
+/// A decoded search page cursor: where in the result order the next page
+/// starts, plus the `queryState` that order belonged to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SearchCursor {
+    position: i32,
+    /// `None` only for the synthetic first page (no cursor supplied).
+    query_state: Option<String>,
 }
 
 /// Build the `Email/query` a search page issues.
@@ -2427,7 +2466,19 @@ fn build_search_query(
     Ok(query_request)
 }
 
-/// Encode a search page cursor: a bare integer position for the primary
+/// Version tag of the current search-page-cursor payload. v1 was a bare
+/// integer position with no `queryState` pin; v2 adds the pin. The two are
+/// distinguishable without ambiguity - a v1 payload is entirely digits (with
+/// an optional sign) and so can never contain the `SEARCH_CURSOR_SEP`.
+const SEARCH_CURSOR_V2: &str = "2";
+
+/// Separator inside the search cursor payload. `:` is safe as a payload
+/// delimiter because only the first two fields are split on it: the
+/// `queryState` is the whole remaining tail and is never re-split, so an
+/// opaque state string containing `:` round-trips verbatim.
+const SEARCH_CURSOR_SEP: char = ':';
+
+/// Encode a search page cursor: `2:<position>:<queryState>` for the primary
 /// account, and the owner-qualified form (the same object-id codec every
 /// other foreign id uses) for a share.
 ///
@@ -2436,24 +2487,43 @@ fn build_search_query(
 /// a page-2 request whose filter routes elsewhere - a caller that reused
 /// the cursor with a different `In`, or dropped the `In` entirely - pages
 /// one account by another's offsets and silently duplicates and skips.
-fn encode_position(position: i32, owner: Option<&str>) -> Vec<u8> {
-    qualify(owner, position.to_string()).into_bytes()
+///
+/// The `queryState` rides for the same class of reason one layer in: the
+/// position means nothing outside the result ORDER that produced it either,
+/// and that order is not stable across calls. Pinning it lets the next page
+/// refuse honestly instead of paging a reordered list.
+fn encode_position(position: i32, query_state: &str, owner: Option<&str>) -> Vec<u8> {
+    qualify(
+        owner,
+        format!("{SEARCH_CURSOR_V2}{SEARCH_CURSOR_SEP}{position}{SEARCH_CURSOR_SEP}{query_state}"),
+    )
+    .into_bytes()
 }
 
 /// Decode a search page cursor and check it belongs to the account this
 /// request routes to. A primary cursor is bare, so the absent-separator
 /// case is "primary", not "unknown".
+///
+/// A v1 (bare-integer) cursor is REFUSED rather than upgraded in place. It
+/// carries no `queryState`, so continuing it is exactly the unpinned paging
+/// this version exists to stop, and silently treating it as pinned-to-
+/// whatever-comes-back would launder the defect into the new shape. That is
+/// the crate's standing cursor policy: an older payload version is
+/// `SyncState(SchemaIncompatible)` and the caller restarts the walk.
 fn decode_position(
     cursor: Option<&[u8]>,
     owner: Option<&str>,
     op: AccountOperation,
-) -> Result<i32, AccountError> {
+) -> Result<SearchCursor, AccountError> {
     let Some(bytes) = cursor else {
-        return Ok(0);
+        return Ok(SearchCursor {
+            position: 0,
+            query_state: None,
+        });
     };
-    let text = std::str::from_utf8(bytes).map_err(|_| schema_incompatible_search_cursor())?;
-    let (cursor_owner, position) = match super::foreign::parse_object(text) {
-        Some((account_id, position)) => (Some(account_id), position),
+    let text = std::str::from_utf8(bytes).map_err(|_| schema_incompatible_search_cursor(op))?;
+    let (cursor_owner, payload) = match super::foreign::parse_object(text) {
+        Some((account_id, payload)) => (Some(account_id), payload),
         None => (None, text),
     };
     if cursor_owner != owner {
@@ -2463,9 +2533,23 @@ fn decode_position(
             owner,
         ));
     }
-    position
-        .parse::<i32>()
-        .map_err(|_| schema_incompatible_search_cursor())
+    let mut parts = payload.splitn(3, SEARCH_CURSOR_SEP);
+    let (Some(version), Some(position), Some(query_state)) =
+        (parts.next(), parts.next(), parts.next())
+    else {
+        // Either a v1 bare integer or an unparseable payload; both are a
+        // schema refusal, and neither can be paged from safely.
+        return Err(schema_incompatible_search_cursor(op));
+    };
+    if version != SEARCH_CURSOR_V2 {
+        return Err(schema_incompatible_search_cursor(op));
+    }
+    Ok(SearchCursor {
+        position: position
+            .parse::<i32>()
+            .map_err(|_| schema_incompatible_search_cursor(op))?,
+        query_state: Some(query_state.to_string()),
+    })
 }
 
 fn build_search_filter(
@@ -3592,7 +3676,10 @@ mod tests {
                     "queryState": "q-1",
                     "canCalculateChanges": false,
                     "position": call[1]["position"].clone(),
-                    "total": 1,
+                    // Three hits, one served per page: a page is short of
+                    // `total`, so the walk continues on `total`, not on the
+                    // page having come back full.
+                    "total": 3,
                     "ids": ["M1"]
                 }),
                 "Email/get" => serde_json::json!({
@@ -3826,8 +3913,9 @@ mod tests {
         let cursor = page.next_cursor.expect("a full page has a next cursor");
         assert_eq!(
             String::from_utf8(cursor.clone()).expect("utf8"),
-            super::super::foreign::encode_object("shared", "1"),
-            "the cursor names the account it was minted against"
+            super::super::foreign::encode_object("shared", "2:1:q-1"),
+            "the cursor names the account it was minted against, \
+             the position it resumes at, and the queryState it belongs to"
         );
 
         // Page 2 with the same filter resumes on the same account at the
@@ -3888,7 +3976,308 @@ mod tests {
         assert_eq!(
             page.next_cursor
                 .map(|c| String::from_utf8(c).expect("utf8")),
-            Some("1".to_string())
+            Some("2:1:q-1".to_string())
+        );
+    }
+
+    /// A scripted `Email/query` server whose answers are given per call:
+    /// `(ids, total, queryState)`. Deliberately independent of
+    /// `SearchTransport`, whose single canned answer cannot express a
+    /// short page, an absent `total`, or a moving result set.
+    #[derive(Clone)]
+    struct PagingTransport {
+        pages: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<serde_json::Value>>>,
+        positions: std::sync::Arc<std::sync::Mutex<Vec<i64>>>,
+    }
+
+    impl PagingTransport {
+        fn new(pages: Vec<(Vec<&'static str>, Option<usize>, &'static str)>) -> Self {
+            let pages = pages
+                .into_iter()
+                .map(|(ids, total, query_state)| {
+                    serde_json::json!({
+                        "ids": ids,
+                        "total": total,
+                        "queryState": query_state,
+                    })
+                })
+                .collect();
+            Self {
+                pages: std::sync::Arc::new(std::sync::Mutex::new(pages)),
+                positions: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            }
+        }
+
+        fn positions(&self) -> Vec<i64> {
+            self.positions.lock().expect("positions").clone()
+        }
+    }
+
+    impl crate::core::transport::HttpTransport for PagingTransport {
+        async fn api_request(
+            &self,
+            _url: &str,
+            body: Vec<u8>,
+        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+            let request: serde_json::Value = serde_json::from_slice(&body).expect("request json");
+            let call = request["methodCalls"][0].clone();
+            let name = call[0].as_str().expect("method name").to_string();
+            assert_eq!(name, "Email/query", "these tests only page the query");
+            let call_id = call[2].as_str().expect("call id").to_string();
+            let position = call[1]["position"].as_i64().unwrap_or(0);
+            self.positions.lock().expect("positions").push(position);
+            let page = self
+                .pages
+                .lock()
+                .expect("pages")
+                .pop_front()
+                .expect("an unscripted page was requested");
+            let mut arguments = serde_json::json!({
+                "accountId": call[1]["accountId"].clone(),
+                "queryState": page["queryState"].clone(),
+                "canCalculateChanges": false,
+                "position": position,
+                "ids": page["ids"].clone(),
+            });
+            if !page["total"].is_null() {
+                arguments["total"] = page["total"].clone();
+            }
+            Ok(bytes::Bytes::from(
+                serde_json::json!({
+                    "sessionState": "session-1",
+                    "methodResponses": [[name, arguments, call_id]]
+                })
+                .to_string(),
+            ))
+        }
+
+        async fn upload(
+            &self,
+            _url: &str,
+            _body: Vec<u8>,
+            _content_type: Option<&str>,
+        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+            Err(crate::core::transport::TransportError::new("no upload"))
+        }
+
+        async fn download(
+            &self,
+            _url: &str,
+        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+            Err(crate::core::transport::TransportError::new("no download"))
+        }
+
+        async fn get_session(
+            &self,
+            _url: &str,
+        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+            Err(crate::core::transport::TransportError::new("no session"))
+        }
+    }
+
+    type PagingHandles = (
+        MailAccount<PagingTransport>,
+        Arc<HashMap<String, MailAccount<PagingTransport>>>,
+        PagingTransport,
+    );
+
+    fn paging_handles(
+        pages: Vec<(Vec<&'static str>, Option<usize>, &'static str)>,
+    ) -> PagingHandles {
+        let transport = PagingTransport::new(pages);
+        let client = crate::client::Client::with_transport(
+            transport.clone(),
+            search_session(),
+            "https://example.test/.well-known/jmap",
+        )
+        .expect("client builds");
+        let primary = crate::account::Account::new(client, "primary");
+        (primary, Arc::new(HashMap::new()), transport)
+    }
+
+    fn search_with_limit(limit: u32) -> SearchRequest {
+        let mut request = SearchRequest::default();
+        request.limit = Some(limit);
+        request
+    }
+
+    /// The defect: `next_cursor` was derived from "the page came back
+    /// full". RFC 8620 lets a server answer a non-final page with fewer
+    /// ids than `limit`, and that walk then ended in Done-shaped silence -
+    /// the consumer sees a complete search that is missing most of its
+    /// hits. `total` is the authority on whether more remains.
+    #[tokio::test]
+    async fn a_short_non_final_page_still_yields_a_next_cursor() {
+        let (primary, foreign, _transport) =
+            paging_handles(vec![(vec!["M1", "M2"], Some(9), "q-1")]);
+
+        let page = search_messages(primary, foreign, search_with_limit(5))
+            .await
+            .expect("search succeeds");
+
+        assert_eq!(page.items.len(), 2, "the server served a short page");
+        assert_eq!(page.estimated_total, Some(9));
+        assert_eq!(
+            page.next_cursor
+                .map(|c| String::from_utf8(c).expect("utf8")),
+            Some("2:2:q-1".to_string()),
+            "seven hits remain, so the walk must continue"
+        );
+    }
+
+    /// The mirror case: a page that came back FULL but exhausted `total`
+    /// is final, and must not hand back a cursor that would page past the
+    /// end of the result set.
+    #[tokio::test]
+    async fn a_full_final_page_ends_the_walk() {
+        let (primary, foreign, _transport) =
+            paging_handles(vec![(vec!["M1", "M2"], Some(2), "q-1")]);
+
+        let page = search_messages(primary, foreign, search_with_limit(2))
+            .await
+            .expect("search succeeds");
+
+        assert!(page.next_cursor.is_none(), "position + served == total");
+    }
+
+    /// With no `total` at all there is nothing better than page fullness,
+    /// and that fallback must stay: refusing to page a server that omits
+    /// `total` would truncate every search against it.
+    #[tokio::test]
+    async fn a_server_that_omits_total_still_pages_on_fullness() {
+        let (primary, foreign, transport) = paging_handles(vec![
+            (vec!["M1", "M2"], None, "q-1"),
+            (vec!["M3"], None, "q-1"),
+        ]);
+
+        let page = search_messages(primary.clone(), Arc::clone(&foreign), search_with_limit(2))
+            .await
+            .expect("search succeeds");
+        let mut resume = search_with_limit(2);
+        resume.page_cursor = Some(
+            page.next_cursor
+                .expect("a full page with no total pages on"),
+        );
+        let second = search_messages(primary, foreign, resume)
+            .await
+            .expect("resume succeeds");
+
+        assert_eq!(transport.positions(), vec![0, 2]);
+        assert!(second.next_cursor.is_none(), "a short page ends it");
+    }
+
+    /// The defect: page 2 was taken from whatever order the server had at
+    /// the time, with no check that it was the order page 1's position
+    /// indexed. One delivered message reorders `receivedAt desc` and the
+    /// window slides, silently duplicating one hit and dropping another.
+    /// A moved `queryState` must be refused, as a concurrency conflict the
+    /// caller resolves by searching again - never as terminal.
+    #[tokio::test]
+    async fn a_moved_query_state_refuses_the_next_page() {
+        let (primary, foreign, _transport) = paging_handles(vec![
+            (vec!["M1", "M2"], Some(9), "q-1"),
+            (vec!["M2", "M3"], Some(10), "q-2"),
+        ]);
+
+        let page = search_messages(primary.clone(), Arc::clone(&foreign), search_with_limit(2))
+            .await
+            .expect("search succeeds");
+        let mut resume = search_with_limit(2);
+        resume.page_cursor = Some(page.next_cursor.expect("more remains"));
+
+        let error = search_messages(primary, foreign, resume)
+            .await
+            .expect_err("a reordered result set must not be paged");
+
+        assert_eq!(
+            error.kind(),
+            &bifrost_types::AccountErrorKind::ConcurrencyConflict
+        );
+        assert!(
+            !error.recovery().is_terminal(),
+            "ordinary mail delivery must not permanently kill search"
+        );
+    }
+
+    /// An unmoved `queryState` is the normal case and must page through
+    /// without complaint, at the position the previous page ended on.
+    #[tokio::test]
+    async fn an_unmoved_query_state_pages_on() {
+        let (primary, foreign, transport) = paging_handles(vec![
+            (vec!["M1", "M2"], Some(4), "q-1"),
+            (vec!["M3", "M4"], Some(4), "q-1"),
+        ]);
+
+        let page = search_messages(primary.clone(), Arc::clone(&foreign), search_with_limit(2))
+            .await
+            .expect("search succeeds");
+        let mut resume = search_with_limit(2);
+        resume.page_cursor = Some(page.next_cursor.expect("more remains"));
+        let second = search_messages(primary, foreign, resume)
+            .await
+            .expect("resume succeeds");
+
+        assert_eq!(transport.positions(), vec![0, 2]);
+        assert_eq!(
+            second.items,
+            vec![ObjectId("M3".to_string()), ObjectId("M4".to_string())]
+        );
+        assert!(second.next_cursor.is_none(), "total is exhausted");
+    }
+
+    /// The cursor codec: version, position and an opaque `queryState`
+    /// round-trip, on the primary account and on a share alike. The state
+    /// is the payload TAIL, so a state containing the field separator
+    /// survives verbatim.
+    #[test]
+    fn the_search_cursor_round_trips_position_state_and_owner() {
+        for owner in [None, Some("shared")] {
+            for state in ["q-1", "a:b:c", ""] {
+                let encoded = encode_position(42, state, owner);
+                let decoded = decode_position(Some(&encoded), owner, AccountOperation::Search)
+                    .expect("round-trips");
+                assert_eq!(decoded.position, 42);
+                assert_eq!(decoded.query_state.as_deref(), Some(state));
+            }
+        }
+    }
+
+    /// A v1 cursor (a bare integer position, no `queryState`) is REFUSED,
+    /// not silently upgraded: continuing it is exactly the unpinned paging
+    /// the version bump exists to stop.
+    #[test]
+    fn a_v1_search_cursor_is_refused_as_schema_incompatible() {
+        let error = decode_position(Some(b"7"), None, AccountOperation::Search)
+            .expect_err("a v1 cursor must not resume");
+        assert_eq!(
+            error.kind(),
+            &bifrost_types::AccountErrorKind::SyncState(
+                bifrost_types::SyncStateErrorKind::SchemaIncompatible
+            )
+        );
+
+        let foreign = super::super::foreign::encode_object("shared", "7").into_bytes();
+        let error = decode_position(Some(&foreign), Some("shared"), AccountOperation::Search)
+            .expect_err("a foreign v1 cursor must not resume either");
+        assert_eq!(
+            error.kind(),
+            &bifrost_types::AccountErrorKind::SyncState(
+                bifrost_types::SyncStateErrorKind::SchemaIncompatible
+            )
+        );
+    }
+
+    /// The owner qualification that landed with the account-mismatch fix
+    /// still binds: a v2 cursor minted on a share is refused against the
+    /// primary account, before the wire.
+    #[test]
+    fn a_v2_cursor_still_refuses_to_cross_accounts() {
+        let cursor = encode_position(3, "q-1", Some("shared"));
+        let error = decode_position(Some(&cursor), None, AccountOperation::Search)
+            .expect_err("a cursor may not cross accounts");
+        assert_eq!(
+            error.kind(),
+            &bifrost_types::AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed)
         );
     }
 

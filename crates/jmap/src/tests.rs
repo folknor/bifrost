@@ -682,9 +682,9 @@ mod session_capabilities_deserialization {
 
         // core
         let core = session.core_capabilities().expect("core missing");
-        assert_eq!(core.max_size_upload(), 50_000_000);
-        assert_eq!(core.max_calls_in_request(), 16);
-        assert_eq!(core.max_objects_in_get(), 500);
+        assert_eq!(core.max_size_upload(), Some(50_000_000));
+        assert_eq!(core.max_calls_in_request(), Some(16));
+        assert_eq!(core.max_objects_in_get(), Some(500));
         assert_eq!(core.collation_algorithms(), &["i;ascii-casemap"]);
 
         #[cfg(feature = "mail")]
@@ -2737,15 +2737,55 @@ mod session_capability_fallbacks {
     }
 
     #[test]
-    fn core_capabilities_default_missing_limits_to_zero() {
+    fn core_capabilities_omitted_limits_are_none_not_zero() {
         // `CoreCapabilities` is `#[serde(default)]`, so an empty object
-        // decodes rather than falling through to `Other` - the zero
-        // limits are what the sync layer's validation has to reject.
+        // decodes rather than falling through to `Other`. Each omitted
+        // limit reads as `None` - "the server advertised nothing" - which
+        // the sync layer must not confuse with an advertised `0`.
         let session = session_with(json!({"urn:ietf:params:jmap:core": {}}));
         let core = session.core_capabilities().expect("core cap");
-        assert_eq!(core.max_objects_in_get(), 0);
-        assert_eq!(core.max_objects_in_set(), 0);
+        assert_eq!(core.max_objects_in_get(), None);
+        assert_eq!(core.max_objects_in_set(), None);
         assert!(core.collation_algorithms().is_empty());
+    }
+
+    /// A present-but-unparseable core block keeps its own state. `Other`
+    /// would have made it indistinguishable from an absent capability at
+    /// every reader, which is exactly how a string-typed limit came to be
+    /// reported as "the server stopped advertising core".
+    #[test]
+    fn a_malformed_core_block_keeps_its_own_state_rather_than_reading_as_absent() {
+        use crate::core::session::CoreCapabilityState;
+
+        let session = session_with(json!({
+            "urn:ietf:params:jmap:core": {"maxCallsInRequest": "16"}
+        }));
+        assert!(matches!(
+            session.core_capability_state(),
+            CoreCapabilityState::Malformed
+        ));
+        assert!(
+            session.core_capabilities().is_none(),
+            "the typed accessor still has nothing to hand back"
+        );
+        assert!(
+            matches!(
+                session.capability("urn:ietf:params:jmap:core"),
+                Some(Capabilities::CoreMalformed(v)) if v == &json!({"maxCallsInRequest": "16"})
+            ),
+            "and the offending value is preserved verbatim for diagnostics"
+        );
+
+        let absent = session_with(json!({}));
+        assert!(matches!(
+            absent.core_capability_state(),
+            CoreCapabilityState::Absent
+        ));
+        let present = session_with(json!({"urn:ietf:params:jmap:core": {}}));
+        assert!(matches!(
+            present.core_capability_state(),
+            CoreCapabilityState::Present(_)
+        ));
     }
 
     #[test]

@@ -483,14 +483,21 @@ impl Client {
         // an absent or zero `maxSizeRequest` is a session-validation
         // matter, and enforcing it here would turn it into a client bug
         // on a request that could never fit anything.
-        if let Some(core) = self.session().core_capabilities() {
-            let max = core.max_size_request();
-            if max > 0 && frame.len() > max {
-                return Err(crate::Error::RequestSizeLimit {
-                    max,
-                    size: frame.len(),
-                });
-            }
+        // An OMITTED `maxSizeRequest` and an advertised `0` are both
+        // unusable here for the same reason `CallLimit` declines both of
+        // its unusable states, but they are distinct on the wire and the
+        // session validator classifies them differently.
+        if let Some(max) = self
+            .session()
+            .core_capabilities()
+            .and_then(crate::core::session::CoreCapabilities::max_size_request)
+            && max > 0
+            && frame.len() > max
+        {
+            return Err(crate::Error::RequestSizeLimit {
+                max,
+                size: frame.len(),
+            });
         }
 
         Ok((frame, request_id))

@@ -62,6 +62,14 @@ pub(crate) enum Capabilities {
     Mail(MailCapabilities),
     #[cfg(feature = "mail")]
     Submission(SubmissionCapabilities),
+    /// The `urn:ietf:params:jmap:core` block was present but did not
+    /// parse as [`CoreCapabilities`] (a limit sent as a string, say).
+    /// Kept as its own variant rather than folded into `Other` so that a
+    /// present-but-malformed core block reads as the INVALID lane instead
+    /// of the unadvertised one: the two map to different recovery classes
+    /// (`Protocol(ContractViolation)` versus `SyncState(CapabilityChanged)`),
+    /// and `Other` is indistinguishable from absent at every reader.
+    CoreMalformed(serde_json::Value),
     WebSocket(WebSocketCapabilities),
     #[cfg(feature = "mail")]
     Sieve(SieveCapabilities),
@@ -105,7 +113,18 @@ where
 
     for (key, value) in raw {
         let cap = match key.as_str() {
-            "urn:ietf:params:jmap:core" => try_cap!(value, Core),
+            // The core block is the one capability whose malformed shape
+            // must not degrade to "absent" - see `Capabilities::CoreMalformed`.
+            "urn:ietf:params:jmap:core" => {
+                // Cloned rather than string-round-tripped: `from_value`
+                // consumes the value on error, and the malformed value has
+                // to survive into `CoreMalformed`. The core object is a
+                // handful of scalars, parsed once per session.
+                match serde_json::from_value(value.clone()) {
+                    Ok(core) => Capabilities::Core(core),
+                    Err(_) => Capabilities::CoreMalformed(value),
+                }
+            }
             #[cfg(feature = "mail")]
             "urn:ietf:params:jmap:mail" => try_cap!(value, Mail),
             #[cfg(feature = "mail")]
@@ -131,32 +150,54 @@ where
     Ok(result)
 }
 
+/// `urn:ietf:params:jmap:core` limits.
+///
+/// Every limit is `Option<usize>`, not a zero-filled `usize`. RFC 8620 §2
+/// makes all of them mandatory members of the core object, so an omitted
+/// one and an advertised `0` are two different server bugs with two
+/// different honest readings - "the server told us nothing" versus "the
+/// server told us a limit that forbids every request" - and a blanket
+/// `#[serde(default)]` merged them into the same zero. The readers that
+/// enforce a bound (`CallLimit`, the WebSocket frame-size guard) and the
+/// reader that validates the session (`sync::capabilities::build`) need the
+/// distinction to land in the right lane.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct CoreCapabilities {
     #[serde(rename = "maxSizeUpload")]
-    max_size_upload: usize,
+    max_size_upload: Option<usize>,
 
     #[serde(rename = "maxConcurrentUpload")]
-    max_concurrent_upload: usize,
+    max_concurrent_upload: Option<usize>,
 
     #[serde(rename = "maxSizeRequest")]
-    max_size_request: usize,
+    max_size_request: Option<usize>,
 
     #[serde(rename = "maxConcurrentRequests")]
-    max_concurrent_requests: usize,
+    max_concurrent_requests: Option<usize>,
 
     #[serde(rename = "maxCallsInRequest")]
-    max_calls_in_request: usize,
+    max_calls_in_request: Option<usize>,
 
     #[serde(rename = "maxObjectsInGet")]
-    max_objects_in_get: usize,
+    max_objects_in_get: Option<usize>,
 
     #[serde(rename = "maxObjectsInSet")]
-    max_objects_in_set: usize,
+    max_objects_in_set: Option<usize>,
 
     #[serde(rename = "collationAlgorithms")]
     collation_algorithms: Vec<String>,
+}
+
+/// The three states the core capability block can be in, which the
+/// two-state `Option<&CoreCapabilities>` could not express.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum CoreCapabilityState<'a> {
+    /// No `urn:ietf:params:jmap:core` key in the session at all.
+    Absent,
+    /// Present, but not parseable as the RFC 8620 core object.
+    Malformed,
+    Present(&'a CoreCapabilities),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -304,6 +345,22 @@ impl Session {
         Core,
         CoreCapabilities
     );
+
+    /// The core capability block as a three-state: absent, present but
+    /// unparseable, or present and typed. `core_capabilities()` collapses
+    /// the first two into `None`; every reader that has to CLASSIFY a bad
+    /// session (rather than merely decline to enforce a bound) must use
+    /// this instead.
+    pub(crate) fn core_capability_state(&self) -> CoreCapabilityState<'_> {
+        match self
+            .capabilities
+            .get(<crate::core::capability::Core as crate::core::capability::Capability>::URI)
+        {
+            None => CoreCapabilityState::Absent,
+            Some(Capabilities::Core(core)) => CoreCapabilityState::Present(core),
+            Some(_) => CoreCapabilityState::Malformed,
+        }
+    }
     session_cap_accessor!(
         #[cfg(feature = "mail")]
         mail_capabilities,
@@ -434,31 +491,31 @@ impl Account {
 }
 
 impl CoreCapabilities {
-    pub(crate) fn max_size_upload(&self) -> usize {
+    pub(crate) fn max_size_upload(&self) -> Option<usize> {
         self.max_size_upload
     }
 
-    pub(crate) fn max_concurrent_upload(&self) -> usize {
+    pub(crate) fn max_concurrent_upload(&self) -> Option<usize> {
         self.max_concurrent_upload
     }
 
-    pub(crate) fn max_size_request(&self) -> usize {
+    pub(crate) fn max_size_request(&self) -> Option<usize> {
         self.max_size_request
     }
 
-    pub(crate) fn max_concurrent_requests(&self) -> usize {
+    pub(crate) fn max_concurrent_requests(&self) -> Option<usize> {
         self.max_concurrent_requests
     }
 
-    pub(crate) fn max_calls_in_request(&self) -> usize {
+    pub(crate) fn max_calls_in_request(&self) -> Option<usize> {
         self.max_calls_in_request
     }
 
-    pub(crate) fn max_objects_in_get(&self) -> usize {
+    pub(crate) fn max_objects_in_get(&self) -> Option<usize> {
         self.max_objects_in_get
     }
 
-    pub(crate) fn max_objects_in_set(&self) -> usize {
+    pub(crate) fn max_objects_in_set(&self) -> Option<usize> {
         self.max_objects_in_set
     }
 

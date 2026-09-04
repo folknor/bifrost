@@ -411,6 +411,39 @@ pub(crate) fn search_cursor_account_mismatch(
     .expect("valid account error classification")
 }
 
+/// The `Email/query` result set moved between the page that minted the
+/// search cursor and the page that presented it (`queryState` changed).
+///
+/// The cursor is a position into a server-recomputed order, so continuing
+/// against a moved order silently duplicates and skips results.
+///
+/// This is a `ConcurrencyConflict` -> `Retry(AfterStateRefresh)`, which is
+/// precisely the shape of the event: the caller's state (the page cursor)
+/// is stale, refreshing it means running the search again from the first
+/// page, and the retry then succeeds. The two neighbouring lanes are both
+/// wrong. `SyncState(CursorInvalid)` is reserved for an ENGINE cursor
+/// scope (the builder refuses it without an `ErrorScope::Cursor`,
+/// `CursorInvalidWithoutScope`), and a search page cursor never enters
+/// the cursor envelope, so there is no scope to restart. `Request(Malformed)`
+/// derives `ClientBug`, and a single delivered message advancing
+/// `queryState` is not the caller's bug and must not be reported as
+/// permanently unfixable.
+#[must_use]
+pub(crate) fn search_result_set_superseded(operation: AccountOperation) -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::ConcurrencyConflict,
+        Cause::State(bifrost_types::StateCause::ConcurrencyConflict),
+    )
+    .protocol(Protocol::Jmap)
+    .operation(operation)
+    .text(DiagnosticText::support_only(
+        "search result set changed between pages \
+         (Email/query queryState moved); repeat the search",
+    ))
+    .try_build()
+    .expect("valid account error classification")
+}
+
 /// A send-as mailbox id that was not present in the successfully seeded
 /// foreign-account routing table. Consumers receive these ids from foreign
 /// membership ownership, so an unknown id is a malformed request.

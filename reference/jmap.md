@@ -37,9 +37,24 @@ and WebSocket requests through the same `call` door, so no call site can
 accidentally put an oversized method batch on the wire.
 
 The snapshot is a three-state `CallLimit`, not a number: `Unadvertised` (no
-`urn:ietf:params:jmap:core` block), `Invalid` (the block advertises
-`maxCallsInRequest: 0`, which RFC 8620 forbids), and `Advertised`, which is the
-only state that enforces. Treating the first two as a limit of zero would make
+`urn:ietf:params:jmap:core` block, or a block that omits `maxCallsInRequest`),
+`Invalid` (the block advertises `maxCallsInRequest: 0`, which RFC 8620 forbids,
+or the block is present and does not parse at all), and `Advertised`, which is
+the only state that enforces.
+
+Both halves of that widening are deliberate. Every core limit is an
+`Option<usize>`, so an OMITTED field reads as "advertised nothing" rather than
+as the zero a blanket `#[serde(default)]` used to fill in - two different server
+bugs with two different classifications. And a present-but-unparseable core
+block (`"maxCallsInRequest": "16"`) is its own `Capabilities::CoreMalformed`
+variant, read through `Session::core_capability_state()` (`Absent` /
+`Malformed` / `Present`); falling back to `Capabilities::Other` made it
+indistinguishable from absent at every reader, so a server sending a
+string-typed limit was classified `SyncState(CapabilityChanged)` and the engine
+reopened forever against a session that will never change. `core_capabilities()`
+still collapses `Absent` and `Malformed` into `None`, which is correct for any
+reader that only declines to enforce a bound; every reader that CLASSIFIES a bad
+session must use the three-state. Treating the first two as a limit of zero would make
 every request unable to hold a single call - and because open issues its probe
 requests through `seed_account_state` *before* `sync::capabilities::build`
 validates the session, that failure would land as `Request(Malformed)` /
@@ -281,7 +296,7 @@ Reopen is engine-delegated: on drop or `close()`, the engine calls `JmapAccountF
 - `filter_rule_shape: Scripts` and every filter flag true with a primary Sieve account; without Sieve they are false and the shape is `None`.
 - `conveniences`: `starred = Keyword`, `replied`/`forwarded`/`mdn_sent` via keyword true, extended-property routes false. `set_starred`/`mark_replied`/`mark_forwarded`/`mark_mdn_sent` map to `$flagged`/`$answered`/`$forwarded`/`$MDNSent`. `set_importance` is two-valued: `High` sets `$important`, else clears; read maps `$important` presence onto `Message.importance`.
 
-`CoreLimits` holds `maxObjectsInGet` and `maxObjectsInSet` - the only two limits the JMAP `Account` impl actually reads. `build` rejects a session whose advertised core limits (including `maxCallsInRequest` and `maxSizeRequest`) are zero, even though those latter two are validated and discarded.
+`CoreLimits` holds `maxObjectsInGet` and `maxObjectsInSet` - the only two limits the JMAP `Account` impl actually reads. `build` reads the three-state `core_capability_state()` and refuses on three grounds, in two different lanes: an ABSENT core block is `SyncState(CapabilityChanged)` -> `RestartAccount` (the server dropped a capability it used to advertise, so a reopen may fix it), while a PRESENT block that does not parse, and a present block whose `maxCallsInRequest` / `maxObjectsInGet` / `maxObjectsInSet` / `maxSizeRequest` is zero OR omitted, are both `Protocol(ContractViolation)`. Omitted counts because RFC 8620 §2 makes every one of those a mandatory member; classifying either as a capability change would buy a reopen loop against a session that will come back identical. `maxCallsInRequest` and `maxSizeRequest` are validated and discarded.
 
 ### Cursor envelope
 
@@ -339,7 +354,7 @@ Each `Email/get` answer is reconciled against the ids the batch submitted (`hydr
 - `WebSocketResponse` decodes `requestId` (RFC 8887 s4.3.4) and `WebSocketMessage::Response` carries it, so a reader can match a response frame to the request it answers. It was previously dropped at decode, which made two in-flight WebSocket requests indistinguishable on the read stream.
 - `frame_stream` runs the session-divergence comparison on every response frame's `sessionState`, through the same `Client::note_session_state` the HTTP door uses - including on a frame whose method responses fail to decode, whose session state was still truthful. The WS door previously handed responses up without ever looking, losing staleness detection on the connection that stays open longest.
 
-- A `maxSizeRequest` guard (RFC 8620 s2) on the encoded frame, matching the HTTP door's refusal to send an oversized batch. It is measured on the FRAME, envelope and `requestId` included, because over WebSocket the frame is the request. Only an advertised, non-zero limit is enforced, for the same reason `CallLimit` refuses to enforce its two unusable states. Over-limit raises `Error::RequestSizeLimit { max, size }` -> `Request(Malformed)` / `ClientBug`; the HTTP door can answer `Ok(None)` against a caller-supplied bound instead because `send_methods_within` has that contract, and `send_ws` has none - it either writes the frame or it does not.
+- A `maxSizeRequest` guard (RFC 8620 s2) on the encoded frame, matching the HTTP door's refusal to send an oversized batch. It is measured on the FRAME, envelope and `requestId` included, because over WebSocket the frame is the request. Only an advertised, non-zero limit is enforced, for the same reason `CallLimit` refuses to enforce its two unusable states - and since the limit is an `Option`, an omitted `maxSizeRequest` declines to enforce without being confused for an advertised zero, which the session validator refuses separately. Over-limit raises `Error::RequestSizeLimit { max, size }` -> `Request(Malformed)` / `ClientBug`; the HTTP door can answer `Ok(None)` against a caller-supplied bound instead because `send_methods_within` has that contract, and `send_ws` has none - it either writes the frame or it does not.
 
 The await side is `PendingRequests`, a map of waiters keyed by `requestId`, held on the `Client` (not the `WsStream`) so it outlives any one connection. `Client::send_ws_awaiting` (and `Request::send_ws_awaiting`, the WebSocket counterpart of `Request::send`) registers a waiter and returns a `PendingResponse` that resolves to the correlated `Response`. `send_ws` is unchanged and still fire-and-forget.
 
@@ -664,3 +679,24 @@ a whole new share still waits for reopen.
   account it was minted against (the same object-id codec), and replaying it
   under a filter that routes elsewhere is refused rather than paging one
   account by another's offsets.
+- The search page cursor payload is versioned: `2:<position>:<queryState>`,
+  owner-qualified for a share. Two things ride in it because a bare position
+  means nothing without either. The account, because the order is
+  account-scoped (above); and the `queryState`, because the order is not
+  stable across calls - `Email/query` recomputes it per call, so page 2 taken
+  under a moved state slides the window and silently duplicates one hit while
+  dropping another. A moved state is refused as `ConcurrencyConflict` ->
+  `Retry(AfterStateRefresh)` ("repeat the search"), never `Done`-shaped
+  silence: it is not the caller's bug (one delivered message moves the state)
+  and it is not terminal. `SyncState(CursorInvalid)` is unavailable here on
+  purpose - it requires an `ErrorScope::Cursor`, and a search page cursor is
+  not an engine cursor scope. A v1 cursor (the bare integer position that
+  carried no pin) is refused `SyncState(SchemaIncompatible)` rather than
+  resumed, since resuming it is exactly the unpinned paging the bump exists
+  to stop; the two shapes are unambiguous (a v1 payload is all digits).
+- Whether a next page exists is decided by the response's echoed `position`
+  plus `total`, not by the page having come back full. RFC 8620 permits a
+  short non-final page, and reading fullness as "more remains" ended such a
+  walk in `Done`-shaped silence with most of the hits unreported. The query
+  always sets `calculateTotal`; page fullness survives only as the fallback
+  for a server that omits `total` anyway.

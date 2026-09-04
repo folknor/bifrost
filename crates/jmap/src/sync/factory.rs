@@ -348,10 +348,8 @@ fn foreign_probe_concurrency(session: &crate::core::session::Session) -> usize {
     const MAX_PROBE_CONCURRENCY: usize = 8;
     session
         .core_capabilities()
-        .map_or(
-            1,
-            crate::core::session::CoreCapabilities::max_concurrent_requests,
-        )
+        .and_then(crate::core::session::CoreCapabilities::max_concurrent_requests)
+        .unwrap_or(1)
         .clamp(1, MAX_PROBE_CONCURRENCY)
 }
 
@@ -584,14 +582,20 @@ async fn batched_open_probes<T: HttpTransport>(
     let Some(core) = session.core_capabilities() else {
         return Ok(None);
     };
-    if core.max_calls_in_request() < OPEN_PROBE_CALLS {
+    // An omitted call/size limit is not a licence to batch: the server
+    // told us nothing, and the conservative shape is one call per request.
+    let (Some(max_calls), Some(max_size)) = (core.max_calls_in_request(), core.max_size_request())
+    else {
+        return Ok(None);
+    };
+    if max_calls < OPEN_PROBE_CALLS {
         return Ok(None);
     }
     // The size limit is checked against the actual encoding inside
     // `send_methods_within`, because it can fall between the individual
     // probes and their batch.
     mail.build()
-        .send_methods_within(open_probe_methods(), core.max_size_request())
+        .send_methods_within(open_probe_methods(), max_size)
         .await
 }
 
