@@ -33,23 +33,12 @@ it up without that comparison, and `send_ws` never sees the response at all. Any
 future consumer of WS method calls silently loses staleness detection. Contract
 asymmetry between the two doors of the same layer.
 
-### 3. No JSON Pointer escaping in dotted-path patch keys
-
-`email/set.rs`: `EmailPatch::keyword` builds `format!("keywords/{keyword}")` and
-`mailbox_id` builds `format!("mailboxIds/{mailbox_id}")`. RFC 8620 s5.3 patch
-paths are JSON Pointers, where `/` must be escaped as `~1` and `~` as `~0`.
-Mailbox ids are safe (RFC 8620 id grammar is URL-safe), but IMAP-derived
-keywords may legally contain `/` (IMAP atoms exclude parens, `%`, `*`, `"`,
-`\` - not `/`). A keyword like `work/urgent` produces the pointer
-`keywords/work/urgent`, which patches a nested key inside the keyword map's
-`work` entry - the server rejects it (`invalidPatch`) or worse, on a lenient
-server, does something else. Same shape applies anywhere in the crate that
-builds dotted paths by `format!` (the sync layer does it too, e.g. RSVP's
-participant path - outside this scope but same missing helper). The fix is one
-`escape_json_pointer_token` used at every path-construction site. Work note:
-this one fix covers the sync-layer sites too (grep the whole crate for
-`format!`-built patch paths when applying it); do not file or fix the sync-side
-instances separately.
+(Finding 3 - no JSON Pointer escaping in dotted patch paths - is fixed
+crate-wide: `core::set::escape_json_pointer_token` now guards every
+`format!`-built path site (keywords, mailboxIds, shareWith, addressBookIds,
+calendarIds, and the sync layer's RSVP participant path). Pinned by
+`keyword_and_mailbox_patch_paths_escape_json_pointer_tokens` with
+revert-and-confirm; the rule is stated in `reference/jmap.md`.)
 
 ### 5. `SetResponse::new_state()` fabricates an empty state string
 

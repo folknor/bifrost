@@ -66,7 +66,10 @@ impl ContactCardPatch {
     ) -> &mut Self {
         self.properties.remove("addressBookIds");
         self.properties.insert(
-            format!("addressBookIds/{}", address_book_id.into().into_string()),
+            format!(
+                "addressBookIds/{}",
+                crate::core::set::escape_json_pointer_token(&address_book_id.into().into_string())
+            ),
             if set {
                 serde_json::Value::Bool(true)
             } else {

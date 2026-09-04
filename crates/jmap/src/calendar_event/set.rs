@@ -66,7 +66,10 @@ impl CalendarEventPatch {
     ) -> &mut Self {
         self.properties.remove("calendarIds");
         self.properties.insert(
-            format!("calendarIds/{}", calendar_id.into().into_string()),
+            format!(
+                "calendarIds/{}",
+                crate::core::set::escape_json_pointer_token(&calendar_id.into().into_string())
+            ),
             if set {
                 serde_json::Value::Bool(true)
             } else {

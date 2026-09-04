@@ -713,7 +713,10 @@ fn jmap_rsvp_patch_from_participants(
     let participant_id = rsvp_participant_id(participants, self_emails)?;
     let mut patch = CalendarEventPatch::default();
     patch.set_property(
-        format!("participants/{participant_id}/participationStatus"),
+        format!(
+            "participants/{}/participationStatus",
+            crate::core::set::escape_json_pointer_token(participant_id)
+        ),
         json!(rsvp_value(status)),
     );
     Ok(patch)

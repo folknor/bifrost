@@ -3,7 +3,10 @@ use super::{
     EmailPatch, Header, HeaderValue,
 };
 use crate::core::id::BlobId;
-use crate::core::{request::ResultReference, set::from_timestamp};
+use crate::core::{
+    request::ResultReference,
+    set::{escape_json_pointer_token, from_timestamp},
+};
 use crate::mailbox::MailboxId;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -194,7 +197,10 @@ impl EmailPatch {
         self.mailbox_ids = None;
         self.remove_patch_property("mailboxIds");
         self.patch.get_or_insert_with(HashMap::new).insert(
-            format!("mailboxIds/{mailbox_id}"),
+            format!(
+                "mailboxIds/{}",
+                escape_json_pointer_token(mailbox_id.as_str())
+            ),
             if set {
                 serde_json::Value::Bool(true)
             } else {
@@ -219,7 +225,7 @@ impl EmailPatch {
         self.keywords = None;
         self.remove_patch_property("keywords");
         self.patch.get_or_insert_with(HashMap::new).insert(
-            format!("keywords/{keyword}"),
+            format!("keywords/{}", escape_json_pointer_token(keyword)),
             if set {
                 serde_json::Value::Bool(true)
             } else {
@@ -500,6 +506,38 @@ mod tests {
         // `mailboxIds` wholesale may show up alongside their paths.
         assert!(json.get("keywords").is_none());
         assert!(json.get("mailboxIds").is_none());
+    }
+
+    /// Patch paths are JSON Pointers (RFC 8620 s5.3 / RFC 6901), and IMAP
+    /// keywords legally contain `/` (atoms exclude parens, `%`, `*`, `"`,
+    /// `\` - not `/`). Unescaped, `keywords/work/urgent` names a nested key
+    /// inside the keyword map's `work` entry: a strict server answers
+    /// `invalidPatch`, a lenient one misapplies it.
+    #[test]
+    fn keyword_and_mailbox_patch_paths_escape_json_pointer_tokens() {
+        let mut patch = EmailPatch::default();
+        patch.keyword("work/urgent", true);
+        let json = serde_json::to_value(&patch).expect("serializable patch");
+        assert_eq!(
+            json.get("keywords/work~1urgent"),
+            Some(&serde_json::Value::Bool(true))
+        );
+
+        let mut patch = EmailPatch::default();
+        patch.keyword("odd~flag", false);
+        let json = serde_json::to_value(&patch).expect("serializable patch");
+        assert_eq!(
+            json.get("keywords/odd~0flag"),
+            Some(&serde_json::Value::Null)
+        );
+
+        let mut patch = EmailPatch::default();
+        patch.mailbox_id(&MailboxId::new("box/nested"), true);
+        let json = serde_json::to_value(&patch).expect("serializable patch");
+        assert_eq!(
+            json.get("mailboxIds/box~1nested"),
+            Some(&serde_json::Value::Bool(true))
+        );
     }
 
     #[test]

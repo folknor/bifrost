@@ -7,6 +7,21 @@ use std::fmt::{self, Display, Formatter};
 use super::id::AccountId;
 use super::{Object, SetCreate, request::ResultReference};
 
+/// Escape one token of an RFC 8620 s5.3 patch path (a JSON Pointer,
+/// RFC 6901): `~` becomes `~0` and `/` becomes `~1`.
+///
+/// Every `format!`-built dotted path in this crate must route its
+/// interpolated token through here. Most JMAP ids are URL-safe by
+/// grammar, but keywords are IMAP atoms (which legally contain `/` -
+/// `work/urgent`), and server-minted map keys carry no grammar promise
+/// at all. An unescaped `/` splits the token into extra pointer steps:
+/// `keywords/work/urgent` patches a nested key inside the keyword map's
+/// `work` entry, which a strict server rejects as `invalidPatch` and a
+/// lenient one misapplies.
+pub(crate) fn escape_json_pointer_token(token: &str) -> String {
+    token.replace('~', "~0").replace('/', "~1")
+}
+
 /// Implemented by a JMAP object's canonical (Get-shape) type. Declares
 /// the input shapes used by `SetRequest`/`CopyRequest`.
 ///

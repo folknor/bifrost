@@ -107,7 +107,10 @@ impl MailboxPatch {
 
     pub(crate) fn acl(&mut self, id: &str, acl: impl IntoIterator<Item = ACL>) -> &mut Self {
         self.acl_patch.get_or_insert_with(HashMap::new).insert(
-            format!("shareWith/{id}"),
+            format!(
+                "shareWith/{}",
+                crate::core::set::escape_json_pointer_token(id)
+            ),
             ACLPatch::Replace(acl.into_iter().map(|acl| (acl, true)).collect()),
         );
         self
@@ -115,7 +118,11 @@ impl MailboxPatch {
 
     pub(crate) fn acl_set(&mut self, id: &str, acl: ACL, set: bool) -> &mut Self {
         self.acl_patch.get_or_insert_with(HashMap::new).insert(
-            format!("shareWith/{id}/{}", acl.as_str()),
+            format!(
+                "shareWith/{}/{}",
+                crate::core::set::escape_json_pointer_token(id),
+                acl.as_str()
+            ),
             ACLPatch::Set(set),
         );
         self
