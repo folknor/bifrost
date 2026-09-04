@@ -8,28 +8,14 @@ engine's test module skimmed rather than exhaustively read).
 
 ## Confident defects
 
-### 1. A terminal changes-stream error puts the scope into a 1-second respawn/re-drive loop forever
-
-`multiplexer/mod.rs`. When `handle_drive_outcome` hits
-`RecoveryPlan::Terminal`, it returns `exit: true`; the poll task exits and
-`retire_scope_token` removes its token. But the terminal arm neither deletes
-the scope's cursor nor records "stopped" anywhere the scan can see. The 1s
-scan in `Multiplexer::run` (`spawn_missing_scope_polls`) sees a live cursor
-with no token and immediately respawns the poll task, whose first drive runs
-with no initial sleep. Result: for a provider whose stream terminates with a
-genuinely terminal error (e.g. `ProviderContractViolation`, the very class
-`batch_boundary_violation` manufactures), the engine performs one wire drive
-per second for the life of the attachment, and every drive re-broadcasts
-`SyncEvent::Terminated` to subscribers. This directly contradicts "the engine
-has nothing left to try" and defeats the whole point of classifying boundary
-violations as terminal ("a provider emitting a nonsense boundary does not heal
-by being asked again" - yet it is asked again every second). The only
-scope-retiring paths are `DisableScope` and registry deletion; Terminal takes
-neither. The fix shape is for the terminal arm to delete/park the scope (or
-record a tombstone the scan honors), not to rely on token absence meaning
-"please respawn". The push reconciler's Terminal arm has the milder sibling
-problem: it leaves the cursor installed, so every later hint re-drives a
-terminally failed scope.
+(Finding 1 - a terminal changes-stream error respawning/re-driving the scope
+once per second forever - is fixed: poll exits now carry a `PollExit`
+disposition, and the Terminal arm parks the scope by leaving its uncancelled
+`ScopeToken` in the map as a tombstone the 1s scan honors; pinned by
+`terminal_drive_outcome_parks_the_scope_instead_of_retiring_it` and documented
+in `reference/sync.md`. The push reconciler's milder sibling - a later hint
+can still re-drive a terminally failed scope, since the reconciler does not
+consult scope tokens - remains open and is now stated in the reference.)
 
 ### 2. `ScopeLifecycle::Deleted` never touches durable state, and the surviving backfill completion marker silently skips a recreated folder's backfill
 

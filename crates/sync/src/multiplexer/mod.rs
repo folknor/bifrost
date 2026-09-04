@@ -680,7 +680,7 @@ fn spawn_and_track_scope_poll(
     let cleanup_tokens = Arc::clone(&scope_tokens);
     let cleanup_scope = scope.clone();
     tokio::spawn(async move {
-        spawn_scope_poll_inner(
+        let exit = spawn_scope_poll_inner(
             account_id,
             account,
             cursors,
@@ -696,7 +696,16 @@ fn spawn_and_track_scope_poll(
             scope,
         )
         .await;
-        retire_scope_token(&cleanup_tokens, &cleanup_scope, generation);
+        // A terminally failed scope leaves its (uncancelled) token in the
+        // map as a tombstone: the 1s scan sees a live entry and never
+        // respawns the poll, so a terminal error really is terminal instead
+        // of a once-per-second re-drive. The scope-retiring paths
+        // (`cancel_scope_token` via lifecycle deletion or an engine restart,
+        // and multiplexer shutdown) still clear the entry, so a scope that
+        // is deleted-and-recreated or explicitly restarted respawns cleanly.
+        if matches!(exit, PollExit::Retire) {
+            retire_scope_token(&cleanup_tokens, &cleanup_scope, generation);
+        }
     });
 }
 
@@ -789,14 +798,14 @@ async fn spawn_scope_poll_inner(
     throttles: Arc<StdMutex<crate::recovery::ThrottleBucket>>,
     scheduler: crate::scheduler::Scheduler,
     scope: CursorScope,
-) {
+) -> PollExit {
     let mut cadence = AdaptiveCadence {
         interval: config.poll_initial,
         no_change_streak: 0,
     };
     loop {
         if shutdown.is_cancelled() || scope_cancel.is_cancelled() {
-            return;
+            return PollExit::Retire;
         }
         // If the boundary is asking us to pause, park here until it
         // changes back to Run (or Stop / Shutdown trips).
@@ -804,11 +813,11 @@ async fn spawn_scope_poll_inner(
             // Park until the request changes.
             loop {
                 tokio::select! {
-                    () = shutdown.cancelled() => return,
-                    () = scope_cancel.cancelled() => return,
+                    () = shutdown.cancelled() => return PollExit::Retire,
+                    () = scope_cancel.cancelled() => return PollExit::Retire,
                     next = boundary.changed() => {
                         match next {
-                            None => return,
+                            None => return PollExit::Retire,
                             Some(crate::cancel::BoundaryRequest::Pause) => continue,
                             Some(_) => break,
                         }
@@ -832,14 +841,14 @@ async fn spawn_scope_poll_inner(
                 "poll deferred by shared throttle deadline"
             );
             tokio::select! {
-                () = shutdown.cancelled() => return,
-                () = scope_cancel.cancelled() => return,
+                () = shutdown.cancelled() => return PollExit::Retire,
+                () = scope_cancel.cancelled() => return PollExit::Retire,
                 () = tokio::time::sleep(wait) => {}
             }
         }
         let _admission = tokio::select! {
-            () = shutdown.cancelled() => return,
-            () = scope_cancel.cancelled() => return,
+            () = shutdown.cancelled() => return PollExit::Retire,
+            () = scope_cancel.cancelled() => return PollExit::Retire,
             permit = scheduler.admit(
                 account_id.clone(),
                 control.priority_snapshot(),
@@ -859,8 +868,8 @@ async fn spawn_scope_poll_inner(
                         "poll admission refused; retrying at the next cadence"
                     );
                     tokio::select! {
-                        () = shutdown.cancelled() => return,
-                        () = scope_cancel.cancelled() => return,
+                        () = shutdown.cancelled() => return PollExit::Retire,
+                        () = scope_cancel.cancelled() => return PollExit::Retire,
                         () = tokio::time::sleep(cadence.interval) => {}
                     }
                     continue;
@@ -907,7 +916,7 @@ async fn spawn_scope_poll_inner(
         drop(_admission);
         let Some((advanced, outcome)) = driven else {
             // Scope was removed from the registry; exit cleanly.
-            return;
+            return PollExit::Retire;
         };
         let recovered = handle_drive_outcome(
             &scope,
@@ -925,8 +934,8 @@ async fn spawn_scope_poll_inner(
             config.poll_min,
             config.poll_max,
         );
-        if recovered.exit {
-            return;
+        if let Some(exit) = recovered.exit {
+            return exit;
         }
         if matches!(
             boundary.peek(),
@@ -934,11 +943,13 @@ async fn spawn_scope_poll_inner(
         ) {
             loop {
                 tokio::select! {
-                    () = shutdown.cancelled() => return,
-                    () = scope_cancel.cancelled() => return,
+                    () = shutdown.cancelled() => return PollExit::Retire,
+                    () = scope_cancel.cancelled() => return PollExit::Retire,
                     next = boundary.changed() => {
                         match next {
-                            None | Some(crate::cancel::BoundaryRequest::Stop) => return,
+                            None | Some(crate::cancel::BoundaryRequest::Stop) => {
+                                return PollExit::Retire;
+                            }
                             Some(crate::cancel::BoundaryRequest::CheckpointNow) => continue,
                             Some(crate::cancel::BoundaryRequest::Pause) => break,
                             Some(crate::cancel::BoundaryRequest::Run) => break,
@@ -951,16 +962,31 @@ async fn spawn_scope_poll_inner(
             }
         }
         tokio::select! {
-            () = shutdown.cancelled() => return,
-            () = scope_cancel.cancelled() => return,
+            () = shutdown.cancelled() => return PollExit::Retire,
+            () = scope_cancel.cancelled() => return PollExit::Retire,
             () = tokio::time::sleep(cadence.interval) => {}
         }
     }
 }
 
+/// How an exiting per-scope poll task leaves its `ScopeToken` entry.
+///
+/// `Retire` removes the entry so the 1s scan can respawn the scope when
+/// its cursor is (still or again) present. `Park` deliberately leaves the
+/// uncancelled entry behind as a tombstone: the scan reads a live token
+/// as "this scope is owned" and never respawns it, which is how a
+/// terminal recovery verdict stays terminal. Only an explicit
+/// scope-retiring path (`cancel_scope_token`, multiplexer shutdown)
+/// clears a parked entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PollExit {
+    Retire,
+    Park,
+}
+
 struct DriveRecovery {
     advanced: bool,
-    exit: bool,
+    exit: Option<PollExit>,
 }
 
 async fn handle_drive_outcome(
@@ -985,17 +1011,17 @@ async fn handle_drive_outcome(
     match outcome {
         Ok(ChangesEvent::Advanced | ChangesEvent::Done) => DriveRecovery {
             advanced,
-            exit: false,
+            exit: None,
         },
         Ok(ChangesEvent::Stopped) => DriveRecovery {
             advanced: false,
-            exit: true,
+            exit: Some(PollExit::Retire),
         },
         // Pause is a temporary park; the poll loop's boundary check picks it
         // up at the top of the next iteration.
         Ok(ChangesEvent::Paused) => DriveRecovery {
             advanced,
-            exit: false,
+            exit: None,
         },
         Ok(ChangesEvent::Terminated(error)) => {
             use crate::recovery::{
@@ -1025,7 +1051,7 @@ async fn handle_drive_outcome(
                     tokio::time::sleep(delay).await;
                     DriveRecovery {
                         advanced: false,
-                        exit: false,
+                        exit: None,
                     }
                 }
                 RecoveryPlan::Reconcile(advice) => {
@@ -1047,7 +1073,7 @@ async fn handle_drive_outcome(
                     tokio::time::sleep(delay).await;
                     DriveRecovery {
                         advanced: false,
-                        exit: false,
+                        exit: None,
                     }
                 }
                 RecoveryPlan::Engine(directive) => {
@@ -1060,7 +1086,7 @@ async fn handle_drive_outcome(
                         .await;
                     DriveRecovery {
                         advanced: false,
-                        exit: false,
+                        exit: None,
                     }
                 }
                 RecoveryPlan::Terminal(fatal) => {
@@ -1076,9 +1102,14 @@ async fn handle_drive_outcome(
                         operation = ?view.operation,
                         "changes stream terminated with terminal recovery"
                     );
+                    // Park, not retire: retiring the token would let the 1s
+                    // scan respawn this poll against a cursor whose provider
+                    // just said "nothing left to try", turning a terminal
+                    // error into a once-per-second re-drive that
+                    // re-broadcasts `Terminated` forever.
                     DriveRecovery {
                         advanced: false,
-                        exit: true,
+                        exit: Some(PollExit::Park),
                     }
                 }
             }
@@ -1093,7 +1124,7 @@ async fn handle_drive_outcome(
             );
             DriveRecovery {
                 advanced: false,
-                exit: false,
+                exit: None,
             }
         }
     }
@@ -1236,13 +1267,46 @@ mod tests {
         )
         .await;
 
-        assert!(!recovery.exit);
+        assert!(recovery.exit.is_none());
         let request = reopen_rx.try_recv().expect("engine directive forwarded");
         assert!(matches!(
             request,
             ReopenRequest::Recovery { error: routed, .. }
                 if routed.kind() == error.kind()
         ));
+    }
+
+    /// A terminal recovery verdict must park the scope, not retire it: a
+    /// retired token is exactly what the 1s scan reads as "please respawn",
+    /// which turned every terminal changes-stream error into a
+    /// once-per-second re-drive that re-broadcast `Terminated` forever.
+    #[tokio::test]
+    async fn terminal_drive_outcome_parks_the_scope_instead_of_retiring_it() {
+        let scope = CursorScope::Account;
+        let (reopen_tx, mut reopen_rx) = mpsc::channel(1);
+        let error = AccountErrorBuilder::new(
+            AccountErrorKind::Authentication(AuthErrorKind::Expired),
+            Cause::Auth(AuthCause::Expired),
+        )
+        .operation(AccountOperation::SyncChanges)
+        .try_build()
+        .expect("valid terminal authentication error");
+
+        let recovery = handle_drive_outcome(
+            &scope,
+            Ok(ChangesEvent::Terminated(error)),
+            false,
+            &reopen_tx,
+            &AccountId("terminal".into()),
+            &StdMutex::new(crate::recovery::ThrottleBucket::default()),
+        )
+        .await;
+
+        assert_eq!(recovery.exit, Some(PollExit::Park));
+        assert!(
+            reopen_rx.try_recv().is_err(),
+            "terminal errors must not be handed to the reopen listener"
+        );
     }
 
     /// A lag destroys batches whose checkpoints are already registered

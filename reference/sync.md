@@ -584,6 +584,20 @@ C. B and C then poll one scope forever, which is both doubled wire
 traffic and two concurrent producers on a lane+scope that the
 checkpoint supersession rule in `control.rs` assumes has exactly one.
 
+An exiting poll task also reports how to leave its token (`PollExit`):
+every ordinary exit retires the entry so the 1s scan can respawn the
+scope, but a `RecoveryPlan::Terminal` verdict parks it - the uncancelled
+token stays in the map as a tombstone the scan reads as "owned", so a
+terminal error stays terminal instead of becoming a once-per-second
+respawn/re-drive loop (each drive of which would re-broadcast
+`Terminated`). A parked scope is only revived by an explicit
+scope-retiring path: `cancel_scope_token` (lifecycle deletion, engine
+restart of the scope) or multiplexer shutdown clears the entry, after
+which a still-present or re-established cursor respawns normally. The
+push reconciler does not consult these tokens; its per-scope terminal
+arm stops the current sweep, and a later hint can still re-drive a
+terminally failed scope (a known, milder gap).
+
 Output is a `broadcast::Sender<MultiplexerEvent>`. The event
 carries `{ scope, event: Arc<SyncEvent<Change>>, checkpoint }`.
 
