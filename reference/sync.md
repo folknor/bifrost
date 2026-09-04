@@ -105,7 +105,7 @@ engine.shutdown().await?; // explicit cleanup; preferred over Drop
      Any other error still fails the attach.
 5. `discover_memberships()` -> populate `CursorRegistry`
    membership index for push-hint routing. `scope_covers_membership`
-   in `engine.rs` is the engine-policy mapping (account-wide
+   in `engine/attach.rs` is the engine-policy mapping (account-wide
    cursors cover every membership; folder-typed cursors cover the
    matching folder; query cursors cover the matching query).
 6. Spawn workers: ack writer, control applier, push reconciler,
@@ -769,6 +769,14 @@ is whether positional resume is also possible:
 Because `get_backfill` returns a consumer-acked checkpoint, resume never
 skips a window the consumer has not durably persisted; a read error falls
 back to a full walk.
+
+Both decisions land in `BackfillPlan::resume`, which returns a
+`ScopeResume` of either `Skip` or `Walk(ScopeWalkDriver)`. That is the
+only place the two plan shapes differ: the orchestrator's walk loop
+below it is written once, so barrier handling, completion-marker
+withholding and `BackfillRegistry` bookkeeping cannot drift apart
+between them. A read failure routes through `walk_from_scratch`, which
+is defined as the no-checkpoint answer rather than a second code path.
 
 Pause and checkpoint waiters observe backfill boundaries through the
 ack writer: it calls `SyncControl::record_checkpoint` after the
@@ -2211,12 +2219,57 @@ outside the error model (advisory only, never aborts streams).
 crates/sync/src/
   lib.rs                  // public re-exports; AccountId/Priority/etc.
                           // from bifrost-types
-  engine.rs               // SyncEngine, SyncEngineBuilder,
-                          // attach/detach/reopen/shutdown,
-                          // ack_checkpoint, ack_writer,
-                          // handle_recovery, scope_covers_membership,
+  engine/
+    mod.rs                // SyncEngine, SyncEngineBuilder, Drop;
+                          // detach / reopen / shutdown;
+                          // ack_checkpoint, ack_publication, debt,
+                          // repair_debt, waive/block_obligation;
+                          // account_changes_stream,
+                          // account_control_stream, invalidation_sink,
+                          // subscribe/unsubscribe_push,
                           // open_skipped_scopes (open-time skip lane),
-                          // live_account + hydration passthrough
+                          // account_capabilities. Every path that
+                          // resolved through `crate::engine` before the
+                          // split still resolves here.
+    context.rs            // SlotContext: the slot-wide handle bundle
+                          // every spawned worker shares, plus
+                          // `recovery()` which borrows it as a
+                          // RecoveryContext
+    attach.rs             // attach / attach_inner / attach_opened,
+                          // discover_scopes(_from), establish_one,
+                          // persist_cursor, scope_covers_membership,
+                          // link_discovered_memberships,
+                          // wait_for_real_subscriber,
+                          // run_deferred_inventory_establishment
+    backfill.rs           // run_backfill_orchestrator + BackfillWiring;
+                          // BackfillScan (rescan eligibility + retry
+                          // ramp); BackfillPlan -> ScopeResume is the
+                          // ONE seam where the fixed and open-page
+                          // shapes differ - the walk itself is shared;
+                          // open_pages_resume,
+                          // backfill_complete_recorded,
+                          // emit_backfill_complete
+    ack.rs                // ack_writer (the account's single durable
+                          // writer) + WriterHandle; persist_ack_request,
+                          // apply_repair_resolutions, apply_replacement;
+                          // take_ack_writer / await_worker_until
+                          // (detach's writer-last ordering)
+    reattach.rs           // RecoveryContext + handle_account_error;
+                          // handle_engine_directive, restart/disable/
+                          // re-establish scope, reattach_account,
+                          // restart_account, run_establish,
+                          // accepted_push_scopes, log_open_skips
+    bulk.rs               // bulk_set_flags / bulk_move / bulk_move_from
+                          // / bulk_destroy + run_bulk_pipeline;
+                          // classify_item_outcome, MutationBucket,
+                          // retry + read-back queueing, directive
+                          // de-duplication
+    passthrough.rs        // live_account + the read-only hydration and
+                          // PIM forwarders (get_stream,
+                          // message_hydrate, open_blob, contacts_*,
+                          // filters_*, identities_*, ...);
+                          // announce_page_loss
+    tests.rs              // the module's unit tests
   control.rs              // SyncControl + record_checkpoint hook
   error.rs                // engine Error wrapping AccountError + Warning
   inventory_walk.rs       // shared inventory barrier and resume state

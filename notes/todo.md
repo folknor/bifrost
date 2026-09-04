@@ -9,12 +9,20 @@ ruled on 2026-09-04. Execution order is as listed; items 1 through 5 touch
 disjoint crates and may run in parallel, 6 and 7 run alone with a cold review
 between them.
 
-1. **sync: split `engine.rs` into modules. PROCEED.** Attach, backfill
-   orchestrator, ack writer, reattach and bulk pipeline into modules under
-   `engine/`; worker wiring bundled into a context struct; the `Fixed` /
-   `OpenPages` orchestrator arms collapsed behind one resume enum. Pure
-   structure, no behavior or published-API change. Supersedes and closes
-   `sync-B1` below. Must land before item 8 whenever that is scheduled.
+1. **DONE 2026-09-04. sync: split `engine.rs` into modules. PROCEED.**
+   Attach, backfill orchestrator, ack writer, reattach and bulk pipeline
+   into modules under `engine/`; worker wiring bundled into a context
+   struct; the `Fixed` / `OpenPages` orchestrator arms collapsed behind
+   one resume enum. Pure structure, no behavior or published-API change.
+   Supersedes and closes `sync-B1` below. Must land before item 8
+   whenever that is scheduled. Landed as `engine/{mod,context,attach,
+   backfill,ack,reattach,bulk,passthrough,tests}.rs`; the worker bundle
+   is `SlotContext` (backfill orchestrator 16 args -> 2, deferred
+   inventory 20 -> 2, and the two hand-built 17-field `RecoveryContext`
+   literals become `ctx.recovery(&writer)`); the arms collapse into
+   `BackfillPlan::resume -> ScopeResume`, with three new tests pinning
+   each arm's skip/walk choice (both ablated). `reference/sync.md`'s file
+   map updated.
 2. **DONE 2026-09-04. graph: split `pim.rs` into modules. PROCEED, split
    only.** Landed as `account/pim/` - `messages`, `send`, `drafts`,
    `search`, `containers`, `identities`, `threads`, `hydrate`, a small
@@ -587,7 +595,7 @@ blocking; each is a real defect or a real decision, not a cleanup.
   - `Account::push_unsubscribe(handle)` - protocol-crate trait method
     (`crates/types/src/account.rs`), destroys ONE subscription.
   - `SyncEngine::unsubscribe_push(account_id)` - engine method
-    (`crates/sync/src/engine.rs`), takes the account's registry records
+    (`crates/sync/src/engine/mod.rs`), takes the account's registry records
     and calls the trait method once per record.
   `Account::close`'s doc points at the first; `SyncEngine::detach`'s doc
   points at the second. Both are correct for their layer, and an app calls
@@ -692,7 +700,7 @@ blocking; each is a real defect or a real decision, not a cleanup.
      `reattach`, `reopen_and_rediscover`. Not settled.
 
      Sizing, because it is bigger than it looks: `reopen` appears 105
-     times in `sync/src/engine.rs` and 35 times in `reference/sync.md`,
+     times in `sync/src/engine/` and 35 times in `reference/sync.md`,
      and most of those are the reopen LANE (`reopen_tx`, `reopen_lock`,
      `ReopenRequest`, the reopen listener), not the public method - a
      blind rename would churn the internal vocabulary too. Decide whether
@@ -984,17 +992,15 @@ Nothing in this section misbehaves. None of it is a bug, and none of it blocks a
 defect fix - in particular, do not let a unification proposal become a
 prerequisite for the small local fixes above.
 
-- **sync-B1. SUPERSEDED 2026-09-04 by ruling 1 at the top of this file
-  (PROCEED).** Kept for the concern inventory below; the file has since
-  grown to ~8000 lines. `crates/sync/src/engine.rs` mixes five concerns:
-  lifecycle, ~900 lines of recovery dispatch free functions, the ~500-line
-  backfill orchestrator, the ~500-line mutation pipeline, and ~1200 lines of 1:1
-  passthrough forwarders that invent no semantics (every one is `live_account(id)?`
-  then forward, with an identical doc comment shape - a macro or a blanket
-  forwarding trait, not 60 hand-written methods). `recovery.rs` exists but holds
-  only the helpers while the dispatch stays in `engine.rs`, so the split is in
-  the wrong place. `reference/sync.md`'s file map already describes the intended
-  layout aspirationally and the code does not match it.
+- **sync-B1. CLOSED 2026-09-04 by ruling 1 at the top of this file.**
+  `engine.rs` was split into `engine/`, and `reference/sync.md`'s file
+  map now describes the real layout. One sub-observation was NOT acted
+  on and stands on its own if anyone wants to re-raise it: the ~900 lines
+  of 1:1 passthrough forwarders (now `engine/passthrough.rs`) still
+  invent no semantics - every one is `live_account(id)?` then forward,
+  with an identical doc comment shape. A macro or a blanket forwarding
+  trait would replace 60 hand-written methods. That is a published-surface
+  question, not a structural one, so it was left alone here.
 - **google-B6.** `inventory.rs::hydrate_one` issues both `get_message(id, "raw")`
   and `get_message(id, "full")` for `Projection::FullWithBlobs`. For a message
   with a 20 MB attachment that is ~40 MB of transfer and 10 quota units to obtain
