@@ -423,7 +423,7 @@ impl OAuthRefresher {
                 self.consecutive_failures.store(0, Ordering::Relaxed);
                 *state = RefreshState::Fresh {
                     token: token.clone(),
-                    refreshed_at: Instant::now(),
+                    refreshed_at: tokio::time::Instant::now(),
                     refresh_not_before: None,
                 };
                 drop(state);
@@ -437,14 +437,16 @@ impl OAuthRefresher {
                 let can_fallback = !terminal
                     && fallback
                         .as_ref()
-                        .and_then(|(token, _)| token.expires_at())
-                        .is_some_and(|expires_at| Instant::now() < expires_at);
+                        .and_then(|(token, _)| token_expiry(token))
+                        .is_some_and(|expires_at| tokio::time::Instant::now() < expires_at);
                 if can_fallback {
                     let (token, refreshed_at) = fallback.expect("fallback was checked as present");
                     *state = RefreshState::Fresh {
                         token: token.clone(),
                         refreshed_at,
-                        refresh_not_before: Some(Instant::now() + PROACTIVE_REFRESH_RETRY_DELAY),
+                        refresh_not_before: Some(
+                            tokio::time::Instant::now() + PROACTIVE_REFRESH_RETRY_DELAY,
+                        ),
                     };
                     drop(state);
                     for waiter in waiters {
@@ -590,9 +592,13 @@ async fn wait_for_refresh(
 ///    behaviour treated such tokens as fresh indefinitely and waited
 ///    for a server 401, which leaked latency into every request that
 ///    happened to coincide with the server-side expiry.
-fn needs_refresh(token: &AccessToken, refreshed_at: Instant, max_age: Duration) -> bool {
-    let now = Instant::now();
-    if let Some(expires_at) = token.expires_at() {
+fn needs_refresh(
+    token: &AccessToken,
+    refreshed_at: tokio::time::Instant,
+    max_age: Duration,
+) -> bool {
+    let now = tokio::time::Instant::now();
+    if let Some(expires_at) = token_expiry(token) {
         let window = Duration::from_secs(60);
         let deadline = expires_at.checked_sub(window).unwrap_or(expires_at);
         return now >= deadline;
@@ -601,12 +607,24 @@ fn needs_refresh(token: &AccessToken, refreshed_at: Instant, max_age: Duration) 
     now.saturating_duration_since(refreshed_at) >= max_age
 }
 
-fn refresh_is_deferred(token: &AccessToken, not_before: Option<Instant>) -> bool {
-    let now = Instant::now();
+fn refresh_is_deferred(token: &AccessToken, not_before: Option<tokio::time::Instant>) -> bool {
+    let now = tokio::time::Instant::now();
     not_before.is_some_and(|not_before| now < not_before)
-        && token
-            .expires_at()
-            .is_some_and(|expires_at| now < expires_at)
+        && token_expiry(token).is_some_and(|expires_at| now < expires_at)
+}
+
+/// A token's issuer-supplied expiry on the tokio clock.
+///
+/// `AccessToken::expires_at` is published as a `std::time::Instant` and
+/// stays that way - callers mint tokens from whatever clock they have.
+/// Every comparison the refresher makes against it happens on the tokio
+/// clock, so that `tokio::time::pause` / `advance` moves the
+/// proactive-refresh and fallback windows in tests instead of leaving
+/// them pinned to real time. The two clocks share a timeline
+/// (`tokio::time::Instant` wraps a `std::time::Instant`), so the
+/// conversion is exact and production behavior is unchanged.
+fn token_expiry(token: &AccessToken) -> Option<tokio::time::Instant> {
+    token.expires_at().map(tokio::time::Instant::from_std)
 }
 
 /// Convert an `Arc<Error>` (the wrapper that lets us fan one refresh
@@ -716,11 +734,14 @@ pub enum RefreshState {
     Fresh {
         /// Currently cached token.
         token: AccessToken,
-        /// Wall-clock instant at which the cached token was minted.
-        refreshed_at: Instant,
+        /// Instant at which the cached token was minted, on the tokio
+        /// clock so a paused-time test can drive the max-age window the
+        /// same way it drives `Backoff::retry_at`.
+        refreshed_at: tokio::time::Instant,
         /// Earliest next proactive refresh attempt after a transient
-        /// failure. Forced refreshes ignore this deadline.
-        refresh_not_before: Option<Instant>,
+        /// failure. Forced refreshes ignore this deadline. Tokio clock,
+        /// as above.
+        refresh_not_before: Option<tokio::time::Instant>,
     },
     /// A refresh is in flight. The task that transitioned the state
     /// to `Refreshing` is driving the network call; concurrent
@@ -742,7 +763,7 @@ pub enum RefreshState {
         /// caller can use the remaining token lifetime. Forced
         /// refreshes never carry a fallback because a target 401 is
         /// evidence that the cached credential is unusable.
-        fallback: Option<(AccessToken, Instant)>,
+        fallback: Option<(AccessToken, tokio::time::Instant)>,
     },
 }
 
@@ -1036,7 +1057,7 @@ mod tests {
         );
         *refresher.state.lock().await = RefreshState::Fresh {
             token,
-            refreshed_at: Instant::now(),
+            refreshed_at: tokio::time::Instant::now(),
             refresh_not_before: None,
         };
 
@@ -1065,6 +1086,85 @@ mod tests {
             panic!("still-valid token was not restored");
         };
         assert_eq!(token.as_str(), "still-valid");
+    }
+
+    /// The proactive-refresh window is on the tokio clock, so paused
+    /// time drives it. With the refresher's instants on
+    /// `std::time::Instant` this test could not exist: `advance()` moves
+    /// only the tokio clock, real time barely moves inside a test, and
+    /// the 60 s pre-expiry window would never open.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn paused_time_drives_the_proactive_refresh_window() {
+        let source = Arc::new(RecoveringRefreshSource {
+            calls: AtomicUsize::new(0),
+            healthy: AtomicBool::new(true),
+        });
+        let refresher = OAuthRefresher::new(Arc::clone(&source) as Arc<dyn TokenSource>);
+        // Expires in 10 minutes; the window opens 60 s before that.
+        let token = AccessToken::new(
+            "minted",
+            Some((tokio::time::Instant::now() + Duration::from_secs(600)).into_std()),
+        );
+        *refresher.state.lock().await = RefreshState::Fresh {
+            token,
+            refreshed_at: tokio::time::Instant::now(),
+            refresh_not_before: None,
+        };
+
+        assert_eq!(
+            refresher.token().await.expect("cached token").as_str(),
+            "minted",
+            "well outside the window, the cached token is served"
+        );
+        assert_eq!(source.calls.load(Ordering::SeqCst), 0);
+
+        // One second short of the window: still cached.
+        tokio::time::advance(Duration::from_secs(539)).await;
+        assert_eq!(
+            refresher.token().await.expect("cached token").as_str(),
+            "minted"
+        );
+        assert_eq!(source.calls.load(Ordering::SeqCst), 0);
+
+        // Crossing into the last 60 s refreshes proactively.
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert_eq!(
+            refresher.token().await.expect("refreshed token").as_str(),
+            "recovered",
+            "inside the 60 s window the refresher mints a replacement"
+        );
+        assert_eq!(source.calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// The max-age branch (opaque tokens with no issuer TTL) is on the
+    /// same clock and is likewise drivable.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn paused_time_drives_the_max_age_window_for_opaque_tokens() {
+        let source = Arc::new(RecoveringRefreshSource {
+            calls: AtomicUsize::new(0),
+            healthy: AtomicBool::new(true),
+        });
+        let refresher = OAuthRefresher::new(Arc::clone(&source) as Arc<dyn TokenSource>)
+            .with_max_age(Duration::from_secs(300));
+        *refresher.state.lock().await = RefreshState::Fresh {
+            token: AccessToken::new("opaque", None),
+            refreshed_at: tokio::time::Instant::now(),
+            refresh_not_before: None,
+        };
+
+        tokio::time::advance(Duration::from_secs(299)).await;
+        assert_eq!(
+            refresher.token().await.expect("cached token").as_str(),
+            "opaque"
+        );
+        assert_eq!(source.calls.load(Ordering::SeqCst), 0);
+
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert_eq!(
+            refresher.token().await.expect("refreshed token").as_str(),
+            "recovered"
+        );
+        assert_eq!(source.calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]

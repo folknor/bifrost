@@ -151,6 +151,31 @@ pub fn into_account_error(error: Error, ctx: NetErrorContext) -> AccountError {
         Error::MalformedRedirect { message, .. } => {
             contract_violation(&ctx, message, TransmissionState::Acknowledged)
         }
+        // Not `auth_lost`. The 401 came back on a hop that carried no
+        // credential *because this transport removed it* crossing an
+        // origin boundary; the account's credential is untested, so
+        // classifying it as `ReauthorizationRequired` (terminal
+        // `AuthLost`) would send the user to a re-auth prompt for a
+        // working account. The provider redirecting an authenticated
+        // request onto an origin it then demands auth for is the
+        // contract fault.
+        Error::UnauthenticatedRedirectHop {
+            message,
+            final_response,
+        } => {
+            let builder = base_builder(
+                &ctx,
+                AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
+                malformed_response_cause(&ctx, message),
+            );
+            let builder = response_diagnostics(
+                builder,
+                final_response.status,
+                &final_response.headers,
+                &final_response.body,
+            );
+            finish(push_attempt(builder, TransmissionState::Acknowledged), &ctx)
+        }
         Error::RedirectLoop { hops } => contract_violation(
             &ctx,
             format!("redirect chain exceeded configured maximum after {hops} hops"),
@@ -710,6 +735,7 @@ fn support_cause_from_source(error: &Error) -> Option<Cause> {
         | Error::RedirectRejected { .. }
         | Error::MalformedRedirect { .. }
         | Error::RedirectLoop { .. }
+        | Error::UnauthenticatedRedirectHop { .. }
         | Error::ResponseTooLarge { .. } => None,
     }
 }

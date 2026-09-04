@@ -131,12 +131,23 @@ impl RedirectPolicy {
     /// Build a `reqwest::redirect::Policy` enforcing this policy's hop
     /// cap and trusted-host allowlist for callers that build their own
     /// `reqwest::Client` rather than routing through `bifrost-net`'s
-    /// request pipeline (the CalDAV / CardDAV clients). This is the
-    /// single source of truth for redirect hardening: the same
-    /// `max_hops` constant and the same case-insensitive host
-    /// allowlist (`allows_host`) the pipeline's `classify_redirect`
-    /// uses internally drive the follow / stop decision here too, so
-    /// the rule lives in exactly one place.
+    /// request pipeline. This is the single source of truth for
+    /// redirect hardening: the same `max_hops` constant, the same
+    /// case-insensitive host allowlist (`allows_host`), and the same
+    /// **cross-origin-only** precondition the pipeline's
+    /// `classify_redirect` applies drive the follow / stop decision
+    /// here too, so the rule lives in exactly one place.
+    ///
+    /// The cross-origin precondition is load-bearing and was once
+    /// missing here: the pipeline consults the allowlist only when a
+    /// hop leaves the current origin, and a same-origin hop is always
+    /// followed. Checking every hop's host instead meant a populated
+    /// allowlist that did not happen to name the origin's own host
+    /// stopped a plain same-host redirect under this path while the
+    /// pipeline followed it - the two paths disagreeing about the
+    /// single rule they are supposed to share. Origin here means
+    /// scheme + host + port (RFC 6454), the same comparison
+    /// `classify_redirect` uses.
     ///
     /// A `reqwest::redirect::Policy` can only decide follow / stop /
     /// error - it cannot rewrite methods or strip headers. Cross-origin
@@ -145,9 +156,9 @@ impl RedirectPolicy {
     /// `bifrost-net` pipeline are out of scope for this bare-client
     /// path.
     ///
-    /// A hop whose target host is outside the allowlist is stopped (the
-    /// 3xx surfaces to the caller as a terminal status) rather than
-    /// followed; exceeding `max_hops` errors the request.
+    /// A cross-origin hop whose target host is outside the allowlist is
+    /// stopped (the 3xx surfaces to the caller as a terminal status)
+    /// rather than followed; exceeding `max_hops` errors the request.
     #[must_use]
     pub fn reqwest_policy(&self) -> reqwest::redirect::Policy {
         let max_hops = usize::from(self.max_hops);
@@ -156,13 +167,31 @@ impl RedirectPolicy {
             if attempt.previous().len() >= max_hops {
                 return attempt.error("too many redirects");
             }
-            let host = attempt.url().host_str().unwrap_or("");
-            if policy.allows_host(host) {
+            let next = attempt.url().clone();
+            // `previous()` is the chain walked so far, ending with the
+            // URL that produced this 3xx; that last entry is the origin
+            // this hop departs from.
+            let prior = attempt.previous().last().cloned();
+            if policy.admits_hop(prior.as_ref(), &next) {
                 attempt.follow()
             } else {
                 attempt.stop()
             }
         })
+    }
+
+    /// The follow / stop decision for one hop, shared by
+    /// `reqwest_policy` and pinned directly by tests (reqwest exposes no
+    /// way to construct an `Attempt`).
+    ///
+    /// A same-origin hop is always admitted; the allowlist governs
+    /// cross-origin hops only. `prior` is `None` when the departing URL
+    /// is unknown, which is treated conservatively as cross-origin.
+    fn admits_hop(&self, prior: Option<&reqwest::Url>, next: &reqwest::Url) -> bool {
+        if prior.is_some_and(|prior| same_origin(prior, next)) {
+            return true;
+        }
+        self.allows_host(next.host_str().unwrap_or(""))
     }
 }
 
@@ -363,6 +392,78 @@ mod tests {
         assert!(policy.allows_host("DAV.Example"));
         // Smoke-check the builder constructs without panicking.
         let _ = policy.reqwest_policy();
+    }
+
+    /// The precondition the two paths must share: the allowlist governs
+    /// cross-origin hops only. A same-origin hop is followed even when
+    /// the allowlist does not name that host - which is exactly what
+    /// `classify_redirect` does (it tests `allows_host` only under
+    /// `cross_host`). Before this was fixed, a populated allowlist that
+    /// omitted the origin's own host stopped a plain same-host redirect
+    /// here while the pipeline followed it.
+    #[test]
+    fn a_same_origin_hop_is_followed_even_when_the_allowlist_omits_its_host() {
+        let policy = RedirectPolicy::default().trust_host("cdn.example");
+        assert!(
+            policy.admits_hop(
+                Some(&url("https://dav.example/a")),
+                &url("https://dav.example/b"),
+            ),
+            "a same-origin hop must not consult the allowlist"
+        );
+        assert!(
+            policy.admits_hop(
+                Some(&url("https://dav.example/a")),
+                &url("https://DAV.Example/b"),
+            ),
+            "hosts are case-insensitive, so this is still the same origin"
+        );
+
+        // And the pipeline agrees: same-host hop, allowlist without the
+        // host, still a Follow.
+        let h = header(LOCATION, "https://dav.example/b");
+        let action = classify_redirect(
+            &policy,
+            &Method::GET,
+            &url("https://dav.example/a"),
+            StatusCode::FOUND,
+            &h,
+        )
+        .expect("the pipeline follows a same-host hop regardless of the allowlist");
+        assert!(matches!(action, RedirectAction::Follow(_)));
+    }
+
+    /// The allowlist still bites where it is meant to: a hop that leaves
+    /// the origin, including one that changes only the port or only the
+    /// scheme, is checked against it.
+    #[test]
+    fn a_cross_origin_hop_is_checked_against_the_allowlist() {
+        let policy = RedirectPolicy::default().trust_host("cdn.example");
+        assert!(
+            !policy.admits_hop(
+                Some(&url("https://dav.example/a")),
+                &url("https://evil.example/b"),
+            ),
+            "an unlisted foreign host is stopped"
+        );
+        assert!(
+            policy.admits_hop(
+                Some(&url("https://dav.example/a")),
+                &url("https://cdn.example/b"),
+            ),
+            "a listed foreign host is followed"
+        );
+        assert!(
+            !policy.admits_hop(
+                Some(&url("https://dav.example/a")),
+                &url("https://dav.example:8443/b"),
+            ),
+            "port is part of the origin, so this hop is checked and its host is unlisted"
+        );
+        assert!(
+            !policy.admits_hop(None, &url("https://dav.example/b")),
+            "an unknown departing origin is treated conservatively as cross-origin"
+        );
     }
 
     #[test]

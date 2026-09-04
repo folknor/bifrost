@@ -297,7 +297,16 @@ could not be exercised against a mock at all.
 under the engine `AccountId`, validates the token with a `users/me` profile
 fetch (`get_profile`, whose `mail`/`userPrincipalName` seeds the public-folder
 Autodiscover lookups), constructs a `GraphAccount`, and runs
-`list_mail_folders_recursive` to seed the `FolderTree`. Cursors mint lazily from
+`list_mail_folders_recursive` to seed the `FolderTree`. That listing is then
+handed forward in `open_folder_seed`, a one-shot slot the first
+`discover_cursor_scopes` consumes instead of walking the hierarchy again: the
+engine calls discovery moments after open, and the second walk answered
+identically and re-seeded the same tree - one full recursive listing of pure
+duplicate traffic per attach, unbounded in request count for a deep mailbox.
+The slot is one-shot on purpose, so a discovery RE-RUN lists for real; noticing
+folders created since open is exactly what a second discovery is for. Pinned by
+`discovery_reuses_the_listing_open_seeded_and_lists_again_on_re_run`. Cursors
+mint lazily from
 `establish_initial_cursor` plus the first `inventory_stream` page. Returns
 `OpenedAccount`; the only skip Graph records on its lane is a failed
 opt-in delegate-Autodiscover pass (account-scoped, since discovery is
@@ -663,6 +672,33 @@ The `hydrated_from_value` projector maps `FlagsOnly`
 -> canonical flag `HashSet`; `Metadata`/body-bearing -> `metadata_or_flags`.
 Graph JSON is not assembled RFC822, so body-bearing projections degrade to
 `Metadata` (assembled bytes come from `open_raw_rfc822`).
+
+### `get_stream` is the mail hydration lane
+
+`hydrate_url_for_id` builds `{prefix}/messages/{id}` for every id, and
+`select_for_projection` returns message-shaped `$select` lists for every
+projection - deliberately, even though this account also establishes
+`ObjectType::Event` and `ObjectType::Contact` cursor scopes and mints their
+inventory entries and change ids through the same generic pipeline.
+
+The determination, from the engine: `bifrost-sync` never routes event or
+contact scope ids into `get_stream`. Its only internal callers are the
+mutation read-back paths (`mutation/readback.rs`), which hydrate at
+`FlagsOnly` / `Metadata` the ids a caller just put through the mail mutation
+API. `SyncEngine::get_stream` is otherwise a consumer-facing passthrough.
+The workspace-wide contract agrees: the standalone calendar and contact
+account crates (`bifrost-caldav`, `bifrost-carddav`), which produce event and
+contact ids and nothing else, answer `get_stream` with
+`unsupported_stream(AccountOperation::Hydrate)`. Calendar events and contacts
+are read through their own typed surfaces instead - `calendar::get` by
+`EventId`, the contacts API by contact id - which address `/events/{id}` and
+`/contacts/{id}` themselves.
+
+Note also that an `ObjectId` carries no object-type marker, so this lane
+could not route by scope kind even if it wanted to; "non-mail ids do not
+arrive here" is the contract, not an inference. Pinned by
+`every_hydration_projection_selects_message_fields_on_a_messages_url`, which
+fails if a non-mail `$select` field or a non-`/messages/` URL appears.
 
 `scope_lifecycle_stream` is empty: Graph exposes no folder-lifecycle
 notification surface; discovery re-runs on account reopen.
@@ -1107,6 +1143,20 @@ expressible half still proceeds, and `Set` is full-replace so it always writes
 all three owned fields.
 `bulk_move` requires `MembershipScope::Folder` (else fatal pre-request).
 `IdempotencyKey` is accepted but not sent (`MutationReplaySafety::None`).
+
+### The mutation lane's terminus is the end of the stream
+
+Every mutation batch is tagged `PageBoundary::Page`, the last one included,
+and the stream closes with `Done(None)`. This is deliberate and NOT the same
+gap the hydration lane had, where a stream that fired chunks tagged only
+`Page` never told the engine where it terminated. `bifrost-sync`'s mutation
+consumer loops on `stream.next()` and matches only `Batch` and `Terminated`;
+it never reads `page_boundary` on this lane, and treats the stream ending as
+the terminus. A mutation batch also carries `checkpoint: None` by
+construction and advances no cursor, so there is nothing for a `Final` tag to
+close - and producing one would mean buffering a chunk just to discover it is
+last, buying the consumer nothing. Pinned by
+`mutation_batches_are_paged_and_the_stream_end_is_the_terminus`.
 
 ## PIM primitives
 

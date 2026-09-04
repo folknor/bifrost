@@ -53,6 +53,7 @@ use tokio_util::sync::CancellationToken;
 
 // pub: consumers build a GraphClient before registering GraphAccountFactory with the engine.
 pub use crate::client::GraphClient;
+use crate::types::GraphMailFolder;
 
 // Re-exported for the client-side api-base override test, which pins that a
 // redirected Graph base also redirects the Autodiscover endpoints.
@@ -135,6 +136,19 @@ pub(crate) struct GraphAccount {
     /// The account's primary SMTP, captured at open from the Graph
     /// profile. Seeds the `GetUserSettings` Autodiscover lookups.
     pub(crate) user_email: Option<String>,
+    /// The primary mailbox's recursive folder listing as it was read at
+    /// `open`, handed to the first cursor-scope discovery instead of
+    /// making it walk the hierarchy a second time.
+    ///
+    /// `open` must list: it seeds `folder_tree`, which paths that never
+    /// call discovery still read. The engine then calls
+    /// `discover_cursor_scopes` moments later, and that pass listed the
+    /// same hierarchy again and re-seeded the same tree with the same
+    /// answer - one full recursive walk of duplicate traffic per attach,
+    /// unbounded in request count for a deep mailbox. The slot is
+    /// one-shot: discovery `take`s it, so a later re-discovery (which
+    /// exists precisely to notice new folders) lists for real.
+    pub(crate) open_folder_seed: Arc<RwLock<Option<Vec<GraphMailFolder>>>>,
 }
 
 /// Change keys are a best-effort mutation optimization. Retaining one per
@@ -302,6 +316,7 @@ impl GraphAccount {
             public_folder_meta: Arc::new(RwLock::new(HashMap::new())),
             public_folders,
             user_email,
+            open_folder_seed: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -633,9 +648,12 @@ impl AccountFactory for GraphAccountFactory {
             })?;
             account.folder_tree.write().await.replace_mail_folders(
                 folders
-                    .into_iter()
-                    .map(|folder| (folder.id, folder.parent_folder_id)),
+                    .iter()
+                    .map(|folder| (folder.id.clone(), folder.parent_folder_id.clone())),
             );
+            // Hand this listing to the first cursor-scope discovery rather
+            // than letting it re-walk the same hierarchy moments later.
+            *account.open_folder_seed.write().await = Some(folders);
             Ok(OpenedAccount {
                 account: Arc::new(account) as Arc<dyn Account>,
                 skipped_scopes,

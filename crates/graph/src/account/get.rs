@@ -572,6 +572,8 @@ fn flags_from_value(value: &Value) -> HashSet<String> {
     flags
 }
 
+/// `$select` list for a hydration projection. Message fields only - see
+/// `hydrate_url_for_id` for why this lane is mail-shaped by contract.
 fn select_for_projection(projection: Projection) -> &'static str {
     match projection {
         Projection::FlagsOnly => "id,isRead,categories,flag,changeKey,parentFolderId",
@@ -593,6 +595,20 @@ pub(crate) fn folder_destination(destination: MembershipScope) -> Option<FolderI
 /// Build the per-id Graph `/$batch` GET URL for hydration, decoding the
 /// (possibly foreign-encoded) id to route to `/users/{owner}` vs `/me`.
 /// Extracted so the routing is unit-testable without a live `$batch`.
+///
+/// Deliberately message-shaped for every id, even though this account also
+/// establishes `ObjectType::Event` and `ObjectType::Contact` cursor scopes.
+/// `get_stream` is the MAIL hydration lane across this workspace: the
+/// standalone calendar and contact account crates answer it with
+/// `unsupported_stream(AccountOperation::Hydrate)`, the sync engine's only
+/// internal callers are the mutation read-back paths (which hydrate ids the
+/// caller just put through the mail mutation API at `FlagsOnly` /
+/// `Metadata`), and calendar events and contacts are read through their own
+/// typed surfaces instead - `calendar::get` by `EventId`, the contacts API
+/// by contact id - which address `/events/{id}` and `/contacts/{id}`
+/// themselves. An `ObjectId` carries no object-type marker, so this function
+/// could not route by kind even if it wanted to; the contract is that
+/// non-mail ids do not arrive here.
 fn hydrate_url_for_id(
     account: &GraphAccount,
     id: &ObjectId,
@@ -1094,6 +1110,50 @@ mod tests {
             ))),
             None
         );
+    }
+
+    /// The hydration lane is mail-shaped for EVERY projection and every id
+    /// shape, and that is the contract rather than an oversight: `get_stream`
+    /// is the mail hydration lane (caldav/carddav answer it
+    /// `unsupported`, the engine drives it only from mutation read-back on
+    /// mail ids), and calendar/contact objects are read through their own
+    /// typed surfaces. An `ObjectId` carries no type marker, so nothing here
+    /// could route by scope kind; this pins the answer so a future reader
+    /// does not have to re-derive it, and fails loudly if someone starts
+    /// mixing event or contact fields into a lane that cannot address them.
+    #[test]
+    fn every_hydration_projection_selects_message_fields_on_a_messages_url() {
+        let account =
+            GraphAccount::new_for_tests(GraphClient::new("token"), PushMode::GraphSubscriptions);
+        for projection in [
+            Projection::FlagsOnly,
+            Projection::Metadata,
+            Projection::Headers,
+            Projection::Preview(1024),
+            Projection::TextOnly,
+            Projection::Full,
+            Projection::FullWithBlobs,
+        ] {
+            let select = select_for_projection(projection);
+            assert!(
+                select.starts_with("id,") || select == "id",
+                "{projection:?} selects {select}"
+            );
+            for event_or_contact_only in
+                ["start", "end", "attendees", "givenName", "emailAddresses"]
+            {
+                assert!(
+                    !select.contains(event_or_contact_only),
+                    "{projection:?} selects the non-mail field {event_or_contact_only}: {select}"
+                );
+            }
+            let url = hydrate_url_for_id(&account, &ObjectId("AAMk".to_string()), select)
+                .expect("primary id routes");
+            assert!(
+                url.starts_with("/me/messages/"),
+                "{projection:?} hydrates from {url}"
+            );
+        }
     }
 
     #[test]

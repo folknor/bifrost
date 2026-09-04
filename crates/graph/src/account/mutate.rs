@@ -56,6 +56,23 @@ pub(crate) fn bulk_destroy_stream(
     bulk_mutation_stream(account, targets, MutationKind::Destroy)
 }
 
+/// Chunk the target stream and submit one `$batch` per chunk.
+///
+/// Every batch is tagged `PageBoundary::Page`, including the last one, and
+/// the stream ends with `Done(None)`. That asymmetry with the hydration and
+/// inventory lanes - which had to be reworked to tag their terminal chunk
+/// `Final` - is deliberate, and it is a fact about the engine rather than a
+/// preference: the mutation consumer in `bifrost-sync` loops on
+/// `stream.next()` and matches only `Batch` and `Terminated`, treating the
+/// END OF THE STREAM as the terminus. It never reads `batch.page_boundary`
+/// on this lane, so there is no boundary to hold a final chunk back for.
+///
+/// The hydration lane is different because a cursor-advancing / checkpointed
+/// reader needs to know which chunk closes the stream before the stream
+/// itself ends. A mutation batch carries `checkpoint: None` by construction
+/// and advances nothing. Tagging the last chunk `Final` here would mean
+/// buffering a chunk to discover it is last, which buys the consumer
+/// nothing.
 fn bulk_mutation_stream(
     account: GraphAccount,
     mut targets: AccountStream<ObjectId>,
@@ -1568,6 +1585,51 @@ mod tests {
             sequence: 0,
             protocol_salt: bifrost_types::ProtocolSalt::Graph("salt".to_string()),
         }
+    }
+
+    /// The mutation lane's terminus is the end of the stream, not a
+    /// `PageBoundary::Final` tag. `bifrost-sync`'s mutation consumer loops
+    /// on `stream.next()` and matches only `Batch` / `Terminated`; it never
+    /// reads `page_boundary` here, and a mutation batch carries no
+    /// checkpoint to close. Pinned so the asymmetry with the hydration lane
+    /// (which WAS reworked to tag its terminal chunk `Final`) is a recorded
+    /// decision rather than a suspicious-looking gap - and so that a change
+    /// to either half is made deliberately.
+    #[tokio::test]
+    async fn mutation_batches_are_paged_and_the_stream_end_is_the_terminus() {
+        let account = shared_account();
+        account
+            .client
+            .script_rest([crate::client::ScriptedRestResponse::json(
+                reqwest::StatusCode::OK,
+                serde_json::json!({ "responses": [{ "id": "0", "status": 204 }] }),
+            )]);
+        let targets: AccountStream<ObjectId> =
+            Box::pin(futures::stream::iter([ObjectId("AAMk1".to_string())]));
+        let mut stream = bulk_destroy_stream(account, targets, idempotency_key());
+
+        let mut boundaries = Vec::new();
+        let mut saw_done = false;
+        while let Some(event) = stream.next().await {
+            match event {
+                SyncEvent::Batch(batch) => boundaries.push(batch.page_boundary),
+                SyncEvent::Done(checkpoint) => {
+                    assert!(checkpoint.is_none(), "a mutation lane advances no cursor");
+                    saw_done = true;
+                }
+                SyncEvent::Terminated(error) => panic!("unexpected termination: {error:?}"),
+                _ => {}
+            }
+        }
+
+        assert!(!boundaries.is_empty(), "the chunk must produce a batch");
+        assert!(
+            boundaries
+                .iter()
+                .all(|boundary| matches!(boundary, PageBoundary::Page)),
+            "mutation batches are Page, never Final: {boundaries:?}"
+        );
+        assert!(saw_done, "the stream closes with Done(None)");
     }
 
     #[tokio::test]

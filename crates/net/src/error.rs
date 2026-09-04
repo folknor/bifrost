@@ -276,6 +276,27 @@ pub enum Error {
         message: String,
     },
 
+    /// A hop in a redirect chain answered `401 Unauthorized` on a
+    /// request whose `Authorization` header **this transport itself
+    /// stripped** on an earlier cross-origin hop.
+    ///
+    /// This is deliberately not `AuthLost`. A bare 401 normally means
+    /// the credential is dead and the user must re-authorize; here the
+    /// credential was never presented, because the redirect walker
+    /// removed it when the chain crossed an origin boundary (and a
+    /// chain that bounces `A -> B -> A` arrives back at its own origin
+    /// unauthenticated). Reporting that as credential loss would drive
+    /// a re-authorization prompt for a working account, so the
+    /// self-stripped provenance is carried here instead and classifies
+    /// as a provider contract violation.
+    #[error("unauthenticated redirect hop: {message}")]
+    UnauthenticatedRedirectHop {
+        /// Description of the chain and the hop that answered 401.
+        message: String,
+        /// The rejecting hop's response evidence.
+        final_response: FinalResponse,
+    },
+
     /// Server returned a malformed redirect response.
     #[error("malformed redirect: {message}")]
     MalformedRedirect {

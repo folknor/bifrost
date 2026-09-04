@@ -104,21 +104,37 @@ async fn discover_cursor_scopes_inner(
 ) -> Result<(Vec<CursorScope>, Vec<Warning>), AccountError> {
     // Primary mailbox: a list failure here is account-fatal (the whole
     // account cannot be discovered), so propagate it.
-    let mail_folders = account
-        .client
-        .list_mail_folders_recursive()
-        .await
-        .map_err(|error| {
-            into_account_error(
-                error,
-                GraphErrorContext::graph(AccountOperation::DiscoverCursorScopes),
-            )
-        })?;
-    account.folder_tree.write().await.replace_mail_folders(
-        mail_folders
-            .iter()
-            .map(|folder| (folder.id.clone(), folder.parent_folder_id.clone())),
-    );
+    //
+    // `open` already walked this hierarchy to seed `folder_tree` and left
+    // the listing in `open_folder_seed`. Consume it rather than repeating
+    // the walk: the engine calls discovery moments after open, so the
+    // second walk answered identically and re-seeded the tree with the
+    // same data. The slot is one-shot, so a discovery re-run - the pass
+    // that exists to notice folders created since open - lists for real.
+    let seeded = account.open_folder_seed.write().await.take();
+    let (mail_folders, from_seed) = match seeded {
+        Some(folders) => (folders, true),
+        None => {
+            let folders = account
+                .client
+                .list_mail_folders_recursive()
+                .await
+                .map_err(|error| {
+                    into_account_error(
+                        error,
+                        GraphErrorContext::graph(AccountOperation::DiscoverCursorScopes),
+                    )
+                })?;
+            (folders, false)
+        }
+    };
+    if !from_seed {
+        account.folder_tree.write().await.replace_mail_folders(
+            mail_folders
+                .iter()
+                .map(|folder| (folder.id.clone(), folder.parent_folder_id.clone())),
+        );
+    }
 
     let mut scopes = Vec::new();
     for folder in mail_folders {
@@ -233,6 +249,70 @@ mod tests {
     use super::super::PushMode;
     use super::*;
     use crate::client::GraphClient;
+
+    /// `open` walks the folder hierarchy to seed `folder_tree`, and the
+    /// engine calls cursor-scope discovery moments later. Discovery used to
+    /// walk the same hierarchy again and re-seed the same tree with the same
+    /// answer - one full recursive listing of pure duplicate traffic per
+    /// attach. It now consumes the listing `open` left behind. The slot is
+    /// one-shot: a re-run lists for real, because noticing folders created
+    /// since open is exactly what a second discovery is for.
+    #[tokio::test]
+    async fn discovery_reuses_the_listing_open_seeded_and_lists_again_on_re_run() {
+        let client = GraphClient::new("token");
+        // Exactly ONE listing response is scripted. A discovery that walks
+        // the hierarchy while the seed is present would take it, and the
+        // re-run below would then hit the exhausted-script panic.
+        client.script_rest([crate::client::ScriptedRestResponse::json(
+            reqwest::StatusCode::OK,
+            serde_json::json!({ "value": [{ "id": "relisted", "displayName": "Relisted" }] }),
+        )]);
+        let account = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
+        *account.open_folder_seed.write().await = Some(vec![crate::types::GraphMailFolder {
+            id: "seeded".to_string(),
+            display_name: Some("Seeded".to_string()),
+            child_folder_count: Some(0),
+            parent_folder_id: None,
+        }]);
+
+        let (scopes, _) = discover_cursor_scopes_inner(&account)
+            .await
+            .expect("discovery succeeds from the seeded listing");
+
+        assert_eq!(
+            scopes,
+            vec![CursorScope::FolderType {
+                folder: FolderId("seeded".to_string()),
+                ty: ObjectType::Email,
+            }],
+            "the first discovery answers from open's listing"
+        );
+        assert!(
+            client.take_rest_requests().is_empty(),
+            "the first discovery must issue no folder listing of its own"
+        );
+        assert!(
+            account.open_folder_seed.read().await.is_none(),
+            "the seed is one-shot"
+        );
+
+        let (scopes, _) = discover_cursor_scopes_inner(&account)
+            .await
+            .expect("a re-run lists for real");
+
+        assert_eq!(
+            scopes,
+            vec![CursorScope::FolderType {
+                folder: FolderId("relisted".to_string()),
+                ty: ObjectType::Email,
+            }],
+            "a second discovery walks the hierarchy so new folders are noticed"
+        );
+        assert!(
+            !client.take_rest_requests().is_empty(),
+            "the re-run issues the listing"
+        );
+    }
 
     /// Each foreign folder contributes an owner tag the engine's covering
     /// rule cannot derive on its own (the folder-id and mailbox-id strings

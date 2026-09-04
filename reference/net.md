@@ -464,6 +464,20 @@ storage.
   treated opaque tokens as fresh indefinitely and waited for a
   server 401; the max-age fallback closes that latency leak.
 
+Every instant the refresher compares is on the **tokio clock**.
+`RefreshState::Fresh::refreshed_at` and `refresh_not_before` are
+`tokio::time::Instant`, matching `Backoff::retry_at`, and the
+issuer-supplied expiry is lifted with `tokio::time::Instant::from_std`
+at the point of comparison (`token_expiry`). `AccessToken::expires_at`
+stays a published `std::time::Instant` - callers mint tokens from
+whatever clock they have, and the two types share a timeline, so
+production behavior is identical. The reason for the migration is
+testability: with the refresher on `std::time::Instant` a paused-time
+test could drive the failure backoff but not the proactive-refresh or
+max-age windows, because `tokio::time::advance` moves only the tokio
+clock and real time barely moves inside a test. Both windows are now
+drivable exactly the way the rate governor and byte bucket already are.
+
 **Do not nest `OAuthRefresher`s.** Wrapping one refresher around
 another causes the outer's `force_refresh` to bypass the inner's
 single-flight. Compose against the raw `TokenSource` instead.
@@ -607,6 +621,28 @@ partition the traffic rather than each restating a running total. Deliberately
 NOT a delta across the cumulative account meter: that meter is shared by every
 concurrent request on the account, so a delta would attribute another scope's
 traffic to this batch.
+
+### Bodies abandoned before they are read are not metered
+
+"Every body the transport reads is metered" is exact, and the word doing
+the work is *reads*. Two returns deliberately drop a response body
+without reading it, so those bytes appear in no counter and no bandwidth
+window:
+
+- `Error::ResponseTooLarge` (`read_capped_response_body`,
+  `download_stream`) - the whole point is to stop reading rather than
+  buffer gigabytes, so metering them would require doing the thing the
+  cap exists to prevent.
+- `Error::RangeNotHonored` - the body is usually the full resource the
+  caller declined to fetch, and it is rejected before any byte is yielded
+  so the caller never assembles a misaligned blob.
+
+Both also mean the connection is likely torn down rather than returned
+to the pool, unlike the error drains above, which read the body
+precisely so the connection survives. This is an accepted asymmetry, not
+a hole: the account meter is a payload-sizing tool, and both shapes are
+terminal errors whose bytes the caller never receives. Do not re-file it
+as missing coverage.
 
 ### OAuth issuer traffic is an explicit exception
 
@@ -801,16 +837,26 @@ retries.
 callers that build their own `reqwest::Client` instead of routing
 through the pipeline. It returns a
 `reqwest::redirect::Policy::custom` whose follow / stop / error
-decision is driven by the same `max_hops` (default 10) and the same
-case-insensitive `allows_host` allowlist check the pipeline's
-`classify_redirect` uses, so the redirect-hardening rule lives in
-exactly one place. A reqwest `Policy` can only decide follow / stop /
+decision is driven by the same `max_hops` (default 10), the same
+case-insensitive `allows_host` allowlist check, and - since the
+divergence below was fixed - the same **cross-origin-only precondition**
+the pipeline's `classify_redirect` applies, so the redirect-hardening
+rule lives in exactly one place. The shared decision is
+`RedirectPolicy::admits_hop(prior, next)`: a same-origin hop (RFC 6454
+scheme + host + port, the `same_origin` comparison above) is always
+admitted, and only a hop that leaves the origin consults the allowlist.
+It previously checked every hop's target host, allowlist-populated or
+not, so a policy whose allowlist did not happen to name the origin's own
+host stopped a plain same-host redirect here while the pipeline followed
+it - the two paths disagreeing about the one rule they exist to share. A
+departing URL that is unknown is treated conservatively as cross-origin.
+A reqwest `Policy` can only decide follow / stop /
 error - it cannot rewrite methods or strip headers; cross-origin
 `Authorization` stripping is reqwest's own default and applies
 regardless, and the method-rewriting / explicit auth-strip in the
-pipeline are not part of this bare-client path. A hop outside the
-allowlist is stopped (the 3xx surfaces as a terminal status);
-exceeding `max_hops` errors. The DAV crates need their redirect gate to
+pipeline are not part of this bare-client path. A cross-origin hop
+outside the allowlist is stopped (the 3xx surfaces as a terminal
+status); exceeding `max_hops` errors. The DAV crates need their redirect gate to
 match their stricter credential gate, which compares scheme, host, and
 effective port - and this crate strips `Authorization` on any origin change
 with no way to restore it, so a followed cross-origin hop would arrive
@@ -818,6 +864,46 @@ unauthenticated. They therefore attach with `FollowRedirects::Disabled` and walk
 every hop themselves in `DavDispatch::send_raw_request`, re-minting credentials
 for each target origin against the set authenticated discovery admitted, with
 the hop cap still sourced from `RedirectPolicy::default`.
+
+### A 401 on a hop the transport disarmed itself
+
+`keep_auth` ANDs monotonically across the chain (`auth_for_next_hop =
+step.keep_auth && auth_for_next_hop`): once a hop leaves the origin the
+credential is gone and is never restored, which is the correct security
+posture. It also means a chain that comes back - `A -> B -> A`, the CDN
+bounce - arrives at its own origin unauthenticated, and the caller-set
+`Authorization` header was removed from the `HeaderMap` on the same hop.
+
+A 401 answered on such a hop is therefore not evidence about the
+credential: the credential was never presented. The pipeline tracks that
+provenance (`auth_self_stripped`, set when the walker removes a
+credential the request was actually carrying) and returns
+`Error::UnauthenticatedRedirectHop { message, final_response }` instead
+of letting the 401 fall through to the terminal-4xx branch. That branch
+mints `Error::Status { code: 401 }`, which `into_account_error` maps to
+`Authentication(ReauthorizationRequired)` and thence to terminal
+`RecoveryClass::AuthLost` - telling the engine to send the user to a
+re-authorization prompt for an account whose token is fine.
+`UnauthenticatedRedirectHop` classifies as
+`Protocol(ContractViolation)` -> `RecoveryClass::ProviderContractViolation`,
+carrying the rejecting hop's status, headers and body as diagnostics. A
+401 on a request that really did present its credential is untouched and
+still reaches `AuthLost` through the normal one-shot-refresh path.
+
+### A per-request cost does not cross a host boundary
+
+`RequestBuilder::cost(n)` is denominated in the quota units of the host
+the caller addressed - Graph counts requests, Gmail counts quota units,
+an unregistered host counts whatever it counts. `cost_override_for_hop`
+drops the override when a redirect hop changes host (case-insensitively)
+so the hop re-resolves the new host's registered `cost_default`, which
+is exactly what the no-override path already did per hop. A same-host
+hop keeps the override: same bucket, same units. Without this, an
+override larger than the new host's `burst` failed the request outright
+with `Error::CostExceedsBurst` on a cost the caller never applied to
+that host. `quota_scope` is unaffected - an explicit
+`RequestBuilder::quota_scope` is a deliberate cross-hop instruction and
+still wins for every hop.
 
 `FollowRedirects::Disabled` skips the loop entirely; 3xx surfaces
 to the caller exactly as it did before the loop landed. Redirects are

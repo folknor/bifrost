@@ -10,66 +10,60 @@ documented in `reference/net.md`; dav-core cites the named
 
 ## Confident findings
 
-### 1. `RedirectPolicy::reqwest_policy()` is dead published API with a false doc comment and divergent semantics
+(Finding 1 - `reqwest_policy`'s divergent cross-origin precondition and its
+false doc comment - is fixed, without deleting the published method: the
+follow/stop decision moved into `RedirectPolicy::admits_hop`, which admits any
+same-origin hop (RFC 6454 scheme+host+port, the same `same_origin` the pipeline
+uses) and consults the allowlist only on a hop that leaves the origin, exactly
+as `classify_redirect` does. The doc comment now states that precondition and
+no longer claims the CalDAV/CardDAV clients as its callers. Pinned by
+`a_same_origin_hop_is_followed_even_when_the_allowlist_omits_its_host` - which
+also asserts the pipeline's agreeing answer - and
+`a_cross_origin_hop_is_checked_against_the_allowlist`, both revert-and-confirmed.
+Whether the method should exist at all remains the owner's call.)
 
-`crates/net/src/redirect.rs:125-160`. No non-test caller exists anywhere in
-the workspace; its doc says it exists for "the CalDAV / CardDAV clients",
-which attach with `Disabled` and walk redirects themselves in `DavDispatch`
-(and `reference/net.md` line ~816 says exactly that). Worse, its semantics
-diverge from the pipeline it claims to unify: the pipeline consults the
-allowlist only on *cross-origin* hops (same-origin hops always follow);
-`reqwest_policy` checks **every** hop's host, so with a populated allowlist
-that omits the origin host, a plain same-host redirect is stopped under the
-bare-client path but followed under the pipeline. "The rule lives in exactly
-one place" is not true of the cross-host precondition. Proposal for the owner:
-delete `reqwest_policy` (published-API deletion, so owner's call), or fix its
-precondition and its doc.
-
-### 2. A redirect chain A->B->A produces a terminal `AuthLost` masquerading as credential loss
-
-`crates/net/src/request.rs:1083`, `account_error.rs:307` in net.
-`auth_for_next_hop = step.keep_auth && auth_for_next_hop` is a monotone AND -
-correct security posture, auth can never come back after a foreign hop. But
-the hop back to the *original* origin then arrives unauthenticated; the
-401-recovery branch is skipped (`auth_for_next_hop` is false), the 401 falls
-to the terminal-4xx branch as `Error::Status{401}`, and `into_account_error`
-maps a bare 401 to `Authentication(ReauthorizationRequired)` -> terminal
-`RecoveryClass::AuthLost`. A provider that bounces requests through a CDN and
-back tells the engine the user must re-authorize, when the credential is fine
-and the transport stripped it itself. The transport knows it stripped the
-header; that provenance should survive - e.g. classify a 401 on a hop where
-auth was self-stripped as `RedirectRejected`-like or
-`Protocol(ContractViolation)` rather than letting it read as credential death.
-Latent (needs a provider that redirects home cross-origin), but the
-misclassification is terminal-severity when it fires.
+(Finding 2 - a redirect chain A->B->A producing a terminal `AuthLost` that
+masquerades as credential loss - is fixed: the pipeline now tracks whether the
+redirect walker itself removed a credential the request was carrying
+(`auth_self_stripped`), and a 401 on such a hop returns
+`Error::UnauthenticatedRedirectHop { message, final_response }` instead of
+falling into the terminal-4xx branch. It classifies as
+`Protocol(ContractViolation)` -> `RecoveryClass::ProviderContractViolation`,
+carrying the rejecting hop's response evidence, so a CDN bounce no longer tells
+the engine the user must re-authorize. Pinned by
+`a_401_after_the_walker_stripped_auth_is_not_auth_lost` (revert-and-confirmed:
+without the branch it fails with `Status { code: 401 }`, the reported shape) and
+`a_401_on_an_authenticated_request_still_reports_auth_lost` for the untouched
+ordinary path. Documented in `reference/net.md`.)
 
 ## Suspected / smells (lower confidence or low severity)
 
-### 7. Mixed clocks in `OAuthRefresher`
+(Finding 7 - mixed clocks in `OAuthRefresher` - is fixed:
+`RefreshState::Fresh::refreshed_at`, `refresh_not_before` and the `Refreshing`
+fallback instant are now `tokio::time::Instant` like `Backoff::retry_at`, and
+the issuer expiry is lifted with `tokio::time::Instant::from_std` at each
+comparison (`token_expiry`). `AccessToken::expires_at` stays a published
+`std::time::Instant`; the clocks share a timeline so production behavior is
+unchanged. Pinned by `paused_time_drives_the_proactive_refresh_window` and
+`paused_time_drives_the_max_age_window_for_opaque_tokens`, both
+revert-and-confirmed against a std-clock `now`. Stated in `reference/net.md`.)
 
-`crates/net/src/auth.rs`: `Backoff.retry_at` uses `tokio::time::Instant`
-(pausable), while `refreshed_at`, `expires_at`, and `refresh_not_before` use
-`std::time::Instant`. Paused-time tests can drive the failure backoff but not
-the max-age/expiry windows; migrating the lot to `tokio::time::Instant` would
-make the proactive-refresh window testable the way the rate governor and byte
-bucket already are.
+(Finding 8 - the metering asymmetry a `RangeNotHonored` / `ResponseTooLarge`
+return creates - is stated: `reference/net.md` now carries a "Bodies abandoned
+before they are read are not metered" section naming both returns, why each
+drops its body deliberately, that the connection is likely torn down rather than
+pooled, and that this is an accepted asymmetry rather than missing coverage. No
+code change.)
 
-### 8. A `RangeNotHonored` / `ResponseTooLarge` return drops the response body undrained
-
-`net.rs::download_stream`, `request.rs::send`. Deliberate for
-`ResponseTooLarge` (stop reading gigabytes), but the dropped bytes are also
-unmetered and the connection is likely torn down rather than pooled. For the
-range-mismatch case the body is usually the full resource, so dropping is
-right - just noting the metering asymmetry the reference's "every body the
-transport reads is metered" phrasing glosses.
-
-### 9. Per-request `.cost(n)` override sticks across redirect hops
-
-`request.rs::recompute_cost_units`: a cost chosen for the original host's
-quota units is applied verbatim to a cross-host hop's bucket, where the units
-may mean something different. The no-override path correctly re-resolves the
-host default per hop. Edge-case semantics; probably fine in practice since
-cross-host hops rarely land on a governed host.
+(Finding 9 - a per-request `.cost(n)` sticking across a cross-host redirect hop
+- is fixed: `cost_override_for_hop` drops the override when the hop changes host
+(case-insensitively) so the new host's registered `cost_default` is re-resolved,
+and keeps it on a same-host hop where the units mean the same thing. An explicit
+`quota_scope` override is deliberately unchanged - that one IS a cross-hop
+instruction. Pinned by `cost_override_is_kept_per_host_and_dropped_across_hosts`
+and the end-to-end `a_cost_override_does_not_follow_a_cross_host_hop`, whose
+ablation fails with `CostExceedsBurst { cost: 20, burst: 5 }` - the concrete
+consequence the finding only guessed at. Documented in `reference/net.md`.)
 
 ## Verified and found sound
 

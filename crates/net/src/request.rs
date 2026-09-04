@@ -730,7 +730,7 @@ pub(crate) async fn send_streaming_inner(
         url,
         mut headers,
         body,
-        cost,
+        mut cost,
         quota_scope: quota_scope_override,
         retry,
         timeout,
@@ -771,6 +771,15 @@ pub(crate) async fn send_streaming_inner(
     let mut body = body;
     let mut headers = headers;
     let mut auth_for_next_hop = bearer_auth;
+    // Whether the request as written presented a credential at all -
+    // either the token-source bearer or a caller-built `Authorization`
+    // header (JMAP Basic auth takes the latter route).
+    let mut carrying_auth = bearer_auth || headers.contains_key(AUTHORIZATION);
+    // Set once the redirect walker itself removes the credential on a
+    // cross-origin hop. A later 401 then proves nothing about the
+    // credential, only that an unauthenticated request was refused, so
+    // it must not be reported as credential loss.
+    let mut auth_self_stripped = false;
     let mut host = host_from_url(&url);
     let mut quota_scope =
         resolve_quota_scope(&account, host.as_deref(), quota_scope_override.as_deref());
@@ -1091,8 +1100,33 @@ pub(crate) async fn send_streaming_inner(
                             // path is suppressed.
                             if !step.keep_auth {
                                 headers.remove(AUTHORIZATION);
+                                // Remember that the credential left the
+                                // request by our own hand, not the
+                                // caller's. A 401 further down the
+                                // chain - including on a hop back to
+                                // the original origin, which arrives
+                                // unauthenticated because `keep_auth`
+                                // ANDs monotonically - is then reported
+                                // as a redirect fault rather than as a
+                                // dead credential.
+                                auth_self_stripped |= carrying_auth;
+                                carrying_auth = false;
                             }
+                            let prior_host = host.clone();
                             host = host_from_url(&url);
+                            // A per-request `.cost(n)` is chosen in the
+                            // ORIGINAL host's quota units. Another
+                            // host's bucket meters something else
+                            // entirely (Graph counts requests, Gmail
+                            // counts quota units), so carrying the
+                            // number verbatim onto a cross-host hop
+                            // debits a bucket in units the caller never
+                            // spoke. Drop the override on a host change
+                            // and let the hop re-resolve the new host's
+                            // registered default, which is what the
+                            // no-override path already did per hop.
+                            cost =
+                                cost_override_for_hop(prior_host.as_deref(), host.as_deref(), cost);
                             quota_scope = resolve_quota_scope(
                                 &account,
                                 host.as_deref(),
@@ -1115,6 +1149,27 @@ pub(crate) async fn send_streaming_inner(
                     }
                 }
             }
+        }
+
+        // A 401 on a hop this transport disarmed itself. The 401
+        // recovery branch above did not fire (it is gated on
+        // `auth_for_next_hop`), and letting this fall to the terminal
+        // 4xx branch below would mint `Error::Status { 401 }`, which
+        // `into_account_error` reads as `ReauthorizationRequired` ->
+        // terminal `AuthLost`. The credential was never presented, so
+        // it proves nothing about the credential; carry the provenance
+        // instead.
+        if status == StatusCode::UNAUTHORIZED && auth_self_stripped && !auth_for_next_hop {
+            let final_response =
+                final_response_from_response(response, &account, deadline, &bytes_in).await?;
+            return Err(Error::UnauthenticatedRedirectHop {
+                message: format!(
+                    "redirect hop to {url} answered 401 after the redirect walker stripped \
+                     Authorization on a cross-origin hop; the account credential was never \
+                     presented to this hop"
+                ),
+                final_response,
+            });
         }
 
         // 4xx that the policy does not call retryable: terminal.
@@ -1463,6 +1518,35 @@ fn resolve_quota_scope(
             .map_or("", |host| account.rate_scope_for(host))
             .to_owned(),
     }
+}
+
+/// Decide whether a per-request `.cost(n)` override still applies after
+/// a redirect hop.
+///
+/// A cost is denominated in the quota units of the host the caller
+/// addressed: Graph counts requests, Gmail counts quota units, and a
+/// host the caller never named counts whatever it counts. Carrying the
+/// number verbatim across an origin boundary debits a foreign bucket in
+/// units nobody agreed on - and an override larger than the new host's
+/// burst is rejected outright as `CostExceedsBurst`, failing a request
+/// the caller never over-costed. On a host change the override is
+/// dropped so the hop re-resolves that host's registered default, which
+/// is what the no-override path already did per hop. A same-host hop
+/// keeps it: the units mean the same thing on the same bucket.
+///
+/// Host comparison is case-insensitive (RFC 3986 §3.2.2), matching the
+/// redirect classifier's own same-origin test.
+fn cost_override_for_hop(
+    prior_host: Option<&str>,
+    next_host: Option<&str>,
+    cost: Option<u32>,
+) -> Option<u32> {
+    let same_host = match (prior_host, next_host) {
+        (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+        (None, None) => true,
+        _ => false,
+    };
+    if same_host { cost } else { None }
 }
 
 fn recompute_cost_units(
@@ -2713,6 +2797,182 @@ mod tests {
         assert!(
             HeaderValue::from_str("fine").is_ok(),
             "an ordinary value must still be accepted"
+        );
+    }
+
+    // ---- self-stripped auth on a redirect chain ------------------------
+
+    /// A chain that leaves its origin and comes back (`A -> B -> A`, the
+    /// CDN-bounce shape) arrives home unauthenticated, because
+    /// `keep_auth` ANDs monotonically and never restores the credential.
+    /// The 401 that follows must NOT read as credential death: the
+    /// account's token was never presented to that hop, and reporting
+    /// `AuthLost` would drive a re-authorization prompt for a perfectly
+    /// good account.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_401_after_the_walker_stripped_auth_is_not_auth_lost() {
+        let mut away = HeaderMap::new();
+        away.insert(LOCATION, HeaderValue::from_static("https://cdn.test/hop"));
+        let mut home = HeaderMap::new();
+        home.insert(
+            LOCATION,
+            HeaderValue::from_static("https://origin.test/final"),
+        );
+        let script = ScriptedDispatch::new([
+            canned_with_headers(StatusCode::TEMPORARY_REDIRECT, away, b""),
+            canned_with_headers(StatusCode::TEMPORARY_REDIRECT, home, b""),
+            canned(StatusCode::UNAUTHORIZED, b"no credential"),
+        ]);
+        let account = scripted_account(
+            &script,
+            NetConfig::default(),
+            Vec::new(),
+            RetryPolicy::disabled(),
+        );
+
+        let error = match account.get("https://origin.test/start").send().await {
+            Err(error) => error,
+            Ok(_) => panic!("the unauthenticated final hop must fail the request"),
+        };
+
+        let requests = script.requests();
+        assert_eq!(requests.len(), 3);
+        assert!(requests[0].headers.contains_key(AUTHORIZATION));
+        assert!(
+            !requests[2].headers.contains_key(AUTHORIZATION),
+            "the hop home arrives unauthenticated - the walker stripped it leaving the origin"
+        );
+        let Error::UnauthenticatedRedirectHop { final_response, .. } = &error else {
+            panic!("expected UnauthenticatedRedirectHop, got {error:?}");
+        };
+        assert_eq!(final_response.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(final_response.body, Bytes::from_static(b"no credential"));
+
+        let classified = crate::account_error::into_account_error(
+            error,
+            crate::account_error::NetErrorContext {
+                provider: None,
+                protocol: bifrost_types::Protocol::Jmap,
+                operation: bifrost_types::AccountOperation::Hydrate,
+                scope: None,
+            },
+        );
+        assert_eq!(
+            *classified.recovery(),
+            bifrost_types::RecoveryClass::ProviderContractViolation,
+            "a self-stripped 401 is a provider contract fault, never terminal AuthLost"
+        );
+    }
+
+    /// The ordinary case is untouched: a 401 on a request that really did
+    /// present its credential still surfaces as `AuthLost` (after the one
+    /// forced refresh + retry the auth budget allows).
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_401_on_an_authenticated_request_still_reports_auth_lost() {
+        let script = ScriptedDispatch::new([
+            canned(StatusCode::UNAUTHORIZED, b"first"),
+            canned(StatusCode::UNAUTHORIZED, b"second"),
+        ]);
+        let account = scripted_account(
+            &script,
+            NetConfig::default(),
+            Vec::new(),
+            RetryPolicy::disabled(),
+        );
+
+        let error = match account.get("https://origin.test/start").send().await {
+            Err(error) => error,
+            Ok(_) => panic!("a genuine 401 must fail the request"),
+        };
+
+        assert!(
+            matches!(error, Error::AuthLost { .. }),
+            "expected AuthLost, got {error:?}"
+        );
+    }
+
+    // ---- per-request cost across a cross-host hop ----------------------
+
+    /// A `.cost(n)` is denominated in the ORIGINAL host's quota units.
+    /// Carrying it verbatim onto another host debits that host's bucket
+    /// in units the caller never spoke - here a 20-unit override against
+    /// a 5-unit burst, which the governor rejects outright as
+    /// `CostExceedsBurst`. The hop must re-resolve the new host's own
+    /// registered default instead.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_cost_override_does_not_follow_a_cross_host_hop() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            LOCATION,
+            HeaderValue::from_static("https://small.test/final"),
+        );
+        let script = ScriptedDispatch::new([
+            canned_with_headers(StatusCode::TEMPORARY_REDIRECT, headers, b""),
+            canned(StatusCode::OK, b"done"),
+        ]);
+        let account = scripted_account(
+            &script,
+            NetConfig::default(),
+            vec![
+                RateLimit {
+                    host: "big.test".to_owned(),
+                    quota_scope: String::new(),
+                    quota_per_second: 1000.0,
+                    cost_default: 1,
+                    burst: 100,
+                },
+                RateLimit {
+                    host: "small.test".to_owned(),
+                    quota_scope: String::new(),
+                    quota_per_second: 1000.0,
+                    cost_default: 1,
+                    burst: 5,
+                },
+            ],
+            RetryPolicy::disabled(),
+        );
+
+        let response = account
+            .get("https://big.test/start")
+            .cost(20)
+            .send()
+            .await
+            .expect("the cross-host hop re-resolves cost against small.test's own bucket");
+
+        assert_eq!(response.body, Bytes::from_static(b"done"));
+        assert_eq!(script.requests().len(), 2);
+    }
+
+    /// The hop-by-hop rule itself: dropped when the host changes, kept
+    /// when it does not (including a mixed-case spelling of the same
+    /// host, which is the same origin and the same bucket), so existing
+    /// same-host callers see no behavior change.
+    #[test]
+    fn cost_override_is_kept_per_host_and_dropped_across_hosts() {
+        assert_eq!(
+            cost_override_for_hop(Some("a.test"), Some("a.test"), Some(20)),
+            Some(20),
+            "a same-host hop keeps the caller's units"
+        );
+        assert_eq!(
+            cost_override_for_hop(Some("a.test"), Some("A.Test"), Some(20)),
+            Some(20),
+            "hosts are case-insensitive; this is the same bucket"
+        );
+        assert_eq!(
+            cost_override_for_hop(Some("a.test"), Some("b.test"), Some(20)),
+            None,
+            "a cross-host hop must re-resolve the new host's own default"
+        );
+        assert_eq!(
+            cost_override_for_hop(Some("a.test"), None, Some(20)),
+            None,
+            "a hop with no resolvable host has no bucket the units apply to"
+        );
+        assert_eq!(
+            cost_override_for_hop(Some("a.test"), Some("b.test"), None),
+            None,
+            "no override stays no override"
         );
     }
 }

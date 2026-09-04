@@ -20,34 +20,44 @@ revert-and-confirm; the rule is documented for the changes lane in
 
 ## Suspected defects (verify against the engine)
 
-### 4. `get_stream` can only hydrate messages, but Graph establishes event and contact cursor scopes
+(Finding 4 - `get_stream` hydrating only messages while Graph also establishes
+event and contact cursor scopes - is answered, and the answer is that the
+routing is correct: `bifrost-sync` never routes event or contact scope ids into
+`get_stream`. Its only internal callers are the mutation read-back paths, which
+hydrate ids the caller just put through the mail mutation API;
+`SyncEngine::get_stream` is otherwise a consumer-facing passthrough, and the
+standalone calendar/contact account crates (caldav, carddav) answer the same
+trait method with `unsupported_stream(Hydrate)`. Calendar events and contacts
+are read through their own typed surfaces (`calendar::get` by `EventId`, the
+contacts API), which address `/events/{id}` and `/contacts/{id}` themselves. An
+`ObjectId` carries no type marker, so this lane could not route by scope kind in
+any case. Pinned by
+`every_hydration_projection_selects_message_fields_on_a_messages_url`
+(revert-and-confirmed: adding a non-mail `$select` field fails it) and stated in
+`reference/graph.md` plus the `hydrate_url_for_id` doc comment, so the next
+reader does not re-derive it.)
 
-`get.rs` `hydrate_url_for_id` (lines 596-605) always builds
-`{prefix}/messages/{id}`, and `select_for_projection` returns message-shaped
-`$select` lists. Event/contact scopes produce inventory entries and change ids
-through the same generic pipeline; if the engine hydrates those object ids
-through `get_stream` (its generic path), every event and contact hydrates as a
-per-item 404 (`/me/messages/{eventId}`). If the engine instead never calls
-`get_stream` for non-email scopes, this is fine but undocumented - neither
-`reference/graph.md` nor the code says which. Worth pinning either way.
-
-### 5. Mutation batches never carry `PageBoundary::Final`
-
-`mutate.rs` `submit_batch` emits every batch as `PageBoundary::Page` and ends
-with `Done(None)`. `get.rs` was explicitly reworked (lines 30-36) because "a
-hydration that fired chunks tagged only `Page` never told the engine where the
-stream terminated", matching inventory/changes. The mutation stream has
-exactly the shape that comment calls a bug. `reference/sync.md` doesn't
-obviously require it for mutation lanes, so this may be benign - but the
-asymmetry with the hydration fix is unexplained.
+(Finding 5 - mutation batches never carrying `PageBoundary::Final` - is
+answered: the engine does not need it. `bifrost-sync`'s mutation consumer loops
+on `stream.next()` and matches only `Batch` / `Terminated`, treating the stream
+ending as the terminus; it never reads `page_boundary` on this lane, and a
+mutation batch carries `checkpoint: None` so there is no cursor for a `Final`
+tag to close. The hydration lane differs because its reader has to know which
+chunk closes the stream before the stream ends. No code change; the rule is
+stated in `reference/graph.md` and in `bulk_mutation_stream`'s doc comment, and
+pinned by `mutation_batches_are_paged_and_the_stream_end_is_the_terminus`
+(revert-and-confirmed by tagging the batch `Final`).)
 
 ## Smells / minor findings
 
-- **`open` lists mail folders twice per attach** - `GraphAccountFactory::open`
-  runs `list_mail_folders_recursive` to seed the folder tree, and
-  `discover_cursor_scopes_inner` runs it again (and re-seeds the same tree)
-  when the engine calls discovery moments later. One recursive folder walk per
-  open is pure duplicate traffic.
+- (The **double folder listing on `open`** is fixed: `open`'s
+  `list_mail_folders_recursive` result is handed forward in a one-shot
+  `open_folder_seed` slot, and the first `discover_cursor_scopes_inner` consumes
+  it instead of walking the hierarchy again. The slot is one-shot so a discovery
+  re-run still lists for real - noticing folders created since open is what a
+  second discovery is for. Pinned by
+  `discovery_reuses_the_listing_open_seeded_and_lists_again_on_re_run`,
+  revert-and-confirmed; documented in `reference/graph.md`.)
 - **`message_reactions` and `get_stream` `$batch` POSTs always go through the
   primary client** while subrequest URLs carry `/users/{owner}` prefixes -
   correct against Graph's account-global `/$batch`, but it means the routing
