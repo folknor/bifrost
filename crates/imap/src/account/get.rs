@@ -14,9 +14,9 @@ use super::hydration::{BodySelection, FetchSelection, decode_body};
 use super::inventory::{fetch_to_inventory, flags_set};
 #[cfg(test)]
 use super::pim::PREVIEW_FETCH_BYTES;
+use super::targets::TargetBatch;
 use super::{
     BATCH_ITEMS, DecodedObjectId, ImapAccount, batch, boxed_receiver_stream, decode_object_id,
-    uid_set_from_u32,
 };
 
 /// Memory ceiling for one body-bearing hydration FETCH.
@@ -277,18 +277,31 @@ async fn run_folder_get(
     let (valid, stale): (Vec<_>, Vec<_>) = pending
         .drain(..)
         .partition(|id| id.uidvalidity == uidvalidity);
-    let requested: Vec<u32> = valid.iter().map(|id| id.uid).collect();
-    let requested_uids: HashSet<u32> = requested.iter().copied().collect();
+    // One owner for "requested ids -> wire operand -> outcome attribution".
+    // The excluded lane is published with the stale failures: like them it
+    // is known truth before any wire work, and unlike them it must never be
+    // able to reach the FETCH path and be reported as hydrated.
+    let target_batch = TargetBatch::new(valid);
+    let uid_set = target_batch.uid_set().cloned();
+    let requested_uids: HashSet<u32> = target_batch.uids().iter().copied().collect();
+    let (valid, excluded_outcomes) =
+        target_batch.settle_streaming(bifrost_types::AccountOperation::Hydrate, folder);
     // Stale-UIDVALIDITY failures are known before any wire work, so they are
     // emitted first. Buffering them behind the FETCH would lose established
     // per-item truth if that FETCH fails and the folder falls back to the
     // uncertain lane.
     emit_stale_failures(tx, stale, folder).await?;
-    // The stale failures are on the channel: from here on only the valid
-    // ids remain unresolved should the FETCH (or MODSEQ recording) fail.
+    if !excluded_outcomes.is_empty() {
+        tx.send(batch(excluded_outcomes, PageBoundary::Page, None))
+            .await
+            .map_err(|_| GetError::ChannelDropped)?;
+    }
+    // The stale and excluded failures are on the channel: from here on only
+    // the valid ids remain unresolved should the FETCH (or MODSEQ
+    // recording) fail.
     *pending = valid.clone();
     let mut out: Vec<ItemOutcome<HydratedObject>> = Vec::with_capacity(BATCH_ITEMS);
-    let Some(uid_set) = uid_set_from_u32(&requested) else {
+    let Some(uid_set) = uid_set else {
         return Ok(());
     };
     let include_modseq = selected.mailbox.highest_mod_seq.is_some() && !selected.mailbox.no_mod_seq;

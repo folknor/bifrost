@@ -11,9 +11,8 @@ use futures::StreamExt;
 
 use crate::types::{Flag, MailboxName, ResponseCode, StoreOperation};
 
-use super::{
-    DecodedObjectId, ImapAccount, batch, boxed_receiver_stream, decode_object_id, uid_set_from_u32,
-};
+use super::targets::TargetBatch;
+use super::{DecodedObjectId, ImapAccount, batch, boxed_receiver_stream, decode_object_id};
 
 pub(crate) fn bulk_set_flags(
     account: ImapAccount,
@@ -299,43 +298,49 @@ async fn run_folder_mutation(
             .extend(run_destroy_mutation_groups(account, &conn, folder, uidvalidity, valid).await?);
         return Ok(results);
     }
-    let uids: Vec<u32> = valid.iter().map(|id| id.uid).collect();
-    let Some(uid_set) = uid_set_from_u32(&uids) else {
-        return Ok(stale_results);
-    };
+    let operation = mutation_operation(kind);
+    let target_batch = TargetBatch::new(valid);
+    let uids: Vec<u32> = target_batch.uids().to_vec();
+    let wire_set = target_batch.uid_set().cloned();
 
-    let outcome = match kind {
-        MutationKind::Flags(_) => unreachable!("flags handled above"),
-        MutationKind::Move(_) => {
-            let destination =
-                move_destination.expect("bulk-move destination validated before folder loop");
-            conn.connection()
-                .uid_move_messages(
-                    uid_set.as_sequence_set(),
-                    destination.as_str(),
-                    account.command_timeout(),
-                )
-                .await
-                .map(|_| StoreWireOutcome::Applied)
-        }
-        MutationKind::Destroy => unreachable!("destroy handled above"),
+    // `None` means no id reached the operand, so no command is sent - but
+    // the batch still owes an outcome for every id it holds, which `settle`
+    // mints from the excluded lane.
+    let outcome = match wire_set {
+        None => None,
+        Some(uid_set) => Some(match kind {
+            MutationKind::Flags(_) => unreachable!("flags handled above"),
+            MutationKind::Move(_) => {
+                let destination =
+                    move_destination.expect("bulk-move destination validated before folder loop");
+                conn.connection()
+                    .uid_move_messages(
+                        uid_set.as_sequence_set(),
+                        destination.as_str(),
+                        account.command_timeout(),
+                    )
+                    .await
+                    .map(|_| StoreWireOutcome::Applied)
+            }
+            MutationKind::Destroy => unreachable!("destroy handled above"),
+        }),
     };
 
     let mut results = stale_results;
-    results.extend(match outcome {
-        Ok(outcome) => {
+    results.extend(target_batch.settle(operation, folder, |ids| match outcome {
+        None => Vec::new(),
+        Some(Ok(outcome)) => {
             account.folders.clear_modseqs(folder, uidvalidity, &uids);
-            mutation_results(valid, outcome, mutation_operation(kind), folder)
+            mutation_results(ids, outcome, operation, folder)
         }
-        Err(err) => mutation_error_outcomes(
-            valid,
+        Some(Err(err)) => mutation_error_outcomes(
+            ids,
             super::account_error_with(
                 err,
-                super::error::ImapErrorContext::operation(mutation_operation(kind))
-                    .with_folder_scope(folder),
+                super::error::ImapErrorContext::operation(operation).with_folder_scope(folder),
             ),
         ),
-    });
+    }));
     Ok(results)
 }
 
@@ -348,8 +353,11 @@ async fn run_destroy_mutation_groups(
 ) -> Result<Vec<ItemOutcome<MutationSuccess>>, crate::Error> {
     let mut results = Vec::new();
     for (unchanged_since, ids) in partition_by_modseq(account, folder, uidvalidity, ids) {
-        let uids: Vec<u32> = ids.iter().map(|id| id.uid).collect();
-        let Some(uid_set) = uid_set_from_u32(&uids) else {
+        let target_batch = TargetBatch::new(ids);
+        let uids: Vec<u32> = target_batch.uids().to_vec();
+        let Some(uid_set) = target_batch.uid_set().cloned() else {
+            results
+                .extend(target_batch.settle(AccountOperation::BulkDestroy, folder, |_| Vec::new()));
             continue;
         };
         let store = conn
@@ -370,7 +378,11 @@ async fn run_destroy_mutation_groups(
                     super::error::ImapErrorContext::operation(AccountOperation::BulkDestroy)
                         .with_folder_scope(folder),
                 );
-                results.extend(mutation_error_outcomes(ids, error));
+                results.extend(
+                    target_batch.settle(AccountOperation::BulkDestroy, folder, |ids| {
+                        mutation_error_outcomes(ids, error)
+                    }),
+                );
                 continue;
             }
         };
@@ -378,7 +390,7 @@ async fn run_destroy_mutation_groups(
         account
             .folders
             .clear_modseqs(folder, uidvalidity, &expunge_uids);
-        if let Some(expunge_set) = uid_set_from_u32(&expunge_uids)
+        if let Some(expunge_set) = target_batch.subset_uid_set(&expunge_uids)
             && let Err(err) = expunge_uids_or_fall_back(
                 account,
                 conn,
@@ -387,25 +399,29 @@ async fn run_destroy_mutation_groups(
             )
             .await
         {
-            let (expunging_ids, remaining_ids) = split_ids_by_uid(ids, &expunge_uids);
-            results.extend(mutation_error_outcomes(
-                expunging_ids,
-                expunge_failed_after_delete_mark(folder, err),
-            ));
-            results.extend(mutation_results(
-                remaining_ids,
-                outcome,
-                AccountOperation::BulkDestroy,
-                folder,
-            ));
+            results.extend(
+                target_batch.settle(AccountOperation::BulkDestroy, folder, |ids| {
+                    let (expunging_ids, remaining_ids) = split_ids_by_uid(ids, &expunge_uids);
+                    let mut split = mutation_error_outcomes(
+                        expunging_ids,
+                        expunge_failed_after_delete_mark(folder, err),
+                    );
+                    split.extend(mutation_results(
+                        remaining_ids,
+                        outcome,
+                        AccountOperation::BulkDestroy,
+                        folder,
+                    ));
+                    split
+                }),
+            );
             continue;
         }
-        results.extend(mutation_results(
-            ids,
-            outcome,
-            AccountOperation::BulkDestroy,
-            folder,
-        ));
+        results.extend(
+            target_batch.settle(AccountOperation::BulkDestroy, folder, |ids| {
+                mutation_results(ids, outcome, AccountOperation::BulkDestroy, folder)
+            }),
+        );
     }
     Ok(results)
 }
@@ -420,8 +436,11 @@ async fn run_flag_mutation_groups(
 ) -> Result<Vec<ItemOutcome<MutationSuccess>>, crate::Error> {
     let mut results = Vec::new();
     for (unchanged_since, ids) in partition_by_modseq(account, folder, uidvalidity, ids) {
-        let uids: Vec<u32> = ids.iter().map(|id| id.uid).collect();
-        let Some(uid_set) = uid_set_from_u32(&uids) else {
+        let target_batch = TargetBatch::new(ids);
+        let uids: Vec<u32> = target_batch.uids().to_vec();
+        let Some(uid_set) = target_batch.uid_set().cloned() else {
+            results
+                .extend(target_batch.settle(AccountOperation::UpdateFlags, folder, |_| Vec::new()));
             continue;
         };
         if let FlagOp::Patch { add, remove } = op
@@ -435,8 +454,7 @@ async fn run_flag_mutation_groups(
                     folder,
                     uidvalidity,
                     PatchMutationWork {
-                        ids,
-                        uids: &uids,
+                        targets: target_batch,
                         add,
                         remove,
                         unchanged_since,
@@ -454,26 +472,28 @@ async fn run_flag_mutation_groups(
             account.command_timeout(),
         )
         .await;
-        results.extend(match outcome {
-            Ok(outcome) => {
-                let changed_uids = applied_uids_after_store(&uids, &outcome);
-                account
-                    .folders
-                    .clear_modseqs(folder, uidvalidity, &changed_uids);
-                mutation_results(ids, outcome, AccountOperation::UpdateFlags, folder)
-            }
-            Err(err) => {
-                if matches!(op, FlagOp::Patch { .. }) {
-                    account.folders.clear_modseqs(folder, uidvalidity, &uids);
+        results.extend(
+            target_batch.settle(AccountOperation::UpdateFlags, folder, |ids| match outcome {
+                Ok(outcome) => {
+                    let changed_uids = applied_uids_after_store(&uids, &outcome);
+                    account
+                        .folders
+                        .clear_modseqs(folder, uidvalidity, &changed_uids);
+                    mutation_results(ids, outcome, AccountOperation::UpdateFlags, folder)
                 }
-                let error = super::account_error_with(
-                    err,
-                    super::error::ImapErrorContext::operation(AccountOperation::UpdateFlags)
-                        .with_folder_scope(folder),
-                );
-                mutation_error_outcomes(ids, error)
-            }
-        });
+                Err(err) => {
+                    if matches!(op, FlagOp::Patch { .. }) {
+                        account.folders.clear_modseqs(folder, uidvalidity, &uids);
+                    }
+                    let error = super::account_error_with(
+                        err,
+                        super::error::ImapErrorContext::operation(AccountOperation::UpdateFlags)
+                            .with_folder_scope(folder),
+                    );
+                    mutation_error_outcomes(ids, error)
+                }
+            }),
+        );
     }
     Ok(results)
 }
@@ -483,8 +503,7 @@ async fn run_flag_mutation_groups(
 /// UIDs must receive the unguarded remove before they can be reported as
 /// `Succeeded(Applied)`.
 struct PatchMutationWork<'a> {
-    ids: Vec<DecodedObjectId>,
-    uids: &'a [u32],
+    targets: TargetBatch,
     add: &'a HashSet<String>,
     remove: &'a HashSet<String>,
     unchanged_since: Option<u64>,
@@ -497,7 +516,12 @@ async fn run_patch_mutation_group(
     uidvalidity: u32,
     work: PatchMutationWork<'_>,
 ) -> Vec<ItemOutcome<MutationSuccess>> {
-    let set = uid_set_from_u32(work.uids).expect("non-empty UID list has a sequence set");
+    let target_batch = work.targets;
+    let uids: Vec<u32> = target_batch.uids().to_vec();
+    let set = target_batch
+        .uid_set()
+        .cloned()
+        .expect("a two-sided patch group always has at least one target");
     let first = match store_flags(
         conn,
         set.as_sequence_set(),
@@ -514,16 +538,16 @@ async fn run_patch_mutation_group(
         // earlier groups are known truth and may never be downgraded to the
         // folder-wide uncertain lane.
         Err(err) => {
-            account
-                .folders
-                .clear_modseqs(folder, uidvalidity, work.uids);
-            return patch_first_store_failure(work.ids, err, folder);
+            account.folders.clear_modseqs(folder, uidvalidity, &uids);
+            return target_batch.settle(AccountOperation::UpdateFlags, folder, |ids| {
+                patch_first_store_failure(ids, err, folder)
+            });
         }
     };
-    let applied = applied_uids_after_store(work.uids, &first);
+    let applied = applied_uids_after_store(&uids, &first);
     account.folders.clear_modseqs(folder, uidvalidity, &applied);
 
-    let second = match uid_set_from_u32(&applied) {
+    let second = match target_batch.subset_uid_set(&applied) {
         Some(set) => store_flags(
             conn,
             set.as_sequence_set(),
@@ -542,7 +566,9 @@ async fn run_patch_mutation_group(
         }),
         None => Ok(StoreWireOutcome::Applied),
     };
-    patch_mutation_results(work.ids, work.uids, first, second, folder)
+    target_batch.settle(AccountOperation::UpdateFlags, folder, |ids| {
+        patch_mutation_results(ids, &uids, first, second, folder)
+    })
 }
 
 /// Per-item outcomes for a MODSEQ group whose guarded add STORE errored on

@@ -127,7 +127,17 @@ and its legacy shapes, `CompactUidSet` normalization/diff, STARTTLS/COMPRESS
 poisoned-sentinel upgrades, and pool close linearization (modulo finding 6)
 all check out against both the RFCs and `reference/imap.md`.
 
-## Architectural note (pre-1.0, aggressive-rewrite lens)
+## Architectural note (pre-1.0, aggressive-rewrite lens) - CLOSED
+
+(Built as ruling 3 of the 2026-09-04 structural rulings. `TargetBatch` lives
+in `crates/imap/src/account/targets.rs`: it takes the decoded ids, owns the
+wire `UidSet`, keeps an explicit excluded lane, and is the only way to mint
+the batch's outcomes - `settle` debug-asserts exactly-once coverage and an
+unsettled batch panics on drop. All four hand-rolled loops now route through
+it: flag mutation, its two-sided patch group, destroy, move, and hydration in
+`get.rs`. Pinned by the `account::targets` tests, each revert-and-confirmed;
+documented in `reference/imap.md` under "One outcome per id". The original
+note follows.)
 
 The one structural weakness worth real investment is that **the
 one-outcome-per-id contract is enforced by convention across four hand-rolled

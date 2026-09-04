@@ -189,6 +189,37 @@ leak past `uid_set_from_u32`'s silent zero-filtering into fabricated
 `Succeeded(Applied)` mutation outcomes, ids with no outcome at all, and an
 empty-but-successful `open_raw_rfc822` stream.
 
+### One outcome per id (`account/targets.rs`)
+
+The one-outcome-per-id contract the sync engine holds is enforced by a type,
+not by convention. `TargetBatch` is the single owner of the derivation
+"requested ids -> wire UID operand -> outcome attribution", and the four paths
+that used to hand-roll it - flag mutation and its two-sided patch group,
+destroy, move, and hydration in `get.rs` - all route through it:
+
+- `TargetBatch::new(ids)` splits the decoded ids into the ids the operand
+  carries and an explicit *excluded* lane for ids it cannot represent (the
+  only such UID is 0). The operand is built from the target ids and nothing
+  else; there is no constructor that takes UIDs from anywhere but the batch.
+- `subset_uid_set` is the only way to build a follow-up operand (the applied
+  subset of a guarded STORE, the UIDs to EXPUNGE after a `\Deleted` mark) and
+  refuses any UID the batch was not given, so a second wire command can never
+  name a message the first was not accountable for.
+- `settle` is the only way to mint the batch's outcomes. It consumes the
+  batch, mints the excluded lane itself as `Failed(Request(Malformed))` - a
+  UID the server never saw may become neither a fabricated success nor a
+  silent drop - and debug-asserts that the caller's outcomes cover the target
+  ids exactly once each. `settle_streaming` is the hydration variant for a
+  path that publishes down a channel: it hands back the target ids and the
+  already-minted excluded lane.
+- A `TargetBatch` dropped with either lane non-empty panics in debug builds,
+  so an early return that leaves an id unaccounted for cannot pass unnoticed.
+
+This is the same move `StoreConsumer::new(unchanged_since)` and
+`SideEffectDigest` made for their classes: the accounting hole that the
+uid-0 decode bug's blast radius rode on is now unrepresentable rather than
+merely absent.
+
 Account cursors use `CompactUidSet`, a sorted, disjoint range list with
 range-native construction, membership, insertion, removal, and linear diff.
 QRESYNC mutates its live and fallback snapshots in that representation.
@@ -258,6 +289,10 @@ Runtime downgrades:
 - VANISHED and FETCH may report the same UID on non-conformant servers; the change stream de-duplicates so a message never surfaces as both expunge and update.
 
 ### Mutations
+
+Every mutation path builds its operand and mints its outcomes through
+`TargetBatch` (see "One outcome per id" above); the per-path rules below
+describe what each mint closure decides, not a second copy of the accounting.
 
 `bulk_set_flags` and `bulk_destroy` partition targets by cached MODSEQ: cache hits go out under `STORE UNCHANGEDSINCE <modseq>`, misses fall back to unprotected STORE, and protected batches run first so their success updates the cache before the unprotected pass.
 
@@ -357,6 +392,7 @@ Output ordering is therefore input-window order, then lexical folder order withi
 
 - Ids whose UIDVALIDITY no longer matches the selected mailbox are `Failed(Request(Malformed))` and are published *before* the hydration FETCH is issued. They are known truth already; buffering them behind a fallible command would relabel them uncertain whenever that command fails. The per-folder error path in turn only downgrades ids that still lack a published outcome (`run_folder_get` prunes the caller's unresolved set as it publishes), so a FETCH failure after the stale batch cannot put one id in two lanes.
 - A requested UID the server never returns is `Failed(NotFound(Message))` rather than being silently dropped.
+- The valid (non-stale) ids of a folder become a `TargetBatch`, so the FETCH operand and the set the loop attributes results to are the same object. Its excluded lane is published alongside the stale failures, before the FETCH: like them it is known truth already, and unlike them it must never be able to reach the FETCH and be reported as hydrated.
 - FETCH responses are merged per UID before conversion. A server may follow the solicited response with unsolicited FLAGS-only FETCHes for the same UID; the merge adopts later `FLAGS` / `MODSEQ` and fills gaps, but never blanks a data item or body section the earlier response carried, so a trailing partial response cannot turn a complete hydration into an empty one.
 - `Projection::Preview` and `Projection::TextOnly` both ask for `BODY.PEEK[]` (whole message, not the TEXT section) - preview bounded to a prefix, text-only unbounded. `BODY[TEXT]` is never requested by either: the hydrated value is raw MIME the consumer parses, and the TEXT section of a multipart message is boundaries and base64 with no headers to decode them by. `get.rs` and `pim.rs` use the same 64 KiB preview floor (`PREVIEW_FETCH_BYTES`), raised to the caller's limit when that is larger.
 - A projection that asks for a body section runs through `uid_fetch_limited` under `HYDRATION_FETCH_BUDGET` (256 MiB per batch); metadata and flag projections keep the unbudgeted `uid_fetch`, being bounded by their own response shape. The budget is a guard against a corrupt or adversarial server, not a per-message limit: crossing it surfaces as `Error::FetchLimit` after the tagged completion, with the stream still synchronized.

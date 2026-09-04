@@ -27,7 +27,11 @@ between them.
    the invalid-index and duplicate-index rules is NOT approved: one recorded
    drift is thin evidence for restructuring four working lanes. Re-raise if a
    future hunt finds a second drift between them.
-3. **imap: `TargetBatch` type owning id-to-outcome accounting. PROCEED.** One
+3. **imap: `TargetBatch` type owning id-to-outcome accounting. DONE
+   (2026-09-04).** Landed as `crates/imap/src/account/targets.rs`; the four
+   loops (flags incl. the two-sided patch group, destroy, move, hydration)
+   route through it, and `reference/imap.md` documents it under "One outcome
+   per id". Original ruling: One
    type takes the decoded ids, produces the wire `UidSet`, and is the only way
    to mint outcomes: each id consumed exactly once, with an explicit lane for
    ids excluded from the wire set. Replaces the four hand-rolled loops

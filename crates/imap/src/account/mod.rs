@@ -52,6 +52,7 @@ mod scopes;
 mod scripted_tests;
 pub(crate) mod sieve;
 mod submission;
+mod targets;
 #[cfg(test)]
 mod test_support;
 
