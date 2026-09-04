@@ -24,15 +24,65 @@ does not hold for a library crate, whose consumers are outside this workspace by
 definition; "nothing calls it" established by grepping here is a fact about the
 workspace, not about who uses `SmtpTransport`.
 
-The two halves are held in step deliberately: the DATA-framing, auth-ladder,
-pipelining-state, transaction-reset and batch error-scope invariants are mirrored
-into the blocking writers and pinned on both sides, as is the pipelined phase
-decoration described under "PIPELINING" and the single batch phase authority
-described alongside it. The one deliberate difference is the `abort()`
-timeout, recorded under "Connection lifecycle". The paired tests are intentional
-while the published sync and async I/O drivers remain separate. Any proposal
-to remove or reshape this surface is the owner's call - see the standing
-lessons in `AGENTS.md`.
+The two halves no longer mirror a protocol state machine each: the send paths
+share one sans-I/O core and differ only in how they move bytes. See "Protocol
+core and I/O adapters". What still exists twice - connect, greeting, EHLO/LHLO,
+the AUTH ladder, STARTTLS, reply reading, deadlines - is I/O-shaped, and the
+paired tests over it remain intentional while the published sync and async
+transports remain separate. The deliberate behavioural differences are the
+`abort()` timeout (see "Connection lifecycle") and the outbound-throttle
+invariant (see "Bandwidth metering"). Any proposal to remove or reshape this
+surface is the owner's call - see the standing lessons in `AGENTS.md`.
+
+## Protocol core and I/O adapters
+
+`client/core.rs` is the sans-I/O protocol core for every send path. It owns
+command sequencing, reply-group accounting (the PIPELINING window and the LMTP
+final-status drain), `SmtpCommandPhase` decoration, `SendProgress` transitions,
+and the RSET-and-keep versus abort decision. It takes typed outcomes in and
+yields byte writes plus typed ops out. It never touches a socket, a timeout or
+a clock, so it can be driven to completion with no I/O at all.
+
+The shape is a step function, not a straight-line routine, because the two
+adapters cannot share control flow - one blocks, one awaits. A machine is asked
+for its next `Op`; the adapter performs it and feeds back an `OpOutcome`
+(`Done`, `Reply(Response)`, or `Failed(Error)`). A negative reply is a
+`Reply`, never a `Failed`: telling a routine rejection apart from a transport
+failure is exactly the decision the core exists to make in one place.
+
+Four machines cover the send surface, and each is what one driver method used
+to be:
+
+| Machine | Drives |
+|---|---|
+| `DirectSmtp` | `send_with_options` / `send_bdat_with_options`, pipelined or not |
+| `DirectLmtp` | `send_lmtp_with_options` / `send_lmtp_bdat_with_options` |
+| `BatchSmtp` | `send_smtp_batch`, pipelined or not |
+| `BatchLmtp` | `send_lmtp_batch` |
+
+The op vocabulary is small and every variant maps to a primitive both drivers
+already had: `Write(String)`, `WriteBody`, `WriteBdat`, `OpenReplyGroup`,
+`ReadGrouped`, `ReadSingle`, `CloseReplyGroup`, `CloseLmtpDrain { restore_ok }`,
+`Abort`. `OpenReplyGroup` / `CloseReplyGroup` are the reply-group bracket: the
+stream is held `Broken` from the group's first read until its last has drained,
+so a connection abandoned mid-drain can never be recycled. `ReadGrouped` defers
+the surplus check to the close; `ReadSingle` applies it itself. A command write
+is followed by the reply read for it, and a write failure is handed to the same
+stage that would have handled the reply, so both carry that boundary's phase.
+
+The `Epilogue` type holds the two terminal sequences every machine shares. It
+carries the value the machine will finish with, so a boundary cannot start an
+abort or a reset and forget to return. RSET-and-keep is expressed there as ops -
+write `RSET`, read the reply, keep the connection on a positive
+acknowledgement and abort otherwise - so no adapter knows the rule.
+
+Each adapter is a `drive` loop plus a `perform` match, roughly thirty lines.
+What stays adapter-side is what is genuinely I/O: dialling, the greeting and
+EHLO/LHLO exchange, the AUTH ladder, the STARTTLS upgrade, reply-line reading
+and parsing with its size caps, read and write deadlines, bandwidth throttling,
+and the socket shutdown `Op::Abort` performs. The local validation that runs
+before `MAIL FROM` - `build_envelope` and `build_batch` - also stays with the
+adapter, because it reads `ServerInfo` capabilities off the live connection.
 
 ## Connection lifecycle
 
@@ -63,6 +113,13 @@ post-TLS reply.
 Sync and async streams carry an explicit state: `Ok` / `Broken` / `Closed`. Writes, flushes, reads, and TLS upgrades set `Broken` before the await; only success restores `Ok`. Dropped futures leave state `Broken`; the pool drops the connection.
 
 LMTP final delivery-status loop holds `Broken` until every accepted recipient's status has been read. A surplus final status that already reached the read buffer is a protocol violation: the connection is marked `Broken` and the drain fails (the batch driver keeps the per-recipient outcomes it already has, since the surplus changes only the stream's reusability).
+
+The direct and batch LMTP paths differ in one respect, preserved rather than
+unified when the drain moved into the core (`Op::CloseLmtpDrain { restore_ok }`):
+a direct LMTP send restores the stream to `Ok` after a clean drain, while an
+LMTP batch leaves it `Broken`. Neither connection is reusable in practice, since
+every drain retires it, so this is a difference in bookkeeping rather than in
+behaviour - but it is a real difference and it is now visible in one place.
 
 Surplus bytes that have not yet crossed into the `BufReader` - still in the socket or a TLS record - cannot be observed without a read that would block against a well-behaved peer, and native-tls exposes no nonblocking peek that would make such a probe honest. So cleanliness is never positively established: every LMTP final-status drain sets a retirement flag (`should_retire()`), and the pool discards those connections at recycle instead of parking them. The cost is one reconnect per LMTP transaction; LMTP is local delivery, so that is cheaper than recycling a possibly desynchronized stream. SMTP connections are unaffected and still pool normally.
 
@@ -126,17 +183,18 @@ and reset between replies.
 
 When the server advertises PIPELINING, `MAIL FROM` and `RCPT TO` commands are written in bounded recipient windows, with every reply in one window drained before the next is written. `DATA` is issued only after all recipient windows complete; the body is never in the pipelined batch. On RCPT failure mid-pipeline the transaction is reset before the body. The shared window bound respects the peer TCP window while preserving the original recipient indexes in `SendProgress`.
 
-Both sync and async drivers hold the stream `Broken` from a successful window
-write until the complete reply group has drained.
+The window bracket is `Op::OpenReplyGroup` / `Op::CloseReplyGroup`, so both
+drivers hold the stream `Broken` from a successful window write until the
+complete reply group has drained, by construction rather than by mirroring.
 
-Every pipelined boundary is decorated with its `SmtpCommandPhase`, and that is
-enforced by the type rather than by remembering it at each call site. The driver
-body is an inner function (`send_pipelined_inner`) whose error type is
-`PhasedError`, which has no `From<Error>` conversion and no phase-less
-constructor. So `?` on an undecorated SMTP result does not compile there, and
-the only exit is through a phase; the outer `send_pipelined` is the single place
-that stamps it back onto the `Error`. A boundary added later cannot ship
-undecorated - it will not build.
+Every direct-SMTP boundary is decorated with its `SmtpCommandPhase`, and that is
+enforced by the type rather than by remembering it at each call site.
+`DirectSmtp` builds its error exits only through the free `phased` helper,
+whose return type is `PhasedError` - no `From<Error>` conversion and no
+phase-less constructor - and the single `Step::Finish` that converts back to
+`Error` is where the phase is stamped. A boundary added later cannot ship
+undecorated; it will not build. Since the machine covers the pipelined and
+non-pipelined paths alike, the guarantee now spans both.
 
 Batch error translation also has one phase authority. `SmtpErrorContext` cannot
 carry a command phase, so a batch site converting a low-level `Error` must use
@@ -152,10 +210,10 @@ claim an account-wide fault for what is a single transaction on a single
 connection, and the id-bearing variants take typed account-surface ids, none of
 which represents an SMTP envelope address. Batch lanes correlate through their
 `BatchItemId` and support-only envelope-recipient text instead. Every context
-construction in the crate goes through `SmtpErrorContext::send`, in equal
-numbers in the two driver halves, so the halves agree here by construction
-rather than by matching call sites; both pin the scope-less shape on the
-non-pipelined recipient path with a paired transcript test.
+construction in the crate goes through `SmtpErrorContext::send`, and since the
+send paths run on one core there is now exactly one set of those call sites for
+both halves; both still pin the scope-less shape on the non-pipelined recipient
+path with a paired transcript test.
 
 That explicit argument is the part of the arrangement that is behaviour rather
 than a type property, and it is pinned by a bare-550 recipient rejection: with
@@ -181,12 +239,11 @@ acknowledges the reset and aborts it otherwise.
 
 This is not a PIPELINING-only rule. The direct sends (`send_with_options` and
 `send_bdat_with_options`) take the same shape when the server advertises no
-PIPELINING: `MAIL FROM`, `RCPT TO` and `DATA` are issued through
-`command_accepting_status`, so a routine 4xx/5xx stays an `Ok(Response)` that
-the driver classifies itself instead of a transport-shaped `Err` that
-`try_smtp!` would turn into an `abort()`. Only genuine I/O or parse failures
-abort. Both halves share a `run_unpipelined_envelope` helper for the
-`MAIL FROM` + `RCPT TO` sequence and are pinned by
+PIPELINING: `MAIL FROM`, `RCPT TO` and `DATA` replies reach the core as
+`OpOutcome::Reply`, so a routine 4xx/5xx is classified by the core instead of
+arriving as a transport-shaped failure that would abort. Only genuine I/O or
+parse failures abort. Both halves run one `DirectSmtp` machine for the
+`MAIL FROM` + `RCPT TO` sequence, pipelined or not, and are pinned by
 `unpipelined_server_rejections_keep_the_connection_reusable`, which asserts the
 exact RSET traffic and that the connection is still unbroken afterwards. A
 server rejection therefore costs no reconnect on either the pipelined or the
@@ -435,6 +492,17 @@ Evidence must match what actually crossed the wire. A transport failure in the e
 
 ## Connection test harness
 
+Two layers, and both still bite. The core-level tests in
+`client/core/core_tests.rs` drive each machine with a scripted list of outcomes
+and record its op stream, so window reply accounting, coalesced-reply handling,
+RSET-and-keep, abort-on-I/O-failure, LMTP per-recipient final status and BDAT
+sequencing are each pinned once, in the place the rule now lives, with no I/O
+at all. Every one of them was confirmed to bite by reintroducing the bug it
+describes. Below them, both drivers' transcript suites are unchanged and still
+drive the full wire exchange through their own adapter, which is what proves
+the adapters perform the ops faithfully; the core tests cannot see a socket and
+so can never replace them.
+
 `test_support::Transcript` is the in-process scripted peer both connection
 drivers test against; it replaced the socket-listener tests, which were neither
 hermetic nor deterministic. `test_support` itself now binds no `TcpListener`
@@ -523,7 +591,9 @@ crates/smtp/src/
 ├── message/             - builder, headers, MIME parts, address parsers
 ├── transport/
 │   └── smtp/
-│       ├── client/      - connection, async_connection, net, async_net
+│       ├── client/      - core (sans-I/O protocol machines), connection and
+│       │                  async_connection (the two I/O adapters), net,
+│       │                  async_net, metering, tls
 │       ├── transport.rs / async_transport.rs - public sync + async transports
 │       ├── commands.rs  - EHLO, MAIL, RCPT, DATA, BDAT, AUTH, NOOP, RSET, VRFY, EXPN, STARTTLS, LHLO
 │       ├── extension.rs - ServerInfo, SendOptions, MAIL/RCPT parameters

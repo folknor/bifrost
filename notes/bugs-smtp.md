@@ -142,16 +142,25 @@ last-write-wins behaviour is intended for the crate's purpose.)
 
 ## Posture / structural note (owner proposal, not a defect)
 
-The most valuable structural move suggested by finding 1 is the one the crate
-already half-believes in: the sync and async drivers are ~3300/3900-line
-near-clones "held in step deliberately," and the batch pipelined path proves
-the mirroring discipline fails silently. Given pre-1.0 freedom, factoring the
-*protocol state machine* (command sequencing, reply-group accounting, phase
-decoration, `SendProgress` transitions) into one sans-I/O core driven by both
-a blocking and an async I/O adapter would eliminate the entire class of
-one-half-only defects - three of which (1, 2's asymmetry with the batch path,
-3) this hunt found. That is a rewrite proposal for the owner, not a defect;
-the published blocking surface itself stays untouched.
+(CLOSED. Ruled on and executed as ruling 7 in `notes/todo.md`: the send paths
+of both drivers now run on one sans-I/O core, `client/core.rs`, and the two
+halves are adapters that move bytes and apply deadlines. Command sequencing,
+reply-group accounting, phase decoration, `SendProgress` transitions and the
+RSET-and-keep versus abort decision exist once. The published surface is
+unchanged and no test was lost. See "Protocol core and I/O adapters" in
+`reference/smtp.md`.)
+
+The original note: the most valuable structural move suggested by finding 1 is
+the one the crate already half-believes in: the sync and async drivers are
+~3300/3900-line near-clones "held in step deliberately," and the batch
+pipelined path proves the mirroring discipline fails silently. Given pre-1.0
+freedom, factoring the *protocol state machine* (command sequencing,
+reply-group accounting, phase decoration, `SendProgress` transitions) into one
+sans-I/O core driven by both a blocking and an async I/O adapter would
+eliminate the entire class of one-half-only defects - three of which (1, 2's
+asymmetry with the batch path, 3) this hunt found. That is a rewrite proposal
+for the owner, not a defect; the published blocking surface itself stays
+untouched.
 
 Key files: `crates/smtp/src/transport/smtp/client/connection.rs`,
 `client/async_connection.rs`, `client/async_net.rs`, `client/mod.rs`,

@@ -78,8 +78,22 @@ between them.
    CardDAV accepted `<addressbook/>` as a resourcetype marker anywhere in the
    prop bag where CalDAV required it inside `<resourcetype>` - now guarded on
    both sides and pinned. Cold review still wanted.
-7. **smtp: sans-I/O protocol core driven by a blocking and an async I/O
-   adapter. PROCEED, last.** Command sequencing, reply-group accounting,
+7. **DONE (2026-09-04). smtp: sans-I/O protocol core driven by a blocking and
+   an async I/O adapter. PROCEED, last.** Landed as
+   `crates/smtp/src/transport/smtp/client/core.rs`: four machines
+   (`DirectSmtp`, `DirectLmtp`, `BatchSmtp`, `BatchLmtp`) own command
+   sequencing, the PIPELINING window and LMTP drain accounting, phase
+   decoration, `SendProgress` transitions and the RSET-and-keep versus abort
+   decision, driven through a nine-variant `Op` vocabulary; each driver is now
+   a `drive` loop plus a `perform` match. Both halves shrank by roughly 800
+   lines. Every published item, every existing test and both transcript suites
+   are unchanged (5730 -> 5742 tests, the 12 new ones being core-level and each
+   revert-confirmed). `PhasedError` survives and now covers the non-pipelined
+   direct path too. Two behavioural differences were found and PRESERVED rather
+   than unified, both recorded in `reference/smtp.md`: the async `abort()`
+   timeout, and a direct LMTP drain restoring the stream to `Ok` where an LMTP
+   batch leaves it `Broken`. Cold review still wanted. Original ruling:
+   Command sequencing, reply-group accounting,
    phase decoration and `SendProgress` transitions in one core; the two
    ~3300 / ~3900-line driver clones become adapters. The published blocking
    surface (`SmtpTransport`, `LmtpTransport`, the pool, the examples) stays

@@ -15,8 +15,9 @@ use super::escape_crlf;
 use super::metering::WireMetering;
 use super::{
     ClientCodec, ConnectionState, MAX_RESPONSE_BYTES, MAX_RESPONSE_LINE_BYTES, NetworkStream,
-    PIPELINING_RECIPIENT_WINDOW, PhasedError, TlsParameters, data_terminator, merge_lmtp_statuses,
-    smtp_data_size,
+    TlsParameters, core,
+    core::{Op, OpOutcome, ProtocolMachine, Step},
+    data_terminator, smtp_data_size,
 };
 use crate::{
     address::{Address, Envelope},
@@ -29,8 +30,8 @@ use crate::{
         },
         batch::{RecipientProgress, SendProgress, SmtpBatchRecipient},
         commands::{
-            Auth, Bdat, Data, Ehlo, Expn, Lhlo, Mail, Noop, Rcpt, Rset, Starttls, Vrfy,
-            build_recipient_commands, build_transaction_commands,
+            Auth, Ehlo, Expn, Lhlo, Mail, Noop, Rcpt, Starttls, Vrfy, build_recipient_commands,
+            build_transaction_commands,
         },
         error,
         error::{Error, SmtpCommandPhase, SmtpTransmissionState},
@@ -72,19 +73,20 @@ macro_rules! try_smtp (
     });
 );
 
-/// `try_smtp!` for the phase-typed pipelined driver: aborts the connection and
-/// returns a `PhasedError`, which is the only error this driver can produce.
-macro_rules! try_phased (
-    ($err: expr, $client: ident, $phase: expr) => ({
-        match $err {
-            Ok(val) => val,
-            Err(err) => {
-                $client.abort();
-                return Err(PhasedError::new($phase, Error::from(err)))
-            },
-        }
-    });
-);
+/// Lift an adapter result into the outcome the protocol core consumes.
+fn op_done(result: Result<(), Error>) -> OpOutcome {
+    match result {
+        Ok(()) => OpOutcome::Done,
+        Err(error) => OpOutcome::Failed(error),
+    }
+}
+
+fn op_reply(result: Result<Response, Error>) -> OpOutcome {
+    match result {
+        Ok(response) => OpOutcome::Reply(response),
+        Err(error) => OpOutcome::Failed(error),
+    }
+}
 
 /// Structure that implements the SMTP client
 pub(crate) struct SmtpConnection {
@@ -233,66 +235,34 @@ impl SmtpConnection {
         self.send_with_options(envelope, email, &SendOptions::default())
     }
 
+    /// Build and validate the whole envelope before `MAIL FROM` is written.
+    ///
+    /// A construction failure raised from inside an open transaction would
+    /// unwind past the abort a wire failure runs, leaving the connection `Ok`,
+    /// poolable, and holding a half-open transaction. Every send path builds
+    /// first for that reason.
+    fn build_envelope(
+        &self,
+        envelope: &Envelope,
+        email: &[u8],
+        options: &SendOptions,
+        allow_binary_mime: bool,
+    ) -> Result<(Mail, Vec<Rcpt>), Error> {
+        let mail_options = self.mail_options(envelope, email, options, allow_binary_mime)?;
+        let rcpt_options = self.rcpt_options(envelope, options)?;
+        build_transaction_commands(envelope, mail_options, &rcpt_options)
+    }
+
     pub(crate) fn send_with_options(
         &mut self,
         envelope: &Envelope,
         email: &[u8],
         options: &SendOptions,
     ) -> Result<Response, Error> {
-        let mail_options = self.mail_options(envelope, email, options, false)?;
-        let rcpt_options = self.rcpt_options(envelope, options)?;
-
-        let (mail, recipients) = build_transaction_commands(envelope, mail_options, &rcpt_options)?;
-
-        if self.server_info().supports_pipelining() {
-            return self.send_pipelined(email, mail, recipients);
-        }
-
-        // A routine negative reply is not a transport failure. Mirror the
-        // pipelined path: a rejected MAIL FROM opened no transaction so the
-        // connection stays reusable untouched; a rejected RCPT or DATA is
-        // cleared with RSET. Only a genuine I/O/parse failure aborts.
-        self.run_unpipelined_envelope(mail, recipients)?;
-
-        let data_response = try_smtp!(
-            self.command_accepting_status(Data),
-            self,
-            SmtpCommandPhase::DataCommand
-        );
-        if !data_response.is_positive() {
-            self.reset_transaction();
-            return Err(error::status(data_response).with_phase(SmtpCommandPhase::DataCommand));
-        }
-
-        let result = try_smtp!(self.message(email), self, SmtpCommandPhase::DataBody);
-        Ok(result)
-    }
-
-    /// MAIL FROM + RCPT TO on a server without PIPELINING, treating routine
-    /// negative replies as recoverable (see `send_with_options`).
-    fn run_unpipelined_envelope(&mut self, mail: Mail, recipients: Vec<Rcpt>) -> Result<(), Error> {
-        let mail_response = try_smtp!(
-            self.command_accepting_status(mail),
-            self,
-            SmtpCommandPhase::MailFrom
-        );
-        if !mail_response.is_positive() {
-            // No RSET: a rejected MAIL FROM opened no transaction.
-            return Err(error::status(mail_response).with_phase(SmtpCommandPhase::MailFrom));
-        }
-
-        for recipient in recipients {
-            let response = try_smtp!(
-                self.command_accepting_status(recipient),
-                self,
-                SmtpCommandPhase::RcptTo
-            );
-            if !response.is_positive() {
-                self.reset_transaction();
-                return Err(error::status(response).with_phase(SmtpCommandPhase::RcptTo));
-            }
-        }
-        Ok(())
+        let (mail, recipients) = self.build_envelope(envelope, email, options, false)?;
+        let pipelined = self.server_info().supports_pipelining();
+        let mut machine = core::DirectSmtp::new(mail, recipients, pipelined, core::BodyKind::Data);
+        self.drive(&mut machine, email)
     }
 
     pub(crate) fn send_bdat_with_options(
@@ -307,117 +277,11 @@ impl SmtpConnection {
             ));
         }
 
-        let mail_options = self.mail_options(envelope, email, options, true)?;
-        let rcpt_options = self.rcpt_options(envelope, options)?;
-
-        let (mail, recipients) = build_transaction_commands(envelope, mail_options, &rcpt_options)?;
-
-        self.run_unpipelined_envelope(mail, recipients)?;
-
-        let result = try_smtp!(self.message_bdat(email), self, SmtpCommandPhase::BdatBody);
-        Ok(result)
-    }
-
-    /// Phase-stamping funnel for the pipelined driver.
-    ///
-    /// `send_pipelined_inner` cannot return an undecorated error: its error
-    /// type is `PhasedError`, which has no `From<Error>` conversion, so `?`
-    /// on a plain SMTP result does not compile there. This is the one place
-    /// that turns a boundary failure back into an `Error`.
-    fn send_pipelined(
-        &mut self,
-        email: &[u8],
-        mail: Mail,
-        recipients: Vec<Rcpt>,
-    ) -> Result<Response, Error> {
-        self.send_pipelined_inner(email, mail, recipients)
-            .map_err(PhasedError::into_error)
-    }
-
-    fn send_pipelined_inner(
-        &mut self,
-        email: &[u8],
-        mail: Mail,
-        recipients: Vec<Rcpt>,
-    ) -> Result<Response, PhasedError> {
-        for (window_index, window) in recipients.chunks(PIPELINING_RECIPIENT_WINDOW).enumerate() {
-            let mut commands = String::new();
-            if window_index == 0 {
-                commands.push_str(&mail.to_string());
-            }
-            for recipient in window {
-                commands.push_str(&recipient.to_string());
-            }
-            let write_phase = if window_index == 0 {
-                SmtpCommandPhase::MailFrom
-            } else {
-                SmtpCommandPhase::RcptTo
-            };
-            try_phased!(self.write(commands.as_bytes()), self, write_phase);
-            try_phased!(self.stream.get_ref().state().verify(), self, write_phase);
-            self.stream.get_mut().set_state(ConnectionState::Broken);
-
-            if window_index == 0 {
-                let mail_response = try_phased!(
-                    self.read_response_inner(true, false),
-                    self,
-                    SmtpCommandPhase::MailFrom
-                );
-                if !mail_response.is_positive() {
-                    for _ in window {
-                        try_phased!(
-                            self.read_response_inner(true, false),
-                            self,
-                            SmtpCommandPhase::RcptTo
-                        );
-                    }
-                    // No RSET: a rejected MAIL FROM opened no transaction, so
-                    // there is nothing to reset and the connection stays
-                    // reusable as it is.
-                    try_phased!(self.finish_reply_group(), self, SmtpCommandPhase::RcptTo);
-                    return Err(PhasedError::new(
-                        SmtpCommandPhase::MailFrom,
-                        error::status(mail_response),
-                    ));
-                }
-            }
-
-            let mut failure = None;
-            for _ in window {
-                let response = try_phased!(
-                    self.read_response_inner(true, false),
-                    self,
-                    SmtpCommandPhase::RcptTo
-                );
-                if failure.is_none() && !response.is_positive() {
-                    failure = Some(response);
-                }
-            }
-            try_phased!(self.finish_reply_group(), self, SmtpCommandPhase::RcptTo);
-            if let Some(response) = failure {
-                self.reset_transaction();
-                return Err(PhasedError::new(
-                    SmtpCommandPhase::RcptTo,
-                    error::status(response),
-                ));
-            }
-        }
-
-        let data_response = try_phased!(
-            self.command_accepting_status(Data),
-            self,
-            SmtpCommandPhase::DataCommand
-        );
-        if !data_response.is_positive() {
-            self.reset_transaction();
-            return Err(PhasedError::new(
-                SmtpCommandPhase::DataCommand,
-                error::status(data_response),
-            ));
-        }
-
-        let result = try_phased!(self.message(email), self, SmtpCommandPhase::DataBody);
-        Ok(result)
+        let (mail, recipients) = self.build_envelope(envelope, email, options, true)?;
+        // BDAT is never pipelined: the path has no window accounting and has
+        // never been driven that way, on either half.
+        let mut machine = core::DirectSmtp::new(mail, recipients, false, core::BodyKind::Bdat);
+        self.drive(&mut machine, email)
     }
 
     pub(crate) fn send_lmtp(
@@ -434,52 +298,9 @@ impl SmtpConnection {
         email: &[u8],
         options: &SendOptions,
     ) -> Result<Vec<Response>, Error> {
-        let mail_options = self.mail_options(envelope, email, options, false)?;
-        let rcpt_options = self.rcpt_options(envelope, options)?;
-
-        let (mail, recipients) = build_transaction_commands(envelope, mail_options, &rcpt_options)?;
-
-        try_smtp!(self.command(mail), self, SmtpCommandPhase::MailFrom);
-
-        let mut recipient_statuses = Vec::with_capacity(recipients.len());
-        let mut accepted_recipients = 0;
-
-        for recipient in recipients {
-            let response = try_smtp!(
-                self.command_accepting_status(recipient),
-                self,
-                SmtpCommandPhase::RcptTo
-            );
-            if response.is_positive() {
-                accepted_recipients += 1;
-                recipient_statuses.push(None);
-            } else {
-                recipient_statuses.push(Some(response));
-            }
-        }
-
-        if accepted_recipients == 0 {
-            let mut rejected = Vec::with_capacity(recipient_statuses.len());
-            for response in recipient_statuses {
-                let Some(response) = response else {
-                    return Err(error::internal(
-                        "recipient status invariant failed after all recipients were rejected",
-                    ));
-                };
-                rejected.push(response);
-            }
-            self.reset_transaction();
-            return Ok(rejected);
-        }
-
-        try_smtp!(self.command(Data), self, SmtpCommandPhase::DataCommand);
-        let delivery_statuses = try_smtp!(
-            self.message_lmtp(email, accepted_recipients),
-            self,
-            SmtpCommandPhase::LmtpFinalStatus
-        );
-
-        merge_lmtp_statuses(recipient_statuses, delivery_statuses)
+        let (mail, recipients) = self.build_envelope(envelope, email, options, false)?;
+        let mut machine = core::DirectLmtp::new(mail, recipients, core::BodyKind::Data);
+        self.drive(&mut machine, email)
     }
 
     pub(crate) fn send_lmtp_bdat_with_options(
@@ -494,65 +315,19 @@ impl SmtpConnection {
             ));
         }
 
-        let mail_options = self.mail_options(envelope, email, options, true)?;
-        let rcpt_options = self.rcpt_options(envelope, options)?;
-
-        let (mail, recipients) = build_transaction_commands(envelope, mail_options, &rcpt_options)?;
-
-        try_smtp!(self.command(mail), self, SmtpCommandPhase::MailFrom);
-
-        let mut recipient_statuses = Vec::with_capacity(recipients.len());
-        let mut accepted_recipients = 0;
-
-        for recipient in recipients {
-            let response = try_smtp!(
-                self.command_accepting_status(recipient),
-                self,
-                SmtpCommandPhase::RcptTo
-            );
-            if response.is_positive() {
-                accepted_recipients += 1;
-                recipient_statuses.push(None);
-            } else {
-                recipient_statuses.push(Some(response));
-            }
-        }
-
-        if accepted_recipients == 0 {
-            let mut rejected = Vec::with_capacity(recipient_statuses.len());
-            for response in recipient_statuses {
-                let Some(response) = response else {
-                    return Err(error::internal(
-                        "recipient status invariant failed after all recipients were rejected",
-                    ));
-                };
-                rejected.push(response);
-            }
-            self.reset_transaction();
-            return Ok(rejected);
-        }
-
-        let delivery_statuses = try_smtp!(
-            self.message_lmtp_bdat(email, accepted_recipients),
-            self,
-            SmtpCommandPhase::LmtpFinalStatus
-        );
-
-        merge_lmtp_statuses(recipient_statuses, delivery_statuses)
+        let (mail, recipients) = self.build_envelope(envelope, email, options, true)?;
+        let mut machine = core::DirectLmtp::new(mail, recipients, core::BodyKind::Bdat);
+        self.drive(&mut machine, email)
     }
 
     /// Account-oriented SMTP multi-recipient send.
     ///
-    /// Drives the SMTP command sequence (MAIL FROM, sequential RCPTs, DATA,
-    /// body, final reply) and records per-recipient progress into a
-    /// `SendProgress` tracker.
-    ///
     /// Returns `Ok(progress)` when the command sequence completes (even if
     /// some recipients were rejected). Returns `Err((error, progress))` for
     /// batch-level failures where no recipient-specific outcome can be
-    /// attributed: MAIL FROM rejection, transport drop before any command,
-    /// or pre-MAIL local validation errors. In the `Err` case, the progress
-    /// tracker contains whatever state was accumulated before the abort.
+    /// attributed: MAIL FROM rejection, transport drop before any command, or
+    /// pre-MAIL local validation errors. In the `Err` case the tracker holds
+    /// whatever state was accumulated before the abort.
     pub(crate) fn send_smtp_batch(
         &mut self,
         from: Option<Address>,
@@ -560,327 +335,17 @@ impl SmtpConnection {
         email: &[u8],
         options: &SendOptions,
     ) -> Result<SendProgress, (Error, SendProgress)> {
-        let mut progress = SendProgress::new(Protocol::Smtp, recipients);
-        let rcpt_options_all = self
-            .rcpt_options_for_batch(&progress.recipients, options)
-            .map_err(|error| {
-                (
-                    error
-                        .with_attempt(SmtpTransmissionState::Unsent)
-                        .with_phase(SmtpCommandPhase::RcptTo),
-                    progress.clone(),
-                )
-            })?;
-
-        let mail_options = self
-            .mail_options_for_batch(from.as_ref(), &progress.recipients, email, options, false)
-            .map_err(|e| {
-                (
-                    e.with_attempt(SmtpTransmissionState::Unsent)
-                        .with_phase(SmtpCommandPhase::MailFrom),
-                    progress.clone(),
-                )
-            })?;
-
-        // Every envelope address is validated here, before `MAIL FROM` opens a
-        // transaction. Constructing an `Rcpt` further down would let a rejected
-        // recipient return past an open transaction without aborting, leaving
-        // the connection poolable but dirty.
-        let mail_cmd = Mail::new(from, mail_options).map_err(|e| (e, progress.clone()))?;
-        let rcpt_cmds = build_recipient_commands(
-            progress.recipients.iter().map(|r| r.address.clone()),
-            &rcpt_options_all,
-        )
-        .map_err(|e| (e, progress.clone()))?;
-
-        if self.server_info().supports_pipelining() {
-            return self.send_smtp_batch_pipelined(email, mail_cmd, rcpt_cmds, progress);
-        }
-
-        // Before DATA, no message content can have reached the peer,
-        // regardless of whether the failed operation was a write or a reply
-        // drain. Negative replies remain `Acknowledged`.
-        // `command_accepting_status` keeps a negative reply as an `Ok`
-        // response instead of folding it into a transport-shaped `Err`.
-        match self.command_accepting_status(mail_cmd) {
-            Ok(resp) if resp.is_positive() => {}
-            Ok(resp) => {
-                self.abort();
-                return Err((
-                    error::status(resp)
-                        .with_attempt(SmtpTransmissionState::Acknowledged)
-                        .with_phase(SmtpCommandPhase::MailFrom),
-                    progress,
-                ));
-            }
-            Err(e) => {
-                self.abort();
-                return Err((
-                    e.with_attempt(SmtpTransmissionState::Unsent)
-                        .with_phase(SmtpCommandPhase::MailFrom),
-                    progress,
-                ));
-            }
-        }
-
-        for (i, rcpt) in rcpt_cmds.into_iter().enumerate() {
-            match self.command_accepting_status(rcpt) {
-                Ok(resp) if resp.is_positive() => progress.record_rcpt_accepted(i),
-                Ok(resp) => progress.record_rcpt_rejected(i, resp),
-                Err(e) => {
-                    // DATA has not been issued, so preserve received RCPT
-                    // answers and mark every remaining recipient `Unsent`.
-                    let err_clone = e
-                        .with_attempt(SmtpTransmissionState::Unsent)
-                        .with_phase(SmtpCommandPhase::RcptTo);
-                    {
-                        let err_for_closure = err_clone.clone();
-                        use crate::transport::smtp::account_error::{
-                            SmtpErrorContext, into_account_error,
-                        };
-                        progress.mark_unresolved_unsent(|| {
-                            into_account_error(
-                                err_for_closure.clone(),
-                                SmtpErrorContext::send(Protocol::Smtp),
-                            )
-                        });
-                    }
-                    self.abort();
-                    return Ok(progress);
-                }
-            }
-        }
-
-        let accepted = progress.recipients.iter().any(|r| {
-            matches!(
-                r.rcpt,
-                crate::transport::smtp::batch::RcptProgress::Accepted
-            )
-        });
-        if !accepted {
-            self.reset_transaction();
-            return Ok(progress);
-        }
-
-        // Send DATA command.
-        match self.command_accepting_status(Data) {
-            Ok(resp) if resp.is_positive() => {}
-            Ok(resp) => {
-                // DATA rejected before body: all accepted recipients failed with this response.
-                progress.mark_accepted_rejected_with_response(resp);
-                self.reset_transaction();
-                return Ok(progress);
-            }
-            Err(e) => {
-                // Transport drop during DATA command: outcome for accepted recipients uncertain.
-                use crate::transport::smtp::account_error::{SmtpErrorContext, into_account_error};
-                let ae = into_account_error(
-                    e.with_attempt(SmtpTransmissionState::InFlight)
-                        .with_phase(SmtpCommandPhase::DataCommand),
-                    SmtpErrorContext::send(Protocol::Smtp),
-                );
-                let ae2 = ae.clone();
-                progress.mark_accepted_uncertain(|| ae2.clone());
-                self.abort();
-                return Ok(progress);
-            }
-        }
-
-        // Body starts here: side-effect boundary crossed.
-        progress.set_body_started();
-        match self.message(email) {
-            Ok(resp) => {
-                progress.set_body_finished();
-                progress.set_data_response(resp);
-            }
-            Err(e) => {
-                // Transport drop after body write started: accepted recipients uncertain.
-                use crate::transport::smtp::account_error::{SmtpErrorContext, into_account_error};
-                let ae = into_account_error(
-                    e.with_attempt(SmtpTransmissionState::InFlight)
-                        .with_phase(SmtpCommandPhase::DataBody),
-                    SmtpErrorContext::send(Protocol::Smtp),
-                );
-                let ae2 = ae.clone();
-                progress.mark_uncertain_unresolved(|| ae2.clone());
-                self.abort();
-                return Ok(progress);
-            }
-        }
-
-        Ok(progress)
-    }
-
-    fn send_smtp_batch_pipelined(
-        &mut self,
-        email: &[u8],
-        mail_cmd: Mail,
-        rcpt_cmds: Vec<Rcpt>,
-        mut progress: SendProgress,
-    ) -> Result<SendProgress, (Error, SendProgress)> {
-        for window_start in (0..progress.recipients.len()).step_by(PIPELINING_RECIPIENT_WINDOW) {
-            let window_end =
-                (window_start + PIPELINING_RECIPIENT_WINDOW).min(progress.recipients.len());
-            let mut commands = String::new();
-            if window_start == 0 {
-                commands.push_str(&mail_cmd.to_string());
-            }
-            for rcpt in &rcpt_cmds[window_start..window_end] {
-                commands.push_str(&rcpt.to_string());
-            }
-            if let Err(e) = self.write(commands.as_bytes()) {
-                if window_start == 0 {
-                    self.abort();
-                    return Err((
-                        e.with_attempt(SmtpTransmissionState::Unsent)
-                            .with_phase(SmtpCommandPhase::MailFrom),
-                        progress,
-                    ));
-                }
-                // A later recipient window failed to write. `DATA` is only
-                // issued after every window, so no message content can have
-                // reached the peer: the still-open recipients are `Unsent`,
-                // and the RCPT replies already collected stay authoritative.
-                use crate::transport::smtp::account_error::{SmtpErrorContext, into_account_error};
-                let ae = into_account_error(
-                    e.with_attempt(SmtpTransmissionState::Unsent)
-                        .with_phase(SmtpCommandPhase::RcptTo),
-                    SmtpErrorContext::send(Protocol::Smtp),
-                );
-                progress.mark_unresolved_unsent(|| ae.clone());
-                self.abort();
-                return Ok(progress);
-            }
-
-            // A batch keeps recipient indexes across windows, but the stream
-            // is only reusable after every reply for this window is drained.
-            self.stream.get_ref().state().verify().map_err(|error| {
-                (
-                    error
-                        .with_attempt(SmtpTransmissionState::Unsent)
-                        .with_phase(SmtpCommandPhase::RcptTo),
-                    progress.clone(),
-                )
-            })?;
-            self.stream.get_mut().set_state(ConnectionState::Broken);
-
-            if window_start == 0 {
-                let mail_response = match self.read_response_inner(true, false) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        self.abort();
-                        return Err((
-                            e.with_attempt(SmtpTransmissionState::Unsent)
-                                .with_phase(SmtpCommandPhase::MailFrom),
-                            progress,
-                        ));
-                    }
-                };
-                if !mail_response.is_positive() {
-                    self.abort();
-                    return Err((
-                        error::status(mail_response)
-                            .with_attempt(SmtpTransmissionState::Acknowledged)
-                            .with_phase(SmtpCommandPhase::MailFrom),
-                        progress,
-                    ));
-                }
-            }
-
-            for i in window_start..window_end {
-                match self.read_response_inner(true, false) {
-                    Ok(resp) if resp.is_positive() => progress.record_rcpt_accepted(i),
-                    Ok(resp) => progress.record_rcpt_rejected(i, resp),
-                    Err(e) => {
-                        // DATA has not been issued, so remaining recipients
-                        // are retryable `Unsent` failures.
-                        use crate::transport::smtp::account_error::{
-                            SmtpErrorContext, into_account_error,
-                        };
-                        let ae = into_account_error(
-                            e.with_attempt(SmtpTransmissionState::Unsent)
-                                .with_phase(SmtpCommandPhase::RcptTo),
-                            SmtpErrorContext::send(Protocol::Smtp),
-                        );
-                        progress.mark_unresolved_unsent(|| ae.clone());
-                        self.abort();
-                        return Ok(progress);
-                    }
-                }
-            }
-            self.finish_reply_group().map_err(|error| {
-                (
-                    error
-                        .with_attempt(SmtpTransmissionState::Unsent)
-                        .with_phase(SmtpCommandPhase::RcptTo),
-                    progress.clone(),
-                )
-            })?;
-        }
-
-        let accepted = progress.recipients.iter().any(|r| {
-            matches!(
-                r.rcpt,
-                crate::transport::smtp::batch::RcptProgress::Accepted
-            )
-        });
-        if !accepted {
-            self.reset_transaction();
-            return Ok(progress);
-        }
-
-        let data_response = match self.command_accepting_status(Data) {
-            Ok(r) => r,
-            Err(e) => {
-                use crate::transport::smtp::account_error::{SmtpErrorContext, into_account_error};
-                let ae = into_account_error(
-                    e.with_attempt(SmtpTransmissionState::InFlight)
-                        .with_phase(SmtpCommandPhase::DataCommand),
-                    SmtpErrorContext::send(Protocol::Smtp),
-                );
-                let ae2 = ae.clone();
-                progress.mark_uncertain_unresolved(|| ae2.clone());
-                self.abort();
-                return Ok(progress);
-            }
-        };
-
-        if !data_response.is_positive() {
-            // DATA negative: all accepted recipients failed with this response.
-            progress.mark_accepted_rejected_with_response(data_response);
-            self.reset_transaction();
-            return Ok(progress);
-        }
-
-        // Body starts here.
-        progress.set_body_started();
-        match self.message(email) {
-            Ok(resp) => {
-                progress.set_body_finished();
-                progress.set_data_response(resp);
-            }
-            Err(e) => {
-                use crate::transport::smtp::account_error::{SmtpErrorContext, into_account_error};
-                let ae = into_account_error(
-                    e.with_attempt(SmtpTransmissionState::InFlight)
-                        .with_phase(SmtpCommandPhase::DataBody),
-                    SmtpErrorContext::send(Protocol::Smtp),
-                );
-                let ae2 = ae.clone();
-                progress.mark_uncertain_unresolved(|| ae2.clone());
-                self.abort();
-                return Ok(progress);
-            }
-        }
-
-        Ok(progress)
+        let (mail_cmd, rcpt_cmds, progress) =
+            self.build_batch(Protocol::Smtp, from, recipients, email, options)?;
+        let pipelined = self.server_info().supports_pipelining();
+        let mut machine = core::BatchSmtp::new(mail_cmd, rcpt_cmds, pipelined, progress);
+        self.drive(&mut machine, email)
     }
 
     /// Account-oriented LMTP multi-recipient send.
     ///
-    /// Like `send_smtp_batch` but reads one final status per accepted recipient
-    /// after the DATA body. Returns `Err((error, progress))` for batch-level
-    /// failures; returns `Ok(progress)` otherwise.
+    /// Like `send_smtp_batch` but reads one final status per accepted
+    /// recipient after the DATA body.
     pub(crate) fn send_lmtp_batch(
         &mut self,
         from: Option<Address>,
@@ -888,7 +353,24 @@ impl SmtpConnection {
         email: &[u8],
         options: &SendOptions,
     ) -> Result<SendProgress, (Error, SendProgress)> {
-        let mut progress = SendProgress::new(Protocol::Lmtp, recipients);
+        let (mail_cmd, rcpt_cmds, progress) =
+            self.build_batch(Protocol::Lmtp, from, recipients, email, options)?;
+        let mut machine = core::BatchLmtp::new(mail_cmd, rcpt_cmds, progress);
+        self.drive(&mut machine, email)
+    }
+
+    /// Local validation and command construction for a batch send, all of it
+    /// before `MAIL FROM` opens a transaction (see `build_envelope`).
+    #[allow(clippy::type_complexity)]
+    fn build_batch(
+        &self,
+        protocol: Protocol,
+        from: Option<Address>,
+        recipients: Vec<SmtpBatchRecipient>,
+        email: &[u8],
+        options: &SendOptions,
+    ) -> Result<(Mail, Vec<Rcpt>, SendProgress), (Error, SendProgress)> {
+        let progress = SendProgress::new(protocol, recipients);
         let rcpt_options_all = self
             .rcpt_options_for_batch(&progress.recipients, options)
             .map_err(|error| {
@@ -902,173 +384,83 @@ impl SmtpConnection {
 
         let mail_options = self
             .mail_options_for_batch(from.as_ref(), &progress.recipients, email, options, false)
-            .map_err(|e| {
+            .map_err(|error| {
                 (
-                    e.with_attempt(SmtpTransmissionState::Unsent)
+                    error
+                        .with_attempt(SmtpTransmissionState::Unsent)
                         .with_phase(SmtpCommandPhase::MailFrom),
                     progress.clone(),
                 )
             })?;
 
-        // Before DATA, a transport drop is `Unsent`; a server rejection is
-        // still `Acknowledged`. The SMTP path applies the same split.
-        //
-        // Both commands are built before `MAIL FROM` goes out so that a
-        // rejected recipient cannot unwind past an open transaction.
         let mail_cmd = Mail::new(from, mail_options).map_err(|e| (e, progress.clone()))?;
         let rcpt_cmds = build_recipient_commands(
             progress.recipients.iter().map(|r| r.address.clone()),
             &rcpt_options_all,
         )
         .map_err(|e| (e, progress.clone()))?;
-        match self.command_accepting_status(mail_cmd) {
-            Ok(resp) if resp.is_positive() => {}
-            Ok(resp) => {
-                self.abort();
-                return Err((
-                    error::status(resp)
-                        .with_attempt(SmtpTransmissionState::Acknowledged)
-                        .with_phase(SmtpCommandPhase::MailFrom),
-                    progress,
-                ));
-            }
-            Err(e) => {
-                self.abort();
-                return Err((
-                    e.with_attempt(SmtpTransmissionState::Unsent)
-                        .with_phase(SmtpCommandPhase::MailFrom),
-                    progress,
-                ));
+
+        Ok((mail_cmd, rcpt_cmds, progress))
+    }
+
+    /// Run a sans-I/O protocol machine to completion.
+    ///
+    /// This loop is the whole blocking adapter: it moves bytes and reports
+    /// what happened. Which command follows which, how many replies a window
+    /// owes, when a transaction is reset versus abandoned, and which phase
+    /// decorates a failure are all decided in `client::core`, so neither half
+    /// of this crate can drift from the other.
+    fn drive<M: ProtocolMachine>(&mut self, machine: &mut M, email: &[u8]) -> M::Output {
+        let mut outcome = OpOutcome::Done;
+        loop {
+            match machine.step(outcome) {
+                Step::Finish(output) => return output,
+                Step::Run(op) => outcome = self.perform(op, email),
             }
         }
+    }
 
-        let mut accepted_count = 0usize;
-        for (i, rcpt) in rcpt_cmds.into_iter().enumerate() {
-            match self.command_accepting_status(rcpt) {
-                Ok(resp) if resp.is_positive() => {
-                    progress.record_rcpt_accepted(i);
-                    accepted_count += 1;
+    fn perform(&mut self, op: Op, email: &[u8]) -> OpOutcome {
+        match op {
+            Op::Write(bytes) => op_done(self.write(bytes.as_bytes())),
+            Op::WriteBody => op_done(self.write_body(email)),
+            Op::WriteBdat => op_done(self.write_bdat_body(email)),
+            Op::OpenReplyGroup => op_done(self.open_reply_group()),
+            Op::ReadGrouped => op_reply(self.read_response_inner(true, false)),
+            Op::ReadSingle => op_reply(self.read_response_inner(true, true)),
+            Op::CloseReplyGroup => op_done(self.finish_reply_group()),
+            Op::CloseLmtpDrain { restore_ok } => {
+                let result = self.finish_lmtp_final_drain();
+                if result.is_ok() && restore_ok {
+                    self.stream.get_mut().set_state(ConnectionState::Ok);
                 }
-                Ok(resp) => progress.record_rcpt_rejected(i, resp),
-                Err(e) => {
-                    use crate::transport::smtp::account_error::{
-                        SmtpErrorContext, into_account_error,
-                    };
-                    let ae = into_account_error(
-                        e.with_attempt(SmtpTransmissionState::Unsent)
-                            .with_phase(SmtpCommandPhase::RcptTo),
-                        SmtpErrorContext::send(Protocol::Lmtp),
-                    );
-                    progress.mark_unresolved_unsent(|| ae.clone());
-                    self.abort();
-                    return Ok(progress);
-                }
+                op_done(result)
             }
-        }
-
-        if accepted_count == 0 {
-            self.reset_transaction();
-            return Ok(progress);
-        }
-
-        // DATA command. Mirror the non-pipelined SMTP path: a negative DATA-
-        // command reply after RCPT acceptances is per-recipient `Failed`,
-        // never a batch-level Err. A batch-level Err here would collapse
-        // RCPT acceptances and let the engine resend the entire non-
-        // idempotent `Send` after the server already rejected it.
-        match self.command_accepting_status(Data) {
-            Ok(resp) if resp.is_positive() => {}
-            Ok(resp) => {
-                progress.mark_accepted_rejected_with_response(resp);
-                self.reset_transaction();
-                return Ok(progress);
-            }
-            Err(e) => {
-                // Transport drop during DATA command write/read: outcome for
-                // accepted recipients uncertain. Phase = DataCommand to
-                // distinguish the command boundary from a body-write drop.
-                use crate::transport::smtp::account_error::{SmtpErrorContext, into_account_error};
-                let ae = into_account_error(
-                    e.with_attempt(SmtpTransmissionState::InFlight)
-                        .with_phase(SmtpCommandPhase::DataCommand),
-                    SmtpErrorContext::send(Protocol::Lmtp),
-                );
-                let ae2 = ae.clone();
-                progress.mark_accepted_uncertain(|| ae2.clone());
+            Op::Abort => {
                 self.abort();
-                return Ok(progress);
+                OpOutcome::Done
             }
         }
+    }
 
-        // Body starts here.
-        progress.set_body_started();
-        if let Err(e) = self.write_body(email) {
-            use crate::transport::smtp::account_error::{SmtpErrorContext, into_account_error};
-            let ae = into_account_error(
-                e.with_attempt(SmtpTransmissionState::InFlight)
-                    .with_phase(SmtpCommandPhase::DataBody),
-                SmtpErrorContext::send(Protocol::Lmtp),
-            );
-            let ae2 = ae.clone();
-            progress.mark_uncertain_unresolved(|| ae2.clone());
-            self.abort();
-            return Ok(progress);
-        }
-        progress.set_body_finished();
-
-        // Read one final LMTP status per accepted recipient.
-        self.stream.get_ref().state().verify().map_err(|e| {
-            (
-                e.with_attempt(SmtpTransmissionState::InFlight)
-                    .with_phase(SmtpCommandPhase::LmtpFinalStatus),
-                progress.clone(),
-            )
-        })?;
+    /// Hold the stream `Broken` for a whole reply group, so a connection
+    /// abandoned mid-drain can never be recycled.
+    fn open_reply_group(&mut self) -> Result<(), Error> {
+        self.stream.get_ref().state().verify()?;
         self.stream.get_mut().set_state(ConnectionState::Broken);
-        for i in 0..progress.recipients.len() {
-            if !matches!(
-                progress.recipients[i].rcpt,
-                crate::transport::smtp::batch::RcptProgress::Accepted
-            ) {
-                continue;
-            }
-            match self.read_response_inner(true, false) {
-                Ok(resp) => {
-                    progress.record_lmtp_final(i, resp);
-                }
-                Err(e) => {
-                    use crate::transport::smtp::account_error::{
-                        SmtpErrorContext, into_account_error,
-                    };
-                    let ae = into_account_error(
-                        e.with_attempt(SmtpTransmissionState::InFlight)
-                            .with_phase(SmtpCommandPhase::LmtpFinalStatus),
-                        SmtpErrorContext::send(Protocol::Lmtp),
-                    );
-                    let ae2 = ae.clone();
-                    progress.mark_uncertain_unresolved(|| ae2.clone());
-                    self.abort();
-                    return Ok(progress);
-                }
-            }
-        }
+        Ok(())
+    }
 
-        // Every recipient outcome is already recorded, so a surplus final
-        // status does not change the send result - it only means this stream
-        // must never be reused. `finish_lmtp_final_drain` marks it broken and
-        // retires it; the batch outcome stands.
-        let _surplus = self.finish_lmtp_final_drain();
-
-        Ok(progress)
+    /// The BDAT chunk header and its raw payload, as two writes, which is the
+    /// framing the transcript suites pin.
+    fn write_bdat_body(&mut self, email: &[u8]) -> Result<(), Error> {
+        self.write(core::bdat_header(email.len()).as_bytes())?;
+        self.write(email)
     }
 
     /// Write the DATA body without reading the final reply.
     fn write_body(&mut self, email: &[u8]) -> Result<(), Error> {
-        let mut codec = ClientCodec::new();
-        let mut out_buf = Vec::with_capacity(email.len());
-        codec.encode(email, &mut out_buf);
-        self.write(out_buf.as_slice())?;
-        self.write(data_terminator(email.ends_with(b"\r\n")))
+        self.write_body_iter(std::iter::once(email))
     }
 
     /// Compute RCPT TO parameters for a single recipient and the given options.
@@ -1505,15 +897,6 @@ impl SmtpConnection {
         Ok(())
     }
 
-    /// Close the current mail transaction, or make the connection
-    /// unrecyclable if the server does not positively acknowledge the reset.
-    fn reset_transaction(&mut self) {
-        match self.command_accepting_status(Rset) {
-            Ok(response) if response.is_positive() => {}
-            Ok(_) | Err(_) => self.abort(),
-        }
-    }
-
     /// Close the connection.
     ///
     /// Unlike the async half this needs no timeout: `Shutdown::Both` on a
@@ -1816,56 +1199,16 @@ impl SmtpConnection {
         }
     }
 
-    /// Sends the message content
-    pub(crate) fn message(&mut self, message: &[u8]) -> Result<Response, Error> {
-        self.message_iter(std::iter::once(message))
-    }
-
     // NB: SCRAM continuation decoding lives in the free `decode_auth_challenge`
     // helper below so the sync and async drivers share one base64/UTF-8 path.
 
-    pub(crate) fn message_lmtp(
-        &mut self,
-        message: &[u8],
-        recipients: usize,
-    ) -> Result<Vec<Response>, Error> {
-        self.message_lmtp_iter(std::iter::once(message), recipients)
-    }
-
-    pub(crate) fn message_bdat(&mut self, message: &[u8]) -> Result<Response, Error> {
-        self.write_command(Bdat::last(message.len()))?;
-        self.write(message)?;
-        self.read_response()
-    }
-
-    pub(crate) fn message_lmtp_bdat(
-        &mut self,
-        message: &[u8],
-        recipients: usize,
-    ) -> Result<Vec<Response>, Error> {
-        // Body-upload failures are DataBody; only the per-recipient status
-        // drain below is LmtpFinalStatus. The caller's coarse LmtpFinalStatus
-        // tag applies set-if-absent, so these inner tags win.
-        self.write_command(Bdat::last(message.len()))
-            .map_err(|error| error.with_phase(SmtpCommandPhase::DataBody))?;
-        self.write(message)
-            .map_err(|error| error.with_phase(SmtpCommandPhase::DataBody))?;
-
-        self.stream.get_ref().state().verify()?;
-        self.stream.get_mut().set_state(ConnectionState::Broken);
-        let mut responses = Vec::with_capacity(recipients);
-        for _ in 0..recipients {
-            responses.push(self.read_response_inner(true, false)?);
-        }
-
-        self.finish_lmtp_final_drain()?;
-
-        self.stream.get_mut().set_state(ConnectionState::Ok);
-        Ok(responses)
-    }
-
-    /// Sends the message content by consuming an iterator that in its whole represents a message.
-    pub(crate) fn message_iter<I, B>(&mut self, message: I) -> Result<Response, Error>
+    /// Write the DATA body and its terminator.
+    ///
+    /// Consumes an iterator that in its whole represents the message: the
+    /// last-two-bytes tracking is what recognizes a final CRLF split across
+    /// two items, so the terminator reuses the message's own final CRLF rather
+    /// than appending an empty line the sender never wrote.
+    fn write_body_iter<I, B>(&mut self, message: I) -> Result<(), Error>
     where
         I: Iterator<Item = B>,
         B: AsRef<[u8]>,
@@ -1887,55 +1230,28 @@ impl SmtpConnection {
             codec.encode(message_part, &mut out_buf);
             self.write(out_buf.as_slice())?;
         }
-        self.write(data_terminator(seen >= 2 && last_two == *b"\r\n"))?;
-
-        self.read_response()
+        self.write(data_terminator(seen >= 2 && last_two == *b"\r\n"))
     }
 
-    /// Sends the message content and reads one LMTP status per recipient.
-    pub(crate) fn message_lmtp_iter<I, B>(
-        &mut self,
-        message: I,
-        recipients: usize,
-    ) -> Result<Vec<Response>, Error>
+    /// Sends the message content.
+    ///
+    /// Test-only since the send paths were factored onto `client::core`: they
+    /// write the body through `Op::WriteBody` and read the final reply through
+    /// `Op::ReadSingle`, over these same writers.
+    #[cfg(test)]
+    pub(crate) fn message(&mut self, message: &[u8]) -> Result<Response, Error> {
+        self.message_iter(std::iter::once(message))
+    }
+
+    /// Sends the message content by consuming an iterator that in its whole represents a message.
+    #[cfg(test)]
+    pub(crate) fn message_iter<I, B>(&mut self, message: I) -> Result<Response, Error>
     where
         I: Iterator<Item = B>,
         B: AsRef<[u8]>,
     {
-        let mut codec = ClientCodec::new();
-        let mut last_two = [0_u8; 2];
-        let mut seen = 0_usize;
-        for message_part in message {
-            let message_part = message_part.as_ref();
-            if message_part.len() >= 2 {
-                last_two.copy_from_slice(&message_part[message_part.len() - 2..]);
-                seen = 2;
-            } else if let Some(&byte) = message_part.first() {
-                last_two[0] = last_two[1];
-                last_two[1] = byte;
-                seen = (seen + 1).min(2);
-            }
-            let mut out_buf = Vec::with_capacity(message_part.len());
-            codec.encode(message_part, &mut out_buf);
-            // Body-upload failures are DataBody; only the status drain below
-            // is LmtpFinalStatus (the caller's coarse tag is set-if-absent).
-            self.write(out_buf.as_slice())
-                .map_err(|error| error.with_phase(SmtpCommandPhase::DataBody))?;
-        }
-        self.write(data_terminator(seen >= 2 && last_two == *b"\r\n"))
-            .map_err(|error| error.with_phase(SmtpCommandPhase::DataBody))?;
-
-        self.stream.get_ref().state().verify()?;
-        self.stream.get_mut().set_state(ConnectionState::Broken);
-        let mut responses = Vec::with_capacity(recipients);
-        for _ in 0..recipients {
-            responses.push(self.read_response_inner(true, false)?);
-        }
-
-        self.finish_lmtp_final_drain()?;
-
-        self.stream.get_mut().set_state(ConnectionState::Ok);
-        Ok(responses)
+        self.write_body_iter(message)?;
+        self.read_response()
     }
 
     /// Sends an SMTP command

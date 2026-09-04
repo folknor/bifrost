@@ -22,6 +22,7 @@ mod async_connection;
 #[cfg(feature = "tokio")]
 mod async_net;
 mod connection;
+mod core;
 pub(crate) mod metering;
 mod net;
 mod tls;
