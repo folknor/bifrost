@@ -316,6 +316,101 @@ pub(crate) fn unsupported_error(
         .expect("valid account error classification")
 }
 
+/// A `SearchFilter::In` naming a container in a foreign (shared) account
+/// this session does not hold a handle for.
+///
+/// `Email/query` addresses exactly one `accountId`, so an unreachable owner
+/// leaves no honest wire form: sending the qualified id to the primary
+/// account matches nothing (the empty result the consumer used to get with
+/// no error), and stripping the qualifier would run the search against the
+/// PRIMARY account's same-id mailbox. Reject before the wire. This is the
+/// one place foreign routing cannot use hydration's stay-literal fallback,
+/// because the id is a filter operand rather than the object identity the
+/// server can report a miss on.
+#[must_use]
+pub(crate) fn search_unknown_account(
+    operation: AccountOperation,
+    container_id: &str,
+    account_id: &str,
+) -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::Request(RequestErrorKind::Malformed),
+        Cause::Request(RequestCause::InvalidArgument {
+            field: Some("filter.in"),
+            message: Some(DiagnosticText::support_only(format!(
+                "container {container_id} names shared account {account_id}, \
+                 which this session cannot reach"
+            ))),
+        }),
+    )
+    .protocol(Protocol::Jmap)
+    .operation(operation)
+    .try_build()
+    .expect("valid account error classification")
+}
+
+/// A search filter whose `In` containers name two different owning
+/// accounts.
+///
+/// One `Email/query` carries one `accountId`, so this is not expressible;
+/// running it as a cross-account union is a deliberate non-goal (no other
+/// provider in the workspace offers one, so the shared trait cannot promise
+/// it). Silently picking one owner would answer a different question than
+/// the one asked.
+#[must_use]
+pub(crate) fn search_cross_account_filter(
+    operation: AccountOperation,
+    first_owner: Option<&str>,
+    second_owner: Option<&str>,
+) -> AccountError {
+    let first = super::foreign::owner_label(first_owner);
+    let second = super::foreign::owner_label(second_owner);
+    AccountErrorBuilder::new(
+        AccountErrorKind::Request(RequestErrorKind::Malformed),
+        Cause::Request(RequestCause::InvalidArgument {
+            field: Some("filter.in"),
+            message: Some(DiagnosticText::support_only(format!(
+                "search filter names containers in accounts {first} and {second}; \
+                 one Email/query cannot span two accounts"
+            ))),
+        }),
+    )
+    .protocol(Protocol::Jmap)
+    .operation(operation)
+    .try_build()
+    .expect("valid account error classification")
+}
+
+/// A search page cursor minted against one account, replayed with a filter
+/// that routes to another.
+///
+/// The cursor is a bare position into one account's `Email/query` result
+/// order, so honouring it across accounts would page account B by account
+/// A's offsets: duplicates and skips with no signal.
+#[must_use]
+pub(crate) fn search_cursor_account_mismatch(
+    operation: AccountOperation,
+    cursor_owner: Option<&str>,
+    filter_owner: Option<&str>,
+) -> AccountError {
+    let cursor_owner = super::foreign::owner_label(cursor_owner);
+    let filter_owner = super::foreign::owner_label(filter_owner);
+    AccountErrorBuilder::new(
+        AccountErrorKind::Request(RequestErrorKind::Malformed),
+        Cause::Request(RequestCause::InvalidArgument {
+            field: Some("page_cursor"),
+            message: Some(DiagnosticText::support_only(format!(
+                "search page cursor belongs to account {cursor_owner}, \
+                 but this filter routes to account {filter_owner}"
+            ))),
+        }),
+    )
+    .protocol(Protocol::Jmap)
+    .operation(operation)
+    .try_build()
+    .expect("valid account error classification")
+}
+
 /// A send-as mailbox id that was not present in the successfully seeded
 /// foreign-account routing table. Consumers receive these ids from foreign
 /// membership ownership, so an unknown id is a malformed request.

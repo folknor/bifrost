@@ -430,7 +430,7 @@ The `onSuccessUpdateEmail` payload (`EmailPatch::submitted_to_sent`) is built en
 
 Scheduled send rides RFC 8621/4865 FUTURERELEASE: when `SendRequest::scheduled` is `Some(t)`, the boundary validates `t` against `max_delayed_send`, forces an envelope, and stamps `holduntil` (RFC 3339) as a `mailFrom` parameter. A scheduled `send_message` returns the **EmailSubmission id** (undo-addressable). `cancel_scheduled_send` sets `undoStatus: canceled`; `reschedule_send` cancel-and-resubmits (no in-place reschedule) with a new `holduntil`.
 
-Search maps the shared `SearchRequest` AST to `Email/query` (query text as a JMAP `text` filter). `search_messages` returns native email ids; `search` uses `collapseThreads = true`, hydrates the emails' `threadId`, returns thread ids. That projection accounts for every submitted email id (`reconcile_search_threads`): an id declared `notFound`, an id answered in neither list, and an email returned without the mandatory `threadId` all ride `Page::failed_ids` instead of being dropped, which used to leave the page silently short of its own result count. Thread ids are deduplicated, since `collapseThreads` is not a guarantee that the server collapsed them. Every known `SearchFilter` variant is translated recursively; the required non-exhaustive catch-all returns `Unsupported(Search)` so a future shared variant cannot silently become an empty JMAP `AND` that matches everything. Page cursors are opaque position bytes, so the search query pins `receivedAt` desc exactly as the inventory walks do: RFC 8621 gives an unsorted `Email/query` a server-defined order with no cross-call stability guarantee, and paging an unstable order by integer position duplicates and skips results.
+Search maps the shared `SearchRequest` AST to `Email/query` (query text as a JMAP `text` filter). `search_messages` returns native email ids; `search` uses `collapseThreads = true`, hydrates the emails' `threadId`, returns thread ids. That projection accounts for every submitted email id (`reconcile_search_threads`): an id declared `notFound`, an id answered in neither list, and an email returned without the mandatory `threadId` all ride `Page::failed_ids` instead of being dropped, which used to leave the page silently short of its own result count. Thread ids are deduplicated, since `collapseThreads` is not a guarantee that the server collapsed them. Every known `SearchFilter` variant is translated recursively; the required non-exhaustive catch-all returns `Unsupported(Search)` so a future shared variant cannot silently become an empty JMAP `AND` that matches everything. Page cursors are opaque position bytes, so the search query pins `receivedAt` desc exactly as the inventory walks do: RFC 8621 gives an unsorted `Email/query` a server-defined order with no cross-call stability guarantee, and paging an unstable order by integer position duplicates and skips results. `route_search` picks the account before the query is built, from the owners of the filter's `In` containers (`search_owner` walks And/Or/Not): no `In` or a primary `In` is primary-only, one foreign owner routes both legs to that share and re-qualifies the result ids, two owners or an unreachable owner are refused. The `In` arm therefore strips the owner qualifier on the wire - the native part is a mailbox id in exactly the account the query addresses - and the cursor carries the owner so a resume cannot cross accounts. See "Foreign (shared/delegate) accounts".
 
 Container CRUD is `Mailbox/get`/`set`. Mailboxes surface as `ContainerKind::Folder` (native mailbox id); `Mailbox.role` maps to `FolderRole` (`inbox`->INBOX, `sent`->SENT, `drafts`->DRAFT, `trash`->TRASH, `junk`->SPAM). `container_delete` leaves `onDestroyRemoveEmails = false`, so non-empty deletion fails rather than dropping messages.
 
@@ -647,6 +647,20 @@ a whole new share still waits for reopen.
   `Unsupported(SyncInventory)` without sending a request.
 - Gmail labels, Graph categories/extended properties, and identity-default selection are unsupported. Attachment handles keep blob id + MIME but not uploaded filenames.
 - Typed filter-rule CRUD is unsupported; JMAP exposes literal Sieve scripts instead.
-- Mail search (`search` / `search_messages`) runs only against the primary
-  account. Foreign (shared) accounts sync and hydrate fully but are invisible
-  to search; qualified ids never appear in search results.
+- Mail search covers a share only when the caller names it. A
+  `SearchFilter::In` whose `ContainerId` is the owner-qualified form
+  `containers_list` mints routes both `Email/query` and the follow-up
+  `Email/get` to that owner's handle with the native mailbox id, and the
+  returned message and thread ids come back qualified in the object
+  namespace. What stays unsupported is the implicit union: with no `In`, or
+  with an `In` naming a primary container, a search is primary-only and never
+  touches a share. Two `In` filters naming different owners are refused
+  (`Request(Malformed)`), not unioned - one `Email/query` carries one
+  `accountId` - and so is an `In` naming a share this session does not hold.
+  That refusal is the one place foreign routing cannot use hydration's
+  stay-literal fallback: the id is a filter operand, not the object identity
+  the server can report a miss on, so the primary account would answer with
+  an empty page instead of an error. The page cursor is qualified with the
+  account it was minted against (the same object-id codec), and replaying it
+  under a filter that routes elsewhere is refused rather than paging one
+  account by another's offsets.

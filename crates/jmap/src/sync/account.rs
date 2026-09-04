@@ -960,14 +960,14 @@ impl Account for JmapAccount {
         &self,
         request: SearchRequest,
     ) -> AccountFuture<Result<Page<ThreadId>, AccountError>> {
-        pim::search(self.mail.clone(), request)
+        pim::search(self.mail.clone(), Arc::clone(&self.foreign_mail), request)
     }
 
     fn search_messages(
         &self,
         request: SearchRequest,
     ) -> AccountFuture<Result<Page<ObjectId>, AccountError>> {
-        pim::search_messages(self.mail.clone(), request)
+        pim::search_messages(self.mail.clone(), Arc::clone(&self.foreign_mail), request)
     }
 
     fn containers_list(&self) -> AccountFuture<Result<ContainerList, AccountError>> {

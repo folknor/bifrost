@@ -85,12 +85,20 @@ mandatory `threadId` all reach `Page::failed_ids`; thread ids are also
 deduplicated. Pinned by `search_emails_without_a_thread_ride_failed_ids` with
 revert-and-confirm.)
 
-### 11. Mail search never covers shares (now documented; product gap stays open)
+### 11. Mail search never covers shares (CLOSED)
 
-`search`/`search_messages` run only against the primary account; foreign
-accounts, which sync and hydrate fully, are invisible to search. The doc gap
-is closed (`reference/jmap.md` Known limitations now states it); whether
-shared mail SHOULD be searchable is a product decision for the owner.
+Ruled on as todo ruling 4 and fixed. The defect half - a `SearchFilter::In`
+naming a shared container sent the owner-qualified id as `inMailbox` to the
+PRIMARY account, matching nothing, so the consumer got an empty page and no
+error - is gone: `route_search` decides the owning account from the filter's
+`In` containers, `Email/query` and the follow-up `Email/get` run against that
+share with the native mailbox id, and the returned message and thread ids are
+re-qualified into the foreign object namespace. An `In` naming an unreachable
+share and a filter naming two different owners are both `Request(Malformed)`
+before the wire, and the page cursor now carries the account it was minted
+against so a page 2 cannot cross accounts. The implicit cross-account union
+was explicitly not approved and is not implemented. Pinned by the six
+`search_handles` transport tests in `sync/pim.rs`, each confirmed to bite.
 
 ### 12. `filters_list` downloads script blobs serially
 

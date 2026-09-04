@@ -647,12 +647,125 @@ pub(crate) fn draft_send<T: HttpTransport>(
     })
 }
 
+/// The JMAP account a search runs against, derived from the `In`
+/// containers in its filter.
+///
+/// `Email/query` addresses exactly one `accountId`, and a foreign
+/// container's `ContainerId` is the owner-qualified form `containers_list`
+/// mints (`encode_foreign`), so the owner has to be decided BEFORE the
+/// query is built: the qualified id is not a mailbox id in any account's
+/// namespace. `None` is the primary account - no `In` at all, or an `In`
+/// naming a primary container.
+///
+/// Two `In` filters naming different owners are rejected rather than
+/// unioned. One request cannot carry two `accountId`s, and an implicit
+/// cross-account union is a deliberate non-goal.
+fn search_owner(
+    filter: Option<&SearchFilter>,
+    op: AccountOperation,
+) -> Result<Option<String>, AccountError> {
+    fn walk<'a>(
+        filter: &'a SearchFilter,
+        found: &mut Option<Option<&'a str>>,
+        op: AccountOperation,
+    ) -> Result<(), AccountError> {
+        match filter {
+            SearchFilter::In(container) => {
+                let owner = super::foreign::owner_of(&container.0);
+                match found {
+                    Some(seen) if *seen != owner => {
+                        return Err(super::error::search_cross_account_filter(op, *seen, owner));
+                    }
+                    Some(_) => {}
+                    None => *found = Some(owner),
+                }
+            }
+            SearchFilter::And(filters) | SearchFilter::Or(filters) => {
+                for inner in filters {
+                    walk(inner, found, op)?;
+                }
+            }
+            SearchFilter::Not(inner) => walk(inner, found, op)?,
+            _ => {}
+        }
+        Ok(())
+    }
+
+    let Some(filter) = filter else {
+        return Ok(None);
+    };
+    let mut found = None;
+    walk(filter, &mut found, op)?;
+    Ok(found.flatten().map(ToString::to_string))
+}
+
+/// Select the `Mail` handle a search routes to.
+///
+/// An `In` naming a share this session does not hold fails honestly. Unlike
+/// hydration, there is no stay-literal fallback available here: the id is a
+/// filter operand, so the primary account would answer "no such mailbox"
+/// as an empty page rather than a miss.
+fn route_search<'a, T: HttpTransport>(
+    primary: &'a MailAccount<T>,
+    foreign_mail: &'a HashMap<String, MailAccount<T>>,
+    filter: Option<&SearchFilter>,
+    op: AccountOperation,
+) -> Result<(&'a MailAccount<T>, Option<String>), AccountError> {
+    let owner = search_owner(filter, op)?;
+    match owner {
+        None => Ok((primary, None)),
+        Some(account_id) => match foreign_mail.get(&account_id) {
+            Some(handle) => Ok((handle, Some(account_id))),
+            None => Err(super::error::search_unknown_account(
+                op,
+                &qualified_container_label(filter, &account_id),
+                &account_id,
+            )),
+        },
+    }
+}
+
+/// The qualified container id that selected an unreachable owner, for the
+/// error text. Falls back to the account id when the filter shape changed
+/// under us.
+fn qualified_container_label(filter: Option<&SearchFilter>, account_id: &str) -> String {
+    fn find(filter: &SearchFilter, account_id: &str) -> Option<String> {
+        match filter {
+            SearchFilter::In(container) => (super::foreign::owner_of(&container.0)
+                == Some(account_id))
+            .then(|| container.0.clone()),
+            SearchFilter::And(filters) | SearchFilter::Or(filters) => {
+                filters.iter().find_map(|inner| find(inner, account_id))
+            }
+            SearchFilter::Not(inner) => find(inner, account_id),
+            _ => None,
+        }
+    }
+    filter
+        .and_then(|filter| find(filter, account_id))
+        .unwrap_or_else(|| account_id.to_string())
+}
+
+/// Re-qualify a native id from `owner`'s namespace back into the
+/// consumer-facing one. A primary result stays bare - one wire form per
+/// logical object.
+fn qualify(owner: Option<&str>, native: String) -> String {
+    match owner {
+        Some(account_id) => super::foreign::encode_object(account_id, &native),
+        None => native,
+    }
+}
+
 pub(crate) fn search<T: HttpTransport>(
     mail: MailAccount<T>,
+    foreign_mail: Arc<HashMap<String, MailAccount<T>>>,
     request: SearchRequest,
 ) -> AccountFuture<Result<Page<ThreadId>, AccountError>> {
     Box::pin(async move {
-        let page = search_email_ids(&mail, request, true, AccountOperation::Search).await?;
+        let op = AccountOperation::Search;
+        let (routed, owner) = route_search(&mail, &foreign_mail, request.filter.as_ref(), op)?;
+        let owner = owner.as_deref();
+        let page = search_email_ids(routed, request, true, owner, op).await?;
         if page.items.is_empty() {
             return Ok(Page {
                 items: Vec::new(),
@@ -668,7 +781,7 @@ pub(crate) fn search<T: HttpTransport>(
             .cloned()
             .map(EmailId::into_string)
             .collect::<Vec<_>>();
-        let response = mail
+        let response = routed
             .call(
                 EmailGet::new()
                     .ids(page.items)
@@ -679,6 +792,18 @@ pub(crate) fn search<T: HttpTransport>(
         let not_found = response.not_found().to_vec();
         let (items, failed_ids) =
             reconcile_search_threads(requested, &not_found, response.into_list());
+        // Thread ids ride the object namespace, exactly as foreign inventory
+        // and hydration mint them: a bare foreign thread id asserts primary
+        // ownership and every thread-keyed door would then act on an
+        // unrelated primary thread.
+        let items = items
+            .into_iter()
+            .map(|thread| ThreadId(qualify(owner, thread.0)))
+            .collect();
+        let failed_ids = failed_ids
+            .into_iter()
+            .map(|id| qualify(owner, id))
+            .collect();
         Ok(Page {
             items,
             next_cursor: page.next_cursor,
@@ -752,16 +877,19 @@ fn reconcile_search_threads(
 
 pub(crate) fn search_messages<T: HttpTransport>(
     mail: MailAccount<T>,
+    foreign_mail: Arc<HashMap<String, MailAccount<T>>>,
     request: SearchRequest,
 ) -> AccountFuture<Result<Page<ObjectId>, AccountError>> {
     Box::pin(async move {
-        let page =
-            search_email_ids(&mail, request, false, AccountOperation::SearchMessages).await?;
+        let op = AccountOperation::SearchMessages;
+        let (routed, owner) = route_search(&mail, &foreign_mail, request.filter.as_ref(), op)?;
+        let owner = owner.as_deref();
+        let page = search_email_ids(routed, request, false, owner, op).await?;
         Ok(Page {
             items: page
                 .items
                 .into_iter()
-                .map(|id| ObjectId(id.into_string()))
+                .map(|id| ObjectId(qualify(owner, id.into_string())))
                 .collect(),
             next_cursor: page.next_cursor,
             estimated_total: page.estimated_total,
@@ -2245,9 +2373,10 @@ async fn search_email_ids<T: HttpTransport>(
     mail: &MailAccount<T>,
     request: SearchRequest,
     collapse_threads: bool,
+    owner: Option<&str>,
     op: AccountOperation,
 ) -> Result<Page<EmailId>, AccountError> {
-    let position = decode_position(request.page_cursor.as_deref())?;
+    let position = decode_position(request.page_cursor.as_deref(), owner, op)?;
     let limit = request.limit.unwrap_or(50).max(1);
     let query_request = build_search_query(request, collapse_threads, position, limit)?;
     let response = mail.call(query_request).await.map_err(to_acct_err(op))?;
@@ -2257,7 +2386,7 @@ async fn search_email_ids<T: HttpTransport>(
         let next = position
             .checked_add(i32::try_from(ids.len()).map_err(|_| schema_incompatible_search_cursor())?)
             .ok_or(schema_incompatible_search_cursor())?;
-        Some(next.to_string().into_bytes())
+        Some(encode_position(next, owner))
     } else {
         None
     };
@@ -2298,16 +2427,45 @@ fn build_search_query(
     Ok(query_request)
 }
 
-fn decode_position(cursor: Option<&[u8]>) -> Result<i32, AccountError> {
-    match cursor {
-        None => Ok(0),
-        Some(bytes) => {
-            let text =
-                std::str::from_utf8(bytes).map_err(|_| schema_incompatible_search_cursor())?;
-            text.parse::<i32>()
-                .map_err(|_| schema_incompatible_search_cursor())
-        }
+/// Encode a search page cursor: a bare integer position for the primary
+/// account, and the owner-qualified form (the same object-id codec every
+/// other foreign id uses) for a share.
+///
+/// The account has to ride in the cursor because the position means
+/// nothing outside the account whose result order produced it. Without it,
+/// a page-2 request whose filter routes elsewhere - a caller that reused
+/// the cursor with a different `In`, or dropped the `In` entirely - pages
+/// one account by another's offsets and silently duplicates and skips.
+fn encode_position(position: i32, owner: Option<&str>) -> Vec<u8> {
+    qualify(owner, position.to_string()).into_bytes()
+}
+
+/// Decode a search page cursor and check it belongs to the account this
+/// request routes to. A primary cursor is bare, so the absent-separator
+/// case is "primary", not "unknown".
+fn decode_position(
+    cursor: Option<&[u8]>,
+    owner: Option<&str>,
+    op: AccountOperation,
+) -> Result<i32, AccountError> {
+    let Some(bytes) = cursor else {
+        return Ok(0);
+    };
+    let text = std::str::from_utf8(bytes).map_err(|_| schema_incompatible_search_cursor())?;
+    let (cursor_owner, position) = match super::foreign::parse_object(text) {
+        Some((account_id, position)) => (Some(account_id), position),
+        None => (None, text),
+    };
+    if cursor_owner != owner {
+        return Err(super::error::search_cursor_account_mismatch(
+            op,
+            cursor_owner,
+            owner,
+        ));
     }
+    position
+        .parse::<i32>()
+        .map_err(|_| schema_incompatible_search_cursor())
 }
 
 fn build_search_filter(
@@ -2352,9 +2510,16 @@ fn search_filter_to_jmap(
             ];
             query::Filter::and(filters)
         }
-        SearchFilter::In(container) => {
-            crate::email::query::Filter::in_mailbox(MailboxId::new(container.0)).into()
-        }
+        // The owner qualifier is stripped here, never sent: `route_search`
+        // already selected the owning account handle and refused a filter
+        // that names two, so the native part is a mailbox id in exactly the
+        // account this query addresses. Sending the qualified form is the
+        // old defect - it matched nothing in the primary account and the
+        // consumer got an empty page with no error.
+        SearchFilter::In(container) => crate::email::query::Filter::in_mailbox(MailboxId::new(
+            super::foreign::native_object(&container.0).to_string(),
+        ))
+        .into(),
         SearchFilter::Labeled(LabelId(label)) => {
             crate::email::query::Filter::has_keyword(label).into()
         }
@@ -3381,6 +3546,350 @@ mod tests {
         assert_eq!(value.get("position"), Some(&serde_json::json!(20)));
         assert_eq!(value.get("limit"), Some(&serde_json::json!(10)));
         assert_eq!(value.get("collapseThreads"), Some(&serde_json::json!(true)));
+    }
+
+    /// Scripted `Email/query` + `Email/get` server for the search routing
+    /// tests. Records every request so the account the query addressed and
+    /// the ids it carried can be asserted.
+    #[derive(Clone)]
+    struct SearchTransport {
+        requests: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    }
+
+    impl SearchTransport {
+        fn new() -> Self {
+            Self {
+                requests: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            }
+        }
+
+        fn calls(&self, method: &str) -> Vec<serde_json::Value> {
+            self.requests
+                .lock()
+                .expect("requests")
+                .iter()
+                .filter(|call| call[0] == serde_json::json!(method))
+                .map(|call| call[1].clone())
+                .collect()
+        }
+    }
+
+    impl crate::core::transport::HttpTransport for SearchTransport {
+        async fn api_request(
+            &self,
+            _url: &str,
+            body: Vec<u8>,
+        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+            let request: serde_json::Value = serde_json::from_slice(&body).expect("request json");
+            let call = request["methodCalls"][0].clone();
+            self.requests.lock().expect("requests").push(call.clone());
+            let name = call[0].as_str().expect("method name").to_string();
+            let call_id = call[2].as_str().expect("call id").to_string();
+            let account_id = call[1]["accountId"].clone();
+            let arguments = match name.as_str() {
+                "Email/query" => serde_json::json!({
+                    "accountId": account_id,
+                    "queryState": "q-1",
+                    "canCalculateChanges": false,
+                    "position": call[1]["position"].clone(),
+                    "total": 1,
+                    "ids": ["M1"]
+                }),
+                "Email/get" => serde_json::json!({
+                    "accountId": account_id,
+                    "state": "s-1",
+                    "list": [{"id": "M1", "threadId": "T1"}],
+                    "notFound": []
+                }),
+                other => panic!("unexpected method {other}"),
+            };
+            Ok(bytes::Bytes::from(
+                serde_json::json!({
+                    "sessionState": "session-1",
+                    "methodResponses": [[name, arguments, call_id]]
+                })
+                .to_string(),
+            ))
+        }
+
+        async fn upload(
+            &self,
+            _url: &str,
+            _body: Vec<u8>,
+            _content_type: Option<&str>,
+        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+            Err(crate::core::transport::TransportError::new("no upload"))
+        }
+
+        async fn download(
+            &self,
+            _url: &str,
+        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+            Err(crate::core::transport::TransportError::new("no download"))
+        }
+
+        async fn get_session(
+            &self,
+            _url: &str,
+        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+            Err(crate::core::transport::TransportError::new("no session"))
+        }
+    }
+
+    fn search_session() -> crate::core::session::Session {
+        serde_json::from_value(serde_json::json!({
+            "capabilities": {
+                "urn:ietf:params:jmap:core": {
+                    "maxSizeUpload": 1000,
+                    "maxConcurrentUpload": 2,
+                    "maxSizeRequest": 100_000,
+                    "maxConcurrentRequests": 4,
+                    "maxCallsInRequest": 8,
+                    "maxObjectsInGet": 256,
+                    "maxObjectsInSet": 256,
+                    "collationAlgorithms": []
+                },
+                "urn:ietf:params:jmap:mail": {}
+            },
+            "accounts": {
+                "primary": {"name": "Primary", "isPersonal": true, "isReadOnly": false,
+                    "accountCapabilities": {"urn:ietf:params:jmap:mail": {}}},
+                "shared": {"name": "Shared", "isPersonal": false, "isReadOnly": false,
+                    "accountCapabilities": {"urn:ietf:params:jmap:mail": {}}}
+            },
+            "primaryAccounts": {"urn:ietf:params:jmap:mail": "primary"},
+            "username": "user@example.test",
+            "apiUrl": "https://example.test/jmap/api",
+            "downloadUrl": "https://example.test/download/{accountId}/{blobId}/{name}/{type}",
+            "uploadUrl": "https://example.test/upload/{accountId}",
+            "eventSourceUrl": "https://example.test/eventsource",
+            "state": "session-1"
+        }))
+        .expect("session parses")
+    }
+
+    /// Primary handle, foreign routing table, and the scripted transport
+    /// backing both.
+    type SearchHandles = (
+        MailAccount<SearchTransport>,
+        Arc<HashMap<String, MailAccount<SearchTransport>>>,
+        SearchTransport,
+    );
+
+    /// Primary handle plus one registered share (`shared`), over one
+    /// scripted transport.
+    fn search_handles() -> SearchHandles {
+        let transport = SearchTransport::new();
+        let client = crate::client::Client::with_transport(
+            transport.clone(),
+            search_session(),
+            "https://example.test/.well-known/jmap",
+        )
+        .expect("client builds");
+        let primary = crate::account::Account::new(client.clone(), "primary");
+        let mut foreign = HashMap::new();
+        foreign.insert(
+            "shared".to_string(),
+            crate::account::Account::new(client, "shared"),
+        );
+        (primary, Arc::new(foreign), transport)
+    }
+
+    fn in_container(id: ContainerId) -> SearchRequest {
+        let mut request = SearchRequest::default();
+        request.filter = Some(SearchFilter::In(id));
+        request.limit = Some(1);
+        request
+    }
+
+    /// The defect: a `SearchFilter::In` naming a shared mailbox sent the
+    /// owner-QUALIFIED id as `inMailbox` to the PRIMARY account, which
+    /// matches nothing, so the consumer got an empty page and no error.
+    /// The query must address the owner with the native mailbox id, and
+    /// the hits must come back in the foreign object namespace.
+    #[tokio::test]
+    async fn a_foreign_container_search_routes_to_its_owner_account() {
+        let (primary, foreign, transport) = search_handles();
+        let container = ContainerId(super::super::foreign::encode_foreign("shared", "mbx-1").0);
+
+        let page = search_messages(primary, foreign, in_container(container))
+            .await
+            .expect("search succeeds");
+
+        let queries = transport.calls("Email/query");
+        assert_eq!(queries.len(), 1);
+        assert_eq!(queries[0]["accountId"], serde_json::json!("shared"));
+        assert_eq!(
+            queries[0]["filter"]["inMailbox"],
+            serde_json::json!("mbx-1"),
+            "the owner qualifier must be stripped from the wire filter"
+        );
+        assert_eq!(
+            page.items,
+            vec![ObjectId(super::super::foreign::encode_object(
+                "shared", "M1"
+            ))]
+        );
+    }
+
+    /// The thread door projects query hits through `Email/get`. Both legs
+    /// must run against the owner, and the thread ids must be qualified:
+    /// a bare foreign thread id asserts primary ownership, and every
+    /// thread-keyed door would then act on an unrelated primary thread.
+    #[tokio::test]
+    async fn a_foreign_thread_search_qualifies_its_thread_ids() {
+        let (primary, foreign, transport) = search_handles();
+        let container = ContainerId(super::super::foreign::encode_foreign("shared", "mbx-1").0);
+
+        let page = search(primary, foreign, in_container(container))
+            .await
+            .expect("search succeeds");
+
+        let gets = transport.calls("Email/get");
+        assert_eq!(gets.len(), 1);
+        assert_eq!(gets[0]["accountId"], serde_json::json!("shared"));
+        assert_eq!(
+            gets[0]["ids"],
+            serde_json::json!(["M1"]),
+            "the follow-up get sends native ids to the owner"
+        );
+        assert_eq!(
+            page.items,
+            vec![ThreadId(super::super::foreign::encode_object(
+                "shared", "T1"
+            ))]
+        );
+    }
+
+    /// An `In` naming a share this session cannot reach must fail
+    /// honestly, before the wire. Falling back to the primary account is
+    /// the silent-empty-result defect in a different costume.
+    #[tokio::test]
+    async fn an_unregistered_foreign_container_search_is_refused() {
+        let (primary, foreign, transport) = search_handles();
+        let container = ContainerId(super::super::foreign::encode_foreign("ghost", "mbx-1").0);
+
+        let error = search_messages(primary, foreign, in_container(container))
+            .await
+            .expect_err("an unreachable share is an error");
+
+        assert!(matches!(
+            error.kind(),
+            bifrost_types::AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed)
+        ));
+        assert!(
+            transport.calls("Email/query").is_empty(),
+            "nothing may reach the wire"
+        );
+    }
+
+    /// One `Email/query` carries one `accountId`. Two `In` filters naming
+    /// different owners is an error, not an implicit union and not a
+    /// silent pick of one of them.
+    #[tokio::test]
+    async fn a_mixed_owner_search_filter_is_refused() {
+        let (primary, foreign, transport) = search_handles();
+        let mut request = SearchRequest::default();
+        request.filter = Some(SearchFilter::And(vec![
+            SearchFilter::In(ContainerId(
+                super::super::foreign::encode_foreign("shared", "mbx-1").0,
+            )),
+            SearchFilter::In(ContainerId("mbx-1".to_string())),
+        ]));
+
+        let error = search_messages(primary, foreign, request)
+            .await
+            .expect_err("a cross-account filter is an error");
+
+        assert!(matches!(
+            error.kind(),
+            bifrost_types::AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed)
+        ));
+        assert!(transport.calls("Email/query").is_empty());
+    }
+
+    /// A search page cursor is a bare position into ONE account's result
+    /// order. It must name that account so a page 2 cannot be paged
+    /// against another one - which would duplicate and skip silently.
+    #[tokio::test]
+    async fn a_foreign_search_cursor_resumes_on_the_same_account() {
+        let (primary, foreign, transport) = search_handles();
+        let container = ContainerId(super::super::foreign::encode_foreign("shared", "mbx-1").0);
+
+        let page = search_messages(
+            primary.clone(),
+            Arc::clone(&foreign),
+            in_container(container),
+        )
+        .await
+        .expect("search succeeds");
+        let cursor = page.next_cursor.expect("a full page has a next cursor");
+        assert_eq!(
+            String::from_utf8(cursor.clone()).expect("utf8"),
+            super::super::foreign::encode_object("shared", "1"),
+            "the cursor names the account it was minted against"
+        );
+
+        // Page 2 with the same filter resumes on the same account at the
+        // decoded position.
+        let container = ContainerId(super::super::foreign::encode_foreign("shared", "mbx-1").0);
+        let mut resume = in_container(container);
+        resume.page_cursor = Some(cursor.clone());
+        search_messages(primary.clone(), Arc::clone(&foreign), resume)
+            .await
+            .expect("resume succeeds");
+        let queries = transport.calls("Email/query");
+        assert_eq!(queries.len(), 2);
+        assert_eq!(queries[1]["accountId"], serde_json::json!("shared"));
+        assert_eq!(queries[1]["position"], serde_json::json!(1));
+
+        // The same cursor replayed with a primary-routing request is
+        // refused rather than paging the primary account by the share's
+        // offsets.
+        let mut crossed = SearchRequest::default();
+        crossed.limit = Some(1);
+        crossed.page_cursor = Some(cursor);
+        let error = search_messages(primary, foreign, crossed)
+            .await
+            .expect_err("a cursor may not cross accounts");
+        assert!(matches!(
+            error.kind(),
+            bifrost_types::AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed)
+        ));
+        assert_eq!(
+            transport.calls("Email/query").len(),
+            2,
+            "the refused resume never reached the wire"
+        );
+    }
+
+    /// The primary path is unchanged: no `In`, or an `In` naming a primary
+    /// container, addresses the primary account with a bare mailbox id,
+    /// bare result ids, and a bare cursor.
+    #[tokio::test]
+    async fn a_primary_container_search_stays_primary_and_bare() {
+        let (primary, foreign, transport) = search_handles();
+
+        let page = search_messages(
+            primary,
+            foreign,
+            in_container(ContainerId("mbx-1".to_string())),
+        )
+        .await
+        .expect("search succeeds");
+
+        let queries = transport.calls("Email/query");
+        assert_eq!(queries[0]["accountId"], serde_json::json!("primary"));
+        assert_eq!(
+            queries[0]["filter"]["inMailbox"],
+            serde_json::json!("mbx-1")
+        );
+        assert_eq!(page.items, vec![ObjectId("M1".to_string())]);
+        assert_eq!(
+            page.next_cursor
+                .map(|c| String::from_utf8(c).expect("utf8")),
+            Some("1".to_string())
+        );
     }
 
     // A foreign-account hydration must come back in the SAME id namespace
