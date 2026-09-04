@@ -1220,6 +1220,17 @@ fn convert_method(method: crate::core::error::MethodError, ctx: JmapErrorContext
     let mut builder = build_with(&ctx, kind, primary).push_cause(Cause::Attempt(
         AttemptCause::new(TransmissionState::Acknowledged),
     ));
+    // Preserve the server's own explanation and named limit as
+    // support-only diagnostics - the error-model contract prizes evidence
+    // preservation, and these were previously dropped at the wire.
+    if let Some(description) = method.description() {
+        builder = builder.text(DiagnosticText::support_only(description.to_string()));
+    }
+    if let Some(limit) = method.limit() {
+        builder = builder.text(DiagnosticText::support_only(format!(
+            "server-named limit: {limit}"
+        )));
+    }
     // Push the wire cause as a forensic-only layer only if it differs
     // from the primary cause already on the chain (ServerPartialFail
     // and Other already use Wire as primary).

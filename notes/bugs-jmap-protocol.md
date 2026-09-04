@@ -93,33 +93,19 @@ mail-ish generic requests quietly ride the calendar account.
   in the wrong lane. Also, blanket `#[serde(default)]` on `CoreCapabilities`
   zero-fills any omitted limit, merging "absent field" and "advertised 0" - the
   two cases the reference says map to different recovery classes.
-- **`MethodError` deserializes only `type`** (`core/error.rs`), discarding
-  `description` and per-error extras (`limit` on
-  `requestTooLarge`/`tooManyChanges`). The error-model docs prize evidence
-  preservation; this drops the server's own explanation at the wire.
-- **HTTP-side `ProblemDetails.request_id` can never populate** - the derived
-  field is snake_case with no rename, and RFC 7807 JMAP bodies wouldn't carry it
-  anyway; only the WS constructor fills it. Harmless but misleading.
-- **`frame_stream` yields the error and keeps reading** after a
-  `tokio_websockets::Error`. On a stream that errors persistently and never
-  ends, a consumer that doesn't break on first error spins. The sync reader does
-  break, so this is only a trap for future consumers.
 - **WS Response decode double-round-trips** (`json!` Value rebuild then
   `from_value`) - works (verified), but it re-allocates every method response; a
   `RawValue`-preserving envelope would decode once.
-- **`well_known_session_url` unconditionally appends `/.well-known/jmap`** to
-  whatever the caller gave, so a caller holding the actual session URL cannot
-  connect to it; and RFC 8620 puts the well-known at the origin root, not under
-  an arbitrary path prefix. Deliberate-looking, but worth a decision note.
 - **`ByteTally` counts only `/jmap/api` responses.** Documented, but it means
   metered streams that also `download` (raw RFC822, sieve script bodies)
   under-report - blob bytes are typically the *bulk* of the traffic those paths
   cause.
-- **SSE parser** is genuinely solid (WHATWG corner cases tested); the one spec
-  nit is no leading-BOM strip at stream start. Also a single malformed *event
-  payload* tears down the whole SSE stream (`break 'events` in stream.rs) where
-  SSE's design intent is skip-and-continue - defensible, but it means one
-  garbled frame costs a reconnect and replay.
+- **SSE stream teardown on one malformed event payload** (`break 'events` in
+  stream.rs) where SSE's design intent is skip-and-continue - defensible, but
+  it means one garbled frame costs a reconnect and replay. (The parser's
+  leading-BOM nit is fixed; the `MethodError` description/limit discard,
+  `frame_stream` spin trap, `request_id` field, and `well_known_session_url`
+  decision note are closed via fixes/comments.)
 
 ## Structural observation
 

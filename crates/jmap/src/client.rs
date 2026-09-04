@@ -343,6 +343,12 @@ impl ClientBuilder {
     }
 }
 
+/// Decision note: the well-known path is appended to WHATEVER the caller
+/// gave, deliberately. RFC 8620 puts `/.well-known/jmap` at the origin
+/// root, but real deployments mount JMAP under a path prefix and answer
+/// the well-known there; appending supports both (pass the bare origin
+/// for the RFC shape). The trade-off is that a caller holding the ACTUAL
+/// session URL cannot connect to it directly through this door.
 fn well_known_session_url(url: &str) -> String {
     format!("{}/.well-known/jmap", url.trim_end_matches('/'))
 }

@@ -336,6 +336,11 @@ where
                 Ok(_) => (),
                 // Post-handshake runtime drop. Classification is
                 // `Protocol(PartialResponse) + Attempt(Acknowledged)`.
+                // The stream yields the error and keeps reading rather than
+                // ending: recoverability is the consumer's call. The sync
+                // push reader breaks on first error; a future consumer that
+                // does not must, or a persistently erroring socket that
+                // never terminates becomes a spin.
                 Err(err) => yield Err(crate::Error::WebSocketRuntime(err)),
             }
         }

@@ -12,6 +12,9 @@ pub(crate) struct ProblemDetails {
     title: Option<String>,
     detail: Option<String>,
     limit: Option<String>,
+    // HTTP-side RFC 7807 bodies never populate this (snake_case with no
+    // rename, and JMAP problem bodies do not carry it anyway); only the
+    // WebSocket RequestError constructor fills it in.
     request_id: Option<String>,
 }
 
@@ -41,6 +44,14 @@ pub(crate) enum ProblemType {
 pub(crate) struct MethodError {
     #[serde(rename = "type")]
     p_type: MethodErrorType,
+    /// RFC 8620 s3.6.2: the server's own explanation of the failure.
+    /// Preserved for support diagnostics rather than dropped at the wire.
+    #[serde(default)]
+    description: Option<String>,
+    /// The per-error `limit` name some errors carry (`requestTooLarge`,
+    /// `tooManyChanges` name the limit that was hit).
+    #[serde(default)]
+    limit: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -154,6 +165,14 @@ impl ProblemDetails {
 impl MethodError {
     pub(crate) fn error_type(&self) -> &MethodErrorType {
         &self.p_type
+    }
+
+    pub(crate) fn description(&self) -> Option<&str> {
+        self.description.as_deref()
+    }
+
+    pub(crate) fn limit(&self) -> Option<&str> {
+        self.limit.as_deref()
     }
 }
 

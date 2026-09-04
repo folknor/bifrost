@@ -54,10 +54,21 @@ pub(crate) struct EventParser {
     // WHATWG "process the field": at most ONE space after the colon is
     // stripped from a value; `data:  x` carries the value ` x`.
     strip_value_space: bool,
+    // WHATWG: one leading U+FEFF at stream start must be ignored. Checked
+    // on the first frame only; a BOM split across frames smaller than
+    // three bytes is not reassembled (no real transport delivers one that
+    // way, and mis-holding bytes would stall the parser).
+    bom_checked: bool,
 }
 
 impl EventParser {
     pub(crate) fn push_bytes(&mut self, mut bytes: Vec<u8>) {
+        if !self.bom_checked {
+            self.bom_checked = true;
+            if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+                bytes.drain(..3);
+            }
+        }
         if let Some(mut buffered) = self.bytes.take() {
             let offset = self.pos.min(buffered.len());
             let mut remaining = buffered.split_off(offset);
@@ -389,6 +400,20 @@ mod tests {
     // dispatches nothing; emitting an empty event here used to make the
     // consumer in `stream.rs` fail an empty JSON parse and hang up on a
     // live connection.
+    #[test]
+    fn a_leading_bom_at_stream_start_is_stripped() {
+        let mut parser = super::EventParser::default();
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(b"data: x\n\n");
+        parser.push_bytes(bytes);
+        let event = parser.next().expect("one event").expect("parses");
+        assert_eq!(event.data, b"x");
+        // Only the FIRST frame is BOM-checked; a mid-stream BOM is data.
+        parser.push_bytes(b"data: y\n\n".to_vec());
+        let event = parser.next().expect("one event").expect("parses");
+        assert_eq!(event.data, b"y");
+    }
+
     #[test]
     fn comment_only_blocks_dispatch_nothing() {
         let mut parser = super::EventParser::default();
