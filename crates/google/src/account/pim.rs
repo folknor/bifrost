@@ -1126,9 +1126,20 @@ fn references_from_header(value: Option<&str>) -> Vec<String> {
     })
 }
 
+/// Minimal RFC 5322 address-list parser (recipient addr-specs and an
+/// optional display name), mirroring the imap crate's.
+///
+/// Commas inside a quoted display name or inside the angle-bracketed
+/// addr-spec do not split addresses. This sits on a WRITE path:
+/// `draft_update` re-renders the parsed headers back into the stored
+/// draft, so a naive comma split would silently corrupt any draft
+/// addressed to `"Last, First" <a@b>` on the next field-level patch.
 fn parse_address_list(value: Option<&str>) -> Vec<Address> {
     value.map_or_else(Vec::new, |value| {
-        value.split(',').filter_map(parse_address).collect()
+        split_address_list(value)
+            .into_iter()
+            .filter_map(|item| parse_address(&item))
+            .collect()
     })
 }
 
@@ -1141,12 +1152,58 @@ fn parse_address(value: &str) -> Option<Address> {
         && let Some((address, _)) = rest.split_once('>')
     {
         let name = name.trim().trim_matches('"').trim();
+        // A quoted display name escapes embedded quotes and backslashes;
+        // resolve them so the model (and the re-render, which re-quotes)
+        // sees the literal name rather than the wire escapes.
+        let name = name.replace("\\\"", "\"").replace("\\\\", "\\");
         return Some(Address {
-            name: (!name.is_empty()).then(|| name.to_string()),
+            name: (!name.is_empty()).then_some(name),
             address: address.trim().to_string(),
         });
     }
     Some(Address::bare(value.to_string()))
+}
+
+/// Split an address-list header value on the top-level commas only:
+/// commas inside a `"..."` quoted display name or inside a `<...>`
+/// addr-spec are not separators.
+fn split_address_list(value: &str) -> Vec<String> {
+    let mut items = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut in_angle = false;
+    let mut escaped = false;
+    for ch in value.chars() {
+        if escaped {
+            escaped = false;
+            current.push(ch);
+            continue;
+        }
+        match ch {
+            '\\' if in_quotes => {
+                escaped = true;
+                current.push(ch);
+            }
+            '"' if !in_angle => {
+                in_quotes = !in_quotes;
+                current.push(ch);
+            }
+            '<' if !in_quotes => {
+                in_angle = true;
+                current.push(ch);
+            }
+            '>' if !in_quotes => {
+                in_angle = false;
+                current.push(ch);
+            }
+            ',' if !in_quotes && !in_angle => {
+                items.push(std::mem::take(&mut current));
+            }
+            _ => current.push(ch),
+        }
+    }
+    items.push(current);
+    items
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1433,6 +1490,26 @@ mod tests {
             &attachment.source,
             bifrost_types::AttachmentSource::Blob(_)
         ));
+    }
+
+    /// A quoted display name legally contains commas (and escaped quotes).
+    /// The comma split must not fire inside quotes or angle brackets: this
+    /// parser feeds `draft_update`'s re-render, so a naive split writes the
+    /// corrupted recipients back into the stored draft.
+    #[test]
+    fn address_list_respects_quoted_commas_and_escapes() {
+        let parsed = parse_address_list(Some(
+            "\"Doe, John\" <jd@example.com>, plain@example.com, \
+             \"Escaped \\\"Nick\\\", Esq.\" <nick@example.com>",
+        ));
+
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed[0].name.as_deref(), Some("Doe, John"));
+        assert_eq!(parsed[0].address, "jd@example.com");
+        assert_eq!(parsed[1].name, None);
+        assert_eq!(parsed[1].address, "plain@example.com");
+        assert_eq!(parsed[2].name.as_deref(), Some("Escaped \"Nick\", Esq."));
+        assert_eq!(parsed[2].address, "nick@example.com");
     }
 
     #[test]

@@ -395,7 +395,13 @@ Hydration primitives use Gmail's `full` and `metadata` formats.
 `message_hydrate` picks the cheapest format for the requested
 `HydrationProjection`, parses common address and threading headers, maps
 label ids to containers and canonical flags, and surfaces attachment blob
-handles for `FullWithBlobs`.
+handles for `FullWithBlobs`. Address-list headers split on top-level commas
+only (commas inside a quoted display name or an angle-bracketed addr-spec
+are not separators, and `\"` / `\\` escapes in quoted names are resolved),
+mirroring the imap crate's parser. This matters beyond display:
+`draft_update` re-renders the parsed headers back into the stored draft, so
+a naive comma split would corrupt any draft addressed to
+`"Last, First" <a@b>` on the next field-level patch.
 
 Google Calendar maps shared lifecycle status, availability, visibility,
 attendees, and recurrence on create/update. Organizer is server-derived

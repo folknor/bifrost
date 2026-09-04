@@ -18,20 +18,12 @@ latent defects and smaller observations.
 
 ## Confident defects
 
-### 1. `parse_address_list` corrupts RFC 5322 addresses with quoted commas - and it sits on a write path
-
-`crates/google/src/account/pim.rs` (`parse_address_list` / `parse_address`):
-the list is split on every `,` with no awareness of quoted strings, so
-`"Doe, John" <jd@example.com>` becomes two garbage addresses (`"Doe` as a bare
-address, plus `John" <jd@example.com>`). On the read path (thread/message
-hydrate) this is a display defect. The dangerous consumer is `draft_update`:
-`document_from_message` parses the existing draft's headers through this
-function, and the re-render (`render_rfc5322`) then **writes the mangled
-recipients back into the stored draft**. A draft addressed to anyone with a
-comma in their display name is silently corrupted by any field-level patch. The
-fix belongs in a real address-list parser (or reusing whatever
-bifrost-types/imap already has); comma-splitting is not salvageable. Also note
-`.trim_matches('"')` only strips quotes, never unescapes `\"`.
+(Finding 1 - the comma-split address-list parser corrupting quoted display
+names on `draft_update`'s write path - is fixed: `split_address_list` now
+splits on top-level commas only (quote-, escape- and angle-aware, mirroring
+the imap crate's parser) and `parse_address` unescapes `\"` / `\\` in quoted
+names. Pinned by `address_list_respects_quoted_commas_and_escapes` with
+revert-and-confirm; `reference/google.md` updated.)
 
 ## Suspected defects (verify before filing as fixes)
 
