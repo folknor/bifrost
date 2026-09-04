@@ -108,9 +108,11 @@ where
 {
     pub(crate) fn create(&mut self, id: impl Into<String>) -> &mut O::Create {
         use crate::core::SetCreate;
-        let id = id.into();
-        self.create.insert(id.clone(), O::Create::new(None));
-        self.create.get_mut(&id).unwrap()
+        // Get-or-insert, like SetRequest::create_with_id: a repeated id must
+        // hand back the existing entry, not silently overwrite an object.
+        self.create
+            .entry(id.into())
+            .or_insert_with(|| O::Create::new(None))
     }
 }
 

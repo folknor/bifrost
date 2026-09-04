@@ -3,47 +3,10 @@
 Hunt date: 2026-09-04. Hunter: Claude (Fable 5), read-only. Scope:
 `crates/net/`, `crates/types/`, and the cross-cutting error-model contract
 (`reference/error-model.md`) as implemented in shared code. Also checked two
-lateral claims routed from the google and DAV hunts; the resolved versions
-live here only.
-
-## The two routed claims
-
-### (a) URL encoder dot-segment behavior: tests exist, but the double-escape has an undocumented consequence
-
-The google hunt suspected bifrost-net's encoders lacked a test pinning the
-`.`/`..` double-escape behavior that `reference/google.md` leans on for
-`events.move`. That suspicion is wrong - `crates/net/src/url.rs` pins the
-behavior directly:
-`complete_dot_segments_cannot_navigate_the_parsed_url` asserts
-`encode_path_component(".") == "%252E"` and `".." == "%252E%252E"` and proves
-via a WHATWG `Url::join` that the encoded component stays in path position;
-`complete_dot_query_values_are_not_double_escaped` pins the query-side
-negative. No gap.
-
-However, a real consequence the reference doesn't state: **the double-escape
-renames the resource.** A server percent-decodes once, so it receives the
-literal three bytes `%2E`, not `.`. A provider id that is literally `.` or
-`..` is therefore permanently unaddressable through this encoder - the request
-goes to a different resource name. There is no correct spelling under WHATWG
-parsing (single-escaped `%2E` is still treated as navigation), so
-safety-over-addressability is the right call, but `reference/net.md` presents
-this as pure hardening; if bifrost-google's reference "relies on"
-round-tripping such an id, it relies on something impossible. Worth one
-sentence in the docs.
-
-### (b) `RedirectPolicy::default().max_hops` in dav-core - latent coupling, not a live trap
-
-The DAV hunt flagged that the DAV redirect walk derives its hop cap from
-bifrost-net's type default rather than from any attached spec.
-`crates/dav-core/src/dispatch.rs:350` reads
-`RedirectPolicy::default().max_hops` for its self-walked hop cap, while line
-61 sets `FollowRedirects::Disabled` on the spec. There is no attached
-per-account redirect policy to consult - DAV exposes no hop-count config - so
-nothing misbehaves today. But the cap is a magic constant laundered through a
-type `Default`: changing `RedirectPolicy::default()` silently changes DAV
-behavior, and if DAV ever grows a redirect config it will be ignored here.
-Suggest a named `pub const DEFAULT_MAX_HOPS` in bifrost-net that both
-`Default` and dav-core cite.
+lateral claims routed from the google and DAV hunts; both are resolved and
+closed (the dot-segment tests exist and the double-escape consequence is now
+documented in `reference/net.md`; dav-core cites the named
+`DEFAULT_MAX_HOPS` constant).
 
 ## Confident findings
 
@@ -80,49 +43,7 @@ auth was self-stripped as `RedirectRejected`-like or
 Latent (needs a provider that redirects home cross-origin), but the
 misclassification is terminal-severity when it fires.
 
-### 3. Doc-vs-code mismatch on `FilterUpdate` idempotency
-
-`reference/error-model.md` (Scope section): "Absolute-state writes against a
-known id, including the `*Update` family and the singleton settings writers,
-are idempotent." But `AccountOperation::is_idempotent`
-(`crates/types/src/error/scope.rs:265`) puts `FilterUpdate` in the
-non-idempotent exclusion set, while
-`DraftUpdate`/`ContactUpdate`/`EventUpdate`/`IdentityUpdate` are idempotent
-and the long comment never mentions filters. Probably deliberate (Gmail filter
-"update" is delete+create; ManageSieve keys on name), but either the code
-comment or the reference must say so - this is exactly the "authoritative
-source" the whole derive table reads, and the binding doc currently asserts
-the opposite of the code. One of the two is wrong; the hunter's read is the
-doc.
-
-### 4. Doc imprecision on headers-timeout evidence
-
-`reference/net.md`: "Expiry before the response is `Timeout { Unsent }`; the
-replacement attempt had not been dispatched, so replay is safe for any
-method." The `response_headers_timeout` expiry in `send_streaming_inner`
-(request.rs, `dispatch_limit` arm) is `Timeout { InFlight }` - correctly,
-since bytes may have gone out - so a headers-timeout on a POST is *not*
-replayed and reconciles instead. The code is right; the doc sentence
-over-promises "replay is safe" for a class of pre-response expiry that is not
-replay-safe. Docs fix.
-
 ## Suspected / smells (lower confidence or low severity)
-
-### 5. `Error::Cancelled` classifies as `Transport(Network) + InFlight`
-
-In `into_account_error` - for a non-idempotent op that yields
-`Reconcile(TransportDropAfterSend)` and a read-back even when cancellation
-happened before dispatch. Nearly unreachable today (`Cancelled` is only minted
-inside `RefreshFailed.source`), so cosmetic - but the arm exists and will fire
-the day someone surfaces `Cancelled` directly.
-
-### 6. `ByteBucket::consume` oversized-chunk path
-
-`crates/net/src/net.rs:1111`: the sleep is capped at 60 s, so a single chunk
-larger than 60x the cap is under-throttled (documented as smoothing - fine),
-and it ignores the tokens already in the (initially full) bucket,
-over-throttling the first oversized chunk. Both minor and defensible; noted
-for completeness.
 
 ### 7. Mixed clocks in `OAuthRefresher`
 

@@ -150,14 +150,6 @@ impl JmapAccount {
         self.mail_for_scope(scope).id_str().to_string()
     }
 
-    /// Resolve a single object mutation to its owning account. As with
-    /// hydration, a qualified id for an account no longer in this session
-    /// stays on the primary route so the server, not a guessed local route,
-    /// reports the miss.
-    fn mail_for_object_id(&self, id: &ObjectId) -> MailAccount {
-        route_object_id(&id.0, &self.mail, &self.foreign_mail).clone()
-    }
-
     /// Resolve a thread-keyed operation to its owning account.
     ///
     /// A foreign thread id is owner-qualified in the object namespace (the
@@ -299,6 +291,10 @@ fn establishment_for_seed(
     }))
 }
 
+/// Production-dead: kept only as the test pin for the object-id routing
+/// rule (a registered foreign id resolves, a departed share stays literal
+/// on the primary route). The production route is `route_object_id`.
+#[cfg(test)]
 fn foreign_account_id_for_object<F>(id: &ObjectId, is_registered: F) -> Option<String>
 where
     F: Fn(&str) -> bool,

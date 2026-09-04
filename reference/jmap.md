@@ -620,3 +620,6 @@ a whole new share still waits for reopen.
   `Unsupported(SyncInventory)` without sending a request.
 - Gmail labels, Graph categories/extended properties, and identity-default selection are unsupported. Attachment handles keep blob id + MIME but not uploaded filenames.
 - Typed filter-rule CRUD is unsupported; JMAP exposes literal Sieve scripts instead.
+- Mail search (`search` / `search_messages`) runs only against the primary
+  account. Foreign (shared) accounts sync and hydrate fully but are invisible
+  to search; qualified ids never appear in search results.

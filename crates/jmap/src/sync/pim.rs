@@ -261,11 +261,26 @@ pub(crate) fn send_message<T: HttpTransport>(
             .chain(&request.bcc)
             .cloned()
             .collect::<Vec<_>>();
-        let draft_mailbox = role_mailbox(&mail, FolderRole::Drafts, AccountOperation::Send).await?;
+        // One batched Mailbox/get for both roles: `fetch_mailboxes` is an
+        // uncached full listing, so resolving Drafts and Sent separately
+        // would double the wire cost of the hottest write path.
+        let mut roles = role_mailboxes(
+            &mail,
+            &[FolderRole::Drafts, FolderRole::Sent],
+            AccountOperation::Send,
+        )
+        .await?;
+        let draft_mailbox = roles
+            .remove(&FolderRole::Drafts)
+            .ok_or_else(|| missing_role_mailbox(AccountOperation::Send))?;
         let sent_mailbox = if request.save_to_sent == Some(false) {
             None
         } else {
-            Some(role_mailbox(&mail, FolderRole::Sent, AccountOperation::Send).await?)
+            Some(
+                roles
+                    .remove(&FolderRole::Sent)
+                    .ok_or_else(|| missing_role_mailbox(AccountOperation::Send))?,
+            )
         };
 
         let mut create =
@@ -386,11 +401,24 @@ pub(crate) fn send_raw_message<T: HttpTransport>(
         // submission omits an explicit envelope, so the server derives
         // MAIL FROM / RCPT TO from the message's own header fields
         // (RFC 8621 §7) - no MIME parse needed on our side.
-        let draft_mailbox = role_mailbox(&mail, FolderRole::Drafts, AccountOperation::Send).await?;
+        // One batched Mailbox/get for both roles (see send_message).
+        let mut roles = role_mailboxes(
+            &mail,
+            &[FolderRole::Drafts, FolderRole::Sent],
+            AccountOperation::Send,
+        )
+        .await?;
+        let draft_mailbox = roles
+            .remove(&FolderRole::Drafts)
+            .ok_or_else(|| missing_role_mailbox(AccountOperation::Send))?;
         let sent_mailbox = if save_to_sent == Some(false) {
             None
         } else {
-            Some(role_mailbox(&mail, FolderRole::Sent, AccountOperation::Send).await?)
+            Some(
+                roles
+                    .remove(&FolderRole::Sent)
+                    .ok_or_else(|| missing_role_mailbox(AccountOperation::Send))?,
+            )
         };
 
         let blob = mail
@@ -872,7 +900,7 @@ pub(crate) fn identities_list<T: HttpTransport>(
             .await
             .map_err(to_acct_err(AccountOperation::IdentitiesList))?;
         let mut identities = Vec::new();
-        for (idx, mut identity) in response.into_list().into_iter().enumerate() {
+        for mut identity in response.into_list() {
             let id = identity.take_id().into_string();
             let reply_to = identity
                 .reply_to()
@@ -885,7 +913,10 @@ pub(crate) fn identities_list<T: HttpTransport>(
                 signature_text: identity.text_signature().map(str::to_string),
                 signature_html: identity.html_signature().map(str::to_string),
                 reply_to,
-                is_default: idx == 0,
+                // JMAP has no default-identity concept (identity_update
+                // refuses is_default for the same reason) and Identity/get
+                // order is server-arbitrary, so no row is reported default.
+                is_default: false,
             });
         }
         Ok(identities)

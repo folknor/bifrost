@@ -239,6 +239,10 @@ impl AccountOperation {
         // `SetIsRead`, the `*Update` family, and the singleton settings
         // writers drive the target to the same value, so a blind retry
         // is safe (pinned by the JMAP `UpdateFlags` contract test).
+        // `FilterUpdate` is the one `*Update` exception, in the set below:
+        // it is not an id-keyed absolute-state write on every protocol -
+        // Gmail filter "update" is delete+create, and ManageSieve keys on
+        // the script name - so a blind replay can double-apply.
         // Read-only and discovery operations are idempotent by omission.
         !matches!(
             self,

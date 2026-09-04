@@ -347,7 +347,11 @@ impl DavDispatch {
         request: DavRequest,
         operation: AccountOperation,
     ) -> Result<DavResponse, AccountError> {
-        let max_hops = usize::from(bifrost_net::RedirectPolicy::default().max_hops);
+        // The named shared constant, not `RedirectPolicy::default().max_hops`:
+        // DAV has no per-account redirect config, and laundering the cap
+        // through a type Default hid the coupling (changing the default
+        // silently changed DAV behavior).
+        let max_hops = usize::from(bifrost_net::DEFAULT_MAX_HOPS);
         let mut request = request;
         let mut hops = 0usize;
         loop {

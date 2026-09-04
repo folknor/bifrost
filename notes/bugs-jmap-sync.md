@@ -44,34 +44,6 @@ treats exactly this class as `Protocol(ContractViolation)` - and
 check terminating through it closes the hole cheaply. Latent (needs a broken
 server), but the cost is unbounded and invisible.
 
-### 3. Dead routing helper: `JmapAccount::mail_for_object_id` has zero callers
-
-`account.rs` line 157. Masked by the crate-root `#![allow(dead_code)]` that
-`error.rs` explicitly calls out as "the wrong default HERE" for boundary code.
-Its sibling `foreign_account_id_for_object` (line 302) is production-dead
-too - referenced only by tests. Not harmful, but a dead routing function at
-exactly the boundary where a primary-fallback regression would live is the kind
-of hole the module's own `#![warn(dead_code)]` discipline (applied in error.rs
-only) exists to catch. Either delete them or extend the opt-back-in to
-account.rs.
-
-### 4. `send_message` resolves Drafts and Sent with two separate full `Mailbox/get` round trips per send
-
-`pim.rs::send_message` calls `role_mailbox(Drafts)` then `role_mailbox(Sent)` -
-each is an uncached `fetch_mailboxes` listing every mailbox with rights.
-`draft_send` already has the batched `role_mailboxes(&[Sent, Drafts])` helper
-for exactly this reason ("Batching matters because ... `fetch_mailboxes` is an
-uncached round trip"); `send_message` simply doesn't use it. Two wasted
-full-list fetches on the hottest write path. Confident, trivial fix.
-
-### 5. `identities_list` fabricates `is_default: idx == 0`
-
-JMAP has no default-identity concept (the crate itself refuses
-`identity_update(is_default)` as Unsupported), and `Identity/get` order is
-server-arbitrary. Reporting the first row as the default hands the consumer a
-fabricated fact it may persist and act on. Should be `false` (or the shared
-type's "unknown" representation if it has one).
-
 ## Suspected / lower confidence
 
 ### 6. `push_subscribe` with zero mappable scopes returns the wrong error kind
@@ -124,13 +96,12 @@ post-filter in `events_in_range`; fine mechanically, but the total is wrong
 when a calendar filter is supplied. Similarly `pim::search` silently drops
 result emails lacking `threadId` with no `failed_ids` entry.
 
-### 11. Mail search never covers shares
+### 11. Mail search never covers shares (now documented; product gap stays open)
 
 `search`/`search_messages` run only against the primary account; foreign
-accounts, which sync and hydrate fully, are invisible to search. Consistent
-with implementation, but it isn't in `reference/jmap.md`'s Known limitations
-list - a consumer reading the qualified-id story would reasonably expect shared
-mail to be searchable. Doc gap at minimum, product gap at most.
+accounts, which sync and hydrate fully, are invisible to search. The doc gap
+is closed (`reference/jmap.md` Known limitations now states it); whether
+shared mail SHOULD be searchable is a product decision for the owner.
 
 ### 12. `filters_list` downloads script blobs serially
 

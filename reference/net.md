@@ -149,8 +149,10 @@ retry loop never observes: with a low cap, a buffered response could otherwise
 finish minutes after an explicit total timeout, and a streaming response could
 hand up an already-buffered chunk past it. Both are now bounded.
 
-Expiry before the response is `Timeout { Unsent }`; the replacement attempt had
-not been dispatched, so replay is safe for any method. Expiry *after* headers
+Expiry before dispatch of the replacement attempt is `Timeout { Unsent }` and
+replay-safe for any method; a `response_headers_timeout` expiry while awaiting
+headers is `Timeout { InFlight }` - bytes may have gone out, so a
+non-idempotent operation reconciles instead of replaying. Expiry *after* headers
 arrived is `Timeout { Acknowledged }`, which converts to
 `Protocol(PartialResponse)` - the same class an inactivity `read_timeout`
 mid-body produces, deriving to `Retry(SameRequest)` for an idempotent operation
@@ -964,7 +966,12 @@ cannot resolve it as navigation while parsing the assembled URL. The
 query form leaves those values literal because dots have no structural
 meaning there. The HTTP protocol crates name the grammar at every call
 site, preventing path hardening from corrupting search and filter
-values.
+values. The double-escape is safety over addressability, not free: a
+server percent-decodes once, so it receives the literal bytes `%2E` -
+a provider id that is literally `.` or `..` is permanently
+unaddressable through this encoder, and no correct spelling exists
+under WHATWG parsing (single-escaped `%2E` still resolves as
+navigation).
 
 `url::parent_collection_url(resource_url)` returns the parent
 collection of an absolute resource URL. It drops query and fragment

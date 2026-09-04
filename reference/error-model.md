@@ -436,7 +436,9 @@ JSON hides but length-prefixed formats turn into corrupt output.
 `AccountOperation` is the large
 `#[non_exhaustive]` operation enum; `is_idempotent()` is the
 **authoritative idempotency source** `derive` consults. Absolute-state writes
-against a known id, including the `*Update` family and the singleton settings
+against a known id, including the `*Update` family (except `FilterUpdate`,
+which is delete+create on Gmail and name-keyed on ManageSieve, so it sits with
+the non-idempotent writes) and the singleton settings
 writers, are idempotent; sends, creates, deletes, moves, renames, uploads, and
 other potentially double-applied side effects are not. Rename is with the moves
 deliberately: IMAP `RENAME` keys on the old name rather than an id, so a replay

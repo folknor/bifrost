@@ -153,16 +153,26 @@ impl Client {
         let auth_value =
             HeaderValue::from_str(&authorization).map_err(crate::Error::from_invalid_header)?;
 
-        let connector = if url.starts_with("wss") {
-            let native = native_tls::TlsConnector::builder()
-                .danger_accept_invalid_certs(self.accept_invalid_certs)
-                .build()
-                .map_err(crate::Error::from_tls)?;
-            Some(Connector::NativeTls(tokio_native_tls::TlsConnector::from(
-                native,
-            )))
-        } else {
-            None
+        // Match the parsed scheme, not a string prefix: `WSS://` must still
+        // get TLS, and a non-websocket scheme in the capability object is a
+        // malformed session, not something to hand the connector.
+        let scheme = uri.scheme_str().map(str::to_ascii_lowercase);
+        let connector = match scheme.as_deref() {
+            Some("wss") => {
+                let native = native_tls::TlsConnector::builder()
+                    .danger_accept_invalid_certs(self.accept_invalid_certs)
+                    .build()
+                    .map_err(crate::Error::from_tls)?;
+                Some(Connector::NativeTls(tokio_native_tls::TlsConnector::from(
+                    native,
+                )))
+            }
+            Some("ws") => None,
+            _ => {
+                return Err(crate::Error::InvalidUrl(format!(
+                    "websocket capability URL has non-websocket scheme: {url}"
+                )));
+            }
         };
 
         let mut builder = ClientBuilder::from_uri(uri)

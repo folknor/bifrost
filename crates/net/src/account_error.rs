@@ -95,6 +95,13 @@ pub fn into_account_error(error: Error, ctx: NetErrorContext) -> AccountError {
             retry_after,
             final_response,
         } => rate_limited(&ctx, retry_after, &final_response),
+        // KNOWN COARSE: `Cancelled` classifies as Transport(Network) +
+        // InFlight, which for a non-idempotent op derives
+        // Reconcile(TransportDropAfterSend) and a read-back even when the
+        // cancellation happened before dispatch. Today `Cancelled` is only
+        // minted inside `RefreshFailed.source`, so the arm is effectively
+        // unreachable; whoever first surfaces `Cancelled` directly should
+        // split it by whether dispatch had begun.
         Error::Cancelled => {
             let builder = base_builder(
                 &ctx,

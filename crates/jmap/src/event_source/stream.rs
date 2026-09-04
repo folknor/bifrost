@@ -33,10 +33,19 @@ impl<T: HttpTransport + SseTransport> Client<T> {
                 URLPart::Parameter(param) => match param {
                     super::URLParameter::Types => {
                         if let Some(types) = types.take() {
+                            // Each type is percent-encoded individually
+                            // (`DataType::Other` is arbitrary wire-derived
+                            // text; a raw `,`, `&`, or `#` would splice the
+                            // query string), while the separating commas stay
+                            // literal - the same RFC 6570 discipline the blob
+                            // templates document in `session.rs`.
                             event_source_url.push_str(
                                 &types
                                     .into_iter()
-                                    .map(|t| t.to_string())
+                                    .map(|t| {
+                                        crate::core::session::encode_template_value(&t.to_string())
+                                            .to_string()
+                                    })
                                     .collect::<Vec<_>>()
                                     .join(","),
                             );

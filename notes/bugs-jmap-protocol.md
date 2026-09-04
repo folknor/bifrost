@@ -51,16 +51,6 @@ this one fix covers the sync-layer sites too (grep the whole crate for
 `format!`-built patch paths when applying it); do not file or fix the sync-side
 instances separately.
 
-### 4. EventSource URL building violates the crate's own RFC 6570 rule
-
-`event_source/stream.rs:34-56`: the `{types}`, `{closeafter}`, `{ping}` template
-substitutions are pushed raw - no `encode_template_value` - while blob
-upload/download go to considerable lengths (with tests and a documented
-rationale in `session.rs`) to percent-encode every template value.
-`DataType::Other(String)` is arbitrary wire-derived text, so a `,`, `&` or `#`
-in it splices the query string. Inconsistent with the invariant the crate
-documents for itself.
-
 ### 5. `SetResponse::new_state()` fabricates an empty state string
 
 `core/set.rs:302-308`: `new_state` is modeled `Option<String>` but the accessors
@@ -70,17 +60,6 @@ layer's state cache documents special "explicitly empty" semantics for exactly
 this shape, so a non-conforming server yields a silently poisoned cache entry
 rather than a `ContractViolation`. The leniency in `GetResponse.not_found` is
 documented and reconciled against; this one is neither.
-
-### 6. `create()` / `create_with_id` / `create_item` id-generation can collide
-
-`core/set.rs:235-265`: auto create-ids are `format!("c{len}")`. Mixing
-`create_with_id("c1")` with a later `create()` (len=1 -> "c1") makes
-`entry("c1").or_insert_with` silently hand back the *existing* entry - two
-logical creates aliased into one - and `create_item` at the same collision
-*overwrites* an entry, losing an object without error. Same len-based scheme in
-`blob/manage.rs` (`b{len}`) and `CopyRequest::create` overwrites silently on
-duplicate id. Latent (current call sites don't mix), but it's a foot-gun in the
-core builder.
 
 ### 7. `Response::get` picks an arbitrary response when call ids repeat
 
@@ -102,15 +81,6 @@ method structs happily serialize `"accountId": ""`.
 The reference even documents `build()`'s "lexicographically first primary
 capability" fallback - which for a session advertising *only* calendars means
 mail-ish generic requests quietly ride the calendar account.
-
-### 9. `connect_ws` scheme handling is string-prefix guesswork
-
-`client_ws.rs:156`: TLS iff `url.starts_with("wss")`. Case-sensitive (a server
-advertising `WSS://...` gets a plaintext connector and a confusing handshake
-failure), and a non-websocket scheme (`https://...` in the websocket
-capability) isn't rejected - it goes to `ClientBuilder` and fails with whatever
-tokio-websockets says. Parse the `Uri` (already available two lines up) and
-match its scheme.
 
 ## Suspicions / lesser notes
 

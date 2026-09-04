@@ -83,10 +83,16 @@ pub struct RedirectPolicy {
     pub trusted_hosts: HashSet<String>,
 }
 
+/// The default redirect hop cap. A named constant rather than a bare
+/// literal in `Default` because non-pipeline redirect walkers (dav-core's
+/// self-walked loop) cite the same number; changing the default must
+/// change them together, visibly.
+pub const DEFAULT_MAX_HOPS: u8 = 10;
+
 impl Default for RedirectPolicy {
     fn default() -> Self {
         Self {
-            max_hops: 10,
+            max_hops: DEFAULT_MAX_HOPS,
             trusted_hosts: HashSet::new(),
         }
     }
