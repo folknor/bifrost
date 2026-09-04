@@ -447,13 +447,19 @@ async fn idle_loop(account: ImapAccount, cancel: CancellationToken, slot: usize)
             let interrupted_by_resubscribe = round_cancel.is_cancelled() && !cancel.is_cancelled();
             nudge.abort();
             match idle_result {
-                Ok(event) if interrupted_by_resubscribe => {
+                // A BYE that lands in the same round a resubscribe cancels is
+                // still a BYE: the connection is dead, so it takes the plain
+                // arm below (Disconnected, redial) rather than a re-IDLE on a
+                // closed socket.
+                Ok(event) if interrupted_by_resubscribe && !event_closes_connection(&event) => {
                     // The scope set changed and this IDLE was cancelled so
                     // the folder choice can be re-evaluated. Absorb what did
                     // come back either way (cache coherence is independent
                     // of what happens next).
-                    if !matches!(event, IdleEvent::Cancelled) {
-                        let _ = absorb_idle_event(&account, &folder, uidvalidity, &event);
+                    if !matches!(event, IdleEvent::Cancelled)
+                        && absorb_idle_event(&account, &folder, uidvalidity, &event).is_err()
+                    {
+                        let _ = account.push.tx.send(invalidated(HintPayload::Unknown));
                     }
                     // Re-choose under the new scope set. Marking the
                     // generation seen first keeps the same discipline as the
