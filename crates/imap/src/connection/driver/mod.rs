@@ -530,9 +530,22 @@ pub(super) async fn driver_task(
     }
 
     // Graceful shutdown: send LOGOUT if still authenticated.
-    // Best-effort; ignore errors.
-    let _ = logout_best_effort(&mut wire_reader, &mut state, &mut tag_gen, &mut event_sink).await;
+    // Best-effort; ignore errors. The drain is bounded: this runs on a
+    // detached task after the last handle dropped, so nothing can abort
+    // it, and an unbounded read loop against a stalled or half-open peer
+    // would leak the task and its socket for the process lifetime (the
+    // same hazard the IDLE DONE handshake bounds one layer up). On
+    // timeout the socket is simply dropped, which is an acceptable
+    // teardown for a peer that is not answering LOGOUT.
+    let _ = tokio::time::timeout(
+        LOGOUT_DRAIN_TIMEOUT,
+        logout_best_effort(&mut wire_reader, &mut state, &mut tag_gen, &mut event_sink),
+    )
+    .await;
 }
+
+/// Upper bound on the terminal LOGOUT write + BYE/OK drain.
+const LOGOUT_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 // ---------------------------------------------------------------------------
 // Command execution

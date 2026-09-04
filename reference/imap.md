@@ -44,6 +44,13 @@ not abandoned). Without this, the next checkout queues behind the still
 running command and times out in turn, so one slow command cascades into a
 run of spurious timeouts on the same connection.
 
+The driver's terminal best-effort LOGOUT (run when the last handle drops
+and the command channel closes) is time-bounded (`LOGOUT_DRAIN_TIMEOUT`,
+5s): it runs on a detached task nothing can abort, so an unbounded BYE/OK
+drain against a stalled or half-open peer would leak the task and its
+socket for the process lifetime - the same hazard the IDLE DONE handshake
+bounds. On timeout the transport is dropped without the graceful exchange.
+
 An untagged `* BYE` is fatal in every driver read loop - regular command,
 prebuilt command, pipeline batch, IDLE (and its drain), literal
 continuation wait, and best-effort LOGOUT. Regular and prebuilt commands use

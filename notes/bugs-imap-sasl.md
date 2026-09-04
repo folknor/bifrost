@@ -18,25 +18,11 @@ or uidvalidity as `Request(Malformed)`, closing every downstream hole at once.
 Pinned by `object_and_thread_ids_reject_uid_zero_and_uidvalidity_zero` with
 revert-and-confirm; documented in `reference/imap.md`.)
 
-### 2. `logout_best_effort` is unbounded, and dropping an `ImapConnection` leaks the driver task against a silent peer
-
-- `crates/imap/src/connection/driver/upgrade.rs::logout_best_effort` writes
-  LOGOUT and then `read_one()`s in a loop with **no timeout**. It runs at the
-  end of `driver_task` (`driver/mod.rs`) when the last handle drops.
-- `crates/imap/src/connection/mod.rs` - dropping `ImapConnection` does not
-  abort the driver (only `terminate()` does, and `Pool` holds only `Weak`
-  refs, which are dead by the time the Arc is dropped). So every path that
-  just drops a connection - the push loop redial (`account/push.rs`, on
-  `Disconnected`/`Bye`/resubscribe break), `PooledConn::discard`, dead members
-  retained out of `idle` - hands the socket to a detached task that will sit
-  in the LOGOUT read loop until the peer closes TCP or OS keepalive gives up.
-  Against a stalled/half-open peer this accumulates leaked tasks and sockets
-  for the account's lifetime; `Account::close` cannot reach them (the weak
-  registry entry is gone). The DONE-handshake timeout added for IDLE
-  (`connection/idle.rs`) shows the exact hazard was recognized one layer up;
-  the terminal LOGOUT drain has the same shape and no bound. Fix: bound
-  `logout_best_effort` with the command timeout (or a short fixed one) inside
-  the driver.
+(Finding 2 - the unbounded terminal LOGOUT drain leaking detached driver
+tasks and sockets against a silent peer - is fixed: the drain is wrapped in a
+5s `LOGOUT_DRAIN_TIMEOUT` inside `driver_task`. Pinned by the paused-time
+test `driver_logout_drain_is_bounded_against_a_silent_peer` with
+revert-and-confirm; documented in `reference/imap.md`.)
 
 ## Latent defects / suspected
 

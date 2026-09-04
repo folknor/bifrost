@@ -130,6 +130,40 @@ async fn peer_certificate_der_none_over_memory_stream() {
     );
 }
 
+/// Dropping the last handle detaches the driver task, which then runs
+/// the terminal LOGOUT drain with nothing able to abort it. Against a
+/// peer that stays connected but never answers, an unbounded drain
+/// leaks the task and its socket for the process lifetime - so the
+/// drain must be time-bounded. Paused time: the bound elapses
+/// instantly, and a regression (unbounded read loop) fails the outer
+/// timeout instead of hanging the suite.
+#[tokio::test(start_paused = true)]
+async fn driver_logout_drain_is_bounded_against_a_silent_peer() {
+    let (conn, mut server) = make_driver_test_pair().await;
+    let handle = conn
+        .driver_handle
+        .lock()
+        .await
+        .take()
+        .expect("driver handle present");
+    drop(conn);
+
+    // The driver writes its best-effort LOGOUT; the peer reads it and
+    // then goes silent while keeping the connection open.
+    let mut buf = [0u8; 256];
+    let n = server.read(&mut buf).await.unwrap();
+    assert!(
+        String::from_utf8_lossy(&buf[..n]).contains("LOGOUT"),
+        "driver must attempt the best-effort LOGOUT"
+    );
+
+    tokio::time::timeout(std::time::Duration::from_secs(300), handle)
+        .await
+        .expect("bounded LOGOUT drain must let the detached driver exit")
+        .expect("driver task must not panic");
+    drop(server);
+}
+
 /// Invariant: a consumer that panics inside the driver task surfaces
 /// as `Error::DriverPanicked` on the caller side. The panic message
 /// is extracted from the `JoinError` and included in the error.
