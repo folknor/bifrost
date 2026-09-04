@@ -708,8 +708,20 @@ impl SmtpConnection {
                 return Ok(progress);
             }
 
+            // A batch keeps recipient indexes across windows, but the stream
+            // is only reusable after every reply for this window is drained.
+            self.stream.get_ref().state().verify().map_err(|error| {
+                (
+                    error
+                        .with_attempt(SmtpTransmissionState::Unsent)
+                        .with_phase(SmtpCommandPhase::RcptTo),
+                    progress.clone(),
+                )
+            })?;
+            self.stream.get_mut().set_state(ConnectionState::Broken);
+
             if window_start == 0 {
-                let mail_response = match self.read_response_accepting_status() {
+                let mail_response = match self.read_response_inner(true, false) {
                     Ok(r) => r,
                     Err(e) => {
                         self.abort();
@@ -732,7 +744,7 @@ impl SmtpConnection {
             }
 
             for i in window_start..window_end {
-                match self.read_response_accepting_status() {
+                match self.read_response_inner(true, false) {
                     Ok(resp) if resp.is_positive() => progress.record_rcpt_accepted(i),
                     Ok(resp) => progress.record_rcpt_rejected(i, resp),
                     Err(e) => {
@@ -752,6 +764,14 @@ impl SmtpConnection {
                     }
                 }
             }
+            self.finish_reply_group().map_err(|error| {
+                (
+                    error
+                        .with_attempt(SmtpTransmissionState::Unsent)
+                        .with_phase(SmtpCommandPhase::RcptTo),
+                    progress.clone(),
+                )
+            })?;
         }
 
         let accepted = progress.recipients.iter().any(|r| {
@@ -2380,6 +2400,54 @@ mod transcript_tests {
         assert_eq!(outcome.failed().len(), 1);
         assert_eq!(outcome.failed()[0].item.0, "item-31");
         assert_eq!(outcome.succeeded().last().unwrap().item.0, "item-32");
+        transcript.assert_exhausted();
+    }
+
+    /// A real PIPELINING peer answers the whole window in one TCP segment, so
+    /// after the MAIL reply is parsed the buffer still holds every RCPT reply.
+    /// The window drain must defer the surplus-bytes check to
+    /// `finish_reply_group`, exactly like the envelope pipelined path and the
+    /// async twin; a per-reply surplus check misreads a healthy exchange as an
+    /// unsolicited reply and fails the batch.
+    #[test]
+    fn pipelined_batch_drains_coalesced_window_replies() {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let addresses = recipients(3);
+        let mut window = "MAIL FROM:<sender@example.com>\r\n".to_owned();
+        window.push_str(&recipient_commands(&addresses));
+        let mut replies = "250 sender ok\r\n".to_owned();
+        replies.push_str(&"250 recipient ok\r\n".repeat(3));
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250-smtp.example\r\n250 PIPELINING\r\n")
+            .expect_coalesced(window, replies)
+            .expect("DATA\r\n", "354 send body\r\n")
+            .expect("body", "")
+            .expect("\r\n.\r\n", "250 queued\r\n");
+        let batch = addresses
+            .into_iter()
+            .enumerate()
+            .map(|(index, address)| SmtpBatchRecipient {
+                id: BatchItemId(format!("item-{index}")),
+                address,
+            })
+            .collect();
+
+        let mut connection =
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp).unwrap();
+        let outcome = connection
+            .send_smtp_batch(
+                Some("sender@example.com".parse().unwrap()),
+                batch,
+                b"body",
+                &Default::default(),
+            )
+            .unwrap()
+            .resolve();
+
+        assert_eq!(outcome.succeeded().len(), 3);
+        assert!(outcome.failed().is_empty());
+        assert!(outcome.uncertain().is_empty());
+        assert!(!connection.has_broken());
         transcript.assert_exhausted();
     }
 

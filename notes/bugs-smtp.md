@@ -5,47 +5,13 @@ Hunt date: 2026-09-04. Hunter: Claude (Fable 5), read-only. Scope:
 model, metering, message builder, DKIM, parsers, plus `reference/smtp.md` and
 the test harness.
 
-Hunter's verification note: the high-severity finding below was verified by
-re-reading both drivers side by side - the sync batch pipelined driver really
-does call the `manage_state = true` reader (`read_response_accepting_status`,
-connection.rs lines 709 and 732) while the async twin calls
-`read_response_with_budget_inner(_, true, false)`, and the surplus-bytes check
-inside the `manage_state` reader errors whenever the `BufReader` still holds
-bytes after one reply.
-
 ## Confident defects
 
-### 1. (HIGH) Sync `send_smtp_batch_pipelined` misfires the "unsolicited reply" check on normally-coalesced pipelined replies - the whole batch fails against a real PIPELINING relay
-
-`crates/smtp/src/transport/smtp/client/connection.rs` lines ~709 and ~732: the
-sync batch pipelined driver drains window replies with
-`read_response_accepting_status()`, which is the `manage_state = true` reader.
-That reader (line ~1976) returns `Err(parse("SMTP server sent an unsolicited
-reply"))` whenever the `BufReader` buffer is non-empty after parsing one
-reply. In a pipelined window the peer's replies for MAIL + all RCPTs almost
-always arrive in one TCP segment, so after parsing the MAIL reply the buffer
-still holds the RCPT replies - the first drain errors, the connection is
-aborted, and `SmtpTransport::send_raw_batch_with_options` returns a
-batch-level error (or all-Unsent lanes) for a perfectly healthy exchange. The
-async twin does it correctly: `async_connection.rs` lines ~874/900 use
-`read_response_with_budget_inner(budget, true, false)` (surplus check
-deferred), plus `finish_reply_group()` at the end of each window; the sync
-batch path has neither the `manage_state=false` reads, nor the
-hold-Broken-across-the-window invariant, nor a `finish_reply_group`. This
-contradicts two explicit reference claims ("Both sync and async drivers hold
-the stream Broken from a successful window write until the complete reply
-group has drained", "This shape is identical in the blocking and async
-drivers"). The tests never catch it because the `Transcript` harness's default
-one-line-per-read behavior empties the buffer between replies; the sync batch
-pipelined tests never use `expect_coalesced`, which exists precisely to model
-this. Fix: mirror the async shape (verify + set Broken after the window
-write, `read_response_inner(true, false)` for the drain, `finish_reply_group()`
-after). This is exactly the crate's own documented recurring defect shape: a
-fix landed in one half only.
-Test obligation: a sync batch pipelined test using `expect_coalesced` window
-replies (the harness feature that exists precisely to model this and that no
-sync batch test uses), with revert-and-confirm that it fails against the
-current reader.
+(Finding 1, HIGH - the sync batch pipelined driver misfiring the unsolicited-
+reply check on coalesced window replies - is fixed: the sync path now mirrors
+the async shape (verify + Broken after the window write, deferred surplus
+reads, `finish_reply_group` per window), pinned by
+`pipelined_batch_drains_coalesced_window_replies` with revert-and-confirm.)
 
 ### 2. Non-pipelined direct sends abort the connection on every routine negative reply
 
