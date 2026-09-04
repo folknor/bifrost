@@ -1,4 +1,5 @@
 use std::pin::Pin;
+use std::sync::Arc;
 
 use bytes::Bytes;
 use futures::{SinkExt, Stream, StreamExt, stream::SplitSink};
@@ -149,6 +150,173 @@ pub(crate) struct WsStream {
     tx: SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
 }
 
+/// Callers waiting for a WebSocket response, keyed by the RFC 8887
+/// `requestId` their request carried.
+///
+/// The map is the await side of the WebSocket request door: `send_ws`
+/// alone puts a frame on the wire and returns an id, which correlates
+/// nothing on its own because the read stream is consumed by the push
+/// reader. Registering here before the frame is written, and routing
+/// matching response frames out of `frame_stream`, is what lets a caller
+/// send over WebSocket and get its own answer back.
+///
+/// Entries are stamped with a CONNECTION GENERATION. A waiter can only
+/// ever be answered by the connection it was registered on, so a
+/// reconnect fails every older-generation waiter with a retryable error
+/// rather than leaving it parked on a socket that no longer exists - and,
+/// symmetrically, an old read stream that is drained to EOF *after* the
+/// reconnect fails only its own generation and cannot reap a waiter
+/// belonging to the live connection.
+pub(crate) struct PendingRequests {
+    inner: std::sync::Mutex<PendingInner>,
+}
+
+struct PendingInner {
+    generation: u64,
+    waiters: HashMap<String, Waiter>,
+}
+
+struct Waiter {
+    generation: u64,
+    tx: tokio::sync::oneshot::Sender<crate::Result<Response>>,
+}
+
+impl PendingRequests {
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: std::sync::Mutex::new(PendingInner {
+                generation: 0,
+                waiters: HashMap::new(),
+            }),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, PendingInner> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Open a new connection generation: every waiter still registered
+    /// belongs to a connection that is being replaced and can never be
+    /// answered, so each is failed with `error()`. Returns the generation
+    /// requests sent on the new connection must register under.
+    pub(crate) fn begin_connection(&self, error: impl Fn() -> crate::Error) -> u64 {
+        let mut inner = self.lock();
+        inner.generation = inner.generation.wrapping_add(1);
+        let generation = inner.generation;
+        for (_, waiter) in inner.waiters.drain() {
+            let _ = waiter.tx.send(Err(error()));
+        }
+        generation
+    }
+
+    /// Register `id` under `generation`. The returned handle deregisters
+    /// on drop, so a caller that goes away before its response arrives
+    /// leaves nothing behind for the reader to route to.
+    pub(crate) fn register(self: &Arc<Self>, id: String, generation: u64) -> PendingResponse {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.lock()
+            .waiters
+            .insert(id.clone(), Waiter { generation, tx });
+        PendingResponse {
+            pending: Arc::clone(self),
+            id,
+            rx,
+        }
+    }
+
+    /// Hand `outcome` to the waiter registered for `id`.
+    ///
+    /// Returns the outcome back when there is no such waiter - an id
+    /// nobody is waiting on, or one whose caller was dropped between the
+    /// lookup and the send. The reader then yields it on the stream
+    /// exactly as it did before this map existed, so an unknown id
+    /// wedges nothing.
+    fn resolve(
+        &self,
+        id: &str,
+        outcome: crate::Result<Response>,
+    ) -> Result<(), crate::Result<Response>> {
+        let Some(waiter) = self.lock().waiters.remove(id) else {
+            return Err(outcome);
+        };
+        waiter.tx.send(outcome)
+    }
+
+    /// Fail every waiter belonging to `generation`. Used when a read
+    /// stream ends: whatever that connection had not answered by then it
+    /// never will.
+    fn fail_generation(&self, generation: u64, error: impl Fn() -> crate::Error) {
+        let mut inner = self.lock();
+        let ids: Vec<String> = inner
+            .waiters
+            .iter()
+            .filter(|(_, waiter)| waiter.generation == generation)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in ids {
+            if let Some(waiter) = inner.waiters.remove(&id) {
+                let _ = waiter.tx.send(Err(error()));
+            }
+        }
+    }
+
+    /// The generation new registrations belong to. Read under the
+    /// client's WebSocket sink lock, which is what makes it the
+    /// generation of the connection the frame is about to be written to.
+    pub(crate) fn generation(&self) -> u64 {
+        self.lock().generation
+    }
+
+    fn remove(&self, id: &str) {
+        self.lock().waiters.remove(id);
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.lock().waiters.len()
+    }
+}
+
+/// A registered wait for one WebSocket response.
+///
+/// Dropping it deregisters the id. That is the whole teardown story for
+/// the caller side: a waiter that goes away before its frame arrives
+/// leaves no entry behind, so the map cannot grow without bound on
+/// cancelled or timed-out calls, and the late frame falls through to the
+/// stream as an unrouted response.
+pub(crate) struct PendingResponse {
+    pending: Arc<PendingRequests>,
+    id: String,
+    rx: tokio::sync::oneshot::Receiver<crate::Result<Response>>,
+}
+
+impl PendingResponse {
+    pub(crate) fn request_id(&self) -> &str {
+        &self.id
+    }
+
+    /// Await the correlated response.
+    ///
+    /// A dropped sender means the registration was torn down without an
+    /// answer (the connection went away by a route that did not fail it
+    /// explicitly); report it as the same retryable close the reconnect
+    /// path reports rather than hanging.
+    pub(crate) async fn response(mut self) -> crate::Result<Response> {
+        match (&mut self.rx).await {
+            Ok(outcome) => outcome,
+            Err(_) => Err(crate::Error::WebSocketClosed),
+        }
+    }
+}
+
+impl Drop for PendingResponse {
+    fn drop(&mut self) {
+        self.pending.remove(&self.id);
+    }
+}
+
 impl Client {
     pub(crate) async fn connect_ws(
         &self,
@@ -211,23 +379,88 @@ impl Client {
         validate_ws_subprotocol(&response)?;
         let (tx, rx) = stream.split();
 
-        *self.ws.lock().await = WsStream { tx }.into();
+        // Install the new sink and open the new pending-request
+        // generation under the SAME lock. `send_ws` registers its waiter
+        // while holding this lock too, so registration and connection
+        // replacement are serialized: a waiter is only ever registered
+        // against an installed connection, and every waiter of the
+        // connection being replaced is failed here with a retryable
+        // error instead of parking forever on a socket that is gone.
+        let mut sink = self.ws.lock().await;
+        let generation = self
+            .ws_pending
+            .begin_connection(|| crate::Error::WebSocketClosed);
+        *sink = WsStream { tx }.into();
+        drop(sink);
 
         // The read half must run the same session-divergence check the
         // HTTP door runs. A `Client` clone is an `Arc` bump and the stream
         // outlives this call, so the closure owns one.
         let client = self.clone();
-        Ok(Box::pin(frame_stream(rx, move |session_state| {
-            client.note_session_state(session_state);
-        })))
+        let pending = Arc::clone(&self.ws_pending);
+        Ok(Box::pin(frame_stream(
+            rx,
+            pending,
+            generation,
+            move |session_state| {
+                client.note_session_state(session_state);
+            },
+        )))
     }
 
+    /// Put a request frame on the WebSocket and return the `requestId`
+    /// it was assigned. Fire-and-forget: nothing waits for the answer.
+    /// Use [`Client::send_ws_awaiting`] to get the correlated response.
     pub(crate) async fn send_ws(&self, request: Request<'_>) -> crate::Result<String> {
-        let mut _ws = self.ws.lock().await;
-        let ws = _ws
+        let (frame, request_id) = self.encode_ws_request(request)?;
+        let mut sink = self.ws.lock().await;
+        sink.as_mut()
+            .ok_or_else(|| crate::Error::WebSocketNotConnected)?
+            .tx
+            .send(Message::text(frame))
+            .await
+            .map_err(crate::Error::WebSocketRuntime)?;
+
+        Ok(request_id)
+    }
+
+    /// Send a request over the WebSocket and hand back a handle that
+    /// resolves to the response frame carrying the same `requestId`.
+    ///
+    /// The waiter is registered BEFORE the frame is written and while the
+    /// sink lock is held, so a server that answers immediately cannot
+    /// beat the registration, and a reconnect cannot slip between the two
+    /// and leave a waiter attached to a connection that never carried the
+    /// request. If the write fails, the returned handle is dropped on the
+    /// error path and the registration goes with it.
+    pub(crate) async fn send_ws_awaiting(
+        &self,
+        request: Request<'_>,
+    ) -> crate::Result<PendingResponse> {
+        let (frame, request_id) = self.encode_ws_request(request)?;
+        let mut sink = self.ws.lock().await;
+        let ws = sink
             .as_mut()
             .ok_or_else(|| crate::Error::WebSocketNotConnected)?;
+        let pending = self
+            .ws_pending
+            .register(request_id, self.ws_pending.generation());
+        ws.tx
+            .send(Message::text(frame))
+            .await
+            .map_err(crate::Error::WebSocketRuntime)?;
 
+        Ok(pending)
+    }
+
+    /// Encode one RFC 8887 `Request` frame, assigning its `requestId`
+    /// and enforcing the session's `maxSizeRequest`.
+    ///
+    /// The size guard is on the encoded FRAME, not on the HTTP body the
+    /// same calls would have produced: `maxSizeRequest` bounds the
+    /// request the server receives, and over WebSocket that request is
+    /// the frame, envelope and `requestId` included.
+    fn encode_ws_request(&self, request: Request<'_>) -> crate::Result<(String, String)> {
         // Assign a request id. The counter is the CLIENT's, so ids do not
         // repeat across reconnects: a per-connection counter restarted at
         // 0, and a late response from the old connection then carried an
@@ -244,12 +477,23 @@ impl Client {
             created_ids: request.created_ids,
         })
         .map_err(crate::Error::RequestEncode)?;
-        ws.tx
-            .send(Message::text(frame))
-            .await
-            .map_err(crate::Error::WebSocketRuntime)?;
 
-        Ok(request_id)
+        // Only an advertised, non-zero limit is enforced, for the same
+        // reason `CallLimit` refuses to enforce its two unusable states:
+        // an absent or zero `maxSizeRequest` is a session-validation
+        // matter, and enforcing it here would turn it into a client bug
+        // on a request that could never fit anything.
+        if let Some(core) = self.session().core_capabilities() {
+            let max = core.max_size_request();
+            if max > 0 && frame.len() > max {
+                return Err(crate::Error::RequestSizeLimit {
+                    max,
+                    size: frame.len(),
+                });
+            }
+        }
+
+        Ok((frame, request_id))
     }
 
     pub(crate) async fn enable_push_ws(
@@ -313,8 +557,18 @@ impl Client {
 /// the WebSocket door detects session divergence exactly as the HTTP door
 /// does. It is a callback rather than a `Client` handle so this function
 /// stays drivable from an in-memory frame transcript.
+///
+/// `pending` is the correlation map: a `Response` or `RequestError` frame
+/// whose `requestId` a caller is waiting on is routed to that caller and
+/// NOT yielded, since the outcome belongs to whoever asked for it. Every
+/// other frame - all push traffic, pongs, and any response for an id
+/// nobody is waiting on - is yielded exactly as before, so the push
+/// reader is unaffected. When the stream ends, waiters of `generation`
+/// are failed: this connection will answer nothing further.
 fn frame_stream<S, F>(
     mut rx: S,
+    pending: Arc<PendingRequests>,
+    generation: u64,
     mut on_session_state: F,
 ) -> impl Stream<Item = crate::Result<WebSocketMessage>> + use<S, F>
 where
@@ -345,12 +599,25 @@ where
                                     "createdIds": response.created_ids,
                                     "sessionState": response.session_state,
                                 });
-                                match serde_json::from_value::<Response>(json) {
-                                    Ok(response) => yield Ok(WebSocketMessage::Response {
-                                        request_id,
-                                        response,
-                                    }),
-                                    Err(e) => yield Err(crate::Error::ResponseDecode(e)),
+                                let outcome = serde_json::from_value::<Response>(json)
+                                    .map_err(crate::Error::ResponseDecode);
+                                // Route to the caller waiting on this id, if
+                                // any. A decode failure goes to the waiter too:
+                                // the frame WAS its answer, and yielding the
+                                // error onto the push stream instead would leave
+                                // that caller parked until the connection died.
+                                let unrouted = match request_id.as_deref() {
+                                    Some(id) => pending.resolve(id, outcome).err(),
+                                    None => Some(outcome),
+                                };
+                                if let Some(outcome) = unrouted {
+                                    match outcome {
+                                        Ok(response) => yield Ok(WebSocketMessage::Response {
+                                            request_id,
+                                            response,
+                                        }),
+                                        Err(e) => yield Err(e),
+                                    }
                                 }
                             }
                             WebSocketMessage_::StateChange { changed, push_state } => {
@@ -360,7 +627,25 @@ where
                             WebSocketMessage_::CalendarAlert(alert) => {
                                 yield Ok(WebSocketMessage::PushNotification(PushObject::CalendarAlert(alert)))
                             }
-                            WebSocketMessage_::RequestError(err) => yield Err(ProblemDetails::from(err).into()),
+                            WebSocketMessage_::RequestError(err) => {
+                                // A request-level error naming a requestId is
+                                // that request's answer, so it fails the waiter
+                                // rather than riding the push stream. An error
+                                // with no id - notably the asynchronous
+                                // rejection of a push-enable frame, which
+                                // carries no id - is yielded exactly as before,
+                                // which is what the push reader's reconnect
+                                // logic reads.
+                                let request_id = err.request_id.clone();
+                                let error: crate::Error = ProblemDetails::from(err).into();
+                                let unrouted = match request_id.as_deref() {
+                                    Some(id) => pending.resolve(id, Err(error)).err(),
+                                    None => Some(Err(error)),
+                                };
+                                if let Some(Err(error)) = unrouted {
+                                    yield Err(error);
+                                }
+                            }
                         },
                         Err(err) => yield Err(err.into()),
                     }
@@ -385,6 +670,13 @@ where
                 Err(err) => yield Err(crate::Error::WebSocketRuntime(err)),
             }
         }
+
+        // The connection is finished, so nothing it was asked will ever
+        // be answered. Fail this generation's waiters with the retryable
+        // close rather than leaving them parked. Only this generation:
+        // an old stream drained to EOF after a reconnect must not reap a
+        // waiter belonging to the live connection.
+        pending.fail_generation(generation, || crate::Error::WebSocketClosed);
 
         if saw_close {
             yield Err(crate::Error::WebSocketClosed);
@@ -523,9 +815,39 @@ mod tests {
         frames: Vec<Result<Message, tokio_websockets::Error>>,
         observe: impl FnMut(&str),
     ) -> Vec<crate::Result<WebSocketMessage>> {
-        frame_stream(StubWsTransport::new(frames).open_ws(), observe)
-            .collect::<Vec<_>>()
-            .await
+        let pending = Arc::new(PendingRequests::new());
+        let generation = pending.generation();
+        frame_stream(
+            StubWsTransport::new(frames).open_ws(),
+            pending,
+            generation,
+            observe,
+        )
+        .collect::<Vec<_>>()
+        .await
+    }
+
+    /// `decode`, against a caller-supplied pending map so a test can
+    /// register waiters and see which frames the reader routes to them.
+    fn decode_with_pending(
+        frames: Vec<Result<Message, tokio_websockets::Error>>,
+        pending: &Arc<PendingRequests>,
+        generation: u64,
+    ) -> impl std::future::Future<Output = Vec<crate::Result<WebSocketMessage>>> + use<> {
+        let stream = frame_stream(
+            StubWsTransport::new(frames).open_ws(),
+            Arc::clone(pending),
+            generation,
+            |_| {},
+        );
+        async move { stream.collect::<Vec<_>>().await }
+    }
+
+    fn response_frame(id: Option<&str>, session_state: &str) -> Message {
+        let id = id.map_or(String::new(), |id| format!(r#""requestId":"{id}","#));
+        Message::text(format!(
+            r#"{{"@type":"Response",{id}"methodResponses":[["Core/echo",{{}},"c0"]],"sessionState":"{session_state}"}}"#
+        ))
     }
 
     #[tokio::test]
@@ -716,6 +1038,421 @@ mod tests {
 
         assert_eq!(out.len(), 1);
         assert!(matches!(out[0], Err(crate::Error::ResponseDecode(_))));
+    }
+
+    /// The point of the correlation map: a caller can send over the
+    /// WebSocket and get back ITS answer. Two waiters must be told apart
+    /// on one read stream, whatever order the server answers in, and a
+    /// routed frame must not also ride the push stream - the outcome
+    /// belongs to the caller that asked for it.
+    #[tokio::test]
+    async fn two_in_flight_requests_are_told_apart_on_the_read_stream() {
+        let pending = Arc::new(PendingRequests::new());
+        let generation = pending.generation();
+        let seven = pending.register("7".to_string(), generation);
+        let eight = pending.register("8".to_string(), generation);
+
+        // Answered out of order, which is exactly the case an id-less
+        // reader cannot survive.
+        let out = decode_with_pending(
+            vec![
+                Ok(response_frame(Some("8"), "s-8")),
+                Ok(response_frame(Some("7"), "s-7")),
+            ],
+            &pending,
+            generation,
+        )
+        .await;
+
+        assert!(out.is_empty(), "routed frames must not be yielded: {out:?}");
+        assert_eq!(
+            seven
+                .response()
+                .await
+                .expect("waiter 7 answered")
+                .session_state(),
+            "s-7"
+        );
+        assert_eq!(
+            eight
+                .response()
+                .await
+                .expect("waiter 8 answered")
+                .session_state(),
+            "s-8"
+        );
+        assert_eq!(pending.len(), 0, "answered waiters must be deregistered");
+    }
+
+    /// A response for an id nobody is waiting on - a late frame from a
+    /// cancelled call, or a server echoing something we never sent -
+    /// must not wedge the reader. It falls through to the stream exactly
+    /// as it did before the map existed.
+    #[tokio::test]
+    async fn a_response_for_an_unknown_id_still_reaches_the_stream() {
+        let pending = Arc::new(PendingRequests::new());
+        let generation = pending.generation();
+        let waiter = pending.register("7".to_string(), generation);
+
+        let out = decode_with_pending(
+            vec![
+                Ok(response_frame(Some("999"), "s-unknown")),
+                Ok(response_frame(Some("7"), "s-7")),
+            ],
+            &pending,
+            generation,
+        )
+        .await;
+
+        assert_eq!(out.len(), 1, "only the unrouted frame is yielded: {out:?}");
+        let Ok(WebSocketMessage::Response {
+            request_id,
+            response,
+        }) = &out[0]
+        else {
+            panic!("expected Response, got {:?}", out[0]);
+        };
+        assert_eq!(request_id.as_deref(), Some("999"));
+        assert_eq!(response.session_state(), "s-unknown");
+        // The frame the reader could not route did not stop it routing
+        // the one it could.
+        assert_eq!(
+            waiter
+                .response()
+                .await
+                .expect("waiter answered")
+                .session_state(),
+            "s-7"
+        );
+    }
+
+    /// Teardown on the caller side: a waiter dropped before its response
+    /// must leave no entry behind, or the map grows without bound on
+    /// every cancelled or timed-out call. The late frame then falls
+    /// through to the stream like any unknown id.
+    #[tokio::test]
+    async fn a_dropped_waiter_leaves_no_registration_behind() {
+        let pending = Arc::new(PendingRequests::new());
+        let generation = pending.generation();
+        let waiter = pending.register("7".to_string(), generation);
+        assert_eq!(pending.len(), 1);
+        drop(waiter);
+        assert_eq!(pending.len(), 0, "a dropped waiter must deregister");
+
+        let out = decode_with_pending(
+            vec![Ok(response_frame(Some("7"), "s-7"))],
+            &pending,
+            generation,
+        )
+        .await;
+
+        assert_eq!(out.len(), 1, "the orphaned frame is yielded: {out:?}");
+        assert!(matches!(out[0], Ok(WebSocketMessage::Response { .. })));
+    }
+
+    /// A reconnect must fail every waiter of the connection it replaces,
+    /// with a retryable error, rather than leaving them parked on a
+    /// socket that is gone. `WebSocketClosed` classifies as
+    /// `Protocol(PartialResponse)` -> `Retry(SameRequest)`.
+    #[tokio::test]
+    async fn a_reconnect_fails_every_pending_waiter() {
+        let pending = Arc::new(PendingRequests::new());
+        let generation = pending.generation();
+        let seven = pending.register("7".to_string(), generation);
+        let eight = pending.register("8".to_string(), generation);
+
+        let next = pending.begin_connection(|| crate::Error::WebSocketClosed);
+
+        assert_ne!(next, generation, "a reconnect opens a new generation");
+        assert_eq!(pending.len(), 0);
+        for waiter in [seven, eight] {
+            let id = waiter.request_id().to_string();
+            let err = waiter
+                .response()
+                .await
+                .expect_err("a reconnect must fail the waiter");
+            assert!(
+                matches!(err, crate::Error::WebSocketClosed),
+                "waiter {id} got {err:?}"
+            );
+        }
+    }
+
+    /// The other half of the reconnect race: an OLD read stream drained
+    /// to EOF after the reconnect must fail only its own generation.
+    /// Failing indiscriminately would reap the waiter belonging to the
+    /// live connection - the same leak moved one layer over.
+    #[tokio::test]
+    async fn an_ended_stream_fails_only_its_own_generation() {
+        let pending = Arc::new(PendingRequests::new());
+        let old_generation = pending.generation();
+        let stale = pending.register("7".to_string(), old_generation);
+
+        // Reconnect: the stale waiter is failed here, and a fresh
+        // request is sent on the new connection.
+        let new_generation = pending.begin_connection(|| crate::Error::WebSocketClosed);
+        let live = pending.register("8".to_string(), new_generation);
+
+        // The old stream is only now drained to its end.
+        let out = decode_with_pending(vec![], &pending, old_generation).await;
+        assert!(out.is_empty());
+
+        assert!(matches!(
+            stale.response().await.expect_err("stale waiter failed"),
+            crate::Error::WebSocketClosed
+        ));
+        assert_eq!(
+            pending.len(),
+            1,
+            "the live connection's waiter must survive the old stream ending"
+        );
+
+        // And the live connection still answers it.
+        let out = decode_with_pending(
+            vec![Ok(response_frame(Some("8"), "s-8"))],
+            &pending,
+            new_generation,
+        )
+        .await;
+        assert!(out.is_empty(), "{out:?}");
+        assert_eq!(
+            live.response()
+                .await
+                .expect("live waiter answered")
+                .session_state(),
+            "s-8"
+        );
+    }
+
+    /// A stream that ends while a waiter of its own generation is still
+    /// registered fails it: that connection will answer nothing further,
+    /// and hanging is the one outcome with no recovery.
+    #[tokio::test]
+    async fn an_ended_stream_fails_its_own_pending_waiters() {
+        let pending = Arc::new(PendingRequests::new());
+        let generation = pending.generation();
+        let waiter = pending.register("7".to_string(), generation);
+
+        let out =
+            decode_with_pending(vec![Ok(Message::close(None, ""))], &pending, generation).await;
+
+        assert_eq!(out.len(), 1);
+        assert!(matches!(out[0], Err(crate::Error::WebSocketClosed)));
+        assert!(matches!(
+            waiter.response().await.expect_err("waiter failed"),
+            crate::Error::WebSocketClosed
+        ));
+    }
+
+    /// A `RequestError` naming a `requestId` IS that request's answer.
+    /// It must fail the waiter rather than ride the push stream, where
+    /// the caller would never see it. One carrying no id - notably the
+    /// asynchronous rejection of a push-enable frame, which has no id -
+    /// still reaches the stream, which is what the push reader's
+    /// reconnect logic reads.
+    #[tokio::test]
+    async fn a_request_error_fails_the_waiter_it_names() {
+        let pending = Arc::new(PendingRequests::new());
+        let generation = pending.generation();
+        let waiter = pending.register("7".to_string(), generation);
+
+        let out = decode_with_pending(
+            vec![
+                Ok(Message::text(
+                    r#"{"@type":"RequestError","requestId":"7","type":"urn:ietf:params:jmap:error:limit","status":400,"limit":"maxSizeRequest"}"#.to_string(),
+                )),
+                Ok(Message::text(
+                    r#"{"@type":"RequestError","type":"urn:ietf:params:jmap:error:unknownCapability","status":400}"#.to_string(),
+                )),
+            ],
+            &pending,
+            generation,
+        )
+        .await;
+
+        assert_eq!(out.len(), 1, "only the id-less error is yielded: {out:?}");
+        let Err(crate::Error::Problem { details, .. }) = &out[0] else {
+            panic!("expected Problem, got {:?}", out[0]);
+        };
+        assert_eq!(details.request_id(), None);
+
+        let Err(crate::Error::Problem { details, .. }) = waiter.response().await else {
+            panic!("the named waiter must receive its own error");
+        };
+        assert_eq!(details.limit(), Some("maxSizeRequest"));
+    }
+
+    /// A response frame whose method responses do not decode was still
+    /// that request's answer. The error goes to the waiter; yielding it
+    /// on the push stream instead would leave the caller parked until
+    /// the connection died.
+    #[tokio::test]
+    async fn an_undecodable_response_frame_fails_its_waiter() {
+        let pending = Arc::new(PendingRequests::new());
+        let generation = pending.generation();
+        let waiter = pending.register("7".to_string(), generation);
+
+        let out = decode_with_pending(
+            vec![Ok(Message::text(
+                r#"{"@type":"Response","requestId":"7","methodResponses":[[1,2]],"sessionState":"s-1"}"#
+                    .to_string(),
+            ))],
+            &pending,
+            generation,
+        )
+        .await;
+
+        assert!(
+            out.is_empty(),
+            "routed to the waiter, not the stream: {out:?}"
+        );
+        assert!(matches!(
+            waiter.response().await.expect_err("waiter failed"),
+            crate::Error::ResponseDecode(_)
+        ));
+    }
+
+    /// Push traffic is untouched by the correlation map: a `StateChange`
+    /// frame arriving while a request is in flight is still yielded, and
+    /// the waiter is still waiting afterwards.
+    #[tokio::test]
+    async fn push_frames_are_unaffected_by_a_pending_request() {
+        let pending = Arc::new(PendingRequests::new());
+        let generation = pending.generation();
+        let waiter = pending.register("7".to_string(), generation);
+
+        let out = decode_with_pending(
+            vec![
+                Ok(Message::text(
+                    r#"{"@type":"StateChange","changed":{"u1":{"Mailbox":"s1"}}}"#.to_string(),
+                )),
+                Ok(response_frame(Some("7"), "s-7")),
+                Ok(Message::ping(Bytes::new())),
+            ],
+            &pending,
+            generation,
+        )
+        .await;
+
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert!(matches!(
+            out[0],
+            Ok(WebSocketMessage::PushNotification(
+                PushObject::StateChange { .. }
+            ))
+        ));
+        assert_eq!(
+            waiter
+                .response()
+                .await
+                .expect("waiter answered")
+                .session_state(),
+            "s-7"
+        );
+    }
+
+    /// `maxSizeRequest` (RFC 8620 s2) is a hard limit the server rejects
+    /// the whole request over. The HTTP door refuses to send an oversized
+    /// batch; the WebSocket door had no guard at all, so an oversized
+    /// frame went out and came back as an opaque request-level problem.
+    /// Enforced on the encoded FRAME, since over WebSocket the frame is
+    /// the request.
+    #[cfg(feature = "mail")]
+    #[test]
+    fn an_oversized_websocket_frame_is_refused_before_the_wire() {
+        let client = size_limited_client(400);
+        let mut request = client.build();
+        request
+            .call(crate::mailbox::MailboxGet::new())
+            .expect("call is added");
+        let big = client.build_oversized_request();
+
+        // A small request still encodes.
+        let (frame, _) = client
+            .encode_ws_request(request)
+            .expect("a request within the limit encodes");
+        assert!(frame.len() <= 400, "fixture must fit: {}", frame.len());
+
+        let err = client
+            .encode_ws_request(big)
+            .expect_err("an oversized frame must not reach the wire");
+        let crate::Error::RequestSizeLimit { max, size } = err else {
+            panic!("expected RequestSizeLimit, got {err:?}");
+        };
+        assert_eq!(max, 400);
+        assert!(size > 400, "reported size {size} must exceed the limit");
+    }
+
+    /// An unadvertised or zero `maxSizeRequest` is not enforced, for the
+    /// same reason `CallLimit` refuses to enforce its two unusable
+    /// states: session validation is the gate for both, and enforcing a
+    /// zero here would fail every request as a client bug.
+    #[cfg(feature = "mail")]
+    #[test]
+    fn a_zero_max_size_request_is_not_enforced() {
+        let client = size_limited_client(0);
+        let big = client.build_oversized_request();
+
+        client
+            .encode_ws_request(big)
+            .expect("a zero limit is not a bound this door enforces");
+    }
+
+    #[cfg(feature = "mail")]
+    fn size_limited_client(max_size_request: usize) -> Client {
+        let session: crate::core::session::Session = serde_json::from_value(serde_json::json!({
+            "capabilities": {
+                "urn:ietf:params:jmap:core": {
+                    "maxSizeUpload": 1000,
+                    "maxConcurrentUpload": 2,
+                    "maxSizeRequest": max_size_request,
+                    "maxConcurrentRequests": 4,
+                    "maxCallsInRequest": 64,
+                    "maxObjectsInGet": 256,
+                    "maxObjectsInSet": 100,
+                    "collationAlgorithms": []
+                },
+                "urn:ietf:params:jmap:mail": {}
+            },
+            "accounts": {},
+            "primaryAccounts": {"urn:ietf:params:jmap:mail": "A1"},
+            "username": "user@example.test",
+            "apiUrl": "https://jmap.invalid/api",
+            "downloadUrl": "https://jmap.invalid/dl/{accountId}/{blobId}/{name}/{type}",
+            "uploadUrl": "https://jmap.invalid/upload/{accountId}",
+            "eventSourceUrl": "https://jmap.invalid/es",
+            "state": "session-1"
+        }))
+        .expect("session fixture parses");
+        let transport = crate::transport_reqwest::ReqwestTransport::new(
+            reqwest::header::HeaderMap::new(),
+            crate::client::Authorization::Basic(String::new()),
+            bifrost_net::AccountId("jmap-ws-size".to_string()),
+            std::time::Duration::from_secs(5),
+            false,
+            Arc::new(std::collections::HashSet::new()),
+        )
+        .expect("transport builds");
+        Client::with_transport(transport, session, "https://jmap.invalid/session")
+            .expect("client builds")
+    }
+
+    #[cfg(feature = "mail")]
+    impl Client {
+        /// A request whose encoded frame comfortably exceeds a 400-byte
+        /// limit, built from ordinary method calls.
+        fn build_oversized_request(&self) -> Request<'_> {
+            let mut request = self.build();
+            for _ in 0..16 {
+                request
+                    .call(
+                        crate::mailbox::MailboxGet::new()
+                            .ids(["a-fairly-long-mailbox-id-value".to_string()]),
+                    )
+                    .expect("call is added");
+            }
+            request
+        }
     }
 
     #[cfg(feature = "calendars")]

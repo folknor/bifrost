@@ -362,4 +362,11 @@ impl Request<'_, crate::transport_reqwest::ReqwestTransport> {
     pub(crate) async fn send_ws(self) -> crate::Result<String> {
         self.client.send_ws(self).await
     }
+
+    /// Send over the WebSocket and await the response frame carrying the
+    /// same RFC 8887 `requestId`, the WebSocket counterpart of
+    /// [`Request::send`].
+    pub(crate) async fn send_ws_awaiting(self) -> crate::Result<Response> {
+        self.client.send_ws_awaiting(self).await?.response().await
+    }
 }

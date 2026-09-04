@@ -168,6 +168,14 @@ pub(crate) struct ClientInner<T: HttpTransport = ReqwestTransport> {
     /// id is actively worse than none.
     #[cfg(feature = "websockets")]
     pub(crate) ws_request_id: std::sync::atomic::AtomicU64,
+    /// Callers awaiting a WebSocket response, keyed by that `requestId`.
+    ///
+    /// On the CLIENT for the same reason the counter is: the map has to
+    /// outlive any one connection so a reconnect can fail the waiters
+    /// the dropped connection will never answer, instead of leaving them
+    /// parked forever on a socket that is gone.
+    #[cfg(feature = "websockets")]
+    pub(crate) ws_pending: Arc<crate::client_ws::PendingRequests>,
 }
 
 /// A JMAP client. Cheap to clone - wraps an `Arc<ClientInner>` internally.
@@ -349,6 +357,8 @@ impl ClientBuilder {
                 ws: None.into(),
                 #[cfg(feature = "websockets")]
                 ws_request_id: std::sync::atomic::AtomicU64::new(0),
+                #[cfg(feature = "websockets")]
+                ws_pending: Arc::new(crate::client_ws::PendingRequests::new()),
             }),
         })
     }
@@ -615,6 +625,8 @@ impl<T: HttpTransport> Client<T> {
                 ws: None.into(),
                 #[cfg(feature = "websockets")]
                 ws_request_id: std::sync::atomic::AtomicU64::new(0),
+                #[cfg(feature = "websockets")]
+                ws_pending: Arc::new(crate::client_ws::PendingRequests::new()),
             }),
         })
     }

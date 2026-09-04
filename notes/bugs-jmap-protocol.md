@@ -24,12 +24,32 @@ frame including one whose method responses fail to decode. Pinned by
 `websocket_request_ids_do_not_restart`; the first two ablated and confirmed
 failing.
 
-Deliberately NOT done: the pending-request MAP that resolves a caller's
-future when its frame arrives. That needs an await-side door (`send_ws`
-handing back a receiver) plus reader routing, and both would be unused
-surface - the only production consumer of the read stream is the push
-reader, which ignores `Response` frames. The correlation data now exists end
-to end, so the map is a local addition whenever a caller wants one.)
+The await side is now built too: `PendingRequests` on the `Client` keys
+waiters by `requestId`, `Client::send_ws_awaiting` /
+`Request::send_ws_awaiting` register one before the frame is written
+(under the sink lock, so a reconnect cannot slip between registration and
+send), and `frame_stream` routes a matching `Response`, decode failure, or
+id-carrying `RequestError` to its waiter instead of yielding it. `send_ws`
+is kept as the fire-and-forget door. Unknown ids fall through to the
+stream as before; a dropped `PendingResponse` deregisters; a reconnect
+fails every waiter of the replaced connection with `WebSocketClosed`
+(retryable), and an ended read stream fails only its OWN generation, so an
+old stream drained after a reconnect cannot reap the live connection's
+waiter. `send_ws` also grew the missing `maxSizeRequest` guard, on the
+encoded frame, raising the new `Error::RequestSizeLimit`. Pinned by
+`two_in_flight_requests_are_told_apart_on_the_read_stream`,
+`a_response_for_an_unknown_id_still_reaches_the_stream`,
+`a_dropped_waiter_leaves_no_registration_behind`,
+`a_reconnect_fails_every_pending_waiter`,
+`an_ended_stream_fails_only_its_own_generation`,
+`an_ended_stream_fails_its_own_pending_waiters`,
+`a_request_error_fails_the_waiter_it_names`,
+`an_undecodable_response_frame_fails_its_waiter`,
+`push_frames_are_unaffected_by_a_pending_request`,
+`an_oversized_websocket_frame_is_refused_before_the_wire` and
+`a_zero_max_size_request_is_not_enforced` - each ablated and confirmed
+failing (the end-of-stream one ablates into a HANG, which is the defect
+it guards, caught by brokkr's per-test timeout).)
 
 (Finding 3 - no JSON Pointer escaping in dotted patch paths - is fixed
 crate-wide: `core::set::escape_json_pointer_token` now guards every
@@ -102,11 +122,11 @@ The layer is in better shape than most: the CallLimit three-state, the atomic
 `SessionState`, the RFC 6570 encoding, and the frame-level WS test seam are all
 carefully reasoned. The one structural gap worth a real investment was the
 **WebSocket request/response half** (findings 1-2). The owner chose "finish
-it" over "delete `send_ws`", and the correlation and session-state halves are
-now in place (see the entry above). What remains of that observation: there is
-still no `maxSizeRequest` guard on `send_ws` (the `maxCallsInRequest` guard
-does cover it, via the shared `call` door), and no pending-request map - the
-latter deliberately, for want of a caller.
+it" over "delete `send_ws`", and that door is now complete: correlation,
+session-state comparison, the pending-request map with its reconnect and
+drop teardown, and the `maxSizeRequest` guard (the `maxCallsInRequest`
+guard already came free via the shared `call` door). Nothing of this
+finding is left open.
 
 Files most relevant: `crates/jmap/src/client_ws.rs`,
 `crates/jmap/src/core/set.rs`, `crates/jmap/src/email/set.rs`,

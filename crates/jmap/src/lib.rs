@@ -274,6 +274,18 @@ pub(crate) enum Error {
     /// `maxCallsInRequest`. Raised before the extra method is added, so
     /// the oversized batch cannot reach the wire.
     RequestCallLimit { max: usize },
+    /// An encoded request frame would exceed the session's advertised
+    /// `maxSizeRequest` (RFC 8620 s2). Raised before the frame is
+    /// written, so the oversized request cannot reach the wire.
+    ///
+    /// The HTTP door answers the same limit by refusing to send
+    /// (`Request::send_methods_within` returns `Ok(None)` against a
+    /// caller-supplied bound); the WebSocket door has no such
+    /// caller-side contract - `send_ws` either writes the frame or it
+    /// does not - so it reports the refusal as an error instead of
+    /// letting the server reject the whole frame with an opaque
+    /// request-level `limit` problem.
+    RequestSizeLimit { max: usize, size: usize },
     /// Inbound JSON response decoding failure. Produced when the JMAP
     /// server's reply or session document cannot be parsed as the
     /// expected shape. Maps to `Protocol(ParseFailed)` /
@@ -427,6 +439,9 @@ impl Display for Error {
             Error::RequestEncode(e) => write!(f, "Request encode error: {e}"),
             Error::RequestCallLimit { max } => {
                 write!(f, "Request exceeds maxCallsInRequest ({max})")
+            }
+            Error::RequestSizeLimit { max, size } => {
+                write!(f, "Request of {size} bytes exceeds maxSizeRequest ({max})")
             }
             Error::ResponseDecode(e) => write!(f, "Response decode error: {e}"),
             Error::Problem { details, .. } => write!(f, "Problem: {details}"),
