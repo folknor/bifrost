@@ -383,11 +383,12 @@ fn parse_u32(value: Option<&str>) -> Result<u32, AccountError> {
 
 /// UIDs and UIDVALIDITY are RFC 9051 `nz-number`s: this crate never mints
 /// a 0, so a 0 on input is a corrupted or foreign id. Rejecting it here
-/// closes every downstream hole at once - `uid_set_from_u32` silently
-/// filters 0 out of wire operands, which otherwise fabricates
-/// `Succeeded(Applied)` outcomes for a uid the STORE/MOVE never targeted
-/// and, for an all-zero group, skips the group so its ids get no outcome
-/// at all.
+/// closes every downstream hole at once: a wire operand cannot carry 0, so
+/// an accepted 0 otherwise fabricates a `Succeeded(Applied)` outcome for a
+/// uid the STORE/MOVE never targeted and, for an all-zero group, skips the
+/// group so its ids get no outcome at all. The operand layer refuses a 0
+/// independently (`UidOperand` reports it as excluded, and the callers turn
+/// that into a failure), so neither boundary depends on the other.
 fn parse_nonzero_u32(value: Option<&str>, what: &str) -> Result<u32, AccountError> {
     let parsed = parse_u32(value)?;
     if parsed == 0 {
@@ -607,7 +608,7 @@ mod tests {
 
     /// UID 0 is not an RFC 9051 `nz-number` and this crate never mints it.
     /// Accepting it at decode used to open a family of downstream holes:
-    /// `uid_set_from_u32` silently drops 0 from wire operands, so a mixed
+    /// a wire operand cannot carry 0, so a mixed
     /// mutation batch reported a fabricated `Succeeded(Applied)` for the
     /// uid-0 id, an all-zero group produced NO outcome for its ids, and
     /// `open_raw_rfc822` turned a uid-0 id into a successful empty stream.

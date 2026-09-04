@@ -27,7 +27,7 @@ use futures::stream::Stream;
 use tokio_util::sync::CancellationToken;
 
 use crate::error::Error;
-use crate::types::{MailboxName, SyncSelectOptions, SyncSelectResult, UidSet, UidValidity};
+use crate::types::{MailboxName, SyncSelectOptions, SyncSelectResult, UidValidity};
 
 mod blob;
 mod capabilities;
@@ -1199,10 +1199,6 @@ pub(crate) fn membership_scope(folder: &MailboxName) -> MembershipScope {
     MembershipScope::Folder(bifrost_types::FolderId(folder.as_str().to_owned()))
 }
 
-pub(crate) fn uid_set_from_u32(uids: &[u32]) -> Option<UidSet> {
-    UidSet::from_uids(uids.iter().filter_map(|uid| crate::types::Uid::new(*uid)))
-}
-
 #[cfg(test)]
 mod router_tests {
     use bifrost_types::{AccountErrorKind, AccountOperation, CursorScope, FolderId, ObjectType};
@@ -1417,22 +1413,6 @@ mod router_tests {
         assert_eq!(
             err.kind(),
             &AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed)
-        );
-    }
-
-    // `UidSet` operands must never go out empty, and UID 0 is not a UID
-    // (RFC 3501 Section 9), so a batch of only-zero targets yields None
-    // rather than an empty or `0`-bearing sequence set.
-    #[test]
-    fn uid_set_from_u32_drops_zeros_and_refuses_to_build_an_empty_operand() {
-        assert!(super::uid_set_from_u32(&[]).is_none());
-        assert!(super::uid_set_from_u32(&[0, 0]).is_none());
-
-        let set = super::uid_set_from_u32(&[3, 1, 2, 0, 2]).expect("non-empty");
-        assert_eq!(
-            set.as_sequence_set().as_str(),
-            "1:3",
-            "adjacent UIDs coalesce into a range and the 0 is dropped",
         );
     }
 }

@@ -1937,6 +1937,75 @@ async fn a_raw_message_read_stops_at_its_byte_budget() {
     let _server = script.await.unwrap();
 }
 
+/// A UID the shared operand cannot carry never reaches the wire, and never
+/// completes as a successful empty read.
+///
+/// `decode_object_id` rejects UID 0 today, so this is reachable only by
+/// calling the fetch core directly - which is the point: the invariant is
+/// the operand's, not the decoder's. Before the operand was shared, this
+/// lane skipped the FETCH and returned `Ok(())`, presenting "nothing was
+/// asked" as "the message has no body".
+#[tokio::test]
+async fn a_uid_the_operand_cannot_carry_never_reaches_the_fetch() {
+    let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1")).await;
+    let account = scripted_account(conn, 1);
+    let folder = crate::types::MailboxName::new("INBOX").unwrap();
+
+    let script = tokio::spawn(async move {
+        let select = read_line(&mut server).await;
+        respond(
+            &mut server,
+            &format!(
+                "* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)\r\n\
+                 * 1 EXISTS\r\n\
+                 * 0 RECENT\r\n\
+                 * OK [UIDVALIDITY 5] ok\r\n\
+                 * OK [UIDNEXT 9] ok\r\n\
+                 {} OK [READ-ONLY] done\r\n",
+                tag_of(&select)
+            ),
+        )
+        .await;
+        server
+    });
+
+    let (tx, _rx) = tokio::sync::mpsc::channel(super::STREAM_CAPACITY);
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(5),
+        super::blob::run_fetch(
+            &account,
+            &folder,
+            5,
+            0,
+            crate::types::FetchAttr::BodySection {
+                peek: true,
+                section: None,
+                partial: None,
+            },
+            bifrost_types::AccountOperation::OpenRawRfc822,
+            1024,
+            &tx,
+        ),
+    )
+    .await
+    .expect("the refused read must finish");
+
+    match outcome {
+        Err(super::blob::BlobError::Account(err)) => assert!(
+            matches!(
+                err.kind(),
+                bifrost_types::AccountErrorKind::Request(
+                    bifrost_types::RequestErrorKind::Malformed
+                )
+            ),
+            "a UID the operand cannot carry is a client-side request defect: {err:?}"
+        ),
+        Ok(()) => panic!("a UID the server never saw must not complete as a successful read"),
+        Err(_) => panic!("unexpected error variant"),
+    }
+    let _server = script.await.unwrap();
+}
+
 /// The engine's bandwidth knob writes the SHARED atomic every pooled dial
 /// reads, and `None` means unlimited while `Some(0)` is clamped to 1 B/s.
 ///

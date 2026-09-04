@@ -22,7 +22,71 @@
 use bifrost_types::{AccountError, AccountOperation, BatchFailure, BatchItemId, ItemOutcome};
 
 use super::envelope::DecodedObjectId;
-use crate::types::{MailboxName, UidSet};
+use crate::types::{MailboxName, Uid, UidSet};
+
+/// The single predicate for "this UID can be named on the wire".
+///
+/// Every operand in the account layer is built from this and nothing else,
+/// so the set of UIDs a command names and the set of UIDs a caller believes
+/// it named cannot disagree.
+fn operand_uid(uid: u32) -> Option<Uid> {
+    Uid::new(uid)
+}
+
+/// A wire UID operand plus the UIDs that did not reach it.
+///
+/// This is the one place a `UidSet` is built from decoded UIDs.
+/// [`TargetBatch`] is the batch-shaped wrapper around it, for lanes that owe
+/// one [`ItemOutcome`] per id; the single-id and PIM-primitive lanes, whose
+/// results are not per-id outcomes, use `UidOperand` directly so that they
+/// share the operand's definition of what a UID set can carry rather than
+/// re-deriving it. A lane with no per-id outcome lane has nowhere to report
+/// an excluded UID, so it must refuse the whole command
+/// ([`UidOperand::excluded`] non-empty) instead of quietly sending a
+/// narrower operand than it was asked for.
+pub(crate) struct UidOperand {
+    uids: Vec<u32>,
+    excluded: Vec<u32>,
+    uid_set: Option<UidSet>,
+}
+
+impl UidOperand {
+    /// Split `uids` into the operand and the UIDs it cannot carry.
+    pub(crate) fn build<I: IntoIterator<Item = u32>>(uids: I) -> Self {
+        let mut kept = Vec::new();
+        let mut excluded = Vec::new();
+        let mut carried = Vec::new();
+        for uid in uids {
+            match operand_uid(uid) {
+                Some(valid) => {
+                    kept.push(uid);
+                    carried.push(valid);
+                }
+                None => excluded.push(uid),
+            }
+        }
+        Self {
+            uids: kept,
+            excluded,
+            uid_set: UidSet::from_uids(carried),
+        }
+    }
+
+    /// The wire operand, or `None` when no UID reached it.
+    pub(crate) fn uid_set(&self) -> Option<&UidSet> {
+        self.uid_set.as_ref()
+    }
+
+    /// The UIDs the operand carries, in request order.
+    pub(crate) fn uids(&self) -> &[u32] {
+        &self.uids
+    }
+
+    /// The UIDs the operand could not carry, in request order.
+    pub(crate) fn excluded(&self) -> &[u32] {
+        &self.excluded
+    }
+}
 
 /// The ids one wire command is accountable for, split into the ids the
 /// operand carries and the ids it excluded.
@@ -49,23 +113,21 @@ impl TargetBatch {
     /// `DecodedObjectId`, cannot reintroduce the silent-drop hole by
     /// construction rather than by review.
     pub(crate) fn new(ids: Vec<DecodedObjectId>) -> Self {
+        let operand = UidOperand::build(ids.iter().map(|id| id.uid));
         let mut targets = Vec::with_capacity(ids.len());
-        let mut uids = Vec::with_capacity(ids.len());
         let mut excluded = Vec::new();
         for id in ids {
-            match crate::types::Uid::new(id.uid) {
-                Some(_) => {
-                    uids.push(id.uid);
-                    targets.push(id);
-                }
+            // The same predicate the operand used, so the accountable set and
+            // the wire set are partitioned identically by construction.
+            match operand_uid(id.uid) {
+                Some(_) => targets.push(id),
                 None => excluded.push(id),
             }
         }
-        let uid_set = UidSet::from_uids(uids.iter().filter_map(|uid| crate::types::Uid::new(*uid)));
         Self {
             targets,
-            uids,
-            uid_set,
+            uids: operand.uids,
+            uid_set: operand.uid_set,
             excluded,
             settled: false,
         }
@@ -90,12 +152,7 @@ impl TargetBatch {
             uids.iter().all(|uid| self.uids.contains(uid)),
             "a follow-up operand may only name UIDs from its own batch"
         );
-        let owned: Vec<u32> = uids
-            .iter()
-            .copied()
-            .filter(|uid| self.uids.contains(uid))
-            .collect();
-        UidSet::from_uids(owned.iter().filter_map(|uid| crate::types::Uid::new(*uid)))
+        UidOperand::build(uids.iter().copied().filter(|uid| self.uids.contains(uid))).uid_set
     }
 
     /// Mint the batch's outcomes: exactly one per id, across both lanes.
@@ -243,7 +300,7 @@ mod tests {
         RequestErrorKind,
     };
 
-    use super::{TargetBatch, item_id};
+    use super::{TargetBatch, UidOperand, item_id};
     use crate::account::envelope::DecodedObjectId;
     use crate::types::MailboxName;
 
@@ -265,6 +322,59 @@ mod tests {
                 ItemOutcome::Succeeded(BatchSuccess::new(item_id(&id), MutationSuccess::Applied))
             })
             .collect()
+    }
+
+    // `UidSet` operands must never go out empty, and UID 0 is not a UID
+    // (RFC 3501 Section 9), so an all-zero request yields no operand rather
+    // than an empty or `0`-bearing sequence set - and the zeros are visible
+    // in `excluded()` instead of vanishing.
+    #[test]
+    fn the_shared_operand_reports_what_it_could_not_carry() {
+        let empty = UidOperand::build([]);
+        assert!(empty.uid_set().is_none());
+        assert!(empty.excluded().is_empty());
+
+        let zeros = UidOperand::build([0, 0]);
+        assert!(zeros.uid_set().is_none());
+        assert_eq!(zeros.excluded(), &[0, 0], "a dropped UID stays visible");
+        assert!(zeros.uids().is_empty());
+
+        let mixed = UidOperand::build([3, 1, 2, 0, 2]);
+        assert_eq!(
+            mixed
+                .uid_set()
+                .expect("non-empty")
+                .as_sequence_set()
+                .as_str(),
+            "1:3",
+            "adjacent UIDs coalesce into a range and the 0 is dropped",
+        );
+        assert_eq!(mixed.uids(), &[3, 1, 2, 2]);
+        assert_eq!(mixed.excluded(), &[0]);
+    }
+
+    // The batch lane and the single-id / PIM lanes must agree on what a UID
+    // operand can carry, because they share one constructor. If `TargetBatch`
+    // ever re-derived the operand itself, this is what would diverge.
+    #[test]
+    fn the_batch_operand_is_the_shared_operand() {
+        let uids = [4u32, 0, 6];
+        let batch = TargetBatch::new(uids.iter().map(|uid| id(*uid)).collect());
+        let shared = UidOperand::build(uids);
+        assert_eq!(batch.uids(), shared.uids());
+        assert_eq!(
+            batch.uid_set().map(|set| set.as_sequence_set().as_str()),
+            shared.uid_set().map(|set| set.as_sequence_set().as_str()),
+        );
+        assert_eq!(
+            batch
+                .subset_uid_set(&[6])
+                .map(|set| set.as_sequence_set().as_str().to_owned()),
+            UidOperand::build([6u32])
+                .uid_set()
+                .map(|set| set.as_sequence_set().as_str().to_owned()),
+        );
+        let _ = batch.settle(AccountOperation::UpdateFlags, &folder(), applied);
     }
 
     #[test]

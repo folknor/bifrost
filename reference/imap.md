@@ -215,6 +215,28 @@ destroy, move, and hydration in `get.rs` - all route through it:
 - A `TargetBatch` dropped with either lane non-empty panics in debug builds,
   so an early return that leaves an id unaccounted for cannot pass unnoticed.
 
+Underneath it, `UidOperand` is the single constructor for a wire UID operand:
+`UidOperand::build(uids)` keeps the UIDs a `UidSet` can carry, records the ones
+it cannot in `excluded()`, and is what `TargetBatch::new` and `subset_uid_set`
+build from. It exists so the lanes that owe no per-id outcome can share one
+definition of "what the operand carries" instead of re-deriving it:
+
+- The PIM primitives (`copy_messages`, `delete_messages`, `set_flag`,
+  `hydrate_decoded`, and the draft `fetch_full_message`) answer
+  `Result<(), AccountError>` for the whole request, so they have nowhere to
+  report a per-id exclusion. `pim_operand` therefore refuses the command with
+  `Request(Malformed)` when `excluded()` is non-empty, rather than sending a
+  narrower operand and returning `Ok(())` for messages the server never saw.
+  An empty group is not an exclusion and still skips its command.
+- The streaming body read (`blob.rs::run_fetch`, behind `open_raw_rfc822`;
+  `open_blob` itself is unsupported) refuses the same way instead of skipping the FETCH and
+  ending the stream with `Done`, which presented "nothing was asked" as "the
+  message has no body".
+
+Both refusals are unreachable through the public API today, since
+`decode_object_id` rejects UID 0 - which is the point: the invariant belongs to
+the operand, not to the decoder, and neither boundary depends on the other.
+
 This is the same move `StoreConsumer::new(unchanged_since)` and
 `SideEffectDigest` made for their classes: the accounting hole that the
 uid-0 decode bug's blast radius rode on is now unrepresentable rather than

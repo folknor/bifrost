@@ -29,9 +29,10 @@ use crate::types::{
     StatusItem, StoreOperation, ThreadNode,
 };
 
+use super::targets::UidOperand;
 use super::{
     DecodedObjectId, ImapAccount, account_error_with, decode_object_id, decode_thread_id,
-    encode_object_id, encode_thread_id, factory, uid_set_from_u32,
+    encode_object_id, encode_thread_id, factory,
 };
 use crate::connection::ImapConnection;
 use crate::error::Error;
@@ -438,11 +439,13 @@ async fn fetch_full_message(
         .select_folder(&mut conn, &decoded.folder, None, true)
         .await
         .map_err(err)?;
-    let uids = uid_set_from_u32(&[decoded.uid])
+    let operand = pim_operand([decoded.uid])?;
+    let uids = operand
+        .uid_set()
         .ok_or_else(|| pim_malformed("draft object id has no UID"))?;
     let responses = conn
         .connection()
-        .uid_fetch_full_messages(&uids, DRAFT_FETCH_BUDGET, account.command_timeout())
+        .uid_fetch_full_messages(uids, DRAFT_FETCH_BUDGET, account.command_timeout())
         .await
         .map_err(err)?;
     responses
@@ -1181,8 +1184,8 @@ async fn copy_messages(
             .mailbox
             .uid_validity
             .ok_or_else(|| pim_malformed("SELECT missing UIDVALIDITY"))?;
-        let uids = valid_uids(ids, uidvalidity)?;
-        let Some(uid_set) = uid_set_from_u32(&uids) else {
+        let operand = pim_operand(valid_uids(ids, uidvalidity)?)?;
+        let Some(uid_set) = operand.uid_set() else {
             continue;
         };
         conn.connection()
@@ -1213,8 +1216,8 @@ async fn delete_messages(
             .mailbox
             .uid_validity
             .ok_or_else(|| pim_malformed("SELECT missing UIDVALIDITY"))?;
-        let uids = valid_uids(ids, uidvalidity)?;
-        let Some(uid_set) = uid_set_from_u32(&uids) else {
+        let operand = pim_operand(valid_uids(ids, uidvalidity)?)?;
+        let Some(uid_set) = operand.uid_set() else {
             continue;
         };
         conn.connection()
@@ -1227,10 +1230,17 @@ async fn delete_messages(
             )
             .await
             .map_err(err)?;
-        super::mutate::expunge_uids_or_fall_back(account, &conn, uid_set.as_sequence_set(), &uids)
-            .await
-            .map_err(err)?;
-        account.folders.clear_modseqs(&folder, uidvalidity, &uids);
+        super::mutate::expunge_uids_or_fall_back(
+            account,
+            &conn,
+            uid_set.as_sequence_set(),
+            operand.uids(),
+        )
+        .await
+        .map_err(err)?;
+        account
+            .folders
+            .clear_modseqs(&folder, uidvalidity, operand.uids());
     }
     Ok(())
 }
@@ -1258,8 +1268,8 @@ async fn set_flag(
             .mailbox
             .uid_validity
             .ok_or_else(|| pim_malformed("SELECT missing UIDVALIDITY"))?;
-        let uids = valid_uids(ids, uidvalidity)?;
-        let Some(uid_set) = uid_set_from_u32(&uids) else {
+        let operand = pim_operand(valid_uids(ids, uidvalidity)?)?;
+        let Some(uid_set) = operand.uid_set() else {
             continue;
         };
         conn.connection()
@@ -1272,7 +1282,9 @@ async fn set_flag(
             )
             .await
             .map_err(err)?;
-        account.folders.clear_modseqs(&folder, uidvalidity, &uids);
+        account
+            .folders
+            .clear_modseqs(&folder, uidvalidity, operand.uids());
     }
     Ok(())
 }
@@ -1295,8 +1307,8 @@ async fn hydrate_decoded(
             .mailbox
             .uid_validity
             .ok_or_else(|| pim_malformed("SELECT missing UIDVALIDITY"))?;
-        let uids = valid_uids(ids, uidvalidity)?;
-        let Some(uid_set) = uid_set_from_u32(&uids) else {
+        let operand = pim_operand(valid_uids(ids, uidvalidity)?)?;
+        let Some(uid_set) = operand.uid_set() else {
             continue;
         };
         let fetches = conn
@@ -1349,6 +1361,24 @@ fn group_by_folder(ids: Vec<DecodedObjectId>) -> Vec<(MailboxName, Vec<DecodedOb
             .push(id);
     }
     grouped.into_values().collect()
+}
+
+/// Build the wire operand for a PIM primitive, from the same source the
+/// batch lanes use.
+///
+/// These lanes answer `Result<(), AccountError>` for the whole request:
+/// there is no per-id outcome lane, so a UID the operand cannot carry has
+/// nowhere to be reported. Refuse the command instead of sending an operand
+/// narrower than the caller asked for, which would report success for a
+/// message the server never saw.
+fn pim_operand<I: IntoIterator<Item = u32>>(uids: I) -> Result<UidOperand, AccountError> {
+    let operand = UidOperand::build(uids);
+    if !operand.excluded().is_empty() {
+        return Err(pim_malformed(
+            "message id could not be placed in an IMAP UID operand",
+        ));
+    }
+    Ok(operand)
 }
 
 fn valid_uids(ids: Vec<DecodedObjectId>, uidvalidity: u32) -> Result<Vec<u32>, AccountError> {
@@ -2223,6 +2253,36 @@ mod tests {
                 namespace_prefix: "Shared/".to_owned(),
             }],
         )
+    }
+
+    // The PIM primitives answer for the whole request, so they have nowhere
+    // to report a per-id exclusion. Sending the narrowed operand anyway
+    // would return `Ok(())` for messages the server was never asked about.
+    #[test]
+    fn a_pim_operand_refuses_a_uid_it_cannot_carry_instead_of_narrowing() {
+        let Err(refused) = super::pim_operand([4u32, 0, 6]) else {
+            panic!("a dropped UID must be refused, not silently narrowed");
+        };
+        assert!(matches!(
+            refused.kind(),
+            AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed)
+        ));
+
+        let operand = super::pim_operand([4u32, 6]).expect("carryable UIDs");
+        assert_eq!(operand.uids(), &[4, 6]);
+        assert_eq!(
+            operand
+                .uid_set()
+                .expect("non-empty operand")
+                .as_sequence_set()
+                .as_str(),
+            "4,6"
+        );
+
+        // An empty group is not an exclusion: nothing was asked for, so
+        // there is no command to send and nothing to refuse.
+        let empty = super::pim_operand([]).expect("an empty request is not malformed");
+        assert!(empty.uid_set().is_none());
     }
 
     #[test]

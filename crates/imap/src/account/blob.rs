@@ -6,9 +6,7 @@ use bytes::Bytes;
 
 use crate::types::{FetchAttr, MailboxName};
 
-use super::{
-    ImapAccount, batch, boxed_receiver_stream, decode_object_id, terminated_event, uid_set_from_u32,
-};
+use super::{ImapAccount, batch, boxed_receiver_stream, decode_object_id, terminated_event};
 
 pub(super) enum BlobError {
     Account(AccountError),
@@ -164,8 +162,30 @@ pub(super) async fn run_fetch(
             .expect("valid account error classification"),
         ));
     }
-    let Some(uid_set) = uid_set_from_u32(&[uid]) else {
-        return Ok(());
+    // Build the operand from the same source the batch lanes use. This lane
+    // streams bytes and has no per-id outcome to report an exclusion in, so
+    // a UID the operand cannot carry is refused: sending nothing and
+    // completing the stream normally would present "no such body" as a
+    // successful empty read of a message the server was never asked about.
+    let operand = super::targets::UidOperand::build([uid]);
+    let Some(uid_set) = operand.uid_set() else {
+        return Err(BlobError::Account(
+            AccountErrorBuilder::new(
+                AccountErrorKind::Request(RequestErrorKind::Malformed),
+                Cause::Request(RequestCause::Malformed {
+                    detail: DiagnosticText::support_only(
+                        "message id could not be placed in an IMAP UID operand",
+                    ),
+                }),
+            )
+            .protocol(Protocol::Imap)
+            .operation(op)
+            .scope(bifrost_types::ErrorScope::Cursor(super::folder_scope(
+                folder,
+            )))
+            .try_build()
+            .expect("valid account error classification"),
+        ));
     };
     let attrs = [attr];
     let connection = conn.connection();

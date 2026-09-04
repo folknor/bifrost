@@ -139,6 +139,33 @@ it: flag mutation, its two-sided patch group, destroy, move, and hydration in
 documented in `reference/imap.md` under "One outcome per id". The original
 note follows.)
 
+Second wave (same day): the five sites the first wave left calling
+`uid_set_from_u32` directly - the four PIM primitives and the streaming body
+read - now take their operand from `UidOperand`, the shared constructor
+`TargetBatch` itself builds on, and refuse rather than silently narrow.
+`uid_set_from_u32` is gone. Documented in `reference/imap.md`.
+
+Assessed and NOT built: a compile-time exactly-once shape for `settle`. A
+per-target token (`Target { id, token: Token }` where `Token` is non-`Clone`,
+non-`Default`, constructible only by `TargetBatch`, and consumed by
+`Token::seal(outcome) -> Sealed<T>`) does give the guarantee at modest cost -
+a moved-once token is at-most-once per target, and a length check on the
+returned `Vec<Sealed<T>>` upgrades that to exactly-once, since a token that
+was dropped instead of sealed cannot be replaced by a second seal of another
+target. It is genuinely sound and roughly 40 lines. It was not built because
+it changes the mint closures' signature from
+`Vec<DecodedObjectId> -> Vec<ItemOutcome<T>>` to
+`Vec<Target> -> Vec<Sealed<T>>`, and every current mint closure classifies by
+walking the server's answer keyed by UID and looking the id up - so each would
+have to carry a UID-keyed token map alongside, adding a lookup that can fail
+at runtime (a token already taken) in exchange for removing a debug assertion
+that cannot. That is a worse trade at the seam the brief named: the closures'
+contract with the wire outcome types is where the classification lives, and
+it should not be reshaped to serve the accounting. What the type does enforce
+unconditionally - that the operand and the accountable set come from one
+place - is now enforced one layer deeper, at `UidOperand`, which is where the
+uid-0 class actually lived.
+
 The one structural weakness worth real investment is that **the
 one-outcome-per-id contract is enforced by convention across four hand-rolled
 loops** (mutate flags/destroy/move, get). Finding 1's downstream blast radius
