@@ -367,12 +367,16 @@ pub(crate) fn send_message<T: HttpTransport>(
             .created(SUBMISSION_CREATE_ID)
             .map_err(to_acct_err(AccountOperation::Send))?;
 
-        if !email_response.new_state().is_empty() {
+        // An absent `newState` is a non-conforming server (RFC 8620 s5.3
+        // makes it mandatory) and an empty one names no state; neither is
+        // a value to cache, and caching either would hand a later
+        // `*/changes` a `sinceState` no server ever issued.
+        if let Some(new_state) = email_response.new_state().filter(|state| !state.is_empty()) {
             state_cache::advance(
                 &email_states,
                 &account_id,
                 prior_state.as_deref(),
-                email_response.new_state().to_string(),
+                new_state.to_string(),
             )
             .await;
         }
@@ -528,12 +532,12 @@ pub(crate) fn draft_create<T: HttpTransport>(
             .call(set)
             .await
             .map_err(to_acct_err(AccountOperation::DraftCreate))?;
-        if !response.new_state().is_empty() {
+        if let Some(new_state) = response.new_state().filter(|state| !state.is_empty()) {
             state_cache::advance(
                 &email_states,
                 &account_id,
                 prior_state.as_deref(),
-                response.new_state().to_string(),
+                new_state.to_string(),
             )
             .await;
         }
@@ -658,6 +662,12 @@ pub(crate) fn search<T: HttpTransport>(
                 skipped_scopes: Vec::new(),
             });
         }
+        let requested = page
+            .items
+            .iter()
+            .cloned()
+            .map(EmailId::into_string)
+            .collect::<Vec<_>>();
         let response = mail
             .call(
                 EmailGet::new()
@@ -666,20 +676,78 @@ pub(crate) fn search<T: HttpTransport>(
             )
             .await
             .map_err(to_acct_err(AccountOperation::Search))?;
-        let mut items = Vec::new();
-        for email in response.into_list() {
-            if let Some(thread) = email.thread_id() {
-                items.push(ThreadId(thread.to_string()));
-            }
-        }
+        let not_found = response.not_found().to_vec();
+        let (items, failed_ids) =
+            reconcile_search_threads(requested, &not_found, response.into_list());
         Ok(Page {
             items,
             next_cursor: page.next_cursor,
             estimated_total: page.estimated_total,
-            failed_ids: Vec::new(),
+            failed_ids,
             skipped_scopes: Vec::new(),
         })
     })
+}
+
+/// Project a thread-id search answer, accounting for every submitted
+/// email id.
+///
+/// A thread search is a query for emails followed by a projection onto
+/// their threads, so an email the projection cannot place is a hit the
+/// caller asked for and does not receive. Three ways that happens - the
+/// id named in `notFound`, the id answered in neither list, and an email
+/// returned WITHOUT a `threadId` (which RFC 8621 makes mandatory) - are
+/// all "the provider fetched it but could not materialize it", which is
+/// what `Page::failed_ids` means. Dropping them left the page silently
+/// short of its own result count.
+///
+/// Thread ids are deduplicated: a query that hits several messages of one
+/// thread describes one thread, and `collapseThreads` is not guaranteed
+/// to have collapsed them.
+fn reconcile_search_threads(
+    requested: Vec<String>,
+    not_found: &[EmailId],
+    list: Vec<Email>,
+) -> (Vec<ThreadId>, Vec<String>) {
+    let mut answered: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut failed_ids: Vec<String> = Vec::new();
+    for missing in not_found {
+        let missing = missing.clone().into_string();
+        if answered.insert(missing.clone()) {
+            failed_ids.push(missing);
+        }
+    }
+
+    let mut seen_threads: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut items = Vec::new();
+    for email in list {
+        let Some(id) = email.id().map(ToString::to_string) else {
+            continue;
+        };
+        if id.is_empty() {
+            continue;
+        }
+        match email.thread_id() {
+            Some(thread) => {
+                answered.insert(id);
+                if seen_threads.insert(thread.to_string()) {
+                    items.push(ThreadId(thread.to_string()));
+                }
+            }
+            None => {
+                if answered.insert(id.clone()) {
+                    failed_ids.push(id);
+                }
+            }
+        }
+    }
+
+    for id in requested {
+        if answered.insert(id.clone()) {
+            failed_ids.push(id);
+        }
+    }
+    (items, failed_ids)
 }
 
 pub(crate) fn search_messages<T: HttpTransport>(
@@ -768,13 +836,8 @@ pub(crate) fn container_create<T: HttpTransport>(
             .call(set)
             .await
             .map_err(to_acct_err(AccountOperation::ContainerCreate))?;
-        if !response.new_state().is_empty() {
-            state_cache::set(
-                &mailbox_states,
-                &account_id,
-                response.new_state().to_string(),
-            )
-            .await;
+        if let Some(new_state) = response.new_state().filter(|state| !state.is_empty()) {
+            state_cache::set(&mailbox_states, &account_id, new_state.to_string()).await;
         }
         let mut mailbox = response
             .created(&create_id)
@@ -803,13 +866,8 @@ pub(crate) fn container_rename<T: HttpTransport>(
         response
             .unwrap_update_errors()
             .map_err(to_acct_err(AccountOperation::ContainerRename))?;
-        if !response.new_state().is_empty() {
-            state_cache::set(
-                &mailbox_states,
-                &account_id,
-                response.new_state().to_string(),
-            )
-            .await;
+        if let Some(new_state) = response.new_state().filter(|state| !state.is_empty()) {
+            state_cache::set(&mailbox_states, &account_id, new_state.to_string()).await;
         }
         Ok(())
     })
@@ -834,13 +892,8 @@ pub(crate) fn container_move<T: HttpTransport>(
         response
             .unwrap_update_errors()
             .map_err(to_acct_err(AccountOperation::ContainerMove))?;
-        if !response.new_state().is_empty() {
-            state_cache::set(
-                &mailbox_states,
-                &account_id,
-                response.new_state().to_string(),
-            )
-            .await;
+        if let Some(new_state) = response.new_state().filter(|state| !state.is_empty()) {
+            state_cache::set(&mailbox_states, &account_id, new_state.to_string()).await;
         }
         Ok(())
     })
@@ -865,13 +918,8 @@ pub(crate) fn container_delete<T: HttpTransport>(
         response
             .destroyed(&mailbox)
             .map_err(to_acct_err(AccountOperation::ContainerDelete))?;
-        if !response.new_state().is_empty() {
-            state_cache::set(
-                &mailbox_states,
-                &account_id,
-                response.new_state().to_string(),
-            )
-            .await;
+        if let Some(new_state) = response.new_state().filter(|state| !state.is_empty()) {
+            state_cache::set(&mailbox_states, &account_id, new_state.to_string()).await;
         }
         Ok(())
     })
@@ -1377,22 +1425,35 @@ pub(crate) fn move_thread<T: HttpTransport>(
     source: Option<ContainerId>,
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
-        patch_mailbox_membership(
+        let mutation_target = MutationTarget::Thread(thread);
+        cross_account_container(&mutation_target, &target, AccountOperation::BulkMove)?;
+        if let Some(source) = source.as_ref() {
+            cross_account_container(
+                &mutation_target,
+                source,
+                AccountOperation::RemoveFromContainer,
+            )?;
+        }
+        // Resolved ONCE, before either leg. Re-resolving between the legs
+        // let a message delivered to the thread in between be removed from
+        // the source having never been added to the target.
+        let ids = resolve_target(&mail, mutation_target, AccountOperation::BulkMove).await?;
+        patch_mailbox_membership_of(
             &mail,
             &email_states,
             &account_id,
-            MutationTarget::Thread(thread.clone()),
+            &ids,
             target,
             true,
             AccountOperation::BulkMove,
         )
         .await?;
         if let Some(source) = source {
-            patch_mailbox_membership(
+            patch_mailbox_membership_of(
                 &mail,
                 &email_states,
                 &account_id,
-                MutationTarget::Thread(thread),
+                &ids,
                 source,
                 false,
                 AccountOperation::RemoveFromContainer,
@@ -1450,22 +1511,33 @@ pub(crate) fn delete_thread<T: HttpTransport>(
             )
             .await
         } else {
-            patch_mailbox_membership(
+            let mutation_target = MutationTarget::Thread(thread);
+            cross_account_container(&mutation_target, &trash, AccountOperation::BulkMove)?;
+            if let Some(source) = current.as_ref() {
+                cross_account_container(
+                    &mutation_target,
+                    source,
+                    AccountOperation::RemoveFromContainer,
+                )?;
+            }
+            // See `move_thread`: resolved once, both legs over that set.
+            let ids = resolve_target(&mail, mutation_target, AccountOperation::BulkMove).await?;
+            patch_mailbox_membership_of(
                 &mail,
                 &email_states,
                 &account_id,
-                MutationTarget::Thread(thread.clone()),
+                &ids,
                 trash,
                 true,
                 AccountOperation::BulkMove,
             )
             .await?;
             if let Some(source) = current {
-                patch_mailbox_membership(
+                patch_mailbox_membership_of(
                     &mail,
                     &email_states,
                     &account_id,
-                    MutationTarget::Thread(thread),
+                    &ids,
                     source,
                     false,
                     AccountOperation::RemoveFromContainer,
@@ -1488,7 +1560,34 @@ async fn patch_mailbox_membership<T: HttpTransport>(
 ) -> Result<(), AccountError> {
     cross_account_container(&target, &container, op)?;
     let ids = resolve_target(mail, target, op).await?;
-    // The owner check above has established that the container names the
+    patch_mailbox_membership_of(mail, email_states, account_id, &ids, container, value, op).await
+}
+
+/// The membership patch over an ALREADY RESOLVED set of message ids.
+///
+/// A thread move is two legs (add to the target, remove from the source)
+/// and each leg used to run its own `Thread/get`. A message delivered to
+/// the thread between the two resolves was therefore removed from the
+/// source without ever having been added to the target: it lost the
+/// source membership and gained nothing. The two-leg non-atomicity is the
+/// documented cross-provider shape and is not fixable here, but the
+/// window only has to be one `Email/set` pair over a FIXED id set, so the
+/// thread is resolved once and both legs run over that set.
+///
+/// The caller performs the cross-account container check for each
+/// container it passes; the ids themselves are already in this account's
+/// namespace.
+async fn patch_mailbox_membership_of<T: HttpTransport>(
+    mail: &MailAccount<T>,
+    email_states: &StateMap,
+    account_id: &str,
+    ids: &[EmailId],
+    container: ContainerId,
+    value: bool,
+    op: AccountOperation,
+) -> Result<(), AccountError> {
+    let ids = ids.to_vec();
+    // The owner check has established that the container names the
     // same account as the target, so the only work left is stripping the
     // qualification the selected account does not use.
     let mailbox = MailboxId::new(wire_id_for_mail(&container.0, mail.id_str()));
@@ -1666,12 +1765,12 @@ where
             mail.call(make_set(&state)).await.map_err(to_acct_err(op))?
         }
     };
-    if !response.new_state().is_empty() {
+    if let Some(new_state) = response.new_state().filter(|state| !state.is_empty()) {
         state_cache::advance(
             email_states,
             account_id,
             Some(&state),
-            response.new_state().to_string(),
+            new_state.to_string(),
         )
         .await;
     }
@@ -3047,6 +3146,219 @@ mod tests {
             value["parentId"] = serde_json::Value::String(parent.to_string());
         }
         serde_json::from_value(value).expect("mailbox deserializes")
+    }
+
+    /// A thread search is a query for emails projected onto their
+    /// threads, so an email the projection cannot place is a hit the
+    /// caller asked for and never receives. All three ways that happens -
+    /// declared `notFound`, answered in neither list, and returned
+    /// without the mandatory `threadId` - belong in `failed_ids`, and one
+    /// thread hit by two messages is still one thread.
+    #[test]
+    fn search_emails_without_a_thread_ride_failed_ids() {
+        let email = |value: serde_json::Value| -> Email {
+            serde_json::from_value(value).expect("email deserializes")
+        };
+        let (items, failed_ids) = reconcile_search_threads(
+            vec![
+                "M0".to_string(),
+                "M1".to_string(),
+                "M2".to_string(),
+                "M3".to_string(),
+                "M4".to_string(),
+            ],
+            &[EmailId::new("M0")],
+            vec![
+                email(serde_json::json!({"id": "M1", "threadId": "T1"})),
+                // Same thread as M1: one thread, one item.
+                email(serde_json::json!({"id": "M2", "threadId": "T1"})),
+                // Returned, but unplaceable - `threadId` is mandatory.
+                email(serde_json::json!({"id": "M3"})),
+            ],
+        );
+
+        assert_eq!(items, vec![ThreadId("T1".to_string())]);
+        let mut failed_ids = failed_ids;
+        failed_ids.sort();
+        assert_eq!(
+            failed_ids,
+            vec!["M0".to_string(), "M3".to_string(), "M4".to_string()]
+        );
+    }
+
+    /// A JMAP boundary that expands one thread to a growing message set:
+    /// the first `Thread/get` answers one message, every later one answers
+    /// two. A `move_thread` that resolved the thread per leg would add
+    /// only M1 to the target and then remove BOTH M1 and M2 from the
+    /// source, stranding M2 with no membership at all.
+    struct GrowingThreadTransport {
+        thread_gets: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        sets: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    }
+
+    impl crate::core::transport::HttpTransport for GrowingThreadTransport {
+        async fn api_request(
+            &self,
+            _url: &str,
+            body: Vec<u8>,
+        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+            let request: serde_json::Value = serde_json::from_slice(&body).expect("request json");
+            let call = request["methodCalls"][0].clone();
+            let name = call[0].as_str().expect("method name").to_string();
+            let call_id = call[2].as_str().expect("call id").to_string();
+            let arguments = match name.as_str() {
+                "Thread/get" => {
+                    let seen = self
+                        .thread_gets
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let email_ids = if seen == 0 {
+                        serde_json::json!(["M1"])
+                    } else {
+                        serde_json::json!(["M1", "M2"])
+                    };
+                    serde_json::json!({
+                        "accountId": "primary",
+                        "state": "t1",
+                        "list": [{"id": "T1", "emailIds": email_ids}],
+                        "notFound": []
+                    })
+                }
+                // The email-state probe the mutation door makes before its
+                // conditional `Email/set`.
+                "Email/get" => serde_json::json!({
+                    "accountId": "primary",
+                    "state": "s1",
+                    "list": [],
+                    "notFound": []
+                }),
+                "Email/set" => {
+                    self.sets.lock().expect("sets").push(call[1].clone());
+                    let updated: serde_json::Map<String, serde_json::Value> = call[1]["update"]
+                        .as_object()
+                        .expect("update map")
+                        .keys()
+                        .map(|id| (id.clone(), serde_json::Value::Null))
+                        .collect();
+                    serde_json::json!({
+                        "accountId": "primary",
+                        "oldState": "s1",
+                        "newState": "s2",
+                        "updated": updated
+                    })
+                }
+                other => panic!("unexpected method {other}"),
+            };
+            let response = serde_json::json!({
+                "sessionState": "session-1",
+                "methodResponses": [[name, arguments, call_id]]
+            });
+            Ok(bytes::Bytes::from(response.to_string()))
+        }
+
+        async fn upload(
+            &self,
+            _url: &str,
+            _body: Vec<u8>,
+            _content_type: Option<&str>,
+        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+            Err(crate::core::transport::TransportError::new("no upload"))
+        }
+
+        async fn download(
+            &self,
+            _url: &str,
+        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+            Err(crate::core::transport::TransportError::new("no download"))
+        }
+
+        async fn get_session(
+            &self,
+            _url: &str,
+        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+            Err(crate::core::transport::TransportError::new("no session"))
+        }
+    }
+
+    /// The two legs of a thread move must run over ONE resolved id set.
+    /// Re-resolving between them let a message that arrived in the middle
+    /// be removed from the source without ever being added to the target.
+    #[tokio::test]
+    async fn a_thread_move_resolves_the_thread_once_for_both_legs() {
+        let thread_gets = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sets = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let session: crate::core::session::Session = serde_json::from_value(serde_json::json!({
+            "capabilities": {
+                "urn:ietf:params:jmap:core": {
+                    "maxSizeUpload": 1000,
+                    "maxConcurrentUpload": 2,
+                    "maxSizeRequest": 100_000,
+                    "maxConcurrentRequests": 4,
+                    "maxCallsInRequest": 8,
+                    "maxObjectsInGet": 256,
+                    "maxObjectsInSet": 256,
+                    "collationAlgorithms": []
+                },
+                "urn:ietf:params:jmap:mail": {}
+            },
+            "accounts": {
+                "primary": {"name": "Primary", "isPersonal": true, "isReadOnly": false,
+                    "accountCapabilities": {"urn:ietf:params:jmap:mail": {}}}
+            },
+            "primaryAccounts": {"urn:ietf:params:jmap:mail": "primary"},
+            "username": "user@example.test",
+            "apiUrl": "https://example.test/jmap/api",
+            "downloadUrl": "https://example.test/download/{accountId}/{blobId}/{name}/{type}",
+            "uploadUrl": "https://example.test/upload/{accountId}",
+            "eventSourceUrl": "https://example.test/eventsource",
+            "state": "session-1"
+        }))
+        .expect("session parses");
+        let client = crate::client::Client::with_transport(
+            GrowingThreadTransport {
+                thread_gets: std::sync::Arc::clone(&thread_gets),
+                sets: std::sync::Arc::clone(&sets),
+            },
+            session,
+            "https://example.test/.well-known/jmap",
+        )
+        .expect("client builds");
+        let mail = crate::account::Account::new(client, "primary");
+        let states: StateMap =
+            std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+
+        move_thread(
+            mail,
+            states,
+            "primary".to_string(),
+            ThreadId("T1".to_string()),
+            ContainerId("archive".to_string()),
+            Some(ContainerId("inbox".to_string())),
+        )
+        .await
+        .expect("move succeeds");
+
+        assert_eq!(
+            thread_gets.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the thread must be resolved once for both legs"
+        );
+        let sets = sets.lock().expect("sets");
+        assert_eq!(sets.len(), 2, "two legs, one Email/set each");
+        let ids_of = |call: &serde_json::Value| {
+            let mut ids: Vec<String> = call["update"]
+                .as_object()
+                .expect("update map")
+                .keys()
+                .cloned()
+                .collect();
+            ids.sort();
+            ids
+        };
+        assert_eq!(
+            ids_of(&sets[0]),
+            ids_of(&sets[1]),
+            "both legs must address the same message set"
+        );
     }
 
     /// The search page cursor is a bare integer position, so the query it

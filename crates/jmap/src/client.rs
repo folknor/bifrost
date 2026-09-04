@@ -159,6 +159,15 @@ pub(crate) struct ClientInner<T: HttpTransport = ReqwestTransport> {
     pub(crate) authorization: Authorization,
     #[cfg(feature = "websockets")]
     pub(crate) ws: tokio::sync::Mutex<Option<crate::client_ws::WsStream>>,
+    /// RFC 8887 `requestId` counter for WebSocket requests.
+    ///
+    /// It lives on the CLIENT, not on the `WsStream`, so it survives a
+    /// reconnect. Per-connection it restarted at 0, which meant a response
+    /// arriving late from a previous connection carried an id the new
+    /// connection was about to reuse - the one case where correlation by
+    /// id is actively worse than none.
+    #[cfg(feature = "websockets")]
+    pub(crate) ws_request_id: std::sync::atomic::AtomicU64,
 }
 
 /// A JMAP client. Cheap to clone - wraps an `Arc<ClientInner>` internally.
@@ -338,6 +347,8 @@ impl ClientBuilder {
                 authorization,
                 #[cfg(feature = "websockets")]
                 ws: None.into(),
+                #[cfg(feature = "websockets")]
+                ws_request_id: std::sync::atomic::AtomicU64::new(0),
             }),
         })
     }
@@ -376,6 +387,86 @@ mod session_state_tests {
             "state": state
         })
         .to_string()
+    }
+
+    /// RFC 8887 request ids must not repeat across WebSocket
+    /// reconnects: a late response from the dropped connection would
+    /// otherwise carry an id the new connection is about to reuse, which
+    /// is worse than having no correlation at all. The counter therefore
+    /// belongs to the CLIENT and not to the per-connection `WsStream`,
+    /// which is reconstructed on every `connect_ws`.
+    #[cfg(feature = "websockets")]
+    #[test]
+    fn websocket_request_ids_do_not_restart() {
+        let session: Session = serde_json::from_str(&session_json("old", "A1", "session-1"))
+            .expect("session fixture parses");
+        let client = Client::with_transport(
+            RefreshingTransport {
+                api_urls: Arc::new(Mutex::new(Vec::new())),
+            },
+            session,
+            "https://example.test/.well-known/jmap",
+        )
+        .expect("client builds");
+
+        let ids: Vec<String> = (0..3).map(|_| client.next_ws_request_id()).collect();
+        assert_eq!(ids, vec!["0", "1", "2"]);
+        // A reconnect replaces the `WsStream`; the counter is not in it,
+        // so the sequence continues rather than restarting at 0.
+        assert_eq!(client.next_ws_request_id(), "3");
+    }
+
+    /// A session advertising no `primaryAccounts` leaves the derived
+    /// default account id empty. `build()` used to bake that into every
+    /// generic request and the method structs serialized
+    /// `"accountId": ""` - a malformed request answered with an opaque
+    /// server error, for a fault that is entirely local. It must fail
+    /// here instead, naming the capability whose account is missing.
+    #[test]
+    fn a_session_without_a_primary_account_refuses_to_build_a_request() {
+        let session: Session = serde_json::from_value(json!({
+            "capabilities": {},
+            "accounts": {},
+            "primaryAccounts": {},
+            "username": "user@example.test",
+            "apiUrl": "https://example.test/api",
+            "downloadUrl": "https://example.test/dl/{accountId}/{blobId}/{name}/{type}",
+            "uploadUrl": "https://example.test/upload/{accountId}",
+            "eventSourceUrl": "https://example.test/es",
+            "state": "session-1"
+        }))
+        .expect("session parses");
+        let client = Client::with_transport(
+            RefreshingTransport {
+                api_urls: Arc::new(Mutex::new(Vec::new())),
+            },
+            session,
+            "https://example.test/.well-known/jmap",
+        )
+        .expect("client builds");
+        assert_eq!(client.default_account_id().as_str(), "");
+
+        let mut request = client.build();
+        let error = request
+            .call(crate::mailbox::MailboxGet::new())
+            .err()
+            .expect("an empty account id must not reach the wire");
+        assert!(
+            matches!(
+                error,
+                crate::Error::NoPrimaryAccount {
+                    capability: "urn:ietf:params:jmap:mail"
+                }
+            ),
+            "unexpected error: {error:?}"
+        );
+        // Nothing was appended, so the request cannot serialize the
+        // malformed call either.
+        let body = serde_json::to_string(&request).expect("request serializes");
+        assert!(
+            !body.contains("\"accountId\":\"\""),
+            "empty account id must not be serialized: {body}"
+        );
     }
 
     fn leading_value<P: crate::core::session::URLParser>(parts: &[super::URLPart<P>]) -> &str {
@@ -522,6 +613,8 @@ impl<T: HttpTransport> Client<T> {
                 authorization: Authorization::Basic(String::new()),
                 #[cfg(feature = "websockets")]
                 ws: None.into(),
+                #[cfg(feature = "websockets")]
+                ws_request_id: std::sync::atomic::AtomicU64::new(0),
             }),
         })
     }
@@ -575,13 +668,36 @@ impl<T: HttpTransport> Client<T> {
             tally.add(bytes_in);
         }
         let response: response::Response = serde_json::from_slice(&bytes)?;
-        if response.session_state() != state.session().state() {
+        self.note_session_state(response.session_state());
+        Ok(response)
+    }
+
+    /// The next RFC 8887 `requestId` for a WebSocket request. Monotonic
+    /// for the life of the CLIENT, so ids are not reused across reconnects.
+    #[cfg(feature = "websockets")]
+    pub(crate) fn next_ws_request_id(&self) -> String {
+        self.inner
+            .ws_request_id
+            .fetch_add(1, Ordering::Relaxed)
+            .to_string()
+    }
+
+    /// Compare a server-reported `sessionState` against the one this client
+    /// is running on, and publish a divergence.
+    ///
+    /// Every response carries `sessionState` (RFC 8620 s3.4), and the whole
+    /// scope-lifecycle `CapabilityChanged` story rests on noticing when it
+    /// moves. Both response doors must therefore run this: the HTTP door
+    /// always did, while the WebSocket door rebuilt a `Response` and handed
+    /// it up without ever looking, so staleness went undetected on exactly
+    /// the connection that stays open longest.
+    pub(crate) fn note_session_state(&self, session_state: &str) {
+        if session_state != self.session_state().session().state() {
             self.inner.session_updated.store(false, Ordering::Release);
             self.inner.session_changes.send_modify(|generation| {
                 *generation = generation.wrapping_add(1);
             });
         }
-        Ok(response)
     }
 
     /// Re-fetch the session and republish everything derived from it.

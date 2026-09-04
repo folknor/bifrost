@@ -360,9 +360,70 @@ fn set_response_deserializes() {
     });
 
     let mut response: SetResponse<TestObj> = serde_json::from_value(raw).unwrap();
-    assert_eq!(response.new_state(), "s2");
+    assert_eq!(response.new_state(), Some("s2"));
     let created = response.created("c0").unwrap();
     assert_eq!(created.name.as_deref(), Some("created-obj"));
+}
+
+/// RFC 8620 s3.2 lets one method call produce SEVERAL responses under the
+/// same call id, and this is the generic envelope, so consuming them out of
+/// order is a fault of the layer rather than of any wired method.
+/// `swap_remove` moved the LAST entry into the vacated slot, so the second
+/// read under a repeated call id returned whichever response happened to
+/// sit at the end - and it reordered unrelated handles read afterwards too.
+#[test]
+fn repeated_call_ids_are_read_in_the_order_the_server_sent_them() {
+    let raw = json!({
+        "sessionState": "session-1",
+        "methodResponses": [
+            ["Test/get", {"accountId": "A1", "state": "s1", "list": [{"id": "first"}], "notFound": []}, "c0"],
+            ["Test/get", {"accountId": "A1", "state": "s1", "list": [{"id": "second"}], "notFound": []}, "c0"],
+            ["Test/get", {"accountId": "A1", "state": "s1", "list": [{"id": "third"}], "notFound": []}, "c0"],
+            ["Test/get", {"accountId": "A1", "state": "s1", "list": [{"id": "fourth"}], "notFound": []}, "c0"]
+        ]
+    });
+    let mut response: Response = serde_json::from_value(raw).expect("response decodes");
+    let handle = make_handle::<TestGet>("c0");
+
+    let ids = |response: super::get::GetResponse<TestObj>| {
+        response
+            .into_list()
+            .into_iter()
+            .filter_map(|obj| obj.id)
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(ids(response.get(&handle).expect("first")), vec!["first"]);
+    assert_eq!(ids(response.get(&handle).expect("second")), vec!["second"]);
+    assert_eq!(ids(response.get(&handle).expect("third")), vec!["third"]);
+    assert_eq!(ids(response.get(&handle).expect("fourth")), vec!["fourth"]);
+}
+
+/// RFC 8620 s5.3 makes `newState` mandatory, so a response without one is
+/// a non-conforming server - and it must stay distinguishable from a
+/// server that reported an empty state. The accessor used to fold both
+/// into `""`, which handed the sync layer's state cache (where an
+/// explicitly empty entry has its own meaning) a value no server sent.
+#[test]
+fn an_absent_set_new_state_is_not_an_empty_one() {
+    use super::set::SetResponse;
+
+    let absent: SetResponse<TestObj> = serde_json::from_value(json!({
+        "accountId": "A1",
+        "oldState": "s1"
+    }))
+    .unwrap();
+    assert_eq!(absent.new_state(), None);
+    assert_eq!(absent.into_new_state(), None);
+
+    let empty: SetResponse<TestObj> = serde_json::from_value(json!({
+        "accountId": "A1",
+        "oldState": "s1",
+        "newState": ""
+    }))
+    .unwrap();
+    assert_eq!(empty.new_state(), Some(""));
+    assert_eq!(empty.into_new_state(), Some(String::new()));
 }
 
 #[test]

@@ -151,6 +151,13 @@ fn email_changes<T: HttpTransport>(
         // traffic instead of each restating a running total.
         let (mail, tally) = mail.metered();
         let max_changes = nonzero(limits.max_objects_in_get);
+        // Every state this walk has already resumed from. A conforming
+        // `newState` never repeats within a walk - it names a point the
+        // server has passed - so a repeat is a cycle, and the single-step
+        // guard below cannot see one: a server alternating two states
+        // "moves" at every step and paginates forever.
+        let mut seen_states: std::collections::HashSet<String> =
+            std::iter::once(since_state.clone()).collect();
         loop {
             let started = Instant::now();
             let response = mail
@@ -186,6 +193,18 @@ fn email_changes<T: HttpTransport>(
                     bifrost_types::AccountOperation::SyncChanges,
                     Some(bifrost_types::ErrorScope::Cursor(scope.clone())),
                     "Email/changes reported hasMoreChanges with an unmoved state",
+                );
+                break;
+            }
+            // Cycle guard: a state this walk already resumed from is being
+            // served again, so the pagination is a loop rather than a walk.
+            // Terminating before this page's batch keeps the durable cursor
+            // at a state the walk has genuinely reached.
+            if response.has_more_changes() && !seen_states.insert(new_state.clone()) {
+                yield super::error::terminated_contract_violation(
+                    bifrost_types::AccountOperation::SyncChanges,
+                    Some(bifrost_types::ErrorScope::Cursor(scope.clone())),
+                    "Email/changes returned to a state this walk had already served",
                 );
                 break;
             }
@@ -235,6 +254,9 @@ fn mailbox_changes<T: HttpTransport>(
         // See `email_changes`: one accumulator for the paged walk.
         let (mail, tally) = mail.metered();
         let max_changes = nonzero(limits.max_objects_in_get);
+        // See `email_changes`: cycle guard over the states this walk served.
+        let mut seen_states: std::collections::HashSet<String> =
+            std::iter::once(since_state.clone()).collect();
         loop {
             let started = Instant::now();
             let response = mail
@@ -262,6 +284,15 @@ fn mailbox_changes<T: HttpTransport>(
                     bifrost_types::AccountOperation::SyncChanges,
                     Some(bifrost_types::ErrorScope::Cursor(scope.clone())),
                     "Mailbox/changes reported hasMoreChanges with an unmoved state",
+                );
+                break;
+            }
+            // See `email_changes`: a repeated state is a cycle, not progress.
+            if response.has_more_changes() && !seen_states.insert(new_state.clone()) {
+                yield super::error::terminated_contract_violation(
+                    bifrost_types::AccountOperation::SyncChanges,
+                    Some(bifrost_types::ErrorScope::Cursor(scope.clone())),
+                    "Mailbox/changes returned to a state this walk had already served",
                 );
                 break;
             }
@@ -439,6 +470,11 @@ mod tests {
         /// sinceState` and `hasMoreChanges: true` - a stuck server that
         /// would drive an unguarded loop forever.
         stuck: bool,
+        /// When set, alternate `newState` between two values, always with
+        /// `hasMoreChanges: true`. Every single step "moves" the state, so
+        /// the single-step guard sees progress; only a cycle guard can end
+        /// the walk.
+        oscillating: bool,
     }
 
     /// Shared handle on the recorded requests. The transport is moved
@@ -513,6 +549,12 @@ mod tests {
             let since = call[1]["sinceState"].clone();
             let new_state = if self.stuck {
                 since.clone()
+            } else if self.oscillating {
+                if since == serde_json::json!("state-2") {
+                    serde_json::json!("state-1")
+                } else {
+                    serde_json::json!("state-2")
+                }
             } else {
                 serde_json::json!("state-2")
             };
@@ -524,7 +566,7 @@ mod tests {
                         "accountId": account_id,
                         "oldState": since,
                         "newState": new_state,
-                        "hasMoreChanges": self.stuck,
+                        "hasMoreChanges": self.stuck || self.oscillating,
                         "created": [],
                         "updated": [],
                         "destroyed": []
@@ -628,6 +670,7 @@ mod tests {
             RecordingTransport {
                 requests: log.clone(),
                 stuck: false,
+                oscillating: false,
             },
             test_session(),
             "https://example.test/.well-known/jmap",
@@ -726,6 +769,7 @@ mod tests {
                 RecordingTransport {
                     requests: log.clone(),
                     stuck: true,
+                    oscillating: false,
                 },
                 test_session(),
                 "https://example.test/.well-known/jmap",
@@ -755,6 +799,66 @@ mod tests {
                 _ => None,
             });
             let error = terminated
+                .unwrap_or_else(|| panic!("{scope:?}: expected Terminated, got {events:?}"));
+            assert_eq!(
+                error.kind(),
+                &bifrost_types::AccountErrorKind::Protocol(
+                    bifrost_types::ProtocolErrorKind::ContractViolation
+                ),
+                "{scope:?}"
+            );
+        }
+    }
+
+    /// A server alternating between two states with `hasMoreChanges: true`
+    /// moves the state at every single step, so the single-step guard sees
+    /// progress at each one and the walk paginates forever. The cycle guard
+    /// must end it the moment a state this walk already served comes back.
+    #[tokio::test]
+    async fn an_oscillating_changes_state_terminates_instead_of_looping() {
+        for scope in [
+            CursorScope::Type(bifrost_types::ObjectType::Email),
+            CursorScope::Type(bifrost_types::ObjectType::Mailbox),
+        ] {
+            let log = RequestLog::new();
+            let client = crate::client::Client::with_transport(
+                RecordingTransport {
+                    requests: log.clone(),
+                    stuck: false,
+                    oscillating: true,
+                },
+                test_session(),
+                "https://example.test/.well-known/jmap",
+            )
+            .expect("client builds");
+            let mail = crate::account::Account::new(client, "primary");
+            let cursor = state::cursor_for_scope(scope.clone(), "state-1").expect("scope encodes");
+            let events = stream(
+                mail,
+                "primary".to_string(),
+                limits(),
+                cursor,
+                None,
+                empty_states(),
+                empty_states(),
+            )
+            .collect::<Vec<_>>()
+            .await;
+
+            // Request one moves state-1 -> state-2 and is served; request
+            // two comes back to state-1, which this walk has already
+            // served, and is refused.
+            assert_eq!(
+                log.methods().len(),
+                2,
+                "{scope:?}: the cycle guard must fire on the second request"
+            );
+            let error = events
+                .iter()
+                .find_map(|event| match event {
+                    SyncEvent::Terminated(error) => Some(error),
+                    _ => None,
+                })
                 .unwrap_or_else(|| panic!("{scope:?}: expected Terminated, got {events:?}"));
             assert_eq!(
                 error.kind(),

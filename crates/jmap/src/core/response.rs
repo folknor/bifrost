@@ -28,6 +28,17 @@ impl Response {
     ///
     /// Compile-time safe: the handle's type parameter ensures the response
     /// is deserialized into the correct type.
+    ///
+    /// RFC 8620 s3.2 lets ONE method call produce SEVERAL responses under
+    /// the same call id. Each `get` takes the first remaining response for
+    /// the handle, so repeated calls on one handle walk them in the order
+    /// the server sent them. That ordering is the point of `remove` here:
+    /// `swap_remove` is cheaper, but it moves the last entry into the
+    /// vacated slot, which reorders every later lookup - including the
+    /// second response under a repeated call id, and including unrelated
+    /// handles read afterwards. The vector holds at most
+    /// `maxCallsInRequest` entries, so the shift is not worth an ordering
+    /// hazard.
     pub(crate) fn get<M: JmapMethod>(
         &mut self,
         handle: &CallHandle<M>,
@@ -38,7 +49,7 @@ impl Response {
             .position(|(_, _, id)| id == &handle.call_id)
             .ok_or_else(|| crate::Error::CallNotFound(handle.call_id.clone()))?;
 
-        let (method_name, result, call_id) = self.raw.swap_remove(pos);
+        let (method_name, result, call_id) = self.raw.remove(pos);
 
         match result {
             RawCallResult::Success(raw) => {

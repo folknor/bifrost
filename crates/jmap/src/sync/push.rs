@@ -305,11 +305,7 @@ pub(crate) fn subscribe<T: PushTransport>(
             .collect::<DataTypeSet>();
 
         if data_types.is_empty() {
-            return Err(super::error::unsupported_error(
-                AccountOperation::PushSubscribe,
-                None,
-                "JMAP push subscribe requires at least one supported scope",
-            ));
+            return Err(super::error::no_mappable_push_scopes());
         }
 
         // Lock order is subscriptions -> enabled -> push_state everywhere that
@@ -658,7 +654,7 @@ async fn reader_pass<T: PushTransport>(
                 emit_push(push, tx, routing);
             }
             Ok(
-                crate::client_ws::WebSocketMessage::Response(_)
+                crate::client_ws::WebSocketMessage::Response { .. }
                 | crate::client_ws::WebSocketMessage::Pong,
             ) => {
                 saw_traffic = true;
@@ -1120,6 +1116,35 @@ mod tests {
         .expect("supported subset applies");
 
         assert_eq!(result.1, vec![true, false, true]);
+    }
+
+    /// An all-rejected subscribe is a fact about the SCOPES, not about the
+    /// account: push was advertised as `InProcess`, and the mixed case
+    /// already reports the same rejection per-scope on the accepted lane.
+    /// `Unsupported(PushSubscribe)` would tell a consumer keying off the
+    /// kind that this account has no push at all, inviting a wholesale
+    /// downgrade.
+    #[tokio::test]
+    async fn zero_mappable_scopes_is_a_malformed_request_not_absent_push() {
+        let error = subscribe(
+            RecordingPushTransport {
+                fail: false,
+                applied: Arc::new(StdMutex::new(Vec::new())),
+            },
+            PushCapability::InProcess,
+            SubscriptionHandle("none".to_string()),
+            vec![CursorScope::Query(bifrost_types::QueryId("q1".to_string()))],
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(HashSet::new())),
+            Arc::new(Mutex::new(None)),
+        )
+        .await
+        .expect_err("no scope maps");
+
+        assert_eq!(
+            error.kind(),
+            &bifrost_types::AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed)
+        );
     }
 
     /// Reconfiguring the live data-type set must carry the last acknowledged

@@ -9,29 +9,27 @@ Hunter's note: reran the one test whose mechanism it doubted
 
 ## Confident findings
 
-### 1. The WebSocket request door cannot correlate responses - RFC 8887 `requestId` is dropped
+(Findings 1 and 2 - the WebSocket request door's missing correlation and
+missing session-state comparison - are fixed on the "finish it" branch, and
+`send_ws` is kept. `WebSocketResponse` now decodes RFC 8887 `requestId` and
+`WebSocketMessage::Response` carries it, so a response frame can be matched
+to the request it answers; the id counter moved from the per-connection
+`WsStream` to the `Client`, so ids no longer restart at 0 on reconnect (a
+late response from the old connection carrying an id the new one is about to
+reuse is worse than no correlation); and `frame_stream` runs the same
+`Client::note_session_state` comparison the HTTP door runs, on every response
+frame including one whose method responses fail to decode. Pinned by
+`a_response_frame_carries_the_request_id_it_answers`,
+`every_response_frame_reports_its_session_state` and
+`websocket_request_ids_do_not_restart`; the first two ablated and confirmed
+failing.
 
-`crates/jmap/src/client_ws.rs`: `WebSocketResponse` deserializes
-`methodResponses`, `createdIds`, `sessionState` - but not `requestId`, the field
-RFC 8887 s4.3.4 echoes so a client can match a `Response` frame to the request
-it answered. `send_ws` dutifully assigns and returns a request id (`ws.req_id`),
-but nothing downstream can ever use it: `WebSocketMessage::Response` carries no
-id. Two in-flight WS requests are indistinguishable on the read stream. Today
-this is latent (grep shows `send_ws` has no production caller outside
-`core/tests.rs`), but the reference doc advertises "WebSocket requests through
-the same `call` door" as a supported path, and the correlation half of that door
-does not exist. Related: `connect_ws` resets `req_id` to 0 on every reconnect,
-so ids also repeat across connections.
-
-### 2. WS-delivered responses bypass session-divergence detection
-
-`Client::send_request` (client.rs:571-577) compares `response.session_state()`
-against the snapshot and bumps the `session_changes` watch - the mechanism the
-whole scope-lifecycle `CapabilityChanged` story rests on. The WS path
-(`frame_stream` -> `WebSocketMessage::Response`) rebuilds a `Response` and hands
-it up without that comparison, and `send_ws` never sees the response at all. Any
-future consumer of WS method calls silently loses staleness detection. Contract
-asymmetry between the two doors of the same layer.
+Deliberately NOT done: the pending-request MAP that resolves a caller's
+future when its frame arrives. That needs an await-side door (`send_ws`
+handing back a receiver) plus reader routing, and both would be unused
+surface - the only production consumer of the read stream is the push
+reader, which ignores `Response` frames. The correlation data now exists end
+to end, so the map is a local addition whenever a caller wants one.)
 
 (Finding 3 - no JSON Pointer escaping in dotted patch paths - is fixed
 crate-wide: `core::set::escape_json_pointer_token` now guards every
@@ -40,36 +38,38 @@ calendarIds, and the sync layer's RSVP participant path). Pinned by
 `keyword_and_mailbox_patch_paths_escape_json_pointer_tokens` with
 revert-and-confirm; the rule is stated in `reference/jmap.md`.)
 
-### 5. `SetResponse::new_state()` fabricates an empty state string
+(Finding 5 - `SetResponse::new_state()` fabricating `""` for an absent
+`newState` - is fixed: `new_state()` and `into_new_state()` are `Option` at
+the boundary, so absence and a genuinely empty state stay distinguishable
+instead of colliding on the sentinel the state cache gives its own meaning.
+Every caller advances the cache only on a present, non-empty state. Pinned by
+`an_absent_set_new_state_is_not_an_empty_one`; its bite is type-level - the
+pre-fix `&str` accessor cannot satisfy the assertion at all.)
 
-`core/set.rs:302-308`: `new_state` is modeled `Option<String>` but the accessors
-return `""` for absent. RFC 8620 s5.3 makes `newState` mandatory. An `""`
-flowing out of here is indistinguishable from a real state to callers; the sync
-layer's state cache documents special "explicitly empty" semantics for exactly
-this shape, so a non-conforming server yields a silently poisoned cache entry
-rather than a `ContractViolation`. The leniency in `GetResponse.not_found` is
-documented and reconciled against; this one is neither.
+(Finding 7's ordering half is fixed: `Response::get` removes in place
+instead of `swap_remove`, so several responses under one call id are read in
+the order the server sent them and later lookups of unrelated handles are not
+displaced. Pinned by
+`repeated_call_ids_are_read_in_the_order_the_server_sent_them`; note its FIRST
+shape passed against the bug by coincidence - with four same-id responses the
+swapped-in tail is observable, and the ablation then failed with "fourth"
+where "second" was due. Modelling multiplicity explicitly - a `get_all`
+returning every response for a handle - is deliberately NOT done: nothing
+wired produces it, and an unused accessor is dead surface. The generic
+envelope now at least does not scramble.)
 
-### 7. `Response::get` picks an arbitrary response when call ids repeat
-
-`core/response.rs:31-56`: RFC 8620 s3.2 explicitly allows a single method call
-to produce *multiple* responses tagged with the same call id. `get` takes the
-first positional match and `swap_remove`s (which also scrambles order for later
-lookups). No currently-wired method does this, but the core envelope claims to
-be the generic RFC 8620 layer and doesn't model it; a second `get` on the same
-handle silently returns the next one, which some caller might even come to
-depend on accidentally.
-
-### 8. Empty-string fallback account id in `SessionState::derive`
-
-`client.rs:105-108`: no `primaryAccounts` -> `AccountId::new("")`, and
-`Request::new` bakes that into every generic `client.build()` request; the
-method structs happily serialize `"accountId": ""`.
-`primary_account::<C>()` errors properly with `NoPrimaryAccount`, but the
-`Client::build()` path ships a malformed request instead of failing locally.
-The reference even documents `build()`'s "lexicographically first primary
-capability" fallback - which for a session advertising *only* calendars means
-mail-ish generic requests quietly ride the calendar account.
+(Finding 8 - the empty-string fallback account id riding out as
+`"accountId": ""` - is fixed at the door that would have serialized it:
+`Request::call` refuses an empty account id with
+`Error::NoPrimaryAccount { capability }`, naming the method's own capability,
+the same variant `primary_account::<C>()` already raises and the sync error
+table already classifies. Every method this crate defines carries an
+`accountId`, so the guard needs no per-method exception. Pinned by
+`a_session_without_a_primary_account_refuses_to_build_a_request` with
+revert-and-confirm. The wrong-account half of the finding - a session
+advertising only calendars serving mail-ish generic requests off the calendar
+account - is untouched: that is the documented `build()` fallback, and
+narrowing it is a product decision, not a defect fix.)
 
 ## Suspicions / lesser notes
 
@@ -100,14 +100,13 @@ mail-ish generic requests quietly ride the calendar account.
 
 The layer is in better shape than most: the CallLimit three-state, the atomic
 `SessionState`, the RFC 6570 encoding, and the frame-level WS test seam are all
-carefully reasoned. The one structural gap worth a real investment is the
-**WebSocket request/response half** (findings 1-2): it is the only part of the
-protocol layer that is wired but not honest - no correlation, no session-state
-check, no `maxSizeRequest` guard on `send_ws`. Either finish it (a
-pending-request map keyed by `requestId`, session-state comparison in
-`frame_stream`) or delete `send_ws` down to push-only plumbing so the door stops
-advertising what it can't deliver - that's an owner decision, not the hunter's
-to make.
+carefully reasoned. The one structural gap worth a real investment was the
+**WebSocket request/response half** (findings 1-2). The owner chose "finish
+it" over "delete `send_ws`", and the correlation and session-state halves are
+now in place (see the entry above). What remains of that observation: there is
+still no `maxSizeRequest` guard on `send_ws` (the `maxCallsInRequest` guard
+does cover it, via the shared `call` door), and no pending-request map - the
+latter deliberately, for want of a caller.
 
 Files most relevant: `crates/jmap/src/client_ws.rs`,
 `crates/jmap/src/core/set.rs`, `crates/jmap/src/email/set.rs`,

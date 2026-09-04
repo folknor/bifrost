@@ -168,6 +168,20 @@ impl<'x, T: HttpTransport> Request<'x, T> {
         {
             return Err(crate::Error::RequestCallLimit { max });
         }
+        // A session with no `primaryAccounts` leaves the derived default
+        // account id empty. Every method this crate defines carries an
+        // `accountId`, so serializing one against that default puts
+        // `"accountId": ""` on the wire - a malformed request the server
+        // answers with an opaque error, when the fault is entirely local
+        // and knowable before a byte moves. Fail here, naming the
+        // capability whose account is missing, exactly as
+        // `Account::primary_account::<C>()` already does; the sync layer's
+        // error table already classifies this variant.
+        if self.account_id.as_str().is_empty() {
+            return Err(crate::Error::NoPrimaryAccount {
+                capability: M::Cap::URI,
+            });
+        }
         let call_id = format!("s{}", self.method_calls.len());
 
         // Auto-add capability

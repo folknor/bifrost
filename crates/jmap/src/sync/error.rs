@@ -326,6 +326,33 @@ pub(crate) fn send_as_unknown_account(mailbox: &bifrost_types::MailboxId) -> Acc
     .expect("valid account error classification")
 }
 
+/// A push subscribe whose every requested scope maps to no JMAP push data
+/// type.
+///
+/// Classified `Request(Malformed)` rather than `Unsupported(PushSubscribe)`
+/// for the same reason as `cross_account_destination`: the account has
+/// already advertised `PushCapability::InProcess`, so `Unsupported` claims
+/// the account has no push at all and invites a consumer keying off the
+/// kind to downgrade push wholesale. What is actually wrong is the
+/// argument - these scopes, which the mixed case already reports
+/// per-scope on the accepted lane.
+#[must_use]
+pub(crate) fn no_mappable_push_scopes() -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::Request(RequestErrorKind::Malformed),
+        Cause::Request(RequestCause::InvalidArgument {
+            field: Some("push_subscribe.scopes"),
+            message: Some(DiagnosticText::support_only(
+                "no requested cursor scope maps to a JMAP push data type",
+            )),
+        }),
+    )
+    .protocol(Protocol::Jmap)
+    .operation(AccountOperation::PushSubscribe)
+    .try_build()
+    .expect("valid account error classification")
+}
+
 /// A mutation whose message and whose destination mailbox belong to
 /// different JMAP accounts.
 ///

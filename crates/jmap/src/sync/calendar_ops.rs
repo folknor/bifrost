@@ -65,20 +65,22 @@ pub(crate) fn events_in_range<T: HttpTransport>(
             .map(|total| usize_to_u64(total, AccountOperation::EventsInRange))
             .transpose()?;
         let next_cursor = next_cursor(response.position(), response.ids().len(), response.total());
-        let events = get_events(
+        let hydrated = get_events(
             &calendars,
             response.into_ids(),
             AccountOperation::EventsInRange,
         )
-        .await?
-        .into_iter()
-        .filter(|event| event_in_range(event, &range.start, &range.end))
-        .collect::<Vec<_>>();
+        .await?;
+        let events = hydrated
+            .events
+            .into_iter()
+            .filter(|event| event_in_range(event, &range.start, &range.end))
+            .collect::<Vec<_>>();
         Ok(Page {
             items: events,
             next_cursor,
             estimated_total: total,
-            failed_ids: Vec::new(),
+            failed_ids: hydrated.failed_ids,
             skipped_scopes: Vec::new(),
         })
     })
@@ -98,18 +100,18 @@ pub(crate) fn get<T: HttpTransport>(
 ) -> AccountFuture<Result<CalendarEvent, AccountError>> {
     Box::pin(async move {
         let calendars = require_calendars(calendars, AccountOperation::EventGet)?;
-        let events = get_events(
+        // A single-event read reports a conversion failure as itself. The
+        // per-item `failed_ids` lane exists so one unrepresentable event
+        // cannot destroy a page of neighbours; with a page of one there is
+        // no neighbour to protect, and swallowing the reason would leave
+        // the caller with "no event" for an event the server did return.
+        let raw = get_raw_event(
             &calendars,
-            vec![CalendarEventId::new(event.0)],
+            CalendarEventId::new(event.0),
             AccountOperation::EventGet,
         )
         .await?;
-        events.into_iter().next().ok_or_else(|| {
-            unsupported(
-                AccountOperation::EventGet,
-                "JMAP CalendarEvent/get returned no event",
-            )
-        })
+        event_from_jmap(raw, AccountOperation::EventGet)
     })
 }
 
@@ -258,48 +260,140 @@ pub(crate) fn search<T: HttpTransport>(
             .total()
             .map(|total| usize_to_u64(total, AccountOperation::EventSearch))
             .transpose()?;
+        // `CalendarEvent/query` has no calendar condition here, so a
+        // requested calendar is applied client-side after hydration. The
+        // server's total counts the unfiltered result set, which is not
+        // the total of what this walk can ever return; reporting it would
+        // be a number the consumer cannot reconcile against the pages it
+        // receives. No total is the honest answer. The cursor stays live -
+        // it addresses the server-side result set, and a page whose every
+        // hit belonged to another calendar is legitimately empty with more
+        // pages behind it.
+        let total = if request.calendar_id.is_some() {
+            None
+        } else {
+            total
+        };
         let next_cursor = next_cursor(response.position(), response.ids().len(), response.total());
-        let events = get_events(
+        let hydrated = get_events(
             &calendars,
             response.into_ids(),
             AccountOperation::EventSearch,
         )
-        .await?
-        .into_iter()
-        .filter(|event| {
-            request
-                .calendar_id
-                .as_ref()
-                .is_none_or(|calendar| event.calendar_id == *calendar)
-        })
-        .collect();
+        .await?;
+        let events = hydrated
+            .events
+            .into_iter()
+            .filter(|event| {
+                request
+                    .calendar_id
+                    .as_ref()
+                    .is_none_or(|calendar| event.calendar_id == *calendar)
+            })
+            .collect();
         Ok(Page {
             items: events,
             next_cursor,
             estimated_total: total,
-            failed_ids: Vec::new(),
+            failed_ids: hydrated.failed_ids,
             skipped_scopes: Vec::new(),
         })
     })
+}
+
+/// The result of hydrating a page of event ids: the events that
+/// materialized, plus every submitted id that did not produce one.
+struct HydratedEvents {
+    events: Vec<CalendarEvent>,
+    failed_ids: Vec<String>,
 }
 
 async fn get_events<T: HttpTransport>(
     calendars: &CalendarAccount<T>,
     ids: Vec<CalendarEventId>,
     operation: AccountOperation,
-) -> Result<Vec<CalendarEvent>, AccountError> {
+) -> Result<HydratedEvents, AccountError> {
     if ids.is_empty() {
-        return Ok(Vec::new());
+        return Ok(HydratedEvents {
+            events: Vec::new(),
+            failed_ids: Vec::new(),
+        });
     }
+    let requested = ids
+        .iter()
+        .cloned()
+        .map(CalendarEventId::into_string)
+        .collect::<Vec<_>>();
     let response = calendars
         .call(CalendarEventGet::new().ids(ids))
         .await
         .map_err(to_acct_err(operation))?;
-    response
-        .into_list()
-        .into_iter()
-        .map(|event| event_from_jmap(event, operation))
-        .collect()
+    let not_found = response.not_found().to_vec();
+    Ok(reconcile_events(
+        requested,
+        &not_found,
+        response.into_list(),
+        operation,
+    ))
+}
+
+/// Split a `CalendarEvent/get` answer into hydrated events and the ids the
+/// walk could not hand back an event for.
+///
+/// Two distinct losses land in the same lane. An id the server answered in
+/// neither `list` nor `notFound` has simply vanished from the page, the
+/// shape `contacts.rs::reconcile_cards` exists to prevent: read as absence
+/// it looks like a deletion. And an event `event_from_jmap` refuses - a
+/// modified recurrence override, multiple or excluded recurrence rules, an
+/// unknown participant role - is a resource the provider fetched but could
+/// not materialize, which is precisely what `Page::failed_ids` is for.
+/// Before this, one such event anywhere in the queried window failed the
+/// entire call, permanently, because the event does not go away.
+fn reconcile_events(
+    requested: Vec<String>,
+    not_found: &[CalendarEventId],
+    list: Vec<JmapCalendarEvent>,
+    operation: AccountOperation,
+) -> HydratedEvents {
+    let mut answered: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut failed_ids: Vec<String> = Vec::new();
+    for missing in not_found {
+        let missing = missing.clone().into_string();
+        if answered.insert(missing.clone()) {
+            failed_ids.push(missing);
+        }
+    }
+
+    let mut events = Vec::with_capacity(list.len());
+    for event in list {
+        // An object returned without a usable id is a handle to nothing;
+        // the crate's other walks refuse the shape. Dropping it leaves the
+        // submitted id unanswered, so it still reaches `failed_ids` below.
+        let Some(id) = event.id().map(CalendarEventId::into_string) else {
+            continue;
+        };
+        if id.is_empty() {
+            continue;
+        }
+        match event_from_jmap(event, operation) {
+            Ok(event) => {
+                answered.insert(id);
+                events.push(event);
+            }
+            Err(_) => {
+                if answered.insert(id.clone()) {
+                    failed_ids.push(id);
+                }
+            }
+        }
+    }
+
+    for id in requested {
+        if answered.insert(id.clone()) {
+            failed_ids.push(id);
+        }
+    }
+    HydratedEvents { events, failed_ids }
 }
 
 async fn get_raw_event<T: HttpTransport>(
@@ -1755,6 +1849,136 @@ mod tests {
         }
     }
 
+    /// Answers `CalendarEvent/query` with a fixed id list and total, and
+    /// `CalendarEvent/get` with events in one calendar, so the client-side
+    /// calendar filter in `search` has something to discard.
+    struct SearchTransport;
+
+    impl crate::core::transport::HttpTransport for SearchTransport {
+        async fn api_request(
+            &self,
+            _url: &str,
+            body: Vec<u8>,
+        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+            let request: Value = serde_json::from_slice(&body).expect("request json");
+            let call = request["methodCalls"][0].clone();
+            let name = call[0].as_str().expect("method name").to_string();
+            let call_id = call[2].as_str().expect("call id").to_string();
+            let arguments = match name.as_str() {
+                "CalendarEvent/query" => json!({
+                    "accountId": "primary",
+                    "queryState": "q1",
+                    "canCalculateChanges": false,
+                    "position": 0,
+                    "total": 9,
+                    "ids": ["e1"]
+                }),
+                "CalendarEvent/get" => json!({
+                    "accountId": "primary",
+                    "state": "s1",
+                    "list": [{
+                        "id": "e1",
+                        "calendarIds": {"other": true},
+                        "start": "2026-06-01T09:00:00",
+                        "duration": "PT1H"
+                    }],
+                    "notFound": []
+                }),
+                other => panic!("unexpected method {other}"),
+            };
+            let response = json!({
+                "sessionState": "session-1",
+                "methodResponses": [[name, arguments, call_id]]
+            });
+            Ok(bytes::Bytes::from(response.to_string()))
+        }
+
+        async fn upload(
+            &self,
+            _url: &str,
+            _body: Vec<u8>,
+            _content_type: Option<&str>,
+        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+            Err(crate::core::transport::TransportError::new("no upload"))
+        }
+
+        async fn download(
+            &self,
+            _url: &str,
+        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+            Err(crate::core::transport::TransportError::new("no download"))
+        }
+
+        async fn get_session(
+            &self,
+            _url: &str,
+        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+            Err(crate::core::transport::TransportError::new("no session"))
+        }
+    }
+
+    fn search_account() -> CalendarAccount<SearchTransport> {
+        let session: crate::core::session::Session = serde_json::from_value(json!({
+            "capabilities": {
+                "urn:ietf:params:jmap:core": {
+                    "maxSizeUpload": 1000,
+                    "maxConcurrentUpload": 2,
+                    "maxSizeRequest": 100_000,
+                    "maxConcurrentRequests": 4,
+                    "maxCallsInRequest": 8,
+                    "maxObjectsInGet": 256,
+                    "maxObjectsInSet": 256,
+                    "collationAlgorithms": []
+                },
+                "urn:ietf:params:jmap:calendars": {}
+            },
+            "accounts": {
+                "primary": {"name": "Primary", "isPersonal": true, "isReadOnly": false,
+                    "accountCapabilities": {"urn:ietf:params:jmap:calendars": {}}}
+            },
+            "primaryAccounts": {"urn:ietf:params:jmap:calendars": "primary"},
+            "username": "user@example.test",
+            "apiUrl": "https://example.test/jmap/api",
+            "downloadUrl": "https://example.test/download/{accountId}/{blobId}/{name}/{type}",
+            "uploadUrl": "https://example.test/upload/{accountId}",
+            "eventSourceUrl": "https://example.test/eventsource",
+            "state": "session-1"
+        }))
+        .expect("session parses");
+        let client = crate::client::Client::with_transport(
+            SearchTransport,
+            session,
+            "https://example.test/.well-known/jmap",
+        )
+        .expect("client builds");
+        JmapProtoAccount::new(client, "primary")
+    }
+
+    /// The server total counts the unfiltered query result, so it is not
+    /// the total of a walk that then discards every hit outside the
+    /// requested calendar. Reporting it hands the consumer a number its
+    /// own pages can never add up to.
+    #[tokio::test]
+    async fn a_calendar_filtered_search_reports_no_server_total() {
+        let unfiltered = search(Some(search_account()), EventSearchRequest::new("standup"))
+            .await
+            .expect("search");
+        assert_eq!(unfiltered.items.len(), 1);
+        assert_eq!(unfiltered.estimated_total, Some(9));
+
+        let filtered = search(
+            Some(search_account()),
+            EventSearchRequest {
+                calendar_id: Some(CalendarId("wanted".to_string())),
+                ..EventSearchRequest::new("standup")
+            },
+        )
+        .await
+        .expect("search");
+        assert!(filtered.items.is_empty());
+        assert_eq!(filtered.estimated_total, None);
+    }
+
     fn create_payload(event: &EventCreate) -> CalendarEventCreate {
         jmap_create_from_event(event, AccountOperation::EventCreate).expect("create payload")
     }
@@ -2360,6 +2584,68 @@ mod tests {
             error.kind(),
             bifrost_types::AccountErrorKind::Unsupported(AccountOperation::EventGet)
         ));
+    }
+
+    fn jmap_event(properties: Value) -> JmapCalendarEvent {
+        JmapCalendarEvent {
+            properties: serde_json::from_value(properties).expect("event"),
+        }
+    }
+
+    /// One unrepresentable event must cost its own row and nothing else,
+    /// and every submitted id the server answered in neither `list` nor
+    /// `notFound` must reach `failed_ids` rather than vanish - absence
+    /// from `items` reads as a deletion downstream.
+    #[test]
+    fn unconvertible_and_unanswered_event_ids_ride_failed_ids() {
+        let hydrated = reconcile_events(
+            vec![
+                "e0".to_string(),
+                "e1".to_string(),
+                "e2".to_string(),
+                "e3".to_string(),
+            ],
+            &[CalendarEventId::new("e0")],
+            vec![
+                jmap_event(json!({
+                    "id": "e1",
+                    "start": "2026-06-01T09:00:00",
+                    "duration": "PT1H"
+                })),
+                // Refused by `event_from_jmap`: a modified recurrence
+                // override has no shared representation.
+                jmap_event(json!({
+                    "id": "e2",
+                    "start": "2026-06-01T09:00:00",
+                    "duration": "PT1H",
+                    "recurrenceOverrides": {"2026-06-03T09:00:00": {"title": "moved"}}
+                })),
+            ],
+            AccountOperation::EventSearch,
+        );
+
+        assert_eq!(hydrated.events.len(), 1);
+        assert_eq!(hydrated.events[0].id.0, "e1");
+        let mut failed_ids = hydrated.failed_ids;
+        failed_ids.sort();
+        assert_eq!(
+            failed_ids,
+            vec!["e0".to_string(), "e2".to_string(), "e3".to_string()]
+        );
+    }
+
+    /// A declared `notFound` id and an id the answer simply omitted are
+    /// the same loss, and must not be counted twice when they overlap.
+    #[test]
+    fn a_not_found_event_id_is_reported_once() {
+        let hydrated = reconcile_events(
+            vec!["e0".to_string()],
+            &[CalendarEventId::new("e0")],
+            Vec::new(),
+            AccountOperation::EventsInRange,
+        );
+        assert!(hydrated.events.is_empty());
+        assert_eq!(hydrated.failed_ids, vec!["e0".to_string()]);
     }
 
     #[test]

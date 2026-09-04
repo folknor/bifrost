@@ -40,6 +40,14 @@ struct WebSocketRequest {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct WebSocketResponse {
+    /// The `id` of the request this frame answers (RFC 8887 s4.3.4),
+    /// echoed by the server when the request carried one. Dropping it made
+    /// two in-flight WebSocket requests indistinguishable on the read
+    /// stream: `send_ws` assigned an id that nothing downstream could
+    /// ever see again.
+    #[serde(rename = "requestId", default)]
+    request_id: Option<String>,
+
     #[serde(rename = "methodResponses")]
     method_responses: Vec<serde_json::Value>,
 
@@ -120,7 +128,14 @@ enum WebSocketMessage_ {
 #[derive(Debug)]
 #[non_exhaustive]
 pub(crate) enum WebSocketMessage {
-    Response(Response),
+    Response {
+        /// The `requestId` the server echoed, when it sent one. This is
+        /// what lets a reader match a response frame to the request
+        /// `send_ws` put on the wire; without it, two in-flight requests
+        /// are indistinguishable.
+        request_id: Option<String>,
+        response: Response,
+    },
     PushNotification(PushObject),
     /// A control-frame pong. Surfaced rather than swallowed because it is
     /// the only evidence the push reader can get that a silent connection
@@ -132,7 +147,6 @@ pub(crate) enum WebSocketMessage {
 
 pub(crate) struct WsStream {
     tx: SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
-    req_id: usize,
 }
 
 impl Client {
@@ -197,9 +211,15 @@ impl Client {
         validate_ws_subprotocol(&response)?;
         let (tx, rx) = stream.split();
 
-        *self.ws.lock().await = WsStream { tx, req_id: 0 }.into();
+        *self.ws.lock().await = WsStream { tx }.into();
 
-        Ok(Box::pin(frame_stream(rx)))
+        // The read half must run the same session-divergence check the
+        // HTTP door runs. A `Client` clone is an `Arc` bump and the stream
+        // outlives this call, so the closure owns one.
+        let client = self.clone();
+        Ok(Box::pin(frame_stream(rx, move |session_state| {
+            client.note_session_state(session_state);
+        })))
     }
 
     pub(crate) async fn send_ws(&self, request: Request<'_>) -> crate::Result<String> {
@@ -208,9 +228,11 @@ impl Client {
             .as_mut()
             .ok_or_else(|| crate::Error::WebSocketNotConnected)?;
 
-        // Assign request id
-        let request_id = ws.req_id.to_string();
-        ws.req_id += 1;
+        // Assign a request id. The counter is the CLIENT's, so ids do not
+        // repeat across reconnects: a per-connection counter restarted at
+        // 0, and a late response from the old connection then carried an
+        // id the new one was about to reuse.
+        let request_id = self.next_ws_request_id();
 
         let method_calls =
             serde_json::to_value(&request.method_calls).map_err(crate::Error::RequestEncode)?;
@@ -287,9 +309,17 @@ impl Client {
 /// driven from an in-memory stream of `Message`s without a socket: the
 /// transport half is the only part of `connect_ws` that needs a real
 /// connection.
-fn frame_stream<S>(mut rx: S) -> impl Stream<Item = crate::Result<WebSocketMessage>> + use<S>
+/// `on_session_state` receives every response frame's `sessionState`, so
+/// the WebSocket door detects session divergence exactly as the HTTP door
+/// does. It is a callback rather than a `Client` handle so this function
+/// stays drivable from an in-memory frame transcript.
+fn frame_stream<S, F>(
+    mut rx: S,
+    mut on_session_state: F,
+) -> impl Stream<Item = crate::Result<WebSocketMessage>> + use<S, F>
 where
     S: Stream<Item = Result<Message, tokio_websockets::Error>> + Unpin,
+    F: FnMut(&str),
 {
     async_stream::stream! {
         let mut saw_close = false;
@@ -301,6 +331,14 @@ where
                     match serde_json::from_slice::<WebSocketMessage_>(payload.as_ref()) {
                         Ok(message) => match message {
                             WebSocketMessage_::Response(response) => {
+                                // Session divergence is checked on the frame's own
+                                // `sessionState`, before the rebuild: a frame whose
+                                // method responses fail to decode still carried a
+                                // truthful session state, and dropping that would
+                                // leave the client running on a session the server
+                                // has already replaced.
+                                on_session_state(&response.session_state);
+                                let request_id = response.request_id;
                                 // Deserialize the raw method responses into a Response
                                 let json = serde_json::json!({
                                     "methodResponses": response.method_responses,
@@ -308,7 +346,10 @@ where
                                     "sessionState": response.session_state,
                                 });
                                 match serde_json::from_value::<Response>(json) {
-                                    Ok(resp) => yield Ok(WebSocketMessage::Response(resp)),
+                                    Ok(response) => yield Ok(WebSocketMessage::Response {
+                                        request_id,
+                                        response,
+                                    }),
                                     Err(e) => yield Err(crate::Error::ResponseDecode(e)),
                                 }
                             }
@@ -473,7 +514,16 @@ mod tests {
     async fn decode(
         frames: Vec<Result<Message, tokio_websockets::Error>>,
     ) -> Vec<crate::Result<WebSocketMessage>> {
-        frame_stream(StubWsTransport::new(frames).open_ws())
+        decode_observing(frames, |_| {}).await
+    }
+
+    /// `decode`, with the session states the frames reported handed to
+    /// `observe` in arrival order.
+    async fn decode_observing(
+        frames: Vec<Result<Message, tokio_websockets::Error>>,
+        observe: impl FnMut(&str),
+    ) -> Vec<crate::Result<WebSocketMessage>> {
+        frame_stream(StubWsTransport::new(frames).open_ws(), observe)
             .collect::<Vec<_>>()
             .await
     }
@@ -571,13 +621,87 @@ mod tests {
         let out = decode(vec![Ok(Message::text(frame.to_string()))]).await;
 
         assert_eq!(out.len(), 1);
-        let Ok(WebSocketMessage::Response(response)) = &out[0] else {
+        let Ok(WebSocketMessage::Response { response, .. }) = &out[0] else {
             panic!("expected Response, got {:?}", out[0]);
         };
         assert_eq!(response.session_state(), "s-1");
         assert_eq!(
             response.created_ids().and_then(|ids| ids.get("k")),
             Some(&"v".to_string())
+        );
+    }
+
+    /// RFC 8887 s4.3.4 echoes `requestId` so a client can match a
+    /// `Response` frame to the request it answers. Dropping it made two
+    /// in-flight WebSocket requests indistinguishable on the read stream,
+    /// while `send_ws` went on assigning ids nothing could ever use.
+    #[tokio::test]
+    async fn a_response_frame_carries_the_request_id_it_answers() {
+        let frame = |id: &str| {
+            Ok(Message::text(format!(
+                r#"{{"@type":"Response","requestId":"{id}","methodResponses":[["Core/echo",{{}},"c0"]],"sessionState":"s-1"}}"#
+            )))
+        };
+        let out = decode(vec![
+            frame("7"),
+            frame("8"),
+            // A server that echoes no id is still decodable; the absence
+            // is reported as absence, not as some other request's id.
+            Ok(Message::text(
+                r#"{"@type":"Response","methodResponses":[["Core/echo",{},"c0"]],"sessionState":"s-1"}"#
+                    .to_string(),
+            )),
+        ])
+        .await;
+
+        let ids = out
+            .iter()
+            .map(|message| match message {
+                Ok(WebSocketMessage::Response { request_id, .. }) => request_id.clone(),
+                other => panic!("expected Response, got {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            vec![Some("7".to_string()), Some("8".to_string()), None]
+        );
+    }
+
+    /// `Client::send_request` compares every response's `sessionState`
+    /// against the session it is running on - the mechanism the whole
+    /// scope-lifecycle `CapabilityChanged` story rests on. The WebSocket
+    /// door rebuilt a `Response` and handed it up without ever looking, so
+    /// staleness went undetected on the connection that stays open
+    /// longest. It must observe the state on every response frame,
+    /// including one whose method responses do not decode: that frame's
+    /// session state was still truthful.
+    #[tokio::test]
+    async fn every_response_frame_reports_its_session_state() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = std::sync::Arc::clone(&seen);
+        let out = decode_observing(
+            vec![
+                Ok(Message::text(
+                    r#"{"@type":"Response","methodResponses":[["Core/echo",{},"c0"]],"sessionState":"s-1"}"#.to_string(),
+                )),
+                // Undecodable method responses, truthful session state.
+                Ok(Message::text(
+                    r#"{"@type":"Response","methodResponses":[[1,2]],"sessionState":"s-2"}"#
+                        .to_string(),
+                )),
+                // Not a response frame: nothing to compare.
+                Ok(Message::text(
+                    r#"{"@type":"StateChange","changed":{"u1":{"Mailbox":"s1"}}}"#.to_string(),
+                )),
+            ],
+            move |state| recorder.lock().expect("seen").push(state.to_string()),
+        )
+        .await;
+
+        assert_eq!(out.len(), 3);
+        assert_eq!(
+            *seen.lock().expect("seen"),
+            vec!["s-1".to_string(), "s-2".to_string()]
         );
     }
 

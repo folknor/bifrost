@@ -140,13 +140,28 @@ pub(crate) fn update<T: HttpTransport>(
             ));
         }
         let id = ContactCardId::new(contact.0);
+        // An address-book move is add-new plus remove-old, and the old
+        // book is only knowable from the current card. If the read did
+        // not materialize one, `None` here would silently degrade the
+        // move into an ADD - leaving the contact in both books, with no
+        // error and nothing to reconcile against later. The read failing
+        // says nothing about the card (this module documents the
+        // unanswered-id lane as a transient, not a deletion), so fail the
+        // update as a retryable `Protocol(PartialResponse)` rather than
+        // performing a different write than the caller asked for.
         let current_address_book = if patch.address_book_id.is_some() {
             get_cards(&contacts, vec![id.clone()], AccountOperation::ContactUpdate)
                 .await?
                 .cards
                 .into_iter()
                 .next()
-                .and_then(|card| card.address_book_id)
+                .ok_or_else(|| {
+                    super::error::get_id_unanswered(
+                        id.as_str(),
+                        super::error::JmapErrorContext::new(AccountOperation::ContactUpdate),
+                    )
+                })?
+                .address_book_id
         } else {
             None
         };
@@ -923,6 +938,142 @@ mod tests {
         JmapContactCard {
             properties: serde_json::from_value(json!({ "id": id })).expect("object"),
         }
+    }
+
+    /// Answers `ContactCard/get` with an empty `list` and an empty
+    /// `notFound` - the unanswered-id lane this module documents as a
+    /// transient - and records every `ContactCard/set` it is asked to
+    /// perform, so a write issued despite the failed read is visible.
+    #[derive(Clone)]
+    struct UnansweredGetTransport {
+        sets: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    }
+
+    impl crate::core::transport::HttpTransport for UnansweredGetTransport {
+        async fn api_request(
+            &self,
+            _url: &str,
+            body: Vec<u8>,
+        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+            let request: Value = serde_json::from_slice(&body).expect("request json");
+            let call = request["methodCalls"][0].clone();
+            let name = call[0].as_str().expect("method name").to_string();
+            let call_id = call[2].as_str().expect("call id").to_string();
+            let arguments = match name.as_str() {
+                "ContactCard/get" => json!({
+                    "accountId": "primary",
+                    "state": "s1",
+                    "list": [],
+                    "notFound": []
+                }),
+                "ContactCard/set" => {
+                    self.sets.lock().expect("sets").push(call[1].clone());
+                    json!({
+                        "accountId": "primary",
+                        "oldState": "s1",
+                        "newState": "s2",
+                        "updated": {"c1": null}
+                    })
+                }
+                other => panic!("unexpected method {other}"),
+            };
+            let response = json!({
+                "sessionState": "session-1",
+                "methodResponses": [[name, arguments, call_id]]
+            });
+            Ok(bytes::Bytes::from(response.to_string()))
+        }
+
+        async fn upload(
+            &self,
+            _url: &str,
+            _body: Vec<u8>,
+            _content_type: Option<&str>,
+        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+            Err(crate::core::transport::TransportError::new("no upload"))
+        }
+
+        async fn download(
+            &self,
+            _url: &str,
+        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+            Err(crate::core::transport::TransportError::new("no download"))
+        }
+
+        async fn get_session(
+            &self,
+            _url: &str,
+        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+            Err(crate::core::transport::TransportError::new("no session"))
+        }
+    }
+
+    /// An address-book move needs the current book to clear it. When the
+    /// read does not materialize the card, writing anyway performs an ADD
+    /// and leaves the contact in both books, silently. The update must
+    /// fail - and retryably, since the unanswered-id lane says nothing
+    /// about the card.
+    #[tokio::test]
+    async fn a_book_move_fails_when_the_read_did_not_materialize_the_card() {
+        let sets = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let session: crate::core::session::Session = serde_json::from_value(json!({
+            "capabilities": {
+                "urn:ietf:params:jmap:core": {
+                    "maxSizeUpload": 1000,
+                    "maxConcurrentUpload": 2,
+                    "maxSizeRequest": 100_000,
+                    "maxConcurrentRequests": 4,
+                    "maxCallsInRequest": 8,
+                    "maxObjectsInGet": 256,
+                    "maxObjectsInSet": 256,
+                    "collationAlgorithms": []
+                },
+                "urn:ietf:params:jmap:contacts": {}
+            },
+            "accounts": {
+                "primary": {"name": "Primary", "isPersonal": true, "isReadOnly": false,
+                    "accountCapabilities": {"urn:ietf:params:jmap:contacts": {}}}
+            },
+            "primaryAccounts": {"urn:ietf:params:jmap:contacts": "primary"},
+            "username": "user@example.test",
+            "apiUrl": "https://example.test/jmap/api",
+            "downloadUrl": "https://example.test/download/{accountId}/{blobId}/{name}/{type}",
+            "uploadUrl": "https://example.test/upload/{accountId}",
+            "eventSourceUrl": "https://example.test/eventsource",
+            "state": "session-1"
+        }))
+        .expect("session parses");
+        let client = crate::client::Client::with_transport(
+            UnansweredGetTransport {
+                sets: std::sync::Arc::clone(&sets),
+            },
+            session,
+            "https://example.test/.well-known/jmap",
+        )
+        .expect("client builds");
+        let account = ContactAccount::new(client, "primary");
+
+        let error = update(
+            Some(account),
+            ContactId("c1".to_string()),
+            ContactPatch {
+                address_book_id: Some(SharedAddressBookId("book-new".to_string())),
+                ..ContactPatch::default()
+            },
+        )
+        .await
+        .expect_err("a book move without the current book must fail");
+        assert_eq!(
+            error.kind(),
+            &bifrost_types::AccountErrorKind::Protocol(
+                bifrost_types::ProtocolErrorKind::PartialResponse
+            )
+        );
+        assert!(
+            sets.lock().expect("sets").is_empty(),
+            "no half-move may reach the wire: {:?}",
+            sets.lock().expect("sets")
+        );
     }
 
     /// `Page::failed_ids` is what stops a consumer reading "absent from

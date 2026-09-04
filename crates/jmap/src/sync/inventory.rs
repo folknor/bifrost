@@ -204,6 +204,27 @@ fn email_inventory_loop<T: HttpTransport>(
             if ids.is_empty() {
                 break;
             }
+            // Forward-progress guard. `anchor` + `anchorOffset: 1` means the
+            // next page starts strictly AFTER the previous page's last id
+            // (RFC 8620 s5.5), so that id can never appear again in a walk
+            // whose `queryState` has not moved - and the state check above
+            // has already established that it has not. A server that echoes
+            // the same trailing ids therefore never yields the empty page
+            // that ends this loop, and the walk spins forever re-fetching
+            // and re-emitting the same batch. Terminating WITHOUT a `Done`
+            // is deliberate, as with the superseded-state exit: the walk's
+            // coverage was never established, so the engine must restart the
+            // scope rather than record a completed inventory.
+            if let Some(previous) = anchor.as_ref()
+                && ids.iter().any(|id| id.to_string() == *previous)
+            {
+                yield super::error::terminated_contract_violation(
+                    bifrost_types::AccountOperation::SyncInventory,
+                    Some(bifrost_types::ErrorScope::Cursor(scope.clone())),
+                    "Email/query re-served the anchor id under an unmoved query state",
+                );
+                return;
+            }
             anchor = ids.last().map(ToString::to_string);
             let get_response = mail
                 .call(EmailGet::new().ids(ids).properties(inventory_properties()))
@@ -677,5 +698,155 @@ mod tests {
             serde_json::from_value(serde_json::json!({"id": "X1", "name": "Inbox"}))
                 .expect("mailbox deserializes");
         assert!(super::mailbox_has_id(&mailbox));
+    }
+
+    /// A server that answers every anchored `Email/query` with the same
+    /// trailing ids under an unmoved `queryState`. The anchor should have
+    /// advanced the window past those ids, so this walk never reaches the
+    /// empty page that ends it: it re-fetches and re-emits the same batch
+    /// forever.
+    struct StuckQueryTransport {
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl crate::core::transport::HttpTransport for StuckQueryTransport {
+        async fn api_request(
+            &self,
+            _url: &str,
+            body: Vec<u8>,
+        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let request: serde_json::Value = serde_json::from_slice(&body).expect("request json");
+            let call = request["methodCalls"][0].clone();
+            let name = call[0].as_str().expect("method name").to_string();
+            let call_id = call[2].as_str().expect("call id").to_string();
+            let arguments = match name.as_str() {
+                "Email/query" => serde_json::json!({
+                    "accountId": "primary",
+                    "queryState": "q1",
+                    "canCalculateChanges": false,
+                    "position": 0,
+                    "ids": ["M1", "M2"]
+                }),
+                "Email/get" => serde_json::json!({
+                    "accountId": "primary",
+                    "state": "s1",
+                    "list": [
+                        {"id": "M1", "blobId": "B1", "size": 1, "mailboxIds": {"inbox": true}, "keywords": {}},
+                        {"id": "M2", "blobId": "B2", "size": 1, "mailboxIds": {"inbox": true}, "keywords": {}}
+                    ],
+                    "notFound": []
+                }),
+                other => panic!("unexpected method {other}"),
+            };
+            let response = serde_json::json!({
+                "sessionState": "session-1",
+                "methodResponses": [[name, arguments, call_id]]
+            });
+            Ok(bytes::Bytes::from(response.to_string()))
+        }
+
+        async fn upload(
+            &self,
+            _url: &str,
+            _body: Vec<u8>,
+            _content_type: Option<&str>,
+        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+            Err(crate::core::transport::TransportError::new("no upload"))
+        }
+
+        async fn download(
+            &self,
+            _url: &str,
+        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+            Err(crate::core::transport::TransportError::new("no download"))
+        }
+
+        async fn get_session(
+            &self,
+            _url: &str,
+        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+            Err(crate::core::transport::TransportError::new("no session"))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_re_served_inventory_anchor_terminates_instead_of_looping() {
+        use futures::StreamExt as _;
+
+        let session: crate::core::session::Session = serde_json::from_value(serde_json::json!({
+            "capabilities": {
+                "urn:ietf:params:jmap:core": {
+                    "maxSizeUpload": 1000,
+                    "maxConcurrentUpload": 2,
+                    "maxSizeRequest": 100_000,
+                    "maxConcurrentRequests": 4,
+                    "maxCallsInRequest": 8,
+                    "maxObjectsInGet": 2,
+                    "maxObjectsInSet": 2,
+                    "collationAlgorithms": []
+                },
+                "urn:ietf:params:jmap:mail": {}
+            },
+            "accounts": {
+                "primary": {"name": "Primary", "isPersonal": true, "isReadOnly": false,
+                    "accountCapabilities": {"urn:ietf:params:jmap:mail": {}}}
+            },
+            "primaryAccounts": {"urn:ietf:params:jmap:mail": "primary"},
+            "username": "user@example.test",
+            "apiUrl": "https://example.test/jmap/api",
+            "downloadUrl": "https://example.test/download/{accountId}/{blobId}/{name}/{type}",
+            "uploadUrl": "https://example.test/upload/{accountId}",
+            "eventSourceUrl": "https://example.test/eventsource",
+            "state": "session-1"
+        }))
+        .expect("session parses");
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let client = crate::client::Client::with_transport(
+            StuckQueryTransport {
+                calls: std::sync::Arc::clone(&calls),
+            },
+            session,
+            "https://example.test/.well-known/jmap",
+        )
+        .expect("client builds");
+        let mail = crate::account::Account::new(client, "primary");
+        let events = stream(
+            mail,
+            CoreLimits {
+                max_objects_in_get: 2,
+                max_objects_in_set: 2,
+            },
+            CursorScope::Type(ObjectType::Email),
+            None,
+        )
+        .collect::<Vec<_>>()
+        .await;
+
+        // Page one is served (query + get); page two re-serves the anchor
+        // and is refused before another `Email/get`.
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 3);
+        let error = events
+            .iter()
+            .find_map(|event| match event {
+                SyncEvent::Terminated(error) => Some(error),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("expected Terminated, got {events:?}"));
+        assert_eq!(
+            error.kind(),
+            &bifrost_types::AccountErrorKind::Protocol(
+                bifrost_types::ProtocolErrorKind::ContractViolation
+            )
+        );
+        // No `Done`: the walk's coverage was never established, so the
+        // engine must restart the scope rather than record a full walk.
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, SyncEvent::Done(_))),
+            "a refused walk must not report completion"
+        );
     }
 }

@@ -6,60 +6,59 @@ mutation pipeline, recovery taxonomy.
 
 ## Confident defects
 
-### 1. `calendar_ops.rs` fails an entire page on one unrepresentable event, and never reconciles ids - the `Page` loss-lane contract is unimplemented for calendars
+(Finding 1 - `calendar_ops.rs` failing an entire page on one unrepresentable
+event and never reconciling submitted ids - is fixed: `get_events` now routes
+its answer through `reconcile_events`, which mirrors `reconcile_cards`. An id
+answered in neither `list` nor `notFound`, and an event `event_from_jmap`
+refuses, both ride `Page::failed_ids` while the rest of the page returns. The
+single-event `get` door keeps returning the conversion error itself, since
+there is no neighbour there to protect. Pinned by
+`unconvertible_and_unanswered_event_ids_ride_failed_ids` and
+`a_not_found_event_id_is_reported_once`, the first ablated against a
+drop-the-unconvertible-id variant and confirmed failing.)
 
-`get_events` (`crates/jmap/src/sync/calendar_ops.rs`, ~line 286) maps every
-returned event through `event_from_jmap` and collects into `Result<Vec<_>>`.
-`event_from_jmap` deliberately errors on modified recurrence overrides,
-multiple/excluded recurrence rules, unknown participant roles or statuses (per
-the documented "fail rather than drop" policy). Consequence: a single exotic
-event anywhere in the queried window makes the whole `events_in_range` /
-`event_search` call fail as `Unsupported` - permanently, since the event
-doesn't go away. `events_in_range` and `search` return `failed_ids:
-Vec::new()` unconditionally. Contrast `contacts.rs::reconcile_cards`, which was
-explicitly built so "the consumer preserves the row instead of reading absence
-as a deletion," and `reference/sync.md`'s Page-lane definition ("resources the
-provider fetched but could not materialize" ride `failed_ids`). Calendars are
-missing both halves: no per-item degradation for conversion failures, and no
-submitted-id reconciliation at all (an id the server answers in neither `list`
-nor `notFound` silently vanishes from the page - the exact shape
-`reconcile_cards` and `reconcile_hydration` exist to prevent). This is the most
-concrete contract mismatch in the scope; the fix is the same reconciliation
-structure contacts already have, with conversion failures routed to
-`failed_ids` instead of aborting.
+(Finding 10's calendar half is fixed: `search` suppresses the server `total`
+when `EventSearchRequest.calendar_id` is set, because that filter is applied
+client-side and the server counted the unfiltered set. The cursor stays live -
+it addresses the server-side result set, so an empty page with more behind it
+is correct. Pinned by `a_calendar_filtered_search_reports_no_server_total`
+with revert-and-confirm.)
 
 (Finding 2's changes-loop half is fixed: `email_changes` / `mailbox_changes`
 now terminate as `Protocol(ContractViolation)` when `hasMoreChanges: true`
 arrives with an unmoved `newState`, before that page's batch. Pinned by
 `a_stuck_changes_state_terminates_instead_of_looping`, whose ablation run
-confirmed the unguarded loop spins forever. Still open from this finding: the
-inventory walk's weaker analogue - a server echoing the same trailing ids
-under a stable `queryState` never yields the empty page and loops forever;
-an oscillating state pair also still defeats the single-step guard.)
+confirmed the unguarded loop spins forever. Both remaining halves are now
+fixed too: the change loops keep a per-walk set of served states and
+terminate as `ContractViolation` when one repeats, which is what catches an
+oscillating state pair (every single step "moves"); and the inventory walk
+refuses a page that re-serves the previous anchor id, impossible under
+`anchorOffset: 1` with an unmoved `queryState`, terminating without a `Done`
+so the engine restarts the scope. Pinned by
+`an_oscillating_changes_state_terminates_instead_of_looping` and
+`a_re_served_inventory_anchor_terminates_instead_of_looping`; both ablations
+hung the test binary until brokkr's 20s per-test timeout killed it, which is
+exactly the unbounded loop they describe.)
 
 ## Suspected / lower confidence
 
-### 6. `push_subscribe` with zero mappable scopes returns the wrong error kind
+(Finding 6 - the wrong error KIND for a zero-mappable-scope
+`push_subscribe` - is fixed: the all-rejected case now returns
+`Request(Malformed)` via `error::no_mappable_push_scopes`, matching
+`cross_account_destination`'s precedent for "the caller asked for something
+this endpoint cannot express", instead of `Unsupported(PushSubscribe)`, which
+claimed the account has no push at all. The `Err`-means-nothing-subscribed
+contract is unchanged. Pinned by
+`zero_mappable_scopes_is_a_malformed_request_not_absent_push` with
+revert-and-confirm.)
 
-`push.rs::subscribe` errors with `Unsupported(PushSubscribe)` when `data_types`
-maps to nothing. The types contract explicitly models the all-rejected case
-("the handle is absent when no scope was accepted"), and per-scope failures
-already ride the failed lane in the mixed case. The error's *kind* is the real
-problem: `Unsupported(PushSubscribe)` claims the account has no push at all,
-when the account advertised `PushCapability::InProcess` and only these scopes
-are unmappable. An engine or consumer keying off that kind could wrongly
-downgrade push wholesale. Legal per the letter of the batch contract (`Err` =
-nothing subscribed), but a misleading classification.
-
-### 7. `contact_update` address-book move can silently leave the contact in two books
-
-`contacts.rs::update`: when `patch.address_book_id` is set, it reads the
-current card to learn the old book. If `get_cards` returns no card (the
-unanswered-id lane - a transient the module itself documents as "not a
-deletion"), `current_address_book` is `None` and the patch only *adds* the new
-book membership without clearing the old. Narrow, transient-triggered, silent.
-Failing the update when the read didn't materialize the card would be the
-honest behavior.
+(Finding 7 - a `contact_update` book move silently degrading into an ADD when
+the read did not materialize the card - is fixed: the update now fails as a
+retryable `Protocol(PartialResponse)` (`get_id_unanswered`) instead of
+inferring "no old book" from a failed read. Pinned by
+`a_book_move_fails_when_the_read_did_not_materialize_the_card`, which also
+asserts no `ContactCard/set` reaches the wire; ablated against the previous
+`and_then` and confirmed failing.)
 
 ### 8. `scope_lifecycle` spurious rename and lost create
 
@@ -70,24 +69,21 @@ new state (the create is lost forever to the lifecycle stream). Both benign
 under the current engine (account-wide cursor shapes create no per-folder
 cursor), but worth knowing they're load-bearing on that engine policy.
 
-### 9. `move_thread` / `delete_thread` re-resolve the thread between the two legs
+(Finding 9 - `move_thread` / `delete_thread` re-resolving the thread between
+the two legs - is fixed: both doors resolve the thread once and run both legs
+over that id set via `patch_mailbox_membership_of`, with the cross-account
+container check hoisted ahead of the resolve for both containers. The two-leg
+non-atomicity itself is unchanged, as documented. Pinned by
+`a_thread_move_resolves_the_thread_once_for_both_legs`, whose transport grows
+the thread between resolves; ablated by restoring the second resolve and
+confirmed failing.)
 
-Each `patch_mailbox_membership` leg runs its own `Thread/get`, so a message
-delivered to the thread between the add-to-target and the remove-from-source
-legs is removed from the source without ever having been added to the target -
-it just loses the source membership. The two-leg non-atomicity itself is the
-documented cross-provider shape, but the double-resolve widens the window;
-resolving once and reusing the id list for both legs would shrink it to a
-single `Email/set` pair over a fixed set.
-
-### 10. Calendar `search` computes totals before its client-side filter
-
-`calendar_ops.rs` ~line 262: `estimated_total` and `next_cursor` are computed
-before the client-side `calendar_id` filter, so totals overcount and a page can
-come back empty with a live cursor. Same class as the (deliberate, documented)
-post-filter in `events_in_range`; fine mechanically, but the total is wrong
-when a calendar filter is supplied. Similarly `pim::search` silently drops
-result emails lacking `threadId` with no `failed_ids` entry.
+(Finding 10's `pim::search` half is fixed too: the thread projection now
+reconciles every submitted email id through `reconcile_search_threads`, so a
+declared `notFound`, an unanswered id, and an email returned without the
+mandatory `threadId` all reach `Page::failed_ids`; thread ids are also
+deduplicated. Pinned by `search_emails_without_a_thread_ride_failed_ids` with
+revert-and-confirm.)
 
 ### 11. Mail search never covers shares (now documented; product gap stays open)
 

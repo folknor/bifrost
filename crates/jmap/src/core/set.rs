@@ -321,12 +321,23 @@ impl<O: SetObject> SetResponse<O> {
         self.old_state.as_deref()
     }
 
-    pub(crate) fn new_state(&self) -> &str {
-        self.new_state.as_deref().unwrap_or("")
+    /// The `newState` the server reported, or `None` when it sent none.
+    ///
+    /// RFC 8620 s5.3 makes `newState` mandatory, so `None` is a
+    /// non-conforming server - but the two cases must stay
+    /// distinguishable here. Folding absence into `""` made a missing
+    /// state indistinguishable from a state the server really did report
+    /// as empty, and the state cache gives an explicitly empty entry its
+    /// own meaning ("probed, empty") separate from "never probed". A
+    /// fabricated `""` therefore poisoned a cache entry with a value no
+    /// server had ever sent. Callers decide what absence costs them; the
+    /// accessor does not decide for them by inventing a value.
+    pub(crate) fn new_state(&self) -> Option<&str> {
+        self.new_state.as_deref()
     }
 
-    pub(crate) fn into_new_state(self) -> String {
-        self.new_state.unwrap_or_default()
+    pub(crate) fn into_new_state(self) -> Option<String> {
+        self.new_state
     }
 
     /// Look up a successful or failed create by its create-id (e.g. "c1").

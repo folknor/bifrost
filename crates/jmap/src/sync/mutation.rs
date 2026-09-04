@@ -430,9 +430,16 @@ async fn apply_batch<T: HttpTransport>(
         }
     };
 
-    let new_state = response.new_state().to_string();
-    if !new_state.is_empty() {
-        state_cache::advance(email_states, account_id, Some(&state), new_state).await;
+    // Absent (non-conforming) and empty both mean "no state to record".
+    // Only a real state string advances the cache.
+    if let Some(new_state) = response.new_state().filter(|state| !state.is_empty()) {
+        state_cache::advance(
+            email_states,
+            account_id,
+            Some(&state),
+            new_state.to_string(),
+        )
+        .await;
     }
 
     let operation = operation_for_kind(kind);
