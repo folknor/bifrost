@@ -106,6 +106,45 @@ narrowing it is a product decision, not a defect fix.)
   the `Option` explicitly. Pinned in `core/request.rs` (`CallLimit` lanes),
   `sync/capabilities.rs` (malformed and omitted-limit refusals) and
   `tests.rs`, each confirmed to bite.
+- ~~**The malformed lane covered only the core block.**~~ FIXED (lateral
+  finding of the above). `try_cap!` still fell back to `Capabilities::Other`
+  for every NON-core capability, so a present-but-malformed `websocket`,
+  `mail`, `submission`, `sieve`, `quota`, `blob`, `calendars`, `contacts` or
+  `principals` block read as unadvertised - concretely, a websocket block
+  missing its mandatory `url` derived `PushCapability::None` with no
+  diagnostic. The fallback is now the generic `Capabilities::Malformed`, so
+  `Other` means only "a URI this crate does not model", and
+  `session_cap_accessor!` generates a `CapabilityState` (`Absent` /
+  `Malformed` / `Present`) reader for every capability from the one
+  mechanism. Readers split by the Unadvertised-versus-Invalid rule: the
+  REQUIRED blocks (core, mail) are `Protocol(ContractViolation)` at
+  `capabilities::build` with the URI named; the optional ones degrade but
+  warn by URI via `Session::malformed_capabilities()`, push through its own
+  arm; and `connect_ws` separates `Absent` (`WebSocketNotConnected` ->
+  `Unsupported`) from `Malformed` (the new `Error::MalformedCapability`,
+  mapped to `Protocol(ContractViolation)` naming the URI). Pinned by
+  `a_malformed_non_core_block_is_malformed_and_not_absent`,
+  `every_modelled_capability_uri_has_a_malformed_lane`,
+  `a_malformed_websocket_block_degrades_push_without_reading_as_absent`,
+  `a_malformed_mail_block_is_a_named_contract_violation`,
+  `a_malformed_optional_block_does_not_fail_open` and
+  `a_malformed_capability_error_classifies_as_a_named_contract_violation`.
+  Ablated by restoring the `Other` fallback: five tests fail. The error-map
+  arm's bite is type-level (the match is exhaustive), and the push arm's own
+  bite is the diagnostic, not the derived value - a malformed websocket block
+  yields no push either way, which is why it went unnoticed.
+- ~~**`CoreCapabilities::max_concurrent_upload` has no reader.**~~ CLOSED as
+  deliberate, not wired. Every upload door in the crate awaits one upload at a
+  time (`Account::upload` is a single request; `pim::attachment_upload`, the
+  send path's attachment loops and `filters.rs`'s script upload all iterate
+  sequentially), so there is no concurrency for the limit to govern and a
+  reader would have to invent the fan-out first. The crate's only overlapping
+  requests are the foreign-account probes, which are API calls already bounded
+  by `maxConcurrentRequests`. The field and its `Option` shape stay so that
+  adding concurrent uploads is a reader change, not a parser change; the
+  decision and its condition are recorded in `reference/jmap.md`, and
+  `core_max_concurrent_upload_is_parsed_even_though_nothing_reads_it` pins the
+  decode (including omitted staying `None` rather than zero).
 - **WS Response decode double-round-trips** (`json!` Value rebuild then
   `from_value`) - works (verified), but it re-allocates every method response; a
   `RawValue`-preserving envelope would decode once.

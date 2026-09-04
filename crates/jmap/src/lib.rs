@@ -319,6 +319,16 @@ pub(crate) enum Error {
     NotParsable(String),
     /// URL template parsing failure.
     InvalidUrl(String),
+    /// The session advertises the named capability but its object does
+    /// not parse into the shape the RFC defines for it. Distinct from
+    /// "not advertised": the server claimed the capability and then
+    /// described it wrongly, which is a contract violation rather than a
+    /// missing feature.
+    MalformedCapability {
+        /// The capability URI whose object failed to parse (e.g.
+        /// `urn:ietf:params:jmap:websocket`).
+        capability: &'static str,
+    },
     /// The session lists no primary account for the requested capability.
     NoPrimaryAccount {
         /// The capability URI that was looked up (e.g.
@@ -456,6 +466,10 @@ impl Display for Error {
             Error::IdNotFound(id) => write!(f, "Id {id} not found"),
             Error::NotParsable(id) => write!(f, "{id} is not parsable"),
             Error::InvalidUrl(msg) => write!(f, "Invalid URL: {msg}"),
+            Error::MalformedCapability { capability } => write!(
+                f,
+                "Session advertises capability {capability} with an unparseable object"
+            ),
             Error::NoPrimaryAccount { capability } => write!(
                 f,
                 "Session lists no primary account for capability {capability}"

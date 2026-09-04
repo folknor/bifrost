@@ -74,13 +74,25 @@ fn unusable_core_limits() -> AccountError {
 /// this session changes on a reopen, so classifying it as a capability
 /// change would buy an endless reopen loop.
 fn malformed_core_capability() -> AccountError {
+    malformed_required_capability(
+        <crate::core::capability::Core as crate::core::capability::Capability>::URI,
+    )
+}
+
+/// A capability block the account DEPENDS on is present but does not
+/// parse. Same lane and same reasoning as the core block: the server
+/// advertised the capability and then described it wrongly, so a reopen
+/// buys nothing and the honest classification is a contract violation.
+/// The URI is named in the diagnostic - "some capability is malformed" is
+/// not an actionable report when a session advertises a dozen.
+fn malformed_required_capability(uri: &str) -> AccountError {
     AccountErrorBuilder::new(
         AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
         Cause::Wire(WireCause::MalformedResponse {
             protocol: Protocol::Jmap,
-            detail: Some(DiagnosticText::support_only(
-                "JMAP core capability object is present but not parseable",
-            )),
+            detail: Some(DiagnosticText::support_only(format!(
+                "JMAP capability object {uri} is present but not parseable"
+            ))),
         }),
     )
     .protocol(Protocol::Jmap)
@@ -148,9 +160,47 @@ pub(crate) fn build(
     let max_objects_in_get = core.max_objects_in_get().unwrap_or(1).max(1);
     let max_objects_in_set = core.max_objects_in_set().unwrap_or(1).max(1);
 
-    let ws_push = session
-        .websocket_capabilities()
-        .is_some_and(crate::core::session::WebSocketCapabilities::supports_push);
+    // The same Absent / Malformed / Present split, applied to every other
+    // capability this crate models. A block the account DEPENDS on -
+    // `urn:ietf:params:jmap:mail`, which is the reason a JMAP account
+    // exists here - is refused at open, in the contract-violation lane and
+    // naming the URI. Every other modelled block is optional: the account
+    // degrades to "that family is off", but it says so, because a silent
+    // downgrade is indistinguishable from a server that never offered the
+    // feature and leaves nobody anything to debug.
+    #[cfg(feature = "mail")]
+    {
+        let mail_uri = <crate::core::capability::Mail as crate::core::capability::Capability>::URI;
+        if session.malformed_capabilities().any(|uri| uri == mail_uri) {
+            return Err(malformed_required_capability(mail_uri));
+        }
+    }
+    for uri in session.malformed_capabilities() {
+        tracing::warn!(
+            capability = uri,
+            "JMAP session advertises this capability with an unparseable object; \
+             the features behind it are treated as unavailable"
+        );
+    }
+
+    // Push specifically: a malformed websocket block used to derive
+    // `PushCapability::None` with nothing said, which reads to the engine
+    // as a server that does not do push at all. It still degrades to
+    // polling - push is optional, and there is no url to connect to - but
+    // the reason is on the record.
+    let ws_push = match session.websocket_capability_state() {
+        crate::core::session::CapabilityState::Present(ws) => ws.supports_push(),
+        crate::core::session::CapabilityState::Absent => false,
+        crate::core::session::CapabilityState::Malformed => {
+            tracing::warn!(
+                capability =
+                    <crate::core::capability::WebSocket as crate::core::capability::Capability>::URI,
+                "JMAP websocket capability object is present but not parseable; \
+                 push is disabled and the account falls back to polling"
+            );
+            false
+        }
+    };
 
     let max_items = max_objects_in_set.clamp(1, 500);
     let caps = AccountCapabilities {
@@ -758,6 +808,122 @@ mod tests {
                 "omitted {field}"
             );
         }
+    }
+
+    /// A session document with a legal core block plus whatever other
+    /// capability blocks the test wants to vary.
+    fn session_with_extra(extra: serde_json::Value) -> Session {
+        let mut capabilities = serde_json::json!({
+            "urn:ietf:params:jmap:core": {
+                "maxSizeUpload": 1000,
+                "maxConcurrentUpload": 2,
+                "maxSizeRequest": 100_000,
+                "maxConcurrentRequests": 4,
+                "maxCallsInRequest": 8,
+                "maxObjectsInGet": 256,
+                "maxObjectsInSet": 256,
+                "collationAlgorithms": []
+            },
+            "urn:ietf:params:jmap:mail": {}
+        });
+        let map = capabilities.as_object_mut().expect("object");
+        for (key, value) in extra.as_object().expect("extra is an object") {
+            map.insert(key.clone(), value.clone());
+        }
+        serde_json::from_value(serde_json::json!({
+            "capabilities": capabilities,
+            "accounts": {},
+            "primaryAccounts": {},
+            "username": "user",
+            "apiUrl": "https://example.test/jmap/api",
+            "downloadUrl": "https://example.test/download/{accountId}/{blobId}/{name}/{type}",
+            "uploadUrl": "https://example.test/upload/{accountId}",
+            "eventSourceUrl": "https://example.test/eventsource",
+            "state": "session-state"
+        }))
+        .expect("session fixture parses")
+    }
+
+    /// The lateral half of the malformed-core defect: the fallback to
+    /// `Other` applied to every NON-core capability too, so a websocket
+    /// block missing its mandatory `url` derived `PushCapability::None`
+    /// exactly as an absent block would. Push is optional, so this still
+    /// degrades rather than failing - but it degrades through the
+    /// malformed lane, and the session reports the block by URI.
+    #[test]
+    fn a_malformed_websocket_block_degrades_push_without_reading_as_absent() {
+        let session = session_with_extra(serde_json::json!({
+            "urn:ietf:params:jmap:websocket": {"supportsPush": true}
+        }));
+        assert_eq!(
+            session.malformed_capabilities().collect::<Vec<_>>(),
+            vec!["urn:ietf:params:jmap:websocket"],
+            "the malformed block must be nameable in a diagnostic"
+        );
+        let (caps, _) = build(&session, no_pim_support())
+            .expect("an optional malformed capability must not fail open");
+        assert_eq!(caps.push, PushCapability::None);
+    }
+
+    /// A malformed block for a capability the account DEPENDS on is not a
+    /// degradation: `urn:ietf:params:jmap:mail` is the reason a JMAP
+    /// account exists here, so a present-and-unparseable mail block takes
+    /// the same contract-violation lane the core block takes, and names
+    /// itself in the diagnostic.
+    #[cfg(feature = "mail")]
+    #[test]
+    fn a_malformed_mail_block_is_a_named_contract_violation() {
+        let session = session_with_extra(serde_json::json!({
+            "urn:ietf:params:jmap:mail": "not an object"
+        }));
+        let err = build(&session, no_pim_support())
+            .expect_err("a malformed required capability must be refused");
+        assert_eq!(
+            err.kind(),
+            &AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation)
+        );
+        assert!(
+            format!("{err:?}").contains("urn:ietf:params:jmap:mail"),
+            "the diagnostic must name the malformed capability: {err:?}"
+        );
+    }
+
+    /// An optional family whose block is malformed must not take the
+    /// account down with it: the sieve/quota/calendar doors are gated on
+    /// their own `PimSupport` flags, and open still succeeds.
+    #[test]
+    fn a_malformed_optional_block_does_not_fail_open() {
+        let session = session_with_extra(serde_json::json!({
+            "urn:ietf:params:jmap:sieve": "not an object",
+            "urn:ietf:params:jmap:quota": 7
+        }));
+        let (caps, limits) =
+            build(&session, no_pim_support()).expect("optional families degrade, they do not fail");
+        assert_eq!(caps.push, PushCapability::None);
+        assert_eq!(limits.max_objects_in_get, 256);
+    }
+
+    /// The `Error::MalformedCapability` the WebSocket door raises when the
+    /// block is present-and-unparseable must classify as a contract
+    /// violation naming the URI - not as the `Unsupported` that an ABSENT
+    /// websocket block earns, which would file a server bug under
+    /// "feature not offered".
+    #[test]
+    fn a_malformed_capability_error_classifies_as_a_named_contract_violation() {
+        let err = crate::sync::error::into_account_error(
+            crate::Error::MalformedCapability {
+                capability: "urn:ietf:params:jmap:websocket",
+            },
+            crate::sync::error::JmapErrorContext::new(AccountOperation::PushSubscribe),
+        );
+        assert_eq!(
+            err.kind(),
+            &AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation)
+        );
+        assert!(
+            format!("{err:?}").contains("urn:ietf:params:jmap:websocket"),
+            "the diagnostic must name the malformed capability: {err:?}"
+        );
     }
 
     /// The invariants the engine reads before it reads anything else.

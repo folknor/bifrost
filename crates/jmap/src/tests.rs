@@ -2771,7 +2771,7 @@ mod session_capability_fallbacks {
         assert!(
             matches!(
                 session.capability("urn:ietf:params:jmap:core"),
-                Some(Capabilities::CoreMalformed(v)) if v == &json!({"maxCallsInRequest": "16"})
+                Some(Capabilities::Malformed(v)) if v == &json!({"maxCallsInRequest": "16"})
             ),
             "and the offending value is preserved verbatim for diagnostics"
         );
@@ -2786,6 +2786,96 @@ mod session_capability_fallbacks {
             present.core_capability_state(),
             CoreCapabilityState::Present(_)
         ));
+    }
+
+    /// The core block was the first capability to get the three-state
+    /// treatment; it must not be the only one. A websocket block with no
+    /// `url` is present-and-wrong, and reading it as absent is how a
+    /// server bug turned into "this server has no push" with nothing said.
+    #[test]
+    fn a_malformed_non_core_block_is_malformed_and_not_absent() {
+        use crate::core::session::CapabilityState;
+
+        let session = session_with(json!({
+            "urn:ietf:params:jmap:websocket": {"supportsPush": true}
+        }));
+        assert!(matches!(
+            session.websocket_capability_state(),
+            CapabilityState::Malformed
+        ));
+        assert!(session.websocket_capabilities().is_none());
+        assert!(
+            matches!(
+                session.capability("urn:ietf:params:jmap:websocket"),
+                Some(Capabilities::Malformed(v)) if v == &json!({"supportsPush": true})
+            ),
+            "the offending value is preserved verbatim for diagnostics"
+        );
+        assert_eq!(
+            session.malformed_capabilities().collect::<Vec<_>>(),
+            vec!["urn:ietf:params:jmap:websocket"]
+        );
+
+        let absent = session_with(json!({}));
+        assert!(matches!(
+            absent.websocket_capability_state(),
+            CapabilityState::Absent
+        ));
+        assert_eq!(absent.malformed_capabilities().count(), 0);
+    }
+
+    /// Every typed capability the crate models, not a hand-picked few:
+    /// a recognized URI carrying a value that cannot possibly be its
+    /// object must land in `Malformed`, never in `Other`.
+    #[test]
+    fn every_modelled_capability_uri_has_a_malformed_lane() {
+        for uri in [
+            "urn:ietf:params:jmap:core",
+            "urn:ietf:params:jmap:mail",
+            "urn:ietf:params:jmap:submission",
+            "urn:ietf:params:jmap:websocket",
+            "urn:ietf:params:jmap:sieve",
+            "urn:ietf:params:jmap:quota",
+            "urn:ietf:params:jmap:blob",
+            "urn:ietf:params:jmap:calendars",
+            "urn:ietf:params:jmap:contacts",
+            "urn:ietf:params:jmap:principals",
+            "urn:ietf:params:jmap:principals:owner",
+        ] {
+            let session = session_with(json!({uri: "not an object at all"}));
+            assert!(
+                matches!(session.capability(uri), Some(Capabilities::Malformed(_))),
+                "{uri} must take the malformed lane, not fall back to Other"
+            );
+            assert_eq!(
+                session.malformed_capabilities().collect::<Vec<_>>(),
+                vec![uri]
+            );
+        }
+    }
+
+    /// `maxConcurrentUpload` is parsed and, by design, has no reader (see
+    /// `reference/jmap.md`): every upload door in this crate awaits one
+    /// upload at a time, so there is no concurrency for the limit to
+    /// govern. It still has to survive the session decode, so that wiring
+    /// it later is a reader change and not a parser change.
+    #[test]
+    fn core_max_concurrent_upload_is_parsed_even_though_nothing_reads_it() {
+        let session = session_with(json!({
+            "urn:ietf:params:jmap:core": {"maxConcurrentUpload": 4}
+        }));
+        let core = session.core_capabilities().expect("core cap");
+        assert_eq!(core.max_concurrent_upload(), Some(4));
+
+        let omitted = session_with(json!({"urn:ietf:params:jmap:core": {}}));
+        assert_eq!(
+            omitted
+                .core_capabilities()
+                .expect("core cap")
+                .max_concurrent_upload(),
+            None,
+            "omitted must stay distinguishable from an advertised zero"
+        );
     }
 
     #[test]

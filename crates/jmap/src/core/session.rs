@@ -62,14 +62,18 @@ pub(crate) enum Capabilities {
     Mail(MailCapabilities),
     #[cfg(feature = "mail")]
     Submission(SubmissionCapabilities),
-    /// The `urn:ietf:params:jmap:core` block was present but did not
-    /// parse as [`CoreCapabilities`] (a limit sent as a string, say).
+    /// A capability block this crate models by URI was PRESENT but did
+    /// not parse into its typed struct (a core limit sent as a string, a
+    /// websocket block with no `url`, say).
+    ///
     /// Kept as its own variant rather than folded into `Other` so that a
-    /// present-but-malformed core block reads as the INVALID lane instead
-    /// of the unadvertised one: the two map to different recovery classes
-    /// (`Protocol(ContractViolation)` versus `SyncState(CapabilityChanged)`),
-    /// and `Other` is indistinguishable from absent at every reader.
-    CoreMalformed(serde_json::Value),
+    /// present-but-malformed block reads as the INVALID lane instead of
+    /// the unadvertised one: the two map to different recovery classes
+    /// (`Protocol(ContractViolation)` versus `SyncState(CapabilityChanged)`
+    /// or a silent feature-off), and `Other` is indistinguishable from
+    /// absent at every reader. `Other` now means only "a URI this crate
+    /// does not model", which is genuinely nothing to say.
+    Malformed(serde_json::Value),
     WebSocket(WebSocketCapabilities),
     #[cfg(feature = "mail")]
     Sieve(SieveCapabilities),
@@ -99,32 +103,26 @@ where
     let mut result = HashMap::with_capacity(raw.len());
 
     /// Deserialize a capability value as a typed struct, falling back to
-    /// `Other(original_value)` on parse failure. Serializes to a string
-    /// first to avoid cloning the Value - `from_value` consumes on error.
+    /// `Malformed(original_value)` on parse failure. Every URI this crate
+    /// models goes through here, so the Absent / Malformed / Present
+    /// discipline is one mechanism rather than a per-capability special
+    /// case: a block whose URI we recognize and whose shape we reject is
+    /// never reported as unadvertised. Serializes to a string first to
+    /// avoid cloning the Value - `from_value` consumes on error, and the
+    /// original has to survive into `Malformed`.
     macro_rules! try_cap {
         ($value:expr, $variant:ident) => {{
             let s = serde_json::to_string(&$value).unwrap();
             match serde_json::from_str(&s) {
                 Ok(v) => Capabilities::$variant(v),
-                Err(_) => Capabilities::Other($value),
+                Err(_) => Capabilities::Malformed($value),
             }
         }};
     }
 
     for (key, value) in raw {
         let cap = match key.as_str() {
-            // The core block is the one capability whose malformed shape
-            // must not degrade to "absent" - see `Capabilities::CoreMalformed`.
-            "urn:ietf:params:jmap:core" => {
-                // Cloned rather than string-round-tripped: `from_value`
-                // consumes the value on error, and the malformed value has
-                // to survive into `CoreMalformed`. The core object is a
-                // handful of scalars, parsed once per session.
-                match serde_json::from_value(value.clone()) {
-                    Ok(core) => Capabilities::Core(core),
-                    Err(_) => Capabilities::CoreMalformed(value),
-                }
-            }
+            "urn:ietf:params:jmap:core" => try_cap!(value, Core),
             #[cfg(feature = "mail")]
             "urn:ietf:params:jmap:mail" => try_cap!(value, Mail),
             #[cfg(feature = "mail")]
@@ -189,16 +187,24 @@ pub(crate) struct CoreCapabilities {
     collation_algorithms: Vec<String>,
 }
 
-/// The three states the core capability block can be in, which the
-/// two-state `Option<&CoreCapabilities>` could not express.
+/// The three states a modelled capability block can be in, which the
+/// two-state `Option<&T>` accessors cannot express.
+///
+/// Every typed capability has all three, not just core: a present block
+/// the crate refuses to parse is a different fact from an absent one, and
+/// collapsing them makes a server's malformed `websocket` block read as
+/// "this server has no websockets".
 #[derive(Debug, Clone, Copy)]
-pub(crate) enum CoreCapabilityState<'a> {
-    /// No `urn:ietf:params:jmap:core` key in the session at all.
+pub(crate) enum CapabilityState<'a, T> {
+    /// No key for this capability URI in the session at all.
     Absent,
-    /// Present, but not parseable as the RFC 8620 core object.
+    /// Present, but not parseable as the typed capability object.
     Malformed,
-    Present(&'a CoreCapabilities),
+    Present(&'a T),
 }
+
+/// The core block's three-state, spelled out for the readers that name it.
+pub(crate) type CoreCapabilityState<'a> = CapabilityState<'a, CoreCapabilities>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct WebSocketCapabilities {
@@ -288,16 +294,32 @@ pub(crate) struct PrincipalsCapabilities {
     account_id_for_principal: Option<crate::core::id::AccountId>,
 }
 
+/// Generates the pair of readers every modelled capability needs: the
+/// two-state `Option` accessor for callers that only want to decline to
+/// act, and the three-state `CapabilityState` accessor for callers that
+/// have to CLASSIFY (refuse at the door, or degrade with a named
+/// diagnostic) - because to those, malformed and absent are not the same
+/// server.
 macro_rules! session_cap_accessor {
-    ($(#[$meta:meta])* $method:ident, $cap_marker:ty, $variant:ident, $return_type:ty) => {
+    ($(#[$meta:meta])* $method:ident, $state_method:ident, $cap_marker:ty, $variant:ident, $return_type:ty) => {
         $(#[$meta])*
         pub(crate) fn $method(&self) -> Option<&$return_type> {
-            self.capabilities
+            match self.$state_method() {
+                CapabilityState::Present(c) => Some(c),
+                CapabilityState::Absent | CapabilityState::Malformed => None,
+            }
+        }
+
+        $(#[$meta])*
+        pub(crate) fn $state_method(&self) -> CapabilityState<'_, $return_type> {
+            match self
+                .capabilities
                 .get(<$cap_marker as crate::core::capability::Capability>::URI)
-                .and_then(|v| match v {
-                    Capabilities::$variant(c) => Some(c),
-                    _ => None,
-                })
+            {
+                None => CapabilityState::Absent,
+                Some(Capabilities::$variant(c)) => CapabilityState::Present(c),
+                Some(_) => CapabilityState::Malformed,
+            }
         }
     };
 }
@@ -335,35 +357,22 @@ impl Session {
 
     session_cap_accessor!(
         websocket_capabilities,
+        websocket_capability_state,
         crate::core::capability::WebSocket,
         WebSocket,
         WebSocketCapabilities
     );
     session_cap_accessor!(
         core_capabilities,
+        core_capability_state,
         crate::core::capability::Core,
         Core,
         CoreCapabilities
     );
-
-    /// The core capability block as a three-state: absent, present but
-    /// unparseable, or present and typed. `core_capabilities()` collapses
-    /// the first two into `None`; every reader that has to CLASSIFY a bad
-    /// session (rather than merely decline to enforce a bound) must use
-    /// this instead.
-    pub(crate) fn core_capability_state(&self) -> CoreCapabilityState<'_> {
-        match self
-            .capabilities
-            .get(<crate::core::capability::Core as crate::core::capability::Capability>::URI)
-        {
-            None => CoreCapabilityState::Absent,
-            Some(Capabilities::Core(core)) => CoreCapabilityState::Present(core),
-            Some(_) => CoreCapabilityState::Malformed,
-        }
-    }
     session_cap_accessor!(
         #[cfg(feature = "mail")]
         mail_capabilities,
+        mail_capability_state,
         crate::core::capability::Mail,
         Mail,
         MailCapabilities
@@ -371,6 +380,7 @@ impl Session {
     session_cap_accessor!(
         #[cfg(feature = "mail")]
         submission_capabilities,
+        submission_capability_state,
         crate::core::capability::Submission,
         Submission,
         SubmissionCapabilities
@@ -378,6 +388,7 @@ impl Session {
     session_cap_accessor!(
         #[cfg(feature = "mail")]
         sieve_capabilities,
+        sieve_capability_state,
         crate::core::capability::Sieve,
         Sieve,
         SieveCapabilities
@@ -385,6 +396,7 @@ impl Session {
     session_cap_accessor!(
         #[cfg(feature = "quota")]
         quota_capabilities,
+        quota_capability_state,
         crate::core::capability::Quota,
         Quota,
         QuotaCapabilities
@@ -392,6 +404,7 @@ impl Session {
     session_cap_accessor!(
         #[cfg(feature = "blob")]
         blob_capabilities,
+        blob_capability_state,
         crate::core::capability::Blob,
         Blob,
         BlobCapabilities
@@ -399,6 +412,7 @@ impl Session {
     session_cap_accessor!(
         #[cfg(feature = "calendars")]
         calendars_capabilities,
+        calendars_capability_state,
         crate::core::capability::Calendars,
         Calendars,
         CalendarsCapabilities
@@ -406,22 +420,39 @@ impl Session {
     session_cap_accessor!(
         #[cfg(feature = "contacts")]
         contacts_capabilities,
+        contacts_capability_state,
         crate::core::capability::Contacts,
         Contacts,
         ContactsCapabilities
     );
     session_cap_accessor!(
         principals_capabilities,
+        principals_capability_state,
         crate::core::capability::Principals,
         Principals,
         PrincipalsCapabilities
     );
     session_cap_accessor!(
         principals_owner_capabilities,
+        principals_owner_capability_state,
         crate::core::capability::PrincipalsOwner,
         PrincipalsOwner,
         PrincipalsOwnerCapabilities
     );
+
+    /// Every capability URI the session advertises whose block this crate
+    /// models by URI and then failed to parse.
+    ///
+    /// The session validator uses this to refuse on a malformed block the
+    /// account DEPENDS on and to name the merely-optional ones in a
+    /// diagnostic, so that "the server advertised it and described it
+    /// wrongly" never leaves the crate as silence.
+    pub(crate) fn malformed_capabilities(&self) -> impl Iterator<Item = &str> {
+        self.capabilities
+            .iter()
+            .filter(|(_, value)| matches!(value, Capabilities::Malformed(_)))
+            .map(|(key, _)| key.as_str())
+    }
 
     pub(crate) fn accounts(&self) -> impl Iterator<Item = &String> {
         self.accounts.keys()

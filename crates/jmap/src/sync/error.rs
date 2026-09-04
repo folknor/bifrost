@@ -205,6 +205,23 @@ pub(crate) fn into_account_error(error: crate::Error, ctx: JmapErrorContext) -> 
         // -> AuthLost` (terminal, operator must re-authorize) rather than
         // a `CapabilityChanged -> RestartAccount` reopen loop that would
         // spin re-running discovery against the same empty session.
+        // The server advertised the capability and then sent an object
+        // that is not one. Nothing about this session changes on a reopen,
+        // so it takes the contract-violation lane rather than the
+        // `CapabilityChanged -> RestartAccount` reopen loop an ABSENT
+        // capability takes, and the URI rides in the diagnostic.
+        crate::Error::MalformedCapability { capability } => build(
+            AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
+            Cause::Wire(WireCause::MalformedResponse {
+                protocol: Protocol::Jmap,
+                detail: Some(DiagnosticText::support_only(format!(
+                    "JMAP capability object {capability} is present but not parseable"
+                ))),
+            }),
+            &ctx,
+        )
+        .try_build()
+        .expect("valid account error classification"),
         crate::Error::NoPrimaryAccount { capability } => build(
             AccountErrorKind::Authentication(AuthErrorKind::ReauthorizationRequired),
             Cause::Auth(AuthCause::ReauthorizationRequired),

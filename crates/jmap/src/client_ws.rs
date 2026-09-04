@@ -322,9 +322,23 @@ impl Client {
         &self,
     ) -> crate::Result<Pin<Box<impl Stream<Item = crate::Result<WebSocketMessage>> + use<>>>> {
         let session = self.session();
-        let capabilities = session
-            .websocket_capabilities()
-            .ok_or_else(|| crate::Error::WebSocketNotConnected)?;
+        // Absent and malformed part company here. No websocket block is
+        // "this server does not do websockets" - `WebSocketNotConnected`,
+        // which the account layer maps to `Unsupported`. A block that is
+        // present and unparseable is the server contradicting its own
+        // advertisement, and reporting that as "unsupported" hides a
+        // server bug behind a feature flag.
+        let capabilities = match session.websocket_capability_state() {
+            crate::core::session::CapabilityState::Present(capabilities) => capabilities,
+            crate::core::session::CapabilityState::Absent => {
+                return Err(crate::Error::WebSocketNotConnected);
+            }
+            crate::core::session::CapabilityState::Malformed => {
+                return Err(crate::Error::MalformedCapability {
+                    capability: <crate::core::capability::WebSocket as crate::core::capability::Capability>::URI,
+                });
+            }
+        };
 
         let url = capabilities.url().to_string();
         let uri: Uri = url

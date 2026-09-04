@@ -46,7 +46,7 @@ Both halves of that widening are deliberate. Every core limit is an
 `Option<usize>`, so an OMITTED field reads as "advertised nothing" rather than
 as the zero a blanket `#[serde(default)]` used to fill in - two different server
 bugs with two different classifications. And a present-but-unparseable core
-block (`"maxCallsInRequest": "16"`) is its own `Capabilities::CoreMalformed`
+block (`"maxCallsInRequest": "16"`) takes the `Capabilities::Malformed`
 variant, read through `Session::core_capability_state()` (`Absent` /
 `Malformed` / `Present`); falling back to `Capabilities::Other` made it
 indistinguishable from absent at every reader, so a server sending a
@@ -193,11 +193,67 @@ Every JMAP object type under `crates/jmap/src/<type>/`:
 
 1. Add struct in `session.rs`.
 2. Add variant to `Capabilities` enum (with `#[cfg]` if feature-gated).
-3. Add match arm in deserializer.
+3. Add match arm in deserializer (via `try_cap!`, which supplies the malformed lane).
 4. Add `Capability` impl in `capability.rs` with `type Config`.
-5. Add session accessor method.
+5. Add the `session_cap_accessor!` invocation, which generates both readers.
 
 `Session::typed_capability::<C>()` is a convenience bridge (serde round-trip). Hand-written accessors are zero-cost and primary.
+
+### Absent, Malformed, Present - for every capability, not just core
+
+`try_cap!` falls back to `Capabilities::Malformed(value)`, never to
+`Capabilities::Other`, so a URI this crate models whose object it refuses to
+parse is never reported as unadvertised. `Other` now means exactly one thing: a
+URI the crate does not model. `session_cap_accessor!` generates the two readers
+each capability needs from one mechanism - `x_capabilities() -> Option<&T>` for
+callers that only decline to act, and `x_capability_state() ->
+CapabilityState<'_, T>` (`Absent` / `Malformed` / `Present`) for callers that
+have to classify. `CoreCapabilityState` is the core block's alias of that type.
+
+The Unadvertised-versus-Invalid rule then decides per reader, and the split is
+whether the account DEPENDS on the block:
+
+- **Required.** `urn:ietf:params:jmap:core` and `urn:ietf:params:jmap:mail`.
+  A malformed block is `Protocol(ContractViolation)` at
+  `sync::capabilities::build`, refused at open, with the URI in the diagnostic.
+  Not `SyncState(CapabilityChanged)`: nothing about this session changes on a
+  reopen, so that lane buys an endless reopen loop.
+- **Optional.** Everything else the crate models (websocket, submission, sieve,
+  quota, blob, calendars, contacts, principals, principals:owner). The family
+  degrades to off, and `build` warns per malformed URI via
+  `Session::malformed_capabilities()`. Push has its own arm on top of that
+  warning, because a malformed `urn:ietf:params:jmap:websocket` block deriving
+  `PushCapability::None` silently is indistinguishable from a server that never
+  offered push. It still degrades - there is no url to connect to - but the
+  reason is on the record.
+- **At the door.** `Client::connect_ws` separates the two states as well:
+  `Absent` stays `Error::WebSocketNotConnected` (which maps to `Unsupported`),
+  while `Malformed` raises `Error::MalformedCapability { capability }`, mapped
+  by `sync::error` to `Protocol(ContractViolation)` naming the URI. Filing a
+  server contradicting its own advertisement under "feature not offered" hides
+  it.
+
+### `maxConcurrentUpload` is parsed and deliberately unread
+
+`CoreCapabilities::max_concurrent_upload` has no reader, and that is the
+correct state, not an oversight. Every upload door in this crate awaits one
+upload at a time - `Account::upload` is a single request, and its callers
+(`pim::attachment_upload`, the inline/attachment loops in the send path, the
+sieve script body upload in `filters.rs`) iterate sequentially with an `await`
+per item. There is no concurrent upload for the limit to govern, so a reader
+would have to invent the fan-out first. The one place the crate does put
+overlapping requests on the wire is the foreign-account probe at open, and
+those are API requests governed by `maxConcurrentRequests`, which
+`foreign_probe_concurrency` already honours (clamped to `[1, 8]`).
+
+The field stays parsed, and stays an `Option<usize>` like every other core
+limit, so that adding concurrent uploads later is a reader change rather than a
+parser change - and so an omitted limit never zero-fills into "advertised 0".
+`core_max_concurrent_upload_is_parsed_even_though_nothing_reads_it` pins the
+decode. Anything that grows a concurrent upload path must read it there; unlike
+the four limits `build` validates, an absent or zero `maxConcurrentUpload` is
+NOT a contract violation, because RFC 8620 §2 mandates the member but a client
+that never uploads concurrently has nothing to refuse.
 
 ## Feature gates
 
@@ -224,7 +280,7 @@ RSVP resolves authenticated email aliases from Basic credentials and RFC 9670 Pr
 The crate-internal JMAP error type uses structured variants. No
 `Error::Internal(String)`:
 
-- `CallNotFound`, `IdNotFound`, `EmptyResponse`, `NotParsable`, `InvalidUrl`, `WebSocketClosed`, `WebSocketNotConnected`.
+- `CallNotFound`, `IdNotFound`, `EmptyResponse`, `NotParsable`, `InvalidUrl`, `MalformedCapability`, `WebSocketClosed`, `WebSocketNotConnected`.
 - `Transport(TransportError)` - wraps transport errors, auto-parses ProblemDetails from body.
 - `Method(MethodError)` - JMAP method-level errors.
 - No `From<reqwest::Error>` - reqwest errors converted to TransportError at point of use.
@@ -285,7 +341,7 @@ Reopen is engine-delegated: on drop or `close()`, the engine calls `JmapAccountF
 
 ### Capabilities advertised
 
-`capabilities::build` reads `session.core_capabilities()` and `session.websocket_capabilities()` to construct `AccountCapabilities`:
+`capabilities::build` reads the core and websocket capability STATES (see "Absent, Malformed, Present" above - it refuses a malformed required block, warns per malformed optional one, and derives push from the websocket three-state) to construct `AccountCapabilities`:
 
 - `cursor_freshness: ServerIssued`; `blob_range: No`; `blob_digest_pre_download: false`.
 - `push: InProcess` when the session advertises `urn:ietf:params:jmap:websocket` with `supportsPush: true`, else `None`.
