@@ -162,6 +162,36 @@ asymmetry with the batch path, 3) this hunt found. That is a rewrite proposal
 for the owner, not a defect; the published blocking surface itself stays
 untouched.
 
+## Core test-harness gap (closed)
+
+The cold review of ruling 7's core found the harness could not aim a scripted
+failure: writes and group boundaries consumed whichever failure came next, so
+`OpenReplyGroup`, `CloseReplyGroup`, `CloseLmtpDrain` and the epilogue's `RSET`
+write were unreachable - and the core tests recorded which ops were requested
+without anything proving the adapters acted on them.
+
+Both halves are closed. `Harness::aiming(Aim::Position(n) | Aim::Kind(sel, nth))`
+fails one named op and leaves the reply script intact, and four core tests use
+it: a failed RSET write aborts without reading for a reply that will not come;
+a failure at `OpenReplyGroup` and at `CloseReplyGroup` in the pipelined batch
+path returns the error with no second abort, with the recipients still `Pending`
+in the first case and already `Accepted` in the second; a failure closing the
+LMTP batch drain keeps every recorded final status (the direct path's contrast,
+an abort carrying `LmtpFinalStatus`, is pinned alongside). At the adapter level
+both transcript suites now observe stream state after the exchange: `Broken`
+after an abort, `Ok` after a clean pipelined group close, `Broken` plus retired
+after a clean LMTP batch drain, and the retirement flag's negative case for a
+plain SMTP send. Every one confirmed to bite - the core tests by reverting the
+core, the adapter tests by breaking the adapter's handling of the very op they
+target (dropping the `Op::Abort` arm, dropping the `Ok` restore in
+`finish_reply_group`, ignoring `restore_ok`). No production behaviour changed.
+
+Worth recording: asserting `has_broken()` after an abort does NOT bite against
+removing `abort()`'s `set_state(Broken)`, because the shutdown it also performs
+sets `Closed`, which fails `verify()` just as well. The observable is only
+sharp against the adapter dropping the op entirely, which is the thing worth
+pinning.
+
 Key files: `crates/smtp/src/transport/smtp/client/connection.rs`,
 `client/async_connection.rs`, `client/async_net.rs`, `client/mod.rs`,
 `src/message/body.rs`, `reference/smtp.md`.

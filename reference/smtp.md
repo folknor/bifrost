@@ -498,10 +498,39 @@ and record its op stream, so window reply accounting, coalesced-reply handling,
 RSET-and-keep, abort-on-I/O-failure, LMTP per-recipient final status and BDAT
 sequencing are each pinned once, in the place the rule now lives, with no I/O
 at all. Every one of them was confirmed to bite by reintroducing the bug it
-describes. Below them, both drivers' transcript suites are unchanged and still
-drive the full wire exchange through their own adapter, which is what proves
-the adapters perform the ops faithfully; the core tests cannot see a socket and
-so can never replace them.
+describes. Below them, both drivers' transcript suites drive the full wire
+exchange through their own adapter, which is what proves the adapters perform
+the ops faithfully; the core tests cannot see a socket and so can never replace
+them.
+
+A scripted outcome list alone cannot reach every boundary. Writes and group
+boundaries consume the next scripted failure whichever one it is, so a failure
+meant for a later boundary is swallowed by the first non-reply op that runs -
+which left `OpenReplyGroup`, `CloseReplyGroup`, `CloseLmtpDrain` and the
+epilogue's own `RSET` write untargetable. The core harness therefore also takes
+an *aimed* failure, `Harness::aiming(Aim)`, matched against the op stream rather
+than queued in the script: `Aim::Position(n)` fails the nth op outright, and
+`Aim::Kind(selector, nth)` fails the nth op matching a selector - an exact op
+tag (`OPEN`, `CLOSE`, `DRAIN`, `READG`, `READ`, `BODY`, `BDAT`, `ABORT`) or a
+`W:` prefix matched against the rendered write, so `Aim::Kind("W:RSET", 0)`
+names the reset write and nothing else. The replies before the aimed op are
+untouched, so the machine reaches the boundary in the state production would.
+That is what pins the failed-RSET-write abort, the two pipelined group
+boundaries returning their error without a second abort and with the recipient
+lanes they had collected, and an LMTP drain close that fails after every final
+status was recorded (the batch result stands; only the stream is lost).
+
+The transcript suites carry the other half of that pair: a requested op is not
+a performed op, so both suites observe the stream state after the exchange, not
+only its result. `an_aborting_batch_failure_leaves_the_stream_broken` (abort,
+and not retired), `a_rejected_pipelined_mail_from_restores_the_stream_at_the_group_close`
+(the group bracket restores `Ok` when every reply drained),
+`a_clean_lmtp_batch_drain_leaves_the_stream_broken_and_retired`
+(`restore_ok: false` reaching the wire) and the direct-LMTP drain pins
+(`Ok` plus retired) exist in both halves. Each was confirmed to bite by breaking
+the adapter's handling of the op it targets - dropping the `Op::Abort` arm,
+dropping the `Ok` restore in `finish_reply_group`, and ignoring `restore_ok` -
+rather than only by reverting the core.
 
 `test_support::Transcript` is the in-process scripted peer both connection
 drivers test against; it replaced the socket-listener tests, which were neither

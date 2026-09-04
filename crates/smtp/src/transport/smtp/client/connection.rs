@@ -2230,6 +2230,127 @@ mod transcript_tests {
         assert!(connection.should_retire());
     }
 
+    /// `Op::Abort` is a request until the adapter performs it. The core's
+    /// batch `MAIL FROM` rejection asks for one; what has to be true at the
+    /// wire afterwards is that the stream can never be handed out again.
+    #[test]
+    fn an_aborting_batch_failure_leaves_the_stream_broken() {
+        let hello = ClientId::Domain("client.example".to_owned());
+        // Nothing follows the rejection: an abort writes no QUIT.
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250 smtp.example\r\n")
+            .expect(
+                "MAIL FROM:<sender@example.com>\r\n",
+                "550 sender rejected\r\n",
+            );
+        let batch = vec![SmtpBatchRecipient {
+            id: BatchItemId("item-0".to_owned()),
+            address: "first@example.com".parse().unwrap(),
+        }];
+
+        let mut connection =
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp).unwrap();
+        connection
+            .send_smtp_batch(
+                Some("sender@example.com".parse().unwrap()),
+                batch,
+                b"body",
+                &Default::default(),
+            )
+            .expect_err("a rejected batch MAIL FROM is a batch-level failure");
+
+        assert!(
+            connection.has_broken(),
+            "an aborted connection must never pass state().verify() again"
+        );
+        assert!(
+            !connection.should_retire(),
+            "retirement is the LMTP drain's flag, not an abort's"
+        );
+        transcript.assert_exhausted();
+    }
+
+    /// `OpenReplyGroup` holds the stream `Broken` for the whole window and
+    /// `CloseReplyGroup` restores it. A rejected pipelined `MAIL FROM` is the
+    /// case that proves the restore happens at the close: the window still
+    /// drains, no RSET is sent, nothing is aborted, and the connection is
+    /// reusable at the end even though the send failed.
+    #[test]
+    fn a_rejected_pipelined_mail_from_restores_the_stream_at_the_group_close() {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let addresses = recipients(2);
+        let mut window = "MAIL FROM:<sender@example.com>\r\n".to_owned();
+        window.push_str(&recipient_commands(&addresses));
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250-smtp.example\r\n250 PIPELINING\r\n")
+            .expect_coalesced(
+                window,
+                "550 sender rejected\r\n250 recipient ok\r\n250 recipient ok\r\n",
+            );
+        let envelope =
+            Envelope::new(Some("sender@example.com".parse().unwrap()), addresses).unwrap();
+
+        let mut connection =
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp).unwrap();
+        connection
+            .send_with_options(&envelope, b"body", &SendOptions::default())
+            .expect_err("MAIL FROM was rejected");
+
+        assert!(
+            !connection.has_broken(),
+            "the group close restores a stream whose replies all drained"
+        );
+        assert!(!connection.should_retire());
+        transcript.assert_exhausted();
+    }
+
+    /// `CloseLmtpDrain { restore_ok: false }` is the batch LMTP drain, and the
+    /// `false` has to reach the wire: unlike a direct LMTP send, a clean batch
+    /// drain leaves the stream `Broken` as well as retired.
+    #[test]
+    fn a_clean_lmtp_batch_drain_leaves_the_stream_broken_and_retired() {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let transcript = Transcript::new("220 lmtp.example\r\n")
+            .expect("LHLO client.example\r\n", "250 lmtp.example\r\n")
+            .expect("MAIL FROM:<sender@example.com>\r\n", "250 sender ok\r\n")
+            .expect("RCPT TO:<first@example.com>\r\n", "250 first ok\r\n")
+            .expect("RCPT TO:<second@example.com>\r\n", "250 second ok\r\n")
+            .expect("DATA\r\n", "354 send body\r\n")
+            .expect("body", "")
+            .expect(
+                "\r\n.\r\n",
+                "250 first delivered\r\n250 second delivered\r\n",
+            );
+        let batch = ["first@example.com", "second@example.com"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, address)| SmtpBatchRecipient {
+                id: BatchItemId(format!("item-{index}")),
+                address: address.parse().unwrap(),
+            })
+            .collect();
+
+        let mut connection =
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Lmtp).unwrap();
+        let outcome = connection
+            .send_lmtp_batch(
+                Some("sender@example.com".parse().unwrap()),
+                batch,
+                b"body",
+                &Default::default(),
+            )
+            .unwrap()
+            .resolve();
+
+        assert_eq!(outcome.succeeded().len(), 2);
+        assert!(connection.should_retire());
+        assert!(
+            connection.has_broken(),
+            "an LMTP batch drain never restores the stream"
+        );
+        transcript.assert_exhausted();
+    }
+
     // The tests below replace the socket-listener tests this harness retired.
     // Same behaviors, same assertions, no listener or thread.
 

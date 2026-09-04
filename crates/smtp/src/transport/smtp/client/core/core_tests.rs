@@ -54,11 +54,61 @@ fn intermediate() -> Response {
     reply(Severity::PositiveIntermediate, "send body")
 }
 
+/// Where a scripted failure lands.
+///
+/// A plain script cannot express "fail at the third grouped read" or "fail the
+/// RSET write": writes and group boundaries consume the next scripted failure
+/// whichever one it is, so a failure aimed at a later boundary is swallowed by
+/// the first non-reply op that runs. An aim is matched against the op stream
+/// instead, so any boundary - `OpenReplyGroup`, `CloseReplyGroup`,
+/// `CloseLmtpDrain`, or the epilogue's own `RSET` write - can be targeted
+/// without perturbing the replies that precede it.
+#[derive(Clone, Copy, Debug)]
+enum Aim {
+    /// Fail the op at this 0-based position in the whole op stream.
+    Position(usize),
+    /// Fail the `nth` (0-based) op matching a selector: an exact op tag
+    /// (`OPEN`, `CLOSE`, `DRAIN`, `READG`, `READ`, `ABORT`, `BODY`, `BDAT`),
+    /// or a `W:` prefix matched against the rendered write, so
+    /// `Kind("W:RSET", 0)` aims at the reset write specifically.
+    Kind(&'static str, usize),
+}
+
+/// The string an [`Aim::Kind`] pattern is matched against: the rendering for a
+/// write (so `W:RSET` picks out one command), the bare tag otherwise.
+///
+/// Non-write patterns match exactly, so `READ` never selects a `READG`.
+fn selector(op: &Op) -> String {
+    match op {
+        Op::Write(_) => render(op),
+        Op::WriteBody => "BODY".to_owned(),
+        Op::WriteBdat => "BDAT".to_owned(),
+        Op::OpenReplyGroup => "OPEN".to_owned(),
+        Op::ReadGrouped => "READG".to_owned(),
+        Op::ReadSingle => "READ".to_owned(),
+        Op::CloseReplyGroup => "CLOSE".to_owned(),
+        Op::CloseLmtpDrain { .. } => "DRAIN".to_owned(),
+        Op::Abort => "ABORT".to_owned(),
+    }
+}
+
+fn selected(selector: &str, pattern: &str) -> bool {
+    if pattern.starts_with("W:") {
+        selector.starts_with(pattern)
+    } else {
+        selector == pattern
+    }
+}
+
 /// A recording driver: performs no I/O, answers each op from a script, and
 /// keeps the op stream for assertions.
 struct Harness {
     script: Vec<OpOutcome>,
     ops: Vec<String>,
+    /// A failure aimed at one op rather than queued in the script.
+    aim: Option<Aim>,
+    /// Every op's selector, so `Aim::Kind` can name the nth match.
+    seen: Vec<String>,
 }
 
 impl Harness {
@@ -66,12 +116,40 @@ impl Harness {
         Self {
             script,
             ops: Vec::new(),
+            aim: None,
+            seen: Vec::new(),
         }
     }
 
     /// A script of positive replies long enough that reads never run out.
     fn positive(len: usize) -> Self {
         Self::new((0..len).map(|_| OpOutcome::Reply(ok_reply())).collect())
+    }
+
+    /// Fail exactly the op `aim` names, leaving the reply script untouched.
+    fn aiming(mut self, aim: Aim) -> Self {
+        self.aim = Some(aim);
+        self
+    }
+
+    /// Whether the aim lands on this op, given where it sits in the stream and
+    /// how many earlier ops shared its selector.
+    fn aimed_at(&self, selector: &str, position: usize) -> bool {
+        match self.aim {
+            None => false,
+            Some(Aim::Position(target)) => position == target,
+            Some(Aim::Kind(pattern, nth)) => {
+                if !selected(selector, pattern) {
+                    return false;
+                }
+                let earlier = self
+                    .seen
+                    .iter()
+                    .filter(|seen| selected(seen, pattern))
+                    .count();
+                earlier == nth
+            }
+        }
     }
 
     fn run<M: ProtocolMachine>(&mut self, machine: &mut M) -> M::Output {
@@ -83,7 +161,18 @@ impl Harness {
             match machine.step(outcome) {
                 Step::Finish(output) => return output,
                 Step::Run(op) => {
+                    let position = self.ops.len();
+                    let selector = selector(&op);
+                    let aimed = self.aimed_at(&selector, position);
                     self.ops.push(render(&op));
+                    self.seen.push(selector);
+                    if aimed {
+                        // The aimed failure replaces this op's outcome and
+                        // leaves the reply script untouched.
+                        self.aim = None;
+                        outcome = network_failure();
+                        continue;
+                    }
                     outcome = match op {
                         // Writes and group boundaries answer `Done` unless the
                         // script says otherwise; reads always consume a step.
@@ -502,5 +591,157 @@ fn a_rejected_batch_mail_from_aborts() {
 
     assert_eq!(error.phase(), Some(SmtpCommandPhase::MailFrom));
     assert!(matches!(error.kind(), ErrorKind::Permanent(_)));
+    assert_eq!(harness.ops.last().map(String::as_str), Some("ABORT"));
+}
+
+/// The RSET-and-keep rule has a third case beyond "acknowledged" and
+/// "refused": the reset write itself fails. A stream that cannot even carry
+/// `RSET` is not a stream whose transaction was cleared, so the epilogue must
+/// abort - and must not go on to read a reply the peer will never send.
+#[test]
+fn a_failed_rset_write_aborts_instead_of_keeping_the_connection() {
+    let mut machine = DirectSmtp::new(mail(), rcpts(1), false, BodyKind::Data);
+    let mut harness = Harness::new(vec![
+        OpOutcome::Reply(ok_reply()),
+        OpOutcome::Reply(rejection()),
+    ])
+    .aiming(Aim::Kind("W:RSET", 0));
+    let error = harness
+        .run(&mut machine)
+        .expect_err("the recipient was rejected");
+
+    assert_eq!(error.phase(), Some(SmtpCommandPhase::RcptTo));
+    let after_reset: Vec<&str> = harness
+        .ops
+        .iter()
+        .skip_while(|op| !op.starts_with("W:RSET"))
+        .skip(1)
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        after_reset,
+        vec!["ABORT"],
+        "a failed RSET write aborts without reading for it: {:?}",
+        harness.ops
+    );
+}
+
+/// The reply-group bracket has two boundaries a plain script cannot reach.
+/// Both hold the stream `Broken` already, so the batch path reports the
+/// failure and returns rather than aborting a second time - and the recipient
+/// answers it did collect stay in the tracker.
+#[test]
+fn a_failure_at_a_pipelined_group_boundary_returns_without_a_second_abort() {
+    // OpenReplyGroup: nothing has been read yet, so no recipient is resolved.
+    let progress = SendProgress::new(Protocol::Smtp, batch_recipients(2));
+    let mut machine = BatchSmtp::new(mail(), rcpts(2), true, progress);
+    let mut harness = Harness::positive(8).aiming(Aim::Kind("OPEN", 0));
+    let (error, progress) = harness
+        .run(&mut machine)
+        .expect_err("the window boundary failed");
+
+    assert_eq!(error.phase(), Some(SmtpCommandPhase::RcptTo));
+    assert_eq!(error.attempt(), Some(SmtpTransmissionState::Unsent));
+    assert!(
+        progress
+            .recipients
+            .iter()
+            .all(|recipient| matches!(recipient.rcpt, RcptProgress::Pending)),
+        "no reply was read, so no recipient is resolved"
+    );
+    assert!(
+        !harness.ops.iter().any(|op| op == "ABORT"),
+        "the stream is already broken: {:?}",
+        harness.ops
+    );
+    assert_eq!(harness.ops.last().map(String::as_str), Some("OPEN"));
+
+    // CloseReplyGroup: every reply in the window was read, so the acceptances
+    // survive the failure that closes it.
+    let progress = SendProgress::new(Protocol::Smtp, batch_recipients(2));
+    let mut machine = BatchSmtp::new(mail(), rcpts(2), true, progress);
+    let mut harness = Harness::positive(8).aiming(Aim::Kind("CLOSE", 0));
+    let (error, progress) = harness
+        .run(&mut machine)
+        .expect_err("the window close failed");
+
+    assert_eq!(error.phase(), Some(SmtpCommandPhase::RcptTo));
+    assert_eq!(error.attempt(), Some(SmtpTransmissionState::Unsent));
+    assert!(
+        progress
+            .recipients
+            .iter()
+            .all(|recipient| matches!(recipient.rcpt, RcptProgress::Accepted)),
+        "the window's replies were read before the close failed"
+    );
+    assert!(
+        !harness.ops.iter().any(|op| op == "ABORT"),
+        "the stream is already broken: {:?}",
+        harness.ops
+    );
+    assert_eq!(harness.ops.last().map(String::as_str), Some("CLOSE"));
+}
+
+/// A surplus final status is a fact about the stream, not about the delivery:
+/// every recipient's final reply has already been read and recorded, so the
+/// batch result stands even though the drain fails.
+#[test]
+fn a_failure_closing_the_lmtp_drain_preserves_the_recipient_outcomes() {
+    let progress = SendProgress::new(Protocol::Lmtp, batch_recipients(2));
+    let mut machine = BatchLmtp::new(mail(), rcpts(2), progress);
+    let mut harness = Harness::new(vec![
+        OpOutcome::Reply(ok_reply()),
+        OpOutcome::Reply(ok_reply()),
+        OpOutcome::Reply(ok_reply()),
+        OpOutcome::Reply(intermediate()),
+        OpOutcome::Reply(reply(Severity::PositiveCompletion, "delivered-0")),
+        OpOutcome::Reply(rejection()),
+    ])
+    .aiming(Aim::Kind("DRAIN", 0));
+    let progress = harness
+        .run(&mut machine)
+        .expect("a failed drain close is not a batch-level failure");
+    let outcome = progress.resolve();
+
+    assert_eq!(outcome.succeeded().len(), 1);
+    assert_eq!(outcome.failed().len(), 1, "the rejected final status");
+    assert!(outcome.uncertain().is_empty(), "both finals were read");
+    assert!(
+        !harness.ops.iter().any(|op| op == "ABORT"),
+        "a surplus status costs the stream, not the transaction: {:?}",
+        harness.ops
+    );
+
+    // The direct path has no per-recipient tracker to preserve, so the same
+    // failure is simply reported, with the drain's phase.
+    let mut machine = DirectLmtp::new(mail(), rcpts(1), BodyKind::Data);
+    let mut harness = Harness::new(vec![
+        OpOutcome::Reply(ok_reply()),
+        OpOutcome::Reply(ok_reply()),
+        OpOutcome::Reply(intermediate()),
+        OpOutcome::Reply(ok_reply()),
+    ])
+    .aiming(Aim::Kind("DRAIN", 0));
+    let error = harness
+        .run(&mut machine)
+        .expect_err("the drain close failed");
+
+    assert_eq!(error.phase(), Some(SmtpCommandPhase::LmtpFinalStatus));
+    assert_eq!(harness.ops.last().map(String::as_str), Some("ABORT"));
+}
+
+/// The aim itself, pinned: a failure aimed by position lands on that op and
+/// on no earlier one, which is what lets the tests above target a boundary a
+/// scripted failure would have been consumed long before.
+#[test]
+fn an_aimed_failure_lands_on_the_op_it_names() {
+    let mut machine = DirectSmtp::new(mail(), rcpts(1), false, BodyKind::Data);
+    let mut harness = Harness::positive(8).aiming(Aim::Position(4));
+    let error = harness.run(&mut machine).expect_err("the aimed op failed");
+
+    // 0: MAIL FROM write, 1: its reply, 2: RCPT write, 3: its reply,
+    // 4: the DATA write.
+    assert_eq!(harness.ops[4], "W:DATA|", "ops: {:?}", harness.ops);
+    assert_eq!(error.phase(), Some(SmtpCommandPhase::DataCommand));
     assert_eq!(harness.ops.last().map(String::as_str), Some("ABORT"));
 }
