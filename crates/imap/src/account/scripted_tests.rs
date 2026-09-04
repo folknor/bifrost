@@ -355,6 +355,80 @@ async fn mutation_flushes_at_target_buffer_boundary_before_input_closes() {
     script.await.unwrap();
 }
 
+/// A folder-level mutation failure raised before any outcome was minted -
+/// here a refused SELECT - owes exactly one `Uncertain` per requested id.
+/// The ids are moved into the folder path and handed back with the error, so
+/// this lane is what proves nothing is dropped or duplicated on the way.
+#[tokio::test]
+async fn mutation_select_failure_reports_every_id_uncertain_once() {
+    use bifrost_types::{FlagOp, ItemOutcome, SyncEvent};
+    use futures::StreamExt;
+
+    let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1")).await;
+    let account = scripted_account(conn, 1);
+    let folder = crate::types::MailboxName::new("INBOX").unwrap();
+    let first_id = super::encode_object_id(&folder, 5, 3);
+    let second_id = super::encode_object_id(&folder, 5, 4);
+
+    let script = tokio::spawn(async move {
+        let select = read_line(&mut server).await;
+        assert!(
+            select.contains("SELECT \"INBOX\""),
+            "expected SELECT, got {select}"
+        );
+        respond(
+            &mut server,
+            &format!("{} NO [UNAVAILABLE] busy\r\n", tag_of(&select)),
+        )
+        .await;
+        server
+    });
+
+    let ids: bifrost_types::AccountStream<bifrost_types::ObjectId> =
+        Box::pin(futures::stream::iter(vec![
+            first_id.clone(),
+            second_id.clone(),
+        ]));
+    let mut output = super::mutate::mutation_stream(
+        account,
+        ids,
+        super::mutate::MutationKind::Flags(FlagOp::Add(std::collections::HashSet::from([
+            "$flagged".to_owned(),
+        ]))),
+    );
+
+    let mut uncertain = Vec::new();
+    let mut other = Vec::new();
+    while let Some(event) = tokio::time::timeout(Duration::from_secs(5), output.next())
+        .await
+        .expect("stream must make progress")
+    {
+        match event {
+            SyncEvent::Batch(batch) => {
+                for outcome in batch.items {
+                    match outcome {
+                        ItemOutcome::Uncertain(item) => uncertain.push(item.item.0.clone()),
+                        ItemOutcome::Failed(item) => other.push(item.item.0.clone()),
+                        ItemOutcome::Succeeded(item) => other.push(item.item.0.clone()),
+                    }
+                }
+            }
+            SyncEvent::Done(_) => break,
+            unexpected => panic!("unexpected event: {unexpected:?}"),
+        }
+    }
+
+    uncertain.sort();
+    let mut expected = vec![first_id.0.clone(), second_id.0.clone()];
+    expected.sort();
+    assert_eq!(
+        uncertain, expected,
+        "every requested id owes exactly one uncertain outcome"
+    );
+    assert!(other.is_empty(), "no id may reach a second lane: {other:?}");
+    let _server = script.await.unwrap();
+}
+
 /// A non-NOTIFY server gets one dedicated IDLE session per pushed folder, so
 /// the fifth folder of a four-session budget cannot be pushed. It must be
 /// refused in the failed lane rather than silently accepted: bifrost-sync

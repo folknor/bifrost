@@ -188,7 +188,7 @@ async fn flush_mutation_groups(
     //   server error) emits per-item `Uncertain` for the failing
     //   folder and continues to the next folder.
     for (folder, ids) in sorted_mutation_groups(std::mem::take(grouped)) {
-        match run_folder_mutation(account, &folder, ids.clone(), kind, move_destination).await {
+        match run_folder_mutation(account, &folder, ids, kind, move_destination).await {
             Ok(results) => {
                 if tx
                     .send(batch(results, PageBoundary::Page, None))
@@ -198,9 +198,13 @@ async fn flush_mutation_groups(
                     return Err(());
                 }
             }
-            Err(err) => {
+            // The folder path hands the still-unaccounted ids back with its
+            // error: nothing before the first outcome is minted consumes
+            // them, so the happy path never has to clone them just to keep
+            // this lane fed.
+            Err(FolderMutationFailure { error, unaccounted }) => {
                 let account_err = super::account_error_with(
-                    err,
+                    error,
                     super::error::ImapErrorContext::operation(mutation_operation(kind))
                         .with_folder_scope(&folder),
                 );
@@ -208,7 +212,7 @@ async fn flush_mutation_groups(
                     let _ = tx.send(SyncEvent::Terminated(account_err)).await;
                     return Err(());
                 }
-                let uncertain = ids
+                let uncertain = unaccounted
                     .into_iter()
                     .map(|id| {
                         let item = BatchItemId(
@@ -253,13 +257,24 @@ fn validated_move_destination(kind: &MutationKind) -> Result<Option<MailboxName>
         .map_err(|_| invalid_move_destination_error())
 }
 
-async fn run_folder_mutation(
+/// A folder-level mutation failure that happened before any of the folder's
+/// ids were accounted for, carrying those ids back to the caller so it can
+/// mint their outcomes. Every failure this type can express is raised while
+/// the id vector is still whole, which is what lets the caller move the ids
+/// in rather than clone them for a lane that usually never runs.
+struct FolderMutationFailure {
+    error: crate::Error,
+    unaccounted: Vec<DecodedObjectId>,
+}
+
+/// Open the folder and fold its SELECT side effects into the MODSEQ cache.
+/// Split out from `run_folder_mutation` so every fallible step that precedes
+/// the first minted outcome sits in one place, and the id vector can be
+/// handed back untouched when any of them fails.
+async fn open_folder_for_mutation(
     account: &ImapAccount,
     folder: &MailboxName,
-    ids: Vec<DecodedObjectId>,
-    kind: &MutationKind,
-    move_destination: Option<&MailboxName>,
-) -> Result<Vec<ItemOutcome<MutationSuccess>>, crate::Error> {
+) -> Result<(super::PooledConn, u32), crate::Error> {
     let mut conn = account.checkout_for_folder(folder).await?;
     let cursor = account.folders.get(folder).and_then(|entry| entry.cursor());
     let selected = account
@@ -280,6 +295,25 @@ async fn run_folder_mutation(
                 .record_modseq(folder, uidvalidity, uid, modseq)?;
         }
     }
+    Ok((conn, uidvalidity))
+}
+
+async fn run_folder_mutation(
+    account: &ImapAccount,
+    folder: &MailboxName,
+    ids: Vec<DecodedObjectId>,
+    kind: &MutationKind,
+    move_destination: Option<&MailboxName>,
+) -> Result<Vec<ItemOutcome<MutationSuccess>>, FolderMutationFailure> {
+    let (conn, uidvalidity) = match open_folder_for_mutation(account, folder).await {
+        Ok(opened) => opened,
+        Err(error) => {
+            return Err(FolderMutationFailure {
+                error,
+                unaccounted: ids,
+            });
+        }
+    };
     let (valid, stale) = split_by_uidvalidity(ids, uidvalidity);
     let stale_results = failed_all(
         stale,
@@ -287,15 +321,14 @@ async fn run_folder_mutation(
     );
     if let MutationKind::Flags(op) = kind {
         let mut results = stale_results;
-        results.extend(
-            run_flag_mutation_groups(account, &conn, folder, uidvalidity, valid, op).await?,
-        );
+        results
+            .extend(run_flag_mutation_groups(account, &conn, folder, uidvalidity, valid, op).await);
         return Ok(results);
     }
     if matches!(kind, MutationKind::Destroy) {
         let mut results = stale_results;
         results
-            .extend(run_destroy_mutation_groups(account, &conn, folder, uidvalidity, valid).await?);
+            .extend(run_destroy_mutation_groups(account, &conn, folder, uidvalidity, valid).await);
         return Ok(results);
     }
     let operation = mutation_operation(kind);
@@ -366,7 +399,7 @@ async fn run_destroy_mutation_groups(
     folder: &MailboxName,
     uidvalidity: u32,
     ids: Vec<DecodedObjectId>,
-) -> Result<Vec<ItemOutcome<MutationSuccess>>, crate::Error> {
+) -> Vec<ItemOutcome<MutationSuccess>> {
     let mut results = Vec::new();
     for (unchanged_since, ids) in partition_by_modseq(account, folder, uidvalidity, ids) {
         let target_batch = TargetBatch::new(ids);
@@ -450,7 +483,7 @@ async fn run_destroy_mutation_groups(
             }),
         );
     }
-    Ok(results)
+    results
 }
 
 async fn run_flag_mutation_groups(
@@ -460,7 +493,7 @@ async fn run_flag_mutation_groups(
     uidvalidity: u32,
     ids: Vec<DecodedObjectId>,
     op: &FlagOp,
-) -> Result<Vec<ItemOutcome<MutationSuccess>>, crate::Error> {
+) -> Vec<ItemOutcome<MutationSuccess>> {
     let mut results = Vec::new();
     for (unchanged_since, ids) in partition_by_modseq(account, folder, uidvalidity, ids) {
         let target_batch = TargetBatch::new(ids);
@@ -543,7 +576,7 @@ async fn run_flag_mutation_groups(
             )),
         }
     }
-    Ok(results)
+    results
 }
 
 /// Apply the two halves of a flag patch with exact per-item accounting.

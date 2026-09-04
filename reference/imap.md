@@ -567,7 +567,7 @@ Mutation error lanes follow transmission evidence. An `InFlight` attempt makes t
 
 ### Per-folder mutation failure contract
 
-`mutate::mutation_stream` emits no trailing global `SyncEvent::Terminated` when a folder fails mid-batch: a per-folder fatal after per-item emissions surfaces as a per-item outcome for every remaining target in that folder (carrying the classified `AccountError`; `Uncertain` on `InFlight` transmission evidence, `Failed` otherwise), and the loop continues to the next folder. Stream-level `Terminated` is reserved for failures that prevent any further folder attempt (auth lost, schema/capability break); `stream_terminating` is the gate.
+`mutate::mutation_stream` emits no trailing global `SyncEvent::Terminated` when a folder fails mid-batch: a per-folder fatal after per-item emissions surfaces as a per-item outcome for every remaining target in that folder (carrying the classified `AccountError`; `Uncertain` on `InFlight` transmission evidence, `Failed` otherwise), and the loop continues to the next folder. Stream-level `Terminated` is reserved for failures that prevent any further folder attempt (auth lost, schema/capability break); `stream_terminating` is the gate. The decoded ids are moved into `run_folder_mutation`, not cloned per batch: every failure it can raise (`FolderMutationFailure`) happens in `open_folder_for_mutation`, before a single outcome is minted, so the error hands the whole id vector back and the fallback lane mints from that. Once the folder is open, the per-group paths are infallible by type - they return outcomes, not `Result` - which is what makes moving the ids in safe.
 
 ### Output-channel-dropped contract
 
