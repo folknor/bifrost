@@ -432,8 +432,12 @@ classified `SyncState(SchemaIncompatible)`, deriving to
 also deletes the backfill checkpoint, and without the re-walk the objects
 already backfilled would keep their pre-correction id spelling.
 An expired token reported as 403 with `DAV:valid-sync-token`, or as 410,
-becomes scoped `SyncState(CursorInvalid)`, which directs the engine to
-restart the calendar-event cursor. Cursor entry counts are payload-bounded
+becomes `SyncState(CursorInvalid)` scoped to the invalid calendar's own
+folder cursor (`ErrorScope::Cursor(CursorScope::Folder(collection url))`),
+which directs the engine to restart exactly that per-calendar cursor. The
+scope must be the folder scope: live cursors are one per calendar, so a
+type-wide scope would ask the engine to restart a cursor that does not
+exist while the stale one failed identically on every poll. Cursor entry counts are payload-bounded
 before allocation. Range, search, inventory, changes, and their failed-id
 lanes all use resolved absolute resource URLs as native ids. Snapshot-poll
 fallback refreshes a collection token with a depth-0 `sync-token` PROPFIND,

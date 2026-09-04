@@ -8,30 +8,11 @@ paths and cross-checked against `reference/caldav.md`, `reference/carddav.md`,
 
 ## High-confidence defects
 
-### 1. CalDAV cursor invalidation names the wrong scope; the engine will restart a cursor that isn't the invalid one
-
-`crates/caldav/src/client.rs`, `cursor_invalid_error` (~line 621): a 403
-`valid-sync-token` / 410 on `sync_events` is classified
-`SyncState(CursorInvalid)` with
-`ErrorScope::Cursor(CursorScope::Type(ObjectType::CalendarEvent))` -
-hardcoded, always. But since the multi-collection redesign, live cursors are
-`CursorScope::Folder(collection_href)`, one per calendar. Per
-`reference/error-model.md`, `CursorInvalid` derives to `Engine(RestartScope)`
-and the engine routes the restart by the `ErrorScope::Cursor` payload (the
-builder even rejects a scope-less one for exactly this reason). So a stale
-sync token on `/cal/work/` tells the engine to restart the legacy type-scoped
-cursor - which in the current design doesn't exist as a live scope - while the
-actually-invalid folder cursor is never restarted and fails identically on
-every subsequent poll: a permanent sync livelock for that calendar.
-`sync_events` doesn't know the scope, but `changes_stream` in `account.rs` has
-`cursor.scope` in hand and pushes the error through unre-scoped. Fix shape:
-thread the scope into `cursor_invalid_error` (or re-scope in
-`changes_stream`). The client test at line ~2055 pins the wrong behavior, so
-it will need updating. CardDAV has no invalidation path (ctag), so no twin
-exists to drift against - which is presumably why this survived.
-Test obligation: the client test at ~2055 currently pins the *wrong* scope;
-flip it to pin the folder scope, and revert-and-confirm that it fails against
-the pre-fix code.
+(Finding 1 - cursor invalidation hardcoding the legacy type-wide error scope -
+is fixed: `cursor_invalid_error` now takes the calendar URL and scopes the
+error `CursorScope::Folder(collection url)`, so the engine restarts the
+actually-invalid per-calendar cursor. Test flipped to pin the folder scope and
+revert-and-confirmed; `reference/caldav.md` updated.)
 
 ### 2. RFC 6578 truncated sync-collection responses are misread as creations, and truncation semantics are unhandled
 

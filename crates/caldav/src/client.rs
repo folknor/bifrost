@@ -7,7 +7,7 @@ use bifrost_dav_core::{
 use bifrost_net::{AccountId, AccountNet};
 use bifrost_types::{
     AccountError, AccountErrorBuilder, AccountErrorKind, AccountOperation, Cause, CursorScope,
-    DiagnosticText, ErrorScope, ObjectType, Protocol, ResourceKind, StateCause, SyncStateErrorKind,
+    DiagnosticText, ErrorScope, FolderId, Protocol, ResourceKind, StateCause, SyncStateErrorKind,
 };
 use reqwest::header::{CONTENT_TYPE, HeaderValue};
 use reqwest::{Method, StatusCode};
@@ -418,7 +418,7 @@ impl CalDavClient {
             || (status == StatusCode::FORBIDDEN
                 && body.to_ascii_lowercase().contains("valid-sync-token"))
         {
-            return Err(cursor_invalid_error(status, body));
+            return Err(cursor_invalid_error(calendar_url, status, body));
         }
         if !status.is_success() {
             return Err(status_error(operation, status, body));
@@ -618,16 +618,21 @@ fn sync_collection_body(sync_token: &str) -> String {
     )
 }
 
-fn cursor_invalid_error(status: StatusCode, body: String) -> AccountError {
+fn cursor_invalid_error(calendar_url: &str, status: StatusCode, body: String) -> AccountError {
+    // The error scope routes the engine's RestartScope directive. Live
+    // cursors are per-calendar (`CursorScope::Folder(collection url)`), so
+    // the invalidation must name the folder scope of the calendar whose
+    // token went stale - a type-wide scope would restart a cursor that does
+    // not exist while the invalid one fails identically on every poll.
     let mut builder = AccountErrorBuilder::new(
         AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
         Cause::State(StateCause::CursorInvalid),
     )
     .protocol(Protocol::CalDav)
     .operation(AccountOperation::SyncChanges)
-    .scope(ErrorScope::Cursor(CursorScope::Type(
-        ObjectType::CalendarEvent,
-    )))
+    .scope(ErrorScope::Cursor(CursorScope::Folder(FolderId(
+        calendar_url.to_string(),
+    ))))
     .status(Some(status.as_u16()));
     let body = body.trim();
     if !body.is_empty() {
@@ -2058,10 +2063,17 @@ mod tests {
         assert_eq!(mailto_email("/principals/ada"), None);
     }
 
+    /// The engine routes `CursorInvalid`'s RestartScope by the error's
+    /// cursor scope, and live CalDAV cursors are one per calendar
+    /// (`CursorScope::Folder`). A type-wide scope here restarted a cursor
+    /// that does not exist while the stale folder cursor livelocked.
     #[test]
-    fn stale_sync_token_maps_to_scoped_cursor_invalid() {
-        let error =
-            cursor_invalid_error(StatusCode::FORBIDDEN, "<D:valid-sync-token/>".to_string());
+    fn stale_sync_token_maps_to_the_invalid_calendars_folder_scope() {
+        let error = cursor_invalid_error(
+            "https://cal.example/cal/work/",
+            StatusCode::FORBIDDEN,
+            "<D:valid-sync-token/>".to_string(),
+        );
 
         assert_eq!(
             error.kind(),
@@ -2069,9 +2081,9 @@ mod tests {
         );
         assert_eq!(
             error.scope(),
-            Some(&ErrorScope::Cursor(CursorScope::Type(
-                ObjectType::CalendarEvent
-            )))
+            Some(&ErrorScope::Cursor(CursorScope::Folder(FolderId(
+                "https://cal.example/cal/work/".to_string()
+            ))))
         );
     }
 
