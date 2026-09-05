@@ -8,7 +8,9 @@ use bifrost_types::{
 use crate::account::graph_error::{invalid_account_error, protocol_violation};
 use crate::account::{GraphAccount, PushMode};
 
-use super::common::{unsupported_push_error, unsupported_push_scope_error};
+use super::common::{
+    no_subscribable_push_scopes, unsupported_push_error, unsupported_push_scope_error,
+};
 use super::ews::subscribe_ews;
 use super::ews::unsubscribe_ews;
 use super::webhook::{subscribe_graph, unsubscribe_graph};
@@ -54,10 +56,18 @@ pub(crate) async fn push_subscribe(
         PushMode::GraphSubscriptions => subscribe_graph(account, eligible, &mut outcomes).await?,
         PushMode::EwsStreaming => subscribe_ews(account, eligible, &mut outcomes).await?,
     };
-    Ok(bifrost_types::PushSubscription::new(
-        handle,
-        finalize_push_outcomes(outcomes, &expected)?,
-    ))
+    let outcomes = finalize_push_outcomes(outcomes, &expected)?;
+    // The arm produced no handle, which it does only when every eligible
+    // scope ended up on the failed lane. That is the same "no scope was
+    // subscribable at all" whole-request fault the pre-dispatch filter above
+    // answers with `Err`, and it must answer the same way: a `PushSubscription`
+    // with no handle is not a subscription, and returning one on the `Ok` arm
+    // hands a caller matching on success an all-failed ledger and nothing to
+    // unsubscribe.
+    let Some(handle) = handle else {
+        return Err(no_subscribable_push_scopes(outcomes.failed()));
+    };
+    Ok(bifrost_types::PushSubscription::new(Some(handle), outcomes))
 }
 
 /// Positional ids for one `push_subscribe` request's scopes. The lanes are

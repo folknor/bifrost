@@ -30,6 +30,7 @@ mod worker_slot;
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
 use bifrost_types::{
@@ -93,6 +94,22 @@ pub(crate) struct GraphAccount {
     pub(crate) graph_subscriptions:
         Arc<RwLock<HashMap<SubscriptionHandle, GraphSubscriptionGroup>>>,
     pub(crate) graph_worker: worker_slot::WorkerSlot,
+    /// Whether push is currently believed to be DOWN, so `Reconnected` can be
+    /// edge-triggered off it rather than published on every successful
+    /// subscribe.
+    ///
+    /// `WatchEvent::Reconnected` is the engine's full-reconcile trigger: the
+    /// push reconciler answers it with an account-wide `Coalesced` /
+    /// `HintPayload::Unknown` invalidation over every registered cursor
+    /// scope. A first subscribe has no gap to cover - the engine has just
+    /// established or resumed those cursors itself - so publishing one there
+    /// bought a redundant reconcile of the whole account per subscribe. The
+    /// latch lives on the account rather than inside the renewal worker
+    /// because the two emitters must agree: the worker raises it when a
+    /// renewal tick fails, and a subscribe that lands while push is degraded
+    /// is a genuine recovery edge and owes the event. Shared across every
+    /// `GraphAccount` clone, and reset by construction on reopen.
+    pub(crate) push_disconnected: Arc<AtomicBool>,
     pub(crate) ews_subscriptions: Arc<RwLock<HashMap<SubscriptionHandle, EwsSubscriptionState>>>,
     pub(crate) ews_worker: worker_slot::WorkerSlot,
     /// Monotone generation counter bumped by `subscribe_ews` /
@@ -306,6 +323,7 @@ impl GraphAccount {
             folder_tree: Arc::new(RwLock::new(FolderTree::default())),
             graph_subscriptions: Arc::new(RwLock::new(HashMap::new())),
             graph_worker: worker_slot::worker_slot(),
+            push_disconnected: Arc::new(AtomicBool::new(false)),
             ews_subscriptions: Arc::new(RwLock::new(HashMap::new())),
             ews_worker: worker_slot::worker_slot(),
             ews_topology: Arc::new(watch::channel(0_u64).0),

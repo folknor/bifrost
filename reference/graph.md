@@ -81,7 +81,12 @@ resumes within an over-delivered page (see "Bounded `nextLink` traversal").
     `restId` -> `ewsId` translation (`translation_input_chunks` /
     `reconcile_translated_ews_scopes`), and the `EwsSubscriptionState`
     registration plus topology bump the worker reads.
-  - `push/tests.rs` - the push suite, kept as one module across the split.
+  - `push/tests/` - the push suite, split along the same seams: `fixtures.rs`
+    (the subscription-row, scope, translation-input and ledger builders more
+    than one arm needs), `webhook.rs`, `renewal.rs`, `ews.rs`, and
+    `dispatch.rs` for the mode-agnostic contract - the per-scope lane rules and
+    the whole-request refusals, which run in both push modes and belong to
+    neither arm.
 - `push_stream.rs` - the broadcast-backed `push_stream` adapter, selecting the
   receiver against the shutdown token, plus `ensure_ews_worker`, the
   spawn-on-demand helper `subscribe_ews` calls.
@@ -405,6 +410,23 @@ mailboxes always install.
     whole-request faults: an empty scope list, a webhook mode with no endpoint,
     a request in which no scope was subscribable at all, and a transport
     failure during subscription creation (which rolls back what it created).
+    The "no scope was subscribable at all" rule covers the scopes that die
+    INSIDE an arm as well as the ones the pre-dispatch poll-only filter
+    catches: an arm that resolved no resource (or whose every id was refused
+    or omitted by `translateExchangeIds`) hands the dispatcher no handle, and
+    the dispatcher turns that into `Err` rather than an `Ok(PushSubscription)`
+    with no handle and an all-failed ledger - a shape a caller matching on
+    success reads as partial coverage it cannot unsubscribe.
+    `push/common.rs no_subscribable_push_scopes` builds that error by
+    PROMOTING the first failed-lane entry verbatim and appending every other
+    entry's causes as secondary chain evidence, so the per-scope diagnosis
+    survives the ledger it is built from. The kind is derived rather than
+    minted: jmap's `no_mappable_push_scopes` can name one kind
+    (`Request(Malformed)`) because its whole population has one failure mode,
+    while these arms mix `Unsupported(PushSubscribe)`, `Request(Malformed)`,
+    `Protocol(ContractViolation)` and transport failures, and flattening a
+    provider contract violation or a retryable 500 into `Request(Malformed)`
+    would derive `ClientBug` for a fault the caller cannot fix.
 - The built `AccountCapabilities`; the push mode plus optional endpoint; a
   `broadcast::Sender<WatchEvent>` feeding `push_stream`.
 - An `Arc<RwLock<CursorIndex>>` (scope list) and `Arc<RwLock<FolderTree>>`
@@ -447,6 +469,16 @@ batch that made it. The record sits at both wire funnels (`execute_wire` and
 `execute_aux`), so the pre-authenticated chunk PUT and the Autodiscover POST are
 counted too. Each engine stream takes one accumulator and each emitted batch
 `take`s it.
+
+`metered()` is a `self.clone()` with two client fields swapped, so it produces
+a SECOND `GraphAccount` value over the same account. Every field that must be
+one thing per account has to be `Arc`-shared for that to hold - which is why
+the maps, the worker slots, and the `push_disconnected` health latch all are.
+A plain (non-`Arc`) field carrying account state silently FORKS across the
+metered view: the metered half would mutate its own copy, and the two halves
+would then disagree about, say, whether push is currently down - a divergence
+nothing in the type system flags. The byte tally itself is the one field that
+is deliberately per-view.
 
 Both funnels record from the request-local `RequestByteCounter` they hand to
 `RequestBuilder::count_bytes_into`, not from the `Response`, so a FAILED request
@@ -994,8 +1026,28 @@ covers, and `due_renewals` carries them through, so a terminal failure's
 resource covers exactly one scope, which is every ordinary case now that each
 resource string is built from one folder or calendar id. `subscribe_graph` used
 to discard the scopes it grouped, leaving the engine with a terminal push
-failure it could not attribute to anything. Three further rules make the
-renewal path safe:
+failure it could not attribute to anything.
+
+The health latch those events are edge-triggered off is the ACCOUNT's
+(`GraphAccount::push_disconnected`), not the worker's local flag, and
+`push/common.rs` owns the three transitions: `mark_push_disconnected` /
+`mark_push_reconnected` publish on the edge, `announce_push_recovered`
+publishes unconditionally for the one caller that knows a gap happened
+without the latch ever rising (the recreate of a subscription Graph had
+already dropped). `subscribe_graph` reads the same latch, so a successful
+subscribe emits `Reconnected` only while push is degraded. It used to emit on
+every subscribe including the first one an account ever makes, and
+`Reconnected` is the engine push reconciler's full-reconcile trigger (a
+`Coalesced` / `HintPayload::Unknown` invalidation over every registered
+scope), so each account paid one redundant account-wide reconcile at startup.
+Nothing depended on the spurious event: `SyncEngine::subscribe_push` only
+records the handle and its covered scopes, and reattach re-establishes its
+cursors itself - and an event published during a reattach's `push_subscribe`
+races the stream forwarder's swap onto the new account anyway, so it was never
+reliable gap coverage. Same shape as the EWS worker's `owes_reconnect` state
+and as the google crate's fix (google-B8).
+
+Three further rules make the renewal path safe:
 
 - A renewal that 404/410s (`subscription_is_gone`) is not retryable - Graph
   retains no deleted subscription to PATCH - so the worker creates a
@@ -1121,7 +1173,15 @@ because the request itself has no in-process seam:
   `inputIds` at 1,000 strings and rejects the whole request above it, so a
   large mailbox fans out over several POSTs instead of failing before EWS
   setup is attempted. First-seen order is preserved, so chunk boundaries are
-  deterministic.
+  deterministic. A chunk boundary is an artifact of the request size, not a
+  property of the folders, so one chunk's transport failure attributes to
+  THAT chunk's scopes on the failed lane (`chunk_failures`, checked in
+  `reconcile_translated_ews_scopes` before the omitted-answer arm, so a failed
+  POST is never reported as a contract violation) and the other chunks'
+  translations stand. Failing the whole request instead discarded answers
+  already collected and denied push to folders Graph had converted
+  successfully. When every chunk fails nothing is left subscribable and the
+  dispatcher's `Err` rule above restores the whole-request failure.
 - **Per-id answers, per-id errors** (`reconcile_translated_ews_scopes`).
   Graph's `convertIdResult` reports failure PER id inside an otherwise
   successful 200: a converted id carries `targetId`, a refused one carries

@@ -7,7 +7,6 @@
 
 use std::collections::HashMap;
 
-use bifrost_types::WatchEvent;
 use bifrost_types::{
     AccountError, AccountOperation, CursorScope, ErrorScope, ObjectType, SubscriptionHandle,
 };
@@ -16,7 +15,9 @@ use crate::account::graph_error::{GraphErrorContext, into_account_error};
 use crate::account::{GraphAccount, PushMode};
 use crate::webhooks::{create_subscription, delete_subscription};
 
-use super::common::{new_handle, unsupported_push_error, unsupported_push_scope_error};
+use super::common::{
+    mark_push_reconnected, new_handle, unsupported_push_error, unsupported_push_scope_error,
+};
 use super::renewal::run_graph_subscription_worker;
 
 #[derive(Debug, Clone)]
@@ -170,7 +171,15 @@ pub(super) async fn subscribe_graph(
         .write()
         .await
         .insert(handle.clone(), GraphSubscriptionGroup::live(subscriptions));
-    let _ = account.push_tx.send(WatchEvent::Reconnected);
+    // Only on the recovery EDGE. `Reconnected` is the engine's account-wide
+    // full-reconcile trigger, and a first subscribe has no gap to cover: the
+    // engine established or resumed these cursors moments earlier and is
+    // already streaming them. Publishing it unconditionally charged every
+    // subscribe - including the first one an account ever makes - one
+    // redundant reconcile over every registered scope. A subscribe that lands
+    // while the renewal worker has push latched down is a real recovery and
+    // still emits.
+    mark_push_reconnected(&account);
     ensure_graph_worker(account).await;
     Ok(Some(handle))
 }

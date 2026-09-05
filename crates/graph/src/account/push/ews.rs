@@ -175,21 +175,45 @@ pub(super) async fn translate_ews_scopes(
     outcomes: &mut bifrost_types::BatchOutcomeBuilder<CursorScope>,
 ) -> Result<Vec<EwsSubscriptionScope>, AccountError> {
     let mut translated = Vec::new();
+    let mut chunk_failures: HashMap<String, AccountError> = HashMap::new();
     for input_ids in translation_input_chunks(&pending) {
         let request = TranslateExchangeIdsRequest {
             input_ids,
             source_id_type: "restId",
             target_id_type: "ewsId",
         };
-        let response: TranslateExchangeIdsResponse = account
+        match account
             .client
-            .post("/me/translateExchangeIds", &request)
+            .post::<TranslateExchangeIdsResponse, _>("/me/translateExchangeIds", &request)
             .await
-            .map_err(|error| into_account_error(error, translate_error_context()))?;
-        translated.extend(response.value);
+        {
+            Ok(response) => translated.extend(response.value),
+            Err(error) => {
+                // The chunk fan-out exists because Graph caps `inputIds`, so a
+                // large mailbox's folders are split across POSTs for a reason
+                // that has nothing to do with them. One chunk's transport
+                // failure is evidence about that chunk's ids only: failing the
+                // whole request discarded every answer already collected and
+                // denied push to folders Graph had successfully translated.
+                // Attribute it to the scopes that chunk carried and let the
+                // rest subscribe - the same per-scope lane rule every other
+                // refusal on this path follows. When it is the ONLY chunk (or
+                // all of them fail) nothing is left subscribable, and the
+                // dispatcher turns the empty result back into this very error
+                // as a whole-request `Err`, which is the behavior that was
+                // there before.
+                let error = into_account_error(error, translate_error_context());
+                for source_id in &request.input_ids {
+                    chunk_failures.insert(source_id.clone(), error.clone());
+                }
+            }
+        }
     }
     Ok(reconcile_translated_ews_scopes(
-        pending, translated, outcomes,
+        pending,
+        translated,
+        &chunk_failures,
+        outcomes,
     ))
 }
 
@@ -230,8 +254,14 @@ pub(super) fn translation_input_chunks(pending: &[PendingEwsScope]) -> Vec<Vec<S
 ///
 /// - refused (`errorDetails`, no target): Graph answered, and the answer is
 ///   "not this id". Terminal, scope-correlated, carries Graph's code.
+/// - the chunk carrying it never got an answer at all, because its POST
+///   failed. `chunk_failures` maps those ids to the transport error, which is
+///   re-filed against each affected scope; the other chunks' translations
+///   stand.
 /// - omitted: Graph must answer every id it was given. A missing answer is
-///   the provider breaking its own contract, not a malformed request.
+///   the provider breaking its own contract, not a malformed request. Checked
+///   only after the chunk-failure lane, so a failed POST is never reported as
+///   a contract violation.
 /// - answered with neither a target nor an error: the same contract
 ///   violation in a different shape, and the one case where falling through
 ///   would leave a scope with no id at all.
@@ -242,6 +272,7 @@ pub(super) fn translation_input_chunks(pending: &[PendingEwsScope]) -> Vec<Vec<S
 pub(super) fn reconcile_translated_ews_scopes(
     pending: Vec<PendingEwsScope>,
     translated: Vec<TranslatedExchangeId>,
+    chunk_failures: &HashMap<String, AccountError>,
     outcomes: &mut bifrost_types::BatchOutcomeBuilder<CursorScope>,
 ) -> Vec<EwsSubscriptionScope> {
     let answers: HashMap<String, TranslatedExchangeId> = translated
@@ -252,6 +283,21 @@ pub(super) fn reconcile_translated_ews_scopes(
     for (item, scope, source_id) in pending {
         let error_scope = ErrorScope::Cursor(scope.clone());
         let Some(answer) = answers.get(&source_id) else {
+            // A chunk whose POST failed has no answers, and the failure is
+            // this scope's, not the provider breaking its contract. Re-file
+            // the transport error against the scope so the ledger names the
+            // folder rather than reporting an omission Graph never had the
+            // chance to commit.
+            if let Some(error) = chunk_failures.get(&source_id) {
+                let error = error
+                    .clone()
+                    .into_builder()
+                    .scope(error_scope)
+                    .try_build()
+                    .unwrap_or_else(|_| error.clone());
+                outcomes.push_failed(item, error);
+                continue;
+            }
             outcomes.push_failed(
                 item,
                 protocol_violation(

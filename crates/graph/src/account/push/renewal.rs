@@ -16,14 +16,20 @@ use crate::webhooks::{
     subscription_is_gone,
 };
 
-use super::common::PushEndpoint;
+use super::common::{
+    PushEndpoint, announce_push_recovered, mark_push_disconnected, mark_push_reconnected,
+};
 use super::webhook::{GraphSubscriptionGroup, GraphSubscriptionState, remove_subscription_state};
 
 pub(super) const RENEWAL_CHECK_INTERVAL: Duration = Duration::from_secs(10 * 60);
 pub(super) const RENEWAL_THRESHOLD_MINUTES: i64 = 30;
 
 pub(super) async fn run_graph_subscription_worker(account: GraphAccount) {
-    let mut disconnected = false;
+    // The health latch is the ACCOUNT's, not this worker's. `subscribe_graph`
+    // reads the same flag to decide whether its own `Reconnected` is owed, and
+    // a worker-local copy let a subscribe during a degraded period announce a
+    // recovery this worker still believed had not happened (and, before the
+    // latch existed at all, announce one on every first subscribe).
     loop {
         tokio::select! {
             () = account.shutdown.cancelled() => return,
@@ -48,6 +54,15 @@ pub(super) async fn run_graph_subscription_worker(account: GraphAccount) {
         };
 
         let mut had_error = false;
+        // Whether this tick recreated at least one vanished subscription, and
+        // so owes the engine a reconcile for the window its resource had no
+        // subscription at all. ONE per tick, however many it recreated:
+        // `Reconnected` is account-wide (a `Coalesced` / `HintPayload::Unknown`
+        // invalidation over every registered scope), so the second and later
+        // emissions of a tick reconcile exactly what the first already did -
+        // and a tick that finds several subscriptions vanished is precisely
+        // the case where the redundant reconciles cost the most.
+        let mut recovered_gap = false;
         for DueRenewal {
             handle,
             server_id,
@@ -94,8 +109,7 @@ pub(super) async fn run_graph_subscription_worker(account: GraphAccount) {
                                     // without it the changes missed while the
                                     // subscription was absent wait for the
                                     // ordinary poll interval.
-                                    let _ = account.push_tx.send(WatchEvent::Reconnected);
-                                    disconnected = false;
+                                    recovered_gap = true;
                                     continue;
                                 }
                                 Ok(Replacement::HandleUnsubscribed) => continue,
@@ -154,14 +168,18 @@ pub(super) async fn run_graph_subscription_worker(account: GraphAccount) {
             }
         }
 
+        // Order matters when a tick both recreated one subscription and failed
+        // another: the recovery is announced first (it names a gap that really
+        // happened and clears the latch), then the health latch is raised for
+        // the resource that is still failing. That is the same event sequence
+        // the per-recreate emission produced, minus its duplicates.
+        if recovered_gap {
+            announce_push_recovered(&account);
+        }
         if had_error {
-            if !disconnected {
-                let _ = account.push_tx.send(WatchEvent::Disconnected);
-                disconnected = true;
-            }
-        } else if disconnected {
-            let _ = account.push_tx.send(WatchEvent::Reconnected);
-            disconnected = false;
+            mark_push_disconnected(&account);
+        } else {
+            mark_push_reconnected(&account);
         }
     }
 }
