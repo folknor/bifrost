@@ -113,6 +113,22 @@ impl GmailErrorContext {
         ctx
     }
 
+    /// The label-vocabulary refresh `repair_inventory` needs before it can
+    /// answer any repair request. Sibling of `hydrate_labels`: the failing
+    /// call is `labels.list`, so the resource is `Label` (not `Message`,
+    /// which would classify a 404/403 as a missing or forbidden MESSAGE),
+    /// and the scope is the account rather than
+    /// `Cursor(CursorScope::Account)` - a transient `labels.list` fault must
+    /// not hand bifrost-sync the scope coordinate its cursor directives are
+    /// routed by. The operation stays the repair lane's own
+    /// `SyncInventory`.
+    pub(crate) fn repair_labels() -> Self {
+        let mut ctx = Self::base(AccountOperation::SyncInventory);
+        ctx.scope = Some(ErrorScope::Account);
+        ctx.resource = Some(GmailResource::Label);
+        ctx
+    }
+
     pub(crate) fn changes() -> Self {
         let mut ctx = Self::base(AccountOperation::SyncChanges);
         ctx.scope = Some(ErrorScope::Cursor(CursorScope::Account));
@@ -132,6 +148,19 @@ impl GmailErrorContext {
             id: (id.into()).into(),
         });
         ctx.resource = Some(GmailResource::Message);
+        ctx
+    }
+
+    /// The label-vocabulary refresh a hydration batch needs before it can
+    /// canonicalize flags. The failure belongs to the account-wide
+    /// `labels.list` resource, not to any one message of the batch that
+    /// happened to be waiting on it: scoping it to an arbitrary id would
+    /// name a message the request never touched, and there is no
+    /// message-collection `ErrorScope` to name the batch as a whole.
+    pub(crate) fn hydrate_labels() -> Self {
+        let mut ctx = Self::base(AccountOperation::HydrateMessage);
+        ctx.scope = Some(ErrorScope::Account);
+        ctx.resource = Some(GmailResource::Label);
         ctx
     }
 

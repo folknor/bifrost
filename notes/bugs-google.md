@@ -42,9 +42,22 @@ a hermetic test suite.
 
 ## Minor observations / smells
 
-- **`get_stream`'s label-refresh failure terminator** (`inventory.rs` line
-  ~500) scopes the error to `ids[0]` only; the other 31 ids of the drained
-  batch vanish into the `Terminated` with no per-id lane. Consistent with
-  "Terminated means unreported", but the arbitrary first-id scope on an error
-  that has nothing to do with that message is mildly misleading in support
-  exports.
+(The `get_stream` label-refresh failure terminator scoping its error to
+`ids[0]` - an arbitrary message the failing `labels.list` never mentioned,
+while the other 31 ids of the drained batch vanish into the `Terminated` - is
+fixed: the terminator now uses a new `GmailErrorContext::hydrate_labels()`
+carrying `ErrorScope::Account` and `GmailResource::Label`, keeping
+`AccountOperation::HydrateMessage`. No per-id lanes are manufactured - nothing
+was transmitted for those ids, so "Terminated means unreported" is unchanged,
+and there is no message-collection `ErrorScope` to name the batch. Pinned by
+`a_failed_label_refresh_terminates_without_borrowing_one_id_of_the_batch` with
+revert-and-confirm; `reference/google.md` updated. The same mis-scoping in
+`repair_inventory`'s label-refresh terminator - it reused
+`GmailErrorContext::inventory()`, whose `resource: Message` classified a
+`labels.list` 404 as a missing MESSAGE and whose `Cursor(CursorScope::Account)`
+scope is the coordinate bifrost-sync routes cursor directives by - is fixed the
+same way with a `repair_labels()` sibling. Pinned by
+`a_failed_repair_label_refresh_names_the_label_resource_not_the_cursor`, whose
+scope and resource halves were each revert-and-confirmed separately. The
+`unsupported(SyncInventory)` region refusal in the same function still uses
+`inventory()` and was left alone.)

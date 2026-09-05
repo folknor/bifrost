@@ -87,9 +87,14 @@ pub(crate) fn repair_inventory(
                 // No per-request conclusion is possible without the label map,
                 // so the stream terminates and the engine converts every
                 // outstanding attempt to a local deferral. It must not invent
-                // an answer none of them received.
+                // an answer none of them received. The failing call is
+                // `labels.list`, so the error names that account-wide
+                // resource - not the message resource and cursor scope the
+                // inventory WALK carries, which would classify a refusal as
+                // a missing message and hand the engine a cursor coordinate
+                // for a fault that has nothing to do with the cursor.
                 yield bifrost_types::InventoryRepairEvent::Terminated(
-                    error::into_account_error(error, error::GmailErrorContext::inventory()),
+                    error::into_account_error(error, error::GmailErrorContext::repair_labels()),
                 );
                 return;
             }
@@ -495,10 +500,17 @@ pub(crate) fn get_stream_cancellable(
             Err(error) => {
                 state.finished = true;
                 state.emitted_done = true;
-                let account_error = error::into_account_error(
-                    error,
-                    error::GmailErrorContext::hydrate_message(ids[0].0.clone()),
-                );
+                // Not one id of the batch was transmitted: the label
+                // refresh failed before any `users.messages.get` went out,
+                // so every drained id stays UNREPORTED behind the
+                // terminator, which is what `Terminated` has always meant
+                // here. The scope is therefore the account-wide label
+                // vocabulary rather than an arbitrary first id - naming
+                // `ids[0]` pointed support exports at a message the failing
+                // request never mentioned, and said nothing about the other
+                // 31.
+                let account_error =
+                    error::into_account_error(error, error::GmailErrorContext::hydrate_labels());
                 return Some((SyncEvent::Terminated(account_error), state));
             }
         };
@@ -1076,6 +1088,98 @@ mod tests {
         );
         assert_eq!(started.elapsed(), std::time::Duration::ZERO);
         assert_eq!(script.requests().len(), HYDRATE_BATCH_SIZE + 1);
+    }
+
+    /// The label refresh a hydration batch needs happens before any
+    /// `users.messages.get` is sent, so when it fails not one id of the
+    /// drained batch was transmitted. The terminator must therefore scope
+    /// the failure to the account-wide label vocabulary - naming an
+    /// arbitrary first id pointed support exports at a message the failing
+    /// request never mentioned and said nothing about the other 31 - and
+    /// must not manufacture per-id lanes for ids nothing was attempted for.
+    #[tokio::test]
+    async fn a_failed_label_refresh_terminates_without_borrowing_one_id_of_the_batch() {
+        let client = scripted_client(vec![canned(
+            StatusCode::SERVICE_UNAVAILABLE,
+            b"{\"error\":{\"code\":503,\"message\":\"backend error\"}}",
+        )]);
+        let ids = ["m1", "m2", "m3"].map(|id| ObjectId(id.to_owned()));
+        let mut events = get_stream(
+            client,
+            Arc::new(super::super::scopes::ScopeCacheState::new(
+                super::super::scopes::ScopeSnapshot::empty(),
+            )),
+            Box::pin(stream::iter(ids)),
+            Projection::Metadata,
+        );
+
+        let first = events.next().await.expect("the stream must terminate");
+        let SyncEvent::Terminated(error) = first else {
+            panic!("a failed label refresh must terminate, got {first:?}");
+        };
+        assert_eq!(
+            error.scope(),
+            Some(&bifrost_types::ErrorScope::Account),
+            "the label vocabulary is account-wide; the scope must not borrow a message id"
+        );
+        assert_eq!(error.operation(), Some(AccountOperation::HydrateMessage));
+        assert!(
+            events.next().await.is_none(),
+            "Terminated ends the hydration stream"
+        );
+    }
+
+    /// `repair_inventory` refreshes the label map before it can answer any
+    /// request, and the same rule as the hydration terminator applies: the
+    /// failing call is `labels.list`, so the error must name the
+    /// account-wide label resource. It must NOT reuse the inventory WALK's
+    /// context, whose `resource: Message` classifies a refusal as a missing
+    /// or forbidden message and whose `Cursor(CursorScope::Account)` scope
+    /// is the coordinate bifrost-sync routes cursor directives by - a
+    /// transient `labels.list` fault has nothing to say about the cursor.
+    #[tokio::test]
+    async fn a_failed_repair_label_refresh_names_the_label_resource_not_the_cursor() {
+        // A 404 pins the RESOURCE half as well as the scope: the walk's
+        // `Message` resource would classify this as `NotFound(Message)`.
+        let client = scripted_client(vec![canned(
+            StatusCode::NOT_FOUND,
+            b"{\"error\":{\"code\":404,\"message\":\"not found\"}}",
+        )]);
+        let request = bifrost_types::InventoryRepairRequest {
+            attempt: bifrost_types::RepairAttemptId(1),
+            key: bifrost_types::ObligationKey(b"k".to_vec()),
+            domain: bifrost_types::CoverageDomain::full(CursorScope::Account),
+            target: bifrost_types::InventoryRepairTarget::Object {
+                id: ObjectId("m1".to_owned()),
+                repair: b"tok".to_vec(),
+            },
+        };
+        let mut events = repair_inventory(
+            client,
+            Arc::new(super::super::scopes::ScopeCacheState::new(
+                super::super::scopes::ScopeSnapshot::empty(),
+            )),
+            Box::pin(stream::iter([request])),
+        );
+
+        let first = events.next().await.expect("the stream must terminate");
+        let bifrost_types::InventoryRepairEvent::Terminated(error) = first else {
+            panic!("a failed label refresh must terminate, got {first:?}");
+        };
+        assert_eq!(
+            error.scope(),
+            Some(&bifrost_types::ErrorScope::Account),
+            "a labels.list fault must not carry the walk's cursor scope"
+        );
+        assert_eq!(
+            error.kind(),
+            &AccountErrorKind::NotFound(ResourceKind::Mailbox),
+            "a labels.list 404 is a missing label, never a missing message"
+        );
+        assert!(
+            events.next().await.is_none(),
+            "Terminated ends the repair stream"
+        );
     }
 
     #[tokio::test(start_paused = true)]

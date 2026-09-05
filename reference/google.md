@@ -682,7 +682,17 @@ could not represent. The label vocabulary is resolved once per batch and
 projected into a `LabelNameIndex` (id -> name) once, rather than rebuilt inside
 `canonical_flags` for every message; `flags::canonical_flags` and
 `flags::flag_set` remain as the by-slice entry points over the same index.
-`labels_for_flags` is single-flight: a stale cache is refreshed under a
+The label refresh runs after the id drain and before any
+`users.messages.get`, so a refresh failure means not one id of the batch was
+transmitted. The stream emits `SyncEvent::Terminated` alone - no per-id lanes,
+because nothing was attempted for them and `Terminated` means unreported - and
+the error is scoped `ErrorScope::Account` with resource `Label`, not to an
+arbitrary first id. Scoping it to `ids[0]` named a message the failing
+`labels.list` never mentioned and said nothing about the other 31; there is no
+message-collection `ErrorScope` to name the batch as a whole, so the
+account-wide resource that actually failed is the honest scope. The operation
+stays `HydrateMessage` so the failure is still attributable to the hydration
+lane. `labels_for_flags` is single-flight: a stale cache is refreshed under a
 `tokio::sync::Mutex` in `ScopeCacheState`, with the staleness re-checked after
 the lock, so 32 concurrent hydrations issue one `labels.list` rather than 32.
 
@@ -813,7 +823,14 @@ then.
 The label map is fetched once per pass. If that fetch fails no per-request
 conclusion is possible, so the stream terminates and the engine converts every
 outstanding attempt to a local deferral - it must not record a conclusion the
-account never reached.
+account never reached. That terminator is scoped by
+`GmailErrorContext::repair_labels()`, the sibling of the hydration lane's
+`hydrate_labels()`: `ErrorScope::Account` with resource `Label`, keeping
+`AccountOperation::SyncInventory`. It deliberately does NOT reuse the inventory
+walk's context, whose `resource: Message` would classify a `labels.list` 404 as
+a missing MESSAGE and whose `Cursor(CursorScope::Account)` scope is the
+coordinate bifrost-sync routes cursor directives by - a transient label-vocabulary
+fault has nothing to say about the cursor.
 
 ## Push: Cloud Pub/Sub
 
