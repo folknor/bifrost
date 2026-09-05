@@ -700,9 +700,10 @@ impl<T: HttpTransport> Client<T> {
     /// Every response carries `sessionState` (RFC 8620 s3.4), and the whole
     /// scope-lifecycle `CapabilityChanged` story rests on noticing when it
     /// moves. Both response doors must therefore run this: the HTTP door
-    /// always did, while the WebSocket door rebuilt a `Response` and handed
-    /// it up without ever looking, so staleness went undetected on exactly
-    /// the connection that stays open longest.
+    /// always did, while the WebSocket door skipped the comparison and
+    /// handed every response frame up without ever reading its
+    /// `sessionState`, so staleness went undetected on exactly the
+    /// connection that stays open longest.
     pub(crate) fn note_session_state(&self, session_state: &str) {
         if session_state != self.session_state().session().state() {
             self.inner.session_updated.store(false, Ordering::Release);

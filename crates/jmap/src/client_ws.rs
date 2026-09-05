@@ -656,7 +656,8 @@ where
                         Ok(message) => match message {
                             WebSocketMessage_::Response(response) => {
                                 // Session divergence is checked on the frame's own
-                                // `sessionState`, before the rebuild: a frame whose
+                                // `sessionState`, before the method responses are
+                                // touched: a frame whose
                                 // method responses fail to decode still carried a
                                 // truthful session state, and dropping that would
                                 // leave the client running on a session the server
@@ -1069,9 +1070,11 @@ mod tests {
     /// `Client::send_request` compares every response's `sessionState`
     /// against the session it is running on - the mechanism the whole
     /// scope-lifecycle `CapabilityChanged` story rests on. The WebSocket
-    /// door rebuilt a `Response` and handed it up without ever looking, so
-    /// staleness went undetected on the connection that stays open
-    /// longest. It must observe the state on every response frame,
+    /// door skipped that comparison entirely, handing every response frame
+    /// up without ever reading its `sessionState`, so staleness went
+    /// undetected on the connection that stays open longest - the one
+    /// most likely to outlive a session change. It must observe the
+    /// state on every response frame,
     /// including one whose method responses do not decode: that frame's
     /// session state was still truthful.
     #[tokio::test]

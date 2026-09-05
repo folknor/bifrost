@@ -7,7 +7,6 @@ rust-version.workspace = true
 license = "MIT"
 repository.workspace = true
 authors.workspace = true
-homepage = "https://github.com/folknor/bifrost"
 keywords = ["email", "smtp", "mailer", "message"]
 categories = ["email", "network-programming"]
 

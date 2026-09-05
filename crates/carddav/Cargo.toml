@@ -7,7 +7,6 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-homepage = "https://github.com/folknor/bifrost"
 keywords = ["contacts", "carddav", "vcard", "webdav"]
 categories = ["email", "network-programming", "asynchronous"]
 

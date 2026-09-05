@@ -5,7 +5,6 @@ version.workspace = true
 rust-version.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage = "https://github.com/folknor/bifrost"
 license.workspace = true
 edition.workspace = true
 
