@@ -82,6 +82,12 @@ termination-level advice. Pinned by `a_per_item_retry_delays_the_resubmission`;
 
 ### 9. Broadcast ring pressure during cold start is structural
 
+(Ruled as item 8 in `notes/todo.md`: WILL HAPPEN, sequenced after the other
+structural items. The consumer surface stays one stream; backfill pages get a
+bounded per-account lane with the existing acks as the permit signal. The
+engine split it was sequenced behind has landed; it runs once the DAV
+watermark cursor lands, alone, with a cold review.)
+
 `changes_capacity` defaults to 256 with no producer-side backpressure; a
 backfill of a large mailbox can outrun a consumer, triggering the (well-built)
 lag-abandonment machinery routinely rather than exceptionally - every
@@ -96,6 +102,11 @@ of machinery (publications ledger abandonment, debt carry-forward, lag
 warnings) compensating for that mismatch.
 
 ### 10. `engine.rs` (8k lines) concentrates too much in one file
+
+(DONE 2026-09-04 as ruling 1 in `notes/todo.md`: `engine/{mod,context,attach,
+backfill,ack,reattach,bulk,passthrough,tests}.rs`, `SlotContext` bundling the
+worker wiring, the two orchestrator arms collapsed behind
+`BackfillPlan::resume -> ScopeResume`.)
 
 Attach wiring, the backfill orchestrator, the ack writer, reattach, and the
 bulk pipeline in one file, with 15-20-argument free functions

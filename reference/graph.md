@@ -56,11 +56,32 @@ resumes within an over-delivered page (see "Bounded `nextLink` traversal").
   and the chunk proceeds; an empty routable half skips the POST. Generic
   over the per-site URL builder, so the lane rule is pinned once while each
   site keeps its own classification.
-- `push.rs` - `/subscriptions` webhook subscribe/unsubscribe, per-handle
-  `GraphSubscriptionGroup`, the renewal health worker that re-issues expiring
-  subscriptions and emits Disconnected/Reconnected on renewal failure, plus
-  the EWS arm's `restId` -> `ewsId` translation
-  (`translation_input_chunks` / `reconcile_translated_ews_scopes`).
+- `push/` - the push subscription surface, split by arm. `mod.rs` declares the
+  modules and re-exports the `pub(crate)` doors the rest of `account/` calls
+  (`push_subscribe` / `push_unsubscribe`, `retire_all_graph_subscriptions`,
+  `PushEndpoint`, `GraphSubscriptionGroup`, `EwsSubscriptionState` /
+  `EwsSubscriptionScope`); everything else is `pub(super)` inside `push`.
+  - `push/dispatch.rs` - the two `Account` doors: the empty-scope refusal, the
+    per-scope poll-only split, the `PushMode` dispatch, and the positional
+    three-lane outcome ledger (`push_item_ids` / `finalize_push_outcomes`).
+  - `push/common.rs` - what both arms share: `PushEndpoint`, the two
+    `Unsupported(PushSubscribe)` refusals (whole-request and scope-correlated),
+    and `new_handle`.
+  - `push/webhook.rs` - the Graph `/subscriptions` arm: `resource_for_scope`,
+    `subscribe_graph` with its create rollback, the per-handle
+    `GraphSubscriptionGroup` / `GraphSubscriptionState`, and teardown -
+    `unsubscribe_graph`, `close()`'s `retire_all_graph_subscriptions`, and the
+    `mark_group_tearing_down` / `remove_subscription_from_groups` pair that
+    makes it race-free against renewal.
+  - `push/renewal.rs` - the renewal health worker that re-issues expiring
+    subscriptions, recreates a vanished one (`replace_gone_subscription` /
+    `install_replacement`), emits Disconnected/Reconnected/Terminated on
+    renewal failure, and retires its own worker slot.
+  - `push/ews.rs` - the EWS streaming arm: `ews_subscribable_folder_id`, the
+    `restId` -> `ewsId` translation (`translation_input_chunks` /
+    `reconcile_translated_ews_scopes`), and the `EwsSubscriptionState`
+    registration plus topology bump the worker reads.
+  - `push/tests.rs` - the push suite, kept as one module across the split.
 - `push_stream.rs` - the broadcast-backed `push_stream` adapter, selecting the
   receiver against the shutdown token, plus `ensure_ews_worker`, the
   spawn-on-demand helper `subscribe_ews` calls.
@@ -78,7 +99,7 @@ resumes within an over-delivered page (see "Bounded `nextLink` traversal").
   message keeps its typed `EwsError`: a classified response error inside
   the stream (`ErrorAccessDenied` and friends) exits through
   `WatchEvent::Terminated`, and only a malformed or truncated frame
-  reconnects. At `push_subscribe` (in `push.rs`),
+  reconnects. At `push_subscribe` (in `push/ews.rs`),
   Graph REST folder `restId`s are translated once through
   `/me/translateExchangeIds` - deduplicated and chunked to Graph's 1,000-id
   request cap - to `ewsId`s and retained beside their `CursorScope` in
@@ -801,7 +822,7 @@ was indistinguishable from a primary folder's.
 `FolderId` (the `destinationId` body must be the native id) and rejects a
 cross-mailbox move - destination owner != source owner - as `Request(Malformed)`,
 since one endpoint can't express it. The etag cache stays keyed by the encoded
-id; only the URL uses the native id. `push.rs resource_for_scope` routes a
+id; only the URL uses the native id. `push/webhook.rs resource_for_scope` routes a
 foreign subscription via `client_for_scope` + the native folder id, never
 percent-encoding a raw `\u{1f}` id into the URL.
 

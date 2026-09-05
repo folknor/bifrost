@@ -67,18 +67,30 @@ pinned by `mutation_batches_are_paged_and_the_stream_end_is_the_terminus`
 
 ## Structural observations (pre-1.0, unlimited-resources posture)
 
-- **`pim.rs` at 4,825 lines is the crate's dumping ground** - search (plus its
-  cursor codec), drafts/send/scheduled-send, containers, identities, vacation,
-  thread doors, trash cache, typed hydration. The thread/trash owner-routing
-  logic and the search walk are each intricate enough to deserve their own
-  modules; the current file makes the reference's per-topic narratives the only
-  navigable map.
-- The per-item lane discipline (`batch_routing`, `reconcile_*`,
-  `BatchOutcomeBuilder`) is now implemented four times with slight variations
-  (get, mutate, reactions, push). `resolve_batch_responses` /
-  `reconcile_hydration_responses` duplicate the invalid/duplicate-index rules;
-  a single validated `$batch` projection type would pin the rule once. Finding
-  2 is precisely the kind of drift this duplication invites.
+- (**`pim.rs` at 4,825 lines as the crate's dumping ground** - DONE: split into
+  `account/pim/` as a pure move, no behaviour change. `mod.rs` declares the
+  modules and re-exports the `pub(crate)` doors the rest of `account/` calls;
+  everything else is `pub(super)` inside `pim`. `messages.rs` (per-message
+  writes plus the shared `$batch` write pipeline), `send.rs` (send / send-as /
+  scheduled-send handle codec), `drafts.rs`, `search.rs` (the KQL and OData
+  builders, the shared-mailbox walk, the versioned opaque search cursor),
+  `containers.rs` (container CRUD across the three namespaces, well-known
+  roles, `trash_container_id` and its per-mailbox cache), `identities.rs`
+  (identity snapshot, vacation), `threads.rs` (`thread_hydrate` / `move_thread`
+  / `delete_thread` and their owner routing), `hydrate.rs` (typed hydration and
+  the Graph-JSON / EWS projections onto `Message`), `common.rs` (only the
+  helpers two or more of them share), and `tests.rs` kept as one module so the
+  suite stays flat. The reference's module map now names each topic, so the
+  thread owner-routing and the search walk are findable by module name. The
+  four `$batch` lane-discipline implementations were moved untouched; their
+  unification is the separate item below.)
+- (The per-item lane discipline (`batch_routing`, `reconcile_*`,
+  `BatchOutcomeBuilder`) implemented four times with slight variations
+  (get, mutate, reactions, push), with `resolve_batch_responses` /
+  `reconcile_hydration_responses` duplicating the invalid/duplicate-index
+  rules - NOT APPROVED, ruling 2 in `notes/todo.md`: one recorded drift is
+  thin evidence for restructuring four working lanes. Re-raise if a future
+  hunt finds a second drift between them.)
 - Everything else read - the worker-slot lifecycle, teardown/renewal race
   handling, the EWS frame decoder, the cursor envelope, the etag LRU, the
   wire-level test seam - is unusually carefully built and densely test-pinned;

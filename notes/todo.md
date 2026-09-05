@@ -102,17 +102,40 @@ between them.
    acceptance suite. Largest blast radius of the set, and teardown /
    RSET-and-keep / abort ordering are exactly the code that moves holes when
    restructured. Not alongside any other smtp work; cold review required.
-8. **sync: bounded backfill lane instead of the broadcast ring. DEFERRED,
-   will happen.** Keep the broadcast channel for live changes; feed cold-start
-   backfill pages through a bounded per-account queue so a slow consumer
-   applies flow control instead of causing lag-abandonment plus re-read.
-   The consumer surface does not change: `account_changes_stream` stays one
-   stream carrying both batch kinds, distinguished by checkpoint kind as
-   today, and the existing backfill acks are the permit signal. Deferred
-   because the current behavior is correct and heavily pinned, the cost is
-   re-reads rather than wrong results, and no measured large-mailbox
-   cold-start number exists yet. Schedule after item 1 so it lands in an
-   orchestrator module.
+8. **sync: bounded backfill lane instead of the broadcast ring. WILL
+   HAPPEN, last of the structural items.** Keep the broadcast channel for
+   live changes; feed cold-start backfill pages through a bounded
+   per-account queue so a slow consumer applies flow control instead of
+   causing lag-abandonment plus re-read. The consumer surface does not
+   change: `account_changes_stream` stays one stream carrying both batch
+   kinds, distinguished by checkpoint kind as today, and the existing
+   backfill acks are the permit signal. Sequenced last so it lands in an
+   orchestrator module (item 1, done) and after the 2026-09-06 DAV
+   watermark cursor (item 9); it is not waiting on any measurement. Runs
+   alone, with a cold review.
+9. **dav: sorted-href watermark page cursor replacing the integer offset.
+   PROCEED (2026-09-06).** Both crates, one codec in
+   `bifrost_dav_core::snapshot`; a page lists, skips past the watermark and
+   multigets only its members. Page order stays href order (the only key
+   the listing carries and the only one an update cannot move). No
+   consumers exist, so the offset codec is replaced outright with no legacy
+   lane. Closes `dav-B8` below.
+10. **DONE 2026-09-06. graph: split `push.rs` into modules along its natural
+    seams.** Landed as `account/push/` - `dispatch` (the two doors, the
+    poll-only split, `PushMode` dispatch), `common`, `webhook` (subscribe
+    with rollback, groups, unsubscribe, retire-all, worker ensure),
+    `renewal` (the tick loop, replacement of gone subscriptions, slot
+    retirement), `ews` (folder-id translation and the EWS arm), the suite
+    whole in `tests`. Pure move; 43 tests before and after. The
+    teardown/renewal race sits on the `webhook`/`renewal` seam and keeps
+    its doc comments on both halves. Closed `graph-B1`. Three lateral notes
+    from the read, none fixed: the reference's "no scope subscribable is an
+    `Err`" claim holds only for the pre-dispatch poll-only filter (an arm in
+    which every scope dies answers `Ok(None)` with an all-failed ledger);
+    `translate_ews_scopes` discards collected chunks on one chunk's
+    transport error; and `subscribe_graph` emits `WatchEvent::Reconnected`
+    on the very first subscribe, costing one redundant account-wide
+    reconcile.
 
 - **sync tenant throttle identity.** `ThrottleScope::Tenant` cannot be enforced
   across sibling accounts because `AccountError` carries no tenant identity.
@@ -1062,12 +1085,15 @@ prerequisite for the small local fixes above.
   labels ships a several-KB body per batch. The engine's read-back guard
   already fetches current state, so this is the site that would benefit
   most from read-back-then-diff.
-- **dav-B8.** `event_search`'s empty-query branch lists and hydrates every
-  resource in the collection before applying `request.limit`, and
-  `events_in_range` likewise truncates to `limit` only after full hydration and
-  projection. CardDAV's `contact_search` reruns the entire remote search and
-  rehydrates everything for every page - documented as intentional and it does
-  make `failed_ids` per-page honest, but it is O(collection) per page.
+- **dav-B8 (residual).** The match-all lanes are closed by ruling 9
+  (2026-09-06): empty-query `event_search`, `contacts_list` and empty-query
+  `contact_search` list, slice at the href watermark and multiget only the
+  page. What remains O(collection) per page is the FILTERING lanes -
+  `events_in_range`, text `event_search` and text `contact_search` - which
+  need bodies to decide membership and so still hydrate the whole result set
+  before the watermark slice. Bounding those needs a server-side filter
+  (calendar-query time-range, addressbook-query text match) carrying the
+  page, which is a separate design.
 - **jmap-B1.** Three near-identical query/get/advance loops in the sync layer;
   `imap` has four copies of the untagged-response dispatch loop. Recorded for
   completeness with the other duplication findings; same standing as the above.
@@ -1249,13 +1275,6 @@ backlog. The same category labels and the PUBLISHED SURFACE fence apply.
   page boundary, whereas a SEARCH returning cancelled instances is a PRODUCT
   decision about what a query surface should answer. Wants a deliberate
   answer.
-
-- **graph-B1. `push.rs` is oversized.** [C3] 2,600 lines. The `pim.rs` half
-  of this item was settled by ruling 2 at the top of this file and is done;
-  what remains is `push.rs`. Low confidence as a defect, higher as
-  maintenance risk. No round has judged the churn worth it. Same standing as
-  the rest of the refactor backlog: it does not misbehave, and it must not
-  become a prerequisite for a local fix.
 
 - **sync-B7. `attach_schema_recovery.rs` still carries its own `HealAccount`
   double.** [C3] The reusable `StubAccount` seam now lives in
