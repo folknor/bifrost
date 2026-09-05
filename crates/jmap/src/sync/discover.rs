@@ -141,6 +141,17 @@ pub(crate) fn scope_lifecycle<T: HttpTransport>(
 ) -> AccountStream<ScopeLifecycleEvent> {
     Box::pin(async_stream::stream! {
         let mut session_changes = client.session_changes();
+        // Forward-progress guard for the pagination BURST this poller is
+        // currently in, not for the poller's whole life. `Mailbox/changes`
+        // is paginated here exactly as in `changes.rs`, so the same two
+        // unbounded shapes exist (an unmoved state under
+        // `hasMoreChanges: true`, and a pair of states alternating
+        // forever); unlike a change walk, this stream is driven for the
+        // life of the account, so an unguarded spin is a permanent hot
+        // loop against one non-conformant server. The guard is dropped
+        // whenever the loop reaches a poll pause, because a state legitimately
+        // repeating across two polls minutes apart is not a spin.
+        let mut walk: Option<super::changes::ChangeWalkGuard> = None;
         loop {
             if shutdown.is_cancelled() {
                 break;
@@ -156,6 +167,7 @@ pub(crate) fn scope_lifecycle<T: HttpTransport>(
             let since_state = state_cache::get(&mailbox_states, &account_id).await;
 
             let Some(since_state) = since_state else {
+                walk = None;
                 poll_pause(&shutdown, &mut session_changes).await;
                 continue;
             };
@@ -166,7 +178,7 @@ pub(crate) fn scope_lifecycle<T: HttpTransport>(
             };
 
             let response = mail
-                .call(MailboxChanges::new(since_state).max_changes(max_changes))
+                .call(MailboxChanges::new(since_state.clone()).max_changes(max_changes))
                 .await;
 
             match response {
@@ -176,8 +188,36 @@ pub(crate) fn scope_lifecycle<T: HttpTransport>(
                     let destroyed = response.destroyed().to_vec();
                     let new_state = response.new_state().to_string();
 
+                    // Refuse a page that does not move the walk forward,
+                    // BEFORE emitting anything from it or committing its
+                    // state: the state never moved (or moved back), so
+                    // nothing is lost. Unlike a change walk, which the
+                    // engine can restart, this stream is the account's
+                    // only lifecycle channel - so the termination is
+                    // final for the account's lifetime, and
+                    // `Protocol(ContractViolation)` is the honest report:
+                    // the engine surfaces a non-conformant provider
+                    // rather than burning a poll loop forever.
+                    let guard = walk.get_or_insert_with(
+                        || super::changes::ChangeWalkGuard::new(&since_state),
+                    );
+                    if let Some(fault) = guard.observe(
+                        &since_state,
+                        &new_state,
+                        response.has_more_changes(),
+                    ) {
+                        yield ScopeLifecycleEvent::Terminated(
+                            super::error::contract_violation(
+                                bifrost_types::AccountOperation::ScopeLifecycle,
+                                None,
+                                fault.describe("Mailbox/changes"),
+                            ),
+                        );
+                        break;
+                    }
+
                     let fetched = if !created.is_empty() || !updated.is_empty() {
-                        match fetch_mailboxes(&mail, created.iter().chain(&updated)).await {
+                        match fetch_mailboxes(&mail, &limits, created.iter().chain(&updated)).await {
                             Ok(fetched) => fetched,
                             Err(err) => {
                                 let acct = super::error::into_account_error(
@@ -195,14 +235,19 @@ pub(crate) fn scope_lifecycle<T: HttpTransport>(
                                 // Do not advance the changes state: retrying
                                 // this response is the only way to preserve
                                 // the created/renamed lifecycle event.
+                                walk = None;
                                 poll_pause(&shutdown, &mut session_changes).await;
                                 continue;
                             }
                         }
                     } else {
-                        Vec::new()
+                        FetchedMailboxes {
+                            list: Vec::new(),
+                            not_found: Vec::new(),
+                        }
                     };
 
+                    let FetchedMailboxes { list: fetched, not_found } = fetched;
                     let mut answered: Vec<String> = Vec::new();
                     for mailbox in fetched {
                         let id = mailbox.id().map(ToString::to_string);
@@ -272,6 +317,21 @@ pub(crate) fn scope_lifecycle<T: HttpTransport>(
                     // that only ever hears the delete would carry no scope
                     // for it to apply to. Ids the same response already
                     // reports as `destroyed` are left to that loop.
+                    //
+                    // An id the server named in `notFound` is the same
+                    // case and takes the same path: RFC 8620 s5.1 makes
+                    // `notFound` and outright omission the two ways one
+                    // `/get` can decline to answer an id, and neither
+                    // says anything more than "this mailbox is not there
+                    // any more". Reconciling against the SUBMITTED ids
+                    // covers both at once - a `notFound` id is by
+                    // construction absent from `list`, so it lands here -
+                    // and `not_found` is bound out above so the decision
+                    // is stated rather than left implicit.
+                    debug_assert!(
+                        !not_found.iter().any(|gone| answered.iter().any(|id| id == gone)),
+                        "Mailbox/get answered and disclaimed the same id",
+                    );
                     for missing in created.iter().chain(&updated) {
                         let id = missing.as_str();
                         if answered.iter().any(|answered| answered == id)
@@ -307,6 +367,9 @@ pub(crate) fn scope_lifecycle<T: HttpTransport>(
                     state_cache::set(&mailbox_states, &account_id, new_state).await;
 
                     if !response.has_more_changes() {
+                        // The burst is over; the next poll starts a new
+                        // walk, so its guard starts empty.
+                        walk = None;
                         poll_pause(&shutdown, &mut session_changes).await;
                     }
                 }
@@ -333,6 +396,7 @@ pub(crate) fn scope_lifecycle<T: HttpTransport>(
                         yield ScopeLifecycleEvent::Terminated(acct);
                         break;
                     }
+                    walk = None;
                     poll_pause(&shutdown, &mut session_changes).await;
                 }
             }
@@ -340,23 +404,51 @@ pub(crate) fn scope_lifecycle<T: HttpTransport>(
     })
 }
 
+/// What one `Mailbox/get` follow-up learned about the ids a changes
+/// response named: the objects that came back, and the ids the server
+/// declared `notFound`.
+struct FetchedMailboxes {
+    list: Vec<Mailbox>,
+    not_found: Vec<String>,
+}
+
+/// Read the named mailboxes, batched at `maxObjectsInGet`.
+///
+/// The id list is bounded by `maxChanges` on the `Mailbox/changes` call
+/// that produced it, and `maxChanges` happens to be fed from the same
+/// limit - but that is an accident of the call site, not a bound this
+/// function may assume. RFC 8620 s5.1 lets a server refuse a `/get` with
+/// `requestTooLarge` on its own advertised `maxObjectsInGet`, so the
+/// batching is done here, where the limit is known.
 async fn fetch_mailboxes<'a, T: HttpTransport>(
     mail: &MailAccount<T>,
+    limits: &CoreLimits,
     ids: impl Iterator<Item = &'a MailboxId>,
-) -> crate::Result<Vec<Mailbox>> {
+) -> crate::Result<FetchedMailboxes> {
     let ids = ids.cloned().collect::<Vec<_>>();
+    let mut fetched = FetchedMailboxes {
+        list: Vec::new(),
+        not_found: Vec::new(),
+    };
     if ids.is_empty() {
-        return Ok(Vec::new());
+        return Ok(fetched);
     }
 
-    Ok(mail
-        .call(
-            MailboxGet::new()
-                .ids(ids)
-                .properties([Property::Id, Property::Name]),
-        )
-        .await?
-        .into_list())
+    for chunk in ids.chunks(limits.max_objects_in_get.max(1)) {
+        let response = mail
+            .call(
+                MailboxGet::new()
+                    .ids(chunk.to_vec())
+                    .properties([Property::Id, Property::Name]),
+            )
+            .await?;
+        fetched
+            .not_found
+            .extend(response.not_found().iter().map(ToString::to_string));
+        fetched.list.extend(response.into_list());
+    }
+
+    Ok(fetched)
 }
 
 async fn replace_mailbox_name(
@@ -391,16 +483,22 @@ mod tests {
     /// Requests are recorded; an unscripted request is an error rather
     /// than a plausible answer, so a loop that polls more than the test
     /// planned for cannot pass quietly.
+    type Recorder = Arc<StdMutex<Vec<serde_json::Value>>>;
+
     struct ScriptTransport {
         replies: StdMutex<VecDeque<String>>,
-        requests: StdMutex<Vec<serde_json::Value>>,
+        requests: Recorder,
     }
 
     impl ScriptTransport {
         fn new(replies: impl IntoIterator<Item = String>) -> Self {
+            Self::recording(replies, &Recorder::default())
+        }
+
+        fn recording(replies: impl IntoIterator<Item = String>, requests: &Recorder) -> Self {
             Self {
                 replies: StdMutex::new(replies.into_iter().collect()),
-                requests: StdMutex::new(Vec::new()),
+                requests: Arc::clone(requests),
             }
         }
     }
@@ -540,8 +638,25 @@ mod tests {
         CancellationToken,
         StateMap,
     ) {
+        let (stream, shutdown, states, _) = lifecycle_stream_with_limit(replies, names, 256);
+        (stream, shutdown, states)
+    }
+
+    /// The full-control variant: caller picks `maxObjectsInGet` and gets
+    /// the recorded request log back.
+    fn lifecycle_stream_with_limit(
+        replies: impl IntoIterator<Item = String>,
+        names: HashMap<String, String>,
+        max_objects_in_get: usize,
+    ) -> (
+        AccountStream<ScopeLifecycleEvent>,
+        CancellationToken,
+        StateMap,
+        Recorder,
+    ) {
+        let recorder = Recorder::default();
         let client = crate::client::Client::with_transport(
-            ScriptTransport::new(replies),
+            ScriptTransport::recording(replies, &recorder),
             test_session(),
             "https://example.test/.well-known/jmap",
         )
@@ -555,7 +670,7 @@ mod tests {
         let stream = scope_lifecycle(
             mail,
             CoreLimits {
-                max_objects_in_get: 256,
+                max_objects_in_get,
                 max_objects_in_set: 256,
             },
             Arc::clone(&states),
@@ -564,7 +679,7 @@ mod tests {
             shutdown.clone(),
             client,
         );
-        (stream, shutdown, states)
+        (stream, shutdown, states, recorder)
     }
 
     #[tokio::test]
@@ -694,6 +809,158 @@ mod tests {
             state_cache::get(&states, "primary").await,
             Some("mbx-2".to_string()),
             "the state still advances; the vanished create is not replayable"
+        );
+    }
+
+    /// One `Mailbox/changes` answer with full control over the state it
+    /// reports and whether it claims more pages behind it.
+    fn paged_changes_reply(new_state: &str, has_more: bool, created: &[&str]) -> String {
+        serde_json::json!({
+            "sessionState": "session-1",
+            "methodResponses": [[
+                "Mailbox/changes",
+                {
+                    "accountId": "primary",
+                    "oldState": "mbx-1",
+                    "newState": new_state,
+                    "hasMoreChanges": has_more,
+                    "created": created,
+                    "updated": [],
+                    "destroyed": []
+                },
+                "s0"
+            ]]
+        })
+        .to_string()
+    }
+
+    /// `Mailbox/changes` is paginated here on the lifecycle poller's own
+    /// loop, so it has the same unbounded shape `changes.rs` guards:
+    /// `hasMoreChanges: true` with an unmoved `newState` never terminates.
+    /// This stream is worse off than a change walk, because the engine
+    /// drives it for the life of the account - the spin is permanent.
+    #[tokio::test]
+    async fn a_stuck_lifecycle_state_terminates_instead_of_looping() {
+        let (mut stream, shutdown, states, requests) = lifecycle_stream_with_limit(
+            [paged_changes_reply("mbx-1", true, &[])],
+            HashMap::new(),
+            256,
+        );
+
+        match stream.next().await {
+            Some(ScopeLifecycleEvent::Terminated(err)) => {
+                assert_eq!(
+                    err.kind(),
+                    &AccountErrorKind::Protocol(
+                        bifrost_types::ProtocolErrorKind::ContractViolation
+                    ),
+                    "an unmoved state under hasMoreChanges is a contract breach"
+                );
+            }
+            other => panic!("expected a contract-violation termination, got {other:?}"),
+        }
+        assert!(stream.next().await.is_none());
+        assert_eq!(
+            state_cache::get(&states, "primary").await,
+            Some("mbx-1".to_string()),
+            "the refused page is not committed; the state never moved"
+        );
+        // The count is the load-bearing half: an unguarded loop polls
+        // again immediately (`hasMoreChanges` is true and there is no
+        // pause), forever against a real server.
+        assert_eq!(
+            requests.lock().expect("recorded requests").len(),
+            1,
+            "the poller must not ask again after a page that did not move"
+        );
+        shutdown.cancel();
+    }
+
+    /// The oscillation the single-step guard cannot see: every step
+    /// "moves" the state, and the pair repeats forever.
+    #[tokio::test]
+    async fn an_oscillating_lifecycle_state_terminates_instead_of_looping() {
+        let (mut stream, shutdown, _states, requests) = lifecycle_stream_with_limit(
+            [
+                // mbx-1 -> mbx-2, served.
+                paged_changes_reply("mbx-2", true, &[]),
+                // mbx-2 -> mbx-1, a state this burst already resumed from.
+                paged_changes_reply("mbx-1", true, &[]),
+            ],
+            HashMap::new(),
+            256,
+        );
+
+        match stream.next().await {
+            Some(ScopeLifecycleEvent::Terminated(err)) => assert_eq!(
+                err.kind(),
+                &AccountErrorKind::Protocol(bifrost_types::ProtocolErrorKind::ContractViolation),
+                "a repeated state is a cycle, not progress"
+            ),
+            other => panic!("expected a contract-violation termination, got {other:?}"),
+        }
+        assert_eq!(
+            requests.lock().expect("recorded requests").len(),
+            2,
+            "the walk stops at the repeat rather than paginating on"
+        );
+        shutdown.cancel();
+    }
+
+    /// The follow-up `Mailbox/get` was bounded only incidentally, by the
+    /// `maxChanges` the changes call happened to carry. It must batch on
+    /// its own `maxObjectsInGet`: five ids under a limit of two are three
+    /// `Mailbox/get` calls, none of them over the limit.
+    #[tokio::test]
+    async fn the_lifecycle_mailbox_read_batches_at_max_objects_in_get() {
+        let ids = ["m1", "m2", "m3", "m4", "m5"];
+        let (mut stream, shutdown, _states, requests) = lifecycle_stream_with_limit(
+            [
+                paged_changes_reply("mbx-2", false, &ids),
+                mailbox_get_reply("session-1", "m1", "One"),
+                mailbox_get_reply("session-1", "m3", "Three"),
+                mailbox_get_reply("session-1", "m5", "Five"),
+            ],
+            HashMap::new(),
+            2,
+        );
+
+        // Drain the three creates the gets did answer plus the
+        // created/deleted pairs for the ids they left out.
+        for _ in 0..3 {
+            assert!(matches!(
+                stream.next().await,
+                Some(ScopeLifecycleEvent::Lifecycle(ScopeLifecycle::Created(_)))
+            ));
+        }
+        shutdown.cancel();
+        let _drained: Vec<_> = stream.collect().await;
+
+        let gets: Vec<Vec<String>> = requests
+            .lock()
+            .expect("recorded requests")
+            .iter()
+            .filter_map(|request| {
+                let call = request.get("methodCalls")?.get(0)?;
+                (call.get(0)?.as_str()? == "Mailbox/get").then(|| {
+                    call.get(1)
+                        .and_then(|args| args.get("ids"))
+                        .and_then(serde_json::Value::as_array)
+                        .expect("a Mailbox/get carries ids")
+                        .iter()
+                        .map(|id| id.as_str().expect("string id").to_string())
+                        .collect()
+                })
+            })
+            .collect();
+        assert_eq!(
+            gets,
+            vec![
+                vec!["m1".to_string(), "m2".to_string()],
+                vec!["m3".to_string(), "m4".to_string()],
+                vec!["m5".to_string()],
+            ],
+            "the read batches at maxObjectsInGet rather than sending one call"
         );
     }
 

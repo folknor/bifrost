@@ -141,6 +141,64 @@ ablated to `buffered(1)` and confirmed failing at peak 1) and
 failure behind a slower undecodable body; ablated to `buffer_unordered` and
 confirmed reporting the wrong one).
 
+## Lateral findings from the 2026-09-05 fix pass
+
+Three defects surfaced while fixing findings 8 and 12, all in code the
+findings walked past rather than in the findings themselves.
+
+(Lateral 1 - `discover.rs::scope_lifecycle` paginating `Mailbox/changes`
+with no forward-progress guard of its own - is fixed: the two guards
+finding 2 put on the change walks are now ONE mechanism,
+`changes::ChangeWalkGuard` / `WalkFault`, and the lifecycle poller shares
+it. It matters more here than there: the engine drives this stream for
+the life of the account, so the unguarded spin was permanent rather than
+one dead walk. The guard covers the pagination burst and is dropped at
+every poll pause, since a state recurring across two polls five minutes
+apart is not a spin; on a fault the stream yields
+`Terminated(Protocol(ContractViolation))` and ends, which is final for
+the account's lifecycle channel and is the point - a non-conformant
+provider is reported rather than polled forever. Pinned by
+`a_stuck_lifecycle_state_terminates_instead_of_looping` and
+`an_oscillating_lifecycle_state_terminates_instead_of_looping`, both
+revert-and-confirmed. Note the ablation shape: asserting only the error
+KIND does NOT bite, because the scripted transport's exhaustion reply
+also classifies `Protocol(ContractViolation)` - both tests assert the
+recorded REQUEST COUNT, which is what actually distinguishes a guarded
+walk from a spinning one.)
+
+(Lateral 2 - the lifecycle poller's follow-up `Mailbox/get` ignoring
+`notFound` and never capping its id list - is fixed: `fetch_mailboxes`
+batches at `maxObjectsInGet` (it was bounded only incidentally, by the
+`maxChanges` fed from the same limit) and returns `notFound` explicitly.
+The two lanes take one path, consistent with the Created-then-Deleted
+rule finding 8 introduced: reconciliation drives from the SUBMITTED ids,
+so a `notFound` id and a silently omitted one both land in the vanished
+loop, which is right because RFC 8620 s5.1 gives them the same meaning
+here. Pinned by `the_lifecycle_mailbox_read_batches_at_max_objects_in_get`
+- five ids under a limit of two are three gets - ablated back to a single
+unbounded call and confirmed failing; the `notFound` lane keeps its
+existing pin, `a_create_that_vanished_before_the_read_is_created_then_deleted`.)
+
+(Lateral 3 - `filters_list` hydrating every `SieveScript/query` id in one
+unbatched `SieveScript/get` and never reconciling the answer - is fixed:
+it batches at `maxObjectsInGet` via the new
+`factory::max_objects_in_get` (the reader for doors holding a bare
+`Account` rather than open-time `CoreLimits`), and reconciles each answer
+against the ids that batch submitted. A script the server omitted used to
+vanish from the returned `Vec`, which the consumer reads as "that filter
+does not exist" - a deletion nothing claimed, and one an absent
+`notFound` cannot disprove. The door has no per-item lane, so it is a
+page-level failure: `error::get_id_unresolved_after_query` gives both an
+unanswered id and a declared `notFound` the retryable
+`Protocol(PartialResponse)` + `Attempt(Acknowledged)` that
+`get_id_unanswered` and `contact_update`'s failed read already use,
+rather than the terminal `get_id_not_found` lane, because a script the
+query named and the get disclaimed is a delete that raced the two calls
+and the retry's fresh query will not name it again. Pinned by
+`the_script_hydration_batches_at_max_objects_in_get` and
+`a_script_the_get_never_answers_fails_the_list` (both lanes, table-driven),
+each revert-and-confirmed.)
+
 ## Checked and found sound
 
 The load-bearing machinery holds up well against its documentation: the cursor

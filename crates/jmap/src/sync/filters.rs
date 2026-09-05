@@ -50,15 +50,50 @@ pub(crate) fn list<T: HttpTransport>(
             return Ok(Vec::new());
         }
 
-        let response = account
-            .call(SieveScriptGet::new().ids(ids).properties([
-                SieveProperty::Id,
-                SieveProperty::Name,
-                SieveProperty::BlobId,
-                SieveProperty::IsActive,
-            ]))
-            .await
-            .map_err(to_acct_err(AccountOperation::FiltersList))?;
+        // The query's id list is unbounded - it is whatever the account
+        // holds - so hydrating it in ONE `SieveScript/get` puts a call on
+        // the wire that a server may refuse wholesale with
+        // `requestTooLarge` (RFC 8620 s5.1). Batch at the advertised
+        // `maxObjectsInGet`.
+        let batch = super::factory::max_objects_in_get(&account.client().session());
+        let mut listed = Vec::new();
+        let mut not_found: Vec<String> = Vec::new();
+        for chunk in ids.chunks(batch) {
+            let response = account
+                .call(SieveScriptGet::new().ids(chunk.to_vec()).properties([
+                    SieveProperty::Id,
+                    SieveProperty::Name,
+                    SieveProperty::BlobId,
+                    SieveProperty::IsActive,
+                ]))
+                .await
+                .map_err(to_acct_err(AccountOperation::FiltersList))?;
+            not_found.extend(response.not_found().iter().map(ToString::to_string));
+            listed.extend(response.into_list());
+        }
+
+        // Reconcile the answer against the SUBMITTED ids, the way
+        // `hydrate::reconcile_hydration` and `contacts::get_cards` do.
+        // Without this a script the server omits from `list` just
+        // disappears from the returned Vec, and the consumer cannot tell
+        // that from "the filter was deleted" - `notFound` decodes as
+        // empty when absent (see the `/get` leniency rule), so absence
+        // proves nothing on its own. This door has no per-item lane, so
+        // the whole call fails, retryably.
+        for id in &ids {
+            let id = id.as_str();
+            if listed
+                .iter()
+                .any(|script| script.id().is_some_and(|got| got.as_str() == id))
+            {
+                continue;
+            }
+            return Err(super::error::get_id_unresolved_after_query(
+                id,
+                not_found.iter().any(|gone| gone == id),
+                super::error::JmapErrorContext::new(AccountOperation::FiltersList),
+            ));
+        }
 
         // One `SieveScript/get` describes every script, but each body
         // lives behind its own blob download. Serially that is N further
@@ -73,8 +108,7 @@ pub(crate) fn list<T: HttpTransport>(
         // accounting unchanged: the first failing download in SCRIPT order
         // is still the error the whole call returns, exactly as the serial
         // loop's `?` produced.
-        let scripts = response
-            .into_list()
+        let scripts = listed
             .into_iter()
             .map(|mut script| {
                 (
@@ -349,19 +383,24 @@ mod tests {
         peak: AtomicUsize,
     }
 
+    type Recorder = std::sync::Arc<StdMutex<Vec<serde_json::Value>>>;
+
     struct BlobTransport {
         api: StdMutex<VecDeque<String>>,
         meter: std::sync::Arc<DownloadMeter>,
+        requests: Recorder,
     }
 
     impl BlobTransport {
         fn new(
             api: impl IntoIterator<Item = String>,
             meter: std::sync::Arc<DownloadMeter>,
+            requests: Recorder,
         ) -> Self {
             Self {
                 api: StdMutex::new(api.into_iter().collect()),
                 meter,
+                requests,
             }
         }
     }
@@ -370,8 +409,12 @@ mod tests {
         async fn api_request(
             &self,
             _url: &str,
-            _body: Vec<u8>,
+            body: Vec<u8>,
         ) -> Result<bytes::Bytes, TransportError> {
+            self.requests
+                .lock()
+                .expect("recorded requests")
+                .push(serde_json::from_slice(&body).expect("the client emits JSON"));
             match self.api.lock().expect("script").pop_front() {
                 Some(reply) => Ok(bytes::Bytes::from(reply)),
                 None => Err(TransportError::new("api script exhausted")),
@@ -417,6 +460,10 @@ mod tests {
     }
 
     fn sieve_session() -> crate::core::session::Session {
+        sieve_session_with_get_limit(256)
+    }
+
+    fn sieve_session_with_get_limit(max_objects_in_get: usize) -> crate::core::session::Session {
         serde_json::from_value(serde_json::json!({
             "capabilities": {
                 "urn:ietf:params:jmap:core": {
@@ -425,7 +472,7 @@ mod tests {
                     "maxSizeRequest": 100_000,
                     "maxConcurrentRequests": 4,
                     "maxCallsInRequest": 8,
-                    "maxObjectsInGet": 256,
+                    "maxObjectsInGet": max_objects_in_get,
                     "maxObjectsInSet": 256,
                     "collationAlgorithms": []
                 },
@@ -488,9 +535,22 @@ mod tests {
         api: impl IntoIterator<Item = String>,
         meter: &std::sync::Arc<DownloadMeter>,
     ) -> SieveAccount<BlobTransport> {
+        sieve_account_with_session(api, meter, sieve_session(), &Recorder::default())
+    }
+
+    fn sieve_account_with_session(
+        api: impl IntoIterator<Item = String>,
+        meter: &std::sync::Arc<DownloadMeter>,
+        session: crate::core::session::Session,
+        requests: &Recorder,
+    ) -> SieveAccount<BlobTransport> {
         let client = crate::client::Client::with_transport(
-            BlobTransport::new(api, std::sync::Arc::clone(meter)),
-            sieve_session(),
+            BlobTransport::new(
+                api,
+                std::sync::Arc::clone(meter),
+                std::sync::Arc::clone(requests),
+            ),
+            session,
             "https://example.test/.well-known/jmap",
         )
         .expect("client builds");
@@ -543,6 +603,102 @@ mod tests {
             "the undecodable body at position two is the reported failure, \
              not the transport failure behind it"
         );
+    }
+
+    /// `SieveScript/query` returns however many scripts the account
+    /// holds, so hydrating that list in ONE `SieveScript/get` builds a
+    /// call a server may refuse outright on its own `maxObjectsInGet`.
+    /// Five ids under a limit of two are three gets.
+    #[tokio::test(start_paused = true)]
+    async fn the_script_hydration_batches_at_max_objects_in_get() {
+        let meter = std::sync::Arc::new(DownloadMeter::default());
+        let requests = Recorder::default();
+        let ids = vec!["s1", "s2", "s3", "s4", "s5"];
+        let account = sieve_account_with_session(
+            [
+                query_reply(&ids),
+                get_reply(&[("s1", "b-ok"), ("s2", "b-ok")]),
+                get_reply(&[("s3", "b-ok"), ("s4", "b-ok")]),
+                get_reply(&[("s5", "b-ok")]),
+            ],
+            &meter,
+            sieve_session_with_get_limit(2),
+            &requests,
+        );
+
+        let filters = list(Some(account)).await.expect("filters list");
+        assert_eq!(filters.len(), 5);
+
+        let gets: Vec<Vec<String>> = requests
+            .lock()
+            .expect("recorded requests")
+            .iter()
+            .filter_map(|request| {
+                let call = request.get("methodCalls")?.get(0)?;
+                (call.get(0)?.as_str()? == "SieveScript/get").then(|| {
+                    call.get(1)
+                        .and_then(|args| args.get("ids"))
+                        .and_then(serde_json::Value::as_array)
+                        .expect("a SieveScript/get carries ids")
+                        .iter()
+                        .map(|id| id.as_str().expect("string id").to_string())
+                        .collect()
+                })
+            })
+            .collect();
+        assert_eq!(
+            gets,
+            vec![
+                vec!["s1".to_string(), "s2".to_string()],
+                vec!["s3".to_string(), "s4".to_string()],
+                vec!["s5".to_string()],
+            ],
+        );
+    }
+
+    /// A script the `/get` leaves out of `list` used to vanish from the
+    /// returned Vec, which reads to the consumer as "that filter does not
+    /// exist" - a deletion the response never claimed. `notFound` cannot
+    /// carry the distinction either: it decodes as empty when absent. The
+    /// answer is reconciled against the submitted ids, and since this
+    /// door has no per-item lane the whole call fails, retryably.
+    #[tokio::test(start_paused = true)]
+    async fn a_script_the_get_never_answers_fails_the_list() {
+        for (case, reply) in [
+            (
+                "silently omitted",
+                get_reply(&[("s1", "b-ok")]),
+            ),
+            (
+                "declared notFound",
+                serde_json::json!({
+                    "sessionState": "session-1",
+                    "methodResponses": [[
+                        "SieveScript/get",
+                        {
+                            "accountId": "primary",
+                            "state": "s1",
+                            "list": [{"id": "s1", "name": "s1", "blobId": "b-ok", "isActive": false}],
+                            "notFound": ["s2"]
+                        },
+                        "s0"
+                    ]]
+                })
+                .to_string(),
+            ),
+        ] {
+            let meter = std::sync::Arc::new(DownloadMeter::default());
+            let account = sieve_account([query_reply(&["s1", "s2"]), reply], &meter);
+
+            let err = list(Some(account))
+                .await
+                .expect_err("an unresolved script must not vanish");
+            assert_eq!(
+                err.kind(),
+                &AccountErrorKind::Protocol(ProtocolErrorKind::PartialResponse),
+                "{case}: retryable, not a shorter list and not terminal"
+            );
+        }
     }
 
     #[test]

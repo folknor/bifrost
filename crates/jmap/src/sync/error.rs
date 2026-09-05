@@ -577,23 +577,30 @@ pub(crate) fn terminated_unsupported<T>(
 /// classification - the server is not refusing the operation; the
 /// library cannot encode the request shape.
 ///
-/// Currently exercised only by its own classification test: the inventory
-/// walk's positional-overflow arms, its last production callers, went away
-/// with positional paging. It is kept because it is the crate's one correct
-/// terminator for a response the library cannot encode, and the next stream
-/// that meets one should reach for it rather than re-deriving the
-/// classification - which is exactly how `Discover`-coded `Unsupported` got
-/// onto inventory in the first place.
+/// The crate's one correct terminator for a response the library cannot
+/// encode: the change walks' forward-progress guards reach for it, and the
+/// next stream that meets such a response should too rather than re-deriving
+/// the classification - which is exactly how `Discover`-coded `Unsupported`
+/// got onto inventory in the first place.
 #[must_use]
-#[allow(
-    dead_code,
-    reason = "classification helper retained for stream call sites"
-)]
 pub(crate) fn terminated_contract_violation<T>(
     operation: AccountOperation,
     scope: Option<ErrorScope>,
     message: impl Into<String>,
 ) -> SyncEvent<T> {
+    terminated(contract_violation(operation, scope, message))
+}
+
+/// The bare `AccountError` behind `terminated_contract_violation`, for
+/// the streams that carry their own terminal envelope rather than
+/// `SyncEvent::Terminated` - `ScopeLifecycleEvent::Terminated` is the
+/// current one. The classification must not fork per envelope.
+#[must_use]
+pub(crate) fn contract_violation(
+    operation: AccountOperation,
+    scope: Option<ErrorScope>,
+    message: impl Into<String>,
+) -> AccountError {
     let mut builder = AccountErrorBuilder::new(
         AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
         Cause::Wire(WireCause::MalformedResponse {
@@ -606,11 +613,9 @@ pub(crate) fn terminated_contract_violation<T>(
     if let Some(scope) = scope {
         builder = builder.scope(scope);
     }
-    terminated(
-        builder
-            .try_build()
-            .expect("valid account error classification"),
-    )
+    builder
+        .try_build()
+        .expect("valid account error classification")
 }
 
 /// Stream-side variant for "the set I was walking moved under me".
@@ -1461,6 +1466,50 @@ pub(crate) fn get_id_unanswered(id: &str, ctx: JmapErrorContext) -> AccountError
             protocol: Protocol::Jmap,
             detail: Some(DiagnosticText::support_only(format!(
                 "requested id {id} appeared in neither `list` nor `notFound`"
+            ))),
+        }),
+        &ctx,
+    )
+    .push_cause(Cause::Attempt(AttemptCause::new(
+        TransmissionState::Acknowledged,
+    )))
+    .try_build()
+    .expect("valid account error classification")
+}
+
+/// An id a `/query` returned that the hydrating `/get` then failed to
+/// materialize - either declared `notFound` or answered in neither lane.
+///
+/// This is the classification for a door whose return type has NO
+/// per-item lane (`filters_list` hands back a plain `Vec`), so the id
+/// cannot ride a failed-ids channel and must not simply be dropped:
+/// silently returning a shorter list reads to the consumer as "that
+/// filter does not exist", which is exactly the deletion this cannot
+/// prove. `Protocol(PartialResponse)` (retryable, acknowledged
+/// transmission) is the same class `get_id_unanswered` uses and the same
+/// answer `contact_update` gives when a read it depends on materializes
+/// nothing. `notFound` deliberately shares it rather than taking the
+/// terminal `get_id_not_found` lane: at page level the honest reading of
+/// a script that the query named and the get disclaimed is a delete that
+/// raced the two calls, and the retry's fresh `/query` will not name it
+/// again.
+#[must_use]
+pub(crate) fn get_id_unresolved_after_query(
+    id: &str,
+    declared_not_found: bool,
+    ctx: JmapErrorContext,
+) -> AccountError {
+    let lane = if declared_not_found {
+        "declared notFound by"
+    } else {
+        "answered in neither `list` nor `notFound` by"
+    };
+    build(
+        AccountErrorKind::Protocol(ProtocolErrorKind::PartialResponse),
+        Cause::Wire(WireCause::MalformedResponse {
+            protocol: Protocol::Jmap,
+            detail: Some(DiagnosticText::support_only(format!(
+                "id {id} returned by /query was {lane} the follow-up /get"
             ))),
         }),
         &ctx,

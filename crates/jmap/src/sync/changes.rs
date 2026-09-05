@@ -151,13 +151,8 @@ fn email_changes<T: HttpTransport>(
         // traffic instead of each restating a running total.
         let (mail, tally) = mail.metered();
         let max_changes = nonzero(limits.max_objects_in_get);
-        // Every state this walk has already resumed from. A conforming
-        // `newState` never repeats within a walk - it names a point the
-        // server has passed - so a repeat is a cycle, and the single-step
-        // guard below cannot see one: a server alternating two states
-        // "moves" at every step and paginates forever.
-        let mut seen_states: std::collections::HashSet<String> =
-            std::iter::once(since_state.clone()).collect();
+        // Forward-progress + cycle guard; see `ChangeWalkGuard`.
+        let mut guard = ChangeWalkGuard::new(&since_state);
         loop {
             let started = Instant::now();
             let response = mail
@@ -183,28 +178,15 @@ fn email_changes<T: HttpTransport>(
             };
 
             let new_state = response.new_state().to_string();
-            // Forward-progress guard: `hasMoreChanges: true` with an unmoved
-            // state is a server that will feed this loop forever (RFC 8620
-            // s5.2 requires newState to reflect the served changes). The
-            // state did not move, so nothing is lost by terminating before
-            // this page - the next drive replays from the same state.
-            if response.has_more_changes() && new_state == since_state {
+            if let Some(fault) = guard.observe(
+                &since_state,
+                &new_state,
+                response.has_more_changes(),
+            ) {
                 yield super::error::terminated_contract_violation(
                     bifrost_types::AccountOperation::SyncChanges,
                     Some(bifrost_types::ErrorScope::Cursor(scope.clone())),
-                    "Email/changes reported hasMoreChanges with an unmoved state",
-                );
-                break;
-            }
-            // Cycle guard: a state this walk already resumed from is being
-            // served again, so the pagination is a loop rather than a walk.
-            // Terminating before this page's batch keeps the durable cursor
-            // at a state the walk has genuinely reached.
-            if response.has_more_changes() && !seen_states.insert(new_state.clone()) {
-                yield super::error::terminated_contract_violation(
-                    bifrost_types::AccountOperation::SyncChanges,
-                    Some(bifrost_types::ErrorScope::Cursor(scope.clone())),
-                    "Email/changes returned to a state this walk had already served",
+                    fault.describe("Email/changes"),
                 );
                 break;
             }
@@ -254,9 +236,8 @@ fn mailbox_changes<T: HttpTransport>(
         // See `email_changes`: one accumulator for the paged walk.
         let (mail, tally) = mail.metered();
         let max_changes = nonzero(limits.max_objects_in_get);
-        // See `email_changes`: cycle guard over the states this walk served.
-        let mut seen_states: std::collections::HashSet<String> =
-            std::iter::once(since_state.clone()).collect();
+        // See `email_changes`: forward-progress + cycle guard.
+        let mut guard = ChangeWalkGuard::new(&since_state);
         loop {
             let started = Instant::now();
             let response = mail
@@ -278,21 +259,15 @@ fn mailbox_changes<T: HttpTransport>(
             };
 
             let new_state = response.new_state().to_string();
-            // Forward-progress guard; see `email_changes`.
-            if response.has_more_changes() && new_state == since_state {
+            if let Some(fault) = guard.observe(
+                &since_state,
+                &new_state,
+                response.has_more_changes(),
+            ) {
                 yield super::error::terminated_contract_violation(
                     bifrost_types::AccountOperation::SyncChanges,
                     Some(bifrost_types::ErrorScope::Cursor(scope.clone())),
-                    "Mailbox/changes reported hasMoreChanges with an unmoved state",
-                );
-                break;
-            }
-            // See `email_changes`: a repeated state is a cycle, not progress.
-            if response.has_more_changes() && !seen_states.insert(new_state.clone()) {
-                yield super::error::terminated_contract_violation(
-                    bifrost_types::AccountOperation::SyncChanges,
-                    Some(bifrost_types::ErrorScope::Cursor(scope.clone())),
-                    "Mailbox/changes returned to a state this walk had already served",
+                    fault.describe("Mailbox/changes"),
                 );
                 break;
             }
@@ -373,6 +348,77 @@ fn checkpoint_for(scope: CursorScope, state_string: String) -> ChangeCursor {
 
 fn nonzero(value: usize) -> NonZeroUsize {
     NonZeroUsize::new(value.max(1)).expect("value.max(1) is non-zero")
+}
+
+/// Why a `*/changes` walk is not making forward progress.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum WalkFault {
+    /// `hasMoreChanges: true` with `newState == sinceState`.
+    Unmoved,
+    /// `hasMoreChanges: true` with a state this walk already resumed from.
+    Cycle,
+}
+
+impl WalkFault {
+    /// A diagnostic naming the JMAP method that produced the fault.
+    pub(super) fn describe(self, method: &str) -> String {
+        match self {
+            Self::Unmoved => {
+                format!("{method} reported hasMoreChanges with an unmoved state")
+            }
+            Self::Cycle => {
+                format!("{method} returned to a state this walk had already served")
+            }
+        }
+    }
+}
+
+/// Forward-progress guard for a paginated `*/changes` walk.
+///
+/// Two shapes make such a walk unbounded, and one guard cannot see both.
+/// `hasMoreChanges: true` with an unmoved `newState` is the single-step
+/// case (RFC 8620 s5.2 requires `newState` to reflect the changes just
+/// served). A server alternating between two states "moves" at every
+/// single step and still paginates forever, so the walk also remembers
+/// every state it has resumed from: a conforming `newState` names a point
+/// the server has passed and therefore never repeats within one walk.
+///
+/// Every `*/changes` loop in this crate shares this one mechanism -
+/// `email_changes`, `mailbox_changes`, and `discover::scope_lifecycle`,
+/// which paginates the same method on its own loop and needs the same
+/// bound for the same reason.
+pub(super) struct ChangeWalkGuard {
+    seen: std::collections::HashSet<String>,
+}
+
+impl ChangeWalkGuard {
+    pub(super) fn new(since_state: &str) -> Self {
+        Self {
+            seen: std::iter::once(since_state.to_string()).collect(),
+        }
+    }
+
+    /// Record one answered page. Returns the fault when the walk must
+    /// terminate INSTEAD of consuming that page: the state never moved
+    /// (or moved back), so nothing is lost by refusing it - the next
+    /// drive replays from the same durable state.
+    pub(super) fn observe(
+        &mut self,
+        since_state: &str,
+        new_state: &str,
+        has_more_changes: bool,
+    ) -> Option<WalkFault> {
+        if !has_more_changes {
+            return None;
+        }
+        if new_state == since_state {
+            return Some(WalkFault::Unmoved);
+        }
+        if !self.seen.insert(new_state.to_string()) {
+            return Some(WalkFault::Cycle);
+        }
+        None
+    }
 }
 
 #[cfg(test)]
