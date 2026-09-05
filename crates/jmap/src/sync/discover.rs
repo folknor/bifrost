@@ -203,45 +203,100 @@ pub(crate) fn scope_lifecycle<T: HttpTransport>(
                         Vec::new()
                     };
 
+                    let mut answered: Vec<String> = Vec::new();
                     for mailbox in fetched {
                         let id = mailbox.id().map(ToString::to_string);
                         let name = mailbox.name().unwrap_or("").to_string();
                         let Some(id) = id else {
                             continue;
                         };
+                        answered.push(id.clone());
 
-                        if created
+                        let old_name = replace_mailbox_name(
+                            &mailbox_names,
+                            id.clone(),
+                            name.clone(),
+                        )
+                        .await;
+
+                        // A mailbox this poller has no name for is one the
+                        // consumer has never been told about, whichever
+                        // change set the server filed it under. `updated`
+                        // is not evidence of a prior announcement: the
+                        // window opened at the seeded state, and a mailbox
+                        // created before that state and renamed after it
+                        // arrives as an update the names map has never
+                        // seen. Emitting a rename from `old_name: ""` there
+                        // asserts a previous name that never existed and
+                        // hands the consumer a scope it must rename into
+                        // place rather than create. Discovery is the honest
+                        // event, and it is also the only one that
+                        // establishes the scope.
+                        let announced = created
                             .iter()
-                            .any(|created_id| created_id.as_str() == id.as_str())
-                        {
-                            update_mailbox_name(&mailbox_names, id.clone(), name).await;
-                            yield ScopeLifecycleEvent::Lifecycle(ScopeLifecycle::Created(MembershipScope::Mailbox(
-                                bifrost_types::MailboxId(id),
-                            )));
-                        } else {
-                            let old_name = replace_mailbox_name(
-                                &mailbox_names,
-                                id.clone(),
-                                name.clone(),
-                            )
-                            .await;
-                            if old_name.as_deref() != Some(name.as_str()) {
+                            .all(|created_id| created_id.as_str() != id.as_str())
+                            .then_some(old_name)
+                            .flatten();
+
+                        match announced {
+                            None => {
+                                yield ScopeLifecycleEvent::Lifecycle(ScopeLifecycle::Created(
+                                    MembershipScope::Mailbox(bifrost_types::MailboxId(id)),
+                                ));
+                            }
+                            Some(old_name) if old_name != name => {
                                 let scope = MembershipScope::Mailbox(
                                     bifrost_types::MailboxId(id),
                                 );
                                 yield ScopeLifecycleEvent::Lifecycle(ScopeLifecycle::Renamed {
                                     old: scope.clone(),
                                     new: scope,
-                                    old_name: old_name.unwrap_or_default(),
+                                    old_name,
                                     new_name: name,
                                 });
                             }
+                            Some(_) => {}
                         }
+                    }
+
+                    // A mailbox named in `created`/`updated` that the
+                    // follow-up `Mailbox/get` did not answer was destroyed
+                    // between the two calls. The state below commits
+                    // regardless - it must, since the mailbox is gone and
+                    // no later poll will ever mention it again - so the
+                    // create cannot be left for a replay that will not
+                    // happen. Surfacing it as a create followed by a delete
+                    // keeps the engine's per-folder cursor model sound: the
+                    // scope is established and then torn down, which is
+                    // what actually happened on the server, and a consumer
+                    // that only ever hears the delete would carry no scope
+                    // for it to apply to. Ids the same response already
+                    // reports as `destroyed` are left to that loop.
+                    for missing in created.iter().chain(&updated) {
+                        let id = missing.as_str();
+                        if answered.iter().any(|answered| answered == id)
+                            || destroyed.iter().any(|gone| gone.as_str() == id)
+                        {
+                            continue;
+                        }
+                        let known = remove_mailbox_name(&mailbox_names, id).await;
+                        let scope = MembershipScope::Mailbox(
+                            bifrost_types::MailboxId(id.to_string()),
+                        );
+                        // An id the consumer never heard of is not created
+                        // and deleted for its benefit; it never existed as
+                        // far as this stream is concerned.
+                        if known.is_none() {
+                            yield ScopeLifecycleEvent::Lifecycle(
+                                ScopeLifecycle::Created(scope.clone()),
+                            );
+                        }
+                        yield ScopeLifecycleEvent::Lifecycle(ScopeLifecycle::Deleted(scope));
                     }
 
                     for destroyed_id in destroyed {
                         let id = destroyed_id.into_string();
-                        remove_mailbox_name(&mailbox_names, &id).await;
+                        drop(remove_mailbox_name(&mailbox_names, &id).await);
                         yield ScopeLifecycleEvent::Lifecycle(ScopeLifecycle::Deleted(MembershipScope::Mailbox(
                             bifrost_types::MailboxId(id),
                         )));
@@ -304,15 +359,6 @@ async fn fetch_mailboxes<'a, T: HttpTransport>(
         .into_list())
 }
 
-async fn update_mailbox_name(
-    names: &Arc<Mutex<HashMap<String, String>>>,
-    id: String,
-    name: String,
-) {
-    let mut guard = names.lock().await;
-    guard.insert(id, name);
-}
-
 async fn replace_mailbox_name(
     names: &Arc<Mutex<HashMap<String, String>>>,
     id: String,
@@ -322,9 +368,12 @@ async fn replace_mailbox_name(
     guard.insert(id, name)
 }
 
-async fn remove_mailbox_name(names: &Arc<Mutex<HashMap<String, String>>>, id: &str) {
+async fn remove_mailbox_name(
+    names: &Arc<Mutex<HashMap<String, String>>>,
+    id: &str,
+) -> Option<String> {
     let mut guard = names.lock().await;
-    guard.remove(id);
+    guard.remove(id)
 }
 
 #[cfg(test)]
@@ -556,6 +605,96 @@ mod tests {
             other => panic!("expected named rename event, got {other:?}"),
         }
         shutdown.cancel();
+    }
+
+    /// One `Mailbox/changes` answer naming arbitrary change sets.
+    fn changes_reply(created: &[&str], updated: &[&str], destroyed: &[&str]) -> String {
+        serde_json::json!({
+            "sessionState": "session-1",
+            "methodResponses": [[
+                "Mailbox/changes",
+                {
+                    "accountId": "primary",
+                    "oldState": "mbx-1",
+                    "newState": "mbx-2",
+                    "hasMoreChanges": false,
+                    "created": created,
+                    "updated": updated,
+                    "destroyed": destroyed
+                },
+                "s0"
+            ]]
+        })
+        .to_string()
+    }
+
+    /// An `updated` mailbox this poller holds no name for was never
+    /// announced to the consumer, so there is no old name to rename FROM.
+    /// It used to emit `Renamed { old_name: "" }`, asserting a previous
+    /// name that never existed and handing the consumer a scope to move
+    /// rather than one to create.
+    #[tokio::test]
+    async fn an_updated_mailbox_with_no_known_name_is_a_discovery() {
+        let (mut stream, shutdown, _) = lifecycle_stream([
+            changes_reply(&[], &["mbx-unknown"], &[]),
+            mailbox_get_reply("session-1", "mbx-unknown", "Archive"),
+        ]);
+
+        match stream.next().await {
+            Some(ScopeLifecycleEvent::Lifecycle(ScopeLifecycle::Created(
+                MembershipScope::Mailbox(id),
+            ))) => assert_eq!(id.0, "mbx-unknown"),
+            other => panic!("expected a discovery, got {other:?}"),
+        }
+        shutdown.cancel();
+    }
+
+    /// A mailbox created and then destroyed between `Mailbox/changes` and
+    /// the follow-up `Mailbox/get` is answered by neither call, yet the
+    /// loop commits the new state past it - it must, since no later poll
+    /// will ever mention that id again. The create therefore has to be
+    /// surfaced here or it is lost forever; it is surfaced together with
+    /// the deletion that overtook it, so the consumer establishes the
+    /// scope and tears it down instead of receiving a delete for a scope
+    /// it never had.
+    #[tokio::test]
+    async fn a_create_that_vanished_before_the_read_is_created_then_deleted() {
+        let empty_get = serde_json::json!({
+            "sessionState": "session-1",
+            "methodResponses": [[
+                "Mailbox/get",
+                {
+                    "accountId": "primary",
+                    "state": "mbx-2",
+                    "list": [],
+                    "notFound": ["mbx-ghost"]
+                },
+                "s0"
+            ]]
+        })
+        .to_string();
+        let (mut stream, shutdown, states) =
+            lifecycle_stream([changes_reply(&["mbx-ghost"], &[], &[]), empty_get]);
+
+        match stream.next().await {
+            Some(ScopeLifecycleEvent::Lifecycle(ScopeLifecycle::Created(
+                MembershipScope::Mailbox(id),
+            ))) => assert_eq!(id.0, "mbx-ghost"),
+            other => panic!("expected the create to be surfaced, got {other:?}"),
+        }
+        match stream.next().await {
+            Some(ScopeLifecycleEvent::Lifecycle(ScopeLifecycle::Deleted(
+                MembershipScope::Mailbox(id),
+            ))) => assert_eq!(id.0, "mbx-ghost"),
+            other => panic!("expected the deletion that overtook it, got {other:?}"),
+        }
+        shutdown.cancel();
+        assert!(stream.next().await.is_none());
+        assert_eq!(
+            state_cache::get(&states, "primary").await,
+            Some("mbx-2".to_string()),
+            "the state still advances; the vanished create is not replayable"
+        );
     }
 
     /// The engine drives the scope-lifecycle stream for the whole life

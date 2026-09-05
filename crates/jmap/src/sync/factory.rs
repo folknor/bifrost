@@ -333,7 +333,7 @@ async fn validate_and_seed<Tr: HttpTransport>(
     // would arrive as a spurious skip of a perfectly healthy
     // share. This is the only place in the crate that issues
     // overlapping API requests, so the bound lives here.
-    let probe_concurrency = foreign_probe_concurrency(&session);
+    let probe_concurrency = api_request_concurrency(&session);
     let foreign_results = futures::stream::iter(foreign_ids.into_iter().map(|foreign_id| {
         let foreign_account = JmapMailAccount::new(client.clone(), JmapAccountId::new(&foreign_id));
         async move {
@@ -387,15 +387,20 @@ async fn validate_and_seed<Tr: HttpTransport>(
     })
 }
 
-/// How many foreign-account state probes may be in flight at once.
+/// How many API requests this crate may put on the wire at once.
 ///
 /// The server's advertised `maxConcurrentRequests` is the ceiling. A
 /// session that omits the core capability, or advertises zero, is treated
-/// as one: serial probing is slower but always legal, whereas guessing a
-/// number above the server's would turn healthy shares into skips. The
-/// upper clamp keeps a server advertising an absurd number from having
-/// `open` fan out that far.
-fn foreign_probe_concurrency(session: &crate::core::session::Session) -> usize {
+/// as one: serial work is slower but always legal, whereas guessing a
+/// number above the server's earns a request-level `limit` error. The
+/// upper clamp keeps a server advertising an absurd number from having a
+/// fan-out go that wide.
+///
+/// Every concurrent lane in the crate shares this one reading - the
+/// open-time foreign-account probes and the `filters_list` script-blob
+/// downloads - so there is one answer to "how wide may we go", not one
+/// per call site that could drift from the session.
+pub(super) fn api_request_concurrency(session: &crate::core::session::Session) -> usize {
     const MAX_PROBE_CONCURRENCY: usize = 8;
     session
         .core_capabilities()
@@ -1631,24 +1636,24 @@ mod tests {
     /// error, which `seed_foreign_account_or_skip` would classify as a
     /// probe failure and turn a healthy share into a skipped scope.
     #[test]
-    fn foreign_probe_concurrency_never_exceeds_the_advertised_limit() {
+    fn api_request_concurrency_never_exceeds_the_advertised_limit() {
         assert_eq!(
-            foreign_probe_concurrency(&session_with_concurrency(json!(4))),
+            api_request_concurrency(&session_with_concurrency(json!(4))),
             4,
             "the server's own number is the ceiling"
         );
         assert_eq!(
-            foreign_probe_concurrency(&session_with_concurrency(json!(1))),
+            api_request_concurrency(&session_with_concurrency(json!(1))),
             1,
             "a strictly serial server must be probed serially"
         );
         assert_eq!(
-            foreign_probe_concurrency(&session_with_concurrency(json!(0))),
+            api_request_concurrency(&session_with_concurrency(json!(0))),
             1,
             "zero is not a usable buffer bound; serial is the safe reading"
         );
         assert_eq!(
-            foreign_probe_concurrency(&session_with_concurrency(json!(10_000))),
+            api_request_concurrency(&session_with_concurrency(json!(10_000))),
             8,
             "an absurd advertisement must not make open fan out that far"
         );

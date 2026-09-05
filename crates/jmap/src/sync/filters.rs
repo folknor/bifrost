@@ -3,6 +3,7 @@ use bifrost_types::{
     FilterScript, FilterValidation, ScriptLanguage, ServerFilter, ServerFilterCreate,
     ServerFilterId, ServerFilterPatch,
 };
+use futures::StreamExt;
 
 use crate::blob::BlobRef;
 use crate::core::SetCreate;
@@ -59,21 +60,59 @@ pub(crate) fn list<T: HttpTransport>(
             .await
             .map_err(to_acct_err(AccountOperation::FiltersList))?;
 
-        let mut filters = Vec::new();
-        for mut script in response.into_list() {
-            let id = script.take_id().into_string();
-            let body = match script.blob_id() {
-                Some(blob_id) => {
-                    download_script_body(&account, blob_id, AccountOperation::FiltersList).await?
+        // One `SieveScript/get` describes every script, but each body
+        // lives behind its own blob download. Serially that is N further
+        // round trips, all of them independent. They run concurrently,
+        // bounded by the SAME `maxConcurrentRequests` clamp the open-time
+        // foreign probes use (`factory::api_request_concurrency`), so the
+        // crate has one answer to how wide it may fan out rather than a
+        // second bound that could drift from the session.
+        //
+        // `buffered` (not `buffer_unordered`) keeps completion order equal
+        // to submission order, which is what preserves the error
+        // accounting unchanged: the first failing download in SCRIPT order
+        // is still the error the whole call returns, exactly as the serial
+        // loop's `?` produced.
+        let scripts = response
+            .into_list()
+            .into_iter()
+            .map(|mut script| {
+                (
+                    script.take_id().into_string(),
+                    script.name().map(str::to_owned),
+                    script.is_active(),
+                    script.blob_id().cloned(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let concurrency = super::factory::api_request_concurrency(&account.client().session());
+        let blob_ids = scripts
+            .iter()
+            .map(|(_, _, _, blob_id)| blob_id.clone())
+            .collect::<Vec<_>>();
+        let account_ref = &account;
+        let bodies: Vec<Result<String, AccountError>> =
+            futures::stream::iter(blob_ids.into_iter().map(move |blob_id| async move {
+                match blob_id {
+                    Some(blob_id) => {
+                        download_script_body(account_ref, &blob_id, AccountOperation::FiltersList)
+                            .await
+                    }
+                    None => Ok(String::new()),
                 }
-                None => String::new(),
-            };
+            }))
+            .buffered(concurrency)
+            .collect()
+            .await;
+
+        let mut filters = Vec::new();
+        for ((id, name, is_active, _), body) in scripts.into_iter().zip(bodies) {
             filters.push(ServerFilter::Script(FilterScript {
                 id: ServerFilterId(id),
-                name: script.name().map(str::to_owned),
+                name,
                 language: ScriptLanguage::Sieve,
-                body,
-                is_active: script.is_active(),
+                body: body?,
+                is_active,
             }));
         }
         Ok(filters)
@@ -291,7 +330,220 @@ async fn download_script_body<T: HttpTransport>(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+    use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use bifrost_types::{AccountErrorKind, ProtocolErrorKind};
+
     use super::*;
+    use crate::core::transport::TransportError;
+
+    /// A JMAP boundary that answers a scripted API sequence and serves
+    /// blob downloads keyed by the blob id in the URL, while recording
+    /// the high-water mark of downloads in flight at once.
+    #[derive(Default)]
+    struct DownloadMeter {
+        in_flight: AtomicUsize,
+        peak: AtomicUsize,
+    }
+
+    struct BlobTransport {
+        api: StdMutex<VecDeque<String>>,
+        meter: std::sync::Arc<DownloadMeter>,
+    }
+
+    impl BlobTransport {
+        fn new(
+            api: impl IntoIterator<Item = String>,
+            meter: std::sync::Arc<DownloadMeter>,
+        ) -> Self {
+            Self {
+                api: StdMutex::new(api.into_iter().collect()),
+                meter,
+            }
+        }
+    }
+
+    impl HttpTransport for BlobTransport {
+        async fn api_request(
+            &self,
+            _url: &str,
+            _body: Vec<u8>,
+        ) -> Result<bytes::Bytes, TransportError> {
+            match self.api.lock().expect("script").pop_front() {
+                Some(reply) => Ok(bytes::Bytes::from(reply)),
+                None => Err(TransportError::new("api script exhausted")),
+            }
+        }
+
+        async fn upload(
+            &self,
+            _url: &str,
+            _body: Vec<u8>,
+            _content_type: Option<&str>,
+        ) -> Result<bytes::Bytes, TransportError> {
+            Err(TransportError::new("no upload reply"))
+        }
+
+        async fn download(&self, url: &str) -> Result<bytes::Bytes, TransportError> {
+            // Answered without ever yielding, so its failure ARRIVES
+            // before any download that parks below. Ordering that is
+            // arrival-driven rather than submission-driven reports this
+            // one; the ordering test exists to catch exactly that.
+            if url.contains("/b-broken/") {
+                return Err(TransportError::new("blob unavailable"));
+            }
+
+            let now = self.meter.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.meter.peak.fetch_max(now, Ordering::SeqCst);
+            // Under `start_paused` the runtime auto-advances, so this is
+            // a scheduling point rather than wall-clock time: every
+            // download that MAY overlap is parked here at once, and the
+            // peak counter above records how many that was.
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            self.meter.in_flight.fetch_sub(1, Ordering::SeqCst);
+
+            if url.contains("/b-badutf8/") {
+                return Ok(bytes::Bytes::from_static(&[0xff, 0xfe]));
+            }
+            Ok(bytes::Bytes::from(format!("# body for {url}")))
+        }
+
+        async fn get_session(&self, _url: &str) -> Result<bytes::Bytes, TransportError> {
+            Err(TransportError::new("no session reply"))
+        }
+    }
+
+    fn sieve_session() -> crate::core::session::Session {
+        serde_json::from_value(serde_json::json!({
+            "capabilities": {
+                "urn:ietf:params:jmap:core": {
+                    "maxSizeUpload": 1000,
+                    "maxConcurrentUpload": 2,
+                    "maxSizeRequest": 100_000,
+                    "maxConcurrentRequests": 4,
+                    "maxCallsInRequest": 8,
+                    "maxObjectsInGet": 256,
+                    "maxObjectsInSet": 256,
+                    "collationAlgorithms": []
+                },
+                "urn:ietf:params:jmap:sieve": {}
+            },
+            "accounts": {"primary": {"name": "Primary", "isPersonal": true, "isReadOnly": false, "accountCapabilities": {"urn:ietf:params:jmap:sieve": {}}}},
+            "primaryAccounts": {"urn:ietf:params:jmap:sieve": "primary"},
+            "username": "user@example.test",
+            "apiUrl": "https://example.test/jmap/api",
+            "downloadUrl": "https://example.test/download/{accountId}/{blobId}/{name}/{type}",
+            "uploadUrl": "https://example.test/upload/{accountId}",
+            "eventSourceUrl": "https://example.test/eventsource",
+            "state": "session-1"
+        }))
+        .expect("test session parses")
+    }
+
+    fn query_reply(ids: &[&str]) -> String {
+        serde_json::json!({
+            "sessionState": "session-1",
+            "methodResponses": [[
+                "SieveScript/query",
+                {
+                    "accountId": "primary",
+                    "queryState": "q1",
+                    "canCalculateChanges": false,
+                    "position": 0,
+                    "ids": ids
+                },
+                "s0"
+            ]]
+        })
+        .to_string()
+    }
+
+    fn get_reply(scripts: &[(&str, &str)]) -> String {
+        let list: Vec<_> = scripts
+            .iter()
+            .map(|(id, blob_id)| {
+                serde_json::json!({
+                    "id": id,
+                    "name": id,
+                    "blobId": blob_id,
+                    "isActive": false
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "sessionState": "session-1",
+            "methodResponses": [[
+                "SieveScript/get",
+                {"accountId": "primary", "state": "s1", "list": list, "notFound": []},
+                "s0"
+            ]]
+        })
+        .to_string()
+    }
+
+    fn sieve_account(
+        api: impl IntoIterator<Item = String>,
+        meter: &std::sync::Arc<DownloadMeter>,
+    ) -> SieveAccount<BlobTransport> {
+        let client = crate::client::Client::with_transport(
+            BlobTransport::new(api, std::sync::Arc::clone(meter)),
+            sieve_session(),
+            "https://example.test/.well-known/jmap",
+        )
+        .expect("client builds");
+        crate::account::Account::new(client, "primary")
+    }
+
+    /// `filters_list` used to cost N+2 serial round trips: one query, one
+    /// get, then a blob download per script awaited one at a time. The
+    /// downloads are independent, so they run concurrently under the same
+    /// `maxConcurrentRequests` clamp the open-time foreign probes use -
+    /// here 4, so six scripts must show four downloads in flight at once
+    /// and never a fifth.
+    #[tokio::test(start_paused = true)]
+    async fn script_bodies_download_concurrently_within_the_advertised_limit() {
+        let meter = std::sync::Arc::new(DownloadMeter::default());
+        let ids: Vec<&str> = vec!["s1", "s2", "s3", "s4", "s5", "s6"];
+        let scripts: Vec<(&str, &str)> = ids.iter().map(|id| (*id, "b-ok")).collect();
+        let account = sieve_account([query_reply(&ids), get_reply(&scripts)], &meter);
+
+        let filters = list(Some(account)).await.expect("filters list");
+        assert_eq!(filters.len(), 6);
+        assert_eq!(
+            meter.peak.load(Ordering::SeqCst),
+            4,
+            "the downloads must overlap, bounded by maxConcurrentRequests"
+        );
+    }
+
+    /// The concurrency must not change WHICH failure the call reports.
+    /// The serial loop returned the first failing script in list order;
+    /// `buffered` preserves that by yielding in submission order, so a
+    /// bad-UTF-8 body at position two still wins over a dead download at
+    /// position three even though both fail in the same wave.
+    #[tokio::test(start_paused = true)]
+    async fn the_first_failing_script_in_order_is_the_reported_error() {
+        let meter = std::sync::Arc::new(DownloadMeter::default());
+        let ids = vec!["s1", "s2", "s3"];
+        let account = sieve_account(
+            [
+                query_reply(&ids),
+                get_reply(&[("s1", "b-ok"), ("s2", "b-badutf8"), ("s3", "b-broken")]),
+            ],
+            &meter,
+        );
+
+        let err = list(Some(account)).await.expect_err("a failing download");
+        assert_eq!(
+            err.kind(),
+            &AccountErrorKind::Protocol(ProtocolErrorKind::ParseFailed),
+            "the undecodable body at position two is the reported failure, \
+             not the transport failure behind it"
+        );
+    }
 
     #[test]
     fn validate_maps_sieve_set_error_to_error_diagnostic() {

@@ -60,14 +60,23 @@ inferring "no old book" from a failed read. Pinned by
 asserts no `ContactCard/set` reaches the wire; ablated against the previous
 `and_then` and confirmed failing.)
 
-### 8. `scope_lifecycle` spurious rename and lost create
-
-Emits a spurious `Renamed { old_name: "" }` for an updated mailbox absent from
-the names map, and drops a `Created` event when the mailbox vanishes between
-`Mailbox/changes` and the follow-up `Mailbox/get` while still committing the
-new state (the create is lost forever to the lifecycle stream). Both benign
-under the current engine (account-wide cursor shapes create no per-folder
-cursor), but worth knowing they're load-bearing on that engine policy.
+(Finding 8 - `scope_lifecycle`'s spurious rename and lost create - is fixed:
+both halves now key on what the CONSUMER has been told rather than on which
+change collection the server used. An id the names map has never seen emits
+`Created`, not `Renamed { old_name: "" }` - `updated` is not evidence of a
+prior announcement, since the poller's window opens at the state seeded at
+`open`. And an id named in `created`/`updated` that the follow-up
+`Mailbox/get` never answers was destroyed in between: the state commit
+cannot be withheld for it (nothing will ever mention that id again, so
+there is no replay), so the create is surfaced together with the deletion
+that overtook it, `Created` then `Deleted`, which leaves the engine with a
+scope it established and then tore down instead of a delete for a scope it
+never had. Ids the same response already reports as `destroyed` are left to
+that loop. Pinned by `an_updated_mailbox_with_no_known_name_is_a_discovery`
+and `a_create_that_vanished_before_the_read_is_created_then_deleted`, both
+revert-and-confirmed - the second's ablation hangs on the 300s poll pause
+until brokkr's per-test timeout kills it, which is the "the event never
+arrives" it describes.)
 
 (Finding 9 - `move_thread` / `delete_thread` re-resolving the thread between
 the two legs - is fixed: both doors resolve the thread once and run both legs
@@ -116,11 +125,21 @@ owner-qualification intact. A moved state is `ConcurrencyConflict` ->
 `PagingTransport` tests plus the codec round-trip and refusal tests in
 `sync/pim.rs`, confirmed to bite by ablating each half.
 
-### 12. `filters_list` downloads script blobs serially
-
-N+2 round trips for N scripts; the only other concurrency-capable spot in the
-crate (foreign probes) bounds by `maxConcurrentRequests`, and the same
-treatment would apply here.
+(Finding 12 - `filters_list` downloading script blobs serially, N+2 round
+trips for N scripts - is fixed: the downloads run concurrently through the
+SAME clamp the open-time foreign probes use, which was renamed
+`foreign_probe_concurrency` -> `factory::api_request_concurrency` and made
+`pub(super)` rather than duplicated, so the crate keeps one answer to how
+wide a fan-out may go. It is `buffered`, not `buffer_unordered`:
+submission-ordered yielding is what preserves the per-script error
+accounting exactly, since the serial loop's `?` reported the first failing
+script in list order. Pinned by
+`script_bodies_download_concurrently_within_the_advertised_limit` (six
+scripts, an advertised limit of 4, peak in-flight asserted at exactly 4;
+ablated to `buffered(1)` and confirmed failing at peak 1) and
+`the_first_failing_script_in_order_is_the_reported_error` (a fast transport
+failure behind a slower undecodable body; ablated to `buffer_unordered` and
+confirmed reporting the wrong one).
 
 ## Checked and found sound
 
@@ -133,6 +152,15 @@ closed per-item accounting, the mutation pipeline's per-owner batching and
 starvation bound, the push reader's bounded setup awaits / keepalive /
 backoff-reset-on-traffic logic, `close()` teardown bounds, the open-time
 foreign probe concurrency clamp, and the error-translation table all match
-`reference/jmap.md` claim for claim. `contact_search`'s pref reading (`pref ==
-1` only) versus RFC 9553 pref semantics (1-100 ranking) is the only spec nit
-there.
+`reference/jmap.md` claim for claim.
+
+(The one spec nit found here - the contact projections reading `pref == 1`
+only, versus RFC 9553's 1-100 ranking in which lower is more preferred - is
+fixed: `pref_rank` accepts a rank only inside 1-100, so `pref: 0` cannot
+outrank every legal value, and `apply_preferred` marks the single lowest
+rank present, ties by position, none when no entry carries one. An absent
+`pref` stays least preferred. Pinned by
+`the_lowest_pref_rank_is_the_primary_entry` - a best rank of 10, a tie at 5,
+and a `pref: 0` losing to a `pref: 100` - and
+`an_unranked_contact_has_no_primary_entry`; the first was ablated back to
+the `pref == 1` reading and confirmed failing.)

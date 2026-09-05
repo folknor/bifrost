@@ -673,42 +673,84 @@ fn display_name(name: Option<&Map<String, Value>>) -> Option<String> {
         .map(ToString::to_string)
 }
 
+/// RFC 9553 s1.5.4: `pref` is a RANKING from 1 to 100 in which the LOWER
+/// number is the more preferred entry, not a boolean flag whose true value
+/// happens to be spelled `1`. Reading `pref == 1` therefore reported no
+/// primary at all for a card whose most-preferred address was ranked `10`,
+/// and reported several primaries for a card that ranked two entries `1`.
+///
+/// A value outside 1-100 is not a ranking, so it reads as absent rather
+/// than as an extremely strong preference (`pref: 0` would otherwise beat
+/// every legal rank).
+fn pref_rank(object: &Map<String, Value>) -> Option<i64> {
+    object
+        .get("pref")
+        .and_then(Value::as_i64)
+        .filter(|rank| (1..=100).contains(rank))
+}
+
+/// The single entry the shared contact model calls primary: the lowest
+/// rank present, ties resolved by position, and none at all when no entry
+/// carries a rank (an absent `pref` is least preferred, never primary).
+fn apply_preferred<T>(
+    mut entries: Vec<(Option<i64>, T)>,
+    primary: fn(&mut T) -> &mut bool,
+) -> Vec<T> {
+    let winner = entries
+        .iter()
+        .enumerate()
+        .filter_map(|(index, (rank, _))| rank.map(|rank| (rank, index)))
+        .min();
+    if let Some((_, index)) = winner {
+        *primary(&mut entries[index].1) = true;
+    }
+    entries.into_iter().map(|(_, entry)| entry).collect()
+}
+
 fn emails(values: Option<&Map<String, Value>>) -> Vec<ContactEmail> {
-    values
+    let entries = values
         .into_iter()
         .flat_map(Map::values)
         .filter_map(|value| {
             let object = value.as_object()?;
-            Some(ContactEmail {
-                value: object
-                    .get("address")
-                    .or_else(|| object.get("email"))
-                    .and_then(Value::as_str)?
-                    .to_string(),
-                kind: first_context(object.get("contexts")),
-                is_primary: object.get("pref").and_then(Value::as_i64).unwrap_or(0) == 1,
-            })
+            Some((
+                pref_rank(object),
+                ContactEmail {
+                    value: object
+                        .get("address")
+                        .or_else(|| object.get("email"))
+                        .and_then(Value::as_str)?
+                        .to_string(),
+                    kind: first_context(object.get("contexts")),
+                    is_primary: false,
+                },
+            ))
         })
-        .collect()
+        .collect();
+    apply_preferred(entries, |email| &mut email.is_primary)
 }
 
 fn phones(values: Option<&Map<String, Value>>) -> Vec<ContactPhone> {
-    values
+    let entries = values
         .into_iter()
         .flat_map(Map::values)
         .filter_map(|value| {
             let object = value.as_object()?;
-            Some(ContactPhone {
-                value: object
-                    .get("number")
-                    .or_else(|| object.get("phone"))
-                    .and_then(Value::as_str)?
-                    .to_string(),
-                kind: phone_kind(object),
-                is_primary: object.get("pref").and_then(Value::as_i64).unwrap_or(0) == 1,
-            })
+            Some((
+                pref_rank(object),
+                ContactPhone {
+                    value: object
+                        .get("number")
+                        .or_else(|| object.get("phone"))
+                        .and_then(Value::as_str)?
+                        .to_string(),
+                    kind: phone_kind(object),
+                    is_primary: false,
+                },
+            ))
         })
-        .collect()
+        .collect();
+    apply_preferred(entries, |phone| &mut phone.is_primary)
 }
 
 fn organizations(
@@ -753,7 +795,7 @@ const STREET_COMPONENTS: &[&str] = &[
 const SCALAR_COMPONENTS: &[&str] = &["locality", "region", "postcode", "country"];
 
 fn addresses(values: Option<&Map<String, Value>>) -> Result<Vec<ContactAddress>, &'static str> {
-    values
+    let entries: Vec<(Option<i64>, ContactAddress)> = values
         .into_iter()
         .flat_map(Map::values)
         .filter_map(Value::as_object)
@@ -799,21 +841,25 @@ fn addresses(values: Option<&Map<String, Value>>) -> Result<Vec<ContactAddress>,
                         .map(ToString::to_string)
                 })
                 .collect();
-            Ok(ContactAddress {
-                kind: first_context(object.get("contexts")),
-                formatted: object
-                    .get("full")
-                    .and_then(Value::as_str)
-                    .map(ToString::to_string),
-                street,
-                locality: component("locality"),
-                region: component("region"),
-                postal_code: component("postcode"),
-                country: component("country"),
-                is_primary: object.get("pref").and_then(Value::as_i64).unwrap_or(0) == 1,
-            })
+            Ok((
+                pref_rank(object),
+                ContactAddress {
+                    kind: first_context(object.get("contexts")),
+                    formatted: object
+                        .get("full")
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string),
+                    street,
+                    locality: component("locality"),
+                    region: component("region"),
+                    postal_code: component("postcode"),
+                    country: component("country"),
+                    is_primary: false,
+                },
+            ))
         })
-        .collect()
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(apply_preferred(entries, |address| &mut address.is_primary))
 }
 
 fn notes(values: Option<&Map<String, Value>>) -> Option<String> {
@@ -1188,6 +1234,89 @@ mod tests {
         assert_eq!(
             contact.photo_url.as_deref(),
             Some("https://example.test/a.jpg")
+        );
+    }
+
+    /// RFC 9553 `pref` ranks 1-100 with lower more preferred. A card whose
+    /// best email is ranked `10` has a primary email; a card ranking two
+    /// entries equally has exactly one, the first; an unranked entry never
+    /// wins; and an out-of-range value is not a rank at all.
+    #[test]
+    fn the_lowest_pref_rank_is_the_primary_entry() {
+        let card = JmapContactCard {
+            properties: serde_json::from_value(json!({
+                "id": "c1",
+                "emails": {
+                    "e1": {"address": "low@example.test", "pref": 40},
+                    "e2": {"address": "best@example.test", "pref": 10},
+                    "e3": {"address": "none@example.test"}
+                },
+                "phones": {
+                    "p1": {"number": "+1", "pref": 5},
+                    "p2": {"number": "+2", "pref": 5}
+                },
+                "addresses": {
+                    "a1": {"components": [{"kind": "locality", "value": "Oslo"}], "pref": 0},
+                    "a2": {"components": [{"kind": "locality", "value": "Bergen"}], "pref": 100}
+                }
+            }))
+            .expect("object"),
+        };
+
+        let contact =
+            contact_from_jmap(card, AccountOperation::ContactGet).expect("supported card");
+
+        let primary_emails: Vec<&str> = contact
+            .emails
+            .iter()
+            .filter(|email| email.is_primary)
+            .map(|email| email.value.as_str())
+            .collect();
+        assert_eq!(
+            primary_emails,
+            vec!["best@example.test"],
+            "the lowest rank present wins, even when nothing is ranked 1"
+        );
+
+        let primary_phones: Vec<&str> = contact
+            .phones
+            .iter()
+            .filter(|phone| phone.is_primary)
+            .map(|phone| phone.value.as_str())
+            .collect();
+        assert_eq!(
+            primary_phones,
+            vec!["+1"],
+            "a tie resolves to the first entry, and only one entry is primary"
+        );
+
+        let primary_localities: Vec<&str> = contact
+            .addresses
+            .iter()
+            .filter(|address| address.is_primary)
+            .filter_map(|address| address.locality.as_deref())
+            .collect();
+        assert_eq!(
+            primary_localities,
+            vec!["Bergen"],
+            "pref 0 is outside the 1-100 ranking and reads as unranked"
+        );
+    }
+
+    #[test]
+    fn an_unranked_contact_has_no_primary_entry() {
+        let card = JmapContactCard {
+            properties: serde_json::from_value(json!({
+                "id": "c1",
+                "emails": {"e1": {"address": "a@example.test"}}
+            }))
+            .expect("object"),
+        };
+        let contact =
+            contact_from_jmap(card, AccountOperation::ContactGet).expect("supported card");
+        assert!(
+            !contact.emails[0].is_primary,
+            "an absent pref is least preferred, never promoted to primary"
         );
     }
 
