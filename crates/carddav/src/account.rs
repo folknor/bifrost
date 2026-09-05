@@ -1,7 +1,8 @@
 use bifrost_dav_core::{
-    DavProtocol, SnapshotEntry, append_path, decode_snapshot, diff_snapshots, encode_snapshot,
-    inventory_entry as inventory_entry_from_snapshot, page_from_offset,
-    preserve_unobserved_entries, same_dav_url,
+    DavProtocol, SnapshotEntry, append_path, decode_snapshot, decode_watermark_cursor,
+    diff_snapshots, encode_snapshot, encode_watermark_cursor,
+    inventory_entry as inventory_entry_from_snapshot, page_after_watermark,
+    preserve_unobserved_entries, same_dav_url, slice_after_watermark,
 };
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -268,36 +269,6 @@ impl CardDavAccount {
             })
     }
 
-    async fn hydrated_contacts(
-        client: &CardDavClient,
-        default_addressbook_url: Option<&str>,
-        address_book: Option<AddressBookId>,
-        operation: AccountOperation,
-    ) -> Result<SearchedContacts, AccountError> {
-        let addressbook =
-            Self::addressbook_url(client, default_addressbook_url, address_book, operation)?;
-        let listing = client
-            .list_contacts_listing(&addressbook, operation)
-            .await?;
-        let uris = listing
-            .entries
-            .iter()
-            .map(|entry| entry.uri.clone())
-            .collect::<Vec<_>>();
-        let fetch = client.fetch_vcards(&addressbook, &uris, operation).await?;
-        let skipped_scopes = skipped_addressbook_scope(fetch.degraded);
-        let (fetched, mut failed_ids) = resolved_report(fetch.report);
-        merge_listing_failures(&mut failed_ids, listing.failed_hrefs);
-        let (cards, projection_failures) = partition_hydrated_vcards(&addressbook, fetched);
-        failed_ids.extend(projection_failures);
-        one_outcome_per_id(&mut failed_ids, &cards);
-        Ok(SearchedContacts {
-            cards,
-            failed_ids,
-            skipped_scopes,
-        })
-    }
-
     async fn searched_contacts(
         client: &CardDavClient,
         default_addressbook_url: Option<&str>,
@@ -329,7 +300,7 @@ impl CardDavAccount {
         client: &CardDavClient,
         default_addressbook_url: Option<&str>,
         address_book: Option<AddressBookId>,
-        offset: usize,
+        watermark: Option<&str>,
         page_size: usize,
         operation: AccountOperation,
     ) -> Result<Page<ContactCard>, AccountError> {
@@ -339,31 +310,36 @@ impl CardDavAccount {
             .list_contacts_listing(&addressbook, operation)
             .await?;
         let total = listing.entries.len();
-        // The offset is local and each page re-runs the depth-1 PROPFIND. DAV
-        // guarantees no ordering on a multistatus, so paging raw response
-        // order would let an unchanged collection come back permuted between
-        // pages, skipping the contacts the permutation moved behind the offset
-        // and serving twice the ones it moved past. The resolved href is the
-        // stable key that makes the offset mean the same thing on every page.
+        // Each page re-runs the depth-1 PROPFIND, and DAV guarantees no
+        // ordering on a multistatus, so paging raw response order would let an
+        // unchanged collection come back permuted between pages, skipping the
+        // contacts the permutation moved behind the cursor and serving twice
+        // the ones it moved past. The resolved href is the stable key, and the
+        // cursor carries the last one served rather than a count into the
+        // collection - so nothing inserted before it can displace a later page,
+        // and the multiget below asks for this page's members only.
         let mut entries = listing.entries;
         entries.sort_by(|left, right| left.uri.cmp(&right.uri));
-        let uris = entries
+        let slice =
+            slice_after_watermark(entries, watermark, page_size, |entry| entry.uri.as_str());
+        let uris = slice
+            .items
             .into_iter()
-            .skip(offset)
-            .take(page_size)
             .map(|entry| entry.uri)
             .collect::<Vec<_>>();
         let fetch = client.fetch_vcards(&addressbook, &uris, operation).await?;
         let skipped_scopes = skipped_addressbook_scope(fetch.degraded);
         let (fetched, mut failed_ids) = resolved_report(fetch.report);
         merge_listing_failures(&mut failed_ids, listing.failed_hrefs);
-        let (cards, projection_failures) = partition_hydrated_vcards(&addressbook, fetched);
+        let (mut cards, projection_failures) = partition_hydrated_vcards(&addressbook, fetched);
         failed_ids.extend(projection_failures);
         one_outcome_per_id(&mut failed_ids, &cards);
+        // The page is served in the same key order it was sliced in; a
+        // multiget answers in whatever order it likes.
+        cards.sort_by(|left, right| left.native_id.cmp(&right.native_id));
         Ok(Page {
             items: cards,
-            next_cursor: (offset + page_size < total)
-                .then(|| (offset + page_size).to_string().into_bytes()),
+            next_cursor: slice.next_watermark.as_deref().map(encode_watermark_cursor),
             estimated_total: Some(estimated_total(total)),
             failed_ids,
             skipped_scopes,
@@ -1020,12 +996,13 @@ impl Account for CardDavAccount {
         let client = Arc::clone(&self.client);
         let default_addressbook_url = self.default_addressbook_url.clone();
         Box::pin(async move {
-            let offset = decode_offset_cursor(page_cursor, AccountOperation::ContactsList)?;
+            let watermark =
+                decode_contact_page_cursor(page_cursor, AccountOperation::ContactsList)?;
             Self::hydrated_contacts_page(
                 &client,
                 default_addressbook_url.as_deref(),
                 address_book,
-                offset,
+                watermark.as_deref(),
                 CONTACT_PAGE_SIZE,
                 AccountOperation::ContactsList,
             )
@@ -1151,44 +1128,52 @@ impl Account for CardDavAccount {
         let client = Arc::clone(&self.client);
         let default_addressbook_url = self.default_addressbook_url.clone();
         Box::pin(async move {
-            let offset =
-                decode_offset_cursor(request.page_cursor.clone(), AccountOperation::ContactSearch)?;
+            let watermark = decode_contact_page_cursor(
+                request.page_cursor.clone(),
+                AccountOperation::ContactSearch,
+            )?;
             let needle = request.query.to_lowercase();
-            let searched = if needle.is_empty() {
-                Self::hydrated_contacts(
+            // A zero limit is honored as an empty exhausted page, not clamped
+            // up to one. Clamping silently served a contact the caller had
+            // asked not to receive; the shared watermark slicer is what makes
+            // the zero case terminate instead of pointing at itself.
+            let page_size = request.limit.map_or(CONTACT_PAGE_SIZE, |limit| {
+                usize::try_from(limit).unwrap_or(usize::MAX)
+            });
+            if needle.is_empty() {
+                // The match-all lane pages the LISTING, so the multiget carries
+                // only this page's hrefs instead of re-hydrating the whole
+                // address book per page. It is the same walk `contacts_list`
+                // takes, differing only in where the page size comes from.
+                return Self::hydrated_contacts_page(
                     &client,
                     default_addressbook_url.as_deref(),
                     request.address_book_id.clone(),
+                    watermark.as_deref(),
+                    page_size,
                     AccountOperation::ContactSearch,
                 )
-                .await?
-            } else {
-                Self::searched_contacts(
-                    &client,
-                    default_addressbook_url.as_deref(),
-                    request.address_book_id.clone(),
-                    &request.query,
-                    AccountOperation::ContactSearch,
-                )
-                .await?
-            };
+                .await;
+            }
+            let searched = Self::searched_contacts(
+                &client,
+                default_addressbook_url.as_deref(),
+                request.address_book_id.clone(),
+                &request.query,
+                AccountOperation::ContactSearch,
+            )
+            .await?;
             let mut items = searched
                 .cards
                 .into_iter()
                 .filter(|contact| contact_matches(contact, &needle))
                 .collect::<Vec<_>>();
             items.sort_by(|left, right| left.native_id.cmp(&right.native_id));
-            // A zero limit is honored as an empty exhausted page, not clamped
-            // up to one. Clamping silently served a contact the caller had
-            // asked not to receive; `page_from_offset` is what makes the zero
-            // case terminate instead of pointing at itself.
-            let page_size = request.limit.map_or(CONTACT_PAGE_SIZE, |limit| {
-                usize::try_from(limit).unwrap_or(usize::MAX)
-            });
-            Ok(page_from_offset(
+            Ok(page_after_watermark(
                 items,
-                offset,
+                watermark.as_deref(),
                 page_size,
+                |contact| contact.native_id.as_str(),
                 searched.failed_ids,
                 searched.skipped_scopes,
             ))
@@ -1640,11 +1625,11 @@ fn cursor_error(message: impl Into<String>) -> AccountError {
     .expect("valid account error classification")
 }
 
-fn decode_offset_cursor(
+fn decode_contact_page_cursor(
     cursor: Option<Vec<u8>>,
     operation: AccountOperation,
-) -> Result<usize, AccountError> {
-    bifrost_dav_core::decode_offset_cursor(cursor, operation, DavProtocol::CardDav)
+) -> Result<Option<String>, AccountError> {
+    decode_watermark_cursor(cursor, operation, DavProtocol::CardDav)
 }
 
 /// One CardDAV search or hydration leg: what materialized, the resources
@@ -1808,11 +1793,187 @@ fn contains(value: &str, needle: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bifrost_dav_core::test_support::{dav_script_empty, scripted_dav_net};
+    use bifrost_dav_core::DavResponse;
+    use bifrost_dav_core::test_support::{
+        dav_script, dav_script_empty, scripted_dav_net, transcripts,
+    };
     use bifrost_types::{
         AccountErrorKind, EngineDirective, ObjectChange, ObjectChangeKind, RecoveryClass,
         SyncStateErrorKind,
     };
+    use reqwest::StatusCode;
+    use reqwest::header::HeaderMap;
+
+    fn book_multistatus(body: String) -> DavResponse {
+        DavResponse {
+            status: StatusCode::MULTI_STATUS,
+            headers: HeaderMap::new(),
+            body,
+            url: "https://dav.example.test/books/".to_string(),
+        }
+    }
+
+    fn listed_vcard(name: &str) -> String {
+        format!(
+            "<D:response><D:href>/books/{name}.vcf</D:href><D:propstat><D:prop>\
+<D:getetag>\"{name}\"</D:getetag></D:prop><D:status>HTTP/1.1 200 OK</D:status>\
+</D:propstat></D:response>"
+        )
+    }
+
+    fn hydrated_vcard(name: &str) -> String {
+        format!(
+            "<D:response><D:href>/books/{name}.vcf</D:href><D:propstat><D:prop>\
+<D:getetag>\"{name}\"</D:getetag>\
+<C:address-data>BEGIN:VCARD\nVERSION:4.0\nFN:{name}\nEND:VCARD</C:address-data>\
+</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>"
+        )
+    }
+
+    fn book_document(responses: &[String]) -> String {
+        format!(
+            "<D:multistatus xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:carddav\">{}</D:multistatus>",
+            responses.concat()
+        )
+    }
+
+    /// The property the watermark cursor was bought for: an empty-query
+    /// `contact_search` page multigets ONLY the hrefs it is about to serve.
+    ///
+    /// The lane used to re-hydrate the whole address book on every page and
+    /// then slice `limit` cards out of it. The assertion is written against the
+    /// REPORT body because that is where a regression shows: a page that goes
+    /// back to hydrating everything names `c.vcf` in it.
+    #[tokio::test]
+    async fn an_empty_query_contact_page_multigets_only_the_page_hrefs() {
+        let script = dav_script([
+            book_multistatus(book_document(&[
+                listed_vcard("a"),
+                listed_vcard("b"),
+                listed_vcard("c"),
+            ])),
+            book_multistatus(book_document(&[hydrated_vcard("a"), hydrated_vcard("b")])),
+        ]);
+        let client =
+            CardDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
+        let account =
+            CardDavAccount::for_tests(Arc::new(client), "https://dav.example.test/books/");
+
+        let page = account
+            .contact_search(ContactSearchRequest {
+                query: String::new(),
+                address_book_id: None,
+                limit: Some(2),
+                page_cursor: None,
+            })
+            .await
+            .expect("match-all page");
+
+        assert_eq!(
+            page.items
+                .iter()
+                .map(|card| card.native_id.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                "https://dav.example.test/books/a.vcf".to_string(),
+                "https://dav.example.test/books/b.vcf".to_string(),
+            ]
+        );
+        assert_eq!(
+            page.next_cursor,
+            Some(b"https://dav.example.test/books/b.vcf".to_vec()),
+            "the cursor is the last href served"
+        );
+        assert_eq!(page.estimated_total, Some(3));
+
+        let requests = transcripts(&script);
+        assert_eq!(requests.len(), 2, "one listing and one multiget");
+        assert_eq!(requests[0].method.as_str(), "PROPFIND");
+        assert_eq!(requests[1].method.as_str(), "REPORT");
+        assert!(requests[1].body.contains("/books/a.vcf"));
+        assert!(requests[1].body.contains("/books/b.vcf"));
+        assert!(
+            !requests[1].body.contains("/books/c.vcf"),
+            "the multiget must not hydrate a member this page does not serve: {}",
+            requests[1].body
+        );
+    }
+
+    /// The continuation half, and the exactly-once property under a concurrent
+    /// insert: a contact filed BEFORE the watermark between the two pages does
+    /// not push the unserved remainder behind the cursor, and is not re-served.
+    /// Against an integer offset, `aa` arriving here makes page two return
+    /// `b.vcf` again and `c.vcf` is never delivered.
+    #[tokio::test]
+    async fn a_contact_inserted_before_the_watermark_does_not_displace_the_next_page() {
+        let script = dav_script([
+            book_multistatus(book_document(&[
+                listed_vcard("a"),
+                listed_vcard("aa"),
+                listed_vcard("b"),
+                listed_vcard("c"),
+            ])),
+            book_multistatus(book_document(&[hydrated_vcard("c")])),
+        ]);
+        let client =
+            CardDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
+        let account =
+            CardDavAccount::for_tests(Arc::new(client), "https://dav.example.test/books/");
+
+        let page = account
+            .contact_search(ContactSearchRequest {
+                query: String::new(),
+                address_book_id: None,
+                limit: Some(2),
+                page_cursor: Some(b"https://dav.example.test/books/b.vcf".to_vec()),
+            })
+            .await
+            .expect("continued page");
+
+        assert_eq!(
+            page.items
+                .iter()
+                .map(|card| card.native_id.clone())
+                .collect::<Vec<_>>(),
+            vec!["https://dav.example.test/books/c.vcf".to_string()]
+        );
+        assert_eq!(page.next_cursor, None, "the last page ends the walk");
+
+        let requests = transcripts(&script);
+        assert_eq!(requests.len(), 2);
+        assert!(
+            !requests[1].body.contains("/books/a.vcf")
+                && !requests[1].body.contains("/books/aa.vcf")
+                && !requests[1].body.contains("/books/b.vcf"),
+            "a member behind the watermark must not be re-served: {}",
+            requests[1].body
+        );
+        assert!(requests[1].body.contains("/books/c.vcf"));
+    }
+
+    /// A watermark past every href is the end of the walk: no multiget at all,
+    /// an empty page, and no continuation. The single-response script is the
+    /// assertion - a page that still hydrates something starves it and panics.
+    #[tokio::test]
+    async fn a_watermark_past_every_href_is_an_empty_final_page() {
+        let script = dav_script([book_multistatus(book_document(&[
+            listed_vcard("a"),
+            listed_vcard("b"),
+        ]))]);
+        let client =
+            CardDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
+        let account =
+            CardDavAccount::for_tests(Arc::new(client), "https://dav.example.test/books/");
+
+        let page = account
+            .contacts_list(None, Some(b"https://dav.example.test/books/z.vcf".to_vec()))
+            .await
+            .expect("final page");
+
+        assert!(page.items.is_empty());
+        assert!(page.next_cursor.is_none());
+        assert_eq!(transcripts(&script).len(), 1, "no multiget is spent");
+    }
 
     /// `set_priority` and `set_bandwidth_cap` reach the account's transport.
     ///
@@ -2049,36 +2210,70 @@ mod tests {
         assert_eq!(failed_ids, vec!["/ab/bad.vcf".to_string()]);
     }
 
+    fn native_ids(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| (*name).to_string()).collect()
+    }
+
     #[test]
-    fn offset_cursor_decodes_ascii_offsets() {
+    fn the_contact_page_cursor_carries_the_last_href_served() {
         assert_eq!(
-            decode_offset_cursor(Some(b"250".to_vec()), AccountOperation::ContactsList).unwrap(),
-            250
+            decode_contact_page_cursor(
+                Some(b"/book/two.vcf".to_vec()),
+                AccountOperation::ContactsList
+            )
+            .unwrap(),
+            Some("/book/two.vcf".to_string())
+        );
+        assert_eq!(
+            decode_contact_page_cursor(None, AccountOperation::ContactsList).unwrap(),
+            None
         );
         assert!(
-            decode_offset_cursor(Some(b"bad".to_vec()), AccountOperation::ContactsList).is_err()
+            decode_contact_page_cursor(Some(Vec::new()), AccountOperation::ContactsList).is_err(),
+            "an empty cursor is corrupt, not a restart from the first contact"
         );
     }
 
     #[test]
-    fn page_from_offset_returns_next_cursor() {
-        let page = page_from_offset(vec![1, 2, 3, 4], 1, 2, Vec::new(), Vec::new());
+    fn a_watermark_page_returns_the_next_cursor() {
+        let page = page_after_watermark(
+            native_ids(&["a", "b", "c", "d"]),
+            Some("a"),
+            2,
+            String::as_str,
+            Vec::new(),
+            Vec::new(),
+        );
 
-        assert_eq!(page.items, vec![2, 3]);
-        assert_eq!(page.next_cursor, Some(b"3".to_vec()));
+        assert_eq!(page.items, native_ids(&["b", "c"]));
+        assert_eq!(page.next_cursor, Some(b"c".to_vec()));
         assert_eq!(page.estimated_total, Some(4));
 
-        let tail = page_from_offset(vec![1, 2, 3, 4], 3, 2, Vec::new(), Vec::new());
-        assert_eq!(tail.items, vec![4]);
+        let tail = page_after_watermark(
+            native_ids(&["a", "b", "c", "d"]),
+            Some("c"),
+            2,
+            String::as_str,
+            Vec::new(),
+            Vec::new(),
+        );
+        assert_eq!(tail.items, native_ids(&["d"]));
         assert_eq!(tail.next_cursor, None);
     }
 
-    /// A zero page size must terminate. Emitting the current offset again
+    /// A zero page size must terminate. Emitting the current watermark again
     /// gives a consumer that follows `next_cursor` an infinite non-advancing
     /// loop. The CalDAV twin pins the same rule for `limit: Some(0)`.
     #[test]
     fn a_zero_page_size_is_an_exhausted_page_with_no_continuation() {
-        let page = page_from_offset(vec![1, 2, 3, 4], 0, 0, Vec::new(), Vec::new());
+        let page = page_after_watermark(
+            native_ids(&["a", "b", "c", "d"]),
+            None,
+            0,
+            String::as_str,
+            Vec::new(),
+            Vec::new(),
+        );
 
         assert!(page.items.is_empty());
         assert_eq!(page.next_cursor, None);
@@ -2141,11 +2336,19 @@ mod tests {
         // re-observed per page. A resource that only starts failing while
         // the consumer is on page two must be reported on page two - the
         // page it was observed on is the only page that can report it.
-        let first = page_from_offset(vec![1, 2, 3], 0, 1, Vec::new(), Vec::new());
-        let second = page_from_offset(
-            vec![1, 2, 3],
+        let first = page_after_watermark(
+            native_ids(&["a", "b", "c"]),
+            None,
             1,
+            String::as_str,
+            Vec::new(),
+            Vec::new(),
+        );
+        let second = page_after_watermark(
+            native_ids(&["a", "b", "c"]),
+            Some("a"),
             1,
+            String::as_str,
             vec!["/book/failed.vcf".to_string()],
             Vec::new(),
         );

@@ -40,8 +40,9 @@ pub use multistatus::{
     extract_href_property, parse_collection_property, parse_multistatus,
 };
 pub use snapshot::{
-    DecodedSnapshot, SnapshotEntry, decode_offset_cursor, decode_snapshot, diff_snapshots,
-    encode_snapshot, inventory_entry, object_change, page_from_offset, preserve_unobserved_entries,
+    DecodedSnapshot, PageSlice, SnapshotEntry, decode_snapshot, decode_watermark_cursor,
+    diff_snapshots, encode_snapshot, encode_watermark_cursor, inventory_entry, object_change,
+    page_after_watermark, preserve_unobserved_entries, slice_after_watermark,
 };
 pub use transport::{
     DAV_CLIENT_TIMEOUT, DavBody, DavRequest, DavResponse, origin_is_secure, settle_body, url_origin,

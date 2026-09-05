@@ -1,7 +1,8 @@
 use bifrost_dav_core::{
-    DavProtocol, SnapshotEntry, append_path, decode_offset_cursor, decode_snapshot, diff_snapshots,
-    encode_snapshot, inventory_entry as inventory_entry_from_snapshot, object_change,
-    page_from_offset, preserve_unobserved_entries, same_dav_url,
+    DavProtocol, SnapshotEntry, append_path, decode_snapshot, decode_watermark_cursor,
+    diff_snapshots, encode_snapshot, encode_watermark_cursor,
+    inventory_entry as inventory_entry_from_snapshot, object_change, page_after_watermark,
+    preserve_unobserved_entries, same_dav_url, slice_after_watermark,
 };
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -914,7 +915,7 @@ impl Account for CalDavAccount {
     ) -> AccountFuture<Result<Page<CalendarEvent>, AccountError>> {
         let client = Arc::clone(&self.client);
         Box::pin(async move {
-            let offset = decode_event_page_cursor(
+            let watermark = decode_event_page_cursor(
                 range.page_cursor.clone(),
                 AccountOperation::EventsInRange,
             )?;
@@ -952,7 +953,13 @@ impl Account for CalDavAccount {
                 }
             }
             one_outcome_per_id(&mut failed, &materialized);
-            Ok(event_page(events, offset, range.limit, failed, Vec::new()))
+            Ok(event_page(
+                events,
+                watermark.as_deref(),
+                range.limit,
+                failed,
+                Vec::new(),
+            ))
         })
     }
 
@@ -1129,7 +1136,7 @@ impl Account for CalDavAccount {
         let client = Arc::clone(&self.client);
         let default_calendar_url = self.default_calendar_url.clone();
         Box::pin(async move {
-            let offset = decode_event_page_cursor(
+            let watermark = decode_event_page_cursor(
                 request.page_cursor.clone(),
                 AccountOperation::EventSearch,
             )?;
@@ -1140,35 +1147,28 @@ impl Account for CalDavAccount {
                 AccountOperation::EventSearch,
             )?;
             let needle = request.query.to_lowercase();
-            let fetched = if needle.is_empty() {
-                // The match-all path lists first, then multigets. Both
-                // legs can lose individual resources inside their 207,
-                // so both feed `failed_ids` - dropping the listing's
-                // casualties would report a match-all search as
-                // complete when it was not.
-                let listing = client
-                    .list_events_listing(&calendar_url, AccountOperation::EventSearch)
-                    .await?;
-                let uris = listing
-                    .entries
-                    .iter()
-                    .map(|entry| entry.uri.clone())
-                    .collect::<Vec<_>>();
-                let mut fetched = client
-                    .fetch_events(&calendar_url, &uris, AccountOperation::EventSearch)
-                    .await?;
-                fetched.report.failed.extend(
-                    listing
-                        .failed_hrefs
-                        .into_iter()
-                        .map(|href| crate::parse::CalDavFailedResource { href, status: None }),
-                );
-                fetched
-            } else {
-                client
-                    .query_events_text(&calendar_url, &request.query)
-                    .await?
-            };
+            if needle.is_empty() {
+                // The match-all path lists first, then multigets - and the
+                // listing is what gets paged, so the multiget carries only the
+                // hrefs this page will serve. Both legs can lose individual
+                // resources inside their 207, so both feed `failed_ids` -
+                // dropping the listing's casualties would report a match-all
+                // search as complete when it was not.
+                let page_size = request.limit.map_or(usize::MAX, |value| {
+                    usize::try_from(value).unwrap_or(usize::MAX)
+                });
+                return listed_event_page(
+                    &client,
+                    &calendar_url,
+                    watermark.as_deref(),
+                    page_size,
+                    AccountOperation::EventSearch,
+                )
+                .await;
+            }
+            let fetched = client
+                .query_events_text(&calendar_url, &request.query)
+                .await?;
             let skipped_scopes = skipped_calendar_scope(&calendar_url, fetched.degraded);
             let fetched = fetched.report;
             let mut seen = HashSet::new();
@@ -1206,7 +1206,7 @@ impl Account for CalDavAccount {
             one_outcome_per_id(&mut failed, &materialized);
             Ok(event_page(
                 events,
-                offset,
+                watermark.as_deref(),
                 request.limit,
                 failed,
                 skipped_scopes,
@@ -1246,26 +1246,31 @@ fn rsvp_email_from_config(config: &CalDavConfig) -> Option<String> {
 fn decode_event_page_cursor(
     cursor: Option<Vec<u8>>,
     operation: AccountOperation,
-) -> Result<usize, AccountError> {
-    decode_offset_cursor(cursor, operation, DavProtocol::CalDav)
+) -> Result<Option<String>, AccountError> {
+    decode_watermark_cursor(cursor, operation, DavProtocol::CalDav)
 }
 
-/// Sort a materialized result set into its stable order, then slice one offset
-/// page out of it through the shared slicer.
+/// Sort a materialized result set into its stable order, then slice the page
+/// that follows `watermark` out of it through the shared slicer.
+///
+/// For the lanes whose REPORT already answered with the event bodies - the
+/// time-range query and the text search. The match-all lane lists first and
+/// pages the LISTING (see `listed_event_page`), so it never materializes the
+/// events it is not about to serve.
 ///
 /// Takes `Vec<CalendarEvent>` rather than being generic on purpose: the sort
-/// below is the load-bearing half of the offset contract, and a generic
+/// below is the load-bearing half of the cursor contract, and a generic
 /// signature would let a caller page something with no stable key at all. The
 /// key is the recurrence-qualified `EventId` (resource href, plus
 /// `#RECURRENCE-ID` for an override instance), which is unique per emitted item
 /// and stable across polls because it is derived from the resource URL rather
-/// than from anything the server chose to order by. `bifrost-carddav` sorts by
-/// `native_id` for the same reason, and both now slice through
-/// `bifrost_dav_core::page_from_offset`, which is where the offset contract -
-/// including the zero-limit exhaustion rule - is written down.
+/// than from anything the server chose to order by. `bifrost-carddav` keys on
+/// `native_id` for the same reason, and both slice through
+/// `bifrost_dav_core::slice_after_watermark`, which is where the cursor
+/// contract - including the zero-limit exhaustion rule - is written down.
 fn event_page(
     mut items: Vec<CalendarEvent>,
-    offset: usize,
+    watermark: Option<&str>,
     limit: Option<u32>,
     failed_ids: Vec<String>,
     skipped_scopes: Vec<SkippedScope>,
@@ -1274,7 +1279,76 @@ fn event_page(
     let page_size = limit.map_or(items.len(), |value| {
         usize::try_from(value).unwrap_or(usize::MAX)
     });
-    page_from_offset(items, offset, page_size, failed_ids, skipped_scopes)
+    page_after_watermark(
+        items,
+        watermark,
+        page_size,
+        |event| event.id.0.as_str(),
+        failed_ids,
+        skipped_scopes,
+    )
+}
+
+/// The match-all search lane: page the depth-1 listing, then multiget ONLY the
+/// hrefs on that page.
+///
+/// The listing is the etag-bearing PROPFIND the poll path already runs, and its
+/// href is exactly the key the page cursor carries, so the whole collection
+/// never has to be hydrated in order to serve a page out of the middle of it.
+/// The previous shape multiget the entire calendar on every page and threw away
+/// all but `limit` of it.
+///
+/// `failed_ids` still carries BOTH legs' casualties: the listing's failed hrefs
+/// (collection-wide, and re-observed on every page, per the `Page::failed_ids`
+/// contract) and the ones the page's own multiget lost.
+async fn listed_event_page(
+    client: &CalDavClient,
+    calendar_url: &str,
+    watermark: Option<&str>,
+    page_size: usize,
+    operation: AccountOperation,
+) -> Result<Page<CalendarEvent>, AccountError> {
+    let listing = client.list_events_listing(calendar_url, operation).await?;
+    let total = u64::try_from(listing.entries.len()).unwrap_or(u64::MAX);
+    let mut entries = listing.entries;
+    entries.sort_by(|left, right| left.uri.cmp(&right.uri));
+    let slice = slice_after_watermark(entries, watermark, page_size, |entry| entry.uri.as_str());
+    let uris = slice
+        .items
+        .into_iter()
+        .map(|entry| entry.uri)
+        .collect::<Vec<_>>();
+    let fetched = client.fetch_events(calendar_url, &uris, operation).await?;
+    let skipped_scopes = skipped_calendar_scope(calendar_url, fetched.degraded);
+    let fetched = fetched.report;
+    let mut failed = fetched.failed_hrefs();
+    failed.extend(listing.failed_hrefs);
+    let mut events = Vec::new();
+    let mut materialized = HashSet::new();
+    for event in fetched.events {
+        let uri = event.uri;
+        match events_from_ical(
+            uri.clone(),
+            CalendarId(calendar_url.to_string()),
+            event.etag,
+            &event.data,
+        ) {
+            Ok(projected) => {
+                materialized.insert(uri);
+                events.extend(projected);
+            }
+            Err(_) => failed.push(uri),
+        }
+    }
+    one_outcome_per_id(&mut failed, &materialized);
+    events.sort_by(|left, right| left.id.0.cmp(&right.id.0));
+    Ok(Page {
+        items: events,
+        next_cursor: slice.next_watermark.as_deref().map(encode_watermark_cursor),
+        estimated_total: Some(total),
+        failed_ids: failed,
+        skipped_scopes,
+    })
 }
 
 /// The scheduling POST completed before the local PUT began. Preserve that
@@ -1938,7 +2012,12 @@ fn contains(value: &str, needle: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bifrost_dav_core::test_support::{dav_script_empty, scripted_dav_net};
+    use bifrost_dav_core::DavResponse;
+    use bifrost_dav_core::test_support::{
+        dav_script, dav_script_empty, scripted_dav_net, transcripts,
+    };
+    use reqwest::StatusCode;
+    use reqwest::header::HeaderMap;
 
     /// `set_priority` and `set_bandwidth_cap` reach the account's transport.
     ///
@@ -1964,6 +2043,159 @@ mod tests {
         assert_eq!(net.bandwidth_cap(), None);
         account.set_priority(Priority::Foreground);
         assert_eq!(net.priority(), Priority::Foreground);
+    }
+
+    /// The property the watermark cursor was bought for: a match-all page
+    /// multigets ONLY the hrefs it is about to serve.
+    ///
+    /// The previous offset shape listed, multiget the WHOLE calendar, and threw
+    /// away all but `limit` of the result - so paging a large collection cost
+    /// O(collection) of wire traffic per page. The assertion is written against
+    /// the REPORT body because that is where the regression would show: a page
+    /// that goes back to hydrating everything names `c.ics` in it.
+    #[tokio::test]
+    async fn a_match_all_event_page_multigets_only_the_page_hrefs() {
+        let multistatus = |body: &str| DavResponse {
+            status: StatusCode::MULTI_STATUS,
+            headers: HeaderMap::new(),
+            body: body.to_string(),
+            url: "https://dav.example.test/cal/".to_string(),
+        };
+        let event = |name: &str| {
+            format!(
+                "<D:response><D:href>/cal/{name}.ics</D:href><D:propstat><D:prop>\
+<D:getetag>\"{name}\"</D:getetag>\
+<C:calendar-data>BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:{name}\nDTSTART:20260101T090000Z\nDTEND:20260101T100000Z\nEND:VEVENT\nEND:VCALENDAR</C:calendar-data>\
+</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>"
+            )
+        };
+        let listed = |name: &str| {
+            format!(
+                "<D:response><D:href>/cal/{name}.ics</D:href><D:propstat><D:prop>\
+<D:getetag>\"{name}\"</D:getetag></D:prop><D:status>HTTP/1.1 200 OK</D:status>\
+</D:propstat></D:response>"
+            )
+        };
+        let listing = format!(
+            "<D:multistatus xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\">{}{}{}</D:multistatus>",
+            listed("a"),
+            listed("b"),
+            listed("c")
+        );
+        let page = format!(
+            "<D:multistatus xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\">{}{}</D:multistatus>",
+            event("a"),
+            event("b")
+        );
+        // Exactly two responses: a regression that multigets in more than one
+        // chunk, or re-lists, starves the script and panics.
+        let script = dav_script([multistatus(&listing), multistatus(&page)]);
+        let client =
+            CalDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
+        let account = CalDavAccount::for_tests(Arc::new(client), "https://dav.example.test/cal/");
+
+        let page = account
+            .event_search(EventSearchRequest {
+                query: String::new(),
+                calendar_id: None,
+                limit: Some(2),
+                page_cursor: None,
+            })
+            .await
+            .expect("match-all page");
+
+        assert_eq!(
+            page.items
+                .iter()
+                .map(|event| event.id.0.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                "https://dav.example.test/cal/a.ics".to_string(),
+                "https://dav.example.test/cal/b.ics".to_string(),
+            ]
+        );
+        assert_eq!(
+            page.next_cursor,
+            Some(b"https://dav.example.test/cal/b.ics".to_vec()),
+            "the cursor is the last href served"
+        );
+        assert_eq!(page.estimated_total, Some(3));
+
+        let requests = transcripts(&script);
+        assert_eq!(requests.len(), 2, "one listing and one multiget");
+        assert_eq!(requests[0].method.as_str(), "PROPFIND");
+        assert_eq!(requests[1].method.as_str(), "REPORT");
+        assert!(
+            requests[1].body.contains("/cal/a.ics"),
+            "{}",
+            requests[1].body
+        );
+        assert!(
+            requests[1].body.contains("/cal/b.ics"),
+            "{}",
+            requests[1].body
+        );
+        assert!(
+            !requests[1].body.contains("/cal/c.ics"),
+            "the multiget must not hydrate a member this page does not serve: {}",
+            requests[1].body
+        );
+    }
+
+    /// The continuation half: a page fetched with a watermark hydrates only the
+    /// members after it, and the final page reports no cursor.
+    #[tokio::test]
+    async fn a_continued_event_page_multigets_only_what_follows_the_watermark() {
+        let multistatus = |body: String| DavResponse {
+            status: StatusCode::MULTI_STATUS,
+            headers: HeaderMap::new(),
+            body,
+            url: "https://dav.example.test/cal/".to_string(),
+        };
+        let listing = "<D:multistatus xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\">\
+<D:response><D:href>/cal/a.ics</D:href><D:propstat><D:prop><D:getetag>\"a\"</D:getetag></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>\
+<D:response><D:href>/cal/b.ics</D:href><D:propstat><D:prop><D:getetag>\"b\"</D:getetag></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>\
+<D:response><D:href>/cal/c.ics</D:href><D:propstat><D:prop><D:getetag>\"c\"</D:getetag></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>\
+</D:multistatus>";
+        let tail = "<D:multistatus xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\">\
+<D:response><D:href>/cal/c.ics</D:href><D:propstat><D:prop><D:getetag>\"c\"</D:getetag>\
+<C:calendar-data>BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:c\nDTSTART:20260101T090000Z\nDTEND:20260101T100000Z\nEND:VEVENT\nEND:VCALENDAR</C:calendar-data>\
+</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response></D:multistatus>";
+        let script = dav_script([
+            multistatus(listing.to_string()),
+            multistatus(tail.to_string()),
+        ]);
+        let client =
+            CalDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
+        let account = CalDavAccount::for_tests(Arc::new(client), "https://dav.example.test/cal/");
+
+        let page = account
+            .event_search(EventSearchRequest {
+                query: String::new(),
+                calendar_id: None,
+                limit: Some(2),
+                page_cursor: Some(b"https://dav.example.test/cal/b.ics".to_vec()),
+            })
+            .await
+            .expect("continued page");
+
+        assert_eq!(
+            page.items
+                .iter()
+                .map(|event| event.id.0.clone())
+                .collect::<Vec<_>>(),
+            vec!["https://dav.example.test/cal/c.ics".to_string()]
+        );
+        assert_eq!(page.next_cursor, None, "the last page ends the walk");
+
+        let requests = transcripts(&script);
+        assert_eq!(requests.len(), 2);
+        assert!(
+            !requests[1].body.contains("/cal/a.ics") && !requests[1].body.contains("/cal/b.ics"),
+            "a member behind the watermark must not be re-hydrated: {}",
+            requests[1].body
+        );
+        assert!(requests[1].body.contains("/cal/c.ics"));
     }
 
     fn collection(href: &str) -> crate::parse::CalendarCollection {
@@ -2527,23 +2759,84 @@ mod tests {
     fn event_page_emits_a_cursor_for_truncated_results() {
         let first = event_page(
             identified_events(&["a", "b", "c"]),
-            0,
+            None,
             Some(2),
             Vec::new(),
             Vec::new(),
         );
         assert_eq!(event_ids(&first), vec!["a", "b"]);
-        assert_eq!(first.next_cursor, Some(b"2".to_vec()));
+        assert_eq!(first.next_cursor, Some(b"b".to_vec()));
 
         let second = event_page(
             identified_events(&["a", "b", "c"]),
-            2,
+            Some("b"),
             Some(2),
             Vec::new(),
             Vec::new(),
         );
         assert_eq!(event_ids(&second), vec!["c"]);
         assert_eq!(second.next_cursor, None);
+    }
+
+    /// The page cursor is the last event id served, so a decoded cursor and the
+    /// id it names are the same bytes in both directions.
+    #[test]
+    fn the_event_page_cursor_round_trips_as_the_last_id_served() {
+        let page = event_page(
+            identified_events(&["a", "b", "c"]),
+            None,
+            Some(2),
+            Vec::new(),
+            Vec::new(),
+        );
+        let cursor = page.next_cursor.expect("page one truncates");
+        assert_eq!(
+            decode_event_page_cursor(Some(cursor), AccountOperation::EventsInRange)
+                .expect("valid cursor")
+                .as_deref(),
+            Some("b")
+        );
+        assert!(
+            decode_event_page_cursor(Some(Vec::new()), AccountOperation::EventsInRange).is_err(),
+            "an empty cursor is corrupt, not a restart from the first event"
+        );
+    }
+
+    /// The property the watermark buys over an integer offset: an event
+    /// inserted BEFORE the watermark between two pages does not push the
+    /// unserved remainder behind the cursor. Against an offset, `aa` arriving
+    /// between the two calls makes page two return `b` again and `c` is never
+    /// delivered at all.
+    #[test]
+    fn an_event_inserted_before_the_watermark_is_not_re_served() {
+        let first = event_page(
+            identified_events(&["a", "b", "c"]),
+            None,
+            Some(2),
+            Vec::new(),
+            Vec::new(),
+        );
+        let watermark = String::from_utf8(first.next_cursor.expect("page one truncates"))
+            .expect("utf-8 cursor");
+
+        let second = event_page(
+            identified_events(&["a", "aa", "b", "c"]),
+            Some(&watermark),
+            Some(2),
+            Vec::new(),
+            Vec::new(),
+        );
+        assert_eq!(event_ids(&second), vec!["c"]);
+
+        // And one inserted AFTER the watermark is served on the later page.
+        let with_insert = event_page(
+            identified_events(&["a", "b", "bb", "c"]),
+            Some(&watermark),
+            Some(2),
+            Vec::new(),
+            Vec::new(),
+        );
+        assert_eq!(event_ids(&with_insert), vec!["bb", "c"]);
     }
 
     fn identified_events(ids: &[&str]) -> Vec<CalendarEvent> {
@@ -2561,30 +2854,28 @@ mod tests {
         page.items.iter().map(|event| event.id.0.clone()).collect()
     }
 
-    /// The offset is local and every continuation re-runs the REPORT, so an
+    /// The cursor is local and every continuation re-runs the REPORT, so an
     /// unchanged result set returned in a DIFFERENT order across the two pages
     /// must still yield each event exactly once. Against unsorted slicing page
     /// two returns `a` again and `c` is never delivered at all.
     #[test]
-    fn offset_pages_survive_a_reordered_second_report() {
+    fn watermark_pages_survive_a_reordered_second_report() {
         let first = event_page(
             identified_events(&["a", "b", "c"]),
-            0,
+            None,
             Some(2),
             Vec::new(),
             Vec::new(),
         );
         let first_ids = event_ids(&first);
         assert_eq!(first_ids, vec!["a", "b"]);
-        let offset = String::from_utf8(first.next_cursor.expect("page one truncates"))
-            .expect("ascii cursor")
-            .parse::<usize>()
-            .expect("numeric cursor");
+        let watermark = String::from_utf8(first.next_cursor.expect("page one truncates"))
+            .expect("utf-8 cursor");
 
         // Same three events, the order the server happened to answer with.
         let second = event_page(
             identified_events(&["c", "a", "b"]),
-            offset,
+            Some(&watermark),
             Some(2),
             Vec::new(),
             Vec::new(),
@@ -2597,13 +2888,13 @@ mod tests {
         assert_eq!(delivered, vec!["a", "b", "c"]);
     }
 
-    /// A zero limit must terminate. Emitting the current offset again gives a
-    /// consumer that follows `next_cursor` an infinite non-advancing loop.
+    /// A zero limit must terminate. Emitting the current watermark again gives
+    /// a consumer that follows `next_cursor` an infinite non-advancing loop.
     #[test]
     fn a_zero_limit_is_an_exhausted_page_with_no_continuation() {
         let page = event_page(
             identified_events(&["a", "b", "c"]),
-            0,
+            None,
             Some(0),
             Vec::new(),
             Vec::new(),

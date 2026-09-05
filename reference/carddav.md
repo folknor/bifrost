@@ -164,10 +164,17 @@ Supported contact primitives:
   (`an_empty_home_lists_no_address_books_rather_than_a_phantom` and its
   CalDAV twin).
 - `contacts_list` - `PROPFIND` depth 1 for vCard resources, local
-  offset-cursor slicing of hrefs - sorted by resolved href first, because the
-  offset is local and every page re-runs the PROPFIND, and DAV guarantees no
-  multistatus ordering - then batched `addressbook-multiget`
-  `REPORT` hydration for only the requested page. Multiget REPORTs enumerate
+  WATERMARK-cursor slicing of hrefs - sorted by resolved href first, because
+  the cursor is local and every page re-runs the PROPFIND, and DAV guarantees
+  no multistatus ordering - then batched `addressbook-multiget`
+  `REPORT` hydration for only the requested page. `next_cursor` carries the
+  last href served, not a count into the collection, so a contact filed
+  before it between two pages cannot displace the unserved remainder and one
+  filed after it is served on a later page. An empty payload is a corrupt
+  cursor, refused rather than read as a silent restart from the first
+  contact; a watermark past every href is an empty final page that spends no
+  multiget at all. The page is re-sorted by `native_id` after hydration,
+  since a multiget answers in whatever order it likes. Multiget REPORTs enumerate
   hrefs in the body and use `Depth: 0`; `addressbook-query` uses `Depth: 1`.
   A hydrated vCard that
   will not parse is recorded (by native uri) in `Page::failed_ids` via
@@ -247,20 +254,22 @@ Supported contact primitives:
 - `contact_search` / `contact_autocomplete` - non-empty searches issue
   CardDAV `addressbook-query` text-match `REPORT`s over common vCard
   fields, including ADR postal addresses, then keep local filtering and
-  offset-cursor paging as a
+  watermark-cursor paging as a
   defensive guard. Results are sorted by native id before slicing so page
-  order is stable while the remote result set is unchanged. A `limit` of zero
+  order is stable while the remote result set is unchanged, and the cursor is
+  the native id of the last contact served. A `limit` of zero
   is honored as an exhausted page - no items, no continuation - rather than
   clamped up to one (which served a contact the caller asked not to receive)
-  or emitted as an empty page naming its own offset again (which loops a
+  or emitted as an empty page naming its own watermark again (which loops a
   cursor-following consumer forever). The CalDAV twin pins the same rule.
   Every page
   reruns the remote search, so `failed_ids` reports what that page's fetch
   observed - a resource that only starts failing on page three is news on
   page three, and one failing throughout is named on every page. The lane is
-  a per-page set, not a running tally. Empty search
-  hydrates the addressbook to preserve
-  match-all behavior. This is the *personal* corpus only;
+  a per-page set, not a running tally. Empty search takes the same walk
+  `contacts_list` does - page the depth-1 listing, multiget only that page's
+  hrefs - differing only in where the page size comes from, so match-all
+  behavior is preserved without re-hydrating the whole address book per page. This is the *personal* corpus only;
   `directory_search` (org directory / GAL) returns
   `Unsupported(DirectorySearch)` with the capability flag `false`. An RFC
   6352 directory-gateway leg is a named follow-up: the
@@ -402,7 +411,7 @@ lane runs through `bifrost_dav_core::parse_multistatus`: address-book discovery,
 the depth-1 contact PROPFIND, and the `addressbook-multiget` /
 `addressbook-query` REPORT. The depth-0 `getctag` read is
 `parse_collection_property(xml, "getctag")`, and the snapshot codec, diff,
-inventory projection and offset page slicer are the shared ones, parameterized
+inventory projection and watermark page slicer are the shared ones, parameterized
 only by the `CDAVCTAG1` magic and this crate's `cursor_error`.
 
 The collapse closed one drift on this side: `<addressbook/>` was accepted as a

@@ -1,11 +1,11 @@
-//! The DAV polling cursor: one snapshot shape, one codec, one diff, one page
-//! slicer.
+//! The DAV polling cursor: one snapshot shape, one codec, one diff, one
+//! watermark page slicer.
 //!
 //! Neither CalDAV nor CardDAV has a change feed it can rely on. Both poll a
 //! collection with a depth-1 PROPFIND, keep `(href, etag)` per member in an
 //! opaque cursor, and derive `Created` / `Updated` / `Destroyed` by comparing
 //! the new listing against the stored one. The two crates carried that whole
-//! mechanism twice - the byte codec, the merge diff, the offset slicer, the
+//! mechanism twice - the byte codec, the merge diff, the page slicer, the
 //! inventory projection - differing only in the words `calendar` and
 //! `addressbook`, and one of the recorded drift defects (a snapshot path fixed
 //! on one side only) lived here.
@@ -289,34 +289,121 @@ fn read_u32(input: &mut &[u8], label: &str) -> Result<usize, String> {
     Ok(value as usize)
 }
 
-/// Read a decimal offset page cursor, treating an absent cursor as offset zero.
-pub fn decode_offset_cursor(
+/// Read a page watermark cursor: the sort key of the LAST item the previous
+/// page served. An absent cursor is the start of the collection.
+///
+/// The watermark replaced an integer offset outright. An offset is only
+/// meaningful against a materialized result set, so every continuation had to
+/// re-fetch the whole collection in order to count into it; a key that lives in
+/// the listing itself lets a page hydrate only its own members. It is also the
+/// stronger cursor: an offset silently skips an item whenever something is
+/// inserted before it between two pages, where a watermark cannot be moved
+/// across by anything but a change of the key itself.
+///
+/// An empty payload is refused rather than read as "the beginning": every key
+/// this pages on is a resource href, so an empty one is a corrupt cursor, and
+/// silently restarting a pagination walk from item zero is the failure mode
+/// with no symptom.
+pub fn decode_watermark_cursor(
     cursor: Option<Vec<u8>>,
     operation: AccountOperation,
     protocol: DavProtocol,
-) -> Result<usize, AccountError> {
+) -> Result<Option<String>, AccountError> {
     let Some(cursor) = cursor else {
-        return Ok(0);
+        return Ok(None);
     };
-    let value = String::from_utf8(cursor)
-        .map_err(|error| local_error(operation, error.to_string(), protocol))?;
-    value.parse().map_err(|error| {
+    let value = String::from_utf8(cursor).map_err(|error| {
         local_error(
             operation,
             format!("invalid {} page cursor: {error}", protocol.label()),
             protocol,
         )
-    })
+    })?;
+    if value.is_empty() {
+        return Err(local_error(
+            operation,
+            format!("empty {} page cursor", protocol.label()),
+            protocol,
+        ));
+    }
+    Ok(Some(value))
 }
 
-/// Slice a materialized result set into one offset page.
+/// Mint the cursor bytes for a watermark.
+#[must_use]
+pub fn encode_watermark_cursor(watermark: &str) -> Vec<u8> {
+    watermark.as_bytes().to_vec()
+}
+
+/// One page taken out of a key-sorted sequence, plus the watermark that
+/// continues it. `next_watermark` is absent when the page exhausted the
+/// sequence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageSlice<T> {
+    pub items: Vec<T>,
+    pub next_watermark: Option<String>,
+}
+
+/// Take the page that follows `watermark` out of a key-sorted sequence.
 ///
-/// `items` must already be in a STABLE order: the offset is local and each
-/// continuation re-runs the remote request, and DAV guarantees no ordering on a
-/// multistatus, so slicing raw response order would let an unchanged result set
-/// come back permuted between page one and page two - items the permutation
-/// moved behind the offset are SKIPPED and items it moved past the offset are
-/// served TWICE, with nothing to tell the consumer either happened.
+/// `items` must already be sorted ASCENDING by `key`, and `key` must be stable
+/// across polls: each continuation re-runs the remote request, and DAV
+/// guarantees no ordering on a multistatus, so slicing raw response order would
+/// let an unchanged result set come back permuted between page one and page two
+/// and serve some members twice while never serving others at all. Both DAV
+/// crates key on the resource href (CalDAV through the recurrence-qualified
+/// event id, CardDAV through the native id), which is the only key the depth-1
+/// listing carries and the only one a member update cannot move.
+///
+/// A member inserted BEFORE the watermark between two pages is therefore not
+/// re-served, and one inserted after it is served on a later page - the
+/// exactly-once property an integer offset could not hold.
+///
+/// A zero page size is an exhausted page, not a page of nothing that still
+/// points at itself: re-emitting the current watermark whenever results exist
+/// gives a consumer that follows `next_cursor` an infinite loop that never
+/// advances and never delivers an item.
+#[must_use]
+pub fn slice_after_watermark<T>(
+    items: Vec<T>,
+    watermark: Option<&str>,
+    page_size: usize,
+    key: impl Fn(&T) -> &str,
+) -> PageSlice<T> {
+    if page_size == 0 {
+        return PageSlice {
+            items: Vec::new(),
+            next_watermark: None,
+        };
+    }
+    let mut remaining = match watermark {
+        Some(watermark) => items
+            .into_iter()
+            .filter(|item| key(item) > watermark)
+            .collect(),
+        None => items,
+    };
+    let more = remaining.len() > page_size;
+    remaining.truncate(page_size);
+    let next_watermark = if more {
+        remaining.last().map(|item| key(item).to_string())
+    } else {
+        None
+    };
+    PageSlice {
+        items: remaining,
+        next_watermark,
+    }
+}
+
+/// Slice one watermark page out of a materialized result set.
+///
+/// For the lanes whose remote leg answers with the object bodies already - a
+/// CalDAV `calendar-query`, a CardDAV text `addressbook-query` - where there is
+/// no listing to page before hydrating. The lanes that DO list first
+/// ([`slice_after_watermark`] over the listing, then a multiget of just that
+/// page) build their `Page` themselves, because the count they can report and
+/// the failures they carry come from two different legs.
 ///
 /// `failed_ids` and `skipped_scopes` describe the fetch that produced `items`,
 /// not the slice, and every page reruns that fetch. Both lanes are therefore
@@ -327,32 +414,19 @@ pub fn decode_offset_cursor(
 /// page, so a consumer accumulating across pages must treat the lane as a set,
 /// not a tally.
 #[must_use]
-pub fn page_from_offset<T>(
+pub fn page_after_watermark<T>(
     items: Vec<T>,
-    offset: usize,
+    watermark: Option<&str>,
     page_size: usize,
+    key: impl Fn(&T) -> &str,
     failed_ids: Vec<String>,
     skipped_scopes: Vec<SkippedScope>,
 ) -> Page<T> {
-    let total = items.len();
-    let estimated_total = Some(u64::try_from(total).unwrap_or(u64::MAX));
-    // A zero page size is an exhausted page, not a page of nothing that still
-    // points at itself: emitting the current offset again whenever results
-    // exist gives a consumer that follows `next_cursor` an infinite loop that
-    // never advances and never delivers an item.
-    if page_size == 0 {
-        return Page {
-            items: Vec::new(),
-            next_cursor: None,
-            estimated_total,
-            failed_ids,
-            skipped_scopes,
-        };
-    }
-    let end = offset.saturating_add(page_size).min(total);
+    let estimated_total = Some(u64::try_from(items.len()).unwrap_or(u64::MAX));
+    let slice = slice_after_watermark(items, watermark, page_size, key);
     Page {
-        items: items.into_iter().skip(offset).take(page_size).collect(),
-        next_cursor: (end < total).then(|| end.to_string().into_bytes()),
+        items: slice.items,
+        next_cursor: slice.next_watermark.as_deref().map(encode_watermark_cursor),
         estimated_total,
         failed_ids,
         skipped_scopes,
@@ -418,9 +492,119 @@ mod tests {
 
     #[test]
     fn a_zero_page_size_is_exhausted_rather_than_self_pointing() {
-        let page = page_from_offset(vec![1, 2, 3], 0, 0, Vec::new(), Vec::new());
+        let page = page_after_watermark(
+            vec!["a".to_string(), "b".to_string(), "c".to_string()],
+            None,
+            0,
+            String::as_str,
+            Vec::new(),
+            Vec::new(),
+        );
         assert!(page.items.is_empty());
         assert!(page.next_cursor.is_none());
         assert_eq!(page.estimated_total, Some(3));
+    }
+
+    fn keys(items: &[String]) -> Vec<&str> {
+        items.iter().map(String::as_str).collect()
+    }
+
+    fn hrefs(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| (*name).to_string()).collect()
+    }
+
+    #[test]
+    fn a_watermark_cursor_round_trips_through_its_codec() {
+        let bytes = encode_watermark_cursor("/c/two.ics");
+        assert_eq!(
+            decode_watermark_cursor(
+                Some(bytes),
+                AccountOperation::EventsInRange,
+                DavProtocol::CalDav
+            )
+            .expect("valid cursor"),
+            Some("/c/two.ics".to_string())
+        );
+        assert_eq!(
+            decode_watermark_cursor(None, AccountOperation::EventsInRange, DavProtocol::CalDav)
+                .expect("absent cursor"),
+            None
+        );
+        // An empty payload is a corrupt cursor, not a silent restart from the
+        // first member of the collection.
+        assert!(
+            decode_watermark_cursor(
+                Some(Vec::new()),
+                AccountOperation::EventsInRange,
+                DavProtocol::CalDav
+            )
+            .is_err()
+        );
+        assert!(
+            decode_watermark_cursor(
+                Some(vec![0xff, 0xfe]),
+                AccountOperation::ContactsList,
+                DavProtocol::CardDav
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn a_watermark_page_continues_from_the_last_key_served() {
+        let first = slice_after_watermark(hrefs(&["a", "b", "c"]), None, 2, String::as_str);
+        assert_eq!(keys(&first.items), vec!["a", "b"]);
+        assert_eq!(first.next_watermark.as_deref(), Some("b"));
+
+        let second = slice_after_watermark(
+            hrefs(&["a", "b", "c"]),
+            first.next_watermark.as_deref(),
+            2,
+            String::as_str,
+        );
+        assert_eq!(keys(&second.items), vec!["c"]);
+        assert_eq!(second.next_watermark, None);
+    }
+
+    /// The property the watermark exists for. Against an integer offset, `aa`
+    /// arriving between the two pages pushes `b` behind the offset and it is
+    /// never served; the watermark cannot be crossed by an insertion.
+    #[test]
+    fn an_insert_before_the_watermark_does_not_displace_a_later_page() {
+        let first = slice_after_watermark(hrefs(&["a", "b", "c"]), None, 2, String::as_str);
+        assert_eq!(keys(&first.items), vec!["a", "b"]);
+
+        let second = slice_after_watermark(
+            hrefs(&["a", "aa", "b", "c"]),
+            first.next_watermark.as_deref(),
+            2,
+            String::as_str,
+        );
+        assert_eq!(keys(&second.items), vec!["c"]);
+        // And one inserted AFTER the watermark is served on the later page
+        // rather than lost.
+        let with_insert = slice_after_watermark(
+            hrefs(&["a", "b", "bb", "c"]),
+            first.next_watermark.as_deref(),
+            2,
+            String::as_str,
+        );
+        assert_eq!(keys(&with_insert.items), vec!["bb", "c"]);
+    }
+
+    /// A watermark past every key is the end of the walk, not a page that
+    /// points at itself.
+    #[test]
+    fn a_watermark_past_every_key_is_an_empty_final_page() {
+        let page = page_after_watermark(
+            hrefs(&["a", "b", "c"]),
+            Some("z"),
+            2,
+            String::as_str,
+            Vec::new(),
+            Vec::new(),
+        );
+        assert!(page.items.is_empty());
+        assert!(page.next_cursor.is_none());
     }
 }

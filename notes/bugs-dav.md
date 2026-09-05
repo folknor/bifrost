@@ -165,11 +165,31 @@ below was subsequently taken, as ruling 6.
   a failed code only for an all-failed response; pinned by
   `a_failed_property_propstat_beside_a_successful_one_is_not_a_member_failure`,
   revert-confirmed.)
-- `event_page` (CalDAV) materializes and sorts the *entire* result set on
-  every page fetch, and empty-query `contact_search` re-hydrates the whole
-  address book per page. Documented and honest, but for a large collection
-  every pagination step is O(collection) in wire traffic. Since the listing is
-  already etag-bearing, a page cursor carrying the sorted href watermark
-  (`last_href`) instead of an integer offset would keep the stability property
-  while allowing the multiget hydration to fetch only the page - no protocol
-  obstacle prevents it.
+- (**The offset page cursor makes every page O(collection)** - DONE 2026-09-06
+  under the owner's ruling. `event_page` (CalDAV) materialized and sorted the
+  entire result set per page, and empty-query `contact_search` re-hydrated the
+  whole address book per page. The integer offset is replaced outright - there
+  were no consumers, so no compatibility lane - by a sorted-href WATERMARK
+  cursor carrying the last key served. `bifrost_dav_core::snapshot` now owns
+  `decode_watermark_cursor` / `encode_watermark_cursor` /
+  `slice_after_watermark`, plus `page_after_watermark` for the lanes whose
+  REPORT already answers with the object bodies (`events_in_range`, text
+  `event_search`, text `contact_search`). The two list-then-hydrate lanes -
+  CalDAV's match-all `event_search`, through the new `listed_event_page`, and
+  CardDAV's `hydrated_contacts_page`, which both `contacts_list` and
+  empty-query `contact_search` now share - page the depth-1 LISTING and
+  multiget only that page's hrefs, which is the traffic this was about. Three
+  paged lanes shared the slicer, not two: `contacts_list` already sliced the
+  listing, by offset, so it moved as well. An empty cursor payload is refused
+  rather than read as a restart from item zero, and a watermark past every
+  href is an empty final page that spends no multiget.
+  Pinned by `a_match_all_event_page_multigets_only_the_page_hrefs` and
+  `a_continued_event_page_multigets_only_what_follows_the_watermark` (CalDAV
+  transcripts), `an_empty_query_contact_page_multigets_only_the_page_hrefs`,
+  `a_contact_inserted_before_the_watermark_does_not_displace_the_next_page`
+  and `a_watermark_past_every_href_is_an_empty_final_page` (CardDAV
+  transcripts), plus the codec round-trips and the insert property at each
+  level; all revert-and-confirmed, the offset tests moved rather than dropped
+  (test count +11, none lost). Both reference docs updated. One incidental
+  removal: `CardDavAccount::hydrated_contacts`, a private helper whose only
+  caller was the empty-query search lane it no longer has.)

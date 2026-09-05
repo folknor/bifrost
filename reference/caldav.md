@@ -254,16 +254,22 @@ Supported calendar primitives:
   before a REPORT is sent, and the encoder preserves legal one-sided ranges.
   Query REPORTs use `Depth: 1`; `calendar-multiget` REPORTs enumerate their
   hrefs in the body and use `Depth: 0`.
-  Range and search results use local offset cursors: when `limit` truncates
-  the materialized set, `next_cursor` names the next offset. The offset is
-  local and every continuation re-runs the remote REPORT, so `event_page`
+  Range and search results use a local WATERMARK cursor: when `limit`
+  truncates the page, `next_cursor` carries the sort key of the LAST item
+  served, and an absent cursor is the start of the collection. The cursor is
+  local and every continuation re-runs the remote request, so `event_page`
   SORTS by the recurrence-qualified `EventId` before slicing. DAV guarantees
   no ordering on a multistatus; slicing raw response order let an unchanged
   result set come back permuted between pages, skipping the events the
-  permutation moved behind the offset and serving twice the ones it moved
-  past. A `limit` of zero is an exhausted page - no items and no
-  continuation - rather than an empty page that names its own offset again
-  and loops a cursor-following consumer forever.
+  permutation moved behind the cursor and serving twice the ones it moved
+  past. The watermark also holds exactly-once under a concurrent insert,
+  which an integer offset did not: an event filed BEFORE the watermark
+  between two pages cannot displace the unserved remainder, and one filed
+  after it is served on a later page. An empty payload is a corrupt cursor,
+  refused rather than read as a silent restart from the first member. A
+  `limit` of zero is an exhausted page - no items and no continuation -
+  rather than an empty page that names its own watermark again and loops a
+  cursor-following consumer forever.
   The local guard uses half-open overlap, matching CalDAV time-range and the
   exclusive all-day end contract. It is recurrence-aware: a recurring master
   whose own interval sits outside the
@@ -436,7 +442,15 @@ Supported calendar primitives:
   CalDAV text-match `calendar-query` `REPORT`s over VEVENT summary,
   description, location, and attendee, then keep local filtering as a
   defensive guard. Empty search lists the collection to preserve
-  match-all behavior.
+  match-all behavior, and that lane pages the LISTING rather than the
+  hydrated result: `listed_event_page` sorts the depth-1 entries by href,
+  slices the page that follows the watermark, and multigets ONLY that page's
+  hrefs, so paging a large calendar no longer costs a full hydration per
+  page. `Page::estimated_total` is the listing size, and `failed_ids` carries
+  both legs - the listing's refused hrefs (collection-wide, and re-observed
+  on every page per the `Page::failed_ids` contract) and the ones this page's
+  own multiget lost. A watermark past every href is an empty final page that
+  spends no multiget at all.
 
 Cursor support is calendar-event only. `discover_cursor_scopes` returns one
 `CursorScope::Folder(FolderId(collection_href))` per discovered calendar, and
@@ -656,12 +670,15 @@ dropping the collection's own response from a sync report and reading its RFC
 `decode_snapshot` (the length-bounded byte codec, with the entry-count guard and
 the trailing-bytes refusal), `diff_snapshots` (including the transient-empty-207
 suppression and the failed-href preservation), `preserve_unobserved_entries`,
-`inventory_entry`, `object_change`, `decode_offset_cursor` and
-`page_from_offset`. What stays local is what genuinely differs: the magic bytes
-(`CALDAVET1` / `CDAVCTAG1`), the envelope-version and scope validation, the name
-of the token, and the crate's own `cursor_error`. `event_page` still sorts by
-the recurrence-qualified `EventId` before slicing - the sort is the load-bearing
-half of the offset contract and stays where the key type is known.
+`inventory_entry`, `object_change`, and the page-cursor trio
+`decode_watermark_cursor` / `encode_watermark_cursor` /
+`slice_after_watermark` (with `page_after_watermark` for the lanes whose
+REPORT already answered with the object bodies). What stays local is what
+genuinely differs: the magic bytes (`CALDAVET1` / `CDAVCTAG1`), the
+envelope-version and scope validation, the name of the token, and the crate's
+own `cursor_error`. `event_page` still sorts by the recurrence-qualified
+`EventId` before slicing - the sort is the load-bearing half of the cursor
+contract and stays where the key type is known.
 
 So the drift rule from the next section still applies, but to a much smaller
 remainder: the query bodies, the property constants, the iCalendar projection,
