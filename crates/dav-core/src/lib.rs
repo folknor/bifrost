@@ -22,6 +22,7 @@ mod dispatch;
 mod error;
 mod etag;
 mod multistatus;
+mod query;
 mod snapshot;
 #[cfg(feature = "test-support")]
 pub mod test_support;
@@ -31,14 +32,15 @@ mod xml;
 pub use dispatch::{DavCredentials, DavDispatch};
 
 pub use error::{
-    DavProtocol, local_error, not_found_error, parse_error, recovery_rank, response_read_error,
-    status_error, transport_error, unsupported_error, worse_recovery,
+    DavProtocol, filter_unsupported, local_error, not_found_error, parse_error, recovery_rank,
+    response_read_error, status_error, transport_error, unsupported_error, worse_recovery,
 };
 pub use etag::{PutCondition, normalize_http_etag, prepare_if_match, response_etag};
 pub use multistatus::{
     MultiStatusSink, PropSet, ResponseParts, commit_if_present, extract_href_properties,
     extract_href_property, parse_collection_property, parse_multistatus,
 };
+pub use query::{FilteredHrefs, HrefQuery, sorted_candidate_hrefs};
 pub use snapshot::{
     DecodedSnapshot, PageSlice, SnapshotEntry, decode_snapshot, decode_watermark_cursor,
     diff_snapshots, encode_snapshot, encode_watermark_cursor, inventory_entry, object_change,

@@ -1,8 +1,8 @@
 use bifrost_dav_core::{
     DavProtocol, SnapshotEntry, append_path, decode_snapshot, decode_watermark_cursor,
     diff_snapshots, encode_snapshot, encode_watermark_cursor,
-    inventory_entry as inventory_entry_from_snapshot, object_change, page_after_watermark,
-    preserve_unobserved_entries, same_dav_url, slice_after_watermark,
+    inventory_entry as inventory_entry_from_snapshot, object_change, preserve_unobserved_entries,
+    same_dav_url, slice_after_watermark, sorted_candidate_hrefs, worse_recovery,
 };
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -17,7 +17,8 @@ use reqwest::Url;
 
 use crate::capabilities::{caldav_capabilities, scheduling_available};
 use crate::client::{
-    CalDavClient, PutCondition, event_scope, local_error, missing_event_error, unsupported_error,
+    CalDavClient, FilteredHrefs, HrefQuery, PutCondition, event_scope, extend_candidates,
+    local_error, missing_event_error, unsupported_error,
 };
 use crate::ical::{
     EventProjectionError, create_to_ical, event_from_ical, events_from_ical, new_uid,
@@ -921,45 +922,40 @@ impl Account for CalDavAccount {
             )?;
             let calendar_url = client.resolve_url(&range.calendar_id.0);
             let (range_start, range_end) = caldav_query_range(&range.start, &range.end)?;
-            let fetched = client
-                .query_events_in_range(&calendar_url, Some(&range_start), Some(&range_end))
-                .await?;
-            let mut events = Vec::new();
-            // Per-resource failures are surfaced (not swallowed) so a
-            // consumer can tell a transient failure apart from a real remote
-            // deletion. Two kinds land here and they are the same thing to
-            // the consumer: a resource the server refused inside the 207
-            // (non-2xx propstat), and one that came back 200 but would not
-            // tokenize. Neither aborts the rest of the pull.
-            let mut failed = fetched.failed_hrefs();
-            let mut materialized = HashSet::new();
-            for event in fetched.events {
-                let uri = event.uri;
-                match events_from_ical(
-                    uri.clone(),
-                    CalendarId(calendar_url.clone()),
-                    event.etag,
-                    &event.data,
-                ) {
-                    Ok(projected) => {
-                        materialized.insert(uri);
-                        events.extend(
-                            projected
-                                .into_iter()
-                                .filter(|event| event_in_range(event, &range.start, &range.end)),
-                        );
-                    }
-                    Err(_) => failed.push(uri),
+            let page_size = range.limit.map_or(usize::MAX, |value| {
+                usize::try_from(value).unwrap_or(usize::MAX)
+            });
+            // The time-range filter runs on the SERVER and answers with hrefs
+            // only, so the page is sliced before anything is hydrated. The
+            // local overlap check below is still the authority over the page:
+            // it is recurrence-aware in ways a bare `time-range` element is
+            // not, and RFC 4791 s9.9 leaves a server free to be generous.
+            let candidates = match client
+                .query_event_hrefs_in_range(&calendar_url, Some(&range_start), Some(&range_end))
+                .await?
+            {
+                FilteredHrefs::Matched(query) => query,
+                // A server that will not run the filter must not fail the
+                // call. Listing the collection is the degrade: it costs one
+                // depth-1 PROPFIND, still hydrates only the page, and returns
+                // the same events for the same cursor.
+                FilteredHrefs::FilterUnsupported => {
+                    listing_candidates(&client, &calendar_url, AccountOperation::EventsInRange)
+                        .await?
                 }
-            }
-            one_outcome_per_id(&mut failed, &materialized);
-            Ok(event_page(
-                events,
+            };
+            let start = range.start;
+            let end = range.end;
+            hydrated_event_page(
+                &client,
+                &calendar_url,
+                candidates,
                 watermark.as_deref(),
-                range.limit,
-                failed,
-                Vec::new(),
-            ))
+                page_size,
+                AccountOperation::EventsInRange,
+                |event| event_in_range(event, &start, &end),
+            )
+            .await
         })
     }
 
@@ -1147,70 +1143,43 @@ impl Account for CalDavAccount {
                 AccountOperation::EventSearch,
             )?;
             let needle = request.query.to_lowercase();
-            if needle.is_empty() {
-                // The match-all path lists first, then multigets - and the
-                // listing is what gets paged, so the multiget carries only the
-                // hrefs this page will serve. Both legs can lose individual
-                // resources inside their 207, so both feed `failed_ids` -
-                // dropping the listing's casualties would report a match-all
-                // search as complete when it was not.
-                let page_size = request.limit.map_or(usize::MAX, |value| {
-                    usize::try_from(value).unwrap_or(usize::MAX)
-                });
-                return listed_event_page(
-                    &client,
-                    &calendar_url,
-                    watermark.as_deref(),
-                    page_size,
-                    AccountOperation::EventSearch,
-                )
-                .await;
-            }
-            let fetched = client
-                .query_events_text(&calendar_url, &request.query)
-                .await?;
-            let skipped_scopes = skipped_calendar_scope(&calendar_url, fetched.degraded);
-            let fetched = fetched.report;
-            let mut seen = HashSet::new();
-            // Search dedups across the four per-property REPORTs, so the
-            // failed hrefs need the same treatment before they become
-            // `failed_ids`.
-            let mut failed = fetched.failed_hrefs();
-            failed.sort_unstable();
-            failed.dedup();
-            let mut events = Vec::new();
-            let mut materialized = HashSet::new();
-            for event in fetched
-                .events
-                .into_iter()
-                .filter(|event| seen.insert(event.uri.clone()))
-            {
-                let uri = event.uri;
-                match events_from_ical(
-                    uri.clone(),
-                    CalendarId(calendar_url.clone()),
-                    event.etag,
-                    &event.data,
-                ) {
-                    Ok(projected) => {
-                        materialized.insert(uri);
-                        events.extend(
-                            projected
-                                .into_iter()
-                                .filter(|event| event_matches(event, &needle)),
-                        );
+            let page_size = request.limit.map_or(usize::MAX, |value| {
+                usize::try_from(value).unwrap_or(usize::MAX)
+            });
+            // Both lanes below page the same way: get candidate hrefs, slice at
+            // the watermark, multiget only the page. They differ only in where
+            // the candidates come from - a server-side text-match for a real
+            // query, the depth-1 listing for a match-all or a server that will
+            // not run the filter - which is what keeps one cursor valid across
+            // a mid-walk degrade. Both legs can lose individual resources
+            // inside their 207, so both feed `failed_ids`.
+            let candidates = if needle.is_empty() {
+                listing_candidates(&client, &calendar_url, AccountOperation::EventSearch).await?
+            } else {
+                match client
+                    .query_event_hrefs_text(&calendar_url, &request.query)
+                    .await?
+                {
+                    FilteredHrefs::Matched(query) => query,
+                    FilteredHrefs::FilterUnsupported => {
+                        listing_candidates(&client, &calendar_url, AccountOperation::EventSearch)
+                            .await?
                     }
-                    Err(_) => failed.push(uri),
                 }
-            }
-            one_outcome_per_id(&mut failed, &materialized);
-            Ok(event_page(
-                events,
+            };
+            hydrated_event_page(
+                &client,
+                &calendar_url,
+                candidates,
                 watermark.as_deref(),
-                request.limit,
-                failed,
-                skipped_scopes,
-            ))
+                page_size,
+                AccountOperation::EventSearch,
+                // The server-side text-match is a PREFILTER; the local match
+                // stays the authority over the page. An empty needle matches
+                // everything, which is the match-all lane.
+                |event| needle.is_empty() || event_matches(event, &needle),
+            )
+            .await
         })
     }
 
@@ -1250,79 +1219,75 @@ fn decode_event_page_cursor(
     decode_watermark_cursor(cursor, operation, DavProtocol::CalDav)
 }
 
-/// Sort a materialized result set into its stable order, then slice the page
-/// that follows `watermark` out of it through the shared slicer.
+/// The whole collection as candidate hrefs, from the depth-1 PROPFIND.
 ///
-/// For the lanes whose REPORT already answered with the event bodies - the
-/// time-range query and the text search. The match-all lane lists first and
-/// pages the LISTING (see `listed_event_page`), so it never materializes the
-/// events it is not about to serve.
-///
-/// Takes `Vec<CalendarEvent>` rather than being generic on purpose: the sort
-/// below is the load-bearing half of the cursor contract, and a generic
-/// signature would let a caller page something with no stable key at all. The
-/// key is the recurrence-qualified `EventId` (resource href, plus
-/// `#RECURRENCE-ID` for an override instance), which is unique per emitted item
-/// and stable across polls because it is derived from the resource URL rather
-/// than from anything the server chose to order by. `bifrost-carddav` keys on
-/// `native_id` for the same reason, and both slice through
-/// `bifrost_dav_core::slice_after_watermark`, which is where the cursor
-/// contract - including the zero-limit exhaustion rule - is written down.
-fn event_page(
-    mut items: Vec<CalendarEvent>,
-    watermark: Option<&str>,
-    limit: Option<u32>,
-    failed_ids: Vec<String>,
-    skipped_scopes: Vec<SkippedScope>,
-) -> Page<CalendarEvent> {
-    items.sort_by(|left, right| left.id.0.cmp(&right.id.0));
-    let page_size = limit.map_or(items.len(), |value| {
-        usize::try_from(value).unwrap_or(usize::MAX)
-    });
-    page_after_watermark(
-        items,
-        watermark,
-        page_size,
-        |event| event.id.0.as_str(),
-        failed_ids,
-        skipped_scopes,
-    )
-}
-
-/// The match-all search lane: page the depth-1 listing, then multiget ONLY the
-/// hrefs on that page.
-///
-/// The listing is the etag-bearing PROPFIND the poll path already runs, and its
-/// href is exactly the key the page cursor carries, so the whole collection
-/// never has to be hydrated in order to serve a page out of the middle of it.
-/// The previous shape multiget the entire calendar on every page and threw away
-/// all but `limit` of it.
-///
-/// `failed_ids` still carries BOTH legs' casualties: the listing's failed hrefs
-/// (collection-wide, and re-observed on every page, per the `Page::failed_ids`
-/// contract) and the ones the page's own multiget lost.
-async fn listed_event_page(
+/// The match-all lane's source, and the degrade every filtered lane falls back
+/// to when the server refuses to run its filter. The listing is the etag-bearing
+/// PROPFIND the poll path already runs, and its href is exactly the key the page
+/// cursor carries.
+async fn listing_candidates(
     client: &CalDavClient,
     calendar_url: &str,
+    operation: AccountOperation,
+) -> Result<HrefQuery, AccountError> {
+    let listing = client.list_events_listing(calendar_url, operation).await?;
+    let mut candidates = HrefQuery::default();
+    extend_candidates(&mut candidates, listing);
+    Ok(candidates)
+}
+
+/// Slice the page that follows `watermark` out of the candidate hrefs, multiget
+/// ONLY that page, and project it.
+///
+/// Every paging lane in this crate funnels through here, which is what keeps one
+/// cursor valid across them: the key is always the resource HREF, never the
+/// event id. That distinction matters because a recurring resource projects to
+/// several events - the recurrence-qualified `EventId` keys (`{uri}#{rid}`)
+/// survive on the items, but they are not what the cursor carries. Keying the
+/// cursor on the event id instead would make the filtered lane and its
+/// whole-collection degrade disagree about what "already served" means, and a
+/// server that starts refusing the filter mid-walk would re-serve or skip the
+/// override instances of the boundary resource.
+///
+/// The page size therefore counts RESOURCES, not emitted events: a page may
+/// carry more items than `limit` when its resources expand into overrides, and
+/// fewer when `keep` rejects some. `estimated_total` is the number of candidate
+/// resources the server named, which is an upper bound on the items.
+///
+/// `keep` is the local match, and it is the AUTHORITY over the page even where
+/// the server already filtered - the server side is a prefilter that may be
+/// generous (or, on the degrade lane, absent entirely).
+///
+/// `failed_ids` carries both legs' casualties: the candidate leg's refused
+/// hrefs (collection-wide, and re-observed on every page, per the
+/// `Page::failed_ids` contract) and the ones this page's own multiget lost.
+async fn hydrated_event_page<K: Fn(&CalendarEvent) -> bool>(
+    client: &CalDavClient,
+    calendar_url: &str,
+    candidates: HrefQuery,
     watermark: Option<&str>,
     page_size: usize,
     operation: AccountOperation,
+    keep: K,
 ) -> Result<Page<CalendarEvent>, AccountError> {
-    let listing = client.list_events_listing(calendar_url, operation).await?;
-    let total = u64::try_from(listing.entries.len()).unwrap_or(u64::MAX);
-    let mut entries = listing.entries;
-    entries.sort_by(|left, right| left.uri.cmp(&right.uri));
-    let slice = slice_after_watermark(entries, watermark, page_size, |entry| entry.uri.as_str());
-    let uris = slice
-        .items
-        .into_iter()
-        .map(|entry| entry.uri)
-        .collect::<Vec<_>>();
-    let fetched = client.fetch_events(calendar_url, &uris, operation).await?;
-    let skipped_scopes = skipped_calendar_scope(calendar_url, fetched.degraded);
+    let HrefQuery {
+        hrefs,
+        failed_hrefs,
+        degraded,
+    } = candidates;
+    let hrefs = sorted_candidate_hrefs(hrefs);
+    let total = u64::try_from(hrefs.len()).unwrap_or(u64::MAX);
+    let slice = slice_after_watermark(hrefs, watermark, page_size, String::as_str);
+    let fetched = client
+        .fetch_events(calendar_url, &slice.items, operation)
+        .await?;
+    let skipped_scopes = skipped_calendar_scope(
+        calendar_url,
+        worse_recovery_option(degraded, fetched.degraded),
+    );
     let fetched = fetched.report;
     let mut failed = fetched.failed_hrefs();
-    failed.extend(listing.failed_hrefs);
+    failed.extend(failed_hrefs);
     let mut events = Vec::new();
     let mut materialized = HashSet::new();
     for event in fetched.events {
@@ -1335,12 +1300,14 @@ async fn listed_event_page(
         ) {
             Ok(projected) => {
                 materialized.insert(uri);
-                events.extend(projected);
+                events.extend(projected.into_iter().filter(|event| keep(event)));
             }
             Err(_) => failed.push(uri),
         }
     }
     one_outcome_per_id(&mut failed, &materialized);
+    // Served in the same key order the page was sliced in; a multiget answers
+    // in whatever order it likes.
     events.sort_by(|left, right| left.id.0.cmp(&right.id.0));
     Ok(Page {
         items: events,
@@ -1349,6 +1316,18 @@ async fn listed_event_page(
         failed_ids: failed,
         skipped_scopes,
     })
+}
+
+/// Keep the worse of two optional failures, so a refused query leg is not
+/// buried under a milder multiget failure or dropped entirely.
+fn worse_recovery_option(
+    current: Option<AccountError>,
+    candidate: Option<AccountError>,
+) -> Option<AccountError> {
+    match candidate {
+        Some(candidate) => worse_recovery(current, candidate),
+        None => current,
+    }
 }
 
 /// The scheduling POST completed before the local PUT began. Preserve that
@@ -2198,6 +2177,290 @@ mod tests {
         assert!(requests[1].body.contains("/cal/c.ics"));
     }
 
+    fn cal_multistatus(body: String) -> DavResponse {
+        DavResponse {
+            status: StatusCode::MULTI_STATUS,
+            headers: HeaderMap::new(),
+            body,
+            url: "https://dav.example.test/cal/".to_string(),
+        }
+    }
+
+    /// A member of a filtered query's answer: href plus etag, no body.
+    fn queried(name: &str) -> String {
+        format!(
+            "<D:response><D:href>/cal/{name}.ics</D:href><D:propstat><D:prop>\
+<D:getetag>\"{name}\"</D:getetag></D:prop><D:status>HTTP/1.1 200 OK</D:status>\
+</D:propstat></D:response>"
+        )
+    }
+
+    /// A member the server refused inside the 207.
+    fn refused(name: &str) -> String {
+        format!(
+            "<D:response><D:href>/cal/{name}.ics</D:href><D:propstat><D:prop>\
+<D:getetag/></D:prop><D:status>HTTP/1.1 403 Forbidden</D:status>\
+</D:propstat></D:response>"
+        )
+    }
+
+    fn hydrated(name: &str) -> String {
+        format!(
+            "<D:response><D:href>/cal/{name}.ics</D:href><D:propstat><D:prop>\
+<D:getetag>\"{name}\"</D:getetag>\
+<C:calendar-data>BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:{name}\nSUMMARY:plan\nDTSTART:20260101T090000Z\nDTEND:20260101T100000Z\nEND:VEVENT\nEND:VCALENDAR</C:calendar-data>\
+</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>"
+        )
+    }
+
+    fn wrap(responses: &[String]) -> String {
+        format!(
+            "<D:multistatus xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\">{}</D:multistatus>",
+            responses.concat()
+        )
+    }
+
+    fn event_ids(page: &Page<CalendarEvent>) -> Vec<String> {
+        page.items.iter().map(|event| event.id.0.clone()).collect()
+    }
+
+    fn range_over_2026() -> EventRange {
+        EventRange {
+            calendar_id: CalendarId("https://dav.example.test/cal/".to_string()),
+            start: time("2026-01-01T00:00:00Z"),
+            end: time("2027-01-01T00:00:00Z"),
+            limit: Some(2),
+            page_cursor: None,
+        }
+    }
+
+    /// The dav-B8 residual, closed: `events_in_range` pushes the time-range
+    /// filter to the server and hydrates only the page it is about to serve.
+    ///
+    /// Before this the REPORT asked for `calendar-data` and the whole matching
+    /// result set arrived on every page. The assertions are written against the
+    /// request bodies because that is where the regression shows: a query that
+    /// goes back to hydrating names `calendar-data`, and a page that goes back
+    /// to slicing after hydration names `c.ics` in its multiget.
+    #[tokio::test]
+    async fn a_range_page_filters_on_the_server_and_multigets_only_the_page() {
+        let query = wrap(&[queried("a"), queried("b"), queried("c"), refused("d")]);
+        let page = wrap(&[hydrated("a"), hydrated("b")]);
+        // Exactly two responses: a regression that lists, or multigets twice,
+        // starves the script and panics.
+        let script = dav_script([cal_multistatus(query), cal_multistatus(page)]);
+        let client =
+            CalDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
+        let account = CalDavAccount::for_tests(Arc::new(client), "https://dav.example.test/cal/");
+
+        let page = account
+            .events_in_range(range_over_2026())
+            .await
+            .expect("range page");
+
+        assert_eq!(
+            event_ids(&page),
+            vec![
+                "https://dav.example.test/cal/a.ics".to_string(),
+                "https://dav.example.test/cal/b.ics".to_string(),
+            ]
+        );
+        assert_eq!(
+            page.next_cursor,
+            Some(b"https://dav.example.test/cal/b.ics".to_vec()),
+            "the cursor is the last href served"
+        );
+        assert_eq!(page.estimated_total, Some(3));
+        assert_eq!(
+            page.failed_ids,
+            vec!["https://dav.example.test/cal/d.ics".to_string()],
+            "a member the query refused is reported on the page it was observed on"
+        );
+
+        let requests = transcripts(&script);
+        assert_eq!(requests.len(), 2, "one query and one multiget");
+        assert_eq!(requests[0].method.as_str(), "REPORT");
+        assert!(
+            requests[0].body.contains("<C:time-range"),
+            "the filter must reach the server: {}",
+            requests[0].body
+        );
+        assert!(
+            !requests[0].body.contains("<C:calendar-data/>"),
+            "the filtered query must not hydrate: {}",
+            requests[0].body
+        );
+        assert!(requests[1].body.contains("/cal/a.ics"));
+        assert!(requests[1].body.contains("/cal/b.ics"));
+        assert!(
+            !requests[1].body.contains("/cal/c.ics"),
+            "the multiget must not hydrate a member this page does not serve: {}",
+            requests[1].body
+        );
+    }
+
+    /// A server that will not run the filter must not fail the call. The lane
+    /// degrades to the whole-collection listing, still hydrating only the page,
+    /// and answers the same events for the same cursor.
+    #[tokio::test]
+    async fn a_range_page_degrades_to_the_listing_when_the_filter_is_refused() {
+        let refusal = DavResponse {
+            status: StatusCode::FORBIDDEN,
+            headers: HeaderMap::new(),
+            body: "<D:error xmlns:D=\"DAV:\"><C:supported-filter/></D:error>".to_string(),
+            url: "https://dav.example.test/cal/".to_string(),
+        };
+        let listing = wrap(&[queried("a"), queried("b"), queried("c")]);
+        let page = wrap(&[hydrated("a"), hydrated("b")]);
+        let script = dav_script([refusal, cal_multistatus(listing), cal_multistatus(page)]);
+        let client =
+            CalDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
+        let account = CalDavAccount::for_tests(Arc::new(client), "https://dav.example.test/cal/");
+
+        let page = account
+            .events_in_range(range_over_2026())
+            .await
+            .expect("a refused filter degrades rather than failing");
+
+        assert_eq!(
+            event_ids(&page),
+            vec![
+                "https://dav.example.test/cal/a.ics".to_string(),
+                "https://dav.example.test/cal/b.ics".to_string(),
+            ]
+        );
+        assert_eq!(
+            page.next_cursor,
+            Some(b"https://dav.example.test/cal/b.ics".to_vec()),
+            "the degrade lane keys the cursor on the href too, so a mid-walk \
+             degrade neither re-serves nor skips"
+        );
+
+        let requests = transcripts(&script);
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[0].method.as_str(), "REPORT");
+        assert_eq!(requests[1].method.as_str(), "PROPFIND");
+        assert!(
+            !requests[2].body.contains("/cal/c.ics"),
+            "the degrade lane still hydrates only the page: {}",
+            requests[2].body
+        );
+    }
+
+    /// The text lane's four per-property REPORTs name hrefs, the union is
+    /// deduped, and only the page is hydrated. The local match stays the
+    /// authority over what the page finally carries.
+    #[tokio::test]
+    async fn a_text_search_page_filters_on_the_server_and_multigets_only_the_page() {
+        let query = wrap(&[queried("a"), queried("b"), queried("c")]);
+        // Every leg answers the same three resources, so the union is only
+        // right if the candidates are deduped.
+        let script = dav_script([
+            cal_multistatus(query.clone()),
+            cal_multistatus(query.clone()),
+            cal_multistatus(query.clone()),
+            cal_multistatus(query),
+            cal_multistatus(wrap(&[hydrated("a"), hydrated("b")])),
+        ]);
+        let client =
+            CalDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
+        let account = CalDavAccount::for_tests(Arc::new(client), "https://dav.example.test/cal/");
+
+        let page = account
+            .event_search(EventSearchRequest {
+                query: "plan".to_string(),
+                calendar_id: None,
+                limit: Some(2),
+                page_cursor: None,
+            })
+            .await
+            .expect("text search page");
+
+        assert_eq!(
+            event_ids(&page),
+            vec![
+                "https://dav.example.test/cal/a.ics".to_string(),
+                "https://dav.example.test/cal/b.ics".to_string(),
+            ]
+        );
+        assert_eq!(
+            page.estimated_total,
+            Some(3),
+            "three candidates, not twelve"
+        );
+
+        let requests = transcripts(&script);
+        assert_eq!(requests.len(), 5, "four query legs and one multiget");
+        for request in &requests[..4] {
+            assert!(
+                request.body.contains("<C:text-match"),
+                "the filter must reach the server: {}",
+                request.body
+            );
+            assert!(
+                !request.body.contains("<C:calendar-data/>"),
+                "the filtered query must not hydrate: {}",
+                request.body
+            );
+        }
+        assert!(
+            !requests[4].body.contains("/cal/c.ics"),
+            "the multiget must not hydrate a member this page does not serve: {}",
+            requests[4].body
+        );
+    }
+
+    /// One leg reporting an unsupported filter degrades the WHOLE lane. Serving
+    /// out of the properties a server happened to accept would narrow the
+    /// search silently.
+    #[tokio::test]
+    async fn a_text_search_degrades_when_one_query_leg_refuses_the_filter() {
+        let query = wrap(&[queried("a"), queried("b")]);
+        let refusal = DavResponse {
+            status: StatusCode::BAD_REQUEST,
+            headers: HeaderMap::new(),
+            body: String::new(),
+            url: "https://dav.example.test/cal/".to_string(),
+        };
+        let script = dav_script([
+            refusal,
+            cal_multistatus(query.clone()),
+            cal_multistatus(query.clone()),
+            cal_multistatus(query),
+            cal_multistatus(wrap(&[queried("a"), queried("b"), queried("c")])),
+            cal_multistatus(wrap(&[hydrated("a"), hydrated("b")])),
+        ]);
+        let client =
+            CalDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
+        let account = CalDavAccount::for_tests(Arc::new(client), "https://dav.example.test/cal/");
+
+        let page = account
+            .event_search(EventSearchRequest {
+                query: "plan".to_string(),
+                calendar_id: None,
+                limit: Some(2),
+                page_cursor: None,
+            })
+            .await
+            .expect("a refused filter degrades rather than failing");
+
+        assert_eq!(
+            event_ids(&page),
+            vec![
+                "https://dav.example.test/cal/a.ics".to_string(),
+                "https://dav.example.test/cal/b.ics".to_string(),
+            ]
+        );
+
+        let requests = transcripts(&script);
+        assert_eq!(
+            requests.len(),
+            6,
+            "four legs, then the listing and the page"
+        );
+        assert_eq!(requests[4].method.as_str(), "PROPFIND");
+    }
+
     fn collection(href: &str) -> crate::parse::CalendarCollection {
         crate::parse::CalendarCollection {
             href: href.to_string(),
@@ -2755,41 +3018,26 @@ mod tests {
         assert!(diff_event_snapshots(&empty, &recovered).is_empty());
     }
 
+    /// Moved down one level with the lane itself: every paging lane now slices
+    /// candidate HREFS before hydrating anything, so these pin the key the
+    /// cursor actually carries.
     #[test]
     fn event_page_emits_a_cursor_for_truncated_results() {
-        let first = event_page(
-            identified_events(&["a", "b", "c"]),
-            None,
-            Some(2),
-            Vec::new(),
-            Vec::new(),
-        );
-        assert_eq!(event_ids(&first), vec!["a", "b"]);
-        assert_eq!(first.next_cursor, Some(b"b".to_vec()));
+        let first = href_page(&["a", "b", "c"], None, 2);
+        assert_eq!(first.items, vec!["a", "b"]);
+        assert_eq!(first.next_watermark.as_deref(), Some("b"));
 
-        let second = event_page(
-            identified_events(&["a", "b", "c"]),
-            Some("b"),
-            Some(2),
-            Vec::new(),
-            Vec::new(),
-        );
-        assert_eq!(event_ids(&second), vec!["c"]);
-        assert_eq!(second.next_cursor, None);
+        let second = href_page(&["a", "b", "c"], Some("b"), 2);
+        assert_eq!(second.items, vec!["c"]);
+        assert_eq!(second.next_watermark, None);
     }
 
-    /// The page cursor is the last event id served, so a decoded cursor and the
-    /// id it names are the same bytes in both directions.
+    /// The page cursor is the last href served, so a decoded cursor and the
+    /// resource it names are the same bytes in both directions.
     #[test]
     fn the_event_page_cursor_round_trips_as_the_last_id_served() {
-        let page = event_page(
-            identified_events(&["a", "b", "c"]),
-            None,
-            Some(2),
-            Vec::new(),
-            Vec::new(),
-        );
-        let cursor = page.next_cursor.expect("page one truncates");
+        let slice = href_page(&["a", "b", "c"], None, 2);
+        let cursor = encode_watermark_cursor(&slice.next_watermark.expect("page one truncates"));
         assert_eq!(
             decode_event_page_cursor(Some(cursor), AccountOperation::EventsInRange)
                 .expect("valid cursor")
@@ -2809,98 +3057,64 @@ mod tests {
     /// delivered at all.
     #[test]
     fn an_event_inserted_before_the_watermark_is_not_re_served() {
-        let first = event_page(
-            identified_events(&["a", "b", "c"]),
-            None,
-            Some(2),
-            Vec::new(),
-            Vec::new(),
-        );
-        let watermark = String::from_utf8(first.next_cursor.expect("page one truncates"))
-            .expect("utf-8 cursor");
+        let watermark = href_page(&["a", "b", "c"], None, 2)
+            .next_watermark
+            .expect("page one truncates");
 
-        let second = event_page(
-            identified_events(&["a", "aa", "b", "c"]),
-            Some(&watermark),
-            Some(2),
-            Vec::new(),
-            Vec::new(),
-        );
-        assert_eq!(event_ids(&second), vec!["c"]);
+        let second = href_page(&["a", "aa", "b", "c"], Some(&watermark), 2);
+        assert_eq!(second.items, vec!["c"]);
 
         // And one inserted AFTER the watermark is served on the later page.
-        let with_insert = event_page(
-            identified_events(&["a", "b", "bb", "c"]),
-            Some(&watermark),
-            Some(2),
-            Vec::new(),
-            Vec::new(),
-        );
-        assert_eq!(event_ids(&with_insert), vec!["bb", "c"]);
+        let with_insert = href_page(&["a", "b", "bb", "c"], Some(&watermark), 2);
+        assert_eq!(with_insert.items, vec!["bb", "c"]);
     }
 
-    fn identified_events(ids: &[&str]) -> Vec<CalendarEvent> {
-        ids.iter()
-            .map(|id| {
-                let mut event = event("2026-01-01T09:00:00Z", "2026-01-01T10:00:00Z", false);
-                event.id = EventId((*id).to_string());
-                event.native_id = (*id).to_string();
-                event
-            })
-            .collect()
-    }
-
-    fn event_ids(page: &Page<CalendarEvent>) -> Vec<String> {
-        page.items.iter().map(|event| event.id.0.clone()).collect()
+    fn href_page(
+        hrefs: &[&str],
+        watermark: Option<&str>,
+        page_size: usize,
+    ) -> bifrost_dav_core::PageSlice<String> {
+        let hrefs = sorted_candidate_hrefs(hrefs.iter().map(|href| (*href).to_string()).collect());
+        slice_after_watermark(hrefs, watermark, page_size, String::as_str)
     }
 
     /// The cursor is local and every continuation re-runs the REPORT, so an
     /// unchanged result set returned in a DIFFERENT order across the two pages
-    /// must still yield each event exactly once. Against unsorted slicing page
-    /// two returns `a` again and `c` is never delivered at all.
+    /// must still yield each resource exactly once. Against unsorted slicing
+    /// page two returns `a` again and `c` is never delivered at all.
     #[test]
     fn watermark_pages_survive_a_reordered_second_report() {
-        let first = event_page(
-            identified_events(&["a", "b", "c"]),
-            None,
-            Some(2),
-            Vec::new(),
-            Vec::new(),
-        );
-        let first_ids = event_ids(&first);
-        assert_eq!(first_ids, vec!["a", "b"]);
-        let watermark = String::from_utf8(first.next_cursor.expect("page one truncates"))
-            .expect("utf-8 cursor");
+        let first = href_page(&["a", "b", "c"], None, 2);
+        assert_eq!(first.items, vec!["a", "b"]);
+        let watermark = first.next_watermark.expect("page one truncates");
 
-        // Same three events, the order the server happened to answer with.
-        let second = event_page(
-            identified_events(&["c", "a", "b"]),
-            Some(&watermark),
-            Some(2),
-            Vec::new(),
-            Vec::new(),
-        );
-        assert_eq!(event_ids(&second), vec!["c"]);
+        // Same three resources, the order the server happened to answer with.
+        let second = href_page(&["c", "a", "b"], Some(&watermark), 2);
+        assert_eq!(second.items, vec!["c"]);
 
-        let mut delivered = first_ids;
-        delivered.extend(event_ids(&second));
+        let mut delivered = first.items;
+        delivered.extend(second.items);
         delivered.sort();
         assert_eq!(delivered, vec!["a", "b", "c"]);
+    }
+
+    /// A resource named by several text-search legs is one candidate, not one
+    /// per property it matched - otherwise the page size counts duplicates and
+    /// the multiget asks for the same href repeatedly.
+    #[test]
+    fn a_resource_named_by_several_query_legs_is_one_candidate() {
+        let page = href_page(&["b", "a", "b", "a", "c"], None, 2);
+        assert_eq!(page.items, vec!["a", "b"]);
+        assert_eq!(page.next_watermark.as_deref(), Some("b"));
     }
 
     /// A zero limit must terminate. Emitting the current watermark again gives
     /// a consumer that follows `next_cursor` an infinite non-advancing loop.
     #[test]
     fn a_zero_limit_is_an_exhausted_page_with_no_continuation() {
-        let page = event_page(
-            identified_events(&["a", "b", "c"]),
-            None,
-            Some(0),
-            Vec::new(),
-            Vec::new(),
-        );
+        let page = href_page(&["a", "b", "c"], None, 0);
         assert!(page.items.is_empty());
-        assert_eq!(page.next_cursor, None);
+        assert_eq!(page.next_watermark, None);
     }
 
     #[test]

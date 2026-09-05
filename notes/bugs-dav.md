@@ -193,3 +193,65 @@ below was subsequently taken, as ruling 6.
   (test count +11, none lost). Both reference docs updated. One incidental
   removal: `CardDavAccount::hydrated_contacts`, a private helper whose only
   caller was the empty-query search lane it no longer has.)
+- (**The FILTERING lanes were still O(collection) per page** - DONE 2026-09-06,
+  the dav-B8 residual, closed. `events_in_range`, text `event_search` and text
+  `contact_search` hydrated the whole result set before the watermark slice
+  because they needed bodies to decide membership. The filter now runs on the
+  SERVER and the query asks for `getetag` only: the REPORT names candidate
+  hrefs, those are sorted and sliced at the watermark, and the multiget carries
+  the page. `bifrost_dav_core::query` owns the shared half (`FilteredHrefs`,
+  `HrefQuery`, `sorted_candidate_hrefs`), and `filter_unsupported` joins the
+  error ladder.
+
+  Three decisions worth keeping:
+
+  - **The server filter is a PREFILTER; the local match is the authority over
+    the page.** `event_matches` / `contact_matches` read projected fields and
+    fold case with Rust's full Unicode rules, which `i;unicode-casemap` over
+    raw properties does not reproduce. Wide on the server, narrow locally - the
+    reverse direction drops matches with no symptom. The cost is that a page
+    can be short or empty while still carrying a cursor.
+  - **The cursor keys on the resource href, never the event id.** The
+    recurrence-qualified `EventId` survives on the ITEMS (a time-range filter
+    matches recurring masters, and the local overlap guard still picks the
+    in-window instances), but the filtered lane slices before hydration and
+    only knows hrefs. Keying on the event id would make a lane and its degrade
+    disagree about what was already served, so a server that started refusing
+    the filter mid-walk would re-serve or skip the override instances of the
+    boundary resource. Consequences: the page size counts RESOURCES, and
+    `estimated_total` is the candidate count rather than an item count.
+  - **A refused filter degrades, a refused caller does not.** 400, 501, or a
+    403 naming a filter precondition degrade to the depth-1 listing (which
+    still hydrates only the page); a bare 403 stays `NoPermission` and a 401
+    stays a reauthorize signal. One leg of a multi-property search reporting
+    the filter unsupported degrades the whole lane, because answering out of
+    the properties a server happened to accept narrows the search silently.
+
+  Pinned by `a_range_page_filters_on_the_server_and_multigets_only_the_page`,
+  `a_range_page_degrades_to_the_listing_when_the_filter_is_refused`,
+  `a_text_search_page_filters_on_the_server_and_multigets_only_the_page`,
+  `a_text_search_degrades_when_one_query_leg_refuses_the_filter` (both crates),
+  `the_local_match_is_the_authority_over_a_generous_server_filter`,
+  `a_failure_first_seen_on_a_later_page_is_still_reported` (moved from a helper
+  assertion to a two-page transcript),
+  `a_refused_filter_degrades_where_a_refused_credential_does_not`,
+  `a_refused_filter_is_told_apart_from_a_refused_caller`, plus the query-body
+  and dedup tests; ablated mechanically - the dedup, the 400 arm, the 403
+  precondition arm, the local-match filter and the page slice were each
+  reverted and confirmed failing. The unit tests that pinned the materialized
+  slicers moved down to the href level rather than being dropped, and
+  `bifrost_dav_core::page_after_watermark` now has no caller anywhere: it is
+  kept with its tests and marked as such, since removing it is the repository
+  owner's call.
+
+  One accepted loss, recorded rather than hidden: the candidate 207 is parsed
+  by the LISTING parser, whose failure lane carries hrefs and no statuses, so a
+  query 207 in which every response failed now comes back as an empty candidate
+  set plus those hrefs in `failed_ids` instead of the classified `Err`
+  `events_in_range` used to raise through `CalDavMultigetReport::classify`.
+  Nothing is dropped - the resources are named on every page they are observed
+  on - and a non-2xx on the REPORT itself is still classified normally, but the
+  recovery class of an all-failed 207 is not reachable from that lane. Closing
+  it means carrying propstat statuses on `CalDavEventListing` /
+  `CardDavContactListing`, which would also let the three older listing lanes
+  classify; that is a parser change, not part of this one.)

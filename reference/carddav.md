@@ -167,7 +167,13 @@ Supported contact primitives:
   WATERMARK-cursor slicing of hrefs - sorted by resolved href first, because
   the cursor is local and every page re-runs the PROPFIND, and DAV guarantees
   no multistatus ordering - then batched `addressbook-multiget`
-  `REPORT` hydration for only the requested page. `next_cursor` carries the
+  `REPORT` hydration for only the requested page.
+  **There is no request limit, and that is the trait's shape rather than a
+  crate omission**: `Account::contacts_list` takes an address book and a page
+  cursor and nothing else, so `CONTACT_PAGE_SIZE` (250) is fixed here. Letting
+  a caller choose would be a published-signature change in `bifrost-types`.
+  `contact_search`, whose request DOES carry a limit, uses the same constant
+  only as its default. `next_cursor` carries the
   last href served, not a count into the collection, so a contact filed
   before it between two pages cannot displace the unserved remainder and one
   filed after it is served on a later page. An empty payload is a corrupt
@@ -192,7 +198,10 @@ Supported contact primitives:
   empty-query `contact_search` path.
 
   Multiget is chunked and text search runs one REPORT per property, so each
-  REPORT is classified independently. Every leg goes through `accumulate_leg`,
+  REPORT is classified independently. A query leg that reports the filter
+  unsupported degrades the WHOLE lane to the listing rather than the one
+  property: answering out of the properties a server happened to accept would
+  narrow the search with no signal to the consumer. Every leg goes through `accumulate_leg`,
   the single funnel each leg result passes through: all four ways a leg can
   fail - transport, a non-2xx status, a body that will not parse, and a 207
   describing complete failure - are folded into `degraded` there, and the
@@ -252,12 +261,34 @@ Supported contact primitives:
   gap is the eighth measured divergence between these two crates.
 - `contact_delete` - deletes the DAV resource.
 - `contact_search` / `contact_autocomplete` - non-empty searches issue
-  CardDAV `addressbook-query` text-match `REPORT`s over common vCard
-  fields, including ADR postal addresses, then keep local filtering and
-  watermark-cursor paging as a
-  defensive guard. Results are sorted by native id before slicing so page
-  order is stable while the remote result set is unchanged, and the cursor is
-  the native id of the last contact served. A `limit` of zero
+  CardDAV `addressbook-query` text-match `REPORT`s over eight common vCard
+  fields, including ADR postal addresses, asking for `getetag` ONLY.
+
+  **The filter runs on the server, and the page is sliced before anything is
+  hydrated.** Requesting `address-data` there is what made this lane
+  O(collection) per page. The union of the eight legs is a PREFILTER over
+  candidate hrefs; `contact_matches` over the hydrated page is the authority on
+  what the page finally carries. The two are not the same predicate - the local
+  match reads PROJECTED fields and folds case with Rust's full Unicode rules,
+  where `i;unicode-casemap` sees raw vCard properties - and the decision is to
+  keep the server side wide and narrow locally, because the reverse direction
+  drops matches silently. A page is therefore allowed to be short, or empty,
+  while still carrying a cursor.
+
+  **A server that will not run the filter degrades rather than failing**, by
+  the shared `bifrost_dav_core::filter_unsupported` rule
+  `reference/caldav.md` documents (400, 501, or a 403 naming a filter
+  precondition; never a bare 403, never a 401). The degrade lane is the depth-1
+  listing - the same walk `contacts_list` and the empty-query lane take - and
+  all three sources produce the same `HrefQuery` and run through the same
+  `hydrated_contacts_page`. The key is always the resource href, which is also
+  the contact's `native_id`, so a search that degrades mid-walk neither
+  re-serves nor skips.
+
+  Candidates are sorted (and deduped, since the eight legs name a resource once
+  per property it matched) before slicing, so page order is stable while the
+  remote result set is unchanged, and the cursor is the href of the last
+  contact served. `estimated_total` is the candidate count. A `limit` of zero
   is honored as an exhausted page - no items, no continuation - rather than
   clamped up to one (which served a contact the caller asked not to receive)
   or emitted as an empty page naming its own watermark again (which loops a

@@ -249,16 +249,40 @@ Supported calendar primitives:
   `Calendar.id`, `Calendar.native_id`, event `calendar_id`, request routing,
   and `ErrorScope::Calendar` all carry that same URL identity.
 - `events_in_range` - `calendar-query` `REPORT` with a CalDAV
-  `time-range` filter and calendar-data hydration, followed by local
-  overlap filtering as a defensive guard. Invalid time bounds fail locally
+  `time-range` filter, followed by local overlap filtering as a defensive
+  guard. Invalid time bounds fail locally
   before a REPORT is sent, and the encoder preserves legal one-sided ranges.
   Query REPORTs use `Depth: 1`; `calendar-multiget` REPORTs enumerate their
   hrefs in the body and use `Depth: 0`.
-  Range and search results use a local WATERMARK cursor: when `limit`
-  truncates the page, `next_cursor` carries the sort key of the LAST item
-  served, and an absent cursor is the start of the collection. The cursor is
-  local and every continuation re-runs the remote request, so `event_page`
-  SORTS by the recurrence-qualified `EventId` before slicing. DAV guarantees
+
+  **The filter runs on the server and the query asks for `getetag` ONLY.**
+  Requesting `calendar-data` there is what made this lane O(collection) per
+  page: the whole matching result set arrived on every page and all but
+  `limit` of it was thrown away. The REPORT now answers with hrefs, those are
+  sorted and sliced at the cursor watermark, and the `calendar-multiget`
+  carries only the page. `QUERY_HREF_PROPS` is the prop skeleton both filtered
+  lanes share.
+
+  **A server that will not run the filter degrades rather than failing.**
+  `bifrost_dav_core::filter_unsupported` decides: a `400`, a `501`, or a `403`
+  naming `supported-filter` / `supported-collation` / `valid-filter` /
+  `supported-report` in its body. A bare `403` is deliberately NOT degraded (it
+  is far more often a permission refusal, and swallowing it would replace a
+  classified `NoPermission` with whatever the listing answered), and a `401`
+  never is - a stale credential must reach the consumer as a reauthorize signal
+  rather than as a quietly different query. The degrade lane is the depth-1
+  PROPFIND: it lists the whole collection but still hydrates only the page.
+  Both lanes then run through the same `hydrated_event_page`, and the local
+  match is the AUTHORITY over the page either way - the server filter is a
+  prefilter that may be generous, or (on the degrade lane) absent.
+
+  Range and search results use a local WATERMARK cursor: when the page size
+  truncates the page, `next_cursor` carries the RESOURCE HREF of the last
+  member served, and an absent cursor is the start of the collection. The
+  cursor is local and every continuation re-runs the remote request, so
+  `bifrost_dav_core::sorted_candidate_hrefs` sorts (and dedups - the text
+  lane's per-property REPORTs name a resource once per property it matched)
+  before slicing. DAV guarantees
   no ordering on a multistatus; slicing raw response order let an unchanged
   result set come back permuted between pages, skipping the events the
   permutation moved behind the cursor and serving twice the ones it moved
@@ -270,6 +294,22 @@ Supported calendar primitives:
   `limit` of zero is an exhausted page - no items and no continuation -
   rather than an empty page that names its own watermark again and loops a
   cursor-following consumer forever.
+
+  **The key is the href, never the event id, and that is load-bearing.** The
+  recurrence-qualified `EventId` (`{uri}#{RECURRENCE-ID}`) survives on the
+  ITEMS - a time-range filter matches a recurring master whose instances fall
+  in the window, `events_from_ical` still projects every VEVENT, and the local
+  overlap guard still decides which instances are in range - but the cursor
+  cannot key on it. The filtered lane slices before hydration and only knows
+  hrefs, so keying the cursor on the event id would make a lane and its degrade
+  disagree about what "already served" means: a server that started refusing
+  the filter mid-walk would re-serve or skip the override instances of the
+  boundary resource. The consequences are that the page size counts RESOURCES,
+  so a page may carry more items than `limit` when its members expand into
+  overrides and fewer when the local match rejects some, and that
+  `estimated_total` is the number of candidate resources the server named -
+  an upper bound on the items, not a count of them. A short or empty page that
+  still carries a cursor is normal.
   The local guard uses half-open overlap, matching CalDAV time-range and the
   exclusive all-day end contract. It is recurrence-aware: a recurring master
   whose own interval sits outside the
@@ -294,7 +334,10 @@ Supported calendar primitives:
   both would count it twice and treat a displayable event as lost.
 
   Multiget is chunked and search runs one REPORT per property, so each REPORT
-  is classified independently. Every leg goes through `accumulate_leg`, which
+  is classified independently. A query leg that reports the filter unsupported
+  degrades the WHOLE lane to the listing rather than the one property:
+  answering out of the three properties a server happened to accept would
+  narrow the search with no signal to the consumer. Every leg goes through `accumulate_leg`, which
   is the single funnel each leg result passes through: all four ways a leg can
   fail - transport, a non-2xx status, a body that will not parse, and a 207
   describing complete failure - are folded into `degraded` there, and the
@@ -306,11 +349,20 @@ Supported calendar primitives:
   an `ErrorScope::Calendar` entry - `failed_ids` carries ids with no
   classification, so folding a 401 into it would keep the data and destroy
   the reauthorize signal. A refusal with nothing usable anywhere is still an
-  `Err`. The degraded lane exists only where a call spans several REPORTs
-  (`event_search`'s per-property legs and the chunked multiget hydration
-  behind its empty-query branch); `events_in_range` itself is a single
-  `calendar-query` REPORT, so a wholly-failed body there stays an `Err` and
-  its pages never carry a skipped scope.
+  `Err`. That funnel governs the MULTIGET legs, which every lane now spends on
+  its page, so `events_in_range` can carry a skipped scope too - it did not
+  while its single REPORT both filtered and hydrated.
+
+  The CANDIDATE leg is classified less finely, and deliberately: a filtered
+  query's 207 is read by the listing parser, whose failure lane is a bare list
+  of hrefs with no status, so a query 207 in which every response failed comes
+  back as an empty candidate set plus those hrefs in `failed_ids` rather than
+  as a classified `Err`. This is the same shape the depth-1 listing and the
+  snapshot poll have always had, and nothing is silently lost - the refused
+  resources are named on every page they are observed on - but the recovery
+  class of a whole-207 refusal is not available there. A non-2xx status on the
+  REPORT itself is still classified normally (and a 401 still reauthorizes);
+  only per-propstat failure inside an otherwise successful 207 is affected.
 
   Properties are collected propstat-scoped and promoted to the response
   only by `commit_propstat`, and only from a 2xx propstat. That is what
@@ -440,17 +492,25 @@ Supported calendar primitives:
   flow is still not atomic; the error class is what communicates that.
 - `event_search` / `event_autocomplete` - non-empty searches issue
   CalDAV text-match `calendar-query` `REPORT`s over VEVENT summary,
-  description, location, and attendee, then keep local filtering as a
-  defensive guard. Empty search lists the collection to preserve
-  match-all behavior, and that lane pages the LISTING rather than the
-  hydrated result: `listed_event_page` sorts the depth-1 entries by href,
-  slices the page that follows the watermark, and multigets ONLY that page's
-  hrefs, so paging a large calendar no longer costs a full hydration per
-  page. `Page::estimated_total` is the listing size, and `failed_ids` carries
-  both legs - the listing's refused hrefs (collection-wide, and re-observed
-  on every page per the `Page::failed_ids` contract) and the ones this page's
-  own multiget lost. A watermark past every href is an empty final page that
-  spends no multiget at all.
+  description, location, and attendee, asking for `getetag` only. The union of
+  the four legs is a PREFILTER over candidate hrefs; `event_matches` over the
+  hydrated page is the authority on what the page finally carries. The two
+  are not the same predicate - the local match reads PROJECTED fields and
+  folds case with Rust's full Unicode rules, where `i;unicode-casemap` sees
+  four raw properties - and the decision is to keep the server side wide and
+  narrow locally, because the reverse direction drops matches silently.
+
+  Empty search lists the collection to preserve match-all behavior, and a
+  server that refuses the text filter degrades to the same listing. All three
+  sources - the time-range query, the text query, and the depth-1 listing -
+  produce the same `HrefQuery` and run through the same `hydrated_event_page`,
+  which is what keeps one cursor valid across a mid-walk degrade. Paging a
+  large calendar therefore never costs a hydration of anything but the page.
+  `Page::estimated_total` is the candidate count, and `failed_ids` carries
+  both legs - the candidate leg's refused hrefs (collection-wide, and
+  re-observed on every page per the `Page::failed_ids` contract) and the ones
+  this page's own multiget lost. A watermark past every href is an empty final
+  page that spends no multiget at all.
 
 Cursor support is calendar-event only. `discover_cursor_scopes` returns one
 `CursorScope::Folder(FolderId(collection_href))` per discovered calendar, and
@@ -672,13 +732,19 @@ the trailing-bytes refusal), `diff_snapshots` (including the transient-empty-207
 suppression and the failed-href preservation), `preserve_unobserved_entries`,
 `inventory_entry`, `object_change`, and the page-cursor trio
 `decode_watermark_cursor` / `encode_watermark_cursor` /
-`slice_after_watermark` (with `page_after_watermark` for the lanes whose
-REPORT already answered with the object bodies). What stays local is what
+`slice_after_watermark`. `page_after_watermark` - the slicer for a lane whose
+REPORT already answered with the object bodies - has NO caller left now that
+every lane pages before hydrating; it is kept with its tests because removing
+a published item is the repository owner's call. What stays local is what
 genuinely differs: the magic bytes (`CALDAVET1` / `CDAVCTAG1`), the
 envelope-version and scope validation, the name of the token, and the crate's
-own `cursor_error`. `event_page` still sorts by the recurrence-qualified
-`EventId` before slicing - the sort is the load-bearing half of the cursor
-contract and stays where the key type is known.
+own `cursor_error`.
+
+The filtered-query half lives in `bifrost_dav_core::query`: `FilteredHrefs`
+(matched, or the server will not run this filter), `HrefQuery` (candidate
+hrefs, the 207's refused hrefs, and the worst degraded leg, with the same
+`settle` rule the multiget lanes use) and `sorted_candidate_hrefs`. Both crates
+supply only the query body and the parser that turns their 207 into hrefs.
 
 So the drift rule from the next section still applies, but to a much smaller
 remainder: the query bodies, the property constants, the iCalendar projection,

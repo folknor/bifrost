@@ -290,9 +290,80 @@ pub fn recovery_rank(class: &RecoveryClass) -> u8 {
     }
 }
 
+/// The DAV precondition elements a server names when it refuses to RUN a
+/// report's filter, as opposed to refusing the caller.
+///
+/// Matched case-insensitively against the response body, which is the only
+/// place the precondition appears: RFC 4918 s16 carries it inside a
+/// `DAV:error` document, and the status alone (403) cannot tell "I do not
+/// implement that filter" apart from "you may not read this collection".
+const FILTER_PRECONDITIONS: [&str; 4] = [
+    "supported-filter",
+    "supported-collation",
+    "valid-filter",
+    "supported-report",
+];
+
+/// Does this REPORT rejection mean "I will not run that filter" rather than
+/// "no"?
+///
+/// The filtered listing lanes push their predicate to the server so a page can
+/// be sliced before anything is hydrated. A server that will not run the filter
+/// must not fail the call: the lane degrades to listing the collection and
+/// matching locally, which is what both crates did unconditionally before.
+/// Only three answers mean that, and each is a statement about the REPORT
+/// rather than about the credential:
+///
+/// - `400`, the catch-all for a body the server would not process. Servers that
+///   implement no query filter at all answer this, with no precondition
+///   element to inspect.
+/// - `501`, an explicit "not implemented".
+/// - `403` naming one of [`FILTER_PRECONDITIONS`]. A bare 403 is deliberately
+///   NOT degraded: it is far more often a permission refusal, and swallowing it
+///   into a whole-collection walk would replace a classified `NoPermission`
+///   with whatever the listing happens to answer.
+///
+/// `401` is never here. A stale credential must reach the consumer as a
+/// reauthorize signal, not as a quietly narrower search.
+#[must_use]
+pub fn filter_unsupported(status: StatusCode, body: &str) -> bool {
+    if status == StatusCode::BAD_REQUEST || status == StatusCode::NOT_IMPLEMENTED {
+        return true;
+    }
+    if status != StatusCode::FORBIDDEN {
+        return false;
+    }
+    let body = body.to_ascii_lowercase();
+    FILTER_PRECONDITIONS
+        .iter()
+        .any(|precondition| body.contains(precondition))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_refused_filter_is_told_apart_from_a_refused_caller() {
+        assert!(filter_unsupported(StatusCode::BAD_REQUEST, ""));
+        assert!(filter_unsupported(StatusCode::NOT_IMPLEMENTED, ""));
+        assert!(filter_unsupported(
+            StatusCode::FORBIDDEN,
+            "<D:error xmlns:D=\"DAV:\"><C:supported-filter/></D:error>"
+        ));
+        assert!(filter_unsupported(
+            StatusCode::FORBIDDEN,
+            "<D:error><C:SUPPORTED-COLLATION/></D:error>"
+        ));
+        // A bare permission refusal keeps its classification.
+        assert!(!filter_unsupported(StatusCode::FORBIDDEN, "go away"));
+        // A stale credential must stay a reauthorize signal.
+        assert!(!filter_unsupported(StatusCode::UNAUTHORIZED, ""));
+        assert!(!filter_unsupported(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "supported-filter"
+        ));
+    }
 
     /// The two dialects differ in exactly the three values `DavProtocol`
     /// carries, and in nothing else.

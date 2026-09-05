@@ -2,8 +2,10 @@ use std::fmt;
 
 pub(crate) use bifrost_dav_core::PutCondition;
 use bifrost_dav_core::{
-    DavDispatch, DavProtocol, escape_xml, prepare_if_match, response_etag, worse_recovery,
+    DavDispatch, DavProtocol, escape_xml, filter_unsupported, prepare_if_match, response_etag,
+    worse_recovery,
 };
+pub(crate) use bifrost_dav_core::{FilteredHrefs, HrefQuery};
 use bifrost_net::{AccountId, AccountNet};
 use bifrost_types::{
     AccountError, AccountErrorBuilder, AccountErrorKind, AccountOperation, Cause, CursorScope,
@@ -236,54 +238,114 @@ impl CalDavClient {
             .map_err(|error| parse_error(operation, format!("collection sync token: {error}")))
     }
 
-    pub(crate) async fn query_events_in_range(
+    /// The time-range lane's server-side filter, asking for `getetag` only.
+    ///
+    /// This is what bounds `events_in_range` to one page of hydration: the
+    /// REPORT answers with the matching hrefs and nothing else, so the account
+    /// layer can sort, slice at the watermark, and multiget just the page.
+    /// Requesting `calendar-data` here would put the whole matching result set
+    /// on the wire again on every page, which is the cost dav-B8 is about.
+    pub(crate) async fn query_event_hrefs_in_range(
         &self,
         calendar_url: &str,
         start: Option<&str>,
         end: Option<&str>,
-    ) -> Result<CalDavMultigetReport, AccountError> {
+    ) -> Result<FilteredHrefs, AccountError> {
         let body = calendar_query_body(start, end);
-        let response = self
-            .dav
-            .report_raw(calendar_url, "1", &body, AccountOperation::EventsInRange)
-            .await?;
-        let mut parsed = parse_multiget_report(&response.text).map_err(|error| {
-            parse_error(AccountOperation::EventsInRange, format!("query: {error}"))
-        })?;
-        parsed.resolve_hrefs(&response.url);
-        multiget_failure(&parsed, AccountOperation::EventsInRange).map_or(Ok(parsed), Err)
+        match self
+            .href_query_leg(calendar_url, &body, AccountOperation::EventsInRange)
+            .await
+        {
+            HrefLeg::Listing(listing) => {
+                let mut query = HrefQuery::default();
+                extend_candidates(&mut query, listing);
+                Ok(FilteredHrefs::Matched(query))
+            }
+            HrefLeg::FilterUnsupported => Ok(FilteredHrefs::FilterUnsupported),
+            HrefLeg::Failed(error) => Err(error),
+        }
     }
 
-    pub(crate) async fn query_events_text(
+    /// The text-search lane's server-side prefilter, one REPORT per property,
+    /// asking for `getetag` only.
+    ///
+    /// The union of the four legs is a PREFILTER, not the answer: the account
+    /// layer still runs `event_matches` over the hydrated page, because the
+    /// local match reads projected fields (and folds case with Rust's full
+    /// Unicode rules) in ways `i;unicode-casemap` on four raw properties does
+    /// not exactly reproduce. Widening the server side and narrowing locally is
+    /// the safe direction; the reverse would silently drop matches.
+    ///
+    /// A leg that reports the filter unsupported degrades the WHOLE lane rather
+    /// than the one property: answering out of the three properties a server
+    /// happened to accept would narrow the search with no signal to the
+    /// consumer.
+    pub(crate) async fn query_event_hrefs_text(
         &self,
         calendar_url: &str,
         query: &str,
-    ) -> Result<MultigetFetch, AccountError> {
-        let mut all_results = CalDavMultigetReport::default();
-        let mut degraded = None;
+    ) -> Result<FilteredHrefs, AccountError> {
         let bodies = ["SUMMARY", "DESCRIPTION", "LOCATION", "ATTENDEE"]
             .map(|property| calendar_text_query_body(property, query));
         let legs: Vec<_> = bodies
             .iter()
-            .map(|body| {
-                self.run_leg(MultigetLeg {
-                    url: calendar_url,
-                    depth: "1",
-                    body,
-                    operation: AccountOperation::EventSearch,
-                    context: "query",
-                })
-            })
+            .map(|body| self.href_query_leg(calendar_url, body, AccountOperation::EventSearch))
             .collect();
         let mut legs =
             futures::StreamExt::buffered(futures::stream::iter(legs), MULTIGET_LEG_CONCURRENCY);
-        while let Some((report, error)) = futures::StreamExt::next(&mut legs).await {
-            all_results.extend(report);
-            if let Some(error) = error {
-                degraded = worse_recovery(degraded, error);
+        let mut merged = HrefQuery::default();
+        let mut unsupported = false;
+        while let Some(leg) = futures::StreamExt::next(&mut legs).await {
+            match leg {
+                HrefLeg::Listing(listing) => extend_candidates(&mut merged, listing),
+                HrefLeg::FilterUnsupported => unsupported = true,
+                HrefLeg::Failed(error) => {
+                    merged.degraded = worse_recovery(merged.degraded.take(), error);
+                }
             }
         }
-        MultigetFetch::settle(all_results, degraded)
+        if unsupported {
+            return Ok(FilteredHrefs::FilterUnsupported);
+        }
+        merged.settle().map(FilteredHrefs::Matched)
+    }
+
+    /// Run one filtered `calendar-query` leg, separating "the server will not
+    /// run this filter" from every other way the leg can fail.
+    ///
+    /// The status has to be read before it becomes an error, which is why this
+    /// goes through `report_raw_response` rather than `report_raw`: a 403
+    /// naming `CALDAV:supported-filter` is a degrade signal, and a 403 naming
+    /// nothing is still a permission refusal.
+    async fn href_query_leg(
+        &self,
+        calendar_url: &str,
+        body: &str,
+        operation: AccountOperation,
+    ) -> HrefLeg {
+        let response = match self
+            .dav
+            .report_raw_response(calendar_url, "1", body, operation)
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => return HrefLeg::Failed(error),
+        };
+        if !response.status.is_success() {
+            return if filter_unsupported(response.status, &response.body) {
+                HrefLeg::FilterUnsupported
+            } else {
+                HrefLeg::Failed(status_error(operation, response.status, response.body))
+            };
+        }
+        let mut listing = match parse_propfind_events(&response.body) {
+            Ok(listing) => listing,
+            Err(error) => {
+                return HrefLeg::Failed(parse_error(operation, format!("query: {error}")));
+            }
+        };
+        listing.resolve_hrefs(&response.url);
+        HrefLeg::Listing(listing)
     }
 
     pub(crate) async fn fetch_events(
@@ -553,6 +615,16 @@ fn schedule_address(address: &str) -> String {
     }
 }
 
+/// The prop skeleton every filtered query asks for.
+///
+/// Deliberately WITHOUT `calendar-data`: the filtered lanes page on the href
+/// and hydrate only the page, so a query that answered with bodies would put
+/// the whole matching result set on the wire once per page.
+const QUERY_HREF_PROPS: &str = "  <D:prop>\n\
+    <D:resourcetype/>\n\
+    <D:getetag/>\n\
+  </D:prop>\n";
+
 fn calendar_query_body(start: Option<&str>, end: Option<&str>) -> String {
     let time_range = match (start, end) {
         (Some(start), Some(end)) => format!(
@@ -567,11 +639,7 @@ fn calendar_query_body(start: Option<&str>, end: Option<&str>) -> String {
     format!(
         "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
 <C:calendar-query xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\">\n\
-  <D:prop>\n\
-    <D:resourcetype/>\n\
-    <D:getetag/>\n\
-    <C:calendar-data/>\n\
-  </D:prop>\n\
+{QUERY_HREF_PROPS}\
   <C:filter>\n\
     <C:comp-filter name=\"VCALENDAR\">\n\
       <C:comp-filter name=\"VEVENT\">\n\
@@ -586,11 +654,7 @@ fn calendar_text_query_body(property: &str, query: &str) -> String {
     format!(
         "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
 <C:calendar-query xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\">\n\
-  <D:prop>\n\
-    <D:resourcetype/>\n\
-    <D:getetag/>\n\
-    <C:calendar-data/>\n\
-  </D:prop>\n\
+{QUERY_HREF_PROPS}\
   <C:filter>\n\
     <C:comp-filter name=\"VCALENDAR\">\n\
       <C:comp-filter name=\"VEVENT\">\n\
@@ -700,6 +764,24 @@ struct MultigetLeg<'a> {
 pub(crate) struct MultigetFetch {
     pub(crate) report: CalDavMultigetReport,
     pub(crate) degraded: Option<AccountError>,
+}
+
+/// Fold one listing's committed and refused hrefs into a candidate set.
+///
+/// The two lanes differ in how many listings they merge - one for a time-range
+/// query, four for a text search - and in nothing else.
+pub(crate) fn extend_candidates(query: &mut HrefQuery, listing: crate::parse::CalDavEventListing) {
+    query.extend(
+        listing.entries.into_iter().map(|entry| entry.uri),
+        listing.failed_hrefs,
+    );
+}
+
+/// One leg of a filtered query, before the lane decides what to do with it.
+enum HrefLeg {
+    Listing(crate::parse::CalDavEventListing),
+    FilterUnsupported,
+    Failed(AccountError),
 }
 
 impl MultigetFetch {
@@ -1805,19 +1887,54 @@ mod tests {
             CalDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
 
         let error = client
-            .query_events_in_range(
+            .query_event_hrefs_in_range(
                 "https://dav.example.test/calendar/",
                 Some("20260101T000000Z"),
                 Some("20260201T000000Z"),
             )
             .await
-            .expect_err("401 REPORT must not be reported as an empty result");
+            .err()
+            .expect("401 REPORT must not be reported as an empty result");
 
         assert!(matches!(
             error.kind(),
             AccountErrorKind::Authentication(bifrost_types::AuthErrorKind::ReauthorizationRequired)
         ));
         assert_eq!(*error.recovery(), RecoveryClass::AuthLost);
+    }
+
+    /// A 401 must never be read as "this server will not run the filter": the
+    /// degrade lane would re-issue the same credential as a PROPFIND and lose
+    /// the reauthorize signal in whatever that answered.
+    #[tokio::test]
+    async fn a_refused_filter_degrades_where_a_refused_credential_does_not() {
+        for (status, body) in [
+            (StatusCode::BAD_REQUEST, ""),
+            (
+                StatusCode::FORBIDDEN,
+                "<D:error xmlns:D=\"DAV:\"><C:supported-filter/></D:error>",
+            ),
+        ] {
+            let script = dav_script([DavResponse {
+                status,
+                headers: HeaderMap::new(),
+                body: body.to_string(),
+                url: String::new(),
+            }]);
+            let client = CalDavClient::with_account_net(
+                "https://dav.example.test",
+                scripted_dav_net(&script),
+            );
+            let answer = client
+                .query_event_hrefs_in_range(
+                    "https://dav.example.test/calendar/",
+                    Some("20260101T000000Z"),
+                    None,
+                )
+                .await
+                .expect("a refused filter is a degrade, not a failure");
+            assert!(matches!(answer, FilteredHrefs::FilterUnsupported));
+        }
     }
 
     #[test]
@@ -1869,9 +1986,27 @@ mod tests {
 
         assert!(body.contains("<C:calendar-query"));
         assert!(body.contains("<D:resourcetype/>"));
-        assert!(body.contains("<C:calendar-data/>"));
+        assert!(body.contains("<D:getetag/>"));
         assert!(
             body.contains("<C:time-range start=\"20260602T000000Z\" end=\"20260603T000000Z\"/>")
+        );
+        // The whole point of the filtered lane: the REPORT names hrefs, and
+        // only the sliced page is hydrated. Asking for bodies here puts the
+        // entire matching result set on the wire once per page.
+        assert!(
+            !body.contains("<C:calendar-data/>"),
+            "the filtered query must not hydrate: {body}"
+        );
+    }
+
+    #[test]
+    fn a_text_query_names_hrefs_rather_than_hydrating() {
+        let body = calendar_text_query_body("SUMMARY", "plan");
+
+        assert!(body.contains("<D:getetag/>"));
+        assert!(
+            !body.contains("<C:calendar-data/>"),
+            "the filtered query must not hydrate: {body}"
         );
     }
 

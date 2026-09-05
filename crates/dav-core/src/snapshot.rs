@@ -398,12 +398,15 @@ pub fn slice_after_watermark<T>(
 
 /// Slice one watermark page out of a materialized result set.
 ///
-/// For the lanes whose remote leg answers with the object bodies already - a
-/// CalDAV `calendar-query`, a CardDAV text `addressbook-query` - where there is
-/// no listing to page before hydrating. The lanes that DO list first
-/// ([`slice_after_watermark`] over the listing, then a multiget of just that
-/// page) build their `Page` themselves, because the count they can report and
-/// the failures they carry come from two different legs.
+/// **No lane uses this any more, and none should.** It was for the lanes whose
+/// remote leg answered with the object bodies already - a CalDAV
+/// `calendar-query`, a CardDAV text `addressbook-query` - which is exactly the
+/// shape that made a page cost O(collection). Those lanes now push their filter
+/// to the server, ask for `getetag` only, slice the candidate hrefs with
+/// [`slice_after_watermark`] and multiget just that page; they build their
+/// `Page` themselves, because the count they can report and the failures they
+/// carry come from two different legs. Kept, with its tests, because removing a
+/// published item is the repository owner's call, not a cleanup.
 ///
 /// `failed_ids` and `skipped_scopes` describe the fetch that produced `items`,
 /// not the slice, and every page reruns that fetch. Both lanes are therefore

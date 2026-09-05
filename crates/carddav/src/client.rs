@@ -1,10 +1,10 @@
 use std::fmt;
 
-pub(crate) use bifrost_dav_core::PutCondition;
-use bifrost_dav_core::escape_xml;
 use bifrost_dav_core::{
-    DavDispatch, DavProtocol, DavRequest, normalize_http_etag, prepare_if_match, worse_recovery,
+    DavDispatch, DavProtocol, DavRequest, escape_xml, filter_unsupported, normalize_http_etag,
+    prepare_if_match, worse_recovery,
 };
+pub(crate) use bifrost_dav_core::{FilteredHrefs, HrefQuery, PutCondition};
 use bifrost_net::{AccountId, AccountNet};
 use bifrost_types::{
     AccountError, AccountErrorKind, AccountOperation, ErrorScope, RequestErrorKind, ResourceKind,
@@ -333,36 +333,86 @@ impl CardDavClient {
         (report, degraded)
     }
 
-    pub(crate) async fn query_vcards_text(
+    /// The text-search lane's server-side prefilter, one REPORT per property,
+    /// asking for `getetag` only.
+    ///
+    /// The union of the eight legs is a PREFILTER, not the answer: the account
+    /// layer still runs `contact_matches` over the hydrated page, because the
+    /// local match reads PROJECTED fields (and folds case with Rust's full
+    /// Unicode rules) rather than the raw vCard properties an
+    /// `i;unicode-casemap` text-match sees. Widening the server side and
+    /// narrowing locally is the safe direction; the reverse would silently drop
+    /// matches. Twin of `bifrost-caldav::query_event_hrefs_text`.
+    ///
+    /// A leg that reports the filter unsupported degrades the WHOLE lane rather
+    /// than the one property: answering out of the properties a server happened
+    /// to accept would narrow the search with no signal to the consumer.
+    pub(crate) async fn query_vcard_hrefs_text(
         &self,
         addressbook_url: &str,
         query: &str,
-    ) -> Result<MultigetFetch, AccountError> {
-        let mut all_results = CardDavMultigetReport::default();
-        let mut degraded = None;
+    ) -> Result<FilteredHrefs, AccountError> {
         let bodies = ["FN", "N", "EMAIL", "TEL", "ADR", "ORG", "TITLE", "NOTE"]
             .map(|property| addressbook_text_query_body(property, query));
         let legs: Vec<_> = bodies
             .iter()
-            .map(|body| {
-                self.run_leg(MultigetLeg {
-                    url: addressbook_url,
-                    depth: "1",
-                    body,
-                    operation: AccountOperation::ContactSearch,
-                    context: "query",
-                })
-            })
+            .map(|body| self.href_query_leg(addressbook_url, body, AccountOperation::ContactSearch))
             .collect();
         let mut legs =
             futures::StreamExt::buffered(futures::stream::iter(legs), MULTIGET_LEG_CONCURRENCY);
-        while let Some((report, error)) = futures::StreamExt::next(&mut legs).await {
-            all_results.extend(report);
-            if let Some(error) = error {
-                degraded = worse_recovery(degraded, error);
+        let mut merged = HrefQuery::default();
+        let mut unsupported = false;
+        while let Some(leg) = futures::StreamExt::next(&mut legs).await {
+            match leg {
+                HrefLeg::Listing(listing) => extend_candidates(&mut merged, listing),
+                HrefLeg::FilterUnsupported => unsupported = true,
+                HrefLeg::Failed(error) => {
+                    merged.degraded = worse_recovery(merged.degraded.take(), error);
+                }
             }
         }
-        MultigetFetch::settle(all_results, degraded)
+        if unsupported {
+            return Ok(FilteredHrefs::FilterUnsupported);
+        }
+        merged.settle().map(FilteredHrefs::Matched)
+    }
+
+    /// Run one filtered `addressbook-query` leg, separating "the server will not
+    /// run this filter" from every other way the leg can fail.
+    ///
+    /// The status has to be read before it becomes an error, which is why this
+    /// goes through `report_raw_response` rather than `report_raw`: a 403 naming
+    /// `CARDDAV:supported-filter` is a degrade signal, and a 403 naming nothing
+    /// is still a permission refusal.
+    async fn href_query_leg(
+        &self,
+        addressbook_url: &str,
+        body: &str,
+        operation: AccountOperation,
+    ) -> HrefLeg {
+        let response = match self
+            .dav
+            .report_raw_response(addressbook_url, "1", body, operation)
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => return HrefLeg::Failed(error),
+        };
+        if !response.status.is_success() {
+            return if filter_unsupported(response.status, &response.body) {
+                HrefLeg::FilterUnsupported
+            } else {
+                HrefLeg::Failed(status_error(operation, response.status, response.body))
+            };
+        }
+        let mut listing = match parse_propfind_contacts(&response.body) {
+            Ok(listing) => listing,
+            Err(error) => {
+                return HrefLeg::Failed(parse_error(operation, format!("query: {error}")));
+            }
+        };
+        listing.resolve_hrefs(&response.url);
+        HrefLeg::Listing(listing)
     }
 
     /// Fetch one vCard resource with a plain `GET`, reading the validator from
@@ -495,15 +545,22 @@ impl CardDavClient {
 ///
 /// Only `https` qualifies; an unparseable URL is treated as insecure so the
 /// downgrade check fails closed.
+/// The prop skeleton the filtered query asks for.
+///
+/// Deliberately WITHOUT `address-data`: the filtered lane pages on the href and
+/// hydrates only the page, so a query that answered with bodies would put the
+/// whole matching result set on the wire once per page. Twin of the CalDAV
+/// constant of the same name.
+const QUERY_HREF_PROPS: &str = "  <D:prop>\n\
+    <D:resourcetype/>\n\
+    <D:getetag/>\n\
+  </D:prop>\n";
+
 fn addressbook_text_query_body(property: &str, query: &str) -> String {
     format!(
         "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
 <C:addressbook-query xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:carddav\">\n\
-  <D:prop>\n\
-    <D:resourcetype/>\n\
-    <D:getetag/>\n\
-    <C:address-data/>\n\
-  </D:prop>\n\
+{QUERY_HREF_PROPS}\
   <C:filter>\n\
     <C:prop-filter name=\"{}\">\n\
       <C:text-match collation=\"i;unicode-casemap\">{}</C:text-match>\n\
@@ -558,6 +615,24 @@ struct MultigetLeg<'a> {
 pub(crate) struct MultigetFetch {
     pub(crate) report: CardDavMultigetReport,
     pub(crate) degraded: Option<AccountError>,
+}
+
+/// Fold one listing's committed and refused hrefs into a candidate set.
+///
+/// The listing lane merges one, the text lane eight, and they differ in nothing
+/// else. Twin of the CalDAV function of the same name.
+pub(crate) fn extend_candidates(query: &mut HrefQuery, listing: CardDavContactListing) {
+    query.extend(
+        listing.entries.into_iter().map(|entry| entry.uri),
+        listing.failed_hrefs,
+    );
+}
+
+/// One leg of a filtered query, before the lane decides what to do with it.
+enum HrefLeg {
+    Listing(CardDavContactListing),
+    FilterUnsupported,
+    Failed(AccountError),
 }
 
 impl MultigetFetch {
@@ -1874,7 +1949,14 @@ mod tests {
 
         assert!(body.contains("<C:addressbook-query"));
         assert!(body.contains("<D:resourcetype/>"));
-        assert!(body.contains("<C:address-data/>"));
+        assert!(body.contains("<D:getetag/>"));
+        // The whole point of the filtered lane: the REPORT names hrefs, and
+        // only the sliced page is hydrated. Asking for bodies here puts the
+        // entire matching result set on the wire once per page.
+        assert!(
+            !body.contains("<C:address-data/>"),
+            "the filtered query must not hydrate: {body}"
+        );
         assert!(body.contains("<C:prop-filter name=\"EMAIL\">"));
         assert!(body.contains("ada &amp; team"));
     }
