@@ -146,6 +146,59 @@ fn response_get_extracts_typed_result() {
     assert_eq!(result.list()[0].name.as_deref(), Some("hello"));
 }
 
+/// The RFC 8887 WebSocket door cannot deserialize a frame straight into
+/// `Response` - the frame carries `@type` and `requestId` beside the
+/// envelope fields - so it decodes the `methodResponses` array through
+/// `Response::from_frame_parts`. That path must produce exactly what the
+/// HTTP envelope produces: typed extraction on a success entry, and the
+/// `"error"` method name split into a `MethodError` rather than handed
+/// out as data.
+#[test]
+fn frame_parts_decode_into_the_same_response_the_envelope_produces() {
+    let method_responses = serde_json::value::RawValue::from_string(
+        r#"[["Test/get",{"accountId":"A1","state":"s1","list":[{"id":"t1","name":"hello"}],"notFound":[]},"s0"],
+            ["error",{"type":"unknownMethod"},"s1"]]"#
+            .to_string(),
+    )
+    .unwrap();
+
+    let mut response = Response::from_frame_parts(
+        &method_responses,
+        Some(std::collections::HashMap::from([(
+            "k".to_string(),
+            "v".to_string(),
+        )])),
+        "abc".to_string(),
+    )
+    .unwrap();
+
+    assert_eq!(response.session_state(), "abc");
+    assert_eq!(
+        response.created_ids().and_then(|ids| ids.get("k")),
+        Some(&"v".to_string())
+    );
+
+    let result: GetResponse<TestObj> = response.get(&make_handle::<TestGet>("s0")).unwrap();
+    assert_eq!(result.list()[0].name.as_deref(), Some("hello"));
+
+    let err = response.get(&make_handle::<TestGet>("s1")).unwrap_err();
+    assert!(
+        matches!(err, Error::Method(_)),
+        "an `error` entry must stay a method error, got {err:?}"
+    );
+}
+
+/// A `methodResponses` array that is not an array of call triples is a
+/// decode failure, not a silently empty response: the WebSocket door
+/// reports it as `Error::ResponseDecode` while still having read the
+/// frame's `sessionState`.
+#[test]
+fn frame_parts_reject_malformed_method_responses() {
+    let method_responses = serde_json::value::RawValue::from_string("[[1,2]]".to_string()).unwrap();
+
+    assert!(Response::from_frame_parts(&method_responses, None, "abc".to_string()).is_err());
+}
+
 // Decode leniency only. An absent `notFound` decoding as empty is NOT
 // evidence that every requested id was answered - `GetResponse` does not
 // know which ids were requested. Callers with a closed per-item

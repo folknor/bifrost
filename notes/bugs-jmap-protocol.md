@@ -214,9 +214,33 @@ narrowing it is a product decision, not a defect fix.)
   BUILDER's refusal to read an absent or zero limit as a hard bound, drive
   `seed_account_state` directly, and that contract is unchanged - only their
   stale prose about `open`'s ordering was corrected.
-- **WS Response decode double-round-trips** (`json!` Value rebuild then
-  `from_value`) - works (verified), but it re-allocates every method response; a
-  `RawValue`-preserving envelope would decode once.
+- ~~**WS Response decode double-round-trips.**~~ FIXED. A `Response` frame now
+  decodes in one pass. `WebSocketResponse::method_responses` is a
+  `Box<RawValue>` instead of a `Vec<serde_json::Value>`, and the new
+  `Response::from_frame_parts` splits that raw array into the same
+  success/`MethodError` lanes the HTTP envelope deserializer uses (both now go
+  through one shared `split_call_results`), so a frame costs a raw-slice copy
+  per method response instead of a full `Value` tree, a `json!` envelope
+  rebuild, and a second walk of the whole thing under `from_value`. The
+  `#[serde(tag = "@type")]` derive on `WebSocketMessage_` had to go with it:
+  an internally-tagged enum buffers the frame into serde's private `Content`
+  tree before choosing a variant, and a `RawValue` cannot survive that buffer
+  (it re-emerges as the newtype token, which the first run of this change
+  proved loudly - four WS tests failed with "invalid type: newtype struct").
+  `decode_frame` reads the `@type` discriminator by itself - a skim that
+  allocates only the tag string and builds no value tree - then deserializes
+  the variant straight from the same bytes; an unknown or absent `@type` is
+  still a `serde_json::Error` on the same arm as before. Behaviour is
+  unchanged throughout: session state is still observed before the method
+  responses are touched, so an undecodable frame still reports its truthful
+  `sessionState` and still fails its own waiter with `ResponseDecode`. Pinned
+  by the existing frame-decode, correlation and session-state tests (which
+  bit hard on the `Content` trap above) plus the two new mechanism pins
+  `frame_parts_decode_into_the_same_response_the_envelope_produces` and
+  `frame_parts_reject_malformed_method_responses`; the two client_ws tests
+  that named the old two-step path were reworded and
+  `response_frame_is_rebuilt_into_a_response` renamed to
+  `response_frame_decodes_into_a_response`.
 - **`ByteTally` counts only `/jmap/api` responses.** Documented, but it means
   metered streams that also `download` (raw RFC822, sieve script bodies)
   under-report - blob bytes are typically the *bulk* of the traffic those paths

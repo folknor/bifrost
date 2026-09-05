@@ -73,6 +73,54 @@ impl Response {
     pub(crate) fn created_ids(&self) -> Option<&HashMap<String, String>> {
         self.created_ids.as_ref()
     }
+
+    /// Build a `Response` from the already-split parts of an RFC 8887
+    /// WebSocket `Response` frame.
+    ///
+    /// The WebSocket frame is not an HTTP response body: it carries the
+    /// envelope fields alongside `@type` and `requestId`, so it cannot be
+    /// deserialized straight into `Response`, and the frame's
+    /// `sessionState` must be readable even when the method responses do
+    /// not decode. This entry point takes `methodResponses` as the raw
+    /// JSON slice the frame parse already captured and runs the SAME
+    /// per-call split the envelope deserializer runs, so a response frame
+    /// costs one pass over the array instead of a `serde_json::Value`
+    /// rebuild followed by a second deserialization of it.
+    pub(crate) fn from_frame_parts(
+        method_responses: &serde_json::value::RawValue,
+        created_ids: Option<HashMap<String, String>>,
+        session_state: String,
+    ) -> Result<Self, serde_json::Error> {
+        let calls: Vec<(String, Box<serde_json::value::RawValue>, String)> =
+            serde_json::from_str(method_responses.get())?;
+
+        Ok(Response {
+            raw: split_call_results(calls)?,
+            session_state,
+            created_ids,
+        })
+    }
+}
+
+/// Split raw `methodResponses` entries into success payloads and decoded
+/// `MethodError`s. Shared by the HTTP envelope deserializer and the
+/// WebSocket frame path so the two doors cannot drift.
+fn split_call_results(
+    calls: Vec<(String, Box<serde_json::value::RawValue>, String)>,
+) -> Result<Vec<(String, RawCallResult, String)>, serde_json::Error> {
+    let mut raw = Vec::with_capacity(calls.len());
+
+    for (method_name, data, call_id) in calls {
+        let result = if method_name == "error" {
+            RawCallResult::Error(serde_json::from_str::<MethodError>(data.get())?)
+        } else {
+            RawCallResult::Success(data)
+        };
+
+        raw.push((method_name, result, call_id));
+    }
+
+    Ok(raw)
 }
 
 impl<'de> Deserialize<'de> for Response {
@@ -91,19 +139,7 @@ impl<'de> Deserialize<'de> for Response {
         }
 
         let envelope = RawEnvelope::deserialize(deserializer)?;
-        let mut raw = Vec::with_capacity(envelope.method_responses.len());
-
-        for (method_name, data, call_id) in envelope.method_responses {
-            let result = if method_name == "error" {
-                let error: MethodError =
-                    serde_json::from_str(data.get()).map_err(de::Error::custom)?;
-                RawCallResult::Error(error)
-            } else {
-                RawCallResult::Success(data)
-            };
-
-            raw.push((method_name, result, call_id));
-        }
+        let raw = split_call_results(envelope.method_responses).map_err(de::Error::custom)?;
 
         Ok(Response {
             raw,

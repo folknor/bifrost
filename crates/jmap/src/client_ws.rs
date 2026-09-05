@@ -49,8 +49,16 @@ pub(crate) struct WebSocketResponse {
     #[serde(rename = "requestId", default)]
     request_id: Option<String>,
 
+    /// The `methodResponses` array, kept as the raw JSON slice the frame
+    /// parse already saw. It used to be a `Vec<serde_json::Value>`, which
+    /// was then rebuilt into a `json!` envelope and deserialized a second
+    /// time - a full `Value` tree plus a re-walk for every method response
+    /// on every frame. Handing the raw slice to
+    /// `Response::from_frame_parts` decodes each call result exactly once,
+    /// while still leaving `sessionState` readable when the array does not
+    /// decode.
     #[serde(rename = "methodResponses")]
-    method_responses: Vec<serde_json::Value>,
+    method_responses: Box<serde_json::value::RawValue>,
 
     #[serde(rename = "createdIds")]
     created_ids: Option<HashMap<String, String>>,
@@ -106,24 +114,65 @@ pub(crate) struct WebSocketError {
     limit: Option<String>,
 }
 
-// RFC 8887 frames carry exactly one `@type` discriminator. This
-// enum's tag consumes it, so the payload variants must inline the
-// post-tag fields directly. A nested `#[serde(tag = "@type")]` type
-// (e.g. `PushObject`) would look for a second `@type` that the wire
-// never sends and fail with `protocol.parse-failed`. The match arm
-// below rebuilds a `PushObject` for the downstream stream output.
-#[derive(Debug, Deserialize)]
-#[serde(tag = "@type")]
+// RFC 8887 frames carry exactly one `@type` discriminator, and the
+// payload fields sit beside it rather than nested under it. A nested
+// `#[serde(tag = "@type")]` type (e.g. `PushObject`) would look for a
+// second `@type` that the wire never sends and fail with
+// `protocol.parse-failed`, so each variant's payload struct inlines the
+// post-tag fields and the match arms below rebuild a `PushObject` for
+// the downstream stream output.
+//
+// The dispatch is hand-written rather than `#[serde(tag = "@type")]`
+// because an internally-tagged enum buffers the whole frame into
+// serde's private `Content` tree before it picks a variant, and a
+// `RawValue` field cannot survive that buffer (it comes back out as the
+// newtype token, not as JSON). Keeping `methodResponses` raw is the
+// whole point of this path, so the tag is read by itself first - a skim
+// that allocates only the tag string and builds no value tree - and the
+// chosen variant is then deserialized straight from the same bytes.
+#[derive(Debug)]
 enum WebSocketMessage_ {
     Response(WebSocketResponse),
-    StateChange {
-        changed: HashMap<String, HashMap<DataType, String>>,
-        #[serde(rename = "pushState", default)]
-        push_state: Option<String>,
-    },
+    StateChange(WebSocketStateChange),
     #[cfg(feature = "calendars")]
     CalendarAlert(crate::CalendarAlert),
     RequestError(WebSocketError),
+}
+
+#[derive(Debug, Deserialize)]
+struct FrameType {
+    #[serde(rename = "@type")]
+    ty: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct WebSocketStateChange {
+    changed: HashMap<String, HashMap<DataType, String>>,
+    #[serde(rename = "pushState", default)]
+    push_state: Option<String>,
+}
+
+/// Decode one RFC 8887 frame: read the `@type` discriminator, then
+/// deserialize the frame's own bytes into the variant it names. An
+/// unrecognized (or absent) `@type` is a `serde_json::Error`, the same
+/// shape the derived internally-tagged dispatch produced.
+fn decode_frame(payload: &[u8]) -> Result<WebSocketMessage_, serde_json::Error> {
+    use serde::de::Error as _;
+
+    let FrameType { ty } = serde_json::from_slice(payload)?;
+
+    Ok(match ty.as_str() {
+        "Response" => WebSocketMessage_::Response(serde_json::from_slice(payload)?),
+        "StateChange" => WebSocketMessage_::StateChange(serde_json::from_slice(payload)?),
+        #[cfg(feature = "calendars")]
+        "CalendarAlert" => WebSocketMessage_::CalendarAlert(serde_json::from_slice(payload)?),
+        "RequestError" => WebSocketMessage_::RequestError(serde_json::from_slice(payload)?),
+        other => {
+            return Err(serde_json::Error::custom(format!(
+                "unknown JMAP WebSocket frame type `{other}`"
+            )));
+        }
+    })
 }
 
 #[derive(Debug)]
@@ -603,7 +652,7 @@ where
             match message {
                 Ok(message) if message.is_text() => {
                     let payload = message.into_payload();
-                    match serde_json::from_slice::<WebSocketMessage_>(payload.as_ref()) {
+                    match decode_frame(payload.as_ref()) {
                         Ok(message) => match message {
                             WebSocketMessage_::Response(response) => {
                                 // Session divergence is checked on the frame's own
@@ -614,14 +663,16 @@ where
                                 // has already replaced.
                                 on_session_state(&response.session_state);
                                 let request_id = response.request_id;
-                                // Deserialize the raw method responses into a Response
-                                let json = serde_json::json!({
-                                    "methodResponses": response.method_responses,
-                                    "createdIds": response.created_ids,
-                                    "sessionState": response.session_state,
-                                });
-                                let outcome = serde_json::from_value::<Response>(json)
-                                    .map_err(crate::Error::ResponseDecode);
+                                // Decode the method responses in place, from
+                                // the raw slice the frame parse already
+                                // captured: one pass, no intermediate
+                                // `serde_json::Value` envelope.
+                                let outcome = Response::from_frame_parts(
+                                    &response.method_responses,
+                                    response.created_ids,
+                                    response.session_state,
+                                )
+                                .map_err(crate::Error::ResponseDecode);
                                 // Route to the caller waiting on this id, if
                                 // any. A decode failure goes to the waiter too:
                                 // the frame WAS its answer, and yielding the
@@ -641,7 +692,7 @@ where
                                     }
                                 }
                             }
-                            WebSocketMessage_::StateChange { changed, push_state } => {
+                            WebSocketMessage_::StateChange(WebSocketStateChange { changed, push_state }) => {
                                 yield Ok(WebSocketMessage::PushNotification(PushObject::StateChange { changed, push_state }))
                             }
                             #[cfg(feature = "calendars")]
@@ -780,19 +831,19 @@ mod tests {
     }
 
     // A real RFC 8887 StateChange frame carries exactly one `@type`.
-    // The outer enum tag consumes it, so the variant must inline
-    // `changed` directly; a nested `#[serde(tag = "@type")]` payload
-    // would demand a second `@type` the wire never sends.
+    // The frame dispatch consumes it, so the variant's payload struct
+    // must inline `changed` directly; a nested `#[serde(tag = "@type")]`
+    // payload would demand a second `@type` the wire never sends.
     #[test]
     fn deserializes_single_type_state_change_frame() {
         let frame = r#"{"@type":"StateChange","changed":{"u1138":{"Mailbox":"f9a8d3"}},"pushState":"ps-9"}"#;
 
-        let message: WebSocketMessage_ = serde_json::from_str(frame).unwrap();
+        let message = decode_frame(frame.as_bytes()).unwrap();
 
-        let WebSocketMessage_::StateChange {
+        let WebSocketMessage_::StateChange(WebSocketStateChange {
             changed,
             push_state,
-        } = message
+        }) = message
         else {
             panic!("expected StateChange variant, got {message:?}");
         };
@@ -957,8 +1008,13 @@ mod tests {
         assert_eq!(details.request_id(), Some("7"));
     }
 
+    /// A `Response` frame decodes into a `Response` in one pass: the
+    /// envelope fields it carries beside `@type`/`requestId` are read
+    /// straight off the frame, and the `methodResponses` array goes to
+    /// `Response::from_frame_parts` as the raw slice the frame parse
+    /// already captured.
     #[tokio::test]
-    async fn response_frame_is_rebuilt_into_a_response() {
+    async fn response_frame_decodes_into_a_response() {
         let frame = r#"{"@type":"Response","methodResponses":[["Core/echo",{"hello":true},"c0"]],"createdIds":{"k":"v"},"sessionState":"s-1"}"#;
 
         let out = decode(vec![Ok(Message::text(frame.to_string()))]).await;
@@ -1051,8 +1107,8 @@ mod tests {
     #[tokio::test]
     async fn response_frame_with_malformed_method_responses_decodes_to_an_error() {
         // The outer frame parses (methodResponses is a JSON array), but
-        // the rebuilt envelope is not a valid `Response`: this pins the
-        // inner `from_value` failure arm distinctly from the outer one.
+        // its entries are not call triples: this pins the method-response
+        // decode failure arm distinctly from the frame-level one.
         let frame = r#"{"@type":"Response","methodResponses":[[1,2]],"sessionState":"s-1"}"#;
 
         let out = decode(vec![Ok(Message::text(frame.to_string()))]).await;
