@@ -1,6 +1,6 @@
 pub(crate) use bifrost_dav_core::resolve_href;
 use bifrost_dav_core::{
-    MultiStatusSink, PropSet, ResponseParts, commit_if_present, normalize_etag,
+    MultiStatusSink, PropSet, ResponseParts, classify_207, commit_if_present, normalize_etag,
     parse_collection_property, parse_multistatus, same_dav_url, trimmed,
 };
 pub(crate) use bifrost_dav_core::{extract_href_properties, extract_href_property};
@@ -20,15 +20,23 @@ pub(crate) struct CalDavEventEntry {
     pub(crate) etag: Option<String>,
 }
 
-/// Outcome of a depth-1 event PROPFIND: the resources whose propstat
-/// succeeded (`entries`) plus the hrefs the server reported *failed*
-/// within the 207. A failed href is a transiently-failed resource, not
-/// an absent one - the snapshot diff preserves the local copy rather
-/// than emitting a Destroyed (brick 7).
+/// Outcome of a depth-1 event PROPFIND or a `calendar-query`: the resources
+/// whose propstat succeeded (`entries`) plus the resources the server reported
+/// *failed* within the 207. A failed resource is a transiently-failed one, not
+/// an absent one - the snapshot diff preserves the local copy rather than
+/// emitting a Destroyed (brick 7).
+///
+/// The failure lane carries each resource's STATUS, not just its href, so this
+/// listing runs through the same RFC 4918 s13 ladder the multiget lanes use.
+/// Without it an all-refused 207 - which the `calendar-query` candidate lane
+/// meets whenever a server refuses every member - came back as an empty
+/// candidate set plus a bare list of hrefs, and the recovery class of that
+/// refusal was unreachable: a consumer saw an empty page and recorded a
+/// completed walk.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct CalDavEventListing {
     pub(crate) entries: Vec<CalDavEventEntry>,
-    pub(crate) failed_hrefs: Vec<String>,
+    pub(crate) failed: Vec<CalDavFailedResource>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,24 +46,11 @@ pub(crate) struct CalDavFetchedEvent {
     pub(crate) data: String,
 }
 
-/// One resource inside a 207 that yielded no usable `calendar-data`,
-/// with the status the server gave it (when it gave one).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CalDavFailedResource {
-    pub(crate) href: String,
-    pub(crate) status: Option<u16>,
-}
-
-impl CalDavFailedResource {
-    /// True when the status means "this particular resource is not
-    /// there" - the benign, genuinely per-resource case that
-    /// `Page::failed_ids` exists to carry. Anything else (auth,
-    /// permission, server error, or no status at all) can just as
-    /// easily be a condition affecting the whole request.
-    pub(crate) fn is_missing_resource(&self) -> bool {
-        matches!(self.status, Some(404 | 410))
-    }
-}
+/// One resource inside a 207 that yielded nothing usable, with the status the
+/// server gave it (when it gave one). Both member lanes use it - the multiget
+/// for a resource with no `calendar-data`, the listing for a resource whose
+/// every propstat failed - so both classify through the same ladder.
+pub(crate) type CalDavFailedResource = bifrost_dav_core::FailedResource;
 
 /// Outcome of a `calendar-multiget` / `calendar-query` REPORT: the
 /// resources that came back with usable `calendar-data` (`events`) plus
@@ -80,17 +75,7 @@ pub(crate) struct CalDavMultigetReport {
 }
 
 /// What a parsed 207 body actually represents, per RFC 4918 s13.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum MultigetOutcome {
-    /// Nothing failed, or enough succeeded that the failures are
-    /// per-resource news the caller should report but not fail on.
-    Usable,
-    /// Every resource in the body failed and at least one of them
-    /// failed for a reason that is not "this resource is missing".
-    /// Reporting this as an empty success lets a consumer record the
-    /// collection as fully walked and drop the resources permanently.
-    CompleteFailure { status: Option<u16> },
-}
+pub(crate) type MultigetOutcome = bifrost_dav_core::MultiStatusOutcome;
 
 impl CalDavMultigetReport {
     /// Fold another chunk's report into this one. Multiget is chunked
@@ -124,19 +109,7 @@ impl CalDavMultigetReport {
     /// the body is a complete failure and the caller must surface it as
     /// an error instead of an empty page.
     pub(crate) fn classify(&self) -> MultigetOutcome {
-        if !self.events.is_empty() || self.failed.is_empty() {
-            return MultigetOutcome::Usable;
-        }
-        let systemic = self
-            .failed
-            .iter()
-            .find(|failure| !failure.is_missing_resource());
-        match systemic {
-            Some(failure) => MultigetOutcome::CompleteFailure {
-                status: failure.status,
-            },
-            None => MultigetOutcome::Usable,
-        }
+        classify_207(!self.events.is_empty(), &self.failed)
     }
 }
 
@@ -170,9 +143,26 @@ impl CalDavEventListing {
         for entry in &mut self.entries {
             entry.uri = resolve_href(request_url, &entry.uri);
         }
-        for href in &mut self.failed_hrefs {
-            *href = resolve_href(request_url, href);
+        for failure in &mut self.failed {
+            failure.href = resolve_href(request_url, &failure.href);
         }
+    }
+
+    /// The refused hrefs, for the lanes that only carry ids (`Page::failed_ids`
+    /// and the snapshot-diff preservation guard).
+    pub(crate) fn failed_hrefs(&self) -> Vec<String> {
+        self.failed
+            .iter()
+            .map(|failure| failure.href.clone())
+            .collect()
+    }
+
+    /// Read this 207 through the RFC 4918 s13 ladder, the same one the multiget
+    /// lanes use. A listing with any committed entry is `Usable` however many
+    /// siblings were refused - a per-member failure beside successes stays a
+    /// per-id failure and the page is served.
+    pub(crate) fn classify(&self) -> MultigetOutcome {
+        classify_207(!self.entries.is_empty(), &self.failed)
     }
 }
 
@@ -387,8 +377,8 @@ impl MultiStatusSink for EventListingSink {
                 uri: href.to_string(),
                 etag: parts.props().etag.clone(),
             });
-        } else if let Some(href) = parts.failed_href() {
-            self.listing.failed_hrefs.push(href.to_string());
+        } else if let Some(failure) = parts.failed_member() {
+            self.listing.failed.push(failure);
         }
     }
 }
@@ -726,7 +716,7 @@ mod tests {
                 etag: Some("abc".to_string()),
             }]
         );
-        assert!(listing.failed_hrefs.is_empty());
+        assert!(listing.failed.is_empty());
     }
 
     #[test]
@@ -800,7 +790,12 @@ mod tests {
 
         let listing = parse_propfind_events(xml).expect("valid XML");
         assert!(listing.entries.is_empty());
-        assert_eq!(listing.failed_hrefs, vec!["/cal/one.ics".to_string()]);
+        assert_eq!(listing.failed_hrefs(), vec!["/cal/one.ics".to_string()]);
+        // The lane carries the STATUS as well as the href, which is what makes
+        // an all-refused 207 classifiable. A 404 is the benign per-resource
+        // case, so this listing still reads as usable.
+        assert_eq!(listing.failed[0].status, Some(404));
+        assert_eq!(listing.classify(), MultigetOutcome::Usable);
     }
 
     /// A `resourcetype` block the server REFUSED says nothing about the
@@ -869,7 +864,7 @@ END:VCALENDAR</C:calendar-data></D:prop>
           </D:response></D:multistatus>"#;
 
         let listing = parse_propfind_events(xml).expect("valid XML");
-        assert_eq!(listing.failed_hrefs, vec!["/cal/opaque-id"]);
+        assert_eq!(listing.failed_hrefs(), vec!["/cal/opaque-id"]);
     }
 
     #[test]

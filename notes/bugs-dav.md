@@ -239,19 +239,35 @@ below was subsequently taken, as ruling 6.
   and dedup tests; ablated mechanically - the dedup, the 400 arm, the 403
   precondition arm, the local-match filter and the page slice were each
   reverted and confirmed failing. The unit tests that pinned the materialized
-  slicers moved down to the href level rather than being dropped, and
-  `bifrost_dav_core::page_after_watermark` now has no caller anywhere: it is
-  kept with its tests and marked as such, since removing it is the repository
-  owner's call.
+  slicers moved down to the href level rather than being dropped.
 
-  One accepted loss, recorded rather than hidden: the candidate 207 is parsed
-  by the LISTING parser, whose failure lane carries hrefs and no statuses, so a
-  query 207 in which every response failed now comes back as an empty candidate
-  set plus those hrefs in `failed_ids` instead of the classified `Err`
-  `events_in_range` used to raise through `CalDavMultigetReport::classify`.
-  Nothing is dropped - the resources are named on every page they are observed
-  on - and a non-2xx on the REPORT itself is still classified normally, but the
-  recovery class of an all-failed 207 is not reachable from that lane. Closing
-  it means carrying propstat statuses on `CalDavEventListing` /
-  `CardDavContactListing`, which would also let the three older listing lanes
-  classify; that is a parser change, not part of this one.)
+  CLOSED, the accepted loss this round recorded: the candidate 207 is parsed by
+  the LISTING parser, and that parser's failure lane now carries a
+  `FailedResource` - href plus the member status from
+  `ResponseParts::failed_member` - rather than a bare href. `CalDavEventListing`
+  and `CardDavContactListing` therefore run
+  `bifrost_dav_core::classify_207`, the one RFC 4918 s13 ladder both crates'
+  multiget reports were already reading (their hand-mirrored `classify` bodies
+  and `*FailedResource` / `MultigetOutcome` types collapsed into it), so an
+  all-refused query 207 is the classified `Err` `events_in_range` used to raise
+  through `CalDavMultigetReport::classify` instead of an empty page. The
+  depth-1 listing and the snapshot poll go through the same `listing_failure`
+  funnel and inherit it; a listing with any committed entry never reaches the
+  funnel, so a partially failed 207 still serves its page with the refused
+  members on `failed_ids`. Pinned on both sides by
+  `an_all_refused_query_207_classifies_rather_than_serving_an_empty_page` and
+  `a_partly_refused_query_207_still_serves_the_page`, and in dav-core by
+  `a_failed_member_carries_the_status_that_classifies_it` and
+  `an_all_failed_207_classifies_where_a_mixed_one_stays_usable`; each ablated
+  and confirmed failing.
+
+  CLOSED too: `bifrost_dav_core::page_after_watermark` is deleted. It had no
+  caller once every lane paged before hydrating, and dav-core is the private
+  shared crate (the `bifrost-sasl` precedent), not a published surface. Its two
+  tests were retargeted onto `slice_after_watermark`, which is where both rules
+  they pinned actually live - a zero page size is an exhausted page rather than
+  one re-emitting its own watermark, and a watermark past every key is an empty
+  final page. Neither rule was dropped and no other assertion was lost: the
+  `failed_ids` / `skipped_scopes` pass-through the deleted function documented
+  was never asserted by them, and it is pinned where it now happens, in the
+  lanes' own `Page` construction.)

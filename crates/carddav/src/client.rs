@@ -213,6 +213,9 @@ impl CardDavClient {
         let mut listing = parse_propfind_contacts(&response.text)
             .map_err(|error| parse_error(operation, format!("contact list: {error}")))?;
         listing.resolve_hrefs(&response.url);
+        if let Some(error) = listing_failure(&listing, operation) {
+            return Err(error);
+        }
         Ok(listing)
     }
 
@@ -412,7 +415,16 @@ impl CardDavClient {
             }
         };
         listing.resolve_hrefs(&response.url);
-        HrefLeg::Listing(listing)
+        // A 207 in which EVERY response failed is a complete failure, not an
+        // empty candidate set: the candidate lane is read by the listing
+        // parser, and until its failure lane carried statuses this arm could
+        // only report the hrefs, so an all-refused query came back as an empty
+        // page and a consumer recorded a completed walk over a collection it
+        // had been refused.
+        match listing_failure(&listing, operation) {
+            Some(error) => HrefLeg::Failed(error),
+            None => HrefLeg::Listing(listing),
+        }
     }
 
     /// Fetch one vCard resource with a plain `GET`, reading the validator from
@@ -622,9 +634,10 @@ pub(crate) struct MultigetFetch {
 /// The listing lane merges one, the text lane eight, and they differ in nothing
 /// else. Twin of the CalDAV function of the same name.
 pub(crate) fn extend_candidates(query: &mut HrefQuery, listing: CardDavContactListing) {
+    let failed_hrefs = listing.failed_hrefs();
     query.extend(
         listing.entries.into_iter().map(|entry| entry.uri),
-        listing.failed_hrefs,
+        failed_hrefs,
     );
 }
 
@@ -663,7 +676,30 @@ fn multiget_failure(
     report: &CardDavMultigetReport,
     operation: AccountOperation,
 ) -> Option<AccountError> {
-    match report.classify() {
+    complete_failure_error(report.classify(), report.failed.len(), operation)
+}
+
+/// The same ladder for a LISTING 207 - the depth-1 PROPFIND, the snapshot poll,
+/// and the `addressbook-query` candidate lane.
+///
+/// A listing with any committed entry never reaches here, so a member refused
+/// beside members that answered stays a per-id failure on `Page::failed_ids`
+/// and the page is served. Only a 207 in which every response failed, for a
+/// reason other than the resource being gone, becomes an error. Twin of the
+/// CalDAV function of the same name.
+fn listing_failure(
+    listing: &CardDavContactListing,
+    operation: AccountOperation,
+) -> Option<AccountError> {
+    complete_failure_error(listing.classify(), listing.failed.len(), operation)
+}
+
+fn complete_failure_error(
+    outcome: MultigetOutcome,
+    failed: usize,
+    operation: AccountOperation,
+) -> Option<AccountError> {
+    match outcome {
         MultigetOutcome::Usable => None,
         MultigetOutcome::CompleteFailure { status } => {
             let code = status
@@ -672,10 +708,7 @@ fn multiget_failure(
             Some(status_error(
                 operation,
                 code,
-                format!(
-                    "multi-status body reported failure for all {} resources",
-                    report.failed.len()
-                ),
+                format!("multi-status body reported failure for all {failed} resources"),
             ))
         }
     }

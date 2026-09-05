@@ -37,14 +37,15 @@ pub use error::{
 };
 pub use etag::{PutCondition, normalize_http_etag, prepare_if_match, response_etag};
 pub use multistatus::{
-    MultiStatusSink, PropSet, ResponseParts, commit_if_present, extract_href_properties,
-    extract_href_property, parse_collection_property, parse_multistatus,
+    FailedResource, MultiStatusOutcome, MultiStatusSink, PropSet, ResponseParts, classify_207,
+    commit_if_present, extract_href_properties, extract_href_property, parse_collection_property,
+    parse_multistatus,
 };
 pub use query::{FilteredHrefs, HrefQuery, sorted_candidate_hrefs};
 pub use snapshot::{
     DecodedSnapshot, PageSlice, SnapshotEntry, decode_snapshot, decode_watermark_cursor,
     diff_snapshots, encode_snapshot, encode_watermark_cursor, inventory_entry, object_change,
-    page_after_watermark, preserve_unobserved_entries, slice_after_watermark,
+    preserve_unobserved_entries, slice_after_watermark,
 };
 pub use transport::{
     DAV_CLIENT_TIMEOUT, DavBody, DavRequest, DavResponse, origin_is_secure, settle_body, url_origin,

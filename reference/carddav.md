@@ -73,9 +73,12 @@ carries the reasoning, and the twin must not drift from it.
   statuses or a missing status, which RFC 4918 requires but the parser
   tolerates as success.
   `parse_propfind_contacts` returns a `CardDavContactListing`: committed
-  non-collection `entries` plus `failed_hrefs` (non-collection resources
-  whose only propstat failed within the 207), so the snapshot diff can preserve a
-  transiently-failed resource instead of destroying it. A response with NO
+  non-collection `entries` plus `failed` (non-collection resources whose only
+  propstat failed within the 207, each carrying its member status), so the
+  snapshot diff can preserve a transiently-failed resource instead of destroying
+  it and the listing classifies through the same RFC 4918 s13 ladder the
+  multiget lanes use. `failed_hrefs()` projects that lane onto the bare ids the
+  diff guard and `Page::failed_ids` take. A response with NO
   propstat at all commits as an etag-less entry, matching the CalDAV twin:
   requiring a successful propstat dropped a bare
   `<response><href/></response>` out of BOTH lanes - not an entry, and not a
@@ -275,6 +278,16 @@ Supported contact primitives:
   drops matches silently. A page is therefore allowed to be short, or empty,
   while still carrying a cursor.
 
+  **An all-refused candidate 207 is classified, not served as an empty page.**
+  The listing failure lane carries each member's status, so the candidate leg
+  runs `bifrost_dav_core::classify_207` exactly as the multiget report does and
+  a wholly refused query reaches the consumer with its recovery class. A member
+  refused BESIDE members that answered stays a per-id failure on `failed_ids`
+  and the page is served. `reference/caldav.md` carries the reasoning; both
+  sides are pinned by
+  `an_all_refused_query_207_classifies_rather_than_serving_an_empty_page` and
+  `a_partly_refused_query_207_still_serves_the_page`.
+
   **A server that will not run the filter degrades rather than failing**, by
   the shared `bifrost_dav_core::filter_unsupported` rule
   `reference/caldav.md` documents (400, 501, or a 403 naming a filter
@@ -442,8 +455,11 @@ lane runs through `bifrost_dav_core::parse_multistatus`: address-book discovery,
 the depth-1 contact PROPFIND, and the `addressbook-multiget` /
 `addressbook-query` REPORT. The depth-0 `getctag` read is
 `parse_collection_property(xml, "getctag")`, and the snapshot codec, diff,
-inventory projection and watermark page slicer are the shared ones, parameterized
-only by the `CDAVCTAG1` magic and this crate's `cursor_error`.
+inventory projection and watermark slicer (`slice_after_watermark`) are the
+shared ones, parameterized only by the `CDAVCTAG1` magic and this crate's
+`cursor_error`. `CardDavFailedResource` and `MultigetOutcome` are now aliases of
+the shared `FailedResource` / `MultiStatusOutcome`, and both member lanes
+classify through the one `classify_207`.
 
 The collapse closed one drift on this side: `<addressbook/>` was accepted as a
 resourcetype marker no matter where in the prop bag it appeared, where the

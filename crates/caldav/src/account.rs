@@ -306,6 +306,7 @@ impl CalDavAccount {
             None => client.collection_sync_token(calendar, operation).await?,
         };
         let listing = client.list_events_listing(calendar, operation).await?;
+        let failed_hrefs = listing.failed_hrefs();
         let mut entries = listing
             .entries
             .into_iter()
@@ -315,7 +316,6 @@ impl CalDavAccount {
             })
             .collect::<Vec<_>>();
         entries.sort_by(|left, right| left.uri.cmp(&right.uri));
-        let failed_hrefs = listing.failed_hrefs;
         Ok(EventSnapshot {
             calendar_url: calendar.to_string(),
             sync_token,
@@ -2204,6 +2204,16 @@ mod tests {
         )
     }
 
+    /// A member the server refused with a named status, so the failure lane's
+    /// classification can be read.
+    fn refused_with(name: &str, status: u16, reason: &str) -> String {
+        format!(
+            "<D:response><D:href>/cal/{name}.ics</D:href><D:propstat><D:prop>\
+<D:getetag/></D:prop><D:status>HTTP/1.1 {status} {reason}</D:status>\
+</D:propstat></D:response>"
+        )
+    }
+
     fn hydrated(name: &str) -> String {
         format!(
             "<D:response><D:href>/cal/{name}.ics</D:href><D:propstat><D:prop>\
@@ -2344,6 +2354,77 @@ mod tests {
             !requests[2].body.contains("/cal/c.ics"),
             "the degrade lane still hydrates only the page: {}",
             requests[2].body
+        );
+    }
+
+    /// A candidate 207 in which EVERY response failed is a complete failure,
+    /// not an empty page.
+    ///
+    /// This was the accepted loss of the server-side-filter round: the
+    /// candidate lane is read by the listing parser, whose failure lane carried
+    /// hrefs and no statuses, so an all-refused query came back as an empty
+    /// candidate set plus `failed_ids` and a consumer recorded a completed walk
+    /// over a collection it had been refused. The listing lane now carries the
+    /// per-member status and runs the same RFC 4918 s13 ladder the multiget
+    /// lanes use, so the recovery class is reachable: a 507 is a quota
+    /// condition on the request, not news about four resources.
+    ///
+    /// The script holds ONE response: a lane that went on to multiget the empty
+    /// page would starve it and panic.
+    #[tokio::test]
+    async fn an_all_refused_query_207_classifies_rather_than_serving_an_empty_page() {
+        let query = wrap(&[
+            refused_with("a", 507, "Insufficient Storage"),
+            refused_with("b", 507, "Insufficient Storage"),
+        ]);
+        let script = dav_script([cal_multistatus(query)]);
+        let client =
+            CalDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
+        let account = CalDavAccount::for_tests(Arc::new(client), "https://dav.example.test/cal/");
+
+        let error = account
+            .events_in_range(range_over_2026())
+            .await
+            .expect_err("an all-refused candidate 207 is a classified failure");
+
+        assert_eq!(
+            error.kind(),
+            &AccountErrorKind::Server(ServerErrorKind::QuotaExhausted),
+            "the member status drives the classification"
+        );
+    }
+
+    /// The other half of the same rule, and the one that guards against
+    /// over-reach: a member refused BESIDE members that answered stays a
+    /// per-id failure on `Page::failed_ids`, and the page is served. A 403 is
+    /// the sharpest case, because alone it would classify as `NoPermission`.
+    #[tokio::test]
+    async fn a_partly_refused_query_207_still_serves_the_page() {
+        let query = wrap(&[queried("a"), refused("b"), queried("c")]);
+        let script = dav_script([
+            cal_multistatus(query),
+            cal_multistatus(wrap(&[hydrated("a"), hydrated("c")])),
+        ]);
+        let client =
+            CalDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
+        let account = CalDavAccount::for_tests(Arc::new(client), "https://dav.example.test/cal/");
+
+        let page = account
+            .events_in_range(range_over_2026())
+            .await
+            .expect("a partially refused 207 is still a page");
+
+        assert_eq!(
+            event_ids(&page),
+            vec![
+                "https://dav.example.test/cal/a.ics".to_string(),
+                "https://dav.example.test/cal/c.ics".to_string(),
+            ]
+        );
+        assert_eq!(
+            page.failed_ids,
+            vec!["https://dav.example.test/cal/b.ics".to_string()],
+            "the refused member is per-id news, not a page failure"
         );
     }
 

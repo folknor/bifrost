@@ -18,7 +18,7 @@ use std::collections::HashSet;
 
 use bifrost_types::{
     AccountError, AccountOperation, Change, Fingerprint, InventoryEntry, ObjectChange,
-    ObjectChangeKind, ObjectId, Page, ServerVersion, SkippedScope,
+    ObjectChangeKind, ObjectId, ServerVersion,
 };
 
 use crate::error::{DavProtocol, local_error};
@@ -396,46 +396,6 @@ pub fn slice_after_watermark<T>(
     }
 }
 
-/// Slice one watermark page out of a materialized result set.
-///
-/// **No lane uses this any more, and none should.** It was for the lanes whose
-/// remote leg answered with the object bodies already - a CalDAV
-/// `calendar-query`, a CardDAV text `addressbook-query` - which is exactly the
-/// shape that made a page cost O(collection). Those lanes now push their filter
-/// to the server, ask for `getetag` only, slice the candidate hrefs with
-/// [`slice_after_watermark`] and multiget just that page; they build their
-/// `Page` themselves, because the count they can report and the failures they
-/// carry come from two different legs. Kept, with its tests, because removing a
-/// published item is the repository owner's call, not a cleanup.
-///
-/// `failed_ids` and `skipped_scopes` describe the fetch that produced `items`,
-/// not the slice, and every page reruns that fetch. Both lanes are therefore
-/// reported on every page, which is exactly what `Page::failed_ids` documents:
-/// a resource that first starts failing while the consumer is on page three is
-/// news on page three, and suppressing it after page one would lose it
-/// entirely. The cost is that a resource failing throughout is named once per
-/// page, so a consumer accumulating across pages must treat the lane as a set,
-/// not a tally.
-#[must_use]
-pub fn page_after_watermark<T>(
-    items: Vec<T>,
-    watermark: Option<&str>,
-    page_size: usize,
-    key: impl Fn(&T) -> &str,
-    failed_ids: Vec<String>,
-    skipped_scopes: Vec<SkippedScope>,
-) -> Page<T> {
-    let estimated_total = Some(u64::try_from(items.len()).unwrap_or(u64::MAX));
-    let slice = slice_after_watermark(items, watermark, page_size, key);
-    Page {
-        items: slice.items,
-        next_cursor: slice.next_watermark.as_deref().map(encode_watermark_cursor),
-        estimated_total,
-        failed_ids,
-        skipped_scopes,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -493,19 +453,23 @@ mod tests {
         ));
     }
 
+    /// A zero page size is an exhausted page, not a page of nothing that still
+    /// points at itself: re-emitting the current watermark whenever results
+    /// exist gives a consumer that follows `next_cursor` an infinite loop that
+    /// never advances and never delivers an item.
     #[test]
     fn a_zero_page_size_is_exhausted_rather_than_self_pointing() {
-        let page = page_after_watermark(
-            vec!["a".to_string(), "b".to_string(), "c".to_string()],
-            None,
-            0,
-            String::as_str,
-            Vec::new(),
-            Vec::new(),
-        );
-        assert!(page.items.is_empty());
-        assert!(page.next_cursor.is_none());
-        assert_eq!(page.estimated_total, Some(3));
+        let slice = slice_after_watermark(hrefs(&["a", "b", "c"]), None, 0, String::as_str);
+        assert!(slice.items.is_empty());
+        assert!(slice.next_watermark.is_none());
+
+        // The loop shape is the one with a cursor: a consumer that follows
+        // `next_cursor` and asks for zero items must not be handed its own
+        // watermark back, which advances nothing and delivers nothing forever.
+        let continued =
+            slice_after_watermark(hrefs(&["a", "b", "c"]), Some("a"), 0, String::as_str);
+        assert!(continued.items.is_empty());
+        assert!(continued.next_watermark.is_none());
     }
 
     fn keys(items: &[String]) -> Vec<&str> {
@@ -599,15 +563,8 @@ mod tests {
     /// points at itself.
     #[test]
     fn a_watermark_past_every_key_is_an_empty_final_page() {
-        let page = page_after_watermark(
-            hrefs(&["a", "b", "c"]),
-            Some("z"),
-            2,
-            String::as_str,
-            Vec::new(),
-            Vec::new(),
-        );
-        assert!(page.items.is_empty());
-        assert!(page.next_cursor.is_none());
+        let slice = slice_after_watermark(hrefs(&["a", "b", "c"]), Some("z"), 2, String::as_str);
+        assert!(slice.items.is_empty());
+        assert!(slice.next_watermark.is_none());
     }
 }

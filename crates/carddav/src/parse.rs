@@ -1,7 +1,7 @@
 pub(crate) use bifrost_dav_core::extract_href_property;
 pub(crate) use bifrost_dav_core::resolve_href;
 use bifrost_dav_core::{
-    MultiStatusSink, PropSet, ResponseParts, commit_if_present, normalize_etag,
+    MultiStatusSink, PropSet, ResponseParts, classify_207, commit_if_present, normalize_etag,
     parse_collection_property, parse_multistatus, trimmed,
 };
 
@@ -11,15 +11,20 @@ pub(crate) struct CardDavContactEntry {
     pub(crate) etag: Option<String>,
 }
 
-/// Outcome of a depth-1 contact PROPFIND: the resources whose propstat
-/// succeeded (`entries`) plus the hrefs the server reported *failed*
-/// within the 207 (a non-2xx propstat). A failed href is a
-/// transiently-failed resource, not an absent one - the snapshot diff
-/// preserves the local copy rather than emitting a Destroyed.
+/// Outcome of a depth-1 contact PROPFIND or an `addressbook-query`: the
+/// resources whose propstat succeeded (`entries`) plus the resources the server
+/// reported *failed* within the 207 (a non-2xx propstat). A failed resource is
+/// a transiently-failed one, not an absent one - the snapshot diff preserves
+/// the local copy rather than emitting a Destroyed.
+///
+/// The failure lane carries each resource's STATUS, not just its href, so this
+/// listing runs through the same RFC 4918 s13 ladder the multiget lanes use;
+/// see the CalDAV twin for why an all-refused candidate 207 must not read as an
+/// empty page.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct CardDavContactListing {
     pub(crate) entries: Vec<CardDavContactEntry>,
-    pub(crate) failed_hrefs: Vec<String>,
+    pub(crate) failed: Vec<CardDavFailedResource>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,17 +34,11 @@ pub(crate) struct CardDavFetchedVCard {
     pub(crate) data: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CardDavFailedResource {
-    pub(crate) href: String,
-    pub(crate) status: Option<u16>,
-}
-
-impl CardDavFailedResource {
-    pub(crate) fn is_missing_resource(&self) -> bool {
-        matches!(self.status, Some(404 | 410))
-    }
-}
+/// One resource inside a 207 that yielded nothing usable, with the status the
+/// server gave it. Both member lanes use it - the multiget for a resource with
+/// no `address-data`, the listing for a resource whose every propstat failed -
+/// so both classify through the same ladder.
+pub(crate) type CardDavFailedResource = bifrost_dav_core::FailedResource;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct CardDavMultigetReport {
@@ -52,11 +51,8 @@ pub(crate) struct CardDavMultigetReport {
     pub(crate) missing_data: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum MultigetOutcome {
-    Usable,
-    CompleteFailure { status: Option<u16> },
-}
+/// What a parsed 207 body actually represents, per RFC 4918 s13.
+pub(crate) type MultigetOutcome = bifrost_dav_core::MultiStatusOutcome;
 
 impl CardDavMultigetReport {
     pub(crate) fn extend(&mut self, other: CardDavMultigetReport) {
@@ -66,19 +62,7 @@ impl CardDavMultigetReport {
     }
 
     pub(crate) fn classify(&self) -> MultigetOutcome {
-        if !self.cards.is_empty() || self.failed.is_empty() {
-            return MultigetOutcome::Usable;
-        }
-        match self
-            .failed
-            .iter()
-            .find(|failure| !failure.is_missing_resource())
-        {
-            Some(failure) => MultigetOutcome::CompleteFailure {
-                status: failure.status,
-            },
-            None => MultigetOutcome::Usable,
-        }
+        classify_207(!self.cards.is_empty(), &self.failed)
     }
 }
 
@@ -107,9 +91,25 @@ impl CardDavContactListing {
         for entry in &mut self.entries {
             entry.uri = resolve_href(request_url, &entry.uri);
         }
-        for href in &mut self.failed_hrefs {
-            *href = resolve_href(request_url, href);
+        for failure in &mut self.failed {
+            failure.href = resolve_href(request_url, &failure.href);
         }
+    }
+
+    /// The refused hrefs, for the lanes that only carry ids (`Page::failed_ids`
+    /// and the snapshot-diff preservation guard).
+    pub(crate) fn failed_hrefs(&self) -> Vec<String> {
+        self.failed
+            .iter()
+            .map(|failure| failure.href.clone())
+            .collect()
+    }
+
+    /// Read this 207 through the RFC 4918 s13 ladder, the same one the multiget
+    /// lanes use. A listing with any committed entry is `Usable` however many
+    /// siblings were refused.
+    pub(crate) fn classify(&self) -> MultigetOutcome {
+        classify_207(!self.entries.is_empty(), &self.failed)
     }
 }
 
@@ -284,8 +284,8 @@ impl MultiStatusSink for ContactListingSink {
                 uri: href.to_string(),
                 etag: parts.props().etag.clone(),
             });
-        } else if let Some(href) = parts.failed_href() {
-            self.listing.failed_hrefs.push(href.to_string());
+        } else if let Some(failure) = parts.failed_member() {
+            self.listing.failed.push(failure);
         }
     }
 }
@@ -427,7 +427,7 @@ mod tests {
                 etag: Some("abc".to_string()),
             }]
         );
-        assert!(listing.failed_hrefs.is_empty());
+        assert!(listing.failed.is_empty());
     }
 
     #[test]
@@ -468,9 +468,14 @@ mod tests {
         let listing = parse_propfind_contacts(xml).expect("valid XML");
         assert!(listing.entries.is_empty());
         assert_eq!(
-            listing.failed_hrefs,
+            listing.failed_hrefs(),
             vec!["/contacts/card-1.vcf".to_string()]
         );
+        // The lane carries the STATUS as well as the href, which is what makes
+        // an all-refused 207 classifiable. A 404 is the benign per-resource
+        // case, so this listing still reads as usable.
+        assert_eq!(listing.failed[0].status, Some(404));
+        assert_eq!(listing.classify(), MultigetOutcome::Usable);
     }
 
     #[test]
@@ -486,7 +491,7 @@ mod tests {
           </D:multistatus>"#;
 
         let listing = parse_propfind_contacts(xml).expect("valid XML");
-        assert_eq!(listing.failed_hrefs, vec!["/contacts/opaque-id"]);
+        assert_eq!(listing.failed_hrefs(), vec!["/contacts/opaque-id"]);
     }
 
     /// A `resourcetype` block the server REFUSED says nothing about the
@@ -526,7 +531,7 @@ mod tests {
         assert_eq!(listing.entries.len(), 1, "{listing:?}");
         assert_eq!(listing.entries[0].uri, "/contacts/opaque-id");
         assert_eq!(listing.entries[0].etag, None);
-        assert!(listing.failed_hrefs.is_empty());
+        assert!(listing.failed.is_empty());
     }
 
     /// Same rule on the multiget lane: a refused `resourcetype` must not

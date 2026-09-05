@@ -382,6 +382,7 @@ impl CardDavAccount {
             CtagSource::Known(ctag) => ctag,
         };
         let listing = client.list_contacts_listing(addressbook, operation).await?;
+        let failed_hrefs = listing.failed_hrefs();
         let mut entries = listing
             .entries
             .into_iter()
@@ -391,7 +392,6 @@ impl CardDavAccount {
             })
             .collect::<Vec<_>>();
         entries.sort_by(|left, right| left.uri.cmp(&right.uri));
-        let failed_hrefs = listing.failed_hrefs;
         Ok(ContactSnapshot {
             addressbook_url: addressbook.to_string(),
             ctag,
@@ -1876,6 +1876,16 @@ mod tests {
         )
     }
 
+    /// A member the server refused with a named status, so the failure lane's
+    /// classification can be read.
+    fn refused_vcard_with(name: &str, status: u16, reason: &str) -> String {
+        format!(
+            "<D:response><D:href>/books/{name}.vcf</D:href><D:propstat><D:prop>\
+<D:getetag/></D:prop><D:status>HTTP/1.1 {status} {reason}</D:status>\
+</D:propstat></D:response>"
+        )
+    }
+
     fn card_ids(page: &Page<ContactCard>) -> Vec<String> {
         page.items
             .iter()
@@ -1957,6 +1967,75 @@ mod tests {
             !requests[8].body.contains("/books/c.vcf"),
             "the multiget must not hydrate a member this page does not serve: {}",
             requests[8].body
+        );
+    }
+
+    /// A candidate 207 in which EVERY response failed is a complete failure,
+    /// not an empty page - the CalDAV twin's rule, closed here for the same
+    /// reason. The listing failure lane carries the per-member status, so the
+    /// candidate leg runs the same RFC 4918 s13 ladder the multiget lanes use
+    /// and a 507 reaches the consumer as a quota condition rather than as an
+    /// empty search that a consumer records as a completed walk.
+    ///
+    /// The script holds only the eight query legs: a lane that went on to
+    /// multiget the empty page would starve it and panic.
+    #[tokio::test]
+    async fn an_all_refused_query_207_classifies_rather_than_serving_an_empty_page() {
+        let query = book_document(&[
+            refused_vcard_with("a", 507, "Insufficient Storage"),
+            refused_vcard_with("b", 507, "Insufficient Storage"),
+        ]);
+        let script = dav_script(vec![book_multistatus(query); 8]);
+        let client =
+            CardDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
+        let account =
+            CardDavAccount::for_tests(Arc::new(client), "https://dav.example.test/books/");
+
+        let error = account
+            .contact_search(text_search("plan", 10))
+            .await
+            .expect_err("an all-refused candidate 207 is a classified failure");
+
+        assert_eq!(
+            error.kind(),
+            &AccountErrorKind::Server(bifrost_types::ServerErrorKind::QuotaExhausted),
+            "the member status drives the classification"
+        );
+    }
+
+    /// The other half of the same rule: a member refused BESIDE members that
+    /// answered stays a per-id failure and the page is served. A 403 is the
+    /// sharpest case, because alone it would classify as `NoPermission`.
+    #[tokio::test]
+    async fn a_partly_refused_query_207_still_serves_the_page() {
+        let query = book_document(&[listed_vcard("a"), refused_vcard("b"), listed_vcard("c")]);
+        let mut responses = vec![book_multistatus(query); 8];
+        responses.push(book_multistatus(book_document(&[
+            hydrated_vcard_named("a", "plan a"),
+            hydrated_vcard_named("c", "plan c"),
+        ])));
+        let script = dav_script(responses);
+        let client =
+            CardDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
+        let account =
+            CardDavAccount::for_tests(Arc::new(client), "https://dav.example.test/books/");
+
+        let page = account
+            .contact_search(text_search("plan", 10))
+            .await
+            .expect("a partially refused 207 is still a page");
+
+        assert_eq!(
+            card_ids(&page),
+            vec![
+                "https://dav.example.test/books/a.vcf".to_string(),
+                "https://dav.example.test/books/c.vcf".to_string(),
+            ]
+        );
+        assert_eq!(
+            page.failed_ids,
+            vec!["https://dav.example.test/books/b.vcf".to_string()],
+            "the refused member is per-id news, not a page failure"
         );
     }
 

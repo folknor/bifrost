@@ -61,6 +61,68 @@ pub trait PropSet: Default {
     }
 }
 
+/// One resource a 207 named but did not answer usably for, with the status the
+/// server gave it (when it gave a parseable one).
+///
+/// Both member lanes produce these: the multiget lanes from
+/// [`ResponseParts::failed_resource`], the listing lanes from
+/// [`ResponseParts::failed_href`] paired with
+/// [`ResponseParts::member_status_code`]. Carrying the status is what makes
+/// [`classify_207`] reachable from a listing, which is the whole reason the
+/// failure lane is not a bare `Vec<String>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailedResource {
+    pub href: String,
+    pub status: Option<u16>,
+}
+
+impl FailedResource {
+    /// True when the status means "this particular resource is not there" - the
+    /// benign, genuinely per-resource case that `Page::failed_ids` exists to
+    /// carry. Anything else (auth, permission, server error, or no status at
+    /// all) can just as easily be a condition affecting the whole request.
+    #[must_use]
+    pub fn is_missing_resource(&self) -> bool {
+        matches!(self.status, Some(404 | 410))
+    }
+}
+
+/// What a parsed 207 body actually represents, per RFC 4918 s13.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MultiStatusOutcome {
+    /// Nothing failed, or enough succeeded that the failures are per-resource
+    /// news the caller should report but not fail on.
+    Usable,
+    /// Every resource in the body failed and at least one of them failed for a
+    /// reason that is not "this resource is missing". Reporting this as an empty
+    /// success lets a consumer record the collection as fully walked and drop
+    /// the resources permanently.
+    CompleteFailure { status: Option<u16> },
+}
+
+/// The one RFC 4918 s13 status ladder, applied to any 207 that has a usable
+/// lane and a failed lane.
+///
+/// `any_usable` is whatever the caller's success lane produced - hydrated
+/// bodies for a multiget, committed entries for a listing. An empty body is
+/// `Usable`: a query that matched nothing is a legitimate empty result. A body
+/// where EVERY resource failed is benign only if every failure was a missing
+/// resource (404/410), which is what happens when hrefs are deleted between the
+/// listing and the fetch; anything else is a condition on the request and must
+/// reach the consumer with its recovery class rather than as an empty page.
+#[must_use]
+pub fn classify_207(any_usable: bool, failed: &[FailedResource]) -> MultiStatusOutcome {
+    if any_usable || failed.is_empty() {
+        return MultiStatusOutcome::Usable;
+    }
+    match failed.iter().find(|failure| !failure.is_missing_resource()) {
+        Some(failure) => MultiStatusOutcome::CompleteFailure {
+            status: failure.status,
+        },
+        None => MultiStatusOutcome::Usable,
+    }
+}
+
 /// Commit a staged property over its committed slot, leaving the committed
 /// value alone when this propstat did not carry the property.
 pub fn commit_if_present<T>(committed: &mut Option<T>, staged: Option<T>) {
@@ -216,6 +278,24 @@ impl<P: PropSet> ResponseParts<P> {
             return None;
         }
         self.href.as_deref()
+    }
+
+    /// The failed member of a LISTING lane, carrying the status the server gave
+    /// it so [`classify_207`] can read the lane.
+    ///
+    /// The status is [`member_status_code`](Self::member_status_code), which is
+    /// exactly the rule the sync lane already applies: a response-level code
+    /// wins, and below it only a response whose every propstat failed reports
+    /// its first failed code. Without the status the listing lanes could report
+    /// WHICH resources a 207 refused but never WHY, so an all-refused 207 came
+    /// back as an empty page carrying a list of hrefs instead of a classified
+    /// error, and a consumer recorded a completed walk over a collection it had
+    /// been refused.
+    pub fn failed_member(&self) -> Option<FailedResource> {
+        Some(FailedResource {
+            href: self.failed_href()?.to_string(),
+            status: self.member_status_code(),
+        })
     }
 
     /// The href and body of a multiget response that yielded usable data.
@@ -543,6 +623,7 @@ mod tests {
     struct MemberSink {
         entries: Vec<(String, Option<String>)>,
         failed_hrefs: Vec<String>,
+        failed_members: Vec<FailedResource>,
         collections: Vec<(String, Option<u16>)>,
         member_statuses: Vec<(String, Option<u16>)>,
         fetched: Vec<(String, String)>,
@@ -601,6 +682,9 @@ mod tests {
                     .push((href.to_string(), parts.props().etag.clone()));
             } else if let Some(href) = parts.failed_href() {
                 self.failed_hrefs.push(href.to_string());
+            }
+            if let Some(failure) = parts.failed_member() {
+                self.failed_members.push(failure);
             }
             if let Some(href) = parts.missing_data_href() {
                 self.missing_data.push(href.to_string());
@@ -766,6 +850,71 @@ mod tests {
 
         assert!(sink.fetched.is_empty());
         assert_eq!(sink.missing_data, vec!["/c/empty".to_string()]);
+    }
+
+    /// The listing failure lane carries the member STATUS, not just the href,
+    /// which is what makes an all-refused 207 classifiable from a lane that
+    /// hydrates nothing. Without it the candidate lane of a filtered query
+    /// could report WHICH resources a server refused but never WHY, so an
+    /// all-refused query read as an empty page.
+    #[test]
+    fn a_failed_member_carries_the_status_that_classifies_it() {
+        let sink = run(r#"<D:multistatus xmlns:D="DAV:"><D:response>
+          <D:href>/c/refused</D:href>
+          <D:propstat><D:prop><D:getetag/></D:prop>
+          <D:status>HTTP/1.1 507 Insufficient Storage</D:status></D:propstat>
+          </D:response><D:response>
+          <D:href>/c/gone</D:href>
+          <D:propstat><D:prop><D:getetag/></D:prop>
+          <D:status>HTTP/1.1 404 Not Found</D:status></D:propstat>
+          </D:response></D:multistatus>"#);
+
+        assert_eq!(
+            sink.failed_members,
+            vec![
+                FailedResource {
+                    href: "/c/refused".to_string(),
+                    status: Some(507),
+                },
+                FailedResource {
+                    href: "/c/gone".to_string(),
+                    status: Some(404),
+                },
+            ]
+        );
+    }
+
+    /// The one RFC 4918 s13 ladder, which both member lanes now read. The
+    /// mixed case is the one that must not over-reach: a refusal beside a
+    /// success stays per-resource news.
+    #[test]
+    fn an_all_failed_207_classifies_where_a_mixed_one_stays_usable() {
+        let refused = FailedResource {
+            href: "/c/refused".to_string(),
+            status: Some(403),
+        };
+        let gone = FailedResource {
+            href: "/c/gone".to_string(),
+            status: Some(410),
+        };
+
+        assert_eq!(
+            classify_207(false, std::slice::from_ref(&refused)),
+            MultiStatusOutcome::CompleteFailure { status: Some(403) }
+        );
+        // A resource deleted between the listing and the fetch is the benign
+        // per-resource case, however many of them there are.
+        assert_eq!(
+            classify_207(false, std::slice::from_ref(&gone)),
+            MultiStatusOutcome::Usable
+        );
+        // Anything usable in the body makes the failures per-resource news.
+        assert_eq!(
+            classify_207(true, &[refused, gone]),
+            MultiStatusOutcome::Usable
+        );
+        // An empty body is a legitimate empty result, not a failure.
+        assert_eq!(classify_207(false, &[]), MultiStatusOutcome::Usable);
     }
 
     #[test]

@@ -97,10 +97,12 @@ not a root-discovery fallback trigger.
   way - it used to require a successful propstat, which dropped such a response
   out of both lanes and let the diff destroy a contact that exists.
   `parse_propfind_events` returns a
-  `CalDavEventListing`: committed non-collection `entries` plus
-  `failed_hrefs` (non-collection resources whose only propstat failed within
-  the 207), so the snapshot
-  diff preserves a transiently-failed resource instead of destroying it.
+  `CalDavEventListing`: committed non-collection `entries` plus `failed`
+  (non-collection resources whose only propstat failed within the 207, each
+  carrying its member status), so the snapshot
+  diff preserves a transiently-failed resource instead of destroying it and the
+  listing classifies through the RFC 4918 s13 ladder. `failed_hrefs()` projects
+  that lane onto the bare ids the diff guard and `Page::failed_ids` take.
   Resource identification does not depend on an `.ics` suffix or a returned
   content type. Depth-1 listing, calendar-query, text-query, and multiget
   requests include `resourcetype` and exclude collection self-responses;
@@ -353,16 +355,22 @@ Supported calendar primitives:
   its page, so `events_in_range` can carry a skipped scope too - it did not
   while its single REPORT both filtered and hydrated.
 
-  The CANDIDATE leg is classified less finely, and deliberately: a filtered
-  query's 207 is read by the listing parser, whose failure lane is a bare list
-  of hrefs with no status, so a query 207 in which every response failed comes
-  back as an empty candidate set plus those hrefs in `failed_ids` rather than
-  as a classified `Err`. This is the same shape the depth-1 listing and the
-  snapshot poll have always had, and nothing is silently lost - the refused
-  resources are named on every page they are observed on - but the recovery
-  class of a whole-207 refusal is not available there. A non-2xx status on the
-  REPORT itself is still classified normally (and a 401 still reauthorizes);
-  only per-propstat failure inside an otherwise successful 207 is affected.
+  The CANDIDATE leg is classified through the SAME ladder. Its 207 is read by
+  the listing parser, whose failure lane carries a `FailedResource` (href plus
+  the member status) rather than a bare href, so `CalDavEventListing::classify`
+  runs `bifrost_dav_core::classify_207` exactly as the multiget report does: a
+  207 in which every response failed, for a reason other than 404/410, is an
+  `Err` with that status's recovery class, not an empty candidate set. The
+  member status comes from `ResponseParts::failed_member`, which reads
+  `member_status_code` - a response-level code wins, and below it only a
+  response whose every propstat failed reports its first failed code. The
+  depth-1 listing and the snapshot poll go through the same `listing_failure`
+  funnel and inherit the classification. A listing with any committed entry
+  never reaches it, so a member refused beside members that answered stays a
+  per-id failure on `Page::failed_ids` and the page is served; only a wholly
+  refused 207 becomes an error. Pinned by
+  `an_all_refused_query_207_classifies_rather_than_serving_an_empty_page` and
+  `a_partly_refused_query_207_still_serves_the_page` on both sides.
 
   Properties are collected propstat-scoped and promoted to the response
   only by `commit_propstat`, and only from a 2xx propstat. That is what
@@ -709,6 +717,11 @@ rules are where every one of the drift defects lived:
   the snapshot diff destroy something that exists.
 - `fetched` / `failed_resource` / `missing_data_href` - the multiget lanes,
   including the collection exclusion and the first-refused-code rule.
+- `failed_member` - the listing lanes' failure entry, an href paired with
+  `member_status_code`. Both lanes therefore produce the shared
+  `FailedResource`, and both feed the one `classify_207` ladder
+  (`MultiStatusOutcome::Usable` / `CompleteFailure { status }`) rather than the
+  two hand-mirrored copies each crate carried.
 
 Each crate supplies only a `PropSet` (which properties it stages and how a
 successful propstat merges them) and its entry constructors. CalDAV has two:
@@ -733,9 +746,13 @@ suppression and the failed-href preservation), `preserve_unobserved_entries`,
 `inventory_entry`, `object_change`, and the page-cursor trio
 `decode_watermark_cursor` / `encode_watermark_cursor` /
 `slice_after_watermark`. `page_after_watermark` - the slicer for a lane whose
-REPORT already answered with the object bodies - has NO caller left now that
-every lane pages before hydrating; it is kept with its tests because removing
-a published item is the repository owner's call. What stays local is what
+REPORT already answered with the object bodies - is GONE: every lane pages
+before hydrating and builds its own `Page`, because the count it reports and
+the failures it carries come from two different legs. It was never published
+(this crate is private), and the two rules its tests pinned - a zero page size
+is an exhausted page rather than one pointing at its own watermark, and a
+watermark past every key is an empty final page - moved onto
+`slice_after_watermark`, which is where they actually live. What stays local is what
 genuinely differs: the magic bytes (`CALDAVET1` / `CDAVCTAG1`), the
 envelope-version and scope validation, the name of the token, and the crate's
 own `cursor_error`.
