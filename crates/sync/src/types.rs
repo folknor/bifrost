@@ -113,6 +113,24 @@ pub struct BackfillConfig {
     /// Clock-skew threshold above which a `Warning::ClockSkew` is
     /// emitted.
     pub clock_skew_warn: Duration,
+    /// How many backfill pages may be published but unacknowledged before
+    /// the cold-start producer parks.
+    ///
+    /// The bound that makes backfill flow-controlled instead of
+    /// loss-and-reconcile. Backfill and live changes share one broadcast ring
+    /// (`MultiplexerConfig::changes_capacity`, default 256) with no
+    /// producer-side backpressure of its own, so a large mailbox's cold start
+    /// used to outrun a consumer as a matter of routine, overwrite unread
+    /// pages, and trigger lag abandonment plus a re-read from the last durable
+    /// checkpoint. A backfill producer now takes one permit per published page
+    /// and returns it when the consumer's acknowledgement of that page - or of
+    /// any later one - reaches the ack writer.
+    ///
+    /// Keep it well under `changes_capacity`: the point of the bound is that a
+    /// cold start cannot overrun the ring by itself, which needs room in the
+    /// same ring for live traffic. A value of 0 is floored to 1, because a
+    /// zero-permit lane is a permanently parked cold start.
+    pub lane_capacity: usize,
 }
 
 impl Default for BackfillConfig {
@@ -121,6 +139,7 @@ impl Default for BackfillConfig {
             uid_range_chunk: 5000,
             page_count_chunk: 1000,
             clock_skew_warn: Duration::from_secs(5 * 60),
+            lane_capacity: crate::engine::lane::DEFAULT_BACKFILL_LANE_CAPACITY,
         }
     }
 }
@@ -231,6 +250,16 @@ pub(crate) struct AccountSlot {
     /// `SyncEngine::open_skipped_scopes` so a consumer can tell a
     /// degraded shared namespace apart from one that does not exist.
     pub open_skips: Arc<Mutex<Vec<bifrost_types::SkippedScope>>>,
+    /// The account's change broadcast plus the numbering of the receivers it has
+    /// handed out.
+    ///
+    /// The engine numbers them because `tokio::broadcast` cannot say whether a
+    /// given receiver can still take delivery of a given batch, and a subscriber
+    /// COUNT answers that question wrongly the moment one consumer is replaced by
+    /// an overlapping successor. One mutex orders send-and-stamp,
+    /// subscribe-and-number, and unregister-and-sweep, so the answer is exact
+    /// rather than approximate.
+    pub delivery: Arc<crate::multiplexer::ChangeDelivery>,
 }
 
 pub(crate) struct WorkerTask {

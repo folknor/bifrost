@@ -226,3 +226,23 @@ not verified.
   layer.** Two ~10k briefs were denied outright; the same content trimmed to ~7k
   went through unchanged. This bites hardest on exactly the large documents whose
   briefs most want to be long.
+
+### A review loop needs a scope fence and a stopping rule
+
+The bounded backfill lane (September 2026) went through seventeen cold-review
+rounds overnight under the instruction "fix all lateral findings before
+committing". Rounds 1 to 4 built the feature that was ruled on. Rounds 5 to 17
+built a second feature - a durability guarantee the new receiver sweep had made
+visible - that nobody had ruled on, and each round's fixes handed the next
+reviewer more surface, so the series never converged: the last round still
+found a P2. Two rules follow.
+
+- **A lateral finding is FILED, not fixed inside the change that surfaced it.**
+  This is the "separate the defects from the proposals" lesson above, applied
+  to reviews: a reviewer's finding outside the ruled scope goes into
+  `notes/todo.md` with its evidence and gets its own ruling. Building it in
+  place lands a product decision nobody made.
+- **An unattended loop stops on a rule stated up front.** Only P1 and P2
+  findings are fixed, everything else is filed, and a round that finds no P1 or
+  P2 ends the loop. "Fix everything the reviewer finds" is an instruction to
+  continue until the reviewer tires, and reviewers do not tire.

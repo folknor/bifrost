@@ -35,6 +35,9 @@ pub(super) struct BackfillWiring {
 /// all) or resumes after the furthest durably-checkpointed full page
 /// instead of re-paginating from page 0 on every re-attach.
 pub(super) async fn run_backfill_orchestrator(ctx: SlotContext, wiring: BackfillWiring) {
+    // The producer's door onto the account's bounded backfill lane. Taken
+    // before the destructure below so it carries the slot's shutdown token.
+    let lane_gate = ctx.lane_gate();
     let SlotContext {
         current: account,
         account_id,
@@ -46,6 +49,7 @@ pub(super) async fn run_backfill_orchestrator(ctx: SlotContext, wiring: Backfill
         coverage,
         writer_tx,
         scheduler,
+        delivery,
         ..
     } = ctx;
     let BackfillWiring {
@@ -91,7 +95,39 @@ pub(super) async fn run_backfill_orchestrator(ctx: SlotContext, wiring: Backfill
             if shutdown.is_cancelled() {
                 return;
             }
+            // RE-GATE on subscriber loss, not just once before the first scan.
+            //
+            // The receiver-drop sweep wakes a parked producer, and if the
+            // consumer that left was the only one, the pages that follow reach
+            // the sentinel receiver alone and are retired the moment they are
+            // sent. Without this the walk would run its remaining inventory into
+            // nobody, reach its completion sentinel, and `record_attempt(.., true)`
+            // would settle the incarnation permanently - so a consumer that
+            // reattaches gets no inventory and no retry, and no amount of waiting
+            // helps. Parking here is the same answer the first gate gives, for
+            // the same reason.
+            if let Some(tx) = &changes_tx
+                && !wait_for_real_subscriber(tx, &subscriber_notify, &shutdown).await
+            {
+                return;
+            }
             let incarnation_key = (scope.clone(), incarnation);
+            // The subscriber wait above is indefinite, and the scan snapshot this
+            // loop is iterating was taken before it. Re-check that the
+            // incarnation is still the live one rather than walking a scope the
+            // registry has since dropped or re-established.
+            if !cursors.all_scope_incarnations().contains(&incarnation_key) {
+                continue;
+            }
+            // The incarnation this walk belongs to, snapshotted at its START.
+            // Carried all the way into the completion marker: a reset that closes
+            // anywhere inside the walk - including after its last page but before
+            // the provider's terminal `Done`, where the old stream simply finishes
+            // - must not be adopted as this walk's own. An emission-time snapshot
+            // reads the REPLACEMENT incarnation's fence, so the marker sails past
+            // both checks, is minted above the fence, acknowledges normally, and
+            // suppresses the replacement's whole inventory walk.
+            let fence_at_walk_start = coverage.scope_fence(&scope);
             let barrier_admission = tokio::select! {
                 () = shutdown.cancelled() => return,
                 permit = scheduler.admit(
@@ -203,7 +239,8 @@ pub(super) async fn run_backfill_orchestrator(ctx: SlotContext, wiring: Backfill
                     &throttles,
                     &coverage,
                     &writer_tx,
-                    &scheduler,
+                    &lane_gate,
+                    &delivery,
                 )
                 .await
                 else {
@@ -249,28 +286,41 @@ pub(super) async fn run_backfill_orchestrator(ctx: SlotContext, wiring: Backfill
             // consumer-ack path the page batches use. It is ordered behind
             // every page, so a crash before its ack re-walks instead of
             // recording a false completion.
-            if completed
-                && !emit_backfill_complete(
+            let mut settle = completed;
+            if settle {
+                match emit_backfill_complete(
                     changes_tx.as_ref(),
                     &scope,
                     driver.total_seen(),
                     &control,
                     &shutdown,
+                    &lane_gate,
+                    &delivery,
+                    fence_at_walk_start,
                 )
                 .await
-            {
-                return;
+                {
+                    MarkerOutcome::Published => {}
+                    // The walk was invalidated while its marker waited - a scope
+                    // reset closed inside the wait. That is not a reason to stop:
+                    // an earlier revision returned the same `false` for this as
+                    // for shutdown, so one reset abandoned every LATER scope and
+                    // every later rescan for the rest of the attachment. Record
+                    // the interrupted attempt and carry on with the next scope.
+                    MarkerOutcome::Withheld => settle = false,
+                    MarkerOutcome::ShuttingDown => return,
+                }
             }
             registry.mark(
                 account_id.clone(),
                 scope.clone(),
-                if completed {
+                if settle {
                     BackfillState::Completed
                 } else {
                     BackfillState::Pending
                 },
             );
-            scan.record_attempt(incarnation_key, completed);
+            scan.record_attempt(incarnation_key, settle);
         }
         tokio::select! {
             () = shutdown.cancelled() => return,
@@ -388,7 +438,8 @@ async fn run_backfill_partition_at_boundary(
     throttles: &std::sync::Mutex<crate::recovery::ThrottleBucket>,
     coverage: &Arc<PendingCoverage>,
     writer_tx: &mpsc::Sender<WriterRequest>,
-    scheduler: &Scheduler,
+    lane: &LaneGate,
+    delivery: &crate::multiplexer::ChangeDelivery,
 ) -> Option<Result<crate::backfill::BackfillPartitionOutcome, Error>> {
     // One generation per partition pass, so a re-walk's proof is ordered after
     // the debt an earlier pass raised.
@@ -421,17 +472,19 @@ async fn run_backfill_partition_at_boundary(
             }
             continue;
         }
-        let admission = tokio::select! {
-            () = shutdown.cancelled() => return None,
-            permit = scheduler.admit(
-                account_id.clone(),
-                control.priority_snapshot(),
-                crate::scheduler::WorkKind::Sync,
-            ) => match permit {
-                Ok(permit) => permit,
-                Err(error) => return Some(Err(error)),
-            },
-        };
+        // Admission is taken THROUGH the lane gate, which owns it for the whole
+        // pass. That is not indirection for its own sake: `run_partition` parks
+        // on the bound in the middle of the pass, and a producer parked while
+        // holding the account's sync permit starves the live lane on a minimal
+        // budget (`per_account = 2` leaves one sync permit once the mutation
+        // share is taken). The gate drops the permit before parking and re-takes
+        // it on the wake, so a parked backfill holds nothing polling or push
+        // reconciliation needs.
+        match lane.admit().await {
+            Ok(()) => {}
+            Err(crate::engine::lane::WaitFailed::ShuttingDown) => return None,
+            Err(crate::engine::lane::WaitFailed::Refused(error)) => return Some(Err(error)),
+        }
         let current = account.load_full();
         let result = BackfillRunner::run_partition(
             current.as_ref().as_ref(),
@@ -444,9 +497,11 @@ async fn run_backfill_partition_at_boundary(
             Some(coverage),
             Some(writer_tx),
             generation,
+            Some(lane),
+            delivery,
         )
         .await;
-        drop(admission);
+        lane.release_admission();
         if matches!(result, Err(Error::Paused)) {
             continue;
         }
@@ -518,19 +573,23 @@ pub(super) fn open_pages_resume(checkpoint: Option<&BackfillCheckpoint>) -> Open
 /// (`<= total_seen`), so `total_seen + 1` is guaranteed larger and the
 /// marker is the row returned on re-attach. The honest total rides in
 /// `items_estimated`.
-async fn emit_backfill_complete(
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn emit_backfill_complete(
     changes_tx: Option<&broadcast::Sender<MultiplexerEvent>>,
     scope: &CursorScope,
     total_seen: u64,
     control: &SyncControl,
     shutdown: &CancellationToken,
-) -> bool {
-    let Some(tx) = changes_tx else {
-        return true;
-    };
+    lane: &LaneGate,
+    delivery: &crate::multiplexer::ChangeDelivery,
+    fence_at_walk_start: u64,
+) -> MarkerOutcome {
+    if changes_tx.is_none() {
+        return MarkerOutcome::Published;
+    }
     let _activity = loop {
         if !control.wait_until_running(shutdown).await {
-            return false;
+            return MarkerOutcome::ShuttingDown;
         }
         if let Some(activity) = control.begin_activity() {
             break activity;
@@ -554,20 +613,78 @@ async fn emit_backfill_complete(
         checkpoint: Some(Checkpoint::Backfill(marker.clone())),
     };
     let expected = Checkpoint::Backfill(marker);
+    // The sentinel is a backfill publication like any other and waits on the
+    // same bound. It takes NO scheduler admission, and must not: it does no wire
+    // work, and it is emitted from here - after the partition pass has already
+    // handed its permit back - so a wait that re-acquired admission on the wake
+    // would leave that permit held for the rest of the attachment, starving
+    // polling, push reconciliation and the next scope's barrier query on a
+    // one-permit budget.
+    // The fence to beat is the one this WALK started under, not one read here.
+    // A reset can close between the walk's last page and the provider stream's
+    // terminal `Done` - the stream is not cancelled, it just ends - and a
+    // snapshot taken at this point is already the replacement incarnation's, so
+    // the comparison below would be a walk checking itself against a fence it
+    // adopted from a scope it never enumerated.
+    let fence_before = fence_at_walk_start;
+    if lane.coverage().scope_fence(scope) != fence_before {
+        tracing::warn!(
+            target: "bifrost.sync.backfill",
+            scope = ?scope,
+            "the scope was reset during this walk; withholding its completion marker"
+        );
+        return MarkerOutcome::Withheld;
+    }
+    if lane.wait_for_capacity().await.is_err() {
+        return MarkerOutcome::ShuttingDown;
+    }
+    // Same revalidation the page path does, and the stakes are higher here: a
+    // completion marker published against a reset scope suppresses the
+    // replacement incarnation's entire inventory walk on the next attach.
+    if lane.coverage().scope_fence(scope) != fence_before {
+        tracing::warn!(
+            target: "bifrost.sync.backfill",
+            scope = ?scope,
+            "scope was reset while its completion marker waited on the bound; \
+             withholding the marker"
+        );
+        return MarkerOutcome::Withheld;
+    }
     // Register before publishing so a fast consumer ack cannot land
     // before the entry exists and leave it outstanding forever.
     let publication = control.publish_checkpoint_without_report(expected.clone(), 0);
     let event = MultiplexerEvent {
         scope: scope.clone(),
         event: Arc::new(SyncEvent::Batch(batch)),
-        checkpoint: Some(expected),
+        checkpoint: Some(expected.clone()),
         publication: Some(publication.clone()),
     };
-    let delivered = tx.send(event).unwrap_or(0);
+    // Send and stamp as one step, exactly as the page path does.
+    let delivered = delivery.publish_backfill(event, lane.coverage(), Some(&publication));
     if !crate::multiplexer::delivered_to_real_subscriber(delivered) {
         control.retire_publication(publication);
     }
-    true
+    MarkerOutcome::Published
+}
+
+/// What became of a scope's completion marker.
+///
+/// Three answers rather than two, and the third is the point: an earlier
+/// revision returned one `false` for "the account is going away" and for "this
+/// walk was invalidated while the marker waited", and the caller could only read
+/// it as shutdown - so a single scope reset landing inside one marker's capacity
+/// wait retired the whole orchestrator, abandoning every later scope and every
+/// later rescan until the account was reattached.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum MarkerOutcome {
+    /// Published, or there was no channel to publish on.
+    Published,
+    /// Deliberately not published: the scope was reset while the marker
+    /// waited. The scope is left unsettled and the orchestrator carries on
+    /// with the next one.
+    Withheld,
+    /// The account is tearing down.
+    ShuttingDown,
 }
 
 pub(super) enum BackfillPlan {

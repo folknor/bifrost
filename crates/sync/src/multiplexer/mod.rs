@@ -103,8 +103,283 @@ impl MultiplexerEvent {
 /// receiver therefore abandons the account's outstanding registrations at
 /// the moment it observes the gap, and reports the count in the warning.
 pub struct ChangesReceiver {
-    inner: broadcast::Receiver<MultiplexerEvent>,
+    /// `Option` only so `Drop` can hand the underlying receiver to
+    /// [`ChangeDelivery::depart`], which destroys it under the delivery lock
+    /// before deciding what is still reachable. `Some` for the whole of a
+    /// receiver's usable life.
+    inner: Option<broadcast::Receiver<MultiplexerEvent>>,
     control: Option<crate::control::SyncControl>,
+    /// This receiver's number and the account's delivery gate, so its DEPARTURE
+    /// is observable.
+    ///
+    /// Dropping it is the moment the engine can conclude that batches only this
+    /// receiver could have taken delivery of will never be acknowledged - which
+    /// is what returns their backfill capacity. Nothing else in the system
+    /// notices: the broadcast channel reports a count, and the count is blind to
+    /// an overlapping replacement.
+    ///
+    /// WEAK, so a consumer holding a receiver cannot keep the account's
+    /// broadcast sender alive past `detach` and then wait for ever on a channel
+    /// only it is keeping open. A failed upgrade means the engine has already
+    /// torn the account down, which is exactly the case where there is nothing
+    /// left to sweep.
+    subscription: Option<(std::sync::Weak<ChangeDelivery>, u64)>,
+    /// The account's publication ledger, which is also its backfill capacity
+    /// ledger. Needed on the lag and drop paths.
+    coverage: Option<Arc<crate::cursor::PendingCoverage>>,
+}
+
+impl Drop for ChangesReceiver {
+    fn drop(&mut self) {
+        let Some((delivery, seq)) = self.subscription.take() else {
+            return;
+        };
+        let Some(inner) = self.inner.take() else {
+            return;
+        };
+        let Some(delivery) = delivery.upgrade() else {
+            // The account is already torn down. Nothing to sweep, nobody to tell.
+            return;
+        };
+        // Destroy, unregister and sweep as one step under the delivery lock.
+        // Anything this receiver was the last possible reader of can never be
+        // acknowledged now, so retiring it here carries its debt forward exactly
+        // as a lag does and returns its capacity - a cold-start producer parked
+        // behind a consumer that walked away resumes at once instead of stalling
+        // for the life of the attachment.
+        let retired = delivery.depart(seq, inner, self.coverage.as_deref());
+        if retired == 0 {
+            return;
+        }
+        // Tell whoever is still attached, on the stream, exactly what the lag
+        // path tells them. A log line does not reach a consumer.
+        delivery.announce_retirement(retired);
+        // Retiring the last outstanding registration can make the account
+        // quiescent, and a `pause` or `checkpoint_now` is waiting on the
+        // checkpoint watch rather than on the ledger. Every other retirement and
+        // abandonment path republishes quiescence; this one must too, or the
+        // waiter sleeps for ever on a boundary that has actually been reached.
+        if let Some(control) = &self.control {
+            control.publish_boundary_progress();
+        }
+        tracing::warn!(
+            target: "bifrost.sync.changes",
+            retired,
+            "change stream dropped with unacknowledged batches; no live receiver can \
+             acknowledge them, so their coverage debt is carried forward and the \
+             consumer should reconcile from its last durable checkpoint"
+        );
+    }
+}
+
+/// The account's change broadcast, plus the numbering that says which live
+/// receivers can still reach a given batch.
+///
+/// # Why the two are one type
+///
+/// `tokio::broadcast` cannot answer "can this receiver still get that batch": it
+/// exposes a COUNT and nothing else. But a receiver joins at the ring's TAIL, so
+/// the question reduces to one the engine can answer if it NUMBERS the receivers
+/// it hands out - a batch broadcast when `n` receivers had ever been issued can
+/// be read only by a receiver numbered below `n`.
+///
+/// A count, or a "has anyone left" epoch, answers correctly only when the
+/// account passes through zero subscribers, and a consumer replaced by an
+/// OVERLAPPING successor never does: A holds unacknowledged pages, B subscribes,
+/// A drops, the count goes 1 -> 2 -> 1 without reaching zero, and B started
+/// beyond A's pages.
+///
+/// # Why one mutex, and what it orders
+///
+/// The numbering is only exact if a batch's send and its stamp, a receiver's
+/// broadcast subscribe and its number, and a departing receiver's unregister and
+/// its sweep are each ATOMIC with respect to the others. Three separate defects
+/// came from approximating that:
+///
+/// - the last reader dropping between the send and the stamp swept an entry
+///   whose `delivered_at` was still `None`, preserved it, and then nothing swept
+///   it again - the page stayed charged against a replacement that could never
+///   read it;
+/// - a receiver subscribing between the send and a post-hoc `issued()` read got
+///   counted as a possible reader of a batch it had joined beyond;
+/// - a departing receiver that computed `min_live` and was then descheduled
+///   swept with a stale answer, retiring a page a receiver which subscribed in
+///   the gap was about to read.
+///
+/// One `Mutex` around all three makes the orders total, so the sweep is exact
+/// rather than approximate. It is held across `broadcast::send` (non-blocking)
+/// and across the coverage ledger's own lock; the lock order is delivery ->
+/// coverage and never the reverse, because nothing in `PendingCoverage` reaches
+/// back here.
+///
+/// Live changes do NOT go through [`ChangeDelivery::publish_backfill`]: they
+/// consume no capacity and are never swept, so they send on [`Self::sender`]
+/// directly and take no lock.
+#[derive(Debug)]
+pub struct ChangeDelivery {
+    tx: broadcast::Sender<MultiplexerEvent>,
+    state: StdMutex<SubscriberState>,
+}
+
+#[derive(Debug, Default)]
+struct SubscriberState {
+    /// How many consumer receivers this account has ever handed out.
+    next: u64,
+    /// The sequences still holding a receiver, in order.
+    live: std::collections::BTreeSet<u64>,
+}
+
+impl SubscriberState {
+    fn min_live(&self) -> Option<u64> {
+        self.live.iter().next().copied()
+    }
+}
+
+impl ChangeDelivery {
+    #[must_use]
+    pub fn new(tx: broadcast::Sender<MultiplexerEvent>) -> Self {
+        Self {
+            tx,
+            state: StdMutex::new(SubscriberState::default()),
+        }
+    }
+
+    fn guard(&self) -> std::sync::MutexGuard<'_, SubscriberState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The raw sender, for publications that consume no backfill capacity.
+    #[must_use]
+    pub fn sender(&self) -> &broadcast::Sender<MultiplexerEvent> {
+        &self.tx
+    }
+
+    /// Broadcast a backfill batch and stamp its publication with the receiver
+    /// numbering as of the send, as ONE step.
+    ///
+    /// Returns what `broadcast::Sender::send` returns: how many receivers took
+    /// delivery.
+    pub fn publish_backfill(
+        &self,
+        event: MultiplexerEvent,
+        coverage: &crate::cursor::PendingCoverage,
+        publication: Option<&crate::cursor::PublicationId>,
+    ) -> usize {
+        let state = self.guard();
+        // Every receiver that can possibly hold this batch is numbered below
+        // `state.next`, and no `subscribe` and no departing receiver's sweep can
+        // interleave, because both want this same lock. That is what makes the
+        // stamp exact rather than an approximation - and it is a STRUCTURAL
+        // guarantee, not a tested one: the interleaving it rules out cannot be
+        // staged from a test, because any hook placed between the send and the
+        // stamp would have to take this lock to subscribe and would simply
+        // deadlock. `publish_backfill` is the only path that sends a backfill
+        // batch, so there is no second ordering to get wrong.
+        let issued = state.next;
+        let delivered = self.tx.send(event).unwrap_or(0);
+        if let Some(id) = publication {
+            coverage.mark_delivered(id, issued);
+        }
+        drop(state);
+        delivered
+    }
+
+    /// Hand out a numbered receiver on the account's change stream.
+    ///
+    /// The receiver holds a WEAK reference back here. A strong one would keep
+    /// this type - and therefore the broadcast `Sender` it owns - alive for as
+    /// long as any consumer held a receiver, so a consumer draining the ring
+    /// after `detach` would wait in `recv()` for ever instead of seeing
+    /// `Closed`: it would be keeping the last sender alive itself. The engine
+    /// must be able to close the channel by dropping the slot, and a weak handle
+    /// is what lets it.
+    pub fn subscribe(
+        self: &Arc<Self>,
+        control: Option<crate::control::SyncControl>,
+        coverage: Option<Arc<crate::cursor::PendingCoverage>>,
+    ) -> ChangesReceiver {
+        let mut state = self.guard();
+        // Subscribe INSIDE the lock: a receiver created here is numbered against
+        // exactly the set of batches already sent, with no window in which a
+        // send could slip between the two and be mis-attributed.
+        let inner = self.tx.subscribe();
+        let seq = state.next;
+        state.next += 1;
+        state.live.insert(seq);
+        drop(state);
+        ChangesReceiver {
+            inner: Some(inner),
+            control,
+            subscription: Some((Arc::downgrade(self), seq)),
+            coverage,
+        }
+    }
+
+    /// A receiver is gone: destroy it, unregister it, and retire every published
+    /// backfill batch no remaining receiver can reach - all under one lock.
+    ///
+    /// The inner `broadcast::Receiver` is dropped HERE, before the sweep decides.
+    /// Unregistering the number while the underlying receiver still existed left
+    /// a window in which the producer published, `broadcast` counted the doomed
+    /// receiver as a live one so the page stayed charged, and the receiver then
+    /// finished dropping with no further sweep to reconsider it. Registration and
+    /// destruction have to be ordered by the same mutex that orders sends.
+    ///
+    /// Returns how many were retired, for the caller's warning.
+    fn depart(
+        &self,
+        seq: u64,
+        inner: broadcast::Receiver<MultiplexerEvent>,
+        coverage: Option<&crate::cursor::PendingCoverage>,
+    ) -> usize {
+        let mut state = self.guard();
+        drop(inner);
+        state.live.remove(&seq);
+        let min_live = state.min_live();
+        // Swept while still holding the lock, so no concurrent subscribe can
+        // make this answer stale and no concurrent publish can stamp a batch
+        // against a numbering this sweep has not seen.
+        let retired = coverage.map_or(0, |coverage| coverage.release_undelivered(min_live));
+        drop(state);
+        retired
+    }
+
+    /// Announce, on the account's own stream, that batches were retired because
+    /// their only possible reader left.
+    ///
+    /// The same reconciliation instruction the LAG path delivers, and for the
+    /// same reason: a consumer still attached to this account has just had
+    /// unacknowledged batches abandoned out from under it, and a log line does
+    /// not reach it. An overlapping replacement receiver gets this; one that
+    /// subscribes later cannot, because it joins at the ring's tail - which is
+    /// itself why those batches were retired.
+    fn announce_retirement(&self, retired: usize) {
+        let warning = bifrost_types::Warning::user_safe(
+            bifrost_types::WarningKind::ChangeStreamLagged,
+            format!(
+                "a change stream was dropped holding {retired} unacknowledged batches; \
+                 no live receiver can acknowledge them"
+            ),
+        )
+        .with_next_action(bifrost_types::DiagnosticText::user_safe(
+            "their coverage debt is carried forward; re-read from the last durable \
+             checkpoint. Boundary waits (pause / checkpoint_now) stay usable, but the \
+             checkpoint they report may predate the retired batches.",
+        ));
+        let _ = self.tx.send(MultiplexerEvent::unacked(
+            CursorScope::Account,
+            Arc::new(SyncEvent::Warning(warning)),
+        ));
+    }
+
+    /// The lowest sequence still holding a receiver. Observability; used by
+    /// tests.
+    #[must_use]
+    pub fn min_live(&self) -> Option<u64> {
+        self.guard().min_live()
+    }
 }
 
 /// Every account keeps this many internal receivers alive solely to keep the
@@ -121,15 +396,30 @@ pub(crate) fn has_real_subscriber(tx: &broadcast::Sender<MultiplexerEvent>) -> b
 }
 
 impl ChangesReceiver {
+    /// An UNNUMBERED receiver, for tests and for internal readers that never
+    /// acknowledge. Production consumer receivers come from
+    /// [`ChangeDelivery::subscribe`], which numbers them - an unnumbered one
+    /// reports no departure, so it can neither free capacity nor be blamed for
+    /// holding it.
+    #[cfg(test)]
     pub(crate) fn new(
         inner: broadcast::Receiver<MultiplexerEvent>,
         control: Option<crate::control::SyncControl>,
+        coverage: Option<Arc<crate::cursor::PendingCoverage>>,
     ) -> Self {
-        Self { inner, control }
+        Self {
+            inner: Some(inner),
+            control,
+            subscription: None,
+            coverage,
+        }
     }
 
     pub async fn recv(&mut self) -> Result<MultiplexerEvent, broadcast::error::RecvError> {
-        match self.inner.recv().await {
+        let Some(inner) = self.inner.as_mut() else {
+            return Err(broadcast::error::RecvError::Closed);
+        };
+        match inner.recv().await {
             Ok(event) => Ok(event),
             Err(broadcast::error::RecvError::Lagged(skipped)) => Ok(self.on_lag(skipped)),
             Err(error) => Err(error),
@@ -137,7 +427,10 @@ impl ChangesReceiver {
     }
 
     pub fn try_recv(&mut self) -> Result<MultiplexerEvent, broadcast::error::TryRecvError> {
-        match self.inner.try_recv() {
+        let Some(inner) = self.inner.as_mut() else {
+            return Err(broadcast::error::TryRecvError::Closed);
+        };
+        match inner.try_recv() {
             Ok(event) => Ok(event),
             Err(broadcast::error::TryRecvError::Lagged(skipped)) => Ok(self.on_lag(skipped)),
             Err(error) => Err(error),
@@ -149,6 +442,11 @@ impl ChangesReceiver {
             .control
             .as_ref()
             .map_or(0, crate::control::SyncControl::abandon_pending_checkpoints);
+        // Nothing further is needed for the backfill bound: abandonment removes
+        // the boundary registrations, and backfill capacity IS those
+        // registrations, so a parked producer is already free. That is the whole
+        // point of not keeping a second ledger - there is no second thing to
+        // remember here.
         lag_warning(skipped, abandoned)
     }
 }
@@ -1327,6 +1625,25 @@ mod tests {
         )
     }
 
+    /// The same control over a caller-supplied ledger, so a test can observe the
+    /// backfill charge the control's publications create - as `attach` does,
+    /// where the slot and the control share one `PendingCoverage`.
+    fn lag_test_control_over(
+        coverage: Arc<crate::cursor::PendingCoverage>,
+    ) -> crate::control::SyncControl {
+        let (boundary, view) = crate::cancel::Boundary::new();
+        let (priority, p) = tokio::sync::watch::channel(bifrost_types::Priority::Normal);
+        let (bandwidth, b) = tokio::sync::watch::channel(None);
+        std::mem::forget((view, p, b));
+        crate::control::SyncControl::new_with_publications(
+            bifrost_types::AccountId("lag".into()),
+            boundary,
+            priority,
+            bandwidth,
+            coverage,
+        )
+    }
+
     fn account_change_checkpoint(state: &[u8]) -> Checkpoint {
         Checkpoint::Change(bifrost_types::ChangeCursor {
             scope: CursorScope::Account,
@@ -1503,7 +1820,7 @@ mod tests {
     async fn try_recv_takes_the_same_lag_recovery_path() {
         let (tx, sentinel) = broadcast::channel(1);
         let control = lag_test_control();
-        let mut receiver = ChangesReceiver::new(tx.subscribe(), Some(control.clone()));
+        let mut receiver = ChangesReceiver::new(tx.subscribe(), Some(control.clone()), None);
         control.expect_checkpoint(account_change_checkpoint(b"lost"));
         tx.send(warning_event("overwritten"))
             .expect("receivers live");
@@ -1522,13 +1839,256 @@ mod tests {
         drop(sentinel);
     }
 
+    /// The lag path's OTHER half, and it has to be exercised through
+    /// `ChangesReceiver` rather than by calling the ledger directly - the wiring
+    /// is the thing that can go missing.
+    ///
+    /// The reasoning it pins: abandonment retires every outstanding
+    /// registration, so no acknowledgement can arrive for them - and backfill
+    /// capacity IS those registrations. Leaving them charged converts the
+    /// in-session loss the warning reports into a cold-start producer that never
+    /// runs again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_lag_frees_the_backfill_bound() {
+        let (tx, sentinel) = broadcast::channel(1);
+        let coverage = Arc::new(crate::cursor::PendingCoverage::new());
+        let control = lag_test_control_over(Arc::clone(&coverage));
+        let mut receiver = ChangesReceiver::new(
+            tx.subscribe(),
+            Some(control.clone()),
+            Some(Arc::clone(&coverage)),
+        );
+
+        // One outstanding backfill publication, charged exactly as the runner
+        // would have left it.
+        let checkpoint = Checkpoint::Backfill(bifrost_types::BackfillCheckpoint {
+            scope: CursorScope::Account,
+            partition: bifrost_types::Partition(b"page:0:10".to_vec()),
+            progress_marker: None,
+            progress: bifrost_types::BackfillProgress::default(),
+            envelope_version: 1,
+        });
+        control.expect_checkpoint(checkpoint);
+        assert_eq!(coverage.backfill_in_flight(), 1);
+
+        // Overflow the one-slot ring under the receiver.
+        for state in [b"a".as_slice(), b"b".as_slice()] {
+            let _ = tx.send(MultiplexerEvent::unacked(
+                CursorScope::Account,
+                Arc::new(SyncEvent::Warning(bifrost_types::Warning::user_safe(
+                    bifrost_types::WarningKind::Other,
+                    String::from_utf8_lossy(state).into_owned(),
+                ))),
+            ));
+        }
+
+        let lag = receiver.recv().await.expect("lag becomes an event");
+        assert!(matches!(
+            lag.event.as_ref(),
+            SyncEvent::Warning(warning)
+                if warning.kind == bifrost_types::WarningKind::ChangeStreamLagged
+        ));
+        assert_eq!(
+            coverage.backfill_in_flight(),
+            0,
+            "a lag abandons the registration, and the registration is the capacity"
+        );
+        drop(sentinel);
+    }
+
+    /// A backfill delivery harness that publishes exactly the way the runner
+    /// does - register the publication, then `publish_backfill` to send and stamp
+    /// under the delivery lock. Nothing here stamps by hand, so the tests below
+    /// exercise the send/stamp/subscribe/sweep ordering rather than assuming it.
+    struct Delivery {
+        delivery: Arc<ChangeDelivery>,
+        coverage: Arc<crate::cursor::PendingCoverage>,
+        control: crate::control::SyncControl,
+        _sentinel: broadcast::Receiver<MultiplexerEvent>,
+    }
+
+    fn delivery_harness(capacity: usize) -> Delivery {
+        let (tx, sentinel) = broadcast::channel(capacity);
+        let coverage = Arc::new(crate::cursor::PendingCoverage::new());
+        let control = lag_test_control_over(Arc::clone(&coverage));
+        Delivery {
+            delivery: Arc::new(ChangeDelivery::new(tx)),
+            coverage,
+            control,
+            _sentinel: sentinel,
+        }
+    }
+
+    impl Delivery {
+        fn backfill_page(partition: &str) -> Checkpoint {
+            Checkpoint::Backfill(bifrost_types::BackfillCheckpoint {
+                scope: CursorScope::Account,
+                partition: bifrost_types::Partition(partition.as_bytes().to_vec()),
+                progress_marker: None,
+                progress: bifrost_types::BackfillProgress::default(),
+                envelope_version: 1,
+            })
+        }
+
+        /// Register and broadcast one backfill page, as `run_partition` does.
+        fn publish(&self, partition: &str) -> crate::cursor::PublicationId {
+            let checkpoint = Self::backfill_page(partition);
+            let id = self.control.expect_checkpoint(checkpoint.clone());
+            let event = MultiplexerEvent {
+                scope: CursorScope::Account,
+                event: Arc::new(SyncEvent::Batch(bifrost_types::Batch {
+                    items: Vec::new(),
+                    page_boundary: bifrost_types::PageBoundary::Final,
+                    server_latency: std::time::Duration::ZERO,
+                    bytes_in: 0,
+                    checkpoint: Some(checkpoint.clone()),
+                })),
+                checkpoint: Some(checkpoint),
+                publication: Some(id.clone()),
+            };
+            self.delivery
+                .publish_backfill(event, &self.coverage, Some(&id));
+            id
+        }
+
+        fn subscribe(&self) -> ChangesReceiver {
+            self.delivery
+                .subscribe(Some(self.control.clone()), Some(Arc::clone(&self.coverage)))
+        }
+    }
+
+    /// FINDINGS 3, 4 and 5 at the seam that has to notice, and all three are one
+    /// ordering question. Receiver A takes delivery of two pages, B subscribes
+    /// afterwards, A drops. The subscriber COUNT never reaches zero, and B joined
+    /// at the ring's tail beyond A's pages, so nothing can ever acknowledge them
+    /// and the producer would park for the life of the attachment.
+    ///
+    /// Every step goes through the real path - `ChangeDelivery::publish_backfill`
+    /// for the send AND stamp, `subscribe` for the numbering,
+    /// `ChangesReceiver::drop` for the sweep. A version of this that stamped by
+    /// hand could not have exercised the ordering at all, which is exactly how
+    /// three separate interleavings survived the previous round.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_overlapping_receiver_replacement_frees_pages_nobody_can_reach() {
+        let h = delivery_harness(8);
+        let a = h.subscribe();
+        h.publish("page:0:10");
+        h.publish("page:10:20");
+        assert_eq!(h.coverage.backfill_in_flight(), 2);
+
+        // B arrives BEFORE A leaves, so the count never touches zero.
+        let mut b = h.subscribe();
+        assert!(
+            has_real_subscriber(h.delivery.sender()),
+            "a consumer is present throughout"
+        );
+        assert_eq!(
+            h.coverage.backfill_in_flight(),
+            2,
+            "B's arrival alone settles nothing"
+        );
+        assert!(
+            b.try_recv().is_err(),
+            "B really did join beyond those pages - it can never receive them"
+        );
+
+        drop(a);
+
+        assert_eq!(
+            h.coverage.backfill_in_flight(),
+            0,
+            "B joined at the ring's tail and can never receive A's pages, so their \
+             capacity must come back when A leaves"
+        );
+    }
+
+    /// The mirror, and the reason the sweep is keyed on the numbering rather than
+    /// on "did anyone leave": a receiver that predates the page can still
+    /// acknowledge it, so the bound must stay in force when a LATER receiver
+    /// departs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_departing_latecomer_does_not_free_a_page_its_predecessor_holds() {
+        let h = delivery_harness(8);
+        let _a = h.subscribe();
+        let b = h.subscribe();
+        h.publish("page:0:10");
+
+        drop(b);
+        assert_eq!(
+            h.coverage.backfill_in_flight(),
+            1,
+            "A still holds the page and can still acknowledge it"
+        );
+    }
+
+    /// FINDING 4 specifically. A receiver that subscribes AFTER the send must not
+    /// be counted as a possible reader of it. The stamp is taken inside the
+    /// delivery lock at send time, so a post-hoc read of the numbering - which is
+    /// what the previous revision did - cannot mis-attribute the batch.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_subscriber_that_arrives_after_the_send_is_not_a_possible_reader() {
+        let h = delivery_harness(8);
+        let a = h.subscribe();
+        h.publish("page:0:10");
+        let _late = h.subscribe();
+
+        drop(a);
+        assert_eq!(
+            h.coverage.backfill_in_flight(),
+            0,
+            "the only receiver that could read the page has gone; a latecomer must not \
+             keep it charged"
+        );
+    }
+
+    /// FINDING 6. Retiring the last outstanding registration can make the account
+    /// quiescent, and a `pause` waiter sits on the checkpoint watch rather than on
+    /// the ledger. The sweep goes through the ledger directly, so it has to
+    /// republish quiescence itself or the waiter never wakes.
+    ///
+    /// Current-thread and paused, so "the waiter has parked" is a fact rather
+    /// than a hope: a spawned task runs deterministically to its first await
+    /// before control returns here. A multi-threaded version of this passed
+    /// against the bug, because the waiter had not started when the sweep ran and
+    /// then found the boundary already gone.
+    #[tokio::test(start_paused = true)]
+    async fn a_receiver_drop_sweep_wakes_a_boundary_waiter() {
+        use bifrost_types::Control as _;
+
+        let h = delivery_harness(8);
+        let a = h.subscribe();
+        h.publish("page:0:10");
+
+        let waiter_control = h.control.clone();
+        let pause = tokio::spawn(async move { waiter_control.pause().await });
+        // Let the waiter reach its park on the checkpoint watch, and confirm the
+        // outstanding registration really is gating it.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert!(
+            !pause.is_finished(),
+            "the outstanding registration must gate the boundary before the sweep"
+        );
+
+        drop(a);
+
+        let released = tokio::time::timeout(std::time::Duration::from_secs(5), pause)
+            .await
+            .expect("the sweep must wake a boundary waiter, not only the capacity gate");
+        assert_eq!(
+            released.expect("pause task").expect("pause"),
+            bifrost_types::DurableCheckpointSet::default(),
+            "nothing became durable, so nothing may be reported as durable"
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn broadcast_lag_releases_boundary_waiters_that_can_never_be_acked() {
         use bifrost_types::Control as _;
 
         let (tx, sentinel) = broadcast::channel(1);
         let control = lag_test_control();
-        let mut receiver = ChangesReceiver::new(tx.subscribe(), Some(control.clone()));
+        let mut receiver = ChangesReceiver::new(tx.subscribe(), Some(control.clone()), None);
         control.expect_checkpoint(account_change_checkpoint(b"lost"));
         tx.send(warning_event("overwritten"))
             .expect("receivers live");
@@ -1560,7 +2120,7 @@ mod tests {
     #[tokio::test]
     async fn changes_receiver_surfaces_broadcast_lag_as_lag_warning() {
         let (tx, sentinel) = broadcast::channel(1);
-        let mut receiver = ChangesReceiver::new(tx.subscribe(), None);
+        let mut receiver = ChangesReceiver::new(tx.subscribe(), None, None);
         tx.send(warning_event("overwritten"))
             .expect("receivers live");
         tx.send(warning_event("retained")).expect("receivers live");

@@ -339,6 +339,21 @@ impl SyncControl {
         abandoned
     }
 
+    /// Republish quiescence after something OTHER than this handle retired
+    /// outstanding registrations.
+    ///
+    /// `retire_publication` and `abandon_pending_checkpoints` do this as part of
+    /// their own work. The receiver-drop sweep retires through the ledger
+    /// directly - it is one transition under the ledger lock, which is what keeps
+    /// a concurrent scope reset from losing the debt - so it has no way to reach
+    /// `publish_quiescence` on its own. Without this the sweep can remove the
+    /// last outstanding boundary while a `pause` or `checkpoint_now` waiter sits
+    /// on the checkpoint watch, and that waiter never wakes.
+    pub(crate) fn publish_boundary_progress(&self) {
+        let generation = self.inner.generation.load(Ordering::SeqCst);
+        self.publish_quiescence(generation);
+    }
+
     /// Engine-side hook: bandwidth meter feeds observed throughput.
     pub fn observe_bandwidth(&self, bps: u64) {
         self.inner.bandwidth_observed.store(bps, Ordering::Relaxed);

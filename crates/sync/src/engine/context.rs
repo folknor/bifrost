@@ -47,6 +47,33 @@ pub(super) struct SlotContext {
     /// with no reader.
     pub subscriber_notify: Arc<Notify>,
     pub scheduler: Scheduler,
+    /// The account's change broadcast plus its receiver numbering. The backfill
+    /// producer publishes through it so a page's send and its delivery stamp are
+    /// one step; see `multiplexer::ChangeDelivery`.
+    pub delivery: Arc<ChangeDelivery>,
+    /// How many published-but-unanswered backfill batches the account may have
+    /// in flight before its cold-start producer parks.
+    pub backfill_capacity: usize,
+}
+
+impl SlotContext {
+    /// The producer-side door onto the backfill bound, already carrying this
+    /// slot's shutdown token so a parked producer always has a way out.
+    ///
+    /// The gate holds no ledger of its own - capacity is a property of the
+    /// publication records in `coverage`. It bundles the bound, the token and
+    /// the account's scheduler admission, and that admission is the only state
+    /// it owns.
+    pub(super) fn lane_gate(&self) -> LaneGate {
+        LaneGate::new(
+            Arc::clone(&self.coverage),
+            self.backfill_capacity,
+            self.shutdown.clone(),
+            self.scheduler.clone(),
+            self.account_id.clone(),
+            self.control.clone(),
+        )
+    }
 }
 
 impl SlotContext {

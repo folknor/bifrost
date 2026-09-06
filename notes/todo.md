@@ -102,17 +102,24 @@ between them.
    acceptance suite. Largest blast radius of the set, and teardown /
    RSET-and-keep / abort ordering are exactly the code that moves holes when
    restructured. Not alongside any other smtp work; cold review required.
-8. **sync: bounded backfill lane instead of the broadcast ring. WILL
-   HAPPEN, last of the structural items.** Keep the broadcast channel for
-   live changes; feed cold-start backfill pages through a bounded
-   per-account queue so a slow consumer applies flow control instead of
-   causing lag-abandonment plus re-read. The consumer surface does not
-   change: `account_changes_stream` stays one stream carrying both batch
-   kinds, distinguished by checkpoint kind as today, and the existing
-   backfill acks are the permit signal. Sequenced last so it lands in an
-   orchestrator module (item 1, done) and after the 2026-09-06 DAV
-   watermark cursor (item 9); it is not waiting on any measurement. Runs
-   alone, with a cold review.
+8. **DONE 2026-09-06. sync: bounded backfill lane instead of the broadcast
+   ring.** Landed as `engine/lane.rs` (the wait plus the account's scheduler
+   admission), the capacity charge on `PendingCoverage`'s own boundary
+   entries, and receiver numbering in `multiplexer::ChangeDelivery` so a
+   departed receiver's unacknowledged pages free the bound. The consumer
+   surface is unchanged. The contract it rests on - any number of receivers,
+   exactly one acknowledger, the acknowledger subscribing first - is stated
+   in `reference/sync.md` under "The bounded backfill lane", and the
+   observer subscription that would remove the ordering constraint is item
+   11. Original ruling: Keep the broadcast channel for live changes; feed
+   cold-start backfill pages through a bounded per-account queue so a slow
+   consumer applies flow control instead of causing lag-abandonment plus
+   re-read. The consumer surface does not change: `account_changes_stream`
+   stays one stream carrying both batch kinds, distinguished by checkpoint
+   kind as today, and the existing backfill acks are the permit signal.
+   Sequenced last so it lands in an orchestrator module (item 1, done) and
+   after the 2026-09-06 DAV watermark cursor (item 9); it is not waiting on
+   any measurement. Runs alone, with a cold review.
 9. **dav: sorted-href watermark page cursor replacing the integer offset.
    PROCEED (2026-09-06).** Both crates, one codec in
    `bifrost_dav_core::snapshot`; a page lists, skips past the watermark and
@@ -136,6 +143,19 @@ between them.
     transport error; and `subscribe_graph` emits `WatchEvent::Reconnected`
     on the very first subscribe, costing one redundant account-wide
     reconcile.
+11. **sync: an explicit observer subscription on the change stream.** Ruled
+    2026-09-06 alongside item 8: `account_changes_stream` supports any number
+    of receivers with exactly one acknowledger, and until this lands the
+    acknowledging receiver must subscribe FIRST. The subscriber gate is a raw
+    receiver count, so an observer that subscribes before the acknowledger
+    satisfies it, takes delivery of pages it never acknowledges, and parks
+    cold start at the bound until it leaves or a lag fires; the acknowledger
+    joins at the ring's tail and cannot see those pages. The fix is a second
+    subscription method returning an UNNUMBERED receiver - the shape
+    `ChangesReceiver::new` already has behind `cfg(test)` - that counts for
+    neither the gate nor the bound, with `wait_for_real_subscriber` counting
+    numbered receivers instead of raw ones. Small and contained; deliberately
+    not folded into the lane landing.
 
 - **sync tenant throttle identity.** `ThrottleScope::Tenant` cannot be enforced
   across sibling accounts because `AccountError` carries no tenant identity.

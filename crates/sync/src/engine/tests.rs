@@ -103,6 +103,73 @@ fn writer_harness_observed() -> (
     (account, inner, coverage, tx, writer, observed)
 }
 
+/// A backfill checkpoint on one partition of one scope.
+fn lane_page(scope: &CursorScope, partition: &str, done: u64) -> bifrost_types::Checkpoint {
+    bifrost_types::Checkpoint::Backfill(bifrost_types::BackfillCheckpoint {
+        scope: scope.clone(),
+        partition: bifrost_types::Partition(partition.as_bytes().to_vec()),
+        progress_marker: None,
+        progress: bifrost_types::BackfillProgress {
+            items_done: done,
+            items_estimated: None,
+        },
+        envelope_version: 1,
+    })
+}
+
+/// Publish a backfill page the way the runner does, and mark it delivered.
+fn publish_a_page(
+    control: &crate::control::SyncControl,
+    coverage: &crate::cursor::PendingCoverage,
+    checkpoint: &bifrost_types::Checkpoint,
+) -> crate::cursor::PublicationId {
+    let id = control.publish_checkpoint_without_report(checkpoint.clone(), 0);
+    coverage.mark_delivered(&id, 1);
+    id
+}
+
+/// A durable scope reset retires that scope's publications; the WRITER is what
+/// has to make that happen, on both of its invalidation passes, and freeing the
+/// backfill bound is a consequence of the retirement rather than a second step.
+///
+/// Driven through a real `ack_writer` on purpose: a test that called
+/// `invalidate_scope` itself would pass with the writer's wiring deleted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_scope_reset_frees_the_backfill_bound_through_the_writer() {
+    let (_account, _store, coverage, tx, writer, control) = writer_harness_observed();
+    let reset_scope = CursorScope::Account;
+    let sibling = CursorScope::Type(ObjectType::Email);
+
+    // Two pages of ONE partition, so the survivor carries a SUBSUMED page. That
+    // shape is the finding: an id list taken from the ledger names only the
+    // survivor, and a release keyed on those ids leaves the subsumed page
+    // charged for ever.
+    publish_a_page(&control, &coverage, &lane_page(&reset_scope, "p:0:10", 1));
+    publish_a_page(&control, &coverage, &lane_page(&reset_scope, "p:0:10", 2));
+    publish_a_page(&control, &coverage, &lane_page(&sibling, "p:0:10", 1));
+    assert_eq!(coverage.backfill_in_flight(), 3);
+
+    let (done, wait) = oneshot::channel();
+    tx.send(WriterRequest::ResetScope {
+        scope: reset_scope.clone(),
+        delete_backfill: false,
+        done,
+    })
+    .await
+    .expect("writer accepts the reset");
+    wait.await.expect("writer answers").expect("reset succeeds");
+
+    assert_eq!(
+        coverage.backfill_in_flight(),
+        1,
+        "both of the reset scope's pages come back, the subsumed one included; the \
+         sibling scope's does not"
+    );
+
+    drop(tx);
+    let _ = writer.await;
+}
+
 /// The common shape: the control handle is only needed by the tests that
 /// assert what a boundary waiter would be told.
 fn writer_harness() -> (
@@ -132,7 +199,17 @@ fn writer_harness_over(
     let (boundary, _view) = crate::cancel::Boundary::new();
     let (priority, _p) = tokio::sync::watch::channel(bifrost_types::Priority::Normal);
     let (bandwidth, _b) = tokio::sync::watch::channel(None);
-    let control = crate::control::SyncControl::new(account.clone(), boundary, priority, bandwidth);
+    // The control's publication ledger IS the coverage handed to the writer, as
+    // `attach` wires it. Two separate ledgers here would mean the writer's
+    // `retire_publication` touches nothing a test can observe - and a test that
+    // stages a retirement would silently stage nothing.
+    let control = crate::control::SyncControl::new_with_publications(
+        account.clone(),
+        boundary,
+        priority,
+        bandwidth,
+        Arc::clone(&coverage),
+    );
     let writer = tokio::spawn(ack_writer(
         account.clone(),
         store,
@@ -142,6 +219,290 @@ fn writer_harness_over(
     ));
     std::mem::forget((_view, _p, _b));
     (account, coverage, tx, writer)
+}
+
+/// A page published INSIDE the reset's own store awaits, staged rather than
+/// argued.
+///
+/// The separate-permit design lost this twice over. It released the lane once up
+/// front, which woke the parked producer; the still-running walk then published
+/// inside the await window and took a permit that the reset's second pass
+/// retired-and-fenced but never returned. Its successor released by the ids the
+/// ledger reported retired, and hit a narrower version: a publication registered
+/// after the retirement kept its permit anyway.
+///
+/// Both vanish when the registration IS the capacity, and this pins that it does:
+/// the page is registered while the writer is parked, and the second invalidation
+/// pass frees it because it removes it.
+///
+/// `GatedDeleteStore` parks the writer inside its deletes, which is the only
+/// place this interleaving can be produced on demand.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_page_published_inside_a_resets_await_window_frees_the_bound() {
+    let inner = Arc::new(crate::cursor::InMemoryCheckpointStore::new());
+    let gate_store = Arc::new(GatedDeleteStore::new(Arc::clone(&inner)));
+    let store: Arc<DynCheckpointStore> = Arc::clone(&gate_store) as Arc<DynCheckpointStore>;
+    let account = bifrost_types::AccountId("acct".into());
+    let coverage = Arc::new(crate::cursor::PendingCoverage::new());
+    let (tx, rx) = mpsc::channel::<WriterRequest>(16);
+    let (boundary, _view) = crate::cancel::Boundary::new();
+    let (priority, _p) = tokio::sync::watch::channel(bifrost_types::Priority::Normal);
+    let (bandwidth, _b) = tokio::sync::watch::channel(None);
+    let control = crate::control::SyncControl::new_with_publications(
+        account.clone(),
+        boundary,
+        priority,
+        bandwidth,
+        Arc::clone(&coverage),
+    );
+    let observed = control.clone();
+    let writer = tokio::spawn(ack_writer(
+        account.clone(),
+        store,
+        control,
+        Arc::clone(&coverage),
+        rx,
+    ));
+    std::mem::forget((_view, _p, _b));
+
+    let scope = email_scope();
+    publish_a_page(&observed, &coverage, &lane_page(&scope, "page:0:10", 1));
+    assert_eq!(coverage.backfill_in_flight(), 1);
+
+    let handle = WriterHandle::new(tx.clone());
+    let reset_scope = scope.clone();
+    let reset = tokio::spawn(async move { handle.reset_scope_for_restart(reset_scope).await });
+
+    // Park the writer inside the reset's deletes - after its first invalidation
+    // pass, before its second.
+    gate_store
+        .entered
+        .acquire()
+        .await
+        .expect("writer reached the delete")
+        .forget();
+
+    // The still-running walk publishes TWO more pages of one partition right
+    // here, so the second is a survivor carrying a subsumed predecessor.
+    publish_a_page(&observed, &coverage, &lane_page(&scope, "page:10:20", 1));
+    publish_a_page(&observed, &coverage, &lane_page(&scope, "page:10:20", 2));
+    assert_eq!(
+        coverage.backfill_in_flight(),
+        2,
+        "the in-window pages are charged"
+    );
+
+    gate_store.release.add_permits(1);
+    reset.await.expect("reset task").expect("reset");
+
+    assert_eq!(
+        coverage.backfill_in_flight(),
+        0,
+        "the reset retired them, and the retirement is what frees the bound; nothing \
+         can ever acknowledge a fenced page, so leaving it charged is permanent"
+    );
+
+    drop(tx);
+    writer.await.expect("writer exits");
+}
+
+/// FINDING 8. A token from one lane presented with another lane's checkpoint is
+/// REFUSED, and a refusal is not evidence of delivery: nothing may be retired,
+/// and the live publication the token names must keep its capacity.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rejected_acknowledgement_frees_no_capacity() {
+    let (_account, _store, coverage, tx, writer, control) = writer_harness_observed();
+    let x = lane_page(&CursorScope::Account, "page:0:10", 1);
+    let y = lane_page(&CursorScope::Type(ObjectType::Email), "page:0:10", 1);
+    publish_a_page(&control, &coverage, &x);
+    let y_id = publish_a_page(&control, &coverage, &y);
+    assert_eq!(coverage.backfill_in_flight(), 2);
+
+    // Y's token, X's checkpoint. The lanes disagree, so the ledger refuses.
+    let (done, wait) = oneshot::channel();
+    tx.send(WriterRequest::Ack(crate::multiplexer::AckRequest {
+        scope: CursorScope::Account,
+        checkpoint: x,
+        publication: Some(y_id),
+        auto: false,
+        complete: Some(done),
+    }))
+    .await
+    .expect("writer accepts the request");
+    assert!(
+        wait.await.expect("writer answers").is_err(),
+        "a lane mismatch must be refused"
+    );
+
+    assert_eq!(
+        coverage.backfill_in_flight(),
+        2,
+        "a refused acknowledgement is evidence about the caller, not about delivery; \
+         retiring on it frees a live publication's capacity"
+    );
+
+    drop(tx);
+    let _ = writer.await;
+}
+
+/// A store failure is the other half of that pair, and DOES retire: the consumer
+/// took delivery and answered, so the batch is no longer in flight even though
+/// nothing became durable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_store_write_still_frees_the_bound() {
+    let store: Arc<DynCheckpointStore> = Arc::new(FailingTransitionStore);
+    let account = bifrost_types::AccountId("acct".into());
+    let coverage = Arc::new(crate::cursor::PendingCoverage::new());
+    let (tx, rx) = mpsc::channel::<WriterRequest>(16);
+    let (boundary, _view) = crate::cancel::Boundary::new();
+    let (priority, _p) = tokio::sync::watch::channel(bifrost_types::Priority::Normal);
+    let (bandwidth, _b) = tokio::sync::watch::channel(None);
+    let control = crate::control::SyncControl::new_with_publications(
+        account.clone(),
+        boundary,
+        priority,
+        bandwidth,
+        Arc::clone(&coverage),
+    );
+    let observed = control.clone();
+    let writer = tokio::spawn(ack_writer(
+        account.clone(),
+        store,
+        control,
+        Arc::clone(&coverage),
+        rx,
+    ));
+    std::mem::forget((_view, _p, _b));
+
+    // TWO pages of one partition, so the second SUBSUMES the first - and the
+    // acknowledgement below names the SUPERSEDED one. Acknowledging the survivor
+    // instead passes without the subsumed-id branch in `retire_publication`,
+    // because removing the survivor's entry takes the whole charge with it; only
+    // an acknowledgement of the subsumed page can tell the two apart.
+    let first = lane_page(&CursorScope::Account, "p", 1);
+    let first_id = publish_a_page(&observed, &coverage, &first);
+    publish_a_page(
+        &observed,
+        &coverage,
+        &lane_page(&CursorScope::Account, "p", 2),
+    );
+    assert_eq!(coverage.backfill_in_flight(), 2);
+
+    let (done, wait) = oneshot::channel();
+    tx.send(WriterRequest::Ack(crate::multiplexer::AckRequest {
+        scope: CursorScope::Account,
+        checkpoint: first,
+        publication: Some(first_id),
+        auto: false,
+        complete: Some(done),
+    }))
+    .await
+    .expect("writer accepts the request");
+    assert!(wait.await.expect("writer answers").is_err());
+
+    assert_eq!(
+        coverage.backfill_in_flight(),
+        1,
+        "the consumer took delivery of the SUPERSEDED page and answered for it, so its \
+         charge must come off the survivor; the survivor's own page is still owed. \
+         Holding the bound over a transient store failure parks cold start for the \
+         life of the attachment"
+    );
+
+    drop(tx);
+    let _ = writer.await;
+}
+
+/// A store whose `apply_transition` always fails, so a test can separate "the
+/// acknowledgement was refused" from "the write did not land".
+struct FailingTransitionStore;
+
+impl crate::cursor::store::CheckpointStore for FailingTransitionStore {
+    fn put_change_cursor<'a>(
+        &'a self,
+        _account: &'a bifrost_types::AccountId,
+        _cursor: bifrost_types::ChangeCursor,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send + 'a>> {
+        Box::pin(async { Err(Error::CheckpointStore("store is down".into())) })
+    }
+
+    fn get_change_cursor<'a>(
+        &'a self,
+        _account: &'a bifrost_types::AccountId,
+        _scope: &'a CursorScope,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<Option<bifrost_types::ChangeCursor>, Error>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async { Ok(None) })
+    }
+
+    fn put_backfill<'a>(
+        &'a self,
+        _account: &'a bifrost_types::AccountId,
+        _checkpoint: bifrost_types::BackfillCheckpoint,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send + 'a>> {
+        Box::pin(async { Err(Error::CheckpointStore("store is down".into())) })
+    }
+
+    fn get_backfill<'a>(
+        &'a self,
+        _account: &'a bifrost_types::AccountId,
+        _scope: &'a CursorScope,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<Option<bifrost_types::BackfillCheckpoint>, Error>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async { Ok(None) })
+    }
+
+    fn delete_change_cursor<'a>(
+        &'a self,
+        _account: &'a bifrost_types::AccountId,
+        _scope: &'a CursorScope,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn delete_backfill<'a>(
+        &'a self,
+        _account: &'a bifrost_types::AccountId,
+        _scope: &'a CursorScope,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn apply_transition<'a>(
+        &'a self,
+        _account: &'a bifrost_types::AccountId,
+        _transition: crate::cursor::store::CheckpointTransition,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send + 'a>> {
+        Box::pin(async { Err(Error::CheckpointStore("store is down".into())) })
+    }
+
+    fn put_ledger<'a>(
+        &'a self,
+        _account: &'a bifrost_types::AccountId,
+        _ledger: crate::cursor::DebtLedger,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn get_ledger<'a>(
+        &'a self,
+        _account: &'a bifrost_types::AccountId,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<crate::cursor::DebtLedger, Error>> + Send + 'a>,
+    > {
+        Box::pin(async { Ok(crate::cursor::DebtLedger::default()) })
+    }
 }
 
 /// Wraps a store and parks inside `delete_change_cursor` until released, so

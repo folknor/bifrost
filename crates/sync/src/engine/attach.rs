@@ -93,6 +93,15 @@ impl SyncEngine {
         let (changes_tx, sentinel_rx) =
             broadcast::channel::<MultiplexerEvent>(self.config.multiplexer.changes_capacity);
 
+        // The delivery gate: the same broadcast sender, plus the numbering of
+        // the receivers handed out on it. A backfill page's send and its delivery
+        // stamp happen together under its lock, as do a receiver's subscribe and
+        // its number, and a departing receiver's unregister and its sweep - which
+        // is what makes "can any live receiver still reach this page" an exact
+        // question rather than an approximate one. See
+        // `multiplexer::ChangeDelivery`.
+        let delivery = Arc::new(crate::multiplexer::ChangeDelivery::new(changes_tx.clone()));
+
         // Per-account control broadcast. The engine publishes
         // `AccountControl::Pause(reason)` on this channel when it
         // auto-pauses the account (operator override, retry budget
@@ -487,6 +496,8 @@ impl SyncEngine {
             coverage: Arc::clone(&pending_coverage),
             subscriber_notify: Arc::clone(&subscriber_notify),
             scheduler: self.scheduler.clone(),
+            delivery: Arc::clone(&delivery),
+            backfill_capacity: self.config.backfill.lane_capacity,
         };
 
         let backfill_wiring = BackfillWiring {
@@ -616,6 +627,7 @@ impl SyncEngine {
             reopen_tx: reopen_tx.clone(),
             throttles: Arc::clone(&throttles),
             open_skips,
+            delivery,
         });
 
         self.accounts.insert(account_id.clone(), slot);

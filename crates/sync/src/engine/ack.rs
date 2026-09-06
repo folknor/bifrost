@@ -325,6 +325,16 @@ pub(super) async fn ack_writer(
                 done,
             } => {
                 provisional.remove(&scope);
+                // Nothing here touches backfill capacity explicitly, and that is
+                // the fix rather than an omission. `invalidate_scope` removes the
+                // scope's boundary registrations, and those registrations ARE the
+                // capacity, so both passes free it atomically with the retirement
+                // - including a page the still-running walk published inside the
+                // store awaits below, and including pages a later publication had
+                // already superseded. The previous shape kept a separate permit
+                // map and needed a reset counter, a per-pass id list, and a rule
+                // about registrations racing retirements; each of those was a
+                // seam, and each seam was a defect.
                 // Retiring the scope's publications and extracting their debt
                 // is ONE ledger operation, and it happens BEFORE the first
                 // await. Snapshotting the debt first and invalidating after the
@@ -372,6 +382,15 @@ pub(super) async fn ack_writer(
                 continue;
             }
         };
+        // No lane bookkeeping here, deliberately. Backfill capacity IS the
+        // publication's boundary registration, so each arm below frees it by
+        // doing what it already does to the ledger: `record_publication`
+        // acknowledges, `retire_publication` retires. An unconditional release
+        // beside them was a defect rather than a shortcut - it fired on the
+        // REJECTED arm too, where the consumer's token named a different lane
+        // from its checkpoint, and released a live sibling publication's
+        // capacity on the strength of an acknowledgement the ledger had just
+        // refused.
         let result = persist_ack_request(&account_id, &store, &coverage, &mut ledger, &req).await;
         match result {
             Ok(AckPersistOutcome::SentinelWithheld) => {
@@ -409,7 +428,7 @@ pub(super) async fn ack_writer(
                     let _ = done.send(Ok(()));
                 }
             }
-            Err(err) => {
+            Err(AckFailure::Store(err)) => {
                 tracing::warn!(
                     target: "bifrost.sync.changes",
                     account = ?account_id,
@@ -432,6 +451,27 @@ pub(super) async fn ack_writer(
                 if let Some(publication) = req.publication {
                     control.retire_publication(publication);
                 }
+                if let Some(done) = req.complete {
+                    let _ = done.send(Err(err));
+                }
+            }
+            Err(AckFailure::Rejected(err)) => {
+                tracing::warn!(
+                    target: "bifrost.sync.changes",
+                    account = ?account_id,
+                    scope = ?req.scope,
+                    error = %err,
+                    auto = req.auto,
+                    "ack: acknowledgement refused before any durable write"
+                );
+                // NOTHING is retired here, and the distinction from a store
+                // failure is the point. A store failure is evidence the consumer
+                // took delivery and answered; a REJECTION is evidence the
+                // acknowledgement did not name what it claimed to - a token from
+                // one lane presented with another lane's checkpoint, or an
+                // undecodable envelope. Acting on it would retire, and so free
+                // the capacity of, a publication that is still perfectly live and
+                // still awaiting its own acknowledgement.
                 if let Some(done) = req.complete {
                     let _ = done.send(Err(err));
                 }
@@ -762,17 +802,32 @@ enum AckPersistOutcome {
     SentinelWithheld,
 }
 
+/// Why an acknowledgement produced nothing durable.
+///
+/// Two cases that look alike and must not be treated alike. `Store` means the
+/// consumer's acknowledgement was valid and the write failed, so the batch is
+/// no longer in flight and its registration must be retired. `Rejected` means
+/// the acknowledgement never named a publication this ledger would honour - a
+/// mismatched lane, an undecodable envelope - so it is evidence about the
+/// CALLER, not about delivery, and retiring anything on the strength of it
+/// would free a live publication's boundary and its backfill capacity.
+#[derive(Debug)]
+enum AckFailure {
+    Rejected(Error),
+    Store(Error),
+}
+
 async fn persist_ack_request(
     account_id: &AccountId,
     store: &Arc<DynCheckpointStore>,
     coverage: &PendingCoverage,
     ledger: &mut crate::cursor::DebtLedger,
     req: &AckRequest,
-) -> Result<AckPersistOutcome, Error> {
+) -> Result<AckPersistOutcome, AckFailure> {
     if let Checkpoint::Change(cursor) = &req.checkpoint {
         cursor
             .validate_envelope()
-            .map_err(|_| Error::SchemaIncompatible)?;
+            .map_err(|_| AckFailure::Rejected(Error::SchemaIncompatible))?;
     }
     match req
         .publication
@@ -794,9 +849,9 @@ async fn persist_ack_request(
             // publication is a stale or buggy caller, and inventing a
             // completeness claim for it is the lying record this whole
             // mechanism exists to prevent.
-            return Err(Error::CheckpointStore(
+            return Err(AckFailure::Rejected(Error::CheckpointStore(
                 "acknowledgement names an unknown publication".into(),
-            ));
+            )));
         }
         // An engine-internal ack with no coverage claim: leave the ledger
         // exactly as it is.
@@ -816,7 +871,9 @@ async fn persist_ack_request(
         // Not an error for the consumer - its batch was empty and its
         // acknowledgement was honoured. The sentinel simply does not become
         // durable, so the next attach re-walks instead of skipping the scope.
-        persist_ledger_only(account_id, store, ledger).await?;
+        persist_ledger_only(account_id, store, ledger)
+            .await
+            .map_err(AckFailure::Store)?;
         return Ok(AckPersistOutcome::SentinelWithheld);
     }
 
@@ -828,6 +885,7 @@ async fn persist_ack_request(
                 ledger: ledger.clone(),
             },
         )
-        .await?;
+        .await
+        .map_err(AckFailure::Store)?;
     Ok(AckPersistOutcome::Durable)
 }

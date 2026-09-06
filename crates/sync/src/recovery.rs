@@ -223,13 +223,44 @@ pub(crate) fn batch_boundary_violation(
     operation: AccountOperation,
     scope: &CursorScope,
 ) -> AccountError {
+    contract_violation(
+        checkpoint,
+        operation,
+        scope,
+        "a PageBoundary::Partial batch carried a checkpoint",
+    )
+}
+
+/// A live batch carrying a BACKFILL checkpoint. The same classification and the
+/// same terminal outcome, with its own words: the boundary was fine, the
+/// checkpoint belongs to a lane this stream does not publish on, and an operator
+/// reading "a PageBoundary::Partial batch carried a checkpoint" would go looking
+/// for the wrong thing.
+#[must_use]
+pub(crate) fn backfill_checkpoint_on_changes(
+    checkpoint: Option<&bifrost_types::Checkpoint>,
+    operation: AccountOperation,
+    scope: &CursorScope,
+) -> AccountError {
+    contract_violation(
+        checkpoint,
+        operation,
+        scope,
+        "a changes batch carried a backfill checkpoint",
+    )
+}
+
+fn contract_violation(
+    checkpoint: Option<&bifrost_types::Checkpoint>,
+    operation: AccountOperation,
+    scope: &CursorScope,
+    detail: &'static str,
+) -> AccountError {
     AccountErrorBuilder::new(
         AccountErrorKind::Protocol(bifrost_types::ProtocolErrorKind::ContractViolation),
         Cause::Wire(bifrost_types::WireCause::MalformedResponse {
             protocol: checkpoint_protocol(checkpoint),
-            detail: Some(bifrost_types::DiagnosticText::support_only(
-                "a PageBoundary::Partial batch carried a checkpoint",
-            )),
+            detail: Some(bifrost_types::DiagnosticText::support_only(detail)),
         }),
     )
     .operation(operation)
@@ -513,6 +544,35 @@ mod tests {
         ServerCause, ServerErrorKind, TransmissionState, TransportCause, TransportErrorKind,
         TransportKind,
     };
+
+    /// The two contract violations say different things.
+    ///
+    /// They share a classification and a terminal outcome, and for a while they
+    /// shared a message too - so a live batch carrying a BACKFILL checkpoint was
+    /// reported as "a PageBoundary::Partial batch carried a checkpoint", sending
+    /// whoever read the log after the wrong thing entirely. The boundary was fine;
+    /// the checkpoint belonged to a lane that stream does not publish on.
+    #[test]
+    fn the_two_contract_violations_do_not_share_a_message() {
+        let scope = CursorScope::Account;
+        let boundary = format!(
+            "{:?}",
+            batch_boundary_violation(None, AccountOperation::SyncChanges, &scope).chain()
+        );
+        let backfill = format!(
+            "{:?}",
+            backfill_checkpoint_on_changes(None, AccountOperation::SyncChanges, &scope).chain()
+        );
+        assert_ne!(
+            boundary, backfill,
+            "an operator has to be able to tell a bad boundary from a checkpoint on the \
+             wrong lane"
+        );
+        assert!(
+            backfill.contains("backfill checkpoint"),
+            "and the message must name what actually happened: {backfill}"
+        );
+    }
 
     fn build_retry() -> AccountError {
         AccountErrorBuilder::new(

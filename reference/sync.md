@@ -18,6 +18,7 @@ SyncEngine
     workers: Vec<WorkerTask {join, abort}>
     Multiplexer task        -> per-scope poll + lifecycle + reopen
     Backfill orchestrator   -> partition runner per scope
+                               (parks on the account's backfill bound)
     Push reconciler task    -> reads per-account mpsc<WatchEvent>
     Push forwarder task     -> Account::push_stream -> per-account mpsc
     Ack writer task         -> AckRequest -> CheckpointStore
@@ -29,6 +30,7 @@ SyncEngine
     Scheduler (four-lane: Foreground / Normal / Background / Bulk)
     BudgetGate (global + per-account semaphores)
     CursorRegistry (scope -> cursor; membership index)
+    LaneGate (per account; the backfill bound's wait plus its admission)
     CheckpointStore (consumer-provided; InMemoryCheckpointStore for tests)
     InvalidationSinkInner (DashMap<AccountId, mpsc::Sender<WatchEvent>>)
     SubscriptionRegistry (per-engine push subscription handles)
@@ -406,6 +408,20 @@ The protocol tag on that error is read off the offending checkpoint's change
 cursor. There is no protocol accessor on `dyn Account`, so a checkpoint that
 carries no tag yields `Protocol::Unknown` rather than a guess.
 
+**Both inventory front ends and the live driver refuse a BACKFILL checkpoint
+outright**, and the reason is about the bound rather than about envelopes. Both
+register the publication and then send on the RAW sender, so an entry created
+there is never stamped with a delivery, and an unsent stamp is deliberately
+never swept. A `Lane::Backfill` entry minted that way would sit charged against
+the account's backfill bound until an acknowledgement, a lag or a reset freed
+it: a permanent slot of the bound spent per scope. No provider in this workspace
+attaches one, so refusing costs nothing real. Fusion fails the inventory pass,
+which is retried; the live driver terminates the scope as a contract violation
+with its own message, so the consumer is told rather than the driver re-polling
+the same cursor for ever. Pinned by
+`a_fusion_batch_may_not_carry_a_backfill_checkpoint` and
+`the_live_driver_refuses_a_backfill_checkpoint`.
+
 ### Broadcast
 
 `drive_changes_stream` broadcasts each `Batch` (item plus
@@ -517,7 +533,11 @@ enumeration the consumer took delivery of, and folding it forward would
 discharge debt against a batch the ring destroyed. Under-reporting coverage
 costs a re-walk; over-reporting it loses objects nobody sees again.
 Surfacing lag without this
-would turn silent in-session loss into a permanent hang. The cost is
+would turn silent in-session loss into a permanent hang. Abandonment is also
+what frees the account's backfill bound, because that bound IS the set of
+outstanding boundary registrations (see "The bounded backfill lane"); no second
+step is needed here, and an earlier revision that kept a separate permit map did
+need one. The cost is
 bounded and disclosed: a registration whose batch is still in the ring
 is also abandoned, so a boundary wait taken between the lag and that
 batch's ack reports the previous durable checkpoint rather than the
@@ -659,7 +679,13 @@ receiver keeps `receiver_count()` at 1, so the send "succeeds" in front
 of no real reader). For a `Ready`-cursor account whose entire cold start
 rides backfill (Gmail `CursorScope::Account`, JMAP
 `CursorScope::Type(Email)`) skipping the wait silently drops the initial
-inventory page and the consumer ingests zero objects. The partitioner
+inventory page and the consumer ingests zero objects. That gate and the
+bounded lane below compose cleanly and answer different questions: the gate is
+a one-time wait for a FIRST subscriber before the walk starts, while the lane
+bounds how far ahead of that subscriber the walk may run. A subscriber that
+arrives, satisfies the gate, and then leaves is handled by the lane's release
+paths, not by re-entering the gate - the walk keeps running and its pages are
+retired as undelivered, which is the pre-lane behaviour. The partitioner
 (`backfill/partitioner.rs::plan`) handles three strategies:
 `TimeWindowed` (boundaries plus a final open-ended partition),
 `UidRange` (newest-first chunking), and `PageCount` (page-size
@@ -782,6 +808,139 @@ Pause and checkpoint waiters observe backfill boundaries through the
 ack writer: it calls `SyncControl::record_checkpoint` after the
 consumer-acked `put_backfill` lands, so waiters wake on a durable,
 consumer-acknowledged boundary - identical to the change-cursor path.
+
+### The bounded backfill lane
+
+Backfill publications are flow controlled; live changes are not. Before
+publishing a page the runner waits until the account has fewer than
+`BackfillConfig::lane_capacity` (default 64) published-but-unacknowledged
+backfill batches. The wait sits after the page is read off the provider stream
+and before its publication is registered, so a parked producer is not asked for
+the next page either. Keeping the bound well under `changes_capacity` (default
+256) is what stops a cold start overrunning the shared ring on its own. A
+live-lane burst still can, and that case keeps the lag-abandonment machinery
+above exactly as it was. Both producers send into the same ring and the bound
+is consulted only before a backfill send, so there is no fairness arbiter: when
+both have a batch ready, both send.
+
+**The consumer contract this rests on.** `account_changes_stream` hands out
+any number of receivers, and exactly ONE of them acknowledges. The others are
+observers. Two independent acknowledgers are not supported by this engine: the
+boundary ledger keeps one entry per lane and releases it on the first
+acknowledgement, so the bound follows the faster acknowledger and the slower
+one is left to the ring. The acknowledging receiver must subscribe FIRST. The
+subscriber gate is a receiver count, so an observer that arrives before the
+acknowledger satisfies it, takes delivery of pages it will never acknowledge,
+and parks cold start at the bound until it leaves or a lag fires; the
+acknowledger joins at the ring's tail and cannot see those pages. That was
+already the failure shape before the bound existed, when such a walk ran into
+the observer and settled. An explicit observer subscription that counts for
+neither the gate nor the bound is the clean fix, and is filed in
+`notes/todo.md`. A bounded `mpsc` for backfill was rejected on the same
+contract: it is single-consumer, so pages would reach one receiver and vanish
+for the rest, while a bound on the producer leaves the stream byte-for-byte
+unchanged.
+
+**The capacity is the publication ledger itself.** An account's backfill
+in-flight count is the sum over its live backfill `BoundaryEntry`s in
+`PendingCoverage`, each charging one for itself plus one per page it
+superseded. `engine/lane.rs` holds no ledger: `LaneGate` is the wait plus the
+account's scheduler admission. A first design kept a permit map beside the
+ledger, and two reviews found the same defect four times over, the two
+structures disagreeing about what was in flight. There is no release call to
+forget, because every ledger mutation that removes or lightens an entry frees
+capacity and pulses one `Notify`:
+
+- an acknowledgement removes the entry, or strips the acknowledged id from its
+  survivor's `subsumed` when the page has since been superseded;
+- a store failure after a valid acknowledgement retires the entry the same way.
+  The entry tracks delivery, not durability, and holding it would park cold
+  start over a transient store error;
+- a REFUSED acknowledgement retires nothing. `AckFailure::Rejected` (a token
+  from another lane, an undecodable envelope) is evidence about the caller and
+  `AckFailure::Store` is evidence about the write; only the second retires;
+- a send that reached only the slot's sentinel receiver is retired by the
+  runner, as it always was;
+- a subscriber lag (`abandon_checkpoints`) drains every registration;
+- a durable scope reset (`invalidate_scope`, on both of the writer's passes)
+  removes the scope's entries, subsumed pages included, and also extracts that
+  scope's share of the carry-forward slot, so debt rescued by a sweep reaches
+  the reset instead of dying with the attachment;
+- a `PENDING_BOUNDARY_CAP` eviction of a charged entry;
+- a receiver departure, below;
+- `detach` cancels the slot token and pulses the wake, so a parked producer
+  leaves at once rather than being awaited to `detach_timeout` and aborted.
+
+A stale acknowledgement settles nothing: settlement is by publication identity
+against the live entries, and there is no scope-wide branch to replay against.
+
+**Supersession is the one place the literal rule is corrected.** Supersession
+removes the older entry on purpose, so that a consumer can persist N batches
+and acknowledge only the last. Under the bare rule one partition could publish
+without limit while holding one record. The survivor therefore inherits the
+charge of what it displaced (`BoundaryEntry::subsumed`, each page with its own
+delivery stamp), and acknowledging a superseded id settles exactly that page.
+Only the backfill lane inherits: `Lane::Change` never consults the bound, and
+inheriting there would let a subscriber that drains without acknowledging grow
+one entry's history without limit.
+
+**A parked producer holds no scheduler admission.** With a minimal budget the
+account has one sync permit, and a backfill parked while holding it starved
+polling and push reconciliation. `wait_for_capacity_holding_admission` keeps
+the permit on the non-blocking fast path, releases it for a real park and
+re-takes it on the wake. A refused re-admission is `WaitFailed::Refused`, which
+the runner turns into a failed partition on the rescan ramp; it is never read
+as `WaitFailed::ShuttingDown`, which would retire the whole orchestrator. The
+completion marker takes no admission at all (`wait_for_capacity`): it does no
+wire work and is emitted after the partition pass has handed its permit back.
+
+**Which receivers can still acknowledge a page is tracked per receiver.** A
+`tokio::broadcast` receiver joins at the ring's tail, so it can never take
+delivery of a batch broadcast before it subscribed. A receiver holding
+unacknowledged pages that departs while a replacement is already subscribed
+leaves pages nobody can answer for, and a subscriber count never sees it. So
+`ChangeDelivery` numbers every receiver it hands out, stamps each backfill
+publication with the numbering at send time (`delivered_at`), and on a
+receiver's drop retires every entry, and every subsumed page, whose stamp is at
+or beyond the lowest live number (`release_undelivered`). The retirement
+carries the pages' debt forward exactly as a lag does, in the same ledger
+transition that removes the entries, and announces the same
+`ChangeStreamLagged` warning on the stream. A page registered but not yet sent
+is never swept, since a receiver subscribing in that window really does receive
+it. One mutex orders a send with its stamp, a subscribe with its number, and a
+receiver's destruction with its unregister and sweep; the lock order is
+delivery then coverage, never the reverse. Live changes send on the raw sender
+and are never stamped or swept. The receiver holds a weak handle to the gate,
+so a receiver retained across `detach` sees `Closed` rather than keeping the
+sender alive itself. The acknowledgeability question cannot be answered by the
+ledger alone, because `claim_checkpoint` falls back to the publication receipt
+by design so acknowledgements can replay after a writer restart.
+
+**A producer that parks revalidates its scope before publishing.** A reset
+fences every id minted before it, but a page still waiting has no id yet. Both
+`run_partition` and `emit_backfill_complete` snapshot
+`PendingCoverage::scope_fence` and refuse to publish if it moved. The marker's
+snapshot is the one the WALK started under, because a reset can close between
+the last page and the provider stream's terminal `Done`. `MarkerOutcome` names
+`Published`, `Withheld` and `ShuttingDown`, so a withheld marker records an
+attempt and the orchestrator carries on with the next scope. The orchestrator
+also re-checks the subscriber gate before every scope, not once at start, and
+re-checks that the incarnation it is about to walk is still live.
+
+Pinned by `tests/backfill_lane_flow_control.rs` (the stall at the bound, live
+changes on a one-permit budget, no loss or duplication through an 8-slot ring, a
+completed walk not stranding admission, the eager-acker bound-of-one walk,
+detach while parked, the receiver replaced while parked, the retained receiver
+seeing `Closed`, and the live driver's refusal of a backfill checkpoint), the
+gate's unit tests in `engine/lane.rs`, the ledger tests in
+`cursor/coverage.rs`, the receiver-ordering tests in `multiplexer::tests`
+(multi-threaded), and the reset and ack-failure tests in `engine/tests.rs`.
+Everything in the integration file runs current-thread under `start_paused`
+with no wall-clock sleeps; none of it is a race test. Each ablation named in
+those tests' doc comments was applied, observed to fail the test, and restored,
+with one deliberate exception: the single-lock ordering in `ChangeDelivery` is
+structural and cannot be staged, since any hook between a send and its stamp
+would deadlock on the same lock rather than race.
 
 `LiveSupersedes` is the ring-evicting `(VecDeque + HashSet)` set
 `BackfillRunner::run_partition` filters each inventory page through,
@@ -2234,7 +2393,17 @@ crates/sync/src/
     context.rs            // SlotContext: the slot-wide handle bundle
                           // every spawned worker shares, plus
                           // `recovery()` which borrows it as a
-                          // RecoveryContext
+                          // RecoveryContext and `lane_gate()` which
+                          // borrows it as the backfill producer's door
+                          // onto the bounded lane
+    lane.rs               // LaneGate + BackfillAdmission + WaitFailed.
+                          // The backfill bound itself lives on the
+                          // publication records in PendingCoverage, so
+                          // this module keeps no ledger: it is the wait
+                          // (`wait_for_capacity`, and the variant that
+                          // gives up scheduler admission while parked)
+                          // plus the account's sync admission, which is
+                          // the only state it owns
     attach.rs             // attach / attach_inner / attach_opened,
                           // discover_scopes(_from), establish_one,
                           // persist_cursor, scope_covers_membership,
@@ -2285,7 +2454,11 @@ crates/sync/src/
   multiplexer/
     mod.rs                // Multiplexer::run; ReopenRequest;
                           // MultiplexerEvent { scope, event, checkpoint };
-                          // lifecycle_reopen wiring
+                          // lifecycle_reopen wiring; ChangeDelivery -
+                          // the change broadcast plus the numbering of
+                          // the receivers handed out on it, under one
+                          // mutex so send+stamp, subscribe+number and
+                          // unregister+sweep are each atomic
     changes.rs            // drive_changes_stream + ChangesEvent +
                           // AckRequest (broadcast-then-consumer-ack)
     fusion.rs             // InventoryFusion::run_with_broadcast
@@ -2313,6 +2486,13 @@ crates/sync/src/
     readback.rs           // Projection::FlagsOnly read-back guard
   cursor/
     mod.rs                // CursorRegistry + membership index
+    coverage.rs           // PendingCoverage: the publication ledger -
+                          // claims, boundary registrations, supersession,
+                          // fences, watermarks - and, on those same
+                          // boundary entries, the backfill lane's
+                          // capacity (`backfill_in_flight`,
+                          // `await_backfill_capacity`,
+                          // `release_undelivered`)
     envelope.rs           // MIN_MIGRATABLE / ENGINE_VERSION + migrations
     ledger.rs             // DebtLedger: entries, barriers, retained proofs
     ledger_envelope.rs    // encode_ledger / decode_ledger + error digest
@@ -2335,4 +2515,29 @@ crates/sync/tests/
   scheduler_priority.rs       // lane ordering, starvation guard, pull shape
   scheduler_admission.rs      // admission queueing, preemption, cross-account
                               // liveness, single-permit engine end-to-end
+  backfill_lane_flow_control.rs // the bounded backfill lane end to end: stall
+                              // at the bound, live lane unaffected on a
+                              // one-sync-permit budget, no loss or duplication
+                              // through an undersized ring, a completed walk
+                              // not stranding admission, and the teardown
+                              // cases (detach while parked, receiver replaced
+                              // while parked)
 ```
+
+### Published surface the bounded lane added
+
+Listed because the standing rule - a change that removes or renames a published
+item stops and asks the repository owner - needs a list to protect, and these are
+not obvious from the module names above. `engine::lane` is a PUBLIC module
+(`LaneGate`, `BackfillAdmission`, `WaitFailed`, `DEFAULT_BACKFILL_LANE_CAPACITY`),
+public because `BackfillRunner::run_partition` is public and gained two
+parameters, a `LaneGate` and a `ChangeDelivery`. `LaneGate::wake` within it has
+no in-engine caller - teardown pulses the slot's
+`PendingCoverage::wake_capacity` directly, having the coverage and no gate - and
+is kept as published surface rather than removed, the same standing as
+`SyncControl::record_checkpoint`. `ChangeDelivery` is public from `multiplexer`
+(`new`, `sender`, `publish_backfill`, `subscribe`, `min_live`). `PendingCoverage`
+gained six public methods: `mark_delivered`, `backfill_in_flight`,
+`await_backfill_capacity`, `release_undelivered`, `scope_fence` and
+`retained_history`. `BackfillConfig` gained `lane_capacity`. Everything else the
+lane work touched is `pub(crate)` or narrower.

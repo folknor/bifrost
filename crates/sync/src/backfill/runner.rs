@@ -25,6 +25,23 @@
 //! its first partition), so no inventory page is lost. An eager write
 //! would let the store record progress the consumer never durably
 //! persisted, permanently losing that page's objects on cold start.
+//!
+//! ## Flow control
+//!
+//! The same acknowledgement is also what frees the bounded backfill lane. The
+//! runner waits, before registering a page, until the account has fewer than
+//! `BackfillConfig::lane_capacity` published-but-unanswered backfill batches, so
+//! it is not asked for the next page while the bound is full. That capacity is
+//! not a separate ledger: it is the publication's own boundary registration in
+//! `PendingCoverage` (see `crate::engine::lane`), which is why nothing here has
+//! to remember to release anything.
+//!
+//! The page is then broadcast through `ChangeDelivery::publish_backfill`, which
+//! sends it and stamps its publication with the receiver numbering as ONE step
+//! under the delivery lock - that stamp is what later tells a page whose readers
+//! have all gone from one a newly-arrived reader is about to acknowledge. Live
+//! changes take no capacity, are never stamped, and are never delayed by a
+//! parked backfill.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -337,6 +354,8 @@ impl BackfillRunner {
         coverage: Option<&Arc<crate::cursor::PendingCoverage>>,
         writer_tx: Option<&tokio::sync::mpsc::Sender<crate::multiplexer::WriterRequest>>,
         generation: u64,
+        lane: Option<&crate::engine::lane::LaneGate>,
+        delivery: &crate::multiplexer::ChangeDelivery,
     ) -> Result<BackfillPartitionOutcome, Error> {
         let _activity = match control {
             Some(control) => Some(control.begin_activity().ok_or(Error::Paused)?),
@@ -427,6 +446,65 @@ impl BackfillRunner {
                     // consumer ack (see module docs); the runner never
                     // writes to CheckpointStore.
                     if let Some(tx) = &changes_tx {
+                        // FLOW CONTROL, and it belongs exactly here: after the
+                        // page has been read off the provider stream and BEFORE
+                        // it is registered. Parking here stops the stream being
+                        // polled again, so the account is not asked for the next
+                        // page while `lane_capacity` are unanswered.
+                        //
+                        // Before the registration and not after, because the
+                        // registration IS the capacity: waiting afterwards would
+                        // be waiting on a bound this page has already consumed.
+                        // The wait also hands the account's scheduler admission
+                        // back for its duration, so a parked cold start is not
+                        // sitting on the permit polling needs.
+                        // The incarnation this page was read from, snapshotted
+                        // BEFORE the wait below. A capacity wait is indefinite,
+                        // and a scope reset can close inside it.
+                        let fence_before =
+                            lane.map_or(0, |gate| gate.coverage().scope_fence(&scope));
+                        if let Some(gate) = lane {
+                            match gate.wait_for_capacity_holding_admission().await {
+                                Ok(()) => {}
+                                // The account is detaching. Publishing now would
+                                // broadcast into a teardown; the partition fails,
+                                // the scope stays Pending, and the next attach
+                                // re-walks it.
+                                Err(crate::engine::lane::WaitFailed::ShuttingDown) => {
+                                    return Err(Error::ShuttingDown);
+                                }
+                                // Transient scheduler pressure. Same treatment as
+                                // any other refused admission on a repeating work
+                                // path: fail the partition, leave the scope
+                                // Pending, come back on the rescan ramp.
+                                Err(crate::engine::lane::WaitFailed::Refused(error)) => {
+                                    return Err(error);
+                                }
+                            }
+                            // REVALIDATE the incarnation after the wait. A reset
+                            // that closed while this page was parked deleted the
+                            // scope's rows and fenced every publication minted
+                            // before it - but this page has not been minted yet,
+                            // so it would come back with a FRESH id above the
+                            // fence, acknowledge normally, and recreate exactly
+                            // the durable state the reset dropped. A stale
+                            // completion marker arriving that way is worse than a
+                            // stale page: it suppresses the replacement
+                            // incarnation's whole inventory walk.
+                            if gate.coverage().scope_fence(&scope) != fence_before {
+                                tracing::warn!(
+                                    target: "bifrost.sync.backfill",
+                                    scope = ?scope,
+                                    "scope was reset while a backfill page waited on the \
+                                     bound; abandoning the page rather than publishing it \
+                                     against rows the reset deleted"
+                                );
+                                return Err(Error::Other(
+                                    "scope reset while the page waited on the backfill bound"
+                                        .into(),
+                                ));
+                            }
+                        }
                         let bf = BackfillCheckpoint {
                             scope: scope.clone(),
                             partition: partition_key.clone(),
@@ -479,13 +557,20 @@ impl BackfillRunner {
                         let me = MultiplexerEvent {
                             scope: scope.clone(),
                             event: Arc::new(SyncEvent::Batch(synthetic)),
-                            checkpoint: Some(expected),
+                            checkpoint: Some(expected.clone()),
                             publication: publication.clone(),
                         };
-                        // Register before publishing so a fast consumer
-                        // ack cannot land before the entry exists and
-                        // leave it outstanding forever.
-                        let delivered = tx.send(me).unwrap_or(0);
+                        // Send and stamp as ONE step, under the delivery lock.
+                        // The stamp says which receivers could possibly hold this
+                        // batch, and that is only true if no subscribe and no
+                        // departing receiver's sweep can interleave between the
+                        // two - see `ChangeDelivery`.
+                        let delivered = match lane {
+                            Some(gate) => {
+                                delivery.publish_backfill(me, gate.coverage(), publication.as_ref())
+                            }
+                            None => tx.send(me).unwrap_or(0),
+                        };
                         if !crate::multiplexer::delivered_to_real_subscriber(delivered) {
                             match (control, coverage, publication) {
                                 // Through control when there is one: it

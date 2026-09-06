@@ -24,6 +24,8 @@
 //! - `passthrough` - the read-only hydration and PIM forwarders.
 //! - `context` - `SlotContext`, the handle bundle the spawned workers
 //!   share.
+//! - `lane` - the bounded backfill lane: producer-side flow control so a
+//!   cold start cannot outrun a consumer into the broadcast ring.
 //!
 //! The split is by concern only: nothing on the published surface moved,
 //! and every path that resolved through `crate::engine` before still
@@ -59,7 +61,8 @@ use crate::cursor::{ClaimLookup, PendingCoverage};
 use crate::error::Error;
 use crate::multiplexer::changes::OperatorDecision;
 use crate::multiplexer::{
-    AckRequest, Multiplexer, MultiplexerEvent, MultiplexerHandle, ReopenRequest, WriterRequest,
+    AckRequest, ChangeDelivery, Multiplexer, MultiplexerEvent, MultiplexerHandle, ReopenRequest,
+    WriterRequest,
 };
 use crate::push::{InvalidationSinkInner, RegisteredSubscription, SubscriptionRegistry};
 use crate::scheduler::{BudgetGate, ConcurrencyBudget, Scheduler};
@@ -70,6 +73,7 @@ mod attach;
 mod backfill;
 mod bulk;
 mod context;
+pub mod lane;
 mod passthrough;
 mod reattach;
 #[cfg(test)]
@@ -82,6 +86,7 @@ use ack::{WriterHandle, ack_writer, await_worker_until, take_ack_writer};
 use attach::{discover_scopes_from, link_discovered_memberships, wait_for_real_subscriber};
 use backfill::{BackfillWiring, run_backfill_orchestrator};
 use context::SlotContext;
+use lane::LaneGate;
 use reattach::{
     RecoveryContext, ReplacementOpen, accepted_push_scopes, handle_account_error, log_open_skips,
     open_replacement, reattach_account,
@@ -554,6 +559,13 @@ impl SyncEngine {
         // workers park on the shutdown token rather than the boundary
         // watch, so waiting first would always run to detach_timeout.
         slot.shutdown.cancel();
+        // And pulse the capacity wake, so a producer parked on the backfill
+        // bound leaves through its shutdown arm at once. The cancel alone is
+        // enough - the wait selects on the token - but a cold start parked at the
+        // bound behind a consumer that stopped acknowledging is exactly the case
+        // that would otherwise be awaited for the whole `detach_timeout` and then
+        // aborted mid-partition, so it is worth being explicit about.
+        slot.coverage.wake_capacity();
 
         // Await spawned workers up to the configured timeout. Each
         // stored worker owns both its join and abort handles so a
@@ -720,14 +732,19 @@ impl SyncEngine {
             .accounts
             .get(account_id)
             .ok_or_else(|| Error::AccountNotAttached(account_id.clone()))?;
-        let rx = slot.multiplexer.changes_tx.subscribe();
+        // Subscribing and numbering happen together inside the delivery gate. A
+        // `tokio::broadcast` receiver joins at the ring's TAIL, so it can never
+        // take delivery of - and therefore never acknowledge - anything broadcast
+        // before this moment; the number is what lets the engine say so later,
+        // and it is exact only because no backfill send can interleave between
+        // the subscribe and the numbering.
+        let receiver = slot
+            .delivery
+            .subscribe(Some(slot.control.clone()), Some(Arc::clone(&slot.coverage)));
         // Wake any deferred-inventory workers parked on the Notify so
         // they observe the new subscriber without hot-polling.
         slot.subscriber_notify.notify_waiters();
-        Ok(crate::multiplexer::ChangesReceiver::new(
-            rx,
-            Some(slot.control.clone()),
-        ))
+        Ok(receiver)
     }
 
     /// Subscribe to the per-account control stream. Engine publishes

@@ -461,15 +461,37 @@ impl InventoryFusion {
     }
 }
 
+/// What a fusion batch's checkpoint may be, and what it may not.
+///
+/// A `Change` cursor is the point of the fusion path and is validated. A
+/// `Backfill` checkpoint is REFUSED, and that refusal is the whole reason this
+/// arm exists: fusion registers the publication and then sends on the RAW sender,
+/// so the entry is never stamped with a delivery. A `Lane::Backfill` entry whose
+/// `delivered_at` stays `None` for ever is charged against the account's backfill
+/// bound and can be freed only by an acknowledgement, a lag or a reset - the
+/// receiver-drop sweep will not touch it, because an unsent page is deliberately
+/// never swept. A provider that attached one to an inventory batch would quietly
+/// spend a permanent slot of the bound per scope.
+///
+/// No provider in this workspace emits one, so refusing costs nothing real, and
+/// refusing is the safe direction: the inventory pass fails and is retried,
+/// rather than the account's cold start narrowing by one page for the life of
+/// the attachment.
 fn validate_checkpoint_envelope(checkpoint: Option<&Checkpoint>) -> Result<(), Error> {
-    if let Some(Checkpoint::Change(cursor)) = checkpoint {
-        cursor.validate_envelope().map_err(|_| {
+    match checkpoint {
+        Some(Checkpoint::Change(cursor)) => cursor.validate_envelope().map_err(|_| {
             Error::Account(crate::recovery::cursor_decode_failure(
                 bifrost_types::AccountOperation::SyncInventory,
             ))
-        })?;
+        }),
+        Some(Checkpoint::Backfill(_)) => Err(Error::Other(
+            "inventory fusion batch carried a backfill checkpoint; the fusion path publishes \
+             on the raw sender, so such a publication is charged against the backfill bound \
+             and never swept"
+                .into(),
+        )),
+        _ => Ok(()),
     }
-    Ok(())
 }
 
 fn inventory_cursor_contract_error() -> Error {
@@ -495,6 +517,51 @@ mod tests {
 
     fn empty_inventory_stream() -> bifrost_types::AccountStream<bifrost_types::InventoryEvent> {
         Box::pin(futures::stream::empty())
+    }
+
+    /// The fusion path takes a `Change` cursor and refuses a `Backfill`
+    /// checkpoint.
+    ///
+    /// Latent rather than live - no provider in this workspace attaches one - and
+    /// refused for a structural reason: fusion registers the publication and then
+    /// sends on the RAW sender, so a `Lane::Backfill` entry created here is never
+    /// stamped with a delivery. An unsent stamp is deliberately never swept, so
+    /// that entry is charged against the account's backfill bound until an
+    /// acknowledgement, a lag or a reset frees it - a permanent slot of the bound
+    /// spent per scope, narrowing every later cold start.
+    #[test]
+    fn a_fusion_batch_may_not_carry_a_backfill_checkpoint() {
+        let cursor = bifrost_types::ChangeCursor {
+            scope: CursorScope::Account,
+            server_state: bifrost_types::OpaqueChangeState {
+                protocol: bifrost_types::ProtocolKind::Imap,
+                envelope_version: 1,
+                bytes: vec![1],
+            },
+            advanced_through: None,
+            envelope_version: 1,
+        };
+        assert!(
+            validate_checkpoint_envelope(Some(&Checkpoint::Change(cursor))).is_ok(),
+            "a change cursor is what this path exists to carry"
+        );
+        assert!(
+            validate_checkpoint_envelope(None).is_ok(),
+            "and a batch with no checkpoint is ordinary"
+        );
+
+        let backfill = Checkpoint::Backfill(bifrost_types::BackfillCheckpoint {
+            scope: CursorScope::Account,
+            partition: bifrost_types::Partition(b"page:0:10".to_vec()),
+            progress_marker: None,
+            progress: bifrost_types::BackfillProgress::default(),
+            envelope_version: 1,
+        });
+        assert!(
+            validate_checkpoint_envelope(Some(&backfill)).is_err(),
+            "a backfill checkpoint on a fusion batch charges the bound with a page \
+             nothing will ever sweep"
+        );
     }
 
     #[test]

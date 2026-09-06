@@ -229,6 +229,84 @@ struct Publication {
     claim: CoverageClaim,
 }
 
+/// One outstanding boundary registration: a batch the engine has published and
+/// the consumer has not answered for.
+///
+/// This entry is ALSO the backfill lane's unit of capacity, and that is
+/// deliberate rather than convenient. An earlier revision kept a second map of
+/// capacity permits beside this one, keyed and released separately, and two
+/// consecutive cold reviews found the same class of defect four times over: the
+/// two registries disagreed about what was in flight. Every mutation below
+/// already had to be right about "is this publication still awaiting the
+/// consumer"; making capacity a property of the entry means supersession,
+/// acknowledgement, retirement, abandonment and scope invalidation each release
+/// capacity because they already remove or fold this record, with nothing extra
+/// to remember at the call site.
+#[derive(Debug, Clone)]
+struct BoundaryEntry {
+    id: PublicationId,
+    lane: Lane,
+    checkpoint: Checkpoint,
+    /// Publications this entry SUPERSEDED that the consumer has still not
+    /// acknowledged.
+    ///
+    /// The one place the "capacity is the live record" rule needed a correction.
+    /// Supersession removes the older entry ON PURPOSE - it is what lets a
+    /// consumer persist N batches, acknowledge only the last, and still reach a
+    /// boundary - so under the bare rule a partition could publish unboundedly
+    /// many pages while never holding more than one live record, and the flow
+    /// control would not bind at all. The survivor therefore inherits the
+    /// capacity charge of what it superseded, and an acknowledgement of a
+    /// superseded id (which the consumer may legitimately send: it really
+    /// received that batch) releases exactly that one page's worth.
+    ///
+    /// Bounded by the lane capacity, because the producer parks once the charge
+    /// reaches it.
+    ///
+    /// Each carries its OWN `delivered_at`, not the survivor's. A page and the
+    /// page that superseded it can have entirely different readers - send P to A,
+    /// let B subscribe, then send Q on the same partition - and judging P by Q's
+    /// stamp says B could have read P when B joined the ring after it. The sweep
+    /// has to ask the question once per page.
+    subsumed: Vec<(PublicationId, Option<u64>)>,
+    /// The subscriber sequence at the moment this batch was broadcast, i.e. the
+    /// number of receivers the account had ever handed out by then.
+    ///
+    /// Only receivers created BEFORE that point can have received this batch: a
+    /// `tokio::broadcast` receiver joins at the ring's tail. So if every live
+    /// receiver was created at or after this sequence, nothing can ever
+    /// acknowledge this publication and its capacity must come back. `None`
+    /// until the send has actually happened, which is what stops a receiver that
+    /// subscribes between the registration and the send from being judged unable
+    /// to acknowledge a batch it is in fact about to receive.
+    delivered_at: Option<u64>,
+}
+
+impl BoundaryEntry {
+    /// How much lane capacity this entry accounts for: itself plus every
+    /// unacknowledged publication folded into it.
+    fn charge(&self) -> usize {
+        1 + self.subsumed.len()
+    }
+
+    /// Whether no live receiver can still acknowledge this publication.
+    ///
+    /// `min_live` is the lowest subscriber sequence still holding a receiver,
+    /// `None` when the account has no real subscriber at all. An entry that has
+    /// not been sent yet is never undeliverable - the send may still be about to
+    /// reach a receiver that has only just subscribed.
+    fn undeliverable(&self, min_live: Option<u64>) -> bool {
+        Self::sent_beyond_reach(self.delivered_at, min_live)
+    }
+
+    fn sent_beyond_reach(delivered_at: Option<u64>, min_live: Option<u64>) -> bool {
+        match delivered_at {
+            None => false,
+            Some(sent_at) => min_live.is_none_or(|min| min >= sent_at),
+        }
+    }
+}
+
 /// Everything the ledger knows, under ONE lock.
 ///
 /// One mutex rather than four, because the interesting operations are
@@ -263,8 +341,9 @@ struct Ledger {
     /// bounded where a per-publication record would not.
     folded: HashMap<Lane, PublicationId>,
     /// Publications whose checkpoint the control path is still waiting on, in
-    /// publication order.
-    boundaries: Vec<(PublicationId, Lane, Checkpoint)>,
+    /// publication order. Also the backfill lane's capacity ledger - see
+    /// [`BoundaryEntry`].
+    boundaries: Vec<BoundaryEntry>,
     /// Per-scope acknowledgement fence installed by a durable scope reset.
     ///
     /// Holds the mint counter as of the moment the reset closed. Every
@@ -280,7 +359,7 @@ struct Ledger {
 /// Hard ceiling on outstanding boundary registrations. Reachable only through a
 /// `Checkpoint` variant this revision does not key; keyed lanes are already
 /// bounded by the account's scope count.
-const PENDING_BOUNDARY_CAP: usize = 1024;
+pub(crate) const PENDING_BOUNDARY_CAP: usize = 1024;
 
 /// Per-account publication registry.
 #[derive(Debug)]
@@ -288,6 +367,11 @@ pub struct PendingCoverage {
     ledger: Mutex<Ledger>,
     next: AtomicU64,
     next_generation: AtomicU64,
+    /// Pulsed whenever backfill capacity is freed, so a producer parked on the
+    /// bound wakes without polling. Every path that removes or lightens a
+    /// boundary entry pulses it, which is one more thing that comes for free
+    /// from capacity being a property of the record.
+    capacity: tokio::sync::Notify,
 }
 
 static NEXT_LEDGER_ID: AtomicU64 = AtomicU64::new(0);
@@ -298,6 +382,7 @@ impl Default for PendingCoverage {
             ledger: Mutex::new(Ledger::default()),
             next: AtomicU64::new(NEXT_LEDGER_ID.fetch_add(1, Ordering::Relaxed) << 32),
             next_generation: AtomicU64::new(0),
+            capacity: tokio::sync::Notify::new(),
         }
     }
 }
@@ -399,17 +484,63 @@ impl PendingCoverage {
         let mut claim = claim;
         let mut ledger = self.guard();
 
+        // Absorb only THIS SCOPE'S share of the carry-forward slot.
+        //
+        // Rescued debt has a scope - the domain of the report it came from - and
+        // a publication on some other scope taking it hides it from the only
+        // durable transition that will ever look for it. Sweep scope A's debt,
+        // publish on scope B, reset A: A's obligation is sitting inside B's claim
+        // and both of the reset's passes walk straight past it. A publication
+        // absorbs what it can actually make durable and leaves the rest carried.
         if let Some(carried) = ledger.carried.take() {
-            claim.absorb(carried);
+            let (mine, theirs): (Vec<_>, Vec<_>) = carried
+                .reports
+                .into_iter()
+                .partition(|report| lane.scope() == Some(&report.domain.scope));
+            if !mine.is_empty() {
+                claim.absorb(CoverageClaim {
+                    reports: mine,
+                    generation: carried.generation,
+                });
+            }
+            if !theirs.is_empty() {
+                ledger.carried = Some(CoverageClaim {
+                    reports: theirs,
+                    generation: carried.generation,
+                });
+            }
         }
 
+        // Inherit the superseded entry's capacity charge - ON THE BACKFILL LANE
+        // ONLY. Supersession removes the older record deliberately, so under a
+        // bare "capacity is the live record" rule the bound would stop binding at
+        // all: one partition could publish unboundedly many pages while never
+        // holding more than one live entry. The survivor carries what it
+        // displaced instead.
+        //
+        // The lane restriction is not tidiness. `Lane::Change` also supersedes,
+        // and live changes never consult the capacity gate, so inheriting there
+        // would make a subscriber that drains without acknowledging grow one
+        // entry's `subsumed` without bound - each retained id holding its
+        // `PublicationReceipt`, which carries a whole coverage claim. Only
+        // backfill has a bound to keep honest, so only backfill keeps the
+        // history.
+        let mut subsumed = Vec::new();
+        let charged = matches!(lane, Lane::Backfill(..));
         if lane.supersedes()
             && let Some(index) = ledger
                 .boundaries
                 .iter()
-                .position(|(_, existing, _)| *existing == lane)
+                .position(|entry| entry.lane == lane)
         {
-            let (superseded, _, _) = ledger.boundaries.remove(index);
+            let previous = ledger.boundaries.remove(index);
+            let superseded = previous.id.clone();
+            if charged {
+                subsumed = previous.subsumed;
+                // Its own stamp travels with it. The survivor's says nothing
+                // about who could read the page it displaced.
+                subsumed.push((superseded.clone(), previous.delivered_at));
+            }
             // Only mark it folded if there was something to fold. A publication
             // whose claim an acknowledgement already consumed is answered by
             // the persisted watermark, or by nothing - it must not be handed a
@@ -428,16 +559,27 @@ impl PendingCoverage {
 
         // Backstop for an unkeyed `Checkpoint` variant, which never supersedes.
         // The debt still carries forward; only the boundary registration goes.
+        let mut freed_capacity = false;
         if ledger.boundaries.len() >= PENDING_BOUNDARY_CAP {
-            let (dropped, _, checkpoint) = ledger.boundaries.remove(0);
+            let evicted = ledger.boundaries.remove(0);
+            // Evicting a charged entry FREES backfill capacity, and anything
+            // parked on the bound has to be told. Every other path that lightens
+            // the ledger pulses the notify; this one is reached only through an
+            // unkeyed `Checkpoint` variant, which is exactly the sort of rarely-
+            // walked arm where a missing wake sits undiscovered.
+            freed_capacity = matches!(evicted.lane, Lane::Backfill(..));
             tracing::warn!(
                 target: "bifrost.sync.control",
                 cap = PENDING_BOUNDARY_CAP,
-                dropped = ?checkpoint,
+                dropped = ?evicted.checkpoint,
                 "boundary registrations at capacity; dropping the oldest outstanding broadcast"
             );
-            if let Some(old) = ledger.claims.remove(&dropped) {
-                carry_forward(&mut ledger.carried, old.claim.debt_only());
+            for dropped in
+                std::iter::once(evicted.id).chain(evicted.subsumed.into_iter().map(|(id, _)| id))
+            {
+                if let Some(old) = ledger.claims.remove(&dropped) {
+                    carry_forward(&mut ledger.carried, old.claim.debt_only());
+                }
             }
         }
 
@@ -448,8 +590,161 @@ impl PendingCoverage {
                 claim,
             },
         );
-        ledger.boundaries.push((id.clone(), lane, checkpoint));
+        ledger.boundaries.push(BoundaryEntry {
+            id: id.clone(),
+            lane,
+            checkpoint,
+            subsumed,
+            delivered_at: None,
+        });
+        drop(ledger);
+        if freed_capacity {
+            self.wake_capacity();
+        }
         id
+    }
+
+    /// Record that a publication's batch has actually been BROADCAST, and how
+    /// many receivers the account had ever handed out by then.
+    ///
+    /// Only receivers created before that point can hold the batch, so this is
+    /// what lets [`PendingCoverage::release_undelivered`] tell a page whose
+    /// readers have all gone from one a newly-arrived reader is about to
+    /// acknowledge. Recorded AFTER the send rather than at registration for
+    /// exactly that reason: a receiver that subscribes between the two really
+    /// does receive the batch, and judging it beforehand would retire the
+    /// capacity of a page that is about to be delivered.
+    pub fn mark_delivered(&self, id: &PublicationId, subscriber_seq: u64) {
+        let mut ledger = self.guard();
+        if let Some(entry) = ledger.boundaries.iter_mut().find(|entry| entry.id == *id) {
+            entry.delivered_at = Some(subscriber_seq);
+        }
+    }
+
+    /// Backfill capacity currently in flight: published batches no consumer has
+    /// answered for, counting the pages each surviving entry subsumed.
+    #[must_use]
+    pub fn backfill_in_flight(&self) -> usize {
+        self.guard()
+            .boundaries
+            .iter()
+            .filter(|entry| matches!(entry.lane, Lane::Backfill(..)))
+            .map(BoundaryEntry::charge)
+            .sum()
+    }
+
+    /// Park until backfill capacity drops below `capacity`.
+    ///
+    /// The wake is driven by the ledger's own mutations - every path that
+    /// removes or lightens a boundary entry pulses the notify - so there is no
+    /// polling and no second source of truth to fall out of step with.
+    pub async fn await_backfill_capacity(&self, capacity: usize) {
+        let capacity = capacity.max(1);
+        loop {
+            // Register interest BEFORE reading, so a release landing between the
+            // read and the await is not missed.
+            let woken = self.capacity.notified();
+            if self.backfill_in_flight() < capacity {
+                return;
+            }
+            woken.await;
+        }
+    }
+
+    /// Retire every published backfill boundary that no live receiver can still
+    /// acknowledge, carrying its debt forward exactly as a lag does.
+    ///
+    /// `min_live` is the lowest subscriber sequence still holding a receiver, or
+    /// `None` when the account has no real subscriber. A `tokio::broadcast`
+    /// receiver joins at the ring's tail, so a batch broadcast before every
+    /// living receiver existed can never reach one - and therefore can never be
+    /// acknowledged. Subscriber COUNT cannot answer this: a consumer replaced by
+    /// an OVERLAPPING successor never lets the count reach zero while leaving
+    /// exactly this state behind.
+    ///
+    /// Returns how many were retired, for the caller's log.
+    pub fn release_undelivered(&self, min_live: Option<u64>) -> usize {
+        let count = {
+            let mut ledger = self.guard();
+            let mut retired = Vec::new();
+            // First, PER PAGE within each surviving entry. A page and the page
+            // that superseded it can have different readers, so a survivor whose
+            // own stamp is still reachable may be carrying pages that are not.
+            let mut demote = Vec::new();
+            for entry in &mut ledger.boundaries {
+                if !matches!(entry.lane, Lane::Backfill(..)) {
+                    continue;
+                }
+                let before = entry.subsumed.len();
+                entry.subsumed.retain(|(id, sent_at)| {
+                    if BoundaryEntry::sent_beyond_reach(*sent_at, min_live) {
+                        retired.push(id.clone());
+                        false
+                    } else {
+                        true
+                    }
+                });
+                if entry.subsumed.len() != before {
+                    demote.push(entry.id.clone());
+                }
+            }
+            // Those pages' coverage was folded into their survivor and can no
+            // longer be told apart from its own. What a batch nobody received
+            // proved CLEAN must not discharge anything, so the whole folded claim
+            // drops to debt only. Conservative about the survivor's own proof as
+            // well, which is the documented safe direction: under-reporting
+            // coverage costs a re-walk, over-reporting it loses objects nobody
+            // sees again.
+            for id in demote {
+                if let Some(publication) = ledger.claims.get_mut(&id) {
+                    publication.claim = publication.claim.clone().debt_only();
+                }
+            }
+            // Then whole entries whose own send is beyond every live reader.
+            ledger.boundaries.retain(|entry| {
+                if matches!(entry.lane, Lane::Backfill(..)) && entry.undeliverable(min_live) {
+                    retired.push(entry.id.clone());
+                    retired.extend(entry.subsumed.iter().map(|(id, _)| id.clone()));
+                    false
+                } else {
+                    true
+                }
+            });
+            // ONE transition, under the lock that removed the boundaries. An
+            // earlier revision removed them, released the lock, and then called
+            // `abandon` to carry their debt: a `ResetScope` landing in that gap
+            // ran both of its invalidation passes, discovered publications
+            // through `boundaries`, saw neither the page nor its debt, and
+            // fenced the id anyway - so the obligation reached only the volatile
+            // `carried` slot and was lost at detach. Retirement and debt
+            // extraction are the same decision and must not be two.
+            Self::carry_and_forget(&mut ledger, retired.iter().cloned());
+            retired.len()
+        };
+        if count > 0 {
+            self.wake_capacity();
+        }
+        count
+    }
+
+    /// Move each publication's DEBT into the carry-forward slot and drop its
+    /// claim. Caller holds the ledger lock and has already dealt with the
+    /// boundary entries.
+    ///
+    /// See [`CoverageClaim::debt_only`] for why only the debt travels: what a
+    /// batch nobody received proved CLEAN must not discharge anything.
+    fn carry_and_forget(ledger: &mut Ledger, ids: impl IntoIterator<Item = PublicationId>) {
+        for id in ids {
+            if let Some(publication) = ledger.claims.remove(&id) {
+                let debt = publication.claim.debt_only();
+                carry_forward(&mut ledger.carried, debt);
+            }
+        }
+    }
+
+    /// Wake anything parked on backfill capacity.
+    pub(crate) fn wake_capacity(&self) {
+        self.capacity.notify_waiters();
     }
 
     /// Release the boundary registration of an acknowledged publication.
@@ -461,33 +756,70 @@ impl PendingCoverage {
     /// value search can release a boundary belonging to a different, still
     /// in-flight publication.
     pub fn acknowledge_publication(&self, id: PublicationId) {
-        let mut ledger = self.guard();
-        if let Some(index) = ledger
-            .boundaries
-            .iter()
-            .position(|(candidate, _, _)| *candidate == id)
         {
-            ledger.boundaries.remove(index);
+            let mut ledger = self.guard();
+            if let Some(index) = ledger.boundaries.iter().position(|entry| entry.id == id) {
+                ledger.boundaries.remove(index);
+            } else if let Some(entry) = ledger
+                .boundaries
+                .iter_mut()
+                .find(|entry| entry.subsumed.iter().any(|(c, _)| *c == id))
+            {
+                // The consumer acknowledged a batch a later publication has
+                // since superseded. It really received that batch, so its
+                // capacity is settled even though its record moved to the
+                // survivor; the survivor's own boundary stays until it is
+                // acknowledged too.
+                entry.subsumed.retain(|(candidate, _)| *candidate != id);
+            }
         }
+        self.wake_capacity();
     }
 
     /// Release the boundary registration of a publication that will never
-    /// produce a durable checkpoint, and drop its claim.
+    /// produce a durable checkpoint, and carry its DEBT forward.
     ///
-    /// The claim is NOT carried forward. Either the batch reached no real
-    /// subscriber - so nothing it proved was consumed and the next walk must
-    /// re-prove it - or its store write failed, in which case its claim was
-    /// already applied to the in-memory ledger by the acknowledgement.
+    /// What it proved CLEAN does not travel - `debt_only` sees to that - but the
+    /// obligations must, and an earlier revision deleted the claim outright on
+    /// the reasoning that the batch reached nobody so nothing it proved was
+    /// consumed. That reasoning missed where the claim's contents come from: a
+    /// registration ABSORBS whatever debt earlier abandonments left carried, so
+    /// deleting this claim destroys obligations rescued from publications that
+    /// have nothing to do with this one. A later reset then finds neither a
+    /// boundary nor carried debt, and the obligation is simply gone. Re-raising
+    /// an obligation is idempotent; losing one is not.
     pub fn retire_publication(&self, id: PublicationId) {
-        let mut ledger = self.guard();
-        if let Some(index) = ledger
-            .boundaries
-            .iter()
-            .position(|(candidate, _, _)| *candidate == id)
         {
-            ledger.boundaries.remove(index);
+            let mut ledger = self.guard();
+            if let Some(index) = ledger.boundaries.iter().position(|entry| entry.id == id) {
+                ledger.boundaries.remove(index);
+            } else if let Some(entry) = ledger
+                .boundaries
+                .iter_mut()
+                .find(|entry| entry.subsumed.iter().any(|(candidate, _)| *candidate == id))
+            {
+                // Retiring a page a later publication has since superseded. Its
+                // charge lives on the survivor, so the survivor is where it has
+                // to come off; searching only `entry.id` left it charged for
+                // ever, which for a failed store write on a multi-page partition
+                // is a bound that shrinks every time the store hiccups.
+                entry.subsumed.retain(|(candidate, _)| *candidate != id);
+            }
+            Self::carry_and_forget(&mut ledger, std::iter::once(id));
         }
-        ledger.claims.remove(&id);
+        self.wake_capacity();
+    }
+
+    /// The acknowledgement fence this scope's last durable reset installed, or
+    /// `0` if it has never been reset.
+    ///
+    /// A producer that parks - on the bound, or waiting for a subscriber - and
+    /// then resumes has to be able to ask whether the incarnation it read its
+    /// page from is still the live one. The fence moves exactly when a reset
+    /// closes for the scope, which is exactly the question.
+    #[must_use]
+    pub fn scope_fence(&self, scope: &CursorScope) -> u64 {
+        self.guard().fenced.get(scope).copied().unwrap_or(0)
     }
 
     /// Best-effort boundary release for a caller that holds only a checkpoint
@@ -499,10 +831,12 @@ impl PendingCoverage {
         if let Some(index) = ledger
             .boundaries
             .iter()
-            .position(|(_, _, candidate)| candidate == checkpoint)
+            .position(|entry| entry.checkpoint == *checkpoint)
         {
             ledger.boundaries.remove(index);
         }
+        drop(ledger);
+        self.wake_capacity();
     }
 
     /// Abandon every outstanding boundary registration after a subscriber lag.
@@ -516,12 +850,22 @@ impl PendingCoverage {
     ///
     /// Returns how many registrations were abandoned.
     pub fn abandon_checkpoints(&self) -> usize {
-        let ids: Vec<_> = {
+        // Boundary removal and debt extraction as ONE transition, for the reason
+        // spelled out on `release_undelivered`.
+        let count = {
             let mut ledger = self.guard();
-            ledger.boundaries.drain(..).map(|(id, _, _)| id).collect()
+            let ids: Vec<_> = ledger
+                .boundaries
+                .drain(..)
+                .flat_map(|entry| {
+                    std::iter::once(entry.id).chain(entry.subsumed.into_iter().map(|(id, _)| id))
+                })
+                .collect();
+            let count = ids.len();
+            Self::carry_and_forget(&mut ledger, ids);
+            count
         };
-        let count = ids.len();
-        self.abandon(ids);
+        self.wake_capacity();
         count
     }
 
@@ -535,27 +879,68 @@ impl PendingCoverage {
     /// its debt was never in the snapshot the writer persisted, so the coverage
     /// obligation is lost silently. The writer therefore calls this BEFORE its
     /// first await and persists what it returns.
+    ///
+    /// Retiring the entries is also what returns their BACKFILL CAPACITY, the
+    /// pages each one subsumed included - so a reset frees the lane wherever it
+    /// runs, on both of its passes, with nothing to remember at the call site
+    /// and no window between retiring a publication and releasing its capacity.
     pub(crate) fn invalidate_scope(&self, scope: &CursorScope) -> CoverageClaim {
         let mut ledger = self.guard();
-        let ids: Vec<_> = ledger
-            .boundaries
-            .iter()
-            .filter(|(_, lane, _)| lane.belongs_to(scope))
-            .map(|(id, _, _)| id.clone())
-            .collect();
-        ledger
-            .boundaries
-            .retain(|(_, lane, _)| !lane.belongs_to(scope));
+        let mut ids: Vec<PublicationId> = Vec::new();
+        // Removing the ENTRY is what frees the capacity - including the pages it
+        // subsumed, which is the whole reason the charge lives on the entry
+        // rather than in a list of ids somebody has to remember to extend. The
+        // ids collected here are for the CLAIMS and their debt, which is a
+        // different question with a different answer.
+        ledger.boundaries.retain(|entry| {
+            if entry.lane.belongs_to(scope) {
+                ids.push(entry.id.clone());
+                ids.extend(entry.subsumed.iter().map(|(id, _)| id.clone()));
+                false
+            } else {
+                true
+            }
+        });
         let mut carried = CoverageClaim {
             reports: Vec::new(),
             generation: 0,
         };
-        for id in ids {
-            if let Some(publication) = ledger.claims.remove(&id) {
+        for id in &ids {
+            if let Some(publication) = ledger.claims.remove(id) {
                 carried.absorb(publication.claim.clone().debt_only());
             }
         }
+        // Also take this scope's share of the CARRY-FORWARD slot.
+        //
+        // Debt rescued from a publication nobody could acknowledge - a lag, a
+        // receiver-drop sweep - lives there rather than on any boundary, waiting
+        // for the next publication anyone can acknowledge. A reset that looked
+        // only at boundary-associated claims walked straight past it, and if no
+        // later publication ever arrives on that scope (a reset that preserves
+        // the backfill rows, then a detach) the obligation existed only in this
+        // volatile slot and was gone. The reset is the writer's one durable
+        // transition for the scope, so it has to be where that debt lands.
+        if let Some(pending) = ledger.carried.take() {
+            let (mine, theirs): (Vec<_>, Vec<_>) = pending
+                .reports
+                .into_iter()
+                .partition(|report| report.domain.scope == *scope);
+            for report in mine {
+                carried.absorb(CoverageClaim {
+                    reports: vec![report],
+                    generation: pending.generation,
+                });
+            }
+            if !theirs.is_empty() {
+                ledger.carried = Some(CoverageClaim {
+                    reports: theirs,
+                    generation: pending.generation,
+                });
+            }
+        }
         Self::fence_in(&mut ledger, scope, self.next.load(Ordering::Relaxed));
+        drop(ledger);
+        self.wake_capacity();
         carried
     }
 
@@ -567,6 +952,21 @@ impl PendingCoverage {
     #[must_use]
     pub fn pending_checkpoints(&self) -> usize {
         self.guard().boundaries.len()
+    }
+
+    /// How many superseded publications the outstanding entries are still
+    /// holding on to. Observability; used by tests.
+    ///
+    /// Bounded by the backfill capacity, because only the backfill lane inherits
+    /// a charge. A non-zero reading on an account doing nothing but live changes
+    /// is the unbounded-history defect.
+    #[must_use]
+    pub fn retained_history(&self) -> usize {
+        self.guard()
+            .boundaries
+            .iter()
+            .map(|entry| entry.subsumed.len())
+            .sum()
     }
 
     /// Fold `superseded` into `survivor` and drop the superseded entry.
@@ -729,20 +1129,25 @@ impl PendingCoverage {
     where
         I: IntoIterator<Item = PublicationId>,
     {
-        let mut ledger = self.guard();
-        for id in ids {
-            if let Some(publication) = ledger.claims.remove(&id) {
-                let debt = publication.claim.debt_only();
-                carry_forward(&mut ledger.carried, debt);
-            }
-            if let Some(index) = ledger
-                .boundaries
-                .iter()
-                .position(|(candidate, _, _)| *candidate == id)
-            {
-                ledger.boundaries.remove(index);
+        {
+            let mut ledger = self.guard();
+            for id in ids {
+                if let Some(publication) = ledger.claims.remove(&id) {
+                    let debt = publication.claim.debt_only();
+                    carry_forward(&mut ledger.carried, debt);
+                }
+                if let Some(index) = ledger.boundaries.iter().position(|entry| entry.id == id) {
+                    ledger.boundaries.remove(index);
+                } else if let Some(entry) = ledger
+                    .boundaries
+                    .iter_mut()
+                    .find(|entry| entry.subsumed.iter().any(|(c, _)| *c == id))
+                {
+                    entry.subsumed.retain(|(candidate, _)| *candidate != id);
+                }
             }
         }
+        self.wake_capacity();
     }
 
     /// Drop a publication that can never be acknowledged: it reached no real
@@ -939,6 +1344,224 @@ mod tests {
         ));
     }
 
+    /// FINDING 7. Retiring a boundary and preserving its DEBT are one decision
+    /// and must be one transition.
+    ///
+    /// The earlier shape removed the boundary, released the lock, and then called
+    /// `abandon` to carry the debt. A `ResetScope` landing in that gap ran both of
+    /// its invalidation passes, discovered publications through `boundaries`, saw
+    /// neither the page nor its debt, and fenced the id anyway - so the obligation
+    /// reached only the volatile `carried` slot and was gone at detach.
+    ///
+    /// Written to the sequence that actually loses the obligation, and it takes
+    /// all of it: degraded P superseded by Q, P acknowledged so its claim folds
+    /// into Q, the receiver drops and sweeps Q into the carry slot, and then a
+    /// scope reset runs with no later publication to ride. The reset is the
+    /// writer's ONE durable transition for that scope, so if the debt is not in
+    /// what it returns, a detach loses it.
+    ///
+    /// The predecessor of this test asserted the reset received EMPTY debt and
+    /// then manufactured a later publication to find it on - which is to say it
+    /// asserted the defect and then arranged for the one circumstance that hides
+    /// it.
+    #[test]
+    fn a_drop_sweep_hands_its_debt_to_a_later_scope_reset() {
+        let pending = PendingCoverage::new();
+
+        // P, degraded, then Q on the same lane: Q supersedes P and absorbs its
+        // claim.
+        let cp = backfill_checkpoint(b"page:0:10");
+        let p = pending.register(cp.clone(), CoverageClaim::new(degraded("owed"), 1));
+        let q = pending.register(cp.clone(), CoverageClaim::new(degraded("later"), 2));
+
+        // The consumer acknowledges P - it really received that batch - which
+        // resolves P without touching the debt now riding Q.
+        assert!(matches!(
+            pending.claim_checkpoint(p, &cp),
+            ClaimLookup::Apply(_)
+        ));
+        pending.mark_delivered(&q, 1);
+
+        // The last receiver goes away. Q can never be acknowledged, so the sweep
+        // retires it and its debt moves to the carry slot - the only place it
+        // now exists.
+        // Q and the P it subsumes.
+        assert_eq!(pending.release_undelivered(None), 2);
+        assert_eq!(pending.backfill_in_flight(), 0);
+
+        // The reset is the last durable transition this scope will get. Nothing
+        // republishes on it afterwards, so this is the obligation's only way out.
+        let carried = pending.invalidate_scope(&scope());
+        let keys: Vec<Vec<u8>> = carried
+            .reports
+            .iter()
+            .flat_map(|report| report.obligations().iter().map(|o| o.key().0.clone()))
+            .collect();
+        assert!(
+            keys.contains(&b"owed".to_vec()) && keys.contains(&b"later".to_vec()),
+            "a reset must extract the carried debt for its scope; without it the \
+             obligation exists only in volatile state and a detach loses it. got {keys:?}"
+        );
+    }
+
+    /// FINDING 2. A page and the page that superseded it can have entirely
+    /// different readers, so the sweep has to judge each one by its own.
+    ///
+    /// P goes out to A alone; B then subscribes; Q supersedes P. Judging P by
+    /// Q's stamp says B could have read P - B joined the ring after it. When A
+    /// leaves, P is unreachable and Q is not.
+    #[test]
+    fn a_superseded_page_is_judged_by_its_own_readers() {
+        let pending = PendingCoverage::new();
+        let cp = backfill_checkpoint(b"page:0:10");
+
+        // P sent when only receiver 0 existed.
+        let p = pending.register(cp.clone(), CoverageClaim::new(degraded("p"), 1));
+        pending.mark_delivered(&p, 1);
+        // B subscribes (number 1), then Q goes out. Q's report is COMPLETE, and
+        // that is what gives the demotion assertion below its bite: a claim built
+        // only from degraded reports has nothing to prove and satisfies "no
+        // complete report survives" against a sweep that demotes nothing at all.
+        let q = pending.register(
+            cp.clone(),
+            CoverageClaim::new(
+                InventoryCoverageReport::complete(CoverageDomain::full(scope())),
+                2,
+            ),
+        );
+        pending.mark_delivered(&q, 2);
+        assert_eq!(pending.backfill_in_flight(), 2);
+
+        // A (number 0) leaves; B (number 1) remains.
+        assert_eq!(
+            pending.release_undelivered(Some(1)),
+            1,
+            "exactly P is beyond every live reader; Q is not"
+        );
+        assert_eq!(
+            pending.backfill_in_flight(),
+            1,
+            "P's charge comes back, Q keeps its own"
+        );
+
+        // And Q's folded claim no longer PROVES anything: P's coverage merged
+        // into it and P reached nobody, so acknowledging Q must not discharge on
+        // the strength of a batch that was never delivered.
+        let ClaimLookup::Apply(claim) = pending.claim_checkpoint(q, &cp) else {
+            panic!("Q is still acknowledgeable");
+        };
+        assert!(
+            !claim.reports.is_empty(),
+            "the fold must still carry Q's report, or the assertion below is vacuous"
+        );
+        assert!(
+            claim.reports.iter().all(|report| !report.is_complete()),
+            "a fold containing an undelivered page may carry debt, never proof - Q's own \
+             report was COMPLETE and must have been demoted by the sweep"
+        );
+    }
+
+    /// FINDING 3. Retiring a publication must CARRY its debt, not delete it.
+    ///
+    /// The claim a retirement drops is not only its own: a registration absorbs
+    /// whatever earlier abandonments left carried, so deleting it destroys
+    /// obligations rescued from publications that have nothing to do with this
+    /// one. The sequence below is the one that loses them - an undelivered page
+    /// rescues debt, the next page absorbs it, and that page is undelivered too.
+    #[test]
+    fn retiring_an_undelivered_page_keeps_the_debt_it_absorbed() {
+        let pending = PendingCoverage::new();
+        let first = backfill_checkpoint(b"page:0:10");
+        let a = pending.register(first, CoverageClaim::new(degraded("rescued"), 1));
+        // Nobody received it.
+        pending.retire_publication(a);
+
+        // The next page absorbs the rescued debt, and also reaches nobody.
+        let second = backfill_checkpoint(b"page:10:20");
+        let b = pending.register(second, CoverageClaim::new(degraded("mine"), 2));
+        pending.retire_publication(b);
+
+        // A reset is the last durable transition. Both obligations have to be in
+        // what it hands the writer.
+        let carried = pending.invalidate_scope(&scope());
+        let keys: Vec<Vec<u8>> = carried
+            .reports
+            .iter()
+            .flat_map(|report| report.obligations().iter().map(|o| o.key().0.clone()))
+            .collect();
+        assert!(
+            keys.contains(&b"rescued".to_vec()) && keys.contains(&b"mine".to_vec()),
+            "retirement must carry debt forward, including debt it absorbed from an \
+             earlier abandonment. got {keys:?}"
+        );
+    }
+
+    /// FINDING 4. A publication absorbs only ITS OWN scope's carried debt.
+    ///
+    /// Otherwise a sibling scope's registration swallows the debt and hides it
+    /// from the only durable transition that will look for it: sweep scope A,
+    /// publish on scope B, reset A, and A's obligation is sitting inside B's
+    /// claim where neither of the reset's passes can see it.
+    #[test]
+    fn a_publication_absorbs_only_its_own_scopes_carried_debt() {
+        let pending = PendingCoverage::new();
+
+        // Scope A's page reaches nobody; its debt is carried.
+        let a_page = backfill_checkpoint(b"page:0:10");
+        let a = pending.register(a_page, CoverageClaim::new(degraded("a-owed"), 1));
+        pending.mark_delivered(&a, 1);
+        assert_eq!(pending.release_undelivered(None), 1);
+
+        // A publication on a DIFFERENT scope must leave it alone.
+        let other = CursorScope::Type(ObjectType::Contact);
+        let b_page = Checkpoint::Backfill(bifrost_types::BackfillCheckpoint {
+            scope: other.clone(),
+            partition: bifrost_types::Partition(b"page:0:10".to_vec()),
+            progress_marker: None,
+            progress: bifrost_types::BackfillProgress::default(),
+            envelope_version: 1,
+        });
+        pending.register(b_page, CoverageClaim::new(degraded("b-owed"), 2));
+
+        let carried = pending.invalidate_scope(&scope());
+        let keys: Vec<Vec<u8>> = carried
+            .reports
+            .iter()
+            .flat_map(|report| report.obligations().iter().map(|o| o.key().0.clone()))
+            .collect();
+        assert!(
+            keys.contains(&b"a-owed".to_vec()),
+            "scope A's reset must still find A's debt after a sibling scope published. \
+             got {keys:?}"
+        );
+    }
+
+    /// And a reset must take only ITS scope's share of the carry slot: another
+    /// scope's rescued debt is still owed and still has to reach that scope's own
+    /// durable transition.
+    #[test]
+    fn a_reset_leaves_another_scopes_carried_debt_alone() {
+        let pending = PendingCoverage::new();
+        let cp = backfill_checkpoint(b"page:0:10");
+        let id = pending.register(cp, CoverageClaim::new(degraded("mine"), 1));
+        pending.mark_delivered(&id, 1);
+        assert_eq!(pending.release_undelivered(None), 1);
+
+        let other = CursorScope::Type(ObjectType::Contact);
+        let carried = pending.invalidate_scope(&other);
+        assert!(
+            carried.reports.is_empty(),
+            "a reset of a different scope must not take this scope's debt"
+        );
+
+        let mine = pending.invalidate_scope(&scope());
+        assert_eq!(
+            mine.reports.len(),
+            1,
+            "and the debt must still be there for its own scope's reset"
+        );
+    }
+
     #[test]
     fn scope_invalidation_refuses_a_late_pre_reset_acknowledgement() {
         let pending = PendingCoverage::new();
@@ -948,6 +1571,11 @@ mod tests {
         let carried = pending.invalidate_scope(&scope());
 
         assert_eq!(carried.reports.len(), 1);
+        assert_eq!(
+            pending.backfill_in_flight(),
+            0,
+            "retiring the registration is also what frees its backfill capacity"
+        );
         assert!(matches!(
             pending.claim_checkpoint(id, &cp),
             ClaimLookup::Unknown

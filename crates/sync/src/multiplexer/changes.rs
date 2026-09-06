@@ -141,6 +141,29 @@ pub async fn drive_changes_stream(
             return Ok(ChangesEvent::Terminated(error));
         }
         let checkpoint = checkpoint_for(&event).cloned();
+        // A BACKFILL checkpoint on the live changes stream is refused, exactly as
+        // the fusion path refuses one, and for the same structural reason: this
+        // driver registers the publication and then sends on the RAW sender, so
+        // the entry is never stamped with a delivery. An unsent stamp is
+        // deliberately never swept, so a `Lane::Backfill` entry minted here is
+        // charged against the account's backfill bound until an acknowledgement,
+        // a lag or a reset frees it - a permanent slot of the bound spent per
+        // scope. Refusing is the safe direction and costs nothing: no provider in
+        // this workspace emits one.
+        if matches!(&checkpoint, Some(Checkpoint::Backfill(_))) {
+            let error = crate::recovery::backfill_checkpoint_on_changes(
+                checkpoint.as_ref(),
+                bifrost_types::AccountOperation::SyncChanges,
+                &scope,
+            );
+            let _ = changes_tx.send(MultiplexerEvent {
+                scope: scope.clone(),
+                event: Arc::new(SyncEvent::Terminated(error.clone())),
+                checkpoint: None,
+                publication: None,
+            });
+            return Ok(ChangesEvent::Terminated(error));
+        }
         if let Some(Checkpoint::Change(cursor)) = &checkpoint
             && cursor.validate_envelope().is_err()
         {

@@ -82,24 +82,32 @@ termination-level advice. Pinned by `a_per_item_retry_delays_the_resubmission`;
 
 ### 9. Broadcast ring pressure during cold start is structural
 
-(Ruled as item 8 in `notes/todo.md`: WILL HAPPEN, sequenced after the other
-structural items. The consumer surface stays one stream; backfill pages get a
-bounded per-account lane with the existing acks as the permit signal. The
-engine split it was sequenced behind has landed; it runs once the DAV
-watermark cursor lands, alone, with a cold review.)
+(Ruling 8 in `notes/todo.md`, DONE 2026-09-06. Cold-start backfill is
+flow-controlled through a bounded per-account lane with the existing backfill
+acknowledgements as the permit signal, and the consumer surface is unchanged.
+The design, and the consumer contract it rests on, are in `reference/sync.md`
+under "The bounded backfill lane".
 
-`changes_capacity` defaults to 256 with no producer-side backpressure; a
-backfill of a large mailbox can outrun a consumer, triggering the (well-built)
-lag-abandonment machinery routinely rather than exceptionally - every
-abandonment costs re-reads from the last durable checkpoint. Since the engine
-already gates backfill on `wait_for_real_subscriber`, a bounded per-account
-mpsc (or a permit from the consumer per N batches) for the backfill lane
-specifically would turn routine loss-plus-reconcile into flow control. This is
-the one place the hunter would consider a real structural rewrite: the
-broadcast channel is the right shape for live changes and the wrong shape for
-cold-start bulk delivery, and the crate has accumulated an impressive amount
-of machinery (publications ledger abandonment, debt carry-forward, lag
-warnings) compensating for that mismatch.
+Two things the work found on the way, recorded because they shaped the
+landing. The first cut kept a permit map beside the publication ledger, and two
+cold reviews found the same defect four times over: the two structures
+disagreed about what was in flight. The bound now lives on the ledger's own
+boundary entries and there is no release call. And bounding by acknowledgement
+turned a consumer's departure with unacknowledged pages from a stale ledger
+entry into a producer deadlock, which is why the engine now numbers receivers
+and sweeps on drop.
+
+That sweep in turn made a PRE-EXISTING defect visible: a consumer replaced
+mid-walk leaves a hole, and the replacement acknowledges the completion marker
+over it. The repository owner ruled on 2026-09-06 that the engine owns that
+guarantee, and that multiple receivers stay a supported shape with exactly one
+acknowledger. The repair lands in the commit after this one and is described
+in `reference/sync.md` under "Completion integrity across consumer
+replacement".
+
+Seventeen overnight review rounds were spent on the two together, thirteen of
+them on the repair; the standing lesson that came out of that is in
+`AGENTS.md`.)
 
 ### 10. `engine.rs` (8k lines) concentrates too much in one file
 
