@@ -651,6 +651,18 @@ async fn discard_backfill(
     // `Unknown` no retry could ever satisfy and no instruction to reconcile -
     // after which the live cursor advances past changes nothing replayed. The
     // discard is about this scope's backfill rows and about nothing else.
+    // The ceiling bounds the ledger retirement; it cannot bound the DELETE.
+    // `CheckpointStore::delete_backfill` takes every row of the scope and knows
+    // nothing of publication ids, so a delayed acknowledgement of an old walk's
+    // marker - refused, correctly, as `WalkNotWhole` - would delete the rows a
+    // LATER attempt earned, up to and including a durable completion its consumer
+    // had already acknowledged. When a newer attempt exists, the fence is the
+    // whole of what this discard may safely do: the old attempt stops being
+    // acknowledgeable, the request stays outstanding (a ceilinged discard never
+    // takes it), and the newer attempt's own repair - the rescan's reopen and its
+    // unbounded pre-retry discard - is what removes rows if they need removing.
+    let rows_belong_to_a_newer_attempt =
+        through.is_some_and(|ceiling| coverage.backfill_minted_after(scope, ceiling));
     let mut debt = coverage.invalidate_scope_backfill(scope, through);
     let now = jiff::Timestamp::now().as_second();
     for report in &debt.reports {
@@ -658,6 +670,16 @@ async fn discard_backfill(
     }
     let result = async {
         persist_ledger_only(account_id, store, ledger).await?;
+        if rows_belong_to_a_newer_attempt {
+            tracing::warn!(
+                target: "bifrost.sync.backfill",
+                account = ?account_id,
+                scope = ?scope,
+                "a later backfill attempt has published on this scope; fencing the refused \
+                 attempt without deleting rows that are not its own"
+            );
+            return Ok(());
+        }
         store.delete_backfill(account_id, scope).await
     }
     .await;
@@ -927,8 +949,9 @@ enum AckFailure {
 ///
 /// A marker whose registration is already gone reports no watermark, and that is
 /// refused too: an abandoned or evicted marker is precisely the case where
-/// delivery cannot be vouched for. An engine-internal acknowledgement carrying no
-/// publication at all is left to the debt check alone, as it always was.
+/// delivery cannot be vouched for. So is an acknowledgement carrying no
+/// publication at all, which skips the reading, the reset fence and the claim
+/// lookup alike.
 fn completion_refusal(
     coverage: &PendingCoverage,
     ledger: &crate::cursor::DebtLedger,
@@ -947,14 +970,24 @@ fn completion_refusal(
     // entry a later publication superseded, still carries its reading and is
     // still judged here. What is left over is an acknowledgement replayed across
     // a detach, and that one is `Unvouchable` - withheld, with nothing touched.
-    if let Some(publication) = publication {
-        match coverage.walk_watermark(publication) {
-            Some(recorded) if recorded != coverage.undelivered_watermark(&checkpoint.scope) => {
-                return Some(CompletionRefusal::WalkNotWhole);
-            }
-            None => return Some(CompletionRefusal::Unvouchable),
-            Some(_) => {}
+    // A completion sentinel acknowledged with NO publication at all is refused
+    // too, and for the same reason: with no id there is no reading, no reset
+    // fence and no claim lookup, so every check that stands between an
+    // acknowledgement and a durable completion is skipped and the marker becomes
+    // durable on the caller's say-so alone. Nothing in the engine acknowledges a
+    // completion marker without its publication - the live driver refuses a
+    // backfill checkpoint outright, and the orchestrator always publishes one -
+    // so this is reachable only from a consumer that dropped the id, which is the
+    // case that must not settle a scope for good.
+    let Some(publication) = publication else {
+        return Some(CompletionRefusal::Unvouchable);
+    };
+    match coverage.walk_watermark(publication) {
+        Some(recorded) if recorded != coverage.undelivered_watermark(&checkpoint.scope) => {
+            return Some(CompletionRefusal::WalkNotWhole);
         }
+        None => return Some(CompletionRefusal::Unvouchable),
+        Some(_) => {}
     }
     if !ledger.completion_permitted(&checkpoint.scope) {
         return Some(CompletionRefusal::OpenDebt);
@@ -974,7 +1007,9 @@ fn completion_refusal(
 ///
 /// `Unvouchable` says this ledger cannot answer the question at all: the marker
 /// was minted by a PRIOR attachment, so the reading its receipt carries belongs
-/// to a per-scope counter that no longer exists. Neither writing it nor
+/// to a per-scope counter that no longer exists - or it arrived with no
+/// publication, in which case there is no reading, no fence and no claim to check
+/// it against. Neither writing it nor
 /// discarding on it is defensible. Writing it lets a cross-attachment replay land
 /// a completion nothing can vouch for - the interleaving is ordinary: a consumer
 /// holds an unacknowledged page, a replacement receives the marker, the detach
@@ -1001,7 +1036,8 @@ impl CompletionRefusal {
                 "the walk that produced this marker did not reach a consumer with every page"
             }
             Self::Unvouchable => {
-                "the marker was minted by a prior attachment, whose walk this ledger cannot judge"
+                "this ledger cannot judge the walk behind the marker: no publication, or one \
+                 minted by a prior attachment"
             }
         }
     }

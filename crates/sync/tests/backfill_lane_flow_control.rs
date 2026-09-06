@@ -1460,8 +1460,10 @@ async fn an_ack_time_refusal_reopens_the_incarnation_and_the_next_attach() {
 /// The abandonment path records its losses too.
 ///
 /// The bound stops a cold start overrunning the ring on its own, but both lanes
-/// share that ring and the live lane has no bound: a burst can still overwrite
-/// unread backfill pages. When it does, `ChangesReceiver::recv` reports the lag
+/// share that ring and the live lane has no bound: a burst can still overrun a
+/// consumer holding backfill pages it has received and not yet acknowledged, and
+/// destroy the acknowledgeability of every registration on the account. When it
+/// does, `ChangesReceiver::recv` reports the lag
 /// and `abandon_checkpoints` drains the account's registrations - pages the
 /// consumer will never answer for, which is the same fact the drop sweep and the
 /// retire-on-sentinel-only path record. It was the one producer of that fact that
@@ -1473,7 +1475,7 @@ async fn pages_lost_to_a_lag_withhold_the_completion_marker() {
     let scope = CursorScope::Account;
     let mut stub = paged_stub(&scope);
     // A live batch on every poll: the burst that overruns the ring past the
-    // consumer's unread backfill pages.
+    // backfill pages the consumer received and never acknowledged.
     stub.changes_hook = Some(Arc::new(|_cursor| {
         vec![SyncEvent::Batch(Batch {
             items: vec![Change::ObjectChange(bifrost_types::ObjectChange {
@@ -1500,8 +1502,10 @@ async fn pages_lost_to_a_lag_withhold_the_completion_marker() {
     let mut events = engine
         .account_changes_stream(&account_id)
         .expect("attached account has a change stream");
-    // The consumer takes `LANE` pages and answers for none of them, so the
-    // producer parks and those pages sit unread in an 8-slot ring.
+    // The consumer RECEIVES `LANE` pages and answers for none of them, so the
+    // producer parks at the bound. They are read, not unread: what makes them
+    // strandable is the missing acknowledgement, and the live burst below is what
+    // takes away any chance of one.
     let held = read_to_the_bound(&mut events).await;
     let stranded: HashSet<String> = held
         .iter()

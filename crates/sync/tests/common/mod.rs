@@ -136,6 +136,18 @@ pub struct StubAccount {
     /// plan time. Default: empty stream, i.e. every request falls through to
     /// a local deferral.
     pub repair_hook: Option<RepairHook>,
+    /// Memberships yielded by `discover_memberships`. Empty means an empty
+    /// stream, which is what an account with no folder topology reports.
+    ///
+    /// The engine's membership INDEX is built from this, and a folder
+    /// deletion resolves through that index - so a lifecycle deletion fired
+    /// at an account that discovered no memberships silently deletes nothing.
+    pub memberships: Vec<MembershipScope>,
+    /// Lifecycle events fired on demand, taken by the FIRST
+    /// `scope_lifecycle_stream` call; later calls (a reopen re-subscribes)
+    /// get an empty stream. Holding the sender keeps the stream open, which
+    /// is what an idle provider poll looks like; dropping it ends it.
+    pub lifecycle_rx: Mutex<Option<tokio::sync::mpsc::Receiver<ScopeLifecycleEvent>>>,
     /// Every partition the engine asked this account to walk, in call order.
     pub walked: Arc<Mutex<Vec<(CursorScope, InventoryPartition)>>>,
     /// Every scope the engine asked to establish, in call order.
@@ -156,6 +168,8 @@ impl StubAccount {
             inventory_hook: None,
             changes_hook: None,
             repair_hook: None,
+            memberships: Vec::new(),
+            lifecycle_rx: Mutex::new(None),
             walked: Arc::new(Mutex::new(Vec::new())),
             established: Arc::new(Mutex::new(Vec::new())),
             closed: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -235,11 +249,29 @@ impl Account for StubAccount {
     }
 
     fn discover_memberships(&self) -> AccountStream<SyncEvent<MembershipScope>> {
-        Box::pin(stream::empty())
+        if self.memberships.is_empty() {
+            return Box::pin(stream::empty());
+        }
+        let items: Vec<SyncEvent<MembershipScope>> = vec![
+            SyncEvent::Batch(Batch {
+                items: self.memberships.clone(),
+                page_boundary: bifrost_types::PageBoundary::Final,
+                server_latency: std::time::Duration::ZERO,
+                bytes_in: 0,
+                checkpoint: None,
+            }),
+            SyncEvent::Done(None),
+        ];
+        Box::pin(stream::iter(items))
     }
 
     fn scope_lifecycle_stream(&self) -> AccountStream<ScopeLifecycleEvent> {
-        Box::pin(stream::empty())
+        match self.lifecycle_rx.lock().expect("lifecycle lock").take() {
+            Some(rx) => Box::pin(stream::unfold(rx, |mut rx| async move {
+                rx.recv().await.map(|event| (event, rx))
+            })),
+            None => Box::pin(stream::empty()),
+        }
     }
 
     fn establish_initial_cursor(

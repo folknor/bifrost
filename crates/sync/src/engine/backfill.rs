@@ -221,29 +221,36 @@ pub(super) async fn run_backfill_orchestrator(ctx: SlotContext, wiring: Backfill
                     coverage.take_backfill_discard(&scope);
                 }
             }
-            let resume = match store.get_backfill(&account_id, &scope).await {
-                Ok(_) if restart_whole => {
-                    tracing::debug!(
-                        target: "bifrost.sync.backfill",
-                        account = ?account_id,
-                        scope = ?scope,
-                        "a previous attempt on this incarnation lost pages; restarting the \
-                         walk from its beginning rather than resuming past them"
-                    );
-                    plan.walk_from_scratch()
-                }
-                Ok(stored) => plan.resume(stored.as_ref()),
-                Err(err) => {
-                    // A read failure is not authoritative; fall back to a
-                    // full walk rather than risk skipping unpersisted
-                    // pages.
-                    tracing::warn!(
-                        target: "bifrost.sync.backfill",
-                        scope = ?scope,
-                        error = %err,
-                        "{}", labels.resume_read_failed
-                    );
-                    plan.walk_from_scratch()
+            // The stored checkpoint is read only when it can decide anything. A
+            // restart-from-scratch has already ruled it out as a resume position,
+            // so reading it costs a store round trip whose answer is discarded -
+            // and its failure logged "resume read failed" for a walk that was
+            // starting over either way, which reads as a degrade where nothing
+            // degraded.
+            let resume = if restart_whole {
+                tracing::debug!(
+                    target: "bifrost.sync.backfill",
+                    account = ?account_id,
+                    scope = ?scope,
+                    "a previous attempt on this incarnation lost pages; restarting the \
+                     walk from its beginning rather than resuming past them"
+                );
+                plan.walk_from_scratch()
+            } else {
+                match store.get_backfill(&account_id, &scope).await {
+                    Ok(stored) => plan.resume(stored.as_ref()),
+                    Err(err) => {
+                        // A read failure is not authoritative; fall back to a
+                        // full walk rather than risk skipping unpersisted
+                        // pages.
+                        tracing::warn!(
+                            target: "bifrost.sync.backfill",
+                            scope = ?scope,
+                            error = %err,
+                            "{}", labels.resume_read_failed
+                        );
+                        plan.walk_from_scratch()
+                    }
                 }
             };
             // Skip a scope whose backfill already reached a durable
@@ -294,6 +301,7 @@ pub(super) async fn run_backfill_orchestrator(ctx: SlotContext, wiring: Backfill
                     &writer_tx,
                     &lane_gate,
                     &delivery,
+                    fence_at_walk_start,
                 )
                 .await
                 else {
@@ -633,6 +641,31 @@ impl BackfillScan {
                 self.settled.remove(&key);
                 self.lost_pages.insert(key.clone());
             }
+            // A loss recorded against an incarnation whose last attempt FAILED,
+            // after that attempt's own comparison had already been made.
+            //
+            // The settled arm above reopens a concluded walk on the same
+            // evidence; this is the other half, and without it the request the
+            // loss raised has no repair to reach. `note_lost_pages` runs at a
+            // walk's END, so a departure sweep landing after a transient failure
+            // is seen by nobody: the next attempt RESUMES (its baseline is the
+            // moved reading, so it judges itself whole), earns a durable marker,
+            // and the discard request sits outstanding until `detach` acts on it
+            // and deletes the marker that walk legitimately earned - a full
+            // re-walk on the next attach, once per flaky partition. Marking the
+            // incarnation here makes the retry start from scratch, and its
+            // pre-retry discard is what settles the request.
+            if let Some(baseline) = self.baseline.get(&key).copied()
+                && coverage.undelivered_watermark(&key.0) != baseline
+                && self.lost_pages.insert(key.clone())
+            {
+                tracing::warn!(
+                    target: "bifrost.sync.backfill",
+                    scope = ?key.0,
+                    "a page reached no consumer after this incarnation's last attempt ended; \
+                     its next walk starts from the beginning"
+                );
+            }
             if fusion_owned.contains(&key.0)
                 && !self.failed.contains_key(&key)
                 && self.fusion_skipped.insert(key.0.clone())
@@ -718,7 +751,14 @@ impl BackfillScan {
             self.settled(key);
             return;
         }
-        self.baseline.remove(&key);
+        // The baseline STAYS on a failed attempt, and that is the point: it is
+        // the reading the attempt was judged against, so a loss recorded after
+        // the walk ended - a departure sweep firing between attempts - is still
+        // detectable at the next rescan (`select`). Dropping it here made the
+        // scope's own history unreadable and left the discard request that loss
+        // raised with nothing to repair it. It is pruned with the rest when the
+        // incarnation leaves the registry, and overwritten by `begin_walk` when
+        // the retry starts.
         let failures = self.failed.get(&key).map_or(0, |(count, _)| *count) + 1;
         let delay = BACKFILL_RETRY_INITIAL
             .saturating_mul(1_u32 << failures.min(6).saturating_sub(1))
@@ -743,6 +783,7 @@ async fn run_backfill_partition_at_boundary(
     writer_tx: &mpsc::Sender<WriterRequest>,
     lane: &LaneGate,
     delivery: &crate::multiplexer::ChangeDelivery,
+    fence_at_walk_start: u64,
 ) -> Option<Result<crate::backfill::BackfillPartitionOutcome, Error>> {
     // One generation per partition pass, so a re-walk's proof is ordered after
     // the debt an earlier pass raised.
@@ -787,6 +828,38 @@ async fn run_backfill_partition_at_boundary(
             Ok(()) => {}
             Err(crate::engine::lane::WaitFailed::ShuttingDown) => return None,
             Err(crate::engine::lane::WaitFailed::Refused(error)) => return Some(Err(error)),
+        }
+        // RE-CHECK THE WALK'S FENCE, with admission in hand and before a single
+        // page has been read. Every step above this line can park indefinitely -
+        // a pause, a throttle deadline, the scheduler's admission queue - and a
+        // scope reset can close inside any of them. `run_partition`'s own
+        // revalidation cannot see that: its reading is taken once a page is in
+        // hand, which is AFTER the reset, so it compares the replacement
+        // incarnation's fence with itself and lets the page through. The pages
+        // this walk would go on to publish are minted above the fence, a
+        // consumer acknowledges them in good faith, and the durable rows a
+        // `delete_backfill: true` reset deleted come back - for a folder the
+        // provider has deleted, that resurrects the completion marker that makes
+        // a folder recreated under the same id skip its cold-start walk.
+        //
+        // Failing the partition is the right shape: the driver ends the walk,
+        // withholds the completion marker, and leaves the scope Pending. If the
+        // scope is still in the registry it is re-walked from its replacement
+        // incarnation's beginning; if the reset removed it, nothing walks it,
+        // which is what a deleted folder should get.
+        if coverage.scope_fence(&scope) != fence_at_walk_start {
+            lane.release_admission();
+            tracing::warn!(
+                target: "bifrost.sync.backfill",
+                account = ?account_id,
+                scope = ?scope,
+                "scope was reset between two partitions of a backfill walk; ending the \
+                 walk rather than publishing its later partitions against rows the \
+                 reset deleted"
+            );
+            return Some(Err(Error::Other(
+                "scope reset between two partitions of the backfill walk".into(),
+            )));
         }
         let current = account.load_full();
         let result = BackfillRunner::run_partition(

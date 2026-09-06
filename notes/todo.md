@@ -140,14 +140,13 @@ and 7 run alone with a cold review between them.
     retirement), `ews` (folder-id translation and the EWS arm), the suite
     whole in `tests`. Pure move; 43 tests before and after. The
     teardown/renewal race sits on the `webhook`/`renewal` seam and keeps
-    its doc comments on both halves. Closed `graph-B1`. Three lateral notes
-    from the read, none fixed: the reference's "no scope subscribable is an
-    `Err`" claim holds only for the pre-dispatch poll-only filter (an arm in
-    which every scope dies answers `Ok(None)` with an all-failed ledger);
-    `translate_ews_scopes` discards collected chunks on one chunk's
-    transport error; and `subscribe_graph` emits `WatchEvent::Reconnected`
-    on the very first subscribe, costing one redundant account-wide
-    reconcile.
+    its doc comments on both halves. Closed `graph-B1`. The three lateral
+    notes from the read were all real and all landed in `e1ae1c23`: the
+    dispatcher now answers `Err(no_subscribable_push_scopes(..))` when an arm
+    leaves no handle, `translate_ews_scopes` attributes a chunk's transport
+    failure to that chunk's own scopes, and `Reconnected` is edge-triggered
+    off the shared `GraphAccount::push_disconnected` latch. Re-verified
+    2026-09-06 by ablating each fix and confirming its pin fails.
 Items 11 through 13 were ruled on 2026-09-06 and are sequenced 13, 11, 12:
 the receipt bound reshapes the accounting the other two touch, so they are
 written against the final shape. Each lands alone, with one scoped cold
@@ -229,52 +228,29 @@ review under the stopping rule in `AGENTS.md`.
     `reference/sync.md` and on `BackfillConfig::lane_capacity` shrinks to the
     receipt rule, and the "should the engine defend" question below is moot.
     Everything below is P3 or P4 from the same review; verify against the
-    code before working any of it.
-    - P3: a discard request recorded by a departure sweep after attempt 1 ended
-      on a transient failure is never cleared by attempt 2 walking whole. That
-      attempt resumes rather than restarting, since `note_lost_pages` runs only
-      at a walk's end, and `begin_walk` takes the moved reading as its
-      baseline, so the walk is whole, its marker is durable, and the request
-      sits until `detach` deletes the marker that walk earned. Safe direction,
-      but unbounded re-work on a flaky provider. Root: the watermark is keyed
-      by scope, not by attempt.
-    - P3: the ack-time discard ceilings the ledger retirement at the refused
-      marker, but `delete_backfill` takes every row of the scope, so a late
-      acknowledgement of W1's marker arriving after W2's marker is durable
-      deletes W2's row. Nothing re-walks this attachment; the next attach does.
+    code before working any of it. The rest of that list was worked on
+    2026-09-06 and its entries deleted: the discard request left outstanding
+    by a loss after a failed attempt (the scan now keeps a failed attempt's
+    baseline and the rescan reopens on it), the ack-time ceilinged discard
+    deleting a later attempt's rows (it now fences without deleting once the
+    scope has minted a publication above the ceiling), `claim_checkpoint`
+    answering `AlreadyPersisted` for a foreign segment, a completion marker
+    acknowledged with `publication: None` (now `Unvouchable`; a PAGE with
+    `None` still persists, deliberately), and the four P4 tidy-ups. One thing
+    found on the way: once a LATER attempt's own completion marker is durable,
+    a delayed marker acknowledgement from the earlier attempt resolves as
+    `AlreadyPersisted` on the shared `Lane::Backfill(scope, completion)` key
+    and never reaches the refusal at all, so the row-deleting variant of that
+    P3 could only ever bite a later attempt's PAGE rows.
     - P3: `detach`'s discard drain awaits the writer with no deadline, while
       every other teardown step is clamped to `detach_timeout`. A store whose
       `delete_backfill` or `put_ledger` hangs now hangs `detach`.
-    - P3, lateral and mostly pre-existing: `run_partition` reads the scope
-      fence per page, so a reset that closes between page k's publish and page
-      k+1's read is compared against itself, and the old walk's later
-      partitions publish above the fence, rewriting rows a `delete_backfill:
-      true` reset just removed. The marker carries the walk-start fence for
-      exactly this reason; pages do not.
-    - P3, lateral and pre-existing: `claim_checkpoint`'s `persisted`
-      comparison spans ledger segments, so a prior attachment's Change-lane
-      replay answers `AlreadyPersisted` once this attachment has persisted
-      anything on that lane. `minted_here` now makes it detectable.
-    - P3, lateral: `ack_checkpoint` with `publication: None` skips the fence,
-      the claim lookup and the walk-integrity refusals, so a consumer passing
-      `None` with a completion checkpoint writes a marker with no check at all.
-    - P4: `walk_watermark` reads an immutable receipt field, so the two
-      assertions on it in `a_stale_marker_ack_leaves_the_retrys_pages_alone`
-      cannot fail; the charge assertion in that test is what bites.
-    - P4: `pages_lost_to_a_lag_withhold_the_completion_marker` says its held
-      pages "sit unread in the ring"; they were received and never
-      acknowledged.
-    - P4: `release_undelivered`'s whole-entry pass counts unsent subsumed
-      pages where its per-page pass and `abandon_checkpoints` count only sent
-      ones. Unreachable today.
-    - P4: `completion_refusal`'s `Unvouchable` arm is shadowed by the earlier
-      page-withhold arm in `persist_ack_request`, which matches the completion
-      partition too; the reference describes the shadowed arm as the mechanism.
-    - P4: a backfill id minted by ANOTHER account's ledger in the same process
-      is answered `Ok` and withheld rather than `Unknown`.
-    - P4: `get_backfill` is awaited and its result discarded on the
-      restart-from-scratch path, and a read error there logs "resume read
-      failed" for a walk that was starting over anyway.
+    - P4, accepted rather than open: a backfill id minted by ANOTHER account's
+      ledger in the same process is answered `Ok` and withheld rather than
+      `Unknown`. The instance segment cannot tell "a prior attachment of this
+      account" from "a sibling account", and withholding is the conservative
+      answer for both; distinguishing them means an account identity in the
+      publication id, which is a published-type change for a nit.
     - Costs, not defects, both in the safe direction and both for item 11 to
       weigh: a lag on ANY receiver, an observer included, records losses for
       every in-flight backfill scope and requests their discard, a
@@ -331,11 +307,6 @@ any item; some may already be obsolete.
 
 ## bifrost-imap
 
-- **imap-F2.** `pim_malformed` and `envelope::malformed` reach helper
-  paths that don't know the op; both currently produce
-  `Request(Malformed) -> ClientBug` so recovery class is op-independent
-  but operation telemetry is degraded. Thread the operation when other
-  pim/envelope refactoring happens.
 - **imap-G1.** (gap, feature-sized) Expose IMAP MIME-part downloads as
   real `BlobHandle`s. Symptom: the account used to advertise
   `BlobRangeSupport::Yes` and accept any `BlobHandle` in `open_blob` /
@@ -453,12 +424,45 @@ any item; some may already be obsolete.
   re-resolve the TZID by name and ignore the supplied component - so this
   is a re-evaluation, not scheduled work. The accepted limit is documented
   in `reference/caldav.md`.
-- **caldav-F1.** VTODO / VJOURNAL resources still occupy the event
-  cursor. The snapshot and changes lanes key on the PROPFIND href
-  listing, which does not carry the component type, so a task resource in
-  a shared calendar collection is emitted as a created/updated event
-  change whose hydration yields no events. Filtering needs either a
-  component-type PROPFIND or a first-fetch classification cache.
+- **caldav-F1 (residual).** The snapshot lanes are now VEVENT-filtered on
+  the server (`list_event_hrefs_filtered`, 2026-09-06), so a VTODO no
+  longer enters the cursor at establish, inventory, or the polling
+  changes fallback. What remains is the `sync-collection` lane: RFC 6578
+  has no filter grammar, so a task resource created or modified between
+  two token polls is still reported once as a created/updated event
+  change that hydrates to nothing, and then sits in the snapshot.
+  Closing it needs positive evidence that a newly-reported href is not a
+  VEVENT, and the cheap shapes each open a hole: a comp-filter query run
+  after the sync report cannot tell "not a VEVENT" from "created after
+  the query ran", and dropping the href on that evidence loses a real
+  event permanently, since the token has already advanced past it. The
+  correct shapes are an unfiltered listing plus a filtered query (two
+  round trips on any poll that creates, ordered listing-then-filter so a
+  mid-flight creation lands in neither drop set), or a durable per-href
+  classification mark in the cursor payload - which is a version-3
+  envelope. Neither is obviously worth its cost against a leak this
+  narrow; needs a ruling before it is built.
+- **caldav-F2 (filed 2026-09-06, lateral).** `getcontenttype` is requested
+  on every depth-1 event PROPFIND (`PROPFIND_EVENTS` in `client.rs`) and
+  staged and committed by `EventProps` in `parse.rs`
+  (`EventProps::content_type`), and then read by nothing at all - grep for
+  `content_type` across `crates/caldav` and `crates/dav-core` returns only
+  the declaration, the commit and the parse arm. So it is a property on
+  the wire and a field in the parser that no lane consumes. Two ways out
+  and they point opposite directions: drop it from the request and the
+  `PropSet`, or USE it - RFC 4791 s5.2 lets a server answer
+  `text/calendar; component=vevent`, which would be free component-type
+  evidence for the caldav-F1 residual above on the servers that emit it
+  (SabreDAV / Baikal do). Decide against F1 rather than in isolation.
+- **caldav-F3 (filed 2026-09-06, lateral).** The DEGRADE lane of
+  `events_in_range` / `event_search` still lists VTODO / VJOURNAL
+  resources as candidates: it is the unfiltered depth-1 PROPFIND by
+  definition, so nothing can filter it server-side. They never reach
+  `Page::items` (a resource with no VEVENT projects to no events), but
+  they inflate `Page::estimated_total` and consume slots in the sliced
+  page, so a degraded page can come back short for a reason the consumer
+  cannot see. Intrinsic to the degrade, not a regression; noted so it is
+  not rediscovered as a bug.
 
 ## bifrost-sasl
 
@@ -655,13 +659,6 @@ Smells:
   to/from Graph `emailAddress.name`, a display name, not a type label.
   Round-trip is consistent (no loss) but semantically conflated.
 
-Nits:
-
-- **s34-N1 (caldav)** `account.rs` - `discover_calendar_user_email`
-  and `discover_schedule_outbox_url` run unconditionally on every
-  `open` (4+ PROPFIND round-trips, errors swallowed), even for
-  accounts that never RSVP. Lazy discovery needs interior mutability
-  and touches the open happy path; skipped during the fix wave.
 
 ## A9 (directory search) follow-ups
 
@@ -733,12 +730,6 @@ container projection itself.
   destructive-action routing on non-English tenants worth six round-trips
   per shared mailbox AT OPEN" (not per operation). Framed that way it
   looks like a yes, but it is still unruled.
-- **nc-8 (jmap)** `pim::containers_list` reports `Container::rights` for the
-  primary account from `Mailbox/myRights`, but a foreign account's mailboxes go
-  through the same `container_from_mailbox`, so a share whose `Mailbox/get`
-  omits `myRights` silently projects as unreported rather than as a
-  degradation. The `ContainerList::skipped_scopes` lane (which closed nc-1)
-  could now carry it, but nothing classifies the omission today.
 
 ## Cross-crate items from the bug-hunt loop (2026-07-29)
 
@@ -1194,13 +1185,6 @@ prerequisite for the small local fixes above.
   with an identical doc comment shape. A macro or a blanket forwarding
   trait would replace 60 hand-written methods. That is a published-surface
   question, not a structural one, so it was left alone here.
-- **google-B6.** `inventory.rs::hydrate_one` issues both `get_message(id, "raw")`
-  and `get_message(id, "full")` for `Projection::FullWithBlobs`. For a message
-  with a 20 MB attachment that is ~40 MB of transfer and 10 quota units to obtain
-  data the `raw` fetch already contains - `full` adds only the attachment ids,
-  which are derivable from the MIME structure in the raw bytes or more cheaply
-  from a `format=metadata` call. The single most expensive line in the crate's
-  read path. The answer is correct, just expensive.
 - **google-B7.** `changes.rs`, `mutation.rs`, `inventory.rs::get_stream` and
   `scopes.rs::scope_lifecycle_stream` are four near-identical hand-rolled
   `stream::unfold` state machines, each with its own `finished`/`emitted_done`
@@ -1226,11 +1210,18 @@ prerequisite for the small local fixes above.
   not by position WITHIN an over-delivered page, which requires the
   provider to violate its own documented cap.
 
-  What remains: `flags.rs::patch_for_set` names every user label in the
-  account in `removeLabelIds`, which on an account with a few hundred
-  labels ships a several-KB body per batch. The engine's read-back guard
-  already fetches current state, so this is the site that would benefit
-  most from read-back-then-diff.
+  The last remaining item - `flags.rs::patch_for_set` naming every user
+  label in `removeLabelIds` - was investigated (2026-09-06) and closed as
+  NOT a defect. The vocabulary-sized removal list is what makes the patch
+  state-independent, and state-independence is what lets one patch cover
+  up to 1000 ids in a single `batchModify` while staying idempotent
+  against unknown and concurrently-changing current state. Read-back-then-diff
+  would cost a `messages.get` per target, shatter the batch into one call
+  per distinct diff, and open a lost-update window (a label added after
+  the read is absent from the diff's `removeLabelIds` and survives an
+  exact-set meant to clear it); the engine's read-back guard verifies
+  after the write and cannot supply pre-state. Reasoning is recorded in
+  `patch_for_set` and in `reference/google.md`. Nothing left under B8.
 - **jmap-B1.** Three near-identical query/get/advance loops in the sync layer;
   `imap` has four copies of the untagged-response dispatch loop. Recorded for
   completeness with the other duplication findings; same standing as the above.
@@ -1294,7 +1285,13 @@ Listed so they are not re-filed as untouched work. Each has its reasoning in the
   POST, including the local encoding steps between the POST and the PUT, is
   wrapped `Protocol(PartialResponse)` with `TransmissionState::Acknowledged`.
 - IMAP's NOTIFY-runtime-rejection misreport: a folder admitted to the IDLE budget
-  whose `NOTIFY SET` is rejected at runtime was already reported as pushed.
+  whose `NOTIFY SET` is rejected at runtime was already reported as pushed. The
+  stale `Succeeded` outcome is still unretractable (settled before the first dial,
+  no per-scope demotion event on the `Account` surface), but the silence it caused
+  is fixed: `signal_notify_coverage_loss` now emits an account-wide `Unknown`
+  invalidation on every round whose registration collapsed, on NOTIFY-advertising
+  accounts only. Retracting the outcome itself would need a `bifrost-types` push
+  surface change and has not been ruled on.
 
 ## Open items folded in from the second bug-hunt wave (2026-08-29)
 
@@ -1442,12 +1439,18 @@ fence apply.
   range read fails, a top-severity defect hiding behind a green suite. The
   only ledger item of the wave left open as a possible defect.
 
-- **jmap-C1. `ByteTally` meters only `/jmap/api` responses.** [C3] Documented
-  in `reference/jmap.md`, but it means a metered stream that also
-  `download`s (raw RFC822, sieve script bodies) under-reports, and blob
-  bytes are typically the BULK of the traffic those paths cause. Extending
-  the tally to the download door is a metering-contract change; decide
-  whether consumers want the blob bytes counted on the same accumulator.
+- **jmap-C4. `filters_list` blob traffic is invisible to any accounting
+  surface.** Filed while closing jmap-C1 (2026-09-06). `sync::filters::list`
+  downloads one sieve script body per filter (fanned out at
+  `api_request_concurrency`), and those bodies can be large, but the door
+  returns `Vec<ServerFilter>` rather than a `Batch`, so there is no
+  `bytes_in` field to report into - the metering contract has nothing to
+  violate here, and the traffic simply never appears. `Client::download`
+  now records into the tally, so a metered handle would count it; what is
+  missing is a place to put the number. This is a shape question about the
+  `filters_list` return type, i.e. a published-surface decision, so it is
+  filed rather than fixed. Same shape applies to `pim`'s upload paths, but
+  those are outbound and the tally is inbound-only.
 
 - **jmap-C2. The SSE stream tears down on one malformed event payload.** [C4]
   `crates/jmap/src/event_source/stream.rs` (`break 'events`). SSE's design
@@ -1478,7 +1481,11 @@ fence apply.
   real dial, so the same-folder re-IDLE wiring (keep the connection, publish
   the round's event, re-issue `NOTIFY SET`) rests on review. Pinning it needs
   a dial seam in the pool, the same machinery `imap-T5` ruled heavier than
-  the risk it retires. Revisit together.
+  the risk it retires. Revisit together. The NOTIFY-collapse degradation
+  added 2026-09-06 lands in the same blind spot: `signal_notify_coverage_loss`
+  is pure and tested against a `PushState` in both directions, but that it is
+  called with `register_notify`'s answer, on both the outer-loop and the
+  re-IDLE paths, rests on review for exactly this reason.
 
 ## Rules for agents working bug-hunt items
 

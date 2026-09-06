@@ -668,6 +668,66 @@ async fn a_ceilinged_discard_leaves_the_request_outstanding() {
     let _ = writer.await;
 }
 
+/// And a delayed acknowledgement of an OLD walk's marker must not DELETE the
+/// rows a later attempt earned.
+///
+/// The ceiling bounds the ledger retirement; `delete_backfill` takes every row of
+/// the scope and knows nothing of publication ids. So the refusal that protects
+/// the retry's publications was still deleting the retry's durable completion -
+/// acknowledged by the consumer, legitimately earned, and the only thing standing
+/// between the next attach and a full re-walk of the scope. The fence is the whole
+/// of what a ceilinged discard may safely do once a newer attempt has published:
+/// the request it cannot answer stays outstanding, and the newer attempt's own
+/// repair is what removes rows if any need removing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stale_marker_ack_leaves_a_later_attempts_rows_alone() {
+    let (account, store, coverage, tx, writer, control) = writer_harness_observed();
+    let scope = email_scope();
+
+    // W1's marker, published under the reading of its own walk.
+    let stale = backfill_checkpoint_at(crate::backfill::partitioner::completion_partition(), 99);
+    let stale_publication =
+        publish_a_marker(&coverage, &stale, coverage.undelivered_watermark(&scope));
+
+    // W1 loses a page, so the delayed acknowledgement below will be refused.
+    coverage.note_undelivered(&scope, 1);
+
+    // W2 is under way: a page of its own, acknowledged and durable. That row is
+    // W2's resume position, and it is the only thing standing between the next
+    // attach and a re-walk of everything W2 has already offered.
+    let retry_page = lane_page(&scope, "page:0:10", 5);
+    let retry_publication = publish_a_page(&control, &coverage, &retry_page);
+    ack(&tx, retry_page, Some(retry_publication))
+        .await
+        .expect("the retry's page persists");
+    assert!(
+        store
+            .get_backfill(&account, &scope)
+            .await
+            .expect("store read")
+            .is_some(),
+        "the staging is only meaningful with the later attempt's row durable"
+    );
+
+    // Only now does W1's marker acknowledgement arrive.
+    ack(&tx, stale, Some(stale_publication))
+        .await
+        .expect("the consumer's acknowledgement is honoured");
+
+    let stored = store
+        .get_backfill(&account, &scope)
+        .await
+        .expect("store read");
+    assert!(
+        stored.is_some(),
+        "the later attempt's rows are not the refused attempt's to delete: taking them \
+         throws away everything W2 has offered so far and costs a walk from scratch"
+    );
+
+    drop(tx);
+    let _ = writer.await;
+}
+
 /// A delayed acknowledgement of an OLD walk's marker must not retire the retry
 /// that has already started.
 ///
@@ -722,17 +782,17 @@ async fn a_stale_marker_ack_leaves_the_retrys_pages_alone() {
         envelope_version: crate::cursor::ENGINE_VERSION,
     });
     let retry_tag = coverage.undelivered_watermark(&scope);
-    let retry_marker_publication = publish_a_marker(&coverage, &retry_marker, retry_tag);
+    let _retry_marker_publication = publish_a_marker(&coverage, &retry_marker, retry_tag);
     let in_flight_before = coverage.backfill_in_flight();
 
-    // The refusal comes from the COMPARISON: the old marker still reports the
-    // reading it was published under, even though the retry's marker superseded
-    // its entry, and that reading no longer matches the scope's.
-    assert_eq!(
-        coverage.walk_watermark(&marker_publication),
-        Some(0),
-        "the reading rides the receipt, so supersession cannot take it away"
-    );
+    // STAGING, not an assertion about the retirement: the reading lives on an
+    // immutable receipt field, so neither of these can be moved by anything under
+    // test. What they establish is that the acknowledgement below takes the
+    // watermark COMPARISON arm - the old marker still reports the reading it was
+    // published under, and the scope's has moved - rather than the "no reading at
+    // all" arm, which refuses nothing and would leave the charge assertion
+    // measuring a discard that never ran.
+    assert_eq!(coverage.walk_watermark(&marker_publication), Some(0));
     assert_ne!(coverage.undelivered_watermark(&scope), 0);
 
     // Now the stale marker is acknowledged. It is refused, and its attempt is
@@ -763,13 +823,6 @@ async fn a_stale_marker_ack_leaves_the_retrys_pages_alone() {
          marker itself - and nothing of the retry's: taking the retry's pages too stops \
          the bound binding for as many pages as it held"
     );
-    assert_eq!(
-        coverage.walk_watermark(&retry_marker_publication),
-        Some(retry_tag),
-        "and the retry's marker must keep the watermark tagged on it, or its own \
-         acknowledgement reads `None`, is refused as WalkNotWhole, and runs a second \
-         discard over rows the consumer already answered for"
-    );
 
     // The retry's page must still be acknowledgeable.
     let (done, wait) = oneshot::channel();
@@ -785,6 +838,53 @@ async fn a_stale_marker_ack_leaves_the_retrys_pages_alone() {
     wait.await.expect("writer answers").expect(
         "a page the RETRY published is newer than the marker being refused and must \
                  stay acknowledgeable",
+    );
+
+    drop(tx);
+    let _ = writer.await;
+}
+
+/// A completion marker acknowledged with NO publication settles nothing.
+///
+/// Every check that stands between an acknowledgement and a durable completion -
+/// the walk's reading, the scope's reset fence, the claim lookup - is keyed by
+/// publication id, so an acknowledgement that carries none skips all of them and
+/// the marker becomes durable on the caller's say-so alone. That marker makes
+/// every later attach answer `Skip`, which is the one outcome that cannot be
+/// walked back. Nothing in the engine acknowledges a marker this way; a consumer
+/// that drops the id can, and it must not be able to retire a scope with it.
+///
+/// A page acknowledged the same way still persists, deliberately: a page row is a
+/// resume position, so the cost of an unvouchable one is a re-read rather than a
+/// scope nobody walks again.
+#[tokio::test]
+async fn a_completion_marker_acknowledged_without_a_publication_is_withheld() {
+    let (account, store, _coverage, tx, writer) = writer_harness();
+
+    let page = backfill_checkpoint(bifrost_types::Partition(b"page:0:10".to_vec()));
+    ack(&tx, page, None).await.expect("the page is honoured");
+    assert!(
+        store
+            .get_backfill(&account, &email_scope())
+            .await
+            .expect("store read")
+            .is_some(),
+        "a page acknowledged without a publication still records its position"
+    );
+
+    let marker = backfill_checkpoint_at(crate::backfill::partitioner::completion_partition(), 99);
+    ack(&tx, marker, None)
+        .await
+        .expect("the consumer's acknowledgement is honoured");
+
+    let stored = store
+        .get_backfill(&account, &email_scope())
+        .await
+        .expect("store read");
+    assert!(
+        !super::backfill::backfill_complete_recorded(stored.as_ref()),
+        "a completion nothing can vouch for must not become durable: it retires the \
+         scope for every later attach. got {stored:?}"
     );
 
     drop(tx);
@@ -2547,6 +2647,58 @@ async fn a_loss_after_the_checks_reopens_the_incarnation_it_settled() {
     assert!(
         scan.restarts_from_scratch(&(scope, 3)),
         "and reopened as a walk that may not trust its stored resume position"
+    );
+}
+
+/// The same reopen, for an incarnation whose last attempt FAILED rather than
+/// settled.
+///
+/// A departure sweep landing after a transient partition failure reaches nobody:
+/// `note_lost_pages` runs at a walk's END, and the next attempt takes the moved
+/// reading as its own baseline, so it RESUMES past the hole, judges itself whole
+/// and earns a durable marker. The discard request that loss raised then sits
+/// outstanding until `detach` acts on it and deletes the marker the second walk
+/// legitimately earned - a full re-walk on the next attach, once per flaky
+/// partition, for as long as the provider keeps failing. The failed attempt's
+/// baseline therefore SURVIVES the failure, and the rescan compares it exactly as
+/// it compares a settled one.
+#[tokio::test(start_paused = true)]
+async fn a_loss_after_a_failed_attempt_restarts_the_next_walk_from_scratch() {
+    let scope = CursorScope::Type(ObjectType::Email);
+    let fusion_owned = HashSet::new();
+    let mut scan = BackfillScan::default();
+    let coverage = crate::cursor::PendingCoverage::new();
+    let key = (scope.clone(), 7);
+
+    scan.select(
+        vec![key.clone()],
+        &fusion_owned,
+        tokio::time::Instant::now(),
+        &coverage,
+    );
+    assert_eq!(scan.begin_walk(&key, &coverage), 0);
+    // The attempt ends on a transient failure, with every page it published
+    // still in a live consumer's hands.
+    scan.record_attempt(key.clone(), false);
+    assert!(
+        !scan.restarts_from_scratch(&key),
+        "a plain failure is not a reason to distrust the stored resume position"
+    );
+
+    // Only now does the consumer holding one of that attempt's pages depart.
+    coverage.note_undelivered(&scope, 1);
+    scan.select(
+        vec![key.clone()],
+        &fusion_owned,
+        tokio::time::Instant::now(),
+        &coverage,
+    );
+
+    assert!(
+        scan.restarts_from_scratch(&key),
+        "the retry must start the walk over: resuming past the hole earns a durable \
+         marker while the discard request the loss raised waits for a repair that \
+         never comes, and detach then deletes the marker that walk earned"
     );
 }
 

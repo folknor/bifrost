@@ -396,6 +396,16 @@ struct Ledger {
     /// above the fence and unaffected, so no unfencing step exists to be
     /// forgotten. One entry per scope, so it stays bounded.
     fenced: HashMap<CursorScope, u64>,
+    /// Highest BACKFILL publication id this ledger has ever minted, per scope.
+    ///
+    /// Survives the publication itself: the entry is removed on acknowledgement,
+    /// retirement or invalidation, so "is anything of a newer attempt still
+    /// outstanding" cannot be asked of `boundaries`. What a ceilinged discard
+    /// needs to know is whether a NEWER attempt exists at all - an attempt whose
+    /// rows a whole-scope `delete_backfill` would take with it - and that
+    /// question is about what was minted, not about what is still in flight. One
+    /// entry per scope, so it stays bounded exactly as `fenced` does.
+    last_backfill_mint: HashMap<CursorScope, u64>,
     /// The same fence, narrowed to the BACKFILL lane.
     ///
     /// Raised by the discard that follows a walk which lost pages: that walk's
@@ -585,6 +595,15 @@ impl PendingCoverage {
         });
         let mut claim = claim;
         let mut ledger = self.guard();
+        if let Lane::Backfill(scope, _) = &lane {
+            let mint = ledger
+                .last_backfill_mint
+                .entry(scope.clone())
+                .or_insert(id.0);
+            if *mint < id.0 {
+                *mint = id.0;
+            }
+        }
 
         // Absorb only THIS SCOPE'S share of the carry-forward slot.
         //
@@ -846,7 +865,21 @@ impl PendingCoverage {
                     retired.push(entry.id.clone());
                     retired.extend(entry.subsumed.iter().map(|(id, _)| id.clone()));
                     if let Some(scope) = entry.lane.scope() {
-                        *by_scope.entry(scope.clone()).or_insert(0) += 1 + entry.subsumed.len();
+                        // Only pages that were actually SENT, exactly as the
+                        // per-page pass above and `abandon_checkpoints` count
+                        // them. An unsent page is not one anybody failed to
+                        // receive; whoever subscribes next takes delivery of it.
+                        // Unreachable while a survivor is only undeliverable once
+                        // its own send is beyond every live reader - but a rule
+                        // that holds in two of three places and not the third is
+                        // the shape that starts judging walks holed over pages
+                        // that arrived.
+                        let sent = 1 + entry
+                            .subsumed
+                            .iter()
+                            .filter(|(_, sent_at)| sent_at.is_some())
+                            .count();
+                        *by_scope.entry(scope.clone()).or_insert(0) += sent;
                     }
                     false
                 } else {
@@ -1172,6 +1205,28 @@ impl PendingCoverage {
         self.invalidate_in(scope, Some(LaneKind::Backfill), through)
     }
 
+    /// Has this scope minted a BACKFILL publication above `ceiling`?
+    ///
+    /// The question a ceilinged discard has to ask before it deletes rows.
+    /// `invalidate_scope_backfill`'s bound stops the RETIREMENT at the refused
+    /// marker, but `CheckpointStore::delete_backfill` takes every row of the
+    /// scope and knows nothing of publication ids - so a delayed acknowledgement
+    /// of an old walk's marker would delete the rows, up to and including the
+    /// durable completion, that a later attempt legitimately earned. Answered
+    /// from `last_backfill_mint` rather than from the live entries, because the
+    /// later attempt's own publications are gone the moment they are
+    /// acknowledged, which is exactly the case that has rows worth protecting.
+    pub(crate) fn backfill_minted_after(
+        &self,
+        scope: &CursorScope,
+        ceiling: &PublicationId,
+    ) -> bool {
+        self.guard()
+            .last_backfill_mint
+            .get(scope)
+            .is_some_and(|mint| *mint > ceiling.0)
+    }
+
     fn invalidate_in(
         &self,
         scope: &CursorScope,
@@ -1376,16 +1431,30 @@ impl PendingCoverage {
             // that really names it can still arrive.
             Some(_) => ClaimLookup::Unknown,
             None => {
-                if ledger
-                    .persisted
-                    .get(lane)
-                    .is_some_and(|watermark| *watermark >= id)
+                // Both watermarks below hold ids THIS ledger minted, and both are
+                // compared by raw id - whose high bits are the minting instance's
+                // segment. A publication minted by a PRIOR attachment carries a
+                // lower segment, so it sits under every watermark this attachment
+                // has moved, and a replayed acknowledgement was answered
+                // `AlreadyPersisted` the moment this attachment had persisted
+                // anything at all on that lane. That is a durable boundary
+                // announced for a write this attachment never made: the replay's
+                // whole purpose is to reach the receipt fallback below and be
+                // persisted here. Segments are not a time order across instances,
+                // so the only honest reading of a foreign id is "no watermark of
+                // mine describes it".
+                let mine = self.minted_here(&id);
+                if mine
+                    && ledger
+                        .persisted
+                        .get(lane)
+                        .is_some_and(|watermark| *watermark >= id)
                 {
                     ClaimLookup::AlreadyPersisted
                 } else if let Some(claim) = ledger
                     .folded
                     .get(lane)
-                    .filter(|watermark| **watermark >= id)
+                    .filter(|watermark| mine && **watermark >= id)
                     .map(|_| CoverageClaim {
                         reports: Vec::new(),
                         generation: 0,
@@ -1970,6 +2039,44 @@ mod tests {
             pending.claim_checkpoint(pending.publish_without_report(0), &cp),
             ClaimLookup::Unknown
         ));
+    }
+
+    /// A PRIOR attachment's acknowledgement must not be answered "already
+    /// persisted" by this attachment's watermark.
+    ///
+    /// Both watermarks hold ids this ledger minted and both are compared by raw
+    /// id, whose high bits are the minting instance's segment - so a foreign id
+    /// from an earlier instance sits UNDER them, and a replay was short-circuited
+    /// as durable the moment this attachment had persisted anything at all on
+    /// that lane. The write never happened here: the replay exists precisely to
+    /// reach the receipt fallback and be persisted, and answering it from a
+    /// watermark announces a durable boundary the store was never asked for.
+    #[test]
+    fn a_prior_attachments_replay_is_not_answered_from_this_ledgers_watermark() {
+        let cp = checkpoint(b"replayed");
+        // The previous attachment mints and hands the id to the consumer.
+        let previous = PendingCoverage::new();
+        let replayed = previous.register(cp.clone(), CoverageClaim::new(degraded("owed"), 1));
+
+        // A fresh attachment that has persisted a publication of its OWN on the
+        // same lane, which is what moves the watermark past every foreign id.
+        let current = PendingCoverage::new();
+        let mine = current.register(cp.clone(), CoverageClaim::new(degraded("mine"), 1));
+        let _ = current.claim_checkpoint(mine.clone(), &cp);
+        current.settle_checkpoint(mine, &cp);
+
+        let ClaimLookup::Apply(claim) = current.claim_checkpoint(replayed, &cp) else {
+            panic!(
+                "a replayed acknowledgement must resolve through its receipt and be \
+                 persisted here, not reported durable on the strength of a watermark \
+                 describing a different attachment's writes"
+            );
+        };
+        assert_eq!(
+            claim.reports.len(),
+            1,
+            "and it carries the receipt's own evidence"
+        );
     }
 
     /// Equal checkpoint VALUES are not one publication. A backfill page that

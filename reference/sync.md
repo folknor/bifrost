@@ -932,12 +932,32 @@ sender alive itself. The acknowledgeability question cannot be answered by the
 ledger alone, because `claim_checkpoint` falls back to the publication receipt
 by design so acknowledgements can replay after a writer restart.
 
-**A producer that parks revalidates its scope before publishing.** A reset
-fences every id minted before it, but a page still waiting has no id yet. Both
-`run_partition` and `emit_backfill_complete` snapshot
-`PendingCoverage::scope_fence` and refuse to publish if it moved. The marker's
-snapshot is the one the WALK started under, because a reset can close between
-the last page and the provider stream's terminal `Done`. `MarkerOutcome` names
+**A producer revalidates its scope before publishing, at every seam it can park
+on.** A reset fences every id minted before it, but a page still waiting has no
+id yet, so it would come back above the fence and rebuild the durable state the
+reset deleted. `run_partition`, `run_backfill_partition_at_boundary` and
+`emit_backfill_complete` all snapshot `PendingCoverage::scope_fence` and refuse
+to publish if it moved, and each snapshot is taken at the start of the span it
+protects rather than at the moment of publishing - a reading taken after the
+reset compares the replacement incarnation's fence with itself:
+
+- the PAGE check compares against the fence the PASS started under, since a
+  reset can close between page k's publish and page k+1's read as easily as
+  inside a capacity park;
+- the PARTITION check runs once admission is in hand and before a single page is
+  read, comparing against the fence the WALK started under, because everything
+  between two partitions can park indefinitely (a pause, a throttle deadline,
+  the scheduler's admission queue) and the pages that follow would otherwise be
+  published against rows a `delete_backfill: true` reset had just removed. It
+  fails the partition, which ends the walk and withholds the marker;
+- the MARKER check compares against the walk's starting fence too, because a
+  reset can close between the last page and the provider stream's terminal
+  `Done`.
+
+Only a full `invalidate_scope` (the writer's `ResetScope`) moves this fence; the
+backfill-lane discard fences `fenced_backfill`, which `scope_fence` does not
+read, so a walk that lost pages is still re-walked rather than aborted.
+`MarkerOutcome` names
 `Published`, `Withheld` and `ShuttingDown`, so a withheld marker records an
 attempt and the orchestrator carries on with the next scope. The orchestrator
 also re-checks the subscriber gate before every scope, not once at start, and
@@ -948,7 +968,13 @@ changes on a one-permit budget, no loss or duplication through an 8-slot ring, a
 completed walk not stranding admission, the eager-acker bound-of-one walk,
 detach while parked, the receiver replaced while parked, the retained receiver
 seeing `Closed`, and the live driver's refusal of a backfill checkpoint), the
-gate's unit tests in `engine/lane.rs`, the ledger tests in
+gate's unit tests in `engine/lane.rs`, `tests/backfill_scope_fence.rs` (the
+between-partitions reset, staged through an account pause - `run_partition`
+holds the control's activity guard for a whole pass, so a `pause()` that returns
+has proved the producer is parked at the top of the NEXT partition with no page
+in hand - and triggered by a provider folder deletion, whose purge of the
+scope's durable rows makes any later row or page proof that a walk kept running),
+the ledger tests in
 `cursor/coverage.rs`, the receiver-ordering tests in `multiplexer::tests`
 (multi-threaded), and the reset and ack-failure tests in `engine/tests.rs`.
 Everything in the integration file runs current-thread under `start_paused`
@@ -1006,15 +1032,38 @@ stamps the walk's reading into the publication RECEIPT, not the boundary entry,
 which a store failure or a supersession removes while the acknowledgement is
 still valid, and the writer's `completion_refusal` compares it against the
 scope's current reading. `WalkNotWhole` is evaluated before `OpenDebt`, since
-only the first is about the walk and its repair must not be masked. A marker
-minted by a PRIOR attachment, recognised by the id's instance segment
-(`minted_here`), is `Unvouchable`: withheld with nothing touched, since
-writing it would land a completion no ledger can vouch for and discarding on
-it would delete one an earlier attachment earned. A backfill PAGE acknowledged
-from a prior attachment is withheld on the same rule, before the claim lookup,
-because a backfill row is the next walk's starting position rather than a
-place to re-read from. All of these ride `AckPersistOutcome::Withheld`: the
-consumer's acknowledgement succeeds, and only the durable row is refused.
+only the first is about the walk and its repair must not be masked. An
+acknowledgement carrying NO publication is `Unvouchable` too, and refused for
+the same reason it is refused everywhere else here: with no id there is no
+reading, no reset fence and no claim lookup, so every check between an
+acknowledgement and a durable completion is skipped and the marker would become
+durable on the caller's say-so. No engine path produces one - the live driver
+refuses a backfill checkpoint outright and the orchestrator always publishes an
+id - so this is a consumer that dropped the id, and a completion is the one
+outcome that cannot be walked back. A page acknowledged the same way still
+persists: a page row is a resume position, so an unvouchable one costs a re-read
+rather than a scope nobody walks again.
+
+A publication minted by a PRIOR attachment is recognised by the id's instance
+segment (`minted_here`). The arm that actually runs for one is the backfill
+withhold BEFORE the claim lookup, which matches any backfill checkpoint whose
+receipt names the same scope and partition - the completion partition included -
+so a marker replayed across a detach is withheld there, with nothing of the
+prior attachment's evidence ingested on the way past. `CompletionRefusal::
+Unvouchable` covers what is left: a marker whose receipt names some other
+partition, and the no-publication case above. Either way nothing is touched,
+since writing it would land a completion no ledger can vouch for and discarding
+on it would delete one an earlier attachment earned. All of these ride
+`AckPersistOutcome::Withheld`: the consumer's acknowledgement succeeds, and only
+the durable row is refused.
+
+The same instance segment bounds the ledger's own watermarks. `claim_checkpoint`
+answers from `persisted` and `folded` only for ids THIS ledger minted: both hold
+this instance's ids and both compare by raw id, so a foreign id from an earlier
+instance sits under them and a replay was reported `AlreadyPersisted` the moment
+this attachment had persisted anything on that lane - a durable boundary
+announced for a write nobody made. A foreign id goes to the receipt fallback,
+which is what the replay is for.
 
 **A walk that lost pages forfeits its resume position, durably.** Withholding
 the marker is not enough for `BackfillPlan::OpenPages`, whose resume starts
@@ -1031,6 +1080,20 @@ fencing the whole scope refused live-lane acknowledgements the replacement
 had genuinely received. The ack-time discard is ceilinged at the refused
 marker's id, the newest id its attempt minted, so a delayed acknowledgement of
 an old walk's marker cannot retire a retry that is already publishing.
+
+**The ceiling bounds the retirement; it cannot bound the delete.**
+`CheckpointStore::delete_backfill` takes every row of the scope and knows
+nothing of publication ids, so the same delayed acknowledgement that must not
+retire a later attempt's publications must not delete its ROWS either - the
+resume position it has already earned, and with it everything that attempt has
+offered so far. A ceilinged discard therefore performs the fence and skips the
+delete once the scope has minted a backfill publication above the ceiling
+(`PendingCoverage::backfill_minted_after`, answered from a per-scope
+highest-minted record rather than from the live entries, because a later
+attempt's publications are gone the moment they are acknowledged). The request
+it cannot answer stays outstanding, exactly as before, and the later attempt's
+own repair - the rescan's reopen and its unbounded pre-retry discard - is what
+removes rows if any need removing.
 
 **The discard is requested when the loss is recorded, and settled only by a
 delete that succeeded.** `note_undelivered` records the scope in a request
@@ -1052,6 +1115,21 @@ BEFORE it walks, since a loss landing after the marker's acknowledgement
 leaves a durable marker that nothing else removes. `select` prunes the
 baseline, retry deadline and lost-pages mark of any incarnation the registry
 no longer carries.
+
+The comparison covers a FAILED attempt too, and the baseline survives the
+failure for that purpose. `note_lost_pages` runs at a walk's end, so a departure
+sweep landing after a transient partition failure is seen by nobody: the next
+attempt resumes, takes the moved reading as its own baseline, judges itself
+whole and earns a durable marker, while the discard request that loss raised
+sits outstanding until `detach` acts on it and deletes the marker that second
+walk legitimately earned - a full re-walk on the next attach, once per flaky
+partition. Reopening it at the rescan makes the retry restart from scratch, and
+that retry's pre-retry discard is what settles the request.
+
+A restart-from-scratch does not read `get_backfill` at all: the stored
+checkpoint has already been ruled out as a resume position, so reading it costs
+a round trip whose answer is discarded and whose failure logged a "resume read
+failed" degrade for a walk that was starting over regardless.
 
 **One recorded gap.** A receiver dropped between `detach`'s drain of the
 request set and the slot being dropped records a request nobody can act on,
@@ -1077,10 +1155,13 @@ to a lag withholding the marker. Pinned at the writer in `engine/tests.rs` by
 the discard fence, its confinement to the backfill lane, the marker retried
 after a store failure and after a loss, the marker replayed after reattach in
 both directions, the failed and the ceilinged discard leaving the request
-outstanding, the stale marker leaving the retry's pages alone, and open debt
-not masking the discard; at the scan by the departed incarnation's residue
-and the loss after the checks; and at the ledger and gate by the watermark
-tests and the abandonment's per-page recording. Each ablation named in those
+outstanding, the stale marker leaving the retry's pages alone and a later
+attempt's rows alone, a completion marker acknowledged with no publication
+being withheld where a page is not, and open debt not masking the discard; at
+the scan by the departed incarnation's residue, the loss after the checks and
+the loss after a failed attempt; and at the ledger and gate by the watermark
+tests, a prior attachment's replay not being answered from this ledger's
+watermarks, and the abandonment's per-page recording. Each ablation named in those
 tests' doc comments was applied, observed to fail the test, and restored.
 
 `LiveSupersedes` is the ring-evicting `(VecDeque + HashSet)` set

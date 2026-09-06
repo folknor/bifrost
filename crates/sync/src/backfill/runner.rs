@@ -368,6 +368,15 @@ impl BackfillRunner {
         let mut complete = true;
         let mut scope_walk = ScopeWalkStep::RequestNextPartition;
         let mut walk = InventoryWalk::default();
+        // The incarnation this PASS belongs to, snapshotted before its first
+        // page. Read once and not per page: a reset that closes between page k's
+        // publish and page k+1's read is invisible to a per-page reading, which
+        // is taken after the reset and therefore compares the replacement
+        // incarnation's fence with itself. Every page of this pass is judged
+        // against the incarnation the pass started under, exactly as the
+        // completion marker is judged against the incarnation its WALK started
+        // under.
+        let fence_at_pass_start = lane.map_or(0, |gate| gate.coverage().scope_fence(&scope));
         while let Some(event) = stream.next().await {
             match event {
                 bifrost_types::InventoryEvent::Batch(batch) => {
@@ -458,11 +467,12 @@ impl BackfillRunner {
                         // The wait also hands the account's scheduler admission
                         // back for its duration, so a parked cold start is not
                         // sitting on the permit polling needs.
-                        // The incarnation this page was read from, snapshotted
-                        // BEFORE the wait below. A capacity wait is indefinite,
-                        // and a scope reset can close inside it.
-                        let fence_before =
-                            lane.map_or(0, |gate| gate.coverage().scope_fence(&scope));
+                        // The incarnation this PASS was started under - see
+                        // `fence_at_pass_start`. A capacity wait is indefinite
+                        // and a scope reset can close inside it, but it can just
+                        // as well close between two pages, so the comparison is
+                        // against the pass, not against this page.
+                        let fence_before = fence_at_pass_start;
                         if let Some(gate) = lane {
                             match gate.wait_for_capacity_holding_admission().await {
                                 Ok(()) => {}
@@ -481,27 +491,27 @@ impl BackfillRunner {
                                     return Err(error);
                                 }
                             }
-                            // REVALIDATE the incarnation after the wait. A reset
-                            // that closed while this page was parked deleted the
-                            // scope's rows and fenced every publication minted
-                            // before it - but this page has not been minted yet,
-                            // so it would come back with a FRESH id above the
-                            // fence, acknowledge normally, and recreate exactly
-                            // the durable state the reset dropped. A stale
-                            // completion marker arriving that way is worse than a
-                            // stale page: it suppresses the replacement
-                            // incarnation's whole inventory walk.
+                            // REVALIDATE the incarnation before publishing. A
+                            // reset that closed anywhere in this pass - while
+                            // this page was parked on the bound, or between two
+                            // of the pass's pages - deleted the scope's rows and
+                            // fenced every publication minted before it, but this
+                            // page has not been minted yet, so it would come back
+                            // with a FRESH id above the fence, acknowledge
+                            // normally, and recreate exactly the durable state the
+                            // reset dropped. A stale completion marker arriving
+                            // that way is worse than a stale page: it suppresses
+                            // the replacement incarnation's whole inventory walk.
                             if gate.coverage().scope_fence(&scope) != fence_before {
                                 tracing::warn!(
                                     target: "bifrost.sync.backfill",
                                     scope = ?scope,
-                                    "scope was reset while a backfill page waited on the \
-                                     bound; abandoning the page rather than publishing it \
-                                     against rows the reset deleted"
+                                    "scope was reset while this backfill pass was in \
+                                     flight; abandoning the page rather than publishing \
+                                     it against rows the reset deleted"
                                 );
                                 return Err(Error::Other(
-                                    "scope reset while the page waited on the backfill bound"
-                                        .into(),
+                                    "scope reset while the backfill pass was in flight".into(),
                                 ));
                             }
                         }
