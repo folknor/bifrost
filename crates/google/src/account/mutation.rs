@@ -25,7 +25,7 @@ use tokio_util::sync::CancellationToken;
 use crate::client::GmailClient;
 use crate::error::Error as GmailError;
 
-use super::capabilities::GMAIL_BATCH_MODIFY_LIMIT;
+use super::capabilities::{GMAIL_BATCH_MODIFY_LIMIT, GMAIL_MODIFY_LABEL_LIMIT};
 use super::error as account_error;
 use super::error::{
     GmailErrorContext, applied_outcomes, is_batch_delete_scope_failure,
@@ -447,29 +447,82 @@ async fn apply_label_patch(
             warning: Some(unsupported_flags_warning(&patch.unsupported_flags)),
         };
     }
-    let body = BatchModifyRequest {
-        ids: ids.iter().map(|id| id.0.clone()).collect(),
-        add_label_ids: patch.add_label_ids.clone(),
-        remove_label_ids: patch.remove_label_ids.clone(),
-    };
-    match post_empty_json(client, "/messages/batchModify", &body, key).await {
-        Ok(()) => MutationApply::Batch {
-            items: label_patch_successes(ids, &patch.unsupported_flags),
-            warning: (!patch.unsupported_flags.is_empty())
-                .then(|| unsupported_flags_warning(&patch.unsupported_flags)),
-        },
-        Err(error) if is_not_found(&error) && ids.len() > 1 => {
-            apply_label_patch_bisected(client, ids, &body, key, operation, &patch.unsupported_flags)
-                .await
+    for body in batch_modify_bodies(ids, &patch) {
+        match post_empty_json(client, "/messages/batchModify", &body, key).await {
+            Ok(()) => {}
+            Err(error) if is_not_found(&error) && ids.len() > 1 => {
+                return apply_label_patch_bisected(
+                    client,
+                    ids,
+                    &body,
+                    key,
+                    operation,
+                    &patch.unsupported_flags,
+                )
+                .await;
+            }
+            Err(error) => {
+                return match mutation_error(ids, error, GmailErrorContext::mutation(operation)) {
+                    Ok(outcomes) => MutationApply::Batch {
+                        items: outcomes,
+                        warning: None,
+                    },
+                    Err(account_error) => MutationApply::terminate(account_error),
+                };
+            }
         }
-        Err(error) => match mutation_error(ids, error, GmailErrorContext::mutation(operation)) {
-            Ok(outcomes) => MutationApply::Batch {
-                items: outcomes,
-                warning: None,
-            },
-            Err(account_error) => MutationApply::terminate(account_error),
-        },
     }
+    MutationApply::Batch {
+        items: label_patch_successes(ids, &patch.unsupported_flags),
+        warning: (!patch.unsupported_flags.is_empty())
+            .then(|| unsupported_flags_warning(&patch.unsupported_flags)),
+    }
+}
+
+/// Lower one `LabelPatch` onto the `batchModify` request bodies that carry
+/// it, splitting the label lists at `GMAIL_MODIFY_LABEL_LIMIT`.
+///
+/// `GMAIL_BATCH_MODIFY_LIMIT` bounds the ids, and the caller has already
+/// chunked against it. Nothing bounds the LABEL lists on the way in:
+/// `flags::patch_for_set` names every user label in the account in
+/// `removeLabelIds` by construction, so an account with more than a
+/// hundred labels overruns Gmail's documented per-update label cap on
+/// every exact-set. That failure mode is invisible to
+/// `apply_label_patch_bisected`, whose whole method is splitting the id
+/// list - which does not shrink the label list at all - so the split has
+/// to happen here instead.
+///
+/// Splitting is sound because a label patch is state-independent and
+/// idempotent: each request asserts an absolute add-or-remove for labels
+/// it names and says nothing about the rest, so applying the same id list
+/// across several requests converges on the same final label set as one
+/// oversized request would have. Only the intermediate states are
+/// observable, and Gmail offers no atomicity across ids in one call
+/// either. The single caveat is a caller CONTRADICTION - the same label in
+/// both lists, pinned in `flags` as removal-wins - whose resolution is
+/// per-request, so a contradiction split across bodies resolves by last
+/// write rather than by removal. That patch is malformed on the way in;
+/// this does not make it more so.
+///
+/// Common accounts stay far under the cap and get exactly one body, i.e.
+/// the pre-chunking request, unchanged.
+fn batch_modify_bodies(ids: &[ObjectId], patch: &LabelPatch) -> Vec<BatchModifyRequest> {
+    let message_ids: Vec<String> = ids.iter().map(|id| id.0.clone()).collect();
+    let mut adds = patch.add_label_ids.chunks(GMAIL_MODIFY_LABEL_LIMIT);
+    let mut removes = patch.remove_label_ids.chunks(GMAIL_MODIFY_LABEL_LIMIT);
+    let mut bodies = Vec::new();
+    loop {
+        let (add, remove) = (adds.next(), removes.next());
+        if add.is_none() && remove.is_none() {
+            break;
+        }
+        bodies.push(BatchModifyRequest {
+            ids: message_ids.clone(),
+            add_label_ids: add.unwrap_or_default().to_vec(),
+            remove_label_ids: remove.unwrap_or_default().to_vec(),
+        });
+    }
+    bodies
 }
 
 /// Split a `batchModify` that answered 404 until every id is isolated as
@@ -986,6 +1039,127 @@ mod tests {
                 br#"{"ids":["live-1"],"addLabelIds":["INBOX"],"removeLabelIds":["SPAM","TRASH"]}"#
                     .as_slice()
             )
+        );
+    }
+
+    /// `GMAIL_BATCH_MODIFY_LIMIT` bounds the ids; nothing on the way in
+    /// bounds the label lists, and `patch_for_set` names every user label
+    /// in the account. An account past Gmail's documented per-update label
+    /// cap must therefore be split into several bodies here - the 404
+    /// bisector cannot help, since halving the id list leaves the label
+    /// list exactly as long.
+    #[test]
+    fn a_label_list_over_the_cap_is_split_across_request_bodies() {
+        let patch = LabelPatch {
+            add_label_ids: (0..GMAIL_MODIFY_LABEL_LIMIT + 5)
+                .map(|n| format!("Add_{n}"))
+                .collect(),
+            remove_label_ids: (0..GMAIL_MODIFY_LABEL_LIMIT * 2 + 1)
+                .map(|n| format!("Rem_{n}"))
+                .collect(),
+            unsupported_flags: Vec::new(),
+        };
+        let ids = [ObjectId("m1".to_string()), ObjectId("m2".to_string())];
+        let bodies = batch_modify_bodies(&ids, &patch);
+
+        assert_eq!(bodies.len(), 3, "the longer list decides the body count");
+        for body in &bodies {
+            assert_eq!(body.ids, vec!["m1".to_string(), "m2".to_string()]);
+            assert!(body.add_label_ids.len() <= GMAIL_MODIFY_LABEL_LIMIT);
+            assert!(body.remove_label_ids.len() <= GMAIL_MODIFY_LABEL_LIMIT);
+        }
+        let added: Vec<String> = bodies
+            .iter()
+            .flat_map(|body| body.add_label_ids.clone())
+            .collect();
+        let removed: Vec<String> = bodies
+            .iter()
+            .flat_map(|body| body.remove_label_ids.clone())
+            .collect();
+        assert_eq!(
+            added, patch.add_label_ids,
+            "splitting must not drop or reorder a label"
+        );
+        assert_eq!(removed, patch.remove_label_ids);
+    }
+
+    /// A patch that fits stays exactly one request: chunking must not cost
+    /// the common account an extra 50-unit call.
+    #[test]
+    fn a_label_list_under_the_cap_stays_one_request_body() {
+        let patch = LabelPatch {
+            add_label_ids: vec!["INBOX".to_string()],
+            remove_label_ids: vec!["SPAM".to_string(), "TRASH".to_string()],
+            unsupported_flags: Vec::new(),
+        };
+        let bodies = batch_modify_bodies(&[ObjectId("m1".to_string())], &patch);
+        assert_eq!(bodies.len(), 1);
+        assert_eq!(bodies[0].add_label_ids, patch.add_label_ids);
+        assert_eq!(bodies[0].remove_label_ids, patch.remove_label_ids);
+    }
+
+    /// The same bound, reached through the real driver: a label-heavy
+    /// account's exact-set reaches the wire as several capped requests
+    /// and still reports one success per id.
+    #[tokio::test]
+    async fn exact_set_on_a_label_heavy_account_sends_capped_requests() {
+        let (client, script) = scripted_client(vec![
+            canned(StatusCode::NO_CONTENT),
+            canned(StatusCode::NO_CONTENT),
+            canned(StatusCode::NO_CONTENT),
+        ]);
+        let labels = (0..250)
+            .map(|n| crate::types::GmailLabel {
+                id: format!("Label_{n}"),
+                name: format!("Name {n}"),
+                label_type: Some("user".to_string()),
+                color: None,
+            })
+            .collect::<Vec<_>>();
+        let events = collect_events(bulk_set_flags(
+            client,
+            fresh_cache(labels),
+            Box::pin(stream::iter([ObjectId("m1".to_string())])),
+            FlagOp::Set(set(&["\\Seen"])),
+            test_key(31),
+        ))
+        .await;
+
+        let SyncEvent::Batch(batch) = &events[0] else {
+            panic!("a label-heavy exact set must still produce one accounted batch");
+        };
+        assert_eq!(batch.items.len(), 1);
+        assert!(matches!(&batch.items[0], ItemOutcome::Succeeded(_)));
+
+        let requests = script.requests();
+        assert_eq!(
+            requests.len(),
+            3,
+            "253 removals must not go out as one oversized body"
+        );
+        let mut removed = Vec::new();
+        for request in &requests {
+            let body: serde_json::Value =
+                serde_json::from_slice(request.body.as_deref().expect("a body")).expect("json");
+            assert_eq!(body["ids"], serde_json::json!(["m1"]));
+            let chunk = body["removeLabelIds"]
+                .as_array()
+                .expect("removeLabelIds")
+                .clone();
+            assert!(
+                chunk.len() <= GMAIL_MODIFY_LABEL_LIMIT,
+                "every emitted body must stay under Gmail's per-update label cap"
+            );
+            removed.extend(
+                chunk
+                    .into_iter()
+                    .map(|id| id.as_str().expect("id").to_string()),
+            );
+        }
+        assert_eq!(
+            removed.len(),
+            253,
+            "every user label plus STARRED / IMPORTANT / UNREAD still has to be removed"
         );
     }
 

@@ -671,8 +671,31 @@ async fn hydrate_one(
             })
         }
         Projection::FullWithBlobs => {
-            let raw = client.get_message(&id.0, "raw").await?;
-            let full = client.get_message(&id.0, "full").await?;
+            // Two calls are irreducible here, and they are issued
+            // CONCURRENTLY rather than one after the other.
+            //
+            // Irreducible: `format=raw` is the only format that returns the
+            // original MIME bytes, and it returns nothing else - no `payload`
+            // part tree. `format=full` is the only format that returns the
+            // part tree carrying `body.attachmentId`, which is the id
+            // `open_blob` needs. That id is minted by Gmail and appears
+            // nowhere in the message's own bytes, so it cannot be recovered
+            // by parsing the raw MIME; and `format=metadata` returns headers
+            // only, no parts, so it cannot supply it either.
+            //
+            // The second call is also far cheaper than it looks: `format=full`
+            // inlines `body.data` only for parts WITHOUT an `attachmentId`,
+            // so a message with a 20 MB attachment does not transfer those
+            // 20 MB twice. The duplicated payload is the inline text bodies.
+            //
+            // What the pairing does cost is quota (5 units each) and, before
+            // this was joined, a second full round trip of latency per
+            // message on the hottest projection in the read path.
+            let (raw, full) = futures::future::try_join(
+                client.get_message(&id.0, "raw"),
+                client.get_message(&id.0, "full"),
+            )
+            .await?;
             Ok(HydratedObject {
                 id,
                 kind: HydratedObjectKind::RawMime(raw_bytes(&raw)?),
@@ -1524,5 +1547,70 @@ mod tests {
         assert_eq!(batch.items.len(), HYDRATE_BATCH_SIZE);
         // The producer is still open, so this batch cannot claim to be final.
         assert!(matches!(batch.page_boundary, PageBoundary::Page));
+    }
+
+    #[tokio::test]
+    async fn full_with_blobs_issues_its_raw_and_full_fetches_concurrently() {
+        // `FullWithBlobs` needs both `format=raw` (the only source of MIME
+        // bytes) and `format=full` (the only source of `body.attachmentId`).
+        // Neither depends on the other's answer, so serializing them costs a
+        // whole round trip per message on the hottest read projection.
+        //
+        // Both canned answers carry BOTH shapes, so the assertion is about
+        // fan-out and not about which leg happens to be answered first.
+        let both_shapes = json!({
+            "id": "m-blob",
+            "threadId": "t-blob",
+            "labelIds": ["INBOX"],
+            "historyId": "9",
+            "raw": "aGk",
+            "payload": {
+                "mimeType": "multipart/mixed",
+                "parts": [{
+                    "mimeType": "application/pdf",
+                    "filename": "report.pdf",
+                    "body": { "attachmentId": "att-1", "size": 2048 },
+                }],
+            },
+        });
+
+        let script =
+            ScriptedDispatch::yielding(vec![ok_json(both_shapes.clone()), ok_json(both_shapes)]);
+        let token_source = Arc::new(StaticTokenSource::new("token", None));
+        let net = bifrost_net::test_support::scripted_account(
+            &script,
+            NetConfig::default(),
+            Vec::new(),
+            token_source,
+            RetryPolicy::disabled(),
+        );
+        let client = GmailClient::with_account_net("https://gmail.test", net);
+
+        let names = flags::label_name_index(&[]);
+        let hydrated = hydrate_one(
+            &client,
+            &names,
+            ObjectId("m-blob".to_owned()),
+            Projection::FullWithBlobs,
+        )
+        .await
+        .expect("both projections answered");
+
+        assert!(matches!(hydrated.kind, HydratedObjectKind::RawMime(_)));
+        assert_eq!(
+            hydrated.blobs.len(),
+            1,
+            "the `full` leg still supplies the attachment blob handle"
+        );
+        assert_eq!(
+            script.requests().len(),
+            2,
+            "exactly two message fetches, no more"
+        );
+        assert_eq!(
+            script.peak_in_flight(),
+            2,
+            "the raw and full fetches must be in flight together, not chained"
+        );
     }
 }

@@ -206,7 +206,30 @@ fn patch_for_set(flags: &HashSet<String>, labels: &[GmailLabel]) -> LabelPatch {
     // user label in the vocabulary - `batchModify` ignores removals for
     // labels a message does not have. Consequence to keep in mind:
     // `remove_label_ids` scales with the account's user label count, not
-    // with the size of the incoming flag set.
+    // with the size of the incoming flag set. Gmail documents a cap of 100
+    // label ids per update, and an account's label vocabulary is allowed to
+    // be much larger than that, so the submitter splits the list across
+    // several `batchModify` bodies rather than letting a label-heavy
+    // account 400 on every exact-set - see `mutation::batch_modify_bodies`.
+    //
+    // Read-back-then-diff was weighed as the replacement and rejected on
+    // correctness, not on effort. One `LabelPatch` is computed ONCE per
+    // mutation and applied to up to 1000 ids in a single `batchModify`,
+    // which is only sound because this patch is state-independent: it
+    // asserts the same absolute set for every target regardless of what
+    // any of them currently carries, so it is idempotent and immune to a
+    // concurrent label change landing between the decision and the write.
+    // A diffed patch is per-message by construction, so it would (a) need
+    // a `messages.get` per target - 5 quota units each - to learn current
+    // state, against a request body of a few KB, (b) shatter one
+    // `batchModify` into one call per distinct diff, and (c) open a
+    // lost-update window this shape does not have: a label added by
+    // another client after the read is absent from the diff's
+    // `removeLabelIds` and survives an exact-set that was supposed to
+    // clear it. The engine's read-back guard does not close that window
+    // either, since it verifies AFTER the write rather than supplying
+    // pre-state. Trading a few KB of body for N reads, N writes and a
+    // race is not a trade; the body size stays.
     //
     // The `user` filter is the point of this loop and is NOT the same
     // mistake as type-filtering `user_label_id_from_flag`. Gmail's

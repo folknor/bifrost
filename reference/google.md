@@ -670,7 +670,18 @@ dispatch per `Projection` is:
 - `FlagsOnly` - `format=minimal` then `flag_set` over the label list.
 - `Metadata` - `format=metadata` via `inventory_entry_from_message`.
 - `FullWithBlobs` - `format=raw` for bytes plus `format=full` to
-  enumerate attachment blob handles.
+  enumerate attachment blob handles, the two issued CONCURRENTLY
+  (`future::try_join`) since neither depends on the other's answer.
+  Both calls are irreducible: `raw` is the only format returning the
+  original MIME bytes and returns no `payload` part tree, while `full`
+  is the only format returning the part tree carrying
+  `body.attachmentId` - an id Gmail mints that appears nowhere in the
+  message's own bytes, so it cannot be recovered by parsing the raw
+  MIME, and `format=metadata` returns headers without parts and cannot
+  supply it either. The pairing is also cheaper than it looks: `full`
+  inlines `body.data` only for parts WITHOUT an `attachmentId`, so a
+  20 MB attachment is not transferred twice; the duplication is the
+  inline text bodies. The real cost is the second call's 5 quota units.
 - `Headers` / `Preview` / `TextOnly` / `Full` - `format=raw`, with
   `HydratedObjectKind::RawMime`.
 - Any other variant falls back to `format=metadata`.
@@ -1083,6 +1094,42 @@ Flag canonicalization in `flags.rs`:
   re-derivation in both directions - Gmail's classifier owns them,
   so they resolve without poisoning the patch but are never added or
   removed by a `Set`.
+
+  That vocabulary-sized removal list is load-bearing, not an oversight
+  awaiting a read-back-then-diff replacement. One `LabelPatch` is computed
+  once per mutation and applied to up to 1000 ids in a single
+  `batchModify`, which is sound only because the patch is
+  state-independent: it asserts the same absolute set for every target
+  whatever each currently carries, making it idempotent and immune to a
+  concurrent label change landing between decision and write. A diffed
+  patch is per-message by construction, so it would need a `messages.get`
+  per target (5 quota units each) to learn current state, shatter one
+  `batchModify` into one call per distinct diff, and open a lost-update
+  window: a label added by another client after the read is absent from
+  the diff's `removeLabelIds` and survives an exact-set meant to clear it.
+  The engine's read-back guard does not close that window, since it
+  verifies after the write rather than supplying pre-state. A few KB of
+  request body is the cheaper side of that trade.
+
+  Two different caps bound one `batchModify`, and only one of them is on
+  the ids. `GMAIL_BATCH_MODIFY_LIMIT` (1000) bounds `ids[]`;
+  `GMAIL_MODIFY_LABEL_LIMIT` (100) bounds `addLabelIds` and
+  `removeLabelIds`, which the `users.messages.modify` reference documents
+  for both lists and the `batchModify` reference leaves unstated. Since
+  the two methods share one label-mutation path and Gmail only
+  *recommends* keeping an account under 500 labels, the crate holds every
+  request under the documented figure rather than assuming the silent
+  method is unbounded. `mutation::batch_modify_bodies` therefore lowers a
+  patch onto as many capped request bodies as its longer label list
+  needs, all carrying the same ids. This is the one bound the 404
+  bisector cannot reach: halving the id list leaves the label list
+  exactly as long, so a label-heavy account without the split would 400
+  on every exact-set with no recovery path. Splitting is sound for the
+  same reason the vocabulary-sized list is: an idempotent,
+  state-independent patch says nothing about labels a given request does
+  not name, so several requests over one id list converge on the same
+  final label set. An account under the cap - nearly all of them - still
+  emits exactly one request.
 - `DRAFT` and `SENT` are read-only projections: Gmail answers 400 for either id
   in `addLabelIds` or in `removeLabelIds`, so neither ever reaches the wire from
   any reverse translation path, including a crafted `$gmail-label:SENT:...`

@@ -8,6 +8,26 @@ use bifrost_types::{
 
 pub(crate) const GMAIL_BATCH_MODIFY_LIMIT: usize = 1000;
 
+/// Gmail's per-request cap on the length of `addLabelIds` and
+/// `removeLabelIds`.
+///
+/// The `users.messages.modify` reference states it for both lists
+/// ("You can add up to 100 labels with each update", and the same
+/// sentence for removal). The `batchModify` reference documents only
+/// the 1000-id cap on `ids[]` and says nothing about the label lists,
+/// but the two methods share one label-mutation path, so the crate
+/// holds every request it emits under the documented figure rather
+/// than assuming the silent method is unbounded.
+///
+/// This is NOT a bound the account's label vocabulary respects on its
+/// own. `FlagOp::Set` names every user label in `removeLabelIds` by
+/// construction (see `flags::patch_for_set`), and Gmail's own guidance
+/// only *recommends* staying under 500 labels per account - the hard
+/// ceiling is far above 100. A label-heavy account would therefore
+/// turn every exact-set into a 400 that id-splitting cannot fix, which
+/// is why the submitter chunks the label lists instead.
+pub(crate) const GMAIL_MODIFY_LABEL_LIMIT: usize = 100;
+
 pub(crate) fn gmail_capabilities() -> AccountCapabilities {
     AccountCapabilities {
         cursor_freshness: CursorFreshness::ServerIssued,
