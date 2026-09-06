@@ -90,6 +90,7 @@ pub(super) async fn run_backfill_orchestrator(ctx: SlotContext, wiring: Backfill
             cursors.all_scope_incarnations(),
             &fusion_owned_scopes,
             tokio::time::Instant::now(),
+            &coverage,
         );
         for (scope, incarnation) in scopes {
             if shutdown.is_cancelled() {
@@ -119,6 +120,18 @@ pub(super) async fn run_backfill_orchestrator(ctx: SlotContext, wiring: Backfill
             if !cursors.all_scope_incarnations().contains(&incarnation_key) {
                 continue;
             }
+            // What the walk has to beat: any page that reaches nobody bumps this,
+            // wherever it happens - the retire-on-sentinel-only path in the
+            // runner, or a receiver's departure sweep. Comparing two readings is
+            // the only honest way to ask "did EVERY page of this walk reach a
+            // consumer", which a subscriber count at the end cannot answer.
+            //
+            // Taken through the SCAN and taken HERE, as this walk begins: the
+            // scan owns the reading, so the settle cannot be recorded against a
+            // number nothing validated, and taking it now rather than when the
+            // batch was selected keeps a sweep during an earlier scope's walk
+            // from being charged to this one.
+            let undelivered_before = scan.begin_walk(&incarnation_key, &coverage);
             // The incarnation this walk belongs to, snapshotted at its START.
             // Carried all the way into the completion marker: a reset that closes
             // anywhere inside the walk - including after its last page but before
@@ -178,7 +191,47 @@ pub(super) async fn run_backfill_orchestrator(ctx: SlotContext, wiring: Backfill
             // withholding, or registry bookkeeping.
             let plan = backfill_plan_for(acc, &scope, config);
             let labels = plan.labels();
+            // A PRIOR attempt on this incarnation that lost pages disqualifies
+            // the stored checkpoint as a resume position, and only for a
+            // positional plan does that matter - but it matters a lot there. The
+            // pages the departed consumer never received sit BEHIND the windows
+            // the replacement did receive and acknowledge, so resuming after the
+            // furthest acked window walks past the hole, hits its empty end
+            // probe, and settles the incarnation having never re-offered the
+            // lost pages to anybody. The retry has to start where the walk is
+            // known whole, which is the walk's own beginning; `walk_from_scratch`
+            // is exactly that answer, already defined as the no-checkpoint case.
+            // Re-emitting acknowledged pages is idempotent, so the cost is
+            // re-work, not correctness.
+            let restart_whole = scan.restarts_from_scratch(&incarnation_key);
+            if restart_whole {
+                // Drop the previous attempt's durable footprint BEFORE walking,
+                // not only when the loss was noticed. The ack-time refusal
+                // repairs memory, but it cannot always repair the store: a loss
+                // that lands AFTER the marker's acknowledgement leaves that
+                // marker durable, and a detach before this retry lands its own
+                // would let the next attach read the stale marker back and answer
+                // `Skip` - the lost pages never re-offered, for good. Idempotent,
+                // and safe to fence here precisely because the retry has minted
+                // no ids yet. It also SETTLES this scope's outstanding request -
+                // but only once the writer has ACCEPTED it, or an abort at
+                // `detach_timeout` between the two loses the request with nothing
+                // left for teardown to drain.
+                if discard_backfill_progress(&writer_tx, &account_id, &scope).await {
+                    coverage.take_backfill_discard(&scope);
+                }
+            }
             let resume = match store.get_backfill(&account_id, &scope).await {
+                Ok(_) if restart_whole => {
+                    tracing::debug!(
+                        target: "bifrost.sync.backfill",
+                        account = ?account_id,
+                        scope = ?scope,
+                        "a previous attempt on this incarnation lost pages; restarting the \
+                         walk from its beginning rather than resuming past them"
+                    );
+                    plan.walk_from_scratch()
+                }
                 Ok(stored) => plan.resume(stored.as_ref()),
                 Err(err) => {
                     // A read failure is not authoritative; fall back to a
@@ -282,11 +335,44 @@ pub(super) async fn run_backfill_orchestrator(ctx: SlotContext, wiring: Backfill
                 }
             }
             let completed = driver.completed();
+            // Did EVERY page of this walk reach a consumer? Any page that reached
+            // nobody bumps this, wherever it happened - the retire-on-sentinel-only
+            // path in the runner, or a receiver's departure sweep. A subscriber
+            // count at the end cannot answer it: a consumer that fills the bound
+            // and leaves, is replaced before the walk finishes, and whose
+            // replacement acknowledges the remaining pages satisfies every
+            // point-in-time check while the pages published in the gap reached
+            // nobody at all.
+            let every_page_reached_someone =
+                coverage.undelivered_watermark(&scope) == undelivered_before;
+            if completed && !every_page_reached_someone {
+                tracing::warn!(
+                    target: "bifrost.sync.backfill",
+                    account = ?account_id,
+                    scope = ?scope,
+                    "backfill walk finished but some of its pages reached no consumer; \
+                     withholding the completion marker so the scope is re-walked"
+                );
+            }
             // Persist a durable completion marker through the same
             // consumer-ack path the page batches use. It is ordered behind
             // every page, so a crash before its ack re-walks instead of
             // recording a false completion.
-            let mut settle = completed;
+            //
+            // The marker is withheld on a walk with a hole in it, and that is
+            // load-bearing rather than tidy: declining to settle the incarnation
+            // in memory buys nothing on its own, because the marker is DURABLE.
+            // A replacement consumer that arrives mid-walk acknowledges it into
+            // the checkpoint store, and the very next rescan reads it back,
+            // answers `ScopeResume::Skip`, and settles the scope with the hole
+            // still in it - for this attachment and every later one.
+            //
+            // The emission can PARK on the bound, indefinitely, so the condition
+            // is re-validated inside it against the same watermark reading rather
+            // than only here: a final page can be swept undelivered while the
+            // marker waits, and a marker published on the wake would record a
+            // durable completion for a walk that had just lost a page.
+            let mut settle = completed && every_page_reached_someone;
             if settle {
                 match emit_backfill_complete(
                     changes_tx.as_ref(),
@@ -296,36 +382,139 @@ pub(super) async fn run_backfill_orchestrator(ctx: SlotContext, wiring: Backfill
                     &shutdown,
                     &lane_gate,
                     &delivery,
+                    undelivered_before,
                     fence_at_walk_start,
                 )
                 .await
                 {
                     MarkerOutcome::Published => {}
                     // The walk was invalidated while its marker waited - a scope
-                    // reset closed inside the wait. That is not a reason to stop:
-                    // an earlier revision returned the same `false` for this as
-                    // for shutdown, so one reset abandoned every LATER scope and
+                    // reset closed inside the wait, or a page was swept
+                    // undelivered. Neither is a reason to stop: an earlier
+                    // revision returned the same `false` for this as for
+                    // shutdown, so one reset abandoned every LATER scope and
                     // every later rescan for the rest of the attachment. Record
                     // the interrupted attempt and carry on with the next scope.
                     MarkerOutcome::Withheld => settle = false,
                     MarkerOutcome::ShuttingDown => return,
                 }
             }
+            // A walk only SETTLES if its pages actually reached somebody. If the
+            // consumer left partway through, every page since was retired on
+            // send, the completion sentinel with them - so the walk "completed"
+            // having delivered nothing, and settling it would retire the
+            // incarnation for the life of the attachment. Recording it as an
+            // attempt instead puts it back on the rescan ramp for whoever
+            // subscribes next.
+            //
+            // Re-read rather than reusing the reading above: the completion
+            // marker is itself a publication and can reach nobody in its turn,
+            // which is the no-consumer case and must not settle either.
+            let walk_reached_someone = coverage.undelivered_watermark(&scope) == undelivered_before;
+            if !walk_reached_someone {
+                // Remember it for the RETRY, not only for this decision. A
+                // positional plan would otherwise resume after the windows the
+                // replacement consumer acknowledged, which sit past the hole.
+                scan.note_lost_pages(incarnation_key.clone());
+                // And remember it DURABLY. The note above dies with the
+                // attachment, while the misleading rows do not: a detach before
+                // the retry leaves a fresh attach resuming past the hole, taking
+                // one empty end probe and completing without ever replaying the
+                // missing windows. Dropping the rows is the durable form of the
+                // same decision - they are resume hints, so the cost is re-work.
+                //
+                // Drained rather than sent directly: recording the loss already
+                // REQUESTED this, at the moment it happened, so that a detach
+                // landing before this line still leaves the rows gone. Taking the
+                // request here is what does the work in the ordinary case - and
+                // only THIS scope's, because this walk can answer for no other. A
+                // drain of every outstanding request would carry off one whose
+                // repair has already run and act on it arbitrarily later, against
+                // rows that scope may since have re-earned. Taken only once the
+                // writer has ACCEPTED it, for the reason on
+                // `discard_backfill_progress`.
+                if discard_backfill_progress(&writer_tx, &account_id, &scope).await {
+                    coverage.take_backfill_discard(&scope);
+                }
+            }
+            let concluded = settle && walk_reached_someone;
+            // Marked AFTER the re-read, on the same answer the scan records.
+            // Marking before it let the registry report `Completed` for a walk
+            // the scan had just put back on the retry ramp - one observable
+            // saying finished while the other says pending, for the life of the
+            // attachment. One value feeds both, so they cannot disagree.
             registry.mark(
                 account_id.clone(),
                 scope.clone(),
-                if settle {
+                if concluded {
                     BackfillState::Completed
                 } else {
                     BackfillState::Pending
                 },
             );
-            scan.record_attempt(incarnation_key, settle);
+            // The settle baseline is NOT passed in: `BackfillScan` holds the
+            // reading `begin_walk` took as this walk started, so a loss landing
+            // between the checks above and this line cannot be adopted as the
+            // baseline it was never checked against.
+            scan.record_attempt(incarnation_key, concluded);
         }
         tokio::select! {
             () = shutdown.cancelled() => return,
             () = tokio::time::sleep(Duration::from_secs(1)) => {}
         }
+    }
+}
+
+/// Ask the account's single writer to drop a scope's durable backfill rows.
+///
+/// Best effort by design: if the writer is gone the attachment is tearing down,
+/// and if the delete fails the in-memory note still forces the restart for the
+/// life of this attachment. Either way the failure direction is a resume that is
+/// too EARLY, never one that is too late.
+/// Returns whether the delete SUCCEEDED, which is the only thing that settles the
+/// request.
+///
+/// Not "the writer accepted the send": a store error leaves the rows exactly
+/// where they were, and a request consumed by a delete that did not happen is a
+/// repair nobody will attempt again - the teardown drain would find nothing to
+/// retry. Not anything earlier either: taking the request before the reply means
+/// an abort at `detach_timeout` in between loses it outright, while a request
+/// still outstanding is simply retried by whoever gets there next.  Both
+/// failures leave the rows in place, so the answer to both is to keep the
+/// request.
+async fn discard_backfill_progress(
+    writer: &mpsc::Sender<WriterRequest>,
+    account_id: &AccountId,
+    scope: &CursorScope,
+) -> bool {
+    let (done, recv) = oneshot::channel();
+    if writer
+        .send(WriterRequest::DiscardBackfillProgress {
+            scope: scope.clone(),
+            done,
+        })
+        .await
+        .is_err()
+    {
+        return false;
+    }
+    match recv.await {
+        Ok(Ok(())) => true,
+        Ok(Err(error)) => {
+            tracing::warn!(
+                target: "bifrost.sync.backfill",
+                account = ?account_id,
+                scope = ?scope,
+                error = %error,
+                "could not drop the backfill rows of a walk that lost pages; the request \
+                 stays outstanding so teardown retries it"
+            );
+            false
+        }
+        // The writer went away before answering. The request stays outstanding;
+        // there is nothing left in this attachment to act on it, and the next one
+        // starts from rows that are still there.
+        Err(_) => false,
     }
 }
 
@@ -362,8 +551,18 @@ pub(super) const BACKFILL_RETRY_CAP: Duration = Duration::from_secs(300);
 /// failing scope from re-walking on every rescan tick.
 #[derive(Default)]
 pub(super) struct BackfillScan {
-    /// Incarnations that reached a durable conclusion. Never re-walked.
-    settled: HashSet<(CursorScope, u64)>,
+    /// Incarnations that reached a durable conclusion, each recorded with the
+    /// scope's undelivered watermark AS OF the settle.
+    ///
+    /// The watermark is what makes the settle revocable, and it has to be: the
+    /// completion marker is published and the incarnation settled in the same
+    /// step, while the loss that invalidates them can land afterwards. A
+    /// receiver holding an earlier page departs, the sweep strands it, the ack
+    /// writer refuses the marker - and nothing in memory knew, so the scope was
+    /// never re-walked for the rest of the attachment. Comparing this reading on
+    /// every rescan is what reopens it, using the same evidence the writer acted
+    /// on rather than a second notification path.
+    settled: HashMap<(CursorScope, u64), u64>,
     /// Fusion-owned scopes whose cold-start incarnation the fusion
     /// worker already published. Only the first sighting is fusion's;
     /// a later incarnation of the same scope is a genuine
@@ -371,6 +570,26 @@ pub(super) struct BackfillScan {
     fusion_skipped: HashSet<CursorScope>,
     /// Failure count plus earliest next attempt, per incarnation.
     failed: HashMap<(CursorScope, u64), (u32, tokio::time::Instant)>,
+    /// The undelivered reading each incarnation's walk BEGAN under, recorded by
+    /// [`BackfillScan::begin_walk`].
+    ///
+    /// The settle baseline is taken from here rather than from a number the call
+    /// site supplies, and that is the whole point: a caller reading the watermark
+    /// afresh at settle time can adopt a loss it never checked - a receiver
+    /// departing between the walk's own comparison and the settle makes the
+    /// writer refuse the marker and discard the rows on exactly the event the
+    /// rescan then records as the baseline, so it compares that reading against
+    /// itself for ever and never reopens. Owning the reading here makes the wrong
+    /// one unavailable rather than merely discouraged.
+    baseline: HashMap<(CursorScope, u64), u64>,
+    /// Incarnations whose last attempt published pages that reached nobody.
+    ///
+    /// Their durable checkpoint is no longer a safe resume position: a
+    /// replacement consumer legitimately acknowledges the windows it DID
+    /// receive, and those sit past the pages it did not, so a positional resume
+    /// walks over the hole and settles the scope having never re-offered them.
+    /// The next attempt starts the walk over instead.
+    lost_pages: HashSet<(CursorScope, u64)>,
 }
 
 impl BackfillScan {
@@ -379,12 +598,40 @@ impl BackfillScan {
         available: Vec<(CursorScope, u64)>,
         fusion_owned: &HashSet<CursorScope>,
         now: tokio::time::Instant,
+        coverage: &PendingCoverage,
     ) -> Vec<(CursorScope, u64)> {
+        // Forget everything about incarnations the registry no longer carries.
+        // A scope that is deleted, re-established, or simply never returns leaves
+        // a retry deadline, a lost-pages mark and a baseline behind it otherwise,
+        // one set per incarnation, for the life of the attachment - and the
+        // `continue` below, which drops an incarnation that vanished during the
+        // subscriber wait, adds one every time it fires. `settled` is deliberately
+        // NOT pruned: it is the memory that stops a concluded incarnation being
+        // walked again, and incarnation numbers only ever move forward, so an
+        // entry there can never be mistaken for a later one.
+        let live: HashSet<(CursorScope, u64)> = available.iter().cloned().collect();
+        self.baseline.retain(|key, _| live.contains(key));
+        self.failed.retain(|key, _| live.contains(key));
+        self.lost_pages.retain(|key| live.contains(key));
         let mut pending = Vec::new();
         for (scope, incarnation) in available {
             let key = (scope, incarnation);
-            if self.settled.contains(&key) {
-                continue;
+            if let Some(settled_at) = self.settled.get(&key).copied() {
+                if coverage.undelivered_watermark(&key.0) == settled_at {
+                    continue;
+                }
+                // A page of that walk reached nobody AFTER it settled, so the
+                // conclusion it settled on is void: the ack writer refuses the
+                // marker on the same evidence and drops the rows, and this is
+                // the half that lets the walk actually happen again.
+                tracing::warn!(
+                    target: "bifrost.sync.backfill",
+                    scope = ?key.0,
+                    "a page of a settled backfill walk has since reached no consumer; \
+                     reopening the incarnation so it is walked again"
+                );
+                self.settled.remove(&key);
+                self.lost_pages.insert(key.clone());
             }
             if fusion_owned.contains(&key.0)
                 && !self.failed.contains_key(&key)
@@ -392,7 +639,8 @@ impl BackfillScan {
             {
                 // Fusion owns this incarnation's cold-start inventory;
                 // walking it here would double-publish the same scope.
-                self.settled.insert(key);
+                let watermark = coverage.undelivered_watermark(&key.0);
+                self.settled.insert(key, watermark);
                 continue;
             }
             if self.failed.get(&key).is_some_and(|(_, at)| *at > now) {
@@ -405,9 +653,63 @@ impl BackfillScan {
 
     /// The incarnation reached a durable conclusion with no walk of our
     /// own (completion marker already present, or fusion owns it).
+    ///
+    /// The settle is recorded against the reading this incarnation's walk BEGAN
+    /// under - the one every check of this pass was made against - so a loss
+    /// that lands after those checks reopens it on the next rescan. An unknown
+    /// baseline reads as 0, which reopens on the first loss the scope ever
+    /// records: the conservative direction, costing a re-walk.
     pub(super) fn settled(&mut self, key: (CursorScope, u64)) {
         self.failed.remove(&key);
-        self.settled.insert(key);
+        self.lost_pages.remove(&key);
+        let baseline = self.baseline.remove(&key).unwrap_or(0);
+        self.settled.insert(key, baseline);
+    }
+
+    /// The last attempt on this incarnation published pages that reached
+    /// nobody, so its durable checkpoint may not be used as a resume position.
+    pub(super) fn note_lost_pages(&mut self, key: (CursorScope, u64)) {
+        self.lost_pages.insert(key);
+    }
+
+    /// Take this incarnation's baseline as its walk BEGINS, and hand it back.
+    ///
+    /// At the start of the walk, not when the batch was selected: one rescan
+    /// hands out several scopes and they are walked one after another, so a
+    /// baseline taken for all of them up front is stale for every scope but the
+    /// first. A sweep during scope X's walk moves scope Y's reading too - Y's
+    /// pages are swept with X's when a receiver departs - and Y would then judge
+    /// itself holed on a loss that happened before it published anything, and
+    /// re-walk from scratch for nothing.
+    ///
+    /// The scan still OWNS the reading, which is the point: the settle is
+    /// recorded against the value taken here, so no call site can settle against
+    /// a number nothing validated.
+    pub(super) fn begin_walk(
+        &mut self,
+        key: &(CursorScope, u64),
+        coverage: &PendingCoverage,
+    ) -> u64 {
+        let watermark = coverage.undelivered_watermark(&key.0);
+        self.baseline.insert(key.clone(), watermark);
+        watermark
+    }
+
+    /// The reading this incarnation's walk began under, which is the ONE baseline
+    /// it is judged against. Unknown reads as 0, so any loss the scope has ever
+    /// recorded counts against it: the conservative direction, costing a re-walk.
+    ///
+    /// Production reads it through `begin_walk`'s return value; this exists so a
+    /// test can observe that a departed incarnation's entry is pruned.
+    #[cfg(test)]
+    pub(super) fn baseline_for(&self, key: &(CursorScope, u64)) -> u64 {
+        self.baseline.get(key).copied().unwrap_or(0)
+    }
+
+    /// Must the next walk of this incarnation start from the beginning rather
+    /// than from its durable checkpoint?
+    pub(super) fn restarts_from_scratch(&self, key: &(CursorScope, u64)) -> bool {
+        self.lost_pages.contains(key)
     }
 
     /// Record the outcome of a walk we actually ran.
@@ -416,6 +718,7 @@ impl BackfillScan {
             self.settled(key);
             return;
         }
+        self.baseline.remove(&key);
         let failures = self.failed.get(&key).map_or(0, |(count, _)| *count) + 1;
         let delay = BACKFILL_RETRY_INITIAL
             .saturating_mul(1_u32 << failures.min(6).saturating_sub(1))
@@ -582,6 +885,7 @@ pub(super) async fn emit_backfill_complete(
     shutdown: &CancellationToken,
     lane: &LaneGate,
     delivery: &crate::multiplexer::ChangeDelivery,
+    undelivered_before: u64,
     fence_at_walk_start: u64,
 ) -> MarkerOutcome {
     if changes_tx.is_none() {
@@ -650,9 +954,35 @@ pub(super) async fn emit_backfill_complete(
         );
         return MarkerOutcome::Withheld;
     }
+    // And re-validate the WALK, not only the scope's rows. The wait above is
+    // indefinite, and the caller's "every page of this walk reached somebody"
+    // reading was taken before it: a final page still unacknowledged when the
+    // marker parked can be swept undelivered by a departing receiver, whose
+    // sweep is also what frees the capacity this wait is parked on. Publishing
+    // on that wake records a durable completion for a walk that lost a page one
+    // instant earlier, and the replacement consumer acknowledges it in good
+    // faith. The page is gone for the life of the attachment either way; what
+    // this refuses is making it permanent.
+    if lane.coverage().undelivered_watermark(scope) != undelivered_before {
+        tracing::warn!(
+            target: "bifrost.sync.backfill",
+            scope = ?scope,
+            "a page of this walk reached no consumer while its completion marker waited \
+             on the bound; withholding the marker so the scope is re-walked"
+        );
+        return MarkerOutcome::Withheld;
+    }
     // Register before publishing so a fast consumer ack cannot land
     // before the entry exists and leave it outstanding forever.
-    let publication = control.publish_checkpoint_without_report(expected.clone(), 0);
+    // Completion eligibility stays tied to THIS walk right up to the
+    // acknowledgement, so the reading is stamped into the publication's RECEIPT
+    // as it is minted. The checks above are point-in-time and the marker is
+    // durable: with spare capacity it reaches every receiver at once, and a
+    // receiver still holding an earlier unacknowledged page can depart
+    // afterwards - the sweep retires that page while a replacement, which had
+    // the marker in its ring all along, acknowledges it. The writer compares
+    // this reading against the scope's watermark again before it writes.
+    let publication = control.publish_walk_marker(expected.clone(), undelivered_before);
     let event = MultiplexerEvent {
         scope: scope.clone(),
         event: Arc::new(SyncEvent::Batch(batch)),
@@ -662,6 +992,7 @@ pub(super) async fn emit_backfill_complete(
     // Send and stamp as one step, exactly as the page path does.
     let delivered = delivery.publish_backfill(event, lane.coverage(), Some(&publication));
     if !crate::multiplexer::delivered_to_real_subscriber(delivered) {
+        lane.coverage().note_undelivered(scope, 1);
         control.retire_publication(publication);
     }
     MarkerOutcome::Published
@@ -679,9 +1010,9 @@ pub(super) async fn emit_backfill_complete(
 pub(super) enum MarkerOutcome {
     /// Published, or there was no channel to publish on.
     Published,
-    /// Deliberately not published: the scope was reset while the marker
-    /// waited. The scope is left unsettled and the orchestrator carries on
-    /// with the next one.
+    /// Deliberately not published: the scope was reset, or a page of this walk
+    /// reached nobody, while the marker waited. The scope is left unsettled and
+    /// the orchestrator carries on with the next one.
     Withheld,
     /// The account is tearing down.
     ShuttingDown,

@@ -148,8 +148,10 @@ pub async fn drive_changes_stream(
         // deliberately never swept, so a `Lane::Backfill` entry minted here is
         // charged against the account's backfill bound until an acknowledgement,
         // a lag or a reset frees it - a permanent slot of the bound spent per
-        // scope. Refusing is the safe direction and costs nothing: no provider in
-        // this workspace emits one.
+        // scope. And if its partition happened to be the completion sentinel, its
+        // acknowledgement would reach `Unvouchable` in this very attachment,
+        // because no walk ever stamped it with a reading. Refusing is the safe
+        // direction and costs nothing: no provider in this workspace emits one.
         if matches!(&checkpoint, Some(Checkpoint::Backfill(_))) {
             let error = crate::recovery::backfill_checkpoint_on_changes(
                 checkpoint.as_ref(),
@@ -380,6 +382,27 @@ pub enum WriterRequest {
         checkpoint: bifrost_types::BackfillCheckpoint,
         done: oneshot::Sender<Result<(), Error>>,
     },
+    /// Drop a scope's durable BACKFILL progress, leaving its change cursor and
+    /// the debt ledger untouched.
+    ///
+    /// Sent when a walk published pages that reached nobody. The rows that
+    /// survive such a walk are the windows a REPLACEMENT consumer received and
+    /// acknowledged, and those sit past the hole - so a positional resume
+    /// (`BackfillPlan::OpenPages`) would start the retry beyond the pages that
+    /// were lost, take its empty end probe, and settle the scope having never
+    /// re-offered them. The in-memory "restart this incarnation from scratch"
+    /// note cannot answer that on its own: it dies with the attachment, and a
+    /// detach before the retry leaves the misleading rows behind.
+    ///
+    /// Deleting them is safe in the direction that matters. A backfill row is a
+    /// resume HINT, never the objects themselves; losing one costs a re-walk,
+    /// and re-emitting acknowledged pages is idempotent. There is no completion
+    /// marker to lose here either: it was withheld by the same condition that
+    /// sends this.
+    DiscardBackfillProgress {
+        scope: CursorScope,
+        done: oneshot::Sender<Result<(), Error>>,
+    },
     /// Invalidate durable state for a scope as one writer-ordered operation.
     /// Pending publications for the affected lanes are retired before the
     /// rows are deleted, so a late acknowledgement cannot revive them.
@@ -493,6 +516,10 @@ impl std::fmt::Debug for WriterRequest {
             Self::PersistBackfill { checkpoint, .. } => f
                 .debug_struct("PersistBackfill")
                 .field("scope", &checkpoint.scope)
+                .finish(),
+            Self::DiscardBackfillProgress { scope, .. } => f
+                .debug_struct("DiscardBackfillProgress")
+                .field("scope", scope)
                 .finish(),
             Self::ResetScope {
                 scope,

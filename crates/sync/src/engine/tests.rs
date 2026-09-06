@@ -117,6 +117,26 @@ fn lane_page(scope: &CursorScope, partition: &str, done: u64) -> bifrost_types::
     })
 }
 
+/// Publish a completion MARKER the way `emit_backfill_complete` does: the walk's
+/// undelivered watermark is stamped into the receipt as the publication is
+/// minted, so it survives retirement and supersession.
+fn publish_a_marker(
+    coverage: &crate::cursor::PendingCoverage,
+    checkpoint: &bifrost_types::Checkpoint,
+    walk_watermark: u64,
+) -> crate::cursor::PublicationId {
+    let id = coverage.register_walk_marker(
+        checkpoint.clone(),
+        crate::cursor::CoverageClaim {
+            reports: Vec::new(),
+            generation: 0,
+        },
+        walk_watermark,
+    );
+    coverage.mark_delivered(&id, 1);
+    id
+}
+
 /// Publish a backfill page the way the runner does, and mark it delivered.
 fn publish_a_page(
     control: &crate::control::SyncControl,
@@ -168,6 +188,674 @@ async fn a_scope_reset_frees_the_backfill_bound_through_the_writer() {
 
     drop(tx);
     let _ = writer.await;
+}
+
+/// Discarding a walk's backfill progress must also FENCE that walk, or a late
+/// acknowledgement rebuilds exactly the resume position the discard removed.
+///
+/// The discard exists because the walk left a hole and its rows point past it.
+/// A replacement consumer holding one of that walk's later pages can let the
+/// delete finish and acknowledge afterwards in perfectly good faith - and an
+/// unfenced writer would honour it, write the row back, and hand the next attach
+/// a position beyond the pages nobody received. Driven through a real
+/// `ack_writer` on purpose: a test that called `invalidate_scope` itself would
+/// pass with the writer's wiring deleted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_discarded_backfill_attempt_cannot_be_rebuilt_by_a_late_ack() {
+    let (account, store, coverage, tx, writer, control) = writer_harness_observed();
+    let scope = CursorScope::Account;
+    let checkpoint = lane_page(&scope, "page:10:20", 5);
+    let publication = publish_a_page(&control, &coverage, &checkpoint);
+
+    let (done, wait) = oneshot::channel();
+    tx.send(WriterRequest::DiscardBackfillProgress {
+        scope: scope.clone(),
+        done,
+    })
+    .await
+    .expect("writer accepts the discard");
+    wait.await
+        .expect("writer answers")
+        .expect("the discard succeeds");
+
+    // The page was in the consumer's hand the whole time, and it answers now.
+    let (done, wait) = oneshot::channel();
+    tx.send(WriterRequest::Ack(crate::multiplexer::AckRequest {
+        scope: scope.clone(),
+        checkpoint,
+        publication: Some(publication),
+        auto: false,
+        complete: Some(done),
+    }))
+    .await
+    .expect("writer accepts the request");
+    let answer = wait.await.expect("writer answers");
+    assert!(
+        answer.is_err(),
+        "an acknowledgement of a discarded attempt's page must be refused, exactly as a \
+         reset's is; got {answer:?}"
+    );
+
+    assert!(
+        store
+            .get_backfill(&account, &scope)
+            .await
+            .expect("store read")
+            .is_none(),
+        "and no resume position may be rebuilt: the row the discard removed is back, so \
+         the next attach resumes past the very hole the discard existed to re-walk"
+    );
+
+    drop(tx);
+    let _ = writer.await;
+}
+
+/// The discard fences the BACKFILL lane and nothing else.
+///
+/// Fencing the whole scope refused a replacement consumer's acknowledgement of
+/// live batches it had genuinely received - an `Unknown` no retry can satisfy,
+/// with no reconciliation instruction, after which the live cursor advances past
+/// changes nothing replayed. The discard is about this scope's backfill rows, so
+/// both halves are asserted here: the live acknowledgement still lands durably,
+/// and the discarded attempt's page is still refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_discard_fences_the_backfill_lane_and_leaves_live_acks_alone() {
+    let (account, store, coverage, tx, writer, control) = writer_harness_observed();
+    let scope = CursorScope::Folder(FolderId("shared".into()));
+    let live = bifrost_types::ChangeCursor {
+        scope: scope.clone(),
+        server_state: bifrost_types::OpaqueChangeState {
+            protocol: bifrost_types::ProtocolKind::Imap,
+            envelope_version: 1,
+            bytes: vec![7],
+        },
+        advanced_through: None,
+        envelope_version: 1,
+    };
+    let live_checkpoint = bifrost_types::Checkpoint::Change(live);
+    let live_publication = control.publish_checkpoint_without_report(live_checkpoint.clone(), 0);
+    let page = lane_page(&scope, "page:10:20", 5);
+    let page_publication = publish_a_page(&control, &coverage, &page);
+
+    let (done, wait) = oneshot::channel();
+    tx.send(WriterRequest::DiscardBackfillProgress {
+        scope: scope.clone(),
+        done,
+    })
+    .await
+    .expect("writer accepts the discard");
+    wait.await
+        .expect("writer answers")
+        .expect("the discard succeeds");
+
+    // The live batch was received before the discard and is acknowledged after
+    // it. It has nothing to do with the backfill rows.
+    let (done, wait) = oneshot::channel();
+    tx.send(WriterRequest::Ack(crate::multiplexer::AckRequest {
+        scope: scope.clone(),
+        checkpoint: live_checkpoint,
+        publication: Some(live_publication),
+        auto: false,
+        complete: Some(done),
+    }))
+    .await
+    .expect("writer accepts the request");
+    wait.await
+        .expect("writer answers")
+        .expect("a live-lane acknowledgement must survive a backfill discard");
+    assert!(
+        store
+            .get_change_cursor(&account, &scope)
+            .await
+            .expect("store read")
+            .is_some(),
+        "and it must be durable: refusing it advances the live cursor past changes \
+         nothing replayed"
+    );
+
+    // The discarded attempt's page is still refused.
+    let (done, wait) = oneshot::channel();
+    tx.send(WriterRequest::Ack(crate::multiplexer::AckRequest {
+        scope: scope.clone(),
+        checkpoint: page,
+        publication: Some(page_publication),
+        auto: false,
+        complete: Some(done),
+    }))
+    .await
+    .expect("writer accepts the request");
+    assert!(
+        wait.await.expect("writer answers").is_err(),
+        "a page of the discarded attempt must still be refused, or it rebuilds the \
+         resume position the discard removed"
+    );
+
+    drop(tx);
+    let _ = writer.await;
+}
+
+/// A completion marker's acknowledgement survives a transient STORE FAILURE.
+///
+/// The engine tells the consumer to retry, and `AckFailure::Store` retires the
+/// marker's registration on the way out - correctly, since the batch is no longer
+/// in flight. The retry then resolves through the publication receipt, and a
+/// watermark that had lived on the boundary entry was gone by then: read as "this
+/// walk cannot be vouched for", refused, and answered by DELETING every backfill
+/// row of the scope and fencing the attempt, while the consumer was told `Ok`.
+/// The scope was already settled and the watermark had not moved, so nothing
+/// re-walked it that attachment; the next attach re-walked the whole scope.
+///
+/// The reading rides the RECEIPT, so retirement cannot take it away.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_marker_ack_retried_after_a_store_failure_keeps_the_scopes_rows() {
+    // Armed only once the page below is durable, so the failure lands on the
+    // MARKER's write - the one the retry has to be able to repeat.
+    let failures = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let store: Arc<DynCheckpointStore> = Arc::new(FailingOnceStore {
+        inner: crate::cursor::InMemoryCheckpointStore::new(),
+        remaining: Arc::clone(&failures),
+    });
+    let (account, coverage, tx, writer) = writer_harness_over(Arc::clone(&store));
+    let scope = email_scope();
+
+    // A page of the walk, acknowledged and durable.
+    let page = backfill_checkpoint(bifrost_types::Partition(b"page:0:10".to_vec()));
+    let page_publication = register(
+        &coverage,
+        &page,
+        crate::cursor::CoverageClaim {
+            reports: Vec::new(),
+            generation: 0,
+        },
+    );
+    ack(&tx, page, Some(page_publication))
+        .await
+        .expect("the page persists");
+
+    failures.store(1, std::sync::atomic::Ordering::SeqCst);
+
+    // The marker, published under a watermark that never moves: this walk is
+    // whole and its completion is legitimate.
+    let marker = backfill_checkpoint_at(crate::backfill::partitioner::completion_partition(), 99);
+    let marker_publication =
+        publish_a_marker(&coverage, &marker, coverage.undelivered_watermark(&scope));
+
+    // The store fails once. The consumer is told so and retries.
+    assert!(
+        ack(&tx, marker.clone(), Some(marker_publication.clone()))
+            .await
+            .is_err(),
+        "the transient store failure reaches the consumer"
+    );
+    ack(&tx, marker, Some(marker_publication))
+        .await
+        .expect("and the retry is honoured");
+
+    let stored = store
+        .get_backfill(&account, &scope)
+        .await
+        .expect("store read")
+        .expect("the retry must have written the marker");
+    assert!(
+        crate::backfill::partitioner::is_completion_partition(&stored.partition),
+        "the retried acknowledgement completes the scope rather than deleting its rows: \
+         got {:?}",
+        stored.partition
+    );
+
+    drop(tx);
+    let _ = writer.await;
+}
+
+/// The same retry, with a page LOST in between: the reading has to survive the
+/// retirement in order to still refuse.
+///
+/// This is what pins the receipt PLACEMENT on its own. The absence rule and the
+/// receipt are two halves of the same repair, and either alone answers the plain
+/// store-failure case - so a reading moved back onto the boundary entry, where
+/// the store failure's retirement takes it away, passes that test. Here a page is
+/// swept undelivered between the failure and the retry: the walk really is holed,
+/// and only a reading that survived the retirement can say so. With the reading
+/// on the entry the retry reads `Unvouchable` instead, withholds without
+/// discarding, and leaves the walk's rows in place as a resume position past the
+/// hole.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_marker_ack_retried_after_a_loss_still_discards_the_walks_rows() {
+    let failures = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let store: Arc<DynCheckpointStore> = Arc::new(FailingOnceStore {
+        inner: crate::cursor::InMemoryCheckpointStore::new(),
+        remaining: Arc::clone(&failures),
+    });
+    let (account, coverage, tx, writer) = writer_harness_over(Arc::clone(&store));
+    let scope = email_scope();
+
+    // A page of the walk, acknowledged and durable: the resume position that must
+    // not survive.
+    let page = backfill_checkpoint(bifrost_types::Partition(b"page:0:10".to_vec()));
+    let page_publication = register(
+        &coverage,
+        &page,
+        crate::cursor::CoverageClaim {
+            reports: Vec::new(),
+            generation: 0,
+        },
+    );
+    ack(&tx, page, Some(page_publication))
+        .await
+        .expect("the page persists");
+
+    // A second page, delivered and unacknowledged - what the sweep will strand.
+    let stranded = register(
+        &coverage,
+        &backfill_checkpoint(bifrost_types::Partition(b"page:10:20".to_vec())),
+        crate::cursor::CoverageClaim {
+            reports: Vec::new(),
+            generation: 0,
+        },
+    );
+    coverage.mark_delivered(&stranded, 1);
+
+    let marker = backfill_checkpoint_at(crate::backfill::partitioner::completion_partition(), 99);
+    let marker_publication =
+        publish_a_marker(&coverage, &marker, coverage.undelivered_watermark(&scope));
+
+    failures.store(1, std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        ack(&tx, marker.clone(), Some(marker_publication.clone()))
+            .await
+            .is_err(),
+        "the transient store failure reaches the consumer"
+    );
+
+    // The receiver departs before the consumer retries. Its page reached nobody
+    // who can answer for it, so this walk is holed.
+    assert_eq!(coverage.release_undelivered(None), 1);
+
+    ack(&tx, marker, Some(marker_publication))
+        .await
+        .expect("the retry is honoured");
+
+    assert!(
+        store
+            .get_backfill(&account, &scope)
+            .await
+            .expect("store read")
+            .is_none(),
+        "the retry must still see the loss and discard the walk's rows; a reading that \
+         vanished with the retirement cannot, and leaves a resume position past the hole"
+    );
+
+    drop(tx);
+    let _ = writer.await;
+}
+
+/// The same arm, one attachment later: an acknowledgement REPLAYED after a
+/// detach and re-attach must not delete a legitimately durable marker.
+///
+/// The receipt travels with the id the consumer persisted, so the reading comes
+/// back - taken against a per-scope counter that no longer exists, in a ledger
+/// that starts every scope at zero. Comparing it there refuses a marker nothing
+/// is wrong with. The id's high bits say which `PendingCoverage` minted it, so
+/// the answer is "not a marker this attachment can judge", which refuses nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_marker_ack_replayed_after_reattach_leaves_the_durable_marker() {
+    let scope = email_scope();
+    let marker = backfill_checkpoint_at(crate::backfill::partitioner::completion_partition(), 99);
+
+    // The PREVIOUS attachment mints the marker, under a watermark of its own.
+    let previous = crate::cursor::PendingCoverage::new();
+    previous.note_undelivered(&scope, 5);
+    let replayed = publish_a_marker(&previous, &marker, previous.undelivered_watermark(&scope));
+
+    // A fresh attachment: new ledger, every scope back at zero - and the marker
+    // ALREADY DURABLE, which is the case this test is about. Starting from an
+    // empty store would let the replay's own write satisfy the assertion, which
+    // is the opposite of what is being pinned.
+    let (account, store, coverage, tx, writer) = writer_harness();
+    store
+        .put_backfill(
+            &account,
+            match &marker {
+                bifrost_types::Checkpoint::Backfill(backfill) => backfill.clone(),
+                other => panic!("the marker is a backfill checkpoint: {other:?}"),
+            },
+        )
+        .await
+        .expect("seed the durable marker an earlier attachment earned");
+    assert_eq!(coverage.undelivered_watermark(&scope), 0);
+    assert_eq!(
+        coverage.walk_watermark(&replayed),
+        None,
+        "a prior attachment's id is not one this ledger can interpret"
+    );
+    ack(&tx, marker, Some(replayed))
+        .await
+        .expect("a replayed acknowledgement is honoured");
+
+    let stored = store
+        .get_backfill(&account, &scope)
+        .await
+        .expect("store read")
+        .expect("the replay must not delete the scope's rows");
+    assert!(
+        crate::backfill::partitioner::is_completion_partition(&stored.partition),
+        "a marker replayed across a re-attach carries a reading this ledger cannot \
+         interpret; discarding on it deletes a completion an earlier attachment \
+         legitimately earned"
+    );
+
+    drop(tx);
+    let _ = writer.await;
+}
+
+/// The other direction of the same rule: a replay must not CREATE a completion
+/// either.
+///
+/// The interleaving is ordinary. A consumer holds an unacknowledged page, a
+/// replacement receives the marker, and the detach beats the replacement's
+/// acknowledgement to the writer. On reattach the orchestrator parks on
+/// `wait_for_real_subscriber`, the replacement subscribes and flushes its pending
+/// acknowledgements, and that replayed marker resolves through the receipt
+/// fallback - landing a durable completion BEFORE the fresh walk has even read
+/// `get_backfill`. The scope is then skipped and the stranded page is never
+/// re-offered. A reading this ledger cannot interpret is not evidence in either
+/// direction: withhold, and let the new attachment earn its own marker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replayed_marker_does_not_create_a_completion_the_new_attachment_never_earned() {
+    let scope = email_scope();
+    let marker = backfill_checkpoint_at(crate::backfill::partitioner::completion_partition(), 99);
+
+    let previous = crate::cursor::PendingCoverage::new();
+    let replayed = publish_a_marker(&previous, &marker, previous.undelivered_watermark(&scope));
+
+    // A fresh attachment over an EMPTY store: nothing here has earned anything.
+    let (account, store, _coverage, tx, writer) = writer_harness();
+    ack(&tx, marker, Some(replayed))
+        .await
+        .expect("a replayed acknowledgement is honoured");
+
+    let stored = store
+        .get_backfill(&account, &scope)
+        .await
+        .expect("store read");
+    assert!(
+        !super::backfill::backfill_complete_recorded(stored.as_ref()),
+        "a replayed marker must not record a completion this ledger cannot vouch for: \
+         the fresh walk reads this row back and answers Skip, so the page the departed \
+         consumer stranded is never re-offered. got {stored:?}"
+    );
+
+    drop(tx);
+    let _ = writer.await;
+}
+
+/// A failed delete does NOT settle the request it could not satisfy.
+///
+/// The rows are exactly where they were, so a request consumed by a delete that
+/// did not happen is a repair nobody will attempt again: the teardown drain finds
+/// nothing to retry, and the next attach resumes from a position past the hole.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_discard_leaves_the_request_for_the_next_attempt() {
+    let store: Arc<DynCheckpointStore> = Arc::new(FailingDeleteStore {
+        inner: crate::cursor::InMemoryCheckpointStore::new(),
+    });
+    let (_account, coverage, tx, writer) = writer_harness_over(Arc::clone(&store));
+    let scope = email_scope();
+
+    // A loss recorded: the request is outstanding.
+    coverage.note_undelivered(&scope, 1);
+
+    let (done, wait) = oneshot::channel();
+    tx.send(WriterRequest::DiscardBackfillProgress {
+        scope: scope.clone(),
+        done,
+    })
+    .await
+    .expect("writer accepts the discard");
+    assert!(
+        wait.await.expect("writer answers").is_err(),
+        "the store refuses the delete"
+    );
+
+    assert!(
+        coverage.take_backfill_discard(&scope),
+        "the request must still be outstanding after a delete that failed - the rows it \
+         was asked to remove are still there, and consuming the request would leave \
+         teardown with nothing to retry"
+    );
+
+    drop(tx);
+    let _ = writer.await;
+}
+
+/// A CEILINGED discard does not answer the outstanding request, so it must not
+/// take it.
+///
+/// The ack path's discard is bounded by the refused marker's id - it retires that
+/// attempt and no newer one - while its delete takes every row of the scope. A
+/// delayed W1 marker acknowledgement arriving during W2 therefore leaves W2's own
+/// loss unrepaired: W2's consumer goes on acknowledging pages that rebuild rows
+/// past W2's hole, and a detach before W2's walk end would find nothing left to
+/// drain. Only an unbounded discard - the orchestrator's, which runs when no
+/// newer attempt exists - is the whole repair the request asks for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_ceilinged_discard_leaves_the_request_outstanding() {
+    let (_account, _store, coverage, tx, writer, _control) = writer_harness_observed();
+    let scope = email_scope();
+
+    // W1's marker, published under the reading of its own walk.
+    let marker = backfill_checkpoint_at(crate::backfill::partitioner::completion_partition(), 99);
+    let marker_publication =
+        publish_a_marker(&coverage, &marker, coverage.undelivered_watermark(&scope));
+
+    // W2 loses a page: the watermark moves and W2's request is outstanding.
+    coverage.note_undelivered(&scope, 1);
+
+    // The delayed W1 acknowledgement is refused and discards - ceilinged at W1's
+    // marker.
+    ack(&tx, marker, Some(marker_publication))
+        .await
+        .expect("the consumer's acknowledgement is honoured");
+
+    assert!(
+        coverage.take_backfill_discard(&scope),
+        "W2's request must still be outstanding: the ceilinged discard retired W1's \
+         attempt only, so nothing has answered W2's loss, and clearing it here leaves \
+         teardown with nothing to drain"
+    );
+
+    drop(tx);
+    let _ = writer.await;
+}
+
+/// A delayed acknowledgement of an OLD walk's marker must not retire the retry
+/// that has already started.
+///
+/// The refusal is right and the discard it triggers is right; its reach is the
+/// question. The marker is the last thing its walk published, so everything of
+/// that attempt sits at or below its id - and a retry that is already publishing
+/// sits above it. Retiring those too costs the retry its in-flight pages and
+/// hands the consumer a stream of refusals it can do nothing about.
+///
+/// A LEDGER-level pin of the ceiling, and staged as one: the orchestrator cannot
+/// actually produce this exact state, because its pre-retry discard retires the
+/// old attempt before the retry publishes anything. What is being pinned is the
+/// reach of `invalidate_scope_backfill`'s bound, which the writer's own path
+/// reaches from a delayed acknowledgement. The refusal here goes through the
+/// watermark COMPARISON - asserted below - and not through the "no reading at
+/// all" arm, which refuses nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stale_marker_ack_leaves_the_retrys_pages_alone() {
+    let (_account, _store, coverage, tx, writer, control) = writer_harness_observed();
+    let scope = CursorScope::Account;
+
+    // The old walk: a page, then its marker, published under a watermark that
+    // then moves - a page of that walk reached nobody.
+    publish_a_page(&control, &coverage, &lane_page(&scope, "page:0:10", 1));
+    let marker = bifrost_types::Checkpoint::Backfill(bifrost_types::BackfillCheckpoint {
+        scope: scope.clone(),
+        partition: crate::backfill::partitioner::completion_partition(),
+        progress_marker: None,
+        progress: bifrost_types::BackfillProgress {
+            items_done: 99,
+            items_estimated: None,
+        },
+        envelope_version: crate::cursor::ENGINE_VERSION,
+    });
+    let marker_publication =
+        publish_a_marker(&coverage, &marker, coverage.undelivered_watermark(&scope));
+    coverage.note_undelivered(&scope, 1);
+
+    // The RETRY is already under way: a page of its own, and its own marker
+    // registered and tagged - both of which the stale acknowledgement must leave
+    // exactly as it found them.
+    let retry_page = lane_page(&scope, "page:20:30", 2);
+    let retry_publication = publish_a_page(&control, &coverage, &retry_page);
+    let retry_marker = bifrost_types::Checkpoint::Backfill(bifrost_types::BackfillCheckpoint {
+        scope: scope.clone(),
+        partition: crate::backfill::partitioner::completion_partition(),
+        progress_marker: None,
+        progress: bifrost_types::BackfillProgress {
+            items_done: 199,
+            items_estimated: None,
+        },
+        envelope_version: crate::cursor::ENGINE_VERSION,
+    });
+    let retry_tag = coverage.undelivered_watermark(&scope);
+    let retry_marker_publication = publish_a_marker(&coverage, &retry_marker, retry_tag);
+    let in_flight_before = coverage.backfill_in_flight();
+
+    // The refusal comes from the COMPARISON: the old marker still reports the
+    // reading it was published under, even though the retry's marker superseded
+    // its entry, and that reading no longer matches the scope's.
+    assert_eq!(
+        coverage.walk_watermark(&marker_publication),
+        Some(0),
+        "the reading rides the receipt, so supersession cannot take it away"
+    );
+    assert_ne!(coverage.undelivered_watermark(&scope), 0);
+
+    // Now the stale marker is acknowledged. It is refused, and its attempt is
+    // discarded.
+    let (done, wait) = oneshot::channel();
+    tx.send(WriterRequest::Ack(crate::multiplexer::AckRequest {
+        scope: scope.clone(),
+        checkpoint: marker,
+        publication: Some(marker_publication),
+        auto: false,
+        complete: Some(done),
+    }))
+    .await
+    .expect("writer accepts the request");
+    wait.await
+        .expect("writer answers")
+        .expect("the consumer's acknowledgement is honoured");
+
+    // The retry's own registrations are untouched. Acknowledgeability alone does
+    // not prove that: `claim_checkpoint` falls back to the publication RECEIPT,
+    // so a page whose claim was retired still answers - which is exactly why the
+    // earlier version of this test passed against an unbounded retirement. The
+    // CHARGE and the tagged watermark are what the retirement takes away.
+    assert_eq!(
+        coverage.backfill_in_flight(),
+        in_flight_before - 2,
+        "exactly the refused marker's own attempt loses its charge - its page and the \
+         marker itself - and nothing of the retry's: taking the retry's pages too stops \
+         the bound binding for as many pages as it held"
+    );
+    assert_eq!(
+        coverage.walk_watermark(&retry_marker_publication),
+        Some(retry_tag),
+        "and the retry's marker must keep the watermark tagged on it, or its own \
+         acknowledgement reads `None`, is refused as WalkNotWhole, and runs a second \
+         discard over rows the consumer already answered for"
+    );
+
+    // The retry's page must still be acknowledgeable.
+    let (done, wait) = oneshot::channel();
+    tx.send(WriterRequest::Ack(crate::multiplexer::AckRequest {
+        scope,
+        checkpoint: retry_page,
+        publication: Some(retry_publication),
+        auto: false,
+        complete: Some(done),
+    }))
+    .await
+    .expect("writer accepts the request");
+    wait.await.expect("writer answers").expect(
+        "a page the RETRY published is newer than the marker being refused and must \
+                 stay acknowledgeable",
+    );
+
+    drop(tx);
+    let _ = writer.await;
+}
+
+/// Open debt must not MASK the discard a lost walk needs.
+///
+/// The two refusals answer different questions and only one of them is about the
+/// walk. Evaluating debt first withholds the marker - which looks like the right
+/// outcome - while the walk's positional rows, which point past the page nobody
+/// received, sit in the store untouched; a detach before the in-memory retry then
+/// hands a fresh attach a resume position beyond the hole.
+#[tokio::test]
+async fn open_debt_does_not_mask_the_discard_a_lost_walk_needs() {
+    let (account, store, coverage, tx, writer) = writer_harness();
+
+    // A degraded page, acknowledged: that is BOTH the scope's open debt and the
+    // durable row this walk leaves behind.
+    let page = backfill_checkpoint(bifrost_types::Partition(b"page:0:10".to_vec()));
+    let page_publication = register(
+        &coverage,
+        &page,
+        crate::cursor::CoverageClaim::new(
+            bifrost_types::InventoryCoverageReport::degraded(
+                bifrost_types::CoverageDomain::full(email_scope()),
+                vec![unrepresentable("broken")],
+            ),
+            1,
+        ),
+    );
+    ack(&tx, page, Some(page_publication))
+        .await
+        .expect("ack persisted");
+    assert!(
+        store
+            .get_backfill(&account, &email_scope())
+            .await
+            .expect("store read")
+            .is_some(),
+        "the walk left a durable row, which is what the discard has to remove"
+    );
+
+    // The walk's completion marker, published under a watermark that then moves:
+    // a page of this walk reached nobody.
+    let marker = backfill_checkpoint_at(crate::backfill::partitioner::completion_partition(), 99);
+    let marker_publication = publish_a_marker(
+        &coverage,
+        &marker,
+        coverage.undelivered_watermark(&email_scope()),
+    );
+    coverage.note_undelivered(&email_scope(), 1);
+
+    // Both conditions now hold. The consumer's acknowledgement is honoured; the
+    // marker is withheld either way, and the rows must go.
+    ack(&tx, marker, Some(marker_publication))
+        .await
+        .expect("the consumer's acknowledgement is honoured");
+
+    assert!(
+        store
+            .get_backfill(&account, &email_scope())
+            .await
+            .expect("store read")
+            .is_none(),
+        "a walk that lost a page must have its rows discarded whatever the scope's debt \
+         state; debt is a property of the scope, and this is a property of the walk"
+    );
+
+    drop(tx);
+    writer.await.expect("writer exits");
 }
 
 /// The common shape: the control handle is only needed by the tests that
@@ -507,6 +1195,169 @@ impl crate::cursor::store::CheckpointStore for FailingTransitionStore {
 
 /// Wraps a store and parks inside `delete_change_cursor` until released, so
 /// a test can act inside the writer's await window rather than around it.
+/// An in-memory store whose `delete_backfill` always FAILS.
+struct FailingDeleteStore {
+    inner: crate::cursor::InMemoryCheckpointStore,
+}
+
+impl CheckpointStore for FailingDeleteStore {
+    fn apply_transition<'a>(
+        &'a self,
+        account: &'a bifrost_types::AccountId,
+        transition: crate::cursor::store::CheckpointTransition,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send + 'a>> {
+        self.inner.apply_transition(account, transition)
+    }
+
+    fn get_change_cursor<'a>(
+        &'a self,
+        account: &'a bifrost_types::AccountId,
+        scope: &'a CursorScope,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Option<ChangeCursor>, Error>> + Send + 'a>,
+    > {
+        self.inner.get_change_cursor(account, scope)
+    }
+
+    fn get_backfill<'a>(
+        &'a self,
+        account: &'a bifrost_types::AccountId,
+        scope: &'a CursorScope,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<Option<bifrost_types::BackfillCheckpoint>, Error>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        self.inner.get_backfill(account, scope)
+    }
+
+    fn put_ledger<'a>(
+        &'a self,
+        account: &'a bifrost_types::AccountId,
+        ledger: crate::cursor::DebtLedger,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send + 'a>> {
+        self.inner.put_ledger(account, ledger)
+    }
+
+    fn get_ledger<'a>(
+        &'a self,
+        account: &'a bifrost_types::AccountId,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<crate::cursor::DebtLedger, Error>> + Send + 'a>,
+    > {
+        self.inner.get_ledger(account)
+    }
+
+    fn delete_change_cursor<'a>(
+        &'a self,
+        account: &'a bifrost_types::AccountId,
+        scope: &'a CursorScope,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send + 'a>> {
+        self.inner.delete_change_cursor(account, scope)
+    }
+
+    fn delete_backfill<'a>(
+        &'a self,
+        _account: &'a bifrost_types::AccountId,
+        _scope: &'a CursorScope,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send + 'a>> {
+        Box::pin(async { Err(Error::CheckpointStore("delete refused".into())) })
+    }
+}
+
+/// An in-memory store whose first `remaining` checkpoint writes FAIL.
+///
+/// The transient store error the ack path is built around: the consumer is told,
+/// and retries with the same publication id.
+struct FailingOnceStore {
+    inner: crate::cursor::InMemoryCheckpointStore,
+    remaining: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl CheckpointStore for FailingOnceStore {
+    fn apply_transition<'a>(
+        &'a self,
+        account: &'a bifrost_types::AccountId,
+        transition: crate::cursor::store::CheckpointTransition,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send + 'a>> {
+        if self
+            .remaining
+            .try_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |left| left.checked_sub(1),
+            )
+            .is_ok()
+        {
+            return Box::pin(async {
+                Err(Error::CheckpointStore("transient store failure".into()))
+            });
+        }
+        self.inner.apply_transition(account, transition)
+    }
+
+    fn get_change_cursor<'a>(
+        &'a self,
+        account: &'a bifrost_types::AccountId,
+        scope: &'a CursorScope,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Option<ChangeCursor>, Error>> + Send + 'a>,
+    > {
+        self.inner.get_change_cursor(account, scope)
+    }
+
+    fn get_backfill<'a>(
+        &'a self,
+        account: &'a bifrost_types::AccountId,
+        scope: &'a CursorScope,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<Option<bifrost_types::BackfillCheckpoint>, Error>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        self.inner.get_backfill(account, scope)
+    }
+
+    fn put_ledger<'a>(
+        &'a self,
+        account: &'a bifrost_types::AccountId,
+        ledger: crate::cursor::DebtLedger,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send + 'a>> {
+        self.inner.put_ledger(account, ledger)
+    }
+
+    fn get_ledger<'a>(
+        &'a self,
+        account: &'a bifrost_types::AccountId,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<crate::cursor::DebtLedger, Error>> + Send + 'a>,
+    > {
+        self.inner.get_ledger(account)
+    }
+
+    fn delete_change_cursor<'a>(
+        &'a self,
+        account: &'a bifrost_types::AccountId,
+        scope: &'a CursorScope,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send + 'a>> {
+        self.inner.delete_change_cursor(account, scope)
+    }
+
+    fn delete_backfill<'a>(
+        &'a self,
+        account: &'a bifrost_types::AccountId,
+        scope: &'a CursorScope,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send + 'a>> {
+        self.inner.delete_backfill(account, scope)
+    }
+}
+
 struct GatedDeleteStore {
     inner: Arc<crate::cursor::InMemoryCheckpointStore>,
     entered: tokio::sync::Semaphore,
@@ -1517,9 +2368,10 @@ fn backfill_skips_only_the_fusion_owned_incarnation_and_rescans_new_scopes() {
     let created = CursorScope::Folder(FolderId("created".into()));
     let fusion_owned = HashSet::from([fused.clone()]);
     let mut scan = BackfillScan::default();
+    let coverage = crate::cursor::PendingCoverage::new();
     let now = tokio::time::Instant::now();
 
-    let first = scan.select(vec![(fused.clone(), 1)], &fusion_owned, now);
+    let first = scan.select(vec![(fused.clone(), 1)], &fusion_owned, now, &coverage);
     assert!(
         first.is_empty(),
         "fusion's inventory must not be double-walked"
@@ -1529,6 +2381,7 @@ fn backfill_skips_only_the_fusion_owned_incarnation_and_rescans_new_scopes() {
         vec![(fused.clone(), 2), (created.clone(), 3)],
         &fusion_owned,
         now,
+        &coverage,
     );
     assert_eq!(later, vec![(fused, 2), (created, 3)]);
 }
@@ -1542,13 +2395,15 @@ async fn a_failed_backfill_incarnation_stays_eligible_for_retry() {
     let scope = CursorScope::Type(ObjectType::Email);
     let fusion_owned = HashSet::new();
     let mut scan = BackfillScan::default();
+    let coverage = crate::cursor::PendingCoverage::new();
     let available = vec![(scope.clone(), 7)];
 
     assert_eq!(
         scan.select(
             available.clone(),
             &fusion_owned,
-            tokio::time::Instant::now()
+            tokio::time::Instant::now(),
+            &coverage
         ),
         vec![(scope.clone(), 7)]
     );
@@ -1557,7 +2412,8 @@ async fn a_failed_backfill_incarnation_stays_eligible_for_retry() {
         scan.select(
             available.clone(),
             &fusion_owned,
-            tokio::time::Instant::now()
+            tokio::time::Instant::now(),
+            &coverage
         )
         .is_empty(),
         "a just-failed incarnation must back off rather than re-walk immediately"
@@ -1568,7 +2424,8 @@ async fn a_failed_backfill_incarnation_stays_eligible_for_retry() {
         scan.select(
             available.clone(),
             &fusion_owned,
-            tokio::time::Instant::now()
+            tokio::time::Instant::now(),
+            &coverage
         ),
         vec![(scope.clone(), 7)],
         "a failed incarnation must come back once its backoff elapses"
@@ -1577,9 +2434,119 @@ async fn a_failed_backfill_incarnation_stays_eligible_for_retry() {
     scan.record_attempt((scope.clone(), 7), true);
     tokio::time::advance(super::backfill::BACKFILL_RETRY_CAP * 2).await;
     assert!(
-        scan.select(available, &fusion_owned, tokio::time::Instant::now())
-            .is_empty(),
+        scan.select(
+            available,
+            &fusion_owned,
+            tokio::time::Instant::now(),
+            &coverage
+        )
+        .is_empty(),
         "a completed incarnation is never re-walked"
+    );
+}
+
+/// An incarnation that leaves the registry takes its residue with it.
+///
+/// A scope that is deleted, re-established, or simply never comes back otherwise
+/// leaves a retry deadline, a lost-pages mark and a baseline behind it - one set
+/// per incarnation, for the life of the attachment - and the orchestrator's
+/// "vanished during the subscriber wait" path adds one every time it fires.
+/// `settled` is deliberately kept: it is the memory that stops a concluded
+/// incarnation being walked again, and incarnation numbers only move forward.
+#[tokio::test(start_paused = true)]
+async fn a_departed_incarnation_leaves_no_residue_behind() {
+    let scope = CursorScope::Type(ObjectType::Email);
+    let fusion_owned = HashSet::new();
+    let mut scan = BackfillScan::default();
+    let coverage = crate::cursor::PendingCoverage::new();
+    coverage.note_undelivered(&scope, 3);
+    let key = (scope.clone(), 11);
+
+    scan.select(
+        vec![key.clone()],
+        &fusion_owned,
+        tokio::time::Instant::now(),
+        &coverage,
+    );
+    assert_eq!(
+        scan.begin_walk(&key, &coverage),
+        3,
+        "the walk begins under the scope's current reading"
+    );
+    scan.note_lost_pages(key.clone());
+    assert_eq!(scan.baseline_for(&key), 3, "which the scan holds for it");
+    assert!(scan.restarts_from_scratch(&key));
+
+    // The registry no longer carries it.
+    assert!(
+        scan.select(
+            Vec::new(),
+            &fusion_owned,
+            tokio::time::Instant::now(),
+            &coverage
+        )
+        .is_empty()
+    );
+    assert_eq!(
+        scan.baseline_for(&key),
+        0,
+        "a departed incarnation's baseline must not be kept for the life of the attachment"
+    );
+    assert!(!scan.restarts_from_scratch(&key), "nor its lost-pages mark");
+}
+
+/// A settle must be recorded against the reading its walk was CHECKED against,
+/// so a loss landing after those checks reopens the incarnation.
+///
+/// The window is small and real: the writer refuses the completion marker and
+/// discards the rows on exactly such a loss, and if the rescan adopts the same
+/// event as its baseline it compares that reading against itself for ever - the
+/// two halves of one repair reading one event in opposite directions, with the
+/// scope never walked again for the rest of the attachment. `BackfillScan` takes
+/// the baseline through `begin_walk`, as the walk starts, for that reason: a
+/// settle cannot be handed a reading nothing validated, because it is not handed
+/// one at all.
+#[tokio::test(start_paused = true)]
+async fn a_loss_after_the_checks_reopens_the_incarnation_it_settled() {
+    let scope = CursorScope::Type(ObjectType::Email);
+    let fusion_owned = HashSet::new();
+    let mut scan = BackfillScan::default();
+    let coverage = crate::cursor::PendingCoverage::new();
+    let available = vec![(scope.clone(), 3)];
+
+    assert_eq!(
+        scan.select(
+            available.clone(),
+            &fusion_owned,
+            tokio::time::Instant::now(),
+            &coverage
+        ),
+        vec![(scope.clone(), 3)]
+    );
+    // A loss BEFORE this walk begins belongs to whatever came earlier, and the
+    // baseline it starts under has to include it - otherwise every scope after
+    // the first in one rescan batch re-walks over its predecessor's losses.
+    coverage.note_undelivered(&scope, 4);
+    assert_eq!(scan.begin_walk(&(scope.clone(), 3), &coverage), 4);
+    // And the loss that lands after every check this pass made, before the
+    // settle, is precisely the interleaving the writer acts on.
+    coverage.note_undelivered(&scope, 1);
+    scan.record_attempt((scope.clone(), 3), true);
+
+    assert_eq!(
+        scan.select(
+            available,
+            &fusion_owned,
+            tokio::time::Instant::now(),
+            &coverage
+        ),
+        vec![(scope.clone(), 3)],
+        "the incarnation must be reopened: its walk was settled on checks made \
+         before a page of it reached nobody"
+    );
+    assert!(
+        scan.restarts_from_scratch(&(scope, 3)),
+        "and reopened as a walk that may not trust its stored resume position"
     );
 }
 

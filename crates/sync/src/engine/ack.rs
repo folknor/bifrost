@@ -319,6 +319,34 @@ pub(super) async fn ack_writer(
                 let _ = done.send(result);
                 continue;
             }
+            WriterRequest::DiscardBackfillProgress { scope, done } => {
+                // The change cursor stays and nothing re-establishes: this is not
+                // a reset, the scope is healthy and its walk simply cannot be
+                // resumed from where it stopped.
+                //
+                // But deleting the rows is not enough on its own, because the
+                // publications of the discarded attempt are still outstanding. A
+                // replacement consumer holding a later page can let this delete
+                // finish and acknowledge afterwards, and the writer would honour
+                // it and RECREATE exactly the resume position past the hole that
+                // the discard existed to remove. So the discarded attempt is
+                // fenced by the same machinery a reset uses: `invalidate_scope`
+                // retires the scope's publications, raises the acknowledgement
+                // fence past every id minted before now, and hands back their
+                // debt - which must be ingested here or the obligations vanish
+                // with the publications carrying them.
+                //
+                // Two passes for the reason the reset has two: the delete below
+                // is an await, and a still-running walk can register a further
+                // publication inside it.
+                // Unbounded: the orchestrator sends this BEFORE its retry mints
+                // anything, so there is nothing newer to protect.
+                let discarded =
+                    discard_backfill(&account_id, &store, &coverage, &mut ledger, &scope, None)
+                        .await;
+                let _ = done.send(discarded);
+                continue;
+            }
             WriterRequest::ResetScope {
                 scope,
                 delete_backfill,
@@ -393,7 +421,7 @@ pub(super) async fn ack_writer(
         // refused.
         let result = persist_ack_request(&account_id, &store, &coverage, &mut ledger, &req).await;
         match result {
-            Ok(AckPersistOutcome::SentinelWithheld) => {
+            Ok(AckPersistOutcome::Withheld) => {
                 // The completion sentinel was deliberately NOT written: the
                 // scope still carries open debt, so only the ledger landed.
                 // Nothing durable was created for this publication, so the
@@ -602,6 +630,70 @@ impl WriterHandle {
     }
 }
 
+/// Drop a scope's durable backfill rows AND fence the attempt that produced
+/// them, as one writer-ordered operation.
+///
+/// Called both for the orchestrator's explicit discard and from the ack path
+/// when a completion marker turns out to belong to a walk that lost pages: in
+/// both cases every publication of that attempt is void, and leaving them
+/// acknowledgeable is what lets a late ack rebuild the resume position the
+/// discard just removed.
+async fn discard_backfill(
+    account_id: &AccountId,
+    store: &Arc<DynCheckpointStore>,
+    coverage: &PendingCoverage,
+    ledger: &mut crate::cursor::DebtLedger,
+    scope: &CursorScope,
+    through: Option<&crate::cursor::PublicationId>,
+) -> Result<(), Error> {
+    // The BACKFILL half only. Fencing the whole scope refused a replacement
+    // consumer's acknowledgement of live batches it had really received, with an
+    // `Unknown` no retry could ever satisfy and no instruction to reconcile -
+    // after which the live cursor advances past changes nothing replayed. The
+    // discard is about this scope's backfill rows and about nothing else.
+    let mut debt = coverage.invalidate_scope_backfill(scope, through);
+    let now = jiff::Timestamp::now().as_second();
+    for report in &debt.reports {
+        ledger.ingest_debt_only(report, debt.generation, now);
+    }
+    let result = async {
+        persist_ledger_only(account_id, store, ledger).await?;
+        store.delete_backfill(account_id, scope).await
+    }
+    .await;
+    // Second pass, closing the window the delete just opened.
+    debt = coverage.invalidate_scope_backfill(scope, through);
+    if !debt.reports.is_empty() {
+        let now = jiff::Timestamp::now().as_second();
+        for report in &debt.reports {
+            ledger.ingest_debt_only(report, debt.generation, now);
+        }
+        if let Err(error) = persist_ledger_only(account_id, store, ledger).await {
+            tracing::warn!(
+                target: "bifrost.sync.backfill",
+                account = ?account_id,
+                scope = ?scope,
+                error = %error,
+                "could not persist debt published while a backfill discard was in flight"
+            );
+        }
+    }
+    // The request is settled only by a delete that SUCCEEDED, and only by an
+    // UNBOUNDED discard.
+    //
+    // Success, because a store error leaves the rows exactly where they were: a
+    // request consumed by a delete that did not happen is a repair nobody will
+    // attempt again, and the teardown drain finds nothing to retry. Unbounded,
+    // because a ceilinged discard retires only the attempt at or below the
+    // refused marker while its delete takes every row - so a delayed W1 marker
+    // acknowledgement arriving during W2 would clear W2's request while leaving
+    // W2's own loss unrepaired.
+    if through.is_none() && result.is_ok() {
+        coverage.take_backfill_discard(scope);
+    }
+    result
+}
+
 /// Write the ledger with no checkpoint advance.
 async fn persist_ledger_only(
     account_id: &AccountId,
@@ -797,9 +889,11 @@ fn apply_replacement(
 enum AckPersistOutcome {
     /// The acknowledged checkpoint itself is in the store.
     Durable,
-    /// A backfill completion sentinel was withheld over open debt; only the
-    /// ledger was persisted, so nothing durable exists for this checkpoint.
-    SentinelWithheld,
+    /// The checkpoint was deliberately NOT written: a completion sentinel the
+    /// ledger refused, or a backfill row acknowledged from a prior attachment's
+    /// publication. Only the ledger was persisted, so nothing durable exists for
+    /// this checkpoint.
+    Withheld,
 }
 
 /// Why an acknowledgement produced nothing durable.
@@ -817,6 +911,102 @@ enum AckFailure {
     Store(Error),
 }
 
+/// Why this completion sentinel must not become durable, if it must not.
+///
+/// Two independent questions, and the second is the one a point-in-time check
+/// cannot answer. The ledger knows whether the scope carries open debt. It does
+/// NOT know whether every page of the walk that produced this marker reached a
+/// consumer: a page that was CLEAN and simply never persisted owes nothing, so
+/// the debt check waves it through. The marker therefore carries the walk's
+/// undelivered watermark from the moment it was published, and it is compared
+/// again here - the same `Withheld` answer the emission gives, one layer later,
+/// because with spare capacity the marker is published before the loss happens.
+/// The reader that departs and strands a page is not required to do so before
+/// the marker goes out; it only has to do so before the replacement acknowledges
+/// it, and the retirement warning arrives BEHIND the marker in the same ring.
+///
+/// A marker whose registration is already gone reports no watermark, and that is
+/// refused too: an abandoned or evicted marker is precisely the case where
+/// delivery cannot be vouched for. An engine-internal acknowledgement carrying no
+/// publication at all is left to the debt check alone, as it always was.
+fn completion_refusal(
+    coverage: &PendingCoverage,
+    ledger: &crate::cursor::DebtLedger,
+    checkpoint: &bifrost_types::BackfillCheckpoint,
+    publication: Option<&crate::cursor::PublicationId>,
+) -> Option<CompletionRefusal> {
+    // Evaluated FIRST and independently of the debt, because the two answers
+    // call for different repairs and the stronger one must not be masked. When
+    // both hold, an early `OpenDebt` return withholds the marker and leaves the
+    // walk's positional rows - which point past the page nobody received -
+    // sitting in the store, so a detach before the in-memory retry hands a fresh
+    // attach a resume position beyond the hole. Debt is a property of the scope;
+    // this is a property of the walk.
+    // The watermark rides the RECEIPT, so "absent" does not mean "the
+    // registration is gone": a marker whose store write failed once, or whose
+    // entry a later publication superseded, still carries its reading and is
+    // still judged here. What is left over is an acknowledgement replayed across
+    // a detach, and that one is `Unvouchable` - withheld, with nothing touched.
+    if let Some(publication) = publication {
+        match coverage.walk_watermark(publication) {
+            Some(recorded) if recorded != coverage.undelivered_watermark(&checkpoint.scope) => {
+                return Some(CompletionRefusal::WalkNotWhole);
+            }
+            None => return Some(CompletionRefusal::Unvouchable),
+            Some(_) => {}
+        }
+    }
+    if !ledger.completion_permitted(&checkpoint.scope) {
+        return Some(CompletionRefusal::OpenDebt);
+    }
+    None
+}
+
+/// Three reasons, kept apart because they call for different repairs.
+///
+/// `OpenDebt` is about the scope's obligations and says nothing about the walk:
+/// the rows it produced are still a valid resume position, and a later pass may
+/// earn the marker once the debt is discharged.
+///
+/// `WalkNotWhole` says the walk itself is void - its pages did not all reach a
+/// consumer - so the rows it left are a resume position PAST a hole and must go,
+/// together with the outstanding publications of the attempt that wrote them.
+///
+/// `Unvouchable` says this ledger cannot answer the question at all: the marker
+/// was minted by a PRIOR attachment, so the reading its receipt carries belongs
+/// to a per-scope counter that no longer exists. Neither writing it nor
+/// discarding on it is defensible. Writing it lets a cross-attachment replay land
+/// a completion nothing can vouch for - the interleaving is ordinary: a consumer
+/// holds an unacknowledged page, a replacement receives the marker, the detach
+/// beats the replacement's acknowledgement, and on reattach that acknowledgement
+/// flushes through the receipt fallback before the orchestrator has even read
+/// `get_backfill`, so the fresh walk answers `Skip` and the stranded page is
+/// never re-offered. Discarding on it is just as wrong in the other direction: it
+/// would delete a marker an earlier attachment legitimately earned. So the answer
+/// is to WITHHOLD and touch nothing. A marker that is already durable keeps its
+/// row; one that never was has to be earned again by the attachment that can
+/// actually judge it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompletionRefusal {
+    OpenDebt,
+    WalkNotWhole,
+    Unvouchable,
+}
+
+impl CompletionRefusal {
+    fn reason(self) -> &'static str {
+        match self {
+            Self::OpenDebt => "the scope has open, unwaived debt",
+            Self::WalkNotWhole => {
+                "the walk that produced this marker did not reach a consumer with every page"
+            }
+            Self::Unvouchable => {
+                "the marker was minted by a prior attachment, whose walk this ledger cannot judge"
+            }
+        }
+    }
+}
+
 async fn persist_ack_request(
     account_id: &AccountId,
     store: &Arc<DynCheckpointStore>,
@@ -828,6 +1018,50 @@ async fn persist_ack_request(
         cursor
             .validate_envelope()
             .map_err(|_| AckFailure::Rejected(Error::SchemaIncompatible))?;
+    }
+    // A BACKFILL acknowledgement whose publication this ledger did not mint is
+    // withheld, and checked before the claim lookup so nothing of a prior
+    // attachment's evidence is ingested on the way past.
+    //
+    // The receipt travels with the id the consumer persisted, so an
+    // acknowledgement can replay across a detach - re-delivery rather than loss
+    // for a change cursor, which simply re-reads from an older position. A
+    // backfill row is not a position to re-read from but the position the next
+    // WALK starts at: replaying one that a discard removed hands the fresh walk a
+    // place to begin beyond a hole, after which an `OpenPages` plan takes its
+    // empty end probe, lands a marker, and never offers the stranded window
+    // again. The window is ordinary, not exotic: the orchestrator parks on the
+    // subscriber gate at attach, which is exactly when a returning consumer
+    // subscribes and flushes what it never got to acknowledge - before
+    // `get_backfill` has been read.
+    //
+    // Answered `Ok` with nothing durable, as `Unvouchable` is: the consumer did
+    // receive that batch, and the engine has nothing to reproach it with.
+    // Only when the receipt really names THIS batch's lane. A publication from
+    // another lane presented with a backfill checkpoint is evidence about the
+    // caller, not a replay, and keeps its `Rejected` answer below.
+    if let Checkpoint::Backfill(acked) = &req.checkpoint
+        && req.publication.as_ref().is_some_and(|id| {
+            !coverage.minted_here(id)
+                && matches!(
+                    id.1.checkpoint.as_ref(),
+                    Some(Checkpoint::Backfill(saved))
+                        if saved.scope == acked.scope && saved.partition == acked.partition
+                )
+        })
+    {
+        tracing::warn!(
+            target: "bifrost.sync.backfill",
+            account = ?account_id,
+            scope = ?req.scope,
+            "withholding a backfill row acknowledged from a prior attachment's \
+             publication; the next walk must not resume from a position this \
+             attachment cannot vouch for"
+        );
+        persist_ledger_only(account_id, store, ledger)
+            .await
+            .map_err(AckFailure::Store)?;
+        return Ok(AckPersistOutcome::Withheld);
     }
     match req
         .publication
@@ -860,21 +1094,45 @@ async fn persist_ack_request(
 
     if let Checkpoint::Backfill(b) = &req.checkpoint
         && crate::backfill::partitioner::is_completion_partition(&b.partition)
-        && !ledger.completion_permitted(&b.scope)
+        && let Some(reason) = completion_refusal(coverage, ledger, b, req.publication.as_ref())
     {
         tracing::warn!(
             target: "bifrost.sync.backfill",
             account = ?account_id,
             scope = ?b.scope,
-            "withholding backfill completion sentinel: the scope has open, unwaived debt"
+            reason = reason.reason(),
+            "withholding backfill completion sentinel"
         );
         // Not an error for the consumer - its batch was empty and its
         // acknowledgement was honoured. The sentinel simply does not become
         // durable, so the next attach re-walks instead of skipping the scope.
+        if reason == CompletionRefusal::WalkNotWhole {
+            // The rows this walk left behind are a resume position PAST a hole,
+            // so they go, and the attempt that wrote them is fenced with them.
+            // Withholding the marker alone would leave an `OpenPages` re-attach
+            // resuming beyond the pages nobody received - the marker is the only
+            // artefact the withholding touched, and it was never the one that
+            // carried the position.
+            // Bounded by the refused marker's own id. The marker is the last
+            // thing its walk published, so everything of that attempt sits at or
+            // below it - and a retry that has already started publishing sits
+            // above it and is left alone.
+            discard_backfill(
+                account_id,
+                store,
+                coverage,
+                ledger,
+                &b.scope,
+                req.publication.as_ref(),
+            )
+            .await
+            .map_err(AckFailure::Store)?;
+            return Ok(AckPersistOutcome::Withheld);
+        }
         persist_ledger_only(account_id, store, ledger)
             .await
             .map_err(AckFailure::Store)?;
-        return Ok(AckPersistOutcome::SentinelWithheld);
+        return Ok(AckPersistOutcome::Withheld);
     }
 
     store

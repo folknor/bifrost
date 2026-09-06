@@ -552,7 +552,13 @@ impl SyncEngine {
         // Drop the public ack sender so no new consumer acks enter
         // during teardown. Worker-held clones remain alive long enough
         // to flush their final checkpoint to the ack writer.
-        self.ack_senders.remove(account_id);
+        //
+        // The removed sender is KEPT here rather than discarded: teardown still
+        // has one durable request to make (the backfill discards below), and
+        // looking the key up again after removing it is a lookup that can only
+        // ever answer `None`. It is dropped before the writer is awaited, so it
+        // cannot hold the writer's channel open past its own drain.
+        let teardown_writer = self.ack_senders.remove(account_id).map(|(_, tx)| tx);
         // Ask running workers to checkpoint cleanly, then stop.
         slot.boundary_tx.send_replace(BoundaryRequest::Stop);
         // Trip shutdown before awaiting workers. Some account-level
@@ -583,6 +589,40 @@ impl SyncEngine {
         let deadline = tokio::time::Instant::now() + timeout;
         for worker in drained {
             await_worker_until(deadline, worker).await;
+        }
+        // Every loss recorded during this attachment asked for that scope's
+        // backfill rows to be dropped, and the walk drains those requests at its
+        // own end - but the orchestrator returns on shutdown from INSIDE its
+        // partition loop, so a detach between a loss and the end of the walk
+        // never reaches that drain. The rows left behind point past the hole and
+        // carry no marker above them: harmless for a `Fixed` plan, which re-walks
+        // everything, and a permanent hole for `OpenPages`, which resumes from
+        // them. This is the last moment the writer is still alive, so it is where
+        // the outstanding requests are settled.
+        if let Some(writer) = teardown_writer {
+            for scope in slot.coverage.take_backfill_discards() {
+                let (done, recv) = oneshot::channel();
+                if writer
+                    .send(WriterRequest::DiscardBackfillProgress {
+                        scope: scope.clone(),
+                        done,
+                    })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                if let Ok(Err(error)) = recv.await {
+                    tracing::warn!(
+                        target: "bifrost.sync.backfill",
+                        account = ?account_id,
+                        scope = ?scope,
+                        error = %error,
+                        "could not drop the backfill rows of a walk that lost pages before \
+                         detaching; a later attach may resume past them"
+                    );
+                }
+            }
         }
         if let Some(worker) = ack_worker {
             await_worker_until(deadline, worker).await;

@@ -442,9 +442,10 @@ mod tests {
         fn emit_marker<'a>(
             &'a self,
             scope: &'a CursorScope,
+            undelivered_before: u64,
         ) -> impl std::future::Future<Output = MarkerOutcome> + 'a {
             let fence = self.lane.coverage.scope_fence(scope);
-            self.emit_marker_for_walk(scope, fence)
+            self.emit_marker_for_walk(scope, undelivered_before, fence)
         }
 
         /// The production emission, exactly as the orchestrator calls it -
@@ -453,6 +454,7 @@ mod tests {
         fn emit_marker_for_walk<'a>(
             &'a self,
             scope: &'a CursorScope,
+            undelivered_before: u64,
             fence_at_walk_start: u64,
         ) -> impl std::future::Future<Output = MarkerOutcome> + 'a {
             crate::engine::backfill::emit_backfill_complete(
@@ -463,6 +465,7 @@ mod tests {
                 &self.lane.shutdown,
                 &self.lane.gate,
                 &self.delivery,
+                undelivered_before,
                 fence_at_walk_start,
             )
         }
@@ -667,6 +670,114 @@ mod tests {
             1,
             "the superseded page's charge lives on the survivor, so that is where \
              retiring it has to come off"
+        );
+    }
+
+    /// An abandonment records the pages it drains as undelivered - but only the
+    /// ones that were SENT.
+    ///
+    /// The consumer will never answer for a page abandoned out from under it, so
+    /// the walk that published it is holed and must not settle. A page that was
+    /// merely REGISTERED is a different thing entirely: the producer broadcasts
+    /// it moments later, the consumer receives and acknowledges it, and counting
+    /// it here would judge a walk holed over a page that arrived intact. That is
+    /// the same care `release_undelivered` takes with an unsent stamp, and for
+    /// the same reason.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_abandonment_records_only_the_pages_it_had_sent() {
+        let h = harness(4);
+        let before = h.coverage.undelivered_watermark(&scope_a());
+
+        // One page broadcast to receiver 0, one registered and not yet sent.
+        h.publish(&page(&scope_a(), "page:0:10", 1), 1);
+        h.coverage.register(
+            page(&scope_a(), "page:10:20", 1),
+            CoverageClaim {
+                reports: Vec::new(),
+                generation: 0,
+            },
+        );
+        assert_eq!(h.coverage.backfill_in_flight(), 2);
+
+        assert_eq!(h.coverage.abandon_checkpoints(), 2, "both are drained");
+        assert_eq!(
+            h.coverage.undelivered_watermark(&scope_a()),
+            before + 1,
+            "and exactly the one that had been sent is recorded as reaching nobody; \
+             charging the unsent page too judges the walk holed over a page the \
+             consumer is about to receive and acknowledge"
+        );
+    }
+
+    /// A discard request belongs to ONE scope, and only that scope's walk may
+    /// take it.
+    ///
+    /// The walk-end drain used to take every outstanding request. A loss recorded
+    /// against scope A after A's own walk ended is already repaired - the
+    /// ack-time refusal withholds A's marker and the pre-retry discard drops its
+    /// rows - but nothing cleared the request, so the next lossy walk of ANY
+    /// scope carried it off and acted on it arbitrarily later, deleting a
+    /// completion A had since re-earned and refusing the consumer's
+    /// acknowledgement of it. Every producer of a request has a scope; so does
+    /// every consumer of one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_walks_drain_takes_only_its_own_scopes_discard_request() {
+        let h = harness(4);
+        h.coverage.note_undelivered(&scope_a(), 1);
+        h.coverage.note_undelivered(&scope_b(), 1);
+
+        assert!(
+            h.coverage.take_backfill_discard(&scope_b()),
+            "scope B's walk takes B's request"
+        );
+        assert!(
+            !h.coverage.take_backfill_discard(&scope_b()),
+            "and taking is draining: the same request is not answered twice"
+        );
+        assert!(
+            h.coverage.take_backfill_discard(&scope_a()),
+            "A's request is still A's to answer - B's walk end must not have carried \
+             it off and discarded rows A may since have re-earned"
+        );
+    }
+
+    /// And it judges each SUBSUMED page by its own stamp, not by the survivor's.
+    ///
+    /// A survivor can be unsent while the pages folded into it were delivered -
+    /// publish page A to the consumer, then register page B on the same partition
+    /// before it goes out - and gating the whole entry on the survivor's stamp
+    /// then records nothing at all. The page the consumer really lost to the lag
+    /// goes unrecorded, and the walk's completion marker becomes durable over it.
+    /// `release_undelivered` asks the question once per page for this reason;
+    /// this path now does too.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_abandonment_judges_each_subsumed_page_by_its_own_stamp() {
+        let h = harness(4);
+        let before = h.coverage.undelivered_watermark(&scope_a());
+
+        // One page of a partition, sent; then a second on the SAME partition,
+        // which supersedes it and has not been sent yet.
+        h.publish(&page(&scope_a(), "page:0:10", 1), 1);
+        h.coverage.register(
+            page(&scope_a(), "page:0:10", 2),
+            CoverageClaim {
+                reports: Vec::new(),
+                generation: 0,
+            },
+        );
+        assert_eq!(
+            h.coverage.retained_history(),
+            1,
+            "the survivor carries the sent page it superseded"
+        );
+
+        assert_eq!(h.coverage.abandon_checkpoints(), 2);
+        assert_eq!(
+            h.coverage.undelivered_watermark(&scope_a()),
+            before + 1,
+            "the SUBSUMED page was delivered and is lost with the abandonment; the \
+             unsent survivor is not. Reading the survivor's stamp for both records \
+             nothing and lets the marker stand over a page the consumer lost"
         );
     }
 
@@ -992,6 +1103,83 @@ mod tests {
         );
     }
 
+    /// FINDING 1. "Is somebody subscribed at the end" is not the question; "did
+    /// every page of this walk reach somebody" is, and only a WATERMARK can
+    /// answer it.
+    ///
+    /// A consumer that fills the bound and leaves, is replaced before the walk
+    /// finishes, and whose replacement acknowledges the rest satisfies every
+    /// point-in-time check while the pages published in the gap reached nobody.
+    /// The orchestrator compares this watermark across the walk for exactly that
+    /// reason.
+    #[tokio::test(start_paused = true)]
+    async fn the_undelivered_watermark_records_pages_that_reached_nobody() {
+        let h = harness(4);
+        let before = h.coverage.undelivered_watermark(&scope_a());
+
+        // Two pages delivered to receiver 0, which then goes away: the sweep
+        // retires them and records the loss.
+        h.publish(&page(&scope_a(), "page:0:10", 1), 1);
+        h.publish(&page(&scope_a(), "page:10:20", 1), 1);
+        assert_eq!(h.coverage.release_undelivered(None), 2);
+        let after_sweep = h.coverage.undelivered_watermark(&scope_a());
+        assert!(
+            after_sweep > before,
+            "a sweep that retires pages nobody can read must record it"
+        );
+
+        // A page the producer sends while nobody is listening records it too -
+        // that is the runner's retire-on-sentinel-only path.
+        h.coverage.note_undelivered(&scope_a(), 1);
+        assert!(h.coverage.undelivered_watermark(&scope_a()) > after_sweep);
+
+        // And it is MONOTONIC: a consumer arriving afterwards cannot erase the
+        // record, which is the whole point. A subscriber count would read as
+        // healthy the instant one appears.
+        assert!(h.coverage.undelivered_watermark(&scope_a()) > before);
+    }
+
+    /// And the record is PER SCOPE. An account-wide counter would let a page of
+    /// one scope that reached nobody make another scope's in-flight walk look
+    /// holed - so a walk that delivered every one of its own pages would have its
+    /// completion marker withheld and be sent round again, for ever, for as long
+    /// as any sibling scope kept losing pages.
+    ///
+    /// Both routes into the counter are checked, because both take a scope and
+    /// either could take the wrong one: the departure sweep, which attributes each
+    /// retired entry through its own lane, and the direct
+    /// retire-on-sentinel-only note.
+    #[tokio::test(start_paused = true)]
+    async fn the_undelivered_watermark_is_recorded_against_one_scope_only() {
+        let h = harness(4);
+        let b_before = h.coverage.undelivered_watermark(&scope_b());
+
+        // A page of scope A, published to a receiver that then departs.
+        h.publish(&page(&scope_a(), "page:0:10", 1), 1);
+        assert_eq!(h.coverage.release_undelivered(None), 1);
+        assert!(
+            h.coverage.undelivered_watermark(&scope_a()) > 0,
+            "the sweep must record against the scope whose page it retired"
+        );
+        assert_eq!(
+            h.coverage.undelivered_watermark(&scope_b()),
+            b_before,
+            "and against no other: a sibling scope's walk delivered everything and \
+             must not be judged holed for it"
+        );
+
+        // Same for the publish path's direct note.
+        h.coverage.note_undelivered(&scope_a(), 1);
+        assert_eq!(
+            h.coverage.undelivered_watermark(&scope_b()),
+            b_before,
+            "the retire-on-sentinel-only path is per scope too"
+        );
+        // And scope B's own losses are still recorded, on B.
+        h.coverage.note_undelivered(&scope_b(), 1);
+        assert_eq!(h.coverage.undelivered_watermark(&scope_b()), b_before + 1);
+    }
+
     /// FINDING 5. A page that parks on the bound and resumes AFTER its scope was
     /// reset must be abandoned, not published.
     ///
@@ -1022,7 +1210,8 @@ mod tests {
         // One page holds the whole bound, so the marker's wait is a real one.
         h.lane.publish(&page(&scope, "page:0:10", 1), 1);
 
-        let emit = h.emit_marker(&scope);
+        let before = h.lane.coverage.undelivered_watermark(&scope);
+        let emit = h.emit_marker(&scope, before);
         tokio::pin!(emit);
         assert!(
             still_parked(emit.as_mut()).await,
@@ -1070,6 +1259,7 @@ mod tests {
         // mint counter it fences at is past the walk's own starting fence.
         h.lane.publish(&page(&scope, "page:0:10", 1), 1);
         let fence_at_walk_start = h.lane.coverage.scope_fence(&scope);
+        let before = h.lane.coverage.undelivered_watermark(&scope);
 
         // The reset closes while the walk's last page is still on the provider
         // stream, so it lands BEFORE the emission rather than during its wait.
@@ -1082,7 +1272,9 @@ mod tests {
 
         // The bound is wide open, so this is the FAST path: no park, no wake, and
         // therefore nothing but the carried fence can catch the reset.
-        let outcome = h.emit_marker_for_walk(&scope, fence_at_walk_start).await;
+        let outcome = h
+            .emit_marker_for_walk(&scope, before, fence_at_walk_start)
+            .await;
         assert_eq!(
             outcome,
             MarkerOutcome::Withheld,
@@ -1091,6 +1283,44 @@ mod tests {
              replacement incarnation with itself"
         );
         assert_eq!(h.received(), 0, "and nothing is broadcast");
+    }
+
+    /// The sixth review's first finding. `every_page_reached_someone` is read
+    /// BEFORE the marker is emitted, and the emission can park indefinitely - so
+    /// the reading has to be re-validated after the wait as well.
+    ///
+    /// The staging is the one that loses a page: the final page of the walk is
+    /// still unacknowledged, so the marker parks behind it; the receiver holding
+    /// it departs, and the sweep both records the page undelivered AND frees the
+    /// capacity the marker is parked on. Publishing on that wake records a
+    /// durable completion for a walk that lost a page an instant earlier, and the
+    /// replacement consumer acknowledges it in good faith.
+    #[tokio::test(start_paused = true)]
+    async fn a_page_swept_while_the_marker_waits_withholds_the_marker() {
+        let h = marker_harness(1);
+        let scope = scope_a();
+        let before = h.lane.coverage.undelivered_watermark(&scope);
+        // The walk's final page: delivered to receiver 0, unacknowledged.
+        h.lane.publish(&page(&scope, "page:0:10", 1), 1);
+
+        let emit = h.emit_marker(&scope, before);
+        tokio::pin!(emit);
+        assert!(still_parked(emit.as_mut()).await, "parked behind the page");
+
+        // Receiver 0 departs. This is the sweep: it records the page as reaching
+        // nobody and frees the bound in the same transition.
+        assert_eq!(h.lane.coverage.release_undelivered(None), 1);
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), emit)
+            .await
+            .expect("the sweep frees the bound and wakes the marker");
+        assert_eq!(
+            outcome,
+            MarkerOutcome::Withheld,
+            "a walk that lost a page while its marker waited must not record a durable \
+             completion; the pre-wait reading cannot see this"
+        );
+        assert_eq!(h.received(), 0, "and the marker is not broadcast");
     }
 
     /// A capacity of zero would be a permanently parked cold start.

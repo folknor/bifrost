@@ -277,6 +277,25 @@ impl SyncControl {
         )
     }
 
+    /// The completion-marker flavour: the same publication, with the walk's
+    /// undelivered watermark stamped into its receipt so the ack writer can ask
+    /// again - at acknowledgement time, and after any retirement - whether the
+    /// walk this marker concludes is still whole.
+    pub(crate) fn publish_walk_marker(
+        &self,
+        checkpoint: Checkpoint,
+        walk_watermark: u64,
+    ) -> crate::cursor::PublicationId {
+        self.inner.publications.register_walk_marker(
+            checkpoint,
+            crate::cursor::CoverageClaim {
+                reports: Vec::new(),
+                generation: 0,
+            },
+            walk_watermark,
+        )
+    }
+
     /// Engine-side hook for a broadcast that will never produce a
     /// durable checkpoint: the checkpoint store rejected the ack, or
     /// the batch reached no real subscriber so no ack is coming.

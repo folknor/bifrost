@@ -572,6 +572,13 @@ impl BackfillRunner {
                             None => tx.send(me).unwrap_or(0),
                         };
                         if !crate::multiplexer::delivered_to_real_subscriber(delivered) {
+                            // This page reached nobody. Record it against the
+                            // account's undelivered watermark so the enclosing
+                            // walk cannot later settle the scope on the strength
+                            // of a subscriber who was not there for this page.
+                            if let Some(gate) = lane {
+                                gate.coverage().note_undelivered(&scope, 1);
+                            }
                             match (control, coverage, publication) {
                                 // Through control when there is one: it
                                 // releases the boundary registration and the

@@ -156,6 +156,19 @@ between them.
     neither the gate nor the bound, with `wait_for_real_subscriber` counting
     numbered receivers instead of raw ones. Small and contained; deliberately
     not folded into the lane landing.
+12. **sync: the teardown window in the completion guarantee.** Recorded with
+    the guarantee's landing (2026-09-06), not fixed. A receiver dropped
+    between `detach`'s drain of the outstanding discard requests and the slot
+    being dropped records a request nobody can act on, because the writer is
+    already gone. Staging: a walk loses pages, teardown takes and settles the
+    outstanding requests, and only then does a consumer still holding an
+    earlier page depart; the sweep records the loss into a set no drain will
+    visit again. The cost is the ordinary one for an unrepaired loss on an
+    `OpenPages` scope: the next attach resumes past the hole. Closing it means
+    either draining again after the last receiver can no longer exist (the
+    slot drop, which is not an async context) or refusing the sweep's record
+    once teardown has begun; neither is obviously right, and it wants a ruling
+    before either is built.
 
 - **sync tenant throttle identity.** `ThrottleScope::Tenant` cannot be enforced
   across sibling accounts because `AccountError` carries no tenant identity.

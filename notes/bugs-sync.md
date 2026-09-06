@@ -101,9 +101,9 @@ That sweep in turn made a PRE-EXISTING defect visible: a consumer replaced
 mid-walk leaves a hole, and the replacement acknowledges the completion marker
 over it. The repository owner ruled on 2026-09-06 that the engine owns that
 guarantee, and that multiple receivers stay a supported shape with exactly one
-acknowledger. The repair lands in the commit after this one and is described
-in `reference/sync.md` under "Completion integrity across consumer
-replacement".
+acknowledger. The repair landed as its own commit and is described in
+`reference/sync.md` under "Completion integrity across consumer replacement";
+its one recorded gap, the teardown window, is `notes/todo.md` item 12.
 
 Seventeen overnight review rounds were spent on the two together, thirteen of
 them on the repair; the standing lesson that came out of that is in

@@ -942,6 +942,129 @@ with one deliberate exception: the single-lock ordering in `ChangeDelivery` is
 structural and cannot be staged, since any hook between a send and its stamp
 would deadlock on the same lock rather than race.
 
+### Completion integrity across consumer replacement
+
+The receiver sweep above made a pre-existing defect visible, and the engine
+now guarantees against it: a consumer replaced mid-walk must not leave a
+durable completion marker, or a durable resume position, over pages nobody
+received. A receiver that departs holding unacknowledged pages strands them,
+because its replacement joined at the ring's tail. Left alone, the walk
+completes, the replacement acknowledges the completion marker in good faith,
+and every later attach answers `Skip` with the stranded pages never offered
+again. The guarantee holds for one acknowledging receiver under the contract
+above, and it costs re-walks in the direction that is safe: under-reporting
+coverage re-walks, over-reporting it loses objects nobody sees again.
+
+**Every page that reaches nobody is recorded, per scope.** `PendingCoverage`
+keeps a monotonic undelivered counter keyed by scope
+(`undelivered_watermark`, bumped by `note_undelivered`). Three paths feed it:
+the runner's send that reached only the sentinel receiver, the receiver-drop
+sweep (`release_undelivered`, attributing each retired entry through its own
+lane), and a lag abandonment (`abandon_checkpoints`). The last two judge one
+page at a time and count only pages that were actually sent, since a survivor
+can be unsent while the pages folded into it were delivered, and an unsent
+page is about to reach whoever subscribes next. Keyed by scope rather than
+counted per account because the reading is a verdict on one walk; a shared
+counter would re-walk scope Y for scope X's losses for as long as X kept
+losing pages. It has its own mutex because the sweep records after dropping
+the ledger lock.
+
+**A walk is judged whole by comparing two readings.** `BackfillScan::begin_walk`
+takes the scope's reading as each walk starts, not when the batch was
+selected, since one rescan hands out several scopes walked in turn, and the
+scan owns it. The orchestrator compares after the walk; `emit_backfill_complete`
+compares again after its capacity wait, because a departing receiver's sweep
+both records the walk's last page undelivered and frees the capacity the
+marker is parked on; and the orchestrator re-reads once more after the
+emission, because the marker is itself a publication that can reach nobody. A
+walk that is not whole records an attempt instead of settling, the registry is
+marked from the same answer, and `MarkerOutcome::Withheld` keeps the
+orchestrator running on the next scope.
+
+**The marker carries its walk's reading to acknowledgement time.** With spare
+capacity the marker reaches every receiver at once, so the loss can land after
+it was published: A holds a page, B subscribes behind it, both receive the
+marker, A departs, B acknowledges. The debt check cannot see this, because a
+clean page that was never persisted owes nothing. So `register_walk_marker`
+stamps the walk's reading into the publication RECEIPT, not the boundary entry,
+which a store failure or a supersession removes while the acknowledgement is
+still valid, and the writer's `completion_refusal` compares it against the
+scope's current reading. `WalkNotWhole` is evaluated before `OpenDebt`, since
+only the first is about the walk and its repair must not be masked. A marker
+minted by a PRIOR attachment, recognised by the id's instance segment
+(`minted_here`), is `Unvouchable`: withheld with nothing touched, since
+writing it would land a completion no ledger can vouch for and discarding on
+it would delete one an earlier attachment earned. A backfill PAGE acknowledged
+from a prior attachment is withheld on the same rule, before the claim lookup,
+because a backfill row is the next walk's starting position rather than a
+place to re-read from. All of these ride `AckPersistOutcome::Withheld`: the
+consumer's acknowledgement succeeds, and only the durable row is refused.
+
+**A walk that lost pages forfeits its resume position, durably.** Withholding
+the marker is not enough for `BackfillPlan::OpenPages`, whose resume starts
+after the furthest acknowledged window, which sits past the hole. So
+`BackfillScan` marks the incarnation `lost_pages` and its next walk takes
+`walk_from_scratch`; and because that note dies with the attachment while the
+rows do not, the scope's backfill rows are also dropped
+(`WriterRequest::DiscardBackfillProgress`, rows only: no cursor, no ledger).
+The discard FENCES the attempt that wrote the rows, the way a reset does and
+twice around its store awaits, or a late acknowledgement from a consumer still
+holding one of that walk's pages rebuilds the row. It fences the backfill lane
+only (`invalidate_scope_backfill`, a second per-scope fence map), because
+fencing the whole scope refused live-lane acknowledgements the replacement
+had genuinely received. The ack-time discard is ceilinged at the refused
+marker's id, the newest id its attempt minted, so a delayed acknowledgement of
+an old walk's marker cannot retire a retry that is already publishing.
+
+**The discard is requested when the loss is recorded, and settled only by a
+delete that succeeded.** `note_undelivered` records the scope in a request
+set, because every trigger that ran at walk end lived in the attachment that
+saw the loss and the orchestrator returns on shutdown from inside its
+partition loop. A walk takes its OWN scope's request at its end, the pre-retry
+discard and the writer's `WalkNotWhole` discard take it because each is the
+repair asked for, and `detach` drains what is left while the writer is still
+alive. A failed delete, or a ceilinged discard, leaves the request outstanding.
+
+**The rescan reopens a settled incarnation whose reading moved.** The marker
+is published and the incarnation settled in one step, and the loss that voids
+both can land afterwards, so `BackfillScan::settled` records the walk's
+baseline and `select` compares it on every rescan: a moved reading unsettles
+the incarnation as `lost_pages`. A retry that restarts from scratch discards
+BEFORE it walks, since a loss landing after the marker's acknowledgement
+leaves a durable marker that nothing else removes. `select` prunes the
+baseline, retry deadline and lost-pages mark of any incarnation the registry
+no longer carries.
+
+**One recorded gap.** A receiver dropped between `detach`'s drain of the
+request set and the slot being dropped records a request nobody can act on,
+because the writer is gone. The cost is the ordinary one for an unrepaired
+loss on an `OpenPages` scope: the next attach resumes past the hole. Filed in
+`notes/todo.md`.
+
+Two consumer-visible answers describe one durable outcome: an acknowledgement
+that lands after the pre-retry discard is refused as an unknown publication,
+one a moment earlier is answered `Ok` with the row withheld. In both cases
+nothing became durable and the consumer's correct response is the same
+re-read from its last durable checkpoint.
+
+Pinned end to end in `tests/backfill_lane_flow_control.rs` by the mid-walk
+replacement, the open-ended retry, the loss after the marker was published
+and after it was durable, the incomplete positional walk across a detach, the
+withheld marker not abandoning the account's other scopes, the runner's own
+sentinel-only recording, the ack-time refusal reopening the incarnation and
+the next attach, the loss with no walk running settled by detach, the detach
+between a loss and the walk's end, the page acknowledgement replayed across a
+detach, the walk-end drain deleting only its own scope's rows, and pages lost
+to a lag withholding the marker. Pinned at the writer in `engine/tests.rs` by
+the discard fence, its confinement to the backfill lane, the marker retried
+after a store failure and after a loss, the marker replayed after reattach in
+both directions, the failed and the ceilinged discard leaving the request
+outstanding, the stale marker leaving the retry's pages alone, and open debt
+not masking the discard; at the scan by the departed incarnation's residue
+and the loss after the checks; and at the ledger and gate by the watermark
+tests and the abandonment's per-page recording. Each ablation named in those
+tests' doc comments was applied, observed to fail the test, and restored.
+
 `LiveSupersedes` is the ring-evicting `(VecDeque + HashSet)` set
 `BackfillRunner::run_partition` filters each inventory page through,
 via `filter_supersedes`. Default cap
@@ -2537,7 +2660,14 @@ no in-engine caller - teardown pulses the slot's
 is kept as published surface rather than removed, the same standing as
 `SyncControl::record_checkpoint`. `ChangeDelivery` is public from `multiplexer`
 (`new`, `sender`, `publish_backfill`, `subscribe`, `min_live`). `PendingCoverage`
-gained six public methods: `mark_delivered`, `backfill_in_flight`,
+gained thirteen public methods: `mark_delivered`, `backfill_in_flight`,
 `await_backfill_capacity`, `release_undelivered`, `scope_fence` and
-`retained_history`. `BackfillConfig` gained `lane_capacity`. Everything else the
-lane work touched is `pub(crate)` or narrower.
+`retained_history` with the bound, then `register_walk_marker`,
+`walk_watermark`, `minted_here`, `note_undelivered`, `take_backfill_discard`,
+`take_backfill_discards` and `undelivered_watermark` with the completion
+guarantee. `PublicationReceipt` gained a public field,
+`walk_watermark: Option<u64>`, which is a struct-literal break for any
+downstream constructing one. `BackfillConfig` gained `lane_capacity`, and
+`WriterRequest` a `DiscardBackfillProgress` variant (crate-internal - that enum
+is not re-exported). Everything else the lane work touched is `pub(crate)` or
+narrower.
