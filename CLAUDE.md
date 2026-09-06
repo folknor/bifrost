@@ -2,12 +2,6 @@
 
 ## More rules
 
-### The spec-loop
-
-- When the user asks to orchestrate, to run the loop, or to work a goal down to landed commits, run `orchestrate` FIRST and follow it exactly - it is the standing procedure (roles, the seven steps, the waiting discipline, codex invocation).
-- Note its Input section: confirm the goal with the user before launching anything.
-- The orchestrate workflow, once invoked, overrides the global foreground-subagent rule (its launches are background by design, per the user's standing instruction in that document).
-
 ### General rules
 
 - Never suggest or use the `Workflow` tool (multi-agent orchestration / "ultracode"). Bifrost orchestration goes through the spec-loop emitted by `orchestrate`.

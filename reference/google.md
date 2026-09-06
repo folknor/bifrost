@@ -767,8 +767,16 @@ History entries map to `Change` variants in
 ## Paging inventory
 
 Google has no universal paging helper, but every internally traversed walk has
-its own repeated-token detection and 10,000-page refusal budget. The production
-paging sites are:
+its own repeated-token detection and 10,000-page refusal budget. Where a page
+trips both guards, the repeated-token check is evaluated FIRST and owns the
+diagnostic: it names a provider contract breach, where the budget only reports
+"too many pages", which is also what an honestly huge corpus looks like. Both
+refusals terminate the walk identically as far as the engine is concerned, so
+the order is purely a diagnostic choice - but it is a fixed one in the two Gmail
+sync walks and in `contactGroups.list`, pinned per lane by a test that feeds a
+page tripping both, and `calendars_list` reaches the same order structurally
+(its budget is the `for` loop's own bound, so it can only fire after the token
+check). The production paging sites are:
 
 - Gmail `search` and `search_messages` each request one provider page and return
   its `nextPageToken`. They are bounded by one request per call and resume at a

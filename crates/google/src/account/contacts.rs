@@ -89,22 +89,30 @@ pub(crate) fn address_books_list(
     })
 }
 
+/// Decides whether the walk must refuse to follow `next_page_token`,
+/// returning the diagnostic detail for the terminating error.
+///
+/// Guard ORDER is deliberate and matches `inventory::inventory_walk_refusal`,
+/// `changes::walk_refusal` and `calendar::calendars_list`: the repeated-token
+/// check runs FIRST. Both guards terminate the walk, so the engine sees the
+/// same outcome either way, but a page that trips both deserves the sharper
+/// diagnosis. A repeated token names a provider contract breach - the server
+/// is cycling and no amount of further paging makes progress - where the
+/// budget only reports "too many pages", which is also what an honestly huge
+/// address book looks like.
 fn address_book_walk_refusal(
     seen_page_tokens: &mut HashSet<String>,
     pages_walked: usize,
     next_page_token: &str,
 ) -> Option<String> {
-    if pages_walked >= MAX_ADDRESS_BOOK_PAGES {
-        Some(format!(
-            "google contactGroups.list exceeded {MAX_ADDRESS_BOOK_PAGES} pages in one walk"
-        ))
-    } else if !seen_page_tokens.insert(next_page_token.to_string()) {
-        Some(format!(
+    if !seen_page_tokens.insert(next_page_token.to_string()) {
+        return Some(format!(
             "google contactGroups.list repeated page token {next_page_token:?}"
-        ))
-    } else {
-        None
+        ));
     }
+    (pages_walked >= MAX_ADDRESS_BOOK_PAGES).then(|| {
+        format!("google contactGroups.list exceeded {MAX_ADDRESS_BOOK_PAGES} pages in one walk")
+    })
 }
 
 pub(crate) fn list(
@@ -1267,6 +1275,26 @@ mod tests {
         let exhausted = address_book_walk_refusal(&mut fresh, MAX_ADDRESS_BOOK_PAGES, "fresh")
             .expect("budget must refuse");
         assert!(exhausted.contains("exceeded"));
+    }
+
+    /// A page that trips BOTH guards is diagnosed as the repeated token,
+    /// not as budget exhaustion: the repeated token is the sharper claim,
+    /// and this lane must agree with `inventory_walk_refusal` and
+    /// `changes::walk_refusal`.
+    #[test]
+    fn a_page_tripping_both_guards_is_diagnosed_as_the_repeated_token() {
+        let mut seen = HashSet::new();
+        seen.insert("cycling".to_string());
+        let detail = address_book_walk_refusal(&mut seen, MAX_ADDRESS_BOOK_PAGES, "cycling")
+            .expect("a page tripping both guards must refuse");
+        assert!(
+            detail.contains("repeated page token"),
+            "repeated-token detection must win over the budget: {detail}",
+        );
+        assert!(
+            !detail.contains("exceeded"),
+            "the budget must not claim a page the repeated-token guard owns: {detail}",
+        );
     }
 
     #[test]

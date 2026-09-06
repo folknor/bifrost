@@ -273,11 +273,19 @@ pub(crate) fn changes_stream_cancellable(
 /// Decides whether the walk must refuse to follow `next_page_token`,
 /// returning the diagnostic detail for the terminating error.
 ///
-/// Two independent guards, matching `calendars_list`: a repeated token
-/// means the server is cycling and no amount of further paging makes
-/// progress, and the page budget catches a server that hands out fresh
-/// tokens forever. `None` means the walk may continue (or stop normally,
-/// when there is no token at all).
+/// Two independent guards, matching `calendars_list` and
+/// `inventory::inventory_walk_refusal`: a repeated token means the server
+/// is cycling and no amount of further paging makes progress, and the page
+/// budget catches a server that hands out fresh tokens forever. `None`
+/// means the walk may continue (or stop normally, when there is no token
+/// at all).
+///
+/// Guard ORDER is deliberate: the repeated-token check runs FIRST. Both
+/// guards terminate the walk identically as far as the engine is
+/// concerned, but for a page that trips both, a repeated token is the
+/// sharper diagnosis - it names a provider contract breach, where the
+/// budget only reports "too many pages", which is also what an honestly
+/// huge mailbox looks like.
 fn walk_refusal(
     seen_page_tokens: &mut HashSet<String>,
     pages_walked: usize,
@@ -565,6 +573,25 @@ mod tests {
         assert!(
             walk_refusal(&mut seen, MAX_HISTORY_PAGES, None).is_none(),
             "a walk that ends on the budget page ends normally",
+        );
+    }
+
+    /// A page that trips BOTH guards is diagnosed as the repeated token,
+    /// not as budget exhaustion: the repeated token is the sharper claim,
+    /// and this lane must agree with `inventory_walk_refusal`.
+    #[test]
+    fn a_page_tripping_both_guards_is_diagnosed_as_the_repeated_token() {
+        let mut seen = HashSet::new();
+        seen.insert("cycling".to_string());
+        let detail = walk_refusal(&mut seen, MAX_HISTORY_PAGES, Some("cycling"))
+            .expect("a page tripping both guards must refuse");
+        assert!(
+            detail.contains("repeated a page token"),
+            "repeated-token detection must win over the budget: {detail}",
+        );
+        assert!(
+            !detail.contains("exceeded"),
+            "the budget must not claim a page the repeated-token guard owns: {detail}",
         );
     }
 

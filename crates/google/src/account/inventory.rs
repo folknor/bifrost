@@ -426,6 +426,49 @@ pub(crate) fn get_stream(
     get_stream_cancellable(client, cache, ids, projection, CancellationToken::new())
 }
 
+/// Surveyed against the crate's other emitting streams and deliberately NOT
+/// merged into a shared batched-stream driver. Recorded here so the next reader
+/// does not redo the survey and reach the opposite conclusion.
+///
+/// The candidates were this function, `changes::changes_stream_cancellable`,
+/// `mutation::mutation_stream`, `scopes::scope_lifecycle_stream`, and
+/// `inventory_stream_cancellable` above. Only the first three are
+/// `stream::unfold` at all: the lifecycle stream is an unfold but emits a
+/// different event enum with no batches, no boundary, no byte tally and no
+/// terminal `Done`, and the inventory walk is an `async_stream::stream!`. What
+/// the three unfolds actually share is a seven-line `finished` / `emitted_done`
+/// epilogue. Everything around it differs, and each difference is load-bearing:
+///
+/// - Batch source. Mutation and hydration drain an input `AccountStream`; the
+///   change stream pages a provider endpoint and has no input stream; the
+///   lifecycle stream polls on a timer with backoff.
+/// - Lookahead. Mutation reads one item past a full batch so a stream whose
+///   length divides the cap still ends `Final`. Hydration must NOT: its ids
+///   come from a backpressured producer that may be waiting on hydration
+///   output, so a lookahead deadlocks the two sides (see the comment in the
+///   drain loop below). One shared drain helper cannot hold both rules without
+///   a flag whose two settings are the two loops.
+/// - Shutdown. The read streams end silently, publishing nothing. The mutation
+///   driver cannot: after dispatch it owes `Uncertain` lanes plus a terminator,
+///   which is why it alone drains a pending-event slot BEFORE testing the
+///   token, inverting the order every other machine uses.
+/// - Failure disposition. Four lanes, four questions, not four answers to one.
+///   A mutation batch was transmitted as a set, so the question is whether the
+///   refusal is attributable per id (`error::terminates_mutation_stream`). The
+///   inventory walk owns a coverage-obligation ledger, so it has a third answer
+///   nothing else has: discharge, defer as an obligation, or terminate on a
+///   list-page failure. A hydration item named its own id and affects no other,
+///   so it always takes a `Failed` lane while a label-vocabulary failure ahead
+///   of any transmission terminates. The lifecycle poll has no items at all and
+///   asks only retry-or-escalate, which the `RecoveryClass` answers alone. A
+///   `FailurePolicy::for(error, lane)` returning `Vec<ItemOutcome>` /
+///   `InventoryObligation` / `ItemOutcome` / continue-or-stop is this match
+///   re-spelled behind an indirection, and it would move the mutation rule away
+///   from the classification in `error.rs` that it reads.
+///
+/// A driver covering all of it needs roughly a dozen parameters, several of
+/// them closures returning the next batch, to delete seven duplicated lines
+/// three times. Keep the machines separate.
 pub(crate) fn get_stream_cancellable(
     client: Arc<GmailClient>,
     cache: ScopeCache,
@@ -603,19 +646,31 @@ struct HydrateState {
     shutdown: CancellationToken,
 }
 
+/// Decides whether the walk must refuse to follow `next_page_token`,
+/// returning the diagnostic detail for the terminating error.
+///
+/// Guard ORDER is deliberate and matches `changes::walk_refusal` and
+/// `calendar::calendars_list`: the repeated-token check runs FIRST. Both
+/// guards terminate the walk, so the engine sees the same outcome either
+/// way, but a page that trips both deserves the sharper diagnosis. A
+/// repeated token names a provider contract breach - the server is cycling
+/// and no amount of further paging makes progress - where the budget only
+/// reports "too many pages", which is also what an honestly huge mailbox
+/// looks like.
 fn inventory_walk_refusal(
     seen_page_tokens: &mut HashSet<String>,
     pages_walked: usize,
     next_page_token: Option<&str>,
 ) -> Option<String> {
     let token = next_page_token?;
-    if pages_walked >= MAX_INVENTORY_PAGES {
+    if !seen_page_tokens.insert(token.to_string()) {
         return Some(format!(
-            "gmail users.messages.list exceeded {MAX_INVENTORY_PAGES} pages in one walk"
+            "gmail users.messages.list repeated page token {token:?}"
         ));
     }
-    (!seen_page_tokens.insert(token.to_string()))
-        .then(|| format!("gmail users.messages.list repeated page token {token:?}"))
+    (pages_walked >= MAX_INVENTORY_PAGES).then(|| {
+        format!("gmail users.messages.list exceeded {MAX_INVENTORY_PAGES} pages in one walk")
+    })
 }
 
 async fn list_messages_page(
@@ -1072,6 +1127,25 @@ mod tests {
                 .contains("exceeded")
         );
         assert!(inventory_walk_refusal(&mut fresh, MAX_INVENTORY_PAGES, None).is_none());
+    }
+
+    /// A page that trips BOTH guards is diagnosed as the repeated token,
+    /// not as budget exhaustion: the repeated token is the sharper claim,
+    /// and this lane must agree with `changes::walk_refusal`.
+    #[test]
+    fn a_page_tripping_both_guards_is_diagnosed_as_the_repeated_token() {
+        let mut seen = HashSet::new();
+        seen.insert("cycling".to_string());
+        let detail = inventory_walk_refusal(&mut seen, MAX_INVENTORY_PAGES, Some("cycling"))
+            .expect("a page tripping both guards must refuse");
+        assert!(
+            detail.contains("repeated page token"),
+            "repeated-token detection must win over the budget: {detail}",
+        );
+        assert!(
+            !detail.contains("exceeded"),
+            "the budget must not claim a page the repeated-token guard owns: {detail}",
+        );
     }
 
     #[tokio::test(start_paused = true)]
