@@ -305,7 +305,13 @@ impl CalDavAccount {
                 .and_then(|collection| collection.sync_token),
             None => client.collection_sync_token(calendar, operation).await?,
         };
-        let listing = client.list_events_listing(calendar, operation).await?;
+        // VEVENT-filtered, not the bare depth-1 PROPFIND: a VTODO or VJOURNAL
+        // sharing the collection would otherwise enter the event snapshot and be
+        // emitted as a created/updated event change that hydrates to nothing.
+        // Degrades to the unfiltered listing when the server refuses the filter.
+        let listing = client
+            .list_event_hrefs_filtered(calendar, operation)
+            .await?;
         let failed_hrefs = listing.failed_hrefs();
         let mut entries = listing
             .entries
@@ -2235,6 +2241,135 @@ mod tests {
             "<D:multistatus xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\">{}</D:multistatus>",
             responses.concat()
         )
+    }
+
+    /// The calendar-home depth-1 answer the snapshot lane reads its collection
+    /// sync token out of.
+    fn home_listing() -> DavResponse {
+        cal_multistatus(wrap(&[
+            "<D:response><D:href>/cal/</D:href><D:propstat><D:prop>\
+<D:resourcetype><D:collection/><C:calendar/></D:resourcetype>\
+<D:displayname>Work</D:displayname></D:prop>\
+<D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>"
+                .to_string(),
+        ]))
+    }
+
+    fn cursor_entry_uris(cursor: &ChangeCursor) -> Vec<String> {
+        decode_cursor_snapshot(cursor)
+            .expect("the cursor this account just minted decodes")
+            .entries
+            .into_iter()
+            .map(|entry| entry.uri)
+            .collect()
+    }
+
+    fn folder_scope() -> CursorScope {
+        CursorScope::Folder(FolderId("https://dav.example.test/cal/".to_string()))
+    }
+
+    /// caldav-F1: a VTODO or VJOURNAL sharing the collection must not occupy
+    /// the event cursor.
+    ///
+    /// The depth-1 PROPFIND carries no component type, so the only way to keep
+    /// a task out of the event snapshot is to make the SERVER apply a VEVENT
+    /// `comp-filter`. The assertion is written against the request because that
+    /// is where a regression shows: a lane that goes back to the bare listing
+    /// sends a PROPFIND, and the task resource the server would then name lands
+    /// in the snapshot as a created event that hydrates to nothing.
+    #[tokio::test]
+    async fn the_cursor_listing_asks_the_server_for_vevent_resources_only() {
+        let query = wrap(&[queried("a"), queried("b")]);
+        let script = dav_script([home_listing(), cal_multistatus(query)]);
+        let client =
+            CalDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
+        let account = CalDavAccount::for_tests(Arc::new(client), "https://dav.example.test/cal/");
+
+        let established = account
+            .establish_initial_cursor(folder_scope())
+            .await
+            .expect("initial cursor");
+        let CursorEstablishment::Ready(cursor) = established else {
+            panic!("a CalDAV cursor is established synchronously");
+        };
+
+        assert_eq!(
+            cursor_entry_uris(&cursor),
+            vec![
+                "https://dav.example.test/cal/a.ics".to_string(),
+                "https://dav.example.test/cal/b.ics".to_string(),
+            ]
+        );
+
+        let requests = transcripts(&script);
+        assert_eq!(requests.len(), 2, "one home listing and one event listing");
+        assert_eq!(
+            requests[1].method.as_str(),
+            "REPORT",
+            "the cursor listing must be the filtered query, not the bare PROPFIND"
+        );
+        assert!(
+            requests[1].body.contains("<C:comp-filter name=\"VEVENT\">"),
+            "the component filter must reach the server: {}",
+            requests[1].body
+        );
+        assert!(
+            !requests[1].body.contains("<C:time-range"),
+            "the cursor listing is unbounded in time: {}",
+            requests[1].body
+        );
+        assert!(
+            !requests[1].body.contains("<C:calendar-data/>"),
+            "the cursor listing must not hydrate: {}",
+            requests[1].body
+        );
+    }
+
+    /// The other half: a server that will not run the filter must not lose its
+    /// cursor. The lane degrades to the unfiltered depth-1 PROPFIND, which is
+    /// what it did unconditionally before, and mints the same snapshot.
+    ///
+    /// Without the degrade a store with no `calendar-query` support would fail
+    /// every `establish_initial_cursor` outright - strictly worse than carrying
+    /// the odd task resource.
+    #[tokio::test]
+    async fn the_cursor_listing_degrades_to_the_propfind_when_the_filter_is_refused() {
+        let refusal = DavResponse {
+            status: StatusCode::METHOD_NOT_ALLOWED,
+            headers: HeaderMap::new(),
+            body: String::new(),
+            url: "https://dav.example.test/cal/".to_string(),
+        };
+        let listing = wrap(&[queried("a"), queried("b")]);
+        let script = dav_script([home_listing(), refusal, cal_multistatus(listing)]);
+        let client =
+            CalDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
+        let account = CalDavAccount::for_tests(Arc::new(client), "https://dav.example.test/cal/");
+
+        let established = account
+            .establish_initial_cursor(folder_scope())
+            .await
+            .expect("a refused filter degrades rather than failing the cursor");
+        let CursorEstablishment::Ready(cursor) = established else {
+            panic!("a CalDAV cursor is established synchronously");
+        };
+
+        assert_eq!(
+            cursor_entry_uris(&cursor),
+            vec![
+                "https://dav.example.test/cal/a.ics".to_string(),
+                "https://dav.example.test/cal/b.ics".to_string(),
+            ]
+        );
+
+        let requests = transcripts(&script);
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[1].method.as_str(), "REPORT");
+        assert_eq!(
+            requests[2].method.as_str(),
+            "PROPFIND",
+            "the degrade lane is the unfiltered collection listing"
+        );
     }
 
     fn event_ids(page: &Page<CalendarEvent>) -> Vec<String> {

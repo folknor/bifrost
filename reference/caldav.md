@@ -266,9 +266,13 @@ Supported calendar primitives:
   lanes share.
 
   **A server that will not run the filter degrades rather than failing.**
-  `bifrost_dav_core::filter_unsupported` decides: a `400`, a `501`, or a `403`
+  `bifrost_dav_core::filter_unsupported` decides: a `400`, a `501`, a `405`, or a
+  `403`
   naming `supported-filter` / `supported-collation` / `valid-filter` /
-  `supported-report` in its body. A bare `403` is deliberately NOT degraded (it
+  `supported-report` in its body. The `405` is the server refusing the REPORT
+  method itself - the same answer one layer down, and the one that matters most
+  for the cursor listing lane below, whose alternative would be failing a sync
+  the unfiltered PROPFIND would have served. A bare `403` is deliberately NOT degraded (it
   is far more often a permission refusal, and swallowing it would replace a
   classified `NoPermission` with whatever the listing answered), and a `401`
   never is - a stale credential must reach the consumer as a reauthorize signal
@@ -594,13 +598,38 @@ When a successful `sync-collection` response omits its required replacement
 sync token, the account emits a warning and retains the previous token. This
 keeps replay-and-deduplicate behavior while exposing the server violation.
 
-Known cursor limitation: VTODO / VJOURNAL resources sharing the collection
-still occupy the event cursor. Both change lanes key on the PROPFIND href
-listing, which does not carry the component type, so a task resource is
-emitted as a created/updated event change whose hydration yields no events
-(the `.ics`-without-VEVENT rule above). Filtering it out needs either a
-component-type PROPFIND or a first-fetch classification cache (tracked as
-caldav-F1).
+**The cursor listing is VEVENT-filtered on the server.** A calendar collection
+may hold VTODO and VJOURNAL resources beside its events - RFC 4791 leaves that
+to `supported-calendar-component-set`, which many servers never restrict - and
+the depth-1 PROPFIND carries no component type, so a task resource used to enter
+the event snapshot and be emitted as a created event change that hydrated to
+nothing. `client.list_event_hrefs_filtered` is what the snapshot lanes
+(`establish_initial_cursor`, `inventory_stream`, and the polling `changes_stream`
+fallback) now take: a `calendar-query` REPORT carrying the bare
+`comp-filter` VEVENT and no time-range, asking for `getetag` only. It is the same
+`calendar_query_body` the range lane uses with both bounds absent, returns the
+same `CalDavEventListing` with the same failure lane, and costs the same single
+round trip the PROPFIND did.
+
+A server that will not run the filter degrades to the unfiltered depth-1
+PROPFIND, which is what these lanes did unconditionally before. The degrade is
+not optional: a narrower listing is only safe when the server actually applied
+the predicate, and an event silently dropped here would be reported to the
+consumer as a deletion by the snapshot diff. `filter_unsupported` degrades a
+`405` for exactly this lane - a store that refuses REPORT would otherwise fail
+every `establish_initial_cursor` outright, which is strictly worse than carrying
+the odd task resource. Both halves are pinned by
+`the_cursor_listing_asks_the_server_for_vevent_resources_only` and
+`the_cursor_listing_degrades_to_the_propfind_when_the_filter_is_refused`, whose
+assertions read the REQUEST, so a lane that reverts to the PROPFIND fails rather
+than passing on an unchanged snapshot.
+
+Residual: the `sync-collection` lane is not filtered - RFC 6578 has no filter
+grammar. A VTODO created or modified between two token polls is still reported
+once as a created/updated event change that hydrates to nothing, and then sits in
+the snapshot. Nothing establishes or re-walks with it any more, so the leak is
+now bounded to resources touched during a token-backed poll rather than to every
+resource in the collection.
 
 All mail, contact, filter, blob, push, and settings methods return
 `AccountErrorKind::Unsupported` stamped with `Protocol::CalDav`.

@@ -318,6 +318,11 @@ const FILTER_PRECONDITIONS: [&str; 4] = [
 ///   implement no query filter at all answer this, with no precondition
 ///   element to inspect.
 /// - `501`, an explicit "not implemented".
+/// - `405`, the server refusing the REPORT method itself. It is the same
+///   answer one layer down - there is no query to run - and it reaches these
+///   lanes from static-ish or proxy-fronted deployments. Degrading it matters
+///   most for the cursor listing lane, whose alternative is failing a sync that
+///   the unfiltered PROPFIND would have served.
 /// - `403` naming one of [`FILTER_PRECONDITIONS`]. A bare 403 is deliberately
 ///   NOT degraded: it is far more often a permission refusal, and swallowing it
 ///   into a whole-collection walk would replace a classified `NoPermission`
@@ -327,7 +332,10 @@ const FILTER_PRECONDITIONS: [&str; 4] = [
 /// reauthorize signal, not as a quietly narrower search.
 #[must_use]
 pub fn filter_unsupported(status: StatusCode, body: &str) -> bool {
-    if status == StatusCode::BAD_REQUEST || status == StatusCode::NOT_IMPLEMENTED {
+    if status == StatusCode::BAD_REQUEST
+        || status == StatusCode::NOT_IMPLEMENTED
+        || status == StatusCode::METHOD_NOT_ALLOWED
+    {
         return true;
     }
     if status != StatusCode::FORBIDDEN {
@@ -347,6 +355,8 @@ mod tests {
     fn a_refused_filter_is_told_apart_from_a_refused_caller() {
         assert!(filter_unsupported(StatusCode::BAD_REQUEST, ""));
         assert!(filter_unsupported(StatusCode::NOT_IMPLEMENTED, ""));
+        // A server that refuses REPORT outright will not run the filter either.
+        assert!(filter_unsupported(StatusCode::METHOD_NOT_ALLOWED, ""));
         assert!(filter_unsupported(
             StatusCode::FORBIDDEN,
             "<D:error xmlns:D=\"DAV:\"><C:supported-filter/></D:error>"

@@ -290,7 +290,7 @@ Supported contact primitives:
 
   **A server that will not run the filter degrades rather than failing**, by
   the shared `bifrost_dav_core::filter_unsupported` rule
-  `reference/caldav.md` documents (400, 501, or a 403 naming a filter
+  `reference/caldav.md` documents (400, 501, 405, or a 403 naming a filter
   precondition; never a bare 403, never a 401). The degrade lane is the depth-1
   listing - the same walk `contacts_list` and the empty-query lane take - and
   all three sources produce the same `HrefQuery` and run through the same

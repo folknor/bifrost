@@ -226,6 +226,38 @@ impl CalDavClient {
         Ok(listing)
     }
 
+    /// The event listing the CURSOR lanes take: the same href/etag listing
+    /// `list_events_listing` produces, but restricted to VEVENT resources by a
+    /// server-side `comp-filter`.
+    ///
+    /// A calendar collection may hold VTODO and VJOURNAL resources beside its
+    /// events (RFC 4791 s4.2 leaves that to
+    /// `supported-calendar-component-set`, which many servers never restrict).
+    /// The depth-1 PROPFIND cannot tell them apart - it carries no component
+    /// type - so a task resource entered the event snapshot, was emitted as a
+    /// created event change, and hydrated to nothing. An empty
+    /// `calendar_query_body` is exactly the "every VEVENT in this collection"
+    /// filter, answers with `getetag` only, and costs the same single round trip
+    /// the PROPFIND did.
+    ///
+    /// A server that will not run the filter degrades to the unfiltered
+    /// PROPFIND, which is what this lane did unconditionally before: a narrower
+    /// listing is only safe when the server actually applied the predicate, and
+    /// an event dropped here would be reported as a deletion by the snapshot
+    /// diff.
+    pub(crate) async fn list_event_hrefs_filtered(
+        &self,
+        calendar_url: &str,
+        operation: AccountOperation,
+    ) -> Result<crate::parse::CalDavEventListing, AccountError> {
+        let body = calendar_query_body(None, None);
+        match self.href_query_leg(calendar_url, &body, operation).await {
+            HrefLeg::Listing(listing) => Ok(listing),
+            HrefLeg::FilterUnsupported => self.list_events_listing(calendar_url, operation).await,
+            HrefLeg::Failed(error) => Err(error),
+        }
+    }
+
     /// Cheap depth-0 PROPFIND used by snapshot polling to refresh the
     /// collection sync token without re-listing every calendar collection.
     pub(crate) async fn collection_sync_token(
