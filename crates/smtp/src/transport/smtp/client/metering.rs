@@ -89,6 +89,25 @@ impl WireMetering {
         self.out_bucket.take(n, self.cap_now())
     }
 
+    /// How many bytes a single socket write may offer, given the cap in
+    /// force right now: one second of budget, or `None` when uncapped.
+    ///
+    /// The bucket lets tokens go negative, so a write charged for several
+    /// megabytes parks a sleep of several *seconds* - and the async funnel
+    /// makes the next write wait that sleep out before it touches the
+    /// socket, inside the caller's per-operation write timeout. A healthy
+    /// throttled upload then looks exactly like a stalled peer. Clamping
+    /// what is offered bounds any parked debt at about a second, so the
+    /// write timeout is only ever spent on the peer. It does not clamp the
+    /// debt itself: a write at or below this limit still owes proportional
+    /// time, which is what keeps a 1 B/s cap at 1 B/s.
+    ///
+    /// Re-read per call for the same reason `cap_now` is.
+    pub(crate) fn write_chunk_limit(&self) -> Option<usize> {
+        self.cap_now()
+            .map(|cap| usize::try_from(cap).unwrap_or(usize::MAX))
+    }
+
     /// Read the cap fresh on every call: a consumer can retune it at any
     /// time through `Account::set_bandwidth_cap`, and a connection that
     /// snapshotted it at construction would hold a stale budget for its
@@ -122,6 +141,16 @@ struct ByteBucketState {
     /// 16 KiB writes would behave like several hundred B/s).
     tokens: f64,
     last_refill: Instant,
+    /// The cap `tokens` is denominated in. Tokens are BYTES and debt is
+    /// read back as `-tokens / cap`, so a cap change between two charges
+    /// would re-price debt already owed: 1 MB charged at 1 MB/s is one
+    /// second of debt, and re-reading it at a 1 KB/s cap makes it ~1000
+    /// seconds - which the next write then waits out inside the caller's
+    /// per-operation timeout, the exact failure `write_chunk_limit`
+    /// exists to prevent. Rescaling on the way in keeps the debt fixed in
+    /// SECONDS, so a retune changes the future rate without repricing the
+    /// past.
+    priced_at: Option<f64>,
 }
 
 impl ByteBucket {
@@ -130,6 +159,7 @@ impl ByteBucket {
             state: Arc::new(Mutex::new(ByteBucketState {
                 tokens: cap.map_or(0.0, |cap| cap as f64),
                 last_refill: Instant::now(),
+                priced_at: cap.map(|cap| cap as f64),
             })),
         }
     }
@@ -145,6 +175,15 @@ impl ByteBucket {
         }
         let cap_f = cap as f64;
         let mut state = self.lock_state();
+        // Re-denominate any standing balance into the cap now in force
+        // before it is read as a duration. See `priced_at`.
+        if let Some(previous) = state.priced_at
+            && previous > 0.0
+            && (previous - cap_f).abs() > f64::EPSILON
+        {
+            state.tokens *= cap_f / previous;
+        }
+        state.priced_at = Some(cap_f);
         let now = Instant::now();
         let elapsed = now.duration_since(state.last_refill).as_secs_f64();
         // Credit never exceeds one second of budget, so an idle
@@ -227,6 +266,39 @@ mod tests {
             metering.record_in(500),
             None,
             "inbound has its own untouched budget"
+        );
+    }
+
+    /// Debt is owed in SECONDS, not in bytes-at-whatever-cap-is-current.
+    /// Tokens are bytes and the debt is `-tokens / cap`, so lowering the
+    /// cap between two charges used to re-price debt already owed: one
+    /// second's worth at the old cap read back as a thousand seconds at
+    /// the new one, which the next write then waits out inside the
+    /// caller's per-operation write timeout - the very failure the
+    /// one-second offer clamp exists to prevent.
+    #[test]
+    fn lowering_the_cap_does_not_reprice_debt_already_owed() {
+        let cap = Arc::new(AtomicU64::new(1_000_000));
+        let metering = WireMetering::new(None, Some(Arc::clone(&cap)));
+
+        // Burn the initial second, then owe about one more second at 1 MB/s.
+        assert_eq!(metering.record_out(1_000_000), None);
+        let debt = metering
+            .record_out(1_000_000)
+            .expect("a second megabyte overspends");
+        assert!(
+            debt <= Duration::from_millis(1100),
+            "1 MB at 1 MB/s is about a second, got {debt:?}"
+        );
+
+        // A consumer retunes down by three orders of magnitude. The debt
+        // standing from the previous charge is a second of time, and it
+        // must stay a second of time.
+        cap.store(1_000, Ordering::Relaxed);
+        let debt = metering.record_out(1).expect("still in debt");
+        assert!(
+            debt <= Duration::from_millis(1100),
+            "the outstanding debt was priced at the old cap; got {debt:?}"
         );
     }
 

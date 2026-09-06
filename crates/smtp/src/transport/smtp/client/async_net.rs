@@ -138,6 +138,8 @@ impl AsyncTokioStream for crate::transport::smtp::test_support::AsyncTranscriptS
 impl AsyncTokioStream for crate::transport::smtp::test_support::StalledPeer {}
 #[cfg(test)]
 impl AsyncTokioStream for crate::transport::smtp::test_support::SlowLinePeer {}
+#[cfg(test)]
+impl AsyncTokioStream for crate::transport::smtp::test_support::SlowSinkPeer {}
 
 /// Represents the different types of underlying network streams
 // usually only one TLS backend at a time is going to be enabled,
@@ -454,6 +456,18 @@ impl AsyncWrite for AsyncNetworkStream {
     ) -> Poll<IoResult<usize>> {
         let this = self.as_mut().get_mut();
         std::task::ready!(this.poll_throttle(cx, false));
+        // Offer the socket at most one second of the cap. A TCP socket with
+        // an autotuned send buffer accepts megabytes in one call, and every
+        // accepted byte is charged, so an unclamped offer parks many seconds
+        // of debt - which the NEXT write waits out inside the caller's
+        // per-operation write timeout, turning a healthy throttled upload
+        // into "SMTP write timed out" with every recipient uncertain. The
+        // clamp bounds parked debt at about a second; it does not clamp the
+        // debt a sub-cap write owes, so a low cap still holds.
+        let buf = match this.metering.write_chunk_limit() {
+            Some(limit) if buf.len() > limit => &buf[..limit],
+            _ => buf,
+        };
         let result = match &mut this.inner {
             InnerAsyncNetworkStream::TokioTcp(s) => Pin::new(s).poll_write(cx, buf),
             #[cfg(unix)]
@@ -544,12 +558,19 @@ mod tokio_test {
         use crate::transport::smtp::client::metering::WireMetering;
         use crate::transport::smtp::test_support::Transcript;
 
-        // One byte per second: any write of consequence parks real debt.
-        let cap = Arc::new(AtomicU64::new(1));
-        let transcript = Transcript::new("").expect("PING\r\n", "250 pong\r\n");
+        // Six bytes per second, which is exactly one `PING` line. The bucket
+        // starts with one second of tokens and a write is now clamped to that
+        // same second (see `write_chunk_limit`), so the FIRST write can never
+        // owe anything - it burns the budget, and the second is the one that
+        // parks debt.
+        let cap = Arc::new(AtomicU64::new(6));
+        let transcript = Transcript::new("")
+            .expect("PING\r\n", "")
+            .expect("PING\r\n", "250 pong\r\n");
         let mut stream = AsyncNetworkStream::from_transcript(transcript);
         stream.set_metering(WireMetering::new(None, Some(cap)));
 
+        stream.write_all(b"PING\r\n").await.unwrap();
         stream.write_all(b"PING\r\n").await.unwrap();
         assert!(
             stream.throttle_out.is_some(),
@@ -571,6 +592,71 @@ mod tokio_test {
             panic!("the reply read was gated on outbound throttle debt: {polled:?}");
         };
         assert_eq!(&buf[..n], b"250 pong\r\n");
+    }
+
+    /// Under a cap, a single write must never park more than about a second
+    /// of throttle debt.
+    ///
+    /// The write funnel charges what the socket ACCEPTED, and a real socket
+    /// accepts megabytes in one call, so an unclamped offer of a whole body
+    /// debits the bucket by megabytes and parks a sleep of many seconds. The
+    /// per-write timeout the async half re-arms is then spent on this crate's
+    /// OWN throttle rather than on the peer: `poll_throttle` holds the next
+    /// write Pending past the timeout and a perfectly healthy capped upload
+    /// fails as "SMTP write timed out" with every recipient uncertain. Clamping
+    /// what is offered to one second of the cap keeps the timeout a statement
+    /// about the peer.
+    ///
+    /// Paused time is safe here even though `ByteBucket` measures on
+    /// `std::time::Instant`: the assertion is about how much is offered and
+    /// charged in one call, and no refill is wanted between the two writes.
+    #[tokio::test(crate = "tokio", start_paused = true)]
+    async fn a_capped_write_offers_at_most_one_second_of_budget() {
+        use std::sync::{Arc, atomic::AtomicU64};
+
+        use tokio::io::AsyncWriteExt;
+
+        use crate::transport::smtp::client::metering::WireMetering;
+        use crate::transport::smtp::test_support::SlowSinkPeer;
+
+        // A sink that accepts everything offered, immediately.
+        let cap = Arc::new(AtomicU64::new(100));
+        let mut stream = AsyncNetworkStream::from_raw_stream_for_test(Box::new(SlowSinkPeer::new(
+            usize::MAX,
+            Duration::ZERO,
+        )));
+        stream.set_metering(WireMetering::new(None, Some(cap)));
+
+        let body = vec![b'x'; 100_000];
+
+        // No single write may park more than about a second, at any point.
+        // (The first burns the bucket's initial second of tokens and parks
+        // nothing; the second is the one that owes time.)
+        let mut offset = 0;
+        for _ in 0..2 {
+            let written = stream.write(&body[offset..]).await.unwrap();
+            assert_eq!(
+                written, 100,
+                "the offer must be clamped to one second of cap"
+            );
+            offset += written;
+            let debt = stream
+                .throttle_out
+                .as_ref()
+                .map_or(Duration::ZERO, |sleep| {
+                    sleep
+                        .deadline()
+                        .saturating_duration_since(tokio::time::Instant::now())
+                });
+            assert!(
+                debt <= Duration::from_secs(2),
+                "parked debt must stay well inside a write timeout, got {debt:?}"
+            );
+        }
+        assert!(
+            stream.throttle_out.is_some(),
+            "the second write must owe time, or this pins nothing"
+        );
     }
 
     /// Finding 4b: this used to bind a `TcpListener` and park a thread in a

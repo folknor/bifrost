@@ -34,6 +34,30 @@ transports remain separate. The deliberate behavioural differences are the
 invariant (see "Bandwidth metering"). Any proposal to remove or reshape this
 surface is the owner's call - see the standing lessons in `AGENTS.md`.
 
+The write timeout is deliberately NOT a third difference, and the async half
+had to be built to keep it that way. The configured timeout bounds one write
+that makes no progress, never the whole transfer: the blocking half gets that
+for free because `SO_SNDTIMEO` is per `write(2)`, and the async half re-arms
+its `tokio::time::timeout` around each write that accepted bytes. Armed once
+around a `write_all` of the entire body, the bound is a function of message
+size and link speed rather than of peer health - a 12 MB message over a
+5 Mbit/s uplink needs ~19 s - so a healthy slow upload timed out inside the
+body write, tagged `InFlight` / `DataBody`, and turned every accepted recipient
+into an `uncertain` lane on the async half while the blocking half delivered
+the message. The property to keep: a stalled peer still times out, a
+slow-but-progressing upload does not. Pinned on the async side by
+`a_slow_but_progressing_body_upload_outlives_the_operation_timeout` and
+`a_stalled_body_upload_still_hits_the_write_timeout`, both under paused tokio
+time. A `SetupDeadline` budget still shrinks across the loop, so the shared
+connect deadline is unaffected.
+
+Re-arming covers the slow LINK. It does not by itself cover a bandwidth CAP,
+and the two failures look identical from inside the loop: a write that hands
+the socket several megabytes has every accepted byte charged, parks a
+multi-second `Sleep` in `throttle_out`, and the next iteration's fresh timeout
+is spent on this crate's own throttle rather than on the peer. The cap half is
+held one layer down instead - see "Bandwidth metering".
+
 ## Protocol core and I/O adapters
 
 `client/core.rs` is the sans-I/O protocol core for every send path. It owns
@@ -230,6 +254,53 @@ case a per-call-site decoration missed: a server rejecting `MAIL FROM` is
 rejection would make the PIPELINING path classify a plain relay rejection
 differently from the non-pipelined path for the same wire exchange. Both halves
 are pinned by transcript tests over all four boundaries.
+
+A negative reply to the DATA end-of-data terminator follows the same rule from
+the other end. The peer read the whole message and refused it, so the
+transaction is complete (RFC 5321 4.1.1.4), there is nothing to reset, and the
+connection stays reusable: `DirectSmtp` finishes with the status error and no
+abort, and `BatchSmtp` (which is DATA-only) records the reply through
+`set_body_finished` + `set_data_response` and finishes `Ok(progress)`, so
+`resolve` fans it out as `DataFinal` `failed` lanes carrying `Acknowledged`.
+Routing it through the transport-failure arm instead put every accepted
+recipient in the `uncertain` lane - asking the caller to reconcile a delivery
+the server had explicitly refused - and aborted a healthy connection. Only a
+genuine I/O or parse failure at that boundary aborts. Pinned in both halves by
+`a_rejected_data_final_reply_fails_the_recipients_and_keeps_the_connection` and
+`a_rejected_data_final_reply_keeps_the_direct_connection_reusable`.
+
+The rule is scoped to DATA, and deliberately. `DirectSmtp`'s `FinalReply` stage
+also serves BDAT - `BDAT n LAST` has no 354 step, so the machine goes
+`after_envelope` -> `BodyWritten` -> `FinalReply` - but RFC 3030 makes no
+equivalent transaction-complete promise for a refused chunk, and its own
+failure example sends `RSET` after the negative reply. The crate's conservative
+rule is to keep a connection only where the protocol guarantees its state, so a
+negative reply to `BDAT ... LAST` goes through `Epilogue::reset`: RSET-and-keep,
+aborting unless the peer acknowledges the reset. Finishing it the DATA way
+parked the connection `Ok` inside a transaction a strict server still considers
+open, and the next checkout's `MAIL FROM` drew `503 bad sequence`.
+`a_rejected_bdat_last_resets_the_transaction_before_the_connection_is_reused`
+pins it in both halves.
+
+One reply overrides all of that, in BOTH machines: `421` means "closing
+transmission channel", so whatever the body framing, a 421 at that boundary
+goes through `Epilogue::abort`. `DirectSmtp` carries the status error as the
+epilogue's value; `BatchSmtp` still records the reply through
+`set_body_finished` + `set_data_response` first, so its lanes resolve as
+`DataFinal` `failed` / `Acknowledged` exactly as any other rejection does, and
+only the connection is retired. Parking a connection the peer just said it is
+closing hands the next checkout a dead socket - and on the batch path, which is
+the account-level `send_smtp_batch`, that dead connection is pooled, so under
+`test_on_checkout(false)` the NEXT send writes `MAIL FROM` into it and fails
+`Unsent`. Pinned by `a_421_data_final_reply_aborts_instead_of_parking_a_dying_connection`
+and `a_421_data_final_reply_aborts_the_batch_connection_too`, both in both
+halves.
+
+The direct path tags a rejected DATA end-of-data reply `DataFinal`, matching
+what `BatchSmtp` already produced; a transport FAILURE at the same boundary
+keeps `body_phase()` (`DataBody` / `BdatBody`), because that is an upload
+failure rather than an answer. BDAT has no distinct final phase, so a rejected
+`BDAT ... LAST` stays `BdatBody`.
 
 A rejected `MAIL FROM` deliberately sends no `RSET`: it opened no transaction,
 so there is nothing to reset and the connection stays reusable as it is. The
@@ -466,6 +537,37 @@ can retune or lift it without reconnecting. Bytes are charged as ACCEPTED
 by the socket, not as offered, so a short write charges the remainder on
 its retry.
 
+What IS clamped is how much a single write offers. `poll_write` trims its
+slice to `WireMetering::write_chunk_limit()` - one second of the cap in
+force, re-read per call - before handing it to the socket. This is the
+cap half of the write-timeout property above, and it is not the same
+thing as clamping the debt: a write at or under the limit still owes
+proportional time, so a low cap still holds. Without it a TCP socket with
+an autotuned send buffer accepts megabytes in one call, all of it is
+charged, and `throttle_out` parks a sleep of many seconds - which the
+NEXT write waits out inside the caller's per-operation write timeout, so
+a healthy capped upload fails as "SMTP write timed out" with every
+recipient `uncertain`. Bounding the offer bounds the parked debt at about
+a second, which keeps the write timeout a statement about the peer.
+`a_capped_write_offers_at_most_one_second_of_budget` pins the offer and
+the resulting debt together (async only - the clamp lives in
+`poll_write`). The blocking funnel needs no
+equivalent: `NetworkStream::charge` sleeps the thread outside
+`SO_SNDTIMEO`, so throttle debt never counts against a write deadline
+there.
+
+That bound survives a RETUNE, which it did not always. Tokens are BYTES
+and debt is read back as `-tokens / cap_now`, so lowering the cap between
+two charges re-priced debt already owed: 1 MB charged at a 1 MB/s cap is
+one second of debt, and re-reading it after `set_bandwidth_cap` dropped
+the cap to 1 KB/s made it about a thousand seconds - which the next write
+then waits out inside the per-operation write timeout, the exact failure
+the offer clamp exists to prevent. `ByteBucketState` therefore records
+the cap its balance is denominated in and rescales on the way in, so a
+standing balance keeps its value in SECONDS across a retune and the new
+cap governs only future traffic.
+`lowering_the_cap_does_not_reprice_debt_already_owed` pins it.
+
 Inbound and outbound are separate buckets: a large send must not throttle
 the reply to it. In the async funnel the parked debt is separate too -
 `throttle_in` and `throttle_out` are distinct `Sleep` slots, `poll_read`
@@ -497,7 +599,10 @@ Internal pipeline errors carry two value-side decorations the classifier reads:
 
 Evidence must match what actually crossed the wire. A transport failure in the envelope phase (`MAIL FROM` / `RCPT TO`), including a failed write of a later PIPELINING recipient window, is `Unsent` and resolves through `SendProgress::mark_unresolved_unsent`: `DATA` has not been issued, so no message content can have reached the peer and an `Uncertain` lane would falsely claim a possible delivery. RCPT rejections the server already gave are preserved; accepted and unanswered recipients are both rewritten (an accepted RCPT with no `DATA` would otherwise resolve as a delivery that never happened), into `failed` lanes that `RecoveryClass` derives as `Retry(SameRequest)`. `InFlight` is reserved for failures from the `DATA` command onward.
 
-`batch.rs` `SendProgress::resolve` is the per-recipient lane resolver. LMTP `DATA`-command negative replies route through `mark_accepted_rejected_with_response` so accepted recipients become per-recipient `Failed` lanes - never a batch-level `Err` (the previous shape let the engine resend the entire non-idempotent `Send` after the server rejected it). DATA-final-negative replies tag `SmtpCommandPhase::DataFinal`. LMTP `Accepted` at resolve time without a per-recipient `Final` is a programming bug caught by `debug_assert!` in debug builds and falls back to an `Uncertain` lane in release. Every failed and uncertain lane carries the envelope recipient as `DiagnosticText::support_only` so support exports preserve per-recipient correlation when N lanes share the same wire response text.
+`batch.rs` `SendProgress::resolve` is the per-recipient lane resolver. LMTP `DATA`-command negative replies route through `mark_accepted_rejected_with_response` so accepted recipients become per-recipient `Failed` lanes - never a batch-level `Err` (the previous shape let the engine resend the entire non-idempotent `Send` after the server rejected it). DATA-final-negative replies tag `SmtpCommandPhase::DataFinal`,
+and that arm is live rather than latent: `BatchSmtp` records a negative
+end-of-data reply through `set_data_response` exactly as it records a positive
+one (see "PIPELINING"), so `DataFinal` is a phase a driver actually produces. LMTP `Accepted` at resolve time without a per-recipient `Final` is a programming bug caught by `debug_assert!` in debug builds and falls back to an `Uncertain` lane in release. Every failed and uncertain lane carries the envelope recipient as `DiagnosticText::support_only` so support exports preserve per-recipient correlation when N lanes share the same wire response text.
 
 ## Connection test harness
 

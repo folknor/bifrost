@@ -1512,13 +1512,38 @@ impl AsyncSmtpConnection {
         stream.get_ref().state().verify()?;
         stream.get_mut().set_state(ConnectionState::Broken);
 
-        with_timeout(
-            budget,
-            "SMTP write timed out",
-            stream.get_mut().write_all(string),
-        )
-        .await?
-        .map_err(error::network)?;
+        // The per-operation timeout bounds ONE write that makes no progress,
+        // not the whole transfer. Arming it once around a `write_all` of the
+        // entire buffer makes the bound a function of message size and link
+        // speed: a 12 MB body over a slow uplink exceeds a 10 s budget while
+        // uploading perfectly happily. The blocking half never had that
+        // problem - `SO_SNDTIMEO` is per `write(2)` - so re-arming per
+        // progressing write is what keeps the two halves equivalent: a stalled
+        // peer still times out, a slow-but-progressing upload does not. A
+        // `SetupDeadline` budget still shrinks across the loop, so the shared
+        // connect deadline is unaffected.
+        //
+        // Re-arming alone does NOT cover an outbound bandwidth cap, and must
+        // not be read as covering it: a write that hands the socket megabytes
+        // parks the whole charge as throttle debt, and the next iteration's
+        // fresh timeout is then spent waiting out this crate's own throttle
+        // rather than the peer. That half is held by
+        // `AsyncNetworkStream::poll_write` clamping what it offers to one
+        // second of the cap in force.
+        let mut rest = string;
+        while !rest.is_empty() {
+            let written =
+                with_timeout(budget, "SMTP write timed out", stream.get_mut().write(rest))
+                    .await?
+                    .map_err(error::network)?;
+            if written == 0 {
+                return Err(error::network(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "SMTP write accepted no bytes",
+                )));
+            }
+            rest = &rest[written..];
+        }
         with_timeout(budget, "SMTP flush timed out", stream.get_mut().flush())
             .await?
             .map_err(error::network)?;
@@ -3618,5 +3643,302 @@ mod transcript_tests {
             "expected a desynchronization error, got: {error}"
         );
         assert!(connection.has_broken());
+    }
+
+    /// A negative reply to the end-of-data terminator is an ANSWER, not a
+    /// transport failure: the server read the whole message and refused it, so
+    /// the transaction is complete (RFC 5321 4.1.1.4), every accepted
+    /// recipient is a `failed` lane classified under `DataFinal`, and the
+    /// connection stays reusable. Routing it through the `Failed` arm put the
+    /// recipients in `uncertain` (asking the caller to reconcile a delivery the
+    /// server explicitly refused) and threw away a healthy connection.
+    #[tokio::test(crate = "tokio")]
+    async fn a_rejected_data_final_reply_fails_the_recipients_and_keeps_the_connection() {
+        use bifrost_types::error::{AccountErrorKind, ServerErrorKind};
+
+        let hello = ClientId::Domain("client.example".to_owned());
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250 smtp.example\r\n")
+            .expect("MAIL FROM:<sender@example.com>\r\n", "250 sender ok\r\n")
+            .expect("RCPT TO:<first@example.com>\r\n", "250 first ok\r\n")
+            .expect("RCPT TO:<second@example.com>\r\n", "250 second ok\r\n")
+            .expect("DATA\r\n", "354 send body\r\n")
+            .expect("body", "")
+            .expect("\r\n.\r\n", "554 Message rejected as spam\r\n");
+        let batch = ["first@example.com", "second@example.com"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, address)| SmtpBatchRecipient {
+                id: BatchItemId(format!("item-{index}")),
+                address: address.parse().unwrap(),
+            })
+            .collect();
+
+        let mut connection =
+            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp)
+                .await
+                .unwrap();
+        let outcome = connection
+            .send_smtp_batch(
+                Some("sender@example.com".parse().unwrap()),
+                batch,
+                b"body",
+                &SendOptions::default(),
+            )
+            .await
+            .expect("an answered transaction is not a batch-level failure")
+            .resolve();
+
+        assert_eq!(outcome.failed().len(), 2);
+        assert!(outcome.succeeded().is_empty());
+        assert!(
+            outcome.uncertain().is_empty(),
+            "the server answered, so nothing is uncertain"
+        );
+        assert!(matches!(
+            outcome.failed()[0].error.kind(),
+            AccountErrorKind::Server(ServerErrorKind::Error { status: Some(554) })
+        ));
+        assert!(
+            !connection.has_broken(),
+            "the transaction completed; the connection is still clean"
+        );
+        transcript.assert_exhausted();
+    }
+
+    /// The direct path takes the same rule: a refused message on an answered
+    /// transaction is a status error on a reusable connection, not an abort.
+    #[tokio::test(crate = "tokio")]
+    async fn a_rejected_data_final_reply_keeps_the_direct_connection_reusable() {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let envelope = Envelope::new(
+            Some("sender@example.com".parse().unwrap()),
+            vec!["recipient@example.com".parse().unwrap()],
+        )
+        .unwrap();
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250 smtp.example\r\n")
+            .expect("MAIL FROM:<sender@example.com>\r\n", "250 sender ok\r\n")
+            .expect(
+                "RCPT TO:<recipient@example.com>\r\n",
+                "250 recipient ok\r\n",
+            )
+            .expect("DATA\r\n", "354 send body\r\n")
+            .expect("body", "")
+            .expect("\r\n.\r\n", "554 Message rejected as spam\r\n");
+        let mut connection =
+            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp)
+                .await
+                .unwrap();
+
+        let error = connection.send(&envelope, b"body").await.unwrap_err();
+        assert_eq!(error.status().map(u16::from), Some(554));
+        assert_eq!(error.phase(), Some(super::SmtpCommandPhase::DataFinal));
+        assert!(!connection.has_broken());
+        transcript.assert_exhausted();
+    }
+
+    /// The end-of-data completion rule is RFC 5321's, and it is about DATA.
+    /// `BDAT ... LAST` reaches the same `FinalReply` stage, but RFC 3030
+    /// promises nothing about the transaction after a refused chunk - its own
+    /// failure example sends RSET after the negative reply - so a strict peer
+    /// may still consider the transaction open. Finishing without a reset
+    /// parked such a connection `Ok`, and the next checkout's `MAIL FROM`
+    /// landed inside a live transaction. RSET-and-keep instead: the reset must
+    /// appear on the wire and the connection survives only because the peer
+    /// acknowledged it.
+    #[tokio::test(crate = "tokio")]
+    async fn a_rejected_bdat_last_resets_the_transaction_before_the_connection_is_reused() {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let envelope = Envelope::new(
+            Some("sender@example.com".parse().unwrap()),
+            vec!["recipient@example.com".parse().unwrap()],
+        )
+        .unwrap();
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250-smtp.example\r\n250 CHUNKING\r\n")
+            .expect("MAIL FROM:<sender@example.com>\r\n", "250 sender ok\r\n")
+            .expect(
+                "RCPT TO:<recipient@example.com>\r\n",
+                "250 recipient ok\r\n",
+            )
+            .expect("BDAT 4 LAST\r\n", "")
+            .expect("body", "452 4.3.1 out of storage\r\n")
+            .expect("RSET\r\n", "250 reset ok\r\n");
+        let mut connection =
+            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp)
+                .await
+                .unwrap();
+
+        let error = connection
+            .send_bdat_with_options(&envelope, b"body", &SendOptions::default())
+            .await
+            .unwrap_err();
+        assert_eq!(error.status().map(u16::from), Some(452));
+        assert_eq!(error.phase(), Some(super::SmtpCommandPhase::BdatBody));
+        assert!(
+            !connection.has_broken(),
+            "the peer acknowledged the reset, so the connection is reusable"
+        );
+        transcript.assert_exhausted();
+    }
+
+    /// A rejected end-of-data reply keeps the connection - unless the peer
+    /// said it is going away. 421 is "closing transmission channel", so
+    /// parking it would hand the next checkout a dead socket. The status
+    /// error is still what the caller sees.
+    #[tokio::test(crate = "tokio")]
+    async fn a_421_data_final_reply_aborts_instead_of_parking_a_dying_connection() {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let envelope = Envelope::new(
+            Some("sender@example.com".parse().unwrap()),
+            vec!["recipient@example.com".parse().unwrap()],
+        )
+        .unwrap();
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250 smtp.example\r\n")
+            .expect("MAIL FROM:<sender@example.com>\r\n", "250 sender ok\r\n")
+            .expect(
+                "RCPT TO:<recipient@example.com>\r\n",
+                "250 recipient ok\r\n",
+            )
+            .expect("DATA\r\n", "354 send body\r\n")
+            .expect("body", "")
+            .expect("\r\n.\r\n", "421 closing transmission channel\r\n");
+        let mut connection =
+            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp)
+                .await
+                .unwrap();
+
+        let error = connection.send(&envelope, b"body").await.unwrap_err();
+        assert_eq!(error.status().map(u16::from), Some(421));
+        assert!(
+            connection.has_broken(),
+            "a peer closing the channel must not leave a reusable connection"
+        );
+        transcript.assert_exhausted();
+    }
+
+    /// The batch machine takes the same 421 rule, and it is the path that
+    /// matters most: `send_smtp_batch` is the account-level send, so a
+    /// connection parked after the peer announced it is closing goes back
+    /// into the pool, and the next checkout under `test_on_checkout(false)`
+    /// writes `MAIL FROM` into a dead socket. The lanes still resolve from
+    /// the answer - `DataFinal` `failed`, never `uncertain` - only the
+    /// connection is retired.
+    #[tokio::test(crate = "tokio")]
+    async fn a_421_data_final_reply_aborts_the_batch_connection_too() {
+        use bifrost_types::error::{AccountErrorKind, ServerErrorKind};
+
+        let hello = ClientId::Domain("client.example".to_owned());
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250 smtp.example\r\n")
+            .expect("MAIL FROM:<sender@example.com>\r\n", "250 sender ok\r\n")
+            .expect("RCPT TO:<first@example.com>\r\n", "250 first ok\r\n")
+            .expect("RCPT TO:<second@example.com>\r\n", "250 second ok\r\n")
+            .expect("DATA\r\n", "354 send body\r\n")
+            .expect("body", "")
+            .expect("\r\n.\r\n", "421 closing transmission channel\r\n");
+        let batch = ["first@example.com", "second@example.com"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, address)| SmtpBatchRecipient {
+                id: BatchItemId(format!("item-{index}")),
+                address: address.parse().unwrap(),
+            })
+            .collect();
+
+        let mut connection =
+            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp)
+                .await
+                .unwrap();
+        let outcome = connection
+            .send_smtp_batch(
+                Some("sender@example.com".parse().unwrap()),
+                batch,
+                b"body",
+                &SendOptions::default(),
+            )
+            .await
+            .expect("an answered transaction is not a batch-level failure")
+            .resolve();
+
+        assert_eq!(outcome.failed().len(), 2);
+        assert!(
+            outcome.uncertain().is_empty(),
+            "the server answered, so nothing is uncertain"
+        );
+        assert!(matches!(
+            outcome.failed()[0].error.kind(),
+            AccountErrorKind::Server(ServerErrorKind::Unavailable)
+        ));
+        assert!(
+            connection.has_broken(),
+            "a peer closing the channel must not leave a poolable connection"
+        );
+        transcript.assert_exhausted();
+    }
+
+    /// The per-operation timeout bounds one write that makes no progress, not
+    /// the whole transfer. Armed once around the entire body it becomes a
+    /// function of message size and link speed - a large message over a slow
+    /// uplink times out while uploading perfectly happily and lands every
+    /// accepted recipient in `uncertain`. The blocking half never had this,
+    /// because `SO_SNDTIMEO` is per `write(2)`.
+    ///
+    /// This is the SLOW-LINK half only. The bandwidth-cap half of the same
+    /// hazard - debt parked by one oversized write being waited out inside the
+    /// next write's timeout - is held in the socket funnel and pinned by
+    /// `a_capped_write_offers_at_most_one_second_of_budget`.
+    #[tokio::test(crate = "tokio", start_paused = true)]
+    async fn a_slow_but_progressing_body_upload_outlives_the_operation_timeout() {
+        use crate::transport::smtp::test_support::SlowSinkPeer;
+
+        let hello = ClientId::Domain("client.example".to_owned());
+        // 16 KiB per second against a 10 s timeout: 256 KiB takes 16 s of
+        // virtual time, and every individual write completes in one second.
+        let peer = SlowSinkPeer::new(16 * 1024, Duration::from_secs(1));
+        let mut connection = AsyncSmtpConnection::from_raw_stream_for_test(
+            Box::new(peer),
+            &hello,
+            Protocol::Smtp,
+            Some(Duration::from_secs(10)),
+        );
+
+        let body = vec![b'x'; 256 * 1024];
+        let started = tokio::time::Instant::now();
+        connection
+            .write_body_iter(std::iter::once(body.as_slice()))
+            .await
+            .expect("a peer that keeps accepting bytes must not time out");
+
+        assert!(
+            started.elapsed() > Duration::from_secs(10),
+            "the upload must have outlasted one operation timeout to mean anything, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// The other half of the same rule: a peer that accepts nothing at all
+    /// must still hit the write timeout, so the re-arming loop above is not a
+    /// licence to hang.
+    #[tokio::test(crate = "tokio", start_paused = true)]
+    async fn a_stalled_body_upload_still_hits_the_write_timeout() {
+        use crate::transport::smtp::test_support::SlowSinkPeer;
+
+        let hello = ClientId::Domain("client.example".to_owned());
+        let mut connection = AsyncSmtpConnection::from_raw_stream_for_test(
+            Box::new(SlowSinkPeer::stalled()),
+            &hello,
+            Protocol::Smtp,
+            Some(Duration::from_secs(10)),
+        );
+
+        let body = vec![b'x'; 256 * 1024];
+        let error = connection
+            .write_body_iter(std::iter::once(body.as_slice()))
+            .await
+            .expect_err("a peer accepting no bytes must time out");
+        assert!(error.is_timeout(), "expected a timeout, got {error:?}");
     }
 }

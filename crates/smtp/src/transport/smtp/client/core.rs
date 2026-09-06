@@ -150,9 +150,10 @@ impl BodyKind {
         }
     }
 
-    /// The phase a body-upload or final-reply failure carries. BDAT has its
-    /// own, because the classifier distinguishes a chunked upload from a DATA
-    /// section.
+    /// The phase a body-upload failure carries. BDAT has its own, because the
+    /// classifier distinguishes a chunked upload from a DATA section. A
+    /// *rejected* DATA end-of-data reply is `DataFinal` instead; BDAT has no
+    /// distinct final phase and keeps this one.
     fn body_phase(self) -> SmtpCommandPhase {
         match self {
             BodyKind::Data => SmtpCommandPhase::DataBody,
@@ -510,23 +511,53 @@ impl ProtocolMachine for DirectSmtp {
                     Step::Run(Op::ReadSingle)
                 }
             },
-            DirectSmtpStage::FinalReply => {
-                let phase = self.body.body_phase();
-                match outcome {
-                    OpOutcome::Reply(response) if response.is_positive() => {
-                        Step::Finish(Ok(response))
-                    }
-                    OpOutcome::Reply(response) => {
-                        let value = phased(phase, error::status(response));
+            DirectSmtpStage::FinalReply => match outcome {
+                OpOutcome::Reply(response) if response.is_positive() => Step::Finish(Ok(response)),
+                OpOutcome::Reply(response) => {
+                    // `DataFinal` names the reply to the dot terminator, which
+                    // is what the batch path already tags. BDAT has no
+                    // distinct final phase - `BDAT ... LAST` is the body write
+                    // - so a rejected chunk stays `BdatBody`.
+                    let phase = match self.body {
+                        BodyKind::Data => SmtpCommandPhase::DataFinal,
+                        BodyKind::Bdat => SmtpCommandPhase::BdatBody,
+                    };
+                    let closing = u16::from(response.code()) == 421;
+                    let value = phased(phase, error::status(response));
+                    if closing {
+                        // 421 is "closing transmission channel". Whatever the
+                        // body framing, the peer is hanging up, so parking
+                        // this connection would hand the next checkout a dead
+                        // socket. The status error is still what the caller
+                        // sees.
                         self.begin_epilogue(Epilogue::abort(value))
+                    } else {
+                        match self.body {
+                            // DATA: the peer answered the end-of-data
+                            // terminator and refused the message. The
+                            // transaction is complete (RFC 5321 4.1.1.4),
+                            // there is nothing to reset, and the connection
+                            // stays reusable - the same rule a rejected
+                            // `MAIL FROM` follows.
+                            BodyKind::Data => Step::Finish(value.map_err(PhasedError::into_error)),
+                            // BDAT: RFC 3030 makes no equivalent
+                            // transaction-complete promise for a refused
+                            // chunk, and its own failure example sends RSET
+                            // after the negative reply, so the transaction may
+                            // still be open on a strict server. Keep the
+                            // connection only when the protocol guarantees its
+                            // state: RSET-and-keep, aborting unless the peer
+                            // acknowledges the reset.
+                            BodyKind::Bdat => self.begin_epilogue(Epilogue::reset(value)),
+                        }
                     }
-                    OpOutcome::Failed(error) => {
-                        let value = phased(phase, error);
-                        self.begin_epilogue(Epilogue::abort(value))
-                    }
-                    OpOutcome::Done => unreachable!("a read op yields a reply or a failure"),
                 }
-            }
+                OpOutcome::Failed(error) => {
+                    let value = phased(self.body.body_phase(), error);
+                    self.begin_epilogue(Epilogue::abort(value))
+                }
+                OpOutcome::Done => unreachable!("a read op yields a reply or a failure"),
+            },
         }
     }
 }
@@ -1115,13 +1146,30 @@ impl ProtocolMachine for BatchSmtp {
             },
             BatchSmtpStage::FinalReply => {
                 let error = match outcome {
-                    OpOutcome::Reply(response) if response.is_positive() => {
+                    OpOutcome::Reply(response) => {
+                        // Positive or negative, the peer answered the
+                        // end-of-data terminator, so the transaction is
+                        // complete (RFC 5321 4.1.1.4) and the lanes are
+                        // resolved from the answer rather than left
+                        // `uncertain`. The response is recorded either way and
+                        // `resolve` fans it out - succeeded on a positive
+                        // reply, `DataFinal` `failed` lanes on a rejection.
+                        let closing = u16::from(response.code()) == 421;
                         self.progress().set_body_finished();
                         self.progress().set_data_response(response);
-                        let progress = self.take_progress();
-                        return Step::Finish(Ok(progress));
+                        if !closing {
+                            let progress = self.take_progress();
+                            return Step::Finish(Ok(progress));
+                        }
+                        // 421 is "closing transmission channel". The lanes
+                        // still resolve from the answer, but parking a
+                        // connection the peer just said it is hanging up on
+                        // hands the next checkout a dead socket - and with
+                        // `test_on_checkout(false)` that shows up as an
+                        // `Unsent` failure on the NEXT send. Same rule the
+                        // direct machine applies at this boundary.
+                        return self.begin_epilogue(Epilogue::abort(BatchExit::Progress));
                     }
-                    OpOutcome::Reply(response) => error::status(response),
                     OpOutcome::Failed(error) => error,
                     OpOutcome::Done => unreachable!("a read op yields a reply or a failure"),
                 };

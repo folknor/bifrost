@@ -3096,4 +3096,225 @@ mod transcript_tests {
         assert_eq!(outcome.succeeded().len(), 2);
         transcript.assert_exhausted();
     }
+
+    /// A negative reply to the end-of-data terminator is an ANSWER, not a
+    /// transport failure: the server read the whole message and refused it, so
+    /// the transaction is complete (RFC 5321 4.1.1.4), every accepted
+    /// recipient is a `failed` lane classified under `DataFinal`, and the
+    /// connection stays reusable. Routing it through the `Failed` arm put the
+    /// recipients in `uncertain` (asking the caller to reconcile a delivery the
+    /// server explicitly refused) and threw away a healthy connection.
+    #[test]
+    fn a_rejected_data_final_reply_fails_the_recipients_and_keeps_the_connection() {
+        use bifrost_types::error::{AccountErrorKind, ServerErrorKind};
+
+        let hello = ClientId::Domain("client.example".to_owned());
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250 smtp.example\r\n")
+            .expect("MAIL FROM:<sender@example.com>\r\n", "250 sender ok\r\n")
+            .expect("RCPT TO:<first@example.com>\r\n", "250 first ok\r\n")
+            .expect("RCPT TO:<second@example.com>\r\n", "250 second ok\r\n")
+            .expect("DATA\r\n", "354 send body\r\n")
+            .expect("body", "")
+            .expect("\r\n.\r\n", "554 Message rejected as spam\r\n");
+        let batch = ["first@example.com", "second@example.com"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, address)| SmtpBatchRecipient {
+                id: BatchItemId(format!("item-{index}")),
+                address: address.parse().unwrap(),
+            })
+            .collect();
+
+        let mut connection =
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp).unwrap();
+        let outcome = connection
+            .send_smtp_batch(
+                Some("sender@example.com".parse().unwrap()),
+                batch,
+                b"body",
+                &SendOptions::default(),
+            )
+            .expect("an answered transaction is not a batch-level failure")
+            .resolve();
+
+        assert_eq!(outcome.failed().len(), 2);
+        assert!(outcome.succeeded().is_empty());
+        assert!(
+            outcome.uncertain().is_empty(),
+            "the server answered, so nothing is uncertain"
+        );
+        assert!(matches!(
+            outcome.failed()[0].error.kind(),
+            AccountErrorKind::Server(ServerErrorKind::Error { status: Some(554) })
+        ));
+        assert!(
+            !connection.has_broken(),
+            "the transaction completed; the connection is still clean"
+        );
+        transcript.assert_exhausted();
+    }
+
+    /// The direct path takes the same rule: a refused message on an answered
+    /// transaction is a status error on a reusable connection, not an abort.
+    #[test]
+    fn a_rejected_data_final_reply_keeps_the_direct_connection_reusable() {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let envelope = Envelope::new(
+            Some("sender@example.com".parse().unwrap()),
+            vec!["recipient@example.com".parse().unwrap()],
+        )
+        .unwrap();
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250 smtp.example\r\n")
+            .expect("MAIL FROM:<sender@example.com>\r\n", "250 sender ok\r\n")
+            .expect(
+                "RCPT TO:<recipient@example.com>\r\n",
+                "250 recipient ok\r\n",
+            )
+            .expect("DATA\r\n", "354 send body\r\n")
+            .expect("body", "")
+            .expect("\r\n.\r\n", "554 Message rejected as spam\r\n");
+        let mut connection =
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp).unwrap();
+
+        let error = connection.send(&envelope, b"body").unwrap_err();
+        assert_eq!(error.status().map(u16::from), Some(554));
+        assert_eq!(error.phase(), Some(super::SmtpCommandPhase::DataFinal));
+        assert!(!connection.has_broken());
+        transcript.assert_exhausted();
+    }
+
+    /// The end-of-data completion rule is RFC 5321's, and it is about DATA.
+    /// `BDAT ... LAST` reaches the same `FinalReply` stage, but RFC 3030
+    /// promises nothing about the transaction after a refused chunk - its own
+    /// failure example sends RSET after the negative reply - so a strict peer
+    /// may still consider the transaction open. Finishing without a reset
+    /// parked such a connection `Ok`, and the next checkout's `MAIL FROM`
+    /// landed inside a live transaction. RSET-and-keep instead: the reset must
+    /// appear on the wire and the connection survives only because the peer
+    /// acknowledged it.
+    #[test]
+    fn a_rejected_bdat_last_resets_the_transaction_before_the_connection_is_reused() {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let envelope = Envelope::new(
+            Some("sender@example.com".parse().unwrap()),
+            vec!["recipient@example.com".parse().unwrap()],
+        )
+        .unwrap();
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250-smtp.example\r\n250 CHUNKING\r\n")
+            .expect("MAIL FROM:<sender@example.com>\r\n", "250 sender ok\r\n")
+            .expect(
+                "RCPT TO:<recipient@example.com>\r\n",
+                "250 recipient ok\r\n",
+            )
+            .expect("BDAT 4 LAST\r\n", "")
+            .expect("body", "452 4.3.1 out of storage\r\n")
+            .expect("RSET\r\n", "250 reset ok\r\n");
+        let mut connection =
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp).unwrap();
+
+        let error = connection
+            .send_bdat_with_options(&envelope, b"body", &SendOptions::default())
+            .unwrap_err();
+        assert_eq!(error.status().map(u16::from), Some(452));
+        assert_eq!(error.phase(), Some(super::SmtpCommandPhase::BdatBody));
+        assert!(
+            !connection.has_broken(),
+            "the peer acknowledged the reset, so the connection is reusable"
+        );
+        transcript.assert_exhausted();
+    }
+
+    /// A rejected end-of-data reply keeps the connection - unless the peer
+    /// said it is going away. 421 is "closing transmission channel", so
+    /// parking it would hand the next checkout a dead socket. The status
+    /// error is still what the caller sees.
+    #[test]
+    fn a_421_data_final_reply_aborts_instead_of_parking_a_dying_connection() {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let envelope = Envelope::new(
+            Some("sender@example.com".parse().unwrap()),
+            vec!["recipient@example.com".parse().unwrap()],
+        )
+        .unwrap();
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250 smtp.example\r\n")
+            .expect("MAIL FROM:<sender@example.com>\r\n", "250 sender ok\r\n")
+            .expect(
+                "RCPT TO:<recipient@example.com>\r\n",
+                "250 recipient ok\r\n",
+            )
+            .expect("DATA\r\n", "354 send body\r\n")
+            .expect("body", "")
+            .expect("\r\n.\r\n", "421 closing transmission channel\r\n");
+        let mut connection =
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp).unwrap();
+
+        let error = connection.send(&envelope, b"body").unwrap_err();
+        assert_eq!(error.status().map(u16::from), Some(421));
+        assert!(
+            connection.has_broken(),
+            "a peer closing the channel must not leave a reusable connection"
+        );
+        transcript.assert_exhausted();
+    }
+
+    /// The batch machine takes the same 421 rule, and it is the path that
+    /// matters most: `send_smtp_batch` is the account-level send, so a
+    /// connection parked after the peer announced it is closing goes back
+    /// into the pool, and the next checkout under `test_on_checkout(false)`
+    /// writes `MAIL FROM` into a dead socket. The lanes still resolve from
+    /// the answer - `DataFinal` `failed`, never `uncertain` - only the
+    /// connection is retired.
+    #[test]
+    fn a_421_data_final_reply_aborts_the_batch_connection_too() {
+        use bifrost_types::error::{AccountErrorKind, ServerErrorKind};
+
+        let hello = ClientId::Domain("client.example".to_owned());
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250 smtp.example\r\n")
+            .expect("MAIL FROM:<sender@example.com>\r\n", "250 sender ok\r\n")
+            .expect("RCPT TO:<first@example.com>\r\n", "250 first ok\r\n")
+            .expect("RCPT TO:<second@example.com>\r\n", "250 second ok\r\n")
+            .expect("DATA\r\n", "354 send body\r\n")
+            .expect("body", "")
+            .expect("\r\n.\r\n", "421 closing transmission channel\r\n");
+        let batch = ["first@example.com", "second@example.com"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, address)| SmtpBatchRecipient {
+                id: BatchItemId(format!("item-{index}")),
+                address: address.parse().unwrap(),
+            })
+            .collect();
+
+        let mut connection =
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp).unwrap();
+        let outcome = connection
+            .send_smtp_batch(
+                Some("sender@example.com".parse().unwrap()),
+                batch,
+                b"body",
+                &SendOptions::default(),
+            )
+            .expect("an answered transaction is not a batch-level failure")
+            .resolve();
+
+        assert_eq!(outcome.failed().len(), 2);
+        assert!(
+            outcome.uncertain().is_empty(),
+            "the server answered, so nothing is uncertain"
+        );
+        assert!(matches!(
+            outcome.failed()[0].error.kind(),
+            AccountErrorKind::Server(ServerErrorKind::Unavailable)
+        ));
+        assert!(
+            connection.has_broken(),
+            "a peer closing the channel must not leave a poolable connection"
+        );
+        transcript.assert_exhausted();
+    }
 }

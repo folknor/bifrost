@@ -342,6 +342,87 @@ impl tokio::io::AsyncWrite for SlowLinePeer {
     }
 }
 
+/// A peer that drains an upload slowly but steadily, or not at all.
+///
+/// `new(chunk, gap)` accepts `chunk` bytes every `gap`, which is a slow link:
+/// the transfer takes `len / chunk` gaps of virtual time while every
+/// individual write makes progress. `stalled(...)` never accepts a byte and
+/// registers no waker, which is a wedged peer. Together they separate the two
+/// things a write timeout has to tell apart - the async half must survive the
+/// first and still fail the second, which is what `SO_SNDTIMEO` gives the
+/// blocking half for free by being per `write(2)`.
+#[cfg(feature = "tokio")]
+#[derive(Debug)]
+pub(super) struct SlowSinkPeer {
+    /// Bytes accepted per `gap`. `None` means the peer never accepts anything.
+    chunk: Option<usize>,
+    gap: Duration,
+    next: std::pin::Pin<Box<tokio::time::Sleep>>,
+}
+
+#[cfg(feature = "tokio")]
+impl SlowSinkPeer {
+    pub(super) fn new(chunk: usize, gap: Duration) -> Self {
+        Self {
+            chunk: Some(chunk),
+            gap,
+            next: Box::pin(tokio::time::sleep(gap)),
+        }
+    }
+
+    /// A peer that accepts nothing, ever.
+    pub(super) fn stalled() -> Self {
+        Self {
+            chunk: None,
+            gap: Duration::ZERO,
+            next: Box::pin(tokio::time::sleep(Duration::ZERO)),
+        }
+    }
+}
+
+#[cfg(feature = "tokio")]
+impl tokio::io::AsyncRead for SlowSinkPeer {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        _buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Pending
+    }
+}
+
+#[cfg(feature = "tokio")]
+impl tokio::io::AsyncWrite for SlowSinkPeer {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let Some(chunk) = self.chunk else {
+            // No waker: only the caller's own timeout may resume this.
+            return std::task::Poll::Pending;
+        };
+        std::task::ready!(std::future::Future::poll(self.next.as_mut(), cx));
+        let gap = self.gap;
+        self.next = Box::pin(tokio::time::sleep(gap));
+        std::task::Poll::Ready(Ok(chunk.min(buf.len())))
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
 /// A peer that accepts every byte written to it and never answers.
 ///
 /// The in-memory stand-in for "a listener that accepts the TCP connection and
