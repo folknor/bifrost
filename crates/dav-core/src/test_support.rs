@@ -105,6 +105,23 @@ pub fn dav_retried(response: crate::DavResponse) -> Vec<Canned> {
         .collect()
 }
 
+/// A connection that dies after the request bytes are on the wire and before
+/// any status line comes back.
+///
+/// The one wire outcome that separates a replayable request from an
+/// unreplayable one: `bifrost-net` retries this when the request is replayable
+/// and surfaces it otherwise. Scripting a SINGLE one of these is what makes a
+/// no-replay assertion bite - a request that is replayed exhausts the script and
+/// panics rather than quietly passing.
+#[must_use]
+pub fn dav_dropped_after_send() -> Canned {
+    Canned::Error(bifrost_net::Error::Network {
+        message: "connection reset before the status line".to_owned(),
+        transmission_state: bifrost_types::TransmissionState::InFlight,
+        source: None,
+    })
+}
+
 /// A script that answers nothing.
 ///
 /// Any request at all exhausts it and panics, which is how a test proves a
@@ -150,7 +167,24 @@ impl From<crate::DavResponse> for Canned {
 /// is not.
 #[must_use]
 pub fn scripted_dav_net(script: &Arc<ScriptedDispatch>) -> AccountNet {
+    scripted_dav_net_capped(script, None)
+}
+
+/// [`scripted_dav_net`] with the buffered-response ceiling lowered.
+///
+/// The production ceiling is 64 MiB, so a test that wants the oversized-body
+/// arm would otherwise have to script 64 MiB of body. Lowering the cap reaches
+/// the same `Error::ResponseTooLarge` through the same drain loop with a body
+/// small enough to write in a test.
+#[must_use]
+pub fn scripted_dav_net_capped(
+    script: &Arc<ScriptedDispatch>,
+    max_buffered_response: Option<usize>,
+) -> AccountNet {
     let mut spec = AccountSpec::new(None);
+    if let Some(limit) = max_buffered_response {
+        spec.max_buffered_response = Some(limit);
+    }
     spec.follow_redirects = FollowRedirects::Disabled;
     // The production retry budget, with the waits removed. Keeping
     // `max_attempts` real matters: a scripted 503 is retried here exactly as

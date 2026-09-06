@@ -578,8 +578,17 @@ impl CalDavClient {
             .headers(self.dav.auth_headers(url, operation).await?)
             .body(body);
         match condition {
+            // A create-PUT is the one PUT a replay cannot repair. HTTP calls
+            // PUT idempotent, so `bifrost-net` replays one whose connection
+            // dropped after the bytes went out; if the first attempt committed,
+            // the replay answers 412, the ladder reads `ConcurrencyConflict` ->
+            // `Retry(AfterStateRefresh)`, and the consumer re-creates the event
+            // under a freshly minted UUID - two copies of one event. Declaring
+            // it unreplayable routes the drop to `Reconcile(CheckTarget)`.
+            // `IfMatch` and `None` address a known URL with absolute state, so
+            // they stay replayable.
             PutCondition::IfNoneMatch => {
-                request = request.header("If-None-Match", "*");
+                request = request.header("If-None-Match", "*").idempotent(false);
             }
             PutCondition::IfMatch(etag) => {
                 if let Some(etag) = prepare_if_match(etag) {
@@ -607,7 +616,11 @@ impl CalDavClient {
         let request = self
             .dav
             .request(Method::DELETE, url)
-            .headers(self.dav.auth_headers(url, operation).await?);
+            .headers(self.dav.auth_headers(url, operation).await?)
+            // Unreplayable for the same reason `DavDispatch::delete_resource`
+            // is: a replayed DELETE that already landed answers 404, which the
+            // ladder reports as a permanent refusal of a delete that succeeded.
+            .idempotent(false);
         self.dav.send_status_request(request, operation).await
     }
 
@@ -986,11 +999,11 @@ mod tests {
 
     use bifrost_dav_core::DavResponse;
     use bifrost_dav_core::test_support::{
-        dav_redirect, dav_retried, dav_script, dav_script_empty, dav_script_yielding,
-        scripted_dav_net, transcripts,
+        dav_dropped_after_send, dav_redirect, dav_retried, dav_script, dav_script_empty,
+        dav_script_yielding, scripted_dav_net, transcripts,
     };
     use bifrost_net::test_support::{Canned, ScriptedDispatch};
-    use bifrost_types::{ProtocolErrorKind, RecoveryClass, ServerErrorKind};
+    use bifrost_types::{ProtocolErrorKind, ReconcileAction, RecoveryClass, ServerErrorKind};
     use reqwest::header::{AUTHORIZATION, HeaderMap};
 
     /// Every error this crate mints is stamped CalDAV, and names calendars.
@@ -1032,6 +1045,202 @@ mod tests {
             ),
             "a CalDAV 404 names a calendar, not a contact: {missing:?}"
         );
+    }
+
+    /// A create-PUT and a DELETE must not be replayed after a mid-flight drop.
+    ///
+    /// Twin of `bifrost-carddav`'s
+    /// `a_create_put_and_a_delete_are_not_replayed_after_a_mid_flight_drop`;
+    /// keep them in step. `bifrost-net` derives replay safety from the METHOD,
+    /// and HTTP calls PUT and DELETE idempotent - true of an absolute-state
+    /// write to a known URL, false of these two. A replayed create whose first
+    /// attempt committed answers 412 -> `ConcurrencyConflict` ->
+    /// `Retry(AfterStateRefresh)`, and `event_create` mints a fresh UUID on the
+    /// retry, so the calendar ends up holding two copies of one event. A
+    /// replayed DELETE that landed answers 404 -> `NotFound` ->
+    /// `ProviderRefused`, reporting a successful delete as a permanent refusal.
+    ///
+    /// One drop is scripted per case, so a request that IS replayed exhausts the
+    /// script and panics rather than passing quietly.
+    #[tokio::test]
+    async fn a_create_put_and_a_delete_are_not_replayed_after_a_mid_flight_drop() {
+        for create in [true, false] {
+            let script = dav_script([dav_dropped_after_send()]);
+            let client = CalDavClient::with_account_net(
+                "https://dav.example.test",
+                scripted_dav_net(&script),
+            );
+            let error = if create {
+                client
+                    .put_event(
+                        "https://dav.example.test/cal/new.ics",
+                        "BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n".to_string(),
+                        PutCondition::IfNoneMatch,
+                        AccountOperation::EventCreate,
+                    )
+                    .await
+                    .expect_err("a dropped create must fail")
+            } else {
+                client
+                    .delete_event(
+                        "https://dav.example.test/cal/one.ics",
+                        AccountOperation::EventDelete,
+                    )
+                    .await
+                    .expect_err("a dropped delete must fail")
+            };
+
+            assert_eq!(
+                transcripts(&script).len(),
+                1,
+                "create={create}: the dropped request must not be replayed"
+            );
+            assert!(
+                matches!(
+                    error.recovery(),
+                    RecoveryClass::Reconcile(advice)
+                        if advice.guidance.actions.contains(&ReconcileAction::CheckTarget)
+                ),
+                "create={create}: a drop after send must reconcile against the target: {:?}",
+                error.recovery()
+            );
+        }
+    }
+
+    /// A dropped create names the target the consumer is told to check.
+    ///
+    /// The URL and the UID are minted locally in `event_create`, so nothing on
+    /// the wire and nothing in the status ladder knows them. Without the scope,
+    /// the `Reconcile(CheckTarget)` that the unreplayable declaration buys is
+    /// unactionable - a consumer that cannot identify the target can only
+    /// re-create, which is the duplicate the declaration exists to prevent.
+    #[tokio::test]
+    async fn a_dropped_create_names_the_target_to_reconcile_against() {
+        use bifrost_types::account::Account as _;
+
+        let script = dav_script([dav_dropped_after_send()]);
+        let client = Arc::new(CalDavClient::with_account_net(
+            "https://dav.example.test",
+            scripted_dav_net(&script),
+        ));
+        let account =
+            crate::account::CalDavAccount::for_tests(client, "https://dav.example.test/cal/work/");
+
+        let error = account
+            .event_create(bifrost_types::EventCreate {
+                calendar_id: bifrost_types::CalendarId(
+                    "https://dav.example.test/cal/work/".to_string(),
+                ),
+                title: Some("one".to_string()),
+                description: None,
+                location: None,
+                start: bifrost_types::EventTime {
+                    value: "2026-06-02T09:00:00Z".to_string(),
+                    timezone: None,
+                },
+                end: bifrost_types::EventTime {
+                    value: "2026-06-02T10:00:00Z".to_string(),
+                    timezone: None,
+                },
+                is_all_day: false,
+                status: bifrost_types::EventStatus::Confirmed,
+                availability: bifrost_types::EventAvailability::Busy,
+                visibility: bifrost_types::EventVisibility::Default,
+                organizer: None,
+                attendees: Vec::new(),
+                recurrence: bifrost_types::EventRecurrence::default(),
+            })
+            .await
+            .expect_err("a dropped create must fail");
+
+        let Some(bifrost_types::ErrorScope::Calendar { id }) = error.scope() else {
+            panic!("a dropped create must name its minted target: {error:?}");
+        };
+        assert!(
+            id.0.starts_with("https://dav.example.test/cal/work/") && id.0.ends_with(".ics"),
+            "the scope must carry the minted resource URL: {id:?}"
+        );
+    }
+
+    /// The `MOVE` leg of a relocate must not be replayed either.
+    ///
+    /// Twin of `bifrost-carddav`'s
+    /// `a_dropped_relocate_move_reconciles_rather_than_replaying`; keep them in
+    /// step. A relocate runs under `EventUpdate`, which the `AccountOperation`
+    /// table calls idempotent, so a mid-flight drop on the MOVE would derive
+    /// `Retry(SameRequest)`: the engine re-issues the update, `event_update`
+    /// GETs the source URL the committed MOVE already emptied, and the answer
+    /// is `NotFound` -> `ProviderRefused` for a move that SUCCEEDED. The
+    /// `move_resource` request declares itself unreplayable so the drop
+    /// reconciles against the destination instead.
+    #[tokio::test]
+    async fn a_dropped_relocate_move_reconciles_rather_than_replaying() {
+        let script = dav_script([dav_dropped_after_send()]);
+        let client =
+            CalDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
+
+        let error = client
+            .move_resource(
+                "https://dav.example.test/cal/a/one.ics",
+                "https://dav.example.test/cal/b/one.ics",
+                AccountOperation::EventUpdate,
+            )
+            .await
+            .expect_err("a dropped MOVE must fail");
+
+        assert_eq!(
+            transcripts(&script).len(),
+            1,
+            "the dropped MOVE must not be replayed"
+        );
+        assert!(
+            matches!(
+                error.recovery(),
+                RecoveryClass::Reconcile(advice)
+                    if advice.guidance.actions.contains(&ReconcileAction::CheckTarget)
+            ),
+            "a dropped MOVE must reconcile against the destination: {:?}",
+            error.recovery()
+        );
+    }
+
+    /// The `If-Match` update PUT stays replayable.
+    ///
+    /// It addresses a known URL with absolute state, and a replay landing after
+    /// the first attempt committed answers 412 - refresh-and-retry, which is
+    /// already the right handling. Losing that resilience is the cost the
+    /// no-replay fix above must NOT impose on the update lane.
+    #[tokio::test]
+    async fn an_if_match_update_put_still_replays_after_a_mid_flight_drop() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            reqwest::header::ETAG,
+            reqwest::header::HeaderValue::from_static("\"v2\""),
+        );
+        let script = dav_script([
+            dav_dropped_after_send(),
+            Canned::from(DavResponse {
+                status: StatusCode::NO_CONTENT,
+                headers,
+                body: String::new(),
+                url: String::new(),
+            }),
+        ]);
+        let client =
+            CalDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
+
+        let etag = client
+            .put_event(
+                "https://dav.example.test/cal/one.ics",
+                "BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n".to_string(),
+                PutCondition::IfMatch("v1"),
+                AccountOperation::EventUpdate,
+            )
+            .await
+            .expect("the replay succeeds");
+
+        assert_eq!(transcripts(&script).len(), 2, "the update PUT must replay");
+        assert_eq!(etag.as_deref(), Some("v2"));
     }
 
     /// A recurrence-instance `EventId` is refused before anything is sent.
@@ -1315,6 +1524,21 @@ mod tests {
                 AccountErrorKind::Protocol(ProtocolErrorKind::PartialResponse)
             ),
             "a copied-but-not-removed event is a partial response: {error:?}"
+        );
+        // The classification, not just the kind. `EventUpdate` is idempotent in
+        // the `AccountOperation` table, so `derive_protocol` answers
+        // `Retry(SameRequest)` for a `PartialResponse` unless the rebuilt error
+        // re-states the unreplayable declaration. That retry is the loop this
+        // asserts against: the re-issued update finds no MOVE, create-PUTs the
+        // destination it already occupied, takes a 412, refreshes, and repeats.
+        assert!(
+            matches!(
+                error.recovery(),
+                RecoveryClass::Reconcile(advice)
+                    if advice.guidance.actions.contains(&ReconcileAction::CheckTarget)
+            ),
+            "a half-applied move must reconcile, not replay: {:?}",
+            error.recovery()
         );
         let methods = transcripts(&script)
             .into_iter()

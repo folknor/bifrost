@@ -24,7 +24,11 @@ mod etag;
 mod multistatus;
 mod query;
 mod snapshot;
-#[cfg(feature = "test-support")]
+// `test` as well as the feature: this crate's own unit tests script the wire
+// seam too (the dispatcher's replay classification is decided here, not in
+// either protocol crate), and a crate cannot turn its own feature on for its
+// own test build.
+#[cfg(any(feature = "test-support", test))]
 pub mod test_support;
 mod transport;
 mod xml;

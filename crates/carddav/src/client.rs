@@ -479,8 +479,10 @@ impl CardDavClient {
             .headers(self.dav.auth_headers(url, operation).await?)
             .body(body);
         match condition {
+            // Twin of `bifrost-caldav`'s `put_vcard` conditional; see there for
+            // why a create-PUT must not be replayed after a mid-flight drop.
             PutCondition::IfNoneMatch => {
-                request = request.header("If-None-Match", "*");
+                request = request.header("If-None-Match", "*").idempotent(false);
             }
             PutCondition::IfMatch(etag) => {
                 if let Some(etag) = prepare_if_match(etag) {
@@ -514,7 +516,11 @@ impl CardDavClient {
         let request = self
             .dav
             .request(Method::DELETE, url)
-            .headers(self.dav.auth_headers(url, operation).await?);
+            .headers(self.dav.auth_headers(url, operation).await?)
+            // Twin of `bifrost-caldav`'s `delete_event`: a replayed DELETE that
+            // already landed answers 404, reporting a successful delete as a
+            // permanent refusal.
+            .idempotent(false);
         self.send_status_request(request, operation).await
     }
 
@@ -848,13 +854,192 @@ mod tests {
     }
     use bifrost_dav_core::DavResponse;
     use bifrost_dav_core::test_support::{
-        dav_redirect, dav_retried, dav_script, dav_script_empty, dav_script_yielding,
-        scripted_dav_net, transcripts,
+        dav_dropped_after_send, dav_redirect, dav_retried, dav_script, dav_script_empty,
+        dav_script_yielding, scripted_dav_net, transcripts,
     };
     use bifrost_net::test_support::{Canned, ScriptedDispatch};
+    use bifrost_types::ReconcileAction;
     use std::sync::Arc;
 
     use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
+
+    /// A create-PUT and a DELETE must not be replayed after a mid-flight drop.
+    ///
+    /// `bifrost-net` derives replay safety from the METHOD, and HTTP calls PUT
+    /// and DELETE idempotent. That is true of an absolute-state write to a known
+    /// URL and false of these two. A replayed create whose first attempt
+    /// committed answers 412 -> `ConcurrencyConflict` ->
+    /// `Retry(AfterStateRefresh)`, and the consumer re-creates the contact under
+    /// a fresh UUID, leaving two copies. A replayed DELETE that landed answers
+    /// 404 -> `NotFound` -> `ProviderRefused`, reporting a successful delete as
+    /// a permanent refusal.
+    ///
+    /// One drop is scripted per case, so a request that IS replayed exhausts the
+    /// script and panics rather than passing quietly.
+    #[tokio::test]
+    async fn a_create_put_and_a_delete_are_not_replayed_after_a_mid_flight_drop() {
+        for create in [true, false] {
+            let script = dav_script([dav_dropped_after_send()]);
+            let client = CardDavClient::with_account_net(
+                "https://dav.example.test",
+                scripted_dav_net(&script),
+            );
+            let error = if create {
+                client
+                    .put_vcard(
+                        "https://dav.example.test/book/new.vcf",
+                        "BEGIN:VCARD\r\nEND:VCARD\r\n".to_string(),
+                        PutCondition::IfNoneMatch,
+                        AccountOperation::ContactCreate,
+                    )
+                    .await
+                    .expect_err("a dropped create must fail")
+            } else {
+                client
+                    .delete_vcard(
+                        "https://dav.example.test/book/one.vcf",
+                        AccountOperation::ContactDelete,
+                    )
+                    .await
+                    .expect_err("a dropped delete must fail")
+            };
+
+            assert_eq!(
+                transcripts(&script).len(),
+                1,
+                "create={create}: the dropped request must not be replayed"
+            );
+            assert!(
+                matches!(
+                    error.recovery(),
+                    RecoveryClass::Reconcile(advice)
+                        if advice.guidance.actions.contains(&ReconcileAction::CheckTarget)
+                ),
+                "create={create}: a drop after send must reconcile against the target: {:?}",
+                error.recovery()
+            );
+        }
+    }
+
+    /// A dropped create names the target the consumer is told to check.
+    ///
+    /// Twin of `bifrost-caldav`'s
+    /// `a_dropped_create_names_the_target_to_reconcile_against`. The URL and the
+    /// UUID are minted locally in `contact_create`, so nothing on the wire knows
+    /// them; without the scope, the `Reconcile(CheckTarget)` the unreplayable
+    /// declaration buys is unactionable and the consumer can only re-create -
+    /// the duplicate the declaration exists to prevent.
+    #[tokio::test]
+    async fn a_dropped_create_names_the_target_to_reconcile_against() {
+        use bifrost_types::account::Account as _;
+
+        let script = dav_script([dav_dropped_after_send()]);
+        let client = Arc::new(CardDavClient::with_account_net(
+            "https://dav.example.test",
+            scripted_dav_net(&script),
+        ));
+        let account = crate::account::CardDavAccount::for_tests(
+            client,
+            "https://dav.example.test/books/work/",
+        );
+
+        let error = account
+            .contact_create(bifrost_types::ContactCreate {
+                address_book_id: Some(bifrost_types::AddressBookId(
+                    "https://dav.example.test/books/work/".to_string(),
+                )),
+                display_name: Some("One".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect_err("a dropped create must fail");
+
+        let Some(bifrost_types::ErrorScope::Contact { id }) = error.scope() else {
+            panic!("a dropped create must name its minted target: {error:?}");
+        };
+        assert!(
+            id.0.starts_with("https://dav.example.test/books/work/") && id.0.ends_with(".vcf"),
+            "the scope must carry the minted resource URL: {id:?}"
+        );
+    }
+
+    /// The `MOVE` leg of a relocate must not be replayed either.
+    ///
+    /// Twin of `bifrost-caldav`'s
+    /// `a_dropped_relocate_move_reconciles_rather_than_replaying`; keep them in
+    /// step. A relocate runs under `ContactUpdate`, which the
+    /// `AccountOperation` table calls idempotent, so a mid-flight drop on the
+    /// MOVE would derive `Retry(SameRequest)`: the engine re-issues the update,
+    /// which reads the source URL the committed MOVE already emptied, and a
+    /// move that SUCCEEDED is reported as a permanent refusal. The
+    /// `move_resource` request declares itself unreplayable so the drop
+    /// reconciles against the destination instead.
+    #[tokio::test]
+    async fn a_dropped_relocate_move_reconciles_rather_than_replaying() {
+        let script = dav_script([dav_dropped_after_send()]);
+        let client =
+            CardDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
+
+        let error = client
+            .move_resource(
+                "https://dav.example.test/book/a/one.vcf",
+                "https://dav.example.test/book/b/one.vcf",
+                AccountOperation::ContactUpdate,
+            )
+            .await
+            .expect_err("a dropped MOVE must fail");
+
+        assert_eq!(
+            transcripts(&script).len(),
+            1,
+            "the dropped MOVE must not be replayed"
+        );
+        assert!(
+            matches!(
+                error.recovery(),
+                RecoveryClass::Reconcile(advice)
+                    if advice.guidance.actions.contains(&ReconcileAction::CheckTarget)
+            ),
+            "a dropped MOVE must reconcile against the destination: {:?}",
+            error.recovery()
+        );
+    }
+
+    /// The `If-Match` update PUT stays replayable.
+    ///
+    /// It addresses a known URL with absolute state, and a replay landing after
+    /// the first attempt committed answers 412 - refresh-and-retry, which is
+    /// already the right handling. Losing that resilience is the cost the
+    /// no-replay fix above must NOT impose on the update lane.
+    #[tokio::test]
+    async fn an_if_match_update_put_still_replays_after_a_mid_flight_drop() {
+        let mut headers = HeaderMap::new();
+        headers.insert(ETAG, HeaderValue::from_static("\"v2\""));
+        let script = dav_script([
+            dav_dropped_after_send(),
+            Canned::from(DavResponse {
+                status: StatusCode::NO_CONTENT,
+                headers,
+                body: String::new(),
+                url: String::new(),
+            }),
+        ]);
+        let client =
+            CardDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
+
+        let etag = client
+            .put_vcard(
+                "https://dav.example.test/book/one.vcf",
+                "BEGIN:VCARD\r\nEND:VCARD\r\n".to_string(),
+                PutCondition::IfMatch("v1"),
+                AccountOperation::ContactUpdate,
+            )
+            .await
+            .expect("the replay succeeds");
+
+        assert_eq!(transcripts(&script).len(), 2, "the update PUT must replay");
+        assert_eq!(etag.as_deref(), Some("v2"));
+    }
 
     #[tokio::test]
     async fn credentials_never_reach_a_resource_href_origin() {
@@ -1708,6 +1893,21 @@ mod tests {
                 AccountErrorKind::Protocol(ProtocolErrorKind::PartialResponse)
             ),
             "a copied-but-not-removed contact is a partial response: {error:?}"
+        );
+        // The classification, not just the kind. `ContactUpdate` is idempotent
+        // in the `AccountOperation` table, so `derive_protocol` answers
+        // `Retry(SameRequest)` for a `PartialResponse` unless the rebuilt error
+        // re-states the unreplayable declaration - and that retry re-runs a
+        // create-PUT against the destination the first attempt already
+        // occupied, forever.
+        assert!(
+            matches!(
+                error.recovery(),
+                RecoveryClass::Reconcile(advice)
+                    if advice.guidance.actions.contains(&ReconcileAction::CheckTarget)
+            ),
+            "a half-applied move must reconcile, not replay: {:?}",
+            error.recovery()
         );
         let methods = transcripts(&script)
             .into_iter()

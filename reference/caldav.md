@@ -52,11 +52,15 @@ not a root-discovery fallback trigger.
   every other HTTP protocol crate; scripted transcripts exercise DAV flows at
   the wire, below all of it, without a listener. DAV still mints its own
   credentials and walks its own redirects, for the reasons in "The shared
-  layer" below. Every request path
-  except `sync_events` classifies a non-2xx status before the body is
-  parsed, so an error page can never decode as an authoritative empty
-  report; `sync_events` alone reads the raw response, because it must see
-  403 `valid-sync-token` and 410 as cursor invalidation rather than failure.
+  layer" below. Every request path classifies a non-2xx status
+  before the body is parsed, so an error page can never decode as an
+  authoritative empty report - except the two that must read a status as data,
+  and read the raw response through `report_raw_response` to do it:
+  `sync_events`, which sees 403 `valid-sync-token` and 410 as cursor
+  invalidation rather than failure, and the `href_query_leg` filtered lanes,
+  which see a refused filter (400/405/501, or a 403 naming a filter
+  precondition) as a signal to degrade to a local match rather than to fail the
+  call. Both classify every other non-2xx.
   A response body exceeding the buffered ceiling is classified as
   `Protocol(PartialResponse)` with `Attempt(Acknowledged)`, so a completed
   non-idempotent mutation reconciles instead of replaying blindly.
@@ -634,10 +638,12 @@ resource in the collection.
 
 All mail, contact, filter, blob, push, and settings methods return
 `AccountErrorKind::Unsupported` stamped with `Protocol::CalDav`.
-`set_priority` and `set_bandwidth_cap` are no-ops because this crate's local
-reqwest transport has no `AccountNet` or metered transport attachment. This
-also means DAV legs composed into an IMAP account are not included in that
-account's priority scheduling, bandwidth measurements, or bandwidth cap.
+`set_priority` and `set_bandwidth_cap` forward to `client.net()`, the crate's
+`AccountNet` handle, so DAV traffic is scheduled and metered like every other
+HTTP protocol crate's. A CalDAV leg composed into an IMAP-shaped account is
+handed that account's own `AccountNet` at construction, so it shares the
+account's priority, bandwidth meter and cap rather than running unmetered
+beside them.
 
 ## Sync scope is per calendar collection
 
@@ -720,6 +726,80 @@ which script an EMPTY transport so a regression panics on an exhausted script.
 `CalDavCredentials` stays published and unchanged; `to_shared` projects it onto
 the dispatcher's `DavCredentials`, cloning the `Arc` so a bearer token is still
 read live from the shared source at every request.
+
+**Which requests are declared unreplayable, and why it is a request-level
+declaration.** `DavRequest::idempotent(false)` is set at three call sites: the
+create-PUT (`If-None-Match: *`) in both crates' `put_event` / `put_vcard` - which
+is also the copy leg of the MOVE fallback, one caller up, so the two lanes share
+one declaration - the DELETE in `delete_event` / `delete_vcard` (and in
+`DavDispatch::delete_resource`, which is published but has no in-workspace
+caller), and the `MOVE` in `DavDispatch::move_resource`. Each is a request whose
+blind replay
+after a mid-flight drop misreports a mutation that SUCCEEDED: a replayed create
+answers 412 and the consumer re-creates under a fresh UUID, leaving two copies;
+a replayed DELETE or a re-issued update after a committed MOVE answers 404 at a
+source the first attempt already emptied, which the status ladder reads as
+`NotFound` -> `ProviderRefused`. `If-Match` and unconditional PUTs are
+deliberately NOT declared: they address a known URL with absolute state, so a
+replay lands on the same end state, and a replay arriving after the first
+attempt committed answers 412 -> `ConcurrencyConflict` ->
+`Retry(AfterStateRefresh)`, which is already the right handling. Losing that
+resilience on the update lane is a cost the fix must not impose.
+
+The declaration does two things, and the second is the one that is easy to miss.
+On the wire it stops `bifrost-net` replaying the request. At CLASSIFICATION it
+also overrides the `AccountOperation` idempotency table, which is the default
+source of `derive`'s idempotency and is keyed on the LOGICAL operation rather
+than on the request: the copy leg and the MOVE both run under
+`EventUpdate` / `ContactUpdate`, which that table calls idempotent, so without
+the override a drop on either derives `Retry(SameRequest)`. `dispatch_once`
+therefore stamps `idempotency_override(false)` on every failure it returns FROM
+THE WIRE, not only the transport one - the oversized-response arm mints
+`Protocol(PartialResponse)`, which `derive_protocol` routes by the same flag.
+(The two invalid-header returns precede the stamp and do not carry it; harmless,
+since a malformed header derives `ClientBug` either way.)
+`MOVE` needs the declaration even though it is an extension method net never
+replays, precisely because the classification half is separate.
+
+**And the declaration must survive a REBUILD.** That is the third place, and the
+easiest to miss. `partial_sequence_error` (caldav) and `partial_move_error`
+(both) reclassify a later leg's failure by minting a FRESH
+`AccountErrorBuilder::new(Protocol(PartialResponse), ..)` and copying only the
+cause chain across - an override is not a cause, so it does not ride along.
+Without re-stating it there, `derive_protocol` fell back to the operation table,
+called `EventUpdate` / `ContactUpdate` idempotent, and answered
+`Retry(SameRequest)` for a half-applied sequence: on a MOVE-less server the
+engine re-issues the update, finds no MOVE, create-PUTs the destination the first
+attempt already occupied, takes a 412 -> `Retry(AfterStateRefresh)`, and loops
+forever - or, if the source DELETE had landed, GETs a 404 and reports a move that
+SUCCEEDED as `ProviderRefused`. Both wrappers therefore set
+`.idempotency_override(false)` unconditionally: a sequence whose earlier leg
+landed cannot be replayed from the top whatever the table says about the logical
+operation. RSVP was right only by accident, because `EventRsvp` is
+non-idempotent in the table. Pinned by
+`a_move_without_server_move_support_copies_then_deletes` and its CardDAV twin,
+which assert the `recovery()` and not only the kind.
+
+One failure is deliberately NOT treated as reaching the server: a token source
+that cannot mint a credential. `transport_error` stamps `Attempt(Unsent)`, since
+no request left the process, so it derives `Retry(SameRequest)` rather than
+sending the consumer probing a target nothing was ever written to. That is right
+for a transient read failure and wrong for a dead credential, so `auth_headers`
+does not fold every `TokenSource::current()` failure into it: a
+`bifrost_net::Error::AuthLost` or `RefreshFailed` is handed to
+`bifrost_net::into_account_error` - the same funnel the wire path uses - and
+comes out `Authentication(ReauthorizationRequired)` or
+`Authentication(RefreshTransient)`. Only the remainder keeps the `Unsent`
+transport classification. Without the split a permanently revoked bearer token
+became an endless retry with no reauthorization signal.
+
+**A `Reconcile(CheckTarget)` must name the target.** `event_create` /
+`contact_create` mint the resource URL and the UID locally, so a dropped
+create-PUT carries nothing that identifies what to probe - and a consumer told to
+check an unnamed target can only re-create, which is the duplicate the whole
+declaration exists to prevent. Both create paths therefore stamp the minted URL
+as an `ErrorScope` on the failure. Pinned by
+`a_dropped_create_names_the_target_to_reconcile_against` in both crates.
 
 Finally the XML decoding primitives, in `bifrost_dav_core::xml`: `local_name`,
 `normalize_etag`, `resolve_href`, `push_text`, `trimmed`, plus `escape_xml` and

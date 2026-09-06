@@ -130,6 +130,17 @@ pub fn parse_error(
     .expect("valid account error classification")
 }
 
+/// A transport failure raised BEFORE any byte of the request left this process.
+///
+/// The attempt is `Unsent`, not `InFlight`. The sole production caller is
+/// `auth_headers`, which reaches here when the token source cannot mint a
+/// credential - there is no request on the wire, and nothing at the target to
+/// reconcile against. Claiming `InFlight` made a non-idempotent operation derive
+/// `Reconcile(CheckTarget)` and sent the consumer probing for a resource that was
+/// never written; `Unsent` derives `Retry(SameRequest)`, which is what a failed
+/// token read deserves. Wire-level transmission evidence comes from
+/// `bifrost_net::into_account_error`, which carries the state the transport
+/// actually observed.
 #[must_use]
 pub fn transport_error(
     operation: AccountOperation,
@@ -143,9 +154,7 @@ pub fn transport_error(
             Some(DiagnosticText::support_only(message)),
         )),
     )
-    .push_cause(Cause::Attempt(AttemptCause::new(
-        TransmissionState::InFlight,
-    )))
+    .push_cause(Cause::Attempt(AttemptCause::new(TransmissionState::Unsent)))
     .protocol(protocol.protocol())
     .operation(operation)
     .try_build()

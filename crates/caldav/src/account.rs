@@ -1010,7 +1010,22 @@ impl Account for CalDavAccount {
                     PutCondition::IfNoneMatch,
                     AccountOperation::EventCreate,
                 )
-                .await?;
+                .await
+                // The URL and the UID are minted LOCALLY, so nothing else in the
+                // failure names them. A dropped create-PUT derives
+                // `Reconcile(CheckTarget)`, and a consumer told to check a
+                // target the error does not identify can only re-create - two
+                // copies of one event, which is exactly what the unreplayable
+                // declaration exists to prevent. The scope carries the minted
+                // URL (whose final segment is the UID) so the probe is possible.
+                .map_err(|error| {
+                    error
+                        .clone()
+                        .into_builder()
+                        .scope(event_scope(url.clone()))
+                        .try_build()
+                        .unwrap_or(error)
+                })?;
             Ok(EventId(url))
         })
     }
@@ -1403,6 +1418,17 @@ fn patch_changes_content(patch: &EventPatch) -> bool {
 /// consumer the request was half-applied rather than refused, so it reconciles
 /// instead of replaying a write that already took effect. The original cause
 /// chain rides along as secondary evidence.
+///
+/// The unreplayable declaration must be RE-STATED here. `dispatch_once` stamps
+/// `idempotency_override(false)` on the leg's own failure, but this is a FRESH
+/// `AccountErrorBuilder`, and an override is not part of the cause chain that
+/// gets copied across - so without the restatement `derive_protocol` falls back
+/// to the `AccountOperation` table, which calls `EventUpdate` idempotent, and
+/// answers `Retry(SameRequest)` for a sequence that is half applied. The
+/// declaration must survive the wire, the classification, and any rebuild.
+/// It holds for every caller regardless of what the table says: a sequence whose
+/// earlier leg landed cannot be replayed from the top, because the replay
+/// re-runs that leg against state it already changed.
 fn partial_sequence_error(
     error: &AccountError,
     operation: AccountOperation,
@@ -1417,6 +1443,7 @@ fn partial_sequence_error(
     )
     .protocol(Protocol::CalDav)
     .operation(operation)
+    .idempotency_override(false)
     .push_cause(Cause::Attempt(AttemptCause::new(
         TransmissionState::Acknowledged,
     )));

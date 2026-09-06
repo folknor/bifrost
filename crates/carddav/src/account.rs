@@ -33,8 +33,8 @@ use uuid::Uuid;
 use crate::CardDavConfig;
 use crate::capabilities::carddav_capabilities;
 use crate::client::{
-    CardDavClient, FilteredHrefs, HrefQuery, PutCondition, extend_candidates, local_error,
-    not_found_error, unsupported_error,
+    CardDavClient, FilteredHrefs, HrefQuery, PutCondition, contact_scope, extend_candidates,
+    local_error, not_found_error, unsupported_error,
 };
 use crate::parse::{AddressBookCollection, CardDavFetchedVCard, CardDavMultigetReport};
 use crate::vcard::{VCardParseError, contact_from_vcard, vcard_from_create, vcard_from_patch};
@@ -1075,7 +1075,21 @@ impl Account for CardDavAccount {
                     PutCondition::IfNoneMatch,
                     AccountOperation::ContactCreate,
                 )
-                .await?;
+                .await
+                // The URL and the UUID are minted LOCALLY, so nothing else in
+                // the failure names them. A dropped create-PUT derives
+                // `Reconcile(CheckTarget)`, and a consumer told to check a
+                // target the error does not identify can only re-create - two
+                // copies of one contact, which is what the unreplayable
+                // declaration exists to prevent. Twin of `event_create`'s.
+                .map_err(|error| {
+                    error
+                        .clone()
+                        .into_builder()
+                        .scope(contact_scope(url.clone()))
+                        .try_build()
+                        .unwrap_or(error)
+                })?;
             Ok(ContactId(url))
         })
     }
@@ -1341,6 +1355,14 @@ fn patch_changes_content(patch: &ContactPatch) -> bool {
 /// consumer the request was half-applied rather than refused, so it reconciles
 /// instead of replaying a write that already took effect. Twin of
 /// `bifrost-caldav`'s `partial_sequence_error`.
+///
+/// The unreplayable declaration must be RE-STATED here. `dispatch_once` stamps
+/// `idempotency_override(false)` on the leg's own failure, but this is a FRESH
+/// `AccountErrorBuilder`, and an override is not part of the cause chain that
+/// gets copied across - so without the restatement `derive_protocol` falls back
+/// to the `AccountOperation` table, which calls `ContactUpdate` idempotent, and
+/// answers `Retry(SameRequest)` for a move that is half applied. The declaration
+/// must survive the wire, the classification, and any rebuild.
 fn partial_move_error(error: &AccountError, detail: &'static str) -> AccountError {
     let mut builder = AccountErrorBuilder::new(
         AccountErrorKind::Protocol(ProtocolErrorKind::PartialResponse),
@@ -1351,6 +1373,7 @@ fn partial_move_error(error: &AccountError, detail: &'static str) -> AccountErro
     )
     .protocol(Protocol::CardDav)
     .operation(AccountOperation::ContactUpdate)
+    .idempotency_override(false)
     .push_cause(Cause::Attempt(AttemptCause::new(
         TransmissionState::Acknowledged,
     )));

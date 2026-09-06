@@ -39,9 +39,12 @@ carries the reasoning, and the twin must not drift from it.
   bandwidth metering and observability with every other HTTP protocol crate;
   scripted transcripts exercise DAV flows at the wire, below all of it, without
   a listener. DAV still mints its own credentials and walks its own redirects.
-  Every request path
-  classifies a non-2xx status before the body is parsed, so an error page
-  can never decode as an authoritative empty report.
+  Every request path classifies a non-2xx status before the body is parsed, so
+  an error page can never decode as an authoritative empty report - except the
+  `href_query_leg` filtered lane, which reads the raw response through
+  `report_raw_response` because it must see a refused filter (400/405/501, or a
+  403 naming a filter precondition) as a signal to degrade to a local match
+  rather than to fail the call. It classifies every other non-2xx.
   A response body exceeding the buffered ceiling is classified as
   `Protocol(PartialResponse)` with `Attempt(Acknowledged)`, so a completed
   non-idempotent mutation reconciles instead of replaying blindly.
@@ -389,10 +392,12 @@ give one contact two ids.
 All mail, filter, blob, push, calendar, and settings methods return
 `AccountErrorKind::Unsupported` stamped with `Protocol::CardDav`.
 `push_stream` and `scope_lifecycle_stream` are empty streams.
-`set_priority` and `set_bandwidth_cap` are no-ops because this crate's local
-reqwest transport has no `AccountNet` or metered transport attachment. This
-also means CardDAV legs composed into an IMAP account are not included in that
-account's priority scheduling, bandwidth measurements, or bandwidth cap.
+`set_priority` and `set_bandwidth_cap` forward to `client.net()`, the crate's
+`AccountNet` handle, so DAV traffic is scheduled and metered like every other
+HTTP protocol crate's. A CardDAV leg composed into an IMAP-shaped account is
+handed that account's own `AccountNet` at construction, so it shares the
+account's priority, bandwidth meter and cap rather than running unmetered
+beside them.
 
 ## Sync scope is per address book
 
@@ -445,6 +450,26 @@ client, credentials, the admitted-origin credential gate, the manual
 cross-origin redirect walk and the generic WebDAV verbs.
 `CardDavCredentials` stays published and unchanged; `to_shared` projects it onto
 the dispatcher's `DavCredentials`.
+
+Replay policy is shared and lives with the dispatcher: `reference/caldav.md`,
+"Which requests are declared unreplayable", is the description. It names the same
+call sites on this side - the create-PUT in `put_vcard` (which is also the copy
+leg of the MOVE fallback), `delete_vcard`, and `DavDispatch::move_resource` -
+states that `If-Match` and unconditional PUTs stay replayable, and explains that
+the declaration overrides the `AccountOperation` idempotency table at
+classification as well as suppressing the wire replay, which is what a
+`ContactUpdate`-scoped copy leg or MOVE needs. The third leg of that rule lands
+in this crate's own `account.rs`: `partial_move_error` rebuilds the error through
+a fresh `AccountErrorBuilder`, which carries no override forward, so it re-states
+`.idempotency_override(false)` itself - without it a half-applied move derived
+`Retry(SameRequest)` and the replay create-PUT the destination it had already
+occupied. Pinned here by
+`a_create_put_and_a_delete_are_not_replayed_after_a_mid_flight_drop`,
+`a_dropped_relocate_move_reconciles_rather_than_replaying`,
+`an_if_match_update_put_still_replays_after_a_mid_flight_drop` and the
+`recovery()` assertion in
+`a_contact_move_without_server_move_support_copies_then_deletes`, each the twin
+of a CalDAV test of the same name.
 
 The 207 parser and the polling cursor were both collapsed into that shared crate
 too; `reference/caldav.md`, "The 207 parser, collapsed" and "The polling cursor,

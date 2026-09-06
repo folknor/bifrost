@@ -247,13 +247,10 @@ impl DavDispatch {
                 headers.insert(AUTHORIZATION, value);
             }
             DavCredentials::Bearer { token_source } => {
-                let token = token_source.current().await.map_err(|error| {
-                    transport_error(
-                        operation,
-                        format!("failed to read OAuth access token: {error}"),
-                        self.protocol,
-                    )
-                })?;
+                let token = token_source
+                    .current()
+                    .await
+                    .map_err(|error| self.token_read_error(error, operation))?;
                 let value =
                     HeaderValue::from_str(&format!("Bearer {}", token.as_str())).map_err(|_| {
                         local_error(
@@ -266,6 +263,41 @@ impl DavDispatch {
             }
         }
         Ok(headers)
+    }
+
+    /// Classify a `TokenSource::current()` failure.
+    ///
+    /// Folding every one of these into `transport_error` was survivable while
+    /// that constructor claimed `InFlight` - the result reconciled and stopped.
+    /// It now claims `Unsent`, which derives `Retry(SameRequest)`, and a
+    /// PERMANENT credential failure retried as a transport blip is a retry storm
+    /// that never emits the reauthorization signal the consumer needs. So the
+    /// two auth-bearing net errors are handed to the same funnel the wire path
+    /// uses, `bifrost_net::into_account_error`, which maps `AuthLost` to
+    /// `Auth(ReauthorizationRequired)` and `RefreshFailed` to
+    /// `Auth(RefreshTransient)`. Only the remainder keeps the `Unsent` transport
+    /// classification, which is correct for it: no request left this process and
+    /// there is nothing at the target to reconcile against.
+    fn token_read_error(&self, error: NetError, operation: AccountOperation) -> AccountError {
+        if matches!(
+            error,
+            NetError::AuthLost { .. } | NetError::RefreshFailed { .. }
+        ) {
+            return into_account_error(
+                error,
+                NetErrorContext {
+                    provider: None,
+                    protocol: self.protocol.protocol(),
+                    operation,
+                    scope: None,
+                },
+            );
+        }
+        transport_error(
+            operation,
+            format!("failed to read OAuth access token: {error}"),
+            self.protocol,
+        )
     }
 
     /// One wire attempt through `bifrost-net`, with its status-bearing failures
@@ -323,7 +355,42 @@ impl DavDispatch {
         if let Some(body) = &request.body {
             builder = builder.body(body.clone());
         }
-        match builder.send().await {
+        // A request that declared itself unreplayable on the wire must classify
+        // that way too, whichever failure it hits. The `AccountOperation` table
+        // is the default source of idempotency and it is keyed on the logical
+        // operation, not on the request: the copy leg of the MOVE fallback is a
+        // create-PUT (`If-None-Match: *`) issued under
+        // `EventUpdate`/`ContactUpdate`, which the table calls idempotent.
+        // Every `Err` arm below is routed by that flag - the transport arm
+        // through `derive`'s transmission-state branch, the oversized-response
+        // arm through `derive_protocol` - so the decoration wraps the whole
+        // result rather than one arm. Left on one arm it let an oversized
+        // response on that copy leg derive `Retry(SameRequest)`, whose replay
+        // answers 412 at the destination the first attempt already occupied,
+        // forever.
+        self.wire_outcome(request, operation, builder.send().await)
+            .map_err(|error| {
+                if request.idempotent == Some(false) {
+                    return error
+                        .into_builder()
+                        .idempotency_override(false)
+                        .try_build()
+                        .expect("declaring a DAV failure unreplayable cannot invalidate it");
+                }
+                error
+            })
+    }
+
+    /// Turn one `bifrost-net` outcome into a `DavResponse` or a classified
+    /// `AccountError`. Split out of [`Self::dispatch_once`] so the unreplayable
+    /// declaration can decorate every failing arm at one point.
+    fn wire_outcome(
+        &self,
+        request: &DavRequest,
+        operation: AccountOperation,
+        outcome: Result<bifrost_net::Response, NetError>,
+    ) -> Result<DavResponse, AccountError> {
+        match outcome {
             Ok(response) => Ok(DavResponse {
                 status: response.status,
                 headers: response.headers,
@@ -509,9 +576,11 @@ impl DavDispatch {
     }
 
     /// A `REPORT` returning the raw response, so a caller that must inspect a
-    /// non-2xx status before it becomes an error can do so. CalDAV's
-    /// `sync-collection` is the only such caller: it reads 403
-    /// `valid-sync-token` and 410 as cursor invalidation rather than failure.
+    /// non-2xx status before it becomes an error can do so. Two kinds of caller
+    /// do: CalDAV's `sync-collection`, which reads 403 `valid-sync-token` and
+    /// 410 as cursor invalidation rather than failure; and both crates'
+    /// `href_query_leg`, which reads a refused filter (`filter_unsupported`)
+    /// as "run the query locally instead" rather than as a failed listing.
     pub async fn report_raw_response(
         &self,
         url: &str,
@@ -548,8 +617,15 @@ impl DavDispatch {
         url: &str,
         operation: AccountOperation,
     ) -> Result<(), AccountError> {
-        let request =
-            DavRequest::new(Method::DELETE, url).headers(self.auth_headers(url, operation).await?);
+        let request = DavRequest::new(Method::DELETE, url)
+            .headers(self.auth_headers(url, operation).await?)
+            // HTTP calls DELETE idempotent, so `bifrost-net` would replay one
+            // whose connection dropped after the bytes went out. A replay of a
+            // DELETE that landed answers 404, which the status ladder reads as
+            // `NotFound` -> `ProviderRefused` - a successful delete reported as
+            // a permanent refusal. Declaring it unreplayable makes the drop
+            // surface as `InFlight` on a non-idempotent op, which reconciles.
+            .idempotent(false);
         self.send_status_request(request, operation).await
     }
 
@@ -588,7 +664,18 @@ impl DavDispatch {
         let request = DavRequest::new(method, from)
             .header("Destination", destination)
             .header("Overwrite", "F")
-            .headers(self.auth_headers(from, operation).await?);
+            .headers(self.auth_headers(from, operation).await?)
+            // `MOVE` is an extension method, so `bifrost-net` never replays it
+            // on the wire - but the CLASSIFICATION of a mid-flight drop is
+            // decided by the `AccountOperation` table, and a relocate runs
+            // under `EventUpdate`/`ContactUpdate`, which that table calls
+            // idempotent. Without this declaration the drop derives
+            // `Retry(SameRequest)`, the engine re-issues the update, and the
+            // re-issue GETs a source URL the committed MOVE already emptied:
+            // 404 -> `NotFound` -> `ProviderRefused`, a move that succeeded
+            // reported as a permanent refusal. Declaring it unreplayable
+            // routes the drop to `Reconcile(CheckTarget)` instead.
+            .idempotent(false);
         let response = self.send_raw_request(request, operation).await?;
         if response.status.is_success() {
             return Ok(true);
@@ -623,5 +710,241 @@ impl std::fmt::Debug for DavDispatch {
             .field("base_url", &self.base_url)
             .field("protocol", &self.protocol)
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bifrost_net::AccessToken;
+    use bifrost_net::test_support::Canned;
+    use bifrost_types::{
+        AccountErrorKind, AuthErrorKind, ProtocolErrorKind, ReconcileAction, RecoveryClass,
+        TransmissionState,
+    };
+    use reqwest::header::HeaderMap;
+
+    use super::*;
+    use crate::test_support::{
+        dav_dropped_after_send, dav_script, dav_script_empty, scripted_dav_net,
+        scripted_dav_net_capped, transcripts,
+    };
+
+    const BASE: &str = "https://dav.example.test";
+
+    fn scripted_dispatch(net: AccountNet) -> DavDispatch {
+        DavDispatch::with_account_net(
+            net,
+            BASE,
+            DavCredentials::Basic {
+                username: "user".to_string(),
+                password: "pass".to_string(),
+            },
+            DavProtocol::CalDav,
+        )
+    }
+
+    fn reconciles(error: &AccountError) -> bool {
+        matches!(
+            error.recovery(),
+            RecoveryClass::Reconcile(advice)
+                if advice.guidance.actions.contains(&ReconcileAction::CheckTarget)
+        )
+    }
+
+    /// A `MOVE` dropped mid-flight must reconcile, not replay.
+    ///
+    /// `MOVE` is an extension method, so `bifrost-net` never replays it on the
+    /// wire - but classification is a separate question, decided by the
+    /// `AccountOperation` table, and a relocate runs under `EventUpdate` /
+    /// `ContactUpdate`, which that table calls idempotent. Without the
+    /// request-level declaration the drop derives `Retry(SameRequest)`; the
+    /// engine re-issues the update, which GETs the source URL the committed
+    /// MOVE already emptied, and a move that SUCCEEDED is reported as
+    /// `NotFound` -> `ProviderRefused`.
+    ///
+    /// Exactly one drop is scripted, so a replay would exhaust the script and
+    /// panic rather than pass quietly.
+    #[tokio::test]
+    async fn a_dropped_move_reconciles_rather_than_replaying() {
+        let script = dav_script([dav_dropped_after_send()]);
+        let dispatch = scripted_dispatch(scripted_dav_net(&script));
+
+        let error = dispatch
+            .move_resource(
+                &format!("{BASE}/cal/a/one.ics"),
+                &format!("{BASE}/cal/b/one.ics"),
+                AccountOperation::EventUpdate,
+            )
+            .await
+            .expect_err("a dropped MOVE must fail");
+
+        assert_eq!(
+            transcripts(&script).len(),
+            1,
+            "the dropped MOVE must not be replayed"
+        );
+        assert!(
+            reconciles(&error),
+            "a dropped MOVE must reconcile against the destination: {:?}",
+            error.recovery()
+        );
+    }
+
+    /// An oversized response on an unreplayable request reconciles too.
+    ///
+    /// `response_read_error` mints `Protocol(PartialResponse)` with an
+    /// ACKNOWLEDGED attempt, and `derive_protocol` routes that purely by
+    /// idempotency - so this arm needs the same declaration the transport arm
+    /// does. The case that bites is the copy leg of the MOVE fallback: a
+    /// create-PUT under `EventUpdate`, which the operation table calls
+    /// idempotent, deriving `Retry(SameRequest)` whose replay answers 412 at
+    /// the destination the first attempt already occupied - forever.
+    #[tokio::test]
+    async fn an_oversized_response_on_an_unreplayable_request_reconciles() {
+        let oversized = || Canned::Response {
+            status: StatusCode::CREATED,
+            headers: HeaderMap::new(),
+            body: Bytes::from(vec![b'x'; 64]),
+        };
+        for idempotent in [true, false] {
+            let script = dav_script([oversized()]);
+            let dispatch = scripted_dispatch(scripted_dav_net_capped(&script, Some(8)));
+            let url = format!("{BASE}/cal/b/one.ics");
+            let request = DavRequest::new(Method::PUT, &url)
+                .header("If-None-Match", "*")
+                .headers(
+                    dispatch
+                        .auth_headers(&url, AccountOperation::EventUpdate)
+                        .await
+                        .expect("credentials mint for the base origin"),
+                )
+                .idempotent(idempotent)
+                .body("BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n".to_string());
+
+            let error = dispatch
+                .send_raw_request(request, AccountOperation::EventUpdate)
+                .await
+                .expect_err("an oversized body must fail");
+
+            assert!(
+                matches!(
+                    error.kind(),
+                    AccountErrorKind::Protocol(ProtocolErrorKind::PartialResponse)
+                ),
+                "idempotent={idempotent}: {:?}",
+                error.kind()
+            );
+            if idempotent {
+                // The control: an ordinary replayable request keeps the retry
+                // classification, so the assertion below is about the
+                // declaration rather than about the arm as a whole.
+                assert!(
+                    matches!(error.recovery(), RecoveryClass::Retry(_)),
+                    "a replayable request may retry: {:?}",
+                    error.recovery()
+                );
+            } else {
+                assert!(
+                    reconciles(&error),
+                    "an unreplayable request must reconcile: {:?}",
+                    error.recovery()
+                );
+            }
+        }
+    }
+
+    /// A token source that always fails, with the error the case under test
+    /// needs.
+    struct FailingTokenSource(fn() -> NetError);
+
+    impl TokenSource for FailingTokenSource {
+        fn current(&self) -> bifrost_types::AccountFuture<Result<AccessToken, NetError>> {
+            let make = self.0;
+            Box::pin(async move { Err(make()) })
+        }
+
+        fn refresh(&self) -> bifrost_types::AccountFuture<Result<AccessToken, NetError>> {
+            self.current()
+        }
+    }
+
+    fn bearer_dispatch(make: fn() -> NetError) -> DavDispatch {
+        DavDispatch::with_account_net(
+            scripted_dav_net(&dav_script_empty()),
+            BASE,
+            DavCredentials::Bearer {
+                token_source: Arc::new(FailingTokenSource(make)),
+            },
+            DavProtocol::CalDav,
+        )
+    }
+
+    /// A credential the token source cannot mint is classified by WHY.
+    ///
+    /// `transport_error` now stamps `Unsent`, which derives
+    /// `Retry(SameRequest)`. That is right for a transient read failure and
+    /// wrong for a permanently revoked token: folding every `TokenSource`
+    /// failure into it turns a dead credential into a retry storm that never
+    /// raises a reauthorization signal. So the two auth-bearing net errors go
+    /// through `bifrost_net::into_account_error`, and only the remainder keeps
+    /// the `Unsent` transport classification.
+    ///
+    /// Nothing is scripted, so a case that reaches the wire panics on an
+    /// exhausted script rather than passing.
+    #[tokio::test]
+    async fn a_token_source_failure_is_classified_by_why_it_failed() {
+        let revoked = bearer_dispatch(|| NetError::AuthLost {
+            transmission_state: None,
+            final_response: None,
+        })
+        .auth_headers(&format!("{BASE}/cal/"), AccountOperation::EventUpdate)
+        .await
+        .expect_err("a revoked token cannot mint a credential");
+        assert!(
+            matches!(
+                revoked.kind(),
+                AccountErrorKind::Authentication(AuthErrorKind::ReauthorizationRequired)
+            ),
+            "a revoked bearer token must ask for reauthorization: {:?}",
+            revoked.kind()
+        );
+        assert!(
+            !matches!(revoked.recovery(), RecoveryClass::Retry(_)),
+            "a revoked bearer token must not retry: {:?}",
+            revoked.recovery()
+        );
+
+        let refresh = bearer_dispatch(|| NetError::RefreshFailed {
+            retry_after: None,
+            source: Arc::new(NetError::Timeout {
+                transmission_state: TransmissionState::Unsent,
+            }),
+        })
+        .auth_headers(&format!("{BASE}/cal/"), AccountOperation::EventUpdate)
+        .await
+        .expect_err("a failed refresh cannot mint a credential");
+        assert!(
+            matches!(
+                refresh.kind(),
+                AccountErrorKind::Authentication(AuthErrorKind::RefreshTransient)
+            ),
+            "a failed refresh is transient auth, not transport: {:?}",
+            refresh.kind()
+        );
+
+        let other = bearer_dispatch(|| NetError::Cancelled)
+            .auth_headers(&format!("{BASE}/cal/"), AccountOperation::EventUpdate)
+            .await
+            .expect_err("a cancelled token read cannot mint a credential");
+        assert!(
+            matches!(other.kind(), AccountErrorKind::Transport(_)),
+            "every other token failure stays a transport error: {:?}",
+            other.kind()
+        );
+        assert!(
+            matches!(other.recovery(), RecoveryClass::Retry(_)),
+            "nothing was sent, so the same request may be retried: {:?}",
+            other.recovery()
+        );
     }
 }

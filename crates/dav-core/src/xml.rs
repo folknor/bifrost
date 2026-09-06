@@ -1,12 +1,15 @@
 //! XML decoding primitives shared by both DAV parsers.
 //!
 //! These five were byte-identical in `bifrost-caldav::parse` and
-//! `bifrost-carddav::parse`. The parsers ABOVE them are not shared and are not
-//! meant to be: `PropStat`, `ResponseParts` and `parse_multiget_report` carry
-//! genuinely different property sets and entry types (calendar-data versus
-//! address-data), and unifying those would mean parameterizing the parser over
-//! the resource kind - a redesign, not a move. See `reference/caldav.md` for
-//! where the extraction stops and why.
+//! `bifrost-carddav::parse`. The 207 Multi-Status machine above them - the
+//! `<response>` / `<propstat>` state walk, `ResponseParts`, and the multiget
+//! parse - was once judged unshareable for carrying different property sets and
+//! entry types (calendar-data versus address-data). That redesign was since
+//! done: the crate-private `multistatus` module parameterizes the walk over a `PropSet` naming
+//! which properties a dialect stages plus the constructors that build its own
+//! entry type, and both crates run through it. What remains dialect-local above
+//! this module is the iCalendar and vCard decoding of the property VALUES, not
+//! the document structure.
 
 use quick_xml::escape::unescape;
 use reqwest::Url;

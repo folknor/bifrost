@@ -28,4 +28,8 @@ reqwest = { workspace = true, features = ["native-tls"] }
 test-support = ["bifrost-net/test-support"]
 
 [dev-dependencies]
+# The crate's own tests script the wire seam through `test_support`, which is
+# feature-gated for consumers and `cfg(test)`-enabled here; the seam it fronts
+# lives behind `bifrost-net/test-support`.
+bifrost-net = { path = "../net", features = ["test-support"] }
 tokio = { workspace = true, features = ["macros", "rt"] }
