@@ -836,7 +836,22 @@ acknowledger joins at the ring's tail and cannot see those pages. That was
 already the failure shape before the bound existed, when such a walk ran into
 the observer and settled. An explicit observer subscription that counts for
 neither the gate nor the bound is the clean fix, and is filed in
-`notes/todo.md`. A bounded `mpsc` for backfill was rejected on the same
+`notes/todo.md`.
+
+The acknowledger may not defer its acknowledgements by more than
+`lane_capacity` publications. The producer parks once that many backfill pages
+are outstanding, and nothing breaks the wait but an acknowledgement, a lag, a
+reset or a departure; a consumer that batches acknowledgements by count must
+batch below the bound, or raise `BackfillConfig::lane_capacity` above its
+window. Only within one partition does the latest acknowledgement settle its
+predecessors: sibling partitions are separate lanes, so acknowledging a later
+partition's page frees nothing of an earlier one's. Before the bound such a
+consumer risked a lag; under it the consumer waits for a page that will not
+come while the producer waits for an acknowledgement the consumer is holding.
+Whether the engine should also defend against that consumer is filed in
+`notes/todo.md`.
+
+A bounded `mpsc` for backfill was rejected on the same
 contract: it is single-consumer, so pages would reach one receiver and vanish
 for the rest, while a bound on the producer leaves the stream byte-for-byte
 unchanged.
@@ -876,7 +891,8 @@ against the live entries, and there is no scope-wide branch to replay against.
 
 **Supersession is the one place the literal rule is corrected.** Supersession
 removes the older entry on purpose, so that a consumer can persist N batches
-and acknowledge only the last. Under the bare rule one partition could publish
+of one partition and acknowledge only the last, for any N below the bound.
+Under the bare rule one partition could publish
 without limit while holding one record. The survivor therefore inherits the
 charge of what it displaced (`BoundaryEntry::subsumed`, each page with its own
 delivery stamp), and acknowledging a superseded id settles exactly that page.
@@ -1021,9 +1037,11 @@ delete that succeeded.** `note_undelivered` records the scope in a request
 set, because every trigger that ran at walk end lived in the attachment that
 saw the loss and the orchestrator returns on shutdown from inside its
 partition loop. A walk takes its OWN scope's request at its end, the pre-retry
-discard and the writer's `WalkNotWhole` discard take it because each is the
-repair asked for, and `detach` drains what is left while the writer is still
-alive. A failed delete, or a ceilinged discard, leaves the request outstanding.
+discard takes it because it is the whole repair asked for, and `detach` drains
+what is left while the writer is still alive. A failed delete leaves the
+request outstanding, and so does the writer's `WalkNotWhole` discard, which is
+ceilinged at the refused marker and therefore not the whole repair; the
+rescan's reopen and its pre-retry discard are what settle that one.
 
 **The rescan reopens a settled incarnation whose reading moved.** The marker
 is published and the incarnation settled in one step, and the loss that voids

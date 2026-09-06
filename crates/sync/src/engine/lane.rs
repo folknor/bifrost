@@ -44,8 +44,9 @@
 //!
 //! **One point where the literal rule needed correcting**, and only one:
 //! supersession removes the older entry deliberately - it is what lets a
-//! consumer persist N batches, acknowledge only the last, and still reach a
-//! boundary. Under the bare rule that would release capacity, and a single
+//! consumer persist N batches of one partition, acknowledge only the last, and
+//! still reach a boundary, for any N below the capacity. Under the bare rule
+//! that would release capacity, and a single
 //! partition could publish unboundedly many pages while never holding more than
 //! one live record, so the bound would not bind at all. The survivor therefore
 //! inherits the charge of what it superseded (`BoundaryEntry::subsumed`), and an

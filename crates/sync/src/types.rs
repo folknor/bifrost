@@ -124,7 +124,16 @@ pub struct BackfillConfig {
     /// pages, and trigger lag abandonment plus a re-read from the last durable
     /// checkpoint. A backfill producer now takes one permit per published page
     /// and returns it when the consumer's acknowledgement of that page - or of
-    /// any later one - reaches the ack writer.
+    /// a later page of the SAME partition - reaches the ack writer. Sibling
+    /// partitions are separate lanes, so acknowledging one frees nothing of
+    /// another.
+    ///
+    /// This is a contract on the consumer as well as a knob: acknowledgements
+    /// may not be deferred by more than this many publications. A consumer
+    /// that batches its acknowledgements by count must batch below the bound,
+    /// or raise it above its window, because a producer parked at the bound
+    /// waits for an acknowledgement the consumer is holding while the consumer
+    /// waits for a page that will not come.
     ///
     /// Keep it well under `changes_capacity`: the point of the bound is that a
     /// cold start cannot overrun the ring by itself, which needs room in the

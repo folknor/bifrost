@@ -169,6 +169,68 @@ between them.
     slot drop, which is not an async context) or refusing the sweep's record
     once teardown has begun; neither is obviously right, and it wants a ruling
     before either is built.
+13. **sync: findings from the bounded-lane cold review (2026-09-06), filed
+    under the stopping rule.** The review's one P2 was the acknowledgement
+    window: a consumer that defers acknowledgements by more than
+    `lane_capacity` publications deadlocks with the parked producer where it
+    used to risk a lag. The contract half is fixed in `reference/sync.md` and
+    on `BackfillConfig::lane_capacity`. What wants a RULING is whether the
+    engine should also defend against such a consumer: a `Warning` on the
+    stream when the producer parks, a time-bounded park that falls back to
+    the ring, or nothing. Everything below is P3 or P4; verify against the
+    code before working any of it.
+    - P3: a discard request recorded by a departure sweep after attempt 1 ended
+      on a transient failure is never cleared by attempt 2 walking whole. That
+      attempt resumes rather than restarting, since `note_lost_pages` runs only
+      at a walk's end, and `begin_walk` takes the moved reading as its
+      baseline, so the walk is whole, its marker is durable, and the request
+      sits until `detach` deletes the marker that walk earned. Safe direction,
+      but unbounded re-work on a flaky provider. Root: the watermark is keyed
+      by scope, not by attempt.
+    - P3: the ack-time discard ceilings the ledger retirement at the refused
+      marker, but `delete_backfill` takes every row of the scope, so a late
+      acknowledgement of W1's marker arriving after W2's marker is durable
+      deletes W2's row. Nothing re-walks this attachment; the next attach does.
+    - P3: `detach`'s discard drain awaits the writer with no deadline, while
+      every other teardown step is clamped to `detach_timeout`. A store whose
+      `delete_backfill` or `put_ledger` hangs now hangs `detach`.
+    - P3, lateral and mostly pre-existing: `run_partition` reads the scope
+      fence per page, so a reset that closes between page k's publish and page
+      k+1's read is compared against itself, and the old walk's later
+      partitions publish above the fence, rewriting rows a `delete_backfill:
+      true` reset just removed. The marker carries the walk-start fence for
+      exactly this reason; pages do not.
+    - P3, lateral and pre-existing: `claim_checkpoint`'s `persisted`
+      comparison spans ledger segments, so a prior attachment's Change-lane
+      replay answers `AlreadyPersisted` once this attachment has persisted
+      anything on that lane. `minted_here` now makes it detectable.
+    - P3, lateral: `ack_checkpoint` with `publication: None` skips the fence,
+      the claim lookup and the walk-integrity refusals, so a consumer passing
+      `None` with a completion checkpoint writes a marker with no check at all.
+    - P4: `walk_watermark` reads an immutable receipt field, so the two
+      assertions on it in `a_stale_marker_ack_leaves_the_retrys_pages_alone`
+      cannot fail; the charge assertion in that test is what bites.
+    - P4: `pages_lost_to_a_lag_withhold_the_completion_marker` says its held
+      pages "sit unread in the ring"; they were received and never
+      acknowledged.
+    - P4: `release_undelivered`'s whole-entry pass counts unsent subsumed
+      pages where its per-page pass and `abandon_checkpoints` count only sent
+      ones. Unreachable today.
+    - P4: `completion_refusal`'s `Unvouchable` arm is shadowed by the earlier
+      page-withhold arm in `persist_ack_request`, which matches the completion
+      partition too; the reference describes the shadowed arm as the mechanism.
+    - P4: a backfill id minted by ANOTHER account's ledger in the same process
+      is answered `Ok` and withheld rather than `Unknown`.
+    - P4: `get_backfill` is awaited and its result discarded on the
+      restart-from-scratch path, and a read error there logs "resume read
+      failed" for a walk that was starting over anyway.
+    - Costs, not defects, both in the safe direction and both for item 11 to
+      weigh: a lag on ANY receiver, an observer included, records losses for
+      every in-flight backfill scope and requests their discard, a
+      from-scratch re-walk per scope; and an abandonment retires a marker
+      still in the ring, so a live burst that lags the consumer between a
+      walk's last page and its marker acknowledgement re-walks that scope
+      from scratch.
 
 - **sync tenant throttle identity.** `ThrottleScope::Tenant` cannot be enforced
   across sibling accounts because `AccountError` carries no tenant identity.

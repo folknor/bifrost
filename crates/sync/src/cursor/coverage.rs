@@ -293,8 +293,9 @@ struct BoundaryEntry {
     ///
     /// The one place the "capacity is the live record" rule needed a correction.
     /// Supersession removes the older entry ON PURPOSE - it is what lets a
-    /// consumer persist N batches, acknowledge only the last, and still reach a
-    /// boundary - so under the bare rule a partition could publish unboundedly
+    /// consumer persist N batches of one partition, acknowledge only the last,
+    /// and still reach a boundary, for any N below the lane capacity - so under
+    /// the bare rule a partition could publish unboundedly
     /// many pages while never holding more than one live record, and the flow
     /// control would not bind at all. The survivor therefore inherits the
     /// capacity charge of what it superseded, and an acknowledgement of a
