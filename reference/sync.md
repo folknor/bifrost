@@ -813,8 +813,8 @@ consumer-acknowledged boundary - identical to the change-cursor path.
 
 Backfill publications are flow controlled; live changes are not. Before
 publishing a page the runner waits until the account has fewer than
-`BackfillConfig::lane_capacity` (default 64) published-but-unacknowledged
-backfill batches. The wait sits after the page is read off the provider stream
+`BackfillConfig::lane_capacity` (default 64) published-but-UNREAD backfill
+batches. The wait sits after the page is read off the provider stream
 and before its publication is registered, so a parked producer is not asked for
 the next page either. Keeping the bound well under `changes_capacity` (default
 256) is what stops a cold start overrunning the shared ring on its own. A
@@ -827,30 +827,93 @@ both have a batch ready, both send.
 any number of receivers, and exactly ONE of them acknowledges. The others are
 observers. Two independent acknowledgers are not supported by this engine: the
 boundary ledger keeps one entry per lane and releases it on the first
-acknowledgement, so the bound follows the faster acknowledger and the slower
-one is left to the ring. The acknowledging receiver must subscribe FIRST. The
-subscriber gate is a receiver count, so an observer that arrives before the
-acknowledger satisfies it, takes delivery of pages it will never acknowledge,
-and parks cold start at the bound until it leaves or a lag fires; the
-acknowledger joins at the ring's tail and cannot see those pages. That was
-already the failure shape before the bound existed, when such a walk ran into
-the observer and settled. An explicit observer subscription that counts for
-neither the gate nor the bound is the clean fix; it is ruled and not yet
-built.
+acknowledgement, so the slower acknowledger's own registration is settled out
+from under it. The RING, though, is followed by the slowest reader, not the
+fastest: a page charges the lane while any live numbered receiver that could
+hold it has not read it, so an observer that reads instantly cannot run cold
+start ahead of an acknowledger that persists as it goes. Following the fastest
+reader instead reproduced the overrun the bound exists to prevent - the observer
+frees the producer, the acknowledger falls `changes_capacity` events behind and
+lags, `on_lag` abandons the walk's pages and withholds its marker, and the
+cycle repeats for the life of the attachment. The acknowledging receiver must
+still subscribe FIRST: the subscriber gate is a receiver count, so an observer
+that arrives before the acknowledger satisfies it and takes delivery of pages
+the acknowledger - joining at the ring's tail - can never see. That was already
+the failure shape before the bound existed, when such a walk ran into the
+observer and settled. An explicit observer subscription that counts for neither
+the gate nor the bound is the clean fix; it is ruled and not yet built, and it
+is also what makes an observer ineligible for the slowest-reader rule rather
+than merely harmless to it.
 
-The acknowledger may not defer its acknowledgements by more than
-`lane_capacity` publications. The producer parks once that many backfill pages
-are outstanding, and nothing breaks the wait but an acknowledgement, a lag, a
-reset or a departure; a consumer that batches acknowledgements by count must
-batch below the bound, or raise `BackfillConfig::lane_capacity` above its
-window. Only within one partition does the latest acknowledgement settle its
-predecessors: sibling partitions are separate lanes, so acknowledging a later
-partition's page frees nothing of an earlier one's. Before the bound such a
-consumer risked a lag; under it the consumer waits for a page that will not
-come while the producer waits for an acknowledgement the consumer is holding.
-The ruled replacement is a receipt bound, where reading rather than
-acknowledging frees the producer; it is not yet built, and this paragraph
-shrinks to the receipt rule when it lands.
+**Every numbered receiver MUST be polled or dropped.** Every receiver
+`account_changes_stream` hands out is numbered, so a consumer that opens a
+second receiver for a UI and stops polling it holds up to `lane_capacity` pages
+unread for the life of the attachment and parks cold start permanently. That
+stall reports nothing on its own - the departure warning fires on drop and the
+lag warning on poll, and this receiver does neither - so `LaneGate` warns on
+`bifrost.sync.backfill` when a park BEGINS, at most once per 30s per account,
+naming the account, the charged scopes and the receiver sequences holding the
+charge (`PendingCoverage::backfill_charge_holders`). The ruled observer
+subscription is what lifts the obligation for receivers that only watch.
+
+**The precise guarantee, which is narrower than "the slowest reader".** The
+bound follows the slowest live numbered reader among pages NOT YET
+ACKNOWLEDGED; an ACKNOWLEDGEMENT frees a page for every receiver. The reader
+set lives on the boundary entry, so every path that resolves the publication -
+`acknowledge_publication`, `acknowledge_checkpoint`, `retire_publication`, and
+the supersession fold in `register_in` - removes the record together with the
+evidence that a slower receiver had not read it. What that leaves: with two
+numbered receivers where the ACKNOWLEDGER is the faster, its acknowledgements
+free the bound at its own pace, the producer runs on, and the slower numbered
+observer is overwritten in the ring and lags - after which `on_lag` abandons
+every outstanding registration of the account, including pages the acknowledger
+read but had not answered for, the marker is withheld and the walk restarts.
+The structural close is a residual `(id, delivered_at, readers)` record kept
+when an entry leaves the ledger still unread by an eligible live receiver; it
+is filed as a residual and deliberately not built here. The
+ruled observer subscription removes the case where the slow receiver is an
+observer, and what remains after it is two ACKNOWLEDGING receivers, which the
+contract above already declares unsupported.
+
+**The permit is the RECEIPT, not the acknowledgement.** A page charges the lane
+from its publication until every eligible NUMBERED receiver has read it off the
+stream (`ChangesReceiver::recv` / `try_recv` call
+`PendingCoverage::mark_received` with the receiver's own sequence, which pulses
+the capacity wake); the entry and each page it subsumed carry their own set of
+reader sequences, and `backfill_in_flight` counts a page while any live receiver
+numbered below its `delivered_at` is absent from that set. Eligibility is the
+numbering, because a broadcast receiver joins at the ring's TAIL: a later
+subscriber never held the page and can never re-charge it, and a departing
+receiver stops charging what it was holding (`PendingCoverage::receiver_departed`,
+called from the departure sweep under the delivery lock) so a slow reader that
+walks away does not park the producer for the life of the attachment. The
+producer therefore runs exactly as far ahead as the slowest consumer READS, and the
+consumer may acknowledge on any schedule it likes - including never, at the
+usual cost of never advancing its durable cursor. Read and acknowledged free
+different things: a read returns lane capacity, an acknowledgement retires the
+registration, its boundary waiter and its coverage claim. Acknowledging a page
+already read frees no further capacity, because the read already did.
+
+The bound is protection for the shared broadcast ring, and what overruns a ring
+is pages nobody has taken out of it. Binding it to the acknowledgement - a
+promise about the CONSUMER's durability - deadlocked a consumer that batches
+acknowledgements against the parked producer, since nothing broke the wait but
+an acknowledgement the consumer was holding. What the receipt bound gives up is
+that the lane no longer limits the consumer's unpersisted backlog, which is the
+ordinary trade on any channel, and with it the bound on how many superseded
+pages one partition's surviving entry retains (see `BoundaryEntry::subsumed`).
+That retained history is unbounded PER PARTITION, and for the `Full` plan -
+which is what JMAP Email uses - there is one partition per scope, so it is
+unbounded over the whole scope's backfill: one `PublicationId`, its
+`PublicationReceipt` and its coverage claim per page the consumer read and did
+not acknowledge.
+Marking is keyed on the numbering: a reader the delivery gate never handed out
+is not the acknowledger, and letting its read free the producer would let a walk
+run a whole ring ahead of whoever answers for the pages.
+
+The completion guarantee is unchanged, and deliberately does not consult the
+receipt: a receiver that departs holding pages it read but never acknowledged
+still strands them, and the departure sweep still records the loss.
 
 A bounded `mpsc` for backfill was rejected on the same
 contract: it is single-consumer, so pages would reach one receiver and vanish
@@ -859,16 +922,32 @@ unchanged.
 
 **The capacity is the publication ledger itself.** An account's backfill
 in-flight count is the sum over its live backfill `BoundaryEntry`s in
-`PendingCoverage`, each charging one for itself plus one per page it
-superseded. `engine/lane.rs` holds no ledger: `LaneGate` is the wait plus the
+`PendingCoverage`, each charging one for itself and one per page it superseded,
+counting only the pages some live numbered receiver could still be holding in
+the ring. `engine/lane.rs` holds no
+ledger: `LaneGate` is the wait plus the
 account's scheduler admission. A first design kept a permit map beside the
 ledger, and two reviews found the same defect four times over, the two
-structures disagreeing about what was in flight. There is no release call to
-forget, because every ledger mutation that removes or lightens an entry frees
-capacity and pulses one `Notify`:
+structures disagreeing about what was in flight. There is no separate release
+call site to forget: the only path that RECORDS a release is the receiver's read
+(`ChangesReceiver::note_receipt`), and every other ledger mutation that removes
+or lightens an entry frees capacity as a side effect of what it was already
+doing, pulsing one `Notify`:
 
+- a numbered receiver's READ adds its sequence to the page's reader set, on the
+  entry or on the `SubsumedPage` that holds it, and is the ordinary way capacity
+  comes back - the charge lifts once the set covers every eligible live receiver;
 - an acknowledgement removes the entry, or strips the acknowledged id from its
-  survivor's `subsumed` when the page has since been superseded;
+  survivor's `subsumed` when the page has since been superseded. It frees
+  nothing further for a page that was already read - but removing the ENTRY
+  frees every unread page folded into it as well, and it does so for every
+  receiver, which is the narrowing described in the contract above;
+- with no eligible live receiver at all, `page_unread` falls back to "has
+  anybody read it": a page broadcast to nobody stays charged until some other
+  path retires it - which is what keeps a send that reached only the slot's
+  sentinel receiver charged until the runner retires it - while a page whose
+  only reader has since departed has left the ring for good and frees the
+  producer rather than parking it for the life of the attachment;
 - a store failure after a valid acknowledgement retires the entry the same way.
   The entry tracks delivery, not durability, and holding it would park cold
   start over a transient store error;
@@ -883,7 +962,8 @@ capacity and pulses one `Notify`:
   scope's share of the carry-forward slot, so debt rescued by a sweep reaches
   the reset instead of dying with the attachment;
 - a `PENDING_BOUNDARY_CAP` eviction of a charged entry;
-- a receiver departure, below;
+- a receiver departure, which both recomputes the departing sequence's charge
+  and sweeps what no remaining receiver can reach - below;
 - `detach` cancels the slot token and pulses the wake, so a parked producer
   leaves at once rather than being awaited to `detach_timeout` and aborted.
 
@@ -964,7 +1044,9 @@ attempt and the orchestrator carries on with the next scope. The orchestrator
 also re-checks the subscriber gate before every scope, not once at start, and
 re-checks that the incarnation it is about to walk is still live.
 
-Pinned by `tests/backfill_lane_flow_control.rs` (the stall at the bound, live
+Pinned by `tests/backfill_lane_flow_control.rs` (the stall at the bound on pages
+held UNREAD, the release a single read buys and the further release an
+acknowledgement of that same page does NOT buy, live
 changes on a one-permit budget, no loss or duplication through an 8-slot ring, a
 completed walk not stranding admission, the eager-acker bound-of-one walk,
 detach while parked, the receiver replaced while parked, the retained receiver
@@ -976,8 +1058,11 @@ has proved the producer is parked at the top of the NEXT partition with no page
 in hand - and triggered by a provider folder deletion, whose purge of the
 scope's durable rows makes any later row or page proof that a walk kept running),
 the ledger tests in
-`cursor/coverage.rs`, the receiver-ordering tests in `multiplexer::tests`
-(multi-threaded), and the reset and ack-failure tests in `engine/tests.rs`.
+`cursor/coverage.rs`, the receiver-ordering and receipt tests in
+`multiplexer::tests` (multi-threaded: a numbered receiver's read frees capacity
+with no acknowledgement while its registration survives, a superseded page's
+receipt reaches it inside its survivor, an unnumbered reader's read frees
+nothing), and the reset and ack-failure tests in `engine/tests.rs`.
 Everything in the integration file runs current-thread under `start_paused`
 with no wall-clock sleeps; none of it is a race test. Each ablation named in
 those tests' doc comments was applied, observed to fail the test, and restored,
@@ -990,7 +1075,9 @@ would deadlock on the same lock rather than race.
 The receiver sweep above made a pre-existing defect visible, and the engine
 now guarantees against it: a consumer replaced mid-walk must not leave a
 durable completion marker, or a durable resume position, over pages nobody
-received. A receiver that departs holding unacknowledged pages strands them,
+received. A receiver that departs holding unacknowledged pages strands them -
+read or unread alike, since the sweep does not consult the receipt bit: freeing
+lane capacity and answering for a page are different questions -
 because its replacement joined at the ring's tail. Left alone, the walk
 completes, the replacement acknowledges the completion marker in good faith,
 and every later attach answers `Skip` with the stranded pages never offered
@@ -2763,7 +2850,10 @@ no in-engine caller - teardown pulses the slot's
 is kept as published surface rather than removed, the same standing as
 `SyncControl::record_checkpoint`. `ChangeDelivery` is public from `multiplexer`
 (`new`, `sender`, `publish_backfill`, `subscribe`, `min_live`). `PendingCoverage`
-gained thirteen public methods: `mark_delivered`, `backfill_in_flight`,
+gained sixteen public methods: `mark_delivered`, `mark_received`
+(the receipt bound's permit), `receiver_joined` and `receiver_departed` (the
+live numbered set the slowest-reader rule is evaluated against),
+`backfill_in_flight`,
 `await_backfill_capacity`, `release_undelivered`, `scope_fence` and
 `retained_history` with the bound, then `register_walk_marker`,
 `walk_watermark`, `minted_here`, `note_undelivered`, `take_backfill_discard`,

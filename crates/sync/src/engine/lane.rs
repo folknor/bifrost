@@ -17,7 +17,27 @@
 //! pages would reach one of them and silently vanish for the rest. So the flow
 //! control sits on the PRODUCER: before publishing a page, backfill waits until
 //! the account has fewer than `BackfillConfig::lane_capacity` published-but-
-//! unanswered backfill batches.
+//! UNREAD backfill batches.
+//!
+//! # Read, not acknowledged
+//!
+//! The permit is the consumer's RECEIPT of the page, recorded from
+//! `ChangesReceiver`'s read path for numbered receivers. What overruns a ring is
+//! pages nobody has taken out of it; an acknowledgement is a promise about the
+//! consumer's own durability, made on whatever schedule the consumer likes, and
+//! binding the producer to it deadlocked a consumer that batches its
+//! acknowledgements against a producer parked here. The producer now runs
+//! exactly as far ahead as the consumer reads. An acknowledgement still retires
+//! the registration - and with it the boundary waiter and the coverage claim -
+//! but for a page already read it frees no further capacity.
+//!
+//! With several numbered receivers the permit is the SLOWEST of them. A page is
+//! still occupying the ring while any live receiver numbered below its
+//! `delivered_at` has not read it, and a departing receiver stops charging the
+//! pages it was holding. Following the fastest reader instead reproduced the very
+//! overrun the bound exists to prevent: an observer that reads at once frees the
+//! producer, the acknowledger that persists as it goes falls `changes_capacity`
+//! events behind, lags, and the lag abandons every outstanding page.
 //!
 //! # Where the capacity actually lives, and why this module is thin
 //!
@@ -37,10 +57,13 @@
 //!
 //! `PendingCoverage::boundaries` already answers, exactly, "which publications
 //! has the engine broadcast that the consumer has not answered for". So capacity
-//! is a property of that entry, and supersession, acknowledgement, retirement,
+//! is a property of that entry - a set of reader sequences on the entry and on
+//! each page it subsumed - and supersession, acknowledgement, retirement,
 //! abandonment and scope invalidation each free capacity because they already
-//! mutate it. There is no release call site to forget, because there is no
-//! release call.
+//! mutate it. There is no separate release call site to forget: the only thing
+//! that ever RECORDS a release sits on the receiver's read path
+//! (`ChangesReceiver::note_receipt`), and every other path frees capacity as a
+//! side effect of the ledger mutation it was already making.
 //!
 //! **One point where the literal rule needed correcting**, and only one:
 //! supersession removes the older entry deliberately - it is what lets a
@@ -49,8 +72,25 @@
 //! that would release capacity, and a single
 //! partition could publish unboundedly many pages while never holding more than
 //! one live record, so the bound would not bind at all. The survivor therefore
-//! inherits the charge of what it superseded (`BoundaryEntry::subsumed`), and an
-//! acknowledgement of a superseded id releases exactly that one page's worth.
+//! inherits the charge of what it superseded (`BoundaryEntry::subsumed`), each
+//! folded page keeping its own reader set, and an acknowledgement of a
+//! superseded id releases exactly that one page's worth. What the survivor
+//! RETAINS is no longer bounded by the capacity, since a fully-read page carries
+//! no charge - see `BoundaryEntry::subsumed` for what that costs and why the
+//! pages cannot simply be dropped.
+//!
+//! # What the bound asks of the consumer
+//!
+//! Every receiver `account_changes_stream` hands out is NUMBERED, and a numbered
+//! receiver that is held but never polled charges up to `lane_capacity` pages for
+//! as long as it lives - parking cold start for the rest of the attachment. So
+//! every numbered receiver MUST be polled or dropped. Nothing else reports that
+//! stall: the departure warning fires on drop and the lag warning on poll, and a
+//! receiver that does neither produces neither. [`LaneGate::wait_for_capacity`]
+//! therefore warns when it parks, naming the account, the scopes and the receiver
+//! sequences holding the charge. The ruled observer subscription - a receiver
+//! counting for neither the subscriber gate nor the bound - is what will lift the
+//! obligation for observers.
 //!
 //! # Fairness, and what a parked producer must not be holding
 //!
@@ -79,13 +119,22 @@ use crate::cursor::PendingCoverage;
 use crate::error::Error;
 use crate::scheduler::{BudgetPermit, Scheduler, WorkKind};
 
-/// How many backfill pages may be outstanding (published, unanswered) before the
+/// How many backfill pages may be outstanding (published, unread) before the
 /// producer parks.
 ///
 /// Deliberately far below `MultiplexerConfig::changes_capacity` (256): the bound
 /// is what keeps a cold start from overrunning the shared ring, so it has to
 /// leave room for live traffic in the same ring.
 pub const DEFAULT_BACKFILL_LANE_CAPACITY: usize = 64;
+
+/// How often one gate repeats its park warning.
+///
+/// The warning is emitted when a park BEGINS, and a park that begins within this
+/// window of the last warning is silent. Rate limited rather than one line per
+/// park because the ordinary healthy case is a producer that parks, is freed by
+/// one read and parks again: that shape would log once per page of the walk and
+/// bury the case worth seeing, which is a park that never ends.
+const PARK_WARN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The account's scheduler admission, owned by the gate so a parked producer is
 /// not sitting on budget the live lane needs.
@@ -180,6 +229,10 @@ pub struct LaneGate {
     capacity: usize,
     shutdown: CancellationToken,
     admission: Arc<BackfillAdmission>,
+    /// When this gate last warned about a park. Shared across clones, because
+    /// the rate limit is about the ACCOUNT's log and a gate is cloned per
+    /// partition pass.
+    park_warned_at: Arc<Mutex<Option<tokio::time::Instant>>>,
 }
 
 impl LaneGate {
@@ -199,6 +252,7 @@ impl LaneGate {
             capacity: capacity.max(1),
             shutdown,
             admission: Arc::new(BackfillAdmission::new(scheduler, account_id, control)),
+            park_warned_at: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -239,6 +293,10 @@ impl LaneGate {
     /// polling, push reconciliation and the next scope's barrier query on a
     /// one-permit budget.
     pub async fn wait_for_capacity(&self) -> Result<(), WaitFailed> {
+        let in_flight = self.coverage.backfill_in_flight();
+        if in_flight >= self.capacity {
+            self.warn_parked(in_flight);
+        }
         tokio::select! {
             () = self.shutdown.cancelled() => Err(WaitFailed::ShuttingDown),
             () = self.coverage.await_backfill_capacity(self.capacity) => Ok(()),
@@ -260,6 +318,41 @@ impl LaneGate {
         self.release_admission();
         self.wait_for_capacity().await?;
         self.admit().await
+    }
+
+    /// Name the stall, at most once per [`PARK_WARN_INTERVAL`].
+    ///
+    /// A numbered receiver that is held but never polled parks cold start for the
+    /// life of the attachment and reports nothing on its own - it never drops, so
+    /// no departure warning, and it never polls, so no lag warning. The receiver
+    /// SEQUENCES are the diagnosable part: they say which of the consumer's
+    /// receivers is the one that stopped reading, which "backfill is stuck" alone
+    /// does not.
+    fn warn_parked(&self, in_flight: usize) {
+        let now = tokio::time::Instant::now();
+        {
+            let mut last = self
+                .park_warned_at
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(previous) = *last
+                && now.duration_since(previous) < PARK_WARN_INTERVAL
+            {
+                return;
+            }
+            *last = Some(now);
+        }
+        let (holders, scopes) = self.coverage.backfill_charge_holders();
+        tracing::warn!(
+            target: "bifrost.sync.backfill",
+            account = %self.admission.account_id.0,
+            capacity = self.capacity,
+            in_flight,
+            holders = ?holders,
+            scopes = ?scopes,
+            "backfill parked on the lane bound; every numbered change-stream receiver \
+             must be polled or dropped"
+        );
     }
 
     /// Wake anything parked on the bound: the gate-side spelling of
@@ -1322,6 +1415,42 @@ mod tests {
              completion; the pre-wait reading cannot see this"
         );
         assert_eq!(h.received(), 0, "and the marker is not broadcast");
+    }
+
+    /// The park warning has to NAME the receiver that stopped reading, or a
+    /// consumer holding an unpolled receiver sees only "backfill is stuck".
+    ///
+    /// The crate has no tracing capture harness, so what is pinned is the
+    /// accessor the warning reads: the live numbered receivers eligible for an
+    /// outstanding page that have not read it, and that page's scope.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_charge_holders_name_the_receiver_that_has_not_read() {
+        let h = harness(1);
+        h.coverage.receiver_joined(0);
+        h.coverage.receiver_joined(1);
+        // Sent when two receivers had been handed out, so both are eligible.
+        let id = h.publish(&page(&scope_a(), "page:0:10", 1), 2);
+
+        assert_eq!(
+            h.coverage.backfill_charge_holders(),
+            (vec![0, 1], vec![scope_a()]),
+            "both eligible receivers are holding the page, and the warning must be \
+             able to say which"
+        );
+
+        h.coverage.mark_received(&id, 1);
+        assert_eq!(
+            h.coverage.backfill_charge_holders(),
+            (vec![0], vec![scope_a()]),
+            "the fast reader drops out of the list; the slow one is the stall"
+        );
+
+        h.coverage.mark_received(&id, 0);
+        assert_eq!(
+            h.coverage.backfill_charge_holders(),
+            (Vec::new(), Vec::new()),
+            "a fully read page holds nothing and names nobody"
+        );
     }
 
     /// A capacity of zero would be a permanently parked cold start.

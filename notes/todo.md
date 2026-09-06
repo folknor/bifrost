@@ -29,10 +29,11 @@ has not made, and ruled work that has not landed. Nothing else.
 
 ## Ruled sync work, sequenced
 
-Three items ruled on 2026-09-06, sequenced 3, 1, 2: the receipt bound
-reshapes the accounting the other two touch, so they are written against
-the final shape. Each lands alone, with one scoped cold review under the
-stopping rule in `AGENTS.md`. Two earlier structural landings of the same
+Two items ruled on 2026-09-06, in this order. The third of that set, the
+receipt bound, has landed; it reshaped the accounting these two touch, and
+they are written against that final shape. Each lands alone, with one
+scoped cold review under the stopping rule in `AGENTS.md`. Two earlier
+structural landings of the same
 week, the dav-core `ResponseParts` collapse and the smtp sans-I/O core,
 never received the cold review their rulings asked for; that review debt
 is listed under their crates below.
@@ -54,8 +55,11 @@ is listed under their crates below.
     numbered receivers; a send that reached no numbered receiver counts as
     reaching nobody, decided by the delivery gate under its own lock since it
     holds the live set; an observer receiver carries no control handle, so its
-    lag warns without abandoning. Once item 3 lands, an observer's read must
-    NOT mark a page received. Observers are documented as never acknowledging.
+    lag warns without abandoning. An observer's read must NOT mark a page
+    received under the receipt bound; the marking is already keyed on a
+    receiver's numbering, so an unnumbered observer inherits that for free -
+    pinned by `an_unnumbered_receivers_read_frees_no_capacity`. Observers are
+    documented as never acknowledging.
     A separate method rather than a flag on the existing one, because the two
     are different roles and a flag lets a call site flip one into the other.
     The "subscribe first" sentence leaves `reference/sync.md` with this.
@@ -83,39 +87,9 @@ is listed under their crates below.
     it is the consumer's contract and not a defect, and what the closing
     alternative would have cost, so a later review reads the ruling there
     rather than re-filing the window as a bug.
-3. **sync: replace the acknowledgement bound with a receipt bound. RULED
-    2026-09-06: PROCEED; the cheap version (an accessor surfacing the
-    maximum) is REJECTED.** The cold review's one P2 was that a consumer
-    deferring acknowledgements by more than `lane_capacity` publications
-    deadlocks with the parked producer, where before the bound it risked a
-    lag. The contract was written down as an interim, but the maximum exists
-    only because the bounded-lane ruling (landed 2026-09-06; "The bounded
-    backfill lane" in `reference/sync.md`) chose the acknowledgement as the
-    permit, and an
-    acknowledgement is a promise about durability while what overruns a ring
-    is pages nobody has READ. The engine observes reading without consumer
-    cooperation: `ChangesReceiver::recv` and `try_recv` are engine code and
-    the event carries its publication id. The build: a received bit per page
-    (on the entry and on each subsumed tuple), set from the receiver's read
-    path for numbered receivers, with `backfill_in_flight` summing unread
-    pages instead of unacknowledged ones and receipt pulsing the capacity
-    wake. The producer then runs exactly as far ahead as the consumer reads,
-    a consumer may acknowledge on any schedule, ring protection is unchanged,
-    and the completion guarantee is unchanged (a receiver departing with
-    read-but-unacknowledged pages is still a recorded loss, the conservative
-    reading it has now). What is given up: the bound no longer limits the
-    consumer's unpersisted backlog, which becomes its own trade-off as on any
-    channel. Departs from the letter of that ruling ("the existing backfill acks
-    are the permit signal") and not its purpose. The cost is in the tests:
-    about a dozen integration tests stage a parked producer by reading to the
-    bound without acknowledging, and under a receipt bound reading is what
-    frees it, so their staging becomes "hold the pages unread". Mechanical,
-    but on the file that took seventeen rounds, and it wants its own scoped
-    review. When it lands, the acknowledgement-window paragraph in
-    `reference/sync.md` and on `BackfillConfig::lane_capacity` shrinks to the
-    receipt rule, and the "should the engine defend" question below is moot.
-    Everything below is P3 or P4 from the same review; verify against the
-    code before working any of it. The rest of that list was worked on
+- **Residuals of the bounded-backfill cold review.** P3 or P4 from that
+    review; verify against the code before working any of it. The rest of
+    that list was worked on
     2026-09-06 and its entries deleted: the discard request left outstanding
     by a loss after a failed attempt (the scan now keeps a failed attempt's
     baseline and the rescan reopens on it), the ack-time ceilinged discard
@@ -132,6 +106,47 @@ is listed under their crates below.
     - P3: `detach`'s discard drain awaits the writer with no deadline, while
       every other teardown step is clamped to `detach_timeout`. A store whose
       `delete_backfill` or `put_ledger` hangs now hangs `detach`.
+    - FILED by the receipt-bound landing, not fixed in it: a surviving
+      backfill entry's `subsumed` history is no longer bounded by
+      `lane_capacity`. It was, while the charge was the unacknowledged page -
+      the producer parked once the charge reached the bound, so no partition
+      could fold more than that many pages into one record. Under the receipt
+      bound a READ page carries no charge, so a consumer that reads without
+      acknowledging lets one partition's `subsumed` grow with the partition,
+      each retained `PublicationId` holding an `Arc<PublicationReceipt>` (a
+      checkpoint plus a whole coverage claim). Evidence:
+      `PendingCoverage::retained_history` counts exactly this, and
+      `reading_a_superseded_page_frees_the_charge_it_left_on_its_survivor`
+      shows a read page staying in `subsumed` at zero charge. The pages
+      cannot simply be dropped on receipt: the departure sweep and
+      `abandon_checkpoints` judge the completion guarantee one page at a
+      time, and a read-but-unacknowledged page whose reader leaves is still a
+      recorded loss. So a fix is a product decision about what to do at a cap
+      - forfeit the per-page loss record, or park the producer on retention -
+      and wants its own ruling. Growth is bounded per attachment by the pages
+      one partition publishes, and every path that retires the entry (ack,
+      lag, reset, departure, detach) clears it.
+      Two more faces of the same thing, found by the slowest-reader round and
+      filed here rather than fixed in it. (a) `register_in` folds each
+      superseded claim's `reports` into the survivor's claim via
+      `CoverageClaim::absorb`, so the survivor carries not only one
+      `Arc<PublicationReceipt>` per retained page but a report vector that
+      grows with the partition too - memory grows with the partition until the
+      last acknowledgement, not with `lane_capacity`. (b) the blast radius of a
+      lag grew with it: the ack bound capped the pages a live-lane burst could
+      abandon at `lane_capacity`, and under the receipt bound one burst that
+      lags a read-without-acking consumer abandons an unbounded number of READ
+      pages, each costing a re-walk. The CHEAP answer is written and needs no
+      ruling: the consumer-facing note now on `BackfillConfig::lane_capacity`
+      says coarse acking widens both memory and lag re-work. The STRUCTURAL
+      answer is the one for the owner - compress read subsumed pages into a
+      per-stamp `(delivered_at, count)` tally instead of retaining ids, since
+      the departure sweep and `abandon_checkpoints` need only the stamp and a
+      count, and an acknowledgement of a superseded id is already answered by
+      the `folded` watermark rather than by the retained page. That would keep
+      the per-page loss record while dropping the receipts, so it is not the
+      forfeit-or-park choice above; it is a representation change with its own
+      correctness argument and wants its own ruling.
     - Costs, not defects, both in the safe direction and both for item 1 to
       weigh: a lag on ANY receiver, an observer included, records losses for
       every in-flight backfill scope and requests their discard, a
@@ -139,6 +154,41 @@ is listed under their crates below.
       still in the ring, so a live burst that lags the consumer between a
       walk's last page and its marker acknowledgement re-walks that scope
       from scratch.
+    - FILED by the last (2026-09-06) pass, not fixed in it - **the
+      slowest-reader bound holds only on the READ path.**
+      `backfill_in_flight` sums live entries only, and every acknowledgement
+      path (`acknowledge_publication`, `acknowledge_checkpoint`,
+      `retire_publication`, and the supersession fold in `register_in`)
+      removes the entry, or strips the subsumed page, together with the
+      `readers` set that recorded a slower receiver having not read it. So if
+      the ACKNOWLEDGER is faster than a numbered observer: slow (seq 0) and
+      fast (seq 1) subscribe; P1 and P2 are published; fast reads and acks
+      both; `in_flight` is 0 while slow read nothing; the producer publishes
+      `RING` more; slow is overwritten and gets `Lagged`; `on_lag` abandons
+      every registration, including pages fast READ but did not ack; the
+      marker is withheld, the walk restarts, and this repeats for as long as
+      the observer stays slower. The structural close the reviewer proposed:
+      keep a residual `(id, delivered_at, readers)` record when an entry
+      leaves the ledger still unread by an eligible live receiver, sum it in
+      `backfill_in_flight`, update it from `mark_received` and
+      `receiver_departed`, and clear it on lag, on reset and on cap eviction.
+      Deliberately NOT built in that pass (the owner ruled the round closed,
+      and this is a second mechanism, not a correction to the one that
+      landed). Scope note before anyone works it: ruled item 1 (the explicit
+      observer subscription) removes the case where the slow receiver is an
+      observer, and what remains after item 1 is two ACKNOWLEDGING receivers,
+      which `reference/sync.md`'s consumer contract already declares
+      unsupported - so this may be a residual that item 1 retires rather than
+      work to schedule. What landed instead: `BoundaryEntry::readers`, the
+      `sync.md` contract paragraph and `BackfillConfig::lane_capacity` now
+      state the guarantee precisely ("the slowest live numbered reader among
+      pages not yet acknowledged; an acknowledgement frees a page for every
+      receiver") and name this failure.
+    - Also filed there: drop a read subsumed page's receipt claim once every
+      eligible reader has read it, as a bound on the unbounded `subsumed`
+      history above. Same shape as the `(delivered_at, count)` tally, and it
+      has the same obstacle - the departure sweep judges the completion
+      guarantee one page at a time - so it wants the same ruling.
 
 - **sync tenant throttle identity.** `ThrottleScope::Tenant` cannot be enforced
   across sibling accounts because `AccountError` carries no tenant identity.
@@ -231,6 +281,120 @@ any item; some may already be obsolete.
   `text/calendar; component=vevent`, which would be free component-type
   evidence for the caldav-F1 residual above on the servers that emit it
   (SabreDAV / Baikal do). Decide against F1 rather than in isolation.
+- **dav-F3 (P3, filed 2026-09-06, cold review).** `multistatus.rs`
+  `member_status_code` reports `failed_statuses.first()`, so a member
+  answering `<propstat 404: getcontenttype>` then `<propstat 403: getetag>`
+  reads as 404. 404 is `is_missing_resource`, so `classify_207` calls the
+  lane `Usable` with no entries, and `establish_initial_cursor` /
+  `inventory_stream` mint an EMPTY snapshot for a collection the server
+  actually refused - a snapshot diff that destroys every resource in it.
+  `failed_member` inherits the same code. Fix shape: with no success
+  propstat, report the WORST failed code, preferring any non-404/410 over a
+  404/410, rather than whichever came first in document order.
+- **dav-F4 (P3, filed 2026-09-06, cold review).** A well-known probe that
+  answers `200 text/html` - a front end that returns the index page for any
+  method - fails `extract_href_property` with an XML parse error, which
+  mints `Protocol(ParseFailed)`. `should_fallback_discovery` admits only
+  `NotFound(Calendar)`, `Request(Malformed)` and `Server(Error{405})`, so
+  the open FAILS instead of falling back to the configured base URL, which
+  is what the same deployment answering an empty 207 gets. Either admit
+  `Protocol(ParseFailed)` for the well-known leg specifically (not for the
+  base leg, where a garbage document is a real contract violation), or
+  gate the probe on a `text/xml`-ish content type.
+- **dav-F5 (P3, filed 2026-09-06, cold review).** `post_schedule_reply`
+  (caldav `client.rs`) drops the RFC 6638 `Originator` and `Recipient`
+  headers silently via `if let Ok(value) = HeaderValue::from_str(..)`. A
+  non-ASCII calendar-user address therefore goes out with no routing
+  headers at all and the server's 400 surfaces as `ProviderRefused`. The
+  seam to refuse locally already exists: routing the value through
+  `DavRequest::header` records the rejection and `dispatch_once` refuses
+  with `Request(Malformed)` before any I/O, which is what every other
+  header on that request already does. Two lines.
+- **dav-F6 (P3, filed 2026-09-06, cold review).** An empty-element
+  `<D:status/>` inside a propstat arrives as `Event::Empty`, which routes to
+  `sink.element` and never sets `staged_status` / `staged_success`, so
+  `commit_propstat` sees `None` and commits under the absent-status-is-
+  success rule. The stated rule in the `multistatus.rs` module doc is the
+  opposite: a status that is PRESENT and unparseable is a failure. Same
+  hole in `extract_href_properties` and `parse_collection_property`, which
+  keep their own `staged_success` and only write it from `Event::End`.
+- **dav-F7 (P4, filed 2026-09-06, cold review).** Page-size default drift:
+  CalDAV `event_search` and `events_in_range` use `usize::MAX` when `limit`
+  is `None` (`account.rs`, two sites), CardDAV `contact_search` defaults to
+  `CONTACT_PAGE_SIZE` (250). Neither reference states the CalDAV default, so
+  a consumer omitting `limit` gets an unbounded page from one crate and a
+  250-entry page from its twin with nothing documenting either.
+- **dav-F8 (P4, filed 2026-09-06, cold review).** `ErrorScope::Calendar {
+  id }` carries an EVENT url on the single-resource get paths -
+  `fetch_event_from_url` decorates with `event_scope(event.0)` - while
+  `reference/caldav.md` promises that scope carries the collection href.
+  There is no `ErrorScope::Event`, so this is a modelling gap in
+  `bifrost-types`, not a local mistake: either the scope gains an event
+  variant or the doc admits the overload. Adding a public variant needs an
+  owner ruling.
+- **dav-F9 (P4, filed 2026-09-06, cold review).** `event_in_range` collapses
+  a missing DTEND to zero length (`time_interval` defaults `end` to `start`)
+  and then tests strict overlap (`event_end > range_start`), so a timed
+  event with no DTEND starting EXACTLY at the window start is dropped.
+  RFC 4791 s9.9 includes it - a zero-length instant at `start` overlaps a
+  `[start, end)` window. One-character fix (`>=`) but it changes the
+  boundary for genuinely zero-length events generally, so it wants a
+  ruling and a pinned pair of tests.
+- **dav-F10 (P4, filed 2026-09-06, cold review).** A transiently degraded
+  cursor listing - `filter_unsupported` reads a 405 hiccup as "the server
+  will not run the filter" and degrades to the unfiltered PROPFIND walk -
+  puts VTODO hrefs into the snapshot as Created, and the next successful
+  filtered REPORT reports them Destroyed. The degradation is deliberate and
+  right; the flap is the cost, and neither reference mentions it. Related
+  to caldav-F1 above and should be decided with it.
+- **dav-F11 (P4, filed 2026-09-06, cold review).** `DavDispatch::resolve_url`
+  joins a relative id two different ways: `Url::join` on the parsed base
+  (which REPLACES the base's last path segment) and, when the base does not
+  parse, a plain `format!` concatenation (which APPENDS). Only reachable for
+  a consumer-supplied relative native id against an unparseable base, so it
+  is latent - but the two branches should agree.
+- **dav-F12 (P4, filed 2026-09-06, cold review).** `move_resource` keeps the
+  original `Destination` header across a redirect OF THE SOURCE: the walk
+  clones `request.headers` and rewrites only the url, so a server that
+  moves `/cal/one.ics` to `/dav/cal/one.ics` gets a MOVE whose destination
+  still names the pre-redirect collection namespace. Rebasing the
+  destination on the same hop the source took is the fix, and it must stay
+  inside the admitted-origin gate.
+- **dav-D1 (product decision for the owner, filed 2026-09-06, third cold
+  review).** Declaring the DELETE unreplayable TRADES AWAY delete resilience,
+  and the trade was made without a ruling. Before, a drop that happened BEFORE
+  the server ever saw the DELETE was transparently replayed and the delete
+  simply succeeded; now every drop, whether the request landed or not, reaches
+  the consumer as `Reconcile(CheckTarget)` and costs a probe. The alternative
+  keeps the replay and absorbs the resulting 404 at `event_delete` /
+  `contact_delete` as SUCCESS, under `reference/error-model.md`'s "a benign
+  NotFound lives at the call site" rule - a delete whose target is already gone
+  has reached its intended end state. That was not taken here, and it is a
+  real choice, not an oversight: absorbing the 404 also hides a genuine
+  "resource never existed" from a consumer that deleted by a stale id, where
+  the current shape reports it. Two coherent answers; the owner picks. Whichever
+  wins, CalDAV and CardDAV must move together, and the reference's
+  "Which requests are declared unreplayable" section is where it is written
+  down.
+
+## bifrost-net
+
+- **net-F1 (P3, filed 2026-09-06, lateral from the DAV cold review).**
+  `into_account_error` stamps `TransmissionState::InFlight` on
+  `Error::RetryBudgetExhausted { final_response: None }` unconditionally
+  (`crates/net/src/account_error.rs`, the `None` arm), even when every attempt
+  in the budget failed `Unsent` - the variant carries only
+  `retry_after_history` and no per-attempt transmission evidence, so the worst
+  observed state is not available to the mapping and the most conservative one
+  is assumed. Safe but over-conservative, and the DAV unreplayable declaration
+  makes it visible: a create-PUT or DELETE whose every attempt never left the
+  process now derives `Reconcile(CheckTarget)`, sending the consumer to probe a
+  target nothing was ever written to, where `Retry(SameRequest)` is the
+  accurate answer. The fix is in net, not DAV: carry the worst transmission
+  state observed across the attempts through the `RetryBudgetExhausted`
+  variant, and stamp that instead of the constant. Not a live defect - the
+  wrong direction is the safe one - but it costs a retry the request had
+  earned. Outside the DAV lane; needs a ruling from whoever owns net.
 
 ## bifrost-sasl
 
@@ -265,6 +429,157 @@ any item; some may already be obsolete.
   So the real remaining item is the success-path outcome record, and it
   should not be designed as a mirror of the failure surface that already
   exists. Still waiting on ratatoskr to need the audit trail.
+
+## bifrost-smtp
+
+Filed 2026-09-06 from the cold review of `client/core.rs`, both I/O adapters,
+the pool and the batch callers. The two P2s from that review (the batch
+DATA-final-negative `uncertain` lane, and the async body upload bounded by one
+per-operation timeout) were fixed in the same pass; everything below is
+verified against the code and awaiting its own ruling.
+
+- **smtp-CR1 (P3).** `DirectLmtp` ABORTS where `DirectSmtp` does not, on two
+  boundaries. `DirectLmtpStage::MailReply` on a negative reply calls
+  `abort_with(SmtpCommandPhase::MailFrom, ..)`, and `DirectLmtpStage::DataReply`
+  on a negative reply calls `abort_with(SmtpCommandPhase::DataCommand, ..)`. On
+  the SMTP side the same two boundaries finish without an RSET (MAIL FROM
+  opened no transaction) and RSET-and-keep (DATA), and `BatchLmtp::DataReply`
+  also RSET-and-keeps. So the two LMTP paths differ from each other as well as
+  from SMTP. `reference/smtp.md` says the direct and batch LMTP paths differ in
+  exactly ONE respect (`restore_ok`), and states the no-RSET MAIL FROM rule
+  with no LMTP carve-out - so either the code is wrong on both counts or the
+  reference owes two carve-outs. Cost of the current shape: one reconnect per
+  rejected LMTP envelope, on a local-delivery socket.
+
+- **smtp-CR2 (P3).** `BatchLmtpStage::GroupOpened` has the wrong exit shape on
+  `OpOutcome::Failed`: it returns `Step::Finish(Err((error, progress)))`, and
+  it is reached only AFTER `BatchLmtpStage::BodyWritten` ran
+  `set_body_finished()`. A batch-level `Err` means "nothing was transmitted"
+  (`reference/error-model.md`), so this arm would claim that for a body that
+  already left. Unreachable today - `open_reply_group` fails only on
+  `verify()`, and a completed body write leaves the stream `Ok` - so it is a
+  latent shape defect, not a live one. `BatchLmtpStage::FinalStatus`'s `Failed`
+  arm has the right shape (`mark_uncertain_unresolved` + `Ok(progress)`).
+  `BatchSmtp::WindowOpened` returns the same `Err` shape but sits on the clean
+  side of DATA, where it is correct.
+
+- **smtp-CR3 (P3).** The async `abort()` is bounded by
+  `per_operation_budget()`, which is `TimeoutBudget::PerOperation(self.timeout)`
+  - so a transport built with `timeout(None)` awaits `poll_shutdown`
+  unbounded, and on a TLS peer that never answers `close_notify` the await
+  never returns. `Pool::shutdown` runs closes concurrently but waits for them,
+  so a single wedged TLS peer can hang shutdown. `reference/smtp.md` states
+  "each close is bounded by the connection's operation timeout" flatly; it
+  holds only when one is configured. Either bound the shutdown with a floor
+  independent of the configured timeout, or say so in the reference.
+
+- **smtp-CR4 (P4).** `DirectLmtpStage::BodyWritten` hardcodes
+  `SmtpCommandPhase::DataBody` where `DirectSmtp::BodyWritten` uses
+  `self.body.body_phase()`, so an LMTP BDAT chunk-write failure reports
+  `DataBody` instead of `BdatBody`. One-line fix; the phase feeds
+  `classify_response`, which does not currently split on it, so nothing
+  observable changes today.
+
+- **smtp-CR5 (P4).** `DirectSmtpStage::MailRejectedDrain` on a `Failed` drain
+  read reports `phased(SmtpCommandPhase::RcptTo, error)`, dropping the
+  `MAIL FROM` rejection it is carrying in `response` along with its reply text.
+  The caller gets the transport failure of the drain and never learns why the
+  transaction was doomed.
+
+- **smtp-CR6 (P4).** `BatchSmtpStage::WindowOpened` and
+  `BatchSmtpStage::WindowClosing` exit `Failed` as
+  `Step::Finish(Err((error, progress)))`, and both transports discard the
+  progress (`Err((e, _progress)) => Err(batch_level_error(e, ctx))`). So the
+  RCPT answers already collected in earlier windows - including `550`s the
+  server gave - fold into one `Unsent` batch-level retry. Contract-correct (no
+  content was transmitted, the whole request is retryable) but lossy for
+  diagnostics: a caller retrying learns nothing about the recipients the server
+  had already refused.
+
+- **smtp-CR7 (P4, doc).** Two reference corrections, plus one unreachable
+  shape. (a) The "Transport types" list of deliberate half-differences is now
+  three, not two: the async setup deadline is ONE shared `AsyncDeadline` across
+  DNS, connect, TLS, banner and EHLO, while the blocking half has a connect
+  timeout plus per-operation `SO_RCVTIMEO`, so blocking setup can take roughly
+  3x the configured timeout where async setup cannot exceed it. That is a real
+  behavioural difference and it is documented only as two separate mechanisms.
+  (b) `DirectSmtpStage::Start` on the pipelined path with an EMPTY recipient
+  list calls `start_window(0)`, which immediately falls through to
+  `after_envelope()` and writes `DATA` with no `MAIL FROM` ahead of it.
+  Unreachable through `Envelope::new`, which requires at least one recipient,
+  but the machine itself does not enforce it.
+
+- **smtp-CR8 (P3).** A `421` reply to `MAIL FROM` still parks the connection.
+  `421` is "closing transmission channel", and the `FinalReply` stage now
+  routes it through `Epilogue::abort` for exactly that reason - but
+  `DirectSmtpStage::MailReply` (and its pipelined `MailWindowReply` /
+  `MailRejectedDrain` siblings) deliberately does NOT reset or abort a
+  negative `MAIL FROM`, on the correct reasoning that no transaction was
+  opened. That reasoning is about the TRANSACTION; a 421 is about the
+  CONNECTION, so a peer shutting down mid-envelope leaves a dead socket
+  parked for the next checkout. Same shape for a 421 to `RCPT TO`, `DATA` and
+  `RSET` itself. Likely fix: one `is_closing_channel(response)` check shared
+  by every negative-reply arm, ahead of the reset/keep decision, rather than
+  the single-arm check that exists now. Surfaced by the cold review of the
+  end-of-data-completion change; the `FinalReply` half was fixed in place
+  because it sat inside the arm being changed.
+
+- **smtp-CR9 (P4).** `SlowSinkPeer::new` arms its first `Sleep` at
+  CONSTRUCTION rather than at the first `poll_write`, so the gap between
+  building the peer and the first write is silently credited against the
+  first chunk's delay. Harmless in the tests that use it (they build and
+  write immediately, under paused time, where no virtual time elapses in
+  between), but it makes the peer's contract "chunk bytes every gap, counted
+  from whenever you happened to construct me", which is a trap for a future
+  test that builds the peer during setup. Arm lazily on the first poll
+  instead.
+
+Filed 2026-09-06 from the third cold review of the same diff. Its two other
+findings (the batch machine parking a 421'd connection, and a cap retune
+re-pricing outstanding metering debt) were fixed in that pass.
+
+- **smtp-CR10 (P2, product decision, spans `bifrost-types`).** A permanent
+  SMTP 5xx at `DataFinal` now derives `Retry(SameRequest)` for a
+  non-idempotent send. `account_error.rs::classify_response` maps an untabled
+  5xx (554 spam rejection, say) to `Server(Error { status: Some(554) })`, and
+  `derive_server` in `crates/types/src/error/recovery.rs` routes
+  `Some(500..=599)` through `transient_retry_or_reconcile` with
+  `RetryReason::ServerUnavailable` - which with `Acknowledged` is
+  `Retry(SameRequest)`. So the exact fixture in
+  `a_rejected_data_final_reply_fails_the_recipients_and_keeps_the_connection`
+  produces failed lanes whose advice is "resend the same message" against a
+  server that permanently refused it. Before this round those recipients were
+  `uncertain` - wrong, but not an instruction to resend. The `500..=599` rule
+  is HTTP semantics; an SMTP 5xx is permanent by definition. `RcptTo` 5xx lanes
+  already suffer this, but `DataFinal` carries a whole message body per retry.
+  The fix belongs either in `classify_response` (a terminal-deriving kind for
+  SMTP 5xx) or as a protocol-aware row in `derive_server`; both touch published
+  surface outside this crate, so it needs the owner's ruling.
+
+- **smtp-CR11 (P3).** With a per-operation timeout of about one second or
+  less, every capped write after the first waits its parked ~1 s of debt
+  INSIDE `with_timeout` and times out. The offer clamp bounds parked debt at
+  one second of cap, which is only helpful while the timeout is comfortably
+  larger than a second. Fix direction: clamp the offer to a FRACTION of the
+  timeout's worth of cap (the clamp already re-reads the cap per call, so it
+  could read the timeout too), or document the constraint as a lower bound on
+  a usable `timeout` under a cap.
+
+- **smtp-CR12 (P3).** There is no TOTAL bound on a body write. The re-armed
+  per-write timeout deliberately bounds only a write that made no progress, so
+  a peer draining one byte per `timeout - epsilon` keeps an upload alive
+  indefinitely. The read side explicitly closed the same shape - the per-reply
+  deadline exists precisely because a peer trickling one line per period could
+  stretch one reply - so the asymmetry is deliberate on one side and unstated
+  on the other. Either add an outer bound or a minimum-progress rule, or state
+  the asymmetry in `reference/smtp.md` beside the per-reply read deadline
+  section.
+
+- **smtp-CR13 (P4).** TLS record overhead is not counted. `charge` meters
+  PLAINTEXT bytes, and under a small cap each clamped `poll_write` becomes its
+  own TLS record, so the bytes actually on the wire exceed the cap by the
+  per-record overhead - and the smaller the cap, the worse the ratio. Note
+  only; charging ciphertext would need the meter below the TLS layer.
 
 ## bifrost-graph
 
@@ -365,10 +680,17 @@ public-folder containers, EWS public-folder hydration, allowlisted public-folder
 scopes). Each was deliberately out of that brick's scope; none blocks the
 container projection itself.
 
-- **nc-2 (graph)** Make the EWS `GetItem` property shape class-conditional by
-  threading `EwsItem.item_class` from inventory; today a mixed-class pinned
-  public folder fails hydration per item on every non-mail class (full context
-  at `EwsClient::get_item`).
+- **nc-2a (graph, filed while landing nc-2, not fixed)** A non-mail
+  public-folder item now HYDRATES (the `GetItem` request is class-safe), but
+  both projections are still mail-shaped: `hydrated_from_ews_item` reuses
+  `item_to_inventory_entry` and `message_from_ews_item` mints a `Message`. A
+  contact's `<t:DisplayName>` is not a subject and does not land anywhere, so
+  a hydrated `IPM.Contact` is a near-empty `Message` carrying only its id,
+  change key and memberships. Evidence: `ews::parse` fills `EwsItem` from a
+  `<t:Contact>` with `item_id` / `change_key` / `item_class` and nothing else
+  (`parse_get_item_response_contact`). Whether non-mail public-folder items
+  should project onto a contact/event type at all is a product decision, not
+  a defect - hence filed rather than built.
 - **nc-4 (graph)** `well_known_folder_roles` is only correct for the primary
   mailbox, so shared-mailbox containers fall back to display-name matching and
   their Inbox / Sent carry no `FolderRole`. A correct fix costs about six extra
@@ -592,20 +914,13 @@ Nothing in this section misbehaves. None of it is a bug, and none of it blocks a
 defect fix - in particular, do not let a unification proposal become a
 prerequisite for the small local fixes above.
 
-- **google-B7.** `changes.rs`, `mutation.rs`, `inventory.rs::get_stream` and
-  `scopes.rs::scope_lifecycle_stream` are four near-identical hand-rolled
-  `stream::unfold` state machines, each with its own `finished`/`emitted_done`
-  pair, its own batching, its own terminate-and-emit-`Done` dance. Relatedly,
-  `terminates_mutation_stream` encodes a real fan-out policy in `error.rs` where
-  it belongs, but only the mutation driver consults it: inventory always
-  terminates, `get_stream` always fans per-item, and the lifecycle stream uses
-  `is_terminal() || requires_engine_action()`. Three different answers to one
-  question. A shared `BatchedStream` driver plus a `FailurePolicy::for(error, lane)`
-  would collapse ~400 lines and make the boundary and terminate contracts
-  enforceable in one place.
-- **jmap-B1.** Three near-identical query/get/advance loops in the sync layer;
-  `imap` has four copies of the untagged-response dispatch loop. Recorded for
-  completeness with the other duplication findings; same standing as the above.
+- **jmap-B1.** `imap` has four copies of the untagged-response dispatch loop.
+  Recorded for completeness with the other duplication findings; same standing
+  as the above. (The jmap half is landed: `sync/changes.rs`'s `email_changes`
+  and `mailbox_changes` are now one generic `changes_walk` over the new
+  `core::changes::ChangesMethod`. The inventory walk stayed separate - it is
+  anchored query-then-get with its own no-`Done` exits, not a state walk - and
+  the reason is written at `changes_walk`.)
 
 ## Open items folded in from the second bug-hunt wave (2026-08-29)
 

@@ -489,9 +489,37 @@ async fn settled_partition_count(stub: &Arc<common::StubAccount>) -> usize {
     }
 }
 
-/// Read forward until `LANE` backfill pages have arrived unacknowledged, which
-/// is the state in which the producer is parked at the bound.
-async fn read_to_the_bound(
+/// Establish that the producer is parked at the bound, holding its pages
+/// UNREAD.
+///
+/// The bound is a receipt bound: a page leaves the ring's pressure when the
+/// consumer READS it, not when the consumer acknowledges it. So the staging for
+/// a parked producer is a subscriber that does not read - the caller subscribes
+/// (the walk needs a subscriber to start at all) and then simply leaves the
+/// pages sitting in the ring. Reading `LANE` pages, which is what these tests
+/// used to do, now RELEASES the producer for `LANE` more.
+///
+/// Returns the settled walk length, which the caller may compare against later
+/// readings.
+async fn park_the_producer_unread(stub: &Arc<common::StubAccount>) -> usize {
+    let parked = settled_partition_count(stub).await;
+    assert!(
+        parked <= LANE + 1,
+        "the producer must be parked at the bound with its pages unread; walked {parked}"
+    );
+    parked
+}
+
+/// Read `LANE` backfill pages and acknowledge NONE of them, which is what makes
+/// them strandable when this receiver departs.
+///
+/// This is NOT a park. Under the receipt bound the read is the permit, so by the
+/// time this returns the producer has been freed for `LANE` further pages and
+/// is parked one bound further along - which is why the callers that assert on
+/// the walk length allow `2 * LANE + 1` rather than `LANE + 1`. What the helper
+/// stages is the hole: pages one receiver took delivery of and never answered
+/// for, which a replacement joining at the ring's tail can never see.
+async fn read_without_acknowledging(
     events: &mut bifrost_sync::ChangesReceiver,
 ) -> Vec<(CursorScope, Checkpoint, bifrost_sync::PublicationId)> {
     let mut held = Vec::new();
@@ -517,11 +545,17 @@ async fn read_to_the_bound(
     held
 }
 
-/// THE property. A consumer that takes delivery but does not acknowledge stops
-/// the producer: no further partition is even requested from the account, and no
-/// further page is published, until an acknowledgement comes back.
+/// THE property, and the whole of the receipt bound in one test. A consumer that
+/// does not READ stops the producer: no further partition is even requested from
+/// the account until a page is taken out of the ring. A consumer that reads
+/// releases exactly what it read. And an acknowledgement of a page already read
+/// releases nothing further, because the read already did.
+///
+/// That last assertion is the one that separates the two contracts. Under the
+/// acknowledgement bound it fails: the ack was the permit, so it bought a page of
+/// headroom and the walk moved on.
 #[tokio::test(start_paused = true)]
-async fn a_slow_consumer_stalls_the_backfill_producer() {
+async fn a_consumer_that_holds_pages_unread_stalls_the_backfill_producer() {
     let account_id = AccountId("lane-stall".to_owned());
     let scope = CursorScope::Account;
     let stub = Arc::new(paged_stub(&scope));
@@ -537,37 +571,55 @@ async fn a_slow_consumer_stalls_the_backfill_producer() {
         .account_changes_stream(&account_id)
         .expect("attached account has a change stream");
 
-    let held = read_to_the_bound(&mut events).await;
+    // The consumer subscribes - the walk needs a subscriber to start at all -
+    // and then reads nothing. The bound is enforced BEFORE the wire call, not
+    // merely at the broadcast, so at most one page is in the producer's hand
+    // past the bound.
+    let parked_at = park_the_producer_unread(&stub).await;
 
-    // Nothing more arrives while the acknowledgements are withheld.
+    // One read, one page of headroom: the READ is the permit signal.
+    let page = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let event = events.recv().await.expect("the broadcast stays open");
+            if let Some(checkpoint) = backfill_checkpoint(&event) {
+                return (
+                    event.scope.clone(),
+                    Checkpoint::Backfill(checkpoint.clone()),
+                    event.publication.clone().expect("checkpointed publication"),
+                );
+            }
+        }
+    })
+    .await
+    .expect("the pages the producer already published are there to be read");
+    let after_one_read = settled_partition_count(&stub).await;
     assert!(
-        tokio::time::timeout(Duration::from_millis(300), events.recv())
-            .await
-            .is_err(),
-        "the producer must park at the bound, not keep publishing"
+        after_one_read > parked_at,
+        "reading a page must release the producer for another; it stayed at {parked_at}"
     );
-    // And the bound is enforced BEFORE the wire call, not merely at the
-    // broadcast: at most one page is in the producer's hand past the bound.
-    let walked = stub.walked_partitions().len();
     assert!(
-        walked <= LANE + 1,
-        "a parked producer must not keep asking the account for partitions; walked {walked}"
+        after_one_read <= parked_at + 2,
+        "and for ONE more, not for the rest of the walk; it ran to {after_one_read}. \
+         The mechanism frees exactly one page per read; the second unit of slack is \
+         the SAMPLING, not the bound. `parked_at` is read while the producer may \
+         have one page in hand past the bound (`park_the_producer_unread` allows \
+         `LANE + 1` for that reason), so a reading taken at `LANE` and one taken \
+         after the freed page settled differ by two"
     );
 
-    // One acknowledgement, one page of headroom - the existing backfill ack IS
-    // the permit signal.
-    let (ack_scope, checkpoint, publication) = held[0].clone();
+    // And the acknowledgement of that same page releases nothing further. It is
+    // a promise about the consumer's own durability, made on whatever schedule
+    // the consumer likes; the ring pressure it would have relieved was already
+    // relieved by the read.
     engine
-        .ack_checkpoint(&account_id, ack_scope, checkpoint, Some(publication))
+        .ack_checkpoint(&account_id, page.0, page.1, Some(page.2))
         .await
         .expect("the ack persists");
-    let resumed = tokio::time::timeout(Duration::from_secs(10), events.recv())
-        .await
-        .expect("an acknowledgement must release the producer")
-        .expect("the broadcast stays open");
-    assert!(
-        backfill_checkpoint(&resumed).is_some(),
-        "and what it releases is the next backfill page"
+    assert_eq!(
+        settled_partition_count(&stub).await,
+        after_one_read,
+        "an acknowledgement is not the permit: the producer must stay parked behind \
+         the pages the consumer has still not read"
     );
 
     engine.detach(&account_id).await.expect("detach succeeds");
@@ -618,20 +670,21 @@ async fn live_changes_still_flow_while_the_backfill_producer_is_parked() {
         .account_changes_stream(&account_id)
         .expect("attached account has a change stream");
 
-    let _held = read_to_the_bound(&mut events).await;
-    let walked_at_the_bound = settled_partition_count(&stub).await;
-    assert!(
-        walked_at_the_bound <= LANE + 1,
-        "the producer must be parked at the bound; walked {walked_at_the_bound}"
-    );
+    let walked_at_the_bound = park_the_producer_unread(&stub).await;
 
-    // Now, with no acknowledgement at all, live changes must keep arriving.
+    // Now, with no acknowledgement at all, live changes must keep arriving. The
+    // one receiver reads both lanes, so draining live batches unavoidably reads
+    // backfill pages too and hands the producer that many permits back - which
+    // is exactly the accounting the assertion below is written in. What must NOT
+    // happen is the backfill lane running away regardless.
     let mut live = 0_usize;
+    let mut pages_read = 0_usize;
     tokio::time::timeout(Duration::from_secs(10), async {
         while live < 3 {
             let event = events.recv().await.expect("the broadcast stays open");
-            if backfill_checkpoint(&event).is_none() && batch_ids(&event) == vec!["live".to_owned()]
-            {
+            if backfill_checkpoint(&event).is_some() {
+                pages_read += 1;
+            } else if batch_ids(&event) == vec!["live".to_owned()] {
                 live += 1;
             }
         }
@@ -639,10 +692,11 @@ async fn live_changes_still_flow_while_the_backfill_producer_is_parked() {
     .await
     .expect("a parked backfill must not stall the live lane");
 
-    assert_eq!(
-        stub.walked_partitions().len(),
-        walked_at_the_bound,
-        "and the backfill producer stayed parked throughout"
+    let walked = stub.walked_partitions().len();
+    assert!(
+        walked <= walked_at_the_bound + pages_read + 1,
+        "the backfill producer must stay within the bound the consumer's reads bought \
+         it: parked at {walked_at_the_bound}, {pages_read} pages read, walked {walked}"
     );
 
     engine.detach(&account_id).await.expect("detach succeeds");
@@ -755,7 +809,7 @@ async fn a_retained_receiver_sees_the_channel_close_after_detach() {
     let mut events = engine
         .account_changes_stream(&account_id)
         .expect("attached account has a change stream");
-    let _held = read_to_the_bound(&mut events).await;
+    park_the_producer_unread(&stub).await;
 
     engine.detach(&account_id).await.expect("detach succeeds");
     drop(engine);
@@ -798,12 +852,10 @@ async fn a_walk_that_reached_nobody_is_not_settled() {
     )
     .await;
 
-    let mut events = engine
+    let events = engine
         .account_changes_stream(&account_id)
         .expect("attached account has a change stream");
-    let _held = read_to_the_bound(&mut events).await;
-    let parked_at = settled_partition_count(&stub).await;
-    assert!(parked_at <= LANE + 1);
+    park_the_producer_unread(&stub).await;
 
     // The only consumer leaves. The sweep frees the bound and the producer is
     // free to run - into nobody.
@@ -870,11 +922,11 @@ async fn a_mid_walk_receiver_replacement_does_not_settle_the_scope() {
     let mut first = engine
         .account_changes_stream(&account_id)
         .expect("attached account has a change stream");
-    let held = read_to_the_bound(&mut first).await;
+    let held = read_without_acknowledging(&mut first).await;
     let parked_at = settled_partition_count(&stub).await;
     assert!(
-        parked_at <= LANE + 1,
-        "the producer must be parked at the bound; walked {parked_at}"
+        parked_at <= 2 * LANE + 1,
+        "A's reads bought the producer one further bound and no more; walked {parked_at}"
     );
     let stranded: HashSet<String> = held
         .iter()
@@ -983,11 +1035,11 @@ async fn a_retry_after_lost_pages_restarts_an_open_ended_walk_from_its_beginning
     let mut first = engine
         .account_changes_stream(&account_id)
         .expect("attached account has a change stream");
-    let held = read_to_the_bound(&mut first).await;
+    let held = read_without_acknowledging(&mut first).await;
     let parked_at = settled_partition_count(&stub).await;
     assert!(
-        parked_at <= LANE + 1,
-        "the producer must be parked at the bound; walked {parked_at}"
+        parked_at <= 2 * LANE + 1,
+        "A's reads bought the producer one further bound and no more; walked {parked_at}"
     );
     let stranded: HashSet<String> = held
         .iter()
@@ -1502,11 +1554,13 @@ async fn pages_lost_to_a_lag_withhold_the_completion_marker() {
     let mut events = engine
         .account_changes_stream(&account_id)
         .expect("attached account has a change stream");
-    // The consumer RECEIVES `LANE` pages and answers for none of them, so the
-    // producer parks at the bound. They are read, not unread: what makes them
-    // strandable is the missing acknowledgement, and the live burst below is what
-    // takes away any chance of one.
-    let held = read_to_the_bound(&mut events).await;
+    // The consumer RECEIVES `LANE` pages and answers for none of them. They are
+    // read, not unread, and deliberately so: what makes them strandable is the
+    // missing acknowledgement, and the live burst below is what takes away any
+    // chance of one. Under the receipt bound the reading also frees the producer
+    // for a further `LANE` pages, which is immaterial here - the walk is not
+    // what this test measures.
+    let held = read_without_acknowledging(&mut events).await;
     let stranded: HashSet<String> = held
         .iter()
         .map(|(_, checkpoint, _)| match checkpoint {
@@ -1817,7 +1871,7 @@ async fn a_page_ack_replayed_across_a_detach_does_not_rebuild_the_resume_positio
     let mut first = engine
         .account_changes_stream(&account_id)
         .expect("attached account has a change stream");
-    let held = read_to_the_bound(&mut first).await;
+    let held = read_without_acknowledging(&mut first).await;
     let stranded: HashSet<String> = held
         .iter()
         .map(|(_, checkpoint, _)| match checkpoint {
@@ -2100,9 +2154,12 @@ async fn a_detach_between_the_loss_and_the_walks_end_still_drops_the_rows() {
     let mut first = engine
         .account_changes_stream(&account_id)
         .expect("attached account has a change stream");
-    let held = read_to_the_bound(&mut first).await;
+    let held = read_without_acknowledging(&mut first).await;
     let parked_at = settled_partition_count(&stub).await;
-    assert!(parked_at <= LANE + 1, "parked at the bound; {parked_at}");
+    assert!(
+        parked_at <= 2 * LANE + 1,
+        "parked one bound past the pages it read; {parked_at}"
+    );
     let stranded: HashSet<String> = held
         .iter()
         .map(|(_, checkpoint, _)| match checkpoint {
@@ -2370,9 +2427,12 @@ async fn an_incomplete_positional_walk_restarts_after_a_detach() {
     let mut first = engine
         .account_changes_stream(&account_id)
         .expect("attached account has a change stream");
-    let held = read_to_the_bound(&mut first).await;
+    let held = read_without_acknowledging(&mut first).await;
     let parked_at = settled_partition_count(&stub).await;
-    assert!(parked_at <= LANE + 1, "parked at the bound; {parked_at}");
+    assert!(
+        parked_at <= 2 * LANE + 1,
+        "parked one bound past the pages it read; {parked_at}"
+    );
     let stranded: HashSet<String> = held
         .iter()
         .map(|(_, checkpoint, _)| match checkpoint {
@@ -2504,20 +2564,18 @@ async fn a_withheld_marker_does_not_abandon_the_accounts_other_scopes() {
     let mut first = engine
         .account_changes_stream(&account_id)
         .expect("attached account has a change stream");
-    // Answer for every page of the first walk but its LAST, so the marker parks
-    // behind exactly one outstanding page.
+    // Read and answer for every page of the first walk but its LAST, which is
+    // left UNREAD - the capacity the marker then parks behind. Under the receipt
+    // bound an unacknowledged page that the consumer has read frees the lane, so
+    // an unread page is what makes the marker park at all.
     let mut pages = 0_usize;
     tokio::time::timeout(Duration::from_secs(20), async {
-        while pages < 2 {
+        while pages < 1 {
             let event = first.recv().await.expect("the broadcast stays open");
             let Some(checkpoint) = backfill_checkpoint(&event) else {
                 continue;
             };
             pages += 1;
-            if pages == 2 {
-                // The last page of the walk, left unacknowledged on purpose.
-                return;
-            }
             engine
                 .ack_checkpoint(
                     &account_id,
@@ -2824,20 +2882,18 @@ async fn detach_does_not_wait_out_a_producer_parked_on_capacity() {
         None,
     )
     .await;
-    let mut events = engine
+    // Held, never read: the subscriber gate needs a receiver for the walk to
+    // start at all, and the unread pages are what park the producer.
+    let _events = engine
         .account_changes_stream(&account_id)
         .expect("attached account has a change stream");
-    let _held = read_to_the_bound(&mut events).await;
     // Establish that the producer has actually REACHED the capacity wait rather
     // than merely being between partitions: the walk must have stopped and
     // stayed stopped. Without this the timing assertion below passes against a
     // producer that was never parked at all, which is what it is meant to prove
-    // something about.
-    let parked_at = settled_partition_count(&stub).await;
-    assert!(
-        parked_at <= LANE + 1,
-        "the producer must be parked at the bound, not still walking; walked {parked_at}"
-    );
+    // something about. The consumer holds its pages unread, which is what parks
+    // it under the receipt bound.
+    let _parked_at = park_the_producer_unread(&stub).await;
 
     let started = tokio::time::Instant::now();
     engine.detach(&account_id).await.expect("detach succeeds");
@@ -2894,17 +2950,12 @@ async fn replacing_the_stream_while_the_producer_is_parked_releases_it() {
         None,
     )
     .await;
-    let mut events = engine
+    let events = engine
         .account_changes_stream(&account_id)
         .expect("attached account has a change stream");
-    let _held = read_to_the_bound(&mut events).await;
-    let parked_at = settled_partition_count(&stub).await;
-    assert!(
-        parked_at <= LANE + 1,
-        "the producer must be parked at the bound; walked {parked_at}"
-    );
+    let parked_at = park_the_producer_unread(&stub).await;
 
-    // Drop and immediately replace, with no acknowledgement in between.
+    // Drop and immediately replace, with nothing read and nothing acknowledged.
     drop(events);
     let mut replacement = engine
         .account_changes_stream(&account_id)
@@ -2912,9 +2963,10 @@ async fn replacing_the_stream_while_the_producer_is_parked_releases_it() {
 
     // The replacement must receive real pages, which can only happen if the
     // producer was released.
-    // Exactly `LANE` pages can flow before the producer parks again: the
-    // replacement acknowledges nothing, so the bound reasserts itself
-    // immediately. Asking for more would be asking the bound to fail.
+    // `LANE` pages is what the released producer publishes before parking again,
+    // and the replacement's own reads then carry it on from there. Asking for
+    // `LANE` is asking only for the release itself, which is the property under
+    // test.
     let mut received = 0_usize;
     let delivered = tokio::time::timeout(Duration::from_secs(10), async {
         while received < LANE {
@@ -2940,9 +2992,11 @@ async fn replacing_the_stream_while_the_producer_is_parked_releases_it() {
     engine.detach(&account_id).await.expect("detach succeeds");
 }
 
-/// The bound of ONE case: forty consecutive pages, each acknowledged the instant
-/// it arrives, so every page in the walk has to free its own capacity before the
-/// next one can be published.
+/// The bound of ONE case: forty consecutive pages, each read and then
+/// acknowledged the instant it arrives, so every page in the walk has to free
+/// its own capacity before the next one can be published. With a bound of one it
+/// is the READ that has to land the release - a page whose receipt goes
+/// unrecorded stalls the whole walk immediately.
 ///
 /// SEQUENTIAL, and described as such. It runs on the current-thread runtime under
 /// paused time like the rest of this file, so there is no cross-thread race here

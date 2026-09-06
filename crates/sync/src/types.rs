@@ -113,8 +113,8 @@ pub struct BackfillConfig {
     /// Clock-skew threshold above which a `Warning::ClockSkew` is
     /// emitted.
     pub clock_skew_warn: Duration,
-    /// How many backfill pages may be published but unacknowledged before
-    /// the cold-start producer parks.
+    /// How many backfill pages may be published but UNREAD before the
+    /// cold-start producer parks.
     ///
     /// The bound that makes backfill flow-controlled instead of
     /// loss-and-reconcile. Backfill and live changes share one broadcast ring
@@ -122,18 +122,52 @@ pub struct BackfillConfig {
     /// producer-side backpressure of its own, so a large mailbox's cold start
     /// used to outrun a consumer as a matter of routine, overwrite unread
     /// pages, and trigger lag abandonment plus a re-read from the last durable
-    /// checkpoint. A backfill producer now takes one permit per published page
-    /// and returns it when the consumer's acknowledgement of that page - or of
-    /// a later page of the SAME partition - reaches the ack writer. Sibling
-    /// partitions are separate lanes, so acknowledging one frees nothing of
-    /// another.
+    /// checkpoint. A backfill producer takes one permit per published page and
+    /// returns it when a consumer receiver READS that page off the stream.
     ///
-    /// This is a contract on the consumer as well as a knob: acknowledgements
-    /// may not be deferred by more than this many publications. A consumer
-    /// that batches its acknowledgements by count must batch below the bound,
-    /// or raise it above its window, because a producer parked at the bound
-    /// waits for an acknowledgement the consumer is holding while the consumer
-    /// waits for a page that will not come.
+    /// Reading, not acknowledging. What overruns a ring is pages nobody has
+    /// taken out of it, while an acknowledgement is a promise about the
+    /// consumer's own durability, made on whatever schedule the consumer likes -
+    /// so this is a knob and not a contract on the consumer's acknowledgement
+    /// window. A consumer may batch its acknowledgements as coarsely as it
+    /// wishes; the producer follows its reads - or, with several receivers, the
+    /// slowest of them, since the ring is shared and a page it has not read is
+    /// still occupying a slot.
+    ///
+    /// What it does not bound is the consumer's unpersisted backlog, exactly as
+    /// on any other channel, and coarse acknowledgement is not free even though
+    /// the producer no longer waits for it. Until a page is acknowledged the
+    /// engine keeps its publication record alive - including, for a page a later
+    /// page of the same partition superseded, its receipt and the coverage claim
+    /// on it, folded into the survivor - so an account's retained ledger grows
+    /// with the unacknowledged run of each partition rather than with this bound.
+    /// And a live-lane burst that lags such a consumer abandons every one of
+    /// those read-but-unacknowledged pages at once, costing a re-walk of all of
+    /// them; acknowledging while the producer is parked has neither cost.
+    ///
+    /// That retained history is unbounded PER PARTITION, and the `Full` plan
+    /// (which is what JMAP Email uses) has one partition per scope, so there it
+    /// is unbounded over the whole scope's backfill.
+    ///
+    /// **Every numbered receiver must be polled or dropped.** Every receiver
+    /// `SyncEngine::account_changes_stream` hands out is numbered, and the bound
+    /// follows the slowest of them, so a receiver that is held and never polled -
+    /// a second stream opened for a UI, say - holds up to this many pages unread
+    /// for the life of the attachment and parks cold start permanently. It
+    /// reports nothing on its own: the departure warning fires on drop and the lag
+    /// warning on poll, and such a receiver does neither, so the engine warns from
+    /// the park instead (`bifrost.sync.backfill`, naming the holding sequences).
+    /// The ruled observer subscription - a receiver counting for neither the
+    /// subscriber gate nor the bound - is what will lift this obligation for
+    /// receivers that only watch.
+    ///
+    /// The bound is also narrower than "the producer follows the slowest reader":
+    /// it follows the slowest live numbered reader among pages NOT YET
+    /// ACKNOWLEDGED, and an acknowledgement frees a page for every receiver. With
+    /// two numbered receivers where the ACKNOWLEDGER is the faster one, its
+    /// acknowledgements can therefore run the producer past a slower observer
+    /// until that observer lags. Two acknowledging receivers are not a supported
+    /// shape for this engine in any case.
     ///
     /// Keep it well under `changes_capacity`: the point of the bound is that a
     /// cold start cannot overrun the ring by itself, which needs room in the

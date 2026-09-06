@@ -308,6 +308,13 @@ impl ChangeDelivery {
         let seq = state.next;
         state.next += 1;
         state.live.insert(seq);
+        // Mirror the membership into the ledger under this same lock: the bound
+        // follows the slowest LIVE numbered reader, so the ledger has to know who
+        // is live, and it has to learn it in the same total order that numbers the
+        // receiver and stamps the sends.
+        if let Some(coverage) = &coverage {
+            coverage.receiver_joined(seq);
+        }
         drop(state);
         ChangesReceiver {
             inner: Some(inner),
@@ -337,6 +344,14 @@ impl ChangeDelivery {
         let mut state = self.guard();
         drop(inner);
         state.live.remove(&seq);
+        // Recompute the charge for the departing sequence first. A page this
+        // receiver read is settled by its departure; a page it never read stops
+        // being charged to it, so a producer parked behind a slow reader that
+        // walked away resumes instead of waiting out the attachment. The sweep
+        // below then judges what no remaining receiver can acknowledge at all.
+        if let Some(coverage) = coverage {
+            coverage.receiver_departed(seq);
+        }
         let min_live = state.min_live();
         // Swept while still holding the lock, so no concurrent subscribe can
         // make this answer stale and no concurrent publish can stamp a batch
@@ -420,7 +435,10 @@ impl ChangesReceiver {
             return Err(broadcast::error::RecvError::Closed);
         };
         match inner.recv().await {
-            Ok(event) => Ok(event),
+            Ok(event) => {
+                self.note_receipt(&event);
+                Ok(event)
+            }
             Err(broadcast::error::RecvError::Lagged(skipped)) => Ok(self.on_lag(skipped)),
             Err(error) => Err(error),
         }
@@ -431,9 +449,52 @@ impl ChangesReceiver {
             return Err(broadcast::error::TryRecvError::Closed);
         };
         match inner.try_recv() {
-            Ok(event) => Ok(event),
+            Ok(event) => {
+                self.note_receipt(&event);
+                Ok(event)
+            }
             Err(broadcast::error::TryRecvError::Lagged(skipped)) => Ok(self.on_lag(skipped)),
             Err(error) => Err(error),
+        }
+    }
+
+    /// Record this receiver's read of the batch, so its backfill lane capacity
+    /// comes back once every reader that could still be holding it has read it.
+    ///
+    /// Reading is the permit, not acknowledging: the bound exists to stop a cold
+    /// start overrunning the shared broadcast ring, and a page every eligible
+    /// consumer has taken delivery of is no longer occupying it. The consumer's
+    /// durable write happens on whatever schedule it likes, and binding the
+    /// producer to THAT deadlocked a consumer batching its acknowledgements
+    /// against a producer parked on the bound.
+    ///
+    /// The receiver's own SEQUENCE goes with the receipt. Several numbered
+    /// receivers are a supported shape, and a bound that lifted on the first read
+    /// followed the fastest of them - so a fast observer freed the producer, the
+    /// slower acknowledger fell a whole ring behind and lagged, and `on_lag`
+    /// abandoned the walk's pages. The ledger judges the slowest live reader
+    /// instead.
+    ///
+    /// NUMBERED receivers only. A receiver with no subscription is one the
+    /// delivery gate never handed out and never sees depart, so it is by
+    /// construction not the acknowledger; letting its read free the producer
+    /// would let the walk run a whole ring ahead of whoever does acknowledge,
+    /// which is exactly the overrun this bound prevents. The engine's own
+    /// unnumbered readers, and the explicit observer subscription, are covered
+    /// by that one condition rather than by a second rule per reader kind.
+    ///
+    /// Only backfill publications carry a charge, and this runs for EVERY event
+    /// including every live-lane one, so the lane question is answered from the
+    /// event's own checkpoint before the ledger lock is taken at all.
+    fn note_receipt(&self, event: &MultiplexerEvent) {
+        let Some((_, seq)) = &self.subscription else {
+            return;
+        };
+        if !matches!(event.checkpoint, Some(Checkpoint::Backfill(_))) {
+            return;
+        }
+        if let (Some(coverage), Some(publication)) = (&self.coverage, &event.publication) {
+            coverage.mark_received(publication, *seq);
         }
     }
 
@@ -1999,6 +2060,176 @@ mod tests {
             0,
             "B joined at the ring's tail and can never receive A's pages, so their \
              capacity must come back when A leaves"
+        );
+    }
+
+    /// The receipt bound itself. A numbered receiver's READ returns the page's
+    /// lane capacity, with no acknowledgement anywhere in sight - and the
+    /// boundary registration survives it, because reading and acknowledging
+    /// answer different questions.
+    ///
+    /// The ablation is the whole point: with `note_receipt` removed, or with
+    /// `backfill_in_flight` summing entries rather than unread pages, the first
+    /// assertion reads 2.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_numbered_receivers_read_frees_capacity_without_an_acknowledgement() {
+        let h = delivery_harness(8);
+        let mut a = h.subscribe();
+        h.publish("page:0:10");
+        h.publish("page:10:20");
+        assert_eq!(h.coverage.backfill_in_flight(), 2);
+
+        a.try_recv().expect("the first page");
+        assert_eq!(
+            h.coverage.backfill_in_flight(),
+            1,
+            "reading a page takes it out of the ring, so its capacity comes back"
+        );
+        a.try_recv().expect("the second page");
+        assert_eq!(h.coverage.backfill_in_flight(), 0);
+
+        assert_eq!(
+            h.coverage.pending_checkpoints(),
+            2,
+            "and neither page is answered for: a read frees the producer, an \
+             acknowledgement retires the registration"
+        );
+
+        // The completion guarantee is unchanged by the receipt. A receiver that
+        // departs holding pages it READ but never acknowledged still strands them.
+        drop(a);
+        assert_eq!(
+            h.coverage.undelivered_watermark(&CursorScope::Account),
+            2,
+            "read-but-unacknowledged pages leaving with their reader are still a loss"
+        );
+    }
+
+    /// The bound follows the SLOWEST live numbered reader, not the fastest.
+    ///
+    /// Every receiver `account_changes_stream` hands out is numbered, and several
+    /// live subscribers with exactly one acknowledging is a supported and
+    /// documented shape. While the receipt was a single bit, the first read by ANY
+    /// of them freed the producer: the fast observer B empties the ring, cold start
+    /// runs on, the acknowledger A - slower because it persists as it goes - falls
+    /// `changes_capacity` events behind, lags, and `on_lag` abandons every
+    /// outstanding backfill page and withholds the walk's marker. That is the
+    /// overrun the bound exists to prevent, reproduced BY the bound, and it repeats
+    /// for as long as B stays faster.
+    ///
+    /// The two halves are one property: the fast reader must not advance the
+    /// producer past the slow one, and the slow one's DEPARTURE must advance it at
+    /// once - a departed reader that still parked the producer would trade this
+    /// failure for the stall the departure sweep exists to prevent.
+    ///
+    /// Ablation: with first-read semantics the first assertion reads 0.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_bound_follows_the_slowest_live_numbered_reader() {
+        let h = delivery_harness(8);
+        let mut slow = h.subscribe();
+        let mut fast = h.subscribe();
+        h.publish("page:0:10");
+        h.publish("page:10:20");
+        assert_eq!(h.coverage.backfill_in_flight(), 2);
+
+        fast.try_recv().expect("the first page");
+        fast.try_recv().expect("the second page");
+        assert_eq!(
+            h.coverage.backfill_in_flight(),
+            2,
+            "both pages are still in the ring as far as the slow reader is concerned, \
+             so the fast one's reads must buy the producer nothing"
+        );
+
+        slow.try_recv().expect("the first page");
+        assert_eq!(
+            h.coverage.backfill_in_flight(),
+            1,
+            "the page every eligible reader has now taken out of the ring is the only \
+             one released"
+        );
+
+        // And the slow reader walking away frees the rest, rather than parking the
+        // producer for the life of the attachment.
+        drop(slow);
+        assert_eq!(
+            h.coverage.backfill_in_flight(),
+            0,
+            "a departed reader can no longer be holding anything in the ring; the \
+             departure has to recompute its charge, not only sweep what nobody can \
+             reach"
+        );
+    }
+
+    /// A page that a later publication SUPERSEDED keeps its own receipt, on the
+    /// survivor that inherited its charge.
+    ///
+    /// Supersession is the one place the "capacity is the live record" rule is
+    /// corrected, so it is also the one place a per-page bit can be lost by
+    /// folding. Reading both pages of one partition must free both.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reading_a_superseded_page_frees_the_charge_it_left_on_its_survivor() {
+        let h = delivery_harness(8);
+        let mut a = h.subscribe();
+        h.publish("partition:one");
+        h.publish("partition:one");
+        assert_eq!(
+            h.coverage.backfill_in_flight(),
+            2,
+            "the survivor inherited the superseded page's charge"
+        );
+
+        a.try_recv().expect("the superseded page");
+        assert_eq!(
+            h.coverage.backfill_in_flight(),
+            1,
+            "the receipt has to reach the page inside the survivor, not only the \
+             survivor's own bit"
+        );
+        a.try_recv().expect("the survivor");
+        assert_eq!(h.coverage.backfill_in_flight(), 0);
+    }
+
+    /// An UNNUMBERED receiver's read frees nothing.
+    ///
+    /// The bound follows the reader that can acknowledge. A reader the delivery
+    /// gate never numbered is by construction not that one, and letting its read
+    /// free the producer would let a walk run a whole ring ahead of the consumer
+    /// who does answer for the pages - the overrun the bound exists to prevent.
+    /// This is also the condition the ruled observer subscription rests on.
+    ///
+    /// A NUMBERED receiver has to be present and unread for this to observe
+    /// anything. With none, the page's `delivered_at` is 0, no live receiver is
+    /// eligible, and `page_unread` answers from its "has anybody read it"
+    /// fallback - so the count reads 1 whether or not the unnumbered read was
+    /// recorded, and the test passes against the bug.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_unnumbered_receivers_read_frees_no_capacity() {
+        let h = delivery_harness(8);
+        // The acknowledger, numbered 0, which reads nothing yet.
+        let mut acker = h.subscribe();
+        let mut observer = ChangesReceiver::new(
+            h.delivery.sender().subscribe(),
+            Some(h.control.clone()),
+            Some(Arc::clone(&h.coverage)),
+        );
+        h.publish("page:0:10");
+        assert_eq!(h.coverage.backfill_in_flight(), 1);
+
+        observer.try_recv().expect("the observer takes delivery");
+        assert_eq!(
+            h.coverage.backfill_in_flight(),
+            1,
+            "a reader that never acknowledges must not free the producer to run \
+             further ahead of the one that does"
+        );
+
+        acker.try_recv().expect("the acknowledger takes delivery");
+        assert_eq!(
+            h.coverage.backfill_in_flight(),
+            0,
+            "and the NUMBERED receiver's read is what frees it, so the assertion \
+             above is about the numbering and not about the page being unreadable"
         );
     }
 

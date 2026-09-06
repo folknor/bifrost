@@ -38,7 +38,7 @@
 //! So the engine issues its own monotonic `PublicationId` per checkpoint-
 //! bearing publication, and the acknowledgement names it.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -270,6 +270,23 @@ struct Publication {
     claim: CoverageClaim,
 }
 
+/// One page an entry SUPERSEDED, with the three facts the lane needs about it:
+/// its identity, its own delivery stamp, and who has read it.
+///
+/// A tuple carried the first two of these; the receipt bit made the positions
+/// stop being self-describing, and every site that folds, sweeps or retires a
+/// page has to be right about which of them it is reading.
+#[derive(Debug, Clone)]
+struct SubsumedPage {
+    id: PublicationId,
+    /// This page's OWN delivery stamp, never the survivor's. See
+    /// [`BoundaryEntry::subsumed`].
+    delivered_at: Option<u64>,
+    /// Which numbered receivers have READ this page. See
+    /// [`BoundaryEntry::readers`].
+    readers: Vec<u64>,
+}
+
 /// One outstanding boundary registration: a batch the engine has published and
 /// the consumer has not answered for.
 ///
@@ -288,6 +305,56 @@ struct BoundaryEntry {
     id: PublicationId,
     lane: Lane,
     checkpoint: Checkpoint,
+    /// Which numbered receivers have READ this batch.
+    ///
+    /// This is the backfill lane's PERMIT, and it is deliberately not the
+    /// acknowledgement. What overruns the broadcast ring is pages nobody has
+    /// taken out of it; an acknowledgement is a promise about the consumer's own
+    /// durability, made on whatever schedule the consumer likes. Binding the
+    /// producer to the acknowledgement made a consumer that batches its
+    /// acknowledgements deadlock against a producer parked on the bound. Set
+    /// from `ChangesReceiver`'s read path, for NUMBERED receivers only - an
+    /// unnumbered reader never acknowledges, so its read must not free the
+    /// producer to run further ahead of the one that does.
+    ///
+    /// A SET of receiver sequences rather than a single bit, because the ring is
+    /// one ring and its pressure is set by the SLOWEST reader of it. Several
+    /// numbered receivers are a supported shape, and while a bit recorded "some
+    /// numbered receiver read this" the bound followed the FASTEST of them: an
+    /// observer that reads at once frees the producer, the acknowledger that
+    /// persists as it goes falls `changes_capacity` events behind, lags, and
+    /// `on_lag` abandons every outstanding page - the exact cold-start overrun
+    /// this bound exists to prevent, repeating for the life of the attachment.
+    /// A page is therefore charged while any live receiver numbered below its
+    /// `delivered_at` is absent from this list; see
+    /// [`BoundaryEntry::page_unread`].
+    ///
+    /// The precise guarantee, and it is narrower than "the bound follows the
+    /// slowest numbered reader": the bound follows the slowest live numbered
+    /// reader among pages NOT YET ACKNOWLEDGED, and an ACKNOWLEDGEMENT frees a
+    /// page for every receiver. This list lives on the entry, so every path that
+    /// resolves the publication - `acknowledge_publication`,
+    /// `acknowledge_checkpoint`, `retire_publication`, and the supersession fold
+    /// in `register_in` when the survivor's page is later acknowledged - takes
+    /// the reader set with the record, including the evidence that some slower
+    /// receiver had not read it. The failure that leaves: if the ACKNOWLEDGER is
+    /// faster than a numbered observer, its acknowledgements free the bound at
+    /// the acknowledger's pace, the producer runs on, and the slower observer is
+    /// overwritten in the ring and lags - after which `on_lag` abandons every
+    /// outstanding registration of the account, including pages the acknowledger
+    /// read but had not yet answered for. Closing that needs a residual record of
+    /// a page that left the ledger still unread, which is filed and not built;
+    /// the ruled observer subscription removes the case where the slow receiver
+    /// is an observer, and what remains after it is two ACKNOWLEDGING receivers,
+    /// which this engine already documents as unsupported.
+    ///
+    /// Read and acknowledged free different things: a read returns lane
+    /// capacity, an acknowledgement retires the registration (and with it the
+    /// boundary waiter and the coverage claim). A page that was read and never
+    /// acknowledged is still an unanswered page, so it is still a recorded loss
+    /// if its reader departs - see [`PendingCoverage::release_undelivered`],
+    /// which does not consult this list.
+    readers: Vec<u64>,
     /// Publications this entry SUPERSEDED that the consumer has still not
     /// acknowledged.
     ///
@@ -302,15 +369,37 @@ struct BoundaryEntry {
     /// superseded id (which the consumer may legitimately send: it really
     /// received that batch) releases exactly that one page's worth.
     ///
-    /// Bounded by the lane capacity, because the producer parks once the charge
-    /// reaches it.
+    /// NOT bounded by the lane capacity. It was, while the charge was the
+    /// unacknowledged page: the producer parked once the charge reached the
+    /// bound, so no partition could fold more than that many pages into one
+    /// record. Under the receipt bound a page every eligible reader has READ
+    /// carries no charge, so a consumer that reads without acknowledging lets one
+    /// partition's history grow with the partition - each retained id holding a
+    /// `PublicationReceipt`, and each still needed, because the departure sweep
+    /// judges the completion guarantee one page at a time and a read page whose
+    /// reader leaves is still a loss. That is the memory face of what the receipt
+    /// bound deliberately gives up: it bounds the ring, not the consumer's
+    /// unpersisted backlog. `Lane::Change` still inherits nothing at all.
+    ///
+    /// Say the size plainly, because it is a memory bound a consumer controls:
+    /// this list grows with the number of pages ONE PARTITION publishes while the
+    /// consumer reads without acknowledging, and nothing caps it. For a `Fixed`
+    /// or `OpenPages` plan the partition is a slice of the scope; for the `Full`
+    /// plan - which is what JMAP Email uses - there is ONE partition per scope, so
+    /// the growth is over the whole scope's backfill. A consumer that never
+    /// acknowledges therefore retains one `PublicationId`, and with it one
+    /// `PublicationReceipt` and its whole coverage claim, per page of the walk.
+    /// Filed rather than fixed: dropping a read subsumed page's receipt claim once
+    /// every eligible reader has read it would bound this, at the cost of the
+    /// departure sweep no longer being able to judge that page's completion
+    /// guarantee one page at a time.
     ///
     /// Each carries its OWN `delivered_at`, not the survivor's. A page and the
     /// page that superseded it can have entirely different readers - send P to A,
     /// let B subscribe, then send Q on the same partition - and judging P by Q's
     /// stamp says B could have read P when B joined the ring after it. The sweep
     /// has to ask the question once per page.
-    subsumed: Vec<(PublicationId, Option<u64>)>,
+    subsumed: Vec<SubsumedPage>,
     /// The subscriber sequence at the moment this batch was broadcast, i.e. the
     /// number of receivers the account had ever handed out by then.
     ///
@@ -325,10 +414,49 @@ struct BoundaryEntry {
 }
 
 impl BoundaryEntry {
-    /// How much lane capacity this entry accounts for: itself plus every
-    /// unacknowledged publication folded into it.
-    fn charge(&self) -> usize {
-        1 + self.subsumed.len()
+    /// How much lane capacity this entry accounts for: every page it stands
+    /// for, itself plus everything folded into it, that some live numbered
+    /// receiver could still be holding in the ring.
+    ///
+    /// Counted per page rather than per entry, because supersession folds a
+    /// partition's history into one record and the pages inside it are read at
+    /// different moments.
+    fn unread_charge(&self, live: &BTreeSet<u64>) -> usize {
+        usize::from(Self::page_unread(self.delivered_at, &self.readers, live))
+            + self
+                .subsumed
+                .iter()
+                .filter(|page| Self::page_unread(page.delivered_at, &page.readers, live))
+                .count()
+    }
+
+    /// Is this page still occupying the ring?
+    ///
+    /// The bound follows the SLOWEST eligible reader, which is the only safe
+    /// direction for a shared ring: a page is out of the ring's way only once
+    /// every receiver that could still be holding it has taken it out. Eligible
+    /// means numbered BELOW the page's `delivered_at` - a `tokio::broadcast`
+    /// receiver joins at the tail, so a later subscriber never held this page and
+    /// must not be able to charge it (which is also why a new subscription can
+    /// never re-charge an already-read page).
+    ///
+    /// With no eligible live receiver at all the question falls back to "has
+    /// anyone read it": a page broadcast to nobody is still occupying a ring slot
+    /// until some other path retires it, while a page whose only reader has since
+    /// departed has left the ring for good and must free the producer rather than
+    /// park it for the life of the attachment.
+    fn page_unread(delivered_at: Option<u64>, readers: &[u64], live: &BTreeSet<u64>) -> bool {
+        // Not sent yet: it will occupy a slot, so it is charged already. Charging
+        // it only at the send would let a partition register its whole history
+        // between two capacity checks.
+        let Some(sent_at) = delivered_at else {
+            return true;
+        };
+        let mut eligible = live.range(..sent_at).peekable();
+        if eligible.peek().is_none() {
+            return readers.is_empty();
+        }
+        eligible.any(|seq| !readers.contains(seq))
     }
 
     /// Whether no live receiver can still acknowledge this publication.
@@ -406,6 +534,18 @@ struct Ledger {
     /// question is about what was minted, not about what is still in flight. One
     /// entry per scope, so it stays bounded exactly as `fenced` does.
     last_backfill_mint: HashMap<CursorScope, u64>,
+    /// The numbered consumer receivers currently holding a subscription.
+    ///
+    /// A mirror of `ChangeDelivery`'s own `live` set, kept here because the
+    /// charge is a question about the ring - "could any live receiver still be
+    /// holding this page" - and `backfill_in_flight` is asked it from a producer
+    /// that has no delivery handle. Maintained by
+    /// [`PendingCoverage::receiver_joined`] and
+    /// [`PendingCoverage::receiver_departed`], which the delivery gate calls
+    /// while holding its own lock, so subscribe/depart, the send's stamp and this
+    /// set stay in one total order. Lock order is delivery -> coverage and never
+    /// the reverse.
+    live: BTreeSet<u64>,
     /// The same fence, narrowed to the BACKFILL lane.
     ///
     /// Raised by the discard that follows a walk which lost pages: that walk's
@@ -658,9 +798,14 @@ impl PendingCoverage {
             let superseded = previous.id.clone();
             if charged {
                 subsumed = previous.subsumed;
-                // Its own stamp travels with it. The survivor's says nothing
-                // about who could read the page it displaced.
-                subsumed.push((superseded.clone(), previous.delivered_at));
+                // Its own stamp and its own receipt travel with it. The
+                // survivor's say nothing about who could read, or did read, the
+                // page it displaced.
+                subsumed.push(SubsumedPage {
+                    id: superseded.clone(),
+                    delivered_at: previous.delivered_at,
+                    readers: previous.readers,
+                });
             }
             // Only mark it folded if there was something to fold. A publication
             // whose claim an acknowledgement already consumed is answered by
@@ -696,7 +841,7 @@ impl PendingCoverage {
                 "boundary registrations at capacity; dropping the oldest outstanding broadcast"
             );
             for dropped in
-                std::iter::once(evicted.id).chain(evicted.subsumed.into_iter().map(|(id, _)| id))
+                std::iter::once(evicted.id).chain(evicted.subsumed.into_iter().map(|page| page.id))
             {
                 if let Some(old) = ledger.claims.remove(&dropped) {
                     carry_forward(&mut ledger.carried, old.claim.debt_only());
@@ -717,6 +862,7 @@ impl PendingCoverage {
             checkpoint,
             subsumed,
             delivered_at: None,
+            readers: Vec::new(),
         });
         drop(ledger);
         if freed_capacity {
@@ -773,16 +919,150 @@ impl PendingCoverage {
         }
     }
 
-    /// Backfill capacity currently in flight: published batches no consumer has
-    /// answered for, counting the pages each surviving entry subsumed.
+    /// Record that the numbered receiver `receiver_seq` has READ the
+    /// publication's batch.
+    ///
+    /// This is what returns backfill lane capacity, so the producer runs exactly
+    /// as far ahead as the SLOWEST subscribed consumer reads and no further.
+    /// Idempotent per receiver, and per receiver rather than per page because a
+    /// page is out of the ring's way only once everyone who could still be
+    /// holding it has taken it out - see [`BoundaryEntry::readers`].
+    ///
+    /// Called for numbered receivers only. An unnumbered reader (one that never
+    /// acknowledges) marking pages received would let the producer outrun the
+    /// acknowledger by the whole ring, which is the overrun this bound exists to
+    /// prevent.
+    ///
+    /// Searches the subsumed pages too, and searches them in REVERSE: a page the
+    /// consumer is only now reading may already have been folded into a later
+    /// publication of its partition, and the page just read is almost always
+    /// either the survivor or the most recently folded element.
+    pub fn mark_received(&self, id: &PublicationId, receiver_seq: u64) {
+        let freed = {
+            let mut ledger = self.guard();
+            let mut freed = false;
+            for entry in &mut ledger.boundaries {
+                // Only the backfill lane has a bound to keep honest, and only it
+                // inherits a charge on supersession. Marking a live-lane entry
+                // would leave state nothing ever reads, which is the sort of
+                // thing a later reader has to prove is dead.
+                if !matches!(entry.lane, Lane::Backfill(..)) {
+                    continue;
+                }
+                if entry.id == *id {
+                    freed = record_reader(&mut entry.readers, receiver_seq);
+                    break;
+                }
+                if let Some(page) = entry.subsumed.iter_mut().rev().find(|page| page.id == *id) {
+                    freed = record_reader(&mut page.readers, receiver_seq);
+                    break;
+                }
+            }
+            freed
+        };
+        if freed {
+            self.wake_capacity();
+        }
+    }
+
+    /// A numbered consumer receiver has subscribed.
+    ///
+    /// It can never re-charge a page that is already out of the ring: it is
+    /// numbered at or above every existing page's `delivered_at`, and only
+    /// receivers numbered strictly below one hold it. So this never needs a wake.
+    pub fn receiver_joined(&self, receiver_seq: u64) {
+        self.guard().live.insert(receiver_seq);
+    }
+
+    /// A numbered consumer receiver has gone.
+    ///
+    /// This is the recompute the departure sweep needs. A slow reader that walks
+    /// away while holding pages in the ring must stop charging them the instant it
+    /// is no longer live, or a producer parked behind it stays parked for the life
+    /// of the attachment - the same failure the sweep in
+    /// [`PendingCoverage::release_undelivered`] exists to prevent, one step
+    /// earlier. Called under the delivery gate's lock, ahead of that sweep.
+    pub fn receiver_departed(&self, receiver_seq: u64) {
+        let mut ledger = self.guard();
+        let was_live = ledger.live.remove(&receiver_seq);
+        drop(ledger);
+        if was_live {
+            self.wake_capacity();
+        }
+    }
+
+    /// Backfill capacity currently in flight: published pages some live numbered
+    /// receiver could still be holding in the ring, counting the pages each
+    /// surviving entry subsumed.
+    ///
+    /// Unread rather than unacknowledged. The ring is what the bound protects,
+    /// and a page leaves the ring's pressure when every eligible reader has read
+    /// it; holding the producer until the consumer's durable write instead made a
+    /// consumer that batches acknowledgements deadlock against the parked
+    /// producer.
     #[must_use]
     pub fn backfill_in_flight(&self) -> usize {
-        self.guard()
+        let ledger = self.guard();
+        ledger
             .boundaries
             .iter()
             .filter(|entry| matches!(entry.lane, Lane::Backfill(..)))
-            .map(BoundaryEntry::charge)
+            .map(|entry| entry.unread_charge(&ledger.live))
             .sum()
+    }
+
+    /// Who is holding the backfill charge right now: the live numbered receivers
+    /// that could have taken delivery of an outstanding page and have not read
+    /// it, and the scopes those pages belong to.
+    ///
+    /// Diagnostics only, and the only reason it exists: every receiver
+    /// `account_changes_stream` hands out is numbered, so a consumer that opens a
+    /// second receiver for a UI and then stops polling it holds `lane_capacity`
+    /// pages unread for the life of the attachment. Nothing else reports that -
+    /// the departure warning fires on drop and the lag warning on poll, and this
+    /// receiver does neither - so the lane's park warning names the sequences
+    /// instead of leaving the stall silent.
+    ///
+    /// Both lists are deduplicated and ordered; an entry not yet sent has no
+    /// eligible reader and contributes only its scope.
+    pub(crate) fn backfill_charge_holders(&self) -> (Vec<u64>, Vec<CursorScope>) {
+        let ledger = self.guard();
+        let mut holders = BTreeSet::new();
+        let mut scopes: Vec<CursorScope> = Vec::new();
+        for entry in ledger
+            .boundaries
+            .iter()
+            .filter(|entry| matches!(entry.lane, Lane::Backfill(..)))
+        {
+            let mut charged = false;
+            let pages = std::iter::once((entry.delivered_at, &entry.readers)).chain(
+                entry
+                    .subsumed
+                    .iter()
+                    .map(|page| (page.delivered_at, &page.readers)),
+            );
+            for (delivered_at, readers) in pages {
+                if !BoundaryEntry::page_unread(delivered_at, readers, &ledger.live) {
+                    continue;
+                }
+                charged = true;
+                if let Some(sent_at) = delivered_at {
+                    holders.extend(
+                        ledger
+                            .live
+                            .range(..sent_at)
+                            .filter(|seq| !readers.contains(seq)),
+                    );
+                }
+            }
+            if charged
+                && let Some(scope) = entry.lane.scope()
+                && !scopes.contains(scope)
+            {
+                scopes.push(scope.clone());
+            }
+        }
+        (holders.into_iter().collect(), scopes)
     }
 
     /// Park until backfill capacity drops below `capacity`.
@@ -832,9 +1112,9 @@ impl PendingCoverage {
                 }
                 let before = entry.subsumed.len();
                 let scope = entry.lane.scope().cloned();
-                entry.subsumed.retain(|(id, sent_at)| {
-                    if BoundaryEntry::sent_beyond_reach(*sent_at, min_live) {
-                        retired.push(id.clone());
+                entry.subsumed.retain(|page| {
+                    if BoundaryEntry::sent_beyond_reach(page.delivered_at, min_live) {
+                        retired.push(page.id.clone());
                         if let Some(scope) = &scope {
                             *by_scope.entry(scope.clone()).or_insert(0) += 1;
                         }
@@ -863,7 +1143,7 @@ impl PendingCoverage {
             ledger.boundaries.retain(|entry| {
                 if matches!(entry.lane, Lane::Backfill(..)) && entry.undeliverable(min_live) {
                     retired.push(entry.id.clone());
-                    retired.extend(entry.subsumed.iter().map(|(id, _)| id.clone()));
+                    retired.extend(entry.subsumed.iter().map(|page| page.id.clone()));
                     if let Some(scope) = entry.lane.scope() {
                         // Only pages that were actually SENT, exactly as the
                         // per-page pass above and `abandon_checkpoints` count
@@ -877,7 +1157,7 @@ impl PendingCoverage {
                         let sent = 1 + entry
                             .subsumed
                             .iter()
-                            .filter(|(_, sent_at)| sent_at.is_some())
+                            .filter(|page| page.delivered_at.is_some())
                             .count();
                         *by_scope.entry(scope.clone()).or_insert(0) += sent;
                     }
@@ -1022,14 +1302,14 @@ impl PendingCoverage {
             } else if let Some(entry) = ledger
                 .boundaries
                 .iter_mut()
-                .find(|entry| entry.subsumed.iter().any(|(c, _)| *c == id))
+                .find(|entry| entry.subsumed.iter().any(|page| page.id == id))
             {
                 // The consumer acknowledged a batch a later publication has
                 // since superseded. It really received that batch, so its
                 // capacity is settled even though its record moved to the
                 // survivor; the survivor's own boundary stays until it is
                 // acknowledged too.
-                entry.subsumed.retain(|(candidate, _)| *candidate != id);
+                entry.subsumed.retain(|page| page.id != id);
             }
         }
         self.wake_capacity();
@@ -1055,14 +1335,14 @@ impl PendingCoverage {
             } else if let Some(entry) = ledger
                 .boundaries
                 .iter_mut()
-                .find(|entry| entry.subsumed.iter().any(|(candidate, _)| *candidate == id))
+                .find(|entry| entry.subsumed.iter().any(|page| page.id == id))
             {
                 // Retiring a page a later publication has since superseded. Its
                 // charge lives on the survivor, so the survivor is where it has
                 // to come off; searching only `entry.id` left it charged for
                 // ever, which for a failed store write on a multi-page partition
                 // is a bound that shrinks every time the store hiccups.
-                entry.subsumed.retain(|(candidate, _)| *candidate != id);
+                entry.subsumed.retain(|page| page.id != id);
             }
             Self::carry_and_forget(&mut ledger, std::iter::once(id));
         }
@@ -1141,13 +1421,13 @@ impl PendingCoverage {
                             + entry
                                 .subsumed
                                 .iter()
-                                .filter(|(_, sent_at)| sent_at.is_some())
+                                .filter(|page| page.delivered_at.is_some())
                                 .count();
                         if sent > 0 {
                             *by_scope.entry(scope.clone()).or_insert(0) += sent;
                         }
                     }
-                    std::iter::once(entry.id).chain(entry.subsumed.into_iter().map(|(id, _)| id))
+                    std::iter::once(entry.id).chain(entry.subsumed.into_iter().map(|page| page.id))
                 })
                 .collect();
             let count = ids.len();
@@ -1260,7 +1540,7 @@ impl PendingCoverage {
                 && through.is_none_or(|ceiling| entry.id <= *ceiling)
             {
                 ids.push(entry.id.clone());
-                ids.extend(entry.subsumed.iter().map(|(id, _)| id.clone()));
+                ids.extend(entry.subsumed.iter().map(|page| page.id.clone()));
                 false
             } else {
                 true
@@ -1341,9 +1621,11 @@ impl PendingCoverage {
     /// How many superseded publications the outstanding entries are still
     /// holding on to. Observability; used by tests.
     ///
-    /// Bounded by the backfill capacity, because only the backfill lane inherits
-    /// a charge. A non-zero reading on an account doing nothing but live changes
-    /// is the unbounded-history defect.
+    /// Only the backfill lane inherits a charge, so a non-zero reading on an
+    /// account doing nothing but live changes is the unbounded-history defect.
+    /// On the backfill lane it is bounded by how many pages one partition
+    /// publishes while the consumer reads without acknowledging, not by the lane
+    /// capacity - see [`BoundaryEntry::subsumed`].
     #[must_use]
     pub fn retained_history(&self) -> usize {
         self.guard()
@@ -1546,9 +1828,9 @@ impl PendingCoverage {
                 } else if let Some(entry) = ledger
                     .boundaries
                     .iter_mut()
-                    .find(|entry| entry.subsumed.iter().any(|(c, _)| *c == id))
+                    .find(|entry| entry.subsumed.iter().any(|page| page.id == id))
                 {
-                    entry.subsumed.retain(|(candidate, _)| *candidate != id);
+                    entry.subsumed.retain(|page| page.id != id);
                 }
             }
         }
@@ -1567,6 +1849,19 @@ impl PendingCoverage {
     pub fn outstanding(&self) -> usize {
         self.guard().claims.len()
     }
+}
+
+/// Note one receiver's read of a page, reporting whether it was new.
+///
+/// A `Vec` and a linear scan: the list holds one entry per numbered receiver that
+/// has read this page, and an account with more than a handful of live change
+/// subscribers is not a shape this engine has.
+fn record_reader(readers: &mut Vec<u64>, receiver_seq: u64) -> bool {
+    if readers.contains(&receiver_seq) {
+        return false;
+    }
+    readers.push(receiver_seq);
+    true
 }
 
 fn carry_forward(carried: &mut Option<CoverageClaim>, claim: CoverageClaim) {
