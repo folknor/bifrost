@@ -45,6 +45,96 @@ fn public_item_id_selects_the_ews_read_arm() {
     assert_eq!(ews_read_folder(&public), Some(folder));
 }
 
+/// The single-id door builds the SAME class-conditional `GetItem` body the
+/// batch door builds. Pinned separately because the two doors have diverged
+/// before (the batch arm routed public ids to EWS while `message_hydrate`
+/// still sent them to `/me/messages/{native}`), and a message-shaped request
+/// for a contact is answered `ErrorInvalidPropertyRequest`.
+#[tokio::test]
+async fn the_single_id_hydration_door_asks_a_contact_for_a_class_safe_shape() {
+    use bifrost_net::test_support::{Canned, ScriptedDispatch, scripted_account};
+    use bifrost_net::{NetConfig, RetryPolicy, StaticTokenSource, TokenSource};
+    use std::sync::Arc;
+
+    let response = r#"<?xml version="1.0" encoding="utf-8"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Body>
+    <m:GetItemResponse xmlns:m="http://schemas.microsoft.com/exchange/services/2006/messages"
+                       xmlns:t="http://schemas.microsoft.com/exchange/services/2006/types">
+      <m:ResponseMessages>
+        <m:GetItemResponseMessage ResponseClass="Success">
+          <m:ResponseCode>NoError</m:ResponseCode>
+          <m:Items>
+            <t:Contact>
+              <t:ItemId Id="notice-1" ChangeKey="CK1"/>
+              <t:ItemClass>IPM.Contact</t:ItemClass>
+            </t:Contact>
+          </m:Items>
+        </m:GetItemResponseMessage>
+      </m:ResponseMessages>
+    </m:GetItemResponse>
+  </s:Body>
+</s:Envelope>"#;
+    let script = ScriptedDispatch::new([Canned::Response {
+        status: reqwest::StatusCode::OK,
+        headers: reqwest::header::HeaderMap::new(),
+        body: Bytes::from(response),
+    }]);
+    let token_source: Arc<dyn TokenSource> = Arc::new(StaticTokenSource::new("token", None));
+    let net = scripted_account(
+        &script,
+        NetConfig::default(),
+        Vec::new(),
+        Arc::clone(&token_source),
+        RetryPolicy::disabled(),
+    );
+    let client =
+        GraphClient::with_account_net(net, "https://graph.contoso.test/v1.0", token_source);
+    let account = GraphAccount::new_for_tests(client, PushMode::EwsStreaming);
+    let folder = FolderId("AAMkPF=".to_string());
+    account
+        .seed_public_folder_meta_for_tests(
+            folder.clone(),
+            crate::account::cursor::PublicFolderRouting {
+                anchor_mailbox: "content@contoso.com".to_string(),
+                public_folder_mailbox: Some("pf@contoso.com".to_string()),
+            },
+            crate::account::public_folder::PublicFolderMeta {
+                // A MAIL folder, so only the per-item class recorded by the
+                // inventory walk can make this request class-safe.
+                display_name: "Notices".to_string(),
+                folder_class: Some("IPF.Note".to_string()),
+                parent: None,
+                effective_rights: crate::ews::EwsEffectiveRights::default(),
+            },
+        )
+        .await;
+    let mut item = ews_item();
+    item.item_class = "IPM.Contact".to_string();
+    account.record_public_item_classes(&folder, &[item]).await;
+
+    let id = encode_public_item_id(&folder, "notice-1");
+    let message = message_hydrate(account, id.clone(), HydrationProjection::Full)
+        .await
+        .expect("the class-safe request hydrates");
+    assert_eq!(message.id, id);
+
+    let requests = script.requests();
+    assert_eq!(requests.len(), 1);
+    let body = String::from_utf8(
+        requests[0]
+            .body
+            .clone()
+            .expect("GetItem carries a body")
+            .to_vec(),
+    )
+    .expect("utf8 SOAP");
+    assert!(
+        !body.contains("message:"),
+        "the single-id door asked a contact for message properties: {body}"
+    );
+}
+
 #[test]
 fn primary_and_foreign_ids_stay_on_the_rest_read_arm() {
     assert_eq!(ews_read_folder(&ObjectId("notice-1".to_string())), None);

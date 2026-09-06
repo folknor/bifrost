@@ -106,8 +106,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use bifrost_types::{
     AccountOperation, AccountStream, Change, ChangeCursor, Checkpoint, CursorScope, ErrorScope,
     Fingerprint, FolderId, InventoryEntry, MailboxId, MembershipScope, ObjectChange,
-    ObjectChangeKind, PageBoundary, ScopeChange, ScopeChangeKind, ServerVersion, SyncEvent,
-    Warning, WarningKind,
+    ObjectChangeKind, ObjectId, PageBoundary, ScopeChange, ScopeChangeKind, ServerVersion,
+    SyncEvent, Warning, WarningKind,
 };
 
 use super::GraphAccount;
@@ -1105,6 +1105,10 @@ pub(crate) fn public_folder_inventory_stream(
             return;
         }
         let ItemWalk { items, unhandled_classes: unhandled, .. } = walk;
+        // The walk parsed every item's `ItemClass`; retain it so hydration
+        // can build a class-conditional `GetItem` for an id whose class no
+        // amount of parsing the id could recover.
+        account.record_public_item_classes(&folder, &items).await;
         if let Some(warning) = unhandled_classes_warning(&folder.0, &unhandled) {
             yield bifrost_types::InventoryEvent::Warning(warning);
         }
@@ -1380,6 +1384,24 @@ fn reduce_public_folder_poll(
     }
 }
 
+/// The folder-qualified ids a reduced poll emitted as `Destroyed`.
+///
+/// Read off the emitted changes rather than recomputed from the baseline
+/// diff so the prune can never name an id the consumer was not told is
+/// gone - the degraded and incomplete-scan paths deliberately emit no
+/// `Destroyed`, and this follows them by construction.
+fn destroyed_ids(changes: &[Change]) -> Vec<ObjectId> {
+    changes
+        .iter()
+        .filter_map(|change| match change {
+            Change::ObjectChange(object) if object.kind == ObjectChangeKind::Destroyed => {
+                Some(object.id.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 pub(crate) fn public_folder_changes_stream(
     account: GraphAccount,
     cursor: ChangeCursor,
@@ -1464,6 +1486,10 @@ pub(crate) fn public_folder_changes_stream(
             }
         };
 
+        // Retain the polled items' classes for hydration (see the inventory
+        // pass); the poll is the only place a NEW item's class is seen.
+        account.record_public_item_classes(&folder, &poll.items).await;
+
         // 2. Throttled deletion reconcile: fetch the full scan only when it
         // is due AND the incremental poll completed (a stalled poll retries
         // before spending a full scan).
@@ -1483,6 +1509,9 @@ pub(crate) fn public_folder_changes_stream(
         } else {
             None
         };
+        if let Some(scan) = &scan {
+            account.record_public_item_classes(&folder, &scan.items).await;
+        }
 
         match reduce_public_folder_poll(pf, &poll, scan.as_ref(), now) {
             PollOutcome::Retry => {
@@ -1496,6 +1525,12 @@ pub(crate) fn public_folder_changes_stream(
                 return;
             }
             PollOutcome::Apply { changes, warnings, cursor: advanced_pf } => {
+                // The destroy site is also the class cache's only eviction
+                // point: an id this poll just declared gone will never be
+                // hydrated again, and the cap is an admission bound, so a
+                // retained dead entry permanently denies a live one its
+                // slot. Prune before the batch goes out.
+                account.forget_public_item_classes(&destroyed_ids(&changes)).await;
                 for warning in warnings {
                     yield SyncEvent::Warning(warning);
                 }
@@ -2118,6 +2153,175 @@ mod tests {
             "exactly one Destroyed for the vanished persisted id"
         );
         assert!(!cursor2.live_ids.contains(&"fresh".to_string()));
+    }
+
+    /// A bare account, enough to exercise the item-class cache. The scripted
+    /// net is never driven here: the cache is pure account state.
+    fn class_cache_account() -> super::super::GraphAccount {
+        use std::sync::Arc;
+
+        use bifrost_net::test_support::{Canned, ScriptedDispatch, scripted_account};
+        use bifrost_net::{NetConfig, RetryPolicy, StaticTokenSource, TokenSource};
+
+        use super::super::{GraphAccount, PushMode};
+        use crate::client::GraphClient;
+
+        let script = ScriptedDispatch::new([Canned::Response {
+            status: reqwest::StatusCode::OK,
+            headers: reqwest::header::HeaderMap::new(),
+            body: bytes::Bytes::from_static(b"<Envelope/>"),
+        }]);
+        let token_source: Arc<dyn TokenSource> = Arc::new(StaticTokenSource::new("token", None));
+        let net = scripted_account(
+            &script,
+            NetConfig::default(),
+            Vec::new(),
+            Arc::clone(&token_source),
+            RetryPolicy::disabled(),
+        );
+        let client =
+            GraphClient::with_account_net(net, "https://graph.contoso.test/v1.0", token_source);
+        GraphAccount::new_for_tests(client, PushMode::EwsStreaming)
+    }
+
+    // The class cache is filled at every EWS walk and read at hydration.
+    // Nothing else removes from it, so a destroyed item's entry used to sit
+    // there until the account died - and because the cap is an ADMISSION
+    // bound (a full map refuses new inserts rather than evicting), those
+    // dead entries deny later live items their slot. Pruning at the destroy
+    // site is what keeps the resident set proportional to the live set.
+    #[tokio::test]
+    async fn destroyed_item_is_pruned_from_the_class_cache() {
+        let account = class_cache_account();
+        let folder = FolderId("AAMkPF=".to_string());
+        account
+            .record_public_item_classes(
+                &folder,
+                &[item("known", None, false), {
+                    let mut contact = item("fresh", None, false);
+                    contact.item_class = "IPM.Contact".to_string();
+                    contact
+                }],
+            )
+            .await;
+        assert_eq!(account.public_item_classes.read().await.len(), 2);
+
+        // Cycle 1 folds `fresh` into the baseline; cycle 2's complete scan
+        // no longer sees it, so the reducer emits its Destroyed - the same
+        // production path `persisted_fresh_id_deleted_emits_one_destroyed`
+        // pins, not a hand-built change list.
+        let poll1 = walk(
+            vec![item("known", None, false), item("fresh", None, false)],
+            &[],
+            true,
+        );
+        let (_c1, _w1, cursor1) = unbox_apply(reduce_public_folder_poll(
+            cursor(None, Some(2_000_000), &["known"]),
+            &poll1,
+            None,
+            2_000_050,
+        ));
+        let poll2 = walk(vec![item("known", None, false)], &[], true);
+        let scan2 = walk(vec![item("known", None, false)], &[], true);
+        let (changes, _w2, _c2) = unbox_apply(reduce_public_folder_poll(
+            cursor1,
+            &poll2,
+            Some(&scan2),
+            9_000_000,
+        ));
+        assert_eq!(count_object_change(&changes, "fresh", true), 1);
+
+        account
+            .forget_public_item_classes(&destroyed_ids(&changes))
+            .await;
+
+        let map = account.public_item_classes.read().await;
+        assert!(
+            !map.contains_key(&emitted_id("fresh")),
+            "the destroyed item's class entry must not survive the poll"
+        );
+        assert!(
+            map.contains_key(&emitted_id("known")),
+            "a live item's entry must be untouched"
+        );
+    }
+
+    // The cap refuses new inserts once full rather than evicting, so a
+    // freshly recorded item is never the victim: the entries that survive
+    // are the oldest ones. That is only tenable because the destroy path
+    // above frees the slots; pin the admission order so a later change to
+    // an eviction policy has to face the question deliberately.
+    #[tokio::test]
+    async fn class_cache_cap_refuses_new_entries_and_never_evicts_recent_ones() {
+        let account = class_cache_account();
+        let folder = FolderId("AAMkPF=".to_string());
+        let filler: Vec<EwsItem> = (0..super::super::PUBLIC_ITEM_CLASS_CACHE_CAP)
+            .map(|n| item(&format!("fill-{n}"), None, false))
+            .collect();
+        account.record_public_item_classes(&folder, &filler).await;
+        assert_eq!(
+            account.public_item_classes.read().await.len(),
+            super::super::PUBLIC_ITEM_CLASS_CACHE_CAP
+        );
+
+        account
+            .record_public_item_classes(&folder, &[item("late", None, false)])
+            .await;
+        let map = account.public_item_classes.read().await;
+        assert_eq!(map.len(), super::super::PUBLIC_ITEM_CLASS_CACHE_CAP);
+        assert!(
+            !map.contains_key(&emitted_id("late")),
+            "a full cache admits nothing; it does not evict for the newcomer"
+        );
+        assert!(
+            map.contains_key(&emitted_id("fill-0")),
+            "the oldest entry is the one that survives"
+        );
+    }
+
+    // The cap bounds ADMISSION of new ids, not refreshes of resident ones.
+    // An id already in a full map used to be skipped along with the
+    // newcomers, so an item whose `ItemClass` changed kept the shape of its
+    // first sighting for the account's lifetime - and hydration then asked
+    // for a property shape that class rejects.
+    #[tokio::test]
+    async fn class_cache_refreshes_a_resident_id_even_when_full() {
+        let account = class_cache_account();
+        let folder = FolderId("AAMkPF=".to_string());
+        let filler: Vec<EwsItem> = (0..super::super::PUBLIC_ITEM_CLASS_CACHE_CAP)
+            .map(|n| item(&format!("fill-{n}"), None, false))
+            .collect();
+        account.record_public_item_classes(&folder, &filler).await;
+        assert_eq!(
+            account.public_item_classes.read().await.len(),
+            super::super::PUBLIC_ITEM_CLASS_CACHE_CAP
+        );
+        assert_eq!(
+            account
+                .public_item_shape(&emitted_id("fill-0"), &folder)
+                .await,
+            crate::ews::EwsItemShape::Message
+        );
+
+        // Same id, different class, map still full.
+        let mut reclassed = item("fill-0", None, false);
+        reclassed.item_class = "IPM.Contact".to_string();
+        account
+            .record_public_item_classes(&folder, &[reclassed])
+            .await;
+
+        assert_eq!(
+            account.public_item_classes.read().await.len(),
+            super::super::PUBLIC_ITEM_CLASS_CACHE_CAP,
+            "an overwrite must not grow the map"
+        );
+        assert_eq!(
+            account
+                .public_item_shape(&emitted_id("fill-0"), &folder)
+                .await,
+            crate::ews::EwsItemShape::NonMessage,
+            "a resident id's class must be refreshed regardless of the cap"
+        );
     }
 
     #[test]

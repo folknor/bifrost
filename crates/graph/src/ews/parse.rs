@@ -1469,11 +1469,12 @@ mod tests {
 
     #[test]
     fn parse_get_item_response_contact() {
-        // Parser-tolerance only: the GetItem parser flips item-collection
-        // state on `<t:Contact>` so a hydration response parses to identity
-        // rather than erroring. This does NOT imply operational non-mail
-        // GetItem: the request builder is still message-shaped and unwired
-        // (see `ops::get_item`); sync runs through FindItem IdOnly.
+        // The GetItem parser flips item-collection state on `<t:Contact>`,
+        // so the answer to a contact-shaped hydration request parses to
+        // identity rather than erroring. The request side is now
+        // class-conditional (`EwsItemShape`, see `ops::get_item`), so this
+        // is the real response shape for a non-mail public-folder item, not
+        // just parser tolerance.
         let xml = r#"<?xml version="1.0" encoding="utf-8"?>
 <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
   <s:Body>

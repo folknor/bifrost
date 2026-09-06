@@ -176,7 +176,11 @@ async fn fetch_ews_outcomes(
             continue;
         };
         let native = super::foreign::parse_message_id(id).native_id().to_string();
-        match ews.get_item(&native, &routing.headers()).await {
+        // Class-conditional property shape: a contact / calendar item in a
+        // mixed public folder answers a message-shaped GetItem with
+        // `ErrorInvalidPropertyRequest`.
+        let shape = account.public_item_shape(id, folder).await;
+        match ews.get_item(&native, shape, &routing.headers()).await {
             Ok(item) => outcomes.push(ItemOutcome::Succeeded(BatchSuccess::new(
                 batch_id,
                 hydrated_from_ews_item(
@@ -1195,5 +1199,178 @@ mod tests {
         let url = hydrate_url_for_id(&account, &id, "id").expect("primary");
         assert!(url.starts_with("/me/messages/"), "{url}");
         assert!(!url.contains('\u{1e}'), "{url}");
+    }
+
+    // ── Class-conditional EWS hydration ─────────────────────
+
+    /// A `GetItem` SOAP answer for `AAMkItem=` of the given class. The
+    /// element name matters: the parser switches item-collection state on
+    /// it.
+    fn get_item_soap(element: &str, item_class: &str) -> String {
+        format!(
+            r#"<?xml version="1.0" encoding="utf-8"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Body>
+    <m:GetItemResponse xmlns:m="http://schemas.microsoft.com/exchange/services/2006/messages"
+                       xmlns:t="http://schemas.microsoft.com/exchange/services/2006/types">
+      <m:ResponseMessages>
+        <m:GetItemResponseMessage ResponseClass="Success">
+          <m:ResponseCode>NoError</m:ResponseCode>
+          <m:Items>
+            <t:{element}>
+              <t:ItemId Id="AAMkItem=" ChangeKey="CK1"/>
+              <t:ItemClass>{item_class}</t:ItemClass>
+            </t:{element}>
+          </m:Items>
+        </m:GetItemResponseMessage>
+      </m:ResponseMessages>
+    </m:GetItemResponse>
+  </s:Body>
+</s:Envelope>"#
+        )
+    }
+
+    fn ews_item_of_class(item_id: &str, item_class: &str) -> crate::ews::EwsItem {
+        let mut item = ews_item();
+        item.item_id = item_id.to_string();
+        item.item_class = item_class.to_string();
+        item
+    }
+
+    /// Drive the real batch hydration door against a scripted EWS transport
+    /// and return the SOAP body that reached the wire, plus whether the
+    /// outcome succeeded.
+    async fn ews_hydrate_request_body(
+        folder_class: Option<&str>,
+        known_item: Option<crate::ews::EwsItem>,
+        response: &str,
+    ) -> (String, bool) {
+        use bifrost_net::test_support::{Canned, ScriptedDispatch, scripted_account};
+        use bifrost_net::{NetConfig, RetryPolicy, StaticTokenSource, TokenSource};
+        use std::sync::Arc;
+
+        let script = ScriptedDispatch::new([Canned::Response {
+            status: StatusCode::OK,
+            headers: HeaderMap::new(),
+            body: Bytes::from(response.to_string()),
+        }]);
+        let token_source: Arc<dyn TokenSource> = Arc::new(StaticTokenSource::new("token", None));
+        let net = scripted_account(
+            &script,
+            NetConfig::default(),
+            Vec::new(),
+            Arc::clone(&token_source),
+            RetryPolicy::disabled(),
+        );
+        let client =
+            GraphClient::with_account_net(net, "https://graph.contoso.test/v1.0", token_source);
+        let account = GraphAccount::new_for_tests(client, PushMode::EwsStreaming);
+
+        let folder = FolderId("AAMkPF=".to_string());
+        account
+            .seed_public_folder_meta_for_tests(
+                folder.clone(),
+                crate::account::cursor::PublicFolderRouting {
+                    anchor_mailbox: "content@contoso.com".to_string(),
+                    public_folder_mailbox: Some("pf@contoso.com".to_string()),
+                },
+                crate::account::public_folder::PublicFolderMeta {
+                    display_name: "Notices".to_string(),
+                    folder_class: folder_class.map(str::to_string),
+                    parent: None,
+                    effective_rights: crate::ews::EwsEffectiveRights::default(),
+                },
+            )
+            .await;
+        if let Some(item) = known_item {
+            // Exactly what the inventory / poll walk records.
+            account
+                .record_public_item_classes(&folder, std::slice::from_ref(&item))
+                .await;
+        }
+
+        let id = super::super::foreign::encode_public_item_id(&folder, "AAMkItem=");
+        let outcomes = fetch_ews_outcomes(&account, &[(id, folder)], Projection::Metadata).await;
+        assert_eq!(outcomes.len(), 1, "one outcome per pulled id");
+        let succeeded = matches!(outcomes[0], ItemOutcome::Succeeded(_));
+
+        let requests = script.requests();
+        assert_eq!(requests.len(), 1, "one GetItem per item");
+        let body = requests[0].body.clone().expect("GetItem carries a body");
+        (
+            String::from_utf8(body.to_vec()).expect("utf8 SOAP"),
+            succeeded,
+        )
+    }
+
+    /// The defect this closes: a `Contact` in a MIXED public folder (the
+    /// folder itself is `IPF.Note`, so the container tier says "message")
+    /// was asked for `message:ToRecipients` and answered
+    /// `ErrorInvalidPropertyRequest`. The per-item class the inventory pass
+    /// already parsed is what makes the request class-safe.
+    #[tokio::test]
+    async fn a_known_contact_in_a_mail_public_folder_is_asked_for_no_message_properties() {
+        let (body, succeeded) = ews_hydrate_request_body(
+            Some("IPF.Note"),
+            Some(ews_item_of_class("AAMkItem=", "IPM.Contact")),
+            &get_item_soap("Contact", "IPM.Contact"),
+        )
+        .await;
+        assert!(
+            !body.contains("message:"),
+            "a contact was asked for message properties: {body}"
+        );
+        assert!(succeeded, "the class-safe request hydrates the contact");
+    }
+
+    /// The mail path is untouched: same folder, same door, the historical
+    /// message-shaped body.
+    #[tokio::test]
+    async fn a_mail_item_still_gets_the_message_shaped_body() {
+        let (body, succeeded) = ews_hydrate_request_body(
+            Some("IPF.Note"),
+            Some(ews_item_of_class("AAMkItem=", "IPM.Note")),
+            &get_item_soap("Message", "IPM.Note"),
+        )
+        .await;
+        assert!(
+            body.contains(r#"FieldURI="message:ToRecipients""#),
+            "{body}"
+        );
+        assert!(
+            body.contains(r#"FieldURI="message:CcRecipients""#),
+            "{body}"
+        );
+        assert!(succeeded);
+    }
+
+    /// The reattach tier: nothing is known about the item (a consumer-held
+    /// id hydrated before any inventory pass ran in this process), but the
+    /// folder's EWS `FolderClass` is re-seeded by discovery on every attach,
+    /// so a contacts public folder still gets a class-safe request.
+    #[tokio::test]
+    async fn an_unknown_item_falls_back_to_the_folder_class() {
+        let (body, succeeded) = ews_hydrate_request_body(
+            Some("IPF.Contact"),
+            None,
+            &get_item_soap("Contact", "IPM.Contact"),
+        )
+        .await;
+        assert!(!body.contains("message:"), "{body}");
+        assert!(succeeded);
+    }
+
+    /// And with NOTHING known - no per-item class, no folder class - the
+    /// request is the historical message-shaped one. An unknown item is
+    /// never guessed into a shape: it fails exactly as it did before, per
+    /// item, with the server's own `ErrorInvalidPropertyRequest`.
+    #[tokio::test]
+    async fn an_entirely_unknown_class_keeps_the_historical_request() {
+        let (body, _) =
+            ews_hydrate_request_body(None, None, &get_item_soap("Message", "IPM.Note")).await;
+        assert!(
+            body.contains(r#"FieldURI="message:ToRecipients""#),
+            "{body}"
+        );
     }
 }

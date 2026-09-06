@@ -68,32 +68,24 @@ impl EwsClient {
     /// `headers` carries the folder's `X-AnchorMailbox` /
     /// `X-PublicFolderMailbox` routing pair.
     ///
-    /// The request body is message-shaped (`get_item_body` asks for
-    /// `message:ToRecipients`/`CcRecipients`), so it is only class-safe for
-    /// `<t:Message>`: a real Contact/CalendarItem GetItem would return
-    /// `ErrorInvalidPropertyRequest`. Making the shape class-conditional
-    /// needs the class at request time, which a bare id does not carry; a
-    /// mixed-class public folder therefore hydrates its mail items and fails
-    /// per-item on the others. The parser tolerates all three classes (see
-    /// `parse_get_item_response`); that tolerance is not a claim of
-    /// operational non-mail GetItem support.
-    ///
-    /// The fix shape, when this is worth closing: `EwsItem.item_class` is
-    /// already parsed by the inventory pass (`FindItem` requests
-    /// `item:ItemClass`), so thread the class forward from inventory to the
-    /// hydration call and make the requested property set conditional on it -
-    /// message properties for `IPM.Note`, the contact or calendar sets
-    /// otherwise. The blocker is only that the hydration lane addresses a
-    /// bare `ObjectId`, which carries no class marker; nothing about EWS
-    /// prevents the conditional body. Until then the blast radius is bounded:
-    /// only a MIXED-class pinned public folder is affected, and a consumer
-    /// that drops non-mail scopes before hydration never reaches it.
+    /// The requested property set is CLASS-CONDITIONAL (`shape`), because
+    /// EWS validates it against the item's real class: the message shape
+    /// asks for `message:ToRecipients`/`CcRecipients`, which a
+    /// `<t:Contact>` or `<t:CalendarItem>` answers with
+    /// `ErrorInvalidPropertyRequest`. The caller supplies the class it
+    /// learned from the inventory/poll pass (`EwsItem.item_class`, which
+    /// `FindItem` requests) or from the folder's `FolderClass`;
+    /// `EwsItemShape::Message` is the fallback when nothing is known, so an
+    /// unknown item behaves exactly as it did before the shape existed
+    /// rather than being guessed into a shape it may not have. The parser
+    /// tolerates all three classes (see `parse_get_item_response`).
     pub(crate) async fn get_item(
         &self,
         item_id: &str,
+        shape: super::EwsItemShape,
         headers: &EwsHeaders,
     ) -> Result<EwsItem, EwsError> {
-        let body = get_item_body(item_id);
+        let body = get_item_body(item_id, shape);
         let xml = self.execute(&body, headers).await?;
         parse_get_item_response(&xml)
     }
@@ -205,19 +197,26 @@ fn find_items_body(folder_id: &str, since: Option<&str>, offset: u32, max_entrie
     )
 }
 
-// Message-shaped: requests `message:ToRecipients`/`CcRecipients`, so this
-// body is only class-safe for `<t:Message>`. See the `get_item` doc comment.
-fn get_item_body(item_id: &str) -> String {
+// Class-conditional: the `message:` field URIs are only valid against a
+// `<t:Message>`, so a contact or calendar item gets the class-agnostic
+// subset. See the `get_item` doc comment. The `Message` arm is byte-identical
+// to the historical unconditional body.
+fn get_item_body(item_id: &str, shape: super::EwsItemShape) -> String {
     let escaped_id = xml_escape(item_id);
+    let message_properties = match shape {
+        super::EwsItemShape::Message => {
+            "\n      <t:FieldURI FieldURI=\"message:ToRecipients\"/>\
+             \n      <t:FieldURI FieldURI=\"message:CcRecipients\"/>"
+        }
+        super::EwsItemShape::NonMessage => "",
+    };
     format!(
         r#"<m:GetItem>
   <m:ItemShape>
     <t:BaseShape>Default</t:BaseShape>
     <t:AdditionalProperties>
       <t:FieldURI FieldURI="item:Body"/>
-      <t:FieldURI FieldURI="item:Attachments"/>
-      <t:FieldURI FieldURI="message:ToRecipients"/>
-      <t:FieldURI FieldURI="message:CcRecipients"/>
+      <t:FieldURI FieldURI="item:Attachments"/>{message_properties}
     </t:AdditionalProperties>
     <t:BodyType>HTML</t:BodyType>
   </m:ItemShape>
@@ -274,13 +273,88 @@ mod tests {
 
     #[test]
     fn get_item_body_requests_body_recipients_and_attachments() {
-        let body = get_item_body("AAMkItem=");
+        let body = get_item_body("AAMkItem=", super::super::EwsItemShape::Message);
         assert!(body.contains(r#"<t:ItemId Id="AAMkItem="/>"#));
         assert!(body.contains(r#"FieldURI="item:Body""#));
         assert!(body.contains(r#"FieldURI="item:Attachments""#));
         assert!(body.contains(r#"FieldURI="message:ToRecipients""#));
         assert!(body.contains(r#"FieldURI="message:CcRecipients""#));
         assert!(body.contains("<t:BodyType>HTML</t:BodyType>"));
+    }
+
+    /// The message arm must stay BYTE-identical to the historical
+    /// unconditional body: the whole point of the class-conditional shape is
+    /// that mail hydration is untouched by it.
+    #[test]
+    fn the_message_shape_is_the_historical_body_verbatim() {
+        let expected = r#"<m:GetItem>
+  <m:ItemShape>
+    <t:BaseShape>Default</t:BaseShape>
+    <t:AdditionalProperties>
+      <t:FieldURI FieldURI="item:Body"/>
+      <t:FieldURI FieldURI="item:Attachments"/>
+      <t:FieldURI FieldURI="message:ToRecipients"/>
+      <t:FieldURI FieldURI="message:CcRecipients"/>
+    </t:AdditionalProperties>
+    <t:BodyType>HTML</t:BodyType>
+  </m:ItemShape>
+  <m:ItemIds>
+    <t:ItemId Id="AAMkItem="/>
+  </m:ItemIds>
+</m:GetItem>"#;
+        assert_eq!(
+            get_item_body("AAMkItem=", super::super::EwsItemShape::Message),
+            expected
+        );
+        // And an unknown class resolves to exactly that shape, so an item
+        // whose class hydration could not learn behaves as it always did.
+        assert_eq!(
+            super::super::EwsItemShape::default(),
+            super::super::EwsItemShape::Message
+        );
+    }
+
+    /// A contact / calendar item must not be asked for `message:` fields -
+    /// that request is what EWS answers with `ErrorInvalidPropertyRequest`.
+    #[test]
+    fn the_non_message_shape_asks_for_no_message_properties() {
+        let body = get_item_body("AAMkItem=", super::super::EwsItemShape::NonMessage);
+        assert!(
+            !body.contains("message:"),
+            "leaked a message property: {body}"
+        );
+        // Still the properties both projections actually read.
+        assert!(body.contains(r#"FieldURI="item:Body""#));
+        assert!(body.contains(r#"FieldURI="item:Attachments""#));
+        assert!(body.contains("<t:BodyType>HTML</t:BodyType>"));
+        assert!(body.contains(r#"<t:ItemId Id="AAMkItem="/>"#));
+    }
+
+    #[test]
+    fn item_and_folder_classes_map_onto_shapes() {
+        use super::super::EwsItemShape as Shape;
+        for mail in ["IPM.Note", "IPM.Note.SMIME", "IPM.Whatever", ""] {
+            assert_eq!(Shape::from_item_class(mail), Shape::Message, "{mail}");
+        }
+        for other in [
+            "IPM.Contact",
+            "IPM.DistList",
+            "IPM.Appointment",
+            "IPM.Schedule.Meeting.Request",
+            "IPM.Task",
+            "IPM.StickyNote",
+        ] {
+            assert_eq!(Shape::from_item_class(other), Shape::NonMessage, "{other}");
+        }
+        assert_eq!(Shape::from_folder_class("IPF.Note"), Shape::Message);
+        assert_eq!(Shape::from_folder_class(""), Shape::Message);
+        for other in ["IPF.Contact", "IPF.Appointment", "IPF.Task"] {
+            assert_eq!(
+                Shape::from_folder_class(other),
+                Shape::NonMessage,
+                "{other}"
+            );
+        }
     }
 
     #[test]
@@ -310,7 +384,8 @@ mod tests {
             get_folder_body("AAMkPF="),
             find_items_body("AAMk=", None, 0, 50),
             find_items_body("AAMk=", Some("2026-03-01T10:00:00Z"), 100, 50),
-            get_item_body("AAMkItem="),
+            get_item_body("AAMkItem=", super::super::EwsItemShape::Message),
+            get_item_body("AAMkItem=", super::super::EwsItemShape::NonMessage),
             get_attachment_body("AAMkAtt="),
         ] {
             assert_eq!(

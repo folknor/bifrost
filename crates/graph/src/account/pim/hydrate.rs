@@ -91,8 +91,11 @@ pub(super) async fn public_message_hydrate(
     let native = crate::account::foreign::parse_message_id(id)
         .native_id()
         .to_string();
+    // Same class-conditional property shape the batch door uses, so both
+    // doors ask a non-mail public-folder item for a set it accepts.
+    let shape = account.public_item_shape(id, folder).await;
     let item = ews
-        .get_item(&native, &routing.headers())
+        .get_item(&native, shape, &routing.headers())
         .await
         .map_err(|error| {
             crate::account::graph_error::ews_error_to_account_error(

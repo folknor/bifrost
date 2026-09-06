@@ -49,6 +49,71 @@ impl EwsHeaders {
     }
 }
 
+/// The property shape a `GetItem` request may ask for.
+///
+/// EWS validates the requested property set against the item's actual
+/// class: asking a `<t:Contact>` or `<t:CalendarItem>` for
+/// `message:ToRecipients` is answered with `ErrorInvalidPropertyRequest`,
+/// per item. A mixed-class public folder therefore needs the class BEFORE
+/// the request is built, which is why the shape is threaded in from the
+/// caller rather than decided inside `ops`.
+///
+/// `NonMessage` deliberately collapses contacts and calendar items into a
+/// single class-agnostic shape (`item:Body` + `item:Attachments`, both
+/// valid on every item class) rather than requesting `contacts:` /
+/// `calendar:` fields: the public-folder projections read only body,
+/// preview and attachments off the result, so a wider set would add
+/// class-specific failure modes for data nothing consumes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum EwsItemShape {
+    /// `IPM.Note` and anything unknown - the historical, message-shaped
+    /// request. Unknown deliberately keeps this shape: it reproduces the
+    /// pre-existing behaviour exactly (mail hydrates, a non-mail item fails
+    /// per item with `ErrorInvalidPropertyRequest`) instead of guessing a
+    /// shape the item may not have.
+    #[default]
+    Message,
+    /// A contact or calendar item: no `message:` properties.
+    NonMessage,
+}
+
+impl EwsItemShape {
+    /// The shape an item's EWS `ItemClass` calls for. `IPM.Note` and its
+    /// subclasses (`IPM.Note.SMIME`, ...) are messages; `IPM.Contact`,
+    /// `IPM.DistList`, `IPM.Appointment` and `IPM.Schedule.*` are not.
+    /// Anything unrecognized falls back to `Message`, the historical shape.
+    pub(crate) fn from_item_class(item_class: &str) -> Self {
+        if item_class.starts_with("IPM.Contact")
+            || item_class.starts_with("IPM.DistList")
+            || item_class.starts_with("IPM.Appointment")
+            || item_class.starts_with("IPM.Schedule")
+            || item_class.starts_with("IPM.Task")
+            || item_class.starts_with("IPM.StickyNote")
+        {
+            Self::NonMessage
+        } else {
+            Self::Message
+        }
+    }
+
+    /// The shape an EWS `FolderClass` (`IPF.Note`, `IPF.Contact`, ...)
+    /// implies for items in that folder. The container-level fallback used
+    /// when no per-item class is known: a folder class is server-reported
+    /// and re-seeded by discovery on every attach, so it survives a
+    /// reattach that empties the per-item cache.
+    pub(crate) fn from_folder_class(folder_class: &str) -> Self {
+        if folder_class.starts_with("IPF.Contact")
+            || folder_class.starts_with("IPF.Appointment")
+            || folder_class.starts_with("IPF.Task")
+            || folder_class.starts_with("IPF.StickyNote")
+        {
+            Self::NonMessage
+        } else {
+            Self::Message
+        }
+    }
+}
+
 /// Structured EWS transport or protocol error.
 ///
 /// Used by `EwsClient::execute` so callers receive structured evidence

@@ -67,6 +67,12 @@ use self::scopes::{CursorIndex, FolderTree};
 // pub: public-folder consumers name the folders they want synced.
 pub use self::public_folder::PublicFolderScope;
 
+/// Defensive bound on the per-item EWS class cache. Sized to the
+/// public-folder live-id cap, so a single fully-walked folder fits; past it
+/// hydration falls back to the folder-class tier, which is already the right
+/// answer for any folder that is not mixed-class.
+pub(crate) const PUBLIC_ITEM_CLASS_CACHE_CAP: usize = cursor::PUBLIC_FOLDER_LIVE_IDS_CAP;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub(crate) enum PushMode {
@@ -149,6 +155,25 @@ pub(crate) struct GraphAccount {
     /// Which public folders this account syncs, or `None` when public-folder
     /// discovery is off (the default, so no existing Graph account pays the
     /// Autodiscover round-trips). Opt in via `with_public_folders`.
+    /// EWS item classes learned by the public-folder inventory / poll
+    /// passes, keyed by the folder-qualified `ObjectId` those passes mint.
+    ///
+    /// Hydration builds a CLASS-CONDITIONAL `GetItem` body, and the class is
+    /// not derivable from an id: this map is how the class the inventory
+    /// pass already parsed (`EwsItem.item_class`) reaches the hydration
+    /// call. It is a cache, never a source of truth - a miss falls back to
+    /// the folder's `FolderClass` in `public_folder_meta` (re-seeded by
+    /// discovery on every attach, so a cold reattach that hydrates a
+    /// consumer-held id before any inventory pass still gets a container
+    /// level answer), and a miss there falls back to the message shape,
+    /// which is the historical request. The alternative - encoding the
+    /// class into the `ObjectId` - was rejected because the poll's
+    /// `Destroyed` ids are minted from the persisted `live_ids` baseline,
+    /// which stores bare native item ids: a class-bearing id would stop
+    /// byte-matching the id the consumer stored unless the class were also
+    /// added to the cursor payload, ticking its schema, and ids already held
+    /// by consumers would carry no class either way.
+    pub(crate) public_item_classes: Arc<RwLock<HashMap<ObjectId, crate::ews::EwsItemShape>>>,
     pub(crate) public_folders: Option<PublicFolderScope>,
     /// The account's primary SMTP, captured at open from the Graph
     /// profile. Seeds the `GetUserSettings` Autodiscover lookups.
@@ -332,6 +357,7 @@ impl GraphAccount {
             trash_folder_ids: Arc::new(RwLock::new(HashMap::new())),
             routing_map: Arc::new(RwLock::new(HashMap::new())),
             public_folder_meta: Arc::new(RwLock::new(HashMap::new())),
+            public_item_classes: Arc::new(RwLock::new(HashMap::new())),
             public_folders,
             user_email,
             open_folder_seed: Arc::new(RwLock::new(None)),
@@ -466,6 +492,99 @@ impl GraphAccount {
         folder: &bifrost_types::FolderId,
     ) -> Option<cursor::PublicFolderRouting> {
         self.routing_map.read().await.get(folder).cloned()
+    }
+
+    /// Record the EWS item class of every item a public-folder inventory or
+    /// poll walk returned, so a later `GetItem` for one of those ids can ask
+    /// for the property shape that item's class accepts.
+    ///
+    /// Keyed by the same folder-qualified `ObjectId` the projections mint,
+    /// so the hydration doors look up exactly the id they were handed. The
+    /// map is bounded by `PUBLIC_ITEM_CLASS_CACHE_CAP`, which bounds
+    /// admission of NEW ids only: past it the folder's `FolderClass` fallback
+    /// carries hydration for ids that never got in, which is the correct
+    /// answer for every single-class folder and the historical one otherwise.
+    /// An id already resident is always refreshed, cap or no cap, so an item
+    /// whose `ItemClass` changed does not keep a stale shape.
+    pub(crate) async fn record_public_item_classes(
+        &self,
+        folder: &bifrost_types::FolderId,
+        items: &[crate::ews::EwsItem],
+    ) {
+        if items.is_empty() {
+            return;
+        }
+        let mut map = self.public_item_classes.write().await;
+        let mut len = map.len();
+        for item in items {
+            let id = foreign::encode_public_item_id(folder, &item.item_id);
+            let shape = crate::ews::EwsItemShape::from_item_class(&item.item_class);
+            match map.entry(id) {
+                // An id already in the map is refreshed unconditionally: the
+                // cap bounds ADMISSION of new keys, and overwriting an
+                // existing key does not grow the map. Without this an item
+                // whose `ItemClass` changed would keep its stale shape for
+                // the account's lifetime once the map filled up.
+                std::collections::hash_map::Entry::Occupied(mut slot) => {
+                    slot.insert(shape);
+                }
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    if len < PUBLIC_ITEM_CLASS_CACHE_CAP {
+                        slot.insert(shape);
+                        len += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Drop the cached item classes for ids the public-folder poll just
+    /// emitted as `Destroyed`.
+    ///
+    /// The map is filled at every EWS walk and nothing else removed from
+    /// it, so without this the entry for a deleted item lived until the
+    /// account was dropped. That is not merely wasted memory: the cap is
+    /// an admission bound, not an eviction policy (see
+    /// `record_public_item_classes`), so a churning folder whose dead
+    /// entries fill the map locks every LATER item out of the cache and
+    /// silently demotes hydration to the folder-class tier for the rest of
+    /// the process. Pruning at the destroy site keeps the resident set
+    /// proportional to the live set; the cap stays as the backstop for a
+    /// folder that is genuinely that large.
+    pub(crate) async fn forget_public_item_classes(&self, ids: &[ObjectId]) {
+        if ids.is_empty() {
+            return;
+        }
+        let mut map = self.public_item_classes.write().await;
+        for id in ids {
+            map.remove(id);
+        }
+    }
+
+    /// The `GetItem` property shape to request for a public-folder item.
+    ///
+    /// Three tiers, most specific first: the class the inventory / poll pass
+    /// parsed for this exact item; else the folder's EWS `FolderClass`,
+    /// which discovery re-seeds on every attach and which is the right
+    /// answer for any folder that is not mixed-class; else the message
+    /// shape, which is byte-identical to the request this lane always made -
+    /// so an item of unknown class fails exactly as it did before, per item,
+    /// rather than being guessed into a shape.
+    pub(crate) async fn public_item_shape(
+        &self,
+        id: &ObjectId,
+        folder: &bifrost_types::FolderId,
+    ) -> crate::ews::EwsItemShape {
+        if let Some(shape) = self.public_item_classes.read().await.get(id) {
+            return *shape;
+        }
+        self.public_folder_meta
+            .read()
+            .await
+            .get(folder)
+            .and_then(|meta| meta.folder_class.as_deref())
+            .map(crate::ews::EwsItemShape::from_folder_class)
+            .unwrap_or_default()
     }
 
     /// The owning shared-mailbox identity for a foreign scope, or `None`

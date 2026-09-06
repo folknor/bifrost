@@ -1432,17 +1432,63 @@ HTML body onto `body_text` / `body_html`, tags the containing folder as the
 only container, and carries `Importance::Normal` and no `thread_id` (EWS's
 message shape reports neither).
 
-The EWS `GetItem` body is MESSAGE-shaped on both doors: it requests
-`message:ToRecipients` / `CcRecipients`, which a real `Contact` or
-`CalendarItem` answers with `ErrorInvalidPropertyRequest`. A mixed-class
-pinned public folder therefore hydrates its mail items correctly and fails
-PER ITEM on the others; the parser tolerating all three classes is not a claim
-of operational non-mail support. The class is not knowable from a bare
-`ObjectId` at request time, so the fix is threading `EwsItem.item_class`
-forward from the inventory pass and making the property set conditional. A
-consumer that drops non-mail scopes before hydration never reaches it.
+The EWS `GetItem` body is CLASS-CONDITIONAL on both doors (`EwsItemShape`,
+threaded into `EwsClient::get_item`). The message shape requests
+`message:ToRecipients` / `CcRecipients` and is byte-identical to the body
+this lane always sent; the non-message shape drops them, because a real
+`Contact` or `CalendarItem` answers a `message:` field URI with
+`ErrorInvalidPropertyRequest` - which is how a mixed-class pinned public
+folder used to hydrate its mail correctly and fail PER ITEM on everything
+else. `NonMessage` deliberately collapses contacts and calendar items onto
+`item:Body` + `item:Attachments` (valid on every class) rather than
+requesting `contacts:` / `calendar:` fields: the projections read only body,
+preview and attachments, so a wider set would only add class-specific failure
+modes for data nothing consumes.
 Public-folder hydration also fans out one `GetItem` per item, because ids in
 one chunk can sit in different folders with different routing headers.
+
+### How the class reaches hydration
+
+`ObjectId` carries no class marker, so `GraphAccount::public_item_shape`
+resolves it in three tiers, most specific first:
+
+1. **`public_item_classes`** - `EwsItem.item_class` (the inventory `FindItem`
+   already requests `item:ItemClass`), recorded by
+   `record_public_item_classes` at every EWS walk: the inventory establish,
+   the incremental poll, and the throttled full scan. Keyed by the same
+   folder-qualified `ObjectId` the projections mint, bounded by
+   `PUBLIC_ITEM_CLASS_CACHE_CAP`. The cap is an ADMISSION bound on NEW ids,
+   not an eviction policy: a full map refuses new inserts and keeps its
+   oldest entries, so a recently recorded item is never the victim - it is
+   simply never admitted. An id already resident is always refreshed, cap or
+   no cap, since an overwrite does not grow the map - otherwise an item whose
+   `ItemClass` changed would keep the shape of its first sighting for the
+   account's lifetime. That only stays tenable because the poll frees slots:
+   `forget_public_item_classes`, called on the `Destroyed` ids the reduced
+   poll actually emitted (read off the changes by `destroyed_ids`, so the
+   degraded and incomplete-scan paths that emit no `Destroyed` prune
+   nothing), keeps the resident set proportional to the live set. Without
+   it a churning folder's dead entries would fill the map and lock every
+   later item down to the folder-class tier for the rest of the process.
+2. **The folder's EWS `FolderClass`** in `public_folder_meta`
+   (`EwsItemShape::from_folder_class`). This is the tier that SURVIVES A
+   REATTACH: discovery re-seeds `public_folder_meta` synchronously inside
+   every `attach`, so a consumer-held id hydrated before any inventory pass
+   has run in this process still gets a container-level answer, correct for
+   any folder that is not mixed-class.
+3. **The message shape**, when neither is known - byte-identical to the
+   historical request, so an item of unknown class fails exactly as it did
+   before, per item, carrying the server's own `ErrorInvalidPropertyRequest`.
+   Unknown is never guessed into a shape.
+
+Encoding the class into the `ObjectId` was considered and rejected: the
+poll's `Destroyed` ids are minted from the persisted `live_ids` baseline,
+which stores bare native item ids, so a class-bearing id would stop
+byte-matching the id the consumer stored unless the class were added to the
+cursor payload too (ticking its schema) - and ids consumers already hold
+would carry no class either way. The durable per-scope cursor state is not
+reachable from hydration (it is serialized into the engine's opaque cursor),
+which is why tier 2 rather than the cursor supplies the reattach answer.
 
 `move_thread` calls Graph move directly (the destination is the container id
 the consumer already holds, which is owner-qualified for a shared folder).
