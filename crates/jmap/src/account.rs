@@ -43,14 +43,18 @@ impl<Tr: HttpTransport> Account<Tr> {
     /// An account view whose every `/jmap/api` call reports its inbound
     /// payload bytes into a fresh batch accumulator.
     pub(crate) fn metered(&self) -> (Self, crate::client::ByteTally) {
-        let (client, tally) = self.client.metered();
-        (
-            Self {
-                client,
-                account_id: self.account_id.clone(),
-            },
-            tally,
-        )
+        let tally = crate::client::ByteTally::default();
+        (self.metered_into(&tally), tally)
+    }
+
+    /// An account view reporting into an EXISTING accumulator, so a
+    /// batch whose traffic runs through both an account view and the
+    /// bare client counts both legs once.
+    pub(crate) fn metered_into(&self, tally: &crate::client::ByteTally) -> Self {
+        Self {
+            client: self.client.metered_into(tally),
+            account_id: self.account_id.clone(),
+        }
     }
 
     /// Construct an `Account` directly. The account ID is not validated

@@ -166,6 +166,26 @@ pub(crate) trait HttpTransport: Send + Sync + 'static {
     /// Download a blob (GET, returns raw bytes).
     fn download(&self, url: &str) -> impl Future<Output = Result<Bytes, TransportError>> + Send;
 
+    /// Download a blob, also reporting the inbound payload bytes the
+    /// transport read to produce the answer.
+    ///
+    /// Defaulted on the same terms as [`Self::api_request_measured`]:
+    /// the default reports the DECODED body length, and the production
+    /// `reqwest` transport overrides it with `bifrost_net`'s
+    /// request-local counter. Blob bytes are the bulk of the traffic a
+    /// raw-message or blob read causes, so a batch emitted by one of
+    /// those paths cannot report an honest count without this door.
+    fn download_measured(
+        &self,
+        url: &str,
+    ) -> impl Future<Output = Result<(Bytes, u64), TransportError>> + Send {
+        async move {
+            let bytes = self.download(url).await?;
+            let measured = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+            Ok((bytes, measured))
+        }
+    }
+
     /// Fetch the session resource (GET, returns JSON).
     fn get_session(&self, url: &str) -> impl Future<Output = Result<Bytes, TransportError>> + Send;
 }

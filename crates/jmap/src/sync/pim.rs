@@ -2234,9 +2234,29 @@ async fn fetch_foreign_containers<T: HttpTransport>(
         let mail = &foreign_mail[account_id];
         let owner_email = owner_emails.get(account_id).map(String::as_str);
         match fetch_mailboxes(mail, op).await {
-            Ok(mailboxes) => containers.extend(mailboxes.into_iter().filter_map(|mailbox| {
-                container_from_mailbox(mailbox, Some(account_id), owner_email)
-            })),
+            Ok(mailboxes) => {
+                for mailbox in mailboxes {
+                    // Read before projection: `container_from_mailbox`
+                    // maps the absence onto `rights: None`, which is
+                    // also what a protocol that never reports rights
+                    // produces, so the omission is unrecoverable after.
+                    let rights_missing = mailbox.my_rights().is_none();
+                    let Some(container) =
+                        container_from_mailbox(mailbox, Some(account_id), owner_email)
+                    else {
+                        continue;
+                    };
+                    if rights_missing {
+                        skipped.push(SkippedScope {
+                            scope: bifrost_types::ErrorScope::Mailbox {
+                                id: container.id.0.clone().into(),
+                            },
+                            error: missing_shared_rights(&container.id.0, op),
+                        });
+                    }
+                    containers.push(container);
+                }
+            }
             Err(error) => skipped.push(SkippedScope {
                 scope: bifrost_types::ErrorScope::Mailbox {
                     id: (account_id.clone()).into(),
@@ -2246,6 +2266,33 @@ async fn fetch_foreign_containers<T: HttpTransport>(
         }
     }
     (containers, skipped)
+}
+
+/// A shared mailbox whose `Mailbox/get` answered without `myRights`.
+///
+/// RFC 8621 s2 makes `myRights` a server-set Mailbox property, and
+/// `fetch_mailboxes` asks for it by name, so an answer that omits it is
+/// a missing field rather than a protocol that has no rights notion. It
+/// matters only on a SHARE: `Container::rights` gates submit and the
+/// read-only-share distinction, and `None` there is indistinguishable
+/// from a personal mailbox where rights are not consulted. Reported as
+/// a degradation, not a failure - the container is still listed, since
+/// a share with unknown rights is far more useful than a share missing
+/// from the sidebar.
+fn missing_shared_rights(container_id: &str, op: AccountOperation) -> AccountError {
+    bifrost_types::AccountErrorBuilder::new(
+        bifrost_types::AccountErrorKind::Protocol(bifrost_types::ProtocolErrorKind::MissingField),
+        bifrost_types::Cause::Wire(bifrost_types::WireCause::MalformedResponse {
+            protocol: bifrost_types::Protocol::Jmap,
+            detail: Some(bifrost_types::DiagnosticText::support_only(format!(
+                "shared Mailbox/get answered without myRights: {container_id}"
+            ))),
+        }),
+    )
+    .protocol(bifrost_types::Protocol::Jmap)
+    .operation(op)
+    .try_build()
+    .expect("valid account error classification")
 }
 
 async fn fetch_mailboxes<T: HttpTransport>(
@@ -3395,6 +3442,135 @@ mod tests {
             value["parentId"] = serde_json::Value::String(parent.to_string());
         }
         serde_json::from_value(value).expect("mailbox deserializes")
+    }
+
+    /// Answers one `Mailbox/get` with two shared mailboxes: one that
+    /// reports `myRights`, one that omits it.
+    #[derive(Clone)]
+    struct RightsTransport;
+
+    impl HttpTransport for RightsTransport {
+        async fn api_request(
+            &self,
+            _url: &str,
+            body: Vec<u8>,
+        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+            let request: serde_json::Value =
+                serde_json::from_slice(&body).expect("the client emits JSON");
+            let call = &request["methodCalls"][0];
+            assert_eq!(call[0], "Mailbox/get");
+            let call_id = call[2].clone();
+            let response = serde_json::json!({
+                "sessionState": "session-1",
+                "methodResponses": [[
+                    "Mailbox/get",
+                    {
+                        "accountId": "shared",
+                        "state": "s1",
+                        "list": [
+                            {
+                                "id": "mbx-rights",
+                                "name": "Reports",
+                                "isSubscribed": true,
+                                "myRights": {
+                                    "mayReadItems": true, "mayAddItems": false,
+                                    "mayRemoveItems": false, "maySetSeen": true,
+                                    "maySetKeywords": false, "mayCreateChild": false,
+                                    "mayRename": false, "mayDelete": false,
+                                    "maySubmit": false
+                                }
+                            },
+                            {
+                                "id": "mbx-bare",
+                                "name": "Silent",
+                                "isSubscribed": true
+                            }
+                        ],
+                        "notFound": []
+                    },
+                    call_id
+                ]]
+            });
+            Ok(bytes::Bytes::from(response.to_string()))
+        }
+
+        async fn upload(
+            &self,
+            _url: &str,
+            _body: Vec<u8>,
+            _content_type: Option<&str>,
+        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+            Err(crate::core::transport::TransportError::new("no upload"))
+        }
+
+        async fn download(
+            &self,
+            _url: &str,
+        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+            Err(crate::core::transport::TransportError::new("no download"))
+        }
+
+        async fn get_session(
+            &self,
+            _url: &str,
+        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+            Err(crate::core::transport::TransportError::new("no session"))
+        }
+    }
+
+    /// A share whose `Mailbox/get` answers without `myRights` projected
+    /// as `rights: None` - byte-identical to a protocol that has no
+    /// rights notion at all - so the sidebar could not tell "this share
+    /// is read-only" from "rights were never reported". The container
+    /// still lists (a share with unknown rights beats a missing share),
+    /// but the omission is now a `SkippedScope` naming that container.
+    #[tokio::test]
+    async fn a_share_omitting_my_rights_is_reported_as_a_degradation() {
+        let client = crate::client::Client::with_transport(
+            RightsTransport,
+            search_session(),
+            "https://example.test/.well-known/jmap",
+        )
+        .expect("client builds");
+        let mut foreign = HashMap::new();
+        foreign.insert(
+            "shared".to_string(),
+            crate::account::Account::new(client, "shared"),
+        );
+
+        let (containers, skipped) = super::fetch_foreign_containers(
+            &foreign,
+            &HashMap::new(),
+            AccountOperation::ContainersList,
+        )
+        .await;
+
+        // Both shares are still listed.
+        assert_eq!(containers.len(), 2);
+        let bare = ContainerId(super::super::foreign::encode_foreign("shared", "mbx-bare").0);
+        assert!(
+            containers
+                .iter()
+                .find(|c| c.id == bare)
+                .expect("the bare share is listed")
+                .rights
+                .is_none()
+        );
+
+        // Exactly the rights-less one is classified.
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(
+            skipped[0].scope,
+            bifrost_types::ErrorScope::Mailbox {
+                id: bare.0.clone().into()
+            }
+        );
+        assert_eq!(
+            *skipped[0].error.kind(),
+            bifrost_types::AccountErrorKind::Protocol(
+                bifrost_types::ProtocolErrorKind::MissingField
+            )
+        );
     }
 
     /// A thread search is a query for emails projected onto their

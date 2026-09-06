@@ -53,9 +53,14 @@ pub(crate) fn open<T: HttpTransport>(
             blob = blob.with_content_type(content_type);
         }
 
+        // Metered rather than measured off the decoded length: under the
+        // production transport the tally is bifrost-net's request-local
+        // inbound counter, which sees retry drains, redirects and 401
+        // recovery bodies that a decoded length cannot.
+        let (client, tally) = client.metered();
         match client.download(&blob).await {
             Ok(bytes) => {
-                let bytes_in = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+                let bytes_in = tally.take();
                 yield SyncEvent::Batch(Batch {
                     items: vec![bytes],
                     page_boundary: PageBoundary::Final,
@@ -106,6 +111,14 @@ pub(crate) fn open_raw_rfc822<T: HttpTransport>(
                 ),
                 None => (account_id, mail, message.0.clone()),
             };
+        // BOTH legs report into one accumulator: the `Email/get` that
+        // resolves the whole-message blobId and the blob download itself
+        // are traffic this batch caused, and a count carrying only the
+        // blob body would omit the first while a count carrying only the
+        // API response would omit the bulk of the bytes.
+        let tally = crate::client::ByteTally::default();
+        let client = client.metered_into(&tally);
+        let mail = mail.metered_into(&tally);
         let response = match mail
             .call(
                 EmailGet::new()
@@ -167,7 +180,7 @@ pub(crate) fn open_raw_rfc822<T: HttpTransport>(
         let blob = BlobRef::new(account_id, blob_id);
         match client.download(&blob).await {
             Ok(bytes) => {
-                let bytes_in = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+                let bytes_in = tally.take();
                 yield SyncEvent::Batch(Batch {
                     items: vec![bytes],
                     page_boundary: PageBoundary::Final,
@@ -241,6 +254,186 @@ mod tests {
     use std::collections::HashSet;
 
     use super::foreign_split;
+
+    /// A boundary that answers one `Email/get` and one blob download,
+    /// reporting an inbound byte count for each that is deliberately
+    /// UNLIKE the decoded body length, so a batch that measured the
+    /// decoded length instead of the transport's own counter is visible.
+    struct MeteredBlobTransport;
+
+    /// What the API leg reports as its request-local inbound total.
+    const API_BYTES_IN: u64 = 4_096;
+    /// What the download leg reports as its request-local inbound total.
+    /// Not `RAW.len()`: on the wire this read cost a redirect plus a
+    /// retry drain the decoded length cannot see.
+    const BLOB_BYTES_IN: u64 = 1_000_000;
+    const RAW: &[u8] = b"From: a@example.test\r\n\r\nbody";
+
+    impl crate::core::transport::HttpTransport for MeteredBlobTransport {
+        async fn api_request(
+            &self,
+            _url: &str,
+            body: Vec<u8>,
+        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+            let request: serde_json::Value =
+                serde_json::from_slice(&body).expect("the client emits JSON");
+            let call = &request["methodCalls"][0];
+            assert_eq!(call[0], "Email/get");
+            let call_id = call[2].clone();
+            let response = serde_json::json!({
+                "sessionState": "session-1",
+                "methodResponses": [[
+                    "Email/get",
+                    {
+                        "accountId": "primary",
+                        "state": "s1",
+                        "list": [{"id": "M1", "blobId": "B1"}],
+                        "notFound": []
+                    },
+                    call_id
+                ]]
+            });
+            Ok(bytes::Bytes::from(response.to_string()))
+        }
+
+        async fn api_request_measured(
+            &self,
+            url: &str,
+            body: Vec<u8>,
+        ) -> Result<(bytes::Bytes, u64), crate::core::transport::TransportError> {
+            Ok((self.api_request(url, body).await?, API_BYTES_IN))
+        }
+
+        async fn upload(
+            &self,
+            _url: &str,
+            _body: Vec<u8>,
+            _content_type: Option<&str>,
+        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+            Err(crate::core::transport::TransportError::new("no upload"))
+        }
+
+        async fn download(
+            &self,
+            _url: &str,
+        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+            Ok(bytes::Bytes::from_static(RAW))
+        }
+
+        async fn download_measured(
+            &self,
+            url: &str,
+        ) -> Result<(bytes::Bytes, u64), crate::core::transport::TransportError> {
+            Ok((self.download(url).await?, BLOB_BYTES_IN))
+        }
+
+        async fn get_session(
+            &self,
+            _url: &str,
+        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+            Err(crate::core::transport::TransportError::new("no session"))
+        }
+    }
+
+    fn metered_client() -> crate::client::Client<MeteredBlobTransport> {
+        let session: crate::core::session::Session = serde_json::from_value(serde_json::json!({
+            "capabilities": {
+                "urn:ietf:params:jmap:core": {
+                    "maxSizeUpload": 1000,
+                    "maxConcurrentUpload": 2,
+                    "maxSizeRequest": 100_000,
+                    "maxConcurrentRequests": 4,
+                    "maxCallsInRequest": 8,
+                    "maxObjectsInGet": 2,
+                    "maxObjectsInSet": 2,
+                    "collationAlgorithms": []
+                },
+                "urn:ietf:params:jmap:mail": {}
+            },
+            "accounts": {
+                "primary": {"name": "Primary", "isPersonal": true, "isReadOnly": false,
+                    "accountCapabilities": {"urn:ietf:params:jmap:mail": {}}}
+            },
+            "primaryAccounts": {"urn:ietf:params:jmap:mail": "primary"},
+            "username": "user@example.test",
+            "apiUrl": "https://example.test/jmap/api",
+            "downloadUrl": "https://example.test/download/{accountId}/{blobId}",
+            "uploadUrl": "https://example.test/upload/{accountId}",
+            "eventSourceUrl": "https://example.test/eventsource",
+            "state": "session-1"
+        }))
+        .expect("session parses");
+        crate::client::Client::with_transport(
+            MeteredBlobTransport,
+            session,
+            "https://example.test/.well-known/jmap",
+        )
+        .expect("client builds")
+    }
+
+    fn only_batch_bytes_in(events: Vec<bifrost_types::SyncEvent<bytes::Bytes>>) -> u64 {
+        events
+            .into_iter()
+            .find_map(|event| match event {
+                bifrost_types::SyncEvent::Batch(batch) => Some(batch.bytes_in),
+                _ => None,
+            })
+            .expect("the read emits one batch")
+    }
+
+    /// The blob door is metered through the same accumulator as the API
+    /// door, so the batch reports the transport's request-local inbound
+    /// count rather than the decoded blob length.
+    #[tokio::test]
+    async fn a_blob_read_reports_the_transports_inbound_count() {
+        use futures::StreamExt as _;
+
+        let handle = bifrost_types::BlobHandle {
+            id: bifrost_types::BlobId("B1".to_string()),
+            size: None,
+            content_type: None,
+            digest: None,
+            capabilities: bifrost_types::BlobCapabilities {
+                supports_range: false,
+                supports_parallel: false,
+                digest_available_pre_download: false,
+                encoding: bifrost_types::BlobEncoding::Raw8Bit,
+            },
+        };
+        let events = super::open(
+            metered_client(),
+            crate::core::id::AccountId::new("primary"),
+            std::sync::Arc::new(std::collections::HashMap::new()),
+            handle,
+        )
+        .collect::<Vec<_>>()
+        .await;
+
+        assert_eq!(only_batch_bytes_in(events), BLOB_BYTES_IN);
+    }
+
+    /// A raw RFC822 read is two requests - the `Email/get` that resolves
+    /// the whole-message blobId, then the blob download - and the batch
+    /// must report BOTH. Counting only the blob body omits the API leg;
+    /// counting only the API response omits the bulk of the bytes.
+    #[tokio::test]
+    async fn a_raw_read_reports_both_the_api_leg_and_the_blob_leg() {
+        use futures::StreamExt as _;
+
+        let client = metered_client();
+        let mail = crate::account::Account::new(client.clone(), "primary");
+        let events = super::open_raw_rfc822(
+            client,
+            crate::core::id::AccountId::new("primary"),
+            mail,
+            std::sync::Arc::new(std::collections::HashMap::new()),
+            bifrost_types::ObjectId("M1".to_string()),
+        )
+        .collect::<Vec<_>>()
+        .await;
+
+        assert_eq!(only_batch_bytes_in(events), API_BYTES_IN + BLOB_BYTES_IN);
+    }
 
     #[test]
     fn foreign_blob_id_selects_the_owning_account() {

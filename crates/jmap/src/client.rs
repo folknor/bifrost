@@ -676,9 +676,7 @@ impl<T: HttpTransport> Client<T> {
             .api_request_measured(state.api_url(), body)
             .await
             .map_err(crate::Error::from)?;
-        if let Some(tally) = self.tally.as_ref() {
-            tally.add(bytes_in);
-        }
+        self.record_bytes_in(bytes_in);
         let response: response::Response = serde_json::from_slice(&bytes)?;
         self.note_session_state(response.session_state());
         Ok(response)
@@ -755,13 +753,29 @@ impl<T: HttpTransport> Client<T> {
     /// scopes cannot contaminate the total.
     pub(crate) fn metered(&self) -> (Self, ByteTally) {
         let tally = ByteTally::default();
-        (
-            Self {
-                inner: Arc::clone(&self.inner),
-                tally: Some(tally.clone()),
-            },
-            tally,
-        )
+        (self.metered_into(&tally), tally)
+    }
+
+    /// A metered handle reporting into an EXISTING accumulator.
+    ///
+    /// One batch is sometimes produced by two differently scoped
+    /// handles - the raw-RFC822 read runs an `Email/get` through an
+    /// account view and the blob download through the client - and both
+    /// legs are traffic that batch caused, so they share one tally
+    /// rather than each opening their own.
+    pub(crate) fn metered_into(&self, tally: &ByteTally) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            tally: Some(tally.clone()),
+        }
+    }
+
+    /// Report inbound payload bytes to this handle's accumulator, if it
+    /// has one. Every transport door that reads a body calls this.
+    pub(crate) fn record_bytes_in(&self, bytes_in: u64) {
+        if let Some(tally) = self.tally.as_ref() {
+            tally.add(bytes_in);
+        }
     }
 
     /// Access the underlying transport.

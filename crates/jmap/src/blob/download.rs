@@ -52,10 +52,17 @@ impl<Tr: HttpTransport> Client<Tr> {
             }
         }
 
-        self.transport()
-            .download(&download_url)
+        // Measured, not plain: blob octets are the bulk of the traffic a
+        // raw-message or blob read causes, and a metered handle whose
+        // batch omitted them would report a count that leaves out
+        // traffic it caused.
+        let (bytes, bytes_in) = self
+            .transport()
+            .download_measured(&download_url)
             .await
-            .map_err(crate::Error::from)
+            .map_err(crate::Error::from)?;
+        self.record_bytes_in(bytes_in);
+        Ok(bytes)
     }
 }
 

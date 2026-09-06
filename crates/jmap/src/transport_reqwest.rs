@@ -197,6 +197,10 @@ impl HttpTransport for ReqwestTransport {
         self.send("GET", url, None, None).await
     }
 
+    async fn download_measured(&self, url: &str) -> Result<(bytes::Bytes, u64), TransportError> {
+        self.send_measured("GET", url, None, None).await
+    }
+
     async fn get_session(&self, url: &str) -> Result<bytes::Bytes, TransportError> {
         self.send("GET", url, None, None).await
     }
